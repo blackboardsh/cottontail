@@ -1701,14 +1701,99 @@ pub const Output = struct {
     var output_buffer: [4096]u8 = undefined;
     var output_writer: std.Io.Writer = std.Io.Writer.fixed(&output_buffer);
 
-    pub const color_map = struct {
-        pub fn get(_: @This(), comptime _: []const u8) ?[]const u8 {
-            return "";
-        }
-    }{};
+    const CSI = "\x1b[";
+    pub const color_map = ComptimeStringMap([]const u8, .{
+        &.{ "b", CSI ++ "1m" },
+        &.{ "d", CSI ++ "2m" },
+        &.{ "i", CSI ++ "3m" },
+        &.{ "u", CSI ++ "4m" },
+        &.{ "black", CSI ++ "30m" },
+        &.{ "red", CSI ++ "31m" },
+        &.{ "green", CSI ++ "32m" },
+        &.{ "yellow", CSI ++ "33m" },
+        &.{ "blue", CSI ++ "34m" },
+        &.{ "magenta", CSI ++ "35m" },
+        &.{ "cyan", CSI ++ "36m" },
+        &.{ "white", CSI ++ "37m" },
+        &.{ "bgred", CSI ++ "41m" },
+        &.{ "bggreen", CSI ++ "42m" },
+    });
+    const RESET: []const u8 = "\x1b[0m";
 
-    pub fn prettyFmt(comptime fmt_text: []const u8, comptime _: bool) []const u8 {
-        return fmt_text;
+    pub fn prettyFmt(comptime fmt_text: []const u8, comptime is_enabled: bool) [:0]const u8 {
+        comptime var new_fmt: [fmt_text.len * 4]u8 = undefined;
+        comptime var new_fmt_i: usize = 0;
+
+        @setEvalBranchQuota(9999);
+        comptime var i: usize = 0;
+        comptime while (i < fmt_text.len) {
+            switch (fmt_text[i]) {
+                '\\' => {
+                    i += 1;
+                    if (i < fmt_text.len) {
+                        switch (fmt_text[i]) {
+                            '<', '>' => {
+                                new_fmt[new_fmt_i] = fmt_text[i];
+                                new_fmt_i += 1;
+                                i += 1;
+                            },
+                            else => {
+                                new_fmt[new_fmt_i] = '\\';
+                                new_fmt_i += 1;
+                                new_fmt[new_fmt_i] = fmt_text[i];
+                                new_fmt_i += 1;
+                                i += 1;
+                            },
+                        }
+                    }
+                },
+                '>' => {
+                    i += 1;
+                },
+                '{' => {
+                    while (fmt_text.len > i and fmt_text[i] != '}') {
+                        new_fmt[new_fmt_i] = fmt_text[i];
+                        new_fmt_i += 1;
+                        i += 1;
+                    }
+                },
+                '<' => {
+                    i += 1;
+                    var is_reset = fmt_text[i] == '/';
+                    if (is_reset) i += 1;
+                    const start = i;
+                    while (i < fmt_text.len and fmt_text[i] != '>') {
+                        i += 1;
+                    }
+
+                    const color_name = fmt_text[start..i];
+                    const color_str = color_picker: {
+                        if (color_map.get(color_name)) |color_name_literal| {
+                            break :color_picker color_name_literal;
+                        } else if (std.mem.eql(u8, color_name, "r")) {
+                            is_reset = true;
+                            break :color_picker "";
+                        } else {
+                            @compileError("Invalid color name passed: " ++ color_name);
+                        }
+                    };
+
+                    if (is_enabled) {
+                        for (if (is_reset) RESET else color_str) |ch| {
+                            new_fmt[new_fmt_i] = ch;
+                            new_fmt_i += 1;
+                        }
+                    }
+                },
+                else => {
+                    new_fmt[new_fmt_i] = fmt_text[i];
+                    new_fmt_i += 1;
+                    i += 1;
+                },
+            }
+        };
+
+        return comptime (new_fmt[0..new_fmt_i].* ++ .{0})[0..new_fmt_i :0];
     }
 
     pub fn writer() *std.Io.Writer {

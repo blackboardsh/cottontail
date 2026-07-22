@@ -231,6 +231,7 @@ test "compiler diagnostics parity uses Bun formatting for errors and notes" {
     setBuildError(&error_message, &log, error.SyntaxError);
     defer if (error_message) |message| ct_bundle_string_free(message);
     const text = std.mem.span(error_message.?);
+    try std.testing.expect(std.mem.indexOfScalar(u8, text, '\x1b') == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "2 |   broken syntax") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "error: Expected identifier") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "note: The declaration started here") != null);
@@ -2386,4 +2387,68 @@ test "bundling a strict ESM dependency does not require an empty wrapper" {
     defer c_allocator.free(output);
 
     try std.testing.expect(std.mem.indexOf(u8, output, "function strictFunction") != null);
+}
+
+test "compiler diagnostics parity keeps linked calls distinct from function expression names" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "lib.ts",
+        .data =
+        \\export function get(x: number) {
+        \\  return x * 2;
+        \\}
+        \\export function doSomething(fn: () => number) {
+        \\  return fn();
+        \\}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "entry.ts",
+        .data =
+        \\import * as $ from "./lib";
+        \\console.log($.doSomething(function get() {
+        \\  return $.get(123);
+        \\}));
+        ,
+    });
+
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(relative_root);
+    const absolute_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    defer allocator.free(absolute_root);
+    const entry_path = try std.fs.path.join(allocator, &.{ absolute_root, "entry.ts" });
+    defer allocator.free(entry_path);
+
+    var error_message: ?[*:0]u8 = null;
+    defer if (error_message) |message| ct_bundle_string_free(message);
+    const output = bundleEntryPointWithOptions(entry_path, absolute_root, .{}, &error_message) catch |err| {
+        if (error_message) |message| std.debug.print("bundle failed: {s}\n", .{std.mem.span(message)});
+        return err;
+    };
+    defer c_allocator.free(output);
+
+    const call_paren = std.mem.indexOf(u8, output, "(123)") orelse return error.MissingLinkedCall;
+    var call_name_start = call_paren;
+    while (call_name_start > 0 and compiler.js_lexer.isIdentifierContinue(output[call_name_start - 1])) {
+        call_name_start -= 1;
+    }
+    const called_name = output[call_name_start..call_paren];
+
+    const function_prefix = "function ";
+    const function_start = std.mem.lastIndexOf(u8, output[0..call_name_start], function_prefix) orelse
+        return error.MissingFunctionExpression;
+    const function_name_start = function_start + function_prefix.len;
+    var function_name_end = function_name_start;
+    while (function_name_end < output.len and compiler.js_lexer.isIdentifierContinue(output[function_name_end])) {
+        function_name_end += 1;
+    }
+    const function_name = output[function_name_start..function_name_end];
+
+    try std.testing.expect(called_name.len > 0);
+    try std.testing.expect(function_name.len > 0);
+    try std.testing.expect(!std.mem.eql(u8, called_name, function_name));
 }

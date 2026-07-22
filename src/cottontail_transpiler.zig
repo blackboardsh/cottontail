@@ -306,6 +306,34 @@ test "compiler diagnostics parity preserves Unicode property regular expressions
     try std.testing.expect(std.mem.indexOf(u8, output, "\\p{Script=Hangul}") != null);
 }
 
+test "compiler diagnostics parity keeps repeated transpiler output deterministic" {
+    const source =
+        \\// @pragma jsx foo
+        \\import { Foo } from "./foo";
+        \\const foo = new Foo();
+        \\foo.bar();
+        \\export default foo;
+        \\export const first = "first" + 123 * 2 + [foo];
+        \\export const second = "second" + 123 * 2 + [foo];
+        \\export const third = "third" + 123 * 2 + [foo];
+    ;
+
+    var baseline_error: ?[*:0]u8 = null;
+    const baseline = try process(.transform, source, "", "", &baseline_error);
+    defer c_allocator.free(baseline);
+    defer if (baseline_error) |message| ct_transpiler_string_free(message);
+    try std.testing.expect(baseline_error == null);
+
+    for (0..4) |_| {
+        var error_message: ?[*:0]u8 = null;
+        const output = try process(.transform, source, "", "", &error_message);
+        defer c_allocator.free(output);
+        defer if (error_message) |message| ct_transpiler_string_free(message);
+        try std.testing.expect(error_message == null);
+        try std.testing.expectEqualStrings(baseline, output);
+    }
+}
+
 fn jsonBool(object: std.json.ObjectMap, name: []const u8) ?bool {
     const value = object.get(name) orelse return null;
     return switch (value) {
