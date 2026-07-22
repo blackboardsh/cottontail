@@ -337,6 +337,13 @@ pub const Runtime = struct {
         return try self.allocator.dupe(u8, std.mem.span(profile));
     }
 
+    pub fn takeHeapSnapshot(self: *Runtime, gc_debugging: bool) !?[]u8 {
+        const snapshot = c.ct_jsc_runtime_take_heap_snapshot(self.handle, gc_debugging);
+        if (snapshot == null) return null;
+        defer c.ct_jsc_string_free(snapshot);
+        return try self.allocator.dupe(u8, std.mem.span(snapshot));
+    }
+
     fn writeLoadError(self: *Runtime, script_path: []const u8, err: anyerror) void {
         var stderr_buffer: [1024]u8 = undefined;
         var stderr_writer = std.Io.File.stderr().writer(self.io, &stderr_buffer);

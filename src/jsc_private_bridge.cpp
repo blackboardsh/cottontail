@@ -403,7 +403,7 @@ static char* ct_jsc_copy_utf8(const WTF::String& value)
     return result;
 }
 
-extern "C" char* ct_jsc_heap_snapshot(JSContextRef context)
+extern "C" char* ct_jsc_heap_snapshot(JSContextRef context, int gc_debugging)
 {
     if (context == nullptr)
         return nullptr;
@@ -471,8 +471,10 @@ extern "C" char* ct_jsc_heap_snapshot(JSContextRef context)
         return nullptr;
 
     profiler->clearSnapshots();
-    JSC::HeapSnapshotBuilder builder(
-        *profiler, JSC::HeapSnapshotBuilder::InspectorSnapshot);
+    const auto snapshot_type = gc_debugging
+        ? JSC::HeapSnapshotBuilder::GCDebuggingSnapshot
+        : JSC::HeapSnapshotBuilder::InspectorSnapshot;
+    JSC::HeapSnapshotBuilder builder(*profiler, snapshot_type);
     builder.buildSnapshot();
     auto json = builder.json();
     return ct_jsc_copy_utf8(json);

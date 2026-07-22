@@ -7,6 +7,7 @@ import {
   estimateShallowMemoryUsageOf,
   fullGC,
   gcAndSweep,
+  generateHeapSnapshotForDebugging,
   getProtectedObjects,
   getRandomSeed,
   heapSize,
@@ -39,6 +40,10 @@ assert(JSON.stringify(deserialize(encoded)) === JSON.stringify(payload), "bun:js
 assert(heapSize() > 0, "bun:jsc heapSize mismatch");
 assert(heapStats().heapCapacity > 0 && heapStats().objectCount > 0, "bun:jsc heapStats mismatch");
 assert(memoryUsage().current > 0 && memoryUsage().peak > 0, "bun:jsc memoryUsage mismatch");
+const debuggingSnapshot = generateHeapSnapshotForDebugging();
+assert(debuggingSnapshot.type === "GCDebugging", "bun:jsc debugging heap snapshot type mismatch");
+assert(Array.isArray(debuggingSnapshot.nodes) && debuggingSnapshot.nodes.length > 0, "bun:jsc debugging heap snapshot nodes mismatch");
+assert(Array.isArray(debuggingSnapshot.labels), "bun:jsc debugging heap snapshot labels mismatch");
 assert(percentAvailableMemoryInUse() >= 0, "bun:jsc percentAvailableMemoryInUse mismatch");
 assert(estimateShallowMemoryUsageOf(new Uint8Array(4)) === 4, "bun:jsc shallow size mismatch");
 assert(jscDescribe({ a: 1 }).includes("a"), "bun:jsc describe mismatch");

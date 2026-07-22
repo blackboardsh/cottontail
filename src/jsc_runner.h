@@ -37,6 +37,7 @@ int ct_jsc_runtime_exit_code(CtJscRuntime *runtime);
 int ct_jsc_runtime_tick(CtJscRuntime *runtime, char **error_out);
 bool ct_jsc_runtime_enable_sampling_profiler(CtJscRuntime *runtime);
 char *ct_jsc_runtime_take_sampling_profiler(CtJscRuntime *runtime);
+char *ct_jsc_runtime_take_heap_snapshot(CtJscRuntime *runtime, bool gc_debugging);
 void ct_jsc_string_free(char *value);
 
 #endif

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const compiler = @import("cottontail_compiler");
 const runtime = @import("runtime.zig");
+const heap_profiler = @import("heap_profiler.zig");
 const icu_bootstrap = @import("icu_bootstrap.zig");
 const native_bundler = @import("cottontail_bundler.zig");
 const native_transpiler = @import("cottontail_transpiler.zig");
@@ -1940,6 +1941,8 @@ fn runElectrobunMainThread(ctx: *const Context) !u8 {
 
 fn runScriptExecution(execution: *ScriptExecution) void {
     const profiler_options = parseCpuProfileOptions(execution.exec_args);
+    const heap_profile_options = parseHeapProfileOptions(execution.exec_args);
+    writeHeapProfileWarnings(execution.io, heap_profile_options);
     var js_runtime = runtime.Runtime.initWithStackSize(
         execution.io,
         execution.allocator,
@@ -2005,10 +2008,10 @@ fn runScriptExecution(execution: *ScriptExecution) void {
         break :blk js_runtime.runSource(source, execution.runnable_path);
     } else js_runtime.runFile(execution.runnable_path);
     if (profiler_options.enabled()) {
-        const raw_profile = js_runtime.takeSamplingProfile() catch |err| {
+        const raw_profile = js_runtime.takeSamplingProfile() catch |err| profile: {
             writeStderr(execution.io, "cottontail: failed to collect CPU profile: {s}\n", .{@errorName(err)});
             execution.exit_code = 1;
-            return;
+            break :profile null;
         };
         if (raw_profile) |profile| {
             writeCpuProfiles(execution, profiler_options, profile) catch |err| {
@@ -2020,6 +2023,112 @@ fn runScriptExecution(execution: *ScriptExecution) void {
             execution.exit_code = 1;
         }
     }
+    if (heap_profile_options.enabled()) {
+        writeHeapProfile(execution, &js_runtime, heap_profile_options) catch |err| {
+            writeStderr(execution.io, "cottontail: failed to write heap profile: {s}\n", .{@errorName(err)});
+        };
+    }
+}
+
+const HeapProfileFormat = enum { v8, markdown };
+
+const HeapProfileOptions = struct {
+    v8: bool = false,
+    markdown: bool = false,
+    dir: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+
+    fn enabled(self: HeapProfileOptions) bool {
+        return self.v8 or self.markdown;
+    }
+
+    fn format(self: HeapProfileOptions) HeapProfileFormat {
+        return if (self.markdown) .markdown else .v8;
+    }
+};
+
+fn parseHeapProfileOptions(args: []const [:0]const u8) HeapProfileOptions {
+    var options: HeapProfileOptions = .{};
+    for (args, 0..) |arg_z, index| {
+        const arg: []const u8 = arg_z;
+        if (std.mem.eql(u8, arg, "--heap-prof")) {
+            options.v8 = true;
+        } else if (std.mem.eql(u8, arg, "--heap-prof-md")) {
+            options.markdown = true;
+        } else if (std.mem.startsWith(u8, arg, "--heap-prof-dir=")) {
+            options.dir = arg["--heap-prof-dir=".len..];
+        } else if (std.mem.eql(u8, arg, "--heap-prof-dir") and index + 1 < args.len) {
+            options.dir = args[index + 1];
+        } else if (std.mem.startsWith(u8, arg, "--heap-prof-name=")) {
+            options.name = arg["--heap-prof-name=".len..];
+        } else if (std.mem.eql(u8, arg, "--heap-prof-name") and index + 1 < args.len) {
+            options.name = args[index + 1];
+        }
+    }
+    return options;
+}
+
+fn writeHeapProfileWarnings(io: std.Io, options: HeapProfileOptions) void {
+    if (options.v8 and options.markdown) {
+        writeStderr(io, "warn: Both --heap-prof and --heap-prof-md specified; using --heap-prof-md (markdown format)\n", .{});
+        return;
+    }
+    if (options.enabled()) return;
+    if (options.name != null) {
+        writeStderr(io, "warn: --heap-prof-name requires --heap-prof or --heap-prof-md to be enabled\n", .{});
+    }
+    if (options.dir != null) {
+        writeStderr(io, "warn: --heap-prof-dir requires --heap-prof or --heap-prof-md to be enabled\n", .{});
+    }
+}
+
+fn heapProfileDefaultName(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    format: HeapProfileFormat,
+) ![]const u8 {
+    const now_ns = std.Io.Clock.real.now(io).nanoseconds;
+    const timestamp_us: u64 = @intCast(@max(0, @divTrunc(now_ns, 1000)));
+    const pid = if (builtin.os.tag == .windows)
+        std.os.windows.GetCurrentProcessId()
+    else
+        std.c.getpid();
+    const extension = if (format == .markdown) "md" else "heapsnapshot";
+    return try std.fmt.allocPrint(allocator, "Heap.{d}.{d}.{s}", .{ timestamp_us, pid, extension });
+}
+
+fn heapProfilePath(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    options: HeapProfileOptions,
+) ![]const u8 {
+    const name = options.name orelse try heapProfileDefaultName(io, allocator, options.format());
+    return if (options.dir) |dir|
+        try std.fs.path.join(allocator, &.{ dir, name })
+    else
+        name;
+}
+
+fn writeHeapProfile(
+    execution: *ScriptExecution,
+    js_runtime: *runtime.Runtime,
+    options: HeapProfileOptions,
+) !void {
+    const format = options.format();
+    const raw_snapshot = try js_runtime.takeHeapSnapshot(format == .markdown) orelse return error.HeapSnapshotUnavailable;
+    const profile = switch (format) {
+        .v8 => try heap_profiler.convertJscToV8(execution.allocator, raw_snapshot),
+        .markdown => try heap_profiler.buildMarkdown(execution.allocator, raw_snapshot),
+    };
+    const path = try heapProfilePath(execution.io, execution.allocator, options);
+    if (std.fs.path.dirname(path)) |parent| {
+        if (parent.len > 0) try std.Io.Dir.cwd().createDirPath(execution.io, parent);
+    }
+    try std.Io.Dir.cwd().writeFile(execution.io, .{ .sub_path = path, .data = profile });
+
+    const cwd = try std.process.currentPathAlloc(execution.io, execution.allocator);
+    const absolute_path = try std.fs.path.resolve(execution.allocator, &.{ cwd, path });
+    writeStderr(execution.io, "Heap profile written to: {s}\n", .{absolute_path});
 }
 
 const CpuProfileOptions = struct {

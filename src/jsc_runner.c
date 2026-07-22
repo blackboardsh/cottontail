@@ -27,7 +27,7 @@ extern JSValueRef ct_jsc_promise_result(JSValueRef value);
 extern uint32_t ct_jsc_weak_collection_size(JSValueRef value);
 extern JSObjectRef ct_jsc_create_buffer_is_ascii(JSContextRef context);
 extern JSObjectRef ct_jsc_create_buffer_transcode(JSContextRef context);
-extern char *ct_jsc_heap_snapshot(JSContextRef context);
+extern char *ct_jsc_heap_snapshot(JSContextRef context, int gc_debugging);
 extern bool ct_jsc_value_is_rope(JSContextRef context, JSValueRef value);
 extern bool ct_jsc_set_time_zone(JSContextRef context, const char *time_zone);
 extern size_t ct_jsc_copy_protected_objects(JSContextRef context, JSValueRef *values, size_t capacity);
@@ -19010,6 +19010,17 @@ static JSValueRef ct_jsc_memory_usage(JSContextRef ctx, JSObjectRef function, JS
     return statistics;
 }
 
+static JSValueRef ct_jsc_heap_snapshot_host_impl(JSContextRef ctx, JSValueRef *exception, bool gc_debugging) {
+    char *snapshot = ct_jsc_heap_snapshot(ctx, gc_debugging ? 1 : 0);
+    if (snapshot == NULL) {
+        ct_throw_message(ctx, exception, "JavaScriptCore heap snapshot generation failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    JSValueRef result = ct_make_string(ctx, snapshot);
+    free(snapshot);
+    return result;
+}
+
 static JSValueRef ct_jsc_heap_snapshot_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -19020,14 +19031,20 @@ static JSValueRef ct_jsc_heap_snapshot_host(JSContextRef ctx, JSObjectRef functi
 #else
     JSGarbageCollect(ctx);
 #endif
-    char *snapshot = ct_jsc_heap_snapshot(ctx);
-    if (snapshot == NULL) {
-        ct_throw_message(ctx, exception, "JavaScriptCore heap snapshot generation failed");
-        return JSValueMakeUndefined(ctx);
-    }
-    JSValueRef result = ct_make_string(ctx, snapshot);
-    free(snapshot);
-    return result;
+    return ct_jsc_heap_snapshot_host_impl(ctx, exception, false);
+}
+
+static JSValueRef ct_jsc_heap_snapshot_for_debugging_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+#if defined(__APPLE__)
+    JSSynchronousGarbageCollectForDebugging(ctx);
+#else
+    JSGarbageCollect(ctx);
+#endif
+    return ct_jsc_heap_snapshot_host_impl(ctx, exception, true);
 }
 
 static JSValueRef ct_jsc_string_is_8_bit_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -24413,6 +24430,16 @@ char *ct_jsc_runtime_take_sampling_profiler(CtJscRuntime *runtime) {
     if (result != NULL) JSStringGetUTF8CString(samples, result, capacity);
     JSStringRelease(samples);
     return result;
+}
+
+char *ct_jsc_runtime_take_heap_snapshot(CtJscRuntime *runtime, bool gc_debugging) {
+    if (runtime == NULL || runtime->context == NULL) return NULL;
+#if defined(__APPLE__)
+    JSSynchronousGarbageCollectForDebugging(runtime->context);
+#else
+    JSGarbageCollect(runtime->context);
+#endif
+    return ct_jsc_heap_snapshot(runtime->context, gc_debugging ? 1 : 0);
 }
 
 void ct_jsc_string_free(char *value) {

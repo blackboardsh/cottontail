@@ -1,9 +1,7 @@
 import {
   deserialize as v8Deserialize,
-  getHeapSnapshot,
   getHeapStatistics,
   serialize as v8Serialize,
-  writeHeapSnapshot,
 } from "../node/v8.js";
 import { inspect } from "../node/util.js";
 
@@ -200,8 +198,11 @@ export function drainMicrotasks() {
   cottontail.drainJobs?.();
 }
 
-export function generateHeapSnapshotForDebugging(filename = undefined) {
-  return filename == null ? getHeapSnapshot() : writeHeapSnapshot(filename);
+export function generateHeapSnapshotForDebugging() {
+  if (typeof cottontail.jscHeapSnapshotForDebugging !== "function") {
+    throw new Error("JavaScriptCore debugging heap snapshots are unavailable in this build");
+  }
+  return accountForExternallyAllocatedMemory(JSON.parse(cottontail.jscHeapSnapshotForDebugging()));
 }
 
 export function estimateShallowMemoryUsageOf(value) {
