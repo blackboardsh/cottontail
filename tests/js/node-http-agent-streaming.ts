@@ -3,6 +3,7 @@ import http from "node:http";
 import net from "node:net";
 import { once } from "node:events";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { finished } from "node:stream";
 
 async function listen(server: http.Server) {
   server.listen(0, "127.0.0.1");
@@ -191,6 +192,44 @@ test("Agent refreshes AsyncLocalStorage context when reusing a socket", async ()
   }
 });
 
+test("stream.finished preserves its registration context for ServerResponse", async () => {
+  const storage = new AsyncLocalStorage<{ value: string }>();
+  const expected = { value: "response-finished" };
+  let observed;
+  let resolveFinished!: () => void;
+  let rejectFinished!: (error: Error) => void;
+  const finishedDone = new Promise<void>((resolve, reject) => {
+    resolveFinished = resolve;
+    rejectFinished = reject;
+  });
+  const server = http.createServer((_request, response) => {
+    storage.run(expected, () => {
+      finished(response, (error) => {
+        if (error) {
+          rejectFinished(error);
+          return;
+        }
+        observed = storage.getStore();
+        resolveFinished();
+      });
+    });
+    setTimeout(response.end.bind(response), 0);
+  });
+  const port = await listen(server);
+
+  try {
+    const response = await new Promise<http.IncomingMessage>((resolve, reject) => {
+      const request = http.get({ hostname: "127.0.0.1", port }, resolve);
+      request.on("error", reject);
+    });
+    response.resume();
+    await withTimeout(Promise.all([once(response, "end"), finishedDone]));
+    expect(observed).toBe(expected);
+    expect(storage.getStore()).toBeUndefined();
+  } finally {
+    await close(server);
+  }
+});
 test("Agent applies FIFO and LIFO scheduling to reusable sockets", async () => {
   for (const scheduling of ["fifo", "lifo"] as const) {
     const heldResponses: http.ServerResponse[] = [];

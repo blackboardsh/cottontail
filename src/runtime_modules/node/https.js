@@ -10,31 +10,65 @@ import {
   _httpListeningCallbackArgs,
 } from "./http.js";
 import { Server as TlsServer, connect as tlsConnect } from "./tls.js";
-import { Buffer } from "./buffer.js";
 import { isIP } from "./net.js";
 
 export { IncomingMessage, OutgoingMessage, ServerResponse, STATUS_CODES };
 
-export class Agent extends HttpAgent {
+class AgentImpl extends HttpAgent {
   constructor(options = {}) {
-    super({ ...options, defaultPort: 443, protocol: "https:" });
-    this.defaultPort = 443;
-    this.protocol = "https:";
-    this.maxCachedSessions = options.maxCachedSessions ?? 100;
-    this._sessionCache = { map: Object.create(null), list: [] };
+    const agentOptions = Object.assign(Object.create(null), options);
+    agentOptions.defaultPort ??= 443;
+    agentOptions.protocol ??= "https:";
+    super(agentOptions);
+    this.defaultPort = agentOptions.defaultPort;
+    this.protocol = agentOptions.protocol;
+    this.maxCachedSessions = this.options.maxCachedSessions;
+    if (this.maxCachedSessions === undefined) this.maxCachedSessions = 100;
+    this._sessionCache = { map: {}, list: [] };
   }
 
   getName(options = {}) {
     let name = super.getName(options);
-    for (const key of [
-      "ca", "cert", "clientCertEngine", "ciphers", "key", "pfx", "rejectUnauthorized",
-      "servername", "minVersion", "maxVersion", "secureProtocol", "crl", "honorCipherOrder",
-      "ecdhCurve", "dhparam", "secureOptions", "sessionIdContext", "sigalgs",
-      "privateKeyIdentifier", "privateKeyEngine",
-    ]) {
-      const value = options[key] ?? this.options[key];
-      if (value !== undefined) name += `:${key}=${tlsCacheKey(value)}`;
-    }
+    name += ":";
+    if (options.ca) name += options.ca;
+    name += ":";
+    if (options.cert) name += options.cert;
+    name += ":";
+    if (options.clientCertEngine) name += options.clientCertEngine;
+    name += ":";
+    if (options.ciphers) name += options.ciphers;
+    name += ":";
+    if (options.key) name += options.key;
+    name += ":";
+    if (options.pfx) name += options.pfx;
+    name += ":";
+    if (options.rejectUnauthorized !== undefined) name += options.rejectUnauthorized;
+    name += ":";
+    if (options.servername && options.servername !== options.host) name += options.servername;
+    name += ":";
+    if (options.minVersion) name += options.minVersion;
+    name += ":";
+    if (options.maxVersion) name += options.maxVersion;
+    name += ":";
+    if (options.secureProtocol) name += options.secureProtocol;
+    name += ":";
+    if (options.crl) name += options.crl;
+    name += ":";
+    if (options.honorCipherOrder !== undefined) name += options.honorCipherOrder;
+    name += ":";
+    if (options.ecdhCurve) name += options.ecdhCurve;
+    name += ":";
+    if (options.dhparam) name += options.dhparam;
+    name += ":";
+    if (options.secureOptions !== undefined) name += options.secureOptions;
+    name += ":";
+    if (options.sessionIdContext) name += options.sessionIdContext;
+    name += ":";
+    if (options.sigalgs) name += JSON.stringify(options.sigalgs);
+    name += ":";
+    if (options.privateKeyIdentifier) name += options.privateKeyIdentifier;
+    name += ":";
+    if (options.privateKeyEngine) name += options.privateKeyEngine;
     return name;
   }
 
@@ -44,49 +78,80 @@ export class Agent extends HttpAgent {
 
   _cacheSession(key, session) {
     if (this.maxCachedSessions === 0 || session == null) return;
-    if (this._sessionCache.map[key] == null) {
-      if (this._sessionCache.list.length >= this.maxCachedSessions) {
-        const oldest = this._sessionCache.list.shift();
-        delete this._sessionCache.map[oldest];
-      }
-      this._sessionCache.list.push(key);
+    if (this._sessionCache.map[key]) {
+      this._sessionCache.map[key] = session;
+      return;
     }
-    this._sessionCache.map[key] = Buffer.from(session);
+    if (this._sessionCache.list.length >= this.maxCachedSessions) {
+      const oldest = this._sessionCache.list.shift();
+      delete this._sessionCache.map[oldest];
+    }
+    this._sessionCache.list.push(key);
+    this._sessionCache.map[key] = session;
   }
 
   _evictSession(key) {
-    delete this._sessionCache.map[key];
     const index = this._sessionCache.list.indexOf(key);
-    if (index >= 0) this._sessionCache.list.splice(index, 1);
+    if (index >= 0) {
+      this._sessionCache.list.splice(index, 1);
+      delete this._sessionCache.map[key];
+    }
   }
 
-  createConnection(options = {}, callback = undefined) {
-    const merged = { ...this.options, ...options };
-    delete merged.path;
-    const name = this.getName(merged);
-    if (merged.session == null) merged.session = this._getSession(name);
-    const host = merged.host ?? merged.hostname ?? "localhost";
-    const servername = merged.servername == null
+  createConnection(...args) {
+    let options;
+    if (args[0] !== null && typeof args[0] === "object") {
+      options = { ...args[0] };
+    } else if (args[1] !== null && typeof args[1] === "object") {
+      options = { ...args[1] };
+    } else if (args[2] !== null && typeof args[2] === "object") {
+      options = { ...args[2] };
+    } else {
+      options = {};
+    }
+    if (typeof args[0] === "number") options.port = args[0];
+    if (typeof args[1] === "string") options.host = args[1];
+    const callback = typeof args[args.length - 1] === "function" ? args[args.length - 1] : undefined;
+
+    const key = options._agentKey;
+    if (key) {
+      const session = this._getSession(key);
+      if (session) options = { session, ...options };
+    }
+
+    const host = options.host ?? options.hostname ?? "localhost";
+    const servername = options.servername == null
       ? (isIP(host) ? "" : host)
-      : merged.servername;
-    const socket = tlsConnect({
-      ...merged,
-      host,
-      servername,
-      port: Number(merged.port ?? 443),
-    }, callback);
-    socket.on?.("session", (session) => this._cacheSession(name, session));
-    socket.once?.("error", () => this._evictSession(name));
+      : options.servername;
+    const socket = tlsConnect({ ...options, host, servername }, callback);
+
+    if (key) {
+      const cacheSession = (session) => {
+        if (session != null) this._cacheSession(key, session);
+      };
+      const refreshSession = () => {
+        try { cacheSession(socket.getSession?.()); } catch {}
+      };
+      socket.on?.("session", cacheSession);
+      socket.once?.("secureConnect", refreshSession);
+      // Stock-JSC's TLS bridge currently exposes post-handshake tickets through
+      // getSession() before the first application-data event.
+      socket.once?.("data", refreshSession);
+      socket.once?.("close", (hadError) => {
+        if (hadError) this._evictSession(key);
+      });
+    }
     return socket;
   }
 }
 
-function tlsCacheKey(value) {
-  if (Array.isArray(value)) return value.map(tlsCacheKey).join(",");
-  if (ArrayBuffer.isView(value)) return Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("base64");
-  if (value instanceof ArrayBuffer) return Buffer.from(value).toString("base64");
-  return String(value);
-}
+Object.defineProperty(AgentImpl, "name", { value: "Agent", configurable: true });
+Object.defineProperty(AgentImpl, "length", { value: 1, configurable: true });
+export const Agent = new Proxy(AgentImpl, {
+  apply(target, _thisArg, args) {
+    return Reflect.construct(target, args);
+  },
+});
 
 export const globalAgent = new Agent({ keepAlive: true, scheduling: "lifo", timeout: 5000 });
 

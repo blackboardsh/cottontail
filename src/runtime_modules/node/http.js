@@ -2296,6 +2296,7 @@ class AgentImpl extends EventEmitter {
       throw nodeError(TypeError, "ERR_INVALID_ARG_TYPE", 'The "request" and "options" arguments are required.');
     }
     const connectOptions = Object.assign(Object.create(null), options, this.options);
+    connectOptions._agentKey = options._agentName ?? this.getName(connectOptions);
     if (connectOptions.socketPath) connectOptions.path = connectOptions.socketPath;
     else delete connectOptions.path;
     const timeout = Number(request?._timeout || request?.timeout || this.options.timeout || 0);
