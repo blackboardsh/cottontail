@@ -116,6 +116,13 @@
       "reason": "The copied gRPC credentials/server and pnpm fixtures pass with HTTP/2 TLS controls, package binary resolution, symlinked .bin entries, and native process behavior (60 cases)."
     },
     {
+      "pattern": "^test/js/third_party/remix/remix\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "The copied Remix fixture starts the real server, serves the application root, and validates its response; stock-JSC child startup slightly exceeds Bun's default case budget.",
+      "args": ["--timeout=30000"],
+      "timeoutMs": 45000
+    },
+    {
       "pattern": "^test/js/bun/.*\\.test\\.(?:js|mjs|cjs|ts|tsx|mts|cts)$",
       "status": "enabled",
       "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
