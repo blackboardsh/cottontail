@@ -55,6 +55,43 @@ const ExecutableKind = enum {
     javascript,
 };
 
+/// Prefixes an initializer package the same way `bun create` does.
+///
+/// Scoped packages keep the prefix inside the scope:
+/// `@scope/tool` becomes `@scope/create-tool`, while a bare scope becomes
+/// `@scope/create`.
+pub fn addCreatePrefix(allocator: std.mem.Allocator, input: []const u8) ![:0]const u8 {
+    const prefix = "create-";
+    if (input.len == 0) return allocator.dupeZ(u8, input);
+
+    const output = try allocator.allocSentinel(u8, input.len + prefix.len, 0);
+    if (input[0] == '@') {
+        if (std.mem.indexOfScalar(u8, input, '/')) |slash| {
+            const insert_at = slash + 1;
+            @memcpy(output[0..insert_at], input[0..insert_at]);
+            @memcpy(output[insert_at .. insert_at + prefix.len], prefix);
+            @memcpy(output[insert_at + prefix.len ..], input[insert_at..]);
+            return output;
+        }
+
+        if (std.mem.indexOfScalar(u8, input[1..], '@')) |relative_at| {
+            const insert_at = relative_at + 1;
+            @memcpy(output[0..insert_at], input[0..insert_at]);
+            @memcpy(output[insert_at .. insert_at + prefix.len], "/create");
+            @memcpy(output[insert_at + prefix.len ..], input[insert_at..]);
+            return output;
+        }
+
+        @memcpy(output[0..input.len], input);
+        @memcpy(output[input.len..], "/create");
+        return output;
+    }
+
+    @memcpy(output[0..prefix.len], prefix);
+    @memcpy(output[prefix.len..], input);
+    return output;
+}
+
 pub fn detectInvocation(args: []const [:0]const u8) ?Invocation {
     if (args.len == 0) return null;
     if (isBunxArgv0(args[0])) {
@@ -903,4 +940,24 @@ test "bunx package parsing preserves versions, scopes, and aliases" {
     try std.testing.expectEqualStrings("latest", scoped.version);
     try std.testing.expect(isDistTag(scoped.version));
     try std.testing.expectEqualStrings("cli", normalizedBinName(scoped.name));
+}
+
+test "bun create initializer prefixes preserve scopes and versions" {
+    const allocator = std.testing.allocator;
+
+    const plain = try addCreatePrefix(allocator, "vite@6.0.0");
+    defer allocator.free(plain);
+    try std.testing.expectEqualStrings("create-vite@6.0.0", plain);
+
+    const scoped = try addCreatePrefix(allocator, "@scope/tool@next");
+    defer allocator.free(scoped);
+    try std.testing.expectEqualStrings("@scope/create-tool@next", scoped);
+
+    const bare_scope = try addCreatePrefix(allocator, "@scope");
+    defer allocator.free(bare_scope);
+    try std.testing.expectEqualStrings("@scope/create", bare_scope);
+
+    const versioned_scope = try addCreatePrefix(allocator, "@scope@next");
+    defer allocator.free(versioned_scope);
+    try std.testing.expectEqualStrings("@scope/create@next", versioned_scope);
 }

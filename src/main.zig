@@ -9,6 +9,7 @@ const cottontail_password = @import("cottontail_password.zig");
 const package_manager_bun_lockfile = @import("package_manager_bun_lockfile.zig");
 const package_manager_bunx = @import("package_manager_bunx.zig");
 const package_manager_cli = @import("package_manager_cli.zig");
+const package_manager_create = @import("package_manager_create.zig");
 const repl = @import("repl.zig");
 const cottontail_transpiler = @import("cottontail_transpiler.zig");
 const completions = @import("completions.zig");
@@ -54,6 +55,7 @@ const help_text_template =
     \\  cottontail init [flags] [destination]
     \\  cottontail repl [-e|--eval <script> | -p|--print <expression>]
     \\  cottontail install|add|remove|update [packages...] [flags]
+    \\  cottontail create <template> [destination] [flags]
     \\  cottontail x [--package <package>] <package-or-bin> [args...]
     \\  cottontail -e|--eval <script> [args...]
     \\  cottontail -p|--print <expression> [args...]
@@ -2778,6 +2780,12 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, arg, "create") or std.mem.eql(u8, arg, "c")) {
+        const exit_code = try package_manager_create.run(init, args, stdout, stderr);
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
     if (std.mem.eql(u8, arg, "completions")) {
         const exit_code = try completions.run(init, args[2..], stderr);
         try stderr.flush();
@@ -2991,6 +2999,7 @@ test "help text mentions cottontail and script usage" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "Bun is a fast JavaScript runtime") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "JavaScriptCore") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<entrypoint.js|entrypoint.ts>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "cottontail create") != null);
 }
 
 test "runtime flags can precede the test command" {

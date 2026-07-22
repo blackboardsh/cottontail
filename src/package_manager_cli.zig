@@ -8532,7 +8532,7 @@ fn verifyIntegrity(bytes: []const u8, integrity: ?[]const u8) !void {
     if (!std.crypto.timing_safe.eql([64]u8, expected, actual)) return error.IntegrityCheckFailed;
 }
 
-fn extractTarballArchive(
+pub fn extractTarballArchive(
     io: std.Io,
     allocator: std.mem.Allocator,
     destination: std.Io.Dir,
@@ -8652,7 +8652,7 @@ fn removeTarDestination(io: std.Io, directory: std.Io.Dir, path: []const u8) !vo
     }
 }
 
-fn sanitizeTarPath(buffer: []u8, path: []const u8, strip_components: u32) error{Invalid}!usize {
+pub fn sanitizeTarPath(buffer: []u8, path: []const u8, strip_components: u32) error{Invalid}!usize {
     if (path.len == 0 or path[0] == '/') return error.Invalid;
     if (builtin.os.tag == .windows and std.mem.indexOfAny(u8, path, "\\:") != null) return error.Invalid;
 
