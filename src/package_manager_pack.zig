@@ -17,7 +17,7 @@ pub const Options = struct {
     quiet: bool = false,
 };
 
-const Entry = struct {
+pub const Entry = struct {
     path: []const u8,
     contents: []const u8,
     mode: u32,
@@ -29,7 +29,7 @@ const Bin = union(enum) {
     directory: []const u8,
 };
 
-const Manifest = struct {
+pub const Manifest = struct {
     source: []const u8,
     value: Value,
 };
@@ -37,6 +37,24 @@ const Manifest = struct {
 const Selection = struct {
     entries: std.array_list.Managed(Entry),
     bundled_count: usize = 0,
+};
+
+pub const BuildOptions = struct {
+    gzip_level: ?[]const u8 = null,
+    create_tarball: bool = true,
+};
+
+pub const PreparedPackage = struct {
+    manifest: Manifest,
+    package_json: []const u8,
+    name: []const u8,
+    version: []const u8,
+    tarball_name: []const u8,
+    tarball: ?[]const u8,
+    entries: []const Entry,
+    unpacked_size: usize,
+    bundled_count: usize,
+    uses_workspaces: bool,
 };
 
 pub fn run(
@@ -57,7 +75,7 @@ pub fn run(
         return 1;
     }
 
-    const gzip_level = parseGzipLevel(options.gzip_level) catch {
+    _ = parseGzipLevel(options.gzip_level) catch {
         const received = options.gzip_level orelse "9";
         try stderr.print("error: compression level must be between 0 and 9, received {s}\n", .{received});
         try stderr.flush();
@@ -92,66 +110,30 @@ pub fn run(
         };
     }
 
-    const name_value = manifest.value.object.get("name");
-    const version_value = manifest.value.object.get("version");
-    if (name_value == null or version_value == null) {
-        try stderr.writeAll("error: package.json must have `name` and `version` fields\n");
-        try stderr.flush();
-        return 1;
-    }
-    if (name_value.? != .string or version_value.? != .string or
-        name_value.?.string.len == 0 or version_value.?.string.len == 0)
-    {
-        try stderr.writeAll("error: package.json `name` and `version` fields must be non-empty strings\n");
-        try stderr.flush();
-        return 1;
-    }
-    const name = name_value.?.string;
-    const package_version = version_value.?.string;
-
-    const edited_package_json = editWorkspaceProtocols(
-        init.io,
-        allocator,
+    const prepared = build(
+        init,
         project_root,
-        &manifest,
-        stderr,
-    ) catch |err| {
-        if (err != error.WorkspaceVersionUnresolved) {
-            try stderr.print("error: failed to prepare package.json: {s}\n", .{@errorName(err)});
-        }
-        try stderr.flush();
-        return 1;
-    };
-
-    var selection = collectEntries(
-        init.io,
-        allocator,
         package_dir,
-        &manifest.value,
-        edited_package_json,
+        .{ .gzip_level = options.gzip_level, .create_tarball = !options.dry_run },
         stderr,
     ) catch |err| {
-        if (err != error.InvalidBundledDependencies) {
-            try stderr.print("error: failed to collect package files: {s}\n", .{@errorName(err)});
+        switch (err) {
+            error.MissingPackageName, error.MissingPackageVersion => try stderr.writeAll("error: package.json must have `name` and `version` fields\n"),
+            error.InvalidPackageName, error.InvalidPackageVersion => try stderr.writeAll("error: package.json `name` and `version` fields must be non-empty strings\n"),
+            error.InvalidPackageJSON => try stderr.writeAll("error: package.json must contain an object\n"),
+            error.WorkspaceVersionUnresolved, error.InvalidBundledDependencies, error.InvalidFiles => {},
+            else => try stderr.print("error: failed to prepare package: {s}\n", .{@errorName(err)}),
         }
         try stderr.flush();
         return 1;
     };
-    std.mem.sort(Entry, selection.entries.items[1..], {}, lessEntry);
 
-    const tarball_name = try defaultTarballName(allocator, name, package_version);
-    const destination = try tarballDestination(allocator, package_dir, tarball_name, options);
-    var unpacked_size: usize = 0;
-    for (selection.entries.items) |entry| unpacked_size += entry.contents.len;
-
-    var tarball: ?[]const u8 = null;
-    if (!options.dry_run) {
-        const tar_bytes = try createTar(allocator, selection.entries.items);
-        tarball = try gzip(allocator, tar_bytes, gzip_level);
+    const destination = try tarballDestination(allocator, package_dir, prepared.tarball_name, options);
+    if (prepared.tarball) |tarball| {
         if (options.destination) |_| {
             if (std.fs.path.dirname(destination)) |parent| try std.Io.Dir.cwd().createDirPath(init.io, parent);
         }
-        std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = destination, .data = tarball.? }) catch |err| {
+        std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = destination, .data = tarball }) catch |err| {
             try stderr.print("error: failed to open tarball file destination: \"{s}\": {s}\n", .{ destination, @errorName(err) });
             try stderr.flush();
             return 1;
@@ -159,43 +141,104 @@ pub fn run(
     }
 
     if (options.quiet) {
-        try stdout.print("{s}\n", .{if (options.filename) |filename| filename else tarball_name});
+        try stdout.print("{s}\n", .{if (options.filename) |filename| filename else prepared.tarball_name});
     } else {
-        try printEntries(stdout, selection.entries.items);
-        const display_name = if (options.filename != null or options.destination != null) destination else tarball_name;
+        try printEntries(stdout, prepared.entries);
+        const display_name = if (options.filename != null or options.destination != null) destination else prepared.tarball_name;
         try stdout.print("\n{s}\n\n", .{display_name});
-        try stdout.print("Total files: {d}\n", .{selection.entries.items.len});
-        if (tarball) |bytes| {
-            var shasum: [20]u8 = undefined;
-            std.crypto.hash.Sha1.hash(bytes, &shasum, .{});
-            var integrity_digest: [64]u8 = undefined;
-            std.crypto.hash.sha2.Sha512.hash(bytes, &integrity_digest, .{});
-            const integrity_len = std.base64.standard.Encoder.calcSize(integrity_digest.len);
-            const integrity = try allocator.alloc(u8, integrity_len);
-            _ = std.base64.standard.Encoder.encode(integrity, &integrity_digest);
-            try stdout.print("Shasum: {s}\n", .{std.fmt.bytesToHex(shasum, .lower)});
-            try stdout.print("Integrity: sha512-{s}\n", .{integrity});
-        }
-        try stdout.writeAll("Unpacked size: ");
-        try printSize(stdout, unpacked_size);
-        try stdout.writeByte('\n');
-        if (tarball) |bytes| {
-            try stdout.writeAll("Packed size: ");
-            try printSize(stdout, bytes.len);
-            try stdout.writeByte('\n');
-        }
-        if (selection.bundled_count > 0) try stdout.print("Bundled deps: {d}\n", .{selection.bundled_count});
+        try printSummary(stdout, prepared, allocator);
     }
     try stdout.flush();
 
     if (!options.ignore_scripts) {
-        if (!options.quiet and hasScript(&manifest.value, "postpack")) {
+        if (!options.quiet and hasScript(&prepared.manifest.value, "postpack")) {
             try stdout.writeByte('\n');
             try stdout.flush();
         }
-        Scripts.runPackStage(init, package_dir, &manifest.value, "postpack", options.quiet, stderr) catch return 1;
+        Scripts.runPackStage(init, package_dir, &prepared.manifest.value, "postpack", options.quiet, stderr) catch return 1;
     }
     return 0;
+}
+
+pub fn build(
+    init: std.process.Init,
+    project_root: []const u8,
+    package_dir: []const u8,
+    options: BuildOptions,
+    stderr: *std.Io.Writer,
+) !PreparedPackage {
+    const allocator = init.arena.allocator();
+    const gzip_level = try parseGzipLevel(options.gzip_level);
+    const package_json_path = try std.fs.path.join(allocator, &.{ package_dir, "package.json" });
+    var manifest = try readManifest(init.io, allocator, package_json_path);
+    if (manifest.value != .object) return error.InvalidPackageJSON;
+
+    const name_value = manifest.value.object.get("name") orelse return error.MissingPackageName;
+    const version_value = manifest.value.object.get("version") orelse return error.MissingPackageVersion;
+    if (name_value != .string or name_value.string.len == 0) return error.InvalidPackageName;
+    if (version_value != .string or version_value.string.len == 0) return error.InvalidPackageVersion;
+    const uses_workspaces = usesWorkspaceProtocol(&manifest.value);
+
+    const edited_package_json = try editWorkspaceProtocols(
+        init.io,
+        allocator,
+        project_root,
+        &manifest,
+        stderr,
+    );
+    var selection = try collectEntries(
+        init.io,
+        allocator,
+        package_dir,
+        &manifest.value,
+        edited_package_json,
+        stderr,
+    );
+    std.mem.sort(Entry, selection.entries.items[1..], {}, lessEntry);
+
+    var unpacked_size: usize = 0;
+    for (selection.entries.items) |entry| unpacked_size += entry.contents.len;
+    const tarball = if (options.create_tarball) blk: {
+        const tar_bytes = try createTar(allocator, selection.entries.items);
+        break :blk try gzip(allocator, tar_bytes, gzip_level);
+    } else null;
+
+    return .{
+        .manifest = manifest,
+        .package_json = edited_package_json,
+        .name = name_value.string,
+        .version = version_value.string,
+        .tarball_name = try defaultTarballName(allocator, name_value.string, version_value.string),
+        .tarball = tarball,
+        .entries = selection.entries.items,
+        .unpacked_size = unpacked_size,
+        .bundled_count = selection.bundled_count,
+        .uses_workspaces = uses_workspaces,
+    };
+}
+
+pub fn printSummary(writer: *std.Io.Writer, prepared: PreparedPackage, allocator: std.mem.Allocator) !void {
+    try writer.print("Total files: {d}\n", .{prepared.entries.len});
+    if (prepared.tarball) |bytes| {
+        var shasum: [20]u8 = undefined;
+        std.crypto.hash.Sha1.hash(bytes, &shasum, .{});
+        var integrity_digest: [64]u8 = undefined;
+        std.crypto.hash.sha2.Sha512.hash(bytes, &integrity_digest, .{});
+        const integrity_len = std.base64.standard.Encoder.calcSize(integrity_digest.len);
+        const integrity = try allocator.alloc(u8, integrity_len);
+        _ = std.base64.standard.Encoder.encode(integrity, &integrity_digest);
+        try writer.print("Shasum: {s}\n", .{std.fmt.bytesToHex(shasum, .lower)});
+        try writer.print("Integrity: sha512-{s}\n", .{integrity});
+    }
+    try writer.writeAll("Unpacked size: ");
+    try printSize(writer, prepared.unpacked_size);
+    try writer.writeByte('\n');
+    if (prepared.tarball) |bytes| {
+        try writer.writeAll("Packed size: ");
+        try printSize(writer, bytes.len);
+        try writer.writeByte('\n');
+    }
+    if (prepared.bundled_count > 0) try writer.print("Bundled deps: {d}\n", .{prepared.bundled_count});
 }
 
 fn readManifest(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Manifest {
@@ -237,7 +280,8 @@ fn editWorkspaceProtocols(
             const requested = value.string["workspace:".len..];
             const rewritten = if (std.mem.eql(u8, requested, "*") or
                 std.mem.eql(u8, requested, "^") or
-                std.mem.eql(u8, requested, "~")) blk: {
+                std.mem.eql(u8, requested, "~"))
+            blk: {
                 if (!has_lockfile) {
                     try stderr.print(
                         "error: Failed to resolve workspace version for \"{s}\" in `{s}`. Run `bun install` and try again.\n",
@@ -402,6 +446,18 @@ fn packageBins(allocator: std.mem.Allocator, manifest: *const Value) ![]const Bi
         }
     }
     return bins.toOwnedSlice();
+}
+
+fn usesWorkspaceProtocol(manifest: *const Value) bool {
+    if (manifest.* != .object) return false;
+    for ([_][]const u8{ "dependencies", "devDependencies", "optionalDependencies", "peerDependencies" }) |section_name| {
+        const section = manifest.object.get(section_name) orelse continue;
+        if (section != .object) continue;
+        for (section.object.values()) |dependency| {
+            if (dependency == .string and std.mem.startsWith(u8, dependency.string, "workspace:")) return true;
+        }
+    }
+    return false;
 }
 
 fn matchesBin(bins: []const Bin, path: []const u8) bool {
@@ -756,7 +812,7 @@ fn tarballDestination(
     return std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ std.mem.trimEnd(u8, destination_dir, "/\\"), std.fs.path.sep, tarball_name });
 }
 
-fn printEntries(writer: *std.Io.Writer, entries: []const Entry) !void {
+pub fn printEntries(writer: *std.Io.Writer, entries: []const Entry) !void {
     var printed_any = false;
     for (entries) |entry| {
         if (entry.bundled) continue;
@@ -768,7 +824,7 @@ fn printEntries(writer: *std.Io.Writer, entries: []const Entry) !void {
     }
 }
 
-fn printSize(writer: *std.Io.Writer, bytes: usize) !void {
+pub fn printSize(writer: *std.Io.Writer, bytes: usize) !void {
     if (bytes < 1000) return writer.print("{d}B", .{bytes});
     if (bytes < 1_000_000) return writer.print("{d:.2}KB", .{@as(f64, @floatFromInt(bytes)) / 1000.0});
     return writer.print("{d:.2}MB", .{@as(f64, @floatFromInt(bytes)) / 1_000_000.0});

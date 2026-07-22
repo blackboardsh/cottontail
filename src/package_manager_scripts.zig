@@ -203,6 +203,29 @@ pub fn runPackStage(
     quiet: bool,
     stderr: *std.Io.Writer,
 ) !void {
+    return runLifecycleStage(init, root_dir, manifest, stage, "pack", quiet, stderr);
+}
+
+pub fn runPublishStage(
+    init: std.process.Init,
+    root_dir: []const u8,
+    manifest: *const Value,
+    stage: []const u8,
+    quiet: bool,
+    stderr: *std.Io.Writer,
+) !void {
+    return runLifecycleStage(init, root_dir, manifest, stage, "publish", quiet, stderr);
+}
+
+fn runLifecycleStage(
+    init: std.process.Init,
+    root_dir: []const u8,
+    manifest: *const Value,
+    stage: []const u8,
+    npm_command: []const u8,
+    quiet: bool,
+    stderr: *std.Io.Writer,
+) !void {
     const scripts = if (manifest.* == .object) manifest.object.get("scripts") orelse return else return;
     if (scripts != .object) return;
     const value = scripts.object.get(stage) orelse return;
@@ -219,7 +242,7 @@ pub fn runPackStage(
     var environment = try init.environ_map.clone(allocator);
     defer environment.deinit();
     try configureEnvironment(&environment, allocator, init.io, root_dir, task, stage, value.string);
-    try environment.put("npm_command", "pack");
+    try environment.put("npm_command", npm_command);
 
     const command = try replaceBunCommand(allocator, init.io, value.string);
     if (!quiet) {

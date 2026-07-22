@@ -19,6 +19,7 @@ const Analyzer = @import("package_manager_analyzer.zig");
 const Audit = @import("package_manager_audit.zig");
 const MinimumReleaseAge = @import("package_manager_minimum_release_age.zig");
 const Pack = @import("package_manager_pack.zig");
+const Publish = @import("package_manager_publish.zig");
 
 const version = @import("version.zig").version;
 const Semver = compiler.Semver;
@@ -120,6 +121,13 @@ const Options = struct {
     pack_destination: ?[]const u8 = null,
     pack_filename: ?[]const u8 = null,
     pack_gzip_level: ?[]const u8 = null,
+    publish_access: ?Publish.Access = null,
+    publish_tag: []const u8 = "",
+    publish_otp: []const u8 = "",
+    publish_auth_type: ?Publish.AuthType = null,
+    tolerate_republish: bool = false,
+    invalid_publish_access: ?[]const u8 = null,
+    invalid_publish_auth_type: ?[]const u8 = null,
 };
 
 const PackageSpec = struct {
@@ -427,17 +435,21 @@ pub fn run(
         try stderr.flush();
         return 1;
     }
+    if (options.invalid_publish_access) |value| {
+        try stderr.print("error: invalid `access` value: '{s}'\n", .{value});
+        try stderr.flush();
+        return 1;
+    }
+    if (options.invalid_publish_auth_type) |value| {
+        try stderr.print("error: invalid `auth-type` value: '{s}'\n", .{value});
+        try stderr.flush();
+        return 1;
+    }
 
     if (options.help) {
         try printPackageManagerHelp(options.command, stdout);
         try stdout.flush();
         return 0;
-    }
-
-    if (options.command == .publish) {
-        try stderr.writeAll("error: bun publish is not implemented yet\n");
-        try stderr.flush();
-        return 1;
     }
 
     if (options.cwd) |cwd| {
@@ -447,6 +459,8 @@ pub fn run(
             return 1;
         };
     }
+
+    if (options.command == .publish) return runPublish(init, options, stdout, stderr);
 
     if (options.command == .pm and
         options.positionals.len > 0 and
@@ -617,6 +631,52 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
             options.pack_gzip_level = args[index];
         } else if (std.mem.startsWith(u8, arg, "--gzip-level=")) {
             options.pack_gzip_level = arg["--gzip-level=".len..];
+        } else if (std.mem.eql(u8, arg, "--access")) {
+            if (options.command != .publish) return error.InvalidPackageManagerOption;
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            options.publish_access = Publish.Access.parse(args[index]);
+            if (options.publish_access == null) options.invalid_publish_access = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--access=")) {
+            if (options.command != .publish) return error.InvalidPackageManagerOption;
+            const value = arg["--access=".len..];
+            if (value.len == 0) return error.MissingOptionValue;
+            options.publish_access = Publish.Access.parse(value);
+            if (options.publish_access == null) options.invalid_publish_access = value;
+        } else if (std.mem.eql(u8, arg, "--tag")) {
+            if (options.command != .publish) return error.InvalidPackageManagerOption;
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            if (args[index].len == 0) return error.MissingOptionValue;
+            options.publish_tag = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--tag=")) {
+            if (options.command != .publish) return error.InvalidPackageManagerOption;
+            const value = arg["--tag=".len..];
+            if (value.len == 0) return error.MissingOptionValue;
+            options.publish_tag = value;
+        } else if (std.mem.eql(u8, arg, "--otp")) {
+            if (options.command != .publish) return error.InvalidPackageManagerOption;
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            options.publish_otp = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--otp=")) {
+            if (options.command != .publish) return error.InvalidPackageManagerOption;
+            options.publish_otp = arg["--otp=".len..];
+        } else if (std.mem.eql(u8, arg, "--auth-type")) {
+            if (options.command != .publish) return error.InvalidPackageManagerOption;
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            options.publish_auth_type = Publish.AuthType.parse(args[index]);
+            if (options.publish_auth_type == null) options.invalid_publish_auth_type = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--auth-type=")) {
+            if (options.command != .publish) return error.InvalidPackageManagerOption;
+            const value = arg["--auth-type=".len..];
+            if (value.len == 0) return error.MissingOptionValue;
+            options.publish_auth_type = Publish.AuthType.parse(value);
+            if (options.publish_auth_type == null) options.invalid_publish_auth_type = value;
+        } else if (std.mem.eql(u8, arg, "--tolerate-republish")) {
+            if (options.command != .publish) return error.InvalidPackageManagerOption;
+            options.tolerate_republish = true;
         } else if (std.mem.eql(u8, arg, "--silent") or std.mem.eql(u8, arg, "--quiet")) {
             options.silent = true;
         } else if (std.mem.eql(u8, arg, "--verbose")) {
@@ -786,6 +846,131 @@ fn printPackageManagerHelp(command: Command, writer: *std.Io.Writer) !void {
         \\  --patches-dir <path>     Set the generated patch directory
         \\
     , .{@tagName(command)});
+    if (command == .publish) {
+        try writer.writeAll(
+            \\Publish options:
+            \\
+            \\  --access <public|restricted>  Set package access
+            \\  --tag <name>                  Publish under a dist-tag (default: latest)
+            \\  --otp <code>                  Provide a one-time password
+            \\  --auth-type <web|legacy>      Select one-time password authentication
+            \\  --tolerate-republish          Succeed when the version already exists
+            \\  --gzip-level <0-9>            Set tarball compression level
+            \\
+        );
+    }
+}
+
+fn runPublish(
+    init: std.process.Init,
+    options: Options,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !u8 {
+    if (options.positionals.len > 1) {
+        try stderr.writeAll("error: bun publish accepts at most one package tarball\n");
+        try stderr.flush();
+        return 1;
+    }
+    if (!options.silent) {
+        try stdout.writeAll("bun publish v1.3.10 (cottontail)\n");
+        try stdout.flush();
+    }
+
+    var manager = Manager.init(init, options, stdout, stderr);
+    defer manager.deinit();
+    manager.invocation_dir = try absolutePath(init.io, manager.allocator, ".");
+    manager.root_dir = manager.invocation_dir;
+    manager.invocation_package_dir = manager.invocation_dir;
+    if (options.positionals.len == 0) {
+        const project = try findInstallProject(init.io, manager.allocator, manager.invocation_dir);
+        manager.root_dir = project.root_dir;
+        manager.invocation_package_dir = project.package_dir;
+    }
+    manager.loadConfiguration() catch |err| {
+        if (err != error.PackageManagerErrorReported) {
+            try stderr.print("error: failed to load package manager configuration: {s}\n", .{@errorName(err)});
+        }
+        try stderr.flush();
+        return 1;
+    };
+    manager.client.initDefaultProxies(manager.allocator, manager.init_data.environ_map) catch {};
+
+    var publish_options: Publish.Options = .{
+        .access = options.publish_access,
+        .tag = options.publish_tag,
+        .otp = options.publish_otp,
+        .auth_type = options.publish_auth_type,
+        .tolerate_republish = options.tolerate_republish,
+        .dry_run = options.dry_run,
+        .ignore_scripts = options.ignore_scripts,
+        .quiet = options.silent,
+        .gzip_level = options.pack_gzip_level,
+    };
+    var prepared = (if (options.positionals.len == 1)
+        Publish.prepareTarball(init, options.positionals[0], &publish_options, stdout)
+    else
+        Publish.prepareWorkspace(
+            init,
+            manager.root_dir,
+            manager.invocation_package_dir,
+            &publish_options,
+            stdout,
+            stderr,
+        )) catch |err| {
+        try reportPublishPreparationError(err, options.positionals.len == 1, options.positionals, stderr);
+        return 1;
+    };
+
+    const configured = manager.registryConfigForPackage(prepared.package_name);
+    const result = try Publish.publish(
+        init,
+        &manager.client,
+        &prepared,
+        .{ .url = configured.url, .authorization = configured.authorization },
+        publish_options,
+        stdout,
+        stderr,
+    );
+    if (result != 0) return result;
+
+    try stdout.print("\n + {s}@{s}{s}\n", .{
+        prepared.package_name,
+        Publish.versionWithoutBuild(prepared.package_version),
+        if (options.dry_run) " (dry-run)" else "",
+    });
+    try stdout.flush();
+    Publish.runPostPublishScripts(init, &prepared, publish_options, stderr) catch return 1;
+    return 0;
+}
+
+fn reportPublishPreparationError(
+    err: anyerror,
+    from_tarball: bool,
+    positionals: []const []const u8,
+    stderr: *std.Io.Writer,
+) !void {
+    switch (err) {
+        error.FileNotFound => if (from_tarball)
+            try stderr.print("error: failed to read tarball: '{s}'\n", .{positionals[0]})
+        else
+            try stderr.writeAll("error: missing package.json, nothing to publish\n"),
+        error.MissingPackageJSON => if (from_tarball)
+            try stderr.print("error: failed to find package.json in tarball '{s}'\n", .{positionals[0]})
+        else
+            try stderr.writeAll("error: missing package.json, nothing to publish\n"),
+        error.InvalidPackageJSON => try stderr.writeAll("error: failed to parse package.json\n"),
+        error.MissingPackageName => try stderr.writeAll("error: missing `name` string in package.json\n"),
+        error.MissingPackageVersion => try stderr.writeAll("error: missing `version` string in package.json\n"),
+        error.InvalidPackageName, error.InvalidPackageVersion => try stderr.writeAll("error: package.json `name` and `version` fields must be non-empty strings\n"),
+        error.PrivatePackage => try stderr.writeAll("error: attempted to publish a private package\n"),
+        error.RestrictedUnscopedPackage => try stderr.writeAll("error: unable to restrict access to unscoped package\n"),
+        error.InvalidPublishAccess => try stderr.writeAll("error: invalid `access` value in publishConfig\n"),
+        error.InvalidGzipLevel => try stderr.writeAll("error: compression level must be between 0 and 9\n"),
+        error.WorkspaceVersionUnresolved, error.InvalidBundledDependencies, error.InvalidFiles, error.LifecycleScriptFailed => {},
+        else => try stderr.print("error: failed to prepare package for publishing: {s}\n", .{@errorName(err)}),
+    }
+    try stderr.flush();
 }
 
 fn runPm(
@@ -2969,6 +3154,7 @@ const Manager = struct {
             }
         }
 
+        const authorization_explicit = manager.registry_authorization != null;
         try manager.loadGlobalBunfigInstallConfiguration(
             &registry,
             &configured_linker,
@@ -2988,7 +3174,10 @@ const Manager = struct {
         };
         if (bunfig) |source| {
             try manager.validateBunfigSyntax(bunfig_path, source);
-            try manager.loadBunfigInstallConfiguration(bunfig_path, source);
+            if (try manager.loadBunfigInstallConfiguration(bunfig_path, source)) |configured| {
+                if (!registry_explicit) registry = configured.url;
+                if (!authorization_explicit) manager.registry_authorization = configured.authorization;
+            }
             if (!registry_explicit) {
                 if (parseTomlString(source, "registry")) |value| registry = value;
             }
@@ -3056,7 +3245,10 @@ const Manager = struct {
         const path = try std.fs.path.join(manager.allocator, &.{ config_home, ".bunfig.toml" });
         const source = (try readOptionalFile(manager.init_data.io, manager.allocator, path, 1024 * 1024)) orelse return;
         try manager.validateBunfigSyntax(path, source);
-        try manager.loadBunfigInstallConfiguration(path, source);
+        if (try manager.loadBunfigInstallConfiguration(path, source)) |configured| {
+            if (!registry_explicit) registry.* = configured.url;
+            if (manager.registry_authorization == null) manager.registry_authorization = configured.authorization;
+        }
         if (!registry_explicit) {
             if (parseTomlString(source, "registry")) |value| registry.* = value;
         }
@@ -3091,7 +3283,7 @@ const Manager = struct {
         }
     }
 
-    fn loadBunfigInstallConfiguration(manager: *Manager, path: []const u8, source_text: []const u8) !void {
+    fn loadBunfigInstallConfiguration(manager: *Manager, path: []const u8, source_text: []const u8) !?RegistryConfig {
         var ast_memory_allocator: compiler.ast.ASTMemoryAllocator = undefined;
         var ast_scope = ast_memory_allocator.enter(manager.allocator);
         defer ast_scope.exit();
@@ -3100,7 +3292,27 @@ const Manager = struct {
         defer log.deinit();
         const source = compiler.logger.Source.initPathString(path, source_text);
         const root = try compiler.interchange.toml.TOML.parse(&source, &log, manager.allocator, true);
-        const install = root.get("install") orelse return;
+        const install = root.get("install") orelse return null;
+        var default_registry_config: ?RegistryConfig = null;
+        if (install.get("registry")) |registry_value| {
+            var configured = std.mem.zeroes(compiler.schema.api.NpmRegistry);
+            switch (registry_value.data) {
+                .e_string => configured.url = registry_value.asString(manager.allocator) orelse "",
+                .e_object => {
+                    if (registry_value.get("url")) |field| configured.url = field.asString(manager.allocator) orelse "";
+                    if (registry_value.get("token")) |field| configured.token = field.asString(manager.allocator) orelse "";
+                    if (registry_value.get("username")) |field| configured.username = field.asString(manager.allocator) orelse "";
+                    if (registry_value.get("password")) |field| configured.password = field.asString(manager.allocator) orelse "";
+                },
+                else => {},
+            }
+            if (configured.url.len > 0) {
+                default_registry_config = .{
+                    .url = try normalizeRegistryUrl(manager.allocator, configured.url),
+                    .authorization = try manager.authorizationForRegistry(configured),
+                };
+            }
+        }
         if (install.get("minimumReleaseAge")) |minimum_age| {
             switch (minimum_age.data) {
                 .e_number => |seconds| {
@@ -3162,8 +3374,8 @@ const Manager = struct {
                 }
             }
         }
-        const scopes = install.get("scopes") orelse return;
-        if (scopes.data != .e_object) return;
+        const scopes = install.get("scopes") orelse return default_registry_config;
+        if (scopes.data != .e_object) return default_registry_config;
 
         for (scopes.data.e_object.properties.slice()) |property| {
             const raw_name = property.key.?.asString(manager.allocator) orelse continue;
@@ -3187,6 +3399,7 @@ const Manager = struct {
                 .authorization = try manager.authorizationForRegistry(configured),
             });
         }
+        return default_registry_config;
     }
 
     fn loadNpmrcConfiguration(manager: *Manager, registry: *?[]const u8) !void {
