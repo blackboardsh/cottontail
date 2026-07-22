@@ -4078,7 +4078,7 @@ function maybeRegisterSourceMap(filename, source) {
 }
 
 function remapRegisteredSourceMapStack(stack) {
-  return String(stack ?? "").replace(/([^\s()]+):(\d+):(\d+)/g, (frame, file, lineText, columnText) => {
+  return String(stack ?? "").replace(/(^|[\s(@])([^\s()@]+):(\d+):(\d+)/gm, (frame, prefix, file, lineText, columnText) => {
     let sourceMap = sourceMapCache.get(file);
     if (!sourceMap) {
       try {
@@ -4093,7 +4093,7 @@ function remapRegisteredSourceMapStack(stack) {
     const resolvedSource = isAbsolute(source) || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(source)
       ? source
       : resolve(dirname(file), source);
-    return `${resolvedSource}:${entry.originalLine + 1}:${entry.originalColumn + 1}`;
+    return `${prefix}${resolvedSource}:${entry.originalLine + 1}:${entry.originalColumn + 1}`;
   });
 }
 

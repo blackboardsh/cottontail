@@ -218,8 +218,11 @@ export function registerBakeServerPatch(source, record, patchId) {
   const safeId = String(patchId).replace(/[^A-Za-z0-9_-]/g, "_");
   const filename = path.join(directory, `patch-${safeId}.cjs`);
   const mapName = `${path.basename(filename)}.map`;
-  const prefix = "module.exports = [{";
-  const patchSource = `${prefix}${registrySource.slice(0, invocationEnd)}];\n//# sourceMappingURL=${mapName}\n`;
+  const prefix = "module.exports = ((Error) => [{";
+  const errorConstructor = "globalThis.Error.__cottontailStackHeader" +
+    " ? Object.getPrototypeOf(globalThis.Error) : globalThis.Error";
+  const patchSource = `${prefix}${registrySource.slice(0, invocationEnd)}])(${errorConstructor});\n` +
+    `//# sourceMappingURL=${mapName}\n`;
   const inputStart = positionAt(source, registryStart);
   const inputEnd = positionAt(source, registryStart + invocationEnd);
   const outputStart = positionAt(patchSource, prefix.length);
