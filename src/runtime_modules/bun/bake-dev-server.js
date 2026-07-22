@@ -213,9 +213,54 @@ socketUrl.protocol = location.protocol === "https:" ? "wss:" : "ws:";
 const socket = new WebSocket(socketUrl);
 socket.binaryType = "arraybuffer";
 let versionSeen = false;
+let currentRouteId = -1;
+const cssStore = new Map();
+const decoder = new TextDecoder();
+function setCssActive(entry, active) {
+  entry.active = active;
+  const sheet = entry.sheet || entry.link?.sheet;
+  if (sheet) sheet.disabled = !active;
+}
+function registerCssLink(link) {
+  const pathname = new URL(link.href, location.href).pathname;
+  if (!pathname.startsWith("/_bun/asset/")) return;
+  const id = pathname.slice(12, 28);
+  if (!/^[a-f0-9]{16}$/.test(id)) return;
+  const entry = cssStore.get(id);
+  if (entry) {
+    entry.link = link;
+    setCssActive(entry, true);
+  } else {
+    cssStore.set(id, { sheet: null, link, active: true });
+  }
+}
+function editCssArray(ids) {
+  const removed = new Set(cssStore.keys());
+  for (const id of ids) {
+    removed.delete(id);
+    const entry = cssStore.get(id);
+    if (entry) setCssActive(entry, true);
+    else cssStore.set(id, { sheet: null, link: null, active: true });
+  }
+  for (const id of removed) setCssActive(cssStore.get(id), false);
+}
+function editCssContent(id, source) {
+  const entry = cssStore.get(id);
+  if (!entry) return;
+  if (!entry.sheet) {
+    entry.sheet = new CSSStyleSheet();
+    entry.sheet.replace(source);
+    document.adoptedStyleSheets.push(entry.sheet);
+    if (entry.link?.sheet) entry.link.sheet.disabled = true;
+  } else {
+    entry.sheet.replace(source);
+  }
+  setCssActive(entry, entry.active);
+}
+document.querySelectorAll("head>link[rel=stylesheet]").forEach(registerCssLink);
 socket.addEventListener("open", () => {
   console.info("[Bun] Hot-module-reloading socket connected, waiting for changes...");
-  socket.send("n");
+  socket.send("n" + location.pathname);
 });
 socket.addEventListener("message", event => {
   const data = event.data;
@@ -226,13 +271,34 @@ socket.addEventListener("message", event => {
     versionSeen = true;
     return;
   }
-  if (id !== 117) return;
-  if (bytes.length <= 17) {
-    window.location.reload();
+  if (id === 110 && bytes.length >= 5) {
+    currentRouteId = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(1, true);
     return;
   }
+  if (id !== 117) return;
   try {
-    (0, eval)(new TextDecoder().decode(bytes.subarray(17)));
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let cursor = 1;
+    const i32 = () => { const value = view.getInt32(cursor, true); cursor += 4; return value; };
+    const u32 = () => { const value = view.getUint32(cursor, true); cursor += 4; return value; };
+    const text = length => { const value = decoder.decode(bytes.subarray(cursor, cursor + length)); cursor += length; return value; };
+    while (i32() !== -1) {}
+    while (true) {
+      const routeId = i32();
+      if (routeId === -1) break;
+      const count = i32();
+      const styles = [];
+      if (count >= 0) {
+        for (let index = 0; index < count; index++) styles.push(text(16));
+        if (routeId === currentRouteId) editCssArray(styles);
+      }
+    }
+    let mutations = u32();
+    while (mutations-- > 0) editCssContent(text(16), text(u32()));
+    if (cursor < bytes.length) {
+      const codeLength = u32();
+      if (codeLength > 0) (0, eval)(text(codeLength));
+    }
   } catch (error) {
     console.error(error);
     window.location.reload();
@@ -275,8 +341,16 @@ async function loadBakeStaticConfig(projectRoot) {
 }
 
 function bakeBuildErrors(logs, fallbackPath) {
+  const projectRoot = globalThis.process?.cwd?.() ?? ".";
   return logs.map(log => ({
-    file: path.basename(log.position?.file || fallbackPath),
+    file: (() => {
+      const file = log.position?.file || fallbackPath;
+      const absolute = path.isAbsolute(file) ? file : path.resolve(projectRoot, file);
+      const relative = path.relative(projectRoot, absolute);
+      return relative && relative !== ".." && !relative.startsWith(`..${path.sep}`)
+        ? relative.replaceAll(path.sep, "/")
+        : path.basename(file);
+    })(),
     line: Number(log.position?.line || 0),
     column: Number(log.position?.column || 0),
     level: String(log.level || "error"),
@@ -325,6 +399,26 @@ function localHtmlModuleScripts(source, htmlPath) {
     },
   }).transform(source);
   return scripts;
+}
+
+function rewriteHtmlCssAssets(source, replacements) {
+  if (replacements.size === 0) return source;
+  return new HTMLRewriter().on("link", {
+    element(element) {
+      const rel = element.getAttribute("rel");
+      const href = element.getAttribute("href");
+      if (rel?.toLowerCase() !== "stylesheet" || !href) return;
+
+      let pathname;
+      try {
+        pathname = new URL(href, "http://cottontail.invalid/").pathname;
+      } catch {
+        return;
+      }
+      const replacement = replacements.get(pathname);
+      if (replacement) element.setAttribute("href", replacement);
+    },
+  }).transform(source);
 }
 
 const bakeSetErrorsClientSource = `(errors => {
@@ -651,7 +745,7 @@ function createHtmlDispatcher(config, development) {
     for (const [pattern, value] of Object.entries(routeTable)) {
       if (!isHtmlAsset(value)) continue;
       const htmlPath = typeof value === "string" ? value : value.index;
-      htmlRoutes.push({ pattern, path: path.resolve(projectRoot, htmlPath) });
+      htmlRoutes.push({ id: htmlRoutes.length, pattern, path: path.resolve(projectRoot, htmlPath) });
       delete routeTable[pattern];
     }
   }
@@ -708,7 +802,7 @@ function createHtmlDispatcher(config, development) {
     // COTTONTAIL-COMPAT: Bake's HMR linker defers require/TLA failures until
     // module evaluation. Keep the original HTML while serving its scripts from
     // the internal HMR graph so the runtime reports Bun's exact diagnostic.
-    return { body: sourceText, sourceText, hmrEntries, buildError: false, errors: [] };
+    return { body: sourceText, sourceText, hmrEntries, css: new Map(), buildError: false, errors: [] };
   }
 
   async function internalHtmlFailureLogs(sourceText, htmlPath, outdir, buildConfig) {
@@ -763,6 +857,7 @@ function createHtmlDispatcher(config, development) {
             body: bakeBuildErrorPage(errors),
             sourceText,
             hmrEntries: [],
+            css: new Map(),
             buildError: true,
             errors,
           };
@@ -772,6 +867,8 @@ function createHtmlDispatcher(config, development) {
 
       let htmlArtifact = null;
       const hmrEntries = [];
+      const css = new Map();
+      const cssAssetReplacements = new Map();
       const htmlEntries = htmlJavaScriptEntries(result.metafile, htmlPath, projectRoot);
       const supportsInternalHmr = !result.outputs.some(output => output.kind === "asset" && output.loader === "file");
       for (const artifact of result.outputs) {
@@ -781,6 +878,14 @@ function createHtmlDispatcher(config, development) {
         }
         const assetPath = outputAssetPath(outdir, artifact, buildConfig.publicPath);
         let servedArtifact = artifact;
+        if (development && isCssArtifact(artifact)) {
+          const id = bakeCssId(result.metafile, artifact, projectRoot);
+          const source = await artifact.text();
+          const url = `/_bun/asset/${id}.css`;
+          css.set(id, { id, source, url });
+          cssAssetReplacements.set(new URL(assetPath, "http://cottontail.invalid/").pathname, url);
+          assets.set(url, new Blob([source], { type: "text/css; charset=utf-8" }));
+        }
         if (development && buildConfig.hmr !== false && supportsInternalHmr && isJavaScriptArtifact(artifact)) {
           const entryPath = sourceEntryForMetafileArtifact(
             result.metafile,
@@ -800,6 +905,7 @@ function createHtmlDispatcher(config, development) {
                   body: bakeBuildErrorPage(errors),
                   sourceText,
                   hmrEntries: [],
+                  css: new Map(),
                   buildError: true,
                   errors,
                 };
@@ -838,7 +944,14 @@ function createHtmlDispatcher(config, development) {
       const body = development && buildConfig.hmr !== false && hmrEntries.length === 0
         ? withBakeLiveReloadClient(await htmlArtifact.text())
         : development ? await htmlArtifact.text() : htmlArtifact;
-      return { body, sourceText, hmrEntries, buildError: false, errors: [] };
+      return {
+        body: development ? rewriteHtmlCssAssets(body, cssAssetReplacements) : body,
+        sourceText,
+        hmrEntries,
+        css,
+        buildError: false,
+        errors: [],
+      };
     })();
     bundles.set(htmlPath, pending);
     try {
@@ -863,6 +976,7 @@ function createHtmlDispatcher(config, development) {
       const bundle = await buildHtml(route.path);
       if (!bundle.buildError) successfulBundles.set(route.path, bundle);
       return new Response(bundle.body, {
+        status: bundle.buildError ? 500 : 200,
         headers: { "content-type": "text/html; charset=utf-8" },
       });
     }
@@ -870,6 +984,10 @@ function createHtmlDispatcher(config, development) {
   };
   dispatchHtmlRequest.projectRoot = projectRoot;
   dispatchHtmlRequest.sourceMapForPath = pathname => sourceMaps.get(pathname) ?? null;
+  dispatchHtmlRequest.routeIdForPath = pathname => {
+    const route = htmlRoutes.find(item => matchesHtmlRoute(item.pattern, pathname));
+    return route?.id ?? null;
+  };
   dispatchHtmlRequest.serveConfig = { ...config, routes, static: staticRoutes };
   dispatchHtmlRequest.invalidate = () => {
     bundles.clear();
@@ -885,16 +1003,22 @@ function createHtmlDispatcher(config, development) {
     dispatchHtmlRequest.invalidate();
     let hardReload = false;
     const packets = [];
+    const routeStyles = new Map();
+    const cssMutations = new Map();
     for (const htmlPath of activePaths) {
       const previous = previousBundles.get(htmlPath);
       const previousSuccessful = successfulBundles.get(htmlPath);
       const next = await buildHtml(htmlPath);
       if (next.buildError) {
-        packets.push(createBakeErrorUpdatePacket(next.errors, nextHotUpdateId()));
+        if (!previous?.buildError || JSON.stringify(previous.errors) !== JSON.stringify(next.errors)) {
+          packets.push(createBakeErrorUpdatePacket(next.errors, nextHotUpdateId()));
+        }
         continue;
       }
-      if (!previousSuccessful || previousSuccessful.sourceText !== next.sourceText ||
-          previousSuccessful.hmrEntries.length === 0 || next.hmrEntries.length === 0) {
+      const htmlChanged = changedPaths.some(changedPath =>
+        path.resolve(projectRoot, changedPath) === htmlPath
+      );
+      if (!previousSuccessful || htmlChanged || previousSuccessful.sourceText !== next.sourceText) {
         hardReload = true;
         successfulBundles.set(htmlPath, next);
         continue;
@@ -902,25 +1026,46 @@ function createHtmlDispatcher(config, development) {
       if (previous?.buildError) {
         packets.push(createBakeErrorUpdatePacket([], nextHotUpdateId()));
       }
-      for (const entry of next.hmrEntries) {
-        const previousEntry = previousSuccessful.hmrEntries.find(item => item.entryPath === entry.entryPath);
-        if (!previousEntry) {
-          hardReload = true;
-          continue;
+
+      const previousCssIds = [...previousSuccessful.css.keys()];
+      const nextCssIds = [...next.css.keys()];
+      const stylesChanged = previousCssIds.length !== nextCssIds.length ||
+        previousCssIds.some((id, index) => id !== nextCssIds[index]);
+      if (stylesChanged) {
+        for (const route of htmlRoutes) {
+          if (route.path === htmlPath) routeStyles.set(route.id, nextCssIds);
         }
-        const changedModules = {};
-        for (const [id, definition] of Object.entries(entry.modules)) {
-          const previousDefinition = previousEntry.modules[id];
-          if (changedPathMatchesModule(projectRoot, changedPaths, id) ||
-              moduleDefinitionSignature(previousDefinition) !== moduleDefinitionSignature(definition)) {
-            changedModules[id] = definition;
+      }
+      for (const [id, item] of next.css) {
+        if (previousSuccessful.css.get(id)?.source !== item.source) cssMutations.set(id, item);
+      }
+
+      if (previousSuccessful.hmrEntries.length !== next.hmrEntries.length) {
+        hardReload = true;
+      } else {
+        for (const entry of next.hmrEntries) {
+          const previousEntry = previousSuccessful.hmrEntries.find(item => item.entryPath === entry.entryPath);
+          if (!previousEntry) {
+            hardReload = true;
+            continue;
           }
-        }
-        if (Object.keys(changedModules).length > 0) {
-          packets.push(createBakeHotUpdatePacket(changedModules, nextHotUpdateId()));
+          const changedModules = {};
+          for (const [id, definition] of Object.entries(entry.modules)) {
+            const previousDefinition = previousEntry.modules[id];
+            if (changedPathMatchesModule(projectRoot, changedPaths, id) ||
+                moduleDefinitionSignature(previousDefinition) !== moduleDefinitionSignature(definition)) {
+              changedModules[id] = definition;
+            }
+          }
+          if (Object.keys(changedModules).length > 0) {
+            packets.push(createBakeHotUpdatePacket(changedModules, nextHotUpdateId()));
+          }
         }
       }
       successfulBundles.set(htmlPath, next);
+    }
+    if (routeStyles.size > 0 || cssMutations.size > 0) {
+      packets.push(createBakeFrameworkUpdatePacket([], routeStyles, [...cssMutations.values()]));
     }
     return { hardReload, packets };
   };
@@ -2275,7 +2420,7 @@ export function startDefaultApp(entryNamespace) {
     ? {
         projectRoot: htmlFetch?.projectRoot ?? frameworkFetch?.projectRoot,
         routeIdForPath(pathname) {
-          return frameworkFetch?.routeIdForPath?.(pathname) ?? null;
+          return htmlFetch?.routeIdForPath?.(pathname) ?? frameworkFetch?.routeIdForPath?.(pathname) ?? null;
         },
         sourceMapForPath(pathname) {
           return htmlFetch?.sourceMapForPath?.(pathname) ?? frameworkFetch?.sourceMapForPath?.(pathname) ?? null;

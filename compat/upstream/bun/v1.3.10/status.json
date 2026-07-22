@@ -687,6 +687,10 @@
       "status": "enabled",
       "reason": "Bake bundle graph recovery, HTML diagnostics, client-side import validation, and loader behavior pass all 16 copied cases with 39 assertions."
     },
+    "test/bake/dev/css.test.ts": {
+      "status": "enabled",
+      "reason": "Bake CSS graph recovery, route attachments, content mutation, assets, diagnostics, and HTML invalidation pass all 12 copied cases with 62 assertions."
+    },
     "test/bake/dev/html.test.ts": {
       "status": "enabled",
       "reason": "Bake HTML development routing, script/style injection, and response behavior pass all 7 copied cases with 26 assertions."
