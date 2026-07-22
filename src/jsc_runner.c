@@ -22756,6 +22756,28 @@ static void *ct_async_process_thread(void *opaque) {
 
     while (!exited || process->stdout_fd >= 0 || process->stderr_fd >= 0 || process->ipc_fd >= 0) {
         ct_async_process_apply_output_close_requests(process);
+        if (!exited && process->stdout_fd < 0 && process->stderr_fd < 0 && process->ipc_fd < 0) {
+            pid_t wait_result;
+            do {
+                wait_result = wait4(process->pid, &status, 0, &resource_usage);
+            } while (wait_result < 0 && errno == EINTR);
+            exited = true;
+            if (wait_result == process->pid) {
+                has_resource_usage = true;
+                int exit_code = 1;
+                int signal_code = 0;
+                if (WIFEXITED(status)) exit_code = WEXITSTATUS(status);
+                else if (WIFSIGNALED(status)) {
+                    signal_code = WTERMSIG(status);
+                    exit_code = 128 + signal_code;
+                }
+                ct_queue_spawn_exit(process, exit_code, signal_code, &resource_usage, true);
+            } else {
+                ct_queue_spawn_exit(process, 1, 0, NULL, false);
+            }
+            exit_queued = true;
+            continue;
+        }
         struct pollfd fds[4];
         const char *types[4];
         int count = 0;
@@ -22840,7 +22862,7 @@ static void *ct_async_process_thread(void *opaque) {
                     }
                     continue;
                 }
-                char buffer[16384];
+                char buffer[64 * 1024];
                 for (;;) {
                     ssize_t n = read(fds[index].fd, buffer, sizeof(buffer));
                     if (n > 0) {
@@ -24706,7 +24728,16 @@ static JSValueRef ct_dispatch_spawn_events(JSContextRef ctx, CtJscRuntime *runti
         ct_set_property(ctx, item, "id", JSValueMakeNumber(ctx, event->process_id), exception);
         ct_set_property(ctx, item, "type", ct_make_string(ctx, event->type != NULL ? event->type : ""), exception);
         if (event->data != NULL) {
-            ct_set_property(ctx, item, "data", ct_array_buffer_from_copy(ctx, event->data, event->data_len, exception), exception);
+            JSValueRef data = JSObjectMakeArrayBufferWithBytesNoCopy(
+                ctx,
+                event->data,
+                event->data_len,
+                ct_array_buffer_free,
+                NULL,
+                exception
+            );
+            event->data = NULL;
+            ct_set_property(ctx, item, "data", data, exception);
         }
         if (strcmp(event->type != NULL ? event->type : "", "ipc") == 0) {
             if (event->has_fd) {
