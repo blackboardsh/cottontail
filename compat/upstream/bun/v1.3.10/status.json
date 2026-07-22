@@ -239,6 +239,11 @@
       "reason": "Requires Bun's hot-reload runtime, which Cottontail does not implement yet."
     },
     {
+      "pattern": "^test/cli/hot/watch-many-dirs\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "The copied 129-directory hot-reload stress case passes all three simultaneous update cycles and exits cleanly (1 case, 6 assertions)."
+    },
+    {
       "pattern": "^test/cli/inspect/",
       "status": "expected-failure",
       "reason": "Requires Bun's WebKit inspector protocol server, which Cottontail does not expose yet."

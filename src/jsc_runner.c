@@ -3802,11 +3802,13 @@ static void ct_reload_trace_event(
     ct_reload_trace_write_json_string(file, full_path);
     fputs(":{\"events\":[", file);
     bool wrote_event = false;
-    if ((events & UV_CHANGE) != 0) {
+    bool watched_file_replaced = status >= 0 && filename != NULL &&
+        !watcher->watch_all && (events & UV_RENAME) != 0;
+    if ((events & UV_CHANGE) != 0 || watched_file_replaced) {
         fputs("\"write\"", file);
         wrote_event = true;
     }
-    if ((events & UV_RENAME) != 0) {
+    if ((events & UV_RENAME) != 0 && !watched_file_replaced) {
         if (wrote_event) fputc(',', file);
         fputs("\"rename\"", file);
         wrote_event = true;
