@@ -289,11 +289,23 @@ g.process.stderr ??= createWritableStdio(2);
 const ipcPrefix = "__COTTONTAIL_IPC__";
 const nativeIpcFd = Number(g.process.env?.COTTONTAIL_IPC_FD);
 let installNativeProcessIpcReader = null;
+let nativeProcessIpcTimer = null;
 if (Number.isInteger(nativeIpcFd) && nativeIpcFd >= 0 &&
     g.process.env?.COTTONTAIL_IPC_BOOTSTRAP !== "node" &&
     typeof cottontail.ipcSend === "function" &&
     typeof g.process.send !== "function") {
+  const channel = {
+    ref() {
+      nativeProcessIpcTimer?.ref?.();
+      return channel;
+    },
+    unref() {
+      nativeProcessIpcTimer?.unref?.();
+      return channel;
+    },
+  };
   g.process.connected = true;
+  g.process.channel = channel;
   g.process.send = (message) => {
     if (!g.process.connected) return false;
     return cottontail.ipcSend(nativeIpcFd, encodeBunSpawnIpc(message)) === true;
@@ -305,6 +317,10 @@ if (Number.isInteger(nativeIpcFd) && nativeIpcFd >= 0 &&
       throw error;
     }
     g.process.connected = false;
+    if (nativeProcessIpcTimer !== null) {
+      g.clearInterval(nativeProcessIpcTimer);
+      nativeProcessIpcTimer = null;
+    }
     try { cottontail.closeFd?.(nativeIpcFd); } catch {}
     queueMicrotask(() => g.process.emit("disconnect"));
   };
@@ -362,8 +378,8 @@ if (Number.isInteger(nativeIpcFd) && nativeIpcFd >= 0 &&
         return messageCount;
       };
       g.__cottontailPollProcessIpc = pollIpc;
-      const ipcTimer = g.setInterval(pollIpc, 1);
-      ipcTimer.unref?.();
+      nativeProcessIpcTimer = g.setInterval(pollIpc, 1);
+      nativeProcessIpcTimer.unref?.();
     };
   }
 } else if (g.process.env?.COTTONTAIL_IPC_STDIO === "1" &&

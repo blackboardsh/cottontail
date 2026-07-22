@@ -1879,7 +1879,7 @@
     },
     "test/js/bun/http/req-url-leak.test.ts": {
       "status": "expected-failure",
-      "reason": "Performance/IPC-only quarantine: a bounded 130-request probe with 15 KB targets plateaued from 844 MB at its midpoint to 845 MB at completion, confirming functional URL release. The copied fixture currently cannot announce its URL because Bun IPC exposes process.send() but leaves process.channel falsy, and the stock-JSC baseline already exceeds Bun's absolute 150 MB ceiling."
+      "reason": "Performance-only quarantine: inherited Bun IPC exposes the transport-backed process.channel control contract, and a bounded 130-request probe with 15 KB targets plateaued from 844 MB at its midpoint to 845 MB at completion, confirming functional URL release. The stock-JSC baseline already exceeds Bun's absolute 150 MB ceiling."
     },
     "test/js/bun/http/request-smuggling.test.ts": {
       "status": "enabled",
