@@ -1588,8 +1588,8 @@
       "reason": "Bun.serve and Fetch async-iterable response/request bodies, chunk grouping, generator returns, and error-header behavior pass under Cottontail."
     },
     "test/js/bun/http/bun-connect-x509.test.ts": {
-      "status": "expected-failure",
-      "reason": "Both tests now execute and the local Bun.listen/Bun.connect X509 case passes; the external example.com case cannot be verified in the current test environment because DNS resolution is unavailable."
+      "status": "enabled",
+      "reason": "Both deterministic local TLS cases pass, preserving peer and local X509 hostname validation plus repeated certificate access across forced GC (2 tests, 3 assertions)."
     },
     "test/js/bun/http/bun-listen-connect-args.test.ts": {
       "status": "enabled",

@@ -3,24 +3,36 @@ import { describe, expect, test } from "bun:test";
 import * as harness from "harness";
 describe("bun.connect", () => {
   test("should have peer x509 certificate", async () => {
-    const defer = Promise.withResolvers();
-    using socket = await Bun.connect({
-      hostname: "example.com",
-      port: 443,
-      tls: true,
+    const listener = Bun.listen({
+      hostname: "localhost",
+      port: 0,
+      tls: harness.tls,
       socket: {
-        open(socket: Socket) {},
-        close() {},
-        handshake(socket: Socket) {
-          defer.resolve(socket);
-        },
         data() {},
-        drain() {},
       },
     });
-    await defer.promise;
-    const x509: import("node:crypto").X509Certificate = socket.getPeerX509Certificate();
-    expect(x509.checkHost("example.com")).toBe("example.com");
+    const defer = Promise.withResolvers<Socket>();
+    try {
+      using socket = await Bun.connect({
+        hostname: listener.hostname,
+        port: listener.port,
+        tls: harness.tls,
+        socket: {
+          open(socket: Socket) {},
+          close() {},
+          handshake(socket: Socket) {
+            defer.resolve(socket);
+          },
+          data() {},
+          drain() {},
+        },
+      });
+      await defer.promise;
+      const x509: import("node:crypto").X509Certificate = socket.getPeerX509Certificate();
+      expect(x509.checkHost("localhost")).toBe("localhost");
+    } finally {
+      listener.stop(true);
+    }
   });
 
   test("should have x509 certificate", async () => {
