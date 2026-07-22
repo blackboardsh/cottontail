@@ -330,10 +330,17 @@ export function lexShell(source) {
 
 const REDIRECTS = new Set(["<", "<<", "0<", "0<<", "0>", "0>>", ">", ">>", "1>", "1>>", "2>", "2>>", "&>", "&>>", "2>&1", "1>&2", ">&2", ">&1"]);
 
+function markRightmostAsync(node) {
+  if (node?.type === "binary") return { ...node, right: markRightmostAsync(node.right) };
+  return { type: "async", command: node };
+}
+
 class Parser {
-  constructor(tokens) {
+  constructor(tokens, options = {}) {
     this.tokens = tokens;
     this.index = 0;
+    this.allowBackground = options.allowBackground === true;
+    this.allowSubshellRedirects = options.allowSubshellRedirects === true;
   }
   peek(offset = 0) { return this.tokens[this.index + offset] ?? this.tokens[this.tokens.length - 1]; }
   take() { return this.tokens[this.index++]; }
@@ -347,10 +354,24 @@ class Parser {
     const items = [];
     this.skipSeparators();
     while (!this.isStop(stopWords, stopOperators)) {
-      const item = this.parseAndOr();
+      if (this.allowBackground && this.isOp("&")) {
+        const background = this.take();
+        throw syntax('Unexpected "&"', background.position);
+      }
+      let item = this.parseAndOr();
       if (this.isOp("&")) {
         const background = this.take();
-        throw syntax('Background commands "&" are not supported yet.', background.position);
+        if (!this.allowBackground) {
+          throw syntax('Background commands "&" are not supported yet.', background.position);
+        }
+        const next = this.peek();
+        if (next.type === "op" && ["&&", "||", "|", "&"].includes(next.value)) {
+          throw syntax(`"&" is not allowed on the left-hand side of "${next.value}"`, background.position);
+        }
+        item = markRightmostAsync(item);
+        items.push(item);
+        this.skipSeparators();
+        continue;
       }
       items.push(item);
       if (!this.consumeOp(";")) {
@@ -418,7 +439,7 @@ class Parser {
       if (!this.consumeOp(")")) throw syntax("Unclosed subshell", this.peek().position);
       const redirectPosition = this.peek().position;
       const redirects = this.parseRedirects();
-      if (redirects.length > 0) {
+      if (redirects.length > 0 && !this.allowSubshellRedirects) {
         throw syntax("Subshells with redirections are currently not supported. Please open a GitHub issue.", redirectPosition);
       }
       return { type: "subshell", script, redirects };
@@ -535,11 +556,11 @@ function terminalBareRedirect(source) {
   return -1;
 }
 
-export function parseShell(source) {
+export function parseShell(source, options = {}) {
   source = String(source);
   const redirect = terminalBareRedirect(source);
   if (redirect >= 0) throw syntax("Redirection with no file", redirect);
-  const parser = new Parser(lexShell(source));
+  const parser = new Parser(lexShell(source), options);
   const script = parser.parse();
   if (parser.peek().type !== "eof") {
     if (parser.isOp(")")) throw syntax("Unexpected ')'", parser.peek().position);

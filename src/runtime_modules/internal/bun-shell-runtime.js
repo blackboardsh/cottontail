@@ -2,14 +2,11 @@ import { closeSync, lstatSync, openSync, readFileSync, readdirSync, statSync, wr
 import { basename, dirname, isAbsolute, join, resolve } from "../node/path.js";
 import picomatch from "../vendor/picomatch.js";
 import { createShellBuiltins } from "./bun-shell-builtins.js";
-import { lexShell, parseShell } from "./bun-shell-parser.js";
+import { parseShell } from "./bun-shell-parser.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const INPUT_REDIRECTS = new Set(["<", "<<", "0<", "0<<", "0>", "0>>"]);
-const SHELL_REDIRECTS = new Set(["<", "<<", "0<", "0<<", "0>", "0>>", ">", ">>", "1>", "1>>", "2>", "2>>", "&>", "&>>", "2>&1", "1>&2", ">&2", ">&1"]);
-const COMMAND_BOUNDARY_OPERATORS = new Set([";", "&&", "||", "|", "!", "(", "{"]);
-const COMMAND_BOUNDARY_WORDS = new Set(["if", "then", "elif", "else"]);
 
 function bytes(value = "") {
   if (value instanceof Uint8Array) return value;
@@ -75,149 +72,6 @@ function validateOutputReferences(source, outputTargets) {
   }
 }
 
-function shellSyntax(message, position) {
-  const error = new SyntaxError(message);
-  error.position = position;
-  return error;
-}
-
-function commandPosition(tokens, index) {
-  if (index === 0) return true;
-  const previous = tokens[index - 1];
-  if (previous.type === "op") return COMMAND_BOUNDARY_OPERATORS.has(previous.value);
-  return previous.type === "word" && COMMAND_BOUNDARY_WORDS.has(previous.raw);
-}
-
-function rewriteSubshellRedirects(source) {
-  if (!source.includes("(")) return source;
-  const tokens = lexShell(source);
-  const stack = [];
-  const ranges = [];
-  let conditionalDepth = 0;
-
-  for (let index = 0; index < tokens.length; index += 1) {
-    const token = tokens[index];
-    if (token.type === "word" && token.raw === "[[") {
-      conditionalDepth += 1;
-      continue;
-    }
-    if (token.type === "word" && token.raw === "]]" && conditionalDepth > 0) {
-      conditionalDepth -= 1;
-      continue;
-    }
-    if (conditionalDepth > 0 || token.type !== "op") continue;
-    if (token.value === "(") {
-      stack.push({ position: token.position, command: commandPosition(tokens, index) });
-      continue;
-    }
-    if (token.value !== ")" || stack.length === 0) continue;
-    const open = stack.pop();
-    const next = tokens[index + 1];
-    if (open.command && next?.type === "op" && SHELL_REDIRECTS.has(next.value)) {
-      ranges.push({ start: open.position, end: token.position + 1 });
-    }
-  }
-
-  if (ranges.length === 0) return source;
-  const edits = [];
-  for (const range of ranges) {
-    edits.push({ position: range.start, text: "{ " });
-    edits.push({ position: range.end, text: "; }" });
-  }
-  edits.sort((left, right) => right.position - left.position || right.text.length - left.text.length);
-  let rewritten = source;
-  for (const edit of edits) {
-    rewritten = `${rewritten.slice(0, edit.position)}${edit.text}${rewritten.slice(edit.position)}`;
-  }
-  return rewritten;
-}
-
-function markerCommand(node, markers) {
-  return node?.type === "command"
-    && (node.redirects?.length ?? 0) === 0
-    && node.words?.length === 1
-    && markers.has(node.words[0].raw);
-}
-
-function markRightmostAsync(node) {
-  if (node?.type === "binary") return { ...node, right: markRightmostAsync(node.right) };
-  return { type: "async", command: node };
-}
-
-function transformBackgroundMarkers(node, markers) {
-  if (node == null || typeof node !== "object") return node;
-  if (node.type === "script") {
-    const items = node.items.map(item => transformBackgroundMarkers(item, markers));
-    for (let index = 0; index < items.length;) {
-      if (!markerCommand(items[index], markers)) {
-        index += 1;
-        continue;
-      }
-      if (index === 0) throw shellSyntax('Unexpected "&"', 0);
-      items[index - 1] = markRightmostAsync(items[index - 1]);
-      items.splice(index, 1);
-    }
-    return { ...node, items };
-  }
-  if (node.type === "binary") {
-    return {
-      ...node,
-      left: transformBackgroundMarkers(node.left, markers),
-      right: transformBackgroundMarkers(node.right, markers),
-    };
-  }
-  if (node.type === "pipeline") {
-    return { ...node, items: node.items.map(item => transformBackgroundMarkers(item, markers)) };
-  }
-  if (node.type === "negate") return { ...node, command: transformBackgroundMarkers(node.command, markers) };
-  if (node.type === "async") return { ...node, command: transformBackgroundMarkers(node.command, markers) };
-  if (node.type === "subshell" || node.type === "group") {
-    return { ...node, script: transformBackgroundMarkers(node.script, markers) };
-  }
-  if (node.type === "if") {
-    return {
-      ...node,
-      branches: node.branches.map(branch => ({
-        condition: transformBackgroundMarkers(branch.condition, markers),
-        consequent: transformBackgroundMarkers(branch.consequent, markers),
-      })),
-      alternate: transformBackgroundMarkers(node.alternate, markers),
-    };
-  }
-  if (node.type === "assignmentPrefix") {
-    return { ...node, command: transformBackgroundMarkers(node.command, markers) };
-  }
-  return node;
-}
-
-function rewriteBackgroundLists(source) {
-  if (!source.includes("&")) return { source, markers: new Set() };
-  const tokens = lexShell(source);
-  const background = [];
-  for (let index = 0; index < tokens.length; index += 1) {
-    const token = tokens[index];
-    if (token.type !== "op" || token.value !== "&") continue;
-    const next = tokens[index + 1];
-    if (next?.type === "op" && ["&&", "||", "|", "&"].includes(next.value)) {
-      throw shellSyntax(`"&" is not allowed on the left-hand side of "${next.value}"`, token.position);
-    }
-    background.push(token);
-  }
-  if (background.length === 0) return { source, markers: new Set() };
-
-  let markerPrefix = "__cottontail_shell_async__";
-  while (source.includes(markerPrefix)) markerPrefix += "_";
-  const markers = new Set();
-  let rewritten = source;
-  for (let index = background.length - 1; index >= 0; index -= 1) {
-    const token = background[index];
-    const marker = `${markerPrefix}${index}`;
-    markers.add(marker);
-    rewritten = `${rewritten.slice(0, token.position)}; ${marker};${rewritten.slice(token.position + 1)}`;
-  }
-  return { source: rewritten, markers };
-}
-
 const shellParseCache = new Map();
 const shellParseCacheEntryLimit = 32;
 const shellParseCacheSourceLimit = 8 * 1024 * 1024;
@@ -260,8 +114,8 @@ function throwCachedShellParseError(cached) {
 }
 
 export function parseBunShellSource(source) {
-  // Public Bun.$ execution accepts async lists and redirected subshells while
-  // the testing serializer keeps Bun v1.3.10's parser diagnostics unchanged.
+  // Production execution enables AST forms whose state machines exist in Bun
+  // 1.3.10 while the testing serializer retains its public parser diagnostics.
   source = String(source);
   const cached = shellParseCache.get(source);
   if (cached) {
@@ -271,9 +125,10 @@ export function parseBunShellSource(source) {
     return cached.value;
   }
   try {
-    const redirected = rewriteSubshellRedirects(source);
-    const rewritten = rewriteBackgroundLists(redirected);
-    const value = transformBackgroundMarkers(parseShell(rewritten.source), rewritten.markers);
+    const value = parseShell(source, {
+      allowBackground: true,
+      allowSubshellRedirects: true,
+    });
     cacheShellParse(source, { value });
     return value;
   } catch (error) {

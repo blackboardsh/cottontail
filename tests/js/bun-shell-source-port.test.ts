@@ -134,6 +134,21 @@ test("background lists execute concurrently and wait joins their output", async 
   expect(output.stderr.toString()).toBe("");
 });
 
+test("production parsing materializes async redirected subshell nodes", () => {
+  const parseProduction = (source: string) => parseShell(source, {
+    allowBackground: true,
+    allowSubshellRedirects: true,
+  });
+  const parsed = parseProduction("(echo nested) > nested.txt & echo foreground");
+
+  expect(parsed.items).toHaveLength(2);
+  expect(parsed.items[0].type).toBe("async");
+  expect(parsed.items[0].command.type).toBe("subshell");
+  expect(parsed.items[0].command.redirects.map(redirect => redirect.operator)).toEqual([">"]);
+  expect(parsed.items[1].type).toBe("command");
+  expect(() => parseProduction("& echo unreachable")).toThrow('Unexpected "&"');
+});
+
 test("background pipelines preserve list ordering and final shell joins", async () => {
   const delayed = "await Bun.sleep(30); console.log('pipeline')";
   const output = await $`
@@ -280,6 +295,19 @@ test("subshell redirections preserve state isolation and descriptor flow", async
   expect(output.stdout.toString()).toBe("inner\nerror\nouter\n");
   expect(output.stderr.toString()).toBe("");
   expect(readFileSync(join(root, "subshell.txt"), "utf8")).toBe("inner\nerror\n");
+});
+
+test("nested redirected subshells isolate assignments at every level", async () => {
+  const output = await shell(`
+    VALUE=outer
+    ((VALUE=inner; echo "$VALUE") > inner.txt; echo "$VALUE") > outer.txt
+    echo "$VALUE"
+    cat inner.txt outer.txt
+  `);
+
+  expect(output.exitCode).toBe(0);
+  expect(output.stdout.toString()).toBe("outer\ninner\nouter\n");
+  expect(output.stderr.toString()).toBe("");
 });
 
 test("ANSI-C quotes decode complete escape sequences exactly once", async () => {
