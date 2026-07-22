@@ -3492,7 +3492,6 @@ fn runReloadExecution(execution: *ScriptExecution, reload: *ReloadExecution) voi
     var generation: usize = 0;
     while (true) : (generation += 1) {
         if (generation > 0) {
-            std.Io.sleep(execution.io, .fromMilliseconds(25), .awake) catch {};
             clearReloadScreen(execution, reload);
         }
 

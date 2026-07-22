@@ -677,6 +677,18 @@ function remapAdjacentBundleFrames(stack) {
 export function formatUncaughtBundleError(error) {
   try {
     const stack = remapStackString(String(error?.stack ?? ""));
+    if (globalThis.process?.execArgv?.includes?.("--hot")) {
+      for (const frameLine of stack.split(/\r?\n/)) {
+        const frame = /@(.+):(\d+):(\d+)$/.exec(frameLine) ??
+          /^\s*at\s+.*?\s+\((.+):(\d+):(\d+)\)$/.exec(frameLine) ??
+          /^\s*at\s+(.+):(\d+):(\d+)$/.exec(frameLine);
+        if (!frame) continue;
+        const header = Error.prototype.toString.call(error);
+        error.stack = `${header}\n    at ${frame[1]}:${frame[2]}:${frame[3]}`;
+        Object.defineProperty(error, "__cottontailFormattedStack", { value: true, configurable: true });
+        return true;
+      }
+    }
     for (const frameLine of stack.split(/\r?\n/)) {
       const frame = /@(.+):(\d+):(\d+)$/.exec(frameLine) ??
         /^\s*at\s+.*?\s+\((.+):(\d+):(\d+)\)$/.exec(frameLine) ??

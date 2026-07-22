@@ -2100,10 +2100,12 @@ function refreshModuleRequire(module) {
   return require;
 }
 
-// Detects top-level ESM declarations (static import / export statements).
+// Detects top-level ESM declarations (static import / export statements) and
+// import.meta expressions. Bun parses import.meta as module syntax even when
+// it is the only module-specific construct in a .js file.
 // Files reaching the CommonJS executor with ESM syntax must be transformed
 // first: `import x from "y"` inside new Function() is a parse error.
-const esmSyntaxPattern = /^[ \t]*(?:import\s+(?:[\w$*{]|["'])|export\s+(?:default\b|const\b|let\b|var\b|function\b|class\b|async\b|\{|\*))/m;
+const esmSyntaxPattern = /(?:\bimport\s*\.\s*meta\b|^[ \t]*(?:import\s+(?:[\w$*{]|["'])|export\s+(?:default\b|const\b|let\b|var\b|function\b|class\b|async\b|\{|\*)))/m;
 
 function codePositionMask(source) {
   const text = String(source);
