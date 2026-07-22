@@ -46,12 +46,12 @@ pub fn printDuplicateWorkspaceName(
         .text = "Package name is also declared here",
         .location = compiler.logger.Location.initOrNull(
             &first_source,
-            first_source.rangeOfString(first_name.loc),
+            first_source.rangeOfString(first_name.expr.loc),
         ),
     };
     try log.addRangeErrorFmtWithNotes(
         &duplicate_source,
-        duplicate_source.rangeOfString(duplicate_name.loc),
+        duplicate_source.rangeOfString(duplicate_name.expr.loc),
         allocator,
         notes,
         "Workspace name \"{s}\" already exists",

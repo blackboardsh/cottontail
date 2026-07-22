@@ -3902,6 +3902,20 @@ const Manager = struct {
         }
     }
 
+    fn ensureProjectInstallCache(manager: *Manager) !void {
+        // COTTONTAIL-COMPAT: With package caching disabled, Bun lazily falls
+        // back to node_modules/.cache while materializing dependencies.
+        if (manager.node_linker != .hoisted or
+            manager.options.lockfile_only or
+            manager.options.dry_run or
+            !manager.options.no_cache)
+        {
+            return;
+        }
+        const cache = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules", ".cache" });
+        try std.Io.Dir.cwd().createDirPath(manager.init_data.io, cache);
+    }
+
     fn prepareIsolatedNodeModules(manager: *Manager, node_modules: []const u8) !void {
         const store = try std.fs.path.join(manager.allocator, &.{ node_modules, ".bun" });
         if (manager.pathExists(store)) {
@@ -7099,6 +7113,7 @@ const Manager = struct {
         }
         switch (package.kind) {
             .npm => {
+                try manager.ensureProjectInstallCache();
                 const patch_paths = try manager.packagePatchPaths(package.name, package.version, protocol_patch_paths);
                 var installed = false;
                 const package_metadata = package.info;
@@ -7174,6 +7189,16 @@ const Manager = struct {
             },
             .workspace => {
                 if (protocol_patch_paths.len > 0) return error.UnsupportedPatchResolution;
+                if (direct and std.mem.eql(u8, parent_dir, manager.root_dir)) {
+                    if (manager.rootDependencySpec(alias)) |spec| {
+                        const request = Workspaces.parseRequest(alias, spec);
+                        // COTTONTAIL-COMPAT: Bun re-resolves symbolic workspace
+                        // selectors through the path that initializes its fallback cache.
+                        if (request.explicit and request.range == null and request.path == null) {
+                            try manager.ensureProjectInstallCache();
+                        }
+                    }
+                }
                 const workspace = manager.workspaces.get(package.name) orelse manager.workspaces.get(alias) orelse return error.WorkspaceNotFound;
                 if (!manager.options.lockfile_only and !manager.options.dry_run) {
                     try manager.linkRelativeDirectory(selection.destination, workspace.path, true);
@@ -7249,15 +7274,7 @@ const Manager = struct {
                 return local.version;
             },
             .local_tarball, .remote_tarball => {
-                if (package.kind == .remote_tarball and
-                    manager.node_linker == .hoisted and
-                    !manager.options.lockfile_only and
-                    !manager.options.dry_run and
-                    manager.init_data.environ_map.get("BUN_INSTALL_CACHE_DIR") == null)
-                {
-                    const project_cache = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules", ".cache" });
-                    try std.Io.Dir.cwd().createDirPath(manager.init_data.io, project_cache);
-                }
+                try manager.ensureProjectInstallCache();
                 const archive = if (package.kind == .remote_tarball)
                     try manager.fetchBytes(package.source, false, max_tarball_bytes)
                 else blk: {
