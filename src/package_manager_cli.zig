@@ -5914,7 +5914,10 @@ const Manager = struct {
         if (package_json.* != .object) return;
         const dependencies = package_json.object.get(key) orelse return;
         if (dependencies != .object) return;
-        for (dependencies.object.keys(), dependencies.object.values()) |alias, spec_value| {
+        const aliases = try manager.allocator.dupe([]const u8, dependencies.object.keys());
+        std.mem.sort([]const u8, aliases, {}, lessString);
+        for (aliases) |alias| {
+            const spec_value = dependencies.object.get(alias) orelse continue;
             if (spec_value != .string) continue;
             if (std.mem.eql(u8, key, "dependencies") and objectSectionContains(package_json, "optionalDependencies", alias)) continue;
             if (std.mem.eql(u8, key, "dependencies") and direct and
