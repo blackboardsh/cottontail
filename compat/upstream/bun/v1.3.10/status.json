@@ -972,6 +972,48 @@
       "status": "enabled",
       "reason": "Bun info and pm view package selection, rendering, property access, JSON output, diagnostics, and concurrent inline snapshots pass all 19 copied cases (60 assertions)."
     },
+    "test/cli/install/bun-audit.test.ts": {
+      "status": "enabled",
+      "reason": "Audit request shaping, severity filtering, JSON and text output, registry selection, and failure diagnostics pass all 16 copied cases (44 assertions).",
+      "args": ["--timeout", "30000"],
+      "timeoutMs": 180000
+    },
+    "test/cli/install/bun-pm-scan.test.ts": {
+      "status": "enabled",
+      "reason": "Configured local and package scanners, payload validation, advisories, process exits, lockfile requirements, and scanner installation behavior pass all 17 copied cases (44 assertions).",
+      "args": ["--timeout", "30000"],
+      "timeoutMs": 360000
+    },
+    "test/cli/install/bun-security-scanner-workspaces.test.ts": {
+      "status": "enabled",
+      "reason": "Security payload construction deduplicates package identities across workspace and isolated lock contexts while preserving dependency paths, passing all 3 copied cases (9 assertions).",
+      "args": ["--timeout", "30000"],
+      "timeoutMs": 240000
+    },
+    "test/cli/install/bun-update-security-edge-cases.test.ts": {
+      "status": "enabled",
+      "reason": "Update-time and post-install scans detect vulnerable direct and transitive packages and preserve canceled installs across all 6 copied cases (19 assertions).",
+      "args": ["--timeout", "30000"],
+      "timeoutMs": 360000
+    },
+    "test/cli/install/bun-update-security-provider.test.ts": {
+      "status": "enabled",
+      "reason": "Update security providers run before mutation, block fatal advisories, and remain disabled without configuration across both copied cases (13 assertions).",
+      "args": ["--timeout", "30000"],
+      "timeoutMs": 180000
+    },
+    "test/cli/install/bun-update-security-scan-all.test.ts": {
+      "status": "enabled",
+      "reason": "Update scanning covers all packages or selected dependency closures, respects configuration, and blocks advisories across all 6 copied cases (18 assertions).",
+      "args": ["--timeout", "30000"],
+      "timeoutMs": 360000
+    },
+    "test/cli/install/bun-update-security-simple.test.ts": {
+      "status": "enabled",
+      "reason": "Configured update scanners run and block fatal advisories while unconfigured updates bypass scanning across both copied cases (11 assertions).",
+      "args": ["--timeout", "30000"],
+      "timeoutMs": 180000
+    },
     "test/cli/install/bun-install-cpu-os.test.ts": {
       "status": "enabled",
       "reason": "Repeatable CPU and operating-system target overrides, wildcards, negation, validation, package filtering, and cross-platform lockfile graph preservation pass all 13 copied cases (168 assertions)."

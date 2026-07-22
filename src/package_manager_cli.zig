@@ -2304,7 +2304,7 @@ const Manager = struct {
         try manager.validateCatalogReferences(&root);
         try manager.prepareNodeModules();
         try manager.reserveWorkspaceRootVersions();
-        if (manager.options.command == .install) {
+        if (manager.options.command == .install and manager.security_scanner == null) {
             // Network prefetch is opportunistic. The normal resolver remains the
             // source of diagnostics and retries if a speculative request fails.
             manager.prefetchInstallNetwork(&root) catch {};
@@ -2639,10 +2639,17 @@ const Manager = struct {
             const name = entry.object.get("name") orelse return error.InvalidSecurityScannerPayload;
             const manifest = entry.object.getPtr("manifest") orelse return error.InvalidSecurityScannerPayload;
             if (name != .string or manifest.* != .object) return error.InvalidSecurityScannerPayload;
+            const owned_name = try manager.allocator.dupe(u8, name.string);
             try manager.registry_manifests.put(
-                try manager.allocator.dupe(u8, name.string),
+                owned_name,
                 manifest,
             );
+            if (manager.options.command == .update) {
+                try manager.refreshed_update_manifests.put(
+                    owned_name,
+                    {},
+                );
+            }
         }
     }
 
@@ -2670,6 +2677,8 @@ const Manager = struct {
         var queue = std.array_list.Managed(SecurityQueueItem).init(manager.allocator);
         var record_indices = std.StringHashMap(usize).init(manager.allocator);
         defer record_indices.deinit();
+        var emitted_packages = std.StringHashMap(void).init(manager.allocator);
+        defer emitted_packages.deinit();
 
         for (manager.records.items, 0..) |record, index| {
             try record_indices.put(recordLogicalKey(record), index);
@@ -2706,17 +2715,21 @@ const Manager = struct {
 
             const record = manager.records.items[item.record_index];
             if (record.kind != .npm or record.name.len == 0 or record.version.len == 0) continue;
-            const tarball = if (record.tarball.len > 0)
-                record.tarball
-            else
-                try manager.defaultTarballURL(record.name, record.version);
-            try packages.append(.{
-                .name = record.name,
-                .version = record.version,
-                .requestedRange = item.requested_range,
-                .tarball = tarball,
-            });
-            try paths.append(.{ .name = record.name, .path = item.path });
+            const identity = try std.fmt.allocPrint(manager.allocator, "{s}@{s}", .{ record.name, record.version });
+            const emitted = try emitted_packages.getOrPut(identity);
+            if (!emitted.found_existing) {
+                const tarball = if (record.tarball.len > 0)
+                    record.tarball
+                else
+                    try manager.defaultTarballURL(record.name, record.version);
+                try packages.append(.{
+                    .name = record.name,
+                    .version = record.version,
+                    .requestedRange = item.requested_range,
+                    .tarball = tarball,
+                });
+                try paths.append(.{ .name = record.name, .path = item.path });
+            }
 
             const metadata = record.metadata orelse continue;
             if (metadata.* != .object) continue;
