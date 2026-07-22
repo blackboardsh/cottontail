@@ -979,9 +979,26 @@ function initializeWellKnownPrototypes() {
   wellKnownPrototypes.set(ArrayBuffer.prototype, { name: "ArrayBuffer", constructor: ArrayBuffer });
   wellKnownPrototypes.set(Function.prototype, { name: "Function", constructor: Function });
   wellKnownPrototypes.set(Map.prototype, { name: "Map", constructor: Map });
-  wellKnownPrototypes.set(Object.prototype, { name: "Object", constructor: Object });
   wellKnownPrototypes.set(Set.prototype, { name: "Set", constructor: Set });
-  // wellKnownPrototypes.set(TypedArray.prototype, { name: "TypedArray", constructor: TypedArray });
+  wellKnownPrototypes.set(Object.prototype, { name: "Object", constructor: Object });
+  const TypedArray = ObjectGetPrototypeOf(Uint8Array);
+  wellKnownPrototypes.set(ObjectGetPrototypeOf(Uint8Array.prototype), {
+    name: "TypedArray",
+    constructor: TypedArray,
+  });
+  wellKnownPrototypes.set(RegExp.prototype, { name: "RegExp", constructor: RegExp });
+  wellKnownPrototypes.set(Date.prototype, { name: "Date", constructor: Date });
+  wellKnownPrototypes.set(DataView.prototype, { name: "DataView", constructor: DataView });
+  wellKnownPrototypes.set(Error.prototype, { name: "Error", constructor: Error });
+  wellKnownPrototypes.set(AggregateError.prototype, { name: "AggregateError", constructor: AggregateError });
+  wellKnownPrototypes.set(RangeError.prototype, { name: "RangeError", constructor: RangeError });
+  wellKnownPrototypes.set(TypeError.prototype, { name: "TypeError", constructor: TypeError });
+  wellKnownPrototypes.set(Boolean.prototype, { name: "Boolean", constructor: Boolean });
+  wellKnownPrototypes.set(Number.prototype, { name: "Number", constructor: Number });
+  wellKnownPrototypes.set(String.prototype, { name: "String", constructor: String });
+  wellKnownPrototypes.set(Promise.prototype, { name: "Promise", constructor: Promise });
+  wellKnownPrototypes.set(WeakMap.prototype, { name: "WeakMap", constructor: WeakMap });
+  wellKnownPrototypes.set(WeakSet.prototype, { name: "WeakSet", constructor: WeakSet });
 }
 
 function getConstructorName(obj, ctx, recurseTimes, protoProps) {
@@ -2727,7 +2744,14 @@ function previewEntries(val, isIterator = false) {
 }
 function internalGetConstructorName(val) {
   if (!val || typeof val !== "object") throw new Error("Invalid object");
-  if (val.constructor?.name) return val.constructor.name;
+  let current = val;
+  while (current !== null) {
+    const descriptor = ObjectGetOwnPropertyDescriptor(current, "constructor");
+    if (descriptor !== undefined && typeof descriptor.value === "function" && descriptor.value.name !== "") {
+      return String(descriptor.value.name);
+    }
+    current = ObjectGetPrototypeOf(current);
+  }
   const str = ObjectPrototypeToString(val);
   const m = StringPrototypeMatch(str, /^\[object ([^\]]+)\]/); // e.g. [object Boolean]
   return m ? m[1] : "Object";
