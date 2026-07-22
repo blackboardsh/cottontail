@@ -3,8 +3,8 @@
 import {
   lstatSync,
   mkdirSync,
+  readlinkSync,
   readFileSync,
-  realpathSync,
   rmSync,
   symlinkSync,
 } from 'fs';
@@ -51,6 +51,21 @@ function statOrNull(path) {
   }
 }
 
+function ensureDirectoryLink(link, target) {
+  const existing = statOrNull(link);
+  if (existing?.isSymbolicLink()) {
+    try {
+      const linkedTarget = resolve(dirname(link), readlinkSync(link));
+      if (linkedTarget === resolve(target)) return link;
+    } catch {}
+  }
+  if (existing) rmSync(link, { recursive: true, force: true });
+  mkdirSync(dirname(link), { recursive: true });
+  const linkTarget = process.platform === 'win32' ? target : relative(dirname(link), target);
+  symlinkSync(linkTarget, link, process.platform === 'win32' ? 'junction' : 'dir');
+  return link;
+}
+
 export function setupSvelteFixture(snapshotRoot = defaultSnapshotRoot()) {
   const snapshot = resolve(snapshotRoot);
   const pluginRoot = join(snapshot, 'packages', 'bun-plugin-svelte');
@@ -69,18 +84,13 @@ export function setupSvelteFixture(snapshotRoot = defaultSnapshotRoot()) {
 
   const testNodeModules = join(snapshot, 'test', 'node_modules');
   const pluginLink = join(testNodeModules, 'bun-plugin-svelte');
-  const existing = statOrNull(pluginLink);
-  if (existing?.isSymbolicLink()) {
-    try {
-      if (realpathSync(pluginLink) === realpathSync(pluginRoot)) return pluginLink;
-    } catch {}
-  }
-  if (existing) rmSync(pluginLink, { recursive: true, force: true });
-  mkdirSync(testNodeModules, { recursive: true });
-  const target = process.platform === 'win32'
-    ? pluginRoot
-    : relative(testNodeModules, pluginRoot);
-  symlinkSync(target, pluginLink, process.platform === 'win32' ? 'junction' : 'dir');
+  ensureDirectoryLink(pluginLink, pluginRoot);
+
+  // Bun's source checkout installs workspace dependencies at an ancestor of
+  // the test fixture. Mirror that resolution point without copying Svelte;
+  // the unchanged upstream beforeAll install populates this target.
+  const svelteLink = join(testNodeModules, 'svelte');
+  ensureDirectoryLink(svelteLink, join(pluginRoot, 'node_modules', 'svelte'));
   console.log(`Prepared bun-plugin-svelte fixture at ${pluginLink}.`);
   return pluginLink;
 }
