@@ -1,11 +1,12 @@
 import Module, { _resolveFilename } from "../node/module.js";
 import { BlockList } from "../node/net.js";
-import { readFileSync } from "../node/fs.js";
+import fsDefault, { readFileSync } from "../node/fs.js";
 import { createHash } from "../node/crypto.js";
 import { gunzipSync } from "../node/zlib.js";
 import { serializeShellLex, serializeShellParse } from "../internal/bun-shell-parser.js";
 import { frameworkRouterInternals } from "./bake-framework-router.js";
 import { getDevServerDeinitCount as getBakeDevServerDeinitCount } from "./bake-dev-server.js";
+import { SQL as SQLConstructor } from "./sql.js";
 
 export const jscInternals = {
   isLatin1String(value) {
@@ -1069,6 +1070,24 @@ export const bindgen = Object.freeze({
 
 export function noOpForTesting() {}
 
+export const SQL = SQLConstructor;
+export const fs = fsDefault.promises;
+
+const kWriteStreamFastPath = Symbol.for("cottontail.node.fs.writeStreamFastPath");
+export const fsStreamInternals = Object.freeze({
+  writeStreamFastPath(stream) {
+    return stream?.[kWriteStreamFastPath];
+  },
+});
+
+export function arrayBufferViewHasBuffer(value) {
+  if (!ArrayBuffer.isView(value)) {
+    throw new TypeError("arrayBufferViewHasBuffer expects an ArrayBuffer view");
+  }
+  if (value instanceof DataView) return true;
+  return Boolean(cottontail.arrayBufferViewHasBuffer(value));
+}
+
 export const timerInternals = Object.freeze({
   timerClockMs() {
     return cottontail.timerClockMs();
@@ -1231,6 +1250,8 @@ export function readTarball(tarballPath) {
 
 export default {
   Dequeue,
+  SQL,
+  arrayBufferViewHasBuffer,
   bindgen,
   getEventLoopStats,
   canonicalizeIP,
@@ -1242,6 +1263,8 @@ export default {
   escapeRegExp,
   escapeRegExpForPackageNameMatching,
   frameworkRouterInternals,
+  fs,
+  fsStreamInternals,
   getDevServerDeinitCount,
   hasNonReifiedStatic,
   highlightJavaScript,

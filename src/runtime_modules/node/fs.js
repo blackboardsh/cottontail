@@ -25,6 +25,7 @@ import fsPromisesDefault from "./fs/promises.js";
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
+const kWriteStreamFastPath = Symbol.for("cottontail.node.fs.writeStreamFastPath");
 
 // fs.constants must be the exact same object as fsPromises.constants. Because
 // fs.js and fs/promises.js form an import cycle whose evaluation order depends
@@ -1623,6 +1624,7 @@ class WriteStreamImpl extends Writable {
     options = normalizeStreamOptions(options);
     // Lifecycle (open/close/destroy) is managed by this class, not the engine.
     super({ ...options, autoDestroy: false, emitClose: false });
+    Object.defineProperty(this, kWriteStreamFastPath, { value: this });
     const hasFd = Object.prototype.hasOwnProperty.call(options, "fd") && options.fd != null;
     const fdHandle = hasFd && isStreamFileHandle(options.fd) ? options.fd : null;
     if (fdHandle && options.fs != null) throw fileHandleCustomFsError();
@@ -1840,13 +1842,27 @@ export function createWriteStream(path, options = {}) {
   return new WriteStream(path, options);
 }
 
+class FSReqCallback {}
+
+function queueFsRequest(operation) {
+  const request = new FSReqCallback();
+  globalThis.cottontail?.activeRequestRegister?.(request);
+  queueMicrotask(() => {
+    try {
+      operation();
+    } finally {
+      globalThis.cottontail?.activeRequestUnregister?.(request);
+    }
+  });
+}
+
 function callbackify(action, callbackName = "callback", validate = undefined) {
   return (...args) => {
     const callback = args[args.length - 1];
     if (typeof callback !== "function") throw makeInvalidCallbackError(callbackName, callback);
     const callArgs = args.slice(0, -1);
     validate?.(...callArgs);
-    queueMicrotask(() => {
+    queueFsRequest(() => {
       try { callback(null, action(...callArgs)); } catch (error) { callback(error); }
     });
   };
@@ -1863,7 +1879,7 @@ export function appendFile(path, data, options, callback) {
   validateWriteData(data);
   normalizeEncoding(options, "utf8");
   const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
-  runAbortable(() => appendFileSync(path, data, options), signal).then(
+  runAbortable(() => appendFileSync(path, data, options), signal, new FSReqCallback()).then(
     () => callback(null),
     error => callback(error),
   );
@@ -1875,7 +1891,7 @@ export function close(fd, callback = undefined) {
   if (callback !== undefined && typeof callback !== "function") {
     throw makeInvalidCallbackError("callback", callback);
   }
-  queueMicrotask(() => {
+  queueFsRequest(() => {
     try {
       closeSync(fd);
       callback?.(null);
@@ -1917,7 +1933,7 @@ export function mkdir(path, options, callback) {
   // Node validates the path and options synchronously.
   validatePathArg(path);
   parseMkdirOptions(options ?? {});
-  queueMicrotask(() => {
+  queueFsRequest(() => {
     try { callback(null, mkdirSync(path, options ?? {})); } catch (error) { callback(error); }
   });
 }
@@ -1934,7 +1950,7 @@ export function open(path, flags, mode, callback) {
   validatePathArg(path);
   normalizeOpenFlags(flags);
   normalizeOpenMode(mode ?? 0o666);
-  queueMicrotask(() => {
+  queueFsRequest(() => {
     try { callback(null, openSync(path, flags, mode ?? 0o666)); } catch (error) { callback(error); }
   });
 }
@@ -1948,7 +1964,7 @@ export function readFile(path, options, callback) {
   if (typeof path !== "number") validatePathArg(path);
   normalizeEncoding(options);
   const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
-  runAbortable(() => readFileSync(path, options), signal).then(
+  runAbortable(() => readFileSync(path, options), signal, new FSReqCallback()).then(
     value => callback(null, value),
     error => callback(error),
   );
@@ -1984,7 +2000,7 @@ export function writeFile(path, data, options, callback) {
   validateWriteData(data);
   normalizeEncoding(options, "utf8");
   const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
-  runAbortable(() => writeFileSync(path, data, options), signal).then(
+  runAbortable(() => writeFileSync(path, data, options), signal, new FSReqCallback()).then(
     () => callback(null),
     error => callback(error),
   );
@@ -1992,7 +2008,7 @@ export function writeFile(path, data, options, callback) {
 
 export function exists(path, callback) {
   if (typeof callback !== "function") throw makeInvalidCallbackError("callback", callback);
-  queueMicrotask(() => callback(existsSync(path)));
+  queueFsRequest(() => callback(existsSync(path)));
 }
 
 export function read(fd, buffer, offset, length, position, callback) {
@@ -2023,7 +2039,7 @@ export function read(fd, buffer, offset, length, position, callback) {
   validateFd(fd);
   validateBufferRange(buffer instanceof ArrayBuffer ? new Uint8Array(buffer) : buffer, offset ?? 0, length);
   validatePosition(position);
-  queueMicrotask(() => {
+  queueFsRequest(() => {
     try {
       const bytesRead = readSync(fd, buffer, offset, length, position);
       callback(null, bytesRead, buffer);
@@ -2061,7 +2077,7 @@ export function write(fd, data, offset = undefined, length = undefined, position
     );
     validatePosition(options?.position ?? position ?? null);
   }
-  queueMicrotask(() => {
+  queueFsRequest(() => {
     try {
       const bytesWritten = writeSync(fd, data, offset, length, position);
       callback(null, bytesWritten, data);
@@ -2080,7 +2096,7 @@ export function readv(fd, buffers, position = null, callback = undefined) {
   validateFd(fd);
   if (!Array.isArray(buffers)) throw invalidArgType("buffers", "an Array of ArrayBufferView instances", buffers);
   validatePosition(position);
-  queueMicrotask(() => {
+  queueFsRequest(() => {
     try { callback(null, readvSync(fd, buffers, position), buffers); } catch (error) { callback(error); }
   });
 }
@@ -2094,7 +2110,7 @@ export function writev(fd, buffers, position = null, callback = undefined) {
   validateFd(fd);
   if (!Array.isArray(buffers)) throw invalidArgType("buffers", "an Array of ArrayBufferView instances", buffers);
   validatePosition(position);
-  queueMicrotask(() => {
+  queueFsRequest(() => {
     try { callback(null, writevSync(fd, buffers, position), buffers); } catch (error) { callback(error); }
   });
 }

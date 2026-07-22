@@ -378,7 +378,11 @@ const utilBinding = {
   getCallerLocation: () => undefined,
   privateSymbols,
   sleep: (ms) => globalThis.cottontail?.sleep?.(ms),
-  arrayBufferViewHasBuffer: () => true,
+  arrayBufferViewHasBuffer: (value) => {
+    if (!ArrayBuffer.isView(value)) return false;
+    if (value instanceof DataView) return true;
+    return Boolean(globalThis.cottontail?.arrayBufferViewHasBuffer?.(value));
+  },
   isInsideNodeModules: () => false,
   parseEnv: parseEnvNative,
   getCallSites: nativeGetCallSites,

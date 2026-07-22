@@ -10,6 +10,8 @@ const kSocketAddressState = new WeakMap();
 const kSocketAddressReadonlyProperties = new Set(["address", "port", "family", "flowlabel"]);
 const kBlockListState = new WeakMap();
 
+class TCPConnectWrap {}
+
 const heapObjectRefs = globalThis.__cottontailHeapObjectRefs ??= new Map();
 const heapObjectCountProviders = globalThis.__cottontailHeapObjectCountProviders ??= new Map();
 const heapObjectFinalizer = globalThis.__cottontailHeapObjectFinalizer ??= typeof FinalizationRegistry === "function"
@@ -1113,6 +1115,9 @@ class SocketImpl extends Duplex {
           options.localPort,
           this._refed,
         );
+        if (nativeAttempt && typeof nativeAttempt === "object") {
+          Object.setPrototypeOf(nativeAttempt, TCPConnectWrap.prototype);
+        }
       } catch (rawError) {
         const error = connectionException(rawError, options, address, port);
         errors.push(error);

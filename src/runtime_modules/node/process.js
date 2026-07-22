@@ -2160,7 +2160,8 @@ export const unref = processObject.unref = (maybeRefable = undefined) => {
 export const _getActiveHandles = processObject._getActiveHandles = () =>
   [processObject.stdin, processObject.stdout, processObject.stderr].filter(Boolean);
 
-export const _getActiveRequests = processObject._getActiveRequests = () => [];
+export const _getActiveRequests = processObject._getActiveRequests = () =>
+  Array.from(cottontail.activeRequests());
 export const getActiveResourcesInfo = processObject.getActiveResourcesInfo = () => {
   const diagnostics = runtimeDiagnostics();
   const typeNames = {

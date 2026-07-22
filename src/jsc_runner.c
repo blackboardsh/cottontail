@@ -25,6 +25,7 @@ extern void ct_jsc_microtask_delay_end(void *opaque_scope);
 extern int ct_jsc_promise_status(JSValueRef value);
 extern JSValueRef ct_jsc_promise_result(JSValueRef value);
 extern uint32_t ct_jsc_weak_collection_size(JSValueRef value);
+extern bool ct_jsc_array_buffer_view_has_buffer(JSValueRef value);
 extern JSObjectRef ct_jsc_create_buffer_is_ascii(JSContextRef context);
 extern JSObjectRef ct_jsc_create_buffer_transcode(JSContextRef context);
 extern char *ct_jsc_heap_snapshot(JSContextRef context, int gc_debugging);
@@ -1412,6 +1413,7 @@ typedef struct CtTcpConnect {
     char *local_address;
     int local_port;
     CtJscRuntime *runtime;
+    JSObjectRef request;
     pthread_t thread;
     pthread_mutex_t mutex;
     bool active;
@@ -1422,6 +1424,11 @@ typedef struct CtTcpConnect {
     int error_code;
     struct CtTcpConnect *next;
 } CtTcpConnect;
+
+typedef struct CtActiveRequest {
+    JSObjectRef value;
+    struct CtActiveRequest *next;
+} CtActiveRequest;
 
 typedef enum {
     CT_DNS_REQUEST_LOOKUP,
@@ -1822,6 +1829,9 @@ struct CtJscRuntime {
     CtFfiCallbackJob *callback_jobs_head;
     CtFfiCallbackJob *callback_jobs_tail;
     CtFfiCallback *callbacks;
+    CtActiveRequest *active_requests_head;
+    CtActiveRequest *active_requests_tail;
+    size_t active_request_count;
     uint32_t next_process_id;
     uint32_t next_worker_id;
     uint32_t next_fd_watch_id;
@@ -9017,6 +9027,115 @@ static CtJscRuntime *ct_callback_runtime(JSObjectRef function) {
     return (CtJscRuntime *)JSObjectGetPrivate(function);
 }
 
+static bool ct_active_request_add(CtJscRuntime *runtime, JSObjectRef value) {
+    if (runtime == NULL || value == NULL) return false;
+    for (CtActiveRequest *entry = runtime->active_requests_head; entry != NULL; entry = entry->next) {
+        if (entry->value == value) return true;
+    }
+
+    CtActiveRequest *entry = (CtActiveRequest *)calloc(1, sizeof(*entry));
+    if (entry == NULL) return false;
+    entry->value = value;
+    JSValueProtect(runtime->context, value);
+    if (runtime->active_requests_tail != NULL) runtime->active_requests_tail->next = entry;
+    else runtime->active_requests_head = entry;
+    runtime->active_requests_tail = entry;
+    runtime->active_request_count += 1;
+    return true;
+}
+
+static bool ct_active_request_remove(CtJscRuntime *runtime, JSObjectRef value) {
+    if (runtime == NULL || value == NULL) return false;
+    CtActiveRequest **cursor = &runtime->active_requests_head;
+    while (*cursor != NULL) {
+        CtActiveRequest *entry = *cursor;
+        if (entry->value != value) {
+            cursor = &entry->next;
+            continue;
+        }
+        *cursor = entry->next;
+        if (runtime->active_requests_tail == entry) {
+            runtime->active_requests_tail = runtime->active_requests_head;
+            while (runtime->active_requests_tail != NULL && runtime->active_requests_tail->next != NULL) {
+                runtime->active_requests_tail = runtime->active_requests_tail->next;
+            }
+        }
+        runtime->active_request_count -= 1;
+        JSValueUnprotect(runtime->context, entry->value);
+        free(entry);
+        return true;
+    }
+    return false;
+}
+
+static void ct_active_requests_destroy(CtJscRuntime *runtime) {
+    if (runtime == NULL || runtime->context == NULL) return;
+    while (runtime->active_requests_head != NULL) {
+        CtActiveRequest *entry = runtime->active_requests_head;
+        runtime->active_requests_head = entry->next;
+        JSValueUnprotect(runtime->context, entry->value);
+        free(entry);
+    }
+    runtime->active_requests_tail = NULL;
+    runtime->active_request_count = 0;
+}
+
+static JSValueRef ct_active_request_register(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 1 || !JSValueIsObject(ctx, argv[0])) {
+        ct_throw_message(ctx, exception, "activeRequestRegister(request) requires an object");
+        return JSValueMakeUndefined(ctx);
+    }
+    JSObjectRef request = JSValueToObject(ctx, argv[0], exception);
+    if (request == NULL || (exception != NULL && *exception != NULL)) return JSValueMakeUndefined(ctx);
+    if (!ct_active_request_add(runtime, request)) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    return request;
+}
+
+static JSValueRef ct_active_request_unregister(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)exception;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 1 || !JSValueIsObject(ctx, argv[0])) return JSValueMakeBoolean(ctx, false);
+    JSObjectRef request = JSValueToObject(ctx, argv[0], NULL);
+    return JSValueMakeBoolean(ctx, ct_active_request_remove(runtime, request));
+}
+
+static JSValueRef ct_active_requests(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || runtime->active_request_count == 0) return ct_make_array(ctx, 0, NULL, exception);
+
+    JSValueRef *values = (JSValueRef *)calloc(runtime->active_request_count, sizeof(*values));
+    if (values == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t count = 0;
+    for (CtActiveRequest *entry = runtime->active_requests_head; entry != NULL; entry = entry->next) {
+        values[count++] = entry->value;
+    }
+    JSObjectRef result = ct_make_array(ctx, count, values, exception);
+    free(values);
+    return result;
+}
+
+static JSValueRef ct_array_buffer_view_has_buffer(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1 || !JSValueIsObject(ctx, argv[0])) return JSValueMakeBoolean(ctx, false);
+    JSTypedArrayType type = JSValueGetTypedArrayType(ctx, argv[0], exception);
+    if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
+    if (type == kJSTypedArrayTypeNone || type == kJSTypedArrayTypeArrayBuffer) return JSValueMakeBoolean(ctx, false);
+    return JSValueMakeBoolean(ctx, ct_jsc_array_buffer_view_has_buffer(argv[0]));
+}
+
 static JSValueRef ct_console_log_impl(JSContextRef ctx, size_t argc, const JSValueRef argv[], FILE *stream) {
     for (size_t index = 0; index < argc; index += 1) {
         char *text = ct_value_to_string_copy(ctx, argv[index]);
@@ -11750,8 +11869,30 @@ static JSValueRef ct_tcp_socket_connect_start(JSContextRef ctx, JSObjectRef func
     operation->next = ct_tcp_connects;
     ct_tcp_connects = operation;
     pthread_mutex_unlock(&ct_tcp_connects_mutex);
+
+    JSObjectRef request = ct_make_object(ctx);
+    ct_set_property(ctx, request, "id", JSValueMakeNumber(ctx, operation->id), exception);
+    ct_set_property(ctx, request, "type", ct_make_string(ctx, "TCPConnectWrap"), exception);
+    if (exception != NULL && *exception != NULL) {
+        pthread_mutex_lock(&ct_tcp_connects_mutex);
+        ct_tcp_connect_remove_locked(operation);
+        pthread_mutex_unlock(&ct_tcp_connects_mutex);
+        ct_tcp_connect_free(operation);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (!ct_active_request_add(runtime, request)) {
+        pthread_mutex_lock(&ct_tcp_connects_mutex);
+        ct_tcp_connect_remove_locked(operation);
+        pthread_mutex_unlock(&ct_tcp_connects_mutex);
+        ct_tcp_connect_free(operation);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    operation->request = request;
+
     bool pending = ct_tcp_connect_prepare(operation);
     if (pending && pthread_create(&operation->thread, NULL, ct_tcp_connect_thread, operation) != 0) {
+        ct_active_request_remove(runtime, request);
         pthread_mutex_lock(&ct_tcp_connects_mutex);
         ct_tcp_connect_remove_locked(operation);
         pthread_mutex_unlock(&ct_tcp_connects_mutex);
@@ -11760,9 +11901,7 @@ static JSValueRef ct_tcp_socket_connect_start(JSContextRef ctx, JSObjectRef func
         return JSValueMakeUndefined(ctx);
     }
     if (pending) pthread_detach(operation->thread);
-    JSObjectRef result = ct_make_object(ctx);
-    ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, operation->id), exception);
-    return result;
+    return request;
 }
 
 static JSValueRef ct_tcp_socket_connect_take(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -11789,6 +11928,7 @@ static JSValueRef ct_tcp_socket_connect_take(JSContextRef ctx, JSObjectRef funct
     pthread_mutex_unlock(&operation->mutex);
     ct_tcp_connect_remove_locked(operation);
     pthread_mutex_unlock(&ct_tcp_connects_mutex);
+    ct_active_request_remove(operation->runtime, operation->request);
 
     JSObjectRef result = ct_make_object(ctx);
     ct_set_property(ctx, result, "ok", JSValueMakeBoolean(ctx, succeeded), exception);
@@ -11835,11 +11975,21 @@ static bool ct_tcp_connect_cancel_id(uint32_t id) {
 }
 
 static JSValueRef ct_tcp_socket_connect_cancel(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
     (void)thisObject;
     (void)exception;
     if (argc < 1) return JSValueMakeBoolean(ctx, false);
-    return JSValueMakeBoolean(ctx, ct_tcp_connect_cancel_id((uint32_t)ct_value_to_number(ctx, argv[0])));
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    JSObjectRef request = NULL;
+    pthread_mutex_lock(&ct_tcp_connects_mutex);
+    CtTcpConnect *operation = ct_tcp_connect_find_locked(id);
+    bool owned = operation != NULL && operation->runtime == runtime;
+    if (owned) request = operation->request;
+    pthread_mutex_unlock(&ct_tcp_connects_mutex);
+    if (!owned) return JSValueMakeBoolean(ctx, false);
+    bool canceled = ct_tcp_connect_cancel_id(id);
+    if (canceled && request != NULL) ct_active_request_remove(runtime, request);
+    return JSValueMakeBoolean(ctx, canceled);
 }
 
 static JSValueRef ct_tcp_socket_connect_set_ref(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -27558,6 +27708,7 @@ int ct_jsc_runtime_prepare_hot_reload(CtJscRuntime *runtime, char **error_out) {
     ct_timer_destroy_all(runtime);
     ct_brotli_encoder_destroy_all(runtime);
     ct_vm_context_destroy_all(runtime);
+    ct_active_requests_destroy(runtime);
     runtime->fatal_exception_routed = false;
     ct_process_set_exit_code(ctx, 0);
 
@@ -27606,6 +27757,7 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
         ct_timer_destroy_all(runtime);
         ct_brotli_encoder_destroy_all(runtime);
         ct_vm_context_destroy_all(runtime);
+        ct_active_requests_destroy(runtime);
         if (runtime->spawn_event_handler != NULL) JSValueUnprotect(ctx, runtime->spawn_event_handler);
         if (runtime->fd_event_handler != NULL) JSValueUnprotect(ctx, runtime->fd_event_handler);
         if (runtime->worker_event_handler != NULL) JSValueUnprotect(ctx, runtime->worker_event_handler);

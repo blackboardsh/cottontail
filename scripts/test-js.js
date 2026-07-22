@@ -121,7 +121,7 @@ try {
       name: 'internal-runtime-bindings',
       argv: ['test', join(rootDir, 'tests', 'js', 'internal-runtime-bindings.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: ['5 pass', '0 fail'],
+      stdoutIncludes: ['7 pass', '0 fail'],
     },
     {
       name: 'cli-version-identity-regressions',

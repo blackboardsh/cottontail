@@ -700,6 +700,22 @@ extern "C" int ct_jsc_promise_status(JSValueRef value)
     return static_cast<int>(static_cast<uint32_t>(fields[0]) & 0x3);
 }
 
+extern "C" bool ct_jsc_array_buffer_view_has_buffer(JSValueRef value)
+{
+    if (value == nullptr)
+        return false;
+
+    // JSArrayBufferView extends the two-word JSObject with m_vector,
+    // m_length, m_byteOffset, then its uint8_t TypedArrayMode. Bit 0x08 is
+    // JSC's isHavingArrayBufferMode. Calling possiblySharedBuffer() here would
+    // materialize the buffer for FastTypedArray and change the queried state.
+    static_assert(sizeof(void*) == 8);
+    constexpr size_t typed_array_mode_offset = 5 * sizeof(void*);
+    constexpr uint8_t is_having_array_buffer_mode = 0x08;
+    const auto* cell = reinterpret_cast<const uint8_t*>(value);
+    return (cell[typed_array_mode_offset] & is_having_array_buffer_mode) != 0;
+}
+
 extern "C" JSValueRef ct_jsc_promise_result(JSValueRef value)
 {
     if (ct_jsc_promise_status(value) < 0)

@@ -85,6 +85,17 @@ const abortableTasks = new WeakMap();
 let pendingAbortableTasks = [];
 let abortableTaskDrainScheduled = false;
 
+class FSReqPromise {}
+
+function registerActiveRequest(request) {
+  globalThis.cottontail?.activeRequestRegister?.(request);
+  return request;
+}
+
+function unregisterActiveRequest(request) {
+  if (request != null) globalThis.cottontail?.activeRequestUnregister?.(request);
+}
+
 function scheduleAbortableTurn(callback) {
   const nextTick = globalThis.process?.nextTick;
   if (typeof nextTick === "function") nextTick(callback);
@@ -130,6 +141,8 @@ function finishAbortableTask(task, callback, value) {
   task.operation = null;
   task.resolve = null;
   task.reject = null;
+  unregisterActiveRequest(task.activeRequest);
+  task.activeRequest = null;
   callback(value);
 }
 
@@ -161,13 +174,23 @@ function runAbortableTask(task) {
 // COTTONTAIL-COMPAT: Bun's native fs task checks the signal before dispatch
 // and again when the task completes. The host syscall is synchronous, so task
 // records and one shared listener avoid retaining a closure graph per request.
-export function runAbortable(operation, signal = null) {
+export function runAbortable(operation, signal = null, activeRequest = undefined) {
   signal = validateAbortSignal(signal);
-  if (signal == null) return Promise.resolve().then(operation);
   if (signal?.aborted) return Promise.reject(abortReason(signal));
+  const request = registerActiveRequest(activeRequest ?? new FSReqPromise());
+  if (signal == null) {
+    return Promise.resolve().then(() => {
+      try {
+        return operation();
+      } finally {
+        unregisterActiveRequest(request);
+      }
+    });
+  }
 
   const deferred = Promise.withResolvers();
   const task = {
+    activeRequest: request,
     aborted: false,
     abortedWith: undefined,
     operation,

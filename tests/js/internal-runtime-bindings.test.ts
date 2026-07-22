@@ -1,10 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import fsPromises from "node:fs/promises";
+import { createWriteStream, existsSync, mkdtempSync, readFile, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  SQL,
+  arrayBufferViewHasBuffer,
   bindgen,
   crash_handler,
+  fs as internalFs,
+  fsStreamInternals,
   getEventLoopStats,
   timerInternals,
   upgrade_test_helpers,
@@ -40,6 +45,60 @@ describe("internal runtime bindings", () => {
     expect(internalBinding("timers")).toBe(process.binding("timers"));
     expect(typeof internalBinding("timers").getLibuvNow()).toBe("number");
     expect(() => internalBinding("definitely_missing")).toThrow("No such module");
+  });
+
+  test("test-facing helpers expose production fs, SQL, and JSC behavior", () => {
+    expect(internalFs).toBe(fsPromises);
+    expect(SQL).toBe(Bun.SQL);
+
+    const directory = mkdtempSync(join(tmpdir(), "cottontail-internal-fs-"));
+    temporaryDirectories.push(directory);
+    const stream = createWriteStream(join(directory, "stream.txt"));
+    expect(fsStreamInternals.writeStreamFastPath(stream)).toBe(stream);
+    stream.destroy();
+
+    for (const length of [0, 48, 96, 1024]) {
+      for (const view of [
+        new Uint8Array(length),
+        new Uint16Array(length / 2),
+        new Uint32Array(length / 4),
+        new Float32Array(length / 4),
+        new Float64Array(length / 8),
+        Buffer.alloc(length),
+        Buffer.allocUnsafeSlow(length),
+      ]) {
+        expect(arrayBufferViewHasBuffer(view)).toBe(false);
+        void view.buffer;
+        expect(arrayBufferViewHasBuffer(view)).toBe(true);
+      }
+    }
+
+    const existingBuffer = new ArrayBuffer(8);
+    expect(arrayBufferViewHasBuffer(new Uint8Array(existingBuffer))).toBe(true);
+    expect(arrayBufferViewHasBuffer(new DataView(existingBuffer))).toBe(true);
+  });
+
+  test("process._getActiveRequests returns live native request objects", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "cottontail-active-requests-"));
+    temporaryDirectories.push(directory);
+    const filename = join(directory, "request.txt");
+    writeFileSync(filename, "active request");
+
+    const readFinished = Promise.withResolvers<void>();
+    readFile(filename, error => error ? readFinished.reject(error) : readFinished.resolve());
+    const fsRequest = process._getActiveRequests().find(
+      request => request?.constructor?.name === "FSReqCallback",
+    );
+    expect(fsRequest).toBeDefined();
+    expect(process._getActiveRequests()).toContain(fsRequest);
+    await readFinished.promise;
+    expect(process._getActiveRequests()).not.toContain(fsRequest);
+
+    const nativeAttempt = cottontail.tcpSocketConnectStart(9, "192.0.2.1", 4);
+    expect(nativeAttempt.type).toBe("TCPConnectWrap");
+    expect(process._getActiveRequests()).toContain(nativeAttempt);
+    expect(cottontail.tcpSocketConnectCancel(nativeAttempt.id)).toBe(true);
+    expect(process._getActiveRequests()).not.toContain(nativeAttempt);
   });
 
   test("upgrade and crash helpers expose platform behavior", () => {
