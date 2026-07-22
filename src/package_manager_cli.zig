@@ -11220,7 +11220,7 @@ const Manager = struct {
                 try writer.writeAll("\n      },");
                 wrote_field = true;
             }
-            const optional_peers = try optionalPeerNames(manager.allocator, workspace_json);
+            const optional_peers = try manager.lockfileOptionalPeerNames(workspace_json, is_root);
             defer manager.allocator.free(optional_peers);
             if (optional_peers.len > 0) {
                 try writer.writeAll("\n      \"optionalPeers\": [");
@@ -11234,6 +11234,51 @@ const Manager = struct {
             }
         }
         if (wrote_field) try writer.writeAll("\n    }") else try writer.writeByte('}');
+    }
+
+    fn lockfileOptionalPeerNames(
+        manager: *Manager,
+        package_json: *const Value,
+        is_root: bool,
+    ) ![][]const u8 {
+        if (package_json.* != .object) return manager.allocator.alloc([]const u8, 0);
+        const peers = package_json.object.get("peerDependencies") orelse return manager.allocator.alloc([]const u8, 0);
+        if (peers != .object) return manager.allocator.alloc([]const u8, 0);
+
+        const workspace_name = if (is_root) null else jsonString(package_json, "name");
+        var names = std.array_list.Managed([]const u8).init(manager.allocator);
+        errdefer names.deinit();
+        for (peers.object.keys()) |name| {
+            if (peerDependencyIsOptional(package_json, name) or
+                !try manager.lockfileHasPeerResolution(name, workspace_name))
+            {
+                try names.append(name);
+            }
+        }
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.lessThan);
+        return names.toOwnedSlice();
+    }
+
+    fn lockfileHasPeerResolution(
+        manager: *Manager,
+        alias: []const u8,
+        workspace_name: ?[]const u8,
+    ) !bool {
+        if (workspace_name) |name| {
+            const workspace_key = try logicalDependencyKey(manager.allocator, name, alias);
+            defer manager.allocator.free(workspace_key);
+            for (manager.records.items) |record| {
+                if (std.mem.eql(u8, recordLogicalKey(record), workspace_key)) return true;
+            }
+        }
+        for (manager.records.items) |record| {
+            if (std.mem.eql(u8, recordLogicalKey(record), alias)) return true;
+        }
+        return false;
     }
 
     fn deleteLockfiles(manager: *Manager) void {
