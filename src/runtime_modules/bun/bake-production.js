@@ -463,64 +463,58 @@ function formatBakeProductionError(error, projectRoot) {
   });
 }
 
-async function buildSsrFrameworkAliases(context) {
-  const { framework, ssrOptions, serverPlugins, builtIns, tempRoot } = context;
-  const aliases = {};
-  const roots = framework.__cottontailSsrEntryPoints ?? [];
-  for (let index = 0; index < roots.length; index += 1) {
-    const specifier = String(roots[index]);
-    const wrapperPath = path.join(context.projectRoot, `.cottontail-bake-prod-ssr-framework-${index}.js`);
-    const result = await globalThis.Bun.build(frameworkBuildOptions({
-      ...ssrOptions,
-      entrypoints: [wrapperPath],
-      target: "bun",
-      format: "esm",
-      sourcemap: "inline",
-      conditions: [...new Set([...(ssrOptions.conditions ?? []), "node"])],
-      define: productionDefines(ssrOptions, "server"),
-      jsx: { ...(ssrOptions.jsx ?? {}), development: false },
-      minify: false,
-      production: true,
-      serverComponents: false,
-      external: [...new Set([...(ssrOptions.external ?? []), "bake/server", "bun:bake/server"])],
-      write: false,
-      throw: false,
-      plugins: serverPlugins,
-    }, builtIns, { [wrapperPath]: `export * from ${JSON.stringify(specifier)};` }));
-    if (!result.success) throwBuildFailure(result, `Failed to bundle SSR framework module ${specifier}`);
-    const filename = path.join(tempRoot, `framework-${index}.mjs`);
-    aliases[specifier] = await writeStandardESM(result, filename);
+async function buildSsrGraph(context, route) {
+  const { framework, ssrOptions, ssrPlugins, builtIns, tempRoot } = context;
+  const roots = (framework.__cottontailSsrEntryPoints ?? []).map(String);
+  if (roots.length === 0 && route.boundaries.length === 0) {
+    return { components: new Map(), frameworkExternals: [] };
   }
-  return aliases;
-}
 
-async function buildSsrComponents(context, route) {
-  const result = new Map();
-  for (let index = 0; index < route.boundaries.length; index += 1) {
-    const boundary = route.boundaries[index];
-    const build = await globalThis.Bun.build(frameworkBuildOptions({
-      ...context.ssrOptions,
-      entrypoints: [boundary.path],
-      target: "bun",
-      format: "esm",
-      sourcemap: "inline",
-      conditions: [...new Set([...(context.ssrOptions.conditions ?? []), "node"])],
-      define: productionDefines(context.ssrOptions, "server"),
-      jsx: { ...(context.ssrOptions.jsx ?? {}), development: false },
-      minify: false,
-      production: true,
-      serverComponents: false,
-      external: [...new Set([...(context.ssrOptions.external ?? []), "bake/server", "bun:bake/server"])],
-      write: false,
-      throw: false,
-      plugins: context.serverPlugins,
-    }, context.builtIns));
-    if (!build.success) throwBuildFailure(build, `Failed to bundle SSR component ${boundary.path}`);
-    const hash = BigInt.asUintN(64, globalThis.Bun.hash(`${route.index}:${boundary.id}`)).toString(16);
-    const filename = path.join(context.tempRoot, `component-${hash}.mjs`);
-    result.set(boundary.id, await writeStandardESM(build, filename));
+  const wrapperPath = path.join(context.projectRoot, `.cottontail-bake-prod-ssr-${route.index}.js`);
+  const imports = [];
+  for (let index = 0; index < roots.length; index += 1) {
+    imports.push(`import * as __ctFramework${index} from ${JSON.stringify(roots[index])};`);
   }
-  return result;
+  for (let index = 0; index < route.boundaries.length; index += 1) {
+    imports.push(`import * as __ctComponent${index} from ${JSON.stringify(route.boundaries[index].path)};`);
+  }
+  const source = `${imports.join("\n")}
+export const frameworks = [${roots.map((_, index) => `__ctFramework${index}`).join(", ")}];
+export const components = [${route.boundaries.map((_, index) => `__ctComponent${index}`).join(", ")}];`;
+  const build = await globalThis.Bun.build(frameworkBuildOptions({
+    ...ssrOptions,
+    entrypoints: [wrapperPath],
+    target: "bun",
+    format: "esm",
+    sourcemap: "inline",
+    conditions: [...new Set([...(ssrOptions.conditions ?? []), "node"])],
+    define: productionDefines(ssrOptions, "server"),
+    jsx: { ...(ssrOptions.jsx ?? {}), development: false },
+    minify: false,
+    production: true,
+    serverComponents: false,
+    external: [...new Set([...(ssrOptions.external ?? []), "bake/server", "bun:bake/server"])],
+    write: false,
+    throw: false,
+    plugins: ssrPlugins,
+  }, builtIns, { [wrapperPath]: source }));
+  if (!build.success) throwBuildFailure(build, `Failed to bundle SSR graph for ${route.page}`);
+
+  const filename = path.join(tempRoot, `ssr-${route.index}.mjs`);
+  await writeStandardESM(build, filename);
+  const graph = await import(pathToFileURL(filename).href);
+  const modules = {};
+  const components = new Map();
+  for (let index = 0; index < roots.length; index += 1) {
+    modules[roots[index]] = graph.frameworks[index];
+  }
+  for (let index = 0; index < route.boundaries.length; index += 1) {
+    const id = `bun:cottontail-bake-ssr-component-${route.index}-${index}`;
+    components.set(route.boundaries[index].id, id);
+    modules[id] = graph.components[index];
+  }
+  __setBuiltinModules(modules);
+  return { components, frameworkExternals: roots };
 }
 
 async function loadServerRoute(context, route) {
@@ -538,12 +532,11 @@ async function loadServerRoute(context, route) {
         [serverEntryFile, ...(route.graphFiles ?? [])],
         { ...context.serverOptions.files, ...context.builtIns.files },
       );
+  const routeAliases = { ...context.builtIns.alias };
+  for (const specifier of route.ssrFrameworkExternals ?? []) delete routeAliases[specifier];
   const routeBuiltIns = {
     ...context.builtIns,
-    alias: {
-      ...context.builtIns.alias,
-      ...context.ssrFrameworkAliases,
-    },
+    alias: routeAliases,
   };
   const configuredConditions = [...(context.serverOptions.conditions ?? []), "node"];
   const conditions = context.serverComponents === null
@@ -561,7 +554,12 @@ async function loadServerRoute(context, route) {
     minify: false,
     production: true,
     serverComponents: context.serverComponents !== null,
-    external: [...new Set([...(context.serverOptions.external ?? []), "bake/server", "bun:bake/server"])],
+    external: [...new Set([
+      ...(context.serverOptions.external ?? []),
+      ...(route.ssrFrameworkExternals ?? []),
+      "bake/server",
+      "bun:bake/server",
+    ])],
     metafile: true,
     write: false,
     throw: false,
@@ -820,9 +818,9 @@ export async function buildBakeProduction({ entrypoint, outdir = "dist" } = {}, 
     serverManifest,
     serverOptions: splitBuildOptions(framework, app, "server"),
     serverPlugins: adaptFrameworkPlugins(configuredPlugins, "server"),
-    ssrFrameworkAliases: {},
     ssrManifest,
     ssrOptions: splitBuildOptions(framework, app, "ssr"),
+    ssrPlugins: adaptFrameworkPlugins(configuredPlugins, "ssr"),
     tempRoot,
   };
   mkdirSync(outputRoot, { recursive: true });
@@ -831,8 +829,6 @@ export async function buildBakeProduction({ entrypoint, outdir = "dist" } = {}, 
   try {
     createRoutes(context, framework);
     copyStaticRouters(normalizeStaticRouters(framework, projectRoot), outputRoot);
-    context.ssrFrameworkAliases = await buildSsrFrameworkAliases(context);
-
     const graphAlias = { ...(context.serverOptions.alias ?? {}), ...builtIns.alias };
     const graphFiles = { ...(context.serverOptions.files ?? {}), ...builtIns.files };
     for (const route of context.routes) {
@@ -848,9 +844,11 @@ export async function buildBakeProduction({ entrypoint, outdir = "dist" } = {}, 
       route.boundaries = graph.boundaries;
       route.graphFiles = graph.visited ?? new Set();
       route.client = await writeClientGraph(context, route);
-      route.ssrComponents = context.serverComponents !== null
-        ? await buildSsrComponents(context, route)
-        : new Map();
+      const ssrGraph = context.serverComponents !== null
+        ? await buildSsrGraph(context, route)
+        : { components: new Map(), frameworkExternals: [] };
+      route.ssrFrameworkExternals = ssrGraph.frameworkExternals;
+      route.ssrComponents = ssrGraph.components;
       activateRouteManifests(context, route);
       route.server = await loadServerRoute(context, route);
     }
