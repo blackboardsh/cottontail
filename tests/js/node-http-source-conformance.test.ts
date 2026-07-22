@@ -148,7 +148,7 @@ test("malformed chunk framing retains the parser fallback response", async () =>
     socket.on("data", (chunk) => { wire += chunk; });
     const ended = once(socket, "end");
     socket.write("POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\ninvalid\r\n");
-    expect(await parserError).toBe("HPE_INTERNAL");
+    expect(await parserError).toBe("HPE_INVALID_CHUNK_SIZE");
     await ended;
     expect(wire).toContain("400 Bad Request");
     socket.destroy();
@@ -172,6 +172,165 @@ test("HTTP response parsing preserves an empty wire status message", async () =>
     await responseText(response);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("live request and response parsers preserve duplicate header semantics", async () => {
+  let resolveRequestHeaders!: (value: {
+    cookie: string;
+    contentType: string;
+    multi: string;
+    distinct: string[];
+  }) => void;
+  const requestHeaders = new Promise<{
+    cookie: string;
+    contentType: string;
+    multi: string;
+    distinct: string[];
+  }>((resolve) => { resolveRequestHeaders = resolve; });
+  const server = http.createServer((request, response) => {
+    resolveRequestHeaders({
+      cookie: String(request.headers.cookie),
+      contentType: String(request.headers["content-type"]),
+      multi: String(request.headers["x-multi"]),
+      distinct: request.headersDistinct["content-type"],
+    });
+    response.end("ok");
+  });
+  const port = await listen(server);
+  try {
+    const socket = net.connect(port, "127.0.0.1");
+    await once(socket, "connect");
+    const closed = once(socket, "close");
+    socket.write(
+      "GET /duplicates HTTP/1.1\r\n" +
+      "Host: localhost\r\n" +
+      "Cookie: a=1\r\n" +
+      "Cookie: b=2\r\n" +
+      "Content-Type: first\r\n" +
+      "Content-Type: second\r\n" +
+      "X-Multi: one\r\n" +
+      "X-Multi: two\r\n" +
+      "Connection: close\r\n\r\n",
+    );
+    const observed = await requestHeaders;
+    expect(observed.cookie).toBe("a=1; b=2");
+    expect(observed.contentType).toBe("first");
+    expect(observed.multi).toBe("one, two");
+    expect(observed.distinct).toEqual(["first", "second"]);
+    await closed;
+  } finally {
+    await close(server);
+  }
+
+  const rawServer = net.createServer((socket) => {
+    socket.once("data", () => socket.end(
+      "HTTP/1.1 200 OK\r\n" +
+      "Set-Cookie: a=1\r\n" +
+      "Set-Cookie: b=2\r\n" +
+      "Cookie: c=3\r\n" +
+      "Cookie: d=4\r\n" +
+      "Content-Type: first\r\n" +
+      "Content-Type: second\r\n" +
+      "X-Multi: one\r\n" +
+      "X-Multi: two\r\n" +
+      "Content-Length: 0\r\n" +
+      "Connection: close\r\n\r\n",
+    ));
+  });
+  const rawPort = await listen(rawServer as unknown as http.Server);
+  try {
+    const response = await new Promise<http.IncomingMessage>((resolve, reject) => {
+      const request = http.get({ host: "127.0.0.1", port: rawPort }, resolve);
+      request.on("error", reject);
+    });
+    expect(response.headers["set-cookie"]).toEqual(["a=1", "b=2"]);
+    expect(response.headers.cookie).toBe("c=3; d=4");
+    expect(response.headers["content-type"]).toBe("first");
+    expect(response.headers["x-multi"]).toBe("one, two");
+    expect(response.headersDistinct["content-type"]).toEqual(["first", "second"]);
+    await responseText(response);
+  } finally {
+    await close(rawServer as unknown as http.Server);
+  }
+});
+
+test("ClientRequest reports binding parser framing failures", async () => {
+  const server = net.createServer((socket) => {
+    socket.once("data", () => socket.end(
+      "HTTP/1.1 200 OK\r\n" +
+      "Transfer-Encoding: chunked\r\n" +
+      "Content-Length: 1\r\n\r\n" +
+      "0\r\n\r\n",
+    ));
+  });
+  const port = await listen(server as unknown as http.Server);
+  try {
+    let emittedResponse = false;
+    const error = await new Promise<NodeJS.ErrnoException & { rawPacket?: Buffer }>((resolve, reject) => {
+      const request = http.get({ host: "127.0.0.1", port }, () => { emittedResponse = true; });
+      request.once("error", resolve);
+      request.once("close", () => {
+        if (!request.destroyed) reject(new Error("request closed without a parser error"));
+      });
+    });
+    expect(error.code).toBe("HPE_INVALID_CONTENT_LENGTH");
+    expect(error.message).toContain("Content-Length can't be present with Transfer-Encoding");
+    expect(Buffer.isBuffer(error.rawPacket)).toBe(true);
+    expect(emittedResponse).toBe(false);
+  } finally {
+    await close(server as unknown as http.Server);
+  }
+});
+
+test("server parser retains pipelined bytes through request backpressure", async () => {
+  const paths: string[] = [];
+  let firstTrailer = "";
+  const server = http.createServer({ highWaterMark: 32 }, (request, response) => {
+    paths.push(String(request.url));
+    if (request.url === "/one") {
+      setTimeout(() => request.resume(), 20);
+      request.once("end", () => {
+        firstTrailer = String(request.trailers["x-final"]);
+        response.end("one");
+      });
+      return;
+    }
+    response.end("two");
+  });
+  const port = await listen(server);
+  try {
+    const body = Buffer.alloc(4096, 0x78);
+    const socket = net.connect(port, "127.0.0.1");
+    await once(socket, "connect");
+    let wire = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => { wire += chunk; });
+    const closed = Promise.race([once(socket, "end"), once(socket, "close")]);
+    socket.write(Buffer.concat([
+      Buffer.from(
+        "POST /one HTTP/1.1\r\n" +
+        "Host: localhost\r\n" +
+        "Transfer-Encoding: chunked\r\n" +
+        "Trailer: X-Final\r\n\r\n" +
+        `${body.byteLength.toString(16)}\r\n`,
+      ),
+      body,
+      Buffer.from(
+        "\r\n0\r\nX-Final: retained\r\n\r\n" +
+        "GET /two HTTP/1.1\r\n" +
+        "Host: localhost\r\n" +
+        "Connection: close\r\n\r\n",
+      ),
+    ]));
+    await closed;
+    expect(paths).toEqual(["/one", "/two"]);
+    expect(firstTrailer).toBe("retained");
+    expect(wire.match(/HTTP\/1\.1 200/g)?.length).toBe(2);
+    expect(wire).toContain("one");
+    expect(wire).toContain("two");
+  } finally {
+    await close(server);
   }
 });
 

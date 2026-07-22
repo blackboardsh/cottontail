@@ -6,12 +6,14 @@ import { connect as tlsConnect } from "./tls.js";
 import { createHash, randomBytes } from "./crypto.js";
 import { deflateRawSync, inflateRawSync, constants as zlibConstants } from "./zlib.js";
 import { AsyncResource } from "./async_hooks.js";
+import { HTTPParser as BindingHTTPParser, allMethods as bindingHTTPMethods } from "../internal/node-http-parser.js";
 
 const asyncIdSymbol = Symbol.for("nodejs.async_id_symbol");
 const captureRejectionSymbol = Symbol.for("nodejs.rejection");
 const socketAsyncResourceSymbol = Symbol("cottontail.http.socketAsyncResource");
 const freeSocketErrorSymbol = Symbol("cottontail.http.freeSocketError");
 const clientSocketCleanupSymbol = Symbol("cottontail.http.clientSocketCleanup");
+const incomingParserResumeSymbol = Symbol("cottontail.http.incomingParserResume");
 const eventLoopTaskStateSymbol = Symbol.for("cottontail.eventLoopTaskState");
 const httpResponseTaskRefSymbol = Symbol("cottontail.http.responseTaskRef");
 const eventLoopTaskState = globalThis[eventLoopTaskStateSymbol] ??= { activeTasks: 0, concurrentRef: 0 };
@@ -594,6 +596,175 @@ function contentLengthFromHeaders(headers) {
   return expected ?? 0;
 }
 
+const joinableIncomingHeaders = new Set([
+  "accept", "accept-encoding", "accept-language", "cache-control", "connection",
+  "date", "expect", "if-match", "if-none-match", "origin", "transfer-encoding",
+  "upgrade", "vary", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto",
+]);
+
+const singleValueIncomingHeaders = new Set([
+  "age", "authorization", "content-length", "content-type", "etag", "expires",
+  "from", "host", "if-modified-since", "if-unmodified-since", "last-modified",
+  "location", "max-forwards", "proxy-authorization", "referer", "retry-after",
+  "server", "user-agent",
+]);
+
+function materializeIncomingHeaders(rawHeaders, joinDuplicateHeaders = false, maxHeadersCount = 0) {
+  const count = Number(maxHeadersCount);
+  const limit = Number.isInteger(count) && count > 0
+    ? Math.min(rawHeaders.length, count * 2)
+    : rawHeaders.length;
+  const raw = rawHeaders.slice(0, limit);
+  const headers = Object.create(null);
+
+  for (let index = 0; index + 1 < raw.length; index += 2) {
+    const name = String(raw[index]).toLowerCase();
+    const value = String(raw[index + 1]);
+    const current = headers[name];
+    if (name === "set-cookie") {
+      if (current === undefined) headers[name] = [value];
+      else current.push(value);
+    } else if (name === "cookie") {
+      headers[name] = current === undefined ? value : `${current}; ${value}`;
+    } else if (current === undefined) {
+      headers[name] = value;
+    } else if (joinDuplicateHeaders || joinableIncomingHeaders.has(name) || !singleValueIncomingHeaders.has(name)) {
+      headers[name] = `${current}, ${value}`;
+    }
+  }
+
+  return { headers, rawHeaders: raw };
+}
+
+const kParserOnMessageBegin = BindingHTTPParser.kOnMessageBegin | 0;
+const kParserOnHeaders = BindingHTTPParser.kOnHeaders | 0;
+const kParserOnHeadersComplete = BindingHTTPParser.kOnHeadersComplete | 0;
+const kParserOnBody = BindingHTTPParser.kOnBody | 0;
+const kParserOnMessageComplete = BindingHTTPParser.kOnMessageComplete | 0;
+
+function throwParserResult(result, rawPacket) {
+  if (!(result instanceof Error) && (result == null || typeof result !== "object" || typeof result.code !== "string")) {
+    return result;
+  }
+  const error = result instanceof Error ? result : Object.assign(new Error("Parse Error"), result);
+  if (typeof error.reason === "string") error.message = `Parse Error: ${error.reason}`;
+  if (error.rawPacket == null) error.rawPacket = Buffer.from(rawPacket ?? kEmptyBuffer);
+  throw error;
+}
+
+// The stock-JSC runtime cannot use Bun's uWS/fetch parser callbacks directly,
+// but it exposes the same process.binding("http_parser") contract. Keep one
+// adapter around that parser for both sides of the socket transport so framing,
+// upgrades, trailers, leniency, and pause/resume share a single state machine.
+class SocketHTTPParser {
+  constructor(type, options = {}) {
+    this.handlers = options;
+    this.pendingHeaders = [];
+    this.pendingUrl = "";
+    this.current = null;
+    this.pendingUpgrade = null;
+    this.paused = false;
+    this.closed = false;
+    this.parser = new BindingHTTPParser();
+    this.parser.initialize(
+      type,
+      options.resource ?? {},
+      Number(options.maxHeaderSize) || getCurrentMaxHeaderSize(),
+      options.insecureHTTPParser ? BindingHTTPParser.kLenientAll : BindingHTTPParser.kLenientNone,
+    );
+    this.parser[kParserOnMessageBegin] = () => this.handlers.onMessageBegin?.();
+    this.parser[kParserOnHeaders] = (headers, url) => {
+      if (Array.isArray(headers) && headers.length > 0) this.pendingHeaders.push(...headers);
+      if (url != null) this.pendingUrl += String(url);
+    };
+    this.parser[kParserOnHeadersComplete] = (
+      major,
+      minor,
+      headers,
+      method,
+      url,
+      statusCode,
+      statusMessage,
+      upgrade,
+      shouldKeepAlive,
+    ) => {
+      if (Array.isArray(headers) && headers.length > 0) this.pendingHeaders.push(...headers);
+      if (url != null) this.pendingUrl += String(url);
+      const rawHeaders = this.pendingHeaders;
+      const requestUrl = this.pendingUrl;
+      this.pendingHeaders = [];
+      this.pendingUrl = "";
+      let parsedMethod = typeof method === "number" ? bindingHTTPMethods[method] : undefined;
+      if (parsedMethod === "M - SEARCH") parsedMethod = "M-SEARCH";
+      const result = this.handlers.onHeaders?.({
+        major: Number(major),
+        minor: Number(minor),
+        method: parsedMethod,
+        url: requestUrl,
+        statusCode: statusCode == null ? undefined : Number(statusCode),
+        statusMessage: statusMessage == null ? "" : String(statusMessage),
+        rawHeaders,
+        upgrade: Boolean(upgrade),
+        shouldKeepAlive: Boolean(shouldKeepAlive),
+      }) ?? {};
+      this.current = result.state ?? result;
+      const action = Number(result.action ?? 0) | 0;
+      if (Boolean(result.upgrade) || Boolean(upgrade) || action === 2) this.pendingUpgrade = this.current;
+      return action;
+    };
+    this.parser[kParserOnBody] = (chunk) => {
+      if (this.handlers.onBody?.(this.current, chunk) === false) {
+        this.paused = true;
+        this.parser.pause();
+      }
+    };
+    this.parser[kParserOnMessageComplete] = () => {
+      const state = this.current;
+      const rawTrailers = this.pendingHeaders;
+      this.pendingHeaders = [];
+      this.pendingUrl = "";
+      this.current = null;
+      this.handlers.onComplete?.(state, rawTrailers);
+    };
+  }
+
+  execute(value) {
+    if (this.closed) return 0;
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value ?? kEmptyBuffer);
+    const result = throwParserResult(this.parser.execute(chunk), chunk);
+    if (this.pendingUpgrade != null) {
+      const state = this.pendingUpgrade;
+      this.pendingUpgrade = null;
+      const consumed = Math.max(0, Math.min(chunk.byteLength, Number(result) || 0));
+      this.handlers.onUpgrade?.(state, Buffer.from(chunk.subarray(consumed)));
+    }
+    return result;
+  }
+
+  finish() {
+    if (this.closed) return;
+    return throwParserResult(this.parser.finish(), kEmptyBuffer);
+  }
+
+  resume() {
+    if (this.closed) return false;
+    if (!this.paused) return true;
+    this.paused = false;
+    this.parser.resume();
+    this.execute(kEmptyBuffer);
+    return !this.paused;
+  }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    this.parser.close();
+    this.current = null;
+    this.pendingHeaders = [];
+    this.pendingUpgrade = null;
+  }
+}
+
 function socketError(value, socket = undefined) {
   if (value instanceof Error) return value;
   const message = value == null
@@ -1104,7 +1275,7 @@ export class IncomingMessage extends Readable {
     if (init && typeof init.on === "function" && init.headers === undefined && init.deferBody === undefined) {
       init = { socket: init, deferBody: true };
     }
-    super({ captureRejections: true });
+    super({ captureRejections: true, highWaterMark: init.highWaterMark });
     this.aborted = false;
     this.complete = init.deferBody !== true;
     this.headers = init.headers ?? {};
@@ -1124,6 +1295,7 @@ export class IncomingMessage extends Readable {
     this._headersDistinct = null;
     this._trailersDistinct = null;
     this._dumped = false;
+    this[incomingParserResumeSymbol] = null;
     this._incomingBody = bytesFromBody(init.body);
     this._incomingBodyChunks = this._incomingBody.byteLength > 0 ? [Buffer.from(this._incomingBody)] : [];
     if (init.deferBody !== true) {
@@ -1140,7 +1312,7 @@ export class IncomingMessage extends Readable {
     return this._dumped ? true : this.push(body);
   }
 
-  _completeIncoming(trailers = {}, rawTrailers = []) {
+  _completeIncoming(trailers = {}, rawTrailers = [], preserveParserResume = false) {
     if (this.complete || this.aborted) return;
     this.complete = true;
     this.trailers = trailers;
@@ -1148,6 +1320,7 @@ export class IncomingMessage extends Readable {
     this._trailersDistinct = null;
     this._incomingBody = kEmptyBuffer;
     this._incomingBodyChunks = [];
+    if (!preserveParserResume) this[incomingParserResumeSymbol] = null;
     this.push(null);
   }
 
@@ -1155,13 +1328,15 @@ export class IncomingMessage extends Readable {
     if (this.complete || this.aborted) return;
     this.aborted = true;
     this.complete = false;
+    this[incomingParserResumeSymbol] = null;
     this.emit("aborted");
     if (destroySocket) this.destroy();
     else this.push(null);
   }
 
   _read() {
-    this.socket?.resume?.();
+    const resumeParser = this[incomingParserResumeSymbol];
+    if (typeof resumeParser !== "function" || resumeParser() !== false) this.socket?.resume?.();
   }
 
   _dump() {
@@ -1172,6 +1347,7 @@ export class IncomingMessage extends Readable {
   }
 
   _destroy(error, callback) {
+    this[incomingParserResumeSymbol] = null;
     if (!this.complete && !this.aborted) {
       this.aborted = true;
       this.emit("aborted");
@@ -2496,23 +2672,11 @@ export class ClientRequest extends OutgoingMessage {
     queueMicrotask(() => this.emit("socket", socket));
     let completed = false;
     let connected = false;
-    let parser = null;
+    let responseMessage = null;
+    let responseShouldKeepAlive = false;
     let processingResponseData = false;
     let pendingSocketEnd = false;
-    const resetParser = () => {
-      parser = {
-        phase: "headers",
-        headBuffer: kEmptyBuffer,
-        searchPos: 0,
-        info: null,
-        bodyBytes: 0,
-        contentLength: null,
-        chunked: null,
-        readToEof: false,
-        message: null,
-      };
-    };
-    resetParser();
+    let wireParser = null;
     const sendContinueBody = () => {
       if (!this._waitingForContinue) return;
       this._waitingForContinue = false;
@@ -2533,21 +2697,20 @@ export class ClientRequest extends OutgoingMessage {
       socket.off?.("end", onEnd);
       socket.off?.("error", onError);
       socket.off?.("drain", onDrain);
+      if (responseMessage) responseMessage[incomingParserResumeSymbol] = null;
+      wireParser?.close();
       if (this[clientSocketCleanupSymbol] === cleanup) this[clientSocketCleanupSymbol] = null;
     };
     this[clientSocketCleanupSymbol] = cleanup;
-    const releaseOrClose = (parsed) => {
+    const releaseOrClose = (message, isTunnel = false) => {
       if (completed) return;
-      const lowerConnection = String(parsed?.message?.headers?.connection ?? "").toLowerCase();
-      const isTunnel = (this.method === "CONNECT" && parsed?.message?.statusCode >= 200 && parsed?.message?.statusCode < 300) || parsed?.message?.statusCode === 101;
       if (!isTunnel && !this._requestFinishedEmitted) {
-        this._deferredResponseRelease = () => releaseOrClose(parsed);
+        this._deferredResponseRelease = () => releaseOrClose(message, false);
         return;
       }
       completed = true;
       cleanup();
-      const responseVersion = String(parsed?.message?.httpVersion ?? "1.1");
-      const canKeepAlive = this.agent?.keepAlive && lowerConnection !== "close" && responseVersion !== "1.0" && this.method !== "CONNECT" && parsed?.message?.statusCode !== 101 && !parser.readToEof;
+      const canKeepAlive = this.agent?.keepAlive && responseShouldKeepAlive && !isTunnel;
       if (!isTunnel) {
         if (canKeepAlive) this.agent._releaseSocket?.(socket, this._agentOptions ?? this._options);
         else {
@@ -2561,6 +2724,21 @@ export class ClientRequest extends OutgoingMessage {
         }
       }
       if (socket._httpMessage === this) socket._httpMessage = null;
+      this._emitClose();
+    };
+    const failResponse = (error, fromSocket = false) => {
+      if (this.destroyed) return;
+      this.destroyed = true;
+      cleanup();
+      const failure = fromSocket ? socketError(error, socket) : error;
+      if (responseMessage && !responseMessage.complete) {
+        const absorbTerminalResponseError = () => {};
+        responseMessage.on?.("error", absorbTerminalResponseError);
+        responseMessage.once?.("close", () => responseMessage?.off?.("error", absorbTerminalResponseError));
+        responseMessage.destroy?.(failure);
+      }
+      socket.destroy?.();
+      this.emit("error", failure);
       this._emitClose();
     };
     const onConnect = () => {
@@ -2611,136 +2789,100 @@ export class ClientRequest extends OutgoingMessage {
         this._flushRequestBody();
       }
     };
-    const emitResponseHead = (head = kEmptyBuffer) => {
-      const info = parser.info;
-      parser.message = new IncomingMessage({ ...info, deferBody: true });
-      parser.message.socket = socket;
-      parser.message.connection = socket;
-      parser.message.req = this;
-      this._emitParsedResponse({ message: parser.message, head, consumed: 0 });
-    };
-    const finishResponse = (leftover = kEmptyBuffer, trailers = {}, rawTrailers = []) => {
-      parser.message?._completeIncoming(trailers, rawTrailers);
-      releaseOrClose({ message: parser.message, head: leftover, consumed: 0 });
-    };
+    wireParser = new SocketHTTPParser(BindingHTTPParser.RESPONSE, {
+      maxHeaderSize: this.maxHeaderSize ?? getCurrentMaxHeaderSize(),
+      insecureHTTPParser: this.insecureHTTPParser === true,
+      onHeaders: (info) => {
+        const block = materializeIncomingHeaders(info.rawHeaders, this.joinDuplicateHeaders === true, this.maxHeadersCount);
+        if (info.statusCode >= 100 && info.statusCode < 200 && info.statusCode !== 101) {
+          const information = {
+            statusCode: info.statusCode,
+            statusMessage: info.statusMessage,
+            headers: block.headers,
+            rawHeaders: block.rawHeaders,
+            httpVersion: `${info.major}.${info.minor}`,
+            httpVersionMajor: info.major,
+            httpVersionMinor: info.minor,
+          };
+          if (info.statusCode === 100) {
+            this.emit("continue");
+            sendContinueBody();
+          }
+          this.emit("information", information);
+          return { state: { informational: true } };
+        }
+
+        if (this._waitingForContinue) {
+          this._waitingForContinue = false;
+          if (this._continueTimer != null) clearTimeout(this._continueTimer);
+          this._continueTimer = null;
+          for (const pending of this._requestPending.splice(0)) pending.callback?.();
+          this._requestPendingBytes = 0;
+          this._finishRequest();
+        }
+
+        const message = new IncomingMessage({
+          httpVersion: `${info.major}.${info.minor}`,
+          statusCode: info.statusCode,
+          statusMessage: info.statusMessage,
+          headers: block.headers,
+          rawHeaders: block.rawHeaders,
+          socket,
+          deferBody: true,
+        });
+        message.joinDuplicateHeaders = this.joinDuplicateHeaders;
+        message.req = this;
+        responseMessage = message;
+        responseShouldKeepAlive = info.shouldKeepAlive;
+        message[incomingParserResumeSymbol] = () => {
+          try {
+            return wireParser.resume();
+          } catch (error) {
+            queueMicrotask(() => failResponse(error));
+            return false;
+          }
+        };
+
+        const isTunnel = (this.method === "CONNECT" && info.statusCode >= 200 && info.statusCode < 300) || info.statusCode === 101;
+        if (!isTunnel) this._emitParsedResponse({ message, head: kEmptyBuffer, consumed: 0 });
+        return {
+          state: { message, isTunnel, informational: false },
+          action: this.method === "HEAD" ? 1 : isTunnel ? 2 : 0,
+          upgrade: isTunnel,
+        };
+      },
+      onBody: (state, bodyChunk) => {
+        if (!state?.message) return true;
+        const accepted = state.message._pushIncomingChunk(bodyChunk);
+        if (!accepted) socket.pause?.();
+        return accepted;
+      },
+      onComplete: (state, rawTrailers) => {
+        if (!state || state.informational || !state.message) return;
+        const trailers = materializeIncomingHeaders(rawTrailers, this.joinDuplicateHeaders === true, this.maxHeadersCount);
+        state.message._completeIncoming(trailers.headers, trailers.rawHeaders);
+        if (!state.isTunnel) {
+          wireParser.paused = true;
+          wireParser.parser.pause();
+          socket.pause?.();
+          releaseOrClose(state.message, false);
+        }
+      },
+      onUpgrade: (state, head) => {
+        if (!state?.message) return;
+        state.message[incomingParserResumeSymbol] = null;
+        this._emitParsedResponse({ message: state.message, head, consumed: 0 });
+        releaseOrClose(state.message, true);
+      },
+    });
     const onData = (chunk) => {
       if (completed) return;
       processingResponseData = true;
       this._installTimeout();
-      let buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       try {
-        while (buf != null && buf.byteLength > 0 && !completed) {
-          if (parser.phase === "headers") {
-            parser.headBuffer = parser.headBuffer.byteLength === 0 ? buf : Buffer.concat([parser.headBuffer, buf]);
-            buf = null;
-            const idx = findHeaderEnd(parser.headBuffer, parser.searchPos);
-            if (idx < 0) {
-              const limit = this.maxHeaderSize ?? getCurrentMaxHeaderSize();
-              if (parser.headBuffer.byteLength > limit) {
-                throw nodeError(Error, "HPE_HEADER_OVERFLOW", "Parse Error: Header overflow");
-              }
-              parser.searchPos = Math.max(0, parser.headBuffer.byteLength - 3);
-              return;
-            }
-            if (idx > (this.maxHeaderSize ?? getCurrentMaxHeaderSize())) {
-              throw nodeError(Error, "HPE_HEADER_OVERFLOW", "Parse Error: Header overflow");
-            }
-            const headText = parser.headBuffer.subarray(0, idx).toString("latin1");
-            const rest = parser.headBuffer.subarray(idx + 4);
-            parser.headBuffer = kEmptyBuffer;
-            parser.searchPos = 0;
-            const [statusLine, ...headerLines] = headText.split("\r\n");
-            const match = /^HTTP\/(\d+)\.(\d+)\s+(\d+)\s*(.*)$/.exec(statusLine);
-            if (!match) throw new Error("Invalid HTTP response");
-            const statusCode = Number(match[3]);
-            const parsedHeaders = parseHeaderLines(headerLines.join("\r\n"));
-            if (statusCode >= 100 && statusCode < 200 && statusCode !== 101) {
-              const information = {
-                statusCode,
-                statusMessage: match[4],
-                headers: parsedHeaders.headers,
-                rawHeaders: parsedHeaders.rawHeaders,
-              };
-              if (statusCode === 100) {
-                this.emit("continue");
-                sendContinueBody();
-              }
-              this.emit("information", information);
-              resetParser();
-              buf = rest;
-              continue;
-            }
-            if (this._waitingForContinue) {
-              this._waitingForContinue = false;
-              if (this._continueTimer != null) clearTimeout(this._continueTimer);
-              this._continueTimer = null;
-              for (const pending of this._requestPending.splice(0)) pending.callback?.();
-              this._requestPendingBytes = 0;
-              this._finishRequest();
-            }
-            parser.info = {
-              httpVersion: `${match[1]}.${match[2]}`,
-              statusCode,
-              statusMessage: match[4],
-              headers: parsedHeaders.headers,
-              rawHeaders: parsedHeaders.rawHeaders,
-            };
-            const noBody = this.method === "HEAD" ||
-              (this.method === "CONNECT" && statusCode >= 200 && statusCode < 300) ||
-              statusCode === 101 || statusCode === 204 || statusCode === 304;
-            if (noBody) {
-              emitResponseHead(rest);
-              finishResponse(rest);
-              return;
-            }
-            const transferEncoding = String(parsedHeaders.headers["transfer-encoding"] ?? "").toLowerCase();
-            if (transferEncoding.split(",").map((item) => item.trim()).includes("chunked")) {
-              parser.chunked = new ChunkedDecoder((bodyChunk) => {
-                if (parser.message?._pushIncomingChunk(bodyChunk) === false) socket.pause?.();
-              });
-            } else if (parsedHeaders.headers["content-length"] != null) {
-              parser.contentLength = contentLengthFromHeaders(parsedHeaders.headers);
-            } else {
-              parser.readToEof = true;
-            }
-            parser.phase = "body";
-            emitResponseHead();
-            buf = rest;
-            if (parser.contentLength === 0) {
-              finishResponse(buf);
-              return;
-            }
-            continue;
-          }
-          // body phase
-          if (parser.chunked != null) {
-            const leftover = parser.chunked.push(buf);
-            if (parser.chunked.done) {
-              finishResponse(leftover, parser.chunked.trailers, parser.chunked.rawTrailers);
-            }
-            return;
-          }
-          if (parser.contentLength != null) {
-            const need = parser.contentLength - parser.bodyBytes;
-            const take = Math.min(need, buf.byteLength);
-            if (take > 0 && parser.message?._pushIncomingChunk(buf.subarray(0, take)) === false) socket.pause?.();
-            parser.bodyBytes += take;
-            if (parser.bodyBytes >= parser.contentLength) {
-              finishResponse(buf.subarray(take));
-            }
-            return;
-          }
-          if (parser.message?._pushIncomingChunk(buf) === false) socket.pause?.();
-          parser.bodyBytes += buf.byteLength;
-          return;
-        }
+        wireParser.execute(chunk);
       } catch (error) {
-        if (this.destroyed) return;
-        this.destroyed = true;
-        cleanup();
-        socket.destroy?.();
-        this.emit("error", error);
-        this._emitClose();
+        failResponse(error);
       } finally {
         processingResponseData = false;
         if (pendingSocketEnd) {
@@ -2754,37 +2896,26 @@ export class ClientRequest extends OutgoingMessage {
         pendingSocketEnd = true;
         return;
       }
-      if (!completed && parser.phase === "body" && parser.readToEof && parser.message != null) {
-        finishResponse(kEmptyBuffer);
-      } else if (!completed && !this.destroyed && !this.aborted) {
-        const error = nodeError(Error, "ECONNRESET", this._responseEmitted ? "aborted" : "socket hang up");
-        this.destroyed = true;
-        parser.message?._abortIncoming?.();
-        cleanup();
-        socket.destroy?.();
-        this.emit("error", error);
-        this._emitClose();
-        return;
+      if (!completed && !this.destroyed && !this.aborted) {
+        try {
+          wireParser.finish();
+        } catch {
+          const error = nodeError(Error, "ECONNRESET", this._responseEmitted ? "aborted" : "socket hang up");
+          failResponse(error);
+          return;
+        }
+        if (!completed && !this._responseEmitted) {
+          failResponse(nodeError(Error, "ECONNRESET", "socket hang up"));
+          return;
+        }
       }
-      cleanup();
-      this._emitClose();
+      if (!completed) {
+        cleanup();
+        this._emitClose();
+      }
     };
     const onError = (error) => {
-      if (this.destroyed) return;
-      this.destroyed = true;
-      cleanup();
-      const failure = socketError(error, socket);
-      if (parser.message) {
-        // IncomingMessage emits "aborted" before readable-stream emits the
-        // destroy error. A body consumer may detach its error listener while
-        // handling "aborted", so retain an owner through the terminal close.
-        const absorbTerminalResponseError = () => {};
-        parser.message.on?.("error", absorbTerminalResponseError);
-        parser.message.once?.("close", () => parser.message?.off?.("error", absorbTerminalResponseError));
-        parser.message.destroy?.(failure);
-      }
-      this.emit("error", failure);
-      this._emitClose();
+      failResponse(error, true);
     };
     socket.once("connect", onConnect);
     socket.on("data", onData);
@@ -2809,6 +2940,7 @@ function createServerIncomingMessage(server, socket, init) {
   message.httpVersionMinor = Number(minor) || 0;
   message.method = init.method;
   message.url = init.url;
+  message.joinDuplicateHeaders = server.joinDuplicateHeaders;
   message.socket = socket;
   message.connection = socket;
   message.trailers = {};
@@ -2849,6 +2981,10 @@ export function _configureHttpServer(server, options = {}, requestListener = und
     : validateIntegerOption(options.connectionsCheckingInterval, "connectionsCheckingInterval", 0);
   server.maxHeaderSize = options.maxHeaderSize;
   if (server.maxHeaderSize !== undefined) validateIntegerOption(server.maxHeaderSize, "maxHeaderSize", 0);
+  server.insecureHTTPParser = options.insecureHTTPParser;
+  if (server.insecureHTTPParser !== undefined) {
+    validateBooleanOption(server.insecureHTTPParser, "options.insecureHTTPParser");
+  }
   server.requireHostHeader = options.requireHostHeader == null ? true : validateBooleanOption(options.requireHostHeader, "options.requireHostHeader");
   server.joinDuplicateHeaders = options.joinDuplicateHeaders;
   if (server.joinDuplicateHeaders !== undefined) validateBooleanOption(server.joinDuplicateHeaders, "options.joinDuplicateHeaders");
@@ -2868,22 +3004,8 @@ export function _attachHttpConnection(server, socket) {
   socket.setNoDelay?.(server.noDelay !== false);
   if (server.keepAlive !== false) socket.setKeepAlive?.(true, server.keepAliveInitialDelay ?? 0);
   socket._cottontailHttpRequestCount = Number(socket._cottontailHttpRequestCount ?? 0);
-  let req = null;
-  const resetReqParser = () => {
-    req = {
-      phase: "headers",
-      headBuffer: kEmptyBuffer,
-      searchPos: 0,
-      head: null,
-      chunked: null,
-      contentLength: null,
-      bodyBytes: 0,
-      message: null,
-      tunnelType: null,
-      continueSent: false,
-    };
-  };
-  resetReqParser();
+  let currentMessage = null;
+  let wireParser = null;
   let tunnelChunks = [];
   const queue = [];
   let active = null;
@@ -2932,15 +3054,19 @@ export function _attachHttpConnection(server, socket) {
     stopped = true;
     socket.off?.("data", onData);
     socket.off?.("error", onSocketError);
+    if (currentMessage) currentMessage[incomingParserResumeSymbol] = null;
+    wireParser?.close();
     clearParserTimers();
     clearKeepAliveTimer();
   };
 
-  const fail = (error, statusLine = "400 Bad Request") => {
+  const fail = (error, statusLine = error?.statusLine ?? (error?.code === "HPE_HEADER_OVERFLOW"
+    ? "431 Request Header Fields Too Large"
+    : error?.code === "HPE_INVALID_VERSION" ? "505 HTTP Version Not Supported" : "400 Bad Request")) => {
     detachParser();
     // Parser failures must abort the request body without closing the
     // transport before a clientError listener or the fallback response runs.
-    req?.message?._abortIncoming?.(false);
+    currentMessage?._abortIncoming?.(false);
     if (error && error.code == null) error.code = "HPE_INTERNAL";
     if (server.listenerCount("clientError") > 0) {
       server.emit("clientError", error, socket);
@@ -2968,13 +3094,7 @@ export function _attachHttpConnection(server, socket) {
     }
     const message = queue.shift();
     clearKeepAliveTimer();
-    const connectionTokens = String(message.headers.connection ?? "")
-      .toLowerCase()
-      .split(",")
-      .map((item) => item.trim());
-    const keepAlive = message.httpVersionMajor === 1 && message.httpVersionMinor === 0
-      ? connectionTokens.includes("keep-alive")
-      : !connectionTokens.includes("close");
+    const keepAlive = message._parserShouldKeepAlive !== false;
     const Response = server._ServerResponse ?? ServerResponse;
     const response = new Response(message);
     response._server = server;
@@ -3031,187 +3151,113 @@ export function _attachHttpConnection(server, socket) {
     }
   };
 
+  wireParser = new SocketHTTPParser(BindingHTTPParser.REQUEST, {
+    maxHeaderSize: server.maxHeaderSize ?? getCurrentMaxHeaderSize(),
+    insecureHTTPParser: server.insecureHTTPParser === true,
+    onMessageBegin: () => {
+      clearKeepAliveTimer();
+      refreshHeadersTimer();
+    },
+    onHeaders: (info) => {
+      if (headersTimer != null) {
+        clearTimeout(headersTimer);
+        headersTimer = null;
+      }
+      if (info.major !== 1 || info.minor > 1) {
+        const error = new Error("Unsupported HTTP version");
+        error.code = "HPE_INVALID_VERSION";
+        error.statusLine = "505 HTTP Version Not Supported";
+        throw error;
+      }
+      const block = materializeIncomingHeaders(info.rawHeaders, server.joinDuplicateHeaders === true);
+      if (server.requireHostHeader !== false && info.minor >= 1 && block.headers.host == null) {
+        const error = new Error("Missing Host header");
+        error.code = "HPE_INTERNAL";
+        throw error;
+      }
+
+      const message = createServerIncomingMessage(server, socket, {
+        httpVersion: `${info.major}.${info.minor}`,
+        method: info.method,
+        url: info.url,
+        headers: block.headers,
+        rawHeaders: block.rawHeaders,
+        highWaterMark: server.highWaterMark,
+      });
+      message._parserShouldKeepAlive = info.shouldKeepAlive;
+      message.upgrade = info.upgrade;
+      currentMessage = message;
+      message[incomingParserResumeSymbol] = () => {
+        try {
+          const resumed = wireParser.resume();
+          if (message.complete) message[incomingParserResumeSymbol] = null;
+          return resumed;
+        } catch (error) {
+          queueMicrotask(() => fail(error));
+          return false;
+        }
+      };
+
+      socket._cottontailHttpRequestCount += 1;
+      message._requestCount = socket._cottontailHttpRequestCount;
+      if (server.maxRequestsPerSocket > 0 && socket._cottontailHttpRequestCount > server.maxRequestsPerSocket) {
+        server.emit("dropRequest", message, socket);
+        socket._cottontailHttpDropPending = true;
+        return { state: { message, dropped: true }, action: 2, upgrade: true };
+      }
+
+      const tunnelType = String(info.method).toUpperCase() === "CONNECT"
+        ? "connect"
+        : info.upgrade ? "upgrade" : null;
+      const state = { message, tunnelType, dropped: false };
+      refreshRequestTimer();
+      if (tunnelType == null) {
+        queue.push(message);
+        processNext();
+      }
+      return { state, action: tunnelType == null ? 0 : 2, upgrade: tunnelType != null };
+    },
+    onBody: (state, bodyChunk) => {
+      if (!state?.message || state.dropped) return true;
+      refreshRequestTimer();
+      const accepted = state.message._pushIncomingChunk(bodyChunk);
+      if (!accepted) socket.pause?.();
+      return accepted;
+    },
+    onComplete: (state, rawTrailers) => {
+      if (requestTimer != null) {
+        clearTimeout(requestTimer);
+        requestTimer = null;
+      }
+      if (!state?.message || state.dropped) return;
+      const trailers = materializeIncomingHeaders(rawTrailers, server.joinDuplicateHeaders === true);
+      state.message._completeIncoming(trailers.headers, trailers.rawHeaders, wireParser.paused);
+      if (currentMessage === state.message) currentMessage = null;
+      if (state.tunnelType != null) tunnel = { type: state.tunnelType, message: state.message };
+    },
+    onUpgrade: (state, head) => {
+      if (!state?.message) return;
+      if (state.dropped) {
+        currentMessage = null;
+        detachParser();
+        socket.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+        return;
+      }
+      if (tunnel == null) tunnel = { type: state.tunnelType, message: state.message };
+      if (head.byteLength > 0) tunnelChunks.push(head);
+      processNext();
+    },
+  });
+
   const onData = (chunk) => {
     clearKeepAliveTimer();
-    let buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     if (tunnel != null || stopped) {
-      if (buf.byteLength > 0) tunnelChunks.push(buf);
+      if (tunnel != null && buf.byteLength > 0) tunnelChunks.push(buf);
       return;
     }
     try {
-      while (buf != null) {
-        if (req.phase === "headers") {
-          if (buf.byteLength > 0) {
-            req.headBuffer = req.headBuffer.byteLength === 0 ? buf : Buffer.concat([req.headBuffer, buf]);
-          }
-          buf = null;
-          const methodEnd = req.headBuffer.indexOf(0x20);
-          const methodPrefixLength = methodEnd < 0 ? req.headBuffer.byteLength : methodEnd;
-          if (methodPrefixLength === 0 ||
-              !tokenPattern.test(req.headBuffer.subarray(0, methodPrefixLength).toString("latin1"))) {
-            const error = new Error("Parse Error: Invalid method encountered");
-            error.code = "HPE_INVALID_METHOD";
-            fail(error);
-            return;
-          }
-          const idx = findHeaderEnd(req.headBuffer, req.searchPos);
-          if (idx < 0) {
-            if (req.headBuffer.byteLength > (server.maxHeaderSize ?? getCurrentMaxHeaderSize())) {
-              const overflow = new Error("Parse Error: Header overflow");
-              overflow.code = "HPE_HEADER_OVERFLOW";
-              fail(overflow, "431 Request Header Fields Too Large");
-              return;
-            }
-            req.searchPos = Math.max(0, req.headBuffer.byteLength - 3);
-            if (req.headBuffer.byteLength > 0) refreshHeadersTimer();
-            break;
-          }
-          if (idx > (server.maxHeaderSize ?? getCurrentMaxHeaderSize())) {
-            const overflow = new Error("Parse Error: Header overflow");
-            overflow.code = "HPE_HEADER_OVERFLOW";
-            fail(overflow, "431 Request Header Fields Too Large");
-            return;
-          }
-          if (headersTimer != null) {
-            clearTimeout(headersTimer);
-            headersTimer = null;
-          }
-          const headText = req.headBuffer.subarray(0, idx).toString("latin1");
-          const rest = req.headBuffer.subarray(idx + 4);
-          req.headBuffer = kEmptyBuffer;
-          req.searchPos = 0;
-          const [requestLine, ...headerLines] = headText.split("\r\n");
-          const requestMatch = /^([!#$%&'*+\-.^_`|~0-9A-Za-z]+)\s+(\S+)\s+HTTP\/(\d+)\.(\d+)$/.exec(requestLine);
-          if (!requestMatch) throw new Error("Invalid HTTP request");
-          const parsedHeaders = (() => {
-            try {
-              return parseHeaderLines(headerLines.join("\r\n"));
-            } catch (error) {
-              if (error && (error.code == null || error.code === "ERR_INVALID_HTTP_TOKEN") &&
-                  /valid HTTP token/i.test(String(error.message))) {
-                error.code = "HPE_INVALID_HEADER_TOKEN";
-              }
-              throw error;
-            }
-          })();
-          for (let rawIndex = 1; rawIndex < parsedHeaders.rawHeaders.length; rawIndex += 2) {
-            if (/[\r\n]/.test(String(parsedHeaders.rawHeaders[rawIndex]))) {
-              const error = new Error("Invalid header value");
-              error.code = "HPE_INTERNAL";
-              fail(error);
-              return;
-            }
-          }
-          req.head = {
-            method: requestMatch[1],
-            url: requestMatch[2],
-            major: Number(requestMatch[3]),
-            minor: Number(requestMatch[4]),
-            headers: parsedHeaders.headers,
-            rawHeaders: parsedHeaders.rawHeaders,
-          };
-          if (req.head.major !== 1 || req.head.minor > 1) {
-            const error = new Error("Unsupported HTTP version");
-            error.code = "HPE_INTERNAL";
-            fail(error, "505 HTTP Version Not Supported");
-            return;
-          }
-          if (server.requireHostHeader !== false && req.head.minor >= 1 && parsedHeaders.headers.host == null) {
-            const error = new Error("Missing Host header");
-            error.code = "HPE_INTERNAL";
-            fail(error);
-            return;
-          }
-          if (parsedHeaders.headers["content-length"] != null && parsedHeaders.headers["transfer-encoding"] != null) {
-            const error = new Error("Both Content-Length and Transfer-Encoding are set");
-            error.code = "HPE_INVALID_TRANSFER_ENCODING";
-            fail(error);
-            return;
-          }
-          const transferEncoding = String(parsedHeaders.headers["transfer-encoding"] ?? "").toLowerCase();
-          const lowerConnection = String(req.head.headers.connection ?? "").toLowerCase();
-          req.tunnelType = String(req.head.method).toUpperCase() === "CONNECT"
-            ? "connect"
-            : (req.head.headers.upgrade != null || lowerConnection.split(",").map((item) => item.trim()).includes("upgrade"))
-              ? "upgrade"
-              : null;
-          req.message = createServerIncomingMessage(server, socket, {
-            httpVersion: `${req.head.major}.${req.head.minor}`,
-            method: req.head.method,
-            url: req.head.url,
-            headers: req.head.headers,
-            rawHeaders: req.head.rawHeaders,
-          });
-          socket._cottontailHttpRequestCount += 1;
-          req.message._requestCount = socket._cottontailHttpRequestCount;
-          if (server.maxRequestsPerSocket > 0 && socket._cottontailHttpRequestCount > server.maxRequestsPerSocket) {
-            server.emit("dropRequest", req.message, socket);
-            detachParser();
-            socket._cottontailHttpDropPending = true;
-            socket.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-            return;
-          }
-          if (transferEncoding.split(",").map((item) => item.trim()).includes("chunked")) {
-            req.chunked = new ChunkedDecoder((bodyChunk) => {
-              if (req.message?._pushIncomingChunk(bodyChunk) === false) socket.pause?.();
-            });
-          } else {
-            req.contentLength = contentLengthFromHeaders(parsedHeaders.headers);
-          }
-          req.phase = "body";
-          if (req.tunnelType == null) {
-            queue.push(req.message);
-            processNext();
-            if (stopped || socket.destroyed) return;
-          }
-          buf = rest;
-          continue;
-        }
-        // body phase
-        let trailers = {};
-        let rawTrailers = [];
-        let leftover = null;
-        if (req.chunked != null) {
-          leftover = buf != null && buf.byteLength > 0 ? req.chunked.push(buf) : null;
-          buf = null;
-          if (!req.chunked.done) {
-            refreshRequestTimer();
-            break;
-          }
-          trailers = req.chunked.trailers;
-          rawTrailers = req.chunked.rawTrailers;
-        } else {
-          const expected = req.contentLength ?? 0;
-          const need = expected - req.bodyBytes;
-          if (need > 0 && buf != null && buf.byteLength > 0) {
-            const take = Math.min(need, buf.byteLength);
-            if (req.message?._pushIncomingChunk(buf.subarray(0, take)) === false) socket.pause?.();
-            req.bodyBytes += take;
-            leftover = buf.subarray(take);
-          } else {
-            leftover = buf ?? kEmptyBuffer;
-          }
-          buf = null;
-          if (req.bodyBytes < expected) {
-            refreshRequestTimer();
-            break;
-          }
-        }
-        if (requestTimer != null) {
-          clearTimeout(requestTimer);
-          requestTimer = null;
-        }
-        const message = req.message;
-        const tunnelType = req.tunnelType;
-        message?._completeIncoming(trailers, rawTrailers);
-        resetReqParser();
-        if (tunnelType != null) {
-          tunnel = { type: tunnelType, message };
-          if (leftover != null && leftover.byteLength > 0) tunnelChunks.push(leftover);
-          break;
-        }
-        buf = leftover != null && leftover.byteLength > 0 ? leftover : null;
-      }
+      wireParser.execute(buf);
     } catch (error) {
       fail(error);
       return;
@@ -3226,9 +3272,17 @@ export function _attachHttpConnection(server, socket) {
   socket.on("error", onSocketError);
   socket.on("data", onData);
   socket.on("end", () => {
-    if (req?.message && !req.message.complete) {
+    if (stopped) return;
+    try {
+      wireParser.finish();
+    } catch (error) {
+      fail(error);
+      return;
+    }
+    if (currentMessage && !currentMessage.complete) {
+      const message = currentMessage;
       detachParser();
-      req.message._abortIncoming();
+      message._abortIncoming();
     }
   });
   socket.on("close", () => {
@@ -3236,7 +3290,9 @@ export function _attachHttpConnection(server, socket) {
       unrefHttpResponseTask(active);
       active = null;
     }
-    req?.message?._abortIncoming?.();
+    currentMessage?._abortIncoming?.();
+    currentMessage = null;
+    wireParser?.close();
     clearParserTimers();
     clearKeepAliveTimer();
   });
