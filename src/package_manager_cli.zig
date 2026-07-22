@@ -8218,13 +8218,25 @@ const Manager = struct {
                 const patch_paths = try manager.packagePatchPaths(package_name, version_value.string, protocol_patch_paths);
                 if (!try manager.packagePatchStateMatches(destination, patch_paths)) continue;
                 try manager.root_versions.put(try manager.allocator.dupe(u8, alias), version_value.string);
+                if (!manager.options.lockfile_only and !manager.options.dry_run) {
+                    try manager.linkBins(alias, destination, value, direct, parent_dir);
+                }
                 try manager.addRecord(.{
-                    .key = try manager.lockKeyForDestination(destination),
+                    .key = destination_key,
                     .alias = alias,
                     .name = package_name,
                     .version = version_value.string,
+                    .resolution = registry_spec,
                     .metadata = value,
+                    .install_dir = destination,
                 });
+                try manager.rememberPackageMetadata(destination, value);
+                try manager.registerBundledPackages(destination_key, value, destination);
+                try manager.installDependencyObject(value, "dependencies", destination, false, false);
+                if (!manager.options.omit_optional) {
+                    try manager.installDependencyObject(value, "optionalDependencies", destination, false, true);
+                }
+                try manager.installOrLinkPeerDependencies(value, destination, destination, parent_dir);
                 return version_value.string;
             }
         }
