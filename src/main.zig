@@ -1148,6 +1148,8 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
             compile = true;
         } else if (std.mem.eql(u8, arg, "--app")) {
             app = true;
+        } else if (std.mem.eql(u8, arg, "--bundle")) {
+            options.transform_only = false;
         } else if (std.mem.eql(u8, arg, "--no-bundle")) {
             options.transform_only = true;
         } else if (std.mem.eql(u8, arg, "--bytecode")) {
