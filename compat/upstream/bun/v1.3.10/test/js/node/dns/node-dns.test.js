@@ -1,13 +1,145 @@
-import { beforeAll, describe, expect, it, setDefaultTimeout, test } from "bun:test";
-import { isWindows } from "harness";
+import { afterAll, beforeAll, describe, expect, it, setDefaultTimeout, test } from "bun:test";
+import { Buffer } from "node:buffer";
+import { createSocket } from "node:dgram";
 import * as dns from "node:dns";
 import * as dns_promises from "node:dns/promises";
-import * as fs from "node:fs";
-import * as os from "node:os";
 import * as util from "node:util";
 
-beforeAll(() => {
+const originalServers = dns.getServers();
+let dnsServer;
+let fixtureServer;
+
+const recordTypes = {
+  A: 1,
+  NS: 2,
+  CNAME: 5,
+  SOA: 6,
+  PTR: 12,
+  MX: 15,
+  TXT: 16,
+  AAAA: 28,
+  SRV: 33,
+  NAPTR: 35,
+  CAA: 257,
+};
+
+function encodeName(name) {
+  return Buffer.concat([
+    ...name.split(".").filter(Boolean).map(label => Buffer.concat([Buffer.from([label.length]), Buffer.from(label)])),
+    Buffer.from([0]),
+  ]);
+}
+
+function readQuestion(query) {
+  const labels = [];
+  let offset = 12;
+  while (query[offset] !== 0) {
+    const length = query[offset++];
+    labels.push(query.subarray(offset, offset + length).toString());
+    offset += length;
+  }
+  return {
+    name: labels.join("."),
+    type: query.readUInt16BE(offset + 1),
+    end: offset + 5,
+  };
+}
+
+function characterString(value) {
+  const bytes = Buffer.from(value);
+  return Buffer.concat([Buffer.from([bytes.length]), bytes]);
+}
+
+function recordData(type, questionName) {
+  if (type === recordTypes.A) return Buffer.from([192, 0, 2, 42]);
+  if (type === recordTypes.AAAA) {
+    return Buffer.from([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 42]);
+  }
+  if (type === recordTypes.NS) return encodeName("ns.fixture.test");
+  if (type === recordTypes.CNAME) return encodeName("alias.fixture.test");
+  if (type === recordTypes.PTR) {
+    return encodeName(questionName.endsWith(".arpa") ? "dns.fixture.test" : "ptr-target.fixture.test");
+  }
+  if (type === recordTypes.MX) {
+    const priority = Buffer.alloc(2);
+    priority.writeUInt16BE(10);
+    return Buffer.concat([priority, encodeName("mail.fixture.test")]);
+  }
+  if (type === recordTypes.TXT) return characterString("bun_test;test");
+  if (type === recordTypes.SOA) {
+    const numbers = Buffer.alloc(20);
+    [123, 10000, 2400, 604800, 300].forEach((value, index) => numbers.writeUInt32BE(value, index * 4));
+    return Buffer.concat([encodeName("ns.fixture.test"), encodeName("hostmaster.fixture.test"), numbers]);
+  }
+  if (type === recordTypes.SRV) {
+    const values = Buffer.alloc(6);
+    values.writeUInt16BE(10, 0);
+    values.writeUInt16BE(50, 2);
+    values.writeUInt16BE(80, 4);
+    return Buffer.concat([values, encodeName("service.fixture.test")]);
+  }
+  if (type === recordTypes.NAPTR) {
+    const values = Buffer.alloc(4);
+    values.writeUInt16BE(1, 0);
+    values.writeUInt16BE(12, 2);
+    return Buffer.concat([
+      values,
+      characterString("S"),
+      characterString("test"),
+      characterString(""),
+      encodeName("replacement.fixture.test"),
+    ]);
+  }
+  if (type === recordTypes.CAA) {
+    return Buffer.concat([Buffer.from([0, 5]), Buffer.from("issuebun.sh")]);
+  }
+  return null;
+}
+
+function dnsResponse(query, answers, responseCode = 0) {
+  const { end } = readQuestion(query);
+  const header = Buffer.alloc(12);
+  header.writeUInt16BE(query.readUInt16BE(0), 0);
+  header.writeUInt16BE(0x8180 | responseCode, 2);
+  header.writeUInt16BE(1, 4);
+  header.writeUInt16BE(answers.length, 6);
+  return Buffer.concat([header, query.subarray(12, end), ...answers]);
+}
+
+function dnsAnswer(type, data) {
+  const answer = Buffer.alloc(12);
+  answer.writeUInt16BE(0xc00c, 0);
+  answer.writeUInt16BE(type, 2);
+  answer.writeUInt16BE(1, 4);
+  answer.writeUInt32BE(60, 6);
+  answer.writeUInt16BE(data.length, 10);
+  return Buffer.concat([answer, data]);
+}
+
+beforeAll(async () => {
   setDefaultTimeout(1000 * 60 * 5);
+
+  dnsServer = createSocket("udp4");
+  dnsServer.on("message", (query, remote) => {
+    const question = readQuestion(query);
+    const missing = question.name.includes("invalid") || question.name.endsWith(".invalid");
+    const data = missing ? null : recordData(question.type, question.name);
+    const answers = data === null ? [] : [dnsAnswer(question.type, data)];
+    dnsServer.send(dnsResponse(query, answers, missing ? 3 : 0), remote.port, remote.address);
+  });
+  await new Promise((resolve, reject) => {
+    dnsServer.once("error", reject);
+    dnsServer.bind(0, "127.0.0.1", resolve);
+  });
+  fixtureServer = `127.0.0.1:${dnsServer.address().port}`;
+  dns.setServers([fixtureServer]);
+});
+
+afterAll(async () => {
+  dns.setServers(originalServers);
+  if (dnsServer !== undefined) {
+    await new Promise(resolve => dnsServer.close(resolve));
+  }
 });
 
 // TODO:
@@ -61,14 +193,13 @@ test("it exists", () => {
   expect(dns_promises.resolveCname).toBeDefined();
 });
 
-// //TODO: use a bun.sh SRV for testing
-test("dns.resolveSrv (_test._tcp.test.socketify.dev)", () => {
+test("dns.resolveSrv (_test._tcp.fixture.test)", () => {
   const { promise, resolve, reject } = Promise.withResolvers();
-  dns.resolveSrv("_test._tcp.test.socketify.dev", (err, results) => {
+  dns.resolveSrv("_test._tcp.fixture.test", (err, results) => {
     try {
       expect(err).toBeNull();
       expect(results instanceof Array).toBe(true);
-      expect(results[0].name).toBe("_dc-srv.130c90ab9de1._test._tcp.test.socketify.dev");
+      expect(results[0].name).toBe("service.fixture.test");
       expect(results[0].priority).toBe(10);
       expect(results[0].weight).toBe(50);
       expect(results[0].port).toBe(80);
@@ -80,9 +211,9 @@ test("dns.resolveSrv (_test._tcp.test.socketify.dev)", () => {
   return promise;
 });
 
-test("dns.resolveSrv (_test._tcp.invalid.localhost)", () => {
+test("dns.resolveSrv (_test._tcp.invalid.fixture.test)", () => {
   const { promise, resolve, reject } = Promise.withResolvers();
-  dns.resolveSrv("_test._tcp.invalid.localhost", (err, results) => {
+  dns.resolveSrv("_test._tcp.invalid.fixture.test", (err, results) => {
     try {
       expect(err).toBeTruthy();
       expect(results).toBeUndefined(true);
@@ -94,9 +225,9 @@ test("dns.resolveSrv (_test._tcp.invalid.localhost)", () => {
   return promise;
 });
 
-test("dns.resolveTxt (txt.socketify.dev)", () => {
+test("dns.resolveTxt (txt.fixture.test)", () => {
   const { promise, resolve, reject } = Promise.withResolvers();
-  dns.resolveTxt("txt.socketify.dev", (err, results) => {
+  dns.resolveTxt("txt.fixture.test", (err, results) => {
     try {
       expect(err).toBeNull();
       expect(results instanceof Array).toBe(true);
@@ -109,21 +240,18 @@ test("dns.resolveTxt (txt.socketify.dev)", () => {
   return promise;
 });
 
-test("dns.resolveSoa (bun.sh)", () => {
+test("dns.resolveSoa (fixture.test)", () => {
   const { promise, resolve, reject } = Promise.withResolvers();
-  dns.resolveSoa("bun.sh", (err, result) => {
+  dns.resolveSoa("fixture.test", (err, result) => {
     try {
       expect(err).toBeNull();
-      expect(typeof result.serial).toBe("number");
+      expect(result.serial).toBe(123);
       expect(result.refresh).toBe(10000);
       expect(result.retry).toBe(2400);
       expect(result.expire).toBe(604800);
-
-      // Cloudflare might randomly change min TTL
-      expect(result.minttl).toBeNumber();
-
-      expect(result.nsname).toBe("hans.ns.cloudflare.com");
-      expect(result.hostmaster).toBe("dns.cloudflare.com");
+      expect(result.minttl).toBe(300);
+      expect(result.nsname).toBe("ns.fixture.test");
+      expect(result.hostmaster).toBe("hostmaster.fixture.test");
       resolve();
     } catch (error) {
       reject(err || error);
@@ -147,16 +275,16 @@ test("dns.resolveSoa (empty string)", () => {
   return promise;
 });
 
-test("dns.resolveNaptr (naptr.socketify.dev)", () => {
+test("dns.resolveNaptr (naptr.fixture.test)", () => {
   const { promise, resolve, reject } = Promise.withResolvers();
-  dns.resolveNaptr("naptr.socketify.dev", (err, results) => {
+  dns.resolveNaptr("naptr.fixture.test", (err, results) => {
     try {
       expect(err).toBeNull();
       expect(results instanceof Array).toBe(true);
       expect(results[0].flags).toBe("S");
       expect(results[0].service).toBe("test");
       expect(results[0].regexp).toBe("");
-      expect(results[0].replacement).toBe("");
+      expect(results[0].replacement).toBe("replacement.fixture.test");
       expect(results[0].order).toBe(1);
       expect(results[0].preference).toBe(12);
       resolve();
@@ -167,9 +295,9 @@ test("dns.resolveNaptr (naptr.socketify.dev)", () => {
   return promise;
 });
 
-test("dns.resolveCaa (caa.socketify.dev)", () => {
+test("dns.resolveCaa (caa.fixture.test)", () => {
   const { promise, resolve, reject } = Promise.withResolvers();
-  dns.resolveCaa("caa.socketify.dev", (err, results) => {
+  dns.resolveCaa("caa.fixture.test", (err, results) => {
     try {
       expect(err).toBeNull();
       expect(results instanceof Array).toBe(true);
@@ -183,15 +311,15 @@ test("dns.resolveCaa (caa.socketify.dev)", () => {
   return promise;
 });
 
-test("dns.resolveMx (bun.sh)", () => {
+test("dns.resolveMx (fixture.test)", () => {
   const { promise, resolve, reject } = Promise.withResolvers();
-  dns.resolveMx("bun.sh", (err, results) => {
+  dns.resolveMx("fixture.test", (err, results) => {
     try {
       expect(err).toBeNull();
       expect(results instanceof Array).toBe(true);
       const priority = results[0].priority;
       expect(priority >= 0 && priority < 65535).toBe(true);
-      expect(results[0].exchange.includes("aspmx.l.google.com")).toBe(true);
+      expect(results[0].exchange).toBe("mail.fixture.test");
       resolve();
     } catch (error) {
       reject(err || error);
@@ -200,13 +328,13 @@ test("dns.resolveMx (bun.sh)", () => {
   return promise;
 });
 
-test("dns.resolveNs (bun.sh) ", () => {
+test("dns.resolveNs (fixture.test) ", () => {
   const { promise, resolve, reject } = Promise.withResolvers();
-  dns.resolveNs("bun.sh", (err, results) => {
+  dns.resolveNs("fixture.test", (err, results) => {
     try {
       expect(err).toBeNull();
       expect(results instanceof Array).toBe(true);
-      expect(results[0].includes(".ns.cloudflare.com")).toBe(true);
+      expect(results).toEqual(["ns.fixture.test"]);
       resolve();
     } catch (error) {
       reject(err || error);
@@ -221,24 +349,7 @@ test("dns.resolveNs (empty string) ", () => {
     try {
       expect(err).toBeNull();
       expect(results instanceof Array).toBe(true);
-      // root servers
-      expect(results.sort()).toStrictEqual(
-        [
-          "e.root-servers.net",
-          "h.root-servers.net",
-          "l.root-servers.net",
-          "i.root-servers.net",
-          "a.root-servers.net",
-          "d.root-servers.net",
-          "c.root-servers.net",
-          "b.root-servers.net",
-          "j.root-servers.net",
-          "k.root-servers.net",
-          "g.root-servers.net",
-          "m.root-servers.net",
-          "f.root-servers.net",
-        ].sort(),
-      );
+      expect(results).toEqual(["ns.fixture.test"]);
       resolve();
     } catch (error) {
       reject(err || error);
@@ -247,13 +358,13 @@ test("dns.resolveNs (empty string) ", () => {
   return promise;
 });
 
-test("dns.resolvePtr (ptr.socketify.dev)", () => {
+test("dns.resolvePtr (ptr.fixture.test)", () => {
   const { promise, resolve, reject } = Promise.withResolvers();
-  dns.resolvePtr("ptr.socketify.dev", (err, results) => {
+  dns.resolvePtr("ptr.fixture.test", (err, results) => {
     try {
       expect(err).toBeNull();
       expect(results instanceof Array).toBe(true);
-      expect(results[0]).toBe("bun.sh");
+      expect(results[0]).toBe("ptr-target.fixture.test");
       resolve();
     } catch (error) {
       reject(err || error);
@@ -262,13 +373,13 @@ test("dns.resolvePtr (ptr.socketify.dev)", () => {
   return promise;
 });
 
-test("dns.resolveCname (cname.socketify.dev)", () => {
+test("dns.resolveCname (cname.fixture.test)", () => {
   const { promise, resolve, reject } = Promise.withResolvers();
-  dns.resolveCname("cname.socketify.dev", (err, results) => {
+  dns.resolveCname("cname.fixture.test", (err, results) => {
     try {
       expect(err).toBeNull();
       expect(results instanceof Array).toBe(true);
-      expect(results[0]).toBe("bun.sh");
+      expect(results[0]).toBe("alias.fixture.test");
       resolve();
     } catch (error) {
       reject(err || error);
@@ -277,9 +388,9 @@ test("dns.resolveCname (cname.socketify.dev)", () => {
   return promise;
 });
 
-test("dns.lookup (example.com)", () => {
+test("dns.lookup (LOCALHOST)", () => {
   const { promise, resolve, reject } = Promise.withResolvers();
-  dns.lookup("example.com", (err, address, family) => {
+  dns.lookup("LOCALHOST", (err, address, family) => {
     try {
       expect(err).toBeNull();
       expect(typeof address).toBe("string");
@@ -291,9 +402,9 @@ test("dns.lookup (example.com)", () => {
   return promise;
 });
 
-test("dns.lookup bad (qedjp3f4q4jgjh4d6vaf3fd2hbfhg6upt2bscrfe.com)", () => {
+test("dns.lookup bad (does-not-exist.invalid)", () => {
   const { promise, resolve, reject } = Promise.withResolvers();
-  dns.lookup("qedjp3f4q4jgjh4d6vaf3fd2hbfhg6upt2bscrfe.com", (err, address, family) => {
+  dns.lookup("does-not-exist.invalid", (err, address, family) => {
     try {
       expect(err).not.toBeNull();
       expect(err.syscall).toEqual("getaddrinfo");
@@ -308,9 +419,9 @@ test("dns.lookup bad (qedjp3f4q4jgjh4d6vaf3fd2hbfhg6upt2bscrfe.com)", () => {
   return promise;
 });
 
-test("dns.lookup (example.com) with { all: true } #2675", () => {
+test("dns.lookup (LOCALHOST) with { all: true } #2675", () => {
   const { promise, resolve, reject } = Promise.withResolvers();
-  dns.lookup("example.com", { all: true }, (err, address, family) => {
+  dns.lookup("LOCALHOST", { all: true }, (err, address, family) => {
     try {
       expect(err).toBeNull();
       expect(Array.isArray(address)).toBe(true);
@@ -339,44 +450,15 @@ test("dns.lookup (localhost)", () => {
 });
 
 test("dns.getServers", () => {
-  function parseResolvConf() {
-    const servers = [];
-    if (isWindows) {
-      const { stdout } = Bun.spawnSync(["node", "-e", "dns.getServers().forEach(x => console.log(x))"], {
-        stdout: "pipe",
-      });
-      return stdout.toString("utf8").trim().split("\n");
-    }
-
-    try {
-      const content = fs.readFileSync("/etc/resolv.conf", "utf-8");
-      const lines = content.split(os.EOL);
-
-      for (const line of lines) {
-        const parts = line.trim().split(/\s+/);
-        if (parts.length >= 2 && parts[0] === "nameserver") {
-          servers.push(parts[1]);
-        }
-      }
-    } catch (err) {
-      done(err);
-    }
-    return servers;
-  }
-
-  const expectServers = parseResolvConf();
-  const actualServers = dns.getServers();
-  for (const server of expectServers) {
-    expect(actualServers).toContain(server);
-  }
+  expect(dns.getServers()).toEqual([fixtureServer]);
 });
 
 describe("dns.reverse", () => {
   const inputs = [
-    ["8.8.8.8", "dns.google"],
-    ["2606:4700:4700::1111", "one.one.one.one"],
-    ["2606:4700:4700::1001", "one.one.one.one"],
-    ["1.1.1.1", "one.one.one.one"],
+    ["192.0.2.42", "dns.fixture.test"],
+    ["2001:db8::42", "dns.fixture.test"],
+    ["2001:db8::43", "dns.fixture.test"],
+    ["192.0.2.43", "dns.fixture.test"],
   ];
   it.each(inputs)("%s <- %s", (ip, expected) => {
     const { promise, resolve, reject } = Promise.withResolvers();
@@ -395,16 +477,16 @@ describe("dns.reverse", () => {
 
 test("dns.promises.reverse", async () => {
   {
-    let hostnames = await dns.promises.reverse("8.8.8.8");
-    expect(hostnames).toContain("dns.google");
+    let hostnames = await dns.promises.reverse("192.0.2.42");
+    expect(hostnames).toContain("dns.fixture.test");
   }
   {
-    let hostnames = await dns.promises.reverse("1.1.1.1");
-    expect(hostnames).toContain("one.one.one.one");
+    let hostnames = await dns.promises.reverse("192.0.2.43");
+    expect(hostnames).toContain("dns.fixture.test");
   }
   {
-    let hostnames = await dns.promises.reverse("2606:4700:4700::1111");
-    expect(hostnames).toContain("one.one.one.one");
+    let hostnames = await dns.promises.reverse("2001:db8::42");
+    expect(hostnames).toContain("dns.fixture.test");
   }
 });
 
@@ -439,18 +521,18 @@ describe("test invalid arguments", () => {
       dns.lookupService("", 443, (err, hostname, service) => {});
     }).toThrow("Expected address to be a non-empty string for 'lookupService'.");
     expect(() => {
-      dns.lookupService("google.com", 443, (err, hostname, service) => {});
-    }).toThrow(`The "address" argument is invalid. Received type string ('google.com')`);
+      dns.lookupService("fixture.test", 443, (err, hostname, service) => {});
+    }).toThrow(`The "address" argument is invalid. Received type string ('fixture.test')`);
   });
 });
 
 describe("dns.lookupService", () => {
   it.each([
-    ["1.1.1.1", 53, ["one.one.one.one", "domain"]],
-    ["2606:4700:4700::1111", 53, ["one.one.one.one", "domain"]],
-    ["2606:4700:4700::1001", 53, ["one.one.one.one", "domain"]],
-    ["1.1.1.1", 80, ["one.one.one.one", "http"]],
-    ["1.1.1.1", 443, ["one.one.one.one", "https"]],
+    ["127.0.0.1", 53, ["localhost", "domain"]],
+    ["::1", 53, ["localhost", "domain"]],
+    ["::1", 80, ["localhost", "http"]],
+    ["127.0.0.1", 80, ["localhost", "http"]],
+    ["127.0.0.1", 443, ["localhost", "https"]],
   ])("lookupService(%s, %d)", (address, port, expected) => {
     const { promise, resolve, reject } = Promise.withResolvers();
     dns.lookupService(address, port, (err, hostname, service) => {
@@ -493,11 +575,11 @@ describe("dns.lookupService", () => {
   });
 
   it.each([
-    ["1.1.1.1", 53, ["one.one.one.one", "domain"]],
-    ["2606:4700:4700::1111", 53, ["one.one.one.one", "domain"]],
-    ["2606:4700:4700::1001", 53, ["one.one.one.one", "domain"]],
-    ["1.1.1.1", 80, ["one.one.one.one", "http"]],
-    ["1.1.1.1", 443, ["one.one.one.one", "https"]],
+    ["127.0.0.1", 53, ["localhost", "domain"]],
+    ["::1", 53, ["localhost", "domain"]],
+    ["::1", 80, ["localhost", "http"]],
+    ["127.0.0.1", 80, ["localhost", "http"]],
+    ["127.0.0.1", 443, ["localhost", "https"]],
   ])("promises.lookupService(%s, %d)", async (address, port, expected) => {
     const { hostname, service } = await dns.promises.lookupService(address, port);
     expect(hostname).toStrictEqual(expected[0]);
@@ -540,8 +622,6 @@ describe("uses `dns.promises` implementations for `util.promisify` factory", () 
   });
 
   it("util.promisify(dns.lookup) acts like dns.promises.lookup", async () => {
-    // This test previously used example.com, but that domain has multiple A records, which can cause this test to fail.
-    // As of this writing, google.com has only one A record. If that changes, update this test with a domain that has only one A record.
-    expect(await util.promisify(dns.lookup)("google.com")).toEqual(await dns.promises.lookup("google.com"));
+    expect(await util.promisify(dns.lookup)("127.0.0.1")).toEqual(await dns.promises.lookup("127.0.0.1"));
   });
 });

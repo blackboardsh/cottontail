@@ -17,23 +17,78 @@
 
 // Allow `any` data type for testing runtime type checking.
 // tslint:disable no-any
-import { StatusObject } from "@grpc/grpc-js/build/src/call-interface";
-import { GRPC_NODE_USE_ALTERNATIVE_RESOLVER } from "@grpc/grpc-js/build/src/environment";
-import * as resolverManager from "@grpc/grpc-js/build/src/resolver";
-import * as resolver_dns from "@grpc/grpc-js/build/src/resolver-dns";
-import * as resolver_ip from "@grpc/grpc-js/build/src/resolver-ip";
-import * as resolver_uds from "@grpc/grpc-js/build/src/resolver-uds";
-import { ServiceConfig } from "@grpc/grpc-js/build/src/service-config";
-import {
-  Endpoint,
-  SubchannelAddress,
-  endpointToString,
-  subchannelAddressEqual,
-} from "@grpc/grpc-js/build/src/subchannel-address";
-import { GrpcUri, parseUri } from "@grpc/grpc-js/build/src/uri-parser";
+import type { StatusObject } from "@grpc/grpc-js/build/src/call-interface";
+import type * as ResolverManager from "@grpc/grpc-js/build/src/resolver";
+import type { ServiceConfig } from "@grpc/grpc-js/build/src/service-config";
+import type { Endpoint, SubchannelAddress } from "@grpc/grpc-js/build/src/subchannel-address";
+import type { GrpcUri } from "@grpc/grpc-js/build/src/uri-parser";
 import assert from "assert";
-import { beforeAll as before, describe, it } from "bun:test";
-import { isIPv6 } from "harness";
+import { afterAll, beforeAll as before, describe, it } from "bun:test";
+import { Buffer } from "node:buffer";
+import { createSocket } from "node:dgram";
+
+// grpc-js applies DNS URI authorities to its Resolver instance in alternative-resolver mode.
+process.env.GRPC_NODE_USE_ALTERNATIVE_RESOLVER = "true";
+
+const [resolverManager, resolver_dns, resolver_ip, resolver_uds, subchannelAddress, uriParser] = await Promise.all([
+  import("@grpc/grpc-js/build/src/resolver"),
+  import("@grpc/grpc-js/build/src/resolver-dns"),
+  import("@grpc/grpc-js/build/src/resolver-ip"),
+  import("@grpc/grpc-js/build/src/resolver-uds"),
+  import("@grpc/grpc-js/build/src/subchannel-address"),
+  import("@grpc/grpc-js/build/src/uri-parser"),
+]);
+const { endpointToString, subchannelAddressEqual } = subchannelAddress;
+const { parseUri } = uriParser;
+
+const recordTypes = { A: 1, TXT: 16, AAAA: 28 } as const;
+let dnsServer: ReturnType<typeof createSocket>;
+let fixtureServer: string;
+
+function readQuestion(query: Buffer) {
+  const labels: string[] = [];
+  let offset = 12;
+  while (query[offset] !== 0) {
+    const length = query[offset++];
+    labels.push(query.subarray(offset, offset + length).toString());
+    offset += length;
+  }
+  return {
+    name: labels.join("."),
+    type: query.readUInt16BE(offset + 1),
+    end: offset + 5,
+  };
+}
+
+function dnsAnswer(type: number, data: Buffer) {
+  const answer = Buffer.alloc(12);
+  answer.writeUInt16BE(0xc00c, 0);
+  answer.writeUInt16BE(type, 2);
+  answer.writeUInt16BE(1, 4);
+  answer.writeUInt32BE(60, 6);
+  answer.writeUInt16BE(data.length, 10);
+  return Buffer.concat([answer, data]);
+}
+
+function dnsResponse(query: Buffer, answers: Buffer[], responseCode = 0) {
+  const { end } = readQuestion(query);
+  const header = Buffer.alloc(12);
+  header.writeUInt16BE(query.readUInt16BE(0), 0);
+  header.writeUInt16BE(0x8180 | responseCode, 2);
+  header.writeUInt16BE(1, 4);
+  header.writeUInt16BE(answers.length, 6);
+  return Buffer.concat([header, query.subarray(12, end), ...answers]);
+}
+
+function characterString(value: string) {
+  const bytes = Buffer.from(value);
+  return Buffer.concat([Buffer.from([bytes.length]), bytes]);
+}
+
+function fixtureDnsTarget(hostname: string, port?: number) {
+  const path = port === undefined ? hostname : `${hostname}:${port}`;
+  return parseUri(`dns://${fixtureServer}/${path}`)!;
+}
 
 function hasMatchingAddress(endpointList: Endpoint[], expectedAddress: SubchannelAddress): boolean {
   for (const endpoint of endpointList) {
@@ -47,19 +102,47 @@ function hasMatchingAddress(endpointList: Endpoint[], expectedAddress: Subchanne
 }
 
 describe("Name Resolver", () => {
-  before(() => {
+  before(async () => {
+    dnsServer = createSocket("udp4");
+    dnsServer.on("message", (query, remote) => {
+      const question = readQuestion(query);
+      const missing = question.name === "missing.fixture.test";
+      let data: Buffer | null = null;
+      if (!missing && question.type === recordTypes.A) {
+        data = Buffer.from([127, 0, 0, 1]);
+      } else if (
+        !missing &&
+        question.type === recordTypes.AAAA &&
+        ["localhost", "dual-stack.fixture.test", "ipv6.fixture.test"].includes(question.name)
+      ) {
+        data = Buffer.from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+      } else if (!missing && question.type === recordTypes.TXT && question.name === "service-config.fixture.test") {
+        data = characterString(
+          'grpc_config=[{"serviceConfig":{"loadBalancingPolicy":"round_robin","methodConfig":[{"name":[{"service":"MyService","method":"Foo"}],"waitForReady":true}]}}]',
+        );
+      }
+      const answers = data === null ? [] : [dnsAnswer(question.type, data)];
+      dnsServer.send(dnsResponse(query, answers, missing ? 3 : 0), remote.port, remote.address);
+    });
+    await new Promise<void>((resolve, reject) => {
+      dnsServer.once("error", reject);
+      dnsServer.bind(0, "127.0.0.1", resolve);
+    });
+    fixtureServer = `127.0.0.1:${dnsServer.address().port}`;
+
     resolver_dns.setup();
     resolver_uds.setup();
     resolver_ip.setup();
   });
+
+  afterAll(async () => {
+    await new Promise<void>(resolve => dnsServer.close(() => resolve()));
+  });
+
   describe("DNS Names", function () {
-    // For some reason DNS queries sometimes take a long time on Windows
     it("Should resolve localhost properly", function (done) {
-      if (GRPC_NODE_USE_ALTERNATIVE_RESOLVER) {
-        this.skip();
-      }
-      const target = resolverManager.mapUriDefaultScheme(parseUri("localhost:50051")!)!;
-      const listener: resolverManager.ResolverListener = {
+      const target = fixtureDnsTarget("localhost", 50051);
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -68,9 +151,7 @@ describe("Name Resolver", () => {
           // Only handle the first resolution result
           listener.onSuccessfulResolution = () => {};
           assert(hasMatchingAddress(endpointList, { host: "127.0.0.1", port: 50051 }));
-          if (isIPv6()) {
-            assert(hasMatchingAddress(endpointList, { host: "::1", port: 50051 }));
-          }
+          assert(hasMatchingAddress(endpointList, { host: "::1", port: 50051 }));
           done();
         },
         onError: (error: StatusObject) => {
@@ -81,11 +162,8 @@ describe("Name Resolver", () => {
       resolver.updateResolution();
     });
     it("Should default to port 443", function (done) {
-      if (GRPC_NODE_USE_ALTERNATIVE_RESOLVER) {
-        this.skip();
-      }
-      const target = resolverManager.mapUriDefaultScheme(parseUri("localhost")!)!;
-      const listener: resolverManager.ResolverListener = {
+      const target = fixtureDnsTarget("localhost");
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -94,9 +172,7 @@ describe("Name Resolver", () => {
           // Only handle the first resolution result
           listener.onSuccessfulResolution = () => {};
           assert(hasMatchingAddress(endpointList, { host: "127.0.0.1", port: 443 }));
-          if (isIPv6()) {
-            assert(hasMatchingAddress(endpointList, { host: "::1", port: 443 }));
-          }
+          assert(hasMatchingAddress(endpointList, { host: "::1", port: 443 }));
           done();
         },
         onError: (error: StatusObject) => {
@@ -108,7 +184,7 @@ describe("Name Resolver", () => {
     });
     it("Should correctly represent an ipv4 address", done => {
       const target = resolverManager.mapUriDefaultScheme(parseUri("1.2.3.4")!)!;
-      const listener: resolverManager.ResolverListener = {
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -128,7 +204,7 @@ describe("Name Resolver", () => {
     });
     it("Should correctly represent an ipv6 address", done => {
       const target = resolverManager.mapUriDefaultScheme(parseUri("::1")!)!;
-      const listener: resolverManager.ResolverListener = {
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -148,7 +224,7 @@ describe("Name Resolver", () => {
     });
     it("Should correctly represent a bracketed ipv6 address", done => {
       const target = resolverManager.mapUriDefaultScheme(parseUri("[::1]:50051")!)!;
-      const listener: resolverManager.ResolverListener = {
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -166,9 +242,9 @@ describe("Name Resolver", () => {
       const resolver = resolverManager.createResolver(target, listener, {});
       resolver.updateResolution();
     });
-    it("Should resolve a public address", done => {
-      const target = resolverManager.mapUriDefaultScheme(parseUri("example.com")!)!;
-      const listener: resolverManager.ResolverListener = {
+    it("Should resolve a DNS address", done => {
+      const target = fixtureDnsTarget("address.fixture.test");
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -186,12 +262,9 @@ describe("Name Resolver", () => {
       const resolver = resolverManager.createResolver(target, listener, {});
       resolver.updateResolution();
     });
-    // Created DNS TXT record using TXT sample from https://github.com/grpc/proposal/blob/master/A2-service-configs-in-dns.md
-    // "grpc_config=[{\"serviceConfig\":{\"loadBalancingPolicy\":\"round_robin\",\"methodConfig\":[{\"name\":[{\"service\":\"MyService\",\"method\":\"Foo\"}],\"waitForReady\":true}]}}]"
-    // Skipped: grpctest.kleinsch.com is no longer available (upstream grpc-node also skips this)
-    it.skip("Should resolve a name with TXT service config", done => {
-      const target = resolverManager.mapUriDefaultScheme(parseUri("grpctest.kleinsch.com")!)!;
-      const listener: resolverManager.ResolverListener = {
+    it("Should resolve a name with TXT service config", done => {
+      const target = fixtureDnsTarget("service-config.fixture.test");
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -209,11 +282,10 @@ describe("Name Resolver", () => {
       const resolver = resolverManager.createResolver(target, listener, {});
       resolver.updateResolution();
     });
-    // Skipped: grpctest.kleinsch.com is no longer available (upstream grpc-node also skips this)
-    it.skip("Should not resolve TXT service config if we disabled service config", done => {
-      const target = resolverManager.mapUriDefaultScheme(parseUri("grpctest.kleinsch.com")!)!;
+    it("Should not resolve TXT service config if we disabled service config", done => {
+      const target = fixtureDnsTarget("service-config.fixture.test");
       let count = 0;
-      const listener: resolverManager.ResolverListener = {
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -235,17 +307,9 @@ describe("Name Resolver", () => {
         done();
       }, 2_000);
     });
-    /* The DNS entry for loopback4.unittest.grpc.io only has a single A record
-     * with the address 127.0.0.1, but the Mac DNS resolver appears to use
-     * NAT64 to create an IPv6 address in that case, so it instead returns
-     * 64:ff9b::7f00:1. Handling that kind of translation is outside of the
-     * scope of this test, so we are skipping it. The test primarily exists
-     * as a regression test for https://github.com/grpc/grpc-node/issues/1044,
-     * and the test 'Should resolve gRPC interop servers' tests the same thing.
-     */
     it("Should resolve a name with multiple dots", done => {
-      const target = resolverManager.mapUriDefaultScheme(parseUri("loopback4.unittest.grpc.io")!)!;
-      const listener: resolverManager.ResolverListener = {
+      const target = fixtureDnsTarget("multiple.dots.fixture.test");
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -266,11 +330,9 @@ describe("Name Resolver", () => {
       const resolver = resolverManager.createResolver(target, listener, {});
       resolver.updateResolution();
     });
-    /* TODO(murgatroid99): re-enable this test, once we can get the IPv6 result
-     * consistently */
-    it.skip("Should resolve a DNS name to an IPv6 address", done => {
-      const target = resolverManager.mapUriDefaultScheme(parseUri("loopback6.unittest.grpc.io")!)!;
-      const listener: resolverManager.ResolverListener = {
+    it("Should resolve a DNS name to an IPv6 address", done => {
+      const target = fixtureDnsTarget("ipv6.fixture.test");
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -288,12 +350,9 @@ describe("Name Resolver", () => {
       const resolver = resolverManager.createResolver(target, listener, {});
       resolver.updateResolution();
     });
-    /* This DNS name resolves to only the IPv4 address on Windows, and only the
-     * IPv6 address on Mac. There is no result that we can consistently test
-     * for here. */
     it("Should resolve a DNS name to IPv4 and IPv6 addresses", done => {
-      const target = resolverManager.mapUriDefaultScheme(parseUri("loopback46.unittest.grpc.io")!)!;
-      const listener: resolverManager.ResolverListener = {
+      const target = fixtureDnsTarget("dual-stack.fixture.test");
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -305,8 +364,10 @@ describe("Name Resolver", () => {
             hasMatchingAddress(endpointList, { host: "127.0.0.1", port: 443 }),
             `None of [${endpointList.map(addr => endpointToString(addr))}] matched '127.0.0.1:443'`,
           );
-          /* TODO(murgatroid99): check for IPv6 result, once we can get that
-           * consistently */
+          assert(
+            hasMatchingAddress(endpointList, { host: "::1", port: 443 }),
+            `None of [${endpointList.map(addr => endpointToString(addr))}] matched '[::1]:443'`,
+          );
           done();
         },
         onError: (error: StatusObject) => {
@@ -317,10 +378,8 @@ describe("Name Resolver", () => {
       resolver.updateResolution();
     });
     it("Should resolve a name with a hyphen", done => {
-      /* TODO(murgatroid99): Find or create a better domain name to test this with.
-       * This is just the first one I found with a hyphen. */
-      const target = resolverManager.mapUriDefaultScheme(parseUri("network-tools.com")!)!;
-      const listener: resolverManager.ResolverListener = {
+      const target = fixtureDnsTarget("name-with-hyphen.fixture.test");
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -344,9 +403,9 @@ describe("Name Resolver", () => {
      * unless there is another test for the same issue. */
     it("Should resolve gRPC interop servers", done => {
       let completeCount = 0;
-      const target1 = resolverManager.mapUriDefaultScheme(parseUri("grpc-test.sandbox.googleapis.com")!)!;
-      const target2 = resolverManager.mapUriDefaultScheme(parseUri("grpc-test4.sandbox.googleapis.com")!)!;
-      const listener: resolverManager.ResolverListener = {
+      const target1 = fixtureDnsTarget("grpc-test.sandbox.fixture.test");
+      const target2 = fixtureDnsTarget("grpc-test4.sandbox.fixture.test");
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -369,13 +428,10 @@ describe("Name Resolver", () => {
       const resolver2 = resolverManager.createResolver(target2, listener, {});
       resolver2.updateResolution();
     });
-    it.todo(
+    it(
       "should not keep repeating successful resolutions",
       function (done) {
-        if (GRPC_NODE_USE_ALTERNATIVE_RESOLVER) {
-          this.skip();
-        }
-        const target = resolverManager.mapUriDefaultScheme(parseUri("localhost")!)!;
+        const target = fixtureDnsTarget("localhost");
         let resultCount = 0;
         const resolver = resolverManager.createResolver(
           target,
@@ -407,7 +463,7 @@ describe("Name Resolver", () => {
       15_000,
     );
     it("should not keep repeating failed resolutions", done => {
-      const target = resolverManager.mapUriDefaultScheme(parseUri("host.invalid")!)!;
+      const target = fixtureDnsTarget("missing.fixture.test");
       let resultCount = 0;
       let doneCalled = false;
       const resolver = resolverManager.createResolver(
@@ -448,7 +504,7 @@ describe("Name Resolver", () => {
   describe("UDS Names", () => {
     it("Should handle a relative Unix Domain Socket name", done => {
       const target = resolverManager.mapUriDefaultScheme(parseUri("unix:socket")!)!;
-      const listener: resolverManager.ResolverListener = {
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -468,7 +524,7 @@ describe("Name Resolver", () => {
     });
     it("Should handle an absolute Unix Domain Socket name", done => {
       const target = resolverManager.mapUriDefaultScheme(parseUri("unix:///tmp/socket")!)!;
-      const listener: resolverManager.ResolverListener = {
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -490,7 +546,7 @@ describe("Name Resolver", () => {
   describe("IP Addresses", () => {
     it("should handle one IPv4 address with no port", done => {
       const target = resolverManager.mapUriDefaultScheme(parseUri("ipv4:127.0.0.1")!)!;
-      const listener: resolverManager.ResolverListener = {
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -510,7 +566,7 @@ describe("Name Resolver", () => {
     });
     it("should handle one IPv4 address with a port", done => {
       const target = resolverManager.mapUriDefaultScheme(parseUri("ipv4:127.0.0.1:50051")!)!;
-      const listener: resolverManager.ResolverListener = {
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -530,7 +586,7 @@ describe("Name Resolver", () => {
     });
     it("should handle multiple IPv4 addresses with different ports", done => {
       const target = resolverManager.mapUriDefaultScheme(parseUri("ipv4:127.0.0.1:50051,127.0.0.1:50052")!)!;
-      const listener: resolverManager.ResolverListener = {
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -551,7 +607,7 @@ describe("Name Resolver", () => {
     });
     it("should handle one IPv6 address with no port", done => {
       const target = resolverManager.mapUriDefaultScheme(parseUri("ipv6:::1")!)!;
-      const listener: resolverManager.ResolverListener = {
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -571,7 +627,7 @@ describe("Name Resolver", () => {
     });
     it("should handle one IPv6 address with a port", done => {
       const target = resolverManager.mapUriDefaultScheme(parseUri("ipv6:[::1]:50051")!)!;
-      const listener: resolverManager.ResolverListener = {
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -591,7 +647,7 @@ describe("Name Resolver", () => {
     });
     it("should handle multiple IPv6 addresses with different ports", done => {
       const target = resolverManager.mapUriDefaultScheme(parseUri("ipv6:[::1]:50051,[::1]:50052")!)!;
-      const listener: resolverManager.ResolverListener = {
+      const listener: ResolverManager.ResolverListener = {
         onSuccessfulResolution: (
           endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
@@ -612,7 +668,7 @@ describe("Name Resolver", () => {
     });
   });
   describe("getDefaultAuthority", () => {
-    class OtherResolver implements resolverManager.Resolver {
+    class OtherResolver implements ResolverManager.Resolver {
       updateResolution() {
         return [];
       }
@@ -627,7 +683,6 @@ describe("Name Resolver", () => {
     it("Should return the correct authority if a different resolver has been registered", () => {
       resolverManager.registerResolver("other", OtherResolver);
       const target = resolverManager.mapUriDefaultScheme(parseUri("other:name")!)!;
-      console.log(target);
 
       const authority = resolverManager.getDefaultAuthority(target);
       assert.equal(authority, "other");

@@ -4,8 +4,8 @@ import { isWindows, withoutAggressiveGC } from "harness";
 import { isIP, isIPv4, isIPv6 } from "node:net";
 
 const backends = ["system", "libc", "c-ares"];
-const validHostnames = ["localhost", "example.com"];
-const invalidHostnames = ["adsfa.asdfasdf.asdf.com"]; // known invalid
+const validHostnames = ["localhost", "LOCALHOST"];
+const invalidHostnames = ["does-not-exist.invalid"];
 const malformedHostnames = [" ", ".", " .", "localhost:80", "this is not a hostname"];
 
 describe("dns", () => {
