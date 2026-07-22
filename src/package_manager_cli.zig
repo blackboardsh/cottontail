@@ -2088,6 +2088,7 @@ const Manager = struct {
     records: std.array_list.Managed(PackageRecord),
     workspaces: std.StringHashMap(Workspace),
     root_versions: std.StringHashMap([]const u8),
+    initial_root_versions: std.StringHashMap([]const u8),
     resolving: std.StringHashMap(void),
     expanded_lock_packages: std.StringHashMap(void),
     registry_manifests: std.StringHashMap(*Value),
@@ -2157,6 +2158,7 @@ const Manager = struct {
             .records = std.array_list.Managed(PackageRecord).init(allocator),
             .workspaces = std.StringHashMap(Workspace).init(allocator),
             .root_versions = std.StringHashMap([]const u8).init(allocator),
+            .initial_root_versions = std.StringHashMap([]const u8).init(allocator),
             .resolving = std.StringHashMap(void).init(allocator),
             .expanded_lock_packages = std.StringHashMap(void).init(allocator),
             .registry_manifests = std.StringHashMap(*Value).init(allocator),
@@ -2192,6 +2194,7 @@ const Manager = struct {
 
     fn deinit(manager: *Manager) void {
         manager.registry_scopes.deinit();
+        manager.initial_root_versions.deinit();
         manager.refreshed_update_manifests.deinit();
         manager.registry_manifest_failures.deinit();
         manager.registry_manifests.deinit();
@@ -2394,12 +2397,14 @@ const Manager = struct {
         }
 
         try manager.validateCatalogReferences(&root);
+        try manager.captureInitialRootVersions(&root);
         try manager.prepareNodeModules();
         try manager.reserveWorkspaceRootVersions();
         if (manager.options.command == .install and manager.security_scanner == null) {
             // Network prefetch is opportunistic. The normal resolver remains the
             // source of diagnostics and retries if a speculative request fails.
             manager.prefetchInstallNetwork(&root) catch {};
+            try manager.reserveDirectRootVersions(&root);
         }
 
         switch (manager.options.command) {
@@ -5570,6 +5575,9 @@ const Manager = struct {
         for (dependencies.object.keys(), dependencies.object.values()) |alias, spec_value| {
             if (spec_value != .string) continue;
             if (std.mem.eql(u8, key, "dependencies") and objectSectionContains(package_json, "optionalDependencies", alias)) continue;
+            if (std.mem.eql(u8, key, "dependencies") and direct and
+                !manager.options.production and !manager.options.omit_dev and
+                objectSectionContains(package_json, "devDependencies", alias)) continue;
             if (std.mem.eql(u8, key, "dependencies") and packageDependencyIsBundled(package_json, alias)) continue;
             if (std.mem.eql(u8, key, "peerDependencies") and
                 (objectSectionContains(package_json, "dependencies", alias) or
@@ -5579,7 +5587,6 @@ const Manager = struct {
             const optional_peer = std.mem.eql(u8, key, "peerDependencies") and peerDependencyIsOptional(package_json, alias);
             if (optional_peer) continue;
             const edge_optional = optional;
-            const installed_before = manager.installed_count;
             const resolved_version = manager.installDependency(alias, spec_value.string, parent_dir, direct, edge_optional) catch |err| {
                 if (manager.options.command == .link and !direct and err == error.MissingPackageJSON) continue;
                 if (edge_optional) continue;
@@ -5594,7 +5601,7 @@ const Manager = struct {
                 !manager.explicit_adds.contains(alias);
             if (should_report and
                 (manager.options.dry_run or
-                    manager.installed_count > installed_before or
+                    manager.directDependencyChanged(alias, resolved_version) or
                     manager.options.command == .remove or
                     (workspace_display != null and manager.lock_graph == null)) and
                 !manager.options.silent)
@@ -5714,6 +5721,17 @@ const Manager = struct {
         return Manifest.Policy.wasTrustedInLock(&graph.document, package_name, loaded_defaults_apply);
     }
 
+    fn directDependencyWasAdded(manager: *const Manager, alias: []const u8) bool {
+        const graph = if (manager.lock_graph) |*value| value else return true;
+        return graph.rootDependencySpec(alias) == null;
+    }
+
+    fn directDependencyChanged(manager: *const Manager, alias: []const u8, resolved_version: []const u8) bool {
+        if (manager.directDependencyWasAdded(alias)) return true;
+        const initial = manager.initial_root_versions.get(alias) orelse return true;
+        return !std.mem.eql(u8, initial, resolved_version);
+    }
+
     fn installDependency(
         manager: *Manager,
         alias: []const u8,
@@ -5757,6 +5775,11 @@ const Manager = struct {
             } else alias;
             for (manager.records.items) |record| {
                 if (std.mem.eql(u8, record.alias, alias) and std.mem.eql(u8, recordLogicalKey(record), direct_key)) {
+                    if (record.kind == .npm) {
+                        const registry_name, const registry_spec = parseNpmAlias(alias, resolution_spec);
+                        if (!std.mem.eql(u8, record.name, registry_name) or
+                            !semverSatisfies(manager.allocator, registry_spec, record.version)) continue;
+                    }
                     const npm_package = record.kind == .npm;
                     const newly_trusted = manager.manifest_policy.?.isTrusted(alias, npm_package) and
                         !manager.packageWasTrustedInLoadedLock(alias, npm_package);
@@ -5891,6 +5914,13 @@ const Manager = struct {
         }
 
         const registry_name, const registry_spec = parseNpmAlias(alias, resolution_spec);
+        const selected_registry_spec = if (!direct)
+            if (manager.root_versions.get(alias)) |root_version|
+                if (semverSatisfies(manager.allocator, registry_spec, root_version)) root_version else registry_spec
+            else
+                registry_spec
+        else
+            registry_spec;
         const cycle_key = try std.fmt.allocPrint(manager.allocator, "{s}@{s}", .{ registry_name, registry_spec });
         if (manager.resolving.contains(cycle_key)) {
             if (manager.node_linker == .isolated) {
@@ -5920,7 +5950,7 @@ const Manager = struct {
             if (try manager.findInstalledVersion(alias, resolution_spec, parent_dir, direct, protocol_patch_paths)) |installed| return installed;
         }
 
-        const resolved = manager.resolveRegistryPackage(registry_name, registry_spec) catch |err| {
+        const resolved = manager.resolveRegistryPackage(registry_name, selected_registry_spec) catch |err| {
             if (err == error.InvalidRegistryURL or err == error.UnsupportedRegistryScheme) {
                 const configured = manager.registryConfigForPackage(registry_name);
                 const source_url = configured.source_url orelse configured.url;
@@ -6122,6 +6152,14 @@ const Manager = struct {
                     if (try manager.lockedSelectionMatchesRootDependency(package, alias, parent_dir, base)) {
                         return .{ .package = package, .destination = destination };
                     }
+                    if (std.mem.eql(u8, base, manager.root_dir) and
+                        !std.mem.eql(u8, parent_dir, manager.root_dir))
+                    {
+                        return .{
+                            .package = package,
+                            .destination = try packageDestination(manager.allocator, parent_dir, alias),
+                        };
+                    }
                 }
             }
             if (std.mem.eql(u8, base, manager.root_dir)) break;
@@ -6229,7 +6267,7 @@ const Manager = struct {
         const record_key = if (manager.node_linker == .isolated)
             try manager.dependencyLockKey(parent_dir, alias)
         else
-            package.key;
+            try manager.lockKeyForDestination(selection.destination);
         if (manager.node_linker == .isolated and package.kind != .workspace) {
             try manager.trackIsolatedPlacement(try manager.packagePlacementFromLock(package, selection.peer_context));
             _ = try manager.peerContextForPackage(package.info, parent_dir, true);
@@ -8326,11 +8364,15 @@ const Manager = struct {
     fn rootDependencySpec(manager: *Manager, alias: []const u8) ?[]const u8 {
         const root = manager.root_package_json orelse return null;
         if (root.* != .object) return null;
-        for (all_dependency_sections) |section_name| {
-            const section = root.object.get(section_name) orelse continue;
-            if (section != .object) continue;
-            const value = section.object.get(alias) orelse continue;
-            if (value == .string) return value.string;
+        if (!manager.options.omit_optional) {
+            if (dependencySpecInSection(root, "optionalDependencies", alias)) |spec| return spec;
+        }
+        if (!manager.options.production and !manager.options.omit_dev) {
+            if (dependencySpecInSection(root, "devDependencies", alias)) |spec| return spec;
+        }
+        if (dependencySpecInSection(root, "dependencies", alias)) |spec| return spec;
+        if (!manager.options.omit_peer) {
+            if (dependencySpecInSection(root, "peerDependencies", alias)) |spec| return spec;
         }
         return null;
     }
@@ -9698,6 +9740,89 @@ const Manager = struct {
             try manager.root_versions.put(
                 try manager.allocator.dupe(u8, workspace.name),
                 try manager.allocator.dupe(u8, workspace.version),
+            );
+        }
+    }
+
+    fn captureInitialRootVersions(manager: *Manager, root: *const Value) !void {
+        if (root.* != .object or manager.options.lockfile_only or manager.options.dry_run) return;
+        for (all_dependency_sections) |section_name| {
+            const section = root.object.get(section_name) orelse continue;
+            if (section != .object) continue;
+            for (section.object.keys()) |alias| {
+                if (manager.initial_root_versions.contains(alias)) continue;
+                const destination = try packageDestination(manager.allocator, manager.root_dir, alias);
+                const package_json = manager.readInstalledPackageJSON(destination) catch continue;
+                const installed_version = jsonString(package_json, "version") orelse continue;
+                try manager.initial_root_versions.put(
+                    try manager.allocator.dupe(u8, alias),
+                    try manager.allocator.dupe(u8, installed_version),
+                );
+            }
+        }
+    }
+
+    fn reserveDirectRootVersions(manager: *Manager, root: *const Value) !void {
+        if (manager.node_linker != .hoisted or root.* != .object) return;
+
+        // COTTONTAIL-COMPAT: Bun resolves the complete graph before hoisting.
+        // Reserve direct selections up front so recursive resolution cannot
+        // occupy the root with a different, merely compatible version.
+        if (!manager.options.omit_optional) {
+            try manager.reserveDirectRootDependencySection(root, "optionalDependencies");
+        }
+        if (!manager.options.production and !manager.options.omit_dev) {
+            try manager.reserveDirectRootDependencySection(root, "devDependencies");
+        }
+        try manager.reserveDirectRootDependencySection(root, "dependencies");
+        if (!manager.options.omit_peer) {
+            try manager.reserveDirectRootDependencySection(root, "peerDependencies");
+        }
+    }
+
+    fn reserveDirectRootDependencySection(
+        manager: *Manager,
+        root: *const Value,
+        section_name: []const u8,
+    ) !void {
+        const section = root.object.get(section_name) orelse return;
+        if (section != .object) return;
+
+        for (section.object.keys(), section.object.values()) |alias, spec_value| {
+            if (spec_value != .string or manager.root_versions.contains(alias)) continue;
+            var workspace_package = manager.isWorkspaceDependency(alias, spec_value.string);
+            const effective_spec = manager.manifest_policy.?.resolveDependency(
+                alias,
+                spec_value.string,
+                workspace_package,
+            ) catch continue;
+            if (!workspace_package) workspace_package = manager.isWorkspaceDependency(alias, effective_spec);
+            const resolution_spec = if (Patch.Spec.parseProtocol(manager.allocator, alias, effective_spec) catch null) |protocol|
+                protocol.base_spec
+            else
+                effective_spec;
+            if (workspace_package or isGitSpec(resolution_spec) or isTarballSpec(resolution_spec) or
+                isLocalSpec(resolution_spec)) continue;
+
+            const registry_name, const registry_spec = parseNpmAlias(alias, resolution_spec);
+            if (manager.lock_graph) |*graph| {
+                if (graph.get(alias)) |package| {
+                    if (package.kind == .npm and std.mem.eql(u8, package.name, registry_name) and
+                        semverSatisfies(manager.allocator, registry_spec, package.version))
+                    {
+                        try manager.root_versions.put(
+                            try manager.allocator.dupe(u8, alias),
+                            try manager.allocator.dupe(u8, package.version),
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            const resolved = manager.resolveRegistryPackage(registry_name, registry_spec) catch continue;
+            try manager.root_versions.put(
+                try manager.allocator.dupe(u8, alias),
+                try manager.allocator.dupe(u8, resolved.version),
             );
         }
     }
@@ -11196,6 +11321,14 @@ fn objectSectionContains(value: *const Value, section_name: []const u8, key: []c
     if (value.* != .object) return false;
     const section = value.object.get(section_name) orelse return false;
     return section == .object and section.object.get(key) != null;
+}
+
+fn dependencySpecInSection(value: *const Value, section_name: []const u8, key: []const u8) ?[]const u8 {
+    if (value.* != .object) return null;
+    const section = value.object.get(section_name) orelse return null;
+    if (section != .object) return null;
+    const spec = section.object.get(key) orelse return null;
+    return if (spec == .string) spec.string else null;
 }
 
 fn packageHasBundledDependencies(value: *const Value) bool {
