@@ -28218,8 +28218,6 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     JSValueProtect(ctx, host);
 
     ct_register_host_native_bindings(ctx, host, runtime);
-    ct_install_function(ctx, host, "nativeBundlerPluginValidate", ct_native_bundler_plugin_validate, runtime);
-    ct_install_function(ctx, host, "nativeBundlerPluginRun", ct_native_bundler_plugin_run, runtime);
     JSObjectRef args = ct_make_array(ctx, 0, NULL, &exception);
     ct_set_property(ctx, host, "args", args, &exception);
 #if defined(COTTONTAIL_VENDORED_JSC)
