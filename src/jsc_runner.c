@@ -77,9 +77,11 @@ extern void JSGlobalContextSetUnhandledRejectionCallback(
 #include <limits.h>
 #if defined(__APPLE__)
 #include <malloc/malloc.h>
+#include <mach-o/dyld.h>
 #endif
 #include <math.h>
 #if !defined(_WIN32)
+#include <execinfo.h>
 #include <netdb.h>
 #include <net/if.h>
 #include <netinet/in.h>
@@ -152,6 +154,7 @@ typedef unsigned int gid_t;
 #elif defined(__linux__)
 #include <linux/fs.h>
 #include <netpacket/packet.h>
+#include <sys/syscall.h>
 #include <sys/statvfs.h>
 #elif !defined(_WIN32)
 #include <sys/statvfs.h>
@@ -1674,6 +1677,8 @@ struct CtJscRuntime {
     uint64_t next_vm_context_id;
     uint64_t spawn_sync_blocking_count;
     uint64_t spawn_memfd_count;
+    uint64_t start_time_ns;
+    uint64_t uv_poll_count;
     bool next_tick_pending;
     bool next_tick_priority_armed;
     bool fatal_exception_routed;
@@ -1692,6 +1697,11 @@ static void ct_uv_wait_timer_callback(uv_timer_t *handle) {
     (void)handle;
 }
 
+static int ct_runtime_uv_run(CtJscRuntime *runtime, uv_run_mode mode) {
+    runtime->uv_poll_count += 1;
+    return uv_run(&runtime->uv_loop, mode);
+}
+
 static void ct_runtime_wake(CtJscRuntime *runtime) {
     if (runtime == NULL) return;
     if (runtime->uv_wake_initialized) (void)uv_async_send(&runtime->uv_wake);
@@ -1704,12 +1714,12 @@ static void ct_napi_wake(void *opaque) {
 static void ct_runtime_wait(CtJscRuntime *runtime, int delay_ms) {
     if (runtime == NULL || !runtime->uv_loop_initialized) return;
     if (delay_ms <= 0) {
-        (void)uv_run(&runtime->uv_loop, UV_RUN_NOWAIT);
+        (void)ct_runtime_uv_run(runtime, UV_RUN_NOWAIT);
         return;
     }
     if (!runtime->uv_wait_timer_initialized) return;
     if (uv_timer_start(&runtime->uv_wait_timer, ct_uv_wait_timer_callback, (uint64_t)delay_ms, 0) != 0) return;
-    (void)uv_run(&runtime->uv_loop, UV_RUN_ONCE);
+    (void)ct_runtime_uv_run(runtime, UV_RUN_ONCE);
     (void)uv_timer_stop(&runtime->uv_wait_timer);
 }
 
@@ -1730,7 +1740,7 @@ fail:
     if (runtime->uv_wake_initialized) {
         runtime->uv_wake_initialized = false;
         uv_close((uv_handle_t *)&runtime->uv_wake, NULL);
-        (void)uv_run(&runtime->uv_loop, UV_RUN_DEFAULT);
+        (void)ct_runtime_uv_run(runtime, UV_RUN_DEFAULT);
     }
     runtime->uv_loop_initialized = false;
     (void)uv_loop_close(&runtime->uv_loop);
@@ -1818,12 +1828,12 @@ static void ct_runtime_uv_shutdown(CtJscRuntime *runtime) {
             uv_close((uv_handle_t *)&runtime->uv_wake, NULL);
         }
     }
-    (void)uv_run(&runtime->uv_loop, UV_RUN_NOWAIT);
+    (void)ct_runtime_uv_run(runtime, UV_RUN_NOWAIT);
 
     int close_status = uv_loop_close(&runtime->uv_loop);
     if (close_status == UV_EBUSY) {
         uv_walk(&runtime->uv_loop, ct_uv_close_walk, NULL);
-        (void)uv_run(&runtime->uv_loop, UV_RUN_DEFAULT);
+        (void)ct_runtime_uv_run(runtime, UV_RUN_DEFAULT);
         close_status = uv_loop_close(&runtime->uv_loop);
     }
     if (close_status != 0) {
@@ -8364,6 +8374,15 @@ static uint64_t ct_timer_now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
+static JSValueRef ct_timer_clock_ms(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    (void)exception;
+    return JSValueMakeNumber(ctx, (double)ct_timer_now_ns() / 1000000.0);
+}
+
 static uint64_t ct_timer_ms_to_ns(double milliseconds) {
     if (!isfinite(milliseconds) || milliseconds <= 0) return 0;
     if (milliseconds >= (double)(UINT64_MAX / 1000000ULL)) return UINT64_MAX;
@@ -14029,35 +14048,20 @@ static double ct_current_rss_bytes(void) {
 }
 
 static double ct_total_memory_bytes(void) {
-#if defined(__APPLE__) || defined(__MACH__)
-    uint64_t value = 0;
-    size_t len = sizeof(value);
-    if (sysctlbyname("hw.memsize", &value, &len, NULL, 0) == 0) return (double)value;
-#endif
-#if defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
-    long pages = sysconf(_SC_PHYS_PAGES);
-    long page_size = sysconf(_SC_PAGESIZE);
-    if (pages > 0 && page_size > 0) return (double)pages * (double)page_size;
-#endif
-    return 0;
+    return (double)uv_get_total_memory();
+}
+
+static double ct_free_memory_bytes(void) {
+    return (double)uv_get_free_memory();
 }
 
 static double ct_available_memory_bytes(void) {
-#if defined(__linux__) && defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGESIZE)
-    long pages = sysconf(_SC_AVPHYS_PAGES);
-    long page_size = sysconf(_SC_PAGESIZE);
-    if (pages > 0 && page_size > 0) return (double)pages * (double)page_size;
-#elif defined(__APPLE__) || defined(__MACH__)
-    vm_statistics64_data_t stats;
-    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&stats, &count) == KERN_SUCCESS) {
-        vm_size_t page_size = 0;
-        host_page_size(mach_host_self(), &page_size);
-        uint64_t pages = (uint64_t)stats.free_count + (uint64_t)stats.inactive_count;
-        return (double)pages * (double)(page_size > 0 ? page_size : 4096);
-    }
-#endif
-    return ct_total_memory_bytes();
+    uint64_t available = uv_get_available_memory();
+    return (double)(available > 0 ? available : uv_get_free_memory());
+}
+
+static double ct_constrained_memory_bytes(void) {
+    return (double)uv_get_constrained_memory();
 }
 
 static JSObjectRef ct_rusage_object(JSContextRef ctx, const struct rusage *usage, JSValueRef *exception) {
@@ -14080,6 +14084,580 @@ static JSObjectRef ct_rusage_object(JSContextRef ctx, const struct rusage *usage
     ct_set_property(ctx, result, "signalsCount", JSValueMakeNumber(ctx, (double)usage->ru_nsignals), exception);
     ct_set_property(ctx, result, "voluntaryContextSwitches", JSValueMakeNumber(ctx, (double)usage->ru_nvcsw), exception);
     ct_set_property(ctx, result, "involuntaryContextSwitches", JSValueMakeNumber(ctx, (double)usage->ru_nivcsw), exception);
+    return result;
+}
+
+static volatile sig_atomic_t ct_crash_handler_active = 0;
+static volatile sig_atomic_t ct_crash_reporting_suppressed = 0;
+
+#if !defined(_WIN32)
+static void ct_crash_write_all(const char *bytes, size_t length) {
+    while (length > 0) {
+        ssize_t written = write(STDERR_FILENO, bytes, length);
+        if (written > 0) {
+            bytes += written;
+            length -= (size_t)written;
+            continue;
+        }
+        if (written < 0 && errno == EINTR) continue;
+        break;
+    }
+}
+
+static const char *ct_crash_signal_name(int signal_number, size_t *length) {
+    switch (signal_number) {
+        case SIGABRT: *length = sizeof("SIGABRT") - 1; return "SIGABRT";
+        case SIGFPE: *length = sizeof("SIGFPE") - 1; return "SIGFPE";
+        case SIGILL: *length = sizeof("SIGILL") - 1; return "SIGILL";
+        case SIGSEGV: *length = sizeof("SIGSEGV") - 1; return "SIGSEGV";
+#if defined(SIGBUS)
+        case SIGBUS: *length = sizeof("SIGBUS") - 1; return "SIGBUS";
+#endif
+        default: *length = sizeof("unknown signal") - 1; return "unknown signal";
+    }
+}
+
+static void ct_crash_signal_handler(int signal_number, siginfo_t *info, void *context) {
+    (void)info;
+    (void)context;
+    if (!ct_crash_reporting_suppressed && !ct_crash_handler_active) {
+        ct_crash_handler_active = 1;
+        size_t signal_name_length = 0;
+        const char *signal_name = ct_crash_signal_name(signal_number, &signal_name_length);
+        ct_crash_write_all("cottontail: fatal runtime signal ", sizeof("cottontail: fatal runtime signal ") - 1);
+        ct_crash_write_all(signal_name, signal_name_length);
+        ct_crash_write_all("\nversion: " COTTONTAIL_VERSION "\nplatform: " CT_PLATFORM_STRING " " CT_ARCH_STRING "\n", sizeof("\nversion: " COTTONTAIL_VERSION "\nplatform: " CT_PLATFORM_STRING " " CT_ARCH_STRING "\n") - 1);
+    }
+
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = SIG_DFL;
+    sigemptyset(&action.sa_mask);
+    (void)sigaction(signal_number, &action, NULL);
+    sigset_t unblocked;
+    sigemptyset(&unblocked);
+    sigaddset(&unblocked, signal_number);
+    (void)sigprocmask(SIG_UNBLOCK, &unblocked, NULL);
+    (void)raise(signal_number);
+    _exit(128 + signal_number);
+}
+
+static pthread_once_t ct_crash_handler_once = PTHREAD_ONCE_INIT;
+
+static void ct_install_crash_handlers_once(void) {
+    static const int signals[] = {
+        SIGABRT,
+        SIGFPE,
+        SIGILL,
+        SIGSEGV,
+#if defined(SIGBUS)
+        SIGBUS,
+#endif
+    };
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_sigaction = ct_crash_signal_handler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    for (size_t index = 0; index < sizeof(signals) / sizeof(signals[0]); index += 1) {
+        (void)sigaction(signals[index], &action, NULL);
+    }
+}
+
+static void ct_install_crash_handlers(void) {
+    (void)pthread_once(&ct_crash_handler_once, ct_install_crash_handlers_once);
+}
+#else
+static LONG WINAPI ct_windows_unhandled_exception_filter(EXCEPTION_POINTERS *exception_info) {
+    if (!ct_crash_reporting_suppressed && !ct_crash_handler_active) {
+        ct_crash_handler_active = 1;
+        DWORD code = exception_info != NULL && exception_info->ExceptionRecord != NULL
+            ? exception_info->ExceptionRecord->ExceptionCode
+            : 0;
+        void *address = exception_info != NULL && exception_info->ExceptionRecord != NULL
+            ? exception_info->ExceptionRecord->ExceptionAddress
+            : NULL;
+        fprintf(stderr,
+                "cottontail: fatal runtime exception 0x%08lx at %p\nversion: %s\nplatform: %s %s\n",
+                (unsigned long)code, address, COTTONTAIL_VERSION, CT_PLATFORM_STRING, CT_ARCH_STRING);
+        fflush(stderr);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static INIT_ONCE ct_crash_handler_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK ct_install_crash_handlers_once(PINIT_ONCE once, PVOID parameter, PVOID *context) {
+    (void)once;
+    (void)parameter;
+    (void)context;
+    SetUnhandledExceptionFilter(ct_windows_unhandled_exception_filter);
+    return TRUE;
+}
+
+static void ct_install_crash_handlers(void) {
+    (void)InitOnceExecuteOnce(&ct_crash_handler_once, ct_install_crash_handlers_once, NULL, NULL);
+}
+#endif
+
+static void ct_write_fatal_diagnostic(const char *reason) {
+    fprintf(stderr, "cottontail: fatal runtime error: %s\nversion: %s\nplatform: %s %s\n",
+            reason, COTTONTAIL_VERSION, CT_PLATFORM_STRING, CT_ARCH_STRING);
+    fflush(stderr);
+}
+
+static JSValueRef ct_internal_crash(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "internalCrash(kind) requires a crash kind");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *kind = ct_value_to_string_copy(ctx, argv[0]);
+    if (kind == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    if (strcmp(kind, "segfault") == 0) {
+        free(kind);
+#if defined(_WIN32)
+        ct_write_fatal_diagnostic("segmentation fault");
+#endif
+        volatile uintptr_t *address = (volatile uintptr_t *)(uintptr_t)0xDEADBEEF;
+        *address = (uintptr_t)0xDEADBEEF;
+        abort();
+    }
+    if (strcmp(kind, "panic") == 0) {
+        free(kind);
+        ct_write_fatal_diagnostic("panic: invoked crash handler");
+        ct_crash_reporting_suppressed = 1;
+        abort();
+    }
+    if (strcmp(kind, "rootError") == 0) {
+        free(kind);
+        fprintf(stderr, "error: Test\n");
+        fflush(stderr);
+        _exit(1);
+    }
+    if (strcmp(kind, "outOfMemory") == 0) {
+        free(kind);
+        ct_write_fatal_diagnostic("out of memory");
+        ct_crash_reporting_suppressed = 1;
+        abort();
+    }
+    if (strcmp(kind, "raiseIgnoringPanicHandler") == 0) {
+        free(kind);
+        ct_crash_reporting_suppressed = 1;
+        (void)signal(SIGSEGV, SIG_DFL);
+        (void)raise(SIGSEGV);
+        _exit(128 + SIGSEGV);
+    }
+
+    ct_throw_message(ctx, exception, "Unknown internal crash kind");
+    free(kind);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_macho_image_zero_offset(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    (void)exception;
+#if defined(__APPLE__)
+    const struct mach_header *header = _dyld_get_image_header(0);
+    if (header == NULL) return JSValueMakeUndefined(ctx);
+    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+    return JSValueMakeNumber(ctx, (double)((uintptr_t)header - (uintptr_t)slide));
+#else
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+#if defined(_WIN32)
+static HANDLE ct_upgrade_temp_directory_handle = INVALID_HANDLE_VALUE;
+#endif
+
+static JSValueRef ct_upgrade_open_temp_directory(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)ctx;
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    (void)exception;
+#if defined(_WIN32)
+    WCHAR temp_path[MAX_PATH + 1];
+    DWORD length = GetTempPathW(MAX_PATH + 1, temp_path);
+    if (length == 0 || length > MAX_PATH) return JSValueMakeUndefined(ctx);
+    HANDLE handle = CreateFileW(
+        temp_path,
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        NULL
+    );
+    if (handle != INVALID_HANDLE_VALUE) {
+        if (ct_upgrade_temp_directory_handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(ct_upgrade_temp_directory_handle);
+        }
+        ct_upgrade_temp_directory_handle = handle;
+    }
+#endif
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_upgrade_close_temp_directory(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    (void)exception;
+#if defined(_WIN32)
+    if (ct_upgrade_temp_directory_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(ct_upgrade_temp_directory_handle);
+        ct_upgrade_temp_directory_handle = INVALID_HANDLE_VALUE;
+    }
+#endif
+    return JSValueMakeUndefined(ctx);
+}
+
+static uint64_t ct_current_thread_id(void) {
+#if defined(_WIN32)
+    return (uint64_t)GetCurrentThreadId();
+#elif defined(__APPLE__)
+    uint64_t thread_id = 0;
+    return pthread_threadid_np(NULL, &thread_id) == 0 ? thread_id : 0;
+#elif defined(__linux__)
+    return (uint64_t)syscall(SYS_gettid);
+#else
+    return (uint64_t)(uintptr_t)pthread_self();
+#endif
+}
+
+typedef struct CtRuntimeHandleWalk {
+    JSContextRef context;
+    JSObjectRef handles;
+    JSValueRef *exception;
+    size_t count;
+    size_t active_count;
+    size_t referenced_count;
+} CtRuntimeHandleWalk;
+
+static void ct_runtime_handle_walk(uv_handle_t *handle, void *opaque) {
+    CtRuntimeHandleWalk *walk = (CtRuntimeHandleWalk *)opaque;
+    if (walk == NULL || (walk->exception != NULL && *walk->exception != NULL)) return;
+
+    bool closing = uv_is_closing(handle) != 0;
+    bool active = !closing && uv_is_active(handle) != 0;
+    bool referenced = !closing && uv_has_ref(handle) != 0;
+    if (active) walk->active_count += 1;
+    if (active && referenced) walk->referenced_count += 1;
+
+    const char *type = uv_handle_type_name(uv_handle_get_type(handle));
+    char address[32];
+    snprintf(address, sizeof(address), "%p", (void *)handle);
+    JSObjectRef entry = ct_make_object(walk->context);
+    ct_set_property(walk->context, entry, "type", ct_make_string(walk->context, type != NULL ? type : "unknown"), walk->exception);
+    ct_set_property(walk->context, entry, "address", ct_make_string(walk->context, address), walk->exception);
+    ct_set_property(walk->context, entry, "is_active", JSValueMakeBoolean(walk->context, active), walk->exception);
+    ct_set_property(walk->context, entry, "is_referenced", JSValueMakeBoolean(walk->context, referenced), walk->exception);
+    ct_set_property(walk->context, entry, "is_closing", JSValueMakeBoolean(walk->context, closing), walk->exception);
+    JSObjectSetPropertyAtIndex(walk->context, walk->handles, (unsigned)walk->count, entry, walk->exception);
+    walk->count += 1;
+}
+
+static JSObjectRef ct_runtime_cpu_info(JSContextRef ctx, JSValueRef *exception) {
+    JSObjectRef result = ct_make_array(ctx, 0, NULL, exception);
+    uv_cpu_info_t *cpu_info = NULL;
+    int cpu_count = 0;
+    if (uv_cpu_info(&cpu_info, &cpu_count) != 0 || cpu_info == NULL) return result;
+
+    for (int index = 0; index < cpu_count; index += 1) {
+        JSObjectRef times = ct_make_object(ctx);
+        ct_set_property(ctx, times, "user", JSValueMakeNumber(ctx, (double)cpu_info[index].cpu_times.user), exception);
+        ct_set_property(ctx, times, "nice", JSValueMakeNumber(ctx, (double)cpu_info[index].cpu_times.nice), exception);
+        ct_set_property(ctx, times, "sys", JSValueMakeNumber(ctx, (double)cpu_info[index].cpu_times.sys), exception);
+        ct_set_property(ctx, times, "idle", JSValueMakeNumber(ctx, (double)cpu_info[index].cpu_times.idle), exception);
+        ct_set_property(ctx, times, "irq", JSValueMakeNumber(ctx, (double)cpu_info[index].cpu_times.irq), exception);
+
+        JSObjectRef cpu = ct_make_object(ctx);
+        ct_set_property(ctx, cpu, "model", ct_make_string(ctx, cpu_info[index].model != NULL ? cpu_info[index].model : ""), exception);
+        ct_set_property(ctx, cpu, "speed", JSValueMakeNumber(ctx, (double)cpu_info[index].speed), exception);
+        ct_set_property(ctx, cpu, "times", times, exception);
+        JSObjectSetPropertyAtIndex(ctx, result, (unsigned)index, cpu, exception);
+        if (exception != NULL && *exception != NULL) break;
+    }
+    uv_free_cpu_info(cpu_info, cpu_count);
+    return result;
+}
+
+static JSObjectRef ct_runtime_native_stack(JSContextRef ctx, JSValueRef *exception) {
+    JSObjectRef result = ct_make_array(ctx, 0, NULL, exception);
+#if defined(_WIN32)
+    void *frames[64];
+    USHORT frame_count = CaptureStackBackTrace(1, (DWORD)(sizeof(frames) / sizeof(frames[0])), frames, NULL);
+    for (USHORT index = 0; index < frame_count; index += 1) {
+        char address[32];
+        snprintf(address, sizeof(address), "%p", frames[index]);
+        JSObjectRef frame = ct_make_object(ctx);
+        ct_set_property(ctx, frame, "pc", ct_make_string(ctx, address), exception);
+        ct_set_property(ctx, frame, "symbol", ct_make_string(ctx, ""), exception);
+        JSObjectSetPropertyAtIndex(ctx, result, (unsigned)index, frame, exception);
+    }
+#else
+    void *frames[64];
+    int frame_count = backtrace(frames, (int)(sizeof(frames) / sizeof(frames[0])));
+    unsigned output_index = 0;
+    for (int index = 1; index < frame_count; index += 1) {
+        char address[32];
+        snprintf(address, sizeof(address), "%p", frames[index]);
+        Dl_info info;
+        memset(&info, 0, sizeof(info));
+        (void)dladdr(frames[index], &info);
+        JSObjectRef frame = ct_make_object(ctx);
+        ct_set_property(ctx, frame, "pc", ct_make_string(ctx, address), exception);
+        ct_set_property(ctx, frame, "symbol", ct_make_string(ctx, info.dli_sname != NULL ? info.dli_sname : ""), exception);
+        JSObjectSetPropertyAtIndex(ctx, result, output_index++, frame, exception);
+        if (exception != NULL && *exception != NULL) break;
+    }
+#endif
+    return result;
+}
+
+static bool ct_append_unique_string(char ***items, size_t *count, size_t *capacity, const char *value) {
+    if (value == NULL || value[0] == '\0') return true;
+    for (size_t index = 0; index < *count; index += 1) {
+        if (strcmp((*items)[index], value) == 0) return true;
+    }
+    if (*count == *capacity) {
+        size_t next_capacity = *capacity == 0 ? 32 : *capacity * 2;
+        char **next_items = (char **)realloc(*items, next_capacity * sizeof(char *));
+        if (next_items == NULL) return false;
+        *items = next_items;
+        *capacity = next_capacity;
+    }
+    char *copy = strdup(value);
+    if (copy == NULL) return false;
+    (*items)[*count] = copy;
+    *count += 1;
+    return true;
+}
+
+static JSObjectRef ct_runtime_shared_objects(JSContextRef ctx, JSValueRef *exception) {
+    JSObjectRef result = ct_make_array(ctx, 0, NULL, exception);
+    char **items = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+#if defined(__APPLE__)
+    uint32_t image_count = _dyld_image_count();
+    for (uint32_t index = 0; index < image_count; index += 1) {
+        if (!ct_append_unique_string(&items, &count, &capacity, _dyld_get_image_name(index))) break;
+    }
+#elif defined(__linux__)
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (maps != NULL) {
+        char line[PATH_MAX + 512];
+        while (fgets(line, sizeof(line), maps) != NULL) {
+            char *path = strchr(line, '/');
+            if (path == NULL) continue;
+            path[strcspn(path, "\r\n")] = '\0';
+            char *deleted = strstr(path, " (deleted)");
+            if (deleted != NULL) *deleted = '\0';
+            if (!ct_append_unique_string(&items, &count, &capacity, path)) break;
+        }
+        fclose(maps);
+    }
+#elif defined(_WIN32)
+    HMODULE modules[1024];
+    DWORD bytes_needed = 0;
+    if (EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytes_needed)) {
+        size_t module_count = bytes_needed / sizeof(HMODULE);
+        if (module_count > sizeof(modules) / sizeof(modules[0])) module_count = sizeof(modules) / sizeof(modules[0]);
+        for (size_t index = 0; index < module_count; index += 1) {
+            char path[MAX_PATH + 1];
+            DWORD length = GetModuleFileNameExA(GetCurrentProcess(), modules[index], path, MAX_PATH);
+            if (length == 0) continue;
+            path[length < MAX_PATH ? length : MAX_PATH] = '\0';
+            if (!ct_append_unique_string(&items, &count, &capacity, path)) break;
+        }
+    }
+#endif
+
+    for (size_t index = 0; index < count; index += 1) {
+        JSObjectSetPropertyAtIndex(ctx, result, (unsigned)index, ct_make_string(ctx, items[index]), exception);
+        free(items[index]);
+    }
+    free(items);
+    return result;
+}
+
+typedef struct CtWorkerDiagnostic {
+    uint32_t id;
+    bool terminated;
+    bool referenced;
+} CtWorkerDiagnostic;
+
+static JSObjectRef ct_runtime_worker_diagnostics(CtJscRuntime *runtime, JSContextRef ctx, JSValueRef *exception) {
+    JSObjectRef result = ct_make_array(ctx, 0, NULL, exception);
+    CtWorkerDiagnostic *workers = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+
+    pthread_mutex_lock(&ct_workers_mutex);
+    for (CtWorker *worker = ct_workers; worker != NULL; worker = worker->next) {
+        pthread_mutex_lock(&worker->mutex);
+        bool belongs_to_runtime = worker->parent_runtime == runtime;
+        if (belongs_to_runtime) {
+            if (count == capacity) {
+                size_t next_capacity = capacity == 0 ? 4 : capacity * 2;
+                CtWorkerDiagnostic *next_workers = (CtWorkerDiagnostic *)realloc(workers, next_capacity * sizeof(CtWorkerDiagnostic));
+                if (next_workers == NULL) {
+                    pthread_mutex_unlock(&worker->mutex);
+                    break;
+                }
+                workers = next_workers;
+                capacity = next_capacity;
+            }
+            workers[count].id = worker->id;
+            workers[count].terminated = worker->terminated;
+            workers[count].referenced = worker->referenced;
+            count += 1;
+        }
+        pthread_mutex_unlock(&worker->mutex);
+    }
+    pthread_mutex_unlock(&ct_workers_mutex);
+
+    for (size_t index = 0; index < count; index += 1) {
+        JSObjectRef entry = ct_make_object(ctx);
+        ct_set_property(ctx, entry, "id", JSValueMakeNumber(ctx, (double)workers[index].id), exception);
+        ct_set_property(ctx, entry, "terminated", JSValueMakeBoolean(ctx, workers[index].terminated), exception);
+        ct_set_property(ctx, entry, "referenced", JSValueMakeBoolean(ctx, workers[index].referenced), exception);
+        JSObjectSetPropertyAtIndex(ctx, result, (unsigned)index, entry, exception);
+    }
+    free(workers);
+    return result;
+}
+
+#if !defined(_WIN32)
+static JSValueRef ct_rlimit_value(JSContextRef ctx, rlim_t value) {
+    return value == RLIM_INFINITY ? ct_make_string(ctx, "unlimited") : JSValueMakeNumber(ctx, (double)value);
+}
+
+static void ct_runtime_add_user_limit(JSContextRef ctx, JSObjectRef limits, const char *name, int resource, JSValueRef *exception) {
+    struct rlimit limit;
+    if (getrlimit(resource, &limit) != 0) return;
+    JSObjectRef entry = ct_make_object(ctx);
+    ct_set_property(ctx, entry, "soft", ct_rlimit_value(ctx, limit.rlim_cur), exception);
+    ct_set_property(ctx, entry, "hard", ct_rlimit_value(ctx, limit.rlim_max), exception);
+    ct_set_property(ctx, limits, name, entry, exception);
+}
+
+static JSObjectRef ct_runtime_user_limits(JSContextRef ctx, JSValueRef *exception) {
+    JSObjectRef result = ct_make_object(ctx);
+#if defined(RLIMIT_CORE)
+    ct_runtime_add_user_limit(ctx, result, "core_file_size_blocks", RLIMIT_CORE, exception);
+#endif
+#if defined(RLIMIT_DATA)
+    ct_runtime_add_user_limit(ctx, result, "data_seg_size_kbytes", RLIMIT_DATA, exception);
+#endif
+#if defined(RLIMIT_FSIZE)
+    ct_runtime_add_user_limit(ctx, result, "file_size_blocks", RLIMIT_FSIZE, exception);
+#endif
+#if defined(RLIMIT_MEMLOCK)
+    ct_runtime_add_user_limit(ctx, result, "max_locked_memory_bytes", RLIMIT_MEMLOCK, exception);
+#endif
+#if defined(RLIMIT_RSS)
+    ct_runtime_add_user_limit(ctx, result, "max_memory_size_kbytes", RLIMIT_RSS, exception);
+#endif
+#if defined(RLIMIT_NOFILE)
+    ct_runtime_add_user_limit(ctx, result, "open_files", RLIMIT_NOFILE, exception);
+#endif
+#if defined(RLIMIT_STACK)
+    ct_runtime_add_user_limit(ctx, result, "stack_size_bytes", RLIMIT_STACK, exception);
+#endif
+#if defined(RLIMIT_CPU)
+    ct_runtime_add_user_limit(ctx, result, "cpu_time_seconds", RLIMIT_CPU, exception);
+#endif
+#if defined(RLIMIT_NPROC)
+    ct_runtime_add_user_limit(ctx, result, "max_user_processes", RLIMIT_NPROC, exception);
+#endif
+#if defined(RLIMIT_AS)
+    ct_runtime_add_user_limit(ctx, result, "virtual_memory_kbytes", RLIMIT_AS, exception);
+#endif
+    return result;
+}
+#endif
+
+static JSValueRef ct_runtime_diagnostics(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || !runtime->uv_loop_initialized) {
+        ct_throw_message(ctx, exception, "Runtime diagnostics are unavailable");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef result = ct_make_object(ctx);
+    JSObjectRef handles = ct_make_array(ctx, 0, NULL, exception);
+    CtRuntimeHandleWalk walk = {
+        .context = ctx,
+        .handles = handles,
+        .exception = exception,
+        .count = 0,
+        .active_count = 0,
+        .referenced_count = 0,
+    };
+    uv_walk(&runtime->uv_loop, ct_runtime_handle_walk, &walk);
+
+    JSObjectRef event_loop = ct_make_object(ctx);
+    ct_set_property(ctx, event_loop, "activeTasks", JSValueMakeNumber(ctx, (double)(walk.active_count + runtime->timer_heap_len)), exception);
+    ct_set_property(ctx, event_loop, "concurrentRef", JSValueMakeNumber(ctx, (double)(walk.referenced_count + runtime->referenced_timer_count)), exception);
+    ct_set_property(ctx, event_loop, "numPolls", JSValueMakeNumber(ctx, (double)runtime->uv_poll_count), exception);
+    ct_set_property(ctx, event_loop, "timers", JSValueMakeNumber(ctx, (double)runtime->timer_heap_len), exception);
+    ct_set_property(ctx, event_loop, "referencedTimers", JSValueMakeNumber(ctx, (double)runtime->referenced_timer_count), exception);
+    ct_set_property(ctx, event_loop, "loopAlive", JSValueMakeBoolean(ctx, uv_loop_alive(&runtime->uv_loop) != 0 || runtime->timer_heap_len > 0), exception);
+    ct_set_property(ctx, event_loop, "backendTimeout", JSValueMakeNumber(ctx, (double)uv_backend_timeout(&runtime->uv_loop)), exception);
+
+    uv_utsname_t uname_info;
+    memset(&uname_info, 0, sizeof(uname_info));
+    (void)uv_os_uname(&uname_info);
+    JSObjectRef os = ct_make_object(ctx);
+    ct_set_property(ctx, os, "name", ct_make_string(ctx, uname_info.sysname), exception);
+    ct_set_property(ctx, os, "release", ct_make_string(ctx, uname_info.release), exception);
+    ct_set_property(ctx, os, "version", ct_make_string(ctx, uname_info.version), exception);
+    ct_set_property(ctx, os, "machine", ct_make_string(ctx, uname_info.machine), exception);
+
+    char hostname[UV_MAXHOSTNAMESIZE];
+    size_t hostname_length = sizeof(hostname);
+    hostname[0] = '\0';
+    if (uv_os_gethostname(hostname, &hostname_length) != 0) hostname[0] = '\0';
+
+    JSObjectRef memory = ct_make_object(ctx);
+    ct_set_property(ctx, memory, "total", JSValueMakeNumber(ctx, ct_total_memory_bytes()), exception);
+    ct_set_property(ctx, memory, "free", JSValueMakeNumber(ctx, ct_free_memory_bytes()), exception);
+    ct_set_property(ctx, memory, "available", JSValueMakeNumber(ctx, ct_available_memory_bytes()), exception);
+    ct_set_property(ctx, memory, "constrained", JSValueMakeNumber(ctx, ct_constrained_memory_bytes()), exception);
+
+    uint64_t now_ns = uv_hrtime();
+    double uptime = now_ns >= runtime->start_time_ns ? (double)(now_ns - runtime->start_time_ns) / 1000000000.0 : 0;
+    ct_set_property(ctx, result, "uptime", JSValueMakeNumber(ctx, uptime), exception);
+    ct_set_property(ctx, result, "threadId", JSValueMakeNumber(ctx, (double)ct_current_thread_id()), exception);
+    ct_set_property(ctx, result, "host", ct_make_string(ctx, hostname), exception);
+    ct_set_property(ctx, result, "os", os, exception);
+    ct_set_property(ctx, result, "memory", memory, exception);
+    ct_set_property(ctx, result, "cpus", ct_runtime_cpu_info(ctx, exception), exception);
+    ct_set_property(ctx, result, "eventLoop", event_loop, exception);
+    ct_set_property(ctx, result, "libuv", handles, exception);
+    ct_set_property(ctx, result, "workers", ct_runtime_worker_diagnostics(runtime, ctx, exception), exception);
+    ct_set_property(ctx, result, "nativeStack", ct_runtime_native_stack(ctx, exception), exception);
+    ct_set_property(ctx, result, "sharedObjects", ct_runtime_shared_objects(ctx, exception), exception);
+#if !defined(_WIN32)
+    ct_set_property(ctx, result, "userLimits", ct_runtime_user_limits(ctx, exception), exception);
+#endif
     return result;
 }
 
@@ -14131,6 +14709,20 @@ static JSValueRef ct_process_info(JSContextRef ctx, JSObjectRef function, JSObje
     if (strcmp(kind, "version") == 0) {
         free(kind);
         return ct_make_string(ctx, COTTONTAIL_VERSION);
+    }
+
+    if (strcmp(kind, "uptime") == 0) {
+        CtJscRuntime *runtime = ct_callback_runtime(function);
+        uint64_t now_ns = uv_hrtime();
+        double uptime = runtime != NULL && now_ns >= runtime->start_time_ns
+            ? (double)(now_ns - runtime->start_time_ns) / 1000000000.0
+            : 0;
+        free(kind);
+        return JSValueMakeNumber(ctx, uptime);
+    }
+    if (strcmp(kind, "diagnostics") == 0) {
+        free(kind);
+        return ct_runtime_diagnostics(ctx, function, thisObject, 0, NULL, exception);
     }
 
     if (strcmp(kind, "chdir") == 0) {
@@ -14292,9 +14884,17 @@ static JSValueRef ct_process_info(JSContextRef ctx, JSObjectRef function, JSObje
         free(kind);
         return JSValueMakeNumber(ctx, ct_available_memory_bytes());
     }
-    if (strcmp(kind, "constrainedMemory") == 0) {
+    if (strcmp(kind, "freeMemory") == 0) {
+        free(kind);
+        return JSValueMakeNumber(ctx, ct_free_memory_bytes());
+    }
+    if (strcmp(kind, "totalMemory") == 0) {
         free(kind);
         return JSValueMakeNumber(ctx, ct_total_memory_bytes());
+    }
+    if (strcmp(kind, "constrainedMemory") == 0) {
+        free(kind);
+        return JSValueMakeNumber(ctx, ct_constrained_memory_bytes());
     }
 
     free(kind);
@@ -17381,7 +17981,7 @@ static void ct_fd_watchers_wait_for_runtime(CtJscRuntime *runtime) {
         usleep(1000);
     }
 #else
-    if (runtime->uv_loop_initialized) (void)uv_run(&runtime->uv_loop, UV_RUN_NOWAIT);
+    if (runtime->uv_loop_initialized) (void)ct_runtime_uv_run(runtime, UV_RUN_NOWAIT);
 #endif
 }
 
@@ -23444,6 +24044,7 @@ static CtJscRuntime *ct_jsc_runtime_create_internal(
     void *terminate_context
 ) {
     (void)stack_size;
+    ct_install_crash_handlers();
 #if defined(_WIN32)
     if (ct_windows_ensure_winsock() != 0) return NULL;
 #endif
@@ -23457,6 +24058,7 @@ static CtJscRuntime *ct_jsc_runtime_create_internal(
 #endif
     CtJscRuntime *runtime = (CtJscRuntime *)calloc(1, sizeof(CtJscRuntime));
     if (runtime == NULL) return NULL;
+    runtime->start_time_ns = uv_hrtime();
     runtime->next_tick_priority_armed = true;
     /* Expose the native SuppressedError global (explicit resource management).
      * JSC latches options from the environment at first VM creation. */
@@ -24720,7 +25322,7 @@ static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_o
     if (delay_ms_out != NULL) *delay_ms_out = 16;
     JSContextRef ctx = runtime->context;
     ct_jsc_run_loop_cycle();
-    if (runtime->uv_loop_initialized) (void)uv_run(&runtime->uv_loop, UV_RUN_NOWAIT);
+    if (runtime->uv_loop_initialized) (void)ct_runtime_uv_run(runtime, UV_RUN_NOWAIT);
     if (ct_dispatch_signals(runtime, error_out) != 0) return -1;
     if (ct_drain_next_ticks(runtime, true, error_out) != 0) return -1;
     if (ct_drain_ffi_callbacks(runtime, error_out) != 0) return -1;

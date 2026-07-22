@@ -16,7 +16,6 @@ import { fileURLToPath } from "./url.js";
 import { makeHttpParserBinding } from "../internal/node-http-parser.js";
 import EventEmitter from "./events.js";
 
-const processStartMs = Date.now();
 const nodeCompatVersion = "24.3.0";
 let sourceMapsState = false;
 let uncaughtExceptionCaptureCallback = null;
@@ -229,6 +228,13 @@ function processInfo(kind, ...args) {
     throw new Error("native processInfo support is unavailable");
   }
   return cottontail.processInfo(kind, ...args);
+}
+
+function runtimeDiagnostics() {
+  if (typeof cottontail.runtimeDiagnostics === "function") {
+    return cottontail.runtimeDiagnostics();
+  }
+  return processInfo("diagnostics");
 }
 
 function createEventApi(processObject) {
@@ -654,14 +660,10 @@ function makeOsBinding() {
       }
       return values;
     },
-    getUptime: () => Math.max(0, (Date.now() - processStartMs) / 1000),
-    getTotalMem: () => Number(processObject.constrainedMemory?.() || processObject.availableMemory?.() || 0),
-    getFreeMem: () => Number(processObject.availableMemory?.() || 0),
-    getCPUs: () => Array.from({ length: Math.max(1, Number(cottontail.cpuCount?.() || 1)) }, () => ({
-      model: "",
-      speed: 0,
-      times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 },
-    })),
+    getUptime: () => Math.max(0, Number(processInfo("uptime")) || 0),
+    getTotalMem: () => Number(processInfo("totalMemory")) || 0,
+    getFreeMem: () => Number(processInfo("freeMemory")) || 0,
+    getCPUs: () => runtimeDiagnostics().cpus,
     getInterfaceAddresses: () => typeof cottontail.osNetworkInterfaces === "function" ? cottontail.osNetworkInterfaces() : [],
     getHomeDirectory: () => cottontail.env("HOME") || cottontail.env("USERPROFILE") || "/",
     getUserInfo: () => ({
@@ -674,7 +676,10 @@ function makeOsBinding() {
     setPriority: (pid, priority) => cottontail.osSetPriority?.(Number(pid || processObject.pid), Number(priority)),
     getPriority: (pid = 0) => typeof cottontail.osGetPriority === "function" ? Number(cottontail.osGetPriority(Number(pid || processObject.pid))) : 0,
     getAvailableParallelism: () => Math.max(1, Number(cottontail.cpuCount?.() || 1)),
-    getOSInformation: () => [processObject.platform, processObject.arch, processObject.version],
+    getOSInformation: () => {
+      const os = runtimeDiagnostics().os;
+      return [os.name, os.release, os.version, os.machine];
+    },
     isBigEndian: () => false,
   });
 }
@@ -876,6 +881,10 @@ function makeProcessBinding(name) {
       return ttyWrapBinding;
     case "http_parser":
       return makeHttpParserBinding();
+    case "timers":
+      return Object.freeze({
+        getLibuvNow: () => cottontail.timerClockMs(),
+      });
     case "crypto/x509":
       return Object.freeze({
         isX509Certificate(value) {
@@ -917,9 +926,142 @@ function parseEnvLine(line) {
 }
 
 function makeReport() {
+  let sequence = 0;
+
+  const pad = (value) => String(value).padStart(2, "0");
+  const generatedFilename = () => {
+    const now = new Date();
+    const date = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
+    const time = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+    sequence += 1;
+    return `report.${date}.${time}.${pid}.${sequence}.json`;
+  };
+
+  const reportResourceUsage = (usage, diagnostics, includeMemory) => {
+    const userCpuSeconds = Number(usage.userCPUTime || 0) / 1_000_000;
+    const kernelCpuSeconds = Number(usage.systemCPUTime || 0) / 1_000_000;
+    const elapsed = Math.max(Number(diagnostics.uptime) || 0, Number.EPSILON);
+    const result = {
+      userCpuSeconds,
+      kernelCpuSeconds,
+      cpuConsumptionPercent: ((userCpuSeconds + kernelCpuSeconds) / elapsed) * 100,
+      userCpuConsumptionPercent: (userCpuSeconds / elapsed) * 100,
+      kernelCpuConsumptionPercent: (kernelCpuSeconds / elapsed) * 100,
+      maxRss: Number(usage.maxRSS) || 0,
+      pageFaults: {
+        IORequired: Number(usage.majorPageFault) || 0,
+        IONotRequired: Number(usage.minorPageFault) || 0,
+      },
+      fsActivity: {
+        reads: Number(usage.fsRead) || 0,
+        writes: Number(usage.fsWrite) || 0,
+      },
+    };
+    if (includeMemory) {
+      Object.assign(result, {
+        free_memory: Number(diagnostics.memory.free) || 0,
+        total_memory: Number(diagnostics.memory.total) || 0,
+        rss: Number(memoryUsage().rss) || 0,
+        available_memory: Number(diagnostics.memory.available) || 0,
+      });
+    }
+    return result;
+  };
+
+  const javascriptStack = (error) => {
+    const supplied = error !== undefined;
+    const value = supplied
+      ? error instanceof Error ? error : new Error(String(error))
+      : new Error("JavaScript Callstack");
+    if (!supplied) value.code = "ERR_SYNTHETIC";
+    const lines = String(value.stack ?? "").split("\n");
+    if (lines.length > 0) lines.shift();
+    const errorProperties = {};
+    for (const key of Object.keys(value)) errorProperties[key] = value[key];
+    if (value.code !== undefined) errorProperties.code = value.code;
+    return {
+      message: supplied ? String(value.message ?? value) : "Error [ERR_SYNTHETIC]: JavaScript Callstack",
+      stack: lines.map((line) => line.trim()).filter(Boolean),
+      errorProperties,
+    };
+  };
+
+  const createReport = (reportObject, error, filename) => {
+    const diagnostics = runtimeDiagnostics();
+    const processUsage = resourceUsage();
+    const threadUsage = processInfo("threadResourceUsage");
+    const heap = memoryUsage();
+    const jscHeap = cottontail.jscMemoryUsage();
+    const heapCapacity = Number(jscHeap.heapCapacity ?? heap.heapTotal) || 0;
+    const heapSize = Number(jscHeap.heapSize ?? heap.heapUsed) || 0;
+    const externalMemory = Number(jscHeap.extraMemorySize ?? heap.external) || 0;
+    const networkInterfaces = reportObject.excludeNetwork
+      ? []
+      : (cottontail.osNetworkInterfaces?.() ?? []);
+    const now = Date.now();
+    const javascriptHeap = {
+      totalMemory: Number(diagnostics.memory.total) || 0,
+      totalCommittedMemory: heapCapacity,
+      availableMemory: Number(diagnostics.memory.available) || 0,
+      usedMemory: heapSize,
+      memoryLimit: Number(diagnostics.memory.constrained || diagnostics.memory.total) || 0,
+      mallocedMemory: externalMemory,
+      externalMemory,
+      nativeContextCount: Number(jscHeap.globalObjectCount) || 1,
+      heapSpaces: {
+        jsc_heap: {
+          space_size: heapCapacity,
+          space_used_size: heapSize,
+          space_available_size: Math.max(0, heapCapacity - heapSize),
+        },
+      },
+    };
+    const reportData = {
+      header: {
+        reportVersion: 3,
+        event: error === undefined ? "JavaScript API" : "Exception",
+        trigger: "GetReport",
+        filename: filename || null,
+        dumpEventTime: String(now),
+        dumpEventTimeStamp: new Date(now).toISOString(),
+        processId: pid,
+        threadId: diagnostics.threadId,
+        cwd: cwd(),
+        commandLine: [...argv],
+        nodejsVersion: version,
+        cottontailVersion: versions.cottontail,
+        wordSize: arch === "x64" || arch === "arm64" ? 64 : 32,
+        arch,
+        platform,
+        componentVersions: { ...versions },
+        release: { ...release },
+        osName: diagnostics.os.name,
+        osRelease: diagnostics.os.release,
+        osVersion: diagnostics.os.version,
+        osMachine: diagnostics.os.machine,
+        host: diagnostics.host,
+        cpus: diagnostics.cpus,
+        networkInterfaces,
+      },
+      javascriptStack: javascriptStack(error),
+      javascriptHeap,
+      nativeStack: diagnostics.nativeStack,
+      resourceUsage: reportResourceUsage(processUsage, diagnostics, true),
+      uvthreadResourceUsage: reportResourceUsage(threadUsage, diagnostics, false),
+      libuv: diagnostics.libuv,
+      workers: diagnostics.workers,
+      environmentVariables: reportObject.excludeEnv ? {} : { ...env },
+      sharedObjects: diagnostics.sharedObjects,
+      cpus: diagnostics.cpus,
+      networkInterfaces,
+    };
+    if (diagnostics.userLimits !== undefined) reportData.userLimits = diagnostics.userLimits;
+    return reportData;
+  };
+
   const reportObject = {
     directory: "",
-    filename: "report.json",
+    filename: "",
     compact: false,
     excludeNetwork: false,
     signal: "SIGUSR2",
@@ -928,27 +1070,24 @@ function makeReport() {
     reportOnUncaughtException: false,
     excludeEnv: false,
     getReport(error = undefined) {
-      return {
-        header: {
-          event: error ? "Exception" : "JavaScript API",
-          trigger: "GetReport",
-          filename: this.filename,
-          dumpEventTime: new Date().toISOString(),
-          processId: pid,
-          cwd: cwd(),
-          commandLine: [...argv],
-          nodejsVersion: version,
-          cottontailVersion: versions.cottontail,
-        },
-        javascriptStack: error ? { message: String(error?.message ?? error), stack: String(error?.stack ?? "") } : {},
-        resourceUsage: resourceUsage(),
-        environmentVariables: this.excludeEnv ? {} : { ...env },
-      };
+      return createReport(this, error, null);
     },
     writeReport(filename = undefined, error = undefined) {
-      const output = filename || this.filename || "report.json";
-      const data = JSON.stringify(this.getReport(error), null, this.compact ? 0 : 2);
-      cottontail.writeFile(output, data);
+      if (filename instanceof Error && error === undefined) {
+        error = filename;
+        filename = undefined;
+      }
+      if (filename !== undefined && typeof filename !== "string") {
+        throw invalidArgType("filename", "string", filename);
+      }
+      let output = filename || this.filename || generatedFilename();
+      const absolute = output.startsWith("/") || output.startsWith("\\") || /^[A-Za-z]:[\\/]/.test(output);
+      if (!absolute && this.directory) {
+        const separator = platform === "win32" ? "\\" : "/";
+        output = `${String(this.directory).replace(/[\\/]$/, "")}${separator}${output}`;
+      }
+      const data = JSON.stringify(createReport(this, error, output), null, this.compact ? 0 : 2);
+      cottontail.writeFile(output, `${data}\n`);
       return output;
     },
   };
@@ -1892,7 +2031,7 @@ export const nextTick = processObject.nextTick = function nextTick(callback, ...
 Object.defineProperty(nextTick, "name", { value: "nextTick", configurable: true });
 
 export const hrtime = processObject.hrtime = makeHrtime;
-export const uptime = processObject.uptime = () => (Date.now() - processStartMs) / 1000;
+export const uptime = processObject.uptime = () => Math.max(0, Number(processInfo("uptime")) || 0);
 
 export const _kill = processObject._kill = (targetPid, signal = signalNumber("SIGTERM")) =>
   cottontail.kill(targetPid, signal);
@@ -2008,9 +2147,33 @@ export const unref = processObject.unref = (maybeRefable = undefined) => {
 export const _getActiveHandles = processObject._getActiveHandles = () =>
   [processObject.stdin, processObject.stdout, processObject.stderr].filter(Boolean);
 
-// COTTONTAIL-COMPAT: Complete reporting needs iterable request/resource registries from fs, net, and the timer host.
 export const _getActiveRequests = processObject._getActiveRequests = () => [];
-export const getActiveResourcesInfo = processObject.getActiveResourcesInfo = () => [];
+export const getActiveResourcesInfo = processObject.getActiveResourcesInfo = () => {
+  const diagnostics = runtimeDiagnostics();
+  const typeNames = {
+    async: "AsyncWrap",
+    check: "CheckWrap",
+    fs_event: "FSEventWrap",
+    fs_poll: "StatWatcher",
+    idle: "IdleWrap",
+    pipe: "PipeWrap",
+    poll: "PollWrap",
+    prepare: "PrepareWrap",
+    process: "ProcessWrap",
+    signal: "SignalWrap",
+    tcp: "TCPWrap",
+    timer: "Timeout",
+    tty: "TTYWrap",
+    udp: "UDPWrap",
+  };
+  const resources = diagnostics.libuv
+    .filter((handle) => handle.is_active && handle.is_referenced)
+    .map((handle) => typeNames[handle.type] ?? `${String(handle.type || "Unknown")}Wrap`);
+  for (let index = 0; index < Number(diagnostics.eventLoop.referencedTimers || 0); index += 1) {
+    resources.push("Timeout");
+  }
+  return resources;
+};
 
 function tokenizeNodeOptions(source) {
   const tokens = [];

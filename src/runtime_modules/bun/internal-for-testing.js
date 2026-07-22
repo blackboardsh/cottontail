@@ -20,12 +20,6 @@ export function getCounters() {
   return cottontail.getCounters();
 }
 
-function internalUnavailable(name) {
-  return () => {
-    throw new Error(`bun:internal-for-testing ${name} is unavailable in Cottontail`);
-  };
-}
-
 export function escapeRegExp(value) {
   return String(value).replace(/[\\^$*+?.()|{}\[\]-]/g, (character) =>
     character === "-" ? "\\x2d" : `\\${character}`
@@ -767,21 +761,6 @@ export function canonicalizeIP(value) {
   return hex.join(":");
 }
 
-// COTTONTAIL-COMPAT: bun:internal-for-testing - Bun-private hooks without a
-// Cottontail equivalent surface as call-time errors so importing files still
-// bundle; implement real behavior per hook as coverage requires it.
-function unimplementedInternal(name) {
-  return new Proxy(function () {
-    throw new Error(`bun:internal-for-testing ${name} is not implemented in Cottontail`);
-  }, {
-    get(target, property) {
-      if (property === Symbol.toPrimitive || property === "toString") return () => `[${name}]`;
-      if (property in Function.prototype) return Reflect.get(target, property);
-      return unimplementedInternal(`${name}.${String(property)}`);
-    },
-  });
-}
-
 export function isArchitectureMatch(architectures) {
   const list = Array.isArray(architectures) ? architectures : [architectures];
   const current = cottontail.arch?.() ?? "arm64";
@@ -979,17 +958,8 @@ export function structuredCloneAdvanced(
 }
 
 export function getEventLoopStats() {
-  const taskState = globalThis[Symbol.for("cottontail.eventLoopTaskState")];
-  const handles = globalThis.__cottontailEventLoopHandleStats?.() ?? {};
-  const hasActiveHandles = globalThis.__cottontailHasActiveHandles?.() === true;
-  const activeTasks = Math.max(0, Number(taskState?.activeTasks) || 0);
-  const concurrentRef = Math.max(0, Number(taskState?.concurrentRef) || Number(handles.workers) || 0);
-  const knownPolls = (Number(handles.timers) || 0) + (Number(handles.spawns) || 0) + (handles.web ? 1 : 0);
-  return {
-    activeTasks,
-    concurrentRef,
-    numPolls: Math.max(knownPolls, hasActiveHandles ? 1 : 0),
-  };
+  const { activeTasks, concurrentRef, numPolls } = cottontail.runtimeDiagnostics().eventLoop;
+  return { activeTasks, concurrentRef, numPolls };
 }
 export const install_test_helpers = {
   parseLockfile(cwd) {
@@ -1005,9 +975,105 @@ export const npm_manifest_test_helpers = {
     };
   },
 };
-export const upgrade_test_helpers = unimplementedInternal("upgrade_test_helpers");
-export const crash_handler = unimplementedInternal("crash_handler");
-export const bindgen = unimplementedInternal("bindgen");
+export const upgrade_test_helpers = Object.freeze({
+  openTempDirWithoutSharingDelete() {
+    cottontail.upgradeOpenTempDirectory();
+  },
+  closeTempDirHandle() {
+    cottontail.upgradeCloseTempDirectory();
+  },
+});
+
+export const crash_handler = Object.freeze({
+  getMachOImageZeroOffset() {
+    return cottontail.machoImageZeroOffset();
+  },
+  segfault() {
+    cottontail.internalCrash("segfault");
+  },
+  panic() {
+    cottontail.internalCrash("panic");
+  },
+  rootError() {
+    cottontail.internalCrash("rootError");
+  },
+  outOfMemory() {
+    cottontail.internalCrash("outOfMemory");
+  },
+  raiseIgnoringPanicHandler() {
+    cottontail.internalCrash("raiseIgnoringPanicHandler");
+  },
+});
+
+function toWebIdlInt32(value) {
+  const number = +value;
+  if (!Number.isFinite(number) || number === 0) return 0;
+  return Math.trunc(number) | 0;
+}
+
+function toWebIdlUint8(value) {
+  const number = +value;
+  if (!Number.isFinite(number) || number === 0) return 0;
+  const integer = Math.trunc(number);
+  return ((integer % 256) + 256) % 256;
+}
+
+function toWebIdlUsize(value) {
+  const number = +value;
+  if (!Number.isFinite(number) || number === 0) return 0n;
+  return BigInt.asUintN(64, BigInt(Math.trunc(number)));
+}
+
+function enforceBindgenRange(value, minimum, maximum) {
+  const number = +value;
+  if (!Number.isFinite(number)) {
+    throw new TypeError(`Value ${number} is outside the range [${minimum}, ${maximum}]`);
+  }
+  const integer = Math.trunc(number);
+  if (integer < minimum || integer > maximum) {
+    throw new TypeError(`Value ${integer} is outside the range [${minimum}, ${maximum}]`);
+  }
+  return integer;
+}
+
+export const bindgen = Object.freeze({
+  add(a, b = -1) {
+    const left = toWebIdlInt32(a);
+    const right = toWebIdlInt32(b === null ? -1 : b);
+    const sum = left + right;
+    if (sum < -2147483648 || sum > 2147483647) {
+      throw new Error("Integer overflow while adding");
+    }
+    return sum;
+  },
+  requiredAndOptionalArg(a, b = null, c = 42, d = null) {
+    if (b === undefined) b = null;
+    if (c === null || c === undefined) c = 42;
+    if (d === undefined) d = null;
+    const convertedC = enforceBindgenRange(c, 0, 100);
+    const convertedD = d === null ? null : toWebIdlUint8(d);
+    if (b === null) {
+      return (123456 + convertedC + (convertedD ?? 0)) | 0;
+    }
+
+    const convertedB = toWebIdlUsize(b);
+    const product = BigInt.asUintN(
+      64,
+      BigInt.asUintN(64, convertedB + BigInt(Math.abs(convertedC))) * BigInt(convertedD ?? 1),
+    );
+    let result = Number(BigInt.asIntN(32, BigInt.asUintN(53, product)));
+    if (Boolean(a)) result = Number(BigInt.asIntN(32, -BigInt(result)));
+    return result;
+  },
+});
+
+export function noOpForTesting() {}
+
+export const timerInternals = Object.freeze({
+  timerClockMs() {
+    return cottontail.timerClockMs();
+  },
+});
 export { frameworkRouterInternals };
 export const hostedGitInfo = {
   parseUrl(value) {
@@ -1188,11 +1254,13 @@ export default {
   jscInternals,
   nativeFrameForTesting,
   npm_manifest_test_helpers,
+  noOpForTesting,
   patchInternals,
   readTarball,
   setSocketOptions,
   setSyntheticAllocationLimitForTesting,
   shellInternals,
   structuredCloneAdvanced,
+  timerInternals,
   upgrade_test_helpers,
 };
