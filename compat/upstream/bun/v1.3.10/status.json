@@ -4005,6 +4005,14 @@
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (1 bun:test cases, 2 assertions)."
     },
+    "test/js/third_party/astro/astro-post.test.js": {
+      "status": "enabled",
+      "reason": "All four copied Astro action cases pass through real production builds and preview servers, covering POST actions and multipart form data under both Bun and Node adapters (6 assertions).",
+      "args": [
+        "--timeout=300000"
+      ],
+      "timeoutMs": 120000
+    },
     "test/js/third_party/duckdb/duckdb-basic-usage.test.ts": {
       "status": "enabled",
       "reason": "The pinned, checksum-verified duckdb@1.3.1 Node ABI 137 fixture loads through Cottontail and executes SELECT 42 AS fortytwo against :memory: (1 case)."
