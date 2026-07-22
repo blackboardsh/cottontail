@@ -1701,6 +1701,11 @@ const SecurityMatrix = struct {
     paths: []const SecurityPackagePath,
 };
 
+const SecurityRegistryManifest = struct {
+    name: []const u8,
+    manifest: Value,
+};
+
 const SecurityQueueItem = struct {
     record_index: usize,
     requested_range: []const u8,
@@ -1733,26 +1738,28 @@ fn securityPackagePath(payload: *const Value, package_name: []const u8) ?[]const
     return null;
 }
 
-const security_scanner_runtime =
-    \\import { isAbsolute, resolve } from "node:path";
-    \\import { pathToFileURL } from "node:url";
-    \\
-    \\const specifier = __COTTONTAIL_SECURITY_SCANNER__;
-    \\const root = __COTTONTAIL_SECURITY_ROOT__;
-    \\const payloadPath = __COTTONTAIL_SECURITY_PAYLOAD__;
-    \\const resultPath = __COTTONTAIL_SECURITY_RESULT__;
+const security_scanner_runtime: [:0]const u8 =
+    \\const [specifier, root, payloadPath, resultPath] = process.argv.slice(-4);
+    \\const originalExit = process.exit;
+    \\const scannerExit = Symbol("security scanner exit");
     \\
     \\try {
     \\  if (!specifier || !root || !payloadPath || !resultPath) {
     \\    throw new Error("incomplete security scanner invocation");
     \\  }
+    \\  process.exit = code => {
+    \\    const error = new Error("Security scanner exited before sending data");
+    \\    error[scannerExit] = Number(code ?? 0);
+    \\    throw error;
+    \\  };
     \\  let resolved;
-    \\  if (isAbsolute(specifier) || specifier.startsWith("./") || specifier.startsWith("../")) {
-    \\    resolved = resolve(root, specifier);
+    \\  const absolutePath = specifier.startsWith("/") || specifier.startsWith("\\\\") || /^[A-Za-z]:[\\/]/.test(specifier);
+    \\  if (absolutePath || specifier.startsWith("./") || specifier.startsWith("../")) {
+    \\    resolved = absolutePath ? specifier : `${root}/${specifier}`;
     \\    if (!(await Bun.file(resolved).exists())) {
-    \\      throw new Error(`Security scanner '${specifier}' is configured in bunfig.toml but the file could not be found.\\n  Please check that the file exists and the path is correct.`);
+    \\      throw new Error(`Security scanner '${specifier}' is configured in bunfig.toml but the file could not be found.\n  Please check that the file exists and the path is correct.`);
     \\    }
-    \\    resolved = pathToFileURL(resolved).href;
+    \\    resolved = Bun.pathToFileURL(resolved).href;
     \\  } else {
     \\    try {
     \\      resolved = Bun.resolveSync(specifier, root);
@@ -1770,47 +1777,21 @@ const security_scanner_runtime =
     \\
     \\  const payload = await Bun.file(payloadPath).json();
     \\  const started = performance.now();
-    \\  const progress = setTimeout(() => {
-    \\    const elapsed = Math.max(1, Math.round(performance.now() - started));
+    \\  const advisories = await scanner.scan({ packages: payload.packages });
+    \\  const elapsed = Math.max(0, Math.round(performance.now() - started));
+    \\  if (elapsed >= 1000) {
     \\    console.error(`[${specifier}] Scanning ${payload.packages.length} package${payload.packages.length === 1 ? "" : "s"} took ${elapsed}ms`);
-    \\  }, 1000);
-    \\  let advisories;
-    \\  try {
-    \\    advisories = await scanner.scan({ packages: payload.packages });
-    \\  } finally {
-    \\    clearTimeout(progress);
     \\  }
     \\  await Bun.write(resultPath, JSON.stringify({ ok: true, advisories }));
     \\} catch (error) {
-    \\  await Bun.write(resultPath, JSON.stringify({ ok: false, error: String(error?.message ?? error) }));
+    \\  const result = error?.[scannerExit] === undefined
+    \\    ? { ok: false, error: String(error?.message ?? error) }
+    \\    : { ok: false, exitCode: error[scannerExit] };
+    \\  await Bun.write(resultPath, JSON.stringify(result));
+    \\} finally {
+    \\  process.exit = originalExit;
     \\}
 ;
-
-fn renderSecurityScannerRuntime(
-    allocator: std.mem.Allocator,
-    scanner: []const u8,
-    root: []const u8,
-    payload_path: []const u8,
-    result_path: []const u8,
-) ![:0]const u8 {
-    var rendered = try allocator.dupe(u8, security_scanner_runtime);
-    for ([_]struct { placeholder: []const u8, value: []const u8 }{
-        .{ .placeholder = "__COTTONTAIL_SECURITY_SCANNER__", .value = scanner },
-        .{ .placeholder = "__COTTONTAIL_SECURITY_ROOT__", .value = root },
-        .{ .placeholder = "__COTTONTAIL_SECURITY_PAYLOAD__", .value = payload_path },
-        .{ .placeholder = "__COTTONTAIL_SECURITY_RESULT__", .value = result_path },
-    }) |replacement| {
-        const literal = try std.json.Stringify.valueAlloc(allocator, replacement.value, .{});
-        rendered = try std.mem.replaceOwned(
-            u8,
-            allocator,
-            rendered,
-            replacement.placeholder,
-            literal,
-        );
-    }
-    return allocator.dupeZ(u8, rendered);
-}
 
 const Manager = struct {
     init_data: std.process.Init,
@@ -2055,6 +2036,8 @@ const Manager = struct {
         try manager.configureInstallFilters(&root);
         if (security_resolution_output == null and
             manager.security_scanner != null and
+            !manager.options.dry_run and
+            !manager.options.lockfile_only and
             commandUsesSecurityScanner(manager.options.command))
         {
             try manager.runSecurityScannerPreflight(&root);
@@ -2137,6 +2120,7 @@ const Manager = struct {
 
         if (security_resolution_output) |output_path| {
             try manager.writeSecurityResolution(output_path, null);
+            try manager.writeSecurityRegistryManifests(output_path);
             return 0;
         }
 
@@ -2307,6 +2291,7 @@ const Manager = struct {
         }
         try manager.discoverWorkspaces(&root);
         try manager.loadRecordsFromLockGraph();
+        try manager.ensureSecurityScannerAvailable(&root);
 
         const payload_path = try manager.securityTempFile("json");
         defer std.Io.Dir.cwd().deleteFile(manager.init_data.io, payload_path) catch {};
@@ -2330,6 +2315,47 @@ const Manager = struct {
         );
     }
 
+    fn securityScannerRuntimePath(manager: *Manager) ![:0]const u8 {
+        const environment = manager.init_data.environ_map;
+        const temp_dir = environment.get("BUN_TMPDIR") orelse
+            environment.get("TMPDIR") orelse
+            environment.get("TEMP") orelse
+            environment.get("TMP") orelse
+            if (builtin.os.tag == .windows) "." else "/tmp";
+        try std.Io.Dir.cwd().createDirPath(manager.init_data.io, temp_dir);
+        const path = try std.fmt.allocPrint(
+            manager.allocator,
+            "{s}/cottontail-security-runtime-{x}-{x}.mjs",
+            .{
+                temp_dir,
+                std.hash.Wyhash.hash(0, manager.root_dir),
+                std.hash.Wyhash.hash(0, security_scanner_runtime),
+            },
+        );
+        if (try readOptionalFile(manager.init_data.io, manager.allocator, path, 1024 * 1024)) |source| {
+            if (std.mem.eql(u8, source, security_scanner_runtime)) return manager.allocator.dupeZ(u8, path);
+            return error.InvalidSecurityScannerRuntime;
+        }
+
+        const temporary_path = try manager.securityTempFile("runtime.mjs");
+        defer std.Io.Dir.cwd().deleteFile(manager.init_data.io, temporary_path) catch {};
+        try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{
+            .sub_path = temporary_path,
+            .data = security_scanner_runtime,
+        });
+        std.Io.Dir.cwd().rename(
+            temporary_path,
+            std.Io.Dir.cwd(),
+            path,
+            manager.init_data.io,
+        ) catch {
+            const source = (try readOptionalFile(manager.init_data.io, manager.allocator, path, 1024 * 1024)) orelse
+                return error.InvalidSecurityScannerRuntime;
+            if (!std.mem.eql(u8, source, security_scanner_runtime)) return error.InvalidSecurityScannerRuntime;
+        };
+        return manager.allocator.dupeZ(u8, path);
+    }
+
     fn writeSecurityResolution(
         manager: *Manager,
         output_path: []const u8,
@@ -2345,6 +2371,47 @@ const Manager = struct {
         };
         const json = try std.json.Stringify.valueAlloc(manager.allocator, payload, .{});
         try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = output_path, .data = json });
+    }
+
+    fn securityRegistryManifestsPath(manager: *Manager, output_path: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(manager.allocator, "{s}.manifests", .{output_path});
+    }
+
+    fn writeSecurityRegistryManifests(manager: *Manager, output_path: []const u8) !void {
+        var manifests = std.array_list.Managed(SecurityRegistryManifest).init(manager.allocator);
+        var iterator = manager.registry_manifests.iterator();
+        while (iterator.next()) |entry| {
+            try manifests.append(.{
+                .name = entry.key_ptr.*,
+                .manifest = entry.value_ptr.*.*,
+            });
+        }
+        const json = try std.json.Stringify.valueAlloc(manager.allocator, manifests.items, .{});
+        const path = try manager.securityRegistryManifestsPath(output_path);
+        try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = path, .data = json });
+    }
+
+    fn loadSecurityRegistryManifests(manager: *Manager, output_path: []const u8) !void {
+        const path = try manager.securityRegistryManifestsPath(output_path);
+        const source = try std.Io.Dir.cwd().readFileAlloc(
+            manager.init_data.io,
+            path,
+            manager.allocator,
+            .limited(256 * 1024 * 1024),
+        );
+        const manifests = std.json.parseFromSliceLeaky(Value, manager.allocator, source, .{}) catch
+            return error.InvalidSecurityScannerPayload;
+        if (manifests != .array) return error.InvalidSecurityScannerPayload;
+        for (manifests.array.items) |*entry| {
+            if (entry.* != .object) return error.InvalidSecurityScannerPayload;
+            const name = entry.object.get("name") orelse return error.InvalidSecurityScannerPayload;
+            const manifest = entry.object.getPtr("manifest") orelse return error.InvalidSecurityScannerPayload;
+            if (name != .string or manifest.* != .object) return error.InvalidSecurityScannerPayload;
+            try manager.registry_manifests.put(
+                try manager.allocator.dupe(u8, name.string),
+                manifest,
+            );
+        }
     }
 
     fn securitySelectedPackages(manager: *Manager) ![]const []const u8 {
@@ -2487,9 +2554,86 @@ const Manager = struct {
         }
     }
 
+    fn ensureSecurityScannerAvailable(manager: *Manager, root: *const Value) !void {
+        const scanner = manager.security_scanner orelse return;
+        if (std.fs.path.isAbsolute(scanner) or
+            std.mem.startsWith(u8, scanner, "./") or
+            std.mem.startsWith(u8, scanner, "../")) return;
+
+        var workspace_iterator = manager.workspaces.iterator();
+        while (workspace_iterator.next()) |entry| {
+            const workspace = entry.value_ptr.*;
+            for (all_dependency_sections) |section_name| {
+                const section = workspace.package_json.object.get(section_name) orelse continue;
+                if (section != .object or section.object.get(scanner) == null) continue;
+                try manager.stderr.print(
+                    "Security scanner '{s}' cannot be a dependency of a workspace package. It must be a direct dependency of the root package.\n",
+                    .{scanner},
+                );
+                return error.PackageManagerErrorReported;
+            }
+        }
+
+        const destination = try packageDestination(manager.allocator, manager.root_dir, scanner);
+        const installed_manifest = try std.fs.path.join(manager.allocator, &.{ destination, "package.json" });
+        if (manager.pathExists(installed_manifest)) return;
+
+        const requested = securityDependencyRequest(root, scanner) orelse {
+            try manager.stderr.print(
+                "Security scanner '{s}' is configured in bunfig.toml but is not installed.\n  To install it, run: bun add --dev {s}\n",
+                .{ scanner, scanner },
+            );
+            return error.PackageManagerErrorReported;
+        };
+        if (isLocalSpec(requested) or
+            isGitSpec(requested) or
+            isTarballSpec(requested) or
+            std.mem.startsWith(u8, requested, "workspace:"))
+        {
+            try manager.stderr.print(
+                "Security scanner '{s}' is configured in bunfig.toml but is not installed.\n  To install it, run: bun add --dev {s}\n",
+                .{ scanner, scanner },
+            );
+            return error.PackageManagerErrorReported;
+        }
+
+        try manager.stdout.writeAll("Attempting to install security scanner from npm...\n");
+        try manager.stdout.flush();
+        try manager.prepareNodeModules();
+        try manager.reserveWorkspaceRootVersions();
+
+        var installed_from_lock = false;
+        if (try manager.findLockedSelection(scanner, manager.root_dir)) |selection| {
+            if (selection.package.kind == .npm and
+                try manager.lockedPackageMatches(selection.package, scanner, requested, manager.root_dir))
+            {
+                const cycle_key = try std.fmt.allocPrint(manager.allocator, "lock:{s}", .{selection.package.key});
+                try manager.resolving.put(cycle_key, {});
+                defer _ = manager.resolving.remove(cycle_key);
+                _ = try manager.installLockedPackage(selection, scanner, manager.root_dir, true, false, &.{});
+                installed_from_lock = true;
+            }
+        }
+        if (!installed_from_lock) {
+            _ = try manager.installDependency(scanner, requested, manager.root_dir, true, false);
+        }
+
+        if (!manager.pathExists(installed_manifest)) {
+            try manager.stderr.print(
+                "Security scanner '{s}' could not be found after installation attempt.\n  If this is a local file, please check that the file exists and the path is correct.\n",
+                .{scanner},
+            );
+            return error.PackageManagerErrorReported;
+        }
+        try manager.stdout.writeAll("Security scanner installed successfully.\n");
+        try manager.stdout.flush();
+    }
+
     fn runSecurityScannerPreflight(manager: *Manager, root: *const Value) !void {
         const payload_path = try manager.securityTempFile("json");
         defer std.Io.Dir.cwd().deleteFile(manager.init_data.io, payload_path) catch {};
+        const manifests_path = try manager.securityRegistryManifestsPath(payload_path);
+        defer std.Io.Dir.cwd().deleteFile(manager.init_data.io, manifests_path) catch {};
 
         var resolver_environment = try manager.init_data.environ_map.clone(manager.allocator);
         defer resolver_environment.deinit();
@@ -2514,6 +2658,7 @@ const Manager = struct {
         defer resolver.kill(manager.init_data.io);
         const resolver_result = try resolver.wait(manager.init_data.io);
         if (packageManagerChildExitCode(resolver_result) != 0) return error.PackageManagerErrorReported;
+        try manager.loadSecurityRegistryManifests(payload_path);
 
         const resolved_payload = try std.Io.Dir.cwd().readFileAlloc(
             manager.init_data.io,
@@ -2538,6 +2683,7 @@ const Manager = struct {
             try manager.writeSecurityResolution(payload_path, root);
         }
 
+        try manager.ensureSecurityScannerAvailable(root);
         try manager.runSecurityScannerPayload(payload_path, "install");
     }
 
@@ -2545,19 +2691,17 @@ const Manager = struct {
         const scanner = manager.security_scanner orelse return;
         const result_path = try manager.securityTempFile("result.json");
         defer std.Io.Dir.cwd().deleteFile(manager.init_data.io, result_path) catch {};
-        const source = try renderSecurityScannerRuntime(
-            manager.allocator,
-            scanner,
-            manager.root_dir,
-            payload_path,
-            result_path,
-        );
-        const scanner_exit_code = ScriptRunner.runEval(
+        const scanner_args = [_][:0]const u8{
+            try manager.allocator.dupeZ(u8, scanner),
+            try manager.allocator.dupeZ(u8, manager.root_dir),
+            try manager.allocator.dupeZ(u8, payload_path),
+            try manager.allocator.dupeZ(u8, result_path),
+        };
+        const runtime_path = try manager.securityScannerRuntimePath();
+        const scanner_exit_code = ScriptRunner.run(
             manager.init_data,
-            source,
-            &.{},
-            &.{},
-            false,
+            runtime_path,
+            &scanner_args,
         ) catch |err| {
             try manager.stderr.print("Security scanner failed: {s}\n", .{@errorName(err)});
             return error.PackageManagerErrorReported;
@@ -2601,6 +2745,16 @@ const Manager = struct {
         const ok = result.object.get("ok") orelse return manager.failSecurityScanner("returned an invalid result envelope");
         if (ok != .bool) return manager.failSecurityScanner("returned an invalid result envelope");
         if (!ok.bool) {
+            if (result.object.get("exitCode")) |exit_code| {
+                if (exit_code == .integer) {
+                    try manager.stderr.print(
+                        "Security scanner exited with code {d} without sending data\n",
+                        .{exit_code.integer},
+                    );
+                    try manager.stderr.flush();
+                    return error.PackageManagerErrorReported;
+                }
+            }
             const message = result.object.get("error") orelse return manager.failSecurityScanner("failed without an error message");
             if (message != .string) return manager.failSecurityScanner("failed without an error message");
             return manager.failSecurityScanner(message.string);
@@ -2661,18 +2815,49 @@ const Manager = struct {
             if (warnings == 1) "" else "s",
         });
         try manager.stdout.writeAll(")\n");
-        if (!std.mem.eql(u8, mode, "scan")) {
-            if (fatal > 0) {
-                try manager.stdout.writeAll("Installation aborted due to fatal security advisories\n");
-            } else {
-                try manager.stdout.writeAll(
-                    "Security warnings found. Cannot prompt for confirmation (no TTY).\n" ++
-                        "Installation cancelled.\n",
-                );
-            }
+        if (std.mem.eql(u8, mode, "scan")) {
+            try manager.stdout.flush();
+            return error.PackageManagerErrorReported;
+        }
+        if (fatal > 0) {
+            try manager.stdout.writeAll("Installation aborted due to fatal security advisories\n");
+            try manager.stdout.flush();
+            return error.PackageManagerErrorReported;
+        }
+        if (try manager.promptForSecurityWarnings()) {
+            try manager.stdout.flush();
+            return;
         }
         try manager.stdout.flush();
         return error.PackageManagerErrorReported;
+    }
+
+    fn promptForSecurityWarnings(manager: *Manager) !bool {
+        if (!(std.Io.File.stdin().isTty(manager.init_data.io) catch false)) {
+            try manager.stdout.writeAll(
+                "\nSecurity warnings found. Cannot prompt for confirmation (no TTY).\n" ++
+                    "Installation cancelled.\n",
+            );
+            return false;
+        }
+
+        try manager.stdout.writeAll("\nSecurity warnings found. Continue anyway? [y/N] ");
+        try manager.stdout.flush();
+
+        var input_buffer: [1024]u8 = undefined;
+        var stdin_reader = std.Io.File.stdin().readerStreaming(manager.init_data.io, &input_buffer);
+        const line = (stdin_reader.interface.takeDelimiter('\n') catch null) orelse {
+            try manager.stdout.writeAll("\nInstallation cancelled.\n");
+            return false;
+        };
+        const response = std.mem.trim(u8, line, " \t\r");
+        if (!std.mem.eql(u8, response, "y") and !std.mem.eql(u8, response, "Y")) {
+            try manager.stdout.writeAll("\nInstallation cancelled.\n");
+            return false;
+        }
+
+        try manager.stdout.writeAll("\nContinuing with installation...\n\n");
+        return true;
     }
 
     fn validateSecurityAdvisory(manager: *Manager, advisory: *const Value, index: usize) !void {
