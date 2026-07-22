@@ -344,6 +344,7 @@ const RegistryArchiveFetch = struct {
     verify_integrity: bool,
     cache_path: []const u8,
     failure: ?anyerror = null,
+    fetched: bool = false,
 
     fn run(fetch_state: *RegistryArchiveFetch) std.Io.Cancelable!void {
         fetch_state.fetch() catch |err| {
@@ -371,6 +372,7 @@ const RegistryArchiveFetch = struct {
         var client: std.http.Client = .{ .allocator = std.heap.smp_allocator, .io = fetch_state.io };
         defer client.deinit();
         client.initDefaultProxies(std.heap.smp_allocator, fetch_state.environment) catch {};
+        fetch_state.fetched = true;
 
         var headers: [1]std.http.Header = undefined;
         const header_count: usize = if (fetch_state.authorization) |authorization| blk: {
@@ -2029,6 +2031,7 @@ const Manager = struct {
     started_ns: i128,
     installed_count: usize = 0,
     removed_count: usize = 0,
+    network_task_count: usize = 0,
     changed: bool = false,
     update_package_json_changed: bool = false,
     interactive_update_prepared: bool = false,
@@ -2210,6 +2213,11 @@ const Manager = struct {
             if (manager.options.command != .install) return error.FrozenLockfileChanged;
         }
         try manager.loadLockfile(&root);
+        if (manager.options.command == .install) {
+            if (manager.lock_graph) |*graph| {
+                manager.removed_count = removedDependencyCount(graph.root_workspace, &root);
+            }
+        }
         if (manager.lock_graph) |*graph| {
             if (graph.provenance == .pnpm) {
                 manager.manifest_policy.?.deinit();
@@ -2245,6 +2253,11 @@ const Manager = struct {
         if (manager.options.command == .patch_commit) {
             return manager.commitPatchCommand(&root, package_json_path, had_trailing_newline);
         }
+        const report_resolution = !manager.options.silent and
+            !internal_bunx_install and
+            manager.options.command == .install and
+            ((manager.lock_graph == null and hasAnyDependencies(&root)) or
+                manager.patch_policy_changed);
         if (!manager.options.silent and !internal_bunx_install) {
             try manager.stdout.print("bun {s} v{s} (cottontail v{s})\n{s}", .{
                 @tagName(manager.options.command),
@@ -2255,10 +2268,7 @@ const Manager = struct {
                     manager.rootLifecycleScriptsWillRun()) "" else "\n",
             });
             try manager.stdout.flush();
-            const fresh_patched_install = manager.options.command == .install and
-                manager.lock_graph == null and
-                manager.manifest_policy.?.patched_dependencies.count() > 0;
-            if (manager.options.command == .install and (manager.patch_policy_changed or fresh_patched_install)) {
+            if (report_resolution) {
                 try manager.stderr.writeAll("Resolving dependencies\n");
             }
         }
@@ -2319,6 +2329,9 @@ const Manager = struct {
             .unlink => unreachable,
             .patch, .patch_commit, .publish => unreachable,
             .audit, .outdated, .pm, .pm_list, .pm_info, .pm_whoami, .pm_why => unreachable,
+        }
+        if (report_resolution) {
+            try manager.stderr.print("Resolved, downloaded and extracted [{d}]\n", .{manager.network_task_count});
         }
 
         if (manager.trusted_additions.count() > 0 and !manager.options.no_save) {
@@ -2412,8 +2425,8 @@ const Manager = struct {
             if (manager.options.command == .install and manager.options.dry_run) {
                 try manager.stdout.print("[{d:.2}ms] done\n", .{elapsed_ms});
             } else if (manager.options.command == .remove) {
-                if (manager.direct_install_reports.items.len > 0) {
-                    const count = manager.direct_install_reports.items.len;
+                if (reported_installed_count > 0) {
+                    const count = reported_installed_count;
                     try manager.stdout.print("\n{d} package{s} installed [{d:.2}ms]\nRemoved: {d}\n", .{
                         count,
                         if (count == 1) "" else "s",
@@ -2433,6 +2446,23 @@ const Manager = struct {
                 } else if (manager.removed_count > 0) {
                     try manager.stdout.print("[{d:.2}ms] done\n", .{elapsed_ms});
                 }
+            } else if (manager.options.command == .install and
+                reported_installed_count == 0 and
+                manager.removed_count > 0)
+            {
+                try manager.stdout.print("{d} package{s} removed [{d:.2}ms]\n", .{
+                    manager.removed_count,
+                    if (manager.removed_count == 1) "" else "s",
+                    elapsed_ms,
+                });
+            } else if (manager.options.command == .install and
+                reported_installed_count == 0 and
+                !hasAnyDependencies(&root))
+            {
+                try manager.stdout.print("{s}[{d:.2}ms] done\n", .{
+                    manager.installSummarySeparator(),
+                    elapsed_ms,
+                });
             } else if (manager.options.command == .install and reported_installed_count == 0) {
                 const checked_installs = manager.records.items.len;
                 if (checked_installs == 0) {
@@ -8531,6 +8561,7 @@ const Manager = struct {
             try group.await(manager.init_data.io);
 
             for (batch) |*fetch| {
+                manager.network_task_count += 1;
                 if (fetch.failure) |failure| {
                     if (failure == error.RegistryManifestRequestFailed) {
                         try manager.registry_manifest_failures.put(
@@ -8583,6 +8614,9 @@ const Manager = struct {
             defer group.cancel(manager.init_data.io);
             for (batch) |*fetch| try group.concurrent(manager.init_data.io, RegistryArchiveFetch.run, .{fetch});
             try group.await(manager.init_data.io);
+            for (batch) |fetch| {
+                if (fetch.fetched) manager.network_task_count += 1;
+            }
             offset = end;
         }
     }
@@ -10933,6 +10967,25 @@ fn hasAnyDependencies(root: *const Value) bool {
     return false;
 }
 
+fn removedDependencyCount(previous: *const Value, current: *const Value) usize {
+    if (previous.* != .object or current.* != .object) return 0;
+    var count: usize = 0;
+    for (all_dependency_sections) |section_name| {
+        const previous_section = previous.object.get(section_name) orelse continue;
+        if (previous_section != .object) continue;
+        const current_section = current.object.get(section_name);
+        for (previous_section.object.keys()) |name| {
+            if (current_section == null or
+                current_section.? != .object or
+                current_section.?.object.get(name) == null)
+            {
+                count += 1;
+            }
+        }
+    }
+    return count;
+}
+
 fn containsString(values: []const []const u8, needle: []const u8) bool {
     for (values) |value| if (std.mem.eql(u8, value, needle)) return true;
     return false;
@@ -11316,6 +11369,24 @@ test "security scanner package metadata uses declared ranges" {
     try std.testing.expectEqualStrings("^0.0.2", securityDependencyRequest(&root, "bar").?);
     try std.testing.expectEqualStrings("latest", securityDependencyRequest(&root, "tool").?);
     try std.testing.expect(securityDependencyRequest(&root, "missing") == null);
+}
+
+test "removed dependency count compares lockfile dependency edges" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const previous = try std.json.parseFromSliceLeaky(
+        Value,
+        arena.allocator(),
+        "{\"dependencies\":{\"kept\":\"1.0.0\",\"moved\":\"1.0.0\"},\"devDependencies\":{\"removed\":\"1.0.0\"}}",
+        .{},
+    );
+    const current = try std.json.parseFromSliceLeaky(
+        Value,
+        arena.allocator(),
+        "{\"dependencies\":{\"kept\":\"2.0.0\"},\"devDependencies\":{\"moved\":\"1.0.0\"}}",
+        .{},
+    );
+    try std.testing.expectEqual(@as(usize, 2), removedDependencyCount(&previous, &current));
 }
 
 test "file URL paths follow Bun folder resolution" {

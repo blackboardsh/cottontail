@@ -556,9 +556,6 @@ const NodeGypWrapper = struct {
 
         const filename = if (builtin.os.tag == .windows) "node-gyp.cmd" else "node-gyp";
         const wrapper_path = try std.fs.path.join(allocator, &.{ directory, filename });
-        const permissions: std.Io.File.Permissions = if (builtin.os.tag == .windows) .default_file else .executable_file;
-        var file = try std.Io.Dir.cwd().createFile(init.io, wrapper_path, .{ .truncate = true, .permissions = permissions });
-        defer file.close(init.io);
         const contents = if (builtin.os.tag == .windows)
             "@if not defined npm_config_node_gyp (\r\n" ++
                 "  @\"%BUN%\" x --silent node-gyp %*\r\n" ++
@@ -572,7 +569,15 @@ const NodeGypWrapper = struct {
                 "else\n" ++
                 "  exec \"$npm_config_node_gyp\" \"$@\"\n" ++
                 "fi\n";
-        try file.writeStreamingAll(init.io, contents);
+        try writeExecutable(init.io, wrapper_path, contents);
+
+        const node_filename = if (builtin.os.tag == .windows) "node.cmd" else "node";
+        const node_path = try std.fs.path.join(allocator, &.{ directory, node_filename });
+        const node_contents = if (builtin.os.tag == .windows)
+            "@\"%BUN%\" %*\r\n"
+        else
+            "#!/bin/sh\nexec \"$BUN\" \"$@\"\n";
+        try writeExecutable(init.io, node_path, node_contents);
         return .{ .directory = directory };
     }
 
@@ -580,6 +585,13 @@ const NodeGypWrapper = struct {
         std.Io.Dir.cwd().deleteTree(io, wrapper.directory) catch {};
     }
 };
+
+fn writeExecutable(io: std.Io, path: []const u8, contents: []const u8) !void {
+    const permissions: std.Io.File.Permissions = if (builtin.os.tag == .windows) .default_file else .executable_file;
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true, .permissions = permissions });
+    defer file.close(io);
+    try file.writeStreamingAll(io, contents);
+}
 
 fn temporaryDirectory(environment: *const std.process.Environ.Map) []const u8 {
     for ([_][]const u8{ "BUN_TMPDIR", "TMPDIR", "TEMP", "TMP" }) |name| {
