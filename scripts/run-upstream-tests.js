@@ -119,7 +119,7 @@ function usage() {
     '  --binary <path>              Use an immutable Cottontail executable for this run.',
     '  --include-expected-failures  Run tests marked expected-failure and require them to fail.',
     '  --case <regexp>              Select generated itBundled case IDs within a split file.',
-    '  --jobs <n>                   Run independent Bun files/cases concurrently (default: up to 4).',
+    '  --jobs <n>                   Bound Bun file, split-case, and in-file test concurrency (default: up to 4).',
     '  --list                       Print status counts and any filtered selection without running tests.',
     '  --max-failures <n>           Stop after this many unexpected results.',
     '  --max-tests <n>              Run at most this many selected tests.',
@@ -127,6 +127,7 @@ function usage() {
     '  --no-serial-retry            Do not retry parallel failures serially (useful for discovery).',
     '  --only-status <status>       Select enabled, expected-failure, or not-enabled tests.',
     '  --test <relative-path>        Run one copied upstream test path.',
+    '  --timeout-scale <n>           Scale in-file Bun test deadlines without skipping cases.',
     '',
     'Snapshot overrides:',
     '  COTTONTAIL_UPSTREAM_TARGETS_PATH   Read target metadata from this JSON file.',
@@ -154,6 +155,7 @@ function parseArgs(argv) {
     serialRetry: true,
     onlyStatus: null,
     test: null,
+    timeoutScale: 1,
   };
   while (args.length > 0) {
     const arg = args.shift();
@@ -201,6 +203,10 @@ function parseArgs(argv) {
       options.onlyStatus = value;
     } else if (arg === '--test') {
       options.test = args.shift() ?? fail('--test requires a relative path');
+    } else if (arg === '--timeout-scale') {
+      const value = Number(args.shift() ?? fail('--timeout-scale requires a number'));
+      if (!Number.isFinite(value) || value < 1) fail('--timeout-scale requires a number greater than or equal to 1');
+      options.timeoutScale = value;
     } else if (arg === '--help' || arg === '-h') {
       usage();
       process.exit(0);
@@ -533,8 +539,12 @@ function runDirect(runtime, target, entry, snapshotRoot) {
   });
 }
 
-function entryArgs(entry) {
-  return Array.isArray(entry.args) ? entry.args.map(String) : [];
+function entryArgs(entry, options = null) {
+  const args = Array.isArray(entry.args) ? entry.args.map(String) : [];
+  if (options?.jobs === 1 && !args.some((arg) => arg === '--max-concurrency' || arg.startsWith('--max-concurrency='))) {
+    args.push('--max-concurrency', '1');
+  }
+  return args;
 }
 
 
@@ -565,9 +575,14 @@ function runDirectAsync(runtime, target, entry, snapshotRoot, options) {
   const timeout = entryTimeout(entry, options);
   const runTemp = mkdtempSync(join(tempRoot, 'run-'));
   return new Promise((resolveResult) => {
-    const child = spawn(binaryPath, [entry.path, ...entryArgs(entry)], {
+    const child = spawn(binaryPath, [entry.path, ...entryArgs(entry, options)], {
       cwd: snapshotRoot,
-      env: makeEnv(runtime, target, runTemp, entry.env),
+      env: makeEnv(runtime, target, runTemp, {
+        ...(entry.env ?? {}),
+        ...(options.timeoutScale !== 1
+          ? { COTTONTAIL_TEST_TIMEOUT_SCALE: String(options.timeoutScale) }
+          : {}),
+      }),
       detached: process.platform !== 'win32',
     });
     activeChildren.add(child);

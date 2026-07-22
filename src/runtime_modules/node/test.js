@@ -83,6 +83,10 @@ const globalOnlyMode = testRuntimeOptions.only;
 const passWithNoTests = testRuntimeOptions.passWithNoTests;
 const junitOptions = junitReporterOptions(testRuntimeOptions);
 const testFileCount = Math.max(1, Number(globalThis.process?.env?.COTTONTAIL_TEST_FILE_COUNT ?? 1) || 1);
+const configuredTimeoutScale = Number(globalThis.process?.env?.COTTONTAIL_TEST_TIMEOUT_SCALE ?? 1);
+const timeoutScale = Number.isFinite(configuredTimeoutScale) && configuredTimeoutScale >= 1
+  ? configuredTimeoutScale
+  : 1;
 
 function cliOption(name, fallback = undefined) {
   const equals = testCliArgs.find((arg) => String(arg).startsWith(`${name}=`));
@@ -467,7 +471,8 @@ class TestContext {
 
 function timeoutFor(options = {}) {
   const value = Number(options.timeout ?? defaultTimeout);
-  return Number.isFinite(value) && value >= 0 ? value : defaultTimeout;
+  const duration = Number.isFinite(value) && value >= 0 ? value : defaultTimeout;
+  return duration * timeoutScale;
 }
 
 function timeoutError(duration) {
