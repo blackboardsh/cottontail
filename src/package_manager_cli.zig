@@ -2342,6 +2342,17 @@ const Manager = struct {
             manager.options.positionals = try manager.globalLinkPackageSpecs();
         }
 
+        const install_header_printed = !manager.options.silent and
+            !internal_bunx_install and
+            manager.options.command == .install;
+        if (install_header_printed) {
+            try manager.stdout.print("bun install v{s} (cottontail v{s})\n\n", .{
+                bun_compat_version,
+                version,
+            });
+            try manager.stdout.flush();
+        }
+
         const package_json_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "package.json" });
         const package_source = blk: {
             break :blk std.Io.Dir.cwd().readFileAlloc(
@@ -2426,15 +2437,17 @@ const Manager = struct {
             ((manager.lock_graph == null and hasAnyDependencies(&root)) or
                 manager.patch_policy_changed);
         if (!manager.options.silent and !internal_bunx_install) {
-            try manager.stdout.print("bun {s} v{s} (cottontail v{s})\n{s}", .{
-                @tagName(manager.options.command),
-                bun_compat_version,
-                version,
-                if (manager.options.command == .link or
-                    manager.options.command == .remove or
-                    manager.rootLifecycleScriptsWillRun()) "" else "\n",
-            });
-            try manager.stdout.flush();
+            if (!install_header_printed) {
+                try manager.stdout.print("bun {s} v{s} (cottontail v{s})\n{s}", .{
+                    @tagName(manager.options.command),
+                    bun_compat_version,
+                    version,
+                    if (manager.options.command == .link or
+                        manager.options.command == .remove or
+                        manager.rootLifecycleScriptsWillRun()) "" else "\n",
+                });
+                try manager.stdout.flush();
+            }
             if (report_resolution) {
                 try manager.stderr.writeAll("Resolving dependencies\n");
             }
