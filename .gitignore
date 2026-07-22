@@ -32,6 +32,11 @@ compat/upstream/bun/*/packages/*
 !compat/upstream/bun/*/packages/bun-native-bundler-plugin-api/
 compat/upstream/bun/*/packages/bun-native-bundler-plugin-api/*
 !compat/upstream/bun/*/packages/bun-native-bundler-plugin-api/bundler_plugin.h
+!compat/upstream/bun/*/packages/bun-plugin-svelte/
+!compat/upstream/bun/*/packages/bun-plugin-svelte/**
+!compat/upstream/bun/*/packages/bun-types/
+compat/upstream/bun/*/packages/bun-types/*
+!compat/upstream/bun/*/packages/bun-types/package.json
 compat/upstream/**/Heap.*.heapsnapshot
 compat/upstream/**/Heap-*.heapsnapshot
 compat/upstream/**/.cottontail-compat-*

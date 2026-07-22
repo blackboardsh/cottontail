@@ -10,11 +10,14 @@
     "test",
     "packages/bun-native-bundler-plugin-api/bundler_plugin.h",
     "packages/bun-error/runtime-error.ts",
+    "packages/bun-plugin-svelte",
+    "packages/bun-types/package.json",
     "LICENSE.md"
   ],
   "notes": [
     "This is an owned Cottontail compatibility-test snapshot copied from Bun.",
     "The minimal root package.json preserves Bun's repository package boundary so ancestor package discovery cannot escape into Cottontail's own package.json.",
+    "The bun-plugin-svelte snapshot excludes its own tests and examples; bun-types package metadata is copied to exercise the plugin's local development dependency without vendoring unused declarations.",
     "Do not edit copied upstream tests in place unless intentionally forking them; document local ownership changes in status.json."
   ]
 }
