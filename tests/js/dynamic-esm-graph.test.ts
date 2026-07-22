@@ -2,6 +2,7 @@ import { afterAll, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
 
 const root = mkdtempSync(join(tmpdir(), "cottontail-dynamic-esm-graph-"));
@@ -126,6 +127,100 @@ test("workers link package graphs containing transitive top-level await", async 
   expect(result).toEqual({
     value: 42,
     executions: 1,
+    namespaceTag: "[object Module]",
+  });
+});
+
+test("queried package graphs preserve unresolved optional dynamic imports", async () => {
+  const packageRoot = join(root, "node_modules", "optional-dynamic-package");
+  mkdirSync(packageRoot, { recursive: true });
+  writeFileSync(join(packageRoot, "package.json"), JSON.stringify({
+    name: "optional-dynamic-package",
+    type: "module",
+    exports: "./index.js",
+    peerDependencies: { "missing-optional-dynamic-package": "*" },
+    peerDependenciesMeta: { "missing-optional-dynamic-package": { optional: true } },
+  }));
+  writeFileSync(join(packageRoot, "index.js"), [
+    "export const value = 42;",
+    'export const loadOptional = () => import("missing-optional-dynamic-package");',
+    "",
+  ].join("\n"));
+
+  const entry = join(root, "optional-entry.js");
+  writeFileSync(entry, [
+    'import { loadOptional, value } from "optional-dynamic-package";',
+    "export { loadOptional, value };",
+    "",
+  ].join("\n"));
+
+  const workerPath = join(root, "optional-worker.js");
+  writeFileSync(workerPath, [
+    'import { parentPort, workerData } from "node:worker_threads";',
+    'import { pathToFileURL } from "node:url";',
+    "const entryUrl = pathToFileURL(workerData).href;",
+    'const namespace = await import(`${entryUrl}?optional-dynamic`);',
+    "parentPort.postMessage({",
+    "  value: namespace.value,",
+    '  optionalType: typeof namespace.loadOptional,',
+    "  namespaceTag: Object.prototype.toString.call(namespace),",
+    "});",
+    "",
+  ].join("\n"));
+
+  const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
+    const worker = new Worker(workerPath, { workerData: entry });
+    worker.once("message", resolve);
+    worker.once("error", reject);
+    worker.once("exit", code => {
+      if (code !== 0) reject(new Error(`worker exited with code ${code}`));
+    });
+  });
+
+  expect(result).toEqual({
+    value: 42,
+    optionalType: "function",
+    namespaceTag: "[object Module]",
+  });
+});
+
+test("package entry graphs with relative-only edges load as one graph", async () => {
+  const packageRoot = join(root, "node_modules", "relative-entry-package");
+  mkdirSync(packageRoot, { recursive: true });
+  writeFileSync(join(packageRoot, "package.json"), JSON.stringify({
+    name: "relative-entry-package",
+    type: "module",
+    exports: "./index.js",
+  }));
+  writeFileSync(join(packageRoot, "value.js"), "export const value = 42;\n");
+  writeFileSync(join(packageRoot, "index.js"), [
+    'import { value } from "./value.js";',
+    "export { value };",
+    "",
+  ].join("\n"));
+
+  const workerPath = join(root, "relative-entry-worker.js");
+  writeFileSync(workerPath, [
+    'import { parentPort, workerData } from "node:worker_threads";',
+    "const namespace = await import(workerData);",
+    "parentPort.postMessage({",
+    "  value: namespace.value,",
+    "  namespaceTag: Object.prototype.toString.call(namespace),",
+    "});",
+    "",
+  ].join("\n"));
+
+  const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
+    const worker = new Worker(workerPath, { workerData: pathToFileURL(join(packageRoot, "index.js")).href });
+    worker.once("message", resolve);
+    worker.once("error", reject);
+    worker.once("exit", code => {
+      if (code !== 0) reject(new Error(`worker exited with code ${code}`));
+    });
+  });
+
+  expect(result).toEqual({
+    value: 42,
     namespaceTag: "[object Module]",
   });
 });
