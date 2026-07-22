@@ -6444,7 +6444,7 @@ const Manager = struct {
                 !manager.explicit_adds.contains(alias);
             if (should_report and
                 (manager.options.dry_run or
-                    manager.directDependencyChanged(alias, resolved_version) or
+                    manager.directDependencyChanged(alias, resolved_version, parent_dir) or
                     manager.options.command == .remove or
                     (workspace_display != null and manager.lock_graph == null)) and
                 !manager.options.silent)
@@ -6556,13 +6556,15 @@ const Manager = struct {
         return Manifest.Policy.wasTrustedInLock(&graph.document, package_name, loaded_defaults_apply);
     }
 
-    fn directDependencyWasAdded(manager: *const Manager, alias: []const u8) bool {
+    fn directDependencyWasAdded(manager: *Manager, alias: []const u8, parent_dir: []const u8) bool {
         const graph = if (manager.lock_graph) |*value| value else return !manager.initial_root_versions.contains(alias);
-        return graph.rootDependencySpec(alias) == null;
+        if (std.mem.eql(u8, parent_dir, manager.root_dir)) return graph.rootDependencySpec(alias) == null;
+        const workspace = manager.workspaceForPath(parent_dir) orelse return true;
+        return graph.workspaceDependencySpec(workspace.relative_path, alias) == null;
     }
 
-    fn directDependencyChanged(manager: *const Manager, alias: []const u8, resolved_version: []const u8) bool {
-        if (manager.directDependencyWasAdded(alias)) return true;
+    fn directDependencyChanged(manager: *Manager, alias: []const u8, resolved_version: []const u8, parent_dir: []const u8) bool {
+        if (manager.directDependencyWasAdded(alias, parent_dir)) return true;
         const initial = manager.initial_root_versions.get(alias) orelse return true;
         return !std.mem.eql(u8, initial, resolved_version);
     }

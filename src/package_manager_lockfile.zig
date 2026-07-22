@@ -82,8 +82,17 @@ pub const Graph = struct {
     }
 
     pub fn rootDependencySpec(graph: *const Graph, name: []const u8) ?[]const u8 {
+        return workspaceDependencySpecValue(graph.root_workspace, name);
+    }
+
+    pub fn workspaceDependencySpec(graph: *const Graph, path: []const u8, name: []const u8) ?[]const u8 {
+        const workspace = graph.workspaces.get(path) orelse return null;
+        return workspaceDependencySpecValue(workspace, name);
+    }
+
+    fn workspaceDependencySpecValue(workspace: *const Value, name: []const u8) ?[]const u8 {
         for (dependency_sections) |section_name| {
-            const section = graph.root_workspace.object.get(section_name) orelse continue;
+            const section = workspace.object.get(section_name) orelse continue;
             if (section != .object) continue;
             const value = section.object.get(name) orelse continue;
             if (value == .string) return value.string;
