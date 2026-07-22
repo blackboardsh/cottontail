@@ -15,6 +15,7 @@ const Invocation = struct {
     mode: RunMode,
     filters: []const []const u8,
     scripts: []const []const u8,
+    script_args: []const []const u8,
     workspaces: bool,
     if_present: bool,
     no_exit_on_error: bool,
@@ -599,10 +600,14 @@ fn parseInvocation(allocator: Allocator, io: std.Io, args: []const [:0]const u8)
 
     if (!triggered) return null;
     const mode: RunMode = if (parallel) .parallel else if (sequential) .sequential else .workspace;
+    const positionals = args[index..];
+    const scripts = if (mode == .workspace and positionals.len > 0) positionals[0..1] else positionals;
+    const script_args = if (mode == .workspace and positionals.len > 0) positionals[1..] else &.{};
     return .{
         .mode = mode,
         .filters = try filters.toOwnedSlice(),
-        .scripts = args[index..],
+        .scripts = scripts,
+        .script_args = script_args,
         .workspaces = workspaces,
         .if_present = if_present,
         .no_exit_on_error = no_exit_on_error,
@@ -875,13 +880,28 @@ fn appendScriptStage(
     });
 }
 
-fn stagesForScript(allocator: Allocator, io: std.Io, package: Package, name: []const u8) ![]const Stage {
+fn stagesForScript(
+    allocator: Allocator,
+    io: std.Io,
+    package: Package,
+    name: []const u8,
+    script_args: []const []const u8,
+) ![]const Stage {
     const main = scriptValue(package, name) orelse return &.{};
     var stages = std.array_list.Managed(Stage).init(allocator);
     const pre_name = try std.mem.concat(allocator, u8, &.{ "pre", name });
     const post_name = try std.mem.concat(allocator, u8, &.{ "post", name });
     if (scriptValue(package, pre_name)) |command| try appendScriptStage(&stages, allocator, io, pre_name, command);
     try appendScriptStage(&stages, allocator, io, name, main);
+    if (script_args.len > 0) {
+        var command = std.array_list.Managed(u8).init(allocator);
+        try command.appendSlice(stages.items[stages.items.len - 1].command);
+        for (script_args) |arg| {
+            try command.append(' ');
+            try command.appendSlice(try shellEscape(allocator, arg));
+        }
+        stages.items[stages.items.len - 1].command = command.items;
+    }
     if (scriptValue(package, post_name)) |command| try appendScriptStage(&stages, allocator, io, post_name, command);
     return try stages.toOwnedSlice();
 }
@@ -892,11 +912,12 @@ fn appendPackageGroup(
     package: Package,
     package_index: usize,
     script_name: []const u8,
+    script_args: []const []const u8,
     workspace_label: bool,
     init_cwd: []const u8,
 ) !void {
     const allocator = init.arena.allocator();
-    const stages = try stagesForScript(allocator, init.io, package, script_name);
+    const stages = try stagesForScript(allocator, init.io, package, script_name, script_args);
     if (stages.len == 0) return;
     const label = if (workspace_label)
         try std.mem.concat(allocator, u8, &.{ package.label(), ":", script_name })
@@ -1020,9 +1041,9 @@ fn runRootMulti(init: std.process.Init, invocation: Invocation, cwd: []const u8)
                 try std.Io.File.stderr().writeStreamingAll(init.io, message);
                 return 1;
             }
-            for (matches) |name| try appendPackageGroup(init, &groups, package, 0, name, false, cwd);
+            for (matches) |name| try appendPackageGroup(init, &groups, package, 0, name, invocation.script_args, false, cwd);
         } else if (scriptValue(package, request) != null) {
-            try appendPackageGroup(init, &groups, package, 0, request, false, cwd);
+            try appendPackageGroup(init, &groups, package, 0, request, invocation.script_args, false, cwd);
         } else {
             try appendRawGroup(init, &groups, cwd, request);
         }
@@ -1112,9 +1133,9 @@ fn runWorkspaces(init: std.process.Init, invocation: Invocation, cwd: []const u8
             if (hasGlob(request)) {
                 const matches = try matchingScriptNames(allocator, package, request);
                 if (matches.len == 0 and invocation.workspaces and !invocation.if_present) missing_workspace_script = request;
-                for (matches) |name| try appendPackageGroup(init, &groups, package, package_index, name, true, cwd);
+                for (matches) |name| try appendPackageGroup(init, &groups, package, package_index, name, invocation.script_args, true, cwd);
             } else if (scriptValue(package, request) != null) {
-                try appendPackageGroup(init, &groups, package, package_index, request, true, cwd);
+                try appendPackageGroup(init, &groups, package, package_index, request, invocation.script_args, true, cwd);
             } else if (invocation.workspaces and !invocation.if_present) {
                 missing_workspace_script = request;
             }

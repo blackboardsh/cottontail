@@ -27,13 +27,25 @@ pub const Scope = struct {
     }
 
     pub fn waitAndPropagate(self: *Scope, io: std.Io, child: *std.process.Child) !u8 {
+        return propagate(try self.wait(io, child));
+    }
+
+    pub fn wait(self: *Scope, io: std.Io, child: *std.process.Child) !std.process.Child.Term {
         if (child.id) |id| self.setChild(id);
         const term = try child.wait(io);
         self.deinit();
-        return switch (term) {
-            .exited => |code| @intCast(@min(code, 255)),
-            .signal => |signal_number| ct_exit_with_signal(@intCast(@intFromEnum(signal_number))),
-            .stopped, .unknown => 1,
-        };
+        return term;
     }
 };
+
+pub fn propagate(term: std.process.Child.Term) u8 {
+    return switch (term) {
+        .exited => |code| @intCast(@min(code, 255)),
+        .signal => |signal_number| exitWithSignal(signal_number),
+        .stopped, .unknown => 1,
+    };
+}
+
+pub fn exitWithSignal(signal_number: std.posix.SIG) noreturn {
+    ct_exit_with_signal(@intCast(@intFromEnum(signal_number)));
+}

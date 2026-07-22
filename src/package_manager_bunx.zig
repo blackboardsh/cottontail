@@ -157,6 +157,15 @@ pub fn run(
     };
 
     const invocation_dir = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
+    if (!isSourceSpec(options.package_spec)) {
+        if (splitRegistrySpec(options.package_spec)) |registry_spec| {
+            if (!validRegistrySpecifier(registry_spec)) {
+                try stderr.print("error: unrecognised dependency format: {s}\n", .{options.package_spec});
+                try stderr.flush();
+                return 1;
+            }
+        }
+    }
     const request = try makeRequest(allocator, invocation_dir, options);
     const ignored_path = init.environ_map.get("BUN_WHICH_IGNORE_CWD");
     const local_bin_dirs = try collectLocalBinDirs(init, allocator, invocation_dir);
@@ -407,6 +416,18 @@ const RegistrySpec = struct {
     version: []const u8,
     explicit_version: bool,
 };
+
+fn validRegistrySpecifier(spec: RegistrySpec) bool {
+    if (spec.name.len == 0) return false;
+    for (spec.name) |byte| {
+        if (std.ascii.isWhitespace(byte) or std.ascii.isControl(byte)) return false;
+        if (std.mem.indexOfScalar(u8, "%?#\\", byte) != null) return false;
+    }
+    for (spec.version) |byte| {
+        if (std.ascii.isWhitespace(byte) or std.ascii.isControl(byte) or byte == '%') return false;
+    }
+    return true;
+}
 
 fn splitRegistrySpec(input: []const u8) ?RegistrySpec {
     if (isSourceSpec(input)) return null;

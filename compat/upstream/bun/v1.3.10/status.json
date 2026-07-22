@@ -1144,6 +1144,16 @@
       "status": "enabled",
       "reason": "Bun info and pm view package selection, rendering, property access, JSON output, diagnostics, and concurrent inline snapshots pass all 19 copied cases (60 assertions)."
     },
+    "test/cli/install/bun-run.test.ts": {
+      "status": "enabled",
+      "reason": "All 291 copied Bun run cases pass across script/module/bin/system-command priority, extension and directory resolution, workspace filters and argument forwarding, lifecycle execution, diagnostics, signals, and monorepo roots (416 assertions)."
+    },
+    "test/cli/install/bun-run-dir.test.ts": {
+      "status": "enabled",
+      "reason": "All three copied auto-install run cases pass with 29 assertions. The extended deadline records Cottontail's current cold package-install cost without weakening behavioral assertions.",
+      "args": ["--timeout", "50000"],
+      "timeoutMs": 180000
+    },
     "test/cli/install/bun-audit.test.ts": {
       "status": "enabled",
       "reason": "Audit request shaping, severity filtering, JSON and text output, registry selection, and failure diagnostics pass all 16 copied cases (44 assertions).",

@@ -93,6 +93,8 @@ const RunScriptFlags = struct {
     if_present: bool = false,
     silent: bool = false,
     bun: bool = false,
+    explicit_run: bool = false,
+    debug: bool = false,
     shell: ?RunShell = null,
     config_path: ?[]const u8 = null,
 };
@@ -494,6 +496,7 @@ fn isBunShellScript(path: []const u8) bool {
 fn unsupportedEntrypointLoader(path: []const u8) ?[]const u8 {
     const extension = std.fs.path.extension(path);
     if (std.ascii.eqlIgnoreCase(extension, ".css")) return "css";
+    if (std.ascii.eqlIgnoreCase(extension, ".json")) return "json";
     return null;
 }
 
@@ -518,6 +521,80 @@ fn cliBunEntrypointExists(io: std.Io, allocator: std.mem.Allocator, path: []cons
         if (pathIsFile(io, candidate)) return true;
     }
     return false;
+}
+
+const run_entrypoint_extensions = [_][]const u8{
+    ".tsx", ".jsx", ".mts", ".ts", ".cts", ".js", ".mjs", ".cjs", ".json",
+};
+
+fn pathIsDirectory(io: std.Io, path: []const u8) bool {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return stat.kind == .directory;
+}
+
+fn resolveRunEntrypoint(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    requested: []const u8,
+) !?[:0]const u8 {
+    return resolveRunEntrypointDepth(io, allocator, requested, 0);
+}
+
+fn resolveRunEntrypointDepth(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    requested: []const u8,
+    depth: usize,
+) !?[:0]const u8 {
+    if (requested.len == 0 or depth > 8) return null;
+    const has_trailing_separator = requested[requested.len - 1] == '/' or requested[requested.len - 1] == '\\';
+
+    if (!has_trailing_separator) {
+        if (pathIsFile(io, requested)) return try allocator.dupeZ(u8, requested);
+
+        const extension = std.fs.path.extension(requested);
+        if (extension.len > 0) {
+            const stem = requested[0 .. requested.len - extension.len];
+            for (script_runner.bunEntrypointFallbackExtensions(requested)) |replacement| {
+                const candidate = try std.mem.concat(allocator, u8, &.{ stem, replacement });
+                if (pathIsFile(io, candidate)) return try allocator.dupeZ(u8, candidate);
+            }
+        } else {
+            for (run_entrypoint_extensions) |candidate_extension| {
+                const candidate = try std.mem.concat(allocator, u8, &.{ requested, candidate_extension });
+                if (pathIsFile(io, candidate)) return try allocator.dupeZ(u8, candidate);
+            }
+        }
+    }
+
+    if (!pathIsDirectory(io, requested)) return null;
+    const package_json = try std.fs.path.join(allocator, &.{ requested, "package.json" });
+    if (std.Io.Dir.cwd().readFileAlloc(io, package_json, allocator, .limited(16 * 1024 * 1024)) catch null) |source| {
+        if (package_manager_lockfile.normalizeJsonc(allocator, source) catch null) |normalized| {
+            if (std.json.parseFromSliceLeaky(std.json.Value, allocator, normalized, .{
+                .duplicate_field_behavior = .use_last,
+            }) catch null) |manifest| {
+                if (manifest == .object) {
+                    if (manifest.object.get("main")) |main_value| {
+                        if (main_value == .string and main_value.string.len > 0) {
+                            const main_path = if (std.fs.path.isAbsolute(main_value.string))
+                                main_value.string
+                            else
+                                try std.fs.path.join(allocator, &.{ requested, main_value.string });
+                            if (try resolveRunEntrypointDepth(io, allocator, main_path, depth + 1)) |resolved| return resolved;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (run_entrypoint_extensions) |candidate_extension| {
+        const basename = try std.mem.concat(allocator, u8, &.{ "index", candidate_extension });
+        const candidate = try std.fs.path.join(allocator, &.{ requested, basename });
+        if (pathIsFile(io, candidate)) return try allocator.dupeZ(u8, candidate);
+    }
+    return null;
 }
 
 fn isHtmlEntrypoint(path: []const u8) bool {
@@ -823,6 +900,7 @@ fn findPackageScripts(
 const RunBunfig = struct {
     silent: bool = false,
     bun: bool = false,
+    debug: bool = false,
     shell: ?RunShell = null,
 };
 
@@ -836,9 +914,13 @@ fn parseRunBunfig(allocator: std.mem.Allocator, path: []const u8, contents: []co
     const source = cottontail_compiler.logger.Source.initPathString(path, contents);
     const root = cottontail_compiler.interchange.toml.TOML.parse(&source, &log, allocator, true) catch return .{};
     if (log.hasErrors()) return .{};
-    const run = root.get("run") orelse return .{};
-
     var config: RunBunfig = .{};
+    if (root.get("logLevel")) |value| {
+        if (value.asString(allocator)) |level| {
+            config.debug = std.mem.eql(u8, level, "debug");
+        }
+    }
+    const run = root.get("run") orelse return config;
     if (run.get("silent")) |value| config.silent = value.asBool() orelse false;
     if (run.get("bun")) |value| config.bun = value.asBool() orelse false;
     if (run.get("shell")) |value| {
@@ -865,8 +947,62 @@ fn configuredRunScriptFlags(init: std.process.Init, flags: RunScriptFlags) !RunS
     const bunfig = parseRunBunfig(init.arena.allocator(), path, contents);
     configured.silent = configured.silent or bunfig.silent;
     configured.bun = configured.bun or bunfig.bun;
+    configured.debug = configured.debug or bunfig.debug;
     if (configured.shell == null) configured.shell = bunfig.shell;
     return configured;
+}
+
+fn tsconfigExtendsExists(io: std.Io, allocator: std.mem.Allocator, candidate: []const u8) !bool {
+    if (pathIsFile(io, candidate)) return true;
+    if (std.fs.path.extension(candidate).len == 0) {
+        const with_json = try std.mem.concat(allocator, u8, &.{ candidate, ".json" });
+        if (pathIsFile(io, with_json)) return true;
+        const package_config = try std.fs.path.join(allocator, &.{ candidate, "tsconfig.json" });
+        if (pathIsFile(io, package_config)) return true;
+    }
+    return false;
+}
+
+fn reportMissingDebugTsconfigExtends(
+    init: std.process.Init,
+    entrypoint: []const u8,
+    flags: RunScriptFlags,
+) !void {
+    const configured = try configuredRunScriptFlags(init, flags);
+    if (!configured.debug) return;
+
+    const allocator = init.arena.allocator();
+    const entrypoint_abs = std.Io.Dir.cwd().realPathFileAlloc(init.io, entrypoint, allocator) catch entrypoint;
+    var current = std.fs.path.dirname(entrypoint_abs) orelse return;
+    while (true) {
+        const tsconfig_path = try std.fs.path.join(allocator, &.{ current, "tsconfig.json" });
+        if (std.Io.Dir.cwd().readFileAlloc(init.io, tsconfig_path, allocator, .limited(16 * 1024 * 1024)) catch null) |source| {
+            const normalized = package_manager_lockfile.normalizeJsonc(allocator, source) catch return;
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, normalized, .{
+                .duplicate_field_behavior = .use_last,
+            }) catch return;
+            if (parsed == .object) {
+                if (parsed.object.get("extends")) |extends_value| {
+                    if (extends_value == .string and extends_value.string.len > 0) {
+                        const candidate = if (std.fs.path.isAbsolute(extends_value.string))
+                            extends_value.string
+                        else
+                            try std.fs.path.join(allocator, &.{ current, extends_value.string });
+                        if (!try tsconfigExtendsExists(init.io, allocator, candidate)) {
+                            var buffer: [4096]u8 = undefined;
+                            var writer = std.Io.File.stderr().writer(init.io, &buffer);
+                            try writer.interface.print("ENOENT loading tsconfig.json extends \"{s}\"\n", .{candidate});
+                            try writer.interface.flush();
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        const parent = std.fs.path.dirname(current) orelse return;
+        if (std.mem.eql(u8, parent, current)) return;
+        current = parent;
+    }
 }
 
 fn prependAncestorBinPaths(
@@ -976,6 +1112,7 @@ fn runAncestorBin(
     executable: []const u8,
     args: []const [:0]const u8,
     force_runtime: bool,
+    silent: bool,
 ) !u8 {
     const allocator = init.arena.allocator();
     const cwd_abs = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
@@ -997,7 +1134,54 @@ fn runAncestorBin(
         .create_no_window = true,
     });
     defer child.kill(init.io);
-    return signal_scope.waitAndPropagate(init.io, &child);
+    const term = try signal_scope.wait(init.io, &child);
+    return switch (term) {
+        .exited => |code| blk: {
+            const narrowed: u8 = @intCast(@min(code, 255));
+            if (narrowed != 0 and !silent) {
+                var buffer: [1024]u8 = undefined;
+                var writer = std.Io.File.stderr().writer(init.io, &buffer);
+                try writer.interface.print("error: \"{s}\" exited with code {d}\n", .{ std.fs.path.basename(executable), narrowed });
+                try writer.interface.flush();
+            }
+            break :blk narrowed;
+        },
+        .signal => |signal_number| {
+            if (!silent) {
+                var buffer: [1024]u8 = undefined;
+                var writer = std.Io.File.stderr().writer(init.io, &buffer);
+                try writer.interface.print("error: \"{s}\" exited with signal SIG{s}\n", .{
+                    std.fs.path.basename(executable),
+                    @tagName(signal_number),
+                });
+                try writer.interface.flush();
+            }
+            signal_forwarding.exitWithSignal(signal_number);
+        },
+        .stopped, .unknown => 1,
+    };
+}
+
+fn findSystemExecutable(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path_value: []const u8,
+    name: []const u8,
+) !?[]const u8 {
+    if (std.mem.indexOfAny(u8, name, "/\\") != null) return null;
+    var directories = std.mem.tokenizeScalar(u8, path_value, std.fs.path.delimiter);
+    while (directories.next()) |directory| {
+        if (directory.len == 0) continue;
+        const candidate = try std.fs.path.join(allocator, &.{ directory, name });
+        if (pathIsFile(io, candidate)) return candidate;
+        if (builtin.os.tag == .windows and std.fs.path.extension(name).len == 0) {
+            for ([_][]const u8{ ".exe", ".cmd", ".bat", ".com" }) |extension| {
+                const with_extension = try std.mem.concat(allocator, u8, &.{ candidate, extension });
+                if (pathIsFile(io, with_extension)) return with_extension;
+            }
+        }
+    }
+    return null;
 }
 
 fn shellEscapeArg(allocator: std.mem.Allocator, arg: []const u8) ![]const u8 {
@@ -1014,15 +1198,12 @@ fn shellEscapeArg(allocator: std.mem.Allocator, arg: []const u8) ![]const u8 {
     }
     if (plain) return arg;
     var buffer = std.array_list.Managed(u8).init(allocator);
-    try buffer.append('\'');
+    try buffer.append('"');
     for (arg) |byte| {
-        if (byte == '\'') {
-            try buffer.appendSlice("'\\''");
-        } else {
-            try buffer.append(byte);
-        }
+        if (byte == '"' or byte == '\\' or byte == '$' or byte == '`') try buffer.append('\\');
+        try buffer.append(byte);
     }
-    try buffer.append('\'');
+    try buffer.append('"');
     return buffer.items;
 }
 
@@ -1036,14 +1217,15 @@ fn runOnePackageScript(
 ) !u8 {
     try env.put("npm_lifecycle_event", stage_name);
     try env.put("npm_lifecycle_script", command);
+    const rewritten_command = try cli_script_command.replacePackageManagerRun(init.arena.allocator(), init.io, command);
     if (!flags.silent) {
         var stderr_buffer: [4096]u8 = undefined;
         var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
         const stderr = &stderr_writer.interface;
-        try stderr.print("$ {s}\n", .{command});
+        const display_command = try cli_script_command.displayPackageManagerRun(init.arena.allocator(), command);
+        try stderr.print("$ {s}\n", .{display_command});
         try stderr.flush();
     }
-    const rewritten_command = try cli_script_command.replacePackageManagerRun(init.arena.allocator(), init.io, command);
     var bun_shell_args: [3][]const u8 = undefined;
     var system_shell_args: [5][]const u8 = undefined;
     const use_bun_shell = flags.shell == .bun or (flags.shell == null and builtin.os.tag == .windows);
@@ -1080,6 +1262,14 @@ fn runOnePackageScript(
     return signal_scope.waitAndPropagate(init.io, &child);
 }
 
+fn reportPackageScriptExit(init: std.process.Init, name: []const u8, code: u8, flags: RunScriptFlags) void {
+    if (code == 0 or code == 2 or flags.silent) return;
+    var buffer: [1024]u8 = undefined;
+    var writer = std.Io.File.stderr().writer(init.io, &buffer);
+    writer.interface.print("error: script \"{s}\" exited with code {d}\n", .{ name, code }) catch {};
+    writer.interface.flush() catch {};
+}
+
 fn runPackageScripts(
     init: std.process.Init,
     pkg: PackageScripts,
@@ -1107,8 +1297,12 @@ fn runPackageScripts(
     for (pkg.config) |entry| try env.put(entry.name, entry.value);
 
     if (pkg.pre) |pre_command| {
-        const code = try runOnePackageScript(init, &env, pkg.dir, try std.mem.concat(allocator, u8, &.{ "pre", pkg.script_name }), pre_command, flags);
-        if (code != 0) return code;
+        const stage_name = try std.mem.concat(allocator, u8, &.{ "pre", pkg.script_name });
+        const code = try runOnePackageScript(init, &env, pkg.dir, stage_name, pre_command, flags);
+        if (code != 0) {
+            reportPackageScriptExit(init, stage_name, code, flags);
+            return code;
+        }
     }
 
     var main_command: []const u8 = pkg.main;
@@ -1122,11 +1316,18 @@ fn runPackageScripts(
         main_command = buffer.items;
     }
     const main_code = try runOnePackageScript(init, &env, pkg.dir, pkg.script_name, main_command, flags);
-    if (main_code != 0) return main_code;
+    if (main_code != 0) {
+        reportPackageScriptExit(init, pkg.script_name, main_code, flags);
+        return main_code;
+    }
 
     if (pkg.post) |post_command| {
-        const code = try runOnePackageScript(init, &env, pkg.dir, try std.mem.concat(allocator, u8, &.{ "post", pkg.script_name }), post_command, flags);
-        if (code != 0) return code;
+        const stage_name = try std.mem.concat(allocator, u8, &.{ "post", pkg.script_name });
+        const code = try runOnePackageScript(init, &env, pkg.dir, stage_name, post_command, flags);
+        if (code != 0) {
+            reportPackageScriptExit(init, stage_name, code, flags);
+            return code;
+        }
     }
     return 0;
 }
@@ -2818,6 +3019,7 @@ fn parseRunInvocation(
     exec_len: *usize,
     flags: *RunScriptFlags,
 ) !CliInvocation {
+    flags.explicit_run = true;
     var index: usize = start_index;
     while (index < args.len) {
         const arg = args[index];
@@ -3481,25 +3683,16 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (invocation.mode == .script) {
-        if (unsupportedEntrypointLoader(invocation.payload)) |loader| {
-            if (cliPathExists(init.io, invocation.payload)) {
-                try stderr.print("error: Cannot run \"{s}\" with the \"{s}\" loader\n", .{ invocation.payload, loader });
-            } else {
-                try stderr.print("error: File not found \"{s}\"\n", .{invocation.payload});
-            }
-            try stderr.flush();
-            std.process.exit(1);
-        }
-    }
+    const resolved_run_entrypoint = if (invocation.mode == .script and !std.mem.eql(u8, arg, "test"))
+        try resolveRunEntrypoint(init.io, init.arena.allocator(), invocation.payload)
+    else
+        null;
 
-    if (invocation.mode == .script and !std.mem.eql(u8, arg, "test") and
-        !(try cliBunEntrypointExists(init.io, init.arena.allocator(), invocation.payload)))
-    {
+    if (invocation.mode == .script and !std.mem.eql(u8, arg, "test")) {
         const payload = invocation.payload;
         const path_like = std.mem.indexOfScalar(u8, payload, '/') != null or
             std.mem.indexOfScalar(u8, payload, '\\') != null;
-        if (!path_like) {
+        if (!path_like and (invocation.flags.explicit_run or resolved_run_entrypoint == null)) {
             if (try findPackageScripts(init.io, init.arena.allocator(), payload)) |pkg| {
                 const flags = try configuredRunScriptFlags(init, invocation.flags);
                 const script_exit = try runPackageScripts(
@@ -3512,33 +3705,93 @@ pub fn main(init: std.process.Init) !void {
                 if (script_exit != 0) std.process.exit(script_exit);
                 return;
             }
+        }
+
+        const resolved_loader = if (resolved_run_entrypoint) |resolved|
+            unsupportedEntrypointLoader(resolved)
+        else
+            null;
+        if (resolved_run_entrypoint == null) {
+            if (unsupportedEntrypointLoader(payload)) |loader| {
+                if (cliPathExists(init.io, payload)) {
+                    try stderr.print("error: Cannot run \"{s}\" with the \"{s}\" loader\n", .{ payload, loader });
+                } else {
+                    try stderr.print("error: File not found \"{s}\"\n", .{payload});
+                }
+                try stderr.flush();
+                std.process.exit(1);
+            }
+        }
+
+        const fallback_can_yield_to_bin = resolved_loader != null and std.fs.path.extension(payload).len == 0;
+        if ((resolved_run_entrypoint == null or fallback_can_yield_to_bin) and !path_like) {
             if (try findAncestorBin(init.io, init.arena.allocator(), payload)) |executable| {
                 const binary_exit = try runAncestorBin(
                     init,
                     executable,
                     invocation.args,
                     forcesBunRuntime(invocation.exec_args),
+                    invocation.flags.silent,
                 );
                 if (binary_exit != 0) std.process.exit(binary_exit);
                 return;
             }
+            if (resolved_run_entrypoint == null and invocation.flags.explicit_run) {
+                if (try findSystemExecutable(
+                    init.io,
+                    init.arena.allocator(),
+                    init.environ_map.get("PATH") orelse "",
+                    payload,
+                )) |executable| {
+                    const binary_exit = try runAncestorBin(
+                        init,
+                        executable,
+                        invocation.args,
+                        forcesBunRuntime(invocation.exec_args),
+                        invocation.flags.silent,
+                    );
+                    if (binary_exit != 0) std.process.exit(binary_exit);
+                    return;
+                }
+            }
         }
-        if (invocation.flags.if_present) return;
-        if (!path_like and std.fs.path.extension(payload).len == 0) {
-            try stderr.print("error: Script not found \"{s}\"\n", .{payload});
-        } else {
-            try stderr.print("error: Module not found \"{s}\"\n", .{payload});
+        if (resolved_loader) |loader| {
+            try stderr.print("error: Cannot run \"{s}\" with the \"{s}\" loader\n", .{ resolved_run_entrypoint.?, loader });
+            try stderr.flush();
+            std.process.exit(1);
         }
-        try stderr.flush();
-        std.process.exit(1);
+        if (resolved_run_entrypoint == null) {
+            if (invocation.flags.if_present) return;
+            if (!path_like and std.fs.path.extension(payload).len == 0) {
+                try stderr.print("error: Script not found \"{s}\"\n", .{payload});
+            } else {
+                try stderr.print("error: Module not found \"{s}\"\n", .{payload});
+            }
+            try stderr.flush();
+            std.process.exit(1);
+        }
     }
 
     if (forcesBunRuntime(invocation.exec_args)) {
         try prependForcedBunRuntimePath(init, init.arena.allocator(), init.environ_map);
     }
 
+    if (resolved_run_entrypoint) |resolved| {
+        try reportMissingDebugTsconfigExtends(init, resolved, invocation.flags);
+    }
+
     const exit_code = switch (invocation.mode) {
-        .script => if (isBunShellScript(invocation.payload))
+        .script => if (resolved_run_entrypoint) |resolved|
+            if (isBunShellScript(resolved))
+                try runBunShellScript(init, resolved, invocation.args)
+            else
+                try script_runner.runWithExecArgv(
+                    init,
+                    resolved,
+                    invocation.args,
+                    invocation.exec_args,
+                )
+        else if (isBunShellScript(invocation.payload))
             try runBunShellScript(init, invocation.payload, invocation.args)
         else
             try script_runner.runWithExecArgv(init, invocation.payload, invocation.args, invocation.exec_args),

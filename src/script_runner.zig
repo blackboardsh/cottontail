@@ -649,6 +649,8 @@ fn prependAutoInstallNodePath(ctx: *const Context, node_modules: []const u8) !vo
     else
         try std.fmt.allocPrint(ctx.allocator, "{s}{c}{s}", .{ node_modules, std.fs.path.delimiter, existing });
     try ctx.environ_map.put("NODE_PATH", value);
+    const value_z = try ctx.allocator.dupeZ(u8, value);
+    _ = setenv("NODE_PATH", value_z.ptr, 1);
 }
 
 fn installedAutoPackageVersion(ctx: *const Context, package_dir: []const u8) ?[]const u8 {
@@ -4860,9 +4862,13 @@ fn bundleScriptNative(
     if (build_options) |provided| try features.appendSlice(ctx.allocator, provided.features);
     try collectFeatures(ctx.allocator, &features, exec_args);
     try collectFeatures(ctx.allocator, &features, script_args);
+    const ignore_dce_annotations = for (exec_args) |arg| {
+        if (std.mem.eql(u8, arg, "--ignore-dce-annotations")) break true;
+    } else false;
     const plain_launcher_cacheable = preload_imports.len == 0 and
         build_options == null and
         !has_custom_conditions and
+        !ignore_dce_annotations and
         reload_dependencies_out == null and
         features.items.len == 0 and
         tsconfig_override == null and
@@ -4947,6 +4953,7 @@ fn bundleScriptNative(
 
     var error_message: ?[*:0]u8 = null;
     var options = build_options orelse native_bundler.BundleOptions{};
+    options.ignore_dce_annotations = options.ignore_dce_annotations or ignore_dce_annotations;
     if (build_options == null) {
         options.skip_teardown = true;
         options.externalize_runtime_require_resolve = true;

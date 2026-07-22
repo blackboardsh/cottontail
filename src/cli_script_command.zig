@@ -46,16 +46,11 @@ fn commandTokenMatches(remainder: []const u8, command: []const u8) bool {
 /// Bun routes nested package-manager script calls back through `bun run`.
 /// Cottontail also replaces a literal `bun` executable because its stock-JSC
 /// binary is normally installed under a different name.
-pub fn replacePackageManagerRun(
+fn replacePackageManagerRunWithCommand(
     allocator: std.mem.Allocator,
-    io: std.Io,
     script: []const u8,
+    bun_command: []const u8,
 ) ![]const u8 {
-    const executable = try std.process.executablePathAlloc(io, allocator);
-    defer allocator.free(executable);
-    const bun_command = try quoteExecutable(allocator, executable);
-    defer allocator.free(bun_command);
-
     var rewritten = try std.array_list.Managed(u8).initCapacity(allocator, script.len + bun_command.len);
     var entry_index: usize = 0;
     var delimiter: u8 = ' ';
@@ -163,6 +158,22 @@ pub fn replacePackageManagerRun(
     }
 
     return try rewritten.toOwnedSlice();
+}
+
+pub fn replacePackageManagerRun(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    script: []const u8,
+) ![]const u8 {
+    const executable = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(executable);
+    const bun_command = try quoteExecutable(allocator, executable);
+    defer allocator.free(bun_command);
+    return replacePackageManagerRunWithCommand(allocator, script, bun_command);
+}
+
+pub fn displayPackageManagerRun(allocator: std.mem.Allocator, script: []const u8) ![]const u8 {
+    return replacePackageManagerRunWithCommand(allocator, script, "bun");
 }
 
 test "rewrite nested package manager commands" {
