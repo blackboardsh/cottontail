@@ -1530,6 +1530,10 @@
       "status": "enabled",
       "reason": "Runtime require and dynamic import accept Bun's JSONC-compatible package JSON syntax, including comments and trailing commas (2 bun:test cases, 2 assertions)."
     },
+    "test/cli/run/require-cache.test.ts": {
+      "status": "expected-failure",
+      "reason": "Performance-only quarantine: CommonJS cache deletion and fresh evaluation, wrapper mutation and factory reuse, dynamic import, basic cache behavior, and long-export modules pass. The remaining unchanged await-import memory case peaks around 96 MB against Bun's 64 MB ceiling."
+    },
     "test/cli/run/run-cjs.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
