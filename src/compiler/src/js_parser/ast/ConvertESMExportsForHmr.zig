@@ -223,6 +223,10 @@ pub fn convertStmt(ctx: *ConvertESMExportsForHmr, p: anytype, stmt: Stmt) !void 
                     .alias = item.original_name,
                     .import_record_index = deduped.import_record_index,
                 };
+                if (p.named_imports.getPtr(ref)) |named_import| {
+                    named_import.namespace_ref = deduped.namespace_ref;
+                    named_import.import_record_index = deduped.import_record_index;
+                }
                 try ctx.visitRefToExport(
                     p,
                     ref,
