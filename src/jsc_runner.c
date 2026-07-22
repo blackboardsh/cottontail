@@ -37,6 +37,22 @@ extern size_t ct_jsc_heap_footprint(JSContextRef context);
 extern bool ct_jsc_value_is_rope(JSContextRef context, JSValueRef value);
 extern bool ct_jsc_set_time_zone(JSContextRef context, const char *time_zone);
 extern size_t ct_jsc_copy_protected_objects(JSContextRef context, JSValueRef *values, size_t capacity);
+extern int ct_jsc_bytecode_generate(
+    JSContextGroupRef group,
+    JSStringRef source,
+    JSStringRef source_url,
+    uint8_t **output,
+    size_t *output_length,
+    JSStringRef *error_message
+);
+extern int ct_jsc_bytecode_evaluate(
+    JSContextRef context,
+    JSStringRef source,
+    JSStringRef source_url,
+    const uint8_t *bytes,
+    size_t length,
+    JSValueRef *exception
+);
 
 typedef struct CtJscInspector CtJscInspector;
 extern CtJscInspector *ct_jsc_inspector_create(JSGlobalContextRef context, char **error_out);
@@ -2126,6 +2142,8 @@ static int ct_jsc_runtime_eval_internal(
     const uint8_t *source,
     size_t source_len,
     const char *filename,
+    const uint8_t *bytecode,
+    size_t bytecode_len,
     bool wait_for_active_handles,
     char **error_out
 );
@@ -30069,6 +30087,8 @@ static int ct_jsc_runtime_eval_internal(
     const uint8_t *source,
     size_t source_len,
     const char *filename,
+    const uint8_t *bytecode,
+    size_t bytecode_len,
     bool wait_for_active_handles,
     char **error_out
 ) {
@@ -30084,7 +30104,30 @@ static int ct_jsc_runtime_eval_internal(
     JSStringRef script = ct_js_string(wrapped);
     JSStringRef source_url = ct_js_string(filename != NULL ? filename : "<script>");
     JSValueRef exception = NULL;
-    JSEvaluateScript(ctx, script, NULL, source_url, 1, &exception);
+    int bytecode_status = 1;
+    if (bytecode != NULL && bytecode_len > 0) {
+        bytecode_status = ct_jsc_bytecode_evaluate(
+            ctx,
+            script,
+            source_url,
+            bytecode,
+            bytecode_len,
+            &exception
+        );
+        if (ct_debug_flag("BUN_JSC_verboseDiskCache") || ct_debug_flag("JSC_verboseDiskCache")) {
+            fprintf(
+                stderr,
+                "[Disk Cache] Cache %s: %s\n",
+                bytecode_status == 0 ? "hit" : "miss",
+                filename != NULL ? filename : "<script>"
+            );
+            fflush(stderr);
+        }
+    }
+    if (bytecode_status != 0) {
+        exception = NULL;
+        JSEvaluateScript(ctx, script, NULL, source_url, 1, &exception);
+    }
     JSStringRelease(script);
     JSStringRelease(source_url);
     free(wrapped);
@@ -30153,7 +30196,119 @@ static int ct_jsc_runtime_eval_internal(
 }
 
 int ct_jsc_runtime_eval(CtJscRuntime *runtime, const uint8_t *source, size_t source_len, const char *filename, char **error_out) {
-    return ct_jsc_runtime_eval_internal(runtime, source, source_len, filename, true, error_out);
+    return ct_jsc_runtime_eval_internal(runtime, source, source_len, filename, NULL, 0, true, error_out);
+}
+
+int ct_jsc_runtime_eval_bytecode(
+    CtJscRuntime *runtime,
+    const uint8_t *source,
+    size_t source_len,
+    const char *filename,
+    const uint8_t *bytecode,
+    size_t bytecode_len,
+    char **error_out
+) {
+    return ct_jsc_runtime_eval_internal(
+        runtime,
+        source,
+        source_len,
+        filename,
+        bytecode,
+        bytecode_len,
+        true,
+        error_out
+    );
+}
+
+static char *ct_copy_js_string_ref(JSStringRef string) {
+    if (string == NULL) return NULL;
+    const size_t capacity = JSStringGetMaximumUTF8CStringSize(string);
+    char *result = (char *)malloc(capacity > 0 ? capacity : 1);
+    if (result == NULL) return NULL;
+    if (JSStringGetUTF8CString(string, result, capacity) == 0) {
+        free(result);
+        return NULL;
+    }
+    return result;
+}
+
+int ct_jsc_generate_bytecode(
+    const uint8_t *source,
+    size_t source_len,
+    const char *filename,
+    uint8_t **bytecode_out,
+    size_t *bytecode_len_out,
+    char **error_out
+) {
+    if (bytecode_out != NULL) *bytecode_out = NULL;
+    if (bytecode_len_out != NULL) *bytecode_len_out = 0;
+    if (error_out != NULL) *error_out = NULL;
+    if (bytecode_out == NULL || bytecode_len_out == NULL) return -1;
+
+    char *wrapped = ct_prepare_wrapped_source(source, source_len, filename);
+    if (wrapped == NULL) {
+        ct_set_error_out(error_out, ct_duplicate_bytes("Out of memory", 13));
+        return -1;
+    }
+
+#if defined(_WIN32) || defined(__linux__)
+    ct_jsc_initialize_main_thread();
+#endif
+    const char *explicit_resource_option = getenv("JSC_useExplicitResourceManagement");
+    char *previous_explicit_resource_option = explicit_resource_option != NULL ? strdup(explicit_resource_option) : NULL;
+    const char *async_stack_trace_option = getenv("JSC_useAsyncStackTrace");
+    char *previous_async_stack_trace_option = async_stack_trace_option != NULL ? strdup(async_stack_trace_option) : NULL;
+    if (explicit_resource_option == NULL) setenv("JSC_useExplicitResourceManagement", "true", 1);
+    if (async_stack_trace_option == NULL) setenv("JSC_useAsyncStackTrace", "true", 1);
+
+    JSGlobalContextRef context = JSGlobalContextCreateInGroup(NULL, NULL);
+
+    if (previous_explicit_resource_option != NULL) {
+        setenv("JSC_useExplicitResourceManagement", previous_explicit_resource_option, 1);
+        free(previous_explicit_resource_option);
+    } else {
+        unsetenv("JSC_useExplicitResourceManagement");
+    }
+    if (previous_async_stack_trace_option != NULL) {
+        setenv("JSC_useAsyncStackTrace", previous_async_stack_trace_option, 1);
+        free(previous_async_stack_trace_option);
+    } else {
+        unsetenv("JSC_useAsyncStackTrace");
+    }
+
+    if (context == NULL) {
+        free(wrapped);
+        ct_set_error_out(error_out, ct_duplicate_bytes("Failed to create bytecode VM", 28));
+        return -1;
+    }
+
+    JSStringRef script = ct_js_string(wrapped);
+    JSStringRef source_url = ct_js_string(filename != NULL ? filename : "<script>");
+    JSStringRef generation_error = NULL;
+    const int status = ct_jsc_bytecode_generate(
+        JSContextGetGroup(context),
+        script,
+        source_url,
+        bytecode_out,
+        bytecode_len_out,
+        &generation_error
+    );
+    if (status != 0) {
+        char *message = ct_copy_js_string_ref(generation_error);
+        if (message == NULL) message = ct_duplicate_bytes("JSC bytecode generation failed", 30);
+        ct_set_error_out(error_out, message);
+    }
+
+    if (generation_error != NULL) JSStringRelease(generation_error);
+    JSStringRelease(script);
+    JSStringRelease(source_url);
+    JSGlobalContextRelease(context);
+    free(wrapped);
+    return status;
+}
+
+void ct_jsc_bytecode_free(uint8_t *bytecode) {
+    free(bytecode);
 }
 
 int ct_jsc_runtime_eval_immediate(

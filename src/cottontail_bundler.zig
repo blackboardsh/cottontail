@@ -733,11 +733,11 @@ pub fn bundleEntryPointGraphWithOptions(
     options: BundleOptions,
     error_out: *?[*:0]u8,
 ) !BundleGraphOutput {
-    // COTTONTAIL-COMPAT: Bun build bytecode - stock JSCOnly does not expose
-    // cached-bytecode serialization. Reject it instead of emitting a fake
-    // artifact or entering Bun's bytecode path with the compiler JSC stubs.
+    // Standalone compilation clears this option and serializes the final
+    // runtime source after bundling. Other callers do not yet have a matching
+    // sidecar loader, so keep them explicit instead of silently omitting it.
     if (options.bytecode) {
-        setError(error_out, "Bun build bytecode requires a JavaScriptCore cached-bytecode API", .{});
+        setError(error_out, "bytecode is currently supported only with --compile", .{});
         return error.UnsupportedBytecode;
     }
     const allocator = compiler.default_allocator;
@@ -841,7 +841,10 @@ pub fn bundleEntryPointGraphWithOptions(
     transpiler.options.compile_to_standalone_html = options.compile_to_standalone_html;
     transpiler.options.env.behavior = options.env_behavior;
     transpiler.options.env.prefix = options.env_prefix;
-    transpiler.options.bytecode = options.bytecode;
+    // Bytecode is generated from the final wrapped standalone source through
+    // Cottontail's stock-JSC bridge. The inherited compiler hook targets Bun's
+    // patched SourceProvider ABI and cannot describe that runtime source.
+    transpiler.options.bytecode = false;
     transpiler.options.inline_import_meta_properties = options.inline_import_meta_properties;
     transpiler.options.minify_whitespace = options.minify_whitespace;
     transpiler.options.minify_identifiers = options.minify_identifiers;

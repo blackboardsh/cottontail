@@ -89,6 +89,7 @@ const ScriptExecution = struct {
     embedded_source: ?[]const u8 = null,
     embedded_source_map: ?[]const u8 = null,
     embedded_files: ?[]const u8 = null,
+    embedded_bytecode: ?[]const u8 = null,
     standalone_flags: ?standalone_executable.Flags = null,
     exit_cleanup_path: ?[:0]const u8 = null,
     reload: ?ReloadExecution = null,
@@ -196,6 +197,11 @@ test "Windows script thread reserves a WebKit-compatible stack" {
 
 pub const StandaloneSource = standalone_executable.Source;
 pub const StandaloneSourceMap = standalone_executable.SourceMap;
+
+const standalone_virtual_path: [:0]const u8 = if (builtin.os.tag == .windows)
+    "B:/~BUN/root/index.js"
+else
+    "/$bunfs/root/index.js";
 
 const Context = struct {
     io: std.Io,
@@ -393,8 +399,7 @@ pub fn runWithExecArgvDisplay(
     defer runnable.deinit(&ctx);
 
     const runnable_path_z = try allocator.dupeZ(u8, runnable.path);
-
-    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null, null, null);
+    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null, null, null, null);
 }
 
 const AutoInstallMode = enum { auto, fallback, force, disable };
@@ -1258,7 +1263,7 @@ pub fn runEval(
     const process_args = try init.arena.allocator().alloc([:0]const u8, script_args.len + 1);
     process_args[0] = try init.arena.allocator().dupeZ(u8, eval_entry.entry_path);
     for (script_args, 0..) |arg, index| process_args[index + 1] = arg;
-    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null, null, null);
+    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null, null, null, null);
 }
 
 fn validateEvalSyntax(ctx: *const Context, source: []const u8) bool {
@@ -1634,6 +1639,7 @@ pub fn runEmbedded(
     source: []const u8,
     source_map: ?[]const u8,
     files: ?[]const u8,
+    bytecode: ?[]const u8,
     script_args: []const [:0]const u8,
     exec_args: []const [:0]const u8,
     flags: standalone_executable.Flags,
@@ -1642,14 +1648,22 @@ pub fn runEmbedded(
     const ctx = try makeContext(init);
     const native_assets = try prepareStandaloneNativeAssets(init, source, files);
     defer native_assets.deinit(init.io);
-    const virtual_path: [:0]const u8 = if (builtin.os.tag == .windows)
-        "B:/~BUN/root/index.js"
-    else
-        "/$bunfs/root/index.js";
     const process_args = try allocator.alloc([:0]const u8, script_args.len + 1);
-    process_args[0] = virtual_path;
+    process_args[0] = standalone_virtual_path;
     for (script_args, 0..) |arg, index| process_args[index + 1] = arg;
-    return try runPrepared(init, &ctx, virtual_path, process_args, 1, exec_args, native_assets.source, source_map, files, flags);
+    return try runPrepared(
+        init,
+        &ctx,
+        standalone_virtual_path,
+        process_args,
+        1,
+        exec_args,
+        native_assets.source,
+        source_map,
+        files,
+        bytecode,
+        flags,
+    );
 }
 
 pub fn compileStandaloneSource(
@@ -1658,16 +1672,22 @@ pub fn compileStandaloneSource(
     build_options: native_bundler.BundleOptions,
 ) !StandaloneSource {
     const ctx = try makeContext(init);
-    return compileStandaloneSourceWithContext(&ctx, script_path, build_options);
+    return compileStandaloneSourceWithContext(init, &ctx, script_path, build_options);
 }
 
 fn compileStandaloneSourceWithContext(
+    init: std.process.Init,
     ctx: *const Context,
     script_path: [:0]const u8,
     build_options: native_bundler.BundleOptions,
 ) !StandaloneSource {
+    if (build_options.bytecode) try icu_bootstrap.ensure(init);
     const empty_args: [0][:0]const u8 = .{};
     var standalone_options = build_options;
+    // Cottontail serializes the exact source consumed by its stock-JSC
+    // wrapper after bundling. The inherited Bun compiler bytecode hook targets
+    // Bun's patched SourceProvider and must stay disabled here.
+    standalone_options.bytecode = false;
     standalone_options.compile = true;
     standalone_options.public_path = standaloneVirtualRoot();
     standalone_options.entry_naming = "index.js";
@@ -1706,11 +1726,16 @@ fn compileStandaloneSourceWithContext(
         }
     }
     const files = try serializeStandaloneGraph(ctx, &graph);
+    const bytecode = if (build_options.bytecode)
+        try runtime.generateCachedBytecode(ctx.allocator, source, standalone_virtual_path)
+    else
+        null;
     return .{
         .source = source,
         .source_map = source_map,
         .source_maps = try source_maps.toOwnedSlice(ctx.allocator),
         .files = files,
+        .bytecode = bytecode,
     };
 }
 
@@ -1829,7 +1854,7 @@ fn compileBuild(
         try std.fs.path.resolve(allocator, &.{working_dir});
     ctx.stderr_capture = &diagnostics;
 
-    var payload = compileStandaloneSourceWithContext(&ctx, entry_z, build_options) catch |err| {
+    var payload = compileStandaloneSourceWithContext(init, &ctx, entry_z, build_options) catch |err| {
         const message = std.mem.trim(u8, diagnostics.items, " \t\r\n");
         if (message.len > 0) {
             diagnostic_out.* = try std.heap.c_allocator.dupe(u8, message);
@@ -2123,7 +2148,7 @@ pub fn runStdin(
     const process_args = try allocator.alloc([:0]const u8, script_args.len + 1);
     process_args[0] = try allocator.dupeZ(u8, stdin_entry.entry_path);
     @memcpy(process_args[1..], script_args);
-    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null, null, null);
+    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null, null, null, null);
 }
 
 fn makeContext(init: std.process.Init) !Context {
@@ -2485,6 +2510,7 @@ fn runPrepared(
     embedded_source: ?[]const u8,
     embedded_source_map: ?[]const u8,
     embedded_files: ?[]const u8,
+    embedded_bytecode: ?[]const u8,
     standalone_flags: ?standalone_executable.Flags,
 ) !u8 {
     const allocator = init.arena.allocator();
@@ -2508,6 +2534,7 @@ fn runPrepared(
         .embedded_source = embedded_source,
         .embedded_source_map = embedded_source_map,
         .embedded_files = embedded_files,
+        .embedded_bytecode = embedded_bytecode,
         .standalone_flags = standalone_flags,
         .exit_cleanup_path = if (runnableDirectoryForCleanup(ctx, runnable_path_z)) |path|
             try allocator.dupeZ(u8, path)
@@ -3128,7 +3155,10 @@ fn runScriptExecution(execution: *ScriptExecution) void {
                 break :blk 1;
             };
         }
-        break :blk js_runtime.runSource(source, execution.runnable_path);
+        break :blk if (execution.embedded_bytecode) |bytecode|
+            js_runtime.runSourceWithBytecode(source, execution.runnable_path, bytecode)
+        else
+            js_runtime.runSource(source, execution.runnable_path);
     } else js_runtime.runFile(execution.runnable_path);
     if (cpu_profiler_started) {
         const raw_profile = js_runtime.takeSamplingProfile() catch |err| profile: {

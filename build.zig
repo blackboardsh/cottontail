@@ -211,6 +211,8 @@ fn compileLinuxCppSource(
         "-std=c++20",
         "-stdlib=libstdc++",
         "-DJS_NO_EXPORT=1",
+        "-fno-rtti",
+        "-Wno-character-conversion",
         "-fPIC",
         "-c",
     });
@@ -218,6 +220,7 @@ fn compileLinuxCppSource(
         "src",
         "vendors/libuv/include",
         "vendors/libuv/src",
+        "src/jsc_sdk_compat",
     }) |include_dir| {
         command.addArg("-I");
         command.addDirectoryArg(b.path(include_dir));
@@ -293,6 +296,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
     step.root_module.link_libc = true;
     configureLibuv(step, b);
     step.root_module.addIncludePath(b.path("src"));
+    step.root_module.addIncludePath(b.path("src/jsc_sdk_compat"));
     step.root_module.addIncludePath(b.path("src/compiler/src/jsc/bindings/sqlite"));
     step.root_module.addCMacro("COTTONTAIL_VERSION", b.fmt("\"{s}\"", .{cottontail_version}));
     const resolved_target = step.root_module.resolved_target.?.result;
@@ -399,6 +403,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
     });
     if (resolved_target.os.tag == .linux) {
         inline for (&.{
+            .{ "src/jsc_bytecode_bridge.cpp", "jsc_bytecode_bridge.o" },
             .{ "src/jsc_private_bridge.cpp", "jsc_private_bridge.o" },
             .{ "src/inspector_bridge.cpp", "inspector_bridge.o" },
             .{ "src/jsc_stock_bridge.cpp", "jsc_stock_bridge.o" },
@@ -411,6 +416,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             &.{
                 "-std=c++20",
                 "-DJS_NO_EXPORT=1",
+                "-fno-rtti",
                 "-DWIN32_LEAN_AND_MEAN=1",
                 "-DNOMINMAX=1",
                 "-DU_DISABLE_RENAMING=1",
@@ -418,10 +424,12 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
                 // otherwise mark private WTF entry points as dllimport.
                 "-DWTF_EXPORT_PRIVATE=",
                 "-Wno-unused-command-line-argument",
+                "-Wno-character-conversion",
             }
         else
-            &.{ "-std=c++20", "-DJS_NO_EXPORT=1" };
+            &.{ "-std=c++20", "-DJS_NO_EXPORT=1", "-fno-rtti", "-Wno-character-conversion" };
         inline for (&.{
+            "src/jsc_bytecode_bridge.cpp",
             "src/jsc_private_bridge.cpp",
             "src/inspector_bridge.cpp",
             "src/jsc_stock_bridge.cpp",

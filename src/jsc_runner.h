@@ -37,6 +37,24 @@ int ct_jsc_runtime_eval(
     const char *filename,
     char **error_out
 );
+int ct_jsc_runtime_eval_bytecode(
+    CtJscRuntime *runtime,
+    const uint8_t *source,
+    size_t source_len,
+    const char *filename,
+    const uint8_t *bytecode,
+    size_t bytecode_len,
+    char **error_out
+);
+int ct_jsc_generate_bytecode(
+    const uint8_t *source,
+    size_t source_len,
+    const char *filename,
+    uint8_t **bytecode_out,
+    size_t *bytecode_len_out,
+    char **error_out
+);
+void ct_jsc_bytecode_free(uint8_t *bytecode);
 int ct_jsc_runtime_eval_immediate(
     CtJscRuntime *runtime,
     const uint8_t *source,

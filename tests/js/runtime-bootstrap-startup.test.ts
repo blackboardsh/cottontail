@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -157,6 +157,44 @@ test("compiled standalone executables retain the low-RSS bootstrap", () => {
   expect(String(result.stderr)).toBe("");
   expect(result.exitCode).toBe(0);
   expect(Number(String(result.stdout).trim())).toBeLessThan(maxStartupRss);
+});
+
+test("compiled bytecode is embedded and invalidates when source identity changes", () => {
+  const entry = join(temporaryDirectory, "bytecode-entry.mjs");
+  const executable = join(temporaryDirectory, process.platform === "win32" ? "bytecode.exe" : "bytecode");
+  writeFileSync(entry, 'console.log("bytecode-one");\n');
+
+  const build = run(["build", "--compile", "--bytecode", entry, "--outfile", executable]);
+  expect(String(build.stderr)).toBe("");
+  expect(build.exitCode).toBe(0);
+
+  const initial = Bun.spawnSync({ cmd: [executable], stdout: "pipe", stderr: "pipe" });
+  expect(initial.exitCode).toBe(0);
+  expect(String(initial.stderr)).toBe("");
+  expect(String(initial.stdout).trim()).toBe("bytecode-one");
+
+  const bytes = readFileSync(executable);
+  const magic = Buffer.from("COTTONTAIL-STAND5");
+  const trailerOffset = bytes.length - magic.length - 5 * 8 - 4;
+  expect(bytes.subarray(trailerOffset + 5 * 8 + 4).equals(magic)).toBe(true);
+  const lengths = [0, 1, 2, 3, 4].map(index => Number(bytes.readBigUInt64LE(trailerOffset + index * 8)));
+  const [sourceLength, mapLength, filesLength, execArgvLength, bytecodeLength] = lengths;
+  expect(execArgvLength).toBe(0);
+  expect(bytecodeLength).toBeGreaterThan(56);
+  const payloadOffset = trailerOffset - sourceLength - mapLength - filesLength - execArgvLength - bytecodeLength;
+  const bytecodeOffset = payloadOffset + sourceLength + mapLength + filesLength + execArgvLength;
+  expect(bytes.subarray(bytecodeOffset, bytecodeOffset + 8).toString()).toBe("CTJSCB01");
+
+  const sourceBytes = bytes.subarray(payloadOffset, payloadOffset + sourceLength);
+  const markerOffset = sourceBytes.indexOf("bytecode-one");
+  expect(markerOffset).toBeGreaterThanOrEqual(0);
+  sourceBytes.set(Buffer.from("bytecode-two"), markerOffset);
+  writeFileSync(executable, bytes);
+
+  const invalidated = Bun.spawnSync({ cmd: [executable], stdout: "pipe", stderr: "pipe" });
+  expect(invalidated.exitCode).toBe(0);
+  expect(String(invalidated.stderr)).toBe("");
+  expect(String(invalidated.stdout).trim()).toBe("bytecode-two");
 });
 
 test("nested test runs remove per-invocation artifacts on process.exit", () => {

@@ -976,6 +976,7 @@ fn runStandaloneIfPresent(
         payload.source,
         payload.source_map,
         payload.files,
+        payload.bytecode,
         args[1..],
         exec_args.items,
         payload.flags,
@@ -1395,8 +1396,8 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         options.compile_to_standalone_html = true;
         compile = false;
     }
-    if (options.bytecode) {
-        try stderr.writeAll("error: Bun build bytecode requires a JavaScriptCore cached-bytecode API\n");
+    if (options.bytecode and !compile) {
+        try stderr.writeAll("error: bytecode is currently supported only with --compile\n");
         try stderr.flush();
         return 1;
     }

@@ -33,6 +33,30 @@ extern fn ct_jsc_runtime_emit_process_shutdown(
 ) c_int;
 extern fn ct_jsc_runtime_had_fatal_exception(runtime: *c.CtJscRuntime) c_int;
 
+pub fn generateCachedBytecode(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    filename: [:0]const u8,
+) ![]u8 {
+    var bytecode: [*c]u8 = null;
+    var bytecode_len: usize = 0;
+    var generation_error: [*c]u8 = null;
+    if (c.ct_jsc_generate_bytecode(
+        source.ptr,
+        source.len,
+        filename.ptr,
+        &bytecode,
+        &bytecode_len,
+        &generation_error,
+    ) != 0) {
+        defer if (generation_error != null) c.ct_jsc_string_free(generation_error);
+        return error.BytecodeGenerationFailed;
+    }
+    defer c.ct_jsc_bytecode_free(bytecode);
+    if (bytecode == null or bytecode_len == 0) return error.EmptyBytecode;
+    return try allocator.dupe(u8, bytecode[0..bytecode_len]);
+}
+
 pub const ReloadResult = union(enum) {
     reload,
     failed: u8,
@@ -259,6 +283,24 @@ pub const Runtime = struct {
     }
 
     pub fn runSource(self: *Runtime, source: []const u8, filename: [:0]const u8) u8 {
+        return self.runSourceInternal(source, filename, null);
+    }
+
+    pub fn runSourceWithBytecode(
+        self: *Runtime,
+        source: []const u8,
+        filename: [:0]const u8,
+        bytecode: []const u8,
+    ) u8 {
+        return self.runSourceInternal(source, filename, bytecode);
+    }
+
+    fn runSourceInternal(
+        self: *Runtime,
+        source: []const u8,
+        filename: [:0]const u8,
+        bytecode: ?[]const u8,
+    ) u8 {
         const source_z = self.allocator.alloc(u8, source.len + 1) catch {
             self.writeStderrLine("cottontail: out of memory preparing script source");
             return 1;
@@ -269,7 +311,18 @@ pub const Runtime = struct {
 
         var eval_error: [*c]u8 = null;
 
-        const eval_status = c.ct_jsc_runtime_eval(self.handle, source_z.ptr, source.len, filename.ptr, &eval_error);
+        const eval_status = if (bytecode) |cached|
+            c.ct_jsc_runtime_eval_bytecode(
+                self.handle,
+                source_z.ptr,
+                source.len,
+                filename.ptr,
+                cached.ptr,
+                cached.len,
+                &eval_error,
+            )
+        else
+            c.ct_jsc_runtime_eval(self.handle, source_z.ptr, source.len, filename.ptr, &eval_error);
         if (eval_status != 0) {
             defer if (eval_error != null) {
                 c.ct_jsc_string_free(eval_error);

@@ -7,11 +7,13 @@ const magic_v1 = "COTTONTAIL-STAND";
 const magic_v2 = "COTTONTAIL-STAND2";
 const magic_v3 = "COTTONTAIL-STAND3";
 const magic_v4 = "COTTONTAIL-STAND4";
+const magic_v5 = "COTTONTAIL-STAND5";
 
 const trailer_v1_len = @sizeOf(u64) + magic_v1.len;
 const trailer_v2_len = @sizeOf(u64) * 2 + magic_v2.len;
 const trailer_v3_len = @sizeOf(u64) * 3 + magic_v3.len;
 const trailer_v4_len = @sizeOf(u64) * 4 + @sizeOf(u32) + magic_v4.len;
+const trailer_v5_len = @sizeOf(u64) * 5 + @sizeOf(u32) + magic_v5.len;
 
 /// Runtime policy serialized into Bun 1.3.10 standalone module graphs. These
 /// bits intentionally match Bun's flag order, while Cottontail owns its wire
@@ -36,6 +38,7 @@ pub const Source = struct {
     files: ?[]const u8 = null,
     compile_exec_argv: []const u8 = "",
     flags: Flags = .{},
+    bytecode: ?[]const u8 = null,
 };
 
 pub const Payload = struct {
@@ -44,6 +47,7 @@ pub const Payload = struct {
     files: ?[]const u8 = null,
     compile_exec_argv: []const u8 = "",
     flags: Flags = .{},
+    bytecode: ?[]const u8 = null,
 };
 
 fn readPayloadPart(
@@ -74,6 +78,64 @@ pub fn load(init: std.process.Init) !?Payload {
     const executable = try std.Io.Dir.cwd().openFile(init.io, executable_path, .{});
     defer executable.close(init.io);
     const executable_len = try executable.length(init.io);
+
+    if (executable_len >= trailer_v5_len) {
+        var trailer: [trailer_v5_len]u8 = undefined;
+        const trailer_offset = executable_len - trailer_v5_len;
+        if (try executable.readPositionalAll(init.io, &trailer, trailer_offset) == trailer.len and
+            std.mem.eql(u8, trailer[@sizeOf(u64) * 5 + @sizeOf(u32) ..], magic_v5))
+        {
+            const source_len = std.math.cast(usize, std.mem.readInt(u64, trailer[0..@sizeOf(u64)], .little)) orelse
+                return error.InvalidStandaloneExecutable;
+            const map_len = std.math.cast(usize, std.mem.readInt(u64, trailer[@sizeOf(u64) .. @sizeOf(u64) * 2], .little)) orelse
+                return error.InvalidStandaloneExecutable;
+            const files_len = std.math.cast(usize, std.mem.readInt(u64, trailer[@sizeOf(u64) * 2 .. @sizeOf(u64) * 3], .little)) orelse
+                return error.InvalidStandaloneExecutable;
+            const exec_argv_len = std.math.cast(usize, std.mem.readInt(u64, trailer[@sizeOf(u64) * 3 .. @sizeOf(u64) * 4], .little)) orelse
+                return error.InvalidStandaloneExecutable;
+            const bytecode_len = std.math.cast(usize, std.mem.readInt(u64, trailer[@sizeOf(u64) * 4 .. @sizeOf(u64) * 5], .little)) orelse
+                return error.InvalidStandaloneExecutable;
+            if (exec_argv_len > max_exec_argv_size or bytecode_len == 0 or
+                !validPayloadLengths(trailer_offset, &.{ source_len, map_len, files_len, exec_argv_len, bytecode_len }))
+            {
+                return error.InvalidStandaloneExecutable;
+            }
+
+            const payload_offset = trailer_offset - source_len - map_len - files_len - exec_argv_len - bytecode_len;
+            const source = try readPayloadPart(init, executable, source_len, payload_offset);
+            const source_map = if (map_len > 0)
+                try readPayloadPart(init, executable, map_len, payload_offset + source_len)
+            else
+                null;
+            const files = if (files_len > 0)
+                try readPayloadPart(init, executable, files_len, payload_offset + source_len + map_len)
+            else
+                null;
+            const compile_exec_argv = if (exec_argv_len > 0)
+                try readPayloadPart(init, executable, exec_argv_len, payload_offset + source_len + map_len + files_len)
+            else
+                "";
+            const bytecode = try readPayloadPart(
+                init,
+                executable,
+                bytecode_len,
+                payload_offset + source_len + map_len + files_len + exec_argv_len,
+            );
+            const flags_bits = std.mem.readInt(
+                u32,
+                trailer[@sizeOf(u64) * 5 .. @sizeOf(u64) * 5 + @sizeOf(u32)],
+                .little,
+            );
+            return .{
+                .source = source,
+                .source_map = source_map,
+                .files = files,
+                .compile_exec_argv = compile_exec_argv,
+                .flags = @bitCast(flags_bits),
+                .bytecode = bytecode,
+            };
+        }
+    }
 
     if (executable_len >= trailer_v4_len) {
         var trailer: [trailer_v4_len]u8 = undefined;
@@ -201,11 +263,11 @@ fn writeBuildFile(io: std.Io, path: []const u8, contents: []const u8) !void {
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
 }
 
-fn supportsStandaloneV4(init: std.process.Init, path: []const u8) !bool {
+fn supportsStandaloneMagic(init: std.process.Init, path: []const u8, comptime magic: []const u8) !bool {
     const executable = try std.Io.Dir.cwd().openFile(init.io, path, .{});
     defer executable.close(init.io);
     const executable_len = try executable.length(init.io);
-    var buffer: [64 * 1024 + magic_v4.len - 1]u8 = undefined;
+    var buffer: [64 * 1024 + magic.len - 1]u8 = undefined;
     var offset: u64 = 0;
     var carry: usize = 0;
     while (offset < executable_len) {
@@ -214,8 +276,8 @@ fn supportsStandaloneV4(init: std.process.Init, path: []const u8) !bool {
         const count = try executable.readPositionalAll(init.io, buffer[carry .. carry + read_len], offset);
         if (count == 0) break;
         const available = carry + count;
-        if (std.mem.indexOf(u8, buffer[0..available], magic_v4) != null) return true;
-        carry = @min(magic_v4.len - 1, available);
+        if (std.mem.indexOf(u8, buffer[0..available], magic) != null) return true;
+        carry = @min(magic.len - 1, available);
         std.mem.copyForwards(u8, buffer[0..carry], buffer[available - carry .. available]);
         offset += count;
     }
@@ -245,15 +307,22 @@ pub fn write(
     const executable_path = base_executable_path orelse try std.process.executablePathAlloc(init.io, allocator);
     const source_map_len = if (payload.source_map) |source_map| source_map.len else 0;
     const files_len = if (payload.files) |files| files.len else 0;
+    const bytecode_len = if (payload.bytecode) |bytecode| bytecode.len else 0;
+    if (payload.bytecode != null and bytecode_len == 0) return error.EmptyStandaloneBytecode;
     if (payload.source.len > max_payload_component_size or
         source_map_len > max_payload_component_size or
         files_len > max_payload_component_size or
+        bytecode_len > max_payload_component_size or
         payload.compile_exec_argv.len > max_exec_argv_size)
     {
         return error.StandalonePayloadTooLarge;
     }
-    if (base_executable_path != null and !try supportsStandaloneV4(init, executable_path)) {
-        return error.IncompatibleStandaloneExecutable;
+    if (base_executable_path != null) {
+        const supported = if (payload.bytecode != null)
+            try supportsStandaloneMagic(init, executable_path, magic_v5)
+        else
+            try supportsStandaloneMagic(init, executable_path, magic_v4);
+        if (!supported) return error.IncompatibleStandaloneExecutable;
     }
     try std.Io.Dir.copyFile(
         std.Io.Dir.cwd(),
@@ -271,25 +340,43 @@ pub fn write(
     const source_map = payload.source_map orelse "";
     const files = payload.files orelse "";
     const exec_argv = payload.compile_exec_argv;
+    const bytecode = payload.bytecode orelse "";
     var offset = executable_len;
-    for ([_][]const u8{ payload.source, source_map, files, exec_argv }) |part| {
+    for ([_][]const u8{ payload.source, source_map, files, exec_argv, bytecode }) |part| {
         try output.writePositionalAll(init.io, part, offset);
         offset += part.len;
     }
 
-    var trailer: [trailer_v4_len]u8 = undefined;
-    std.mem.writeInt(u64, trailer[0..@sizeOf(u64)], @intCast(payload.source.len), .little);
-    std.mem.writeInt(u64, trailer[@sizeOf(u64) .. @sizeOf(u64) * 2], @intCast(source_map.len), .little);
-    std.mem.writeInt(u64, trailer[@sizeOf(u64) * 2 .. @sizeOf(u64) * 3], @intCast(files.len), .little);
-    std.mem.writeInt(u64, trailer[@sizeOf(u64) * 3 .. @sizeOf(u64) * 4], @intCast(exec_argv.len), .little);
-    std.mem.writeInt(
-        u32,
-        trailer[@sizeOf(u64) * 4 .. @sizeOf(u64) * 4 + @sizeOf(u32)],
-        @bitCast(payload.flags),
-        .little,
-    );
-    @memcpy(trailer[@sizeOf(u64) * 4 + @sizeOf(u32) ..], magic_v4);
-    try output.writePositionalAll(init.io, &trailer, offset);
+    if (payload.bytecode != null) {
+        var trailer: [trailer_v5_len]u8 = undefined;
+        std.mem.writeInt(u64, trailer[0..@sizeOf(u64)], @intCast(payload.source.len), .little);
+        std.mem.writeInt(u64, trailer[@sizeOf(u64) .. @sizeOf(u64) * 2], @intCast(source_map.len), .little);
+        std.mem.writeInt(u64, trailer[@sizeOf(u64) * 2 .. @sizeOf(u64) * 3], @intCast(files.len), .little);
+        std.mem.writeInt(u64, trailer[@sizeOf(u64) * 3 .. @sizeOf(u64) * 4], @intCast(exec_argv.len), .little);
+        std.mem.writeInt(u64, trailer[@sizeOf(u64) * 4 .. @sizeOf(u64) * 5], @intCast(bytecode.len), .little);
+        std.mem.writeInt(
+            u32,
+            trailer[@sizeOf(u64) * 5 .. @sizeOf(u64) * 5 + @sizeOf(u32)],
+            @bitCast(payload.flags),
+            .little,
+        );
+        @memcpy(trailer[@sizeOf(u64) * 5 + @sizeOf(u32) ..], magic_v5);
+        try output.writePositionalAll(init.io, &trailer, offset);
+    } else {
+        var trailer: [trailer_v4_len]u8 = undefined;
+        std.mem.writeInt(u64, trailer[0..@sizeOf(u64)], @intCast(payload.source.len), .little);
+        std.mem.writeInt(u64, trailer[@sizeOf(u64) .. @sizeOf(u64) * 2], @intCast(source_map.len), .little);
+        std.mem.writeInt(u64, trailer[@sizeOf(u64) * 2 .. @sizeOf(u64) * 3], @intCast(files.len), .little);
+        std.mem.writeInt(u64, trailer[@sizeOf(u64) * 3 .. @sizeOf(u64) * 4], @intCast(exec_argv.len), .little);
+        std.mem.writeInt(
+            u32,
+            trailer[@sizeOf(u64) * 4 .. @sizeOf(u64) * 4 + @sizeOf(u32)],
+            @bitCast(payload.flags),
+            .little,
+        );
+        @memcpy(trailer[@sizeOf(u64) * 4 + @sizeOf(u32) ..], magic_v4);
+        try output.writePositionalAll(init.io, &trailer, offset);
+    }
 
     if (write_external_source_map and payload.source_map != null) {
         const map_path = try std.mem.concat(allocator, u8, &.{ output_path, ".map" });
