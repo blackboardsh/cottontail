@@ -187,6 +187,12 @@ parseAtEverySplit(chunked, "123123456123456789");
     "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nnot-hex\r\n",
   ));
   equal(invalidChunk.code, "HPE_INVALID_CHUNK_SIZE", "invalid chunk size code");
+
+  const invalidMethod = new HTTPParser();
+  invalidMethod.initialize(HTTPParser.REQUEST, {});
+  const invalidPrefix = invalidMethod.execute(Buffer.from([0x16, 0x03, 0x01, 0x00, 0x00]));
+  equal(invalidPrefix.code, "HPE_INVALID_METHOD", "invalid method prefix code");
+  equal(invalidPrefix.reason, "Invalid method encountered", "invalid method prefix reason");
 }
 
 {

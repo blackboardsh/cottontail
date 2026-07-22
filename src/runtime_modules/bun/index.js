@@ -74,6 +74,10 @@ import {
   isCottontailIpcFrame,
 } from "../internal/bun-spawn-ipc.js";
 import { createBunShellRuntime, parseBunShellSource } from "../internal/bun-shell-runtime.js";
+import {
+  createNativeServeRequestState,
+  incomingRequestURLFactory,
+} from "../internal/bun-http-server.js";
 import { installStandaloneRuntimeLoaders } from "../internal/standalone-runtime.js";
 
 const estimatedMemoryCostSymbol = Symbol.for("cottontail.estimatedMemoryCost");
@@ -6173,6 +6177,7 @@ function parseMultipartFormDataText(source, boundary) {
 }
 
 const requestState = new WeakMap();
+const lazyRequestURLToken = {};
 
 function externallyOwnedBodyBytes(body) {
   if (body == null) return 0;
@@ -6199,20 +6204,24 @@ function canonicalFetchUrl(input) {
 }
 
 export class Request {
-  constructor(input, init = {}) {
+  constructor(input, init = {}, internalToken = null, internalURLFactory = null) {
     if (init === null || init === undefined) init = {};
     else if (typeof init !== "object" && typeof init !== "function") {
       throw new TypeError("Failed to construct 'Request': the second argument must be an object");
     }
     // WebIDL converts the request input before reading RequestInit. In
     // particular, a throwing input.toString() must win over init.headers.
-    const url = canonicalFetchUrl(input);
+    const urlFactory = internalToken === lazyRequestURLToken && typeof internalURLFactory === "function"
+      ? internalURLFactory
+      : null;
+    const url = urlFactory == null ? canonicalFetchUrl(input) : "";
     const headers = new Headers(init.headers ?? input?.headers);
     const inputRequestState = input instanceof Request ? requestState.get(input) : null;
     const signalExplicit = init.signal != null || inputRequestState?.signalExplicit === true ||
       (!(input instanceof Request) && input?.signal != null);
     requestState.set(this, {
       url,
+      urlFactory,
       method: String(init.method ?? input?.method ?? "GET").toUpperCase(),
       headers,
       params: init.params ?? input?.params ?? {},
@@ -6238,7 +6247,15 @@ export class Request {
     this._bodyStream = undefined;
     this._bodyUsed = false;
   }
-  get url() { return requestState.get(this)?.url; }
+  get url() {
+    const state = requestState.get(this);
+    if (typeof state?.urlFactory === "function") {
+      const url = canonicalFetchUrl(state.urlFactory());
+      state.url = url;
+      state.urlFactory = null;
+    }
+    return state?.url;
+  }
   get method() { return requestState.get(this)?.method; }
   get headers() { return requestState.get(this)?.headers; }
   get params() { return requestState.get(this)?.params; }
@@ -6374,6 +6391,10 @@ export class Request {
     const size = inspectBodyByteSize(this._body) ?? "0 KB";
     return `Request (${size}) {\n  method: ${JSON.stringify(this.method)},\n  url: ${JSON.stringify(normalizeRequestUrl(this.url))},\n  headers: ${renderedHeaders}\n}`;
   }
+}
+
+function requestWithLazyURL(urlFactory, init) {
+  return new Request(undefined, init, lazyRequestURLToken, urlFactory);
 }
 
 function cloneCookieMap(map) {
@@ -6663,6 +6684,29 @@ const activeServeDispatches = globalThis.__cottontailActiveServeDispatches ??= n
 const activeServeAbortControllers = globalThis.__cottontailActiveServeAbortControllers ??= new WeakMap();
 const activeServeLifecycles = globalThis.__cottontailActiveServeLifecycles ??= new WeakMap();
 const activeServeRequestBodyStateSymbol = Symbol("cottontail.activeServeRequestBodyState");
+const serveRequestIdleTimeouts = new WeakMap();
+
+function setServeRequestIdleTimeout(request, seconds, isUnix, argumentCount) {
+  if (argumentCount < 2 || request == null) {
+    throw new TypeError(`timeout() requires 2 arguments, got ${argumentCount}`);
+  }
+  if (isUnix) return null;
+  if (typeof seconds !== "number") throw new TypeError("timeout() requires a number");
+  const integer = Number.isFinite(seconds) ? Math.trunc(seconds) : 0;
+  const value = Math.min(255, integer >>> 0);
+  if (request instanceof Request) {
+    serveRequestIdleTimeouts.set(request, value);
+  } else if (request instanceof nodeHttp.ServerResponse) {
+    request.setTimeout(value * 1000);
+  } else {
+    throw new TypeError("timeout() requires a Request object");
+  }
+  return undefined;
+}
+
+function requestIdleTimeout(request, fallback) {
+  return serveRequestIdleTimeouts.has(request) ? serveRequestIdleTimeouts.get(request) : fallback;
+}
 
 function createServeLifecycle(getPendingWebSockets) {
   const requests = new Set();
@@ -9244,7 +9288,7 @@ async function dispatchServeFetch(options, server, input, init = {}) {
     }
   }
   finishActiveServeRequestBody(dispatchRequest, response);
-  response = serveResponseWithIdleTimeout(response, options.idleTimeout);
+  response = serveResponseWithIdleTimeout(response, requestIdleTimeout(dispatchRequest, options.idleTimeout));
   response.url = request.url;
   return response;
 }
@@ -10579,7 +10623,6 @@ function requestFromNodeIncoming(message, protocol, fallbackHost, tunnelRequest 
     }
   }
   const host = message.headers?.host ?? fallbackHost;
-  const url = normalizeRequestUrl(`${protocol}//${host}${message.url ?? "/"}`);
   const controller = new AbortController();
   const init = {
     method: message.method,
@@ -10587,7 +10630,10 @@ function requestFromNodeIncoming(message, protocol, fallbackHost, tunnelRequest 
     signal: controller.signal,
   };
   const method = String(message.method ?? "GET").toUpperCase();
-  const request = new Request(url, init);
+  const request = requestWithLazyURL(
+    incomingRequestURLFactory(protocol, host, message.url, `${protocol}//${fallbackHost}`, normalizeRequestUrl),
+    init,
+  );
   if (method !== "GET" && method !== "HEAD") {
     const body = message._incomingBody;
     if (message.complete && body != null && body.byteLength > 0) {
@@ -10817,7 +10863,9 @@ function serveNodeBacked(options, context) {
         }
       }
     },
-    timeout() {},
+    timeout(request, seconds) {
+      return setServeRequestIdleTimeout(request, seconds, isUnix, arguments.length);
+    },
     upgrade(request, upgradeOptions = {}) {
       if (!(request instanceof Request)) {
         throw new TypeError("upgrade requires a Request object");
@@ -10918,6 +10966,7 @@ function serveNodeBacked(options, context) {
   for (const origin of originKeys) activeServeOrigins.set(origin, server);
 
   const writeNodeResponse = (nodeResponse, response, request) => {
+    response = serveResponseWithIdleTimeout(response, requestIdleTimeout(request, activeOptions.idleTimeout));
     const method = String(request.method ?? "GET").toUpperCase();
     nodeResponse._omitImplicitConnectionHeader = true;
     nodeResponse.setHeader("X-Cottontail-Omit-Implicit-Connection", "1");
@@ -11268,7 +11317,9 @@ export function serve(options) {
     closeIdleConnections() {
       if (!nativeClosed) cottontail.httpServerCloseIdle(native.id);
     },
-    timeout() {},
+    timeout(request, seconds) {
+      return setServeRequestIdleTimeout(request, seconds, isUnix, arguments.length);
+    },
     upgrade() {
       return false;
     },
@@ -11300,92 +11351,14 @@ export function serve(options) {
     return error;
   };
 
-  const createNativeRequestState = (item) => {
-    const abortController = new globalThis.AbortController();
-    let bodyController = null;
-    const state = {
-      item,
-      abortController,
-      lifecycleRequest: null,
-      body: null,
-      bodySettled: !item.hasBody,
-      wantsData: false,
-      polling: false,
-      cancelNativeBody() {
-        if (nativeClosed || !item.hasBody) return;
-        try { cottontail.httpServerRequestCancel(native.id, item.id); } catch {}
-      },
-      abortBody(reason, cancelNative = true) {
-        if (state.bodySettled) return;
-        state.bodySettled = true;
-        state.wantsData = false;
-        try { bodyController?.error(reason); } catch {}
-        if (cancelNative) state.cancelNativeBody();
-      },
-      abort(reason) {
-        state.abortBody(reason);
-      },
-      abortConnection() {
-        state.abortBody(new globalThis.DOMException("The operation was aborted.", "AbortError"), false);
-        if (!abortController.signal.aborted) abortController.abort(nativeConnectionClosedError());
-      },
-      forceAbort() {
-        state.abortBody(new globalThis.DOMException("The operation was aborted.", "AbortError"));
-        if (!abortController.signal.aborted) abortController.abort(nativeConnectionClosedError());
-      },
-      finishResponse(response = null) {
-        if (state.bodySettled || response?._body === state.body) return;
-        state.abortBody(activeServeUnreadBodyAbortError);
-      },
-      poll() {
-        if (nativeClosed || state.polling) return;
-        state.polling = true;
-        try {
-          const event = cottontail.httpServerRequestEventPoll(native.id, item.id, state.wantsData);
-          if (!event) return;
-          if (event.type === "abort") {
-            state.abortConnection();
-            return;
-          }
-          if (state.bodySettled) return;
-          if (event.type === "data") {
-            state.wantsData = false;
-            const bytes = new Uint8Array(event.data);
-            if (bytes.byteLength > 0) bodyController.enqueue(bytes);
-          } else if (event.type === "end") {
-            state.wantsData = false;
-            state.bodySettled = true;
-            bodyController.close();
-          }
-        } finally {
-          state.polling = false;
-        }
-      },
-    };
-
-    if (item.hasBody) {
-      state.body = new globalThis.ReadableStream({
-        start(controller) {
-          bodyController = controller;
-        },
-        pull() {
-          if (state.bodySettled) return undefined;
-          state.wantsData = true;
-          state.poll();
-          return undefined;
-        },
-        cancel() {
-          if (state.bodySettled) return undefined;
-          state.bodySettled = true;
-          state.wantsData = false;
-          state.cancelNativeBody();
-          return undefined;
-        },
-      }, new globalThis.ByteLengthQueuingStrategy({ highWaterMark: 0 }));
-      Object.defineProperty(state.body, activeServeRequestBodyStateSymbol, { value: state });
-    }
-    return state;
-  };
+  const createNativeRequestState = (item) => createNativeServeRequestState(item, {
+    binding: cottontail,
+    serverId: native.id,
+    isServerClosed: () => nativeClosed,
+    bodyStateSymbol: activeServeRequestBodyStateSymbol,
+    unreadBodyAbortReason: () => activeServeUnreadBodyAbortError,
+    connectionClosedError: nativeConnectionClosedError,
+  });
 
   const responseBody = (response) => {
     if (response instanceof Response) {
@@ -11481,14 +11454,17 @@ export function serve(options) {
     if (String(item.method).toUpperCase() !== "GET" && String(item.method).toUpperCase() !== "HEAD") {
       requestInit.body = state.body;
     }
-    const host = requestHeaders.get("host");
-    const requestBase = host ? `http://${host}` : requestOrigin;
-    const requestUrl = normalizeRequestUrl(/^https?:\/\//i.test(String(item.url)) ? String(item.url) : `${requestBase}${item.url}`);
-    const request = new Request(requestUrl, requestInit);
+    const request = requestWithLazyURL(
+      incomingRequestURLFactory("http:", requestHeaders.get("host"), item.url, requestOrigin, normalizeRequestUrl),
+      requestInit,
+    );
     if (item.remote) serveRequestPeers.set(request, item.remote);
     const sendHandledResponse = (response) => {
       finishActiveServeRequestBody(request, response);
-      return sendResponse(item, response);
+      return sendResponse(item, serveResponseWithIdleTimeout(
+        response,
+        requestIdleTimeout(request, activeOptions.idleTimeout),
+      ));
     };
     const sendHandledError = (error) => {
       finishActiveServeRequestBody(request, null);
@@ -11511,6 +11487,7 @@ export function serve(options) {
     state.finishResponse();
     nativeRequests.delete(item.id);
     lifecycle.finishRequest(state.lifecycleRequest);
+    state.dispose();
   };
 
   const maybeFinishNativeStop = () => {
@@ -11530,7 +11507,10 @@ export function serve(options) {
     for (const origin of originKeys) activeServeOrigins.delete(origin);
     if (force) {
       abortActiveServeRequests(server);
-      for (const state of nativeRequests.values()) state.forceAbort();
+      for (const state of nativeRequests.values()) {
+        state.forceAbort();
+        state.dispose();
+      }
       nativeClosed = true;
       if (interval != null) {
         clearInterval(interval);

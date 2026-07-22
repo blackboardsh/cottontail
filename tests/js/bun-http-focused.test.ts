@@ -476,6 +476,26 @@ test("native Bun.serve errors an unread pending body read after responding", asy
   }
 });
 
+test("native Bun.serve retains a lazy request URL after request finalization", async () => {
+  const captured = Promise.withResolvers();
+  const longPath = `/${"segment/".repeat(1024)}done?value=1`;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      captured.resolve(request);
+      return new Response("ok");
+    },
+  });
+  try {
+    expect(await getNativeHttpText(`${server.url.origin}${longPath}`)).toBe("ok");
+    const request = await captured.promise;
+    expect(request.url).toBe(`${server.url.origin}${longPath}`);
+  } finally {
+    await server.stop(true);
+  }
+});
+
 test("native Bun.serve rejects an oversized declared body before dispatch", async () => {
   let calls = 0;
   const server = Bun.serve({
@@ -679,6 +699,27 @@ test("Bun.serve idleTimeout aborts a stalled response body", async () => {
   }
   expect(error?.code).toBe("ECONNRESET");
   expect(error?.message).toBe("The socket connection was closed unexpectedly.");
+});
+
+test("Bun.serve server.timeout overrides the response idle timeout", async () => {
+  using server = Bun.serve({
+    port: 0,
+    idleTimeout: 1,
+    fetch(request, activeServer) {
+      activeServer.timeout(request, 0);
+      return new Response(new ReadableStream({
+        async pull(controller) {
+          controller.enqueue("first");
+          await Bun.sleep(1200);
+          controller.enqueue("second");
+          controller.close();
+        },
+      }));
+    },
+  });
+
+  expect(await fetch(server.url).then(response => response.text())).toBe("firstsecond");
+  expect(() => server.timeout(new Request(server.url), "1")).toThrow("timeout() requires a number");
 });
 
 test("in-process TLS keepalive peers are stable and separated by config", async () => {

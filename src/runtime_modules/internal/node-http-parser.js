@@ -56,6 +56,7 @@ const DECIMAL = /^[0-9]+$/;
 const HEX = /^[0-9A-Fa-f]+$/;
 const METHOD_ENUM = new Map(allMethods.map((name, index) => [name, index]));
 METHOD_ENUM.set("M-SEARCH", 24);
+const REQUEST_METHOD_TOKENS = Array.from(METHOD_ENUM.keys()).filter(method => !method.includes(" "));
 const parserStates = new WeakMap();
 const connectionsListStates = new WeakMap();
 
@@ -98,6 +99,26 @@ function findLineEnd(bytes) {
     if (bytes[index] === 13 && bytes[index + 1] === 10) return index;
   }
   return -1;
+}
+
+function hasValidRequestMethodPrefix(bytes) {
+  let methodLength = bytes.indexOf(32);
+  const complete = methodLength >= 0;
+  if (!complete) methodLength = bytes.length;
+  if (methodLength === 0) return false;
+
+  for (const method of REQUEST_METHOD_TOKENS) {
+    if ((complete && method.length !== methodLength) || (!complete && method.length < methodLength)) continue;
+    let matches = true;
+    for (let index = 0; index < methodLength; index += 1) {
+      if (bytes[index] !== method.charCodeAt(index)) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) return true;
+  }
+  return false;
 }
 
 function toUint32(value) {
@@ -442,6 +463,9 @@ HTTPParserState.prototype._parsePending = function _parsePending() {
       if (!this._messageStarted) this._beginMessage();
       const lineEnd = findLineEnd(this._pending);
       if (lineEnd < 0) {
+        if (this._type === HTTP_REQUEST && !hasValidRequestMethodPrefix(this._pending)) {
+          return this._fail("HPE_INVALID_METHOD", "Invalid method encountered");
+        }
         if (this._pending.length >= this._maxHeaderSize) return this._fail("HPE_HEADER_OVERFLOW", "Header overflow");
         return null;
       }
