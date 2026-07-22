@@ -5516,18 +5516,22 @@ fn NewPrinter(
             // Special-case lazy-export AST
             if (ast.has_lazy_export) {
                 @branchHint(.unlikely);
+                const lazy_export = for (func.body.stmts) |stmt| {
+                    switch (stmt.data) {
+                        .s_lazy_export => |expr| break Expr{ .data = expr.*, .loc = stmt.loc },
+                        .s_export_default => |export_default| break export_default.value.toExpr(),
+                        else => {},
+                    }
+                } else @panic("Internal error: lazy export module is missing its default export");
                 p.printFnArgs(func.open_parens_loc, func.args, func.flags.contains(.has_rest_arg), false);
                 p.printSpace();
                 p.print("{\n");
-                if (func.body.stmts[0].data.s_lazy_export.* != .e_undefined) {
+                if (lazy_export.data != .e_undefined) {
                     p.indent();
                     p.printIndent();
                     p.printSymbol(p.options.hmr_ref);
                     p.print(".cjs.exports = ");
-                    p.printExpr(.{
-                        .data = func.body.stmts[0].data.s_lazy_export.*,
-                        .loc = func.body.stmts[0].loc,
-                    }, .comma, .{});
+                    p.printExpr(lazy_export, .comma, .{});
                     p.print("; // bun .s_lazy_export\n");
                     p.unindent();
                 }
