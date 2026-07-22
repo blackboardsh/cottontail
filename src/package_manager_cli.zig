@@ -5638,7 +5638,10 @@ const Manager = struct {
             if (std.mem.eql(u8, key, "dependencies") and direct and
                 !manager.options.production and !manager.options.omit_dev and
                 objectSectionContains(package_json, "devDependencies", alias)) continue;
-            if (std.mem.eql(u8, key, "dependencies") and packageDependencyIsBundled(package_json, alias)) continue;
+            if (std.mem.eql(u8, key, "dependencies") and
+                !std.mem.eql(u8, parent_dir, manager.root_dir) and
+                !manager.pathIsWorkspace(parent_dir) and
+                packageDependencyIsBundled(package_json, alias)) continue;
             if (std.mem.eql(u8, key, "peerDependencies") and
                 (objectSectionContains(package_json, "dependencies", alias) or
                     objectSectionContains(package_json, "optionalDependencies", alias) or
