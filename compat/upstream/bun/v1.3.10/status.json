@@ -764,7 +764,7 @@
     },
     "test/bundler/bundler_compile.test.ts": {
       "status": "expected-failure",
-      "reason": "35 of 51 generated standalone compile cases pass in exact isolation; the remaining cases stay expected-failure for their specific compiler or runtime gaps.",
+      "reason": "39 of 51 generated standalone compile cases pass in exact isolation; the remaining cases stay expected-failure for their specific compiler or runtime gaps.",
       "splitBundlerTests": true,
       "includeBundlerFileTests": true,
       "enabledBundlerTests": {
@@ -783,6 +783,10 @@
         "compile/ESMBytecode+DynamicImportTLA+minify": "Minified ESM bytecode evaluates top-level await in a dynamic module.",
         "compile/ESMBytecode+MultipleDynamicImports": "ESM bytecode loads multiple separate dynamic modules.",
         "compile/ESMBytecode+MultipleDynamicImports+minify": "Minified ESM bytecode loads multiple separate dynamic modules.",
+        "compile/WorkerBytecodeESM": "A separately emitted worker entry executes from an ESM bytecode standalone graph.",
+        "compile/EmbeddedFileOutfile": "A file-loader asset remains readable from a nested standalone outfile.",
+        "compile/WorkerRelativePathNoExtension": "A standalone worker resolves a relative extensionless entry from the embedded graph.",
+        "compile/WorkerRelativePathTSExtension": "A standalone worker resolves a relative TypeScript entry from the embedded graph.",
         "compile/pathToFileURLWorks": "Standalone import.meta path and URL identity matches Bun's virtual executable entry.",
         "compile/VariousBunAPIs": "Standalone SQLite, server, fetch, and bun:jsc APIs execute together.",
         "compile/ReactSSR+cjs": "CJS React SSR standalone output executes.",
