@@ -227,6 +227,8 @@ fn compileLinuxCppSource(
     }
     command.addArg("-I");
     command.addDirectoryArg(b.path(b.fmt("{s}/include", .{vendor_dir})));
+    command.addArg("-include");
+    command.addFileArg(b.path("src/libuv_internal_symbols.h"));
     command.addFileArg(b.path(source));
     command.addArg("-o");
     return command.addOutputFileArg(output_name);
@@ -248,6 +250,8 @@ fn configureLibuv(step: *std.Build.Step.Compile, b: *std.Build) void {
                 "-D_LARGEFILE_SOURCE",
                 "-D_DARWIN_UNLIMITED_SELECT=1",
                 "-D_DARWIN_USE_64_BIT_INODE=1",
+                "-include",
+                "src/libuv_internal_symbols.h",
             };
             module.addCSourceFiles(.{ .root = root, .files = libuv_common_sources, .flags = flags });
             module.addCSourceFiles(.{ .root = root, .files = libuv_unix_sources, .flags = flags });
@@ -262,6 +266,8 @@ fn configureLibuv(step: *std.Build.Step.Compile, b: *std.Build) void {
                 "-D_LARGEFILE_SOURCE",
                 "-D_GNU_SOURCE",
                 "-D_POSIX_C_SOURCE=200112",
+                "-include",
+                "src/libuv_internal_symbols.h",
             };
             module.addCSourceFiles(.{ .root = root, .files = libuv_common_sources, .flags = flags });
             module.addCSourceFiles(.{ .root = root, .files = libuv_unix_sources, .flags = flags });
@@ -285,6 +291,27 @@ fn configureLibuv(step: *std.Build.Step.Compile, b: *std.Build) void {
             }) |library| module.linkSystemLibrary(library, .{});
         },
         else => unreachable,
+    }
+
+    if (target.os.tag != .windows) {
+        module.addCSourceFiles(.{
+            .root = b.path("src/compiler/src/jsc/bindings"),
+            .files = &.{
+                "uv-posix-polyfills.c",
+                "uv-posix-stubs.c",
+            },
+            .flags = &.{
+                "-std=c11",
+                "-Wno-c23-extensions",
+                "-Isrc/compiler/src/jsc/bindings/libuv",
+                "-include",
+                "src/bun_uv_compat_config.h",
+            },
+        });
+        module.addCSourceFile(.{
+            .file = b.path("src/libuv_compat_bridge.c"),
+            .flags = &.{"-std=c11"},
+        });
     }
 }
 
@@ -390,16 +417,30 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             "src/native_bindings/sqlite.c",
             "src/native_bindings/platform.c",
         },
-        .flags = &.{
-            "-std=c11",
-            "-Wno-deprecated-declarations",
-            "-DSQLITE_ENABLE_COLUMN_METADATA",
-            "-DSQLITE_ENABLE_FTS5",
-            "-DSQLITE_ENABLE_SESSION",
-            "-DSQLITE_ENABLE_PREUPDATE_HOOK",
-            "-DCOTTONTAIL_VENDORED_JSC=1",
-            "-DJS_NO_EXPORT=1",
-        },
+        .flags = if (resolved_target.os.tag == .windows)
+            &.{
+                "-std=c11",
+                "-Wno-deprecated-declarations",
+                "-DSQLITE_ENABLE_COLUMN_METADATA",
+                "-DSQLITE_ENABLE_FTS5",
+                "-DSQLITE_ENABLE_SESSION",
+                "-DSQLITE_ENABLE_PREUPDATE_HOOK",
+                "-DCOTTONTAIL_VENDORED_JSC=1",
+                "-DJS_NO_EXPORT=1",
+            }
+        else
+            &.{
+                "-std=c11",
+                "-Wno-deprecated-declarations",
+                "-DSQLITE_ENABLE_COLUMN_METADATA",
+                "-DSQLITE_ENABLE_FTS5",
+                "-DSQLITE_ENABLE_SESSION",
+                "-DSQLITE_ENABLE_PREUPDATE_HOOK",
+                "-DCOTTONTAIL_VENDORED_JSC=1",
+                "-DJS_NO_EXPORT=1",
+                "-include",
+                "src/libuv_internal_symbols.h",
+            },
     });
     if (resolved_target.os.tag == .linux) {
         inline for (&.{
@@ -427,7 +468,14 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
                 "-Wno-character-conversion",
             }
         else
-            &.{ "-std=c++20", "-DJS_NO_EXPORT=1", "-fno-rtti", "-Wno-character-conversion" };
+            &.{
+                "-std=c++20",
+                "-DJS_NO_EXPORT=1",
+                "-fno-rtti",
+                "-Wno-character-conversion",
+                "-include",
+                "src/libuv_internal_symbols.h",
+            };
         inline for (&.{
             "src/jsc_bytecode_bridge.cpp",
             "src/jsc_private_bridge.cpp",

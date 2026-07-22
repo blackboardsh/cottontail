@@ -4207,11 +4207,29 @@
       "args": ["--timeout=120000"],
       "timeoutMs": 180000
     },
+    "test/napi/napi.test.ts": {
+      "status": "enabled",
+      "reason": "All 93 active copied cases pass across native-addon bundling and compilation, registration, handle and finalizer lifetimes, async work, thread-safe functions, cleanup hooks, errors, and Node output parity (470 assertions).",
+      "args": ["--timeout=120000", "--max-concurrency=4"],
+      "env": {
+        "COTTONTAIL_TEST_TIMEOUT_SCALE": "12"
+      },
+      "timeoutMs": 900000
+    },
     "test/napi/uv.test.ts": {
       "status": "enabled",
       "reason": "The Cottontail-owned libuv headers and exported Node-API symbols pass all 6 copied mutex, process ID, once, and high-resolution timer cases (14 assertions).",
       "args": ["--timeout=120000"],
       "timeoutMs": 180000
+    },
+    "test/napi/uv_stub.test.ts": {
+      "status": "enabled",
+      "reason": "Bun's POSIX libuv compatibility ABI passes all 295 copied unsupported-symbol diagnostic and supported-polyfill cases (590 assertions).",
+      "args": ["--concurrent", "--max-concurrency=4", "--timeout=120000"],
+      "env": {
+        "COTTONTAIL_TEST_TIMEOUT_SCALE": "12"
+      },
+      "timeoutMs": 900000
     },
     "test/package-json-lint.test.ts": {
       "status": "enabled",
