@@ -2567,7 +2567,11 @@ function executeBundledCommonJsModule(module, filename, source) {
   if (typeof factory !== "function") {
     throw new TypeError(`Runtime bundle for '${filename}' did not produce a CommonJS wrapper`);
   }
-  factory(module.exports, module.require, module, filename, dirname(filename));
+  // The bundler lowers this ESM file's static imports to require() calls. They
+  // still resolve with ESM conditions: using the module's ordinary CommonJS
+  // require here can select a package's `require` export (or reject an
+  // import-only package) even though the original edge was an import.
+  factory(module.exports, createEsmRequire(filename, module), module, filename, dirname(filename));
   if (module.exports != null &&
       (typeof module.exports === "object" || typeof module.exports === "function") &&
       Object.hasOwn(module.exports, "module.exports")) {
@@ -2575,6 +2579,31 @@ function executeBundledCommonJsModule(module, filename, source) {
   }
   module.loaded = true;
   return module.exports;
+}
+
+function createEsmRequire(basePath, parentModule) {
+  const require = request => {
+    if (typeof request !== "string") throw invalidModuleIdType(request);
+    if (request.length === 0) throw invalidEmptyModuleId();
+    const directMock = bunModuleMockFor(request);
+    if (directMock.found) return directMock.value;
+    const resolved = resolveRequest(request, basePath, true, "import");
+    const resolvedMock = bunModuleMockFor(resolved);
+    if (resolvedMock.found) return resolvedMock.value;
+    return loadCommonJsModule(resolved, parentModule);
+  };
+  require.resolve = request => {
+    if (typeof request !== "string") throw invalidRequestType(request);
+    return resolveRequest(request, basePath, true, "import");
+  };
+  require.cache = commonJsCacheObject;
+  require.extensions = extensionsForRequire(basePath);
+  Object.defineProperty(require, "main", {
+    configurable: true,
+    enumerable: true,
+    get() { return mainModule; },
+  });
+  return require;
 }
 
 function executeDefaultExtension(module, filename, loader) {
@@ -2770,17 +2799,49 @@ function namespaceFromBuiltin(name, value) {
   return namespaceFromCommonJs(unwrapped);
 }
 
-function rewriteImportBindings(names) {
+function importedBindingEntries(names) {
   return String(names)
     .split(",")
-    .map((part) => {
-      const trimmed = part.trim();
-      if (!trimmed) return "";
-      const pieces = trimmed.split(/\s+as\s+/);
-      return pieces.length === 2 ? `${pieces[0].trim()}: ${pieces[1].trim()}` : trimmed;
-    })
+    .map(part => part.trim())
     .filter(Boolean)
-    .join(", ");
+    .map(part => {
+      const pieces = part.split(/\s+as\s+/);
+      return {
+        imported: pieces[0].trim(),
+        local: (pieces[1] ?? pieces[0]).trim(),
+      };
+    });
+}
+
+function rewriteImportedExportClauses(source, importedBindings) {
+  if (Object.keys(importedBindings).length === 0) return source;
+  return replaceCodePattern(
+    source,
+    /\bexport\s*\{([^}]*)\}\s*(from\s*['"][^'"]+['"])?\s*;?/g,
+    (statement, names, fromClause) => {
+      if (fromClause) return statement;
+      const retained = [];
+      const liveExports = [];
+      for (const part of String(names).split(",")) {
+        const trimmed = part.trim();
+        if (!trimmed) continue;
+        const pieces = trimmed.split(/\s+as\s+/);
+        const local = pieces[0].trim();
+        const exported = (pieces[1] ?? pieces[0]).trim();
+        const expression = importedBindings[local];
+        if (expression === undefined) {
+          retained.push(trimmed);
+          continue;
+        }
+        liveExports.push(
+          `Object.defineProperty(${ESM_EXPORTS_BINDING}, ${JSON.stringify(exported)}, ` +
+          `{ configurable: true, enumerable: true, get: () => ${expression} });`,
+        );
+      }
+      if (retained.length > 0) liveExports.push(`export { ${retained.join(", ")} };`);
+      return liveExports.join(" ");
+    },
+  );
 }
 
 function staticImportCall(specifier, asyncStaticImports, attributeKeyword, attributes) {
@@ -2799,35 +2860,57 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
   // (matching ESM semantics, where imports are initialized before any module
   // code runs, even when the import statement appears at the bottom).
   const importDeclarations = [];
+  const importedBindings = Object.create(null);
+  let importNamespaceIndex = 0;
+  const importNamespace = (spec, attributeKeyword, attributes) => {
+    const name = `__cottontailImportNamespace${importNamespaceIndex++}`;
+    importDeclarations.push(
+      `const ${name} = ${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)};`,
+    );
+    return name;
+  };
+  const liveImportedBinding = (namespace, imported) => {
+    const name = String(imported).replace(/^(['"])(.*)\1$/, "$2");
+    return `${namespace}[${JSON.stringify(name)}]`;
+  };
   let output = replaceCodePattern(source, /\bimport\.meta\b/g, "__ctImportMeta");
-  // Static import declarations are rewritten to synchronous requires so the
-  // source can run inside new Function() (where `import x from "..."` would
-  // otherwise parse as a malformed dynamic import call).
+  // Keep imported bindings live across cyclic ESM graphs. Capturing them with
+  // destructuring snapshots an incompletely initialized namespace; Svelte's
+  // compiler graph, for example, intentionally closes a cycle between its
+  // node constructors and map_children module.
   output = replaceCodePattern(output,
     /\bimport\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s+from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
     (_all, name, spec, attributeKeyword, attributes) => {
-      importDeclarations.push(`const ${name} = ${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)};`);
+      importedBindings[name] = importNamespace(spec, attributeKeyword, attributes);
       return ";";
     },
   );
   output = replaceCodePattern(output,
     /\bimport\s+([A-Za-z_$][\w$]*)\s*,\s*\{([^}]*)\}\s*from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
     (_all, def, names, spec, attributeKeyword, attributes) => {
-      importDeclarations.push(`const { default: ${def}, ${rewriteImportBindings(names)} } = ${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)};`);
+      const namespace = importNamespace(spec, attributeKeyword, attributes);
+      importedBindings[def] = liveImportedBinding(namespace, "default");
+      for (const binding of importedBindingEntries(names)) {
+        importedBindings[binding.local] = liveImportedBinding(namespace, binding.imported);
+      }
       return ";";
     },
   );
   output = replaceCodePattern(output,
     /\bimport\s*\{([^}]*)\}\s*from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
     (_all, names, spec, attributeKeyword, attributes) => {
-      importDeclarations.push(`const { ${rewriteImportBindings(names)} } = ${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)};`);
+      const namespace = importNamespace(spec, attributeKeyword, attributes);
+      for (const binding of importedBindingEntries(names)) {
+        importedBindings[binding.local] = liveImportedBinding(namespace, binding.imported);
+      }
       return ";";
     },
   );
   output = replaceCodePattern(output,
     /\bimport\s+([A-Za-z_$][\w$]*)\s+from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
     (_all, def, spec, attributeKeyword, attributes) => {
-      importDeclarations.push(`const { default: ${def} } = ${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)};`);
+      const namespace = importNamespace(spec, attributeKeyword, attributes);
+      importedBindings[def] = liveImportedBinding(namespace, "default");
       return ";";
     },
   );
@@ -2835,6 +2918,7 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
     importDeclarations.push(`${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)};`);
     return ";";
   });
+  output = rewriteImportedExportClauses(output, importedBindings);
   // Dynamic import() cannot execute inside new Function()-compiled code for
   // formats JSC's own loader cannot parse (e.g. TypeScript); route it through
   // the runtime module loader, which also consults the CommonJS cache.
@@ -2916,7 +3000,23 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
     return "";
   });
   const helperSource = asyncStaticImports ? asyncStaticImportHelperSource : staticImportHelperSource;
-  return `${helperSource}${importDeclarations.join(" ")}${output}\n${exportAssignments.join("\n")}`;
+  const bindingEntries = Object.entries(importedBindings);
+  if (bindingEntries.length === 0) {
+    return `${helperSource}${importDeclarations.join(" ")}${output}\n${exportAssignments.join("\n")}`;
+  }
+  const bindingScope = "__cottontailImportedBindings";
+  const bindingDeclarations = bindingEntries.map(([local, expression]) =>
+    `Object.defineProperty(${bindingScope}, ${JSON.stringify(local)}, { ` +
+    `enumerable: true, get: () => ${expression}, ` +
+    `set() { throw new TypeError(${JSON.stringify(`Cannot assign to import '${local}'`)}); } });`
+  );
+  // A with-environment gives imported names live reads without compiling every
+  // dependency a second time. Lexical declarations and function parameters
+  // inside the module remain inner scopes and therefore shadow imports exactly
+  // where ordinary ESM bindings do.
+  return `${helperSource}const ${bindingScope} = Object.create(null);` +
+    `${importDeclarations.join(" ")}${bindingDeclarations.join(" ")}` +
+    `with (${bindingScope}) { ${output}\n${exportAssignments.join("\n")} }`;
 }
 
 const dynamicErrorSourceSymbol = Symbol.for("cottontail.dynamicErrorSource");
