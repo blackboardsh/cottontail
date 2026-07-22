@@ -2445,7 +2445,8 @@ function executeCommonJsSource(module, filename, source) {
   const wrapper = compilePublicCommonJsWrapper(effectiveSource, filename);
   const moduleDirname = dirname(filename);
   try {
-    wrapper(
+    wrapper.call(
+      module.exports,
       module.exports,
       module.require,
       module,
@@ -2718,14 +2719,16 @@ function executeHookSource(resolved, source, format) {
     "__ctImportMeta",
     `${executableSource}\n//# sourceURL=${resolved}`,
   );
-  wrapper(
+  const args = [
     module.exports,
     createRequire(hookRequireBase(resolved)),
     module,
     resolved,
     dirname(resolved),
     importMetaForHookModule(resolved),
-  );
+  ];
+  if (effectiveFormat === "module") wrapper(...args);
+  else wrapper.call(module.exports, ...args);
   if (module.exports != null &&
       (typeof module.exports === "object" || typeof module.exports === "function") &&
       Object.hasOwn(module.exports, "module.exports")) {

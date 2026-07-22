@@ -15,6 +15,22 @@ test("bundled test modules resolve global require from their source file", () =>
   expect(require.resolve.paths("./fixtures/require-resolve-target.js")).toEqual([import.meta.dir]);
 });
 
+test("CommonJS top-level this is the initial exports object", () => {
+  const target = join(root, "commonjs-top-level-this.cjs");
+  writeFileSync(target, [
+    "module.exports.sameAsExports = this === exports;",
+    "module.exports.sameAsModuleExports = this === module.exports;",
+    "module.exports.sameAsGlobal = this === globalThis;",
+    "",
+  ].join("\n"));
+
+  expect(require(target)).toEqual({
+    sameAsExports: true,
+    sameAsModuleExports: true,
+    sameAsGlobal: false,
+  });
+});
+
 test("require uses an ESM module.exports export as its direct result", () => {
   const interop = join(root, "interop.mjs");
   const namespace = join(root, "namespace.mjs");

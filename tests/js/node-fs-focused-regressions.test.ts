@@ -39,6 +39,15 @@ test("unlinking a directory reports the platform errno", () => {
   fs.rmdirSync(target);
 });
 
+test("readlink reports EINVAL for regular files", async () => {
+  const target = path.join(root, "readlink-regular-file.txt");
+  fs.writeFileSync(target, "not a symbolic link");
+  const expected = { code: "EINVAL", syscall: "readlink", path: target };
+
+  expect(() => fs.readlinkSync(target)).toThrow(expect.objectContaining(expected));
+  expect(fsp.readlink(target)).rejects.toMatchObject(expected);
+});
+
 test("concurrent recursive readdir calls return independent snapshots", async () => {
   const target = path.join(root, "recursive");
   fs.mkdirSync(path.join(target, "a", "b"), { recursive: true });

@@ -180,6 +180,7 @@ function makeFsError(error, path, syscall = "open") {
     else if (source.includes("Is a directory") || source.includes("IsDir")) code = "EISDIR";
     else if (source.includes("Directory not empty") || source.includes("DirNotEmpty")) code = "ENOTEMPTY";
     else if (source.includes("Bad file descriptor")) code = "EBADF";
+    else if (/invalid argument/i.test(source)) code = "EINVAL";
     else if (source.includes("Device not configured") || source.includes("No such device or address") || source.includes("NoDevice")) code = "ENXIO";
     else if (source.includes("Operation not supported") || source.includes("Not supported")) code = "ENOTSUP";
     else if (source.includes("Function not implemented")) code = "ENOSYS";
