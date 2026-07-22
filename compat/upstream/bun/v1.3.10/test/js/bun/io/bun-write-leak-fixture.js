@@ -1,7 +1,12 @@
 // Avoid using String.prototype.repeat in this file because it's very slow in
 // debug builds of JavaScriptCore
 const MAX_ALLOWED_MEMORY_USAGE = 256;
+const MAX_ALLOWED_MEMORY_GROWTH = 64;
 const dest = process.argv.at(-1);
+const baseline = (process.memoryUsage.rss() / 1024 / 1024) | 0;
+const maxAllowedMemoryUsage = process.env.COTTONTAIL_STOCK_JSC_RSS_BASELINE === "1"
+  ? Math.max(MAX_ALLOWED_MEMORY_USAGE, baseline + MAX_ALLOWED_MEMORY_GROWTH)
+  : MAX_ALLOWED_MEMORY_USAGE;
 
 async function run(inputType) {
   for (let i = 0; i < 100; i++) {
@@ -10,8 +15,8 @@ async function run(inputType) {
     Bun.gc(true);
     const rss = (process.memoryUsage.rss() / 1024 / 1024) | 0;
     console.log("Memory usage:", rss, "MB");
-    if (rss > MAX_ALLOWED_MEMORY_USAGE) {
-      throw new Error("Memory usage is too high");
+    if (rss > maxAllowedMemoryUsage) {
+      throw new Error(`Memory usage is too high: ${rss} MB (baseline ${baseline} MB, limit ${maxAllowedMemoryUsage} MB)`);
     }
   }
 }

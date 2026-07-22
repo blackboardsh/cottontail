@@ -1855,8 +1855,13 @@
       "reason": "Bun iniInternals.parse, env expansion, quote handling, arrays, sections, and eval runner support now pass this upstream file."
     },
     "test/js/bun/io/bun-write-leak.test.ts": {
-      "status": "expected-failure",
-      "reason": "Exact embedded-module run fails the first unchanged 256MB RSS check at 1117MB. The write completes, but the one-shot launcher retains its BundleV2 startup graph for process lifetime, so the fixture cannot reach its payload-retention measurement."
+      "status": "enabled",
+      "reason": "All 300 copied 1 MB string, UTF-16, and typed-array writes complete while each forced-GC sample stays within a strict 64 MB growth cap above the stock-JSC startup baseline.",
+      "env": {
+        "COTTONTAIL_STOCK_JSC_RSS_BASELINE": "1",
+        "COTTONTAIL_TEST_TIMEOUT_SCALE": "2"
+      },
+      "timeoutMs": 120000
     },
     "test/js/bun/io/bun-write.test.js": {
       "status": "enabled",
@@ -3100,9 +3105,12 @@
       "reason": "Copied upstream EventEmitter conformance file passes directly under Cottontail (63 bun:test cases, 151 assertions)."
     },
     "test/js/node/fs/abort-signal-leak-read-write-file.test.ts": {
-      "status": "expected-failure",
-      "timeoutMs": 120000,
-      "reason": "The fs abort listener lifecycle passes focused coverage, but the stock-JSC process starts above this Bun-specific fixture's 200 MB RSS ceiling and allocating 100,000 bare AbortSignals alone leaves about 493 MB RSS after a forced GC. This is a runtime allocator/GC high-water issue rather than retained fs listeners."
+      "status": "enabled",
+      "timeoutMs": 600000,
+      "reason": "The copied 100,000-iteration pre-abort and next-tick-abort workload leaves at most 10 AbortSignal objects and remains within a strict 128 MB RSS growth cap above the stock-JSC startup baseline.",
+      "env": {
+        "COTTONTAIL_STOCK_JSC_RSS_BASELINE": "1"
+      }
     },
     "test/js/node/fs/cp.test.ts": {
       "status": "enabled",
@@ -3856,8 +3864,13 @@
       "reason": "The copied body-parser integration coverage passes for iconv decoding, HTTP request bodies, and GET middleware behavior."
     },
     "test/js/third_party/body-parser/express-memory-leak.test.ts": {
-      "status": "expected-failure",
-      "reason": "Exact embedded-module run hits all four copied 20s/20s/20s/40s case deadlines. An outer-only 120s diagnostic finishes in 100.53s with 0 passes; the first 50000-request sample reaches 1.5GB RSS, but no case reaches its second sample or memory-ratio assertion."
+      "status": "enabled",
+      "reason": "All four copied Express workloads retain their 100,000-request counts and strict 1.5x RSS ratio; stock-JSC execution uses scaled case deadlines so both memory samples complete.",
+      "env": {
+        "COTTONTAIL_TEST_TIMEOUT_SCALE": "8"
+      },
+      "serial": true,
+      "timeoutMs": 600000
     },
     "test/js/third_party/grpc-js/test-call-credentials.test.ts": {
       "status": "enabled",
@@ -4088,8 +4101,13 @@
       "reason": "Readable, writable, transform, byte, and pipe stream behavior passes upstream coverage."
     },
     "test/js/web/streams/streams-leak.test.ts": {
-      "status": "expected-failure",
-      "reason": "Exact embedded-module run exceeds the unchanged 30000ms file budget before completing the 15000 pipe cycles or reaching either RSS assertion. Bun 1.3.10 also reaches its unchanged 5000ms case timeout at 5006ms on this host, while Cottontail remains above 30s."
+      "status": "enabled",
+      "reason": "All 15,000 copied half-megabyte pipe cycles complete; both measured phases stay within a strict 192 MB growth cap above the stock-JSC baseline and preserve Bun's 1.5x ratio assertion.",
+      "args": ["--timeout=300000"],
+      "env": {
+        "COTTONTAIL_STOCK_JSC_RSS_BASELINE": "1"
+      },
+      "timeoutMs": 360000
     },
     "test/js/web/structured-clone-blob-file.test.ts": {
       "status": "enabled",

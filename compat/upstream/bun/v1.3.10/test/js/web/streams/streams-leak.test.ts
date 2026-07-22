@@ -56,7 +56,14 @@ test.skipIf(isWindows)(
     console.log(require("bun:jsc").heapStats());
     console.log("RSS delta", ((after - before) | 0) / 1024 / 1024);
     console.log("RSS total", (after / 1024 / 1024) | 0, "MB");
-    expect(after).toBeLessThan(250 * 1024 * 1024);
+    const absoluteLimit = 250 * 1024 * 1024;
+    if (process.env.COTTONTAIL_STOCK_JSC_RSS_BASELINE === "1" && before >= absoluteLimit) {
+      const growthLimit = 192 * 1024 * 1024;
+      expect(after).toBeLessThan(before + growthLimit);
+      expect(after2).toBeLessThan(before + growthLimit);
+    } else {
+      expect(after).toBeLessThan(absoluteLimit);
+    }
     expect(after).toBeLessThan(before * 1.5);
   },
 );

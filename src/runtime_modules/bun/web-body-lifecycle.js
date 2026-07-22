@@ -132,10 +132,15 @@ export function registerFetchBodyFinalizer(response, body, cleanupSymbol) {
     consumed: false,
   };
   fetchBodyFinalizerStates.set(body, state);
-  fetchBodyFinalizer?.register(response, state);
+  fetchBodyFinalizer?.register(response, state, body);
 }
 
 export function markFetchBodyConsumed(body) {
   const state = body && fetchBodyFinalizerStates.get(body);
-  if (state) state.consumed = true;
+  if (!state) return;
+  state.consumed = true;
+  // Once a consumer owns the stream, the response finalizer must not retain
+  // its transport cleanup closure until a later GC/finalization turn.
+  fetchBodyFinalizer?.unregister(body);
+  fetchBodyFinalizerStates.delete(body);
 }

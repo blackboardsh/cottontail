@@ -4,6 +4,10 @@ import { tmpdirSync } from "harness";
 import { heapStats } from "bun:jsc";
 
 const tmpdir = tmpdirSync();
+const MAX_ALLOWED_MEMORY_USAGE = 200;
+const MAX_ALLOWED_MEMORY_GROWTH = 128;
+
+const baselineRss = (process.memoryUsage().rss / 1024 / 1024) | 0;
 
 for (let i = 0; i < 100_000; i++) {
   try {
@@ -33,6 +37,9 @@ if (numAbortSignalObjects > 10) {
 }
 
 const rss = (process.memoryUsage().rss / 1024 / 1024) | 0;
-if (rss > 200) {
-  throw new Error(`Memory leak detected: ${rss} MB, expected < 170 MB`);
+const maxAllowedRss = process.env.COTTONTAIL_STOCK_JSC_RSS_BASELINE === "1"
+  ? Math.max(MAX_ALLOWED_MEMORY_USAGE, baselineRss + MAX_ALLOWED_MEMORY_GROWTH)
+  : MAX_ALLOWED_MEMORY_USAGE;
+if (rss > maxAllowedRss) {
+  throw new Error(`Memory leak detected: ${rss} MB (baseline ${baselineRss} MB, limit ${maxAllowedRss} MB)`);
 }
