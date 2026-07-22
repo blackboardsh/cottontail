@@ -2790,6 +2790,30 @@ const Manager = struct {
         return manager.init_data.environ_map.get(security_resolution_output_env) != null;
     }
 
+    fn shouldRefreshInstalledSecurityRoot(
+        manager: *const Manager,
+        parent_dir: []const u8,
+        direct: bool,
+    ) bool {
+        // COTTONTAIL-COMPAT: Bun resolves every root manifest for an update
+        // without a lockfile, even when the package is already materialized.
+        // The scanner payload still reuses the installed archive afterwards.
+        return manager.isSecurityResolution() and
+            manager.options.command == .update and
+            manager.lock_graph == null and
+            direct and
+            std.mem.eql(u8, parent_dir, manager.root_dir);
+    }
+
+    fn shouldTraverseInstalledSecurityDependencies(manager: *const Manager) bool {
+        // COTTONTAIL-COMPAT: without a lockfile, Bun's scanner-backed remove
+        // reuses the materialized hoisted roots without treating dependency
+        // fields from packed package.json files as registry graph metadata.
+        return !(manager.security_scanner != null and
+            manager.options.command == .remove and
+            manager.lock_graph == null);
+    }
+
     fn buildSecurityMatrix(
         manager: *Manager,
         root: *const Value,
@@ -4662,7 +4686,12 @@ const Manager = struct {
             const target_section = manager.sectionForAdd(package_json, name);
             const section = try ensureObjectProperty(manager.allocator, &package_json.object, target_section.key());
 
-            if (manager.isSecurityResolution() and !packageSpecHasExplicitSpecifier(raw_spec)) {
+            // COTTONTAIL-COMPAT: an implicit scanner-backed add must install
+            // the manifest range approved by preflight, rather than resolving
+            // the default tag again after the scan has completed.
+            if ((manager.isSecurityResolution() or manager.security_scanner != null) and
+                !packageSpecHasExplicitSpecifier(raw_spec))
+            {
                 if (section.get(name)) |current| {
                     if (current == .string) requested = current.string;
                 }
@@ -4732,6 +4761,13 @@ const Manager = struct {
         }
     }
 
+    fn securityFinalGraphUsesPath(manager: *const Manager, path: []const u8) bool {
+        for (manager.records.items) |record| {
+            if (record.install_dir.len > 0 and std.mem.eql(u8, record.install_dir, path)) return true;
+        }
+        return false;
+    }
+
     fn removePackages(manager: *Manager, package_json: *Value, parent_dir: []const u8) !void {
         if (manager.options.positionals.len == 0) return error.MissingPackageName;
         if (!hasAnyDependencies(package_json)) {
@@ -4743,6 +4779,9 @@ const Manager = struct {
         }
         if (!manager.options.silent) try manager.stdout.writeByte('\n');
 
+        const defer_hoisted_security_removal = manager.security_scanner != null and
+            manager.node_linker == .hoisted and
+            !manager.options.dry_run;
         var removed: usize = 0;
         for (manager.options.positionals) |name| {
             var name_removed = false;
@@ -4767,10 +4806,21 @@ const Manager = struct {
                     try manager.removed_materialized_names.append(try manager.allocator.dupe(u8, name));
                 }
             }
-            if (!manager.options.dry_run) deletePath(manager.init_data.io, path);
+            if (!manager.options.dry_run and !defer_hoisted_security_removal) {
+                deletePath(manager.init_data.io, path);
+            }
         }
         manager.removed_count += removed;
         try manager.installRoot(manager.root_package_json.?, true);
+        if (defer_hoisted_security_removal) {
+            // COTTONTAIL-COMPAT: resolve the surviving hoisted graph before
+            // removing direct entries. A removed direct package may still be
+            // the valid materialization of a transitive dependency.
+            for (manager.options.positionals) |name| {
+                const path = try packageDestination(manager.allocator, manager.root_dir, name);
+                if (!manager.securityFinalGraphUsesPath(path)) deletePath(manager.init_data.io, path);
+            }
+        }
     }
 
     fn printOutdated(manager: *Manager, package_json: *Value, parent_dir: []const u8) !u8 {
@@ -5756,13 +5806,33 @@ const Manager = struct {
         } else effective_spec;
 
         const explicit_global_link = manager.options.command == .link and direct;
+        // COTTONTAIL-COMPAT: scanner preflight has already resolved selected
+        // add roots. Reuse that result so an installed root is not fetched a
+        // second time while materializing newly approved dependencies.
+        const refresh_unscanned_add = manager.options.command == .add and
+            manager.security_scanner == null and
+            !manager.report_direct_installs and
+            !manager.isSecurityResolution();
+        const refresh_missing_scanned_lock_root = blk: {
+            if (manager.options.command != .add or
+                manager.security_scanner == null or
+                manager.lock_graph == null or
+                manager.report_direct_installs or
+                manager.isSecurityResolution()) break :blk false;
+            const locked = (try manager.findLockedSelection(alias, parent_dir)) orelse break :blk false;
+            // COTTONTAIL-COMPAT: Bun refreshes a selected locked root when its
+            // materialization is missing, while new roots reuse the manifests
+            // already fetched by scanner preflight.
+            break :blk !manager.pathExists(locked.destination);
+        };
         const refresh_direct_registry = direct and
             !workspace_package and
             !isGitSpec(resolution_spec) and
             !isTarballSpec(resolution_spec) and
             !isLocalSpec(resolution_spec) and
             (manager.refresh_direct_registry or
-                (manager.options.command == .add and !manager.report_direct_installs and !manager.isSecurityResolution()));
+                refresh_unscanned_add or
+                refresh_missing_scanned_lock_root);
         const refresh_direct_source = direct and manager.refresh_direct_source and
             (workspace_package or isGitSpec(resolution_spec) or isTarballSpec(resolution_spec) or
                 isLocalSpec(resolution_spec) or std.mem.startsWith(u8, effective_spec, "patch:"));
@@ -5946,7 +6016,10 @@ const Manager = struct {
         try manager.resolving.put(cycle_key, {});
         defer _ = manager.resolving.remove(cycle_key);
 
-        if (!manager.options.force and !refresh_direct_registry) {
+        if (!manager.options.force and
+            !refresh_direct_registry and
+            !manager.shouldRefreshInstalledSecurityRoot(parent_dir, direct))
+        {
             if (try manager.findInstalledVersion(alias, resolution_spec, parent_dir, direct, protocol_patch_paths)) |installed| return installed;
         }
 
@@ -8551,11 +8624,13 @@ const Manager = struct {
                 });
                 try manager.rememberPackageMetadata(destination, value);
                 try manager.registerBundledPackages(destination_key, value, destination);
-                try manager.installDependencyObject(value, "dependencies", destination, false, false);
-                if (!manager.options.omit_optional) {
-                    try manager.installDependencyObject(value, "optionalDependencies", destination, false, true);
+                if (manager.shouldTraverseInstalledSecurityDependencies()) {
+                    try manager.installDependencyObject(value, "dependencies", destination, false, false);
+                    if (!manager.options.omit_optional) {
+                        try manager.installDependencyObject(value, "optionalDependencies", destination, false, true);
+                    }
+                    try manager.installOrLinkPeerDependencies(value, destination, destination, parent_dir);
                 }
-                try manager.installOrLinkPeerDependencies(value, destination, destination, parent_dir);
                 return version_value.string;
             }
         }
