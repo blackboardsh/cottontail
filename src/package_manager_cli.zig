@@ -8792,7 +8792,7 @@ fn newUpdateDependencySpec(
 
 fn isExactVersionLiteral(input: []const u8) bool {
     var value = std.mem.trim(u8, input, " \t\r\n");
-    if (value.len > 0 and value[0] == '=') value = std.mem.trimLeft(u8, value[1..], " \t\r\n");
+    if (value.len > 0 and value[0] == '=') value = std.mem.trimStart(u8, value[1..], " \t\r\n");
     if (value.len > 1 and value[0] == 'v') value = value[1..];
     if (std.SemanticVersion.parse(value)) |_| return true else |_| return false;
 }
@@ -8803,7 +8803,7 @@ fn dependencyBaselineVersion(spec: []const u8) ?[]const u8 {
     while (value.len > 0 and switch (value[0]) {
         '^', '~', '=', '<', '>', 'v' => true,
         else => false,
-    }) value = std.mem.trimLeft(u8, value[1..], " \t\r\n");
+    }) value = std.mem.trimStart(u8, value[1..], " \t\r\n");
     const parsed = Semver.Version.parseUTF8(value);
     if (!parsed.valid or parsed.len == 0 or parsed.len > value.len) return null;
     return value[0..parsed.len];

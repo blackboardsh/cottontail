@@ -577,7 +577,7 @@ fn looksLikeSemverRange(input: []const u8) bool {
     while (value.len > 0 and switch (value[0]) {
         '<', '>', '=', '~', '^' => true,
         else => false,
-    }) value = std.mem.trimLeft(u8, value[1..], " \t\r\n");
+    }) value = std.mem.trimStart(u8, value[1..], " \t\r\n");
     if (value.len > 1 and value[0] == 'v' and std.ascii.isDigit(value[1])) value = value[1..];
     if (value.len == 1 and (value[0] == '*' or value[0] == 'x' or value[0] == 'X')) return true;
     if (value.len == 0 or !std.ascii.isDigit(value[0])) return false;
@@ -603,7 +603,7 @@ fn looksLikeSemverRange(input: []const u8) bool {
     }
 
     if (index < value.len and std.ascii.isWhitespace(value[index])) {
-        const remainder = std.mem.trimLeft(u8, value[index..], " \t\r\n");
+        const remainder = std.mem.trimStart(u8, value[index..], " \t\r\n");
         if (remainder.len == 0) return true;
         if (std.mem.startsWith(u8, remainder, "||")) return looksLikeSemverRange(remainder[2..]);
         if (remainder[0] == '-') return looksLikeSemverRange(remainder[1..]);
