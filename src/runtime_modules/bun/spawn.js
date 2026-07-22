@@ -731,7 +731,6 @@ export function createBunSpawnRuntime(deps) {
         const sent = host.spawnKill?.(child._id, code) === true;
         if (sent && code !== 0) {
           killRequested = true;
-          killed = true;
         }
       },
       ref() { unregisterSpawnListener?.ref?.(); },
