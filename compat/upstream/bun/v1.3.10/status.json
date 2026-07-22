@@ -155,6 +155,25 @@
       "reason": "Copied runtime regressions pass directly under Cottontail in the grouped unclassified discovery run."
     },
     {
+      "pattern": "^test/regression/issue/(?:invalid-escape-sequences|jsx-template-string-crash)\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "The copied parser regressions pass on the integrated compiler: malformed escapes produce diagnostics without crashing, and JSX template strings compile and execute correctly."
+    },
+    {
+      "pattern": "^test/regression/issue/24387\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "A failed synchronous require of top-level-await code clears the module cache so a subsequent dynamic import succeeds; stock-JSC startup requires a larger per-case budget.",
+      "args": ["--timeout=20000"],
+      "timeoutMs": 30000
+    },
+    {
+      "pattern": "^test/regression/issue/25648\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Explicit --bundle builds correctly rename shadowing function and class expressions and execute without recursive symbol capture; stock-JSC startup requires a larger per-case budget.",
+      "args": ["--timeout=20000"],
+      "timeoutMs": 30000
+    },
+    {
       "pattern": "^test/regression/issue/(?:19652|20321|21677|21792)\\.test\\.ts$",
       "status": "enabled",
       "reason": "Copied build production mode, runtime API, raw Date header, and SNI TLS-array regressions pass under Cottontail."
