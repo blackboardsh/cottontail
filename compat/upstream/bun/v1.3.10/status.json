@@ -270,8 +270,11 @@
     },
     {
       "pattern": "^test/cli/create/create-jsx\\.test\\.ts$",
-      "status": "expected-failure",
-      "reason": "The copied assertions remain exact, but the file is not currently promotable: its committed bun.sh/HMR snapshots and live npm/shadcn@canary results have drifted from current Bun 1.3.10 behavior. The larger harness cap only allows all original 5-second cases to report.",
+      "status": "enabled",
+      "reason": "The exact Bun CI contract passes: four deterministic React/Tailwind create-and-build workflows complete with 12 assertions, while the eight dev-server snapshot and live shadcn@canary cases remain upstream-authored CI todos.",
+      "env": {
+        "CI": "1"
+      },
       "timeoutMs": 240000
     },
     {
