@@ -25,6 +25,59 @@ test("require uses an ESM module.exports export as its direct result", () => {
   expect(require(namespace).value).toBe(42);
 });
 
+test("a failed synchronous TLA require is evicted before dynamic import", async () => {
+  const { createRequire } = require("node:module");
+  const { pathToFileURL } = require("node:url");
+  const target = join(root, "require-tla-cache.js");
+  writeFileSync(target, [
+    "await new Promise(resolve => setTimeout(resolve, 1));",
+    "export const foo = 67;",
+    "",
+  ].join("\n"));
+  const localRequire = createRequire(join(root, "entry.js"));
+
+  expect(() => localRequire(target)).toThrow(
+    `require() async module "${target}" is unsupported. use "await import()" instead.`,
+  );
+  expect(localRequire.cache[target]).toBeUndefined();
+  const namespace = await import(pathToFileURL(target).href);
+  expect(namespace.foo).toBe(67);
+  expect(Object.prototype.toString.call(namespace)).toBe("[object Module]");
+});
+
+test("TypeScript CommonJS entries receive the main module", () => {
+  const target = join(root, "typescript-commonjs-main.ts");
+  writeFileSync(target, [
+    "exports.forceCommonJS = true;",
+    "async function nested() { await Promise.resolve(); }",
+    "if (require.main !== module) process.exit(91);",
+    "console.log('typescript-commonjs-main');",
+    "",
+  ].join("\n"));
+
+  const child = Bun.spawnSync({ cmd: [process.execPath, target] });
+  expect(child.exitCode).toBe(0);
+  expect(child.stdout.toString()).toBe("typescript-commonjs-main\n");
+  expect(child.stderr.toString()).toBe("");
+});
+
+test("bundled ESM entries expose a bound import.meta.require", () => {
+  const dependency = join(root, "import-meta-require-dependency.cjs");
+  const target = join(root, "import-meta-require-entry.js");
+  writeFileSync(dependency, "module.exports = 42;\n");
+  writeFileSync(target, [
+    "const { require: localRequire } = import.meta;",
+    `console.log(localRequire(${JSON.stringify(dependency)}));`,
+    "export {};",
+    "",
+  ].join("\n"));
+
+  const child = Bun.spawnSync({ cmd: [process.execPath, target] });
+  expect(child.exitCode).toBe(0);
+  expect(child.stdout.toString()).toBe("42\n");
+  expect(child.stderr.toString()).toBe("");
+});
+
 test("createRequire validates its filename like Node", () => {
   const { createRequire } = require("node:module");
 

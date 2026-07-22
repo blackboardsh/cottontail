@@ -2214,24 +2214,60 @@ function formatExtensionCompileSource(source, leadingNewline = false) {
   return leadingNewline ? `\n${body}\n` : `${body}\n`;
 }
 
-function executeBundledCommonJsModule(module, filename) {
-  const bundled = String(cottontail.bundleNative(
-    filename,
-    dirname(filename),
-    JSON.stringify({
-      format: "cjs",
-      target: "bun",
-      preserveExternalRequireName: true,
-      runtimeFileLoaderPaths: true,
-      // Keep JavaScript dependencies in createRequire()'s shared module
-      // cache. Bundling them into each required ESM entry creates duplicate
-      // module instances and breaks ESM live bindings across re-exports.
-      external: ["*.js", "*.mjs", "*.cjs"],
-      define: {
-        "import.meta": "__ctImportMeta",
-      },
-    }),
-  ));
+function isAsyncModuleBundleFailure(error, filename, source) {
+  const message = String(error?.message ?? error);
+  if (/top-level await/i.test(message)) return true;
+  if (!/["']await["'] can only be used inside an ["']async["'] function/i.test(message)) return false;
+
+  let transformed;
+  try {
+    transformed = transformEsmSourceForDynamicImport(maybeStripTypeScript(filename, source));
+  } catch {
+    return false;
+  }
+  const parameters = [ESM_EXPORTS_BINDING, "require", "module", "__ctImportMeta", "Error"];
+  try {
+    new Function(...parameters, transformed);
+    return false;
+  } catch (syncError) {
+    if (!(syncError instanceof SyntaxError)) return false;
+  }
+
+  try {
+    const AsyncFunction = (async () => {}).constructor;
+    new AsyncFunction(...parameters, transformed);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function executeBundledCommonJsModule(module, filename, source) {
+  let bundled;
+  try {
+    bundled = String(cottontail.bundleNative(
+      filename,
+      dirname(filename),
+      JSON.stringify({
+        format: "cjs",
+        target: "bun",
+        preserveExternalRequireName: true,
+        runtimeFileLoaderPaths: true,
+        // Keep JavaScript dependencies in createRequire()'s shared module
+        // cache. Bundling them into each required ESM entry creates duplicate
+        // module instances and breaks ESM live bindings across re-exports.
+        external: ["*.js", "*.mjs", "*.cjs"],
+        define: {
+          "import.meta": "__ctImportMeta",
+        },
+      }),
+    ));
+  } catch (error) {
+    if (isAsyncModuleBundleFailure(error, filename, source)) {
+      throw new TypeError(`require() async module "${filename}" is unsupported. use "await import()" instead.`);
+    }
+    throw error;
+  }
   maybeRegisterSourceMap(filename, bundled);
   recordCompileCache(filename, bundled);
   const createFactory = cottontail.compileFunction(
@@ -2257,7 +2293,7 @@ function executeDefaultExtension(module, filename, loader) {
   if (hasEsmSyntax(originalSource) &&
       !standaloneFileEntry(filename).found &&
       typeof cottontail.bundleNative === "function") {
-    return executeBundledCommonJsModule(module, filename);
+    return executeBundledCommonJsModule(module, filename, originalSource);
   }
   const compileOverridden = module._compile !== Module.prototype._compile;
   const source = transpileExtensionSource(filename, loader, compileOverridden);
@@ -2409,8 +2445,14 @@ function applyLoadHooks(resolved) {
   return executeHookSource(resolved, result.source, result.format);
 }
 
-function namespaceFromCommonJs(value) {
+function createModuleNamespace() {
   const namespace = {};
+  Object.defineProperty(namespace, Symbol.toStringTag, { value: "Module" });
+  return namespace;
+}
+
+function namespaceFromCommonJs(value) {
+  const namespace = createModuleNamespace();
   Object.defineProperty(namespace, "default", {
     configurable: true,
     enumerable: true,
@@ -2615,7 +2657,7 @@ function executeDynamicImportSource(resolved, source, format) {
       "commonjs",
     ));
   }
-  const namespace = {};
+  const namespace = createModuleNamespace();
   const originalSource = sourceText;
   const transformed = transformEsmSourceForDynamicImport(maybeStripTypeScript(resolvedPath, originalSource));
   maybeRegisterSourceMap(resolvedPath, transformed);
@@ -2733,7 +2775,13 @@ export function __importModule(specifier, referrer = undefined, options = undefi
     return executeDynamicImportSource(resolved, embedded.value, "module");
   }
   const resolvedFormat = resolvedByHook ? hookResolvedFormats.get(resolved) : formatForResolved(resolved);
-  if (resolvedFormat === "commonjs") return namespaceFromCommonJs(loadCommonJsModule(resolved));
+  if (resolvedFormat === "commonjs") {
+    if (/\.(?:js|jsx|ts|tsx)$/i.test(resolvedPath)) {
+      const source = readModuleFile(resolvedPath);
+      if (hasEsmSyntax(source)) return executeDynamicImportSource(resolved, source, "module");
+    }
+    return namespaceFromCommonJs(loadCommonJsModule(resolved));
+  }
   return executeDynamicImportSource(resolved, readModuleFile(resolvedPath), resolvedFormat);
 }
 

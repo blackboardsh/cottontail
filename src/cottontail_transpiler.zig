@@ -889,6 +889,11 @@ test "module syntax scan distinguishes top-level and nested await" {
     defer c_allocator.free(top_level_json);
     const nested_json = try scanModuleSyntaxJson("async function nested() { await Promise.resolve(1); }", "js");
     defer c_allocator.free(nested_json);
+    const commonjs_json = try scanModuleSyntaxJson(
+        "exports.forceCommonJS = true; async function main() { await Promise.resolve(1); }",
+        "ts",
+    );
+    defer c_allocator.free(commonjs_json);
 
     const Syntax = struct {
         hasTopLevelAwait: bool,
@@ -898,8 +903,12 @@ test "module syntax scan distinguishes top-level and nested await" {
     defer top_level.deinit();
     const nested = try std.json.parseFromSlice(Syntax, std.testing.allocator, nested_json, .{});
     defer nested.deinit();
+    const commonjs = try std.json.parseFromSlice(Syntax, std.testing.allocator, commonjs_json, .{});
+    defer commonjs.deinit();
 
     try std.testing.expect(top_level.value.hasTopLevelAwait);
     try std.testing.expectEqualStrings("esm", top_level.value.exportsKind);
     try std.testing.expect(!nested.value.hasTopLevelAwait);
+    try std.testing.expect(!commonjs.value.hasTopLevelAwait);
+    try std.testing.expectEqualStrings("cjs", commonjs.value.exportsKind);
 }

@@ -43,6 +43,31 @@ if (Symbol.asyncDispose == null) {
 // entrypoint path is published as `globalThis.__filename` before the bundle
 // is imported, so intercept the assignment and restore the original file's
 // metadata.
+const currentRuntimeRequire = () => g.__ctMetaRequire ?? g.require;
+const lazyImportMetaRequire = new Proxy(function importMetaRequire(...args) {
+  const runtimeRequire = currentRuntimeRequire();
+  if (typeof runtimeRequire !== "function") throw new TypeError("import.meta.require is unavailable");
+  return Reflect.apply(runtimeRequire, this, args);
+}, {
+  get(target, property) {
+    const runtimeRequire = currentRuntimeRequire();
+    return Reflect.get(typeof runtimeRequire === "function" ? runtimeRequire : target, property);
+  },
+});
+const hydrateImportMetaRequire = (meta) => {
+  if (!meta || typeof meta !== "object" || typeof meta.require === "function") return meta;
+  const runtimeRequire = g.__ctMetaRequire;
+  try {
+    Object.defineProperty(meta, "require", {
+      value: typeof runtimeRequire === "function" ? runtimeRequire : lazyImportMetaRequire,
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+  } catch {}
+  return meta;
+};
+
 if (!g.__cottontailImportMetaFixInstalled) {
   Object.defineProperty(g, "__cottontailImportMetaFixInstalled", { value: true, configurable: true });
   const generatedPattern = /(?:^|[\\/])(?:script\.bundle\.mjs|script-entry-[^\\/]*\.mjs|\.cottontail-compat-[0-9a-f]+(?:\.[A-Za-z0-9]+)?)$/;
@@ -56,6 +81,7 @@ if (!g.__cottontailImportMetaFixInstalled) {
   };
   const fixImportMeta = (meta) => {
     if (!meta || typeof meta !== "object") return meta;
+    hydrateImportMetaRequire(meta);
     const original = g.__filename;
     if (
       typeof original === "string" &&
@@ -81,13 +107,23 @@ if (!g.__cottontailImportMetaFixInstalled) {
     get() {
       // Fix lazily: the generated prelude may assign before the entry
       // wrapper publishes globalThis.__filename. fixImportMeta is idempotent.
-      return fixImportMeta(currentImportMeta);
+      return fixImportMeta(currentImportMeta ??= {});
     },
     set(value) {
       currentImportMeta = value;
     },
   });
 }
+
+let runtimeImportMeta = g.__cottontailImportMeta;
+if (!runtimeImportMeta || typeof runtimeImportMeta !== "object") {
+  runtimeImportMeta = {};
+  try {
+    g.__cottontailImportMeta = runtimeImportMeta;
+    runtimeImportMeta = g.__cottontailImportMeta ?? runtimeImportMeta;
+  } catch {}
+}
+hydrateImportMetaRequire(runtimeImportMeta);
 
 function platform() {
   return cottontail.platform();

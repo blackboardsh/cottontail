@@ -4620,37 +4620,64 @@ fn shouldBundleCommonJsEntrypoint(ctx: *const Context, script_abs: []const u8) !
         return !try entrypointHasTopLevelAwait(ctx, script_abs);
     }
     if (std.mem.endsWith(u8, script_abs, ".mjs") or std.mem.endsWith(u8, script_abs, ".mts")) return false;
-    if (!std.mem.endsWith(u8, script_abs, ".js")) {
+    const supports_syntax_detection = std.mem.endsWith(u8, script_abs, ".js") or
+        std.mem.endsWith(u8, script_abs, ".jsx") or
+        std.mem.endsWith(u8, script_abs, ".ts") or
+        std.mem.endsWith(u8, script_abs, ".tsx");
+    if (!supports_syntax_detection) {
         if (std.fs.path.extension(script_abs).len == 0) {
             return try extensionlessEntrypointLooksCommonJs(ctx, script_abs);
         }
         return false;
     }
 
-    if (try sourceFileLooksEsm(ctx, script_abs)) return false;
-    if (try sourceLooksCommonJs(ctx, script_abs)) return true;
+    if (try entrypointModuleSyntax(ctx, script_abs)) |syntax| {
+        if (syntax.has_top_level_await or syntax.exports_kind == .esm) return false;
+        if (syntax.exports_kind == .cjs) return true;
+    } else {
+        if (try sourceFileLooksEsm(ctx, script_abs)) return false;
+        if (try sourceLooksCommonJs(ctx, script_abs)) return true;
+    }
 
     const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
     return !(try nearestPackageTypeIsModule(ctx, script_dir));
 }
 
-fn entrypointHasTopLevelAwait(ctx: *const Context, script_abs: []const u8) !bool {
-    const loader = transpilerLoaderForPath(script_abs) orelse return false;
+const EntrypointModuleSyntax = struct {
+    has_top_level_await: bool,
+    exports_kind: enum { none, cjs, esm },
+};
+
+fn entrypointModuleSyntax(ctx: *const Context, script_abs: []const u8) !?EntrypointModuleSyntax {
+    const loader = transpilerLoaderForPath(script_abs) orelse return null;
     const source = std.Io.Dir.cwd().readFileAlloc(
         ctx.io,
         script_abs,
         ctx.allocator,
         .limited(16 * 1024 * 1024),
-    ) catch return false;
-    const syntax_json = native_transpiler.scanModuleSyntaxJson(source, loader) catch return false;
+    ) catch return null;
+    const syntax_json = native_transpiler.scanModuleSyntaxJson(source, loader) catch return null;
     defer std.heap.c_allocator.free(syntax_json);
     const ModuleSyntax = struct {
         hasTopLevelAwait: bool,
         exportsKind: []const u8,
     };
-    const parsed = std.json.parseFromSlice(ModuleSyntax, ctx.allocator, syntax_json, .{}) catch return false;
+    const parsed = std.json.parseFromSlice(ModuleSyntax, ctx.allocator, syntax_json, .{}) catch return null;
     defer parsed.deinit();
-    return parsed.value.hasTopLevelAwait;
+    return .{
+        .has_top_level_await = parsed.value.hasTopLevelAwait,
+        .exports_kind = if (std.mem.eql(u8, parsed.value.exportsKind, "cjs"))
+            .cjs
+        else if (std.mem.startsWith(u8, parsed.value.exportsKind, "esm"))
+            .esm
+        else
+            .none,
+    };
+}
+
+fn entrypointHasTopLevelAwait(ctx: *const Context, script_abs: []const u8) !bool {
+    const syntax = try entrypointModuleSyntax(ctx, script_abs) orelse return false;
+    return syntax.has_top_level_await;
 }
 
 fn extensionlessEntrypointLooksCommonJs(ctx: *const Context, script_abs: []const u8) !bool {
