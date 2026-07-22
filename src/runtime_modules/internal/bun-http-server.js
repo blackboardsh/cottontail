@@ -1,4 +1,35 @@
 const incomingRequestTargetDecoder = new TextDecoder();
+const serveReadableStreamRefs = new Set();
+const serveReadableStreamValues = new WeakSet();
+const serveReadableStreamFinalizer = typeof FinalizationRegistry === "function"
+  ? new FinalizationRegistry((reference) => serveReadableStreamRefs.delete(reference))
+  : null;
+
+function liveServeReadableStreamCount() {
+  let count = 0;
+  for (const reference of serveReadableStreamRefs) {
+    if (reference.deref() === undefined) serveReadableStreamRefs.delete(reference);
+    else count += 1;
+  }
+  return count;
+}
+
+const heapObjectCountProviders = globalThis.__cottontailHeapObjectCountProviders ??= new Map();
+if (!heapObjectCountProviders.has("ReadableStream")) {
+  // COTTONTAIL-COMPAT: stock JSC reports JavaScript stream instances as
+  // Objects. Keep an HTTP-owned weak count without retaining the streams.
+  heapObjectCountProviders.set("ReadableStream", liveServeReadableStreamCount);
+}
+
+export function trackServeReadableStream(stream) {
+  if (stream == null || typeof stream !== "object" ||
+      typeof WeakRef !== "function" || serveReadableStreamValues.has(stream)) return stream;
+  serveReadableStreamValues.add(stream);
+  const reference = new WeakRef(stream);
+  serveReadableStreamRefs.add(reference);
+  serveReadableStreamFinalizer?.register(stream, reference);
+  return stream;
+}
 
 function incomingRequestTargetText(target) {
   if (target instanceof ArrayBuffer) return incomingRequestTargetDecoder.decode(target);
@@ -229,7 +260,7 @@ export function createNativeServeRequestState(item, options) {
   };
 
   if (hasBody) {
-    state.body = new globalThis.ReadableStream({
+    state.body = trackServeReadableStream(new globalThis.ReadableStream({
       start(controller) {
         bodyController = controller;
       },
@@ -247,7 +278,7 @@ export function createNativeServeRequestState(item, options) {
         state.cancelNativeBody();
         return undefined;
       },
-    }, new globalThis.ByteLengthQueuingStrategy({ highWaterMark: 0 }));
+    }, new globalThis.ByteLengthQueuingStrategy({ highWaterMark: 0 })));
     Object.defineProperty(state.body, bodyStateSymbol, { value: state });
   }
 

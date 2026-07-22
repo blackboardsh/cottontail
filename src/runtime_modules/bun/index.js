@@ -83,19 +83,48 @@ import {
   createNativeServeRequestState,
   createServeLifecycle,
   incomingRequestURLFactory,
+  trackServeReadableStream,
 } from "../internal/bun-http-server.js";
 import { installStandaloneRuntimeLoaders } from "../internal/standalone-runtime.js";
 import { runtimeDefaultUserAgent } from "../internal/runtime-options.js";
 import { createBunSpawnRuntime } from "./spawn.js";
 import {
-  file,
+  file as createBunFile,
   guessMimeType,
   isBunFileLike,
   pathDirname,
   write,
 } from "./file-io.js";
 
-export { file, write };
+const bunFileServeEmptySlices = new WeakSet();
+const wrappedBunFileSlices = new WeakSet();
+
+function wrapBunFileSlices(value) {
+  if (!isBunFileLike(value) || wrappedBunFileSlices.has(value)) return value;
+  const originalSlice = value.slice;
+  if (typeof originalSlice !== "function") return value;
+  wrappedBunFileSlices.add(value);
+  Object.defineProperty(value, "slice", {
+    value: function slice(start = 0, end = undefined, type = "") {
+      const normalizedEnd = typeof end === "number" && Number.isNaN(end) ? 0 : end;
+      const sliced = wrapBunFileSlices(originalSlice.call(this, start, normalizedEnd, type));
+      if (typeof start === "number" && start < 0 && end === Infinity) {
+        bunFileServeEmptySlices.add(sliced);
+      }
+      return sliced;
+    },
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+  return value;
+}
+
+export function file(path, options = undefined) {
+  return wrapBunFileSlices(createBunFile(path, options));
+}
+
+export { write };
 
 const estimatedMemoryCostSymbol = Symbol.for("cottontail.estimatedMemoryCost");
 const stackFunctionRegistrySymbol = Symbol.for("cottontail.stackFunctionRegistry");
@@ -8960,6 +8989,17 @@ function bunFileSliceMetadata(body) {
   }
 }
 
+function bunFileServeSliceIsEmpty(body) {
+  let source = body;
+  const seen = new Set();
+  while (source != null && typeof source === "object" && !seen.has(source)) {
+    if (bunFileServeEmptySlices.has(source)) return true;
+    seen.add(source);
+    source = source[bodyBlobSourceSymbol] ?? source._source;
+  }
+  return false;
+}
+
 function ifModifiedSinceNotModified(headerValue, lastModified) {
   if (!headerValue || !lastModified) return false;
   const requestTime = Date.parse(String(headerValue));
@@ -8985,7 +9025,9 @@ async function prepareServeResponse(value, request, options = {}) {
   const method = String(request.method || "GET").toUpperCase();
   const isFile = isBunFileLike(body);
   const fileSlice = bunFileSliceMetadata(body);
+  const emptyFileSlice = isFile && bunFileServeSliceIsEmpty(body);
   const sourceStreaming = !cached && isStreamingBody(body);
+  if (sourceStreaming) trackServeReadableStream(body);
   const streaming = method !== "HEAD" && sourceStreaming;
 
   if (options.allowFileFallback && isFile && typeof body.exists === "function" && !(await body.exists())) {
@@ -8999,6 +9041,8 @@ async function prepareServeResponse(value, request, options = {}) {
       bytes = { byteLength: Number(body.size) };
     } else if (!cached && method === "HEAD" && sourceStreaming) {
       bytes = { byteLength: 0 };
+    } else if (!cached && !streaming && emptyFileSlice) {
+      bytes = new Uint8Array(0);
     } else if (!cached && !streaming) {
       try {
         bytes = await bytesFromBody(body);
@@ -10843,7 +10887,7 @@ function requestFromNodeIncoming(message, protocol, fallbackHost, tunnelRequest 
     } else {
       const contentLength = Number(message.headers?.["content-length"] ?? 0);
       const hasStreamingBody = message.headers?.["transfer-encoding"] != null || contentLength > 0;
-      if (hasStreamingBody) request._body = NodeReadable.toWeb(message);
+      if (hasStreamingBody) request._body = trackServeReadableStream(NodeReadable.toWeb(message));
     }
   }
   return { request, controller };

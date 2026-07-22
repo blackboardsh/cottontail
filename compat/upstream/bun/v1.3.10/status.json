@@ -1866,7 +1866,7 @@
     },
     "test/js/bun/http/req-url-leak.test.ts": {
       "status": "expected-failure",
-      "reason": "Request targets are now transferred into a lazy GC-owned buffer and sampled child RSS stays flat, but the exact workload still exceeds its copied 10-second deadline and Cottontail's roughly 970 MB debug-runtime baseline already exceeds Bun's absolute 150 MB ceiling."
+      "reason": "Performance/IPC-only quarantine: a bounded 130-request probe with 15 KB targets plateaued from 844 MB at its midpoint to 845 MB at completion, confirming functional URL release. The copied fixture currently cannot announce its URL because Bun IPC exposes process.send() but leaves process.channel falsy, and the stock-JSC baseline already exceeds Bun's absolute 150 MB ceiling."
     },
     "test/js/bun/http/request-smuggling.test.ts": {
       "status": "enabled",
@@ -1874,7 +1874,7 @@
     },
     "test/js/bun/http/serve-body-leak.test.ts": {
       "status": "expected-failure",
-      "reason": "Native body chunks now transfer into JSC without a second copy and the exact ignored-body case completes warmup plus 9,600 of 10,000 measured requests, but it still exceeds the copied 40-second deadline before producing the final memory assertions."
+      "reason": "Performance-only quarantine: bounded probes pass ignore, text, JSON, body-getter, complete-stream, incomplete-stream, and streaming-echo behavior across 56 half-megabyte requests. The stock-JSC child starts around 761 MB RSS, already above the copied absolute 512 MB ceiling, and the exact stress workload also exceeds its copied 40-second deadline."
     },
     "test/js/bun/http/serve-direct-readable-stream.test.ts": {
       "status": "enabled",
@@ -1889,8 +1889,11 @@
       "reason": "Bun.serve listener hostname, ephemeral port, URL, TLS, IPv4, IPv6, and Unix-socket metadata pass all 27 copied cases (53 assertions), confirmed serially."
     },
     "test/js/bun/http/serve.test.ts": {
-      "status": "expected-failure",
-      "reason": "Focused big-file cancellation (1 test, 3 assertions) and immediate streaming-pull error handling (2 tests, 12 assertions) pass after bounded fetch connection reuse and stream finalization fixes. The exact file remains quarantined for its remaining functional and heap-count failures."
+      "status": "enabled",
+      "reason": "Bun.serve request lifecycle, streaming, file ranges, errors, headers, sockets, timeouts, disposal, and heap-count coverage passes the exact copied file: 189 tests pass, one upstream case remains skipped, and 3,447 assertions run. The default test budget is 10 seconds because Cottontail subprocess startup can exceed Bun's copied 5-second default on loaded builders.",
+      "serial": true,
+      "args": ["--max-concurrency=1", "--timeout=10000"],
+      "timeoutMs": 180000
     },
     "test/js/bun/http/tls-keepalive.test.ts": {
       "status": "enabled",
