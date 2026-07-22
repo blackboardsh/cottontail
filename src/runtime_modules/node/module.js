@@ -3333,14 +3333,15 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
       "commonjs",
     ));
   }
-  if (isAbsolute(resolvedPath) &&
+  if (!forceAsync &&
+      isAbsolute(resolvedPath) &&
       modulePathExists(resolvedPath) &&
       !standaloneFileEntry(resolvedPath).found &&
       moduleHooks.length === 0 &&
       runtimePluginOnResolve.length === 0 &&
       runtimePluginOnLoad.length === 0) {
     const asyncGraph = runtimeAsyncEsmGraph(resolvedPath, sourceText);
-    if (asyncGraph !== null) {
+    if (asyncGraph?.async === true) {
       return executeAsyncDynamicImportSource(
         resolved,
         resolvedPath,
@@ -3349,17 +3350,15 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
         asyncAncestors,
       );
     }
-    if (!forceAsync) {
-      runtimeEsmSourceExecutionDepth += 1;
-      try {
-        return loadCommonJsModule(resolved);
-      } catch (error) {
-        if (!isAsyncModuleRequireError(error)) throw error;
-      } finally {
-        runtimeEsmSourceExecutionDepth -= 1;
-      }
-      return executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, sourceText, asyncAncestors);
+    runtimeEsmSourceExecutionDepth += 1;
+    try {
+      return loadCommonJsModule(resolved);
+    } catch (error) {
+      if (!isAsyncModuleRequireError(error)) throw error;
+    } finally {
+      runtimeEsmSourceExecutionDepth -= 1;
     }
+    return executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, sourceText, asyncAncestors);
   }
   if (forceAsync) {
     return executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, sourceText, asyncAncestors);
