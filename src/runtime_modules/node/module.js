@@ -2873,6 +2873,11 @@ function staticImportCall(specifier, asyncStaticImports, attributeKeyword, attri
 // numbers of the transformed module source.
 const staticImportHelperSource = `const __ctStaticImport = (spec) => { const value = require(spec); const ns = { default: value }; if (value && (typeof value === "object" || typeof value === "function")) { for (const key of Object.keys(value)) { if (key !== "default") ns[key] = value[key]; } if (value.__esModule && Object.hasOwn(value, "default")) ns.default = value.default; } return ns; }; const __ctDynamicImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options); `;
 const asyncStaticImportHelperSource = `const __ctDynamicImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options, true); const __ctStaticImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options, true, __ctModuleAncestors); `;
+const esmExportDeclarationTrivia = String.raw`((?:\s|\/\*(?:[^*]|\*(?!\/))*\*\/|\/\/[^\r\n]*(?:\r?\n|$))*)`;
+
+function esmExportDeclarationPattern(declaration) {
+  return new RegExp(String.raw`\bexport\b${esmExportDeclarationTrivia}${declaration}`, "g");
+}
 
 function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) {
   const exportAssignments = [];
@@ -2968,37 +2973,39 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
     /\bexport\s*\*\s*from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
     (_all, spec, attributeKeyword, attributes) => `{ const __ctNs = ${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)}; for (const __ctKey of Object.keys(__ctNs)) { if (__ctKey !== "default") ${ESM_EXPORTS_BINDING}[__ctKey] = __ctNs[__ctKey]; } }`,
   );
-  output = replaceCodePattern(output, /\bexport\s+default\s+/g, `${ESM_EXPORTS_BINDING}.default = `);
-  output = replaceCodePattern(output, /\bexport\s+(const|let|var)\s+\{([^}]*)\}\s*=/g, (_all, kind, bindings) => {
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`default\b`), (_all, trivia) => {
+    return `${trivia}${ESM_EXPORTS_BINDING}.default =`;
+  });
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`(const|let|var)\s+\{([^}]*)\}\s*=`), (_all, trivia, kind, bindings) => {
     for (const part of codeOnlyText(bindings).split(",")) {
       const name = part.trim().replace(/^\.\.\./, "").split(/\s*:\s*|\s*=\s*/, 2).at(-1)?.trim();
       if (/^[A-Za-z_$][\w$]*$/.test(name ?? "")) {
         exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);
       }
     }
-    return `${kind} {${bindings}} =`;
+    return `${trivia}${kind} {${bindings}} =`;
   });
-  output = replaceCodePattern(output, /\bexport\s+(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/g, (_all, kind, name) => {
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=`), (_all, trivia, kind, name) => {
     exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);
-    return `${kind} ${name} =`;
+    return `${trivia}${kind} ${name} =`;
   });
   // Declarations without initializer (e.g. the `export var ns;` emitted for
   // TypeScript namespaces by the type stripper).
-  output = replaceCodePattern(output, /\bexport\s+(let|var)\s+([A-Za-z_$][\w$]*)\s*;/g, (_all, kind, name) => {
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`(let|var)\s+([A-Za-z_$][\w$]*)\s*;`), (_all, trivia, kind, name) => {
     exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);
-    return `${kind} ${name};`;
+    return `${trivia}${kind} ${name};`;
   });
-  output = replaceCodePattern(output, /\bexport\s+async\s+function\s*(\*?)\s*([A-Za-z_$][\w$]*)\s*\(/g, (_all, star, name) => {
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`async\s+function\s*(\*?)\s*([A-Za-z_$][\w$]*)\s*\(`), (_all, trivia, star, name) => {
     exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);
-    return `async function ${star}${name}(`;
+    return `${trivia}async function ${star}${name}(`;
   });
-  output = replaceCodePattern(output, /\bexport\s+function\s*(\*?)\s*([A-Za-z_$][\w$]*)\s*\(/g, (_all, star, name) => {
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`function\s*(\*?)\s*([A-Za-z_$][\w$]*)\s*\(`), (_all, trivia, star, name) => {
     exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);
-    return `function ${star}${name}(`;
+    return `${trivia}function ${star}${name}(`;
   });
-  output = replaceCodePattern(output, /\bexport\s+class\s+([A-Za-z_$][\w$]*)\s*/g, (_all, name) => {
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`class\s+([A-Za-z_$][\w$]*)\s*`), (_all, trivia, name) => {
     exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);
-    return `class ${name} `;
+    return `${trivia}class ${name} `;
   });
   output = replaceCodePattern(output, /\bexport\s*\{([^}]*)\}\s*;?/g, (_all, names) => {
     for (const part of String(names).split(",")) {

@@ -95,6 +95,22 @@ test("a failed synchronous TLA require is evicted before dynamic import", async 
   expect(Object.prototype.toString.call(namespace)).toBe("[object Module]");
 });
 
+test("dynamic ESM accepts comments before export declarations", async () => {
+  const { pathToFileURL } = require("node:url");
+  const target = join(root, "commented-export-declarations.mjs");
+  writeFileSync(target, [
+    "export /*@__NO_SIDE_EFFECTS__*/ function construct(value) { return value; }",
+    "export /* generated */ const marker = 42;",
+    "export /* generated */ class Box { value = 73; }",
+    "",
+  ].join("\n"));
+
+  const namespace = await import(pathToFileURL(target).href);
+  expect(namespace.construct("ok")).toBe("ok");
+  expect(namespace.marker).toBe(42);
+  expect(new namespace.Box().value).toBe(73);
+});
+
 test("TypeScript CommonJS entries receive the main module", () => {
   const target = join(root, "typescript-commonjs-main.ts");
   writeFileSync(target, [
