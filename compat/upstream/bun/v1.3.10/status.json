@@ -4531,6 +4531,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
     },
+    "test/regression/issue/09748.test.ts": {
+      "status": "enabled",
+      "reason": "Concurrent Bun.Transpiler transforms remain stable across 20 rounds and 2,000 transformations (1 case, 20 assertions)."
+    },
     "test/regression/issue/09778.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
@@ -4564,6 +4568,14 @@
     "test/regression/issue/11866.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/12042.test.ts": {
+      "status": "enabled",
+      "reason": "Verbose fetch logs the form-urlencoded request body without recursion or a crash (1 case, 1 assertion); stock-JSC subprocess startup requires a larger case budget.",
+      "args": [
+        "--timeout=30000"
+      ],
+      "timeoutMs": 60000
     },
     "test/regression/issue/12250.test.ts": {
       "status": "enabled",
@@ -4749,6 +4761,14 @@
       ],
       "timeoutMs": 60000
     },
+    "test/regression/issue/22199.test.ts": {
+      "status": "enabled",
+      "reason": "Plugin onResolve callbacks handle async undefined, async null, sync undefined, and rejected promises without crashing (4 cases, 8 assertions).",
+      "args": [
+        "--timeout=15000"
+      ],
+      "timeoutMs": 90000
+    },
     "test/regression/issue/22243.test.ts": {
       "status": "enabled",
       "reason": "RedisClient constructor invocation semantics pass both copied regression cases on a freshly embedded runtime (2 cases, 2 assertions)."
@@ -4836,6 +4856,10 @@
     "test/regression/issue/23489.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 6 assertions)."
+    },
+    "test/regression/issue/23569.test.ts": {
+      "status": "enabled",
+      "reason": "HTML entrypoints reject both --no-bundle output forms with the expected diagnostic while normal HTML bundling succeeds (3 cases, 6 assertions)."
     },
     "test/regression/issue/23621.test.ts": {
       "status": "enabled",
@@ -5044,6 +5068,14 @@
     "test/regression/issue/26669.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/26851.test.ts": {
+      "status": "enabled",
+      "reason": "Both --bail JUnit reporter regressions write the requested output file and preserve their copied assertions (2 cases, 13 assertions); subprocess startup requires a larger case budget.",
+      "args": [
+        "--timeout=30000"
+      ],
+      "timeoutMs": 120000
     },
     "test/regression/issue/27014.test.ts": {
       "status": "enabled",
