@@ -2861,7 +2861,7 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
       const local = pieces[0].trim();
       const exported = (pieces[1] ?? pieces[0]).trim();
       if (exported === '"module.exports"' || exported === "'module.exports'") {
-        if (/^[A-Za-z_$][\w$]*$/.test(local)) exportAssignments.push(`module.exports = ${local};`);
+        if (/^[A-Za-z_$][\w$]*$/.test(local)) exportAssignments.push(`__ctModuleRecord.exports = ${local};`);
         continue;
       }
       if (/^[A-Za-z_$][\w$]*$/.test(local) && /^[A-Za-z_$][\w$]*$/.test(exported)) {
@@ -2950,7 +2950,7 @@ function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, origina
 
 function executeDynamicImportSource(resolved, source, format, forceAsync = false, asyncAncestors = undefined) {
   const { bare: resolvedPath, suffix } = splitSpecifierSuffix(resolved);
-  const sourceText = String(source ?? "");
+  const sourceText = String(source ?? "").replace(/^#!/, "//");
   const effectiveFormat = format ?? formatForHookSource(resolvedPath, sourceText);
   if (effectiveFormat === "builtin") {
     return namespaceFromBuiltin(resolvedPath, loadBuiltinOrReplacement(resolvedPath));
@@ -2982,7 +2982,7 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
   const body = `${transformed}\n//# sourceURL=${resolvedPath}${suffix}`;
   let run;
   try {
-    run = new Function(ESM_EXPORTS_BINDING, "require", "module", "__ctImportMeta", "Error", body);
+    run = new Function(ESM_EXPORTS_BINDING, "require", "__ctModuleRecord", "__ctImportMeta", "Error", body);
   } catch (error) {
     // Dynamically imported ES modules may use top-level await (e.g. Bun.build
     // outputs re-imported via blob: URLs). Preserve synchronous evaluation for
