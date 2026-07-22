@@ -875,7 +875,12 @@ function parseJSONC(source) {
 // ---------------------------------------------------------------------------
 const tsconfigPathsCache = new Map();
 
+function standaloneAutoloadDisabled(flag) {
+  return globalThis.__cottontailStandaloneFlags?.[flag] === true;
+}
+
 function loadTsconfigPaths(dir) {
+  if (standaloneAutoloadDisabled("disableAutoloadTsconfig")) return null;
   if (tsconfigPathsCache.has(dir)) return tsconfigPathsCache.get(dir);
   let entry = null;
   try {
@@ -988,10 +993,11 @@ function nodeModulesLookupDir(dir) {
 
 function packageRootFor(request, startDir) {
   const packageName = packageNameForRequest(request);
+  const loadPackageJson = !standaloneAutoloadDisabled("disableAutoloadPackageJson");
   let dir = startDir;
   while (true) {
     const selfManifest = join(dir, "package.json");
-    if (modulePathExists(selfManifest)) {
+    if (loadPackageJson && modulePathExists(selfManifest)) {
       try {
         const packageJson = readPackageJson(selfManifest);
         if (packageJsonValue(packageJson, "name") === packageName && packageJsonValue(packageJson, "exports") != null) {
@@ -1011,7 +1017,7 @@ function packageRootFor(request, startDir) {
     // only accept it when its package.json "name" actually matches.
     const directCandidate = join(dir, packageName);
     const directManifest = join(directCandidate, "package.json");
-    if (modulePathExists(directManifest)) {
+    if (loadPackageJson && modulePathExists(directManifest)) {
       let manifestName;
       try {
         manifestName = packageJsonValue(readPackageJson(directManifest), "name");
@@ -1070,7 +1076,9 @@ function resolveAsFile(candidate) {
 function resolveAsDirectory(candidate, kind = "require") {
   if (!isDirectory(candidate)) return null;
   const packagePath = join(candidate, "package.json");
-  const packageJson = isFile(packagePath) ? readPackageJson(packagePath) : null;
+  const packageJson = !standaloneAutoloadDisabled("disableAutoloadPackageJson") && isFile(packagePath)
+    ? readPackageJson(packagePath)
+    : null;
   if (packageJsonValue(packageJson, "exports") != null) {
     const exported = resolvePackageTargetPath(candidate, resolvePackageExports(candidate, packageJson, "", kind), kind);
     if (exported) return exported;
@@ -1556,6 +1564,7 @@ function resolutionStartDir(basePath) {
 }
 
 function nearestPackageScope(basePath) {
+  if (standaloneAutoloadDisabled("disableAutoloadPackageJson")) return null;
   let dir = resolutionStartDir(basePath);
   while (true) {
     const packageJsonPath = join(dir, "package.json");
@@ -1734,7 +1743,9 @@ function resolveRequestCore(request, basePath, kind = "require", packageImportSe
   }
   const packageSuffix = text.startsWith("@") ? text.split("/").slice(2).join("/") : text.split("/").slice(1).join("/");
   const packageJsonPath = join(root, "package.json");
-  const packageJson = modulePathExists(packageJsonPath) ? readPackageJson(packageJsonPath) : null;
+  const packageJson = !standaloneAutoloadDisabled("disableAutoloadPackageJson") && modulePathExists(packageJsonPath)
+    ? readPackageJson(packageJsonPath)
+    : null;
   if (packageJsonValue(packageJson, "exports") != null) {
     let exported = resolvePackageTargetPath(root, resolvePackageExports(root, packageJson, packageSuffix, kind), kind);
     // Bun permits package.json reads and TypeScript-style redundant .js
@@ -2777,7 +2788,7 @@ export function __importModule(specifier, referrer = undefined, options = undefi
   const resolvedFormat = resolvedByHook ? hookResolvedFormats.get(resolved) : formatForResolved(resolved);
   if (resolvedFormat === "commonjs") {
     if (/\.(?:js|jsx|ts|tsx)$/i.test(resolvedPath)) {
-      const source = readModuleFile(resolvedPath);
+      const source = embedded.found ? embedded.value : readModuleFile(resolvedPath);
       if (hasEsmSyntax(source)) return executeDynamicImportSource(resolved, source, "module");
     }
     return namespaceFromCommonJs(loadCommonJsModule(resolved));

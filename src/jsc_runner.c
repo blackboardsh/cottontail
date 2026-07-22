@@ -1147,6 +1147,18 @@ extern uint8_t *ct_bundle_build(
 );
 extern void ct_bundle_free(uint8_t *value, size_t len);
 extern void ct_bundle_string_free(char *value);
+extern uint8_t *ct_compile_build(
+    const uint8_t *request,
+    size_t request_len,
+    const uint8_t *working_dir,
+    size_t working_dir_len,
+    const uint8_t *output_path,
+    size_t output_path_len,
+    size_t *out_len,
+    char **error_out
+);
+extern void ct_compile_build_free(uint8_t *value, size_t len);
+extern void ct_compile_build_string_free(char *value);
 extern uint8_t *ct_password_hash(
     int algorithm,
     const uint8_t *password,
@@ -26774,6 +26786,53 @@ static JSValueRef ct_build_native(JSContextRef ctx, JSObjectRef function, JSObje
     }
     JSValueRef result = ct_make_string_len(ctx, (const char *)output, output_len);
     ct_bundle_free(output, output_len);
+    return result;
+}
+
+static JSValueRef ct_compile_build_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "compileBuildNative(optionsJson, workingDirectory, outputPath) requires three arguments");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t request_len = 0;
+    size_t working_dir_len = 0;
+    size_t output_path_len = 0;
+    char *request = ct_value_to_utf8_copy(ctx, argv[0], &request_len);
+    char *working_dir = ct_value_to_utf8_copy(ctx, argv[1], &working_dir_len);
+    char *output_path = ct_value_to_utf8_copy(ctx, argv[2], &output_path_len);
+    if (request == NULL || working_dir == NULL || output_path == NULL) {
+        free(request);
+        free(working_dir);
+        free(output_path);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t output_len = 0;
+    char *error = NULL;
+    uint8_t *output = ct_compile_build(
+        (const uint8_t *)request,
+        request_len,
+        (const uint8_t *)working_dir,
+        working_dir_len,
+        (const uint8_t *)output_path,
+        output_path_len,
+        &output_len,
+        &error
+    );
+    free(request);
+    free(working_dir);
+    free(output_path);
+    if (output == NULL) {
+        ct_throw_message(ctx, exception, error != NULL ? error : "Standalone build failed");
+        if (error != NULL) ct_compile_build_string_free(error);
+        return JSValueMakeUndefined(ctx);
+    }
+    JSValueRef result = ct_make_string_len(ctx, (const char *)output, output_len);
+    ct_compile_build_free(output, output_len);
     return result;
 }
 

@@ -1130,7 +1130,7 @@ pub export fn ct_bundle_entry_point(
     return output.ptr;
 }
 
-fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !BundleOptions {
+pub fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !BundleOptions {
     if (options_json.len == 0) return .{};
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, options_json, .{});
     if (parsed.value != .object) return error.InvalidOptions;

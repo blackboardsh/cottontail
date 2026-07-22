@@ -1,5 +1,6 @@
 const std = @import("std");
 const host = @import("host.zig");
+const standalone_executable = @import("standalone_executable.zig");
 
 const c = @cImport({
     @cInclude("jsc_runner.h");
@@ -199,6 +200,33 @@ pub const Runtime = struct {
             defer if (eval_error != null) c.ct_jsc_string_free(eval_error);
             if (eval_error != null) self.writeStderrLine(std.mem.span(eval_error));
             return error.StandaloneGraphSetupFailed;
+        }
+    }
+
+    pub fn setStandaloneFlags(self: *Runtime, flags: standalone_executable.Flags) !void {
+        const setup_source = try std.fmt.allocPrint(
+            self.allocator,
+            "globalThis.__cottontailStandaloneFlags={{disableDefaultEnvFiles:{s},disableAutoloadBunfig:{s},disableAutoloadTsconfig:{s},disableAutoloadPackageJson:{s}}};",
+            .{
+                if (flags.disable_default_env_files) "true" else "false",
+                if (flags.disable_autoload_bunfig) "true" else "false",
+                if (flags.disable_autoload_tsconfig) "true" else "false",
+                if (flags.disable_autoload_package_json) "true" else "false",
+            },
+        );
+        defer self.allocator.free(setup_source);
+
+        var eval_error: [*c]u8 = null;
+        if (c.ct_jsc_runtime_eval(
+            self.handle,
+            setup_source.ptr,
+            setup_source.len,
+            "cottontail:standalone-flags",
+            &eval_error,
+        ) != 0) {
+            defer if (eval_error != null) c.ct_jsc_string_free(eval_error);
+            if (eval_error != null) self.writeStderrLine(std.mem.span(eval_error));
+            return error.StandaloneFlagsSetupFailed;
         }
     }
 

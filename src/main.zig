@@ -19,6 +19,7 @@ const native_bindings = @import("native_bindings.zig");
 const cli_init = @import("cli_init.zig");
 const cli_run = @import("cli_run.zig");
 const script_runner = @import("script_runner.zig");
+const standalone_executable = @import("standalone_executable.zig");
 
 comptime {
     cottontail_bundler.forceLink();
@@ -28,6 +29,7 @@ comptime {
     cottontail_password.forceLink();
     cottontail_transpiler.forceLink();
     native_bindings.forceLink();
+    script_runner.forceLink();
 }
 
 const version = @import("version.zig").version;
@@ -925,201 +927,27 @@ fn writeBuildFile(io: std.Io, path: []const u8, contents: []const u8) !void {
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
 }
 
-fn standaloneExtraSourceMapPath(allocator: std.mem.Allocator, output_path: []const u8, map_path: []const u8) ![]const u8 {
-    var relative = map_path;
-    while (std.mem.startsWith(u8, relative, "./")) relative = relative[2..];
-    if (relative.len == 0 or std.fs.path.isAbsolute(relative) or
-        std.mem.eql(u8, relative, "..") or std.mem.startsWith(u8, relative, "../"))
-    {
-        return error.InvalidStandaloneSourceMapPath;
-    }
-    const output_dir = std.fs.path.dirname(output_path) orelse ".";
-    return try std.fs.path.join(allocator, &.{ output_dir, relative });
-}
-
-const standalone_magic_v1 = "COTTONTAIL-STAND";
-const standalone_magic_v2 = "COTTONTAIL-STAND2";
-const standalone_magic = "COTTONTAIL-STAND3";
-const standalone_trailer_v1_len = @sizeOf(u64) + standalone_magic_v1.len;
-const standalone_trailer_v2_len = @sizeOf(u64) * 2 + standalone_magic_v2.len;
-const standalone_trailer_len = @sizeOf(u64) * 3 + standalone_magic.len;
-
-const StandalonePayload = struct {
-    source: []const u8,
-    source_map: ?[]const u8 = null,
-    files: ?[]const u8 = null,
-};
-
-fn loadStandalonePayload(init: std.process.Init) !?StandalonePayload {
-    const allocator = init.arena.allocator();
-    const executable_path = try std.process.executablePathAlloc(init.io, allocator);
-    const executable = try std.Io.Dir.cwd().openFile(init.io, executable_path, .{});
-    defer executable.close(init.io);
-    const executable_len = try executable.length(init.io);
-
-    if (executable_len >= standalone_trailer_len) {
-        var trailer: [standalone_trailer_len]u8 = undefined;
-        const trailer_offset = executable_len - standalone_trailer_len;
-        if (try executable.readPositionalAll(init.io, &trailer, trailer_offset) == trailer.len and
-            std.mem.eql(u8, trailer[@sizeOf(u64) * 3 ..], standalone_magic))
-        {
-            const source_len_u64 = std.mem.readInt(u64, trailer[0..@sizeOf(u64)], .little);
-            const map_len_u64 = std.mem.readInt(u64, trailer[@sizeOf(u64) .. @sizeOf(u64) * 2], .little);
-            const files_len_u64 = std.mem.readInt(u64, trailer[@sizeOf(u64) * 2 .. @sizeOf(u64) * 3], .little);
-            const source_len = std.math.cast(usize, source_len_u64) orelse return error.InvalidStandaloneExecutable;
-            const map_len = std.math.cast(usize, map_len_u64) orelse return error.InvalidStandaloneExecutable;
-            const files_len = std.math.cast(usize, files_len_u64) orelse return error.InvalidStandaloneExecutable;
-            if (source_len > 512 * 1024 * 1024 or map_len > 512 * 1024 * 1024 or files_len > 512 * 1024 * 1024 or
-                source_len > trailer_offset or map_len > trailer_offset - source_len or
-                files_len > trailer_offset - source_len - map_len)
-            {
-                return error.InvalidStandaloneExecutable;
-            }
-            const payload_offset = trailer_offset - source_len - map_len - files_len;
-            const source = try allocator.alloc(u8, source_len);
-            if (try executable.readPositionalAll(init.io, source, payload_offset) != source.len)
-                return error.InvalidStandaloneExecutable;
-            const source_map = if (map_len > 0) blk: {
-                const map = try allocator.alloc(u8, map_len);
-                if (try executable.readPositionalAll(init.io, map, payload_offset + source_len) != map.len)
-                    return error.InvalidStandaloneExecutable;
-                break :blk map;
-            } else null;
-            const files = if (files_len > 0) blk: {
-                const files = try allocator.alloc(u8, files_len);
-                if (try executable.readPositionalAll(init.io, files, payload_offset + source_len + map_len) != files.len)
-                    return error.InvalidStandaloneExecutable;
-                break :blk files;
-            } else null;
-            return .{ .source = source, .source_map = source_map, .files = files };
-        }
-    }
-
-    if (executable_len >= standalone_trailer_v2_len) {
-        var trailer: [standalone_trailer_v2_len]u8 = undefined;
-        const trailer_offset = executable_len - standalone_trailer_v2_len;
-        if (try executable.readPositionalAll(init.io, &trailer, trailer_offset) == trailer.len and
-            std.mem.eql(u8, trailer[@sizeOf(u64) * 2 ..], standalone_magic_v2))
-        {
-            const source_len_u64 = std.mem.readInt(u64, trailer[0..@sizeOf(u64)], .little);
-            const map_len_u64 = std.mem.readInt(u64, trailer[@sizeOf(u64) .. @sizeOf(u64) * 2], .little);
-            const source_len = std.math.cast(usize, source_len_u64) orelse return error.InvalidStandaloneExecutable;
-            const map_len = std.math.cast(usize, map_len_u64) orelse return error.InvalidStandaloneExecutable;
-            if (source_len > 512 * 1024 * 1024 or map_len > 512 * 1024 * 1024 or
-                source_len > trailer_offset or map_len > trailer_offset - source_len)
-            {
-                return error.InvalidStandaloneExecutable;
-            }
-            const payload_offset = trailer_offset - source_len - map_len;
-            const source = try allocator.alloc(u8, source_len);
-            if (try executable.readPositionalAll(init.io, source, payload_offset) != source.len)
-                return error.InvalidStandaloneExecutable;
-            const source_map = if (map_len > 0) blk: {
-                const map = try allocator.alloc(u8, map_len);
-                if (try executable.readPositionalAll(init.io, map, payload_offset + source_len) != map.len)
-                    return error.InvalidStandaloneExecutable;
-                break :blk map;
-            } else null;
-            return .{ .source = source, .source_map = source_map };
-        }
-    }
-
-    if (executable_len < standalone_trailer_v1_len) return null;
-    var trailer: [standalone_trailer_v1_len]u8 = undefined;
-    const trailer_offset = executable_len - standalone_trailer_v1_len;
-    if (try executable.readPositionalAll(init.io, &trailer, trailer_offset) != trailer.len) return null;
-    if (!std.mem.eql(u8, trailer[@sizeOf(u64)..], standalone_magic_v1)) return null;
-    const source_len_u64 = std.mem.readInt(u64, trailer[0..@sizeOf(u64)], .little);
-    const source_len = std.math.cast(usize, source_len_u64) orelse return error.InvalidStandaloneExecutable;
-    if (source_len > trailer_offset or source_len > 512 * 1024 * 1024) return error.InvalidStandaloneExecutable;
-    const source = try allocator.alloc(u8, source_len);
-    const source_offset = trailer_offset - source_len;
-    if (try executable.readPositionalAll(init.io, source, source_offset) != source.len) return error.InvalidStandaloneExecutable;
-    return .{ .source = source };
-}
-
-fn writeStandaloneExecutable(
-    init: std.process.Init,
-    output_path: []const u8,
-    payload: script_runner.StandaloneSource,
-    write_external_source_map: bool,
-) !void {
-    const executable_path = try std.process.executablePathAlloc(init.io, init.arena.allocator());
-    try std.Io.Dir.copyFile(
-        std.Io.Dir.cwd(),
-        executable_path,
-        std.Io.Dir.cwd(),
-        output_path,
-        init.io,
-        .{ .make_path = true },
-    );
-
-    const output = try std.Io.Dir.cwd().openFile(init.io, output_path, .{ .mode = .read_write });
-    defer output.close(init.io);
-    const executable_len = try output.length(init.io);
-    try output.writePositionalAll(init.io, payload.source, executable_len);
-    const source_map = payload.source_map orelse "";
-    try output.writePositionalAll(init.io, source_map, executable_len + payload.source.len);
-    const files = payload.files orelse "";
-    try output.writePositionalAll(init.io, files, executable_len + payload.source.len + source_map.len);
-    var trailer: [standalone_trailer_len]u8 = undefined;
-    std.mem.writeInt(u64, trailer[0..@sizeOf(u64)], @intCast(payload.source.len), .little);
-    std.mem.writeInt(u64, trailer[@sizeOf(u64) .. @sizeOf(u64) * 2], @intCast(source_map.len), .little);
-    std.mem.writeInt(u64, trailer[@sizeOf(u64) * 2 .. @sizeOf(u64) * 3], @intCast(files.len), .little);
-    @memcpy(trailer[@sizeOf(u64) * 3 ..], standalone_magic);
-    try output.writePositionalAll(
-        init.io,
-        &trailer,
-        executable_len + payload.source.len + source_map.len + files.len,
-    );
-
-    if (write_external_source_map and payload.source_map != null) {
-        const map_path = try std.mem.concat(init.arena.allocator(), u8, &.{ output_path, ".map" });
-        try writeBuildFile(init.io, map_path, source_map);
-        for (payload.source_maps) |extra_map| {
-            const extra_path = try standaloneExtraSourceMapPath(init.arena.allocator(), output_path, extra_map.path);
-            try writeBuildFile(init.io, extra_path, extra_map.contents);
-        }
-    }
-}
-
 fn runStandaloneIfPresent(
     init: std.process.Init,
     args: []const [:0]const u8,
 ) !?u8 {
-    const payload = (try loadStandalonePayload(init)) orelse return null;
+    const payload = (try standalone_executable.load(init)) orelse return null;
     const allocator = init.arena.allocator();
-    var exec_args = try allocator.alloc([:0]const u8, args.len);
-    var exec_len: usize = 0;
-    var script_start = args.len;
-    var index: usize = 1;
-    while (index < args.len) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "--")) {
-            script_start = index + 1;
-            break;
-        }
-        if (!isRuntimeFlag(arg)) {
-            script_start = index;
-            break;
-        }
-        exec_args[exec_len] = arg;
-        exec_len += 1;
-        if (runtimeFlagTakesValue(arg) and index + 1 < args.len) {
-            index += 1;
-            exec_args[exec_len] = args[index];
-            exec_len += 1;
-        }
-        index += 1;
+    var exec_args = std.array_list.Managed([:0]const u8).init(allocator);
+    if (init.environ_map.get("BUN_OPTIONS")) |options| {
+        try appendBunOptionsEnv(allocator, options, &exec_args);
+    }
+    if (payload.compile_exec_argv.len > 0) {
+        try appendBunOptionsEnv(allocator, payload.compile_exec_argv, &exec_args);
     }
     return try script_runner.runEmbedded(
         init,
-        args[0],
         payload.source,
         payload.source_map,
         payload.files,
-        args[script_start..],
-        exec_args[0..exec_len],
+        args[1..],
+        exec_args.items,
+        payload.flags,
     );
 }
 
@@ -1137,6 +965,32 @@ fn runBakeProductionBuild(init: std.process.Init, entrypoint: []const u8, outdir
     try source.appendSlice(allocator, " });\n");
     const source_z = try allocator.dupeZ(u8, source.items);
     return script_runner.runEval(init, source_z, &.{}, &.{}, false);
+}
+
+const CompileAutoloadKind = enum { dotenv, bunfig, tsconfig, package_json };
+
+const CompileAutoloadArgument = struct {
+    kind: CompileAutoloadKind,
+    enabled: bool,
+    positive_name: []const u8,
+    negative_name: []const u8,
+};
+
+fn compileAutoloadArgument(arg: []const u8) ?CompileAutoloadArgument {
+    for ([_]CompileAutoloadArgument{
+        .{ .kind = .dotenv, .enabled = true, .positive_name = "--compile-autoload-dotenv", .negative_name = "--no-compile-autoload-dotenv" },
+        .{ .kind = .bunfig, .enabled = true, .positive_name = "--compile-autoload-bunfig", .negative_name = "--no-compile-autoload-bunfig" },
+        .{ .kind = .tsconfig, .enabled = true, .positive_name = "--compile-autoload-tsconfig", .negative_name = "--no-compile-autoload-tsconfig" },
+        .{ .kind = .package_json, .enabled = true, .positive_name = "--compile-autoload-package-json", .negative_name = "--no-compile-autoload-package-json" },
+    }) |option| {
+        if (std.mem.eql(u8, arg, option.positive_name)) return option;
+        if (std.mem.eql(u8, arg, option.negative_name)) {
+            var disabled = option;
+            disabled.enabled = false;
+            return disabled;
+        }
+    }
+    return null;
 }
 
 fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
@@ -1164,12 +1018,41 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
     var metafile_json_path: ?[]const u8 = null;
     var metafile_markdown_path: ?[]const u8 = null;
     var compile = false;
+    var compile_exec_argv: ?[]const u8 = null;
+    var compile_executable_path: ?[]const u8 = null;
+    var compile_autoload_dotenv: ?bool = null;
+    var compile_autoload_bunfig: ?bool = null;
+    var compile_autoload_tsconfig: ?bool = null;
+    var compile_autoload_package_json: ?bool = null;
     var app = false;
     var index: usize = 2;
     while (index < args.len) : (index += 1) {
         const arg: []const u8 = args[index];
         if (std.mem.eql(u8, arg, "--compile")) {
             compile = true;
+        } else if (std.mem.startsWith(u8, arg, "--compile-exec-argv=")) {
+            compile_exec_argv = arg["--compile-exec-argv=".len..];
+        } else if (std.mem.eql(u8, arg, "--compile-exec-argv") and index + 1 < args.len) {
+            index += 1;
+            compile_exec_argv = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--compile-executable-path=")) {
+            compile_executable_path = arg["--compile-executable-path=".len..];
+        } else if (std.mem.eql(u8, arg, "--compile-executable-path") and index + 1 < args.len) {
+            index += 1;
+            compile_executable_path = args[index];
+        } else if (compileAutoloadArgument(arg)) |autoload| {
+            const setting: *?bool = switch (autoload.kind) {
+                .dotenv => &compile_autoload_dotenv,
+                .bunfig => &compile_autoload_bunfig,
+                .tsconfig => &compile_autoload_tsconfig,
+                .package_json => &compile_autoload_package_json,
+            };
+            if (setting.* != null and setting.*.? != autoload.enabled) {
+                try stderr.print("error: Cannot use both {s} and {s}\n", .{ autoload.positive_name, autoload.negative_name });
+                try stderr.flush();
+                return 1;
+            }
+            setting.* = autoload.enabled;
         } else if (std.mem.eql(u8, arg, "--app")) {
             app = true;
         } else if (std.mem.eql(u8, arg, "--bundle")) {
@@ -1425,8 +1308,21 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         try stderr.flush();
         return 1;
     }
+    if (!compile and (compile_exec_argv != null or compile_executable_path != null or
+        compile_autoload_dotenv != null or compile_autoload_bunfig != null or
+        compile_autoload_tsconfig != null or compile_autoload_package_json != null))
+    {
+        try stderr.writeAll("error: compile-specific options require --compile\n");
+        try stderr.flush();
+        return 1;
+    }
     if (outfile != null and entries.items.len != 1 and !compile) {
         try stderr.print("error: --outfile requires exactly one entrypoint\n", .{});
+        try stderr.flush();
+        return 1;
+    }
+    if (compile and entries.items.len != 1) {
+        try stderr.writeAll("error: --compile requires exactly one entrypoint\n");
         try stderr.flush();
         return 1;
     }
@@ -1482,10 +1378,17 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         // materialize the same compiler output next to the binary.
         if (requested_source_map != .none) options.source_map = .external;
         const entry_z = try allocator.dupeZ(u8, entries.items[0]);
-        const payload = script_runner.compileStandaloneSource(init, entry_z, options) catch |err| {
+        var payload = script_runner.compileStandaloneSource(init, entry_z, options) catch |err| {
             try stderr.print("error: standalone build failed: {s}\n", .{@errorName(err)});
             try stderr.flush();
             return 1;
+        };
+        payload.compile_exec_argv = compile_exec_argv orelse "";
+        payload.flags = .{
+            .disable_default_env_files = !(compile_autoload_dotenv orelse true),
+            .disable_autoload_bunfig = !(compile_autoload_bunfig orelse true),
+            .disable_autoload_tsconfig = !(compile_autoload_tsconfig orelse false),
+            .disable_autoload_package_json = !(compile_autoload_package_json orelse false),
         };
         const default_basename = std.fs.path.stem(entries.items[0]);
         const default_name = if (builtin.os.tag == .windows)
@@ -1493,9 +1396,10 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         else
             default_basename;
         const destination = outfile orelse default_name;
-        try writeStandaloneExecutable(
+        try standalone_executable.write(
             init,
             destination,
+            compile_executable_path,
             payload,
             requested_source_map == .external or requested_source_map == .linked,
         );
@@ -1503,7 +1407,7 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
             (requested_source_map == .external or requested_source_map == .linked))
         {
             for (payload.source_maps) |extra_map| {
-                const map_path = try standaloneExtraSourceMapPath(allocator, destination, extra_map.path);
+                const map_path = try standalone_executable.extraSourceMapPath(allocator, destination, extra_map.path);
                 try stdout.print("COTTONTAIL_SOURCEMAP\t{s}\n", .{map_path});
             }
         }
@@ -2735,6 +2639,7 @@ fn runMacroEvaluator(init: std.process.Init, args: []const [:0]const u8) !u8 {
 }
 
 pub fn main(init: std.process.Init) !void {
+    script_runner.configureProcess(init);
     const allocator = init.arena.allocator();
     var process_args = try init.minimal.args.toSlice(allocator);
     process_args = try consumeSpawnGate(allocator, process_args);
@@ -2743,14 +2648,13 @@ pub fn main(init: std.process.Init) !void {
         if (exit_code != 0) std.process.exit(exit_code);
         return;
     }
-    var args = try argsWithBunOptions(allocator, process_args, init.environ_map);
-
     if (init.environ_map.get("BUN_BE_BUN") == null) {
-        if (try runStandaloneIfPresent(init, args)) |exit_code| {
+        if (try runStandaloneIfPresent(init, process_args)) |exit_code| {
             if (exit_code != 0) std.process.exit(exit_code);
             return;
         }
     }
+    var args = try argsWithBunOptions(allocator, process_args, init.environ_map);
     args = try normalizeLeadingTestRuntimeFlags(allocator, args);
     args = try normalizeLeadingPackageManagerConfig(allocator, args);
 

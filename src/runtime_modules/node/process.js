@@ -1097,7 +1097,9 @@ function makeReport() {
 const cottontailExecPath = cottontail.execPath?.() ?? "cottontail";
 const cottontailArgv = Array.isArray(cottontail.argv) ? [...cottontail.argv] : [cottontailExecPath, ...(cottontail.args || [])];
 if (cottontailArgv.length === 0) cottontailArgv.push(cottontailExecPath);
-if (cottontailArgv[0] === "cottontail") cottontailArgv[0] = cottontailExecPath;
+if (cottontailArgv[0] === "cottontail") {
+  cottontailArgv[0] = globalThis.__cottontailStandaloneFlags == null ? cottontailExecPath : "bun";
+}
 const processObject = globalThis.process ?? {
   argv: cottontailArgv,
   argv0: cottontailExecPath,
@@ -1119,7 +1121,10 @@ Object.defineProperty(globalThis, "__cottontailProcessObject", {
 createEventApi(processObject);
 
 processObject.argv ??= cottontailArgv;
-if (Array.isArray(processObject.argv) && processObject.argv[0] === "cottontail") processObject.argv[0] = cottontailExecPath;
+if (Array.isArray(processObject.argv)) {
+  if (globalThis.__cottontailStandaloneFlags != null) processObject.argv[0] = "bun";
+  else if (processObject.argv[0] === "cottontail") processObject.argv[0] = cottontailExecPath;
+}
 processObject.argv0 ??= cottontailExecPath;
 processObject.execPath ??= cottontailExecPath;
 processObject.env ??= cottontail.env();
@@ -1321,8 +1326,13 @@ processObject.browser ??= false;
   const terminator = rawExecArgv.indexOf("--");
   processObject.execArgv = terminator === -1 ? rawExecArgv : rawExecArgv.slice(0, terminator);
 }
-const startupTitle = processObject.execArgv.find((argument) => argument.startsWith("--title="));
-if (startupTitle !== undefined) processObject.title = startupTitle.slice("--title=".length);
+for (let index = 0; index < processObject.execArgv.length; index += 1) {
+  const argument = String(processObject.execArgv[index]);
+  if (argument.startsWith("--title=")) processObject.title = argument.slice("--title=".length);
+  else if (argument === "--title" && index + 1 < processObject.execArgv.length) {
+    processObject.title = String(processObject.execArgv[++index]);
+  }
+}
 // Bun reports "bun" as the default process title (upstream regression 23183).
 // COTTONTAIL-COMPAT: Assignments update the JS value; changing the operating-system process title needs a native host API.
 processObject.title ??= "bun";
@@ -1552,13 +1562,15 @@ globalThis.__cottontailLoadDotenv = function __cottontailLoadDotenv() {
     if (isTest && env.NODE_ENV === undefined) env.NODE_ENV = "test";
     const original = { ...env };
 
-    try {
-      const bunfig = String(cottontail.readFile("bunfig.toml"));
-      // `env = false` at top level or `file = false` inside [env] disables loading.
-      if (/^\s*env\s*=\s*false\s*$/m.test(bunfig)) return;
-      const envSection = bunfig.split(/^\s*\[/m).find((section) => section.startsWith("env]"));
-      if (envSection && /^\s*file\s*=\s*false\s*$/m.test(envSection)) return;
-    } catch {}
+    if (globalThis.__cottontailStandaloneFlags?.disableAutoloadBunfig !== true) {
+      try {
+        const bunfig = String(cottontail.readFile("bunfig.toml"));
+        // `env = false` at top level or `file = false` inside [env] disables loading.
+        if (/^\s*env\s*=\s*false\s*$/m.test(bunfig)) return;
+        const envSection = bunfig.split(/^\s*\[/m).find((section) => section.startsWith("env]"));
+        if (envSection && /^\s*file\s*=\s*false\s*$/m.test(envSection)) return;
+      } catch {}
+    }
 
     const files = [];
     let explicit = false;
@@ -1582,6 +1594,7 @@ globalThis.__cottontailLoadDotenv = function __cottontailLoadDotenv() {
       }
     }
     if (!explicit) {
+      if (globalThis.__cottontailStandaloneFlags?.disableDefaultEnvFiles === true) return;
       const nodeEnv = env.NODE_ENV;
       const suffix = nodeEnv === "production" ? "production" : nodeEnv === "test" ? "test" : "development";
       files.push(".env", `.env.${suffix}`);

@@ -73,9 +73,12 @@ import {
   isCottontailIpcFrame,
 } from "../internal/bun-spawn-ipc.js";
 import { createBunShellRuntime, parseBunShellSource } from "../internal/bun-shell-runtime.js";
+import { installStandaloneRuntimeLoaders } from "../internal/standalone-runtime.js";
 
 const estimatedMemoryCostSymbol = Symbol.for("cottontail.estimatedMemoryCost");
 const stackFunctionRegistrySymbol = Symbol.for("cottontail.stackFunctionRegistry");
+
+installStandaloneRuntimeLoaders(globalThis.process);
 
 if (globalThis.process && Object.prototype.toString.call(globalThis.process) !== "[object process]") {
   Object.defineProperty(globalThis.process, Symbol.toStringTag, {
@@ -2787,6 +2790,14 @@ async function buildWithPlugins(options, plugins) {
   await Promise.all(onStartCallbacks.map((callback) => callback()));
 
   if (onResolveRules.length === 0 && onLoadRules.length === 0) {
+    const compile = ctNormalizeCompileOptions(options);
+    if (compile) {
+      return ctRunCompiledBuild(options, compile, {
+        setupPromises: [],
+        onStart: [],
+        onEnd: onEndCallbacks,
+      });
+    }
     return finalizePluginDriverResult(
       runBuildDriver({ ...options, plugins: undefined }),
       options,
@@ -3434,11 +3445,11 @@ function ctCurrentCompileTargets() {
 function ctNormalizeCompileOptions(options) {
   const value = options?.compile;
   if (value == null || value === false) return null;
-  if (value !== true && (typeof value !== "object" || Array.isArray(value))) {
-    throw new TypeError('Bun.build expects "compile" to be a boolean or object');
+  if (value !== true && typeof value !== "string" && (typeof value !== "object" || Array.isArray(value))) {
+    throw new TypeError('Bun.build expects "compile" to be a boolean, target string, or object');
   }
 
-  const compile = value === true ? {} : value;
+  const compile = value === true ? {} : typeof value === "string" ? { target: value } : { ...value };
   if (compile.target != null) {
     if (typeof compile.target !== "string" || !ctCurrentCompileTargets().has(compile.target)) {
       throw new Error(`Unknown compile target: ${String(compile.target)}`);
@@ -3446,6 +3457,18 @@ function ctNormalizeCompileOptions(options) {
   }
   if (compile.outfile != null && typeof compile.outfile !== "string") {
     throw new TypeError('Bun.build compile.outfile must be a string');
+  }
+  if (compile.execArgv != null && !Array.isArray(compile.execArgv)) {
+    throw new TypeError('Bun.build compile.execArgv must be an array');
+  }
+  if (compile.executablePath != null && typeof compile.executablePath !== "string") {
+    throw new TypeError('Bun.build compile.executablePath must be a string');
+  }
+  if (compile.windows != null) {
+    throw new TypeError("Bun.build compile.windows is not supported by this Cottontail target");
+  }
+  for (const name of ["autoloadDotenv", "autoloadBunfig", "autoloadTsconfig", "autoloadPackageJson"]) {
+    if (Object.hasOwn(compile, name)) compile[name] = Boolean(compile[name]);
   }
   return compile;
 }
@@ -3472,60 +3495,6 @@ function ctCompiledOutputPath(options, compile, cwd) {
   return outfile;
 }
 
-function ctAppendCompileBuildOptions(args, options) {
-  if (options.bundle === false) args.push("--no-bundle");
-  if (options.production === true) args.push("--production");
-  if (options.bytecode === true) args.push("--bytecode");
-  if (options.packages === "external") args.push("--packages=external");
-  if (options.splitting === true) args.push("--splitting");
-  if (options.ignoreDCEAnnotations === true) args.push("--ignore-dce-annotations");
-  if (options.emitDCEAnnotations === true) args.push("--emit-dce-annotations");
-  if (options.sourcemap === true) {
-    args.push("--sourcemap=inline");
-  } else if (["inline", "external", "linked"].includes(options.sourcemap)) {
-    args.push(`--sourcemap=${options.sourcemap}`);
-  }
-
-  if (options.minify === true) {
-    args.push("--minify");
-  } else if (options.minify && typeof options.minify === "object") {
-    if (options.minify.whitespace === true) args.push("--minify-whitespace");
-    if (options.minify.identifiers === true) args.push("--minify-identifiers");
-    if (options.minify.syntax === true) args.push("--minify-syntax");
-  }
-
-  const append = (flag, value) => {
-    if (value != null) args.push(flag, String(value));
-  };
-  append("--banner", options.banner);
-  append("--footer", options.footer);
-  append("--public-path", options.publicPath);
-  append("--entry-naming", options.naming?.entry ?? (typeof options.naming === "string" ? options.naming : null));
-  append("--chunk-naming", options.naming?.chunk);
-  append("--asset-naming", options.naming?.asset);
-  append("--jsx-runtime", options.jsx?.runtime);
-  append("--jsx-factory", options.jsx?.factory);
-  append("--jsx-fragment", options.jsx?.fragment);
-  append("--jsx-import-source", options.jsx?.importSource);
-  if (options.jsx?.sideEffects === true) args.push("--jsx-side-effects");
-  if (options.jsx?.development === true) args.push("--jsx-dev");
-
-  const appendMany = (flag, values) => {
-    if (typeof values === "string") values = [values];
-    if (!Array.isArray(values)) return;
-    for (const value of values) args.push(flag, String(value));
-  };
-  appendMany("--external", options.external);
-  appendMany("--drop", options.drop);
-  appendMany("--feature", options.features);
-  appendMany("--conditions", options.conditions);
-  if (options.define && typeof options.define === "object") {
-    for (const [key, value] of Object.entries(options.define)) {
-      args.push("--define", `${key}=${String(value)}`);
-    }
-  }
-}
-
 async function ctRunCompiledBuild(options, compile, state) {
   if (options.entrypoints.length !== 1) {
     throw new TypeError("Bun.build compile requires exactly one entrypoint");
@@ -3538,73 +3507,39 @@ async function ctRunCompiledBuild(options, compile, state) {
   const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
   const entry = nodePathResolve(cwd, String(options.entrypoints[0]));
   const outfile = ctCompiledOutputPath(options, compile, cwd);
-  const args = ["build", entry, "--compile", "--outfile", outfile];
-  ctAppendCompileBuildOptions(args, options);
-
-  const env = { ...(globalThis.process?.env ?? {}) };
-  delete env.COTTONTAIL_TEST_CLI_HEADER_PRINTED;
-  delete env.COTTONTAIL_TEST_AGGREGATE_FILE;
-  env.COTTONTAIL_BUILD_OUTPUT_MANIFEST = "1";
-  let processResult;
+  const request = {
+    ...options,
+    plugins: undefined,
+    entrypoints: [entry],
+    compile: {
+      ...compile,
+      execArgv: Array.isArray(compile.execArgv) ? compile.execArgv.map(String) : undefined,
+    },
+  };
+  let parsed;
   try {
-    processResult = cottontail.spawnSync(globalThis.process?.execPath ?? cottontail.execPath(), args, {
-      cwd,
-      env,
-      clearEnv: true,
-      stdio: "pipe",
-    });
+    parsed = JSON.parse(cottontail.compileBuildNative(JSON.stringify(request), cwd, outfile));
   } catch (error) {
     const result = { success: false, outputs: [], logs: [new CTBuildMessage({ message: ctErrorMessage(error) })] };
-    await ctRunOnEnd(state, result);
-    if (options.throw === false) return result;
-    throw error;
-  }
-
-  const exitCode = Number(processResult.status ?? processResult.exitCode ?? 0);
-  if (exitCode !== 0) {
-    const message = new TextDecoder().decode(asBuffer(processResult.stderr ?? "")).trim() ||
-      `Standalone build exited with code ${exitCode}`;
-    const result = { success: false, outputs: [], logs: [new CTBuildMessage({ message })] };
     await ctRunOnEnd(state, result);
     if (options.throw === false) return result;
     throw new AggregateError(result.logs, "Bundle failed");
   }
 
-  const bytes = new Uint8Array(await file(outfile).arrayBuffer());
-  const executableArtifact = new CTBuildArtifact(bytes, {
-    path: outfile,
-    kind: "entry-point",
-    loader: "file",
-    hash: null,
-  });
-  const outputs = [executableArtifact];
-  if (options.sourcemap === "external" || options.sourcemap === "linked") {
-    const mapPath = `${outfile}.map`;
-    if (await file(mapPath).exists()) {
-      const mapArtifact = new CTBuildArtifact(new Uint8Array(await file(mapPath).arrayBuffer()), {
-        path: mapPath,
-        kind: "sourcemap",
-        loader: "json",
-        hash: null,
-      });
-      executableArtifact.sourcemap = mapArtifact;
-      outputs.push(mapArtifact);
-    }
-    const buildStdout = new TextDecoder().decode(asBuffer(processResult.stdout ?? ""));
-    for (const line of buildStdout.split(/\r?\n/)) {
-      if (!line.startsWith("COTTONTAIL_SOURCEMAP\t")) continue;
-      const extraMapPath = line.slice("COTTONTAIL_SOURCEMAP\t".length);
-      if (!extraMapPath || extraMapPath === mapPath || !(await file(extraMapPath).exists())) continue;
-      outputs.push(new CTBuildArtifact(new Uint8Array(await file(extraMapPath).arrayBuffer()), {
-        path: extraMapPath,
-        kind: "sourcemap",
-        loader: "json",
-        hash: null,
-      }));
-    }
+  const outputs = [];
+  for (const output of parsed.outputs ?? []) {
+    outputs.push(new CTBuildArtifact(new Uint8Array(await file(output.path).arrayBuffer()), {
+      path: output.path,
+      kind: output.kind,
+      loader: output.loader,
+      hash: null,
+    }));
   }
+  const executableArtifact = outputs.find(output => output.kind === "entry-point");
+  const sourceMapArtifact = outputs.find(output => output.kind === "sourcemap");
+  if (executableArtifact && sourceMapArtifact) executableArtifact.sourcemap = sourceMapArtifact;
   const result = {
-    success: true,
+    success: parsed.success !== false,
     outputs,
     logs: [],
   };

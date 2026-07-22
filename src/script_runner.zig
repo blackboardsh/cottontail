@@ -7,9 +7,16 @@ const icu_bootstrap = @import("icu_bootstrap.zig");
 const native_bundler = @import("cottontail_bundler.zig");
 const native_transpiler = @import("cottontail_transpiler.zig");
 const embedded_runtime_modules = @import("embedded_runtime_modules.zig");
+const standalone_executable = @import("standalone_executable.zig");
 
 const script_thread_stack_size = 128 * 1024 * 1024;
 const script_js_stack_size = 96 * 1024 * 1024;
+
+var process_init: ?std.process.Init = null;
+
+pub fn configureProcess(init: std.process.Init) void {
+    process_init = init;
+}
 
 const RunElectrobunMainThreadFn = *const fn (
     [*:0]const u8,
@@ -76,6 +83,7 @@ const ScriptExecution = struct {
     embedded_source: ?[]const u8 = null,
     embedded_source_map: ?[]const u8 = null,
     embedded_files: ?[]const u8 = null,
+    standalone_flags: ?standalone_executable.Flags = null,
     exit_cleanup_path: ?[:0]const u8 = null,
     reload: ?ReloadExecution = null,
     exit_code: u8 = 1,
@@ -170,17 +178,8 @@ test "Windows script thread reserves a WebKit-compatible stack" {
     try std.testing.expect(valid);
 }
 
-pub const StandaloneSource = struct {
-    source: []const u8,
-    source_map: ?[]const u8 = null,
-    source_maps: []const StandaloneSourceMap = &.{},
-    files: ?[]const u8 = null,
-};
-
-pub const StandaloneSourceMap = struct {
-    path: []const u8,
-    contents: []const u8,
-};
+pub const StandaloneSource = standalone_executable.Source;
+pub const StandaloneSourceMap = standalone_executable.SourceMap;
 
 const Context = struct {
     io: std.Io,
@@ -188,6 +187,7 @@ const Context = struct {
     environ_map: *std.process.Environ.Map,
     project_root: []const u8,
     executable_stamp: []const u8,
+    stderr_capture: ?*std.ArrayList(u8) = null,
 
     fn writeStdout(self: *const Context, comptime fmt: []const u8, args: anytype) void {
         var buffer: [2048]u8 = undefined;
@@ -198,6 +198,11 @@ const Context = struct {
     }
 
     fn writeStderr(self: *const Context, comptime fmt: []const u8, args: anytype) void {
+        if (self.stderr_capture) |capture| {
+            const message = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
+            capture.appendSlice(self.allocator, message) catch {};
+            return;
+        }
         var buffer: [2048]u8 = undefined;
         var writer = std.Io.File.stderr().writer(self.io, &buffer);
         const stderr = &writer.interface;
@@ -320,7 +325,7 @@ pub fn runWithExecArgvDisplay(
 
     const runnable_path_z = try allocator.dupeZ(u8, runnable.path);
 
-    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null, null);
+    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null, null, null);
 }
 
 const AutoInstallMode = enum { auto, fallback, force, disable };
@@ -1151,7 +1156,7 @@ pub fn runEval(
     const process_args = try init.arena.allocator().alloc([:0]const u8, script_args.len + 1);
     process_args[0] = try init.arena.allocator().dupeZ(u8, eval_entry.entry_path);
     for (script_args, 0..) |arg, index| process_args[index + 1] = arg;
-    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null, null);
+    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null, null, null);
 }
 
 fn validateEvalSyntax(ctx: *const Context, source: []const u8) bool {
@@ -1524,25 +1529,25 @@ fn prepareStandaloneNativeAssets(
 
 pub fn runEmbedded(
     init: std.process.Init,
-    executable_path: [:0]const u8,
     source: []const u8,
     source_map: ?[]const u8,
     files: ?[]const u8,
     script_args: []const [:0]const u8,
     exec_args: []const [:0]const u8,
+    flags: standalone_executable.Flags,
 ) !u8 {
     const allocator = init.arena.allocator();
     const ctx = try makeContext(init);
     const native_assets = try prepareStandaloneNativeAssets(init, source, files);
     defer native_assets.deinit(init.io);
-    const process_args = try allocator.alloc([:0]const u8, script_args.len + 1);
-    process_args[0] = executable_path;
-    for (script_args, 0..) |arg, index| process_args[index + 1] = arg;
     const virtual_path: [:0]const u8 = if (builtin.os.tag == .windows)
         "B:/~BUN/root/index.js"
     else
         "/$bunfs/root/index.js";
-    return try runPrepared(init, &ctx, virtual_path, process_args, 1, exec_args, native_assets.source, source_map, files);
+    const process_args = try allocator.alloc([:0]const u8, script_args.len + 1);
+    process_args[0] = virtual_path;
+    for (script_args, 0..) |arg, index| process_args[index + 1] = arg;
+    return try runPrepared(init, &ctx, virtual_path, process_args, 1, exec_args, native_assets.source, source_map, files, flags);
 }
 
 pub fn compileStandaloneSource(
@@ -1551,6 +1556,14 @@ pub fn compileStandaloneSource(
     build_options: native_bundler.BundleOptions,
 ) !StandaloneSource {
     const ctx = try makeContext(init);
+    return compileStandaloneSourceWithContext(&ctx, script_path, build_options);
+}
+
+fn compileStandaloneSourceWithContext(
+    ctx: *const Context,
+    script_path: [:0]const u8,
+    build_options: native_bundler.BundleOptions,
+) !StandaloneSource {
     const empty_args: [0][:0]const u8 = .{};
     var standalone_options = build_options;
     standalone_options.public_path = "";
@@ -1558,7 +1571,7 @@ pub fn compileStandaloneSource(
     if (standalone_options.source_map != .none) standalone_options.source_map = .linked;
     var graph: native_bundler.BundleGraphOutput = undefined;
     var runnable = try bundleScriptNative(
-        &ctx,
+        ctx,
         script_path,
         empty_args[0..],
         empty_args[0..],
@@ -1568,34 +1581,248 @@ pub fn compileStandaloneSource(
         true,
         null,
     );
-    defer runnable.deinit(&ctx);
+    defer runnable.deinit(ctx);
     defer graph.deinit();
     if (standalone_options.code_splitting) {
-        try bundleStandaloneBootstrap(&ctx, runnable.path, &graph, build_options.source_map != .none);
+        try bundleStandaloneBootstrap(ctx, runnable.path, &graph, build_options.source_map != .none);
     }
     const entry = graph.entryPoint() orelse return error.MissingStandaloneEntryPoint;
-    const source = try init.arena.allocator().dupe(u8, entry.contents);
+    const source = try ctx.allocator.dupe(u8, entry.contents);
     const source_map = if (entry.source_map) |source_map|
-        try init.arena.allocator().dupe(u8, source_map.contents)
+        try ctx.allocator.dupe(u8, source_map.contents)
     else
         null;
     var source_maps: std.ArrayList(StandaloneSourceMap) = .empty;
     for (graph.files, 0..) |file, index| {
         if (index == graph.entry_point_file_index.?) continue;
         if (file.source_map) |map| {
-            try source_maps.append(init.arena.allocator(), .{
-                .path = try init.arena.allocator().dupe(u8, map.path),
-                .contents = try init.arena.allocator().dupe(u8, map.contents),
+            try source_maps.append(ctx.allocator, .{
+                .path = try ctx.allocator.dupe(u8, map.path),
+                .contents = try ctx.allocator.dupe(u8, map.contents),
             });
         }
     }
-    const files = try serializeStandaloneGraph(&ctx, &graph);
+    const files = try serializeStandaloneGraph(ctx, &graph);
     return .{
         .source = source,
         .source_map = source_map,
-        .source_maps = try source_maps.toOwnedSlice(init.arena.allocator()),
+        .source_maps = try source_maps.toOwnedSlice(ctx.allocator),
         .files = files,
     };
+}
+
+const CompileBuildOutputJson = struct {
+    path: []const u8,
+    kind: []const u8,
+    loader: []const u8,
+};
+
+const CompileBuildResultJson = struct {
+    success: bool = true,
+    outputs: []const CompileBuildOutputJson,
+};
+
+fn setCompileBuildError(error_out: *?[*:0]u8, comptime fmt: []const u8, args: anytype) void {
+    const message = std.fmt.allocPrintSentinel(std.heap.c_allocator, fmt, args, 0) catch return;
+    error_out.* = message.ptr;
+}
+
+fn compileObject(request: *const std.json.ObjectMap) ?*const std.json.ObjectMap {
+    const value = request.getPtr("compile") orelse return null;
+    return if (value.* == .object) &value.object else null;
+}
+
+fn compileExecArgv(
+    allocator: std.mem.Allocator,
+    compile: ?*const std.json.ObjectMap,
+) ![]const u8 {
+    const object = compile orelse return "";
+    const value = object.get("execArgv") orelse return "";
+    if (value != .array) return "";
+
+    var joined: std.ArrayList(u8) = .empty;
+    for (value.array.items) |item| {
+        if (item != .string) return error.InvalidCompileExecArgv;
+        if (joined.items.len > 0) try joined.append(allocator, ' ');
+        try joined.appendSlice(allocator, item.string);
+    }
+    return joined.items;
+}
+
+fn compileFlags(compile: ?*const std.json.ObjectMap) standalone_executable.Flags {
+    const object = compile orelse return .{};
+    const boolValue = struct {
+        fn get(map: *const std.json.ObjectMap, name: []const u8, default: bool) bool {
+            const value = map.get(name) orelse return default;
+            return if (value == .bool) value.bool else default;
+        }
+    }.get;
+    return .{
+        .disable_default_env_files = !boolValue(object, "autoloadDotenv", true),
+        .disable_autoload_bunfig = !boolValue(object, "autoloadBunfig", true),
+        .disable_autoload_tsconfig = !boolValue(object, "autoloadTsconfig", false),
+        .disable_autoload_package_json = !boolValue(object, "autoloadPackageJson", false),
+    };
+}
+
+fn compileExecutablePath(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    working_dir: []const u8,
+    compile: ?*const std.json.ObjectMap,
+) !?[]const u8 {
+    const object = compile orelse return null;
+    const value = object.get("executablePath") orelse return null;
+    if (value != .string or value.string.len == 0) return error.InvalidCompileExecutablePath;
+    const candidate = if (std.fs.path.isAbsolute(value.string))
+        try allocator.dupe(u8, value.string)
+    else
+        try std.fs.path.resolve(allocator, &.{ working_dir, value.string });
+    const stat = std.Io.Dir.cwd().statFile(io, candidate, .{}) catch return error.InvalidCompileExecutablePath;
+    if (stat.kind != .file) return error.InvalidCompileExecutablePath;
+    return candidate;
+}
+
+fn wantsExternalCompileSourceMap(request: *const std.json.ObjectMap) bool {
+    const value = request.get("sourcemap") orelse return false;
+    return value == .string and
+        (std.ascii.eqlIgnoreCase(value.string, "external") or
+            std.ascii.eqlIgnoreCase(value.string, "linked"));
+}
+
+fn compileBuild(
+    request_json: []const u8,
+    working_dir: []const u8,
+    output_path: []const u8,
+    diagnostic_out: *?[]u8,
+) ![]u8 {
+    const configured_init = process_init orelse return error.ProcessNotConfigured;
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var init = configured_init;
+    init.arena = &arena;
+    init.gpa = std.heap.c_allocator;
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, request_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidCompileOptions;
+    const request = &parsed.value.object;
+    const entries_value = request.get("entrypoints") orelse return error.MissingCompileEntryPoint;
+    if (entries_value != .array or entries_value.array.items.len != 1 or entries_value.array.items[0] != .string) {
+        return error.InvalidCompileEntryPoint;
+    }
+    const entry_path = entries_value.array.items[0].string;
+    const entry_z = try allocator.dupeZ(u8, entry_path);
+
+    var build_options = try native_bundler.parseBuildOptions(request_json, allocator);
+    build_options.target = .bun;
+    build_options.output_format = .esm;
+
+    var diagnostics: std.ArrayList(u8) = .empty;
+    var ctx = try makeContext(init);
+    ctx.project_root = std.Io.Dir.cwd().realPathFileAlloc(init.io, working_dir, allocator) catch
+        try std.fs.path.resolve(allocator, &.{working_dir});
+    ctx.stderr_capture = &diagnostics;
+
+    var payload = compileStandaloneSourceWithContext(&ctx, entry_z, build_options) catch |err| {
+        const message = std.mem.trim(u8, diagnostics.items, " \t\r\n");
+        if (message.len > 0) {
+            diagnostic_out.* = try std.heap.c_allocator.dupe(u8, message);
+            return error.CompileBuildDiagnostic;
+        }
+        return err;
+    };
+    const compile_options = compileObject(request);
+    payload.compile_exec_argv = try compileExecArgv(allocator, compile_options);
+    payload.flags = compileFlags(compile_options);
+    const write_external_source_map = wantsExternalCompileSourceMap(request);
+    const executable_path = try compileExecutablePath(init.io, allocator, working_dir, compile_options);
+    try standalone_executable.write(
+        init,
+        output_path,
+        executable_path,
+        payload,
+        write_external_source_map,
+    );
+
+    var outputs: std.ArrayList(CompileBuildOutputJson) = .empty;
+    try outputs.append(allocator, .{ .path = output_path, .kind = "entry-point", .loader = "file" });
+    if (write_external_source_map and payload.source_map != null) {
+        try outputs.append(allocator, .{
+            .path = try std.mem.concat(allocator, u8, &.{ output_path, ".map" }),
+            .kind = "sourcemap",
+            .loader = "json",
+        });
+        for (payload.source_maps) |source_map| {
+            try outputs.append(allocator, .{
+                .path = try standalone_executable.extraSourceMapPath(allocator, output_path, source_map.path),
+                .kind = "sourcemap",
+                .loader = "json",
+            });
+        }
+    }
+
+    const json = try std.json.Stringify.valueAlloc(
+        allocator,
+        CompileBuildResultJson{ .outputs = outputs.items },
+        .{},
+    );
+    return try std.heap.c_allocator.dupe(u8, json);
+}
+
+pub export fn ct_compile_build(
+    request_ptr: ?[*]const u8,
+    request_len: usize,
+    working_dir_ptr: ?[*]const u8,
+    working_dir_len: usize,
+    output_path_ptr: ?[*]const u8,
+    output_path_len: usize,
+    out_len: *usize,
+    error_out: *?[*:0]u8,
+) ?[*]u8 {
+    out_len.* = 0;
+    error_out.* = null;
+    const request_json = if (request_ptr) |ptr| ptr[0..request_len] else {
+        setCompileBuildError(error_out, "Bun.build compile options are required", .{});
+        return null;
+    };
+    const working_dir = if (working_dir_ptr) |ptr| ptr[0..working_dir_len] else {
+        setCompileBuildError(error_out, "Bun.build compile working directory is required", .{});
+        return null;
+    };
+    const output_path = if (output_path_ptr) |ptr| ptr[0..output_path_len] else {
+        setCompileBuildError(error_out, "Bun.build compile output path is required", .{});
+        return null;
+    };
+
+    var diagnostic: ?[]u8 = null;
+    defer if (diagnostic) |message| std.heap.c_allocator.free(message);
+    const output = compileBuild(request_json, working_dir, output_path, &diagnostic) catch |err| {
+        if (diagnostic) |message| {
+            setCompileBuildError(error_out, "{s}", .{message});
+        } else {
+            setCompileBuildError(error_out, "Standalone build failed: {s}", .{@errorName(err)});
+        }
+        return null;
+    };
+    out_len.* = output.len;
+    return output.ptr;
+}
+
+pub export fn ct_compile_build_free(ptr: ?[*]u8, len: usize) void {
+    if (ptr) |value| std.heap.c_allocator.free(value[0..len]);
+}
+
+pub export fn ct_compile_build_string_free(ptr: ?[*:0]u8) void {
+    if (ptr) |value| std.heap.c_allocator.free(std.mem.span(value));
+}
+
+pub fn forceLink() void {
+    _ = &ct_compile_build;
+    _ = &ct_compile_build_free;
+    _ = &ct_compile_build_string_free;
 }
 
 fn standaloneGraphOutputPath(ctx: *const Context, output_path: []const u8) ![]const u8 {
@@ -1790,7 +2017,7 @@ pub fn runStdin(
     const process_args = try allocator.alloc([:0]const u8, script_args.len + 1);
     process_args[0] = try allocator.dupeZ(u8, stdin_entry.entry_path);
     @memcpy(process_args[1..], script_args);
-    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null, null);
+    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null, null, null);
 }
 
 fn makeContext(init: std.process.Init) !Context {
@@ -2013,6 +2240,7 @@ fn runPrepared(
     embedded_source: ?[]const u8,
     embedded_source_map: ?[]const u8,
     embedded_files: ?[]const u8,
+    standalone_flags: ?standalone_executable.Flags,
 ) !u8 {
     const allocator = init.arena.allocator();
     if (!applyRuntimeEnvFlags(init.io, allocator, exec_args)) return 1;
@@ -2035,6 +2263,7 @@ fn runPrepared(
         .embedded_source = embedded_source,
         .embedded_source_map = embedded_source_map,
         .embedded_files = embedded_files,
+        .standalone_flags = standalone_flags,
         .exit_cleanup_path = if (runnableDirectoryForCleanup(ctx, runnable_path_z)) |path|
             try allocator.dupeZ(u8, path)
         else
@@ -2486,6 +2715,12 @@ fn runScriptExecution(execution: *ScriptExecution) void {
     }
 
     execution.exit_code = if (execution.embedded_source) |source| blk: {
+        if (execution.standalone_flags) |flags| {
+            js_runtime.setStandaloneFlags(flags) catch {
+                writeStderr(execution.io, "cottontail: failed to install standalone runtime flags\n", .{});
+                break :blk 1;
+            };
+        }
         if (execution.embedded_files) |files| {
             js_runtime.setStandaloneFiles(files) catch {
                 writeStderr(execution.io, "cottontail: failed to install standalone module graph\n", .{});
@@ -3386,6 +3621,7 @@ fn nativeBundleFailure(
         // adding a Zig error-return trace to an ordinary JavaScript failure.
         cleanupGeneratedSource(ctx, script_entry_abs, script_abs);
         std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
+        if (ctx.stderr_capture != null) return error.NativeBundleFailed;
         if (recoverable) return error.ReloadBundleFailed;
         std.process.exit(1);
     }
@@ -3502,13 +3738,16 @@ fn bundleScriptNative(
     else
         try runtimeEntrypointIdentity(ctx, script_entry_abs, script_abs);
 
-    const bunfig_preload_imports = try buildBunfigTestPreloadImports(
-        ctx,
-        script_abs,
-        is_test_cli_execution,
-        exec_args,
-        script_args,
-    );
+    const bunfig_preload_imports = if (standalone_compile)
+        ""
+    else
+        try buildBunfigTestPreloadImports(
+            ctx,
+            script_abs,
+            is_test_cli_execution,
+            exec_args,
+            script_args,
+        );
     const cli_preload_imports = try buildCliPreloadImports(ctx, script_abs, exec_args, true);
     const test_preload_imports = if (is_test_cli_execution)
         try buildCliPreloadImports(ctx, script_abs, script_args, false)
@@ -3518,7 +3757,8 @@ fn bundleScriptNative(
     const is_common_js_entrypoint = !is_wasm_entrypoint and try shouldBundleCommonJsEntrypoint(ctx, script_abs);
     if (is_common_js_entrypoint) try validateCommonJsTestSyntax(ctx, script_abs);
     const runtime_bootstrap_mode: RuntimeBootstrapMode = if (reload_dependencies_out == null and
-        (build_options == null or standalone_compile) and
+        !standalone_compile and
+        build_options == null and
         preload_imports.len == 0 and
         !is_wasm_entrypoint)
         try entrypointRuntimeBootstrapMode(ctx, script_entry_abs)
@@ -5344,6 +5584,8 @@ fn writeMinimalRuntimeEntryWrapper(
         \\globalThis.Loader ??= {{ registry: new Map() }};
         \\{s}
         \\globalThis.__cottontailLoadDotenv?.();
+        \\await globalThis.__cottontailLoadStandaloneBunfig?.();
+        \\await globalThis.__cottontailLoadStandaloneExecPreloads?.();
         \\globalThis.__cottontailLoadingTestModules = true;
         \\try {{
         \\{s}
@@ -5474,6 +5716,8 @@ fn writeCottontailEntryWrapper(
         \\globalThis.__ctMetaResolve = (specifier, parent = {s}) => globalThis.__cottontailImportMetaResolve(specifier, parent);
         \\{s}
         \\globalThis.__cottontailLoadDotenv?.();
+        \\await globalThis.__cottontailLoadStandaloneBunfig?.();
+        \\await globalThis.__cottontailLoadStandaloneExecPreloads?.();
         \\globalThis.__cottontailLoadingTestModules = true;
         \\try {{
         \\{s}
@@ -7911,6 +8155,8 @@ fn writeCommonJsEntryWrapper(
         "(moduleModule.default ?? moduleModule.Module).runMain();";
     const main_statement = try std.fmt.allocPrint(ctx.allocator,
         \\globalThis.__cottontailLoadDotenv?.();
+        \\await globalThis.__cottontailLoadStandaloneBunfig?.();
+        \\await globalThis.__cottontailLoadStandaloneExecPreloads?.();
         \\{s}
         \\globalThis.__cottontailLoadingTestModules = true;
         \\try {{

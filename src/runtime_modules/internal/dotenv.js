@@ -116,12 +116,14 @@ export function installDotenvLoader(processObject = globalThis.process) {
       if (isTest && env.NODE_ENV === undefined) env.NODE_ENV = "test";
       const original = { ...env };
 
-      try {
-        const bunfig = String(cottontail.readFile("bunfig.toml"));
-        if (/^\s*env\s*=\s*false\s*$/m.test(bunfig)) return;
-        const envSection = bunfig.split(/^\s*\[/m).find(section => section.startsWith("env]"));
-        if (envSection && /^\s*file\s*=\s*false\s*$/m.test(envSection)) return;
-      } catch {}
+      if (globalThis.__cottontailStandaloneFlags?.disableAutoloadBunfig !== true) {
+        try {
+          const bunfig = String(cottontail.readFile("bunfig.toml"));
+          if (/^\s*env\s*=\s*false\s*$/m.test(bunfig)) return;
+          const envSection = bunfig.split(/^\s*\[/m).find(section => section.startsWith("env]"));
+          if (envSection && /^\s*file\s*=\s*false\s*$/m.test(envSection)) return;
+        } catch {}
+      }
 
       const files = [];
       let explicit = false;
@@ -145,6 +147,7 @@ export function installDotenvLoader(processObject = globalThis.process) {
         }
       }
       if (!explicit) {
+        if (globalThis.__cottontailStandaloneFlags?.disableDefaultEnvFiles === true) return;
         const nodeEnv = env.NODE_ENV;
         const suffix = nodeEnv === "production" ? "production" : nodeEnv === "test" ? "test" : "development";
         files.push(".env", `.env.${suffix}`);

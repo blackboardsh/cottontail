@@ -1,6 +1,7 @@
 import { createWritableStdio } from "../node/stdio.js";
 import { remapStackString, sourceContextForLocation } from "../vendor/sourcemap.js";
 import { installDotenvLoader } from "./dotenv.js";
+import { installStandaloneRuntimeLoaders } from "./standalone-runtime.js";
 
 const nodeCompatVersion = "24.11.1";
 const bunCompatVersion = "1.3.10";
@@ -82,7 +83,7 @@ function installProcess() {
     ? [...cottontail.argv]
     : [execPath, ...(cottontail.args ?? [])];
   if (argv.length === 0) argv.push(execPath);
-  if (argv[0] === "cottontail") argv[0] = execPath;
+  if (argv[0] === "cottontail") argv[0] = globalThis.__cottontailStandaloneFlags == null ? execPath : "bun";
 
   const target = globalThis.process ?? {};
   target.argv ??= argv;
@@ -155,6 +156,7 @@ function installProcess() {
 
 const processObject = installProcess();
 installDotenvLoader(processObject);
+installStandaloneRuntimeLoaders(processObject);
 try {
   __ctMetaEnv = processObject.env;
 } catch {}
