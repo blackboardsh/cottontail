@@ -261,7 +261,7 @@
     {
       "pattern": "^test/cli/hot/",
       "status": "expected-failure",
-      "reason": "Requires Bun's hot-reload runtime, which Cottontail does not implement yet."
+      "reason": "Cottontail now reloads tracked dependency graphs, preserves hot VM state, restarts --watch processes, and supports build --watch. The exact hot files remain unpromoted because fixed-deadline reload cycles can time out and the source-map stress loops do not yet complete within Bun's deadlines."
     },
     {
       "pattern": "^test/cli/hot/watch-many-dirs\\.test\\.ts$",
@@ -1571,6 +1571,10 @@
     "test/cli/watch/watch.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
+    },
+    "test/cli/watch/watcher-trace.test.ts": {
+      "status": "enabled",
+      "reason": "Watcher tracing records create, change, empty-path, and append-across-reload behavior (4 bun:test cases, 35 assertions)."
     },
     "test/integration/bun-types/bun-types.test.ts": {
       "status": "enabled",
