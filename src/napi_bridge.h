@@ -30,6 +30,17 @@ JSValueRef ct_napi_load_addon(
     JSValueRef *exception
 );
 
+void *ct_napi_get_addon_symbol(
+    CtNapiEnv *env,
+    JSValueRef addon_exports,
+    const char *symbol
+);
+bool ct_napi_get_external_value(
+    CtNapiEnv *env,
+    JSValueRef value,
+    void **result
+);
+
 bool ct_napi_env_has_pending_work(CtNapiEnv *env);
 void ct_napi_env_drain(CtNapiEnv *env, JSValueRef *exception);
 void ct_napi_env_drain_gc(CtNapiEnv *env, JSValueRef *exception);

@@ -38,7 +38,23 @@ const pluginResult = await Bun.build({
     name: "virtual-module",
     setup(build) {
       build.onStart(() => lifecycle.push("start"));
-      build.onResolve({ filter: /^virtual-entry$/ }, ({ path }) => ({ path, namespace: "virtual" }));
+      build.onResolve({ filter: /^virtual-entry$/ }, () => {
+        lifecycle.push("resolve-first");
+        return null;
+      });
+      build.onResolve({ filter: /^virtual-entry$/ }, ({ path }) => {
+        lifecycle.push("resolve-second");
+        return { path, namespace: "virtual" };
+      });
+      build.onLoad({ filter: /.*/ }, () => {
+        throw new Error("default file namespace must not match a virtual module");
+      });
+      build.onLoad({ filter: /.*/, namespace: "virtual" }, ({ loader, side }) => {
+        assert(loader === "js", "custom-namespace onLoad should receive the JavaScript default loader");
+        assert(side === "server", "target bun onLoad should run on the server side");
+        lifecycle.push("load-first");
+        return null;
+      });
       build.onLoad({ filter: /.*/, namespace: "virtual" }, () => ({
         contents: "const answer: number = 42; console.log(answer);",
         loader: "ts",
@@ -51,7 +67,55 @@ const pluginResult = await Bun.build({
 assert(pluginResult.success, "native Bun.build plugins should succeed");
 assert(pluginResult.outputs[0] instanceof Blob, "plugin builds should return BuildArtifact blobs");
 assert((await pluginResult.outputs[0].text()).includes("var answer = 42"), "onLoad output should be transpiled");
-assert(lifecycle.join(",") === "start,end", "plugin lifecycle hooks should run in order");
+assert(
+  lifecycle.join(",") === "start,resolve-first,resolve-second,load-first,end",
+  "plugin lifecycle hooks should run in registration order and namespace",
+);
+let invalidNativePluginRejected = false;
+try {
+  await Bun.build({
+    entrypoints: ["tests/js/fixtures/bun-build-entry.ts"],
+    plugins: [{
+      name: "invalid-native-plugin",
+      setup(build) {
+        build.onBeforeParse(
+          { filter: /\.ts$/ },
+          { napiModule: {}, symbol: "plugin_impl" } as never,
+        );
+      },
+    }],
+  });
+} catch (error) {
+  invalidNativePluginRejected = String(error).includes("BUN_PLUGIN_NAME");
+}
+assert(invalidNativePluginRejected, "onBeforeParse should reject non-N-API modules during registration");
+
+assert(typeof Bun.plugin.clearAll === "function", "Bun.plugin.clearAll should be exposed");
+Bun.plugin({
+  name: "clear-runtime-plugins",
+  setup(build) {
+    build.module("cottontail-clear-loaded", () => ({ loader: "object", exports: { value: 1 } }));
+    build.module("cottontail-clear-pending", () => ({ loader: "object", exports: { value: 2 } }));
+  },
+});
+const loadedPluginId = "cottontail-clear-loaded";
+const pendingPluginId = "cottontail-clear-pending";
+assert((await import(loadedPluginId)).value === 1, "runtime plugin module should load before clearAll");
+Bun.plugin.clearAll();
+let clearedPluginRejected = false;
+try {
+  await import(loadedPluginId);
+} catch {
+  clearedPluginRejected = true;
+}
+assert(clearedPluginRejected, "clearAll should make loaded virtual plugin modules unresolvable");
+clearedPluginRejected = false;
+try {
+  await import(pendingPluginId);
+} catch {
+  clearedPluginRejected = true;
+}
+assert(clearedPluginRejected, "clearAll should remove pending runtime plugin registrations");
 
 const keepNamesResult = await Bun.build({
   entrypoints: ["virtual-keep-names.js"],

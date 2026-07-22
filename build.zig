@@ -588,6 +588,35 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Build and run cottontail");
     run_step.dependOn(&run_cmd.step);
 
+    const native_plugin_fixture_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .pic = true,
+    });
+    native_plugin_fixture_module.addIncludePath(b.path("src/compiler/src/napi"));
+    native_plugin_fixture_module.addCSourceFile(.{
+        .file = b.path("tests/js/fixtures/native-bundler-plugin.c"),
+        .flags = &.{"-std=c11"},
+    });
+    const native_plugin_fixture = b.addLibrary(.{
+        .name = "native-bundler-plugin",
+        .linkage = .dynamic,
+        .root_module = native_plugin_fixture_module,
+    });
+    native_plugin_fixture.linker_allow_shlib_undefined = true;
+    const install_native_plugin_fixture = b.addInstallFile(
+        native_plugin_fixture.getEmittedBin(),
+        "lib/native-bundler-plugin.node",
+    );
+    const run_native_plugin_test = b.addRunArtifact(exe);
+    run_native_plugin_test.step.dependOn(&install_native_plugin_fixture.step);
+    run_native_plugin_test.addArg("run");
+    run_native_plugin_test.addFileArg(b.path("tests/js/bun-native-plugin.ts"));
+    run_native_plugin_test.addArg(b.getInstallPath(.prefix, "lib/native-bundler-plugin.node"));
+    const native_plugin_test_step = b.step("test-native-plugin", "Run the native Bun plugin integration test");
+    native_plugin_test_step.dependOn(&run_native_plugin_test.step);
+
     // Linking vendored JSC, ICU, SQLite, and libuv into a Debug test
     // executable exceeds the Linux CI runner's memory limit. ReleaseSafe keeps
     // runtime safety checks without the Debug link's memory-heavy metadata.

@@ -387,6 +387,8 @@ struct NapiEnv {
     uint64_t next_cleanup_order { 1 };
     int32_t module_api_version { NAPI_VERSION };
     std::string module_filename;
+    void* addon_handle { nullptr };
+    JSValueRef addon_exports { nullptr };
     std::string wrap_key;
     uint64_t finalizer_key { 1 };
     JSObjectRef wrap_map { nullptr };
@@ -2025,6 +2027,8 @@ static void destroy_single_env(NapiEnv* env)
         JSValueUnprotect(env->context, env->wrap_map);
     if (env->logically_detached_buffers)
         JSValueUnprotect(env->context, env->logically_detached_buffers);
+    if (env->addon_exports)
+        JSValueUnprotect(env->context, env->addon_exports);
     if (env == env->runtime_root) {
         env->event_loop_lifecycle = NapiEventLoopLifecycle::unavailable;
         env->event_loop = nullptr;
@@ -2257,6 +2261,28 @@ static JSValueRef invoke_legacy_module(NapiEnv* env, node::node_module* module, 
     return *exception ? nullptr : result;
 }
 
+static JSValueRef remember_addon_exports(NapiEnv* env, void* handle, JSValueRef exports)
+{
+    env->addon_handle = handle;
+    env->addon_exports = exports;
+    if (exports)
+        JSValueProtect(env->context, exports);
+    return exports;
+}
+
+static void* find_addon_symbol(void* handle, const char* symbol)
+{
+    if (!handle || !symbol)
+        return nullptr;
+    uv_lib_t library {};
+    library.handle = reinterpret_cast<decltype(library.handle)>(handle);
+    void* pointer = nullptr;
+    const int status = uv_dlsym(&library, symbol, &pointer);
+    library.handle = nullptr;
+    uv_dlclose(&library);
+    return status == 0 ? pointer : nullptr;
+}
+
 extern "C" JSValueRef ct_napi_load_addon(
     CtNapiEnv* opaque_env,
     const char* path,
@@ -2383,6 +2409,7 @@ extern "C" JSValueRef ct_napi_load_addon(
             }
             if (*exception)
                 return nullptr;
+            current_exports = remember_addon_exports(module_env, handle, current_exports);
             if (registration_session.allocation_failed) {
                 *exception = make_loader_error(module_env, "failed to record a native addon registration");
                 return nullptr;
@@ -2422,7 +2449,46 @@ extern "C" JSValueRef ct_napi_load_addon(
     JSValueRef result = invoke_napi_module(env, direct_register, exports, exception);
     if (*exception)
         return nullptr;
-    return result ? result : exports;
+    return remember_addon_exports(env, handle, result ? result : exports);
+}
+
+extern "C" void* ct_napi_get_addon_symbol(
+    CtNapiEnv* opaque_env,
+    JSValueRef addon_exports,
+    const char* symbol
+)
+{
+    auto* root = root_env(static_cast<NapiEnv*>(opaque_env));
+    if (!root || !addon_exports || !symbol)
+        return nullptr;
+    for (auto* env : root->addon_envs) {
+        if (!env->addon_handle || !env->addon_exports)
+            continue;
+        if (JSValueIsStrictEqual(root->context, env->addon_exports, addon_exports))
+            return find_addon_symbol(env->addon_handle, symbol);
+    }
+    return nullptr;
+}
+
+extern "C" bool ct_napi_get_external_value(
+    CtNapiEnv* opaque_env,
+    JSValueRef value,
+    void** result
+)
+{
+    auto* root = root_env(static_cast<NapiEnv*>(opaque_env));
+    if (!root || !value || !result)
+        return false;
+    std::call_once(classes_once, initialize_classes);
+    if (!JSValueIsObjectOfClass(root->context, value, external_class))
+        return false;
+    auto* finalizer = static_cast<NapiFinalizerData*>(
+        JSObjectGetPrivate(const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(value))));
+    if (!finalizer || !finalizer->active || !finalizer->external ||
+        !finalizer->env || root_env(finalizer->env) != root)
+        return false;
+    *result = finalizer->data;
+    return true;
 }
 
 extern "C" napi_status napi_get_last_error_info(napi_env opaque_env, const napi_extended_error_info** result)

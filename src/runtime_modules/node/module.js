@@ -254,10 +254,13 @@ hotReloadHooks.add(() => {
 });
 
 function runtimePluginFilterMatches(filter, path) {
+  const lastIndex = filter.lastIndex;
   filter.lastIndex = 0;
-  const matched = filter.test(path);
-  filter.lastIndex = 0;
-  return matched;
+  try {
+    return filter.test(path);
+  } finally {
+    filter.lastIndex = lastIndex;
+  }
 }
 
 function runtimePluginNamespace(value) {
@@ -276,7 +279,7 @@ function runtimePluginRegistration(kind, constraints, callback) {
     throw new Error(`${kind}() expects second argument to be a function`);
   }
   return {
-    filter: constraints.filter,
+    filter: new RegExp(constraints.filter.source, constraints.filter.flags),
     namespace: runtimePluginNamespace(constraints.namespace),
     callback,
   };
@@ -643,6 +646,15 @@ export function _registerBunPlugin(pluginOptions) {
     },
   };
   return pluginOptions.setup(builder);
+}
+
+export function _clearBunPlugins(_unused) {
+  void _unused;
+  runtimePluginOnResolve.length = 0;
+  runtimePluginOnLoad.length = 0;
+  runtimePluginVirtualModules.clear();
+  runtimePluginResolvedModules.clear();
+  runtimePluginPendingLoads.clear();
 }
 
 globalThis.__cottontailImportPluginModule = (specifier, referrer, options, resolvedPath) => {

@@ -6661,7 +6661,7 @@ static int ct_get_bytes(JSContextRef ctx, JSValueRef value, uint8_t **out_data, 
     if (type == kJSTypedArrayTypeArrayBuffer) {
         *out_data = (uint8_t *)JSObjectGetArrayBufferBytesPtr(ctx, object, &exception);
         *out_len = JSObjectGetArrayBufferByteLength(ctx, object, &exception);
-        return exception == NULL && *out_data != NULL ? 0 : -1;
+        return exception == NULL && (*out_data != NULL || *out_len == 0) ? 0 : -1;
     }
 
     if (type != kJSTypedArrayTypeNone) {
@@ -6670,8 +6670,8 @@ static int ct_get_bytes(JSContextRef ctx, JSValueRef value, uint8_t **out_data, 
         JSObjectRef buffer = JSObjectGetTypedArrayBuffer(ctx, object, &exception);
         if (exception != NULL || buffer == NULL) return -1;
         uint8_t *base = (uint8_t *)JSObjectGetArrayBufferBytesPtr(ctx, buffer, &exception);
-        if (exception != NULL || base == NULL) return -1;
-        *out_data = base + byte_offset;
+        if (exception != NULL || (base == NULL && byte_len > 0)) return -1;
+        *out_data = base != NULL ? base + byte_offset : NULL;
         *out_len = byte_len;
         return 0;
     }
@@ -18547,6 +18547,410 @@ static JSValueRef ct_native_symbol(JSContextRef ctx, JSObjectRef function, JSObj
     return JSValueMakeNumber(ctx, (double)(uintptr_t)symbol);
 }
 
+typedef struct CtNativePluginArguments CtNativePluginArguments;
+typedef struct CtNativePluginResult CtNativePluginResult;
+typedef struct CtNativePluginLogOptions CtNativePluginLogOptions;
+
+typedef int (*CtNativePluginFetchSource)(const CtNativePluginArguments *, CtNativePluginResult *);
+typedef void (*CtNativePluginFreeContext)(void *);
+typedef void (*CtNativePluginLog)(const CtNativePluginArguments *, const CtNativePluginLogOptions *);
+typedef void (*CtNativePluginCallback)(const CtNativePluginArguments *, CtNativePluginResult *);
+
+struct CtNativePluginArguments {
+    size_t struct_size;
+    void *bun;
+    const uint8_t *path_ptr;
+    size_t path_len;
+    const uint8_t *namespace_ptr;
+    size_t namespace_len;
+    uint8_t default_loader;
+    void *external;
+};
+
+struct CtNativePluginResult {
+    size_t struct_size;
+    uint8_t *source_ptr;
+    size_t source_len;
+    uint8_t loader;
+    CtNativePluginFetchSource fetch_source_code;
+    void *plugin_source_code_context;
+    CtNativePluginFreeContext free_plugin_source_code_context;
+    CtNativePluginLog log;
+};
+
+struct CtNativePluginLogOptions {
+    size_t struct_size;
+    const uint8_t *message_ptr;
+    size_t message_len;
+    const uint8_t *path_ptr;
+    size_t path_len;
+    const uint8_t *source_line_text_ptr;
+    size_t source_line_text_len;
+    int8_t level;
+    int32_t line;
+    int32_t column;
+    int32_t line_end;
+    int32_t column_end;
+};
+
+typedef struct CtNativePluginLogRecord {
+    char *message;
+    char *path;
+    char *source_line_text;
+    int8_t level;
+    int32_t line;
+    int32_t column;
+    int32_t line_end;
+    int32_t column_end;
+} CtNativePluginLogRecord;
+
+typedef struct CtNativePluginInvocation {
+    uint8_t *source;
+    size_t source_len;
+    CtNativePluginLogRecord *logs;
+    size_t log_count;
+    bool source_fetched;
+    bool has_errors;
+    bool out_of_memory;
+} CtNativePluginInvocation;
+
+static char *ct_native_plugin_copy_bytes(const uint8_t *bytes, size_t len) {
+    if (bytes == NULL) len = 0;
+    if (len == SIZE_MAX) return NULL;
+    char *copy = (char *)malloc(len + 1);
+    if (copy == NULL) return NULL;
+    if (len > 0 && bytes != NULL) memcpy(copy, bytes, len);
+    copy[len] = 0;
+    return copy;
+}
+
+static int ct_native_plugin_fetch_source(
+    const CtNativePluginArguments *arguments,
+    CtNativePluginResult *result
+) {
+    CtNativePluginInvocation *invocation = arguments != NULL
+        ? (CtNativePluginInvocation *)arguments->bun
+        : NULL;
+    if (invocation == NULL || result == NULL || invocation->has_errors || invocation->out_of_memory) return 1;
+    invocation->source_fetched = true;
+    if (result->source_ptr != NULL) return 0;
+    result->source_ptr = invocation->source;
+    result->source_len = invocation->source_len;
+    result->plugin_source_code_context = NULL;
+    result->free_plugin_source_code_context = NULL;
+    return 0;
+}
+
+static void ct_native_plugin_log(
+    const CtNativePluginArguments *arguments,
+    const CtNativePluginLogOptions *options
+) {
+    CtNativePluginInvocation *invocation = arguments != NULL
+        ? (CtNativePluginInvocation *)arguments->bun
+        : NULL;
+    if (invocation == NULL || options == NULL || invocation->out_of_memory) return;
+    if (invocation->log_count == SIZE_MAX / sizeof(CtNativePluginLogRecord)) {
+        invocation->out_of_memory = true;
+        return;
+    }
+    size_t next_count = invocation->log_count + 1;
+    CtNativePluginLogRecord *next = (CtNativePluginLogRecord *)realloc(
+        invocation->logs,
+        next_count * sizeof(CtNativePluginLogRecord));
+    if (next == NULL) {
+        invocation->out_of_memory = true;
+        return;
+    }
+    invocation->logs = next;
+    CtNativePluginLogRecord *record = &next[invocation->log_count];
+    memset(record, 0, sizeof(*record));
+    record->message = ct_native_plugin_copy_bytes(options->message_ptr, options->message_len);
+    record->path = ct_native_plugin_copy_bytes(options->path_ptr, options->path_len);
+    record->source_line_text = ct_native_plugin_copy_bytes(
+        options->source_line_text_ptr,
+        options->source_line_text_len);
+    if (record->message == NULL || record->path == NULL || record->source_line_text == NULL) {
+        free(record->message);
+        free(record->path);
+        free(record->source_line_text);
+        memset(record, 0, sizeof(*record));
+        invocation->out_of_memory = true;
+        return;
+    }
+    record->level = options->level;
+    record->line = options->line;
+    record->column = options->column;
+    record->line_end = options->line_end;
+    record->column_end = options->column_end;
+    if (options->level == 4) invocation->has_errors = true;
+    invocation->log_count = next_count;
+}
+
+static void ct_native_plugin_free_logs(CtNativePluginInvocation *invocation) {
+    for (size_t index = 0; index < invocation->log_count; index += 1) {
+        free(invocation->logs[index].message);
+        free(invocation->logs[index].path);
+        free(invocation->logs[index].source_line_text);
+    }
+    free(invocation->logs);
+    invocation->logs = NULL;
+    invocation->log_count = 0;
+}
+
+static JSObjectRef ct_native_plugin_logs_to_js(
+    JSContextRef ctx,
+    const CtNativePluginInvocation *invocation,
+    JSValueRef *exception
+) {
+    JSValueRef *values = invocation->log_count > 0
+        ? (JSValueRef *)calloc(invocation->log_count, sizeof(JSValueRef))
+        : NULL;
+    if (invocation->log_count > 0 && values == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return NULL;
+    }
+    for (size_t index = 0; index < invocation->log_count; index += 1) {
+        const CtNativePluginLogRecord *record = &invocation->logs[index];
+        JSObjectRef item = ct_make_object(ctx);
+        ct_set_property(ctx, item, "message", ct_make_string(ctx, record->message), exception);
+        ct_set_property(ctx, item, "path", ct_make_string(ctx, record->path), exception);
+        ct_set_property(ctx, item, "sourceLineText", ct_make_string(ctx, record->source_line_text), exception);
+        ct_set_property(ctx, item, "level", JSValueMakeNumber(ctx, record->level), exception);
+        ct_set_property(ctx, item, "line", JSValueMakeNumber(ctx, record->line), exception);
+        ct_set_property(ctx, item, "column", JSValueMakeNumber(ctx, record->column), exception);
+        ct_set_property(ctx, item, "lineEnd", JSValueMakeNumber(ctx, record->line_end), exception);
+        ct_set_property(ctx, item, "columnEnd", JSValueMakeNumber(ctx, record->column_end), exception);
+        values[index] = item;
+        if (exception != NULL && *exception != NULL) break;
+    }
+    JSObjectRef result = exception == NULL || *exception == NULL
+        ? ct_make_array(ctx, invocation->log_count, values, exception)
+        : NULL;
+    free(values);
+    return result;
+}
+
+static JSValueRef ct_native_plugin_validation_result(
+    JSContextRef ctx,
+    const char *status,
+    const char *plugin_name,
+    JSValueRef *exception
+) {
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "status", ct_make_string(ctx, status), exception);
+    if (plugin_name != NULL) {
+        ct_set_property(ctx, result, "name", ct_make_string(ctx, plugin_name), exception);
+    }
+    return result;
+}
+
+static JSValueRef ct_native_bundler_plugin_validate(
+    JSContextRef ctx,
+    JSObjectRef function,
+    JSObjectRef thisObject,
+    size_t argc,
+    const JSValueRef argv[],
+    JSValueRef *exception
+) {
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    (void)thisObject;
+    if (runtime == NULL || runtime->napi_env == NULL || argc < 2) {
+        return ct_native_plugin_validation_result(ctx, "invalid-module", NULL, exception);
+    }
+    const char **plugin_name = (const char **)ct_napi_get_addon_symbol(
+        runtime->napi_env,
+        argv[0],
+        "BUN_PLUGIN_NAME");
+    if (plugin_name == NULL) {
+        return ct_native_plugin_validation_result(ctx, "invalid-module", NULL, exception);
+    }
+    char *symbol = ct_value_to_string_copy(ctx, argv[1]);
+    if (symbol == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    void *callback = ct_napi_get_addon_symbol(runtime->napi_env, argv[0], symbol);
+    free(symbol);
+    if (callback == NULL) {
+        return ct_native_plugin_validation_result(
+            ctx,
+            "missing-symbol",
+            plugin_name != NULL ? *plugin_name : NULL,
+            exception);
+    }
+    if (argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2])) {
+        void *external = NULL;
+        if (!ct_napi_get_external_value(runtime->napi_env, argv[2], &external)) {
+            return ct_native_plugin_validation_result(
+                ctx,
+                "invalid-external",
+                plugin_name != NULL ? *plugin_name : NULL,
+                exception);
+        }
+    }
+    return ct_native_plugin_validation_result(
+        ctx,
+        "ok",
+        plugin_name != NULL ? *plugin_name : NULL,
+        exception);
+}
+
+static JSValueRef ct_native_bundler_plugin_run(
+    JSContextRef ctx,
+    JSObjectRef function,
+    JSObjectRef thisObject,
+    size_t argc,
+    const JSValueRef argv[],
+    JSValueRef *exception
+) {
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    (void)thisObject;
+    if (runtime == NULL || runtime->napi_env == NULL || argc < 7) {
+        return ct_native_plugin_validation_result(ctx, "invalid-module", NULL, exception);
+    }
+
+    char *symbol = ct_value_to_string_copy(ctx, argv[1]);
+    char *path = NULL;
+    char *namespace_name = NULL;
+    uint8_t *source = NULL;
+    size_t path_len = 0;
+    size_t namespace_len = 0;
+    size_t source_len = 0;
+    if (symbol == NULL) goto out_of_memory;
+    CtNativePluginCallback callback = (CtNativePluginCallback)ct_napi_get_addon_symbol(
+        runtime->napi_env,
+        argv[0],
+        symbol);
+    if (callback == NULL) {
+        free(symbol);
+        return ct_native_plugin_validation_result(ctx, "missing-symbol", NULL, exception);
+    }
+
+    void *external = NULL;
+    if (!JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2]) &&
+        !ct_napi_get_external_value(runtime->napi_env, argv[2], &external)) {
+        free(symbol);
+        return ct_native_plugin_validation_result(ctx, "invalid-external", NULL, exception);
+    }
+    path = ct_value_to_utf8_copy_checked(ctx, argv[3], &path_len, exception);
+    if (path == NULL) goto cleanup;
+    namespace_name = ct_value_to_utf8_copy_checked(ctx, argv[4], &namespace_len, exception);
+    if (namespace_name == NULL) goto cleanup;
+    uint8_t *source_view = NULL;
+    if (ct_get_bytes(ctx, argv[5], &source_view, &source_len) == 0) {
+        if (source_len == SIZE_MAX) goto out_of_memory;
+        source = (uint8_t *)malloc(source_len + 1);
+        if (source == NULL) goto out_of_memory;
+        if (source_len > 0) memcpy(source, source_view, source_len);
+        source[source_len] = 0;
+    } else {
+        source = (uint8_t *)ct_value_to_utf8_copy_checked(ctx, argv[5], &source_len, exception);
+        if (source == NULL) goto cleanup;
+    }
+
+    int loader = 0;
+    if (!ct_value_to_int_checked(
+            ctx,
+            argv[6],
+            0,
+            UINT8_MAX,
+            &loader,
+            exception,
+            "Native plugin loader is out of range")) {
+        goto cleanup;
+    }
+
+    bool source_available = argc >= 8 && JSValueToBoolean(ctx, argv[7]);
+    CtNativePluginInvocation invocation = {
+        .source = source,
+        .source_len = source_len,
+    };
+    CtNativePluginArguments arguments = {
+        .struct_size = sizeof(CtNativePluginArguments),
+        .bun = &invocation,
+        .path_ptr = (const uint8_t *)path,
+        .path_len = path_len,
+        .namespace_ptr = (const uint8_t *)namespace_name,
+        .namespace_len = namespace_len,
+        .default_loader = (uint8_t)loader,
+        .external = external,
+    };
+    CtNativePluginResult native_result = {
+        .struct_size = sizeof(CtNativePluginResult),
+        .source_ptr = source_available ? source : NULL,
+        .source_len = source_available ? source_len : 0,
+        .loader = (uint8_t)loader,
+        .fetch_source_code = ct_native_plugin_fetch_source,
+        .plugin_source_code_context = NULL,
+        .free_plugin_source_code_context = NULL,
+        .log = ct_native_plugin_log,
+    };
+
+    callback(&arguments, &native_result);
+
+    JSObjectRef result = ct_make_object(ctx);
+    const char *status = invocation.out_of_memory ? "out-of-memory" : "ok";
+    if (native_result.plugin_source_code_context == NULL &&
+        native_result.free_plugin_source_code_context != NULL) {
+        status = "invalid-context";
+    }
+    bool has_source = native_result.source_ptr != NULL;
+    bool stops_chain = has_source && native_result.source_ptr != source;
+    JSValueRef input_contents = ct_array_buffer_from_copy(
+        ctx,
+        (const char *)source,
+        source_len,
+        exception);
+    JSValueRef contents = JSValueMakeUndefined(ctx);
+    if (has_source) {
+        contents = native_result.source_ptr == source
+            ? input_contents
+            : ct_array_buffer_from_copy(
+                ctx,
+                (const char *)native_result.source_ptr,
+                native_result.source_len,
+                exception);
+    }
+    JSObjectRef logs = exception == NULL || *exception == NULL
+        ? ct_native_plugin_logs_to_js(ctx, &invocation, exception)
+        : NULL;
+    if (exception == NULL || *exception == NULL) {
+        ct_set_property(ctx, result, "status", ct_make_string(ctx, status), exception);
+        ct_set_property(ctx, result, "hasSource", JSValueMakeBoolean(ctx, has_source), exception);
+        ct_set_property(
+            ctx,
+            result,
+            "fetchedSource",
+            JSValueMakeBoolean(ctx, source_available || invocation.source_fetched),
+            exception);
+        ct_set_property(ctx, result, "stopsChain", JSValueMakeBoolean(ctx, stops_chain), exception);
+        ct_set_property(ctx, result, "contents", contents, exception);
+        ct_set_property(ctx, result, "inputContents", input_contents, exception);
+        ct_set_property(ctx, result, "loader", JSValueMakeNumber(ctx, native_result.loader), exception);
+        ct_set_property(ctx, result, "logs", logs, exception);
+    }
+
+    if (native_result.plugin_source_code_context != NULL &&
+        native_result.free_plugin_source_code_context != NULL) {
+        native_result.free_plugin_source_code_context(native_result.plugin_source_code_context);
+    }
+    ct_native_plugin_free_logs(&invocation);
+    free(source);
+    free(namespace_name);
+    free(path);
+    free(symbol);
+    return exception != NULL && *exception != NULL ? JSValueMakeUndefined(ctx) : result;
+
+out_of_memory:
+    ct_throw_message(ctx, exception, "Out of memory");
+cleanup:
+    free(source);
+    free(namespace_name);
+    free(path);
+    free(symbol);
+    return JSValueMakeUndefined(ctx);
+}
+
 static JSValueRef ct_native_addon_load(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     CtJscRuntime *runtime = ct_callback_runtime(function);
     (void)thisObject;
@@ -27710,6 +28114,8 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     JSValueProtect(ctx, host);
 
     ct_register_host_native_bindings(ctx, host, runtime);
+    ct_install_function(ctx, host, "nativeBundlerPluginValidate", ct_native_bundler_plugin_validate, runtime);
+    ct_install_function(ctx, host, "nativeBundlerPluginRun", ct_native_bundler_plugin_run, runtime);
     JSObjectRef args = ct_make_array(ctx, 0, NULL, &exception);
     ct_set_property(ctx, host, "args", args, &exception);
 #if defined(COTTONTAIL_VENDORED_JSC)

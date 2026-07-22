@@ -16,6 +16,7 @@ import * as zlib from "../node/zlib.js";
 import { createUndiciModule } from "../node/undici.js";
 import { CryptoKey, SubtleCrypto as NodeSubtleCrypto, createHash, createHmac, randomBytes, randomUUID, webcrypto as nodeWebcrypto } from "../node/crypto.js";
 import {
+  _clearBunPlugins as nodeClearBunPlugins,
   _registerBunPlugin as nodeRegisterBunPlugin,
   _resolveForImport as nodeResolveForImport,
   __setBuiltinModules as nodeSetBuiltinModules,
@@ -25,6 +26,7 @@ import {
 import { cpSync as nodeCpSync } from "../node/fs.js";
 import {
   basename as nodePathBasename,
+  isAbsolute as nodePathIsAbsolute,
   join as nodePathJoin,
   relative as nodePathRelative,
   resolve as nodePathResolve,
@@ -2626,12 +2628,73 @@ const bundleLoaderExtensions = {
   css: ".css",
   html: ".html",
   json: ".json",
+  jsonc: ".jsonc",
+  json5: ".json5",
+  yaml: ".yaml",
   toml: ".toml",
   text: ".txt",
   wasm: ".wasm",
+  napi: ".node",
+  base64: ".base64",
+  dataurl: ".dataurl",
+  bunsh: ".bun.sh",
+  sqlite: ".sqlite",
+  sqlite_embedded: ".sqlite-embedded",
+  md: ".md",
 };
 
-async function ctNormalizeBuildFiles(options) {
+// Keep this table in lockstep with Bun's public native bundler plugin ABI.
+const nativePluginLoaderNames = [
+  "jsx", "js", "ts", "tsx", "css", "file", "json", "jsonc", "toml", "wasm",
+  "napi", "base64", "dataurl", "text", "bunsh", "sqlite", "sqlite_embedded",
+  "html", "yaml", "json5", "md",
+];
+const nativePluginLoaderIds = Object.fromEntries(
+  nativePluginLoaderNames.map((loader, id) => [loader, id]),
+);
+const nativePluginLogLevels = ["verbose", "debug", "info", "warning", "error"];
+
+function ctBuildContentsText(contents) {
+  if (typeof contents === "string") return contents;
+  if (contents instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(contents));
+  if (ArrayBuffer.isView(contents)) {
+    return new TextDecoder().decode(new Uint8Array(contents.buffer, contents.byteOffset, contents.byteLength));
+  }
+  return String(contents);
+}
+
+function ctNativePluginFilterMatches(filter, value) {
+  const lastIndex = filter.lastIndex;
+  filter.lastIndex = 0;
+  try {
+    return filter.test(value);
+  } finally {
+    filter.lastIndex = lastIndex;
+  }
+}
+
+function ctValidatePluginConstraints(constraints) {
+  if (!constraints || typeof constraints !== "object") {
+    throw new TypeError('Expected an object with "filter" RegExp');
+  }
+  let { filter, namespace = "file" } = constraints;
+  if (!filter) throw new TypeError('Expected an object with "filter" RegExp');
+  if (!(filter instanceof RegExp)) throw new TypeError("filter must be a RegExp");
+  if (namespace && typeof namespace !== "string") throw new TypeError("namespace must be a string");
+  if ((namespace?.length ?? 0) === 0) namespace = "file";
+  if (!/^([/$a-zA-Z0-9_-]+)$/.test(namespace)) {
+    throw new TypeError("namespace can only contain $a-zA-Z0-9_\\-");
+  }
+  return { filter, namespace };
+}
+
+function ctPluginInvalidArgument(message) {
+  const error = new TypeError(message);
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
+}
+
+async function ctNormalizeBuildFiles(options, preserveBinary = false) {
   if (options?.files == null || typeof options.files !== "object") return options;
   const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
   const files = {};
@@ -2642,11 +2705,17 @@ async function ctNormalizeBuildFiles(options) {
     if (typeof value === "string") {
       files[absolute] = value;
     } else if (value instanceof ArrayBuffer) {
-      files[absolute] = new TextDecoder().decode(new Uint8Array(value));
+      files[absolute] = preserveBinary ? value : ctBuildContentsText(value);
     } else if (ArrayBuffer.isView(value)) {
-      files[absolute] = new TextDecoder().decode(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+      const view = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+      files[absolute] = preserveBinary ? view : ctBuildContentsText(view);
+    } else if (preserveBinary && typeof value?.arrayBuffer === "function") {
+      const buffer = await value.arrayBuffer();
+      files[absolute] = buffer;
     } else if (typeof value?.text === "function") {
       files[absolute] = String(await value.text());
+    } else if (typeof value?.arrayBuffer === "function") {
+      files[absolute] = ctBuildContentsText(await value.arrayBuffer());
     } else {
       throw new TypeError(`Bun.build files[${JSON.stringify(path)}] must be a string, Blob, ArrayBuffer, or typed array`);
     }
@@ -2751,30 +2820,34 @@ function ctBuildSourceExtension(path) {
   return dot > 0 ? base.slice(dot) : "";
 }
 
-// Runs Bun.build plugins (onResolve/onLoad) in-process, materializes the
+// Runs Bun.build plugins in-process, materializes the
 // resolved module graph into a shadow directory, and delegates the actual
 // bundling of the materialized files to the plugin-free build pipeline.
 async function buildWithPlugins(options, plugins) {
-  options = await ctNormalizeBuildFiles(options);
+  options = await ctNormalizeBuildFiles(options, true);
   const onResolveRules = [];
   const onLoadRules = [];
-  const onStartCallbacks = [];
+  const onBeforeParseRules = [];
+  const onStartPromises = [];
   const onEndCallbacks = [];
-  const toFilter = (value) => (value instanceof RegExp ? value : new RegExp(String(value ?? ".*")));
   const builder = {
     config: options,
     initialOptions: ctBuildPluginInitialOptions(options),
     target: options?.target ?? "browser",
     onResolve(constraints, callback) {
-      onResolveRules.push({ filter: toFilter(constraints?.filter), namespace: constraints?.namespace, callback });
+      if (!callback || typeof callback !== "function") throw new TypeError("lmao callback must be a function");
+      onResolveRules.push({ ...ctValidatePluginConstraints(constraints), callback });
       return builder;
     },
     onLoad(constraints, callback) {
-      onLoadRules.push({ filter: toFilter(constraints?.filter), namespace: constraints?.namespace, callback });
+      if (!callback || typeof callback !== "function") throw new TypeError("lmao callback must be a function");
+      onLoadRules.push({ ...ctValidatePluginConstraints(constraints), callback });
       return builder;
     },
     onStart(callback) {
-      onStartCallbacks.push(callback);
+      if (typeof callback !== "function") throw new TypeError("callback must be a function");
+      const result = callback();
+      if (result && typeof result.then === "function") onStartPromises.push(result);
       return builder;
     },
     onEnd(callback) {
@@ -2782,7 +2855,39 @@ async function buildWithPlugins(options, plugins) {
       onEndCallbacks.push(callback);
       return builder;
     },
-    onBeforeParse() { return builder; },
+    onBeforeParse(constraints, { napiModule, external, symbol }) {
+      if (!constraints || typeof constraints !== "object") {
+        throw new TypeError('Expected an object with "filter" RegExp');
+      }
+      if (!napiModule || (typeof napiModule !== "object" && typeof napiModule !== "function")) {
+        throw new TypeError(
+          "onBeforeParse `napiModule` must be a Napi module which exports the `BUN_PLUGIN_NAME` symbol.",
+        );
+      }
+      if (typeof symbol !== "string") throw new TypeError("onBeforeParse `symbol` must be a string");
+      const rule = ctValidatePluginConstraints(constraints);
+      const validation = cottontail.nativeBundlerPluginValidate(napiModule, symbol, external);
+      if (validation?.status === "invalid-module") {
+        throw new TypeError(
+          "onBeforeParse `napiModule` must be a Napi module which exports the `BUN_PLUGIN_NAME` symbol.",
+        );
+      }
+      if (validation?.status === "missing-symbol") {
+        throw ctPluginInvalidArgument(`Could not find the symbol "${symbol}" in the given napi module.`);
+      }
+      if (validation?.status === "invalid-external") {
+        throw ctPluginInvalidArgument("Expected external (3rd argument) to be a NAPI external");
+      }
+      onBeforeParseRules.push({
+        ...rule,
+        filter: new RegExp(rule.filter.source, rule.filter.flags),
+        napiModule,
+        external,
+        symbol,
+        name: validation?.name ?? "<unknown>",
+      });
+      return builder;
+    },
   };
   for (const plugin of plugins) {
     if (typeof plugin?.setup !== "function") {
@@ -2792,9 +2897,10 @@ async function buildWithPlugins(options, plugins) {
     }
   }
   for (const plugin of plugins) await plugin.setup(builder);
-  await Promise.all(onStartCallbacks.map((callback) => callback()));
+  if (onStartPromises.length > 0) await Promise.all(onStartPromises);
 
-  if (onResolveRules.length === 0 && onLoadRules.length === 0) {
+  if (onResolveRules.length === 0 && onLoadRules.length === 0 && onBeforeParseRules.length === 0) {
+    options = await ctNormalizeBuildFiles(options);
     const compile = ctNormalizeCompileOptions(options);
     if (compile) {
       return ctRunCompiledBuild(options, compile, {
@@ -2811,6 +2917,7 @@ async function buildWithPlugins(options, plugins) {
   }
 
   const errors = [];
+  const pluginWarnings = [];
   const pluginResolveFailures = [];
   const moduleRecords = new Map();
   const packageMetadata = new Map();
@@ -2873,20 +2980,41 @@ async function buildWithPlugins(options, plugins) {
 
   const resolveWithPlugins = async (specifier, importer, importerNamespace, resolveDir, kind) => {
     for (const rule of onResolveRules) {
-      if (rule.namespace && rule.namespace !== importerNamespace) continue;
+      if (rule.namespace !== importerNamespace) continue;
       if (!rule.filter.test(specifier)) continue;
       const result = await rule.callback({
         path: specifier,
         importer,
         namespace: importerNamespace,
-        resolveDir,
+        resolveDir: importerNamespace === "file" ? resolveDir : undefined,
         kind,
         pluginData: undefined,
       });
       if (result == null || typeof result !== "object") continue;
-      if (result.external) return { external: true };
-      if (result.path == null) continue;
-      return { path: String(result.path), namespace: result.namespace ? String(result.namespace) : "file" };
+      let { path, namespace: userNamespace = importerNamespace, external } = result;
+      if (path !== undefined && typeof path !== "string") {
+        throw new TypeError("onResolve plugins 'path' field must be a string if provided");
+      }
+      if (result.namespace !== undefined && typeof result.namespace !== "string") {
+        throw new TypeError("onResolve plugins 'namespace' field must be a string if provided");
+      }
+      if (!path) continue;
+      if (!userNamespace) userNamespace = importerNamespace;
+      if (typeof external !== "boolean" && external != null) {
+        throw new TypeError('onResolve plugins "external" field must be boolean or unspecified');
+      }
+      if (!external) {
+        if (userNamespace === "file" && (!nodePathIsAbsolute(path) || path.includes(".."))) {
+          throw new TypeError('onResolve plugin "path" must be absolute when the namespace is "file"');
+        }
+        if (userNamespace === "dataurl" && !path.startsWith("data:")) {
+          throw new TypeError('onResolve plugin "path" must start with "data:" when the namespace is "dataurl"');
+        }
+        if (userNamespace !== "file" && !onLoadRules.some(rule => rule.namespace === userNamespace)) {
+          throw new TypeError(`Expected onLoad plugin for namespace ${userNamespace} to exist`);
+        }
+      }
+      return external ? { external: true } : { path, namespace: userNamespace };
     }
     return null;
   };
@@ -2920,30 +3048,152 @@ async function buildWithPlugins(options, plugins) {
   };
 
   const loadWithPlugins = async (record) => {
+    const defaultLoader = record.namespace === "file" ? bundleLoaderForPath(record.path) : "js";
     for (const rule of onLoadRules) {
-      if ((rule.namespace ?? "file") !== record.namespace) continue;
+      if (rule.namespace !== record.namespace) continue;
       if (!rule.filter.test(record.path)) continue;
       const result = await invokeOnLoadCallback(rule.callback, {
         path: record.path,
         namespace: record.namespace,
-        loader: undefined,
+        loader: defaultLoader,
         pluginData: undefined,
+        side: options?.target === "browser" ? "client" : "server",
       });
-      if (result == null || typeof result !== "object" || result.contents == null) continue;
-      const contents = typeof result.contents === "string"
-        ? result.contents
-        : new TextDecoder().decode(result.contents);
-      // Bun treats an onLoad result without an explicit loader as JavaScript,
-      // independently of the source path's extension.
-      return { contents, loader: result.loader ? String(result.loader) : "js" };
+      if (result == null || typeof result !== "object") continue;
+      let { contents, loader = defaultLoader } = result;
+      if (loader === "object") {
+        if (!("exports" in result)) {
+          throw new TypeError('onLoad plugin returning loader: "object" must have "exports" property');
+        }
+        try {
+          contents = JSON.stringify(result.exports);
+          loader = "json";
+        } catch (error) {
+          throw new TypeError(`When using Bun.build, onLoad plugin must return a JSON-serializable object: ${error}`);
+        }
+      }
+      if (typeof contents !== "string" && !ArrayBuffer.isView(contents)) {
+        throw new TypeError('onLoad plugins must return an object with "contents" as a string or Uint8Array');
+      }
+      if (typeof loader !== "string") {
+        throw new TypeError('onLoad plugins must return an object with "loader" as a string');
+      }
+      if (nativePluginLoaderIds[loader] === undefined) throw new TypeError(`Loader ${loader} is not supported.`);
+      const normalizedContents = typeof contents === "string"
+        ? contents
+        : new Uint8Array(contents.buffer, contents.byteOffset, contents.byteLength);
+      return { contents: normalizedContents, loader, fromOnLoad: true };
     }
     if (record.namespace === "file") {
       const virtual = ctBuildVirtualFile(options, record.path);
       const loader = bundleLoaderForPath(record.path);
       if (virtual !== undefined) return { contents: virtual, loader };
-      return { contents: cottontail.readFile(record.path), loader };
+      return { contents: cottontail.readFileBuffer(record.path), loader };
     }
     throw new Error(`Could not load: "${record.namespace}:${record.path}" (no onLoad plugin returned contents)`);
+  };
+
+  const runNativeBeforeParse = (record, loaded) => {
+    if (loaded.fromOnLoad) return { loaded, failed: false };
+    const rules = onBeforeParseRules.filter(rule => rule.namespace === record.namespace);
+    if (rules.length === 0) return { loaded, failed: false };
+
+    const initialContents = loaded.contents;
+    const initialLoader = loaded.loader ?? bundleLoaderForPath(record.path);
+    const loaderId = nativePluginLoaderIds[initialLoader];
+    if (loaderId === undefined) {
+      errors.push(new BuildMessage({
+        message: `Native plugin received an invalid loader: ${String(initialLoader)}`,
+        position: { file: record.path, namespace: record.namespace },
+      }));
+      return { loaded, failed: true };
+    }
+
+    let sourceContents = initialContents;
+    let sourceFetched = false;
+    let finalHasSource = false;
+    let finalContents;
+    let finalLoader = initialLoader;
+    let matched = false;
+    let failed = false;
+
+    for (let index = 0; index < rules.length; index++) {
+      const rule = rules[index];
+      finalHasSource = sourceFetched;
+      finalContents = sourceFetched ? sourceContents : undefined;
+      finalLoader = initialLoader;
+      if (!ctNativePluginFilterMatches(rule.filter, record.path)) continue;
+      matched = true;
+
+      const result = cottontail.nativeBundlerPluginRun(
+        rule.napiModule,
+        rule.symbol,
+        rule.external,
+        record.path,
+        record.namespace,
+        sourceContents,
+        loaderId,
+        sourceFetched,
+      );
+
+      for (const log of result?.logs ?? []) {
+        const level = nativePluginLogLevels[log.level] ?? "info";
+        const line = Number.isFinite(Number(log.line)) ? Math.max(Number(log.line), -1) : -1;
+        const column = Number.isFinite(Number(log.column)) ? Math.max(Number(log.column), -1) : -1;
+        const columnEnd = Number.isFinite(Number(log.columnEnd))
+          ? Math.max(Number(log.columnEnd), column)
+          : column;
+        const message = new BuildMessage({
+          message: log.message ?? "",
+          level,
+          position: {
+            file: log.path || record.path,
+            namespace: record.namespace,
+            line,
+            column,
+            length: columnEnd - column,
+            lineText: log.sourceLineText || "",
+          },
+        });
+        if (level === "error") {
+          errors.push(message);
+          failed = true;
+        } else {
+          pluginWarnings.push(message);
+        }
+      }
+
+      if (result?.status === "invalid-context") {
+        errors.push(new BuildMessage({
+          message: "Native plugin set the `free_plugin_source_code_context` field without setting the `plugin_source_code_context` field.",
+        }));
+        failed = true;
+      } else if (result?.status === "out-of-memory") {
+        errors.push(new BuildMessage({ message: "Native plugin callback ran out of memory." }));
+        failed = true;
+      } else if (result?.status !== "ok") {
+        errors.push(new BuildMessage({ message: `Native plugin callback failed: ${result?.status ?? "unknown error"}` }));
+        failed = true;
+      }
+
+      if (result?.inputContents instanceof ArrayBuffer) sourceContents = result.inputContents;
+      sourceFetched ||= result?.fetchedSource === true;
+      finalHasSource = result?.hasSource === true;
+      finalContents = finalHasSource ? result.contents : undefined;
+      finalLoader = finalHasSource ? nativePluginLoaderNames[result.loader] : initialLoader;
+      if (finalHasSource && finalLoader === undefined) {
+        errors.push(new BuildMessage({
+          message: `Native plugin returned an invalid loader: ${String(result.loader)}`,
+          position: { file: record.path, namespace: record.namespace },
+        }));
+        failed = true;
+        finalLoader = initialLoader;
+      }
+      if (result?.stopsChain) break;
+    }
+
+    if (!matched || !finalHasSource) return { loaded: { contents: initialContents, loader: initialLoader }, failed };
+    return { loaded: { contents: finalContents, loader: finalLoader }, failed };
   };
 
   const packageLocation = sourcePath => {
@@ -2978,7 +3228,7 @@ async function buildWithPlugins(options, plugins) {
     if (contents === undefined) {
       try { contents = cottontail.readFile(sourcePackageJson); } catch {}
     }
-    if (contents !== undefined) packageMetadata.set(shadowPackageJson, String(contents));
+    if (contents !== undefined) packageMetadata.set(shadowPackageJson, ctBuildContentsText(contents));
   };
 
   const shadowName = (sourcePath, loader, entryName, namespace = "file") => {
@@ -3012,7 +3262,7 @@ async function buildWithPlugins(options, plugins) {
   };
 
   const addModule = async (resolved, entryName = undefined) => {
-    const key = `${resolved.namespace} ${resolved.path}`;
+    const key = `${resolved.namespace}\0${resolved.path}`;
     if (moduleRecords.has(key)) return moduleRecords.get(key);
     const record = {
       path: resolved.path,
@@ -3033,16 +3283,21 @@ async function buildWithPlugins(options, plugins) {
       record.shadowPath = shadowName(record.path, "js", entryName, record.namespace);
       return record;
     }
-    record.contents = String(loaded.contents);
+    const nativeResult = runNativeBeforeParse(record, loaded);
+    loaded = nativeResult.loaded;
+    record.contents = loaded.contents;
     const loader = loaded.loader ?? bundleLoaderForPath(record.path);
     record.loader = loader;
     record.shadowPath = shadowName(record.path, loader, entryName, record.namespace);
-    if (loader === "file") {
-      const extension = ctBuildSourceExtension(record.shadowPath);
-      if (extension) materializedLoaders[extension] = "file";
-    }
+    const materializedExtension = ctBuildSourceExtension(record.shadowPath);
+    if (materializedExtension) materializedLoaders[materializedExtension] = loader;
     if (record.namespace === "file") preservePackageMetadata(record.path);
+    if (nativeResult.failed) {
+      record.pluginLoadFailed = true;
+      return record;
+    }
     if (loader === "js" || loader === "jsx" || loader === "ts" || loader === "tsx" || loader === "html" || loader === "css") {
+      record.contents = ctBuildContentsText(record.contents);
       const edges = await Promise.all(scanBundleImportsForLoader(record.contents, loader).map(async ({ specifier, kind }) => {
         const resolveDir = record.namespace === "file" ? pathDirname(record.path) : cottontail.cwd();
         let target;
@@ -3073,7 +3328,7 @@ async function buildWithPlugins(options, plugins) {
   for (const entry of (options?.entrypoints ?? []).map(String)) {
     let resolved;
     try {
-      resolved = await resolveWithPlugins(entry, "", "", cottontail.cwd(), "entry-point-build");
+      resolved = await resolveWithPlugins(entry, "", "file", cottontail.cwd(), "entry-point-build");
     } catch (error) {
       errors.push(ctPluginBuildMessage(error, entry.startsWith("/") ? entry : nodePathResolve(entry), "file"));
       continue;
@@ -3097,6 +3352,7 @@ async function buildWithPlugins(options, plugins) {
   }
   for (const record of moduleRecords.values()) {
     let contents = record.contents;
+    if (record.edges.length > 0 && typeof contents !== "string") contents = ctBuildContentsText(contents);
     for (const edge of record.edges) {
       if (!edge.target?.shadowPath) continue;
       let relativeTarget = nodePathRelative(pathDirname(record.shadowPath), edge.target.shadowPath).replace(/\\/g, "/");
@@ -3115,19 +3371,31 @@ async function buildWithPlugins(options, plugins) {
     if (record.shadowPath) sourceByShadowPath.set(nodePathResolve(record.shadowPath), record.path);
   }
 
+  const shadowLoaderOptions = Object.keys(materializedLoaders).length > 0
+    ? {
+        ...(options?.loader && typeof options.loader === "object" ? options.loader : {}),
+        ...materializedLoaders,
+      }
+    : options?.loader;
   const compile = ctNormalizeCompileOptions(options);
   if (compile && errors.length === 0) {
-    return ctRunCompiledBuild(
+    const result = await ctRunCompiledBuild(
       {
         ...options,
+        throw: false,
         files: undefined,
         plugins: undefined,
         root: shadowRoot,
+        loader: shadowLoaderOptions,
         entrypoints: shadowEntries,
       },
       compile,
-      { setupPromises: [], onStart: [], onEnd: onEndCallbacks },
+      { setupPromises: [], onStart: [], onEnd: [] },
     );
+    result.logs = [...pluginWarnings, ...(result.logs ?? [])];
+    await ctRunOnEnd({ onEnd: onEndCallbacks }, result);
+    if (!result.success && options?.throw !== false) throw new AggregateError(result.logs, "Bundle failed");
+    return result;
   }
 
   const driverResult = runBuildDriver({
@@ -3136,12 +3404,7 @@ async function buildWithPlugins(options, plugins) {
     plugins: undefined,
     root: shadowRoot,
     __cottontailWorkingDirectory: shadowRoot,
-    loader: Object.keys(materializedLoaders).length > 0
-      ? {
-          ...(options?.loader && typeof options.loader === "object" ? options.loader : {}),
-          ...materializedLoaders,
-        }
-      : options?.loader,
+    loader: shadowLoaderOptions,
     entrypoints: shadowEntries,
   });
   for (const log of driverResult.logs ?? []) {
@@ -3167,6 +3430,7 @@ async function buildWithPlugins(options, plugins) {
     }
     return true;
   });
+  driverResult.logs = [...pluginWarnings, ...(driverResult.logs ?? [])];
   if (errors.length > 0) {
     driverResult.ok = false;
     driverResult.success = false;
@@ -15377,6 +15641,13 @@ async function createUdpSocket(options) {
 export function plugin(pluginOptions) {
   return nodeRegisterBunPlugin(...arguments);
 }
+Object.defineProperty(plugin, "clearAll", {
+  value: function clearAll(_unused) {
+    return nodeClearBunPlugins(_unused);
+  },
+  configurable: false,
+  writable: true,
+});
 
 export function registerMacro(_name, _macro = undefined) {
   return undefined;
