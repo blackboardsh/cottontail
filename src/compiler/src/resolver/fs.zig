@@ -34,10 +34,6 @@ pub const FileSystem = struct {
     }
 
     pub fn setTopLevelDir(this: *FileSystem, value: stringZ) !void {
-        // Each Cottontail build gets a fresh resolver, but the underlying file
-        // system store is process-global. Drop its path index so files created
-        // between builds are visible while retaining backing entry storage.
-        this.fs.entries.indexes.clearRetainingCapacity();
         if (this.top_level_dir_owned != null and strings.eqlLong(this.top_level_dir, value, true)) return;
         const owned = try bun.default_allocator.dupeZ(u8, value);
         if (this.top_level_dir_owned) |previous| bun.default_allocator.free(previous);

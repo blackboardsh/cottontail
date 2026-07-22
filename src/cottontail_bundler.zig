@@ -115,6 +115,19 @@ pub const BundleOptions = struct {
 /// arena, which is what makes freeing that arena after each bundle safe.
 var shared_worker_pool: ?*compiler.ThreadPool = null;
 
+/// Bun serializes `Bun.build()` through BundleThread and advances this generation
+/// between builds. Cottontail's synchronous bridge bypasses BundleThread, so it must
+/// advance the same cache generation itself while retaining the process-global caches.
+var bundle_generation = std.atomic.Value(compiler.Generation).init(0);
+
+fn claimBundleGeneration() compiler.Generation {
+    var current = bundle_generation.load(.monotonic);
+    while (current < std.math.maxInt(compiler.Generation)) {
+        current = bundle_generation.cmpxchgWeak(current, current + 1, .monotonic, .monotonic) orelse return current;
+    }
+    return current;
+}
+
 /// Dev-only (`COTTONTAIL_RUNTIME_MODULES_DIR`): overlay runtime modules from a
 /// directory on disk so edits can be tested without rebuilding the binary.
 /// Modules absent from the directory continue to use the embedded version.
@@ -842,6 +855,7 @@ pub fn bundleEntryPointGraphWithOptions(
         return err;
     };
     defer transpiler.deinitPreservingFileSystem();
+    transpiler.resolver.generation = claimBundleGeneration();
     // Bun's run/build commands populate the compiler environment before
     // resolution. The resolver consumes NODE_PATH and condition-related env
     // values even when runtime process.env reads are intentionally not inlined.
@@ -2221,6 +2235,7 @@ pub fn buildEntryPointsJson(
         return json;
     };
     defer transpiler.deinitPreservingFileSystem();
+    transpiler.resolver.generation = claimBundleGeneration();
     // Match Bun's compiler lifecycle so package resolution sees NODE_PATH and
     // the rest of the inherited process environment.
     try transpiler.env.loadProcess();

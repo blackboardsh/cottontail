@@ -227,15 +227,19 @@ pub const Transpiler = struct {
         this.deinitImpl(true);
     }
 
+    /// Release per-transpiler state while retaining the process-global filesystem and
+    /// resolver caches used by subsequent in-process builds.
     pub fn deinitPreservingFileSystem(this: *Transpiler) void {
         this.deinitImpl(false);
     }
 
-    fn deinitImpl(this: *Transpiler, deinit_file_system: bool) void {
+    fn deinitImpl(this: *Transpiler, deinit_process_caches: bool) void {
         this.options.deinit(this.allocator);
         this.log.deinit();
-        this.resolver.deinit();
-        if (deinit_file_system) this.fs.deinit();
+        if (deinit_process_caches) {
+            this.resolver.deinit();
+            this.fs.deinit();
+        }
     }
 
     pub fn configureLinkerWithAutoJSX(transpiler: *Transpiler, auto_jsx: bool) void {
