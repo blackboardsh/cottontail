@@ -531,7 +531,7 @@ fn appendEscaped(output: *std.array_list.Managed(u8), value: []const u8, limit: 
             '"' => try output.appendSlice("\\\""),
             '|' => try output.appendSlice("\\|"),
             '`' => try output.appendSlice("\\`"),
-            0...31, 127 => {},
+            0...8, 11...12, 14...31, 127 => {},
             else => try output.append(byte),
         }
     }
