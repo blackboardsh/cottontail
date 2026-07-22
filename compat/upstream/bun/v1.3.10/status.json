@@ -1156,6 +1156,16 @@
       },
       "timeoutMs": 180000
     },
+    "test/cli/install/bun-install-lifecycle-scripts.test.ts": {
+      "status": "enabled",
+      "reason": "Root, workspace, dependency, trust-transition, automatic node-gyp, concurrency, linker, inherited stdio, and npmrc lifecycle behavior passes all 52 copied cases (749 assertions).",
+      "serial": true,
+      "args": ["--max-concurrency=1"],
+      "env": {
+        "COTTONTAIL_TEST_TIMEOUT_SCALE": "6"
+      },
+      "timeoutMs": 300000
+    },
     "test/cli/install/bun-security-scanner-workspaces.test.ts": {
       "status": "enabled",
       "reason": "Security payload construction deduplicates package identities across workspace and isolated lock contexts while preserving dependency paths, passing all 3 copied cases (9 assertions).",
