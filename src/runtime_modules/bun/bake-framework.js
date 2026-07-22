@@ -157,6 +157,9 @@ export function bakeGraphAttributeFiles(paths, files = {}, options = {}) {
 export function frameworkBuildOptions(options, builtIns, extraFiles = undefined) {
   return {
     ...options,
+    // Bun's Bake transpilers always carry framework metadata, which makes
+    // import.meta.dir/file/path/url compile to the original source location.
+    inlineImportMetaProperties: true,
     alias: {
       ...(options.alias ?? {}),
       ...builtIns.alias,
