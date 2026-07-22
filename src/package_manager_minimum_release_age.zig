@@ -147,12 +147,11 @@ fn selectUnfiltered(
         left.version.isZero();
     if (normalized_wildcard) {
         if (distTagVersion(manifest, "latest")) |latest_name| {
-            if (findCandidate(releases.items, latest_name) orelse findCandidate(prereleases.items, latest_name)) |latest| {
+            if (findCandidate(releases.items, latest_name)) |latest| {
                 return latest.name;
             }
         }
         if (releases.items.len > 0) return releases.items[0].name;
-        if (prereleases.items.len > 0) return prereleases.items[0].name;
         return error.NoMatchingVersion;
     }
     if (left.op == .eql) {
@@ -408,6 +407,28 @@ test "unfiltered registry selection follows Bun wildcard normalization" {
         );
         try std.testing.expectEqualStrings("2.0.0", result.version);
     }
+
+    const prerelease_source =
+        \\{
+        \\  "dist-tags": { "latest": "2.0.0-pre.0" },
+        \\  "versions": { "2.0.0-pre.0": {} }
+        \\}
+    ;
+    var prerelease_parsed = try std.json.parseFromSlice(Value, std.testing.allocator, prerelease_source, .{});
+    defer prerelease_parsed.deinit();
+
+    try std.testing.expectError(
+        error.NoMatchingVersion,
+        selectVersion(
+            std.testing.allocator,
+            &prerelease_parsed.value,
+            "example",
+            "x.0.0",
+            null,
+            &.{},
+            0,
+        ),
+    );
 }
 
 test "minimum release age rejects a recent exact version" {
