@@ -1138,6 +1138,16 @@
       "args": ["--timeout", "30000"],
       "timeoutMs": 360000
     },
+    "test/cli/install/bun-publish.test.ts": {
+      "status": "enabled",
+      "reason": "Publishing, tarballs, scoped packages, binaries, workspaces, lifecycle ordering, dry runs, OTP flows, access, tags, CI user agents, and republish tolerance pass all 31 copied cases (203 assertions).",
+      "serial": true,
+      "args": ["--max-concurrency=1"],
+      "env": {
+        "COTTONTAIL_TEST_TIMEOUT_SCALE": "6"
+      },
+      "timeoutMs": 180000
+    },
     "test/cli/install/bun-security-scanner-workspaces.test.ts": {
       "status": "enabled",
       "reason": "Security payload construction deduplicates package identities across workspace and isolated lock contexts while preserving dependency paths, passing all 3 copied cases (9 assertions).",
