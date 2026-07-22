@@ -12,7 +12,7 @@ const package_manager_cli = @import("package_manager_cli.zig");
 const repl = @import("repl.zig");
 const cottontail_transpiler = @import("cottontail_transpiler.zig");
 const completions = @import("completions.zig");
-const host = @import("host.zig");
+const native_bindings = @import("native_bindings.zig");
 const cli_run = @import("cli_run.zig");
 const script_runner = @import("script_runner.zig");
 
@@ -23,7 +23,7 @@ comptime {
     cottontail_markdown.forceLink();
     cottontail_password.forceLink();
     cottontail_transpiler.forceLink();
-    host.forceLink();
+    native_bindings.forceLink();
 }
 
 const version = @import("version.zig").version;
