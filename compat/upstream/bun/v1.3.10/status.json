@@ -1101,6 +1101,15 @@
       "args": ["--timeout", "30000"],
       "timeoutMs": 240000
     },
+    "test/cli/install/bun-security-scanner-matrix-without-node-modules.test.ts": {
+      "status": "enabled",
+      "reason": "The upstream-authored CI sampling path covers scanner bootstrap, lock and no-lock resolution, all package commands, linkers, advisory outcomes, and TTY choices across 720 registered matrix cases (594 assertions in the validated run).",
+      "args": ["--timeout", "60000"],
+      "timeoutMs": 600000,
+      "env": {
+        "CI": "1"
+      }
+    },
     "test/cli/install/bun-update-security-edge-cases.test.ts": {
       "status": "enabled",
       "reason": "Update-time and post-install scans detect vulnerable direct and transitive packages and preserve canceled installs across all 6 copied cases (19 assertions).",
