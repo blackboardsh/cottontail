@@ -124,6 +124,15 @@ try {
       stdoutIncludes: ['3 pass', '0 fail'],
     },
     {
+      name: 'cli-init-regressions',
+      argv: ['test', join(rootDir, 'tests', 'js', 'cli-init.test.ts')],
+      env: {
+        COTTONTAIL_INIT_TEST_ROOT: join(rootDir, '.cottontail-tmp'),
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['5 pass', '0 fail'],
+    },
+    {
       name: 'module-syntax-in-multiline-string',
       scriptPath: join(rootDir, 'tests', 'js', 'module-syntax-in-multiline-string.js'),
       expectExitCode: 0,

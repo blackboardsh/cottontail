@@ -13,6 +13,7 @@ const repl = @import("repl.zig");
 const cottontail_transpiler = @import("cottontail_transpiler.zig");
 const completions = @import("completions.zig");
 const native_bindings = @import("native_bindings.zig");
+const cli_init = @import("cli_init.zig");
 const cli_run = @import("cli_run.zig");
 const script_runner = @import("script_runner.zig");
 
@@ -31,7 +32,7 @@ const bun_compat_version = "1.3.10";
 // Build-metadata suffix reported by `--revision` (`<version>+<suffix>`),
 // mirroring how bun reports `<version>+<git sha>`.
 const revision_suffix = "cottontail";
-const completion_commands = [_][]const u8{ "run", "test", "build", "repl", "x", "exec", "completions", "getcompletes" };
+const completion_commands = [_][]const u8{ "run", "test", "build", "init", "create", "repl", "x", "exec", "completions", "getcompletes" };
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 fn testRunnerDisplayVersion(init: std.process.Init) []const u8 {
@@ -50,6 +51,7 @@ const help_text_template =
     \\  cottontail <entrypoint.js|entrypoint.ts> [args...]
     \\  cottontail run <entrypoint.js|entrypoint.ts> [args...]
     \\  cottontail test [args...]
+    \\  cottontail init [flags] [destination]
     \\  cottontail repl [-e|--eval <script> | -p|--print <expression>]
     \\  cottontail install|add|remove|update [packages...] [flags]
     \\  cottontail x [--package <package>] <package-or-bin> [args...]
@@ -2757,6 +2759,12 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, arg, "--revision")) {
         try stdout.print("{s}+{s}\n", .{ commandDisplayVersion(init), revision_suffix });
         try stdout.flush();
+        return;
+    }
+
+    if (std.mem.eql(u8, arg, "init")) {
+        const exit_code = try cli_init.run(init, args[2..], stdout, stderr);
+        if (exit_code != 0) std.process.exit(exit_code);
         return;
     }
 
