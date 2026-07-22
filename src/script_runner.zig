@@ -6076,6 +6076,15 @@ fn writeBunCompatTransformedSource(
     ) catch return script_abs;
     var transformed_source: []const u8 = source;
     var changed = false;
+    // Rewrites can prepend compatibility helpers, so neutralize the hashbang
+    // while it is still guaranteed to be the first line of the source.
+    if (std.mem.startsWith(u8, transformed_source, "#!")) {
+        const stripped = try ctx.allocator.dupe(u8, transformed_source);
+        stripped[0] = '/';
+        stripped[1] = '/';
+        transformed_source = stripped;
+        changed = true;
+    }
     if (isTestAggregateEntrypointPath(script_abs)) {
         if (try rewriteTestAggregateImports(ctx, transformed_source)) |transformed| {
             transformed_source = transformed;
@@ -6139,13 +6148,6 @@ fn writeBunCompatTransformedSource(
     const extensionless = std.fs.path.extension(script_abs).len == 0;
     if (extensionless) changed = true;
     if (!changed) return script_abs;
-
-    if (std.mem.startsWith(u8, transformed_source, "#!")) {
-        const stripped = try ctx.allocator.dupe(u8, transformed_source);
-        stripped[0] = '/';
-        stripped[1] = '/';
-        transformed_source = stripped;
-    }
 
     const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
     const ext = blk: {
@@ -6789,20 +6791,7 @@ fn scanDynamicImports(
                         if (comma != null or std.mem.indexOfAny(u8, prefix, "?#") != null or uses_module_mock or
                             (inferred_loader != null and std.mem.eql(u8, inferred_loader.?, "text")))
                         {
-                            if (comma == null and inferred_loader != null and std.mem.eql(u8, inferred_loader.?, "text")) {
-                                try occurrences.append(ctx.allocator, .{
-                                    .start = cursor,
-                                    .end = close + 1,
-                                    .expression = expression,
-                                    .options = "undefined",
-                                    .target_index = null,
-                                    .runtime_require = true,
-                                });
-                                has_custom_signal = true;
-                                cursor = close + 1;
-                                continue;
-                            }
-                            if (uses_module_mock and comma == null and std.mem.indexOfAny(u8, prefix, "?#") == null) {
+                            if (comma == null) {
                                 try occurrences.append(ctx.allocator, .{
                                     .start = cursor,
                                     .end = close + 1,

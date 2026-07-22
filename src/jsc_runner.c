@@ -19346,9 +19346,19 @@ static JSValueRef ct_spawn_result_to_js(JSContextRef ctx, const CtHostSpawnResul
                         ? ct_make_string_len(ctx, result->stdout_ptr != NULL ? result->stdout_ptr : "", result->stdout_len)
                         : JSValueMakeUndefined(ctx),
                     exception);
+    ct_set_property(ctx, response, "stdoutBytes",
+                    result->stdout_present
+                        ? ct_array_buffer_from_copy(ctx, result->stdout_ptr != NULL ? result->stdout_ptr : "", result->stdout_len, exception)
+                        : JSValueMakeUndefined(ctx),
+                    exception);
     ct_set_property(ctx, response, "stderr",
                     result->stderr_present
                         ? ct_make_string_len(ctx, result->stderr_ptr != NULL ? result->stderr_ptr : "", result->stderr_len)
+                        : JSValueMakeUndefined(ctx),
+                    exception);
+    ct_set_property(ctx, response, "stderrBytes",
+                    result->stderr_present
+                        ? ct_array_buffer_from_copy(ctx, result->stderr_ptr != NULL ? result->stderr_ptr : "", result->stderr_len, exception)
                         : JSValueMakeUndefined(ctx),
                     exception);
     ct_set_property(ctx, response, "exitedDueToTimeout", JSValueMakeBoolean(ctx, result->exited_due_to_timeout), exception);

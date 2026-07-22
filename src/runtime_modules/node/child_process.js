@@ -447,8 +447,8 @@ function normalizeSpawnCommand(file, args = [], options = {}) {
 
 function normalizeSyncResult(result, options = {}, file = "", args = []) {
   const encoding = options.encoding === "buffer" ? null : options.encoding;
-  const stdoutBuffer = Buffer.from(result.stdout || "");
-  const stderrBuffer = Buffer.from(result.stderr || "");
+  const stdoutBuffer = Buffer.from(result.stdoutBytes ?? result.stdout ?? "");
+  const stderrBuffer = Buffer.from(result.stderrBytes ?? result.stderr ?? "");
   const stdout = encoding ? stdoutBuffer.toString(encoding) : stdoutBuffer;
   const stderr = encoding ? stderrBuffer.toString(encoding) : stderrBuffer;
   const signal = result.signal ?? signalNumberToName(result.signalCode) ?? null;
