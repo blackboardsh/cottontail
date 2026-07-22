@@ -2568,6 +2568,7 @@ function executeBundledCommonJsModule(module, filename, source, loader) {
         target: "bun",
         preserveExternalRequireName: true,
         runtimeFileLoaderPaths: true,
+        ignoreDCEAnnotations: true,
         // Keep packages and JavaScript dependencies in createRequire()'s
         // shared module cache. Inlining a package while externalizing its
         // relative files also moves those require() calls under the entry's

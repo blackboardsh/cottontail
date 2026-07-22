@@ -1805,7 +1805,9 @@ pub const LinkerContext = struct {
                         entry_point_kinds,
                         css_reprs,
                     );
-                } else if (record.flags.is_external_without_side_effects) {
+                } else if (record.flags.is_external_without_side_effects and
+                    !c.options.ignore_dce_annotations)
+                {
                     // This can be removed if it's unused
                     continue;
                 }

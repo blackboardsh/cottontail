@@ -75,6 +75,20 @@ test("synchronous ESM entries preserve package-relative import referrers", () =>
   expect(localRequire(entry).encoded).toBe("6f6b");
 });
 
+test("require preserves re-exports from side-effect-free ESM packages", () => {
+  const packageDir = join(root, "side-effect-free-reexport");
+  require("node:fs").mkdirSync(packageDir, { recursive: true });
+  writeFileSync(join(packageDir, "package.json"), JSON.stringify({
+    name: "side-effect-free-reexport",
+    type: "module",
+    sideEffects: false,
+  }));
+  writeFileSync(join(packageDir, "index.js"), 'export { value } from "./lib.js";\n');
+  writeFileSync(join(packageDir, "lib.js"), "export const value = 42;\n");
+
+  expect(require(join(packageDir, "index.js")).value).toBe(42);
+});
+
 test("a failed synchronous TLA require is evicted before dynamic import", async () => {
   const { createRequire } = require("node:module");
   const { pathToFileURL } = require("node:url");
