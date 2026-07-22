@@ -10793,16 +10793,12 @@ const Manager = struct {
                 const section = workspace_json.object.get(section_name) orelse continue;
                 if (section != .object or section.object.count() == 0) continue;
                 try writer.print("\n      \"{s}\": {{", .{section_name});
-                const sort_keys = is_root and manager.lock_graph != null and manager.lock_graph.?.provenance == .pnpm;
-                const keys = if (sort_keys) blk: {
-                    const sorted = try manager.allocator.dupe([]const u8, section.object.keys());
-                    std.mem.sort([]const u8, sorted, {}, struct {
-                        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
-                            return std.mem.order(u8, left, right) == .lt;
-                        }
-                    }.lessThan);
-                    break :blk sorted;
-                } else section.object.keys();
+                const keys = try manager.allocator.dupe([]const u8, section.object.keys());
+                std.mem.sort([]const u8, keys, {}, struct {
+                    fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+                        return std.mem.order(u8, left, right) == .lt;
+                    }
+                }.lessThan);
                 for (keys) |key| {
                     const value = section.object.get(key) orelse continue;
                     if (value != .string) continue;
