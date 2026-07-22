@@ -89,6 +89,10 @@ pub const BundleOptions = struct {
     code_splitting: bool = false,
     /// `Bun.build({ external: [...] })`: import specifiers left unresolved.
     external: []const []const u8 = &.{},
+    /// Borrowed in-memory files used by internal graph rebundles. Exact paths
+    /// listed in `external` stay external even when their contents are present.
+    virtual_file_paths: []const []const u8 = &.{},
+    virtual_file_contents: []const []const u8 = &.{},
     allow_unresolved: ?[]const []const u8 = null,
     /// Package names whose pure barrel modules should only load the exports
     /// requested by the importing graph.
@@ -973,6 +977,16 @@ pub fn bundleEntryPointGraphWithOptions(
         runtime_file_map.map.deinit(c_allocator);
         for (runtime_file_keys.items) |key| c_allocator.free(key);
         runtime_file_keys.deinit(c_allocator);
+    }
+    if (options.virtual_file_paths.len != options.virtual_file_contents.len) {
+        setError(error_out, "Virtual file path/content counts do not match", .{});
+        return error.InvalidVirtualFileMap;
+    }
+    for (options.virtual_file_paths, options.virtual_file_contents) |path, contents| {
+        const is_external = for (options.external) |external| {
+            if (std.mem.eql(u8, path, external)) break true;
+        } else false;
+        if (!is_external) try runtime_file_map.map.put(c_allocator, path, contents);
     }
     if (options.include_runtime_modules) {
         const runtime_virtual_root = options.runtime_virtual_root orelse working_dir;

@@ -484,10 +484,7 @@ export class FrameworkRouter {
     if (matchedParams.length > 0) {
       params = {};
       for (const [key, value] of matchedParams) {
-        const existing = params[key];
-        if (existing === undefined) params[key] = value;
-        else if (Array.isArray(existing)) existing.push(value);
-        else params[key] = [existing, value];
+        params[key] = value;
       }
     }
     return { params, route: routeToInverseJSON(node) };

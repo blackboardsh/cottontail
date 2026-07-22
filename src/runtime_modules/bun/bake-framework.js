@@ -12,12 +12,22 @@ import reactSsrSource from "./bake-react-ssr.txt";
 
 const javascriptExtensions = [".tsx", ".ts", ".jsx", ".js", ".mts", ".mjs", ".cts", ".cjs"];
 const transpilers = new Map();
+const pluginBoundaryPrefix = "cottontail-bake-client-boundary:";
+export const ssrGraphBridgePrefix = "cottontail-bake-ssr:";
 
 export function stripBakeGraphAttributes(source) {
   return source.replace(
     /\s+with\s*\{\s*bunBakeGraph\s*:\s*(?:"(?:client|server|ssr)"|'(?:client|server|ssr)')\s*,?\s*\}/g,
     "",
   );
+}
+
+function bridgeSsrGraphAttributes(source) {
+  const bridged = source.replace(
+    /(\b(?:from|import)\s*)(["'])([^"'\\]+)\2\s+with\s*\{\s*bunBakeGraph\s*:\s*(?:"ssr"|'ssr')\s*,?\s*\}/g,
+    (_match, prefix, quote, specifier) => `${prefix}${quote}${ssrGraphBridgePrefix}${specifier}${quote}`,
+  );
+  return stripBakeGraphAttributes(bridged);
 }
 
 function builtInReactFramework() {
@@ -93,22 +103,22 @@ export function normalizeBuiltInModules(framework, projectRoot) {
       resolved = path.join(projectRoot, ".cottontail-bake-builtins", `module-${index}${extension}`);
       source = stripBakeGraphAttributes(item.code);
       files[resolved] = source;
+      sources.set(path.normalize(resolved), item.code);
     } else {
       throw new TypeError(`'builtInModules[${index}]' needs either 'path' or 'code'`);
     }
 
     alias[item.import] = resolved;
-    if (source !== null) sources.set(path.normalize(resolved), source);
   }
 
   return { alias, files, sources };
 }
 
-export function bakeGraphAttributeFiles(paths, files = {}) {
+export function bakeGraphAttributeFiles(paths, files = {}, options = {}) {
   const overrides = {};
   for (const filename of paths) {
     if (typeof filename !== "string" || !path.isAbsolute(filename)) continue;
-    let source = sourceText(files[filename]);
+    let source = sourceText(options.sources?.get(path.normalize(filename))) ?? sourceText(files[filename]);
     if (source === null) {
       try {
         source = readFileSync(filename, "utf8");
@@ -116,7 +126,7 @@ export function bakeGraphAttributeFiles(paths, files = {}) {
         continue;
       }
     }
-    const transformed = stripBakeGraphAttributes(source);
+    const transformed = options.ssrBridge ? bridgeSsrGraphAttributes(source) : stripBakeGraphAttributes(source);
     if (transformed !== source) overrides[filename] = transformed;
   }
   return overrides;
@@ -226,6 +236,10 @@ function loaderForModule(filename) {
 
 function transpilerFor(filename) {
   const loader = loaderForModule(filename);
+  return transpilerForLoader(loader);
+}
+
+function transpilerForLoader(loader) {
   let transpiler = transpilers.get(loader);
   if (transpiler === undefined) {
     transpiler = new globalThis.Bun.Transpiler({ loader });
@@ -366,6 +380,58 @@ export function clientReferenceProxySource(boundary, serverComponents) {
     lines.push(name === "default" ? `export default ${local};` : `export { ${local} as ${JSON.stringify(name)} };`);
   });
   return `${lines.join("\n")}\n`;
+}
+
+export function pluginClientBoundaryReplacements({
+  projectRoot,
+  modules,
+  boundaries,
+  serverComponents,
+}) {
+  const replacements = new Map();
+  const boundaryIndexes = new Map(boundaries.map((boundary, index) => [boundary.id, index]));
+  for (const module of modules) {
+    if (!["js", "jsx", "ts", "tsx"].includes(module.loader)) continue;
+    const source = sourceText(module.contents);
+    if (source === null || !hasUseClientDirective(source)) continue;
+
+    const namespace = String(module.namespace || "file");
+    const modulePath = String(module.path);
+    const id = String(module.id || (namespace === "file"
+      ? moduleIdForPath(projectRoot, path.normalize(modulePath))
+      : `${namespace}:${modulePath}`));
+    const hash = BigInt.asUintN(64, globalThis.Bun.hash(`${namespace}\0${modulePath}`)).toString(16);
+    const scan = transpilerForLoader(module.loader).scan(source);
+    const boundary = {
+      path: `${pluginBoundaryPrefix}${hash}`,
+      id,
+      exports: [...new Set(scan.exports ?? [])],
+      source,
+      __pluginTarget: { path: modulePath, namespace },
+    };
+    const existingIndex = boundaryIndexes.get(id);
+    if (existingIndex === undefined) {
+      boundaryIndexes.set(id, boundaries.length);
+      boundaries.push(boundary);
+    } else {
+      boundaries[existingIndex] = boundary;
+    }
+    replacements.set(module.key, clientReferenceProxySource(boundary, serverComponents));
+  }
+  boundaries.sort((left, right) => left.id.localeCompare(right.id));
+  return replacements;
+}
+
+export function pluginBoundaryResolverPlugin(boundaries) {
+  const targets = new Map(boundaries
+    .filter(boundary => boundary.__pluginTarget !== undefined)
+    .map(boundary => [boundary.path, boundary.__pluginTarget]));
+  return {
+    name: "cottontail-bake-client-boundaries",
+    setup(build) {
+      build.onResolve({ filter: /^cottontail-bake-client-boundary:/ }, args => targets.get(args.path));
+    },
+  };
 }
 
 export function serverBoundaryFiles(boundaries, serverComponents) {

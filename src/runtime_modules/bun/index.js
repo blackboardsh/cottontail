@@ -2844,6 +2844,9 @@ function ctBuildSourceExtension(path) {
 // bundling of the materialized files to the plugin-free build pipeline.
 async function buildWithPlugins(options, plugins) {
   options = await ctNormalizeBuildFiles(options, true);
+  const pluginGraphHook = typeof options?.__cottontailPluginGraph === "function"
+    ? options.__cottontailPluginGraph
+    : null;
   const onResolveRules = [];
   const onLoadRules = [];
   const onBeforeParseRules = [];
@@ -3040,7 +3043,20 @@ async function buildWithPlugins(options, plugins) {
     return null;
   };
 
+  const applyBuildAlias = specifier => {
+    const aliases = options?.alias;
+    if (aliases === null || typeof aliases !== "object" || Array.isArray(aliases)) return specifier;
+    let matched = null;
+    for (const key of Object.keys(aliases)) {
+      if (specifier !== key && !specifier.startsWith(`${key}/`)) continue;
+      if (matched === null || key.length > matched.length) matched = key;
+    }
+    if (matched === null || typeof aliases[matched] !== "string") return specifier;
+    return `${aliases[matched]}${specifier.slice(matched.length)}`;
+  };
+
   const defaultResolveImport = (specifier, importerRecord) => {
+    specifier = applyBuildAlias(specifier);
     if (!specifier.startsWith("./") && !specifier.startsWith("../") && !specifier.startsWith("/")) {
       try {
         const resolved = resolveSync(specifier, importerRecord.path);
@@ -3267,10 +3283,16 @@ async function buildWithPlugins(options, plugins) {
     const sourceRelativeIsLocal = sourceRelative !== "" && sourceRelative !== ".." &&
       !sourceRelative.startsWith("../") && !sourceRelative.startsWith("/");
     const sourceRelativeDir = sourceRelativeIsLocal ? pathDirname(sourceRelative).replace(/\\/g, "/") : "";
+    const namespaceHash = namespace === "file"
+      ? ""
+      : BigInt.asUintN(64, hash(`${namespace}\0${sourcePath}`)).toString(16);
+    const namespaceName = String(namespace).replace(/[^a-zA-Z0-9_-]+/g, "-") || "virtual";
     let name = location
       ? `${location.relativePath.slice(0, location.relativePath.length - base.length)}${stem}${ext}`
       : sourceRelativeIsLocal
         ? `${sourceRelativeDir === "." ? "" : `${sourceRelativeDir}/`}${stem}${ext}`
+        : namespace !== "file"
+          ? `deps/${namespaceName}-${stem}-${namespaceHash}${ext}`
         : `${entryName == null ? `deps/dep-${depCounter++}-` : ""}${stem}${ext}`;
     let counter = 1;
     const originalName = name;
@@ -3285,6 +3307,7 @@ async function buildWithPlugins(options, plugins) {
     const key = `${resolved.namespace}\0${resolved.path}`;
     if (moduleRecords.has(key)) return moduleRecords.get(key);
     const record = {
+      key,
       path: resolved.path,
       namespace: resolved.namespace,
       shadowPath: null,
@@ -3366,6 +3389,47 @@ async function buildWithPlugins(options, plugins) {
     shadowEntries.push(record.shadowPath);
   }
 
+  const jsxRecord = [...moduleRecords.values()].find(record => record.loader === "jsx" || record.loader === "tsx");
+  const implicitImports = new Set();
+  if (jsxRecord) {
+    const importSource = typeof options?.jsx?.importSource === "string" ? options.jsx.importSource : "react";
+    implicitImports.add(`${importSource}/jsx-runtime`);
+    implicitImports.add(`${importSource}/jsx-dev-runtime`);
+  }
+  if (options?.reactFastRefresh) implicitImports.add("react-refresh/runtime");
+  const implicitImporter = jsxRecord ?? moduleRecords.values().next().value;
+  if (implicitImporter) {
+    for (const specifier of implicitImports) {
+      const target = defaultResolveImport(specifier, implicitImporter);
+      if (target?.path && !target.external) await addModule(target);
+    }
+  }
+
+  if (pluginGraphHook !== null && errors.length === 0) {
+    const replacements = await pluginGraphHook([...moduleRecords.values()].map(record => ({
+      key: record.key,
+      id: nodePathRelative(shadowRoot, record.shadowPath).replace(/\\/g, "/"),
+      path: record.path,
+      namespace: record.namespace,
+      contents: record.contents,
+      loader: record.loader,
+    })));
+    if (replacements != null && !(replacements instanceof Map)) {
+      throw new TypeError("Bake's plugin graph hook must return a Map");
+    }
+    if (replacements) {
+      for (const record of moduleRecords.values()) {
+        if (!replacements.has(record.key)) continue;
+        const contents = replacements.get(record.key);
+        if (typeof contents !== "string" && !ArrayBuffer.isView(contents)) {
+          throw new TypeError("Bake's plugin graph replacement must be a string or Uint8Array");
+        }
+        record.contents = contents;
+        record.edges = [];
+      }
+    }
+  }
+
   for (const [path, contents] of packageMetadata) {
     cottontail.mkdirSync(pathDirname(path), true);
     cottontail.writeFile(path, contents);
@@ -3376,7 +3440,7 @@ async function buildWithPlugins(options, plugins) {
     for (const edge of record.edges) {
       if (!edge.target?.shadowPath) continue;
       let relativeTarget = nodePathRelative(pathDirname(record.shadowPath), edge.target.shadowPath).replace(/\\/g, "/");
-      if (!relativeTarget.startsWith(".")) relativeTarget = `./${relativeTarget}`;
+      if (!relativeTarget.startsWith("./") && !relativeTarget.startsWith("../")) relativeTarget = `./${relativeTarget}`;
       const replacement = JSON.stringify(relativeTarget);
       for (const quote of ['"', "'", "`"]) {
         contents = contents.split(`${quote}${edge.specifier}${quote}`).join(replacement);
@@ -3402,6 +3466,7 @@ async function buildWithPlugins(options, plugins) {
     const result = await ctRunCompiledBuild(
       {
         ...options,
+        __cottontailPluginGraph: undefined,
         throw: false,
         files: undefined,
         plugins: undefined,
@@ -3420,6 +3485,7 @@ async function buildWithPlugins(options, plugins) {
 
   const driverResult = runBuildDriver({
     ...options,
+    __cottontailPluginGraph: undefined,
     files: undefined,
     plugins: undefined,
     root: shadowRoot,

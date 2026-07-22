@@ -126,13 +126,15 @@ function routePattern(prefix, pattern) {
   return pattern === "/" ? prefix : `${prefix}${pattern}`;
 }
 
-function productionDefines(options) {
+function productionDefines(options, side) {
   return {
-    ...(options.define ?? {}),
     "import.meta.env.DEV": "false",
     "import.meta.env.PROD": "true",
+    "import.meta.env.MODE": '"production"',
+    "import.meta.env.SSR": side === "client" ? "false" : "true",
     "import.meta.env.STATIC": "true",
     "process.env.NODE_ENV": '"production"',
+    ...(options.define ?? {}),
   };
 }
 
@@ -278,7 +280,8 @@ async function writeClientGraph(context, route) {
       asset: "_bun/[name]-[hash].[ext]",
       ...(typeof clientOptions.naming === "object" ? clientOptions.naming : {}),
     },
-    define: productionDefines(clientOptions),
+    define: productionDefines(clientOptions, "client"),
+    jsx: { ...(clientOptions.jsx ?? {}), development: false },
     minify: clientOptions.minify ?? true,
     publicPath: "/",
     serverComponents: false,
@@ -341,7 +344,8 @@ async function buildSsrFrameworkAliases(context) {
       target: "bun",
       format: "cjs",
       conditions: [...new Set([...(ssrOptions.conditions ?? []), "node"])],
-      define: productionDefines(ssrOptions),
+      define: productionDefines(ssrOptions, "server"),
+      jsx: { ...(ssrOptions.jsx ?? {}), development: false },
       minify: false,
       serverComponents: false,
       external: [...new Set([...(ssrOptions.external ?? []), "bun:bake/server"])],
@@ -366,7 +370,8 @@ async function buildSsrComponents(context, route) {
       target: "bun",
       format: "cjs",
       conditions: [...new Set([...(context.ssrOptions.conditions ?? []), "node"])],
-      define: productionDefines(context.ssrOptions),
+      define: productionDefines(context.ssrOptions, "server"),
+      jsx: { ...(context.ssrOptions.jsx ?? {}), development: false },
       minify: false,
       serverComponents: false,
       external: [...new Set([...(context.ssrOptions.external ?? []), "bun:bake/server"])],
@@ -404,7 +409,7 @@ async function loadServerRoute(context, route) {
       ...context.ssrFrameworkAliases,
     },
   };
-  const configuredConditions = context.serverOptions.conditions ?? [];
+  const configuredConditions = [...(context.serverOptions.conditions ?? []), "node"];
   const conditions = context.serverComponents === null
     ? configuredConditions
     : [...new Set([...configuredConditions, "react-server"])];
@@ -414,7 +419,8 @@ async function loadServerRoute(context, route) {
     target: "bun",
     format: "cjs",
     conditions,
-    define: productionDefines(context.serverOptions),
+    define: productionDefines(context.serverOptions, "server"),
+    jsx: { ...(context.serverOptions.jsx ?? {}), development: false },
     minify: false,
     serverComponents: context.serverComponents !== null,
     external: [...new Set([...(context.serverOptions.external ?? []), "bun:bake/server"])],

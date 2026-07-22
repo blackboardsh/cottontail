@@ -2157,14 +2157,35 @@ fn bundleStandaloneBootstrap(
         }
     }
 
-    const imports_json = try native_transpiler.scanImportsJson(entry.contents, "js");
-    defer std.heap.c_allocator.free(imports_json);
     const ScannedImport = struct { path: []const u8, kind: []const u8 };
-    const parsed = try std.json.parseFromSlice([]const ScannedImport, ctx.allocator, imports_json, .{});
-    defer parsed.deinit();
     var dynamic_imports: std.ArrayList([]const u8) = .empty;
-    for (parsed.value) |item| {
-        if (std.mem.eql(u8, item.kind, "dynamic-import")) try dynamic_imports.append(ctx.allocator, item.path);
+    for (graph.files) |file| {
+        if (!file.loader.isJavaScriptLike()) continue;
+        const imports_json = try native_transpiler.scanImportsJson(file.contents, "js");
+        defer std.heap.c_allocator.free(imports_json);
+        const parsed = try std.json.parseFromSlice([]const ScannedImport, ctx.allocator, imports_json, .{});
+        defer parsed.deinit();
+        for (parsed.value) |item| {
+            if (!std.mem.eql(u8, item.kind, "dynamic-import")) continue;
+            var already_present = false;
+            for (dynamic_imports.items) |existing| {
+                if (std.mem.eql(u8, existing, item.path)) {
+                    already_present = true;
+                    break;
+                }
+            }
+            if (!already_present) {
+                try dynamic_imports.append(ctx.allocator, try ctx.allocator.dupe(u8, item.path));
+            }
+        }
+    }
+
+    var virtual_file_paths: std.ArrayList([]const u8) = .empty;
+    var virtual_file_contents: std.ArrayList([]const u8) = .empty;
+    for (graph.files, 0..) |file, index| {
+        if (index == graph.entry_point_file_index.? or !file.loader.isJavaScriptLike()) continue;
+        try virtual_file_paths.append(ctx.allocator, try standaloneVirtualPath(ctx, file.path));
+        try virtual_file_contents.append(ctx.allocator, file.contents);
     }
 
     var options: native_bundler.BundleOptions = .{
@@ -2172,6 +2193,8 @@ fn bundleStandaloneBootstrap(
         .output_format = .esm,
         .target = .bun,
         .external = dynamic_imports.items,
+        .virtual_file_paths = virtual_file_paths.items,
+        .virtual_file_contents = virtual_file_contents.items,
         .entry_naming = "index.js",
         .code_splitting = false,
         .inline_import_meta_properties = true,
