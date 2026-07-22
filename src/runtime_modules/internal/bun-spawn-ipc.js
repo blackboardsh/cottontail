@@ -1,5 +1,4 @@
 import { deserializeJscValue, serializeJscValue } from "./jsc-value-serialization.js";
-import { Server as NetServer, Socket as NetSocket } from "../node/net.js";
 
 const ipcPrefix = "__COTTONTAIL_IPC__";
 const advancedPrefix = "A:";
@@ -8,25 +7,38 @@ const advancedEnvelopeKey = "__cottontailBunSpawnIpcAdvanced";
 const nodeIpcEnvelopeKey = "__cottontailIpcEnvelope";
 const inheritedNodeIpcSymbol = Symbol.for("cottontail.inheritedNodeIpc");
 
+function nodeNetConstructors() {
+  const runtimeRequire = globalThis.__ctMetaRequire ?? globalThis.require;
+  if (typeof runtimeRequire !== "function") return {};
+  try {
+    return runtimeRequire("node:net") ?? {};
+  } catch {
+    return {};
+  }
+}
+
 export function bunSpawnIpcHandleInfo(handle = undefined) {
   if (handle == null) return null;
+  const { Server: NetServer, Socket: NetSocket } = nodeNetConstructors();
+  const isSocket = typeof NetSocket === "function" && handle instanceof NetSocket;
+  const isServer = typeof NetServer === "function" && handle instanceof NetServer;
   if (Number.isInteger(handle) && handle >= 0) return { fd: Number(handle), type: "net.Handle" };
   if (Number.isInteger(handle.fd) && handle.fd >= 0) {
     return {
       fd: Number(handle.fd),
-      type: handle instanceof NetSocket ? "net.Socket" : "net.Handle",
+      type: isSocket ? "net.Socket" : "net.Handle",
     };
   }
   if (Number.isInteger(handle._fd) && handle._fd >= 0) {
     return {
       fd: Number(handle._fd),
-      type: handle instanceof NetServer ? "net.Server" : "net.Handle",
+      type: isServer ? "net.Server" : "net.Handle",
     };
   }
   if (Number.isInteger(handle._handle?.fd) && handle._handle.fd >= 0) {
     return {
       fd: Number(handle._handle.fd),
-      type: handle instanceof NetServer ? "net.Server" : handle instanceof NetSocket ? "net.Socket" : "net.Handle",
+      type: isServer ? "net.Server" : isSocket ? "net.Socket" : "net.Handle",
     };
   }
   return null;
@@ -35,7 +47,10 @@ export function bunSpawnIpcHandleInfo(handle = undefined) {
 export function adoptBunSpawnIpcHandle(host, fd = undefined, type = "net.Socket") {
   if (!Number.isInteger(fd) || fd < 0) return undefined;
   try {
-    if (type === "net.Server" && typeof NetServer._fromFd === "function") return NetServer._fromFd(fd);
+    const { Server: NetServer, Socket: NetSocket } = nodeNetConstructors();
+    if (type === "net.Server" && typeof NetServer === "function" && typeof NetServer._fromFd === "function") {
+      return NetServer._fromFd(fd);
+    }
     if (type === "net.Handle") {
       let open = true;
       return {
@@ -55,6 +70,7 @@ export function adoptBunSpawnIpcHandle(host, fd = undefined, type = "net.Socket"
     let remote;
     try { local = host.tcpSocketAddress?.(fd, false); } catch {}
     try { remote = host.tcpSocketAddress?.(fd, true); } catch {}
+    if (typeof NetSocket !== "function") throw new Error("node:net is unavailable");
     return new NetSocket({
       fd,
       local,

@@ -2844,6 +2844,11 @@ static int ct_http_read_request_head(int fd, CtHttpRequest *request, CtHttpReadB
         if (read_count == 0) return -1;
         input->len += (size_t)read_count;
         input->data[input->len] = 0;
+        for (size_t index = 0; index < input->len; index += 1) {
+            unsigned char value = (unsigned char)input->data[index];
+            if (value == ' ') break;
+            if (!ct_http_is_token_char(value)) return -1;
+        }
     }
 }
 

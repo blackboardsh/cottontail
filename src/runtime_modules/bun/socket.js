@@ -557,6 +557,9 @@ function attachBunSocketHandlers(socket, handlerState, data = undefined, connect
       }
       return;
     }
+    if (socket.encrypted && socket._secureEventsEmitted !== true && typeof handlerState.current.error !== "function") {
+      return;
+    }
     call("error", socket, error);
   });
   socket.on("close", (hadError) => {

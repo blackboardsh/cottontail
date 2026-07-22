@@ -6116,6 +6116,15 @@ fn writeMinimalRuntimeEntryWrapper(
             .{try jsonStringLiteral(ctx, process_module)},
         );
     } else "";
+    const ipc_bootstrap_import = if (ctx.environ_map.get("COTTONTAIL_IPC_BOOTSTRAP")) |mode| blk: {
+        if (!std.mem.eql(u8, mode, "node")) break :blk "";
+        const child_process_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "child_process.js" });
+        break :blk try std.fmt.allocPrint(
+            ctx.allocator,
+            "import {s};\n",
+            .{try jsonStringLiteral(ctx, child_process_module)},
+        );
+    } else "";
     const process_install = if (bootstrap_mode == .process)
         "globalThis.process = __ctFullProcess;"
     else
@@ -6141,6 +6150,7 @@ fn writeMinimalRuntimeEntryWrapper(
         \\import {s};
         \\import {{ installRuntimeBootstrap as __ctInstallRuntimeBootstrap }} from {s};
         \\import {{ fileURLToPath as __ctFileURLToPath, pathToFileURL as __ctPathToFileURL }} from {s};
+        \\{s}
         \\{s}
         \\__ctInstallRuntimeBootstrap({{ fileURLToPath: __ctFileURLToPath, pathToFileURL: __ctPathToFileURL }});
         \\{s}
@@ -6168,6 +6178,7 @@ fn writeMinimalRuntimeEntryWrapper(
         try jsonStringLiteral(ctx, bootstrap_module),
         try jsonStringLiteral(ctx, url_module),
         process_import,
+        ipc_bootstrap_import,
         process_install,
         bundle_map_literal,
         try jsonStringLiteral(ctx, ctx.project_root),

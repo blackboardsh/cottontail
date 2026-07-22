@@ -329,7 +329,7 @@ if (Number.isInteger(nativeIpcFd) && nativeIpcFd >= 0 &&
                 try { cottontail.closeFd?.(ipcPendingFd); } catch {}
                 ipcPendingFd = undefined;
               }
-              g.process.disconnect();
+              if (g.process.connected) g.process.disconnect();
               return;
             }
             if (Number.isInteger(event.fd) && event.fd >= 0) {
