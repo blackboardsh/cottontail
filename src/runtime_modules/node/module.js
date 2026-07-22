@@ -2472,11 +2472,7 @@ function formatExtensionCompileSource(source, leadingNewline = false) {
   return leadingNewline ? `\n${body}\n` : `${body}\n`;
 }
 
-function isAsyncModuleBundleFailure(error, filename, source) {
-  const message = String(error?.message ?? error);
-  if (/top-level await/i.test(message)) return true;
-  if (!/["']await["'] can only be used inside an ["']async["'] function/i.test(message)) return false;
-
+function sourceRequiresAsyncModuleExecution(filename, source) {
   let transformed;
   try {
     transformed = transformEsmSourceForDynamicImport(maybeStripTypeScript(filename, source));
@@ -2498,6 +2494,13 @@ function isAsyncModuleBundleFailure(error, filename, source) {
   } catch {
     return false;
   }
+}
+
+function isAsyncModuleBundleFailure(error, filename, source) {
+  const message = String(error?.message ?? error);
+  if (/top-level await/i.test(message)) return true;
+  if (!/["']await["'] can only be used inside an ["']async["'] function/i.test(message)) return false;
+  return sourceRequiresAsyncModuleExecution(filename, source);
 }
 
 function executeBundledCommonJsModule(module, filename, source) {
@@ -3068,11 +3071,15 @@ function importResolvedRuntimeModule(resolved, options = undefined, forceAsync =
   }
   const resolvedFormat = resolvedByHook ? hookResolvedFormats.get(resolved) : formatForResolved(resolved);
   if (resolvedFormat === "commonjs") {
+    let source;
     if (/\.(?:js|jsx|ts|tsx)$/i.test(resolvedPath)) {
-      const source = embedded.found ? embedded.value : readModuleFile(resolvedPath);
+      source = embedded.found ? embedded.value : readModuleFile(resolvedPath);
       if (hasEsmSyntax(source)) {
         return executeDynamicImportSource(resolved, source, "module", forceAsync, asyncAncestors);
       }
+    }
+    if (forceAsync && source !== undefined && sourceRequiresAsyncModuleExecution(resolvedPath, source)) {
+      return executeDynamicImportSource(resolved, source, "module", true, asyncAncestors);
     }
     return namespaceFromCommonJs(loadCommonJsModule(resolved));
   }

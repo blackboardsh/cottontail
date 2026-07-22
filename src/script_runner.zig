@@ -4822,9 +4822,9 @@ fn bundleScriptNative(
     const detected_common_js_entrypoint = if (is_wasm_entrypoint or runtime_package_bin_entrypoint)
         false
     else
-        try shouldBundleCommonJsEntrypoint(ctx, script_abs);
+        try shouldBundleCommonJsEntrypoint(ctx, script_entry_abs);
     const is_common_js_entrypoint = detected_common_js_entrypoint or runtime_cache_common_js_entrypoint;
-    if (is_common_js_entrypoint) try validateCommonJsTestSyntax(ctx, script_abs);
+    if (is_common_js_entrypoint) try validateCommonJsTestSyntax(ctx, script_entry_abs);
     const runtime_bootstrap_mode: RuntimeBootstrapMode = if (!runtime_package_bin_entrypoint and
         !runtime_cache_common_js_entrypoint and
         !standalone_compile and
@@ -8574,9 +8574,12 @@ fn appendDynamicDispatcher(
     }
     const referrer = try std.fmt.allocPrint(ctx.allocator, "{s}/", .{resolution_dir});
     const referrer_literal = try jsonStringLiteral(ctx, referrer);
+    // COTTONTAIL-COMPAT: A rewritten dynamic import is still an asynchronous
+    // ESM operation. Let the runtime loader promote top-level-await sources
+    // without changing ordinary CommonJS interop.
     const fallback = try std.fmt.allocPrint(ctx.allocator,
         \\  if (typeof globalThis.__cottontailImportModule === "function") {{
-        \\    try {{ return await globalThis.__cottontailImportModule(__ctText, {s}, options); }}
+        \\    try {{ return await globalThis.__cottontailImportModule(__ctText, {s}, options, true); }}
         \\    catch (error) {{
         \\      if (__ctBare.toLowerCase().startsWith("file:") && error && (error.code === "MODULE_NOT_FOUND" || error.code === "ERR_MODULE_NOT_FOUND")) {{
         \\        error.message = `Cannot find module '${{__ctText}}'`;
