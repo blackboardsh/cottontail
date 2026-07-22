@@ -4299,6 +4299,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
     },
+    "test/regression/issue/22243.test.ts": {
+      "status": "enabled",
+      "reason": "RedisClient constructor invocation semantics pass both copied regression cases on a freshly embedded runtime (2 cases, 2 assertions)."
+    },
     "test/regression/issue/22353.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (1 bun:test cases, 202 assertions)."
@@ -4374,6 +4378,10 @@
     "test/regression/issue/23489.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 6 assertions)."
+    },
+    "test/regression/issue/23621.test.ts": {
+      "status": "enabled",
+      "reason": "RedisClient validates malformed URLs and TCP ports while accepting valid TCP, TLS, Unix, and default URLs (13 cases, 24 assertions)."
     },
     "test/regression/issue/23723.test.js": {
       "status": "enabled",
