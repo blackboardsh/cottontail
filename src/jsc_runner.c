@@ -14542,7 +14542,7 @@ static JSObjectRef ct_runtime_worker_diagnostics(CtJscRuntime *runtime, JSContex
                 capacity = next_capacity;
             }
             workers[count].id = worker->id;
-            workers[count].terminated = worker->terminated;
+            workers[count].terminated = worker->terminate_requested || worker->finishing || worker->finished;
             workers[count].referenced = worker->referenced;
             count += 1;
         }
