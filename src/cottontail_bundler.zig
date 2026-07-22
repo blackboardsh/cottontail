@@ -15,6 +15,9 @@ pub const BundleOptions = struct {
     node_path: ?[]const u8 = null,
     tsconfig_override: ?[]const u8 = null,
     source_map: compiler.schema.api.SourceMapMode = .none,
+    /// Internal runtime bundles can load these exact source paths from disk
+    /// when formatting an error instead of copying them into every hot map.
+    source_map_exclude_sources_content: []const []const u8 = &.{},
     output_format: compiler.options.Format = .esm,
     target: compiler.schema.api.Target = .bun,
     banner: []const u8 = "",
@@ -852,6 +855,7 @@ pub fn bundleEntryPointGraphWithOptions(
 
     transpiler.options.output_format = options.output_format;
     transpiler.options.source_map = compiler.options.SourceMapOption.fromApi(options.source_map);
+    transpiler.options.source_map_exclude_sources_content = options.source_map_exclude_sources_content;
     transpiler.options.banner = options.banner;
     transpiler.options.footer = options.footer;
     transpiler.options.public_path = options.public_path;

@@ -72,6 +72,7 @@ pub const LinkerContext = struct {
         css_chunking: bool = false,
         compile_to_standalone_html: bool = false,
         source_maps: options.SourceMapOption = .none,
+        source_map_exclude_sources_content: []const []const u8 = &.{},
         target: options.Target = .browser,
         compile: bool = false,
         metafile: bool = false,
@@ -172,12 +173,21 @@ pub const LinkerContext = struct {
             }
 
             const source: *const Logger.Source = &this.parse_graph.input_files.items(.source)[source_index];
+            if (this.excludeSourceMapContent(source_index)) return;
             var mutable = MutableString.initEmpty(bun.default_allocator);
             bun.handleOom(js_printer.quoteForJSON(source.contents, &mutable, false));
             var mutableOwned = mutable.toDefaultOwned();
             quoted_source_contents.* = mutableOwned.toOptional();
         }
     };
+
+    fn excludeSourceMapContent(this: *const LinkerContext, source_index: Index.Int) bool {
+        const source = &this.parse_graph.input_files.items(.source)[source_index];
+        for (this.options.source_map_exclude_sources_content) |path| {
+            if (strings.eqlLong(source.path.text, path, true)) return true;
+        }
+        return false;
+    }
 
     pub fn isExternalDynamicImport(this: *LinkerContext, record: *const ImportRecord, source_index: u32) bool {
         return this.graph.code_splitting and
@@ -770,13 +780,20 @@ pub const LinkerContext = struct {
         const source_indices_for_contents = source_id_map.keys();
         if (source_indices_for_contents.len > 0) {
             j.pushStatic("\n    ");
-            j.pushStatic(
-                quoted_source_map_contents[source_indices_for_contents[0]].get() orelse "",
-            );
+            const first_source_index = source_indices_for_contents[0];
+            if (c.excludeSourceMapContent(first_source_index)) {
+                j.pushStatic("null");
+            } else {
+                j.pushStatic(quoted_source_map_contents[first_source_index].get() orelse "");
+            }
 
             for (source_indices_for_contents[1..]) |index| {
                 j.pushStatic(",\n    ");
-                j.pushStatic(quoted_source_map_contents[index].get() orelse "");
+                if (c.excludeSourceMapContent(index)) {
+                    j.pushStatic("null");
+                } else {
+                    j.pushStatic(quoted_source_map_contents[index].get() orelse "");
+                }
             }
         }
         j.pushStatic(

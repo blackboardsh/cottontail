@@ -989,6 +989,7 @@ pub const BundleV2 = struct {
         this.linker.options.css_chunking = transpiler.options.css_chunking;
         this.linker.options.compile_to_standalone_html = transpiler.options.compile_to_standalone_html;
         this.linker.options.source_maps = transpiler.options.source_map;
+        this.linker.options.source_map_exclude_sources_content = transpiler.options.source_map_exclude_sources_content;
         this.linker.options.tree_shaking = transpiler.options.tree_shaking;
         this.linker.options.public_path = transpiler.options.public_path;
         this.linker.options.target = transpiler.options.target;

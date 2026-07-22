@@ -1743,6 +1743,8 @@ pub const BundleOptions = struct {
     tree_shaking: bool = false,
     code_splitting: bool = false,
     source_map: SourceMapOption = SourceMapOption.none,
+    /// Cottontail runtime-only source paths whose map content is read lazily.
+    source_map_exclude_sources_content: []const []const u8 = &.{},
     packages: PackagesOption = PackagesOption.bundle,
 
     disable_transpilation: bool = false,

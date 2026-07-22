@@ -1358,34 +1358,8 @@ const BuildWatchState = struct {
     }
 };
 
-fn replaceBuildWatchProcess(init: std.process.Init, args: []const [:0]const u8) !void {
-    if (comptime builtin.os.tag == .windows) {
-        if (TerminateProcess(
-            GetCurrentProcess(),
-            @intCast(cottontail_compiler.windows.watcher_reload_exit),
-        ) == 0) return error.BuildWatchProcessReplacementFailed;
-        while (true) std.atomic.spinLoopHint();
-    }
-
-    if (comptime builtin.os.tag == .macos or builtin.os.tag == .linux) {
-        const allocator = std.heap.c_allocator;
-        const executable = try std.process.executablePathAlloc(init.io, allocator);
-        defer allocator.free(executable);
-        const argv = try allocator.allocSentinel(?[*:0]const u8, args.len, null);
-        defer allocator.free(argv);
-        for (args, 0..) |arg, index| argv[index] = arg.ptr;
-        if (std.c.execve(executable.ptr, @ptrCast(argv.ptr), @ptrCast(std.c.environ)) != 0) {
-            return error.BuildWatchProcessReplacementFailed;
-        }
-        unreachable;
-    }
-
-    return error.BuildWatchProcessReplacementUnsupported;
-}
-
-fn waitForBuildWatchAndReplace(
+fn waitForBuildWatch(
     init: std.process.Init,
-    args: []const [:0]const u8,
     cwd_abs: []const u8,
     entries: []const []const u8,
     inputs: []const []const u8,
@@ -1400,11 +1374,29 @@ fn waitForBuildWatchAndReplace(
         include_entry_directories,
     );
     state.wait(init.io);
-    try replaceBuildWatchProcess(init, args);
-    unreachable;
 }
 
 fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
+    const watch_reload_code: u8 = 254;
+    while (true) {
+        const code = generation: {
+            // COTTONTAIL-COMPAT: Keep build --watch in-process for Bun's edit
+            // cadence while releasing all generation-owned parsing state.
+            var generation_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer generation_arena.deinit();
+            var generation_init = init;
+            generation_init.arena = &generation_arena;
+            break :generation try nativeBuildGeneration(generation_init, args, watch_reload_code);
+        };
+        if (code != watch_reload_code) return code;
+    }
+}
+
+fn nativeBuildGeneration(
+    init: std.process.Init,
+    args: []const [:0]const u8,
+    watch_reload_code: u8,
+) !u8 {
     const allocator = init.arena.allocator();
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
@@ -1850,7 +1842,10 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         std.Io.Dir.cwd().access(init.io, entry_abs, .{}) catch {
             try stderr.print("error: Module not found \"{s}\"\n", .{entry});
             try stderr.flush();
-            if (watch) try waitForBuildWatchAndReplace(init, args, cwd_abs, entries.items, &.{}, true);
+            if (watch) {
+                try waitForBuildWatch(init, cwd_abs, entries.items, &.{}, true);
+                return watch_reload_code;
+            }
             return 1;
         };
     }
@@ -1936,7 +1931,10 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
             try stderr.print("error: build failed: {s}\n", .{@errorName(err)});
         }
         try stderr.flush();
-        if (watch) try waitForBuildWatchAndReplace(init, args, cwd_abs, entries.items, &.{}, true);
+        if (watch) {
+            try waitForBuildWatch(init, cwd_abs, entries.items, &.{}, true);
+            return watch_reload_code;
+        }
         return 1;
     };
     defer cottontail_bundler.ct_bundle_free(result_json.ptr, result_json.len);
@@ -1994,7 +1992,10 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
                 };
             }
             try stderr.flush();
-            if (watch) try waitForBuildWatchAndReplace(init, args, cwd_abs, entries.items, &.{}, true);
+            if (watch) {
+                try waitForBuildWatch(init, cwd_abs, entries.items, &.{}, true);
+                return watch_reload_code;
+            }
             return 1;
         }
     }
@@ -2118,8 +2119,7 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
     try stdout.flush();
     if (build_watch_state) |*state| {
         state.wait(init.io);
-        try replaceBuildWatchProcess(init, args);
-        unreachable;
+        return watch_reload_code;
     }
     return 0;
 }

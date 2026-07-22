@@ -174,6 +174,8 @@ function buildState(mapPath, mapData, configuredBundlePath, configuredSourceRoot
       sources,
       generatedSources,
       sourceLines,
+      sourceLineAttempts: new Set(),
+      nestedStates: new Map(),
       lines,
       firstGeneratedLines,
       firstExecutableGeneratedLines,
@@ -226,12 +228,77 @@ function decodeOriginalPath(lines) {
   }
 }
 
+function sourceLinesForIndex(state, sourceIndex) {
+  const cached = state.sourceLines[sourceIndex];
+  if (Array.isArray(cached)) return cached;
+  if (state.sourceLineAttempts.has(sourceIndex)) return null;
+  state.sourceLineAttempts.add(sourceIndex);
+  const source = state.sources[sourceIndex];
+  if (typeof source !== "string" || source === "") return null;
+  try {
+    const contents = readMapText(source);
+    if (typeof contents === "string") {
+      const lines = contents.split(/\r?\n/);
+      state.sourceLines[sourceIndex] = lines;
+      return lines;
+    }
+  } catch {}
+  return null;
+}
+
+function decodeInlineSourceMap(lines) {
+  if (!Array.isArray(lines)) return null;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    const marker = "sourceMappingURL=data:application/json";
+    const markerIndex = line.indexOf(marker);
+    if (markerIndex < 0) continue;
+    const dataUri = line.slice(markerIndex + "sourceMappingURL=".length);
+    const comma = dataUri.indexOf(",");
+    if (comma < 0) return null;
+    try {
+      const metadata = dataUri.slice(0, comma);
+      const payload = dataUri.slice(comma + 1);
+      if (!metadata.includes(";base64")) return decodeURIComponent(payload);
+      if (typeof globalThis.Buffer?.from === "function") {
+        return globalThis.Buffer.from(payload, "base64").toString("utf8");
+      }
+      const binary = globalThis.atob(payload);
+      return new TextDecoder().decode(Uint8Array.from(binary, character => character.charCodeAt(0)));
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function nestedSourceMapState(state, sourceIndex) {
+  if (state.nestedStates.has(sourceIndex)) return state.nestedStates.get(sourceIndex);
+  // COTTONTAIL-COMPAT: Bun composes an inline map from build --watch with the
+  // runtime bundle map before reporting the original TypeScript location.
+  const source = state.sources[sourceIndex];
+  const mapData = decodeInlineSourceMap(sourceLinesForIndex(state, sourceIndex));
+  const nested = typeof source === "string" && mapData
+    ? buildState(`${source}.map`, mapData, source)
+    : null;
+  state.nestedStates.set(sourceIndex, nested);
+  return nested;
+}
+
+function preferNestedConstructedErrorCallSite(state, mapped) {
+  const source = sourceLinesForIndex(state, mapped.sourceIndex)?.[mapped.line - 1] ?? "";
+  const constructor = /\bnew\s+(?:(?:Aggregate|Eval|Range|Reference|Syntax|Type|URI)?Error)\b/.exec(source);
+  if (!constructor) return mapped;
+  const constructorColumn = constructor.index + 1;
+  return mapped.column > constructorColumn ? { ...mapped, column: constructorColumn } : mapped;
+}
+
 function virtualSourceMapping(state, sourceIndex) {
   let mappings = virtualSourceMappings.get(state);
   if (!mappings) virtualSourceMappings.set(state, mappings = new Map());
   if (mappings.has(sourceIndex)) return mappings.get(sourceIndex);
 
-  const transformedLines = state.sourceLines[sourceIndex];
+  const transformedLines = sourceLinesForIndex(state, sourceIndex);
   const source = decodeOriginalPath(transformedLines);
   if (!source || !Array.isArray(transformedLines)) {
     mappings.set(sourceIndex, null);
@@ -313,8 +380,19 @@ function remapVirtualSourcePosition(mapping, line, column) {
   return { source: mapping.source, line: mappedLine + 1, column: mappedColumn };
 }
 
-function finalizeMappedPosition(state, mapped) {
+function finalizeMappedPosition(state, mapped, visited = new Set()) {
   if (!mapped || mapped.sourceIndex == null) return mapped;
+  const nested = nestedSourceMapState(state, mapped.sourceIndex);
+  if (nested && !visited.has(nested)) {
+    visited.add(state);
+    const initial = lookup(nested, mapped.line, mapped.column);
+    const preferred = initial
+      ? preferConstructedErrorCallSite(nested, mapped.line, mapped.column, initial)
+      : null;
+    const nestedMapped = preferred ? preferNestedConstructedErrorCallSite(nested, preferred) : null;
+    if (nestedMapped) return finalizeMappedPosition(nested, nestedMapped, visited);
+  }
+
   const virtual = virtualSourceMapping(state, mapped.sourceIndex);
   return remapVirtualSourcePosition(virtual, mapped.line, mapped.column) ?? mapped;
 }
@@ -453,18 +531,19 @@ export function sourceContextForLocation(source, line, column) {
     }
     sourceIndex = bestIndex;
   }
-  if (sourceIndex < 0 || !state.sourceLines[sourceIndex]) return null;
+  const sourceLines = sourceIndex < 0 ? null : sourceLinesForIndex(state, sourceIndex);
+  if (sourceIndex < 0 || !sourceLines) return null;
   const virtual = virtualSourceMapping(state, sourceIndex);
   return {
     source: virtual?.source ?? state.sources[sourceIndex],
     line: Number(line),
     column: Number(column),
-    lines: virtual?.originalLines ?? state.sourceLines[sourceIndex],
+    lines: virtual?.originalLines ?? sourceLines,
   };
 }
 
 function preferConstructedErrorCallSite(state, generatedLine, generatedColumn, mapped) {
-  const sourceLines = state.sourceLines[mapped.sourceIndex];
+  const sourceLines = sourceLinesForIndex(state, mapped.sourceIndex);
   const currentSource = sourceLines?.[mapped.line - 1] ?? "";
   const currentConstructor = /\bnew\s+((?:Aggregate|Eval|Range|Reference|Syntax|Type|URI)?Error)\b/.exec(currentSource);
   if (currentConstructor) {

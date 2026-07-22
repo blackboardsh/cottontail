@@ -390,7 +390,7 @@ pub fn runWithExecArgvDisplay(
         );
     }
 
-    var runnable = bundleScriptNative(&ctx, entrypoint_path, exec_args, script_args, null, null, null, false, null) catch |err| {
+    var runnable = bundleScriptNative(&ctx, entrypoint_path, exec_args, script_args, null, null, null, false, null, false) catch |err| {
         if (err == error.TestBundleFailed) return 1;
         if (err == error.SyntaxError) {
             ctx.writeStderr("error: Syntax Error\n", .{});
@@ -1397,7 +1397,7 @@ pub fn runEval(
     const eval_entry = try writeEvalEntrypoint(&ctx, ctx.project_root, executable_source, print_result, module_input, "[eval]", true, .omit_entrypoint);
     defer std.Io.Dir.cwd().deleteFile(ctx.io, eval_entry.entry_path) catch {};
     defer if (eval_entry.source_path) |path| std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
-    var runnable = try bundleScriptNative(&ctx, eval_entry.entry_path, exec_args, script_args, ctx.project_root, null, null, false, null);
+    var runnable = try bundleScriptNative(&ctx, eval_entry.entry_path, exec_args, script_args, ctx.project_root, null, null, false, null, false);
     defer runnable.deinit(&ctx);
     canonicalizeEvalSourceMap(&ctx, runnable.path, eval_entry.source_path orelse eval_entry.entry_path) catch |err| switch (err) {
         error.EvalSourceMissingFromSourceMap => {},
@@ -1520,6 +1520,7 @@ fn runHtmlDevServerOnThread(server_run: *HtmlDevServerRun) !u8 {
         null,
         false,
         null,
+        false,
     );
     defer runnable.deinit(&ctx);
     canonicalizeEvalSourceMap(&ctx, runnable.path, eval_entry.source_path orelse eval_entry.entry_path) catch |err| switch (err) {
@@ -1701,6 +1702,11 @@ fn rewriteRuntimeEntrypointSourceMap(
     physical_path: []const u8,
     identity_path: []const u8,
 ) ![]const u8 {
+    // COTTONTAIL-COMPAT: Runtime wrappers already resolve relative map sources
+    // against the project root. Avoid parsing and reserializing large hot maps
+    // when no generated entrypoint identity needs to be repaired.
+    if (std.mem.eql(u8, physical_path, identity_path)) return source_map;
+
     var parsed = try std.json.parseFromSlice(std.json.Value, ctx.allocator, source_map, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return source_map;
@@ -1733,8 +1739,7 @@ fn rewriteRuntimeEntrypointSourceMap(
                 continue;
             }
         }
-        if (std.mem.eql(u8, physical_path, identity_path) or
-            source.* != .string or
+        if (source.* != .string or
             !sourcePathEndsWithComponent(source.string, physical_name))
         {
             continue;
@@ -1984,6 +1989,7 @@ fn compileStandaloneSourceWithContext(
         &graph,
         true,
         null,
+        false,
     );
     defer runnable.deinit(ctx);
     defer graph.deinit();
@@ -2524,7 +2530,7 @@ pub fn runStdin(
     const stdin_entry = try writeEvalEntrypoint(&ctx, ctx.project_root, source_z, false, module_input, "[stdin]", true, .stdin);
     defer std.Io.Dir.cwd().deleteFile(ctx.io, stdin_entry.entry_path) catch {};
     defer if (stdin_entry.source_path) |path| std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
-    var runnable = try bundleScriptNative(&ctx, stdin_entry.entry_path, exec_args, script_args, ctx.project_root, null, null, false, null);
+    var runnable = try bundleScriptNative(&ctx, stdin_entry.entry_path, exec_args, script_args, ctx.project_root, null, null, false, null, false);
     defer runnable.deinit(&ctx);
     canonicalizeVirtualSourceMap(&ctx, runnable.path, stdin_entry.source_path orelse stdin_entry.entry_path, "[stdin]") catch |err| switch (err) {
         error.EvalSourceMissingFromSourceMap => {},
@@ -3347,6 +3353,7 @@ fn runReloadGeneration(
     var watch_runtime: ?runtime.Runtime = null;
     defer if (watch_runtime) |*js_runtime| js_runtime.deinit();
 
+    const reuse_reload_runtime = reload.mode == .hot and hot_runtime.* != null;
     const js_runtime: *runtime.Runtime = if (reload.mode == .hot)
         try ensureHotRuntime(execution, hot_runtime)
     else blk: {
@@ -3365,6 +3372,7 @@ fn runReloadGeneration(
         null,
         false,
         &generated_dependencies,
+        reuse_reload_runtime,
     ) catch |err| {
         if (err != error.ReloadBundleFailed and err != error.TestBundleFailed) {
             generation_ctx.writeStderr("cottontail: reload build failed: {s}\n", .{@errorName(err)});
@@ -4756,6 +4764,7 @@ fn bundleScriptNative(
     graph_out: ?*native_bundler.BundleGraphOutput,
     standalone_compile: bool,
     reload_dependencies_out: ?*[]const [:0]const u8,
+    reuse_reload_runtime: bool,
 ) !RuntimeArtifact {
     if (reload_dependencies_out) |dependencies| dependencies.* = &.{};
     const tmp_dir = try ensureTempDir(ctx);
@@ -4838,6 +4847,12 @@ fn bundleScriptNative(
     else
         .full;
     const use_selective_runtime = runtime_bootstrap_mode != .full;
+    // COTTONTAIL-COMPAT: Hot mode keeps one JSC runtime alive. Once its minimal
+    // bootstrap has run, later generations only need to evaluate the entry.
+    const reuse_minimal_reload_runtime = reuse_reload_runtime and
+        runtime_bootstrap_mode == .minimal and
+        !is_common_js_entrypoint and
+        !is_wasm_entrypoint;
     const has_custom_conditions = hasCustomConditions(exec_args) or hasCustomConditions(script_args);
     const tsconfig_override = (try tsconfigOverridePath(ctx, exec_args)) orelse
         try tsconfigOverridePath(ctx, script_args);
@@ -4874,7 +4889,15 @@ fn bundleScriptNative(
         reusable_runtime_bundle_root
     else
         ctx.project_root;
-    const wrapped_entry = if (is_wasm_entrypoint)
+    const wrapped_entry = if (reuse_minimal_reload_runtime)
+        try writeReusedReloadEntryWrapper(
+            ctx,
+            tmp_dir,
+            script_entry_abs,
+            script_identity_abs,
+            is_test_cli_execution,
+        )
+    else if (is_wasm_entrypoint)
         try writeWasiEntryWrapper(ctx, tmp_dir, script_abs)
     else if (runtime_package_bin_entrypoint)
         try writeCommonJsEntryWrapper(
@@ -4985,7 +5008,14 @@ fn bundleScriptNative(
         null;
     // Runtime bundles advertise an adjacent source map to the JS stack
     // remapper. Cached maps move with their immutable generated artifact.
-    if (build_options == null) options.source_map = .external;
+    if (build_options == null) {
+        options.source_map = .external;
+        // COTTONTAIL-COMPAT: Repeated hot maps should not copy a large entry
+        // source that remains available at its stable on-disk identity.
+        if (reload_dependencies_out != null and std.mem.eql(u8, script_entry_abs, script_identity_abs)) {
+            options.source_map_exclude_sources_content = &.{script_abs};
+        }
+    }
     var launcher_cache = if (launcher_cache_name) |name|
         try acquireLauncherCache(
             ctx,
@@ -6641,6 +6671,42 @@ fn buildCliPreloadImports(ctx: *const Context, script_abs: []const u8, exec_args
         }
     }
     return try output.toOwnedSlice(ctx.allocator);
+}
+
+fn writeReusedReloadEntryWrapper(
+    ctx: *const Context,
+    tmp_dir: []const u8,
+    script_import_abs: []const u8,
+    script_abs: []const u8,
+    test_cli_execution: bool,
+) ![]const u8 {
+    const wrapper_name = try std.fmt.allocPrint(
+        ctx.allocator,
+        "script-entry-reload-{x}.mjs",
+        .{std.hash.Wyhash.hash(0, script_abs)},
+    );
+    const wrapper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, wrapper_name });
+    const test_header_signal = if (test_cli_execution)
+        "globalThis.__cottontailBunTestHeaderPrinted = true;"
+    else
+        "";
+    const source = try std.fmt.allocPrint(ctx.allocator,
+        \\globalThis.__cottontailLoadingTestModules = true;
+        \\try {{
+        \\  {s}
+        \\  globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
+        \\  await import({s});
+        \\}} finally {{
+        \\  globalThis.__cottontailLoadingTestModules = false;
+        \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
+        \\}}
+        \\
+    , .{
+        test_header_signal,
+        try jsonStringLiteral(ctx, script_import_abs),
+    });
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
+    return wrapper_path;
 }
 
 fn writeMinimalRuntimeEntryWrapper(
