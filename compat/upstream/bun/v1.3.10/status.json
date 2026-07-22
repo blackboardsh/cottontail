@@ -1702,6 +1702,11 @@
       "reason": "The unchanged Next pages SSR fixture completes all 100 requests and lifecycle checks under Cottontail (1 bun:test case, 204 assertions).",
       "timeoutMs": 300000
     },
+    "test/integration/next-pages/test/next-build.test.ts": {
+      "status": "enabled",
+      "reason": "The unchanged Next pages production build completes static generation and matches Node's normalized output and generated-file hashes (1 bun:test case, 8 assertions, 2 snapshots).",
+      "timeoutMs": 240000
+    },
     "test/integration/sass/sass.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
