@@ -1,15 +1,15 @@
 import { expect, test } from "bun:test";
 import { createSocketPair } from "bun:internal-for-testing";
-import { closeSync, unlinkSync } from "node:fs";
+import { closeSync, readSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
 const tlsFixtures = join(
   import.meta.dir,
-  "../../compat/upstream/bun/v1.3.10/test/js/bun/http/fixtures",
+  "fixtures",
 );
 const tls = {
-  cert: await Bun.file(join(tlsFixtures, "cert.pem")).text(),
-  key: await Bun.file(join(tlsFixtures, "cert.key")).text(),
+  cert: await Bun.file(join(tlsFixtures, "bun-socket-cert.pem")).text(),
+  key: await Bun.file(join(tlsFixtures, "bun-socket-cert.key")).text(),
 };
 
 function withTimeout<T>(promise: Promise<T>, milliseconds = 5000): Promise<T> {
@@ -40,7 +40,7 @@ test("Bun.listen and Bun.connect exchange TCP data", async () => {
       port: server.port,
       socket: {
         open(socket) {
-          socket.write("hello");
+          expect(socket.write(new Uint8Array([0x78, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x79]), 1, 5)).toBe(5);
         },
         data(socket, data) {
           received.resolve(data.toString());
@@ -148,6 +148,206 @@ test.skipIf(process.platform === "win32")("Bun.listen and Bun.connect exchange U
   } finally {
     server.stop(true);
     try { unlinkSync(path); } catch {}
+  }
+});
+
+test("Bun sockets validate handlers and binaryType", () => {
+  expect(() => Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: {} as any,
+  })).toThrow('Expected at least "data" or "drain" callback');
+  expect(() => Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: { data: 1 } as any,
+  })).toThrow('Expected "onData" callback to be a function');
+  expect(() => Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: { data() {}, binaryType: "nodebuffer" } as any,
+  })).toThrow('SocketHandler.binaryType must be "arraybuffer", "buffer", or "uint8array"');
+});
+
+test("listener and socket reload replace handlers on an active connection", async () => {
+  const completed = Promise.withResolvers<void>();
+  const events: string[] = [];
+  let serverSocketData: object | undefined;
+  const initialData = { generation: 1 };
+  const nextData = { generation: 2 };
+  const server = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    data: initialData,
+    socket: {
+      data(socket, data) {
+        serverSocketData = socket.data;
+        events.push(`server-old:${Buffer.isBuffer(data)}:${data}`);
+        expect(server.reload({
+          socket: {
+            binaryType: "uint8array",
+            data(reloadedSocket, reloadedData) {
+              events.push(`server-new:${reloadedData.constructor.name}:${Buffer.from(reloadedData).toString()}`);
+              reloadedSocket.end("ack-two");
+            },
+          },
+        })).toBeUndefined();
+        server.data = nextData;
+        socket.write("ack-one");
+      },
+    },
+  });
+
+  let client: Bun.Socket | undefined;
+  try {
+    client = await Bun.connect({
+      hostname: "127.0.0.1",
+      port: server.port,
+      socket: {
+        open(socket) {
+          socket.write("one");
+        },
+        data(socket, data) {
+          events.push(`client-old:${Buffer.isBuffer(data)}:${data}`);
+          expect(socket.reload({
+            socket: {
+              binaryType: "arraybuffer",
+              data(reloadedSocket, reloadedData) {
+                events.push(`client-new:${reloadedData.constructor.name}:${Buffer.from(reloadedData).toString()}`);
+                reloadedSocket.end();
+                completed.resolve();
+              },
+            },
+          })).toBeUndefined();
+          socket.write("two");
+        },
+      },
+    });
+    await withTimeout(completed.promise);
+    expect(events).toEqual([
+      "server-old:true:one",
+      "client-old:true:ack-one",
+      "server-new:Uint8Array:two",
+      "client-new:ArrayBuffer:ack-two",
+    ]);
+    expect(serverSocketData).toBe(initialData);
+    expect(server.data).toBe(nextData);
+  } finally {
+    client?.terminate();
+    server.stop(true);
+  }
+});
+
+test("Bun socket lifecycle methods and timeout follow Bun contracts", async () => {
+  const timedOut = Promise.withResolvers<number>();
+  const server = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: { data() {} },
+  });
+  const started = Date.now();
+  const client = await Bun.connect({
+    hostname: "127.0.0.1",
+    port: server.port,
+    socket: {
+      data() {},
+      timeout(socket) {
+        timedOut.resolve(Date.now() - started);
+        socket.end();
+      },
+    },
+  });
+
+  try {
+    expect(client.readyState).toBe(1);
+    expect(client.write.length).toBe(3);
+    expect(client.end.length).toBe(3);
+    expect(client.shutdown.length).toBe(1);
+    expect(client.timeout.length).toBe(1);
+    expect(client.reload.length).toBe(1);
+    expect(client.ref()).toBeUndefined();
+    expect(client.unref()).toBeUndefined();
+    expect(client.ref()).toBeUndefined();
+    expect(client.pause()).toBeUndefined();
+    expect(client.resume()).toBeUndefined();
+    expect(client.timeout(1)).toBeUndefined();
+    expect(await withTimeout(timedOut.promise, 3000)).toBeGreaterThanOrEqual(800);
+  } finally {
+    client.terminate();
+    server.stop(true);
+  }
+});
+
+test.skipIf(process.platform === "win32")("Bun socket drain waits for native writable readiness", async () => {
+  const [socketFd, peerFd] = createSocketPair();
+  const drained = Promise.withResolvers<void>();
+  let peerReadStarted = false;
+  let drainBeforeRead = false;
+  let socket: Bun.Socket | undefined;
+
+  try {
+    socket = await Bun.connect({
+      fd: socketFd,
+      socket: {
+        data() {},
+        drain() {
+          if (!peerReadStarted) drainBeforeRead = true;
+          drained.resolve();
+        },
+      },
+    });
+    const payload = Buffer.alloc(1024 * 1024, 0x61);
+    let written = payload.byteLength;
+    for (let attempt = 0; attempt < 8 && written === payload.byteLength; attempt += 1) {
+      written = socket.write(payload);
+    }
+    expect(written).toBeGreaterThanOrEqual(0);
+    expect(written).toBeLessThan(payload.byteLength);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(drainBeforeRead).toBe(false);
+
+    peerReadStarted = true;
+    readSync(peerFd, Buffer.alloc(1024 * 1024), 0, 1024 * 1024, null);
+    await withTimeout(drained.promise);
+  } finally {
+    socket?.terminate();
+    closeSync(peerFd);
+  }
+});
+
+test("allowHalfOpen sockets can reply after the peer ends its write side", async () => {
+  const response = Promise.withResolvers<string>();
+  const server = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    allowHalfOpen: true,
+    socket: {
+      data() {},
+      end(socket) {
+        socket.end("after-fin");
+      },
+    },
+  });
+  let client: Bun.Socket | undefined;
+
+  try {
+    client = await Bun.connect({
+      hostname: "127.0.0.1",
+      port: server.port,
+      allowHalfOpen: true,
+      socket: {
+        open(socket) {
+          socket.end("request");
+        },
+        data(_socket, data) {
+          response.resolve(data.toString());
+        },
+      },
+    });
+    expect(await withTimeout(response.promise)).toBe("after-fin");
+  } finally {
+    client?.terminate();
+    server.stop(true);
   }
 });
 

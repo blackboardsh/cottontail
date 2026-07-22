@@ -10706,6 +10706,7 @@ static JSValueRef ct_tcp_server_listen(JSContextRef ctx, JSObjectRef function, J
     }
     bool ipv6_only = argc >= 5 && ct_value_to_bool(ctx, argv[4]);
     bool reuse_port = argc >= 6 && ct_value_to_bool(ctx, argv[5]);
+    bool exclusive = argc >= 7 && ct_value_to_bool(ctx, argv[6]);
 
     struct addrinfo *results = NULL;
     if (ct_tcp_resolve_address(ctx, address, port, family, true, &results, exception) != 0) {
@@ -10719,7 +10720,18 @@ static JSValueRef ct_tcp_server_listen(JSContextRef ctx, JSObjectRef function, J
         listen_fd = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
         if (listen_fd < 0) continue;
         int yes = 1;
-        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#if defined(_WIN32) && defined(SO_EXCLUSIVEADDRUSE)
+        if (exclusive) {
+            if (setsockopt(listen_fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, &yes, sizeof(yes)) != 0) {
+                close(listen_fd);
+                listen_fd = -1;
+                continue;
+            }
+        } else
+#endif
+        if (!exclusive) {
+            setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        }
 #if defined(IPV6_V6ONLY)
         if (entry->ai_family == AF_INET6) {
             int only = ipv6_only ? 1 : 0;
@@ -10737,7 +10749,7 @@ static JSValueRef ct_tcp_server_listen(JSContextRef ctx, JSObjectRef function, J
             continue;
         }
 #endif
-        if (reuse_port) {
+        if (reuse_port && !exclusive) {
 #if defined(SO_REUSEPORT) && !defined(_WIN32)
             if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes)) != 0) {
                 close(listen_fd);
@@ -11557,7 +11569,8 @@ static JSValueRef ct_tcp_socket_shutdown(JSContextRef ctx, JSObjectRef function,
     }
     int fd;
     if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid TCP socket")) return JSValueMakeUndefined(ctx);
-    if (shutdown(fd, SHUT_WR) != 0 && errno != ENOTCONN) {
+    int how = argc >= 2 && ct_value_to_bool(ctx, argv[1]) ? SHUT_RD : SHUT_WR;
+    if (shutdown(fd, how) != 0 && errno != ENOTCONN) {
         ct_throw_message(ctx, exception, strerror(errno));
         return JSValueMakeUndefined(ctx);
     }
@@ -11580,6 +11593,9 @@ static JSValueRef ct_tcp_socket_reset(JSContextRef ctx, JSObjectRef function, JS
     if (setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger_option, sizeof(linger_option)) != 0) {
         int option_error = errno;
         close(fd);
+        if (option_error == EINVAL || option_error == ENOTCONN) {
+            return JSValueMakeBoolean(ctx, true);
+        }
         ct_throw_message(ctx, exception, strerror(option_error));
         return JSValueMakeUndefined(ctx);
     }
@@ -19463,6 +19479,7 @@ static void *ct_fd_watcher_thread(void *opaque) {
         bool writable = false;
         bool readiness_only = false;
         ct_fd_watcher_get_interest(watcher, &readable, &writable, &readiness_only);
+        bool poll_readable = readable;
         if (!readable && !writable) {
             usleep(1000);
             continue;
@@ -19479,7 +19496,8 @@ static void *ct_fd_watcher_thread(void *opaque) {
                 }
                 break;
             }
-            if (available == 0) {
+            poll_readable = available > 0;
+            if (!poll_readable && !writable) {
                 Sleep(10);
                 continue;
             }
@@ -19488,12 +19506,12 @@ static void *ct_fd_watcher_thread(void *opaque) {
         struct pollfd poll_fd;
         poll_fd.fd = watcher->fd;
         poll_fd.events = 0;
-        if (readable) poll_fd.events |= POLLIN | POLLHUP | POLLERR;
+        if (poll_readable) poll_fd.events |= POLLIN | POLLHUP | POLLERR;
         if (writable) poll_fd.events |= POLLOUT | POLLHUP | POLLERR;
         poll_fd.revents = 0;
 #if defined(_WIN32)
         if (is_crt_handle) {
-            if (readable) poll_fd.revents |= POLLIN;
+            if (poll_readable) poll_fd.revents |= POLLIN;
             if (writable) poll_fd.revents |= POLLOUT;
         }
 #endif
@@ -19526,7 +19544,7 @@ static void *ct_fd_watcher_thread(void *opaque) {
         }
 
         ct_fd_watcher_get_interest(watcher, &readable, &writable, &readiness_only);
-        if (!readable || (poll_fd.revents & (POLLIN | POLLHUP | POLLERR)) == 0) continue;
+        if (!readable || !poll_readable || (poll_fd.revents & (POLLIN | POLLHUP | POLLERR)) == 0) continue;
         if (readiness_only && ct_fd_watcher_take_readable_notification(watcher)) {
             ct_queue_fd_simple(watcher->runtime, watcher->id, "readable", NULL);
             continue;

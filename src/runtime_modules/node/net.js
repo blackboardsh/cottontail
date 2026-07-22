@@ -782,6 +782,7 @@ class SocketImpl extends EventEmitter {
       }
       if (event.type === "writable") {
         this._flushOutboundWrites();
+        this.__cottontailBunWritable?.();
         return;
       }
       if (event.type === "data") {
@@ -1635,7 +1636,7 @@ class ServerImpl extends EventEmitter {
     if (options.backlog != null && (!Number.isInteger(Number(options.backlog)) || Number(options.backlog) < 0)) {
       throw outOfRange("options.backlog", "a non-negative integer", options.backlog);
     }
-    for (const optionName of ["ipv6Only", "reusePort"]) {
+    for (const optionName of ["ipv6Only", "reusePort", "exclusive"]) {
       if (options[optionName] != null && typeof options[optionName] !== "boolean") {
         throw invalidArgType(`options.${optionName}`, "of type boolean", options[optionName]);
       }
@@ -1684,6 +1685,7 @@ class ServerImpl extends EventEmitter {
           Number(options.backlog ?? 511),
           options.ipv6Only === true,
           options.reusePort === true,
+          options.exclusive === true,
         );
       }
       if (result != null) {

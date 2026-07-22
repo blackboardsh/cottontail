@@ -14678,6 +14678,64 @@ export function openInEditor(path) {
 }
 
 const bunSocketCallbackError = Symbol("cottontail.bunSocketCallbackError");
+const bunSocketCallbackNames = {
+  open: "onOpen",
+  close: "onClose",
+  data: "onData",
+  drain: "onWritable",
+  timeout: "onTimeout",
+  connectError: "onConnectError",
+  end: "onEnd",
+  error: "onError",
+  handshake: "onHandshake",
+};
+
+function bunSocketInvalidArgument(message) {
+  const error = new TypeError(message);
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
+}
+
+function normalizeBunSocketHandlers(value, isServer = false) {
+  if (value === undefined) throw bunSocketInvalidArgument("SocketOptions.socket is required");
+  if (value === null || typeof value !== "object") {
+    throw bunSocketInvalidArgument("SocketHandler must be an object");
+  }
+
+  const handlers = { binaryType: "buffer", isServer };
+  for (const [name, callbackName] of Object.entries(bunSocketCallbackNames)) {
+    const callback = value[name];
+    if (callback == null) continue;
+    if (typeof callback !== "function") {
+      throw bunSocketInvalidArgument(`Expected "${callbackName}" callback to be a function`);
+    }
+    handlers[name] = _wrapAsyncCallback(callback);
+  }
+
+  if (value.binaryType !== undefined) {
+    if (typeof value.binaryType !== "string") {
+      throw bunSocketInvalidArgument("SocketHandler.binaryType must be a string");
+    }
+    if (value.binaryType !== "arraybuffer" && value.binaryType !== "buffer" && value.binaryType !== "uint8array") {
+      throw bunSocketInvalidArgument('SocketHandler.binaryType must be "arraybuffer", "buffer", or "uint8array"');
+    }
+    handlers.binaryType = value.binaryType;
+  }
+
+  if (handlers.data == null && handlers.drain == null) {
+    throw bunSocketInvalidArgument('Expected at least "data" or "drain" callback');
+  }
+  return handlers;
+}
+
+function createBunSocketHandlerState(value, isServer = false) {
+  return { current: normalizeBunSocketHandlers(value, isServer), isServer };
+}
+
+function reloadBunSocketHandlerState(state, value) {
+  const handlers = normalizeBunSocketHandlers(value, state.isServer);
+  state.current = handlers;
+}
 
 function normalizeBunSocketCallbackError(error) {
   if (!(error instanceof Error)) return error;
@@ -14707,12 +14765,12 @@ function bunSocketTlsTransport(socket) {
       return transport;
     },
     write(chunk) {
-      const length = bytesFromData(chunk).byteLength;
-      const written = socket.write(chunk);
-      return typeof written === "number" ? written >= length : written !== false;
+      const write = socket.__cottontailNodeWrite ?? socket.write.bind(socket);
+      return write(chunk) !== false;
     },
     end(...args) {
-      socket.end(...args);
+      const end = socket.__cottontailNodeEnd ?? socket.end.bind(socket);
+      end(...args);
       return transport;
     },
     destroy(error) {
@@ -14748,12 +14806,13 @@ function bunSocketUpgradeTlsError(error) {
 }
 
 function upgradeBunSocketToTls(socket, options) {
-  if (socket.destroyed || socket.connecting || !socket.readable || !socket.writable) {
-    throw new TypeError("upgradeTLS requires an established socket");
+  if (socket.destroyed || socket.connecting || !socket.readable || !socket.writable) return undefined;
+  if (socket._isPipe) return undefined;
+  if (socket.listener != null) {
+    throw new TypeError("Server-side upgradeTLS is not supported. Use upgradeDuplexToTLS with isServer: true instead.");
   }
   if (options === null || typeof options !== "object") throw new TypeError("Expected options object");
-  const handlers = options.socket;
-  if (handlers === null || typeof handlers !== "object") throw new TypeError('Expected "socket" option');
+  const handlerState = createBunSocketHandlerState(options.socket, false);
   const tls = options.tls;
   if (tls !== true && (tls === null || typeof tls !== "object" || Object.keys(tls).length === 0)) {
     throw new TypeError('Expected "tls" option');
@@ -14776,139 +14835,351 @@ function upgradeBunSocketToTls(socket, options) {
     throw bunSocketUpgradeTlsError(error);
   }
 
-  const attached = attachBunSocketHandlers(tlsSocket, handlers, options.data);
-  attached.handlers = handlers;
-  if (typeof handlers.handshake === "function") attached.call("open", tlsSocket);
+  tlsSocket.allowHalfOpen = socket.allowHalfOpen === true;
+  const attached = attachBunSocketHandlers(tlsSocket, handlerState, options.data);
+  if (typeof attached.handlers.handshake === "function") attached.call("open", tlsSocket);
   tlsSocket.once("secureConnect", () => {
     completeBunTlsHandshake(attached);
-    if (typeof handlers.drain === "function") queueMicrotask(() => attached.call("drain", tlsSocket));
+    if (typeof attached.handlers.drain === "function") {
+      queueMicrotask(() => {
+        if (!tlsSocket.destroyed) attached.call("drain", tlsSocket);
+      });
+    }
   });
   return [socket, tlsSocket];
 }
 
-function attachBunSocketHandlers(socket, handlers = {}, data = undefined, connectionState = undefined) {
-  socket.data = data;
-  if (!socket.__cottontailBunSocketMethods) {
-    const nodeWrite = socket.write.bind(socket);
-    const nodeSetTimeout = socket.setTimeout.bind(socket);
-    Object.defineProperty(socket, "__cottontailBunSocketMethods", { value: true });
-    socket.write = (chunk, encoding = undefined, callback = undefined) => {
-      if (socket.destroyed || !socket.writable) return 0;
-      const length = bytesFromData(chunk).byteLength;
-      const before = Number(socket.bytesWritten) || 0;
-      const acceptedWithoutBackpressure = nodeWrite(chunk, encoding, callback);
-      const written = Math.max(0, Math.min(length, (Number(socket.bytesWritten) || 0) - before));
-      if (!acceptedWithoutBackpressure) socket.__cottontailScheduleBunDrain?.();
-      return acceptedWithoutBackpressure ? length : written;
-    };
-    socket.flush = () => {
-      if (typeof socket._flushTlsPendingWrites === "function") socket._flushTlsPendingWrites();
-      else socket._flushOutboundWrites?.();
-    };
-    socket.shutdown = () => {
-      socket.end();
-    };
-    const timeout = (milliseconds) => {
-      nodeSetTimeout(milliseconds);
-      socket.timeout = timeout;
-      return socket;
-    };
-    socket.timeout = timeout;
-    if (!socket.encrypted) {
-      socket.upgradeTLS = (options) => upgradeBunSocketToTls(socket, options);
-    }
+function defineBunSocketMethod(socket, name, value) {
+  Object.defineProperty(socket, name, {
+    value,
+    configurable: true,
+    writable: true,
+    enumerable: false,
+  });
+}
+
+function bunSocketRangeError(name, value, maximum) {
+  const error = new RangeError(`The value of "${name}" is out of range. It must be >= 0 and <= ${maximum}. Received ${String(value)}`);
+  error.code = "ERR_OUT_OF_RANGE";
+  return error;
+}
+
+function bunSocketWriteArguments(args, label) {
+  const data = args[0];
+  if (data === undefined) return new Uint8Array(0);
+
+  let byteOffset = args[1];
+  let byteLength = args[2];
+  let encoding = args[3];
+  if (typeof byteLength === "string") {
+    encoding = byteLength;
+    byteLength = undefined;
+  } else if (typeof byteOffset === "string") {
+    encoding = byteOffset;
+    byteOffset = undefined;
   }
+  if (encoding !== undefined && typeof encoding !== "string") {
+    throw bunSocketInvalidArgument(`Socket.${label} encoding must be a string`);
+  }
+  if (encoding !== undefined && (byteOffset !== undefined || byteLength !== undefined)) {
+    throw new Error("Encoding cannot be combined with byteOffset or byteLength");
+  }
+
+  let bytes;
+  if (typeof data === "string") {
+    bytes = globalThis.Buffer?.from
+      ? globalThis.Buffer.from(data, encoding ?? "utf8")
+      : new TextEncoder().encode(data);
+  } else {
+    const sharedCopy = sharedArrayBufferBytes(data);
+    if (sharedCopy != null) bytes = sharedCopy;
+    else if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
+    else if (ArrayBuffer.isView(data)) bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    else throw bunSocketInvalidArgument(`Socket.${label} data must be a string, buffer, or blob`);
+  }
+
+  const offset = byteOffset === undefined ? 0 : byteOffset;
+  if (!Number.isInteger(offset)) {
+    throw bunSocketInvalidArgument(`Socket.${label} byteOffset must be an integer`);
+  }
+  if (offset < 0 || offset > bytes.byteLength) throw bunSocketRangeError("byteOffset", offset, bytes.byteLength);
+
+  const length = byteLength === undefined ? bytes.byteLength : byteLength;
+  if (!Number.isInteger(length)) {
+    throw bunSocketInvalidArgument(`Socket.${label} byteLength must be an integer`);
+  }
+  const remaining = bytes.byteLength - offset;
+  if (length < 0 || length > remaining) throw bunSocketRangeError("byteLength", length, remaining);
+  return bytes.subarray(offset, offset + length);
+}
+
+function armBunSocketWritable(socket) {
+  if (!socket._watchId && socket.fd != null) socket._startRead?.();
+  if (socket._watchId) cottontail.fdWatchSetWritable?.(socket._watchId, true);
+}
+
+function writeBunSocketBytes(socket, bytes) {
+  if (socket.destroyed || !socket.writable) return -1;
+  if (socket.encrypted) {
+    if (socket._tlsId == null && !socket.connecting) return -1;
+    socket.__cottontailNodeWrite(bytes);
+    return bytes.byteLength;
+  }
+  if (socket.fd == null) return -1;
+  if (bytes.byteLength === 0) return 0;
+
+  let written;
+  try {
+    written = Number(cottontail.fdWriteSome(socket.fd, bytes));
+  } catch (error) {
+    queueMicrotask(() => {
+      if (!socket.destroyed) socket.destroy(error);
+    });
+    return -1;
+  }
+  if (!Number.isFinite(written) || written < 0) return -1;
+  written = Math.min(bytes.byteLength, Math.trunc(written));
+  socket._bytesDispatchedValue = (Number(socket._bytesDispatchedValue) || 0) + written;
+  if (written > 0) socket._refreshTimeout?.();
+  if (written < bytes.byteLength) {
+    socket.__cottontailBunNeedsDrain = true;
+    armBunSocketWritable(socket);
+  }
+  return written;
+}
+
+function attachBunSocketHandlers(socket, handlerState, data = undefined, connectionState = undefined) {
+  socket.data = data;
+  socket.__cottontailBunHandlerState = handlerState;
+
   const call = (name, ...args) => {
+    const handlers = handlerState.current;
     const callback = handlers?.[name];
-    if (typeof callback !== "function") return undefined;
+    if (typeof callback !== "function") {
+      if (name === "error") throw args[1];
+      return undefined;
+    }
     try {
-      return callback(...args);
+      return callback.apply(socket, args);
     } catch (error) {
       error = normalizeBunSocketCallbackError(error);
-      if (name !== "error" && typeof handlers?.error === "function") {
-        handlers.error(socket, error);
+      if (name !== "error" && typeof handlers.error === "function") {
+        handlers.error.call(socket, socket, error);
         return { [bunSocketCallbackError]: true, error };
       }
       throw error;
     }
   };
+  socket.__cottontailBunCall = call;
+
+  if (!socket.__cottontailBunSocketMethods) {
+    const nodeWrite = socket.write.bind(socket);
+    const nodeEnd = socket.end.bind(socket);
+    const nodePause = socket.pause.bind(socket);
+    const nodeResume = socket.resume.bind(socket);
+    const nodeRef = socket.ref.bind(socket);
+    const nodeUnref = socket.unref.bind(socket);
+    const nodeDestroy = socket.destroy.bind(socket);
+    Object.defineProperties(socket, {
+      __cottontailBunSocketMethods: { value: true },
+      __cottontailNodeWrite: { value: nodeWrite },
+      __cottontailNodeEnd: { value: nodeEnd },
+    });
+
+    defineBunSocketMethod(socket, "write", function write(data, byteOffset, byteLength) {
+      if (socket.destroyed || !socket.writable || (!socket.encrypted && socket.fd == null)) return -1;
+      return writeBunSocketBytes(socket, bunSocketWriteArguments(arguments, "write"));
+    });
+    defineBunSocketMethod(socket, "end", function end(data, byteOffset, byteLength) {
+      if (socket.destroyed || !socket.writable || (!socket.encrypted && socket.fd == null)) return -1;
+      const bytes = bunSocketWriteArguments(arguments, "end");
+      const written = writeBunSocketBytes(socket, bytes);
+      if (written < 0) return written;
+      if (socket.encrypted || written === bytes.byteLength) {
+        nodeEnd();
+        socket.__cottontailBunShutdown = true;
+      } else {
+        socket.__cottontailBunEndAfterDrain = true;
+      }
+      return written;
+    });
+    defineBunSocketMethod(socket, "flush", function flush() {
+      socket._flushTlsPendingWrites?.();
+      return undefined;
+    });
+    defineBunSocketMethod(socket, "shutdown", function shutdown(read) {
+      if (socket.destroyed) return undefined;
+      if (read) {
+        if (!socket.encrypted && socket.fd != null) {
+          try { cottontail.tcpSocketShutdown?.(socket.fd, true); } catch {}
+        }
+        nodePause();
+        socket.readable = false;
+        socket._stopRead?.();
+      } else {
+        nodeEnd();
+      }
+      socket.__cottontailBunShutdown = true;
+      return undefined;
+    });
+    defineBunSocketMethod(socket, "timeout", function timeout(seconds) {
+      if (arguments.length === 0) throw new Error("Expected 1 argument, got 0");
+      const value = Math.trunc(Number(seconds));
+      if (value < 0) throw new Error("Timeout must be a positive integer");
+      socket._timeoutValue = Number.isFinite(value) ? value * 1000 : 0;
+      socket._refreshTimeout?.();
+      return undefined;
+    });
+    defineBunSocketMethod(socket, "pause", function pause() {
+      nodePause();
+      return undefined;
+    });
+    defineBunSocketMethod(socket, "resume", function resume() {
+      nodeResume();
+      return undefined;
+    });
+    defineBunSocketMethod(socket, "ref", function ref() {
+      nodeRef();
+      return undefined;
+    });
+    defineBunSocketMethod(socket, "unref", function unref() {
+      nodeUnref();
+      return undefined;
+    });
+    defineBunSocketMethod(socket, "setNoDelay", function setNoDelay(enabled) {
+      if (socket.destroyed || socket.fd == null || socket._isPipe) return false;
+      return cottontail.tcpSocketSetNoDelay?.(socket.fd, arguments.length === 0 ? true : Boolean(enabled)) === true;
+    });
+    defineBunSocketMethod(socket, "setKeepAlive", function setKeepAlive(enabled, initialDelay) {
+      if (socket.destroyed || socket.fd == null || socket._isPipe) return false;
+      const delay = Number(arguments.length > 1 ? initialDelay : 0);
+      if (!Number.isInteger(delay) || delay < 0) throw bunSocketRangeError("initialDelay", initialDelay, 0x7fffffff);
+      return cottontail.tcpSocketSetKeepAlive?.(socket.fd, Boolean(enabled), delay * 1000) === true;
+    });
+    defineBunSocketMethod(socket, "terminate", function terminate() {
+      if (socket.destroyed) return undefined;
+      if (socket.encrypted || socket.fd == null) {
+        nodeDestroy();
+        return undefined;
+      }
+      const fd = socket.fd;
+      socket._stopRead?.();
+      socket.fd = null;
+      try { cottontail.tcpSocketReset?.(fd); }
+      catch { try { cottontail.closeFd?.(fd); } catch {} }
+      socket._destroyImmediately?.();
+      return undefined;
+    });
+    defineBunSocketMethod(socket, "close", function close() {
+      nodeDestroy();
+      return undefined;
+    });
+    defineBunSocketMethod(socket, "reload", function reload(nextOptions) {
+      if (arguments.length === 0) throw new Error("Expected 1 argument");
+      if (socket.destroyed) return undefined;
+      if (nextOptions === null || typeof nextOptions !== "object") throw new TypeError("Expected options object");
+      if (nextOptions.socket === undefined) throw new TypeError('Expected "socket" option');
+      reloadBunSocketHandlerState(socket.__cottontailBunHandlerState, nextOptions.socket);
+      return undefined;
+    });
+    defineBunSocketMethod(socket, "getAuthorizationError", function getAuthorizationError() {
+      return socket.encrypted ? bunSocketAuthorizationError(socket) : null;
+    });
+    if (!socket.encrypted) {
+      defineBunSocketMethod(socket, "upgradeTLS", function upgradeTLS(options) {
+        return upgradeBunSocketToTls(socket, options);
+      });
+    }
+    Object.defineProperty(socket, "readyState", {
+      get() {
+        if (socket.destroyed || socket._closeEmitted) return -1;
+        if (socket.fd != null || socket.encrypted) return 1;
+        if (socket.__cottontailBunShutdown || !socket.writable) return -2;
+        if (socket.connecting) return 2;
+        return 0;
+      },
+      configurable: true,
+      enumerable: false,
+    });
+    Object.defineProperty(socket, Symbol.dispose, {
+      value() {
+        socket.end();
+      },
+      configurable: true,
+    });
+    Object.defineProperty(socket, Symbol.asyncDispose, {
+      value() {
+        if (socket.destroyed || socket._closeEmitted) return Promise.resolve();
+        return new Promise((resolve) => {
+          socket.once("close", resolve);
+          socket.end();
+        });
+      },
+      configurable: true,
+    });
+    socket.__cottontailBunWritable = () => {
+      if (socket.destroyed || (!socket.__cottontailBunNeedsDrain && !socket.__cottontailBunEndAfterDrain)) return;
+      socket.__cottontailBunNeedsDrain = false;
+      if (socket.__cottontailBunEndAfterDrain) {
+        socket.__cottontailBunEndAfterDrain = false;
+        nodeEnd();
+        socket.__cottontailBunShutdown = true;
+        return;
+      }
+      socket.__cottontailBunCall?.("drain", socket);
+    };
+  }
 
   socket.on("data", (chunk) => {
+    const binaryType = handlerState.current.binaryType;
     let value = chunk;
-    if (handlers.binaryType === "arraybuffer") {
+    if (binaryType === "arraybuffer") {
       const bytes = asBuffer(chunk);
       value = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-    } else if (handlers.binaryType === "uint8array") {
+    } else if (binaryType === "uint8array") {
       const bytes = asBuffer(chunk);
       value = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    } else if (!globalThis.Buffer?.isBuffer?.(value) && globalThis.Buffer?.from) {
+      value = globalThis.Buffer.from(asBuffer(value));
     }
     call("data", socket, value);
   });
-  let drainGeneration = 0;
-  socket.__cottontailScheduleBunDrain = () => {
-    const generation = ++drainGeneration;
-    setTimeout(() => {
-      if (generation !== drainGeneration || socket.destroyed) return;
-      drainGeneration += 1;
-      call("drain", socket);
-    }, 1);
-  };
   socket.on("drain", () => {
-    drainGeneration += 1;
+    if (socket.encrypted && !socket.authorized) {
+      socket.__cottontailBunDrainAfterHandshake = true;
+      return;
+    }
+    socket.__cottontailBunNeedsDrain = false;
     call("drain", socket);
   });
   socket.on("end", () => call("end", socket));
   socket.on("timeout", () => call("timeout", socket));
   socket.on("error", (error) => {
+    socket.__cottontailBunCloseError = error;
     if (connectionState?.connecting) {
       connectionState.connecting = false;
       connectionState.failed = true;
       const connectError = new Error("Failed to connect");
       connectError.code = error?.code ?? "ECONNREFUSED";
       connectError.errno = error?.errno ?? connectError.code;
-      call("connectError", socket, connectError);
-      connectionState.reject?.(connectError);
+      try {
+        call("connectError", socket, connectError);
+      } finally {
+        connectionState.reject?.(connectError);
+      }
       return;
     }
     call("error", socket, error);
   });
   socket.on("close", (hadError) => {
     if (connectionState?.failed && !connectionState.opened) return;
-    call("close", socket, hadError ? new Error("Socket closed with an error") : undefined);
+    call("close", socket, hadError ? socket.__cottontailBunCloseError ?? new Error("Socket closed with an error") : undefined);
   });
-  if (typeof socket.terminate !== "function") {
-    Object.defineProperty(socket, "terminate", {
-      value() {
-        socket.destroy();
-      },
-      configurable: true,
-      writable: true,
-    });
-  }
-  if (typeof socket.close !== "function") {
-    Object.defineProperty(socket, "close", {
-      value() {
-        socket.destroy();
-      },
-      configurable: true,
-      writable: true,
-    });
-  }
-  Object.defineProperty(socket, Symbol.dispose, {
-    value() {
-      socket.end();
-      socket.destroy();
-    },
-    configurable: true,
-  });
-  Object.defineProperty(socket, Symbol.asyncDispose, {
-    value() {
-      socket[Symbol.dispose]();
-      return Promise.resolve();
-    },
-    configurable: true,
-  });
-  return { socket, call };
+  return {
+    socket,
+    call,
+    get handlers() { return handlerState.current; },
+  };
 }
 
 function callBunSocketOpen(attached, closeOnError = true) {
@@ -14930,22 +15201,83 @@ function callBunSocketOpen(attached, closeOnError = true) {
 
 function normalizeBunSocketOptions(options) {
   if (options === null || typeof options !== "object") throw new TypeError("Bun socket options must be an object");
-  let unix = options.unix ? coerceServeOptionString(options.unix, "unix") : "";
-  // Bun accepts unix:// URLs (e.g. server.url.toString()) as unix socket paths.
-  if (unix.startsWith("unix://")) unix = unix.slice("unix://".length);
-  else if (unix.startsWith("unix:")) unix = unix.slice("unix:".length);
-  if (unix.includes("\0")) throw new TypeError("unix must not contain NUL bytes");
-  const suppliedHostname = options.hostname ? coerceServeOptionString(options.hostname, "hostname") : "";
-  if (unix && suppliedHostname) throw new TypeError("Cannot specify both unix and hostname");
-  const hostname = suppliedHostname || "127.0.0.1";
-  const port = Number(options.port ?? 0);
-  if (!unix && (!Number.isFinite(port) || port < 0 || port > 65535)) {
-    throw new RangeError("port must be in the range [0, 65535]");
+  const booleanOptions = ["exclusive", "allowHalfOpen", "reusePort", "ipv6Only"];
+  for (const name of booleanOptions) {
+    if (options[name] !== undefined && typeof options[name] !== "boolean") {
+      throw bunSocketInvalidArgument(`SocketOptions.${name} must be a boolean`);
+    }
+  }
+  if (options.backlog !== undefined && (!Number.isInteger(Number(options.backlog)) || Number(options.backlog) < 0)) {
+    throw bunSocketRangeError("backlog", options.backlog, 0x7fffffff);
   }
   if (options.tls != null && options.tls !== false && options.tls !== true && typeof options.tls !== "object") {
     throw new TypeError("TLSOptions must be an object");
   }
-  return { unix, hostname, port };
+
+  let fd;
+  if (options.fd !== undefined) {
+    if (typeof options.fd !== "number") {
+      throw bunSocketInvalidArgument("SocketOptions.fd must be a number");
+    }
+    fd = options.fd;
+    if (!Number.isInteger(fd)) {
+      const error = new RangeError(`SocketOptions.fd must be an integer (received ${String(options.fd)})`);
+      error.code = "ERR_OUT_OF_RANGE";
+      throw error;
+    }
+    if (fd < -0x80000000 || fd > 0x7fffffff) {
+      throw bunSocketRangeError("fd", options.fd, 0x7fffffff);
+    }
+  }
+
+  let unix = "";
+  if (fd === undefined && options.unix) {
+    unix = coerceServeOptionString(options.unix, "unix");
+    if (unix.startsWith("file://") || unix.startsWith("unix://") || unix.startsWith("sock://")) {
+      unix = unix.slice(7);
+    }
+    if (unix.includes("\0")) throw new TypeError("unix must not contain NUL bytes");
+  }
+
+  let hostname = "";
+  let port = 0;
+  if (fd === undefined && !unix && options.hostname) {
+    hostname = coerceServeOptionString(options.hostname, "hostname");
+    let portValue = options.port;
+    if (portValue === undefined && hostname.includes("://")) {
+      try {
+        const parsed = new URL(hostname);
+        if (parsed.port !== "") portValue = parsed.port;
+        hostname = parsed.hostname || hostname;
+      } catch {}
+    }
+    if (portValue == null) throw bunSocketInvalidArgument('Missing "port"');
+    port = Number(portValue);
+    if (!Number.isInteger(port)) {
+      const error = new RangeError(`SocketOptions.port must be an integer (received ${String(portValue)})`);
+      error.code = "ERR_OUT_OF_RANGE";
+      throw error;
+    }
+    if (port < 0 || port > 65535) {
+      const error = new RangeError(`SocketOptions.port must be in the range [0, 65535] (received ${String(portValue)})`);
+      error.code = "ERR_OUT_OF_RANGE";
+      throw error;
+    }
+  }
+  if (fd === undefined && !unix && !hostname) {
+    throw bunSocketInvalidArgument('Expected either "hostname" or "unix"');
+  }
+  return {
+    fd,
+    unix,
+    hostname,
+    port,
+    backlog: Number(options.backlog ?? 128),
+    exclusive: options.exclusive === true,
+    allowHalfOpen: options.allowHalfOpen === true,
+    reusePort: options.reusePort === true,
+    ipv6Only: options.ipv6Only === true,
+  };
 }
 
 function bunSocketTlsOptions(value, normalized, isServer = false) {
@@ -14957,7 +15289,7 @@ function bunSocketTlsOptions(value, normalized, isServer = false) {
     // Bun reports certificate verification through the handshake callback but
     // does not abort an otherwise successful TLS handshake on verification.
     options.rejectUnauthorized = false;
-    if (options.servername == null && !nodeNet.isIP(normalized.hostname)) {
+    if (options.servername == null && normalized.hostname && !nodeNet.isIP(normalized.hostname)) {
       options.servername = normalized.hostname;
     }
   }
@@ -14984,12 +15316,19 @@ function completeBunTlsHandshake(attached) {
   } else {
     callBunSocketOpen(attached, false);
   }
+  if (socket.__cottontailBunDrainAfterHandshake) {
+    socket.__cottontailBunDrainAfterHandshake = false;
+    queueMicrotask(() => {
+      if (!socket.destroyed) attached.call("drain", socket);
+    });
+  }
 }
 
-export function connect(options = {}) {
+export function connect(options) {
+  if (arguments.length === 0) throw bunSocketInvalidArgument("Missing argument");
+  if (options === null || typeof options !== "object") throw new TypeError("Bun socket options must be an object");
+  const handlerState = createBunSocketHandlerState(options.socket, false);
   const normalized = normalizeBunSocketOptions(options);
-  const handlers = options.socket ?? {};
-  if (handlers === null || typeof handlers !== "object") throw new TypeError("socket must be an object");
   const promise = new Promise((resolve, reject) => {
     const state = { connecting: true, opened: false, failed: false, reject };
     let socket;
@@ -14997,13 +15336,11 @@ export function connect(options = {}) {
     const useTls = options.tls != null && options.tls !== false;
     if (useTls) {
       let transport;
-      if (options.fd != null) {
-        transport = new nodeNet.Socket();
+      if (normalized.fd !== undefined) {
+        transport = new nodeNet.Socket({ allowHalfOpen: normalized.allowHalfOpen });
         try {
-          const fd = Number(options.fd);
-          if (!Number.isInteger(fd) || fd < 0) throw new Error("Bad file descriptor");
-          cottontail.fstatSync(fd);
-          transport._attachFd(fd, undefined, undefined, true);
+          cottontail.fstatSync(normalized.fd);
+          transport._attachFd(normalized.fd, undefined, undefined, true);
         } catch (error) {
           state.connecting = false;
           state.failed = true;
@@ -15015,8 +15352,8 @@ export function connect(options = {}) {
         }
       } else {
         transport = nodeNet.connect(normalized.unix
-          ? { path: normalized.unix }
-          : { host: normalized.hostname, port: normalized.port });
+          ? { path: normalized.unix, allowHalfOpen: normalized.allowHalfOpen }
+          : { host: normalized.hostname, port: normalized.port, allowHalfOpen: normalized.allowHalfOpen });
       }
       socket = nodeTlsConnect({
         ...bunSocketTlsOptions(options.tls, normalized),
@@ -15024,8 +15361,8 @@ export function connect(options = {}) {
         host: normalized.hostname,
         port: normalized.port,
       });
-      attached = attachBunSocketHandlers(socket, handlers, options.data, state);
-      attached.handlers = handlers;
+      socket.allowHalfOpen = normalized.allowHalfOpen;
+      attached = attachBunSocketHandlers(socket, handlerState, options.data, state);
       let settled = false;
       const settle = () => {
         if (settled || state.failed) return;
@@ -15036,7 +15373,7 @@ export function connect(options = {}) {
       };
       const onTransportOpen = () => {
         settle();
-        if (typeof handlers.handshake === "function") callBunSocketOpen(attached);
+        if (typeof attached.handlers.handshake === "function") callBunSocketOpen(attached);
         if (!normalized.unix) {
           const host = normalized.hostname.includes(":") ? `[${normalized.hostname}]` : normalized.hostname;
           const plainHttpServer = activeServerForFetchUrl(`http://${host}:${normalized.port}/`);
@@ -15064,15 +15401,13 @@ export function connect(options = {}) {
       resolve(socket);
       callBunSocketOpen(attached);
     };
-    if (options.fd != null) {
-      socket = new nodeNet.Socket();
-      attached = attachBunSocketHandlers(socket, handlers, options.data, state);
+    if (normalized.fd !== undefined) {
+      socket = new nodeNet.Socket({ allowHalfOpen: normalized.allowHalfOpen });
+      attached = attachBunSocketHandlers(socket, handlerState, options.data, state);
       socket.once("connect", onConnect);
       try {
-        const fd = Number(options.fd);
-        if (!Number.isInteger(fd) || fd < 0) throw new Error("Bad file descriptor");
-        cottontail.fstatSync(fd);
-        socket._attachFd(fd, undefined, undefined, true);
+        cottontail.fstatSync(normalized.fd);
+        socket._attachFd(normalized.fd, undefined, undefined, true);
       } catch (error) {
         state.connecting = false;
         state.failed = true;
@@ -15084,20 +15419,26 @@ export function connect(options = {}) {
       }
     } else {
       socket = nodeNet.connect(normalized.unix
-        ? { path: normalized.unix }
-        : { host: normalized.hostname, port: normalized.port });
-      attached = attachBunSocketHandlers(socket, handlers, options.data, state);
+        ? { path: normalized.unix, allowHalfOpen: normalized.allowHalfOpen }
+        : { host: normalized.hostname, port: normalized.port, allowHalfOpen: normalized.allowHalfOpen });
+      attached = attachBunSocketHandlers(socket, handlerState, options.data, state);
       socket.once("connect", onConnect);
     }
   });
-  if (typeof handlers.connectError === "function") promise.catch(() => {});
+  if (typeof handlerState.current.connectError === "function") promise.catch(() => {});
   return promise;
 }
 
-export function listen(options = {}) {
+export function listen(options) {
+  if (arguments.length === 0) throw bunSocketInvalidArgument("Missing argument");
+  if (options === null || typeof options !== "object") throw new TypeError("Bun socket options must be an object");
+  const handlerState = createBunSocketHandlerState(options.socket, true);
   const normalized = normalizeBunSocketOptions(options);
-  const handlers = options.socket ?? {};
-  if (handlers === null || typeof handlers !== "object") throw new TypeError("socket must be an object");
+  if (normalized.fd !== undefined) {
+    const error = new Error("Bun does not support listening on a file descriptor.");
+    error.code = "EINVAL";
+    throw error;
+  }
 
   const useTls = options.tls != null && options.tls !== false;
   let server;
@@ -15105,7 +15446,10 @@ export function listen(options = {}) {
   if (useTls) {
     const tlsList = Array.isArray(options.tls) ? options.tls : [options.tls];
     if (tlsList.length === 0) throw new TypeError("TLSOptions must be an object");
-    server = nodeTlsCreateServer(bunSocketTlsOptions(tlsList[0], normalized, true));
+    server = nodeTlsCreateServer({
+      ...bunSocketTlsOptions(tlsList[0], normalized, true),
+      allowHalfOpen: normalized.allowHalfOpen,
+    });
     for (let index = 1; index < tlsList.length; index += 1) {
       const item = tlsList[index];
       if (item == null || typeof item !== "object" || typeof item.serverName !== "string" || item.serverName.length === 0) {
@@ -15114,28 +15458,44 @@ export function listen(options = {}) {
       server.addContext(item.serverName, bunSocketTlsOptions(item, normalized, true));
     }
     server.listen(normalized.unix
-      ? { path: normalized.unix, backlog: Number(options.backlog ?? 128) }
-      : { host: normalized.hostname, port: normalized.port, backlog: Number(options.backlog ?? 128) });
+      ? { path: normalized.unix, backlog: normalized.backlog }
+      : {
+          host: normalized.hostname,
+          port: normalized.port,
+          backlog: normalized.backlog,
+          exclusive: normalized.exclusive,
+          ipv6Only: normalized.ipv6Only,
+          reusePort: normalized.reusePort,
+        });
     address = server.address();
   } else {
     const native = normalized.unix
-      ? cottontail.unixServerListen(normalized.unix, Number(options.backlog ?? 128))
-      : cottontail.tcpServerListen(normalized.port, normalized.hostname, normalized.hostname.includes(":") ? 6 : 4);
+      ? cottontail.unixServerListen(normalized.unix, normalized.backlog)
+      : cottontail.tcpServerListen(
+          normalized.port,
+          normalized.hostname,
+          nodeNet.isIP(normalized.hostname) || 0,
+          normalized.backlog,
+          normalized.ipv6Only,
+          normalized.reusePort,
+          normalized.exclusive,
+        );
     address = normalized.unix ? { path: String(native.path ?? normalized.unix), family: "Unix" } : native.address;
     server = nodeNet.Server._fromFd(native.fd, {
       pipe: Boolean(normalized.unix),
       path: normalized.unix || undefined,
       ownsPipePath: Boolean(normalized.unix),
+      allowHalfOpen: normalized.allowHalfOpen,
     });
   }
   let stopped = false;
-  let activeOptions = options;
+  let listenerData = options.data;
   const tlsConnections = new WeakMap();
 
   server.on("connection", (socket) => {
     socket.listener = listener;
-    const attached = attachBunSocketHandlers(socket, activeOptions.socket ?? handlers, activeOptions.data);
-    attached.handlers = activeOptions.socket ?? handlers;
+    socket.allowHalfOpen = normalized.allowHalfOpen;
+    const attached = attachBunSocketHandlers(socket, handlerState, listenerData);
     if (useTls) {
       tlsConnections.set(socket, attached);
       if (typeof attached.handlers?.handshake === "function") callBunSocketOpen(attached);
@@ -15152,10 +15512,10 @@ export function listen(options = {}) {
 
   const listener = {
     get data() {
-      return activeOptions.data;
+      return listenerData;
     },
     set data(value) {
-      activeOptions = { ...activeOptions, data: value };
+      listenerData = value;
     },
     get connections() {
       return Number(server._connections ?? server._activeSockets?.size ?? 0);
@@ -15166,7 +15526,7 @@ export function listen(options = {}) {
     hostname: normalized.unix ? undefined : normalized.hostname,
     port: normalized.unix ? undefined : Number(address?.port ?? normalized.port),
     unix: normalized.unix || undefined,
-    stop(closeActiveConnections = false) {
+    stop(closeActiveConnections) {
       if (stopped) return;
       stopped = true;
       server.close();
@@ -15178,9 +15538,12 @@ export function listen(options = {}) {
     unref() {
       server.unref();
     },
-    reload(nextOptions = {}) {
-      activeOptions = { ...activeOptions, ...nextOptions };
-      return listener;
+    reload(nextOptions) {
+      if (arguments.length === 0) throw new Error("Expected 1 argument");
+      if (nextOptions === null || typeof nextOptions !== "object") throw new TypeError("Expected options object");
+      if (nextOptions.socket === undefined) throw new TypeError('Expected "socket" object');
+      reloadBunSocketHandlerState(handlerState, nextOptions.socket);
+      return undefined;
     },
     addServerName(serverName, tls) {
       if (!useTls) throw new Error("addServerName requires SSL support");
