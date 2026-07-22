@@ -791,7 +791,7 @@ function unregisterSharedEnvironmentWorker(groupId, workerThreadId) {
 function workerRunSource(input) {
   if (input.kind === "eval") {
     return [
-      `const __ctModuleNamespace = await import("node:module");`,
+      `const __ctModuleNamespace = await globalThis.__cottontailImportModule("node:module");`,
       `const __ctModule = __ctModuleNamespace.Module ?? __ctModuleNamespace.default;`,
       `const __ctEvalModule = new __ctModule(${JSON.stringify(input.filename)}, null);`,
       `__ctEvalModule.filename = ${JSON.stringify(input.filename)};`,
@@ -811,14 +811,13 @@ function workerRunSource(input) {
   }
   if (input.kind === "commonjs") {
     return [
-      `const __ctModuleNamespace = await import("node:module");`,
+      `const __ctModuleNamespace = await globalThis.__cottontailImportModule("node:module");`,
       `const __ctRunMain = __ctModuleNamespace.runMain ?? __ctModuleNamespace.default?.runMain;`,
       `__ctRunMain(${JSON.stringify(input.filename)});`,
     ].join("\n");
   }
   return [
-    `const __ctWorkerSpecifier = ${JSON.stringify(input.specifier)};`,
-    `await import(__ctWorkerSpecifier);`,
+    `await import(${JSON.stringify(input.specifier)});`,
   ].join("\n");
 }
 
@@ -872,7 +871,7 @@ function makeWorkerWrapper(input, options = {}, sharedEnvironmentGroupId = null)
     `  Object.assign(__ctWorkerEnv, ${JSON.stringify(workerEnvironment)});`,
     `  globalThis.process.env = __ctWorkerEnv;`,
     `}`,
-    `await import("node:worker_threads");`,
+    `await globalThis.__cottontailImportModule("node:worker_threads");`,
     `globalThis.__cottontailConfigureWorkerStdio?.();`,
     `globalThis.__cottontailWorkerThreadsNotifyReady?.();`,
     `try {`,

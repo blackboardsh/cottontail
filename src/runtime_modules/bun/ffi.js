@@ -2443,84 +2443,72 @@ function rewriteWorkerNamedImports(spec) {
 }
 
 const workerBundleCache = new Map();
-const workerRuntimePreludeCache = new Map();
-const workerRuntimePreludeCacheMarker = "\n//# cottontail-worker-runtime-cache";
-const workerRuntimePreludeDiskPaths = new Set();
-let workerRuntimePreludeCleanupInstalled = false;
 const preparedWorkerScript = Symbol.for("cottontail.worker.prepared-script");
 const workerEvalSource = Symbol.for("cottontail.worker.eval-source");
 const workerThreadName = Symbol.for("cottontail.worker.thread-name");
 const workerStackSize = Symbol.for("cottontail.worker.stack-size");
 const workerNativeOptions = Symbol.for("cottontail.worker.native-options");
 
+const workerRuntimeAliasPaths = Object.freeze({
+  assert: "node/assert.cjs",
+  "path/posix": "node/path/posix.cjs",
+  "path/win32": "node/path/win32.cjs",
+  events: "node/events.cjs",
+  stream: "node/stream.cjs",
+  undici: "node/undici-public.js",
+  bun: "bun/index.js",
+  "bun:ffi": "bun/ffi.js",
+  "bun:jsc": "bun/jsc.js",
+  "bun:sqlite": "bun/sqlite.js",
+  "bun:test": "bun/test.js",
+  "bun:internal-for-testing": "bun/internal-for-testing.js",
+  "bun:wrap": "bun/wrap.js",
+  vitest: "bun/test.js",
+  "string-width": "bun/string-width.js",
+  "strip-ansi": "bun/strip-ansi.js",
+  "node-fetch": "bun/node-fetch.js",
+  "next/dist/compiled/node-fetch": "bun/node-fetch.js",
+  "isomorphic-fetch": "vendor/isomorphic-fetch.js",
+  "@vercel/fetch": "vendor/vercel-fetch.js",
+  "abort-controller": "vendor/abort-controller.js",
+  "utf-8-validate": "bun/utf-8-validate.js",
+  ws: "vendor/ws.js",
+  "ws/lib/websocket": "vendor/ws.js",
+  "next/dist/compiled/ws": "vendor/ws.js",
+  sea: "node/sea.js",
+  sqlite: "node/sqlite.js",
+  test: "node/test.js",
+  "test/reporters": "node/test/reporters.js",
+});
+
+function workerRuntimeAliases(runtimeRoot) {
+  const aliases = {};
+  let builtinNames = [];
+  try {
+    const namespace = currentRuntimeRequire()?.("node:module");
+    builtinNames = namespace?.builtinModules ?? namespace?.default?.builtinModules ?? [];
+  } catch {}
+  for (const name of builtinNames) {
+    const specifier = String(name).replace(/^node:/, "");
+    if (!specifier || specifier === "ws" || specifier.startsWith("bun:")) continue;
+    const relativePath = workerRuntimeAliasPaths[specifier] ?? `node/${specifier}.js`;
+    const path = `${runtimeRoot}/${relativePath}`;
+    aliases[specifier] = path;
+    aliases[`node:${specifier}`] = path;
+  }
+  for (const [specifier, relativePath] of Object.entries(workerRuntimeAliasPaths)) {
+    aliases[specifier] = `${runtimeRoot}/${relativePath}`;
+  }
+  aliases["node:undici"] = `${runtimeRoot}/node/undici-public.js`;
+  for (const specifier of ["sea", "sqlite", "test", "test/reporters"]) {
+    aliases[`node:${specifier}`] = aliases[specifier];
+  }
+  return aliases;
+}
+
 function workerTempDir() {
   const configured = cottontail.env?.()?.COTTONTAIL_TMP_DIR;
   return configured ? `${configured}/workers` : `${cottontail.cwd()}/.cottontail-tmp`;
-}
-
-function workerRuntimePreludeDiskPath(tempDir, cwd) {
-  const cacheId = String(g.__cottontailWorkerRuntimeCacheId ?? "")
-    .replace(/[^A-Za-z0-9_.-]/g, "_")
-    .slice(0, 128);
-  if (!cacheId) return null;
-  let cwdHash = 2166136261;
-  for (let index = 0; index < cwd.length; index += 1) {
-    cwdHash = Math.imul(cwdHash ^ cwd.charCodeAt(index), 16777619) >>> 0;
-  }
-  return `${tempDir}/bun-worker-runtime-cache-${cacheId}-${cwdHash.toString(16)}.js`;
-}
-
-function trackWorkerRuntimePreludeDiskPath(path) {
-  if (path === null || cottontail.isWorker?.()) return;
-  workerRuntimePreludeDiskPaths.add(path);
-  if (workerRuntimePreludeCleanupInstalled) return;
-  workerRuntimePreludeCleanupInstalled = true;
-  processObject.once?.("exit", () => {
-    for (const cachedPath of workerRuntimePreludeDiskPaths) {
-      try { cottontail.unlinkSync?.(cachedPath); } catch {}
-    }
-    workerRuntimePreludeDiskPaths.clear();
-  });
-}
-
-function loadWorkerRuntimePrelude(tempDir, cwd, runtimeEntry, nonce) {
-  let runtimePrelude = workerRuntimePreludeCache.get(cwd);
-  if (runtimePrelude !== undefined) return runtimePrelude;
-
-  const diskPath = workerRuntimePreludeDiskPath(tempDir, cwd);
-  trackWorkerRuntimePreludeDiskPath(diskPath);
-  if (diskPath !== null) {
-    try {
-      const cached = String(cottontail.readFile(diskPath));
-      if (cached.endsWith(workerRuntimePreludeCacheMarker)) runtimePrelude = cached;
-    } catch {}
-  }
-
-  if (runtimePrelude === undefined) {
-    const preludeEntry = `${tempDir}/bun-worker-runtime-${nonce}.mjs`;
-    // Prepared Node workers append their wrapper without rebundling it. Install
-    // the module loader before that wrapper imports node:worker_threads.
-    const moduleEntry = runtimeEntry.replace(/\/bun\/ffi\.js$/, "/node/module.js");
-    cottontail.writeFile(preludeEntry, [
-      `import ${JSON.stringify(runtimeEntry)};`,
-      `import ${JSON.stringify(moduleEntry)};`,
-    ].join("\n"));
-    try {
-      runtimePrelude = cottontail.bundleNative(preludeEntry, cottontail.cwd(), JSON.stringify({
-        format: "esm",
-        target: "bun",
-        includeRuntimeModules: true,
-        inlineImportMetaProperties: true,
-      }));
-    } finally {
-      try { cottontail.unlinkSync?.(preludeEntry); } catch {}
-    }
-    runtimePrelude += workerRuntimePreludeCacheMarker;
-    if (diskPath !== null) cottontail.writeFile(diskPath, runtimePrelude);
-  }
-
-  workerRuntimePreludeCache.set(cwd, runtimePrelude);
-  return runtimePrelude;
 }
 
 function canUseBareWorkerScript(target, options, hasWorkerOptions) {
@@ -2635,10 +2623,26 @@ function prepareWorkerScriptPath(scriptPath, options = undefined) {
   // Worker entry dependencies are linked into the bundle below as usual.
   const runtimeEntry = `${slashCwd}/.cottontail-embedded-runtime/bun/ffi.js`;
   if (options?.[preparedWorkerScript] === true) {
-    const runtimePrelude = loadWorkerRuntimePrelude(tempDir, slashCwd, runtimeEntry, nonce);
-    const source = cottontail.readFile(target);
-    cottontail.writeFile(bundledPath, `${runtimePrelude}\n${source}\n//# sourceURL=${slashTarget}`);
-    return bundledPath;
+    const moduleEntry = runtimeEntry.replace(/\/bun\/ffi\.js$/, "/node/module.js");
+    const runtimeRoot = `${slashCwd}/.cottontail-embedded-runtime`;
+    cottontail.writeFile(wrapperPath, [
+      `import ${JSON.stringify(runtimeEntry)};`,
+      `import ${JSON.stringify(moduleEntry)};`,
+      `import ${JSON.stringify(slashTarget)};`,
+    ].join("\n"));
+    try {
+      const bundled = cottontail.bundleNative(wrapperPath, cottontail.cwd(), JSON.stringify({
+        format: "esm",
+        target: "bun",
+        includeRuntimeModules: true,
+        inlineImportMetaProperties: true,
+        alias: workerRuntimeAliases(runtimeRoot),
+      }));
+      cottontail.writeFile(bundledPath, bundled);
+      return bundledPath;
+    } finally {
+      try { cottontail.unlinkSync?.(wrapperPath); } catch {}
+    }
   }
   try {
     const imports = [`import ${JSON.stringify(runtimeEntry)};`];
