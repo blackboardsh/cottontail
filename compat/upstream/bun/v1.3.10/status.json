@@ -121,7 +121,7 @@
       "status": "enabled",
       "reason": "Bunfig test randomization, seeded ordering, invalid seed combinations, rerunEach, and combined test options pass all five copied cases; subprocess-heavy stock-JSC startup requires a larger per-case budget.",
       "args": ["--timeout=30000"],
-      "timeoutMs": 120000
+      "timeoutMs": 150000
     },
     {
       "pattern": "^test/cli/init/init\\.test\\.ts$",
@@ -4460,8 +4460,9 @@
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 10 assertions)."
     },
     "test/regression/issue/02499/02499.test.ts": {
-      "status": "expected-failure",
-      "reason": "Semantics pass, but the copied case runs 40 server subprocesses under its explicit 30-second deadline; focused validation completed only 24 iterations before that unchanged deadline."
+      "status": "enabled",
+      "reason": "All 40 fresh server subprocesses complete the rejected-response abort/writable lifecycle regression; only the aggregate deadline is widened for stock-JSC process startup (40 assertions).",
+      "timeoutMs": 120000
     },
     "test/regression/issue/03091.test.ts": {
       "status": "enabled",

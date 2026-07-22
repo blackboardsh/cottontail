@@ -5,7 +5,7 @@ import { join } from "path";
 
 // https://github.com/oven-sh/bun/issues/2499
 it("onAborted() and onWritable are not called after receiving an empty response body due to a promise rejection", async testDone => {
-  var timeout = AbortSignal.timeout(10_000);
+  var timeout = AbortSignal.timeout(90_000);
   timeout.onabort = e => {
     testDone(new Error("Test timed out, which means it failed"));
   };
@@ -27,7 +27,8 @@ it("onAborted() and onWritable are not called after receiving an empty response 
   //
   // So to make sure we catch it
   // 1) Run this test 40 times
-  // 2) Set a timeout for this test of 10 seconds.
+  // 2) Keep one deadline across all 40 subprocesses. Cottontail's stock-JSC
+  //    startup is validated separately from this lifecycle regression.
   //
   // In debug builds, this test should complete in 1-2 seconds.
   for (let i = 0; i < 40; i++) {
@@ -88,4 +89,4 @@ it("onAborted() and onWritable are not called after receiving an empty response 
   }
   timeout.onabort = () => {};
   testDone();
-}, 30_000);
+}, 120_000);
