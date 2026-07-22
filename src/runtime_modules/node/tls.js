@@ -337,7 +337,12 @@ function tlsCredentialOptions(options) {
   };
 }
 
-function validateNativeServerContext(options, credentials = tlsCredentialOptions(options), protocols = tlsProtocolOptions(options)) {
+function validateNativeServerContext(
+  options,
+  credentials = tlsCredentialOptions(options),
+  protocols = tlsProtocolOptions(options),
+  advanced = tlsAdvancedOptions(options),
+) {
   cottontail.tlsValidateServerContext?.(
     credentials.cert,
     credentials.key,
@@ -349,6 +354,7 @@ function validateNativeServerContext(options, credentials = tlsCredentialOptions
     protocols.minVersion,
     protocols.maxVersion,
     protocols.secureOptions,
+    advanced,
   );
 }
 
@@ -375,6 +381,72 @@ function bufferFromNativeBytes(bytes) {
   if (bytes instanceof ArrayBuffer) return Buffer.from(new Uint8Array(bytes));
   if (ArrayBuffer.isView(bytes)) return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   return undefined;
+}
+
+function tlsContextOption(options, name) {
+  if (options?.[name] != null) return options[name];
+  return options?.secureContext?.context?.[name];
+}
+
+function tlsBufferSource(name, value) {
+  if (typeof value === "string") return Buffer.from(value);
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return Buffer.from(bytesFrom(value));
+  throw invalidArgType(name, "of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer", value);
+}
+
+function tlsPassphrase(name, value) {
+  if (value == null) return undefined;
+  if (typeof value === "string") return value;
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return Buffer.from(bytesFrom(value)).toString();
+  throw invalidArgType(name, "of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer", value);
+}
+
+function tlsAdvancedOptions(options = {}) {
+  const advanced = {};
+  const globalPassphrase = tlsPassphrase("options.passphrase", tlsContextOption(options, "passphrase"));
+  const pfxOption = tlsContextOption(options, "pfx");
+  if (pfxOption != null) {
+    const entries = Array.isArray(pfxOption) ? pfxOption : [pfxOption];
+    advanced.pfx = entries.map((entry, index) => {
+      const name = Array.isArray(pfxOption) ? `options.pfx[${index}]` : "options.pfx";
+      if (entry != null && typeof entry === "object" && !(entry instanceof ArrayBuffer) && !ArrayBuffer.isView(entry) && "buf" in entry) {
+        return {
+          data: tlsBufferSource(`${name}.buf`, entry.buf),
+          passphrase: tlsPassphrase(`${name}.passphrase`, entry.passphrase) ?? globalPassphrase,
+        };
+      }
+      return { data: tlsBufferSource(name, entry), passphrase: globalPassphrase };
+    });
+  }
+
+  const crlOption = tlsContextOption(options, "crl");
+  if (crlOption != null) {
+    const entries = Array.isArray(crlOption) ? crlOption : [crlOption];
+    advanced.crl = entries.map((entry, index) => tlsBufferSource(
+      Array.isArray(crlOption) ? `options.crl[${index}]` : "options.crl",
+      entry,
+    ));
+  }
+
+  const sigalgs = tlsContextOption(options, "sigalgs");
+  if (sigalgs != null) {
+    if (typeof sigalgs !== "string") throw invalidArgType("options.sigalgs", "of type string", sigalgs);
+    if (sigalgs.length === 0) throw invalidArgValue("options.sigalgs", sigalgs, "must not be empty");
+    advanced.sigalgs = sigalgs;
+  }
+
+  const ecdhCurve = tlsContextOption(options, "ecdhCurve");
+  if (ecdhCurve != null) {
+    if (typeof ecdhCurve !== "string") throw invalidArgType("options.ecdhCurve", "of type string", ecdhCurve);
+    advanced.ecdhCurve = ecdhCurve;
+  }
+
+  const dhparam = tlsContextOption(options, "dhparam");
+  if (dhparam != null) {
+    if (dhparam === "auto") advanced.dhAuto = true;
+    else advanced.dhparam = tlsBufferSource("options.dhparam", dhparam);
+  }
+  return advanced;
 }
 
 function validateSessionTimeout(value, name = "options.sessionTimeout") {
@@ -414,6 +486,20 @@ function serverSessionIdContext() {
     defaultServerSessionIdContext = createHash("sha1").update(process.argv.join(" ")).digest("hex").slice(0, 32);
   }
   return defaultServerSessionIdContext;
+}
+
+function findServerContext(contexts, servername) {
+  if (!servername || !Array.isArray(contexts)) return undefined;
+  const normalized = servername.toLowerCase();
+  for (let index = contexts.length - 1; index >= 0; index -= 1) {
+    const candidate = contexts[index];
+    const pattern = String(candidate.hostname).toLowerCase();
+    if (pattern === normalized) return candidate.secureContext;
+    if (pattern.startsWith("*.") && normalized.includes(".") && pattern.slice(1) === normalized.slice(normalized.indexOf("."))) {
+      return candidate.secureContext;
+    }
+  }
+  return undefined;
 }
 
 function legacyCertificateFromBytes(bytes) {
@@ -631,8 +717,9 @@ class SecureContextImpl {
     if (options.sessionIdContext != null) context.sessionIdContext = validateSessionIdContext(options.sessionIdContext);
     const protocols = tlsProtocolOptions(context);
     const credentials = tlsCredentialOptions(context);
+    const advanced = tlsAdvancedOptions(context);
     try {
-      cottontail.tlsValidateSecureContext?.(
+      const contextInfo = cottontail.tlsValidateSecureContext?.(
         credentials.cert,
         credentials.key,
         credentials.passphrase,
@@ -641,7 +728,13 @@ class SecureContextImpl {
         protocols.minVersion,
         protocols.maxVersion,
         protocols.secureOptions,
+        advanced,
       );
+      this._certificate = bufferFromNativeBytes(contextInfo?.certificate);
+      this._issuer = bufferFromNativeBytes(contextInfo?.issuer);
+      if (contextInfo?.dhWarning) {
+        process.emitWarning("DH parameter is less than 2048 bits", "SecurityWarning");
+      }
     } catch (error) {
       throw normalizeTlsError(error, "Failed to initialize TLS context");
     }
@@ -714,6 +807,7 @@ export class TLSSocket extends Socket {
     this._ALPNCallback = options.ALPNCallback;
     this._clientHelloHandling = false;
     this._clientHelloError = null;
+    this._sniContexts = options._sniContexts;
     this._ticketKeys = options.ticketKeys == null ? undefined : validateTicketKeys(options.ticketKeys, "options.ticketKeys");
     this._sessionTimeout = options.sessionTimeout == null ? undefined : validateSessionTimeout(options.sessionTimeout);
     this._sessionIdContext = options.sessionIdContext == null
@@ -854,7 +948,7 @@ export class TLSSocket extends Socket {
     if (this._handshakeTimeout > 0) {
       this._tlsHandshakeTimer = setTimeout(() => {
         if (!this.secureConnecting || this.destroyed) return;
-        const error = tlsError("TLS handshake timed out", "ETIMEDOUT");
+        const error = tlsError("TLS handshake timeout", "ERR_TLS_HANDSHAKE_TIMEOUT");
         this.destroy(error);
       }, this._handshakeTimeout);
       if (!this._refed) this._tlsHandshakeTimer.unref?.();
@@ -901,6 +995,35 @@ export class TLSSocket extends Socket {
       if (session == null || session.byteLength === 0) return;
       this._session = session;
       this.emit("session", session);
+    }
+  }
+
+  _emitPendingServerSessions() {
+    if (!this.isServer || this._tlsId == null || typeof cottontail.tlsConnectionTakeServerSession !== "function") return;
+    for (;;) {
+      const pending = cottontail.tlsConnectionTakeServerSession(this._tlsId);
+      if (pending == null) return;
+      const sessionId = bufferFromNativeBytes(pending.sessionId);
+      const session = bufferFromNativeBytes(pending.session);
+      if (sessionId == null || session == null) {
+        cottontail.tlsConnectionNewSessionDone?.(this._tlsId);
+        continue;
+      }
+      let called = false;
+      const done = () => {
+        if (called) {
+          this.destroy(tlsError("Callback called multiple times", "ERR_MULTIPLE_CALLBACK"));
+          return;
+        }
+        called = true;
+        if (this._tlsId != null) cottontail.tlsConnectionNewSessionDone?.(this._tlsId);
+      };
+      try {
+        if (!this.server?.emit("newSession", sessionId, session, done)) done();
+      } catch (error) {
+        this.destroy(normalizeTlsError(error));
+        return;
+      }
     }
   }
 
@@ -1038,6 +1161,7 @@ export class TLSSocket extends Socket {
     const contextOptions = secureContext.context ?? {};
     const credentials = tlsCredentialOptions(contextOptions);
     const protocols = tlsProtocolOptions(contextOptions);
+    const advanced = tlsAdvancedOptions(contextOptions);
     const sessionIdContext = contextOptions.sessionIdContext == null
       ? this._sessionIdContext
       : Buffer.from(contextOptions.sessionIdContext);
@@ -1057,6 +1181,7 @@ export class TLSSocket extends Socket {
       contextOptions.ticketKeys ?? this._ticketKeys,
       contextOptions.sessionTimeout ?? this._sessionTimeout,
       sessionIdContext,
+      advanced,
     );
   }
 
@@ -1075,60 +1200,143 @@ export class TLSSocket extends Socket {
     this._clientHelloHandling = true;
     const servername = typeof hello?.servername === "string" ? hello.servername : undefined;
     const protocols = Array.isArray(hello?.protocols) ? hello.protocols.map(String) : [];
+    const sessionId = bufferFromNativeBytes(hello?.sessionId);
     this.servername = servername ?? this.servername;
-
     let selectedProtocol;
-    if (typeof this._ALPNCallback === "function" && protocols.length > 0) {
-      try {
-        selectedProtocol = this._ALPNCallback({ servername, protocols: [...protocols] });
-      } catch (error) {
-        this._rejectClientHello(error);
-        return;
-      }
-      if (typeof selectedProtocol !== "string" || !protocols.includes(selectedProtocol)) {
-        this._rejectClientHello(
-          tlsError(
-            `ALPN callback selected a protocol that was not offered: ${String(selectedProtocol)}`,
-            "ERR_TLS_ALPN_CALLBACK_INVALID_RESULT",
-          ),
-          120,
-        );
-        return;
-      }
-    }
+    let selectedContext = findServerContext(this._sniContexts, servername) ?? this._secureContext;
+    let resumedSession;
 
-    let callbackCalled = false;
-    const finish = (error, secureContext) => {
-      if (callbackCalled || !this._clientHelloHandling || this._tlsId == null) return;
-      callbackCalled = true;
-      if (error) {
-        this._rejectClientHello(error);
-        return;
-      }
-      try {
-        if (secureContext != null) {
-          if (!(secureContext instanceof SecureContext)) {
-            throw tlsError("Invalid SNI context", "ERR_TLS_INVALID_CONTEXT");
-          }
-          if (servername != null) this._addServerContext(servername, secureContext);
+    const reject = (error, alert = 80) => this._rejectClientHello(error, alert);
+    const once = (callback) => {
+      let called = false;
+      return (...args) => {
+        if (called) {
+          this.destroy(tlsError("Callback called multiple times", "ERR_MULTIPLE_CALLBACK"));
+          return;
         }
+        called = true;
+        callback(...args);
+      };
+    };
+
+    const resolve = (ocspResponse = undefined) => {
+      if (!this._clientHelloHandling || this._tlsId == null) return;
+      try {
         const selected = selectedProtocol == null ? undefined : Buffer.from(selectedProtocol);
-        cottontail.tlsConnectionResolveClientHello(this._tlsId, selected, false, 0);
+        cottontail.tlsConnectionResolveClientHello(
+          this._tlsId,
+          selected,
+          false,
+          0,
+          resumedSession,
+          ocspResponse,
+        );
         this._clientHelloHandling = false;
-      } catch (contextError) {
-        this._rejectClientHello(contextError);
+      } catch (error) {
+        reject(error);
       }
     };
 
-    if (servername != null && typeof this._SNICallback === "function") {
+    const requestOCSP = () => {
+      const server = this.server;
+      if (hello?.ocspRequest !== true || server?.listenerCount?.("OCSPRequest") === 0) {
+        resolve();
+        return;
+      }
+      const certificate = selectedContext?._certificate == null ? null : Buffer.from(selectedContext._certificate);
+      const issuer = selectedContext?._issuer == null ? null : Buffer.from(selectedContext._issuer);
+      const callback = once((error, response) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        if (response != null && !(response instanceof ArrayBuffer) && !ArrayBuffer.isView(response)) {
+          reject(invalidArgType("response", "an instance of Buffer, TypedArray, DataView, or ArrayBuffer", response));
+          return;
+        }
+        resolve(response == null ? undefined : Buffer.from(bytesFrom(response)));
+      });
       try {
-        this._SNICallback(servername, finish);
+        if (!server.emit("OCSPRequest", certificate, issuer, callback)) resolve();
       } catch (error) {
-        finish(error);
+        reject(error);
+      }
+    };
+
+    const selectSNI = () => {
+      if (servername == null || typeof this._SNICallback !== "function") {
+        requestOCSP();
+        return;
+      }
+      const callback = once((error, secureContext) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        try {
+          if (secureContext != null) {
+            if (!(secureContext instanceof SecureContext)) {
+              throw tlsError("Invalid SNI context", "ERR_TLS_INVALID_CONTEXT");
+            }
+            selectedContext = secureContext;
+            this._addServerContext(servername, secureContext);
+          }
+          requestOCSP();
+        } catch (contextError) {
+          reject(contextError);
+        }
+      });
+      try {
+        this._SNICallback(servername, callback);
+      } catch (error) {
+        callback(error);
+      }
+    };
+
+    const selectALPN = () => {
+      if (typeof this._ALPNCallback === "function" && protocols.length > 0) {
+        try {
+          selectedProtocol = this._ALPNCallback({ servername, protocols: [...protocols] });
+        } catch (error) {
+          reject(error);
+          return;
+        }
+        if (typeof selectedProtocol !== "string" || !protocols.includes(selectedProtocol)) {
+          reject(
+            tlsError(
+              `ALPN callback selected a protocol that was not offered: ${String(selectedProtocol)}`,
+              "ERR_TLS_ALPN_CALLBACK_INVALID_RESULT",
+            ),
+            120,
+          );
+          return;
+        }
+      }
+      selectSNI();
+    };
+
+    if (sessionId != null && sessionId.byteLength > 0 && hello?.tlsTicket !== true &&
+        this.server?.listenerCount?.("resumeSession") > 0) {
+      const callback = once((error, session) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        if (session != null && !(session instanceof ArrayBuffer) && !ArrayBuffer.isView(session)) {
+          reject(invalidArgType("session", "an instance of Buffer, TypedArray, DataView, or ArrayBuffer", session));
+          return;
+        }
+        resumedSession = session == null ? undefined : Buffer.from(bytesFrom(session));
+        selectALPN();
+      });
+      try {
+        this.server.emit("resumeSession", sessionId, callback);
+      } catch (error) {
+        callback(error);
       }
       return;
     }
-    finish(null, null);
+    selectALPN();
   }
 
   _continueTlsHandshake(connectedEvent) {
@@ -1139,13 +1347,16 @@ export class TLSSocket extends Socket {
       try {
         if (this._clientHelloHandling) {
           if (this._handshakeTimeout > 0 && Date.now() - startedAt >= this._handshakeTimeout) {
-            throw tlsError("TLS handshake timed out", "ETIMEDOUT");
+            throw tlsError("TLS handshake timeout", "ERR_TLS_HANDSHAKE_TIMEOUT");
           }
           this._tlsHandshakeTimer = setTimeout(step, 1);
           if (!this._refed) this._tlsHandshakeTimer.unref?.();
           return;
         }
-        if (cottontail.tlsClientHandshake(this._tlsId) === true) {
+        const handshakeComplete = cottontail.tlsClientHandshake(this._tlsId) === true;
+        this._emitPendingServerSessions();
+        if (this.destroyed) return;
+        if (handshakeComplete) {
           this._tlsInfo = cottontail.tlsConnectionInfo?.(this._tlsId) ?? this._tlsInfo;
           this._finishTlsConnect(connectedEvent);
           return;
@@ -1153,9 +1364,7 @@ export class TLSSocket extends Socket {
         const hello = cottontail.tlsConnectionClientHello?.(this._tlsId);
         if (hello != null) this._handleClientHello(hello);
         if (this._handshakeTimeout > 0 && Date.now() - startedAt >= this._handshakeTimeout) {
-          const error = new Error("TLS handshake timed out");
-          error.code = "ETIMEDOUT";
-          throw error;
+          throw tlsError("TLS handshake timeout", "ERR_TLS_HANDSHAKE_TIMEOUT");
         }
         this._tlsHandshakeTimer = setTimeout(step, 1);
         if (!this._refed) this._tlsHandshakeTimer.unref?.();
@@ -1206,6 +1415,10 @@ export class TLSSocket extends Socket {
           this._session = session;
           this.emit("session", session);
         }
+        return;
+      }
+      if (event.type === "newSession") {
+        this._emitPendingServerSessions();
         return;
       }
       if (event.type === "secure") {
@@ -1786,6 +1999,8 @@ class ServerImpl extends NetServer {
         ...this._tlsOptions,
         isServer: true,
         contexts: this._tlsContexts,
+        _sessionCallbacks: this.listenerCount("newSession") > 0 || this.listenerCount("resumeSession") > 0,
+        _ocspCallback: this.listenerCount("OCSPRequest") > 0,
       });
     } catch (error) {
       error = normalizeTlsError(error);
@@ -1967,6 +2182,8 @@ export function connect(...args) {
     );
   }
 
+  if (options.signal?.aborted) return socket;
+
   const fail = (error) => {
     if (socket.destroyed) return;
     socket.authorized = false;
@@ -1980,6 +2197,7 @@ export function connect(...args) {
     parentSocket?.removeListener?.("close", onParentClose);
     try {
       const credentials = tlsCredentialOptions(options);
+      const advanced = tlsAdvancedOptions(options);
       if (parentSocket?.encrypted !== true && typeof parentSocket?._detachFdForTls === "function" && typeof cottontail.tlsClientConnectFd === "function") {
         const fd = parentSocket._detachFdForTls();
         const native = cottontail.tlsClientConnectFd(
@@ -1997,6 +2215,7 @@ export function connect(...args) {
           protocolOptions.secureOptions,
           socket._session,
           socket._requestOCSP,
+          advanced,
         );
         socket._attachNative(native, "secureConnect");
         return;
@@ -2017,6 +2236,7 @@ export function connect(...args) {
           protocolOptions.secureOptions,
           socket._session,
           socket._requestOCSP,
+          advanced,
         );
         socket._attachMemoryTransport(native, parentSocket, "secureConnect");
         return;
@@ -2095,6 +2315,7 @@ export function _connectMemoryTransport(parentSocket, options = {}) {
   };
 
   const credentials = tlsCredentialOptions(options);
+  const advanced = tlsAdvancedOptions(options);
   const native = cottontail.tlsClientConnectMemory(
     servername,
     socket._rejectUnauthorized,
@@ -2109,6 +2330,7 @@ export function _connectMemoryTransport(parentSocket, options = {}) {
     protocolOptions.secureOptions,
     socket._session,
     socket._requestOCSP,
+    advanced,
   );
   socket._attachMemoryTransport(native, parentSocket, "secureConnect");
   return socket;
@@ -2121,6 +2343,7 @@ export function _upgradeServerSocket(parentSocket, options = {}) {
     throw error;
   }
   const credentials = tlsCredentialOptions(options);
+  const advanced = tlsAdvancedOptions(options);
   const alpnProtocols = prepareALPNProtocols(options.ALPNProtocols);
   const protocolOptions = tlsProtocolOptions(options);
   validateNativeServerContext(options, credentials, protocolOptions);
@@ -2130,13 +2353,15 @@ export function _upgradeServerSocket(parentSocket, options = {}) {
       const contextOptions = secureContext instanceof SecureContext ? secureContext.context : secureContext;
       contexts.push({
         hostname,
+        secureContext,
         options: contextOptions,
         credentials: tlsCredentialOptions(contextOptions),
+        advanced: tlsAdvancedOptions(contextOptions),
         protocols: tlsProtocolOptions(contextOptions),
       });
     }
   }
-  const socket = new TLSSocket(parentSocket, options);
+  const socket = new TLSSocket(parentSocket, { ...options, _sniContexts: contexts });
   const fd = parentSocket._detachFdForTls();
   const rejectUnauthorized = options.rejectUnauthorized == null ? rejectUnauthorizedDefault : options.rejectUnauthorized !== false;
   const native = cottontail.tlsServerUpgradeFd(
@@ -2159,6 +2384,9 @@ export function _upgradeServerSocket(parentSocket, options = {}) {
     socket._sessionIdContext,
     CLIENT_RENEG_LIMIT,
     CLIENT_RENEG_WINDOW,
+    Boolean(options._sessionCallbacks),
+    Boolean(options._ocspCallback),
+    advanced,
   );
   try {
     if (typeof cottontail.tlsConnectionAddServerContext === "function") {
@@ -2181,6 +2409,7 @@ export function _upgradeServerSocket(parentSocket, options = {}) {
           context.options?.sessionIdContext == null
             ? socket._sessionIdContext
             : Buffer.from(context.options.sessionIdContext),
+          context.advanced,
         );
       }
     }
@@ -2357,9 +2586,6 @@ const defaultCipherNames = defaultCipherList();
 export function getCiphers() {
   return [...defaultCipherNames];
 }
-
-// COTTONTAIL-COMPAT: OpenSSL trace output, OCSP stapling callbacks, and custom
-// server-side newSession/resumeSession stores are not exposed by the stock-JSC host boundary yet.
 
 const tlsDefault = {
   CLIENT_RENEG_LIMIT,

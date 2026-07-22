@@ -986,12 +986,14 @@ extern void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx);
 #if __has_include(<openssl/core_names.h>)
 #include <openssl/core_names.h>
 #endif
+#include <openssl/dh.h>
 #include <openssl/ec.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/kdf.h>
 #include <openssl/params.h>
+#include <openssl/pkcs12.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <openssl/rsa.h>
@@ -1674,6 +1676,8 @@ typedef struct CtTlsSniContext {
 } CtTlsSniContext;
 
 typedef struct CtTlsPendingSession {
+    unsigned char *id;
+    size_t id_len;
     unsigned char *data;
     size_t len;
     struct CtTlsPendingSession *next;
@@ -1706,6 +1710,8 @@ typedef struct CtTlsConnection {
     bool memory_bio;
     bool client_hello_enabled;
     bool alpn_callback_enabled;
+    bool session_callbacks_enabled;
+    bool ocsp_callback_enabled;
     bool client_hello_pending;
     bool client_hello_resolved;
     bool client_hello_rejected;
@@ -1724,8 +1730,20 @@ typedef struct CtTlsConnection {
     char *client_hello_servername;
     unsigned char *client_hello_alpn;
     unsigned int client_hello_alpn_len;
+    unsigned char *client_hello_session_id;
+    size_t client_hello_session_id_len;
+    bool client_hello_has_ticket;
+    bool client_hello_requests_ocsp;
     unsigned char *selected_alpn;
     unsigned int selected_alpn_len;
+    unsigned char *ocsp_response;
+    size_t ocsp_response_len;
+#if CT_HAS_OPENSSL
+    SSL_SESSION *resume_session;
+#else
+    void *resume_session;
+#endif
+    size_t pending_server_session_callbacks;
     CtTlsPendingSession *pending_sessions_head;
     CtTlsPendingSession *pending_sessions_tail;
     unsigned char *alpn_protocols;
@@ -12713,10 +12731,14 @@ static void ct_tls_connection_free(CtTlsConnection *connection) {
     if (connection->fd >= 0) close(connection->fd);
     free(connection->client_hello_servername);
     free(connection->client_hello_alpn);
+    free(connection->client_hello_session_id);
     free(connection->selected_alpn);
+    free(connection->ocsp_response);
+    if (connection->resume_session != NULL) SSL_SESSION_free(connection->resume_session);
     while (connection->pending_sessions_head != NULL) {
         CtTlsPendingSession *session = connection->pending_sessions_head;
         connection->pending_sessions_head = session->next;
+        free(session->id);
         free(session->data);
         free(session);
     }
@@ -13071,6 +13093,250 @@ static SSL_CTX *ct_tls_context_new(const SSL_METHOD *method) {
     return ssl_ctx;
 }
 
+static bool ct_tls_value_is_missing(JSContextRef ctx, JSValueRef value) {
+    return value == NULL || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value);
+}
+
+static JSValueRef ct_tls_advanced_property(
+    JSContextRef ctx,
+    JSValueRef advanced_options,
+    const char *name,
+    JSValueRef *exception
+) {
+    if (ct_tls_value_is_missing(ctx, advanced_options) || !JSValueIsObject(ctx, advanced_options)) {
+        return JSValueMakeUndefined(ctx);
+    }
+    return ct_get_property(ctx, (JSObjectRef)advanced_options, name, exception);
+}
+
+static int ct_tls_use_pfx_entries(
+    JSContextRef ctx,
+    SSL_CTX *ssl_ctx,
+    JSValueRef entries_value,
+    JSValueRef *exception
+) {
+    if (ct_tls_value_is_missing(ctx, entries_value)) return 0;
+    if (!JSValueIsObject(ctx, entries_value)) {
+        ct_tls_throw_error(ctx, exception, "TLS PFX entries must be an array", "ERR_INVALID_ARG_TYPE");
+        return -1;
+    }
+    JSObjectRef entries = (JSObjectRef)entries_value;
+    JSValueRef length_value = ct_get_property(ctx, entries, "length", exception);
+    if (exception != NULL && *exception != NULL) return -1;
+    double length_number = JSValueToNumber(ctx, length_value, exception);
+    if ((exception != NULL && *exception != NULL) || length_number < 0 || length_number > UINT_MAX) {
+        ct_tls_throw_error(ctx, exception, "Invalid TLS PFX entry count", "ERR_INVALID_ARG_VALUE");
+        return -1;
+    }
+    unsigned int length = (unsigned int)length_number;
+    for (unsigned int index = 0; index < length; index += 1) {
+        JSValueRef item_value = JSObjectGetPropertyAtIndex(ctx, entries, index, exception);
+        if ((exception != NULL && *exception != NULL) || !JSValueIsObject(ctx, item_value)) {
+            ct_tls_throw_error(ctx, exception, "TLS PFX entry must be an object", "ERR_INVALID_ARG_TYPE");
+            return -1;
+        }
+        JSObjectRef item = (JSObjectRef)item_value;
+        JSValueRef data_value = ct_get_property(ctx, item, "data", exception);
+        JSValueRef passphrase_value = ct_get_property(ctx, item, "passphrase", exception);
+        if (exception != NULL && *exception != NULL) return -1;
+        uint8_t *data = NULL;
+        size_t data_len = 0;
+        if (ct_get_bytes(ctx, data_value, &data, &data_len) != 0 || data_len == 0 || data_len > INT_MAX) {
+            ct_tls_throw_error(ctx, exception, "TLS PFX data must be a non-empty BufferSource", "ERR_INVALID_ARG_TYPE");
+            return -1;
+        }
+        char *passphrase = ct_tls_value_is_missing(ctx, passphrase_value)
+            ? NULL
+            : ct_value_to_string_copy(ctx, passphrase_value);
+        BIO *bio = BIO_new_mem_buf(data, (int)data_len);
+        ERR_clear_error();
+        PKCS12 *pfx = bio != NULL ? d2i_PKCS12_bio(bio, NULL) : NULL;
+        EVP_PKEY *private_key = NULL;
+        X509 *certificate = NULL;
+        STACK_OF(X509) *chain = NULL;
+        int parsed = pfx != NULL
+            ? PKCS12_parse(pfx, passphrase, &private_key, &certificate, &chain)
+            : 0;
+        free(passphrase);
+        if (bio != NULL) BIO_free(bio);
+        if (pfx != NULL) PKCS12_free(pfx);
+        if (parsed != 1 || private_key == NULL || certificate == NULL) {
+            if (private_key != NULL) EVP_PKEY_free(private_key);
+            if (certificate != NULL) X509_free(certificate);
+            if (chain != NULL) sk_X509_pop_free(chain, X509_free);
+            char *message = ct_tls_error_message("Failed to parse TLS PFX data");
+            ct_tls_throw_error(ctx, exception, message, "ERR_SSL_PKCS12_PARSE_ERROR");
+            free(message);
+            return -1;
+        }
+        SSL_CTX_clear_chain_certs(ssl_ctx);
+        int ok = SSL_CTX_use_certificate(ssl_ctx, certificate) == 1 &&
+            SSL_CTX_use_PrivateKey(ssl_ctx, private_key) == 1;
+        EVP_PKEY_free(private_key);
+        X509_free(certificate);
+        if (!ok) {
+            if (chain != NULL) sk_X509_pop_free(chain, X509_free);
+            char *message = ct_tls_error_message("Failed to use TLS PFX identity");
+            ct_tls_throw_error(ctx, exception, message, "ERR_SSL_PKCS12_PARSE_ERROR");
+            free(message);
+            return -1;
+        }
+        while (chain != NULL && sk_X509_num(chain) > 0) {
+            X509 *chain_cert = sk_X509_shift(chain);
+            X509_STORE_add_cert(SSL_CTX_get_cert_store(ssl_ctx), chain_cert);
+            ERR_clear_error();
+            SSL_CTX_add_client_CA(ssl_ctx, chain_cert);
+            if (SSL_CTX_add_extra_chain_cert(ssl_ctx, chain_cert) != 1) {
+                X509_free(chain_cert);
+                sk_X509_pop_free(chain, X509_free);
+                char *message = ct_tls_error_message("Failed to use TLS PFX certificate chain");
+                ct_tls_throw_error(ctx, exception, message, "ERR_SSL_PKCS12_PARSE_ERROR");
+                free(message);
+                return -1;
+            }
+        }
+        if (chain != NULL) sk_X509_free(chain);
+    }
+    return 0;
+}
+
+static int ct_tls_use_crl_entries(
+    JSContextRef ctx,
+    SSL_CTX *ssl_ctx,
+    JSValueRef entries_value,
+    JSValueRef *exception
+) {
+    if (ct_tls_value_is_missing(ctx, entries_value)) return 0;
+    if (!JSValueIsObject(ctx, entries_value)) {
+        ct_tls_throw_error(ctx, exception, "TLS CRL entries must be an array", "ERR_INVALID_ARG_TYPE");
+        return -1;
+    }
+    JSObjectRef entries = (JSObjectRef)entries_value;
+    JSValueRef length_value = ct_get_property(ctx, entries, "length", exception);
+    if (exception != NULL && *exception != NULL) return -1;
+    double length_number = JSValueToNumber(ctx, length_value, exception);
+    if ((exception != NULL && *exception != NULL) || length_number < 0 || length_number > UINT_MAX) {
+        ct_tls_throw_error(ctx, exception, "Invalid TLS CRL entry count", "ERR_INVALID_ARG_VALUE");
+        return -1;
+    }
+    unsigned int length = (unsigned int)length_number;
+    for (unsigned int index = 0; index < length; index += 1) {
+        JSValueRef entry = JSObjectGetPropertyAtIndex(ctx, entries, index, exception);
+        uint8_t *data = NULL;
+        size_t data_len = 0;
+        if ((exception != NULL && *exception != NULL) ||
+            ct_get_bytes(ctx, entry, &data, &data_len) != 0 || data_len == 0 || data_len > INT_MAX) {
+            ct_tls_throw_error(ctx, exception, "TLS CRL data must be a non-empty BufferSource", "ERR_INVALID_ARG_TYPE");
+            return -1;
+        }
+        BIO *bio = BIO_new_mem_buf(data, (int)data_len);
+        X509_CRL *crl = bio != NULL ? PEM_read_bio_X509_CRL(bio, NULL, NULL, NULL) : NULL;
+        if (bio != NULL) BIO_free(bio);
+        if (crl == NULL || X509_STORE_add_crl(SSL_CTX_get_cert_store(ssl_ctx), crl) != 1) {
+            if (crl != NULL) X509_CRL_free(crl);
+            ERR_clear_error();
+            ct_tls_throw_error(ctx, exception, "Failed to parse CRL", "ERR_CRYPTO_OPERATION_FAILED");
+            return -1;
+        }
+        X509_CRL_free(crl);
+    }
+    if (length > 0 && X509_STORE_set_flags(
+            SSL_CTX_get_cert_store(ssl_ctx),
+            X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL
+        ) != 1) {
+        ct_tls_throw_error(ctx, exception, "Failed to enable CRL checking", "ERR_CRYPTO_OPERATION_FAILED");
+        return -1;
+    }
+    return 0;
+}
+
+static int ct_tls_use_dhparam(
+    JSContextRef ctx,
+    SSL_CTX *ssl_ctx,
+    JSValueRef advanced_options,
+    bool *dh_warning,
+    JSValueRef *exception
+) {
+    JSValueRef auto_value = ct_tls_advanced_property(ctx, advanced_options, "dhAuto", exception);
+    if (exception != NULL && *exception != NULL) return -1;
+    if (!ct_tls_value_is_missing(ctx, auto_value) && ct_value_to_bool(ctx, auto_value)) {
+#ifdef SSL_CTRL_SET_DH_AUTO
+        if (SSL_CTX_set_dh_auto(ssl_ctx, 1) != 1) {
+            ct_tls_throw_error(ctx, exception, "Failed to enable automatic DH parameters", "ERR_CRYPTO_OPERATION_FAILED");
+            return -1;
+        }
+#endif
+        return 0;
+    }
+    JSValueRef dh_value = ct_tls_advanced_property(ctx, advanced_options, "dhparam", exception);
+    if ((exception != NULL && *exception != NULL) || ct_tls_value_is_missing(ctx, dh_value)) return 0;
+    uint8_t *data = NULL;
+    size_t data_len = 0;
+    if (ct_get_bytes(ctx, dh_value, &data, &data_len) != 0 || data_len == 0 || data_len > INT_MAX) {
+        ct_tls_throw_error(ctx, exception, "TLS DH parameters must be a non-empty BufferSource", "ERR_INVALID_ARG_TYPE");
+        return -1;
+    }
+    BIO *bio = BIO_new_mem_buf(data, (int)data_len);
+    ERR_clear_error();
+    DH *dh = bio != NULL ? PEM_read_bio_DHparams(bio, NULL, NULL, NULL) : NULL;
+    if (bio != NULL) BIO_free(bio);
+    if (dh == NULL) {
+        ERR_clear_error();
+        return 0;
+    }
+    int bits = DH_bits(dh);
+    if (bits < 1024) {
+        DH_free(dh);
+        ct_tls_throw_error(ctx, exception, "DH parameter is less than 1024 bits", "ERR_INVALID_ARG_VALUE");
+        return -1;
+    }
+    if (SSL_CTX_set_tmp_dh(ssl_ctx, dh) != 1) {
+        DH_free(dh);
+        char *message = ct_tls_error_message("Failed to set DH parameters");
+        ct_tls_throw_error(ctx, exception, message, "ERR_CRYPTO_OPERATION_FAILED");
+        free(message);
+        return -1;
+    }
+    DH_free(dh);
+    if (dh_warning != NULL && bits < 2048) *dh_warning = true;
+    return 0;
+}
+
+static int ct_tls_configure_advanced_ctx(
+    JSContextRef ctx,
+    SSL_CTX *ssl_ctx,
+    JSValueRef advanced_options,
+    bool *dh_warning,
+    JSValueRef *exception
+) {
+    if (ct_tls_value_is_missing(ctx, advanced_options)) return 0;
+    JSValueRef crl = ct_tls_advanced_property(ctx, advanced_options, "crl", exception);
+    if ((exception != NULL && *exception != NULL) || ct_tls_use_crl_entries(ctx, ssl_ctx, crl, exception) != 0) return -1;
+    JSValueRef pfx = ct_tls_advanced_property(ctx, advanced_options, "pfx", exception);
+    if ((exception != NULL && *exception != NULL) || ct_tls_use_pfx_entries(ctx, ssl_ctx, pfx, exception) != 0) return -1;
+
+    JSValueRef sigalgs_value = ct_tls_advanced_property(ctx, advanced_options, "sigalgs", exception);
+    char *sigalgs = ct_tls_value_is_missing(ctx, sigalgs_value) ? NULL : ct_value_to_string_copy(ctx, sigalgs_value);
+    if (sigalgs != NULL && SSL_CTX_set1_sigalgs_list(ssl_ctx, sigalgs) != 1) {
+        free(sigalgs);
+        ERR_clear_error();
+        ct_tls_throw_error(ctx, exception, "Failed to set signature algorithms", "ERR_SSL_INVALID_SIGALGS");
+        return -1;
+    }
+    free(sigalgs);
+
+    JSValueRef curve_value = ct_tls_advanced_property(ctx, advanced_options, "ecdhCurve", exception);
+    char *curve = ct_tls_value_is_missing(ctx, curve_value) ? NULL : ct_value_to_string_copy(ctx, curve_value);
+    if (curve != NULL && strcmp(curve, "auto") != 0 && SSL_CTX_set1_curves_list(ssl_ctx, curve) != 1) {
+        free(curve);
+        ERR_clear_error();
+        ct_tls_throw_error(ctx, exception, "Failed to set ECDH curve", "ERR_CRYPTO_OPERATION_FAILED");
+        return -1;
+    }
+    free(curve);
+    return ct_tls_use_dhparam(ctx, ssl_ctx, advanced_options, dh_warning, exception);
+}
+
 static int ct_tls_configure_ctx(
     JSContextRef ctx,
     SSL_CTX *ssl_ctx,
@@ -13085,6 +13351,8 @@ static int ct_tls_configure_ctx(
     int min_version,
     int max_version,
     uint64_t secure_options,
+    JSValueRef advanced_options,
+    bool *dh_warning,
     JSValueRef *exception
 ) {
     if (ssl_ctx == NULL) {
@@ -13093,20 +13361,6 @@ static int ct_tls_configure_ctx(
     }
     if (cert != NULL && cert[0] != '\0' && ct_tls_use_cert_pem(ctx, ssl_ctx, cert, exception) != 0) return -1;
     if (key != NULL && key[0] != '\0' && ct_tls_use_key_pem(ctx, ssl_ctx, key, passphrase, exception) != 0) return -1;
-    bool has_cert = cert != NULL && cert[0] != '\0';
-    bool has_key = key != NULL && key[0] != '\0';
-    // COTTONTAIL-COMPAT: Node and Bun accept cert-only client contexts. TLS
-    // servers still require a complete identity before they can listen.
-    if (server_side && has_cert != has_key) {
-        ct_throw_message(ctx, exception, "TLS certificate and private key must be provided together");
-        return -1;
-    }
-    if (has_cert && has_key && SSL_CTX_check_private_key(ssl_ctx) != 1) {
-        char *message = ct_tls_error_message("TLS private key does not match certificate");
-        ct_throw_message(ctx, exception, message);
-        free(message);
-        return -1;
-    }
     if (ca != NULL) {
         X509_STORE *store = X509_STORE_new();
         if (store == NULL) {
@@ -13120,6 +13374,21 @@ static int ct_tls_configure_ctx(
         }
     } else if (!server_side) {
         SSL_CTX_set_default_verify_paths(ssl_ctx);
+    }
+    if (ct_tls_configure_advanced_ctx(ctx, ssl_ctx, advanced_options, dh_warning, exception) != 0) return -1;
+    bool has_cert = SSL_CTX_get0_certificate(ssl_ctx) != NULL;
+    bool has_key = SSL_CTX_get0_privatekey(ssl_ctx) != NULL;
+    // COTTONTAIL-COMPAT: Node and Bun accept cert-only client contexts. TLS
+    // servers still require a complete identity before they can listen.
+    if (server_side && has_cert != has_key) {
+        ct_throw_message(ctx, exception, "TLS certificate and private key must be provided together");
+        return -1;
+    }
+    if (has_cert && has_key && SSL_CTX_check_private_key(ssl_ctx) != 1) {
+        char *message = ct_tls_error_message("TLS private key does not match certificate");
+        ct_throw_message(ctx, exception, message);
+        free(message);
+        return -1;
     }
     if (ciphers != NULL && ciphers[0] != '\0') {
         ERR_clear_error();
@@ -13149,6 +13418,11 @@ static int ct_tls_configure_ctx(
     }
     if (secure_options != 0) SSL_CTX_set_options(ssl_ctx, (uint64_t)secure_options);
     if (server_side) {
+#ifdef SSL_OP_ALLOW_CLIENT_RENEGOTIATION
+        // OpenSSL 3 disables client-initiated renegotiation by default. Node
+        // permits it and enforces its bounded renegotiation policy above TLS.
+        SSL_CTX_set_options(ssl_ctx, SSL_OP_ALLOW_CLIENT_RENEGOTIATION);
+#endif
         int mode = request_cert ? SSL_VERIFY_PEER : SSL_VERIFY_NONE;
         if (request_cert && reject_unauthorized) mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
         SSL_CTX_set_verify(ssl_ctx, mode, request_cert && !reject_unauthorized ? ct_tls_allow_verify_error : NULL);
@@ -13364,7 +13638,7 @@ static unsigned char *ct_tls_serialize_session(SSL_SESSION *session, size_t *out
 
 static int ct_tls_new_session_callback(SSL *ssl, SSL_SESSION *session) {
     CtTlsConnection *connection = (CtTlsConnection *)SSL_get_app_data(ssl);
-    if (connection == NULL || connection->server_side) return 0;
+    if (connection == NULL || (connection->server_side && !connection->session_callbacks_enabled)) return 0;
 
     size_t session_len = 0;
     unsigned char *session_data = ct_tls_serialize_session(session, &session_len);
@@ -13372,7 +13646,7 @@ static int ct_tls_new_session_callback(SSL *ssl, SSL_SESSION *session) {
         free(session_data);
         return 0;
     }
-    if (!connection->memory_bio && connection->watcher_started) {
+    if (!connection->server_side && !connection->memory_bio && connection->watcher_started) {
         ct_queue_fd_binary(
             connection->runtime,
             connection->id,
@@ -13389,12 +13663,90 @@ static int ct_tls_new_session_callback(SSL *ssl, SSL_SESSION *session) {
         free(session_data);
         return 0;
     }
+    if (connection->server_side) {
+        unsigned int session_id_len = 0;
+        const unsigned char *session_id = SSL_SESSION_get_id(session, &session_id_len);
+        if (session_id == NULL || session_id_len == 0) {
+            free(session_data);
+            free(pending);
+            return 0;
+        }
+        pending->id = (unsigned char *)malloc(session_id_len);
+        if (pending->id == NULL) {
+            free(session_data);
+            free(pending);
+            return 0;
+        }
+        memcpy(pending->id, session_id, session_id_len);
+        pending->id_len = session_id_len;
+    }
     pending->data = session_data;
     pending->len = session_len;
     if (connection->pending_sessions_tail != NULL) connection->pending_sessions_tail->next = pending;
     else connection->pending_sessions_head = pending;
     connection->pending_sessions_tail = pending;
+    if (connection->server_side) {
+        connection->pending_server_session_callbacks += 1;
+        if (!connection->memory_bio && connection->watcher_started) {
+            ct_queue_fd_simple(connection->runtime, connection->id, "newSession", NULL);
+        }
+    }
     return 0;
+}
+
+static SSL_SESSION *ct_tls_get_session_callback(
+    SSL *ssl,
+    const unsigned char *session_id,
+    int session_id_len,
+    int *copy
+) {
+    CtTlsConnection *connection = (CtTlsConnection *)SSL_get_app_data(ssl);
+    if (connection == NULL || !connection->server_side || connection->resume_session == NULL) return NULL;
+    unsigned int loaded_id_len = 0;
+    const unsigned char *loaded_id = SSL_SESSION_get_id(connection->resume_session, &loaded_id_len);
+    if (session_id == NULL || session_id_len <= 0 || loaded_id == NULL ||
+        loaded_id_len != (unsigned int)session_id_len ||
+        memcmp(loaded_id, session_id, loaded_id_len) != 0) {
+        return NULL;
+    }
+    SSL_SESSION *session = connection->resume_session;
+    connection->resume_session = NULL;
+    *copy = 0;
+    return session;
+}
+
+static int ct_tls_set_ocsp_response(SSL *ssl, const unsigned char *data, size_t len) {
+    if (ssl == NULL || data == NULL || len == 0 || len > INT_MAX) return 0;
+    unsigned char *response = (unsigned char *)OPENSSL_malloc(len);
+    if (response == NULL) return 0;
+    memcpy(response, data, len);
+    if (SSL_set_tlsext_status_ocsp_resp(ssl, response, (int)len) != 1) {
+        OPENSSL_free(response);
+        return 0;
+    }
+    return 1;
+}
+
+static int ct_tls_server_ocsp_status_callback(SSL *ssl, void *opaque) {
+    (void)opaque;
+    unsigned char *existing_response = NULL;
+    if (SSL_get_tlsext_status_ocsp_resp(ssl, &existing_response) > 0) return SSL_TLSEXT_ERR_OK;
+
+    CtTlsConnection *connection = (CtTlsConnection *)SSL_get_app_data(ssl);
+    if (connection == NULL || !connection->server_side || connection->ocsp_response == NULL ||
+        connection->ocsp_response_len == 0 || connection->ocsp_response_len > INT_MAX) {
+        return SSL_TLSEXT_ERR_NOACK;
+    }
+    if (!ct_tls_set_ocsp_response(ssl, connection->ocsp_response, connection->ocsp_response_len)) {
+        return SSL_TLSEXT_ERR_ALERT_FATAL;
+    }
+    return SSL_TLSEXT_ERR_OK;
+}
+
+static int ct_tls_client_ocsp_status_callback(SSL *ssl, void *opaque) {
+    (void)ssl;
+    (void)opaque;
+    return 1;
 }
 
 static JSValueRef ct_tls_session_der(JSContextRef ctx, SSL *ssl, JSValueRef *exception) {
@@ -13737,6 +14089,32 @@ static int ct_tls_client_hello_capture(SSL *ssl, int *alert, void *opaque) {
         connection->client_hello_servername = ct_tls_client_hello_servername(ssl);
         const unsigned char *extension = NULL;
         size_t extension_len = 0;
+        const unsigned char *session_id = NULL;
+        connection->client_hello_session_id_len = SSL_client_hello_get0_session_id(ssl, &session_id);
+        if (session_id != NULL && connection->client_hello_session_id_len > 0) {
+            connection->client_hello_session_id = (unsigned char *)malloc(connection->client_hello_session_id_len);
+            if (connection->client_hello_session_id != NULL) {
+                memcpy(
+                    connection->client_hello_session_id,
+                    session_id,
+                    connection->client_hello_session_id_len
+                );
+            } else {
+                connection->client_hello_session_id_len = 0;
+            }
+        }
+        connection->client_hello_has_ticket = SSL_client_hello_get0_ext(
+            ssl,
+            TLSEXT_TYPE_session_ticket,
+            &extension,
+            &extension_len
+        ) == 1;
+        connection->client_hello_requests_ocsp = SSL_client_hello_get0_ext(
+            ssl,
+            TLSEXT_TYPE_status_request,
+            &extension,
+            &extension_len
+        ) == 1;
         if (SSL_client_hello_get0_ext(
                 ssl,
                 TLSEXT_TYPE_application_layer_protocol_negotiation,
@@ -14133,6 +14511,7 @@ static JSValueRef ct_tls_client_connect_owned_fd(
     size_t session_len,
     bool request_ocsp,
     bool defer_handshake,
+    JSValueRef advanced_options,
     JSValueRef *exception
 ) {
     SSL_CTX *ssl_ctx = ct_tls_context_new(TLS_client_method());
@@ -14157,6 +14536,8 @@ static JSValueRef ct_tls_client_connect_owned_fd(
             min_version,
             max_version,
             secure_options,
+            advanced_options,
+            NULL,
             exception
         ) != 0) {
         SSL_CTX_free(ssl_ctx);
@@ -14166,6 +14547,7 @@ static JSValueRef ct_tls_client_connect_owned_fd(
     SSL_CTX_set_info_callback(ssl_ctx, ct_tls_connection_info_callback);
     SSL_CTX_set_session_cache_mode(ssl_ctx, SSL_SESS_CACHE_CLIENT);
     SSL_CTX_sess_set_new_cb(ssl_ctx, ct_tls_new_session_callback);
+    if (request_ocsp) SSL_CTX_set_tlsext_status_cb(ssl_ctx, ct_tls_client_ocsp_status_callback);
     SSL *ssl = SSL_new(ssl_ctx);
     if (ssl == NULL) {
         SSL_CTX_free(ssl_ctx);
@@ -14343,6 +14725,7 @@ static JSValueRef ct_tls_client_connect(JSContextRef ctx, JSObjectRef function, 
         return JSValueMakeUndefined(ctx);
     }
     bool request_ocsp = argc >= 15 && ct_value_to_bool(ctx, argv[14]);
+    JSValueRef advanced_options = argc >= 16 ? argv[15] : JSValueMakeUndefined(ctx);
 
     int fd = ct_tls_make_socket(ctx, host != NULL ? host : "127.0.0.1", port, AF_UNSPEC, exception);
     JSValueRef result = fd >= 0
@@ -14366,6 +14749,7 @@ static JSValueRef ct_tls_client_connect(JSContextRef ctx, JSObjectRef function, 
             session_len,
             request_ocsp,
             false,
+            advanced_options,
             exception
         )
         : JSValueMakeUndefined(ctx);
@@ -14448,6 +14832,7 @@ static JSValueRef ct_tls_client_connect_fd(JSContextRef ctx, JSObjectRef functio
         return JSValueMakeUndefined(ctx);
     }
     bool request_ocsp = argc >= 14 && ct_value_to_bool(ctx, argv[13]);
+    JSValueRef advanced_options = argc >= 15 ? argv[14] : JSValueMakeUndefined(ctx);
     JSValueRef result = ct_tls_client_connect_owned_fd(
         ctx,
         function,
@@ -14468,6 +14853,7 @@ static JSValueRef ct_tls_client_connect_fd(JSContextRef ctx, JSObjectRef functio
         session_len,
         request_ocsp,
         true,
+        advanced_options,
         exception
     );
     free(servername);
@@ -14543,6 +14929,7 @@ static JSValueRef ct_tls_client_connect_memory(JSContextRef ctx, JSObjectRef fun
         return JSValueMakeUndefined(ctx);
     }
     bool request_ocsp = argc >= 13 && ct_value_to_bool(ctx, argv[12]);
+    JSValueRef advanced_options = argc >= 14 ? argv[13] : JSValueMakeUndefined(ctx);
 
     SSL_CTX *ssl_ctx = ct_tls_context_new(TLS_client_method());
     if (ssl_ctx == NULL || ct_tls_configure_ctx(
@@ -14559,6 +14946,8 @@ static JSValueRef ct_tls_client_connect_memory(JSContextRef ctx, JSObjectRef fun
             min_version,
             max_version,
             secure_options,
+            advanced_options,
+            NULL,
             exception
         ) != 0) {
         if (ssl_ctx != NULL) SSL_CTX_free(ssl_ctx);
@@ -14573,6 +14962,7 @@ static JSValueRef ct_tls_client_connect_memory(JSContextRef ctx, JSObjectRef fun
     SSL_CTX_set_info_callback(ssl_ctx, ct_tls_connection_info_callback);
     SSL_CTX_set_session_cache_mode(ssl_ctx, SSL_SESS_CACHE_CLIENT);
     SSL_CTX_sess_set_new_cb(ssl_ctx, ct_tls_new_session_callback);
+    if (request_ocsp) SSL_CTX_set_tlsext_status_cb(ssl_ctx, ct_tls_client_ocsp_status_callback);
     SSL *ssl = SSL_new(ssl_ctx);
     ct_tls_enable_partial_writes(ssl);
     if (ssl != NULL && ct_tls_apply_session(ctx, ssl, session_bytes, session_len, exception) != 0) {
@@ -14777,6 +15167,10 @@ static JSValueRef ct_tls_server_upgrade_fd(JSContextRef ctx, JSObjectRef functio
         free(ciphers);
         return JSValueMakeUndefined(ctx);
     }
+    bool session_callbacks_enabled = argc >= 20 && ct_value_to_bool(ctx, argv[19]);
+    bool ocsp_callback_enabled = argc >= 21 && ct_value_to_bool(ctx, argv[20]);
+    JSValueRef advanced_options = argc >= 22 ? argv[21] : JSValueMakeUndefined(ctx);
+    client_hello_enabled = client_hello_enabled || session_callbacks_enabled || ocsp_callback_enabled;
 #if OPENSSL_VERSION_NUMBER < 0x10101000L
     if (client_hello_enabled) {
         close(fd);
@@ -14791,7 +15185,7 @@ static JSValueRef ct_tls_server_upgrade_fd(JSContextRef ctx, JSObjectRef functio
 #endif
 
     SSL_CTX *ssl_ctx = ct_tls_context_new(TLS_server_method());
-    if (ssl_ctx == NULL || cert == NULL || cert[0] == '\0' || key == NULL || key[0] == '\0' ||
+    if (ssl_ctx == NULL ||
         ct_tls_configure_ctx(
             ctx,
             ssl_ctx,
@@ -14806,8 +15200,10 @@ static JSValueRef ct_tls_server_upgrade_fd(JSContextRef ctx, JSObjectRef functio
             min_version,
             max_version,
             secure_options,
+            advanced_options,
+            NULL,
             exception
-        ) != 0 ||
+        ) != 0 || SSL_CTX_get0_certificate(ssl_ctx) == NULL || SSL_CTX_get0_privatekey(ssl_ctx) == NULL ||
         ct_tls_configure_server_session(
             ctx,
             ssl_ctx,
@@ -14855,6 +15251,8 @@ static JSValueRef ct_tls_server_upgrade_fd(JSContextRef ctx, JSObjectRef functio
     connection->handshake_complete = false;
     connection->client_hello_enabled = client_hello_enabled;
     connection->alpn_callback_enabled = alpn_callback_enabled;
+    connection->session_callbacks_enabled = session_callbacks_enabled;
+    connection->ocsp_callback_enabled = ocsp_callback_enabled;
     connection->renegotiation_limit = renegotiation_limit;
     connection->renegotiation_window = renegotiation_window;
     if (ticket_keys_len == sizeof(connection->ticket_keys.material)) {
@@ -14869,6 +15267,13 @@ static JSValueRef ct_tls_server_upgrade_fd(JSContextRef ctx, JSObjectRef functio
     SSL_CTX_set_tlsext_servername_callback(ssl_ctx, ct_tls_connection_servername_select);
     SSL_CTX_set_tlsext_servername_arg(ssl_ctx, connection);
     SSL_CTX_set_info_callback(ssl_ctx, ct_tls_connection_info_callback);
+    if (session_callbacks_enabled) {
+        SSL_CTX_sess_set_get_cb(ssl_ctx, ct_tls_get_session_callback);
+        SSL_CTX_sess_set_new_cb(ssl_ctx, ct_tls_new_session_callback);
+    }
+    if (ocsp_callback_enabled) {
+        SSL_CTX_set_tlsext_status_cb(ssl_ctx, ct_tls_server_ocsp_status_callback);
+    }
     if (alpn_protocols_len > 0) {
         connection->alpn_protocols = (unsigned char *)malloc(alpn_protocols_len);
         if (connection->alpn_protocols == NULL) {
@@ -14925,8 +15330,8 @@ static JSValueRef ct_tls_connection_add_server_context(JSContextRef ctx, JSObjec
         return JSValueMakeUndefined(ctx);
     }
     char *hostname = ct_value_to_string_copy(ctx, argv[1]);
-    char *cert = ct_value_to_string_copy(ctx, argv[2]);
-    char *key = ct_value_to_string_copy(ctx, argv[3]);
+    char *cert = ct_value_to_optional_string(ctx, argv[2]);
+    char *key = ct_value_to_optional_string(ctx, argv[3]);
     char *ca = argc >= 5 ? ct_value_to_optional_string(ctx, argv[4]) : NULL;
     char *passphrase = argc >= 6 ? ct_value_to_optional_string(ctx, argv[5]) : NULL;
     bool request_cert = argc >= 7 && ct_value_to_bool(ctx, argv[6]);
@@ -14992,8 +15397,9 @@ static JSValueRef ct_tls_connection_add_server_context(JSContextRef ctx, JSObjec
         ct_tls_throw_error(ctx, exception, "TLS session ID context must be an ArrayBuffer or typed array", "ERR_INVALID_ARG_TYPE");
         return JSValueMakeUndefined(ctx);
     }
+    JSValueRef advanced_options = argc >= 16 ? argv[15] : JSValueMakeUndefined(ctx);
     SSL_CTX *ssl_ctx = ct_tls_context_new(TLS_server_method());
-    if (hostname == NULL || hostname[0] == '\0' || cert == NULL || cert[0] == '\0' || key == NULL || key[0] == '\0' ||
+    if (hostname == NULL || hostname[0] == '\0' ||
         ct_tls_configure_ctx(
             ctx,
             ssl_ctx,
@@ -15008,8 +15414,10 @@ static JSValueRef ct_tls_connection_add_server_context(JSContextRef ctx, JSObjec
             min_version,
             max_version,
             secure_options,
+            advanced_options,
+            NULL,
             exception
-        ) != 0 ||
+        ) != 0 || SSL_CTX_get0_certificate(ssl_ctx) == NULL || SSL_CTX_get0_privatekey(ssl_ctx) == NULL ||
         ct_tls_configure_server_session(
             ctx,
             ssl_ctx,
@@ -15036,6 +15444,13 @@ static JSValueRef ct_tls_connection_add_server_context(JSContextRef ctx, JSObjec
     free(passphrase);
     free(ciphers);
     SSL_CTX_set_info_callback(ssl_ctx, ct_tls_connection_info_callback);
+    if (connection->session_callbacks_enabled) {
+        SSL_CTX_sess_set_get_cb(ssl_ctx, ct_tls_get_session_callback);
+        SSL_CTX_sess_set_new_cb(ssl_ctx, ct_tls_new_session_callback);
+    }
+    if (connection->ocsp_callback_enabled) {
+        SSL_CTX_set_tlsext_status_cb(ssl_ctx, ct_tls_server_ocsp_status_callback);
+    }
     if (connection->alpn_protocols_len > 0 || connection->alpn_callback_enabled) {
         SSL_CTX_set_alpn_select_cb(ssl_ctx, ct_tls_connection_alpn_select, connection);
     }
@@ -15100,27 +15515,29 @@ static JSValueRef ct_tls_validate_server_context(JSContextRef ctx, JSObjectRef f
         free(ciphers);
         return JSValueMakeUndefined(ctx);
     }
+    JSValueRef advanced_options = argc >= 11 ? argv[10] : JSValueMakeUndefined(ctx);
     SSL_CTX *ssl_ctx = ct_tls_context_new(TLS_server_method());
-    int status = -1;
-    if (cert == NULL || cert[0] == '\0' || key == NULL || key[0] == '\0') {
+    int status = ct_tls_configure_ctx(
+        ctx,
+        ssl_ctx,
+        true,
+        cert,
+        key,
+        passphrase,
+        ca,
+        request_cert,
+        reject_unauthorized,
+        ciphers,
+        min_version,
+        max_version,
+        secure_options,
+        advanced_options,
+        NULL,
+        exception
+    );
+    if (status == 0 && (SSL_CTX_get0_certificate(ssl_ctx) == NULL || SSL_CTX_get0_privatekey(ssl_ctx) == NULL)) {
+        status = -1;
         ct_throw_message(ctx, exception, "TLS server requires both a certificate and private key");
-    } else {
-        status = ct_tls_configure_ctx(
-            ctx,
-            ssl_ctx,
-            true,
-            cert,
-            key,
-            passphrase,
-            ca,
-            request_cert,
-            reject_unauthorized,
-            ciphers,
-            min_version,
-            max_version,
-            secure_options,
-            exception
-        );
     }
     if (ssl_ctx != NULL) SSL_CTX_free(ssl_ctx);
     free(cert);
@@ -15162,7 +15579,9 @@ static JSValueRef ct_tls_validate_secure_context(JSContextRef ctx, JSObjectRef f
         free(ciphers);
         return JSValueMakeUndefined(ctx);
     }
+    JSValueRef advanced_options = argc >= 9 ? argv[8] : JSValueMakeUndefined(ctx);
     SSL_CTX *ssl_ctx = ct_tls_context_new(TLS_method());
+    bool dh_warning = false;
     int status = ct_tls_configure_ctx(
         ctx,
         ssl_ctx,
@@ -15177,15 +15596,42 @@ static JSValueRef ct_tls_validate_secure_context(JSContextRef ctx, JSObjectRef f
         min_version,
         max_version,
         secure_options,
+        advanced_options,
+        &dh_warning,
         exception
     );
-    if (ssl_ctx != NULL) SSL_CTX_free(ssl_ctx);
     free(cert);
     free(key);
     free(passphrase);
     free(ca);
     free(ciphers);
-    return status == 0 ? JSValueMakeBoolean(ctx, true) : JSValueMakeUndefined(ctx);
+    if (status != 0) {
+        if (ssl_ctx != NULL) SSL_CTX_free(ssl_ctx);
+        return JSValueMakeUndefined(ctx);
+    }
+    JSObjectRef result = ct_make_object(ctx);
+    X509 *certificate = SSL_CTX_get0_certificate(ssl_ctx);
+    ct_set_property(ctx, result, "certificate", ct_tls_x509_der(ctx, certificate, exception), exception);
+    X509 *issuer = NULL;
+    if (certificate != NULL) {
+        X509_STORE_CTX *store_ctx = X509_STORE_CTX_new();
+        STACK_OF(X509) *chain = NULL;
+        SSL_CTX_get0_chain_certs(ssl_ctx, &chain);
+        if (store_ctx != NULL && X509_STORE_CTX_init(
+                store_ctx,
+                SSL_CTX_get_cert_store(ssl_ctx),
+                certificate,
+                chain
+            ) == 1) {
+            X509_STORE_CTX_get1_issuer(&issuer, store_ctx, certificate);
+        }
+        if (store_ctx != NULL) X509_STORE_CTX_free(store_ctx);
+    }
+    ct_set_property(ctx, result, "issuer", ct_tls_x509_der(ctx, issuer, exception), exception);
+    if (issuer != NULL) X509_free(issuer);
+    ct_set_property(ctx, result, "dhWarning", JSValueMakeBoolean(ctx, dh_warning), exception);
+    SSL_CTX_free(ssl_ctx);
+    return result;
 }
 
 static JSValueRef ct_tls_validate_ciphers(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -15236,6 +15682,11 @@ static JSValueRef ct_tls_client_handshake(JSContextRef ctx, JSObjectRef function
     }
 
     pthread_mutex_lock(&connection->mutex);
+    if (connection->handshake_complete) {
+        bool ready = connection->pending_server_session_callbacks == 0;
+        pthread_mutex_unlock(&connection->mutex);
+        return JSValueMakeBoolean(ctx, ready);
+    }
     int status = connection->server_side ? SSL_accept(connection->ssl) : SSL_connect(connection->ssl);
     int handshake_errno = errno;
     int ssl_error = status == 1 ? SSL_ERROR_NONE : SSL_get_error(connection->ssl, status);
@@ -15253,8 +15704,9 @@ static JSValueRef ct_tls_client_handshake(JSContextRef ctx, JSObjectRef function
         }
         pthread_mutex_lock(&connection->mutex);
         connection->handshake_complete = true;
+        bool ready = connection->pending_server_session_callbacks == 0;
         pthread_mutex_unlock(&connection->mutex);
-        return JSValueMakeBoolean(ctx, true);
+        return JSValueMakeBoolean(ctx, ready);
     }
     if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE
 #if OPENSSL_VERSION_NUMBER >= 0x10101000L
@@ -15303,6 +15755,22 @@ static JSValueRef ct_tls_connection_client_hello(JSContextRef ctx, JSObjectRef f
             : JSValueMakeNull(ctx),
         exception
     );
+    ct_set_property(
+        ctx,
+        result,
+        "sessionId",
+        connection->client_hello_session_id != NULL && connection->client_hello_session_id_len > 0
+            ? ct_array_buffer_from_copy(
+                ctx,
+                (const char *)connection->client_hello_session_id,
+                connection->client_hello_session_id_len,
+                exception
+            )
+            : JSValueMakeNull(ctx),
+        exception
+    );
+    ct_set_property(ctx, result, "tlsTicket", JSValueMakeBoolean(ctx, connection->client_hello_has_ticket), exception);
+    ct_set_property(ctx, result, "ocspRequest", JSValueMakeBoolean(ctx, connection->client_hello_requests_ocsp), exception);
 
     size_t count = 0;
     size_t offset = 0;
@@ -15336,7 +15804,7 @@ static JSValueRef ct_tls_connection_resolve_client_hello(JSContextRef ctx, JSObj
     (void)function;
     (void)thisObject;
     if (argc < 1) {
-        ct_throw_message(ctx, exception, "tlsConnectionResolveClientHello(id[, protocol[, rejected[, alert]]]) requires a connection id");
+        ct_throw_message(ctx, exception, "tlsConnectionResolveClientHello(id[, protocol[, rejected[, alert[, session[, ocspResponse]]]]]) requires a connection id");
         return JSValueMakeUndefined(ctx);
     }
     CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
@@ -15362,25 +15830,77 @@ static JSValueRef ct_tls_connection_resolve_client_hello(JSContextRef ctx, JSObj
         return JSValueMakeUndefined(ctx);
     }
 
+    uint8_t *session_bytes = NULL;
+    size_t session_len = 0;
+    if (argc >= 5 && !ct_tls_value_is_missing(ctx, argv[4]) &&
+        ct_get_bytes(ctx, argv[4], &session_bytes, &session_len) != 0) {
+        ct_tls_throw_error(ctx, exception, "Resumed TLS session must be an ArrayBuffer or typed array", "ERR_INVALID_ARG_TYPE");
+        return JSValueMakeUndefined(ctx);
+    }
+    SSL_SESSION *resume_session = NULL;
+    if (session_bytes != NULL && session_len > 0 && session_len <= LONG_MAX) {
+        const unsigned char *cursor = session_bytes;
+        ERR_clear_error();
+        resume_session = d2i_SSL_SESSION(NULL, &cursor, (long)session_len);
+        ERR_clear_error();
+    }
+
+    uint8_t *ocsp_response = NULL;
+    size_t ocsp_response_len = 0;
+    if (argc >= 6 && !ct_tls_value_is_missing(ctx, argv[5]) &&
+        ct_get_bytes(ctx, argv[5], &ocsp_response, &ocsp_response_len) != 0) {
+        if (resume_session != NULL) SSL_SESSION_free(resume_session);
+        ct_tls_throw_error(ctx, exception, "OCSP response must be an ArrayBuffer or typed array", "ERR_INVALID_ARG_TYPE");
+        return JSValueMakeUndefined(ctx);
+    }
+
     unsigned char *selected_copy = NULL;
     if (selected_len > 0) {
         selected_copy = (unsigned char *)malloc(selected_len);
         if (selected_copy == NULL) {
+            if (resume_session != NULL) SSL_SESSION_free(resume_session);
             ct_throw_message(ctx, exception, "Out of memory");
             return JSValueMakeUndefined(ctx);
         }
         memcpy(selected_copy, selected, selected_len);
     }
+    unsigned char *ocsp_copy = NULL;
+    if (ocsp_response_len > 0) {
+        ocsp_copy = (unsigned char *)malloc(ocsp_response_len);
+        if (ocsp_copy == NULL) {
+            free(selected_copy);
+            if (resume_session != NULL) SSL_SESSION_free(resume_session);
+            ct_throw_message(ctx, exception, "Out of memory");
+            return JSValueMakeUndefined(ctx);
+        }
+        memcpy(ocsp_copy, ocsp_response, ocsp_response_len);
+    }
     pthread_mutex_lock(&connection->mutex);
     if (!connection->client_hello_pending || connection->client_hello_resolved) {
         pthread_mutex_unlock(&connection->mutex);
         free(selected_copy);
+        free(ocsp_copy);
+        if (resume_session != NULL) SSL_SESSION_free(resume_session);
         ct_tls_throw_error(ctx, exception, "TLS ClientHello is not waiting for a callback", "ERR_TLS_INVALID_STATE");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (ocsp_response_len > 0 &&
+        !ct_tls_set_ocsp_response(connection->ssl, ocsp_response, ocsp_response_len)) {
+        pthread_mutex_unlock(&connection->mutex);
+        free(selected_copy);
+        free(ocsp_copy);
+        if (resume_session != NULL) SSL_SESSION_free(resume_session);
+        ct_tls_throw_error(ctx, exception, "Failed to set TLS OCSP response", "ERR_SSL_INTERNAL_ERROR");
         return JSValueMakeUndefined(ctx);
     }
     free(connection->selected_alpn);
     connection->selected_alpn = selected_copy;
     connection->selected_alpn_len = (unsigned int)selected_len;
+    free(connection->ocsp_response);
+    connection->ocsp_response = ocsp_copy;
+    connection->ocsp_response_len = ocsp_response_len;
+    if (connection->resume_session != NULL) SSL_SESSION_free(connection->resume_session);
+    connection->resume_session = resume_session;
     connection->client_hello_rejected = rejected;
     connection->client_hello_alert = alert;
     connection->client_hello_resolved = true;
@@ -15459,6 +15979,8 @@ static JSValueRef ct_tls_server_listen(JSContextRef ctx, JSObjectRef function, J
             min_version,
             max_version,
             secure_options,
+            JSValueMakeUndefined(ctx),
+            NULL,
             exception
         ) != 0) {
         if (exception != NULL && *exception == NULL) {
@@ -15618,6 +16140,8 @@ static JSValueRef ct_tls_server_add_context(JSContextRef ctx, JSObjectRef functi
             min_version,
             max_version,
             secure_options,
+            JSValueMakeUndefined(ctx),
+            NULL,
             exception
         ) != 0) {
         if (ssl_ctx != NULL) SSL_CTX_free(ssl_ctx);
@@ -15853,9 +16377,11 @@ static JSValueRef ct_tls_connection_take_session(JSContextRef ctx, JSObjectRef f
 
     pthread_mutex_lock(&connection->mutex);
     CtTlsPendingSession *pending = connection->pending_sessions_head;
-    if (pending != NULL) {
+    if (pending != NULL && pending->id == NULL) {
         connection->pending_sessions_head = pending->next;
         if (connection->pending_sessions_head == NULL) connection->pending_sessions_tail = NULL;
+    } else {
+        pending = NULL;
     }
     pthread_mutex_unlock(&connection->mutex);
     if (pending == NULL) return JSValueMakeNull(ctx);
@@ -15870,6 +16396,65 @@ static JSValueRef ct_tls_connection_take_session(JSContextRef ctx, JSObjectRef f
     );
     free(pending);
     return result;
+}
+
+static JSValueRef ct_tls_connection_take_server_session(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "tlsConnectionTakeServerSession(id) requires a connection id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (connection == NULL || !connection->server_side) return JSValueMakeNull(ctx);
+
+    pthread_mutex_lock(&connection->mutex);
+    CtTlsPendingSession *pending = connection->pending_sessions_head;
+    if (pending != NULL && pending->id != NULL) {
+        connection->pending_sessions_head = pending->next;
+        if (connection->pending_sessions_head == NULL) connection->pending_sessions_tail = NULL;
+    } else {
+        pending = NULL;
+    }
+    pthread_mutex_unlock(&connection->mutex);
+    if (pending == NULL) return JSValueMakeNull(ctx);
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(
+        ctx,
+        result,
+        "sessionId",
+        JSObjectMakeArrayBufferWithBytesNoCopy(ctx, pending->id, pending->id_len, ct_array_buffer_free, NULL, exception),
+        exception
+    );
+    ct_set_property(
+        ctx,
+        result,
+        "session",
+        JSObjectMakeArrayBufferWithBytesNoCopy(ctx, pending->data, pending->len, ct_array_buffer_free, NULL, exception),
+        exception
+    );
+    free(pending);
+    return result;
+}
+
+static JSValueRef ct_tls_connection_new_session_done(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "tlsConnectionNewSessionDone(id) requires a connection id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (connection == NULL || !connection->server_side) return JSValueMakeBoolean(ctx, false);
+    bool completed = false;
+    pthread_mutex_lock(&connection->mutex);
+    if (connection->pending_server_session_callbacks > 0) {
+        connection->pending_server_session_callbacks -= 1;
+        completed = true;
+    }
+    pthread_mutex_unlock(&connection->mutex);
+    return JSValueMakeBoolean(ctx, completed);
 }
 
 static JSValueRef ct_tls_connection_read_start(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -15894,7 +16479,7 @@ static JSValueRef ct_tls_connection_read_start(JSContextRef ctx, JSObjectRef fun
             pthread_detach(connection->thread);
         }
     }
-    if (!watcher_failed) {
+    if (!watcher_failed && !connection->server_side) {
         pending_sessions = connection->pending_sessions_head;
         connection->pending_sessions_head = NULL;
         connection->pending_sessions_tail = NULL;
@@ -15908,6 +16493,7 @@ static JSValueRef ct_tls_connection_read_start(JSContextRef ctx, JSObjectRef fun
         CtTlsPendingSession *pending = pending_sessions;
         pending_sessions = pending->next;
         ct_queue_fd_binary(connection->runtime, connection->id, "session", (const char *)pending->data, pending->len);
+        free(pending->id);
         free(pending->data);
         free(pending);
     }
@@ -16332,6 +16918,8 @@ static JSValueRef ct_tls_unavailable(JSContextRef ctx, JSObjectRef function, JSO
 #define ct_tls_connection_drain_memory ct_tls_unavailable
 #define ct_tls_connection_read_memory ct_tls_unavailable
 #define ct_tls_connection_take_session ct_tls_unavailable
+#define ct_tls_connection_take_server_session ct_tls_unavailable
+#define ct_tls_connection_new_session_done ct_tls_unavailable
 #define ct_tls_connection_read_start ct_tls_unavailable
 #define ct_tls_connection_set_ref ct_tls_unavailable
 #define ct_tls_connection_set_read_paused ct_tls_unavailable
