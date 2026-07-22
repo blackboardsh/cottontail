@@ -1137,8 +1137,10 @@
       "reason": "Passes on the native-bundler pipeline after stabilization (1 bun:test cases, 3 assertions)."
     },
     "test/cli/run/env.test.ts": {
-      "status": "expected-failure",
-      "reason": "The focused environment-loading file does not complete within the owned 30-second file deadline in the integrated runtime."
+      "status": "enabled",
+      "reason": "The copied environment corpus passes 62 active cases covering precedence, parsing, expansion, --env-file, NODE_ENV, large files, and environment APIs.",
+      "args": ["--timeout=30000"],
+      "timeoutMs": 240000
     },
     "test/cli/run/glob-on-fuse.test.ts": {
       "status": "enabled",
