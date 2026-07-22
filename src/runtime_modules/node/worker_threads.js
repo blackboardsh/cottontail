@@ -1120,6 +1120,13 @@ function nativeBoundaryError(api) {
   return error;
 }
 
+function bunNotImplementedError(feature) {
+  const error = new Error(`${feature} is not yet implemented in Bun.`);
+  error.name = "NotImplementedError";
+  error.code = "ERR_NOT_IMPLEMENTED";
+  return error;
+}
+
 function deserializeWorkerError(payload) {
   const name = typeof payload?.name === "string" ? payload.name : "Error";
   const message = typeof payload?.message === "string" ? payload.message : String(payload ?? "Worker error");
@@ -2457,6 +2464,9 @@ export function getEnvironmentData(key) {
 }
 
 export function markAsUntransferable(object) {
+  if (object === undefined) {
+    throw bunNotImplementedError("worker_threads.markAsUntransferable");
+  }
   if (object && typeof object === "object") markedUntransferable.add(object);
 }
 
@@ -2469,6 +2479,9 @@ export function markAsUncloneable(object) {
 }
 
 export function moveMessagePortToContext(port, contextifiedSandbox) {
+  if (port === undefined) {
+    throw bunNotImplementedError("worker_threads.moveMessagePortToContext");
+  }
   if (!(port instanceof MessagePort)) throw invalidArgumentType("port", "a MessagePort instance", port);
   if (!isContext(contextifiedSandbox)) {
     throw invalidArgumentType("contextifiedSandbox", "a vm.Context", contextifiedSandbox);
