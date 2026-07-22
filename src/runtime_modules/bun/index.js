@@ -7189,7 +7189,12 @@ export class Request {
   }
   async json() {
     if (this._body instanceof Blob && typeof this._body.json === "function") {
-      return this._takeBody().json();
+      try {
+        return await this._takeBody().json();
+      } catch (error) {
+        if (error instanceof SyntaxError) throw new SyntaxError("Failed to parse JSON");
+        throw error;
+      }
     }
     return parseBodyJson(await this.text());
   }
@@ -7413,7 +7418,12 @@ export class Response {
   }
   async json() {
     if (this._body instanceof Blob && typeof this._body.json === "function") {
-      return this._takeBody().json();
+      try {
+        return await this._takeBody().json();
+      } catch (error) {
+        if (error instanceof SyntaxError) throw new SyntaxError("Failed to parse JSON");
+        throw error;
+      }
     }
     return parseBodyJson(await this.text());
   }
