@@ -552,6 +552,27 @@ function preferConstructedErrorCallSite(state, generatedLine, generatedColumn, m
       return { ...mapped, column: constructorColumn + 1 };
     }
   }
+  const previousSource = sourceLines?.[mapped.line - 2] ?? "";
+  if (/^\s*(?:Aggregate|Eval|Range|Reference|Syntax|Type|URI)?Error\s*\(/.test(currentSource) &&
+      /\bnew\s*$/.test(previousSource)) {
+    const target = generatedColumn - 1;
+    for (let candidateLine = generatedLine; candidateLine >= Math.max(1, generatedLine - 1); candidateLine -= 1) {
+      const segments = state.lines[candidateLine - 1] ?? [];
+      for (let index = segments.length - 1; index >= 0; index -= 1) {
+        const [generatedSegmentColumn, sourceIndex, sourceLine, sourceColumn] = segments[index];
+        if (candidateLine === generatedLine && generatedSegmentColumn > target) continue;
+        if (sourceIndex !== mapped.sourceIndex || sourceLine !== mapped.line - 2) continue;
+        if (!/^new\b/.test(previousSource.slice(sourceColumn))) continue;
+        return {
+          source: state.sources[sourceIndex],
+          line: sourceLine + 1,
+          column: sourceColumn + 1,
+          sourceIndex,
+          generatedLine: candidateLine,
+        };
+      }
+    }
+  }
   if (/\.stack\b/.test(currentSource)) {
     for (let line = generatedLine - 1; line >= Math.max(1, generatedLine - 8); line -= 1) {
       const segments = state.lines[line - 1] ?? [];
@@ -576,8 +597,8 @@ function preferConstructedErrorCallSite(state, generatedLine, generatedColumn, m
   if (!/^\s*[}\])]+(?:\s*,[^;]*)?;?\s*$/.test(currentSource)) return mapped;
   const previous = lookup(state, generatedLine - 1, generatedColumn);
   if (!previous || previous.sourceIndex !== mapped.sourceIndex || previous.line >= mapped.line) return mapped;
-  const previousSource = sourceLines?.[previous.line - 1] ?? "";
-  return previousSource.trim() === "" ? mapped : previous;
+  const previousMappedSource = sourceLines?.[previous.line - 1] ?? "";
+  return previousMappedSource.trim() === "" ? mapped : previous;
 }
 
 export function remapStackString(stack) {
@@ -653,8 +674,41 @@ function remapAdjacentBundleFrames(stack) {
   });
 }
 
+export function formatUncaughtBundleError(error) {
+  try {
+    const stack = remapStackString(String(error?.stack ?? ""));
+    for (const frameLine of stack.split(/\r?\n/)) {
+      const frame = /@(.+):(\d+):(\d+)$/.exec(frameLine) ??
+        /^\s*at\s+.*?\s+\((.+):(\d+):(\d+)\)$/.exec(frameLine) ??
+        /^\s*at\s+(.+):(\d+):(\d+)$/.exec(frameLine);
+      if (!frame) continue;
+      const context = sourceContextForLocation(frame[1], Number(frame[2]), Number(frame[3]));
+      if (!context || !Array.isArray(context.lines)) continue;
+      const line = Number(context.line);
+      const column = Number(context.column);
+      if (!Number.isFinite(line) || !Number.isFinite(column)) continue;
+      const start = Math.max(1, line - 5);
+      const codeFrame = [];
+      for (let sourceLine = start; sourceLine <= line && sourceLine <= context.lines.length; sourceLine += 1) {
+        codeFrame.push(`${sourceLine} | ${context.lines[sourceLine - 1]}`);
+      }
+      codeFrame.push(`${" ".repeat(String(line).length + 3 + Math.max(0, column - 1))}^`);
+      const label = String(error?.name ?? "Error") === "Error" ? "error" : String(error.name);
+      codeFrame.push(`${label}: ${String(error?.message ?? "")}`);
+      codeFrame.push(`    at ${context.source}:${line}:${column}`);
+      error.stack = codeFrame.join("\n");
+      Object.defineProperty(error, "__cottontailFormattedStack", { value: true, configurable: true });
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+globalThis.__cottontailFormatUncaughtModuleError ??= formatUncaughtBundleError;
+
 export default {
   createSourceMapConsumer,
+  formatUncaughtBundleError,
   remapErrorPosition,
   remapPosition,
   remapStackString,

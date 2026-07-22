@@ -3990,10 +3990,11 @@ function bunUncaughtCodeFrame(location, message) {
   return frame.join("\n");
 }
 
-globalThis.__cottontailFormatUncaughtModuleError ??= error => {
+const formatUncaughtBundleError = globalThis.__cottontailFormatUncaughtModuleError;
+globalThis.__cottontailFormatUncaughtModuleError = error => {
   try {
     const metadata = error?.__ctModuleErrorMetadata;
-    if (!metadata) return;
+    if (!metadata) return formatUncaughtBundleError?.(error);
     const location = originalErrorLocation(error, metadata);
     const codeFrame = bunUncaughtCodeFrame(location, error?.message);
     if (codeFrame && location) {
@@ -4004,8 +4005,10 @@ globalThis.__cottontailFormatUncaughtModuleError ??= error => {
     }
     if (!metadata.sourceMap && String(metadata.generatedSource).startsWith("// @bun")) {
       error.stack = `${String(error.stack ?? error)}\nnote: missing sourcemaps for ${metadata.filename}\nnote: consider bundling with '--sourcemap' to get unminified traces`;
+      return;
     }
   } catch {}
+  return formatUncaughtBundleError?.(error);
 };
 
 export const _cache = commonJsCacheObject;
