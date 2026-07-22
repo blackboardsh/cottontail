@@ -19,6 +19,7 @@ const Analyzer = @import("package_manager_analyzer.zig");
 const Audit = @import("package_manager_audit.zig");
 const MinimumReleaseAge = @import("package_manager_minimum_release_age.zig");
 const Pack = @import("package_manager_pack.zig");
+const ScriptRunner = @import("script_runner.zig");
 const Publish = @import("package_manager_publish.zig");
 
 const version = @import("version.zig").version;
@@ -1568,6 +1569,17 @@ const SecurityPackagePath = struct {
     path: []const u8,
 };
 
+const SecurityMatrix = struct {
+    packages: []const SecurityPackage,
+    paths: []const SecurityPackagePath,
+};
+
+const SecurityQueueItem = struct {
+    record_index: usize,
+    requested_range: []const u8,
+    path: []const u8,
+};
+
 fn securityDependencyRequest(root: ?*const Value, name: []const u8) ?[]const u8 {
     const package_json = root orelse return null;
     if (package_json.* != .object) return null;
@@ -1580,39 +1592,47 @@ fn securityDependencyRequest(root: ?*const Value, name: []const u8) ?[]const u8 
     return null;
 }
 
-const security_scanner_bridge =
-    \\import { readdirSync, readFileSync, realpathSync } from "node:fs";
+fn securityPackagePath(payload: *const Value, package_name: []const u8) ?[]const u8 {
+    if (payload.* != .object) return null;
+    const paths = payload.object.get("paths") orelse return null;
+    if (paths != .array) return null;
+    for (paths.array.items) |entry| {
+        if (entry != .object) continue;
+        const name = entry.object.get("name") orelse continue;
+        const path = entry.object.get("path") orelse continue;
+        if (name != .string or path != .string) continue;
+        if (std.mem.eql(u8, name.string, package_name)) return path.string;
+    }
+    return null;
+}
+
+const security_scanner_runtime =
     \\import { isAbsolute, resolve } from "node:path";
     \\import { pathToFileURL } from "node:url";
     \\
-    \\const specifier = process.env.COTTONTAIL_PM_SECURITY_SCANNER;
-    \\const root = process.env.COTTONTAIL_PM_SECURITY_ROOT;
-    \\const payloadPath = process.env.COTTONTAIL_PM_SECURITY_PAYLOAD;
-    \\const mode = process.env.COTTONTAIL_PM_SECURITY_MODE ?? "install";
-    \\if (!specifier || !root || !payloadPath) {
-    \\  console.error("error: incomplete security scanner invocation");
-    \\  process.exit(1);
-    \\}
-    \\
-    \\let resolved;
-    \\if (isAbsolute(specifier) || specifier.startsWith("./") || specifier.startsWith("../")) {
-    \\  resolved = resolve(root, specifier);
-    \\  if (!(await Bun.file(resolved).exists())) {
-    \\    console.error(`Security scanner '${specifier}' is configured in bunfig.toml but the file could not be found.`);
-    \\    console.error("  Please check that the file exists and the path is correct.");
-    \\    process.exit(1);
-    \\  }
-    \\  resolved = pathToFileURL(resolved).href;
-    \\} else {
-    \\  try {
-    \\    resolved = Bun.resolveSync(specifier, root);
-    \\  } catch {
-    \\    console.error(`Security scanner '${specifier}' is configured in bunfig.toml but the package could not be resolved.`);
-    \\    process.exit(1);
-    \\  }
-    \\}
+    \\const specifier = __COTTONTAIL_SECURITY_SCANNER__;
+    \\const root = __COTTONTAIL_SECURITY_ROOT__;
+    \\const payloadPath = __COTTONTAIL_SECURITY_PAYLOAD__;
+    \\const resultPath = __COTTONTAIL_SECURITY_RESULT__;
     \\
     \\try {
+    \\  if (!specifier || !root || !payloadPath || !resultPath) {
+    \\    throw new Error("incomplete security scanner invocation");
+    \\  }
+    \\  let resolved;
+    \\  if (isAbsolute(specifier) || specifier.startsWith("./") || specifier.startsWith("../")) {
+    \\    resolved = resolve(root, specifier);
+    \\    if (!(await Bun.file(resolved).exists())) {
+    \\      throw new Error(`Security scanner '${specifier}' is configured in bunfig.toml but the file could not be found.\\n  Please check that the file exists and the path is correct.`);
+    \\    }
+    \\    resolved = pathToFileURL(resolved).href;
+    \\  } else {
+    \\    try {
+    \\      resolved = Bun.resolveSync(specifier, root);
+    \\    } catch {
+    \\      throw new Error(`Security scanner '${specifier}' is configured in bunfig.toml but the package could not be resolved.`);
+    \\    }
+    \\  }
     \\  const imported = await import(resolved);
     \\  const scanner = imported.scanner ?? imported.default?.scanner;
     \\  if (!scanner || !("version" in scanner)) {
@@ -1622,91 +1642,6 @@ const security_scanner_bridge =
     \\  if (typeof scanner.scan !== "function") throw new Error("scanner.scan is not a function");
     \\
     \\  const payload = await Bun.file(payloadPath).json();
-    \\  const readManifest = path => {
-    \\    try { return JSON.parse(readFileSync(path, "utf8")); } catch { return null; }
-    \\  };
-    \\  const dependencyNames = manifest => {
-    \\    const names = new Set();
-    \\    for (const section of ["dependencies", "optionalDependencies", "peerDependencies"]) {
-    \\      for (const name of Object.keys(manifest?.[section] ?? {})) names.add(name);
-    \\    }
-    \\    return [...names];
-    \\  };
-    \\  const installed = new Map();
-    \\  const visitedModules = new Set();
-    \\  const visitPackage = directory => {
-    \\    const manifest = readManifest(resolve(directory, "package.json"));
-    \\    if (!manifest?.name || !manifest?.version) return;
-    \\    if (!installed.has(manifest.name)) installed.set(manifest.name, { directory, manifest });
-    \\    visitModules(resolve(directory, "node_modules"));
-    \\  };
-    \\  const visitModules = directory => {
-    \\    let identity;
-    \\    try { identity = realpathSync(directory); } catch { return; }
-    \\    if (visitedModules.has(identity)) return;
-    \\    visitedModules.add(identity);
-    \\    let entries;
-    \\    try { entries = readdirSync(directory, { withFileTypes: true }); } catch { return; }
-    \\    for (const entry of entries) {
-    \\      if (entry.name.startsWith(".")) continue;
-    \\      const entryPath = resolve(directory, entry.name);
-    \\      if (entry.name.startsWith("@")) {
-    \\        let scoped;
-    \\        try { scoped = readdirSync(entryPath, { withFileTypes: true }); } catch { continue; }
-    \\        for (const packageEntry of scoped) visitPackage(resolve(entryPath, packageEntry.name));
-    \\      } else {
-    \\        visitPackage(entryPath);
-    \\      }
-    \\    }
-    \\  };
-    \\  visitModules(resolve(root, "node_modules"));
-    \\  const rootManifest = readManifest(resolve(root, "package.json")) ?? {};
-    \\  const rootName = rootManifest.name ?? "root";
-    \\  const rootDependencies = new Map();
-    \\  for (const section of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
-    \\    for (const [name, range] of Object.entries(rootManifest[section] ?? {})) rootDependencies.set(name, String(range));
-    \\  }
-    \\  const existingPackages = new Set(payload.packages.map(pkg => `${pkg.name}\u0000${pkg.version}`));
-    \\  for (const [name, entry] of installed) {
-    \\    const key = `${name}\u0000${entry.manifest.version}`;
-    \\    if (existingPackages.has(key)) continue;
-    \\    payload.packages.push({
-    \\      name,
-    \\      version: entry.manifest.version,
-    \\      requestedRange: rootDependencies.get(name) ?? entry.manifest.version,
-    \\      tarball: pathToFileURL(entry.directory).href,
-    \\    });
-    \\  }
-    \\  const computedPaths = new Map((payload.paths ?? []).map(entry => [entry.name, entry.path]));
-    \\  const queue = [...rootDependencies.keys()].map(name => ({ name, path: `${rootName} \u203a ${name}` }));
-    \\  const expandedPaths = new Set();
-    \\  while (queue.length > 0) {
-    \\    const current = queue.shift();
-    \\    if (expandedPaths.has(current.name)) continue;
-    \\    expandedPaths.add(current.name);
-    \\    if (!computedPaths.has(current.name)) computedPaths.set(current.name, current.path);
-    \\    const entry = installed.get(current.name);
-    \\    if (!entry) continue;
-    \\    for (const child of dependencyNames(entry.manifest)) {
-    \\      if (!computedPaths.has(child)) queue.push({ name: child, path: `${current.path} \u203a ${child}` });
-    \\    }
-    \\  }
-    \\  const selected = new Set(payload.selectedPackages ?? []);
-    \\  if (selected.size > 0) {
-    \\    const allowed = new Set(selected);
-    \\    const selectedQueue = [...selected];
-    \\    while (selectedQueue.length > 0) {
-    \\      const entry = installed.get(selectedQueue.shift());
-    \\      if (!entry) continue;
-    \\      for (const child of dependencyNames(entry.manifest)) {
-    \\        if (allowed.has(child)) continue;
-    \\        allowed.add(child);
-    \\        selectedQueue.push(child);
-    \\      }
-    \\    }
-    \\    payload.packages = payload.packages.filter(pkg => allowed.has(pkg.name));
-    \\  }
-    \\  payload.paths = [...computedPaths].map(([name, path]) => ({ name, path }));
     \\  const started = performance.now();
     \\  const progress = setTimeout(() => {
     \\    const elapsed = Math.max(1, Math.round(performance.now() - started));
@@ -1718,56 +1653,37 @@ const security_scanner_bridge =
     \\  } finally {
     \\    clearTimeout(progress);
     \\  }
-    \\  if (!Array.isArray(advisories)) throw new Error("Security scanner must return an array of advisories");
-    \\
-    \\  for (let index = 0; index < advisories.length; index++) {
-    \\    const advisory = advisories[index];
-    \\    if (advisory === null || typeof advisory !== "object" || Array.isArray(advisory)) {
-    \\      throw new Error(`Security advisory at index ${index} must be an object`);
-    \\    }
-    \\    if (!("package" in advisory)) throw new Error(`Security advisory at index ${index} missing required 'package' field`);
-    \\    if (typeof advisory.package !== "string") throw new Error(`Security advisory at index ${index} 'package' field must be a string`);
-    \\    if (advisory.package.length === 0) throw new Error(`Security advisory at index ${index} 'package' field cannot be empty`);
-    \\    if (advisory.description !== undefined && advisory.description !== null && typeof advisory.description !== "string") {
-    \\      throw new Error(`Security advisory at index ${index} 'description' field must be a string or null`);
-    \\    }
-    \\    if (advisory.url !== undefined && advisory.url !== null && typeof advisory.url !== "string") {
-    \\      throw new Error(`Security advisory at index ${index} 'url' field must be a string or null`);
-    \\    }
-    \\    if (!("level" in advisory)) throw new Error(`Security advisory at index ${index} missing required 'level' field`);
-    \\    if (typeof advisory.level !== "string") throw new Error(`Security advisory at index ${index} 'level' field must be a string`);
-    \\    if (advisory.level !== "fatal" && advisory.level !== "warn") {
-    \\      throw new Error(`Security advisory at index ${index} 'level' field must be 'fatal' or 'warn'`);
-    \\    }
-    \\  }
-    \\
-    \\  let fatal = 0;
-    \\  let warnings = 0;
-    \\  const packagePaths = new Map((payload.paths ?? []).map(entry => [entry.name, entry.path]));
-    \\  for (const advisory of advisories) {
-    \\    if (advisory.level === "fatal") fatal++;
-    \\    else warnings++;
-    \\    console.log(`${advisory.level === "fatal" ? "FATAL" : "WARNING"}: ${advisory.package}`);
-    \\    if (packagePaths.has(advisory.package)) console.log(`via ${packagePaths.get(advisory.package)}`);
-    \\    if (advisory.description) console.log(advisory.description);
-    \\    if (advisory.url) console.log(advisory.url);
-    \\  }
-    \\  if (advisories.length === 0) {
-    \\    if (mode === "scan") console.log("No advisories found");
-    \\    process.exit(0);
-    \\  }
-    \\  const details = [fatal ? `${fatal} fatal` : "", warnings ? `${warnings} warning${warnings === 1 ? "" : "s"}` : ""].filter(Boolean).join(", ");
-    \\  console.log(`${advisories.length} advisor${advisories.length === 1 ? "y" : "ies"} (${details})`);
-    \\  if (mode !== "scan") {
-    \\    if (fatal > 0) console.log("Installation aborted due to fatal security advisories");
-    \\    else console.log("Security warnings found. Cannot prompt for confirmation (no TTY).\nInstallation cancelled.");
-    \\  }
-    \\  process.exit(1);
+    \\  await Bun.write(resultPath, JSON.stringify({ ok: true, advisories }));
     \\} catch (error) {
-    \\  console.error(`Security scanner failed: ${error?.message ?? error}`);
-    \\  process.exit(1);
+    \\  await Bun.write(resultPath, JSON.stringify({ ok: false, error: String(error?.message ?? error) }));
     \\}
 ;
+
+fn renderSecurityScannerRuntime(
+    allocator: std.mem.Allocator,
+    scanner: []const u8,
+    root: []const u8,
+    payload_path: []const u8,
+    result_path: []const u8,
+) ![:0]const u8 {
+    var rendered = try allocator.dupe(u8, security_scanner_runtime);
+    for ([_]struct { placeholder: []const u8, value: []const u8 }{
+        .{ .placeholder = "__COTTONTAIL_SECURITY_SCANNER__", .value = scanner },
+        .{ .placeholder = "__COTTONTAIL_SECURITY_ROOT__", .value = root },
+        .{ .placeholder = "__COTTONTAIL_SECURITY_PAYLOAD__", .value = payload_path },
+        .{ .placeholder = "__COTTONTAIL_SECURITY_RESULT__", .value = result_path },
+    }) |replacement| {
+        const literal = try std.json.Stringify.valueAlloc(allocator, replacement.value, .{});
+        rendered = try std.mem.replaceOwned(
+            u8,
+            allocator,
+            rendered,
+            replacement.placeholder,
+            literal,
+        );
+    }
+    return allocator.dupeZ(u8, rendered);
+}
 
 const Manager = struct {
     init_data: std.process.Init,
@@ -2258,6 +2174,8 @@ const Manager = struct {
             try manager.stderr.writeAll("error: Lockfile not found. Run 'bun install' first.\n");
             return error.PackageManagerErrorReported;
         }
+        try manager.discoverWorkspaces(&root);
+        try manager.loadRecordsFromLockGraph();
 
         const payload_path = try manager.securityTempFile("json");
         defer std.Io.Dir.cwd().deleteFile(manager.init_data.io, payload_path) catch {};
@@ -2287,142 +2205,155 @@ const Manager = struct {
         root_override: ?*const Value,
     ) !void {
         const selected_root: ?*const Value = if (root_override) |root| root else manager.root_package_json;
-        var packages = std.array_list.Managed(SecurityPackage).init(manager.allocator);
-        var seen = std.StringHashMap(void).init(manager.allocator);
-        defer seen.deinit();
+        const root = selected_root orelse return error.InvalidSecurityScannerPayload;
+        const selected_packages = try manager.securitySelectedPackages();
+        const matrix = try manager.buildSecurityMatrix(root, selected_packages);
+        const payload = .{
+            .packages = matrix.packages,
+            .paths = matrix.paths,
+        };
+        const json = try std.json.Stringify.valueAlloc(manager.allocator, payload, .{});
+        try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = output_path, .data = json });
+    }
 
-        for (manager.records.items) |record| {
-            if (record.kind != .npm or
-                record.name.len == 0 or
-                record.version.len == 0 or
-                record.tarball.len == 0) continue;
-            const requested_range = securityDependencyRequest(selected_root, record.alias) orelse
-                if (record.resolution.len > 0) record.resolution else record.version;
-            const key = try std.fmt.allocPrint(manager.allocator, "{s}\x00{s}\x00{s}", .{
-                record.name,
-                record.version,
-                record.tarball,
-            });
-            if (seen.contains(key)) continue;
-            try seen.put(key, {});
+    fn securitySelectedPackages(manager: *Manager) ![]const []const u8 {
+        var selected = std.array_list.Managed([]const u8).init(manager.allocator);
+        if (manager.options.positionals.len == 0) return selected.toOwnedSlice();
+        switch (manager.options.command) {
+            .update => try selected.appendSlice(manager.options.positionals),
+            .add, .link => for (manager.options.positionals) |raw_spec| {
+                const parsed = splitPackageSpec(raw_spec);
+                try selected.append(parsed.name orelse raw_spec);
+            },
+            else => {},
+        }
+        return selected.toOwnedSlice();
+    }
+
+    fn buildSecurityMatrix(
+        manager: *Manager,
+        root: *const Value,
+        selected_packages: []const []const u8,
+    ) !SecurityMatrix {
+        var packages = std.array_list.Managed(SecurityPackage).init(manager.allocator);
+        var paths = std.array_list.Managed(SecurityPackagePath).init(manager.allocator);
+        var queue = std.array_list.Managed(SecurityQueueItem).init(manager.allocator);
+        var record_indices = std.StringHashMap(usize).init(manager.allocator);
+        defer record_indices.deinit();
+
+        for (manager.records.items, 0..) |record, index| {
+            try record_indices.put(recordLogicalKey(record), index);
+        }
+
+        try manager.appendSecurityManifestRoots(
+            root,
+            "",
+            jsonString(root, "name") orelse "root",
+            selected_packages,
+            &record_indices,
+            &queue,
+        );
+        var workspace_iterator = manager.workspaces.iterator();
+        while (workspace_iterator.next()) |entry| {
+            const workspace = entry.value_ptr.*;
+            try manager.appendSecurityManifestRoots(
+                workspace.package_json,
+                workspace.name,
+                workspace.name,
+                selected_packages,
+                &record_indices,
+                &queue,
+            );
+        }
+
+        const visited = try manager.allocator.alloc(bool, manager.records.items.len);
+        @memset(visited, false);
+        var cursor: usize = 0;
+        while (cursor < queue.items.len) : (cursor += 1) {
+            const item = queue.items[cursor];
+            if (visited[item.record_index]) continue;
+            visited[item.record_index] = true;
+
+            const record = manager.records.items[item.record_index];
+            if (record.kind != .npm or record.name.len == 0 or record.version.len == 0) continue;
+            const tarball = if (record.tarball.len > 0)
+                record.tarball
+            else
+                try manager.defaultTarballURL(record.name, record.version);
             try packages.append(.{
                 .name = record.name,
                 .version = record.version,
-                .requestedRange = requested_range,
-                .tarball = record.tarball,
+                .requestedRange = item.requested_range,
+                .tarball = tarball,
             });
-        }
+            try paths.append(.{ .name = record.name, .path = item.path });
 
-        if (packages.items.len == 0) {
-            if (manager.lock_graph) |*graph| {
-                var locked = graph.packages.iterator();
-                while (locked.next()) |entry| {
-                    const package = entry.value_ptr;
-                    if (package.kind != .npm or
-                        package.name.len == 0 or
-                        package.version.len == 0 or
-                        package.source.len == 0) continue;
-                    try packages.append(.{
-                        .name = package.name,
-                        .version = package.version,
-                        .requestedRange = graph.rootDependencySpec(package.name) orelse package.version,
-                        .tarball = package.source,
+            const metadata = record.metadata orelse continue;
+            if (metadata.* != .object) continue;
+            for ([_][]const u8{ "dependencies", "optionalDependencies", "peerDependencies" }) |section_name| {
+                const section = metadata.object.get(section_name) orelse continue;
+                if (section != .object) continue;
+                for (section.object.keys(), section.object.values()) |alias, spec| {
+                    if (spec != .string) continue;
+                    const child_index = manager.providerRecordIndex(
+                        &record_indices,
+                        recordLogicalKey(record),
+                        alias,
+                        spec.string,
+                    ) orelse continue;
+                    if (manager.records.items[child_index].kind != .npm) continue;
+                    try queue.append(.{
+                        .record_index = child_index,
+                        .requested_range = spec.string,
+                        .path = try std.fmt.allocPrint(
+                            manager.allocator,
+                            "{s} \u{203a} {s}",
+                            .{ item.path, alias },
+                        ),
                     });
                 }
             }
         }
+        return .{
+            .packages = try packages.toOwnedSlice(),
+            .paths = try paths.toOwnedSlice(),
+        };
+    }
 
-        if (packages.items.len == 0) {
-            if (selected_root) |root| {
-                for (all_dependency_sections) |section_name| {
-                    var section = root.object.get(section_name) orelse continue;
-                    if (section != .object) continue;
-                    var dependencies = section.object.iterator();
-                    while (dependencies.next()) |entry| {
-                        const alias = entry.key_ptr.*;
-                        const requested = entry.value_ptr.*;
-                        if (requested != .string) continue;
-                        const locked = if (manager.lock_graph) |*graph| graph.get(alias) else null;
-                        var installed: ?Value = null;
-                        if (locked == null or locked.?.version.len == 0) {
-                            const package_json_path = try std.fs.path.join(manager.allocator, &.{
-                                manager.root_dir,
-                                "node_modules",
-                                alias,
-                                "package.json",
-                            });
-                            const source = std.Io.Dir.cwd().readFileAlloc(
-                                manager.init_data.io,
-                                package_json_path,
-                                manager.allocator,
-                                .limited(16 * 1024 * 1024),
-                            ) catch null;
-                            if (source) |bytes| {
-                                installed = std.json.parseFromSliceLeaky(Value, manager.allocator, bytes, .{}) catch null;
-                            }
-                        }
-                        const installed_name = if (installed) |*value| jsonString(value, "name") else null;
-                        const installed_version = if (installed) |*value| jsonString(value, "version") else null;
-                        const name = if (locked) |package|
-                            if (package.name.len > 0) package.name else installed_name orelse alias
-                        else
-                            installed_name orelse alias;
-                        const package_version = if (locked) |package|
-                            if (package.version.len > 0) package.version else installed_version orelse requested.string
-                        else
-                            installed_version orelse requested.string;
-                        const locked_tarball = if (locked) |package|
-                            if (package.source.len > 0) package.source else null
-                        else
-                            null;
-                        const tarball = locked_tarball orelse try std.fmt.allocPrint(
-                            manager.allocator,
-                            "{s}{s}/-/{s}-{s}.tgz",
-                            .{ manager.registry, name, std.fs.path.basename(name), package_version },
-                        );
-                        if (package_version.len == 0 or tarball.len == 0) continue;
-                        try packages.append(.{
-                            .name = name,
-                            .version = package_version,
-                            .requestedRange = requested.string,
-                            .tarball = tarball,
-                        });
-                    }
-                }
-            }
-        }
-
-        var package_paths = std.array_list.Managed(SecurityPackagePath).init(manager.allocator);
-        if (selected_root) |root| {
-            const root_name = jsonString(root, "name") orelse "root";
-            for (packages.items) |package| {
-                if (securityDependencyRequest(root, package.name) == null) continue;
-                try package_paths.append(.{
-                    .name = package.name,
+    fn appendSecurityManifestRoots(
+        manager: *Manager,
+        manifest: *const Value,
+        importer_key: []const u8,
+        owner_name: []const u8,
+        selected_packages: []const []const u8,
+        record_indices: *const std.StringHashMap(usize),
+        queue: *std.array_list.Managed(SecurityQueueItem),
+    ) !void {
+        if (manifest.* != .object) return;
+        for (all_dependency_sections) |section_name| {
+            const section = manifest.object.get(section_name) orelse continue;
+            if (section != .object) continue;
+            for (section.object.keys(), section.object.values()) |alias, spec| {
+                if (spec != .string) continue;
+                if (selected_packages.len > 0 and !containsString(selected_packages, alias)) continue;
+                const record_index = manager.providerRecordIndex(
+                    record_indices,
+                    importer_key,
+                    alias,
+                    spec.string,
+                ) orelse continue;
+                if (manager.records.items[record_index].kind != .npm) continue;
+                try queue.append(.{
+                    .record_index = record_index,
+                    .requested_range = spec.string,
                     .path = try std.fmt.allocPrint(
                         manager.allocator,
                         "{s} \u{203a} {s}",
-                        .{ root_name, package.name },
+                        .{ owner_name, alias },
                     ),
                 });
             }
         }
-        var selected_packages = std.array_list.Managed([]const u8).init(manager.allocator);
-        if (manager.options.positionals.len > 0) switch (manager.options.command) {
-            .update => try selected_packages.appendSlice(manager.options.positionals),
-            .add, .link => for (manager.options.positionals) |raw_spec| {
-                const parsed = splitPackageSpec(raw_spec);
-                try selected_packages.append(parsed.name orelse raw_spec);
-            },
-            else => {},
-        };
-        const payload = .{
-            .packages = packages.items,
-            .paths = package_paths.items,
-            .selectedPackages = selected_packages.items,
-        };
-        const json = try std.json.Stringify.valueAlloc(manager.allocator, payload, .{});
-        try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = output_path, .data = json });
     }
 
     fn runSecurityScannerPreflight(manager: *Manager, root: *const Value) !void {
@@ -2481,39 +2412,187 @@ const Manager = struct {
 
     fn runSecurityScannerPayload(manager: *Manager, payload_path: []const u8, mode: []const u8) !void {
         const scanner = manager.security_scanner orelse return;
-        const bridge_path = try manager.securityTempFile("mjs");
-        defer std.Io.Dir.cwd().deleteFile(manager.init_data.io, bridge_path) catch {};
-        try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{
-            .sub_path = bridge_path,
-            .data = security_scanner_bridge,
-        });
-        const executable = try std.process.executablePathAlloc(manager.init_data.io, manager.allocator);
-        var scanner_environment = try manager.init_data.environ_map.clone(manager.allocator);
-        defer scanner_environment.deinit();
-        try scanner_environment.put("COTTONTAIL_PM_SECURITY_SCANNER", scanner);
-        try scanner_environment.put("COTTONTAIL_PM_SECURITY_ROOT", manager.root_dir);
-        try scanner_environment.put("COTTONTAIL_PM_SECURITY_PAYLOAD", payload_path);
-        try scanner_environment.put("COTTONTAIL_PM_SECURITY_MODE", mode);
-
-        var scanner_process = try std.process.spawn(manager.init_data.io, .{
-            .argv = &.{ executable, bridge_path },
-            .cwd = .{ .path = manager.root_dir },
-            .environ_map = &scanner_environment,
-            .stdin = .inherit,
-            .stdout = .inherit,
-            .stderr = .inherit,
-            .create_no_window = true,
-        });
-        defer scanner_process.kill(manager.init_data.io);
-        const scanner_result = try scanner_process.wait(manager.init_data.io);
-        const scanner_exit_code = packageManagerChildExitCode(scanner_result);
-        if (scanner_exit_code == 0) return;
-        if (scanner_exit_code != 1) {
+        const result_path = try manager.securityTempFile("result.json");
+        defer std.Io.Dir.cwd().deleteFile(manager.init_data.io, result_path) catch {};
+        const source = try renderSecurityScannerRuntime(
+            manager.allocator,
+            scanner,
+            manager.root_dir,
+            payload_path,
+            result_path,
+        );
+        const scanner_exit_code = ScriptRunner.runEval(
+            manager.init_data,
+            source,
+            &.{},
+            &.{},
+            false,
+        ) catch |err| {
+            try manager.stderr.print("Security scanner failed: {s}\n", .{@errorName(err)});
+            return error.PackageManagerErrorReported;
+        };
+        const result_source = std.Io.Dir.cwd().readFileAlloc(
+            manager.init_data.io,
+            result_path,
+            manager.allocator,
+            .limited(64 * 1024 * 1024),
+        ) catch |err| {
+            if (scanner_exit_code != 0) {
+                try manager.stderr.print(
+                    "Security scanner exited with code {d} without sending data\n",
+                    .{scanner_exit_code},
+                );
+            } else {
+                try manager.stderr.print("Security scanner failed: {s}\n", .{@errorName(err)});
+            }
+            return error.PackageManagerErrorReported;
+        };
+        if (scanner_exit_code != 0) {
             try manager.stderr.print(
                 "Security scanner exited with code {d} without sending data\n",
                 .{scanner_exit_code},
             );
+            return error.PackageManagerErrorReported;
         }
+        const result = std.json.parseFromSliceLeaky(Value, manager.allocator, result_source, .{}) catch {
+            return manager.failSecurityScanner("returned invalid JSON");
+        };
+        try manager.handleSecurityScannerResult(payload_path, mode, &result);
+    }
+
+    fn handleSecurityScannerResult(
+        manager: *Manager,
+        payload_path: []const u8,
+        mode: []const u8,
+        result: *const Value,
+    ) !void {
+        if (result.* != .object) return manager.failSecurityScanner("returned an invalid result envelope");
+        const ok = result.object.get("ok") orelse return manager.failSecurityScanner("returned an invalid result envelope");
+        if (ok != .bool) return manager.failSecurityScanner("returned an invalid result envelope");
+        if (!ok.bool) {
+            const message = result.object.get("error") orelse return manager.failSecurityScanner("failed without an error message");
+            if (message != .string) return manager.failSecurityScanner("failed without an error message");
+            return manager.failSecurityScanner(message.string);
+        }
+
+        const advisories = result.object.get("advisories") orelse
+            return manager.failSecurityScanner("Security scanner must return an array of advisories");
+        if (advisories != .array) return manager.failSecurityScanner("Security scanner must return an array of advisories");
+        for (advisories.array.items, 0..) |*advisory, index| {
+            try manager.validateSecurityAdvisory(advisory, index);
+        }
+
+        const payload_source = try std.Io.Dir.cwd().readFileAlloc(
+            manager.init_data.io,
+            payload_path,
+            manager.allocator,
+            .limited(64 * 1024 * 1024),
+        );
+        const payload = std.json.parseFromSliceLeaky(Value, manager.allocator, payload_source, .{}) catch
+            return error.InvalidSecurityScannerPayload;
+
+        var fatal: usize = 0;
+        var warnings: usize = 0;
+        for (advisories.array.items) |advisory| {
+            const package_name = advisory.object.get("package").?.string;
+            const level = advisory.object.get("level").?.string;
+            if (std.mem.eql(u8, level, "fatal")) fatal += 1 else warnings += 1;
+            try manager.stdout.print("{s}: {s}\n", .{
+                if (std.mem.eql(u8, level, "fatal")) "FATAL" else "WARNING",
+                package_name,
+            });
+            if (securityPackagePath(&payload, package_name)) |package_path| {
+                try manager.stdout.print("via {s}\n", .{package_path});
+            }
+            if (advisory.object.get("description")) |description| {
+                if (description == .string and description.string.len > 0) {
+                    try manager.stdout.print("{s}\n", .{description.string});
+                }
+            }
+            if (advisory.object.get("url")) |url| {
+                if (url == .string and url.string.len > 0) try manager.stdout.print("{s}\n", .{url.string});
+            }
+        }
+
+        if (advisories.array.items.len == 0) {
+            if (std.mem.eql(u8, mode, "scan")) try manager.stdout.writeAll("No advisories found\n");
+            try manager.stdout.flush();
+            return;
+        }
+        try manager.stdout.print("{d} advisor{s} (", .{
+            advisories.array.items.len,
+            if (advisories.array.items.len == 1) "y" else "ies",
+        });
+        if (fatal > 0) try manager.stdout.print("{d} fatal", .{fatal});
+        if (fatal > 0 and warnings > 0) try manager.stdout.writeAll(", ");
+        if (warnings > 0) try manager.stdout.print("{d} warning{s}", .{
+            warnings,
+            if (warnings == 1) "" else "s",
+        });
+        try manager.stdout.writeAll(")\n");
+        if (!std.mem.eql(u8, mode, "scan")) {
+            if (fatal > 0) {
+                try manager.stdout.writeAll("Installation aborted due to fatal security advisories\n");
+            } else {
+                try manager.stdout.writeAll(
+                    "Security warnings found. Cannot prompt for confirmation (no TTY).\n" ++
+                        "Installation cancelled.\n",
+                );
+            }
+        }
+        try manager.stdout.flush();
+        return error.PackageManagerErrorReported;
+    }
+
+    fn validateSecurityAdvisory(manager: *Manager, advisory: *const Value, index: usize) !void {
+        if (advisory.* != .object) {
+            const message = try std.fmt.allocPrint(manager.allocator, "Security advisory at index {d} must be an object", .{index});
+            return manager.failSecurityScanner(message);
+        }
+        const package_name = advisory.object.get("package") orelse {
+            const message = try std.fmt.allocPrint(manager.allocator, "Security advisory at index {d} missing required 'package' field", .{index});
+            return manager.failSecurityScanner(message);
+        };
+        if (package_name != .string) {
+            const message = try std.fmt.allocPrint(manager.allocator, "Security advisory at index {d} 'package' field must be a string", .{index});
+            return manager.failSecurityScanner(message);
+        }
+        if (package_name.string.len == 0) {
+            const message = try std.fmt.allocPrint(manager.allocator, "Security advisory at index {d} 'package' field cannot be empty", .{index});
+            return manager.failSecurityScanner(message);
+        }
+        for ([_][]const u8{ "description", "url" }) |field_name| {
+            const field = advisory.object.get(field_name) orelse continue;
+            if (field != .string and field != .null) {
+                const message = try std.fmt.allocPrint(
+                    manager.allocator,
+                    "Security advisory at index {d} '{s}' field must be a string or null",
+                    .{ index, field_name },
+                );
+                return manager.failSecurityScanner(message);
+            }
+        }
+        const level = advisory.object.get("level") orelse {
+            const message = try std.fmt.allocPrint(manager.allocator, "Security advisory at index {d} missing required 'level' field", .{index});
+            return manager.failSecurityScanner(message);
+        };
+        if (level != .string) {
+            const message = try std.fmt.allocPrint(manager.allocator, "Security advisory at index {d} 'level' field must be a string", .{index});
+            return manager.failSecurityScanner(message);
+        }
+        if (!std.mem.eql(u8, level.string, "fatal") and !std.mem.eql(u8, level.string, "warn")) {
+            const message = try std.fmt.allocPrint(
+                manager.allocator,
+                "Security advisory at index {d} 'level' field must be 'fatal' or 'warn'",
+                .{index},
+            );
+            return manager.failSecurityScanner(message);
+        }
+    }
+
+    fn failSecurityScanner(manager: *Manager, message: []const u8) error{PackageManagerErrorReported} {
+        manager.stderr.print("Security scanner failed: {s}\n", .{message}) catch {};
+        manager.stderr.flush() catch {};
         return error.PackageManagerErrorReported;
     }
 

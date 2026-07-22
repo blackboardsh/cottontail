@@ -8,12 +8,19 @@ const Value = std.json.Value;
 const max_lockfile_bytes = 256 * 1024 * 1024;
 const max_package_json_bytes = 16 * 1024 * 1024;
 
+const LockfileFormat = enum {
+    text,
+    binary,
+};
+
 const Project = struct {
     root_dir: []const u8,
     package_json_path: []const u8,
     package_json_source: []const u8,
     package_json: Value,
     lock_path: []const u8,
+    lock_source: []const u8,
+    lock_format: LockfileFormat,
     graph: Lockfile.Graph,
 
     fn deinit(project: *Project) void {
@@ -172,14 +179,26 @@ pub fn runTrust(
         try stderr.flush();
         return 1;
     };
-    try setTrustedDependencies(init.arena.allocator(), &project.graph.document, trusted_names);
-
     const package_json = try stringifyDocument(
         init.arena.allocator(),
         project.package_json,
         endsWithNewline(project.package_json_source),
     );
-    const lockfile = try stringifyDocument(init.arena.allocator(), project.graph.document, true);
+    const lockfile = switch (project.lock_format) {
+        .text => text: {
+            try setTrustedDependencies(init.arena.allocator(), &project.graph.document, trusted_names);
+            break :text try stringifyDocument(init.arena.allocator(), project.graph.document, true);
+        },
+        .binary => BunLockfile.updateBinaryTrustedDependencies(
+            init.arena.allocator(),
+            project.lock_source,
+            trusted_names,
+        ) catch |err| {
+            try stderr.print("error: unable to update binary lockfile: {s}\n", .{@errorName(err)});
+            try stderr.flush();
+            return 1;
+        },
+    };
     std.Io.Dir.cwd().writeFile(init.io, .{
         .sub_path = project.package_json_path,
         .data = package_json,
@@ -259,6 +278,8 @@ fn loadProject(io: std.Io, allocator: std.mem.Allocator, cwd: []const u8) !Proje
             .package_json_source = package_json_source,
             .package_json = package_json,
             .lock_path = text_path,
+            .lock_source = source,
+            .lock_format = .text,
             .graph = Lockfile.parseText(allocator, source) catch return error.InvalidLockfile,
         };
     }
@@ -279,7 +300,9 @@ fn loadProject(io: std.Io, allocator: std.mem.Allocator, cwd: []const u8) !Proje
         .package_json_path = package_json_path,
         .package_json_source = package_json_source,
         .package_json = package_json,
-        .lock_path = text_path,
+        .lock_path = binary_path,
+        .lock_source = binary,
+        .lock_format = .binary,
         .graph = Lockfile.parseText(allocator, converted) catch return error.InvalidLockfile,
     };
 }

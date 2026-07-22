@@ -286,6 +286,47 @@ pub fn upgradeBinaryFormat(allocator: std.mem.Allocator, binary: []const u8) ![]
     return bytes.toOwnedSlice();
 }
 
+pub fn updateBinaryTrustedDependencies(
+    allocator: std.mem.Allocator,
+    binary: []const u8,
+    trusted_names: []const []const u8,
+) ![]u8 {
+    const lockfile_allocator = compiler.z_allocator;
+    var log = compiler.logger.Log.init(lockfile_allocator);
+    defer deinitLog(&log, lockfile_allocator);
+
+    const mutable = try lockfile_allocator.dupe(u8, binary);
+    defer lockfile_allocator.free(mutable);
+    var lockfile: BunLockfile = undefined;
+    const load_result = lockfile.loadFromBytesStandalone(mutable, lockfile_allocator, &log);
+    switch (load_result) {
+        .ok => {},
+        .err => |failure| return failure.value,
+        .not_found => return error.InvalidBinaryLockfile,
+    }
+    defer lockfile.deinit();
+
+    if (lockfile.trusted_dependencies) |*trusted| trusted.deinit(lockfile_allocator);
+    lockfile.trusted_dependencies = .{};
+    try lockfile.trusted_dependencies.?.ensureTotalCapacity(lockfile_allocator, trusted_names.len);
+    for (trusted_names) |name| {
+        lockfile.trusted_dependencies.?.putAssumeCapacity(
+            @truncate(compiler.Semver.String.Builder.stringHash(name)),
+            {},
+        );
+    }
+
+    const options: StandaloneOptions = .{ .config_version = lockfile.saved_config_version };
+    var bytes = std.Io.Writer.Allocating.init(allocator);
+    errdefer bytes.deinit();
+    var total_size: usize = 0;
+    var end_pos: usize = 0;
+    try BunLockfile.Serializer.save(&lockfile, &options, &bytes, &total_size, &end_pos);
+    if (bytes.written().len < end_pos + @sizeOf(usize)) return error.InvalidBinaryLockfileBuffer;
+    bytes.written()[end_pos..][0..@sizeOf(usize)].* = @bitCast(total_size);
+    return bytes.toOwnedSlice();
+}
+
 pub fn writeYarnFromBinary(allocator: std.mem.Allocator, binary: []const u8, writer: *std.Io.Writer) !void {
     var log = compiler.logger.Log.init(allocator);
     defer deinitLog(&log, allocator);
