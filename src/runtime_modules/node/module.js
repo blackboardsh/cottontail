@@ -2735,8 +2735,9 @@ function rewriteImportBindings(names) {
 // Single line (no trailing newline) so prepending it does not shift line
 // numbers of the transformed module source.
 const staticImportHelperSource = `const __ctStaticImport = (spec) => { const value = require(spec); const ns = { default: value }; if (value && (typeof value === "object" || typeof value === "function")) { for (const key of Object.keys(value)) { if (key !== "default") ns[key] = value[key]; } if (value.__esModule && Object.hasOwn(value, "default")) ns.default = value.default; } return ns; }; const __ctDynamicImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options); `;
+const asyncStaticImportHelperSource = `const __ctDynamicImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options, true); const __ctStaticImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options, true, __ctModuleAncestors); `;
 
-function transformEsmSourceForDynamicImport(source) {
+function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) {
   const exportAssignments = [];
   // Import declarations are hoisted to the top of the transformed output
   // (matching ESM semantics, where imports are initialized before any module
@@ -2749,33 +2750,33 @@ function transformEsmSourceForDynamicImport(source) {
   output = replaceCodePattern(output,
     /\bimport\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s+from\s*(['"][^'"]+['"])\s*;?/g,
     (_all, name, spec) => {
-      importDeclarations.push(`const ${name} = __ctStaticImport(${spec});`);
+      importDeclarations.push(`const ${name} = ${asyncStaticImports ? "await " : ""}__ctStaticImport(${spec});`);
       return ";";
     },
   );
   output = replaceCodePattern(output,
     /\bimport\s+([A-Za-z_$][\w$]*)\s*,\s*\{([^}]*)\}\s*from\s*(['"][^'"]+['"])\s*;?/g,
     (_all, def, names, spec) => {
-      importDeclarations.push(`const { default: ${def}, ${rewriteImportBindings(names)} } = __ctStaticImport(${spec});`);
+      importDeclarations.push(`const { default: ${def}, ${rewriteImportBindings(names)} } = ${asyncStaticImports ? "await " : ""}__ctStaticImport(${spec});`);
       return ";";
     },
   );
   output = replaceCodePattern(output,
     /\bimport\s*\{([^}]*)\}\s*from\s*(['"][^'"]+['"])\s*;?/g,
     (_all, names, spec) => {
-      importDeclarations.push(`const { ${rewriteImportBindings(names)} } = __ctStaticImport(${spec});`);
+      importDeclarations.push(`const { ${rewriteImportBindings(names)} } = ${asyncStaticImports ? "await " : ""}__ctStaticImport(${spec});`);
       return ";";
     },
   );
   output = replaceCodePattern(output,
     /\bimport\s+([A-Za-z_$][\w$]*)\s+from\s*(['"][^'"]+['"])\s*;?/g,
     (_all, def, spec) => {
-      importDeclarations.push(`const { default: ${def} } = __ctStaticImport(${spec});`);
+      importDeclarations.push(`const { default: ${def} } = ${asyncStaticImports ? "await " : ""}__ctStaticImport(${spec});`);
       return ";";
     },
   );
   output = replaceCodePattern(output, /\bimport\s*(['"][^'"]+['"])\s*;?/g, (_all, spec) => {
-    importDeclarations.push(`__ctStaticImport(${spec});`);
+    importDeclarations.push(`${asyncStaticImports ? "await " : ""}__ctStaticImport(${spec});`);
     return ";";
   });
   // Dynamic import() cannot execute inside new Function()-compiled code for
@@ -2794,16 +2795,29 @@ function transformEsmSourceForDynamicImport(source) {
         const pieces = trimmed.split(/\s+as\s+/);
         const local = pieces[0].trim();
         const exported = (pieces[1] ?? pieces[0]).trim();
-        statements.push(`${ESM_EXPORTS_BINDING}.${exported} = __ctStaticImport(${spec}).${local};`);
+        statements.push(`${ESM_EXPORTS_BINDING}.${exported} = (${asyncStaticImports ? "await " : ""}__ctStaticImport(${spec})).${local};`);
       }
       return statements.join(" ");
     },
   );
   output = replaceCodePattern(output,
+    /\bexport\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s+from\s*(['"][^'"]+['"])\s*;?/g,
+    (_all, name, spec) => `${ESM_EXPORTS_BINDING}.${name} = ${asyncStaticImports ? "await " : ""}__ctStaticImport(${spec});`,
+  );
+  output = replaceCodePattern(output,
     /\bexport\s*\*\s*from\s*(['"][^'"]+['"])\s*;?/g,
-    (_all, spec) => `{ const __ctNs = __ctStaticImport(${spec}); for (const __ctKey of Object.keys(__ctNs)) { if (__ctKey !== "default") ${ESM_EXPORTS_BINDING}[__ctKey] = __ctNs[__ctKey]; } }`,
+    (_all, spec) => `{ const __ctNs = ${asyncStaticImports ? "await " : ""}__ctStaticImport(${spec}); for (const __ctKey of Object.keys(__ctNs)) { if (__ctKey !== "default") ${ESM_EXPORTS_BINDING}[__ctKey] = __ctNs[__ctKey]; } }`,
   );
   output = replaceCodePattern(output, /\bexport\s+default\s+/g, `${ESM_EXPORTS_BINDING}.default = `);
+  output = replaceCodePattern(output, /\bexport\s+(const|let|var)\s+\{([^}]*)\}\s*=/g, (_all, kind, bindings) => {
+    for (const part of String(bindings).split(",")) {
+      const name = part.trim().replace(/^\.\.\./, "").split(/\s*:\s*|\s*=\s*/, 2).at(-1)?.trim();
+      if (/^[A-Za-z_$][\w$]*$/.test(name ?? "")) {
+        exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);
+      }
+    }
+    return `${kind} {${bindings}} =`;
+  });
   output = replaceCodePattern(output, /\bexport\s+(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/g, (_all, kind, name) => {
     exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);
     return `${kind} ${name} =`;
@@ -2843,7 +2857,8 @@ function transformEsmSourceForDynamicImport(source) {
     }
     return "";
   });
-  return `${staticImportHelperSource}${importDeclarations.join(" ")}${output}\n${exportAssignments.join("\n")}`;
+  const helperSource = asyncStaticImports ? asyncStaticImportHelperSource : staticImportHelperSource;
+  return `${helperSource}${importDeclarations.join(" ")}${output}\n${exportAssignments.join("\n")}`;
 }
 
 const dynamicErrorSourceSymbol = Symbol.for("cottontail.dynamicErrorSource");
@@ -2872,7 +2887,55 @@ function dynamicModuleErrorConstructor(filename, source) {
   });
 }
 
-function executeDynamicImportSource(resolved, source, format) {
+function isAsyncModuleRequireError(error) {
+  return /^require\(\) async module .* is unsupported\. use "await import\(\)" instead\.$/
+    .test(String(error?.message ?? error));
+}
+
+const asyncEsmModuleCache = new Map();
+
+function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, originalSource, ancestors = undefined) {
+  const cacheKey = String(resolved);
+  const cached = asyncEsmModuleCache.get(cacheKey);
+  if (cached !== undefined) {
+    return ancestors?.has(cacheKey) ? cached.namespace : cached.promise;
+  }
+  const namespace = createModuleNamespace();
+  const record = { namespace, promise: null };
+  asyncEsmModuleCache.set(cacheKey, record);
+  const moduleAncestors = new Set(ancestors ?? []);
+  moduleAncestors.add(cacheKey);
+  const transformed = transformEsmSourceForDynamicImport(
+    maybeStripTypeScript(resolvedPath, originalSource),
+    true,
+  );
+  maybeRegisterSourceMap(resolvedPath, transformed);
+  recordCompileCache(resolvedPath, transformed);
+  const body = `${transformed}\n//# sourceURL=${resolvedPath}${suffix}`;
+  const AsyncFunction = (async () => {}).constructor;
+  let run;
+  try {
+    run = new AsyncFunction(ESM_EXPORTS_BINDING, "__ctImportMeta", "__ctModuleAncestors", "Error", body);
+  } catch (error) {
+    asyncEsmModuleCache.delete(cacheKey);
+    throw markModuleCompileError(error, resolvedPath, originalSource);
+  }
+  record.promise = run(
+    namespace,
+    importMetaForHookModule(resolvedPath, suffix),
+    moduleAncestors,
+    dynamicModuleErrorConstructor(resolvedPath, originalSource),
+  ).then(
+    () => namespace,
+    error => {
+      if (asyncEsmModuleCache.get(cacheKey) === record) asyncEsmModuleCache.delete(cacheKey);
+      throw error;
+    },
+  );
+  return record.promise;
+}
+
+function executeDynamicImportSource(resolved, source, format, forceAsync = false, asyncAncestors = undefined) {
   const { bare: resolvedPath, suffix } = splitSpecifierSuffix(resolved);
   const sourceText = String(source ?? "");
   const effectiveFormat = format ?? formatForHookSource(resolvedPath, sourceText);
@@ -2895,6 +2958,9 @@ function executeDynamicImportSource(resolved, source, format) {
       "commonjs",
     ));
   }
+  if (forceAsync) {
+    return executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, sourceText, asyncAncestors);
+  }
   const namespace = createModuleNamespace();
   const originalSource = sourceText;
   const transformed = transformEsmSourceForDynamicImport(maybeStripTypeScript(resolvedPath, originalSource));
@@ -2909,28 +2975,24 @@ function executeDynamicImportSource(resolved, source, format) {
     // outputs re-imported via blob: URLs). Preserve synchronous evaluation for
     // ordinary modules and only retry syntax containing await asynchronously.
     if (!(error instanceof SyntaxError) || !/(?<![.\w$])await\b/.test(transformed)) throw error;
-    const AsyncFunction = (async () => {}).constructor;
-    const run = new AsyncFunction(ESM_EXPORTS_BINDING, "require", "module", "__ctImportMeta", "Error", body);
-    const module = { exports: namespace };
-    return run(
+    return executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, originalSource);
+  }
+  try {
+    run(
       namespace,
       createRequire(hookRequireBase(resolvedPath)),
-      module,
+      { exports: namespace },
       importMetaForHookModule(resolvedPath, suffix),
       dynamicModuleErrorConstructor(resolvedPath, originalSource),
-    ).then(() => namespace);
+    );
+  } catch (error) {
+    if (!isAsyncModuleRequireError(error)) throw error;
+    return executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, originalSource);
   }
-  run(
-    namespace,
-    createRequire(hookRequireBase(resolvedPath)),
-    { exports: namespace },
-    importMetaForHookModule(resolvedPath, suffix),
-    dynamicModuleErrorConstructor(resolvedPath, originalSource),
-  );
   return namespace;
 }
 
-function importResolvedRuntimeModule(resolved, options = undefined) {
+function importResolvedRuntimeModule(resolved, options = undefined, forceAsync = false, asyncAncestors = undefined) {
   const cachedPluginModule = commonJsCache.get(resolved);
   if (cachedPluginModule && Object.hasOwn(cachedPluginModule, "__cottontailPluginNamespace")) {
     return cachedPluginModule.__cottontailPluginNamespace;
@@ -2947,7 +3009,7 @@ function importResolvedRuntimeModule(resolved, options = undefined) {
   const resolvedByHook = hookResolvedFormats.has(resolved);
   const loadResult = runLoadHooks(resolved);
   if (loadResult !== undefined) {
-    return executeDynamicImportSource(resolved, loadResult.source, loadResult.format);
+    return executeDynamicImportSource(resolved, loadResult.source, loadResult.format, forceAsync, asyncAncestors);
   }
   if (builtinModuleMap.has(resolved) || hasRuntimePackageReplacement(resolved)) {
     return namespaceFromBuiltin(resolved, loadBuiltinOrReplacement(resolved));
@@ -2958,20 +3020,34 @@ function importResolvedRuntimeModule(resolved, options = undefined) {
   }
   const embedded = standaloneFileEntry(resolvedPath);
   if (embedded.found && hasEsmSyntax(embedded.value)) {
-    return executeDynamicImportSource(resolved, embedded.value, "module");
+    return executeDynamicImportSource(resolved, embedded.value, "module", forceAsync, asyncAncestors);
   }
   const resolvedFormat = resolvedByHook ? hookResolvedFormats.get(resolved) : formatForResolved(resolved);
   if (resolvedFormat === "commonjs") {
     if (/\.(?:js|jsx|ts|tsx)$/i.test(resolvedPath)) {
       const source = embedded.found ? embedded.value : readModuleFile(resolvedPath);
-      if (hasEsmSyntax(source)) return executeDynamicImportSource(resolved, source, "module");
+      if (hasEsmSyntax(source)) {
+        return executeDynamicImportSource(resolved, source, "module", forceAsync, asyncAncestors);
+      }
     }
     return namespaceFromCommonJs(loadCommonJsModule(resolved));
   }
-  return executeDynamicImportSource(resolved, readModuleFile(resolvedPath), resolvedFormat);
+  return executeDynamicImportSource(
+    resolved,
+    readModuleFile(resolvedPath),
+    resolvedFormat,
+    forceAsync,
+    asyncAncestors,
+  );
 }
 
-export function __importModule(specifier, referrer = undefined, options = undefined) {
+export function __importModule(
+  specifier,
+  referrer = undefined,
+  options = undefined,
+  forceAsync = false,
+  asyncAncestors = undefined,
+) {
   const directMock = bunModuleMockFor(specifier);
   if (directMock.found) {
     if (directMock.value && typeof directMock.value.then === "function") {
@@ -3010,7 +3086,13 @@ export function __importModule(specifier, referrer = undefined, options = undefi
         throw new SyntaxError("Invalid percent-encoding in data URL");
       }
     }
-    return executeDynamicImportSource(`${cottontail.cwd()}/__cottontail-data-module.mjs`, source, "module");
+    return executeDynamicImportSource(
+      `${cottontail.cwd()}/__cottontail-data-module.mjs`,
+      source,
+      "module",
+      forceAsync,
+      asyncAncestors,
+    );
   }
   if (specifierText.startsWith("blob:")) {
     const blob = globalThis.__cottontailObjectURLRegistry?.get(specifierText);
@@ -3018,7 +3100,7 @@ export function __importModule(specifier, referrer = undefined, options = undefi
       const extension = /typescript/i.test(String(blob.type ?? "")) ? "ts" : "mjs";
       const virtualPath = join(cottontail.cwd(), `__cottontail-blob-${specifierText.replace(/[^a-zA-Z0-9._-]/g, "_")}.${extension}`);
       return Promise.resolve(blob.text()).then((source) =>
-        executeDynamicImportSource(virtualPath, source, "module"));
+        executeDynamicImportSource(virtualPath, source, "module", forceAsync, asyncAncestors));
     }
     throw moduleNotFoundError(specifierText, false);
   }
@@ -3028,16 +3110,22 @@ export function __importModule(specifier, referrer = undefined, options = undefi
     throw dynamicResolveMessage(`Cannot find module '${specifierText}' from '${parent}'`);
   }
   const resolved = pluginAttempt?.resolved ?? resolveRequest(String(specifier), parent, true, "import");
-  return importResolvedRuntimeModule(resolved, options);
+  return importResolvedRuntimeModule(resolved, options, forceAsync, asyncAncestors);
 }
 
 // The native dynamic-import shim (cottontail.importModule) stringifies any
 // exception thrown synchronously by this hook, losing error identity (e.g.
 // error.code). Return a rejected promise instead so the original Error object
 // reaches the awaiting caller intact.
-globalThis.__cottontailImportModule = (specifier, referrer, options) => {
+globalThis.__cottontailImportModule = (
+  specifier,
+  referrer,
+  options,
+  forceAsync = false,
+  asyncAncestors = undefined,
+) => {
   try {
-    return __importModule(specifier, referrer, options);
+    return __importModule(specifier, referrer, options, forceAsync, asyncAncestors);
   } catch (error) {
     const rejected = Promise.reject(error);
     // Pre-attach a no-op handler so the runtime's unhandled-rejection tracker
