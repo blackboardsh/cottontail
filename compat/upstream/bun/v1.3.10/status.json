@@ -1260,6 +1260,10 @@
       "reason": "Package adds pass all 51 copied cases and 556 assertions across registry, GitHub and SCP Git dependencies, aliases, local paths and tarballs, workspaces, dependency sections, repeated adds, lockfiles, and analyze/only-missing behavior.",
       "timeoutMs": 120000
     },
+    "test/cli/install/bun-run-bunfig.test.ts": {
+      "status": "enabled",
+      "reason": "All 28 copied bunfig run cases pass with 60 assertions across root and local configuration, preload ordering, shell selection, environment expansion, and nested directories."
+    },
     "test/cli/install/bun-remove.test.ts": {
       "status": "enabled",
       "reason": "Package removal passes all 5 copied cases and 26 assertions across retained dependency reinstall reporting, no-op removals, peer dependencies, package.json newline preservation, and empty lockfile cleanup."
