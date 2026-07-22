@@ -6571,8 +6571,17 @@ const Manager = struct {
         if (manager.changed) return false;
         const graph = if (manager.lock_graph) |*value| value else return false;
         if (graph.provenance != .bun_text) return false;
-        const locked_spec = graph.rootDependencySpec(alias) orelse return false;
         const declared_spec = manager.rootDependencySpec(alias) orelse return false;
+        // COTTONTAIL-COMPAT: A non-production lock can map a duplicate direct
+        // dependency to its dev version. Revalidate that mapping when dev edges
+        // are omitted and their spec differs from the selected production edge.
+        if (manager.options.production or manager.options.omit_dev) {
+            const root = manager.root_package_json orelse return false;
+            if (dependencySpecInSection(root, "devDependencies", alias)) |dev_spec| {
+                if (!std.mem.eql(u8, dev_spec, declared_spec)) return false;
+            }
+        }
+        const locked_spec = graph.rootDependencySpec(alias) orelse return false;
         return std.mem.eql(u8, locked_spec, declared_spec);
     }
 
