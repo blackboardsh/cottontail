@@ -63,6 +63,11 @@
       "reason": "Serially confirmed after unclassified discovery: Unicode script names and arguments pass both copied upstream cases with two assertions."
     },
     {
+      "pattern": "^test/cli/init/init\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "The copied Bun init corpus passes with interactive and noninteractive defaults, JavaScript/TypeScript choices, deterministic package metadata, overwrite handling, and generated file contents (10 cases, 76 assertions)."
+    },
+    {
       "pattern": "^test/js/node/(?:cluster\\.test\\.ts|util/node-inspect-tests/parallel/util-inspect-getters-accessing-this\\.test\\.js)$",
       "status": "enabled",
       "reason": "Serially confirmed after unclassified discovery: Node cluster compatibility and util.inspect getter receiver behavior pass four copied upstream cases."
