@@ -1244,6 +1244,12 @@
       "status": "enabled",
       "reason": "Bun v2 binary lockfiles migrate through the vendored Zig lockfile graph without registry re-resolution, preserving package IDs, metadata snapshots, workspace placements, and byte stability (2 bun:test cases, 14 assertions)."
     },
+    "test/cli/install/minimum-release-age.test.ts": {
+      "status": "enabled",
+      "reason": "All 48 copied minimum-release-age cases pass across age filtering, stability fallbacks, prereleases, exclusions, lockfile reuse, workspace linkers, and security scanner payloads (173 assertions).",
+      "args": ["--max-concurrency=1"],
+      "timeoutMs": 60000
+    },
     "test/cli/install/bun-install-patch.test.ts": {
       "status": "enabled",
       "reason": "Install-time patch application, lockfile patch metadata, malformed-patch diagnostics, and hoisted and isolated linker behavior pass all 17 copied upstream cases (63 assertions).",
