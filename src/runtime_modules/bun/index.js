@@ -79,7 +79,9 @@ import {
   takeBody as lifecycleTakeBody,
 } from "./web-body-lifecycle.js";
 import {
+  createNativeServeRequestOperation,
   createNativeServeRequestState,
+  createServeLifecycle,
   incomingRequestURLFactory,
 } from "../internal/bun-http-server.js";
 import { installStandaloneRuntimeLoaders } from "../internal/standalone-runtime.js";
@@ -4194,11 +4196,17 @@ if (nodeHttp.IncomingMessage?.prototype &&
     wrapped.__cottontailBOM = true;
     Object.defineProperty(proto, "text", { value: wrapped, writable: true, configurable: true });
   }
-  if (typeof proto.json !== "function") {
-    Object.defineProperty(proto, "json", {
-      value: async function json() {
+  if (typeof proto.json !== "function" || !proto.json.__cottontailBunJson) {
+    const json = async function json() {
+      try {
         return JSON.parse(await this.text());
-      },
+      } catch {
+        throw new SyntaxError("Failed to parse JSON");
+      }
+    };
+    json.__cottontailBunJson = true;
+    Object.defineProperty(proto, "json", {
+      value: json,
       writable: true,
       configurable: true,
     });
@@ -6590,89 +6598,6 @@ function requestIdleTimeout(request, fallback) {
   return requestState.get(request)?.serveIdleTimeout ?? fallback;
 }
 
-function createServeLifecycle(getPendingWebSockets) {
-  const requests = new Set();
-  let pendingRequests = 0;
-  let stopRequested = false;
-  let forceRequested = false;
-  let transportDrained = false;
-  let stopPromise = null;
-  let resolveStop = null;
-  let stopTransport = null;
-  let forceTransport = null;
-
-  const maybeResolveStop = () => {
-    if (!stopRequested || !transportDrained || pendingRequests !== 0 || getPendingWebSockets() !== 0) return;
-    resolveStop?.();
-    resolveStop = null;
-  };
-
-  const finishRequest = (request) => {
-    if (request == null || request.finished) return;
-    request.finished = true;
-    requests.delete(request);
-    if (pendingRequests > 0) pendingRequests -= 1;
-    maybeResolveStop();
-  };
-
-  const finishForcedRequests = () => {
-    for (const request of Array.from(requests)) {
-      try { request.onForce?.(); } catch {}
-      finishRequest(request);
-    }
-  };
-
-  return {
-    get pendingRequests() {
-      return pendingRequests;
-    },
-    get stopRequested() {
-      return stopRequested;
-    },
-    get forceRequested() {
-      return forceRequested;
-    },
-    configure(stop, force) {
-      stopTransport = stop;
-      forceTransport = force;
-    },
-    beginRequest(onForce = undefined) {
-      const request = { finished: false, onForce };
-      requests.add(request);
-      pendingRequests += 1;
-      return request;
-    },
-    finishRequest,
-    stop(force = false) {
-      const abrupt = force === true;
-      if (stopPromise == null) {
-        stopPromise = new Promise((resolve) => {
-          resolveStop = resolve;
-        });
-      }
-      if (!stopRequested) {
-        stopRequested = true;
-        forceRequested = abrupt;
-        stopTransport?.(abrupt);
-        if (abrupt) finishForcedRequests();
-      } else if (abrupt && !forceRequested) {
-        forceRequested = true;
-        forceTransport?.();
-        finishForcedRequests();
-      }
-      maybeResolveStop();
-      return stopPromise;
-    },
-    markTransportDrained() {
-      transportDrained = true;
-      maybeResolveStop();
-    },
-    notifyWebSocketsChanged() {
-      maybeResolveStop();
-    },
-  };
-}
-
 function abortActiveServeRequests(server) {
   const controllers = activeServeAbortControllers.get(server);
   if (controllers == null) return;
@@ -7236,6 +7161,10 @@ function incomingMessageBodyStream(message, signal) {
   const expectedBytes = contentLengthText != null && /^\d+$/.test(String(contentLengthText))
     ? Number(contentLengthText)
     : null;
+  const status = Number(message.statusCode ?? 200);
+  const hasNoMessageBody = expectedBytes === 0 ||
+    String(message.req?.method ?? "").toUpperCase() === "HEAD" ||
+    status === 204 || status === 304 || status >= 100 && status < 200;
   const state = { controller: null, done: false, paused: false, receivedBytes: 0, started: false };
   const transport = createIncomingMessageBodyTransport(message, signal, expectedBytes);
   const startTransport = () => {
@@ -7265,6 +7194,10 @@ function incomingMessageBodyStream(message, signal) {
   }, new ByteLengthQueuingStrategy({ highWaterMark: 0 }));
   Object.defineProperty(stream, fetchBodyStartSymbol, { value: startBodyConsumption });
   Object.defineProperty(stream, abandonedFetchBodyCleanupSymbol, { value: transport.abandon });
+  // Empty responses must release their socket even when the caller never
+  // reads body. Bun drains these at the transport layer without disturbing
+  // the exposed ReadableStream.
+  if (hasNoMessageBody) startTransport();
   return stream;
 }
 
@@ -7360,6 +7293,7 @@ function fetchTlsOptions(url, config = null) {
 const reusableFetchHttpsAgents = new Map();
 const reusableCustomFetchHttpsAgents = new Map();
 const MAX_REUSABLE_CUSTOM_FETCH_HTTPS_AGENTS = 64;
+const proxyTunnelAgentSymbol = Symbol("cottontail.fetchProxyTunnelAgent");
 
 function defaultFetchHttpsAgent(tlsOptions, keepalive) {
   if (!keepalive) return new nodeHttps.Agent({ ...tlsOptions, keepAlive: false });
@@ -7395,6 +7329,7 @@ function customFetchHttpsAgent(tlsOptions, tlsConfig, keepalive) {
 
 function httpsProxyTunnelAgent(target, proxy, proxyHeaders, tlsOptions, keepalive) {
   const agent = new nodeHttps.Agent({ ...tlsOptions, keepAlive: keepalive });
+  Object.defineProperty(agent, proxyTunnelAgentSymbol, { value: true });
   agent.createConnection = function createConnection(options, callback) {
     const proxyClient = proxy.protocol === "https:" ? nodeHttps : nodeHttp;
     const headers = new Headers(proxyHeaders ?? undefined);
@@ -7446,6 +7381,18 @@ function httpsProxyTunnelAgent(target, proxy, proxyHeaders, tlsOptions, keepaliv
   return agent;
 }
 
+function destroyOneShotProxyTunnelAgent(agent) {
+  const sockets = new Set([
+    ...Object.values(agent?.sockets ?? {}).flat(),
+    ...Object.values(agent?.freeSockets ?? {}).flat(),
+    ...(agent?._trackedSockets ?? []),
+  ]);
+  agent?.destroy?.();
+  // CONNECT agents are not reused. Finalize their native TLS handles before
+  // stock JSC can recycle an identifier still owned by a deferred destroy.
+  for (const socket of sockets) socket?._destroyImmediately?.();
+}
+
 function fetchOnceUsingNodeClient(request, redirected = false, transport = {}, onResponse = null) {
   // COTTONTAIL-COMPAT: A pending fetch remains referenced while body
   // preparation and node:net address fallback have no active socket handle.
@@ -7490,16 +7437,17 @@ function dispatchNodeFetchRequest(request, redirected, transport, onResponse, ur
   if (proxyValue) {
     const proxy = normalizedProxyUrl(proxyValue);
     if (url.protocol === "https:") {
-      agent = httpsProxyTunnelAgent(url, proxy, transport.proxy.headers, tlsOptions, keepalive);
+      agent = httpsProxyTunnelAgent(url, proxy, transport.proxy.headers, tlsOptions, false);
     } else {
       client = proxy.protocol === "https:" ? nodeHttps : nodeHttp;
       hostname = proxy.hostname;
       port = Number(proxy.port || (proxy.protocol === "https:" ? 443 : 80));
       path = request.url;
+      agent = false;
       const authorization = proxyAuthorization(proxy);
       if (authorization && !request.headers.has("proxy-authorization")) request.headers.set("Proxy-Authorization", authorization);
       for (const [name, value] of transport.proxy.headers ?? []) request.headers.set(name, value);
-      if (!request.headers.has("proxy-connection")) request.headers.set("Proxy-Connection", keepalive ? "Keep-Alive" : "close");
+      if (!request.headers.has("proxy-connection")) request.headers.set("Proxy-Connection", "close");
     }
   } else if (url.protocol === "https:") {
     agent = transport.tlsConfig
@@ -7546,6 +7494,9 @@ function dispatchNodeFetchRequest(request, redirected, transport, onResponse, ur
         signal?.removeEventListener?.("abort", onAbort);
         clientRequest.off?.("error", onRequestError);
         clientRequest.once?.("error", absorbResponseTransportError);
+        if (agent?.[proxyTunnelAgentSymbol]) {
+          incoming.once?.("end", () => destroyOneShotProxyTunnelAgent(agent));
+        }
         const headers = headersFromIncomingMessage(incoming);
         const stream = incomingMessageBodyStream(incoming, signal);
         const response = responseWithMetadata(stream, {
@@ -11337,7 +11288,9 @@ export function serve(options) {
     return sendResponse(item, response);
   };
 
-  const handle = (item, state) => {
+  const handle = (operation) => {
+    const item = operation.item;
+    const state = operation.state;
     const requestHeaders = parseHeadersText(item.headersText);
     const requestInit = {
       method: item.method,
@@ -11351,8 +11304,12 @@ export function serve(options) {
       incomingRequestURLFactory("http:", requestHeaders.get("host"), item.url, requestOrigin, normalizeRequestUrl),
       requestInit,
     );
+    operation.attachRequest(request);
     if (item.remote) serveRequestPeers.set(request, item.remote);
     const sendHandledResponse = (response) => {
+      const item = operation.item;
+      const request = operation.request;
+      if (item == null || request == null || nativeClosed) return undefined;
       finishActiveServeRequestBody(request, response);
       return sendResponse(item, serveResponseWithIdleTimeout(
         response,
@@ -11360,6 +11317,9 @@ export function serve(options) {
       ));
     };
     const sendHandledError = (error) => {
+      const item = operation.item;
+      const request = operation.request;
+      if (item == null || request == null || nativeClosed) return undefined;
       finishActiveServeRequestBody(request, null);
       return handleError(item, error);
     };
@@ -11376,11 +11336,13 @@ export function serve(options) {
     }
   };
 
-  const finishNativeRequest = (item, state) => {
+  const finishNativeRequest = (operation) => {
+    const state = operation.state;
+    if (state == null) return;
     state.finishResponse();
-    nativeRequests.delete(item.id);
+    nativeRequests.delete(operation.id);
     lifecycle.finishRequest(state.lifecycleRequest);
-    state.dispose();
+    operation.dispose();
   };
 
   const maybeFinishNativeStop = () => {
@@ -11400,9 +11362,9 @@ export function serve(options) {
     for (const origin of originKeys) activeServeOrigins.delete(origin);
     if (force) {
       abortActiveServeRequests(server);
-      for (const state of nativeRequests.values()) {
-        state.forceAbort();
-        state.dispose();
+      for (const operation of nativeRequests.values()) {
+        operation.forceAbort();
+        operation.dispose();
       }
       nativeClosed = true;
       if (interval != null) {
@@ -11420,7 +11382,7 @@ export function serve(options) {
   lifecycle.configure(stopNativeTransport, () => stopNativeTransport(true));
 
   const pollNativeRequestEvents = () => {
-    for (const state of nativeRequests.values()) state.poll();
+    for (const operation of nativeRequests.values()) operation.poll();
   };
 
   const pump = () => {
@@ -11438,23 +11400,24 @@ export function serve(options) {
       const item = cottontail.httpServerPoll(native.id);
       if (!item) break;
       const state = createNativeRequestState(item);
-      state.lifecycleRequest = lifecycle.beginRequest(() => state.forceAbort());
-      nativeRequests.set(item.id, state);
-      const handled = handle(item, state);
+      const operation = createNativeServeRequestOperation(item, state);
+      state.lifecycleRequest = lifecycle.beginRequest(() => operation.forceAbort());
+      nativeRequests.set(operation.id, operation);
+      const handled = handle(operation);
       if (isPromiseLike(handled)) {
         Promise.resolve(handled).then(
           () => {
-            finishNativeRequest(item, state);
+            finishNativeRequest(operation);
             pump();
           },
           (error) => {
             console.error(error instanceof Error ? error.stack || error.message : error);
-            finishNativeRequest(item, state);
+            finishNativeRequest(operation);
             pump();
           },
         );
       } else {
-        finishNativeRequest(item, state);
+        finishNativeRequest(operation);
       }
     }
     pollNativeRequestEvents();

@@ -5,6 +5,129 @@ export function incomingRequestURLFactory(protocol, host, target, fallbackOrigin
   return () => normalizeURL(isAbsolute ? rawTarget : `${requestBase}${rawTarget}`);
 }
 
+export function createServeLifecycle(getPendingWebSockets) {
+  const requests = new Set();
+  let pendingRequests = 0;
+  let stopRequested = false;
+  let forceRequested = false;
+  let transportDrained = false;
+  let stopPromise = null;
+  let resolveStop = null;
+  let stopTransport = null;
+  let forceTransport = null;
+
+  const maybeResolveStop = () => {
+    if (!stopRequested || !transportDrained || pendingRequests !== 0 || getPendingWebSockets() !== 0) return;
+    resolveStop?.();
+    resolveStop = null;
+  };
+
+  const finishRequest = (request) => {
+    if (request == null || request.finished) return;
+    request.finished = true;
+    requests.delete(request);
+    if (pendingRequests > 0) pendingRequests -= 1;
+    maybeResolveStop();
+  };
+
+  const finishForcedRequests = () => {
+    for (const request of Array.from(requests)) {
+      try { request.onForce?.(); } catch {}
+      finishRequest(request);
+    }
+  };
+
+  return {
+    get pendingRequests() {
+      return pendingRequests;
+    },
+    get stopRequested() {
+      return stopRequested;
+    },
+    get forceRequested() {
+      return forceRequested;
+    },
+    configure(stop, force) {
+      stopTransport = stop;
+      forceTransport = force;
+    },
+    beginRequest(onForce = undefined) {
+      const request = { finished: false, onForce };
+      requests.add(request);
+      pendingRequests += 1;
+      return request;
+    },
+    finishRequest,
+    stop(force = false) {
+      const abrupt = force === true;
+      if (stopPromise == null) {
+        stopPromise = new Promise((resolve) => {
+          resolveStop = resolve;
+        });
+      }
+      if (!stopRequested) {
+        stopRequested = true;
+        forceRequested = abrupt;
+        stopTransport?.(abrupt);
+        if (abrupt) finishForcedRequests();
+      } else if (abrupt && !forceRequested) {
+        forceRequested = true;
+        forceTransport?.();
+        finishForcedRequests();
+      }
+      maybeResolveStop();
+      return stopPromise;
+    },
+    markTransportDrained() {
+      transportDrained = true;
+      maybeResolveStop();
+    },
+    notifyWebSocketsChanged() {
+      maybeResolveStop();
+    },
+  };
+}
+
+export function createNativeServeRequestOperation(item, state) {
+  const id = item.id;
+  let activeItem = item;
+  let activeRequest = null;
+  let activeState = state;
+
+  return {
+    id,
+    get item() {
+      return activeItem;
+    },
+    get request() {
+      return activeRequest;
+    },
+    get state() {
+      return activeState;
+    },
+    attachRequest(request) {
+      if (activeState == null) return false;
+      activeRequest = request;
+      return true;
+    },
+    poll() {
+      activeState?.poll();
+    },
+    forceAbort() {
+      activeState?.forceAbort();
+    },
+    dispose() {
+      if (activeState == null) return null;
+      const stateToDispose = activeState;
+      activeItem = null;
+      activeRequest = null;
+      activeState = null;
+      stateToDispose.dispose();
+      return stateToDispose;
+    },
+  };
+}
+
 export function createNativeServeRequestState(item, options) {
   const {
     binding,

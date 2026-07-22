@@ -729,6 +729,7 @@ export class TLSSocket extends Socket {
     this._tlsHandshakeTimer = null;
     this._tlsDestroyTimer = null;
     this._tlsDestroyId = null;
+    this._tlsDestroyFinalize = null;
     this._memoryTransport = null;
     this._memoryTransportListeners = null;
     this._memoryTransportEnded = false;
@@ -1453,8 +1454,13 @@ export class TLSSocket extends Socket {
     if (!this._closeEmitted) {
       const hadError = Boolean(error);
       this._closeEmitted = true;
-      this._tlsDestroyTimer = setTimeout(() => {
+      let finalized = false;
+      const finalize = () => {
+        if (finalized) return;
+        finalized = true;
+        if (this._tlsDestroyTimer != null) clearTimeout(this._tlsDestroyTimer);
         this._tlsDestroyTimer = null;
+        this._tlsDestroyFinalize = null;
         if (tlsId != null) {
           try { cottontail.tlsConnectionClose(tlsId); } catch {}
           this._tlsDestroyId = null;
@@ -1467,9 +1473,17 @@ export class TLSSocket extends Socket {
         }
         if (error) this.emit("error", error);
         this.emit("close", hadError);
-      }, 0);
+      };
+      this._tlsDestroyFinalize = finalize;
+      this._tlsDestroyTimer = setTimeout(finalize, 0);
       if (!this._refed) this._tlsDestroyTimer.unref?.();
     }
+    return this;
+  }
+
+  _destroyImmediately(error = undefined) {
+    this.destroy(error);
+    this._tlsDestroyFinalize?.();
     return this;
   }
 

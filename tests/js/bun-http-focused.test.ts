@@ -18,6 +18,26 @@ function getNativeHttpText(url) {
   });
 }
 
+function requestNativeHttpText(url, body) {
+  return new Promise((resolve, reject) => {
+    const request = http.request(url, {
+      method: "POST",
+      headers: {
+        connection: "close",
+        "content-length": String(body.byteLength),
+      },
+    }, response => {
+      const chunks = [];
+      response.on("data", chunk => chunks.push(Buffer.from(chunk)));
+      response.once("end", () => resolve(Buffer.concat(chunks).toString()));
+      response.once("error", reject);
+    });
+    request.setTimeout(3000, () => request.destroy(new Error("native HTTP request timed out")));
+    request.once("error", reject);
+    request.end(body);
+  });
+}
+
 function withTimeout(promise, message, timeout = 3000) {
   let timer;
   return Promise.race([
@@ -118,6 +138,10 @@ async function createForwardProxy(useTls = false) {
   return {
     requests,
     url: `${useTls ? "https" : "http"}://127.0.0.1:${address.port}`,
+    async closeGracefully() {
+      server.close();
+      await once(server, "close");
+    },
     async close() {
       for (const socket of sockets) socket.destroy();
       server.close();
@@ -494,6 +518,47 @@ test("native Bun.serve retains a lazy request URL after request finalization", a
   } finally {
     await server.stop(true);
   }
+});
+
+test("native Bun.serve releases bounded long-URL and request-body state", async () => {
+  const requests = [];
+  const payload = Buffer.alloc(128 * 1024, 0x61);
+  using server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      requests.push(new WeakRef(request));
+      const pathname = new URL(request.url).pathname;
+      if (pathname === "/buffer") return new Response(String((await request.arrayBuffer()).byteLength));
+      if (pathname === "/partial") {
+        const { value } = await request.body.getReader().read();
+        return new Response(String(value.byteLength));
+      }
+      if (pathname === "/echo") return new Response(request.body);
+      return new Response("ignored");
+    },
+  });
+
+  const suffix = `?${"long-url-state".repeat(256)}`;
+  for (let round = 0; round < 2; round += 1) {
+    const [ignored, buffered, partial, echoed] = await Promise.all([
+      requestNativeHttpText(`${server.url.origin}/ignore${suffix}`, payload),
+      requestNativeHttpText(`${server.url.origin}/buffer${suffix}`, payload),
+      requestNativeHttpText(`${server.url.origin}/partial${suffix}`, payload),
+      requestNativeHttpText(`${server.url.origin}/echo${suffix}`, payload),
+    ]);
+    expect(ignored).toBe("ignored");
+    expect(buffered).toBe(String(payload.byteLength));
+    expect(Number(partial)).toBeGreaterThan(0);
+    expect(echoed).toBe(payload.toString());
+  }
+
+  await Bun.sleep(0);
+  expect(server.pendingRequests).toBe(0);
+  Bun.gc(true);
+  await Bun.sleep(0);
+  Bun.gc(true);
+  expect(requests.some(request => request.deref() === undefined)).toBe(true);
 });
 
 test("native Bun.serve rejects an oversized declared body before dispatch", async () => {
@@ -901,6 +966,33 @@ test("proxy object headers override URL proxy credentials", async () => {
     expect(request.match(/proxy-authorization:/g)?.length).toBe(1);
   } finally {
     await proxy.close();
+  }
+});
+
+test("an unconsumed empty HTTPS proxy response releases its CONNECT tunnel", async () => {
+  const proxy = await createForwardProxy();
+  let closed = false;
+  using origin = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    tls: { cert, key },
+    fetch: () => new Response(""),
+  });
+  try {
+    const response = await fetch(origin.url, {
+      proxy: {
+        url: proxy.url,
+        headers: { "X-Proxy-Tunnel": "present" },
+      },
+      keepalive: false,
+      tls: { ca: cert, rejectUnauthorized: false },
+    });
+    expect(response.status).toBe(200);
+    expect(proxy.requests[0].toLowerCase()).toContain("x-proxy-tunnel: present");
+    await withTimeout(proxy.closeGracefully(), "CONNECT tunnel remained open after an empty response");
+    closed = true;
+  } finally {
+    if (!closed) await proxy.close();
   }
 });
 
