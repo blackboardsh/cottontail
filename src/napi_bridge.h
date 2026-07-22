@@ -13,6 +13,7 @@ typedef struct NapiEnv CtNapiEnv;
 typedef struct uv_loop_s uv_loop_t;
 typedef void (*CtNapiWakeCallback)(void *opaque);
 
+/* The caller owns event_loop and must keep it alive through ct_napi_env_destroy. */
 CtNapiEnv *ct_napi_env_create(
     JSGlobalContextRef context,
     uv_loop_t *event_loop,

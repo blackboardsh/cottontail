@@ -25,8 +25,6 @@
 #include <uv.h>
 #include <vector>
 
-#include <dlfcn.h>
-
 using CtExternalStringFinalize = void (*)(void*, void*, size_t);
 extern "C" JSStringRef ct_jsc_string_create_external_latin1(
     const uint8_t*,
@@ -328,6 +326,12 @@ struct NapiTsfnCall {
     void* data { nullptr };
 };
 
+enum class NapiEventLoopLifecycle : uint8_t {
+    unavailable,
+    active,
+    cleanup,
+};
+
 struct napi_threadsafe_function__ {
     NapiEnv* env { nullptr };
     JSValueRef callback { nullptr };
@@ -352,7 +356,9 @@ struct NapiEnv {
     NapiEnv* runtime_root { nullptr };
     JSGlobalContextRef context { nullptr };
     JSObjectRef function_call { nullptr };
+    // The runtime owns this loop. Only the root env stores the borrowed pointer.
     uv_loop_t* event_loop { nullptr };
+    NapiEventLoopLifecycle event_loop_lifecycle { NapiEventLoopLifecycle::unavailable };
     void* wake_opaque { nullptr };
     CtNapiWakeCallback wake_callback { nullptr };
     napi_extended_error_info last_error {};
@@ -531,6 +537,59 @@ private:
     ModuleRegistrationSession* previous_session { nullptr };
 };
 
+class AddonLibrary {
+public:
+    AddonLibrary() = default;
+    AddonLibrary(const AddonLibrary&) = delete;
+    AddonLibrary& operator=(const AddonLibrary&) = delete;
+
+    ~AddonLibrary()
+    {
+        if (initialized)
+            uv_dlclose(&library);
+    }
+
+    bool open(const char* path)
+    {
+        initialized = true;
+        return uv_dlopen(path, &library) == 0;
+    }
+
+    const char* error() const
+    {
+        return initialized ? uv_dlerror(&library) : "dynamic library is not open";
+    }
+
+    void* key() const
+    {
+        return reinterpret_cast<void*>(library.handle);
+    }
+
+    template<typename Function>
+    Function symbol(const char* name)
+    {
+        void* pointer = nullptr;
+        if (uv_dlsym(&library, name, &pointer) != 0)
+            return nullptr;
+        return reinterpret_cast<Function>(pointer);
+    }
+
+    void keep_loaded()
+    {
+        if (!initialized)
+            return;
+        // Addon code and cached registrations remain valid for process lifetime.
+        // Clear only libuv's transient symbol-error allocation.
+        library.handle = nullptr;
+        uv_dlclose(&library);
+        initialized = false;
+    }
+
+private:
+    uv_lib_t library {};
+    bool initialized { false };
+};
+
 static std::mutex registered_modules_mutex;
 static std::unordered_map<void*, std::vector<RegisteredModule>> registered_modules;
 
@@ -568,6 +627,22 @@ static void wake(NapiEnv* env);
 static NapiEnv* root_env(NapiEnv* env)
 {
     return env && env->runtime_root ? env->runtime_root : env;
+}
+
+static uv_loop_t* event_loop_for_env(NapiEnv* env)
+{
+    auto* root = root_env(env);
+    if (!root || root->event_loop_lifecycle == NapiEventLoopLifecycle::unavailable)
+        return nullptr;
+    return root->event_loop;
+}
+
+static bool event_loop_is_active(NapiEnv* env)
+{
+    auto* root = root_env(env);
+    return root
+        && root->event_loop_lifecycle == NapiEventLoopLifecycle::active
+        && root->event_loop;
 }
 
 static void finalize_function(JSObjectRef object)
@@ -1725,12 +1800,18 @@ static NapiEnv* allocate_env(
     NapiEnv* root
 )
 {
+    if (!context || (!root && !event_loop)
+        || (root && (!event_loop_is_active(root) || event_loop != event_loop_for_env(root))))
+        return nullptr;
     auto* env = new (std::nothrow) NapiEnv;
     if (!env)
         return nullptr;
     env->runtime_root = root ? root : env;
     env->context = context;
-    env->event_loop = event_loop;
+    if (!root) {
+        env->event_loop = event_loop;
+        env->event_loop_lifecycle = NapiEventLoopLifecycle::active;
+    }
     env->wake_opaque = wake_opaque;
     env->wake_callback = wake_callback;
     env->owner_thread = std::this_thread::get_id();
@@ -1820,9 +1901,15 @@ static void destroy_single_env(NapiEnv* env)
                 continue;
             }
 
-            // Async cleanup owns the loop until the hook removes itself. This
-            // is how addons finish uv_close callbacks before object finalizers.
-            if (env->event_loop) (void)uv_run(env->event_loop, UV_RUN_DEFAULT);
+            // Drive only until this hook unregisters. UV_RUN_DEFAULT would
+            // also wait for unrelated referenced handles on the shared loop.
+            if (auto* loop = event_loop_for_env(env)) {
+                while (std::find(env->async_cleanup_hooks.begin(), env->async_cleanup_hooks.end(), hook)
+                    != env->async_cleanup_hooks.end()) {
+                    if (uv_run(loop, UV_RUN_ONCE) == 0)
+                        break;
+                }
+            }
             auto iterator = std::find(env->async_cleanup_hooks.begin(), env->async_cleanup_hooks.end(), hook);
             if (iterator != env->async_cleanup_hooks.end()) {
                 env->async_cleanup_hooks.erase(iterator);
@@ -1931,19 +2018,23 @@ static void destroy_single_env(NapiEnv* env)
         JSValueUnprotect(env->context, env->wrap_map);
     if (env->logically_detached_buffers)
         JSValueUnprotect(env->context, env->logically_detached_buffers);
+    if (env == env->runtime_root) {
+        env->event_loop_lifecycle = NapiEventLoopLifecycle::unavailable;
+        env->event_loop = nullptr;
+    }
     delete env;
 }
 
 extern "C" CtNapiEnv* ct_napi_env_for_ffi_library(CtNapiEnv* opaque_env, const char* identity)
 {
     auto* root = root_env(static_cast<NapiEnv*>(opaque_env));
-    if (!root || !identity)
+    if (!root || !identity || !event_loop_is_active(root))
         return nullptr;
     auto existing = root->ffi_envs.find(identity);
     if (existing != root->ffi_envs.end())
         return existing->second;
 
-    auto* env = allocate_env(root->context, root->event_loop, root->wake_opaque, root->wake_callback, root);
+    auto* env = allocate_env(root->context, event_loop_for_env(root), root->wake_opaque, root->wake_callback, root);
     if (!env)
         return nullptr;
     env->module_api_version = 9;
@@ -1962,10 +2053,11 @@ extern "C" CtNapiEnv* ct_napi_env_for_ffi_library(CtNapiEnv* opaque_env, const c
 extern "C" void ct_napi_env_destroy(CtNapiEnv* opaque_env)
 {
     auto* root = root_env(static_cast<NapiEnv*>(opaque_env));
-    if (!root)
+    if (!root || !event_loop_is_active(root))
         return;
     MicrotaskDelayScope microtasks(root->context);
 
+    root->event_loop_lifecycle = NapiEventLoopLifecycle::cleanup;
     root->destroying = true;
     for (auto* env : root->addon_envs)
         env->destroying = true;
@@ -1992,8 +2084,9 @@ extern "C" void ct_napi_env_destroy(CtNapiEnv* opaque_env)
             }
             if (pending) break;
         }
-        if (!pending || !root->event_loop) break;
-        (void)uv_run(root->event_loop, UV_RUN_ONCE);
+        auto* loop = event_loop_for_env(root);
+        if (!pending || !loop) break;
+        (void)uv_run(loop, UV_RUN_ONCE);
     }
 
     for (auto iterator = root->addon_envs.rbegin(); iterator != root->addon_envs.rend(); ++iterator)
@@ -2167,10 +2260,10 @@ extern "C" JSValueRef ct_napi_load_addon(
     auto* root = root_env(static_cast<NapiEnv*>(opaque_env));
     if (exception)
         *exception = nullptr;
-    if (!root || !path || !exception)
+    if (!root || !path || !exception || !event_loop_is_active(root))
         return nullptr;
 
-    auto* env = allocate_env(root->context, root->event_loop, root->wake_opaque, root->wake_callback, root);
+    auto* env = allocate_env(root->context, event_loop_for_env(root), root->wake_opaque, root->wake_callback, root);
     if (!env) {
         *exception = make_loader_error(root, "failed to allocate a Node-API environment");
         return nullptr;
@@ -2185,20 +2278,19 @@ extern "C" JSValueRef ct_napi_load_addon(
 
     ModuleRegistrationSession registration_session;
     ModuleRegistrationScope registration_scope(env, &registration_session);
-    dlerror();
-    void* handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
-    const char* open_error = handle ? nullptr : dlerror();
+    AddonLibrary library;
+    const bool opened = library.open(path);
     registration_scope.did_finish_loading();
-    if (!handle) {
-        *exception = make_loader_error(env, std::string("dlopen(") + path + ") failed: " + (open_error ? open_error : "unknown error"));
+    if (!opened) {
+        *exception = make_loader_error(env, std::string("uv_dlopen(") + path + ") failed: " + library.error());
         destroy_single_env(env);
         return nullptr;
     }
+    void* handle = library.key();
 
     if (registration_session.allocation_failed) {
         *exception = make_loader_error(env, "failed to record a native addon registration");
         destroy_single_env(env);
-        dlclose(handle);
         return nullptr;
     }
 
@@ -2208,14 +2300,12 @@ extern "C" JSValueRef ct_napi_load_addon(
         && !find_registered_modules(handle, &registration_session.registrations, &found_cached_registrations)) {
         *exception = make_loader_error(env, "failed to retrieve cached native addon registrations");
         destroy_single_env(env);
-        dlclose(handle);
         return nullptr;
     }
 
     if (registered_during_load && registration_session.invalid) {
         *exception = make_loader_error(env, "Module has no declared entry point.");
         destroy_single_env(env);
-        dlclose(handle);
         return nullptr;
     }
 
@@ -2223,9 +2313,9 @@ extern "C" JSValueRef ct_napi_load_addon(
         if (registered_during_load && !cache_registered_modules(handle, registration_session.registrations)) {
             *exception = make_loader_error(env, "failed to cache native addon registrations");
             destroy_single_env(env);
-            dlclose(handle);
             return nullptr;
         }
+        library.keep_loaded();
 
         JSValueRef current_exports = exports ? static_cast<JSValueRef>(exports) : JSObjectMake(env->context, nullptr, nullptr);
         const size_t cached_registration_count = registration_session.registrations.size();
@@ -2234,7 +2324,7 @@ extern "C" JSValueRef ct_napi_load_addon(
             RegisteredModule registration = registration_session.registrations[index++];
             NapiEnv* module_env = env;
             if (index > 1) {
-                module_env = allocate_env(root->context, root->event_loop, root->wake_opaque, root->wake_callback, root);
+                module_env = allocate_env(root->context, event_loop_for_env(root), root->wake_opaque, root->wake_callback, root);
                 if (!module_env) {
                     *exception = make_loader_error(root, "failed to allocate a Node-API environment");
                     return nullptr;
@@ -2306,13 +2396,12 @@ extern "C" JSValueRef ct_napi_load_addon(
 
     using RegisterFunction = napi_value (*)(napi_env, napi_value);
     using ApiVersionFunction = int32_t (*)();
-    auto* direct_register = reinterpret_cast<RegisterFunction>(dlsym(handle, "napi_register_module_v1"));
-    auto* get_api_version = reinterpret_cast<ApiVersionFunction>(dlsym(handle, "node_api_module_get_api_version_v1"));
+    auto direct_register = library.symbol<RegisterFunction>("napi_register_module_v1");
+    auto get_api_version = library.symbol<ApiVersionFunction>("node_api_module_get_api_version_v1");
     env->module_api_version = get_api_version ? get_api_version() : 8;
     if (!direct_register) {
         *exception = make_loader_error(env, std::string("Native addon ") + path + " does not export a Node-API or V8 module initializer");
         destroy_single_env(env);
-        dlclose(handle);
         return nullptr;
     }
 
@@ -2320,9 +2409,9 @@ extern "C" JSValueRef ct_napi_load_addon(
         exports = JSObjectMake(env->context, nullptr, nullptr);
     if (!retain_addon_env(root, env, exception)) {
         destroy_single_env(env);
-        dlclose(handle);
         return nullptr;
     }
+    library.keep_loaded();
     JSValueRef result = invoke_napi_module(env, direct_register, exports, exception);
     if (*exception)
         return nullptr;
@@ -5182,11 +5271,14 @@ extern "C" napi_status napi_queue_async_work(napi_env opaque_env, napi_async_wor
     auto* work = reinterpret_cast<napi_async_work__*>(opaque_work);
     if (!env || !work || work->env != env)
         return invalid(env);
+    auto* loop = event_loop_is_active(env) ? event_loop_for_env(env) : nullptr;
+    if (!loop)
+        return finish(env, napi_generic_failure);
     int expected = 0;
     if (!work->state.compare_exchange_strong(expected, 1))
         return finish(env, napi_generic_failure);
     work->request.data = work;
-    int status = uv_queue_work(env->event_loop, &work->request, napi_uv_work_execute, napi_uv_work_complete);
+    int status = uv_queue_work(loop, &work->request, napi_uv_work_execute, napi_uv_work_complete);
     if (status != 0) {
         work->state.store(0);
         return finish(env, napi_generic_failure);
@@ -5237,7 +5329,10 @@ extern "C" napi_status napi_get_uv_event_loop(napi_env opaque_env, uv_loop_s** r
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
     if (!env || !result)
         return invalid(env);
-    *result = env->event_loop;
+    auto* loop = event_loop_for_env(env);
+    if (!loop)
+        return finish(env, napi_generic_failure);
+    *result = loop;
     return finish(env, napi_ok);
 }
 
