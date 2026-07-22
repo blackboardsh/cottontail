@@ -3089,7 +3089,7 @@ const Manager = struct {
             }
         }
         if (!installed_from_lock) {
-            _ = try manager.installDependency(scanner, requested, manager.root_dir, true, false);
+            _ = try manager.installDependency(scanner, requested, manager.root_dir, true, false, false);
         }
 
         if (!manager.pathExists(installed_manifest)) {
@@ -5033,7 +5033,7 @@ const Manager = struct {
 
             if (manager.options.only_missing and section.get(name) != null) continue;
             if (!isTarballSpec(requested) and !isGitSpec(requested)) {
-                resolved_version = manager.installDependency(name, requested, parent_dir, true, false) catch |err| {
+                resolved_version = manager.installDependency(name, requested, parent_dir, true, false, false) catch |err| {
                     if (std.mem.startsWith(u8, requested, "npm:")) {
                         try manager.stderr.print("error: {s} failed to resolve\n", .{raw_spec});
                         return error.PackageManagerErrorReported;
@@ -5887,7 +5887,7 @@ const Manager = struct {
             const previous_refresh = manager.refresh_direct_registry;
             manager.refresh_direct_registry = true;
             defer manager.refresh_direct_registry = previous_refresh;
-            break :blk try manager.installDependency(alias, resolution_spec, parent_dir, true, optional);
+            break :blk try manager.installDependency(alias, resolution_spec, parent_dir, true, optional, false);
         };
         return .{
             .alias = alias,
@@ -5934,7 +5934,7 @@ const Manager = struct {
             const previous_refresh = manager.refresh_direct_source;
             manager.refresh_direct_source = true;
             defer manager.refresh_direct_source = previous_refresh;
-            resolved_version = try manager.installDependency(name, saved_spec, parent_dir, true, optional);
+            resolved_version = try manager.installDependency(name, saved_spec, parent_dir, true, optional, false);
         } else if (isGitSpec(requested_spec)) {
             const git = try manager.installGit(null, requested_spec, parent_dir, true, optional, null, &.{});
             alias = git.alias;
@@ -6014,8 +6014,12 @@ const Manager = struct {
             const optional_peer = std.mem.eql(u8, key, "peerDependencies") and peerDependencyIsOptional(package_json, alias);
             if (optional_peer) continue;
             const edge_optional = optional;
-            const resolved_version = manager.installDependency(alias, spec_value.string, parent_dir, direct, edge_optional) catch |err| {
+            const edge_peer = std.mem.eql(u8, key, "peerDependencies");
+            const resolved_version = manager.installDependency(alias, spec_value.string, parent_dir, direct, edge_optional, edge_peer) catch |err| {
                 if (manager.options.command == .link and !direct and err == error.MissingPackageJSON) continue;
+                // COTTONTAIL-COMPAT: Bun resolves peer edges after required
+                // dependencies and leaves an unresolved peer non-fatal.
+                if (edge_peer and err != error.OutOfMemory) continue;
                 if (edge_optional) continue;
                 if (direct and manager.options.command == .install and err == error.PackageManagerErrorReported) {
                     if (manager.deferred_install_error == null) manager.deferred_install_error = err;
@@ -6170,10 +6174,12 @@ const Manager = struct {
         parent_dir: []const u8,
         direct: bool,
         optional: bool,
+        peer: bool,
     ) anyerror![]const u8 {
         var workspace_package = manager.isWorkspaceDependency(alias, spec);
         const effective_spec = manager.manifest_policy.?.resolveDependency(alias, spec, workspace_package) catch |err| {
             if (err == error.CatalogDependencyNotFound or err == error.InvalidCatalogDependency) {
+                if (peer) return err;
                 try manager.stderr.print("error: {s}@{s} failed to resolve\n", .{ alias, spec });
                 return error.PackageManagerErrorReported;
             }
@@ -6275,7 +6281,7 @@ const Manager = struct {
         if (isLocalSpec(resolution_spec)) {
             if (protocol_patch_paths.len > 0) return error.UnsupportedPatchResolution;
             const local = manager.resolveLocalPackage(resolution_spec, parent_dir) catch |err| {
-                if (err == error.MissingPackageJSON and !optional) {
+                if (err == error.MissingPackageJSON and !optional and !peer) {
                     try manager.stderr.print(
                         "note: error occurred while resolving {s}@{s}\n",
                         .{ alias, resolution_spec },
@@ -6397,7 +6403,7 @@ const Manager = struct {
             if (try manager.findInstalledVersion(alias, resolution_spec, parent_dir, direct, protocol_patch_paths)) |installed| return installed;
         }
 
-        const fetch_log_level: FetchLogLevel = if (optional) .warn else .err;
+        const fetch_log_level: FetchLogLevel = if (optional or peer) .warn else .err;
         const resolved = manager.resolveRegistryPackageWithLogLevel(registry_name, selected_registry_spec, fetch_log_level) catch |err| {
             if (err == error.InvalidRegistryURL or err == error.UnsupportedRegistryScheme) {
                 const configured = manager.registryConfigForPackage(registry_name);
@@ -6405,17 +6411,18 @@ const Manager = struct {
                 if (err == error.InvalidRegistryURL) {
                     try manager.stderr.print(
                         "{s}: Failed to join registry \"{s}\" and package \"{s}\" URLs\n",
-                        .{ if (optional) "warn" else "error", source_url, registry_name },
+                        .{ if (optional or peer) "warn" else "error", source_url, registry_name },
                     );
                 } else {
                     try manager.stderr.print(
                         "{s}: Registry URL must be http:// or https://\nReceived: \"{s}\"\n",
-                        .{ if (optional) "warn" else "error", source_url },
+                        .{ if (optional or peer) "warn" else "error", source_url },
                     );
                 }
                 return error.PackageManagerErrorReported;
             }
             if (err == error.TooRecentVersion or err == error.AllVersionsTooRecent) {
+                if (peer) return err;
                 const minimum_age_seconds = (manager.options.minimum_release_age_ms orelse 0) / std.time.ms_per_s;
                 try manager.stderr.print(
                     "error: No version matching \"{s}\" found for specifier \"{s}\" (blocked by minimum-release-age: {d} seconds)\n",
@@ -6433,6 +6440,7 @@ const Manager = struct {
                 return manager.installResolvedWorkspace(alias, workspace, parent_dir, direct, protocol_patch_paths);
             }
             if (err == error.NoMatchingVersion) {
+                if (peer) return err;
                 const package_exists = manager.registry_manifests.contains(registry_name);
                 try manager.stderr.print(
                     "error: No version matching \"{s}\" found for specifier \"{s}\"{s}\n",
@@ -6440,7 +6448,7 @@ const Manager = struct {
                 );
                 return error.PackageManagerErrorReported;
             }
-            if (!optional and (err == error.RegistryManifestRequestFailed or err == error.PackageManagerErrorReported)) {
+            if (!optional and !peer and (err == error.RegistryManifestRequestFailed or err == error.PackageManagerErrorReported)) {
                 try manager.stderr.print("error: {s}@{s} failed to resolve\n", .{ alias, registry_spec });
                 return error.PackageManagerErrorReported;
             }
@@ -7232,8 +7240,9 @@ const Manager = struct {
                         requested.parent_dir,
                         requested.direct,
                         optional,
+                        true,
                     ) catch |err| {
-                        if (!optional) return err;
+                        if (err == error.OutOfMemory) return err;
                     };
                 }
             }
@@ -7572,7 +7581,10 @@ const Manager = struct {
                 try manager.maybeWarnPeerConflict(range_value.string, provider);
                 continue;
             }
-            _ = try manager.installDependency(alias, range_value.string, dependency_parent_dir, false, false);
+            _ = manager.installDependency(alias, range_value.string, dependency_parent_dir, false, false, true) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                continue;
+            };
         }
     }
 
