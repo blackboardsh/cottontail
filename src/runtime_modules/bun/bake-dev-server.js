@@ -3,6 +3,7 @@ import { readFileSync, readdirSync, statSync, writeFileSync } from "../node/fs.j
 import { pathToFileURL } from "../node/url.js";
 import { __setBuiltinModules } from "../node/module.js";
 import { Bun, HTMLRewriter, Response as RuntimeResponse, serve } from "./index.js";
+import bundledReactRefreshSource from "./bake-react-refresh.txt";
 import {
   bakeGraphAttributeFiles,
   contentTypeForStaticFile,
@@ -408,6 +409,17 @@ function localHtmlModuleScripts(source, htmlPath) {
   return scripts;
 }
 
+function hasLinkedHtmlAssets(source) {
+  let found = false;
+  new HTMLRewriter()
+    .on("link[href]", { element() { found = true; } })
+    .on("img[src], source[src], source[srcset], video[src], video[poster], audio[src], iframe[src], embed[src], object[data]", {
+      element() { found = true; },
+    })
+    .transform(source);
+  return found;
+}
+
 function rewriteHtmlCssAssets(source, replacements) {
   if (replacements.size === 0) return source;
   return new HTMLRewriter().on("link", {
@@ -590,7 +602,25 @@ function developmentBuildConditions(options, extras = []) {
   return [...new Set([...configured, "development", ...extras])];
 }
 
-async function buildInternalBakeEntry(entryPath, outdir, buildConfig) {
+function reactRefreshBuildOptions(entryPath, buildConfig) {
+  const projectRoot = globalThis.process?.cwd?.() ?? ".";
+  let refreshPath = resolveBakeImport(entryPath, "react-refresh/runtime", {
+    alias: buildConfig.alias,
+  });
+  let alias = buildConfig.alias;
+  let files;
+  if (refreshPath === null && resolveBakeImport(entryPath, "react", { alias }) !== null) {
+    refreshPath = path.join(projectRoot, ".cottontail-bake-react-refresh.js");
+    alias = { ...(alias ?? {}), "react-refresh/runtime": refreshPath };
+    files = { [refreshPath]: bundledReactRefreshSource };
+  }
+  return { alias, files, refreshPath, usesBundledFallback: files !== undefined };
+}
+
+async function buildInternalBakeEntry(entryPath, outdir, buildConfig, refreshOptions = null) {
+  const projectRoot = globalThis.process?.cwd?.() ?? ".";
+  const { alias, files, refreshPath, usesBundledFallback } =
+    refreshOptions ?? reactRefreshBuildOptions(entryPath, buildConfig);
   const result = await Bun.build({
     entrypoints: [entryPath],
     target: "browser",
@@ -600,6 +630,10 @@ async function buildInternalBakeEntry(entryPath, outdir, buildConfig) {
     format: "internal_bake_dev",
     minify: false,
     sourcemap: "external",
+    reactFastRefresh: refreshPath !== null,
+    alias,
+    files,
+    metafile: usesBundledFallback,
     define: developmentBuildDefines(buildConfig, "client"),
     env: buildConfig.env,
     conditions: developmentBuildConditions(buildConfig, ["browser"]),
@@ -611,7 +645,24 @@ async function buildInternalBakeEntry(entryPath, outdir, buildConfig) {
   }
   const artifact = result.outputs.find(isJavaScriptEntry);
   if (!artifact) throw new Error(`Bake's internal build did not emit ${entryPath}`);
-  return artifact;
+  const refreshId = usesBundledFallback
+    ? Object.keys(result.metafile?.inputs ?? {}).find(inputPath =>
+      path.basename(inputPath) === path.basename(refreshPath)
+    )
+    : refreshPath === null ? null : moduleIdForPath(projectRoot, refreshPath);
+  return {
+    artifact,
+    outputs: result.outputs,
+    refreshId: refreshId ?? null,
+  };
+}
+
+async function internalBakeEntry(entryPath, outdir, buildConfig, eagerBuilds = null) {
+  const pending = eagerBuilds?.get(entryPath);
+  if (pending === undefined) return buildInternalBakeEntry(entryPath, outdir, buildConfig);
+  const { error, value } = await pending;
+  if (error !== undefined) throw error;
+  return value;
 }
 
 function bakeRegistrySource(source) {
@@ -874,20 +925,30 @@ function createHtmlDispatcher(config, development) {
     packets.push(update.packet);
   }
 
-  async function buildDeferredHtmlHmr(sourceText, htmlPath, outdir, buildConfig) {
+  async function buildDeferredHtmlHmr(
+    sourceText,
+    htmlPath,
+    outdir,
+    buildConfig,
+    eagerBuilds = null,
+    requireStandalone = false,
+  ) {
     const scripts = localHtmlModuleScripts(sourceText, htmlPath);
     if (scripts.length === 0) return null;
 
     const hmrEntries = [];
     for (const { assetPath, entryPath } of scripts) {
-      let artifact;
+      let internal;
       try {
-        artifact = await buildInternalBakeEntry(entryPath, outdir, buildConfig);
+        internal = await internalBakeEntry(entryPath, outdir, buildConfig, eagerBuilds);
       } catch {
         return null;
       }
+      const { artifact, outputs, refreshId } = internal;
+      if (requireStandalone && outputs.some(output => output !== artifact && output.kind !== "sourcemap")) return null;
 
       let source = await artifact.text();
+      if (refreshId !== null) source = addBakeBundleConfig(source, "refresh", refreshId);
       const sourceMapRecord = await sourceMapRecordForArtifact(artifact, [artifact], source, projectRoot);
       if (artifact.sourcemap) {
         const sourceMapPath = `${assetPath}.map`;
@@ -945,6 +1006,30 @@ function createHtmlDispatcher(config, development) {
       const buildConfig = await staticConfig;
       const sourceText = await Bun.file(htmlPath).text();
       const outdir = path.join(projectRoot, ".cottontail-tmp", "bake-html", String(buildId++));
+      const htmlScripts = localHtmlModuleScripts(sourceText, htmlPath);
+      const eagerInternalBuilds = new Map();
+      if (
+        development &&
+        buildConfig.hmr !== false &&
+        htmlScripts.length === 1 &&
+        !hasLinkedHtmlAssets(sourceText)
+      ) {
+        const { entryPath } = htmlScripts[0];
+        const refreshOptions = reactRefreshBuildOptions(entryPath, buildConfig);
+        if (refreshOptions.usesBundledFallback) {
+          eagerInternalBuilds.set(entryPath, buildInternalBakeEntry(entryPath, outdir, buildConfig, refreshOptions)
+            .then(value => ({ value }), error => ({ error })));
+          const direct = await buildDeferredHtmlHmr(
+            sourceText,
+            htmlPath,
+            outdir,
+            buildConfig,
+            eagerInternalBuilds,
+            true,
+          );
+          if (direct !== null) return direct;
+        }
+      }
       const result = await Bun.build({
         entrypoints: [htmlPath],
         target: "browser",
@@ -969,7 +1054,13 @@ function createHtmlDispatcher(config, development) {
       if (!result.success) {
         if (development) {
           if (buildConfig.hmr !== false && canDeferBakeHmrBuildErrors(result.logs ?? [])) {
-            const deferred = await buildDeferredHtmlHmr(sourceText, htmlPath, outdir, buildConfig);
+            const deferred = await buildDeferredHtmlHmr(
+              sourceText,
+              htmlPath,
+              outdir,
+              buildConfig,
+              eagerInternalBuilds,
+            );
             if (deferred !== null) return deferred;
           }
           const internalLogs = buildConfig.hmr === false
@@ -1019,8 +1110,14 @@ function createHtmlDispatcher(config, development) {
           ) ?? await sourceEntryForArtifact(artifact, projectRoot);
           if (entryPath) {
             let internalArtifact;
+            let refreshId;
             try {
-              internalArtifact = await buildInternalBakeEntry(entryPath, outdir, buildConfig);
+              ({ artifact: internalArtifact, refreshId } = await internalBakeEntry(
+                entryPath,
+                outdir,
+                buildConfig,
+                eagerInternalBuilds,
+              ));
             } catch (error) {
               if (error instanceof AggregateError) {
                 const errors = bakeBuildErrors(error.errors ?? [], entryPath);
@@ -1036,6 +1133,7 @@ function createHtmlDispatcher(config, development) {
               throw error;
             }
             let source = await internalArtifact.text();
+            if (refreshId !== null) source = addBakeBundleConfig(source, "refresh", refreshId);
             const sourceMapRecord = await sourceMapRecordForArtifact(
               internalArtifact,
               [internalArtifact],
