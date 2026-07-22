@@ -306,7 +306,11 @@ const FetchLogLevel = enum {
 
 fn packageManagerFetchErrorName(err: anyerror) []const u8 {
     return switch (err) {
-        error.TlsCertificateNotVerified => "DEPTH_ZERO_SELF_SIGNED_CERT",
+        // COTTONTAIL-COMPAT: Zig's HTTP client collapses TLS certificate
+        // verification failures into TlsInitializationFailed at its TCP/TLS
+        // boundary. Bun exposes this untrusted-registry condition with its
+        // certificate-specific error code.
+        error.TlsCertificateNotVerified, error.TlsInitializationFailed => "DEPTH_ZERO_SELF_SIGNED_CERT",
         else => @errorName(err),
     };
 }
