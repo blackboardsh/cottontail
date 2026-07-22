@@ -241,6 +241,38 @@ class ProcessReadable {
   }
 }
 
+class ProcessReadableSlot {
+  constructor(concatChunks, cancel = undefined) {
+    this._concatChunks = concatChunks;
+    this._cancel = cancel;
+    this._chunks = [];
+    this._stream = undefined;
+    this._ended = false;
+  }
+
+  get() {
+    if (this._stream !== undefined) return this._stream;
+    const stream = new ProcessReadable(this._concatChunks, this._cancel);
+    stream._chunks = this._chunks;
+    this._chunks = null;
+    if (this._ended) stream._finish();
+    this._stream = stream;
+    return stream;
+  }
+
+  push(chunk) {
+    if (this._ended) return;
+    if (this._stream !== undefined) this._stream._push(chunk);
+    else this._chunks.push(chunk);
+  }
+
+  finish() {
+    if (this._ended) return;
+    this._ended = true;
+    this._stream?._finish();
+  }
+}
+
 class ProcessWritable {
   constructor(host, processId, asBuffer) {
     this._host = host;
@@ -681,6 +713,8 @@ export function createBunSpawnRuntime(deps) {
     let disconnected = false;
     let disconnectNotified = false;
     let extraFds = [];
+    let stdoutPipe = null;
+    let stderrPipe = null;
     const terminal = nativeOptions.terminal;
 
     const child = {
@@ -688,16 +722,16 @@ export function createBunSpawnRuntime(deps) {
       stdin: terminal ? null : nativeOptions.stdinFd != null && nativeOptions.stdinFd !== 0
         ? nativeOptions.stdinFd
         : undefined,
-      stdout: terminal ? null : nativeOptions.stdoutFd != null && nativeOptions.stdoutFd !== 1
-        ? nativeOptions.stdoutFd
-        : nativeOptions.stdout === "pipe" && nativeOptions.stdoutFilePath == null && nativeOptions.stdoutBuffer == null
-          ? new ProcessReadable(concatChunks, () => host.spawnCloseOutput?.(child._id, 1))
-          : undefined,
-      stderr: terminal ? null : nativeOptions.stderrFd != null && nativeOptions.stderrFd !== 2
-        ? nativeOptions.stderrFd
-        : nativeOptions.stderr === "pipe" && nativeOptions.stderrFilePath == null && nativeOptions.stderrBuffer == null
-          ? new ProcessReadable(concatChunks, () => host.spawnCloseOutput?.(child._id, 2))
-          : undefined,
+      get stdout() {
+        if (terminal) return null;
+        if (nativeOptions.stdoutFd != null && nativeOptions.stdoutFd !== 1) return nativeOptions.stdoutFd;
+        return stdoutPipe?.get();
+      },
+      get stderr() {
+        if (terminal) return null;
+        if (nativeOptions.stderrFd != null && nativeOptions.stderrFd !== 2) return nativeOptions.stderrFd;
+        return stderrPipe?.get();
+      },
       get readable() { return child.stdout; },
       get writable() { return child.stdin; },
       get stdio() { return [null, null, null, ...extraFds]; },
@@ -844,6 +878,16 @@ export function createBunSpawnRuntime(deps) {
     }
     child._id = native.id;
     child._ipcFd = native.ipcFd == null ? -1 : Number(native.ipcFd);
+    if (!terminal && nativeOptions.stdout === "pipe" &&
+        (nativeOptions.stdoutFd == null || nativeOptions.stdoutFd === 1) &&
+        nativeOptions.stdoutFilePath == null && nativeOptions.stdoutBuffer == null) {
+      stdoutPipe = new ProcessReadableSlot(concatChunks, () => host.spawnCloseOutput?.(native.id, 1));
+    }
+    if (!terminal && nativeOptions.stderr === "pipe" &&
+        (nativeOptions.stderrFd == null || nativeOptions.stderrFd === 2) &&
+        nativeOptions.stderrFilePath == null && nativeOptions.stderrBuffer == null) {
+      stderrPipe = new ProcessReadableSlot(concatChunks, () => host.spawnCloseOutput?.(native.id, 2));
+    }
     extraFds = Array.isArray(native.extraFds) ? native.extraFds : [];
     while (extraFds.length > 0 && extraFds.at(-1) == null) extraFds.pop();
     const ownedExtraFds = extraFds.filter((fd, index) =>
@@ -934,8 +978,8 @@ export function createBunSpawnRuntime(deps) {
         }
         if (nativeOptions.stdoutBuffer != null) writeOutputBuffer(nativeOptions.stdoutBuffer, concatChunks(stdoutChunks));
         if (nativeOptions.stderrBuffer != null) writeOutputBuffer(nativeOptions.stderrBuffer, concatChunks(stderrChunks));
-        child.stdout?._finish?.();
-        child.stderr?._finish?.();
+        stdoutPipe?.finish();
+        stderrPipe?.finish();
         notifyDisconnect();
         emit("close", exitCode, signalCode);
         host.spawnDispose?.(native.id);
@@ -950,21 +994,21 @@ export function createBunSpawnRuntime(deps) {
           if (isStdout) {
             if (nativeOptions.stdoutBuffer != null) stdoutChunks.push(chunk);
             stdoutLength += chunk.byteLength;
-            child.stdout?._push?.(chunk);
+            stdoutPipe?.push(chunk);
           } else {
             if (nativeOptions.stderrBuffer != null) stderrChunks.push(chunk);
             stderrLength += chunk.byteLength;
-            child.stderr?._push?.(chunk);
+            stderrPipe?.push(chunk);
           }
           enforceMaxBuffer();
           return;
         }
         if (event.type === "stdout_end") {
-          child.stdout?._finish?.();
+          stdoutPipe?.finish();
           return;
         }
         if (event.type === "stderr_end") {
-          child.stderr?._finish?.();
+          stderrPipe?.finish();
           return;
         }
         if (event.type === "ipc") {
