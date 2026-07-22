@@ -4221,6 +4221,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
     },
+    "test/regression/issue/08093.test.ts": {
+      "status": "enabled",
+      "reason": "Vendored node_modules installation through hardlinks passes the copied regression case (1 case, 17 assertions)."
+    },
     "test/regression/issue/08095.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (4 bun:test cases, 14 assertions)."
@@ -4451,6 +4455,14 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
     },
+    "test/regression/issue/21907.test.ts": {
+      "status": "enabled",
+      "reason": "The CSS parser handles extremely large floating-point values without crashing (1 case, 4 assertions)."
+    },
+    "test/regression/issue/22003.test.ts": {
+      "status": "enabled",
+      "reason": "Source maps correctly escape tab characters in filenames (1 case, 5 assertions)."
+    },
     "test/regression/issue/22243.test.ts": {
       "status": "enabled",
       "reason": "RedisClient constructor invocation semantics pass both copied regression cases on a freshly embedded runtime (2 cases, 2 assertions)."
@@ -4531,6 +4543,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
     },
+    "test/regression/issue/23474.test.ts": {
+      "status": "enabled",
+      "reason": "WebSocket upgrades preserve cookies set through request.cookies with default and custom response headers (2 cases, 10 assertions)."
+    },
     "test/regression/issue/23489.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 6 assertions)."
@@ -4538,6 +4554,10 @@
     "test/regression/issue/23621.test.ts": {
       "status": "enabled",
       "reason": "RedisClient validates malformed URLs and TCP ports while accepting valid TCP, TLS, Unix, and default URLs (13 cases, 24 assertions)."
+    },
+    "test/regression/issue/23649.test.ts": {
+      "status": "enabled",
+      "reason": "Invalid async-function and labeled async-function syntax returns compiler diagnostics without parser assertions (2 cases, 2 snapshots)."
     },
     "test/regression/issue/23723.test.js": {
       "status": "enabled",
