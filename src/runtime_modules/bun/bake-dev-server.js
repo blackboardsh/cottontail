@@ -2181,6 +2181,13 @@ function createFrameworkDispatcher(config) {
     record.pathname = new URL(String(pathname), "http://localhost/").pathname;
     return record.id;
   };
+  dispatchFrameworkRequest.prepare = async () => {
+    for (const router of routers) {
+      for (const route of router.router.routes()) {
+        await bundleRoute(router, { params: null, route: route.route });
+      }
+    }
+  };
   dispatchFrameworkRequest.invalidate = () => {
     bundles.clear();
     for (const record of routeRecords) {
@@ -2599,7 +2606,7 @@ Object.defineProperty(globalThis, Symbol.for("cottontail.internal.buildBakeProdu
   writable: false,
 });
 
-export function startDefaultApp(entryNamespace) {
+export async function startDefaultApp(entryNamespace) {
   const exportedConfig = entryNamespace?.default;
   if (!isServerConfig(exportedConfig) || globalThis.__cottontailServeEverCalled) return null;
   const config = normalizeDefaultServerConfig(exportedConfig);
@@ -2610,6 +2617,7 @@ export function startDefaultApp(entryNamespace) {
   const htmlFetch = createHtmlDispatcher(normalizedConfig, development);
   const baseConfig = htmlFetch?.serveConfig ?? normalizedConfig;
   const frameworkFetch = baseConfig.app !== undefined ? createFrameworkDispatcher(baseConfig) : null;
+  await frameworkFetch?.prepare?.();
   const bakeRuntime = htmlFetch || frameworkFetch
     ? {
         projectRoot: htmlFetch?.projectRoot ?? frameworkFetch?.projectRoot,

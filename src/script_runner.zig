@@ -6995,7 +6995,7 @@ fn writeCottontailEntryWrapper(
         \\{s}  globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
         \\  const __ctPluginEntry = await globalThis.__cottontailResolvePluginEntrypoint?.({s}, {s});
         \\  const __ctEntryNamespace = __ctPluginEntry?.matched ? await __ctPluginEntry.value : await import({s});
-        \\  __ctStartDefaultApp(__ctEntryNamespace);
+        \\  await __ctStartDefaultApp(__ctEntryNamespace);
         \\}} finally {{
         \\  globalThis.__cottontailLoadingTestModules = false;
         \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
@@ -9293,10 +9293,19 @@ fn writeRuntimeEntryWrapper(
     const dns_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "dns.js" });
     const dns_promises_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "dns", "promises.js" });
     const tls_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "tls.js" });
+    const start_default_app_import = if (runtime_module_entrypoint)
+        try std.fmt.allocPrint(
+            ctx.allocator,
+            "import {{ startDefaultApp as __ctStartDefaultApp }} from {s};",
+            .{try jsonStringLiteral(ctx, try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "bun", "bake-dev-server.js" }))},
+        )
+    else
+        "";
 
     const imports_a = try std.fmt.allocPrint(
         ctx.allocator,
         \\import {s};
+        \\{s}
         \\import * as fs from {s};
         \\import * as fsPromises from {s};
         \\import * as os from {s};
@@ -9317,6 +9326,7 @@ fn writeRuntimeEntryWrapper(
     ,
         .{
             try jsonStringLiteral(ctx, bun_module),
+            start_default_app_import,
             try jsonStringLiteral(ctx, fs_module),
             try jsonStringLiteral(ctx, fs_promises_module),
             try jsonStringLiteral(ctx, os_module),
@@ -9457,8 +9467,10 @@ fn writeRuntimeEntryWrapper(
         \\const __ctEntryPath = globalThis.process?.argv?.[1];
         \\if (!__ctEntryPath) throw new Error("Missing runtime entrypoint");
         \\const __ctPluginEntry = await globalThis.__cottontailResolvePluginEntrypoint?.(__ctEntryPath, __ctEntryPath);
-        \\if (__ctPluginEntry?.matched) await __ctPluginEntry.value;
-        \\else await globalThis.__cottontailImportModule(__ctEntryPath, __ctEntryPath, undefined, true);
+        \\const __ctEntryNamespace = __ctPluginEntry?.matched
+        \\  ? await __ctPluginEntry.value
+        \\  : await globalThis.__cottontailImportModule(__ctEntryPath, __ctEntryPath, undefined, true);
+        \\await __ctStartDefaultApp(__ctEntryNamespace);
     else if (bundle_entry)
         try std.fmt.allocPrint(ctx.allocator,
             \\const __ctPluginEntry = await globalThis.__cottontailResolvePluginEntrypoint?.({s}, {s});

@@ -127,6 +127,43 @@ test("runtime module launcher is reused while entry sources stay live", async ()
   expect(statSync(manifestPath).mtimeMs).toBe(recoveredManifestMtime);
 }, 60_000);
 
+test("runtime module launcher starts an exported server config", async () => {
+  const entry = join(project, "default-server.mjs");
+  const ready = join(project, "default-server.ready");
+  writeFileSync(entry, [
+    "export default {",
+    "  port: 0,",
+    '  fetch() { return new Response("runtime server"); },',
+    "};",
+    "",
+  ].join("\n"));
+
+  const child = Bun.spawn({
+    cmd: [process.execPath, entry],
+    cwd: project,
+    env: {
+      ...process.env,
+      COTTONTAIL_TMP_DIR: cacheRoot,
+      BUN_DEV_SERVER_TEST_RUNNER: "1",
+      BUN_DEV_SERVER_TEST_READY_FILE: ready,
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  try {
+    const deadline = Date.now() + 5_000;
+    while (!existsSync(ready) && child.exitCode === null && Date.now() < deadline) await Bun.sleep(10);
+    expect(child.exitCode).toBeNull();
+    expect(existsSync(ready)).toBe(true);
+
+    const port = Number(readFileSync(ready, "utf8"));
+    expect(await fetch(`http://127.0.0.1:${port}`).then(response => response.text())).toBe("runtime server");
+  } finally {
+    child.kill();
+    await child.exited;
+  }
+}, 10_000);
+
 test("shared runtime launcher stays reusable while an entry is running", async () => {
   const dependency = join(project, "leased-dependency.mjs");
   const entry = join(project, "leased-entry.mjs");
