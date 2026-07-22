@@ -90,6 +90,7 @@ import {
   incomingRequestURLFactory,
 } from "../internal/bun-http-server.js";
 import { installStandaloneRuntimeLoaders } from "../internal/standalone-runtime.js";
+import { runtimeDefaultUserAgent } from "../internal/runtime-options.js";
 
 const estimatedMemoryCostSymbol = Symbol.for("cottontail.estimatedMemoryCost");
 const stackFunctionRegistrySymbol = Symbol.for("cottontail.stackFunctionRegistry");
@@ -7880,7 +7881,10 @@ function fetchUsesKeepalive(request) {
 function applyDefaultFetchHeaders(request, keepalive = fetchUsesKeepalive(request)) {
   const headers = request.headers;
   if (!headers.has("user-agent")) {
-    headers.set("User-Agent", globalThis.navigator?.userAgent ?? `Bun/${BunObject.version ?? "1.0.0"}`);
+    headers.set(
+      "User-Agent",
+      runtimeDefaultUserAgent(globalThis.navigator?.userAgent ?? `Bun/${BunObject.version ?? "1.0.0"}`),
+    );
   }
   if (!headers.has("accept")) headers.set("Accept", "*/*");
   if (keepalive && !headers.has("connection")) headers.set("Connection", "keep-alive");

@@ -294,6 +294,7 @@ fn runtimeFlagTakesValue(arg: []const u8) bool {
         "--preload",
         "--env-file",
         "--env-file-if-exists",
+        "--user-agent",
         "--tsconfig-override",
         "--diagnostic-dir",
         "--redirect-warnings",
@@ -2973,6 +2974,11 @@ test "runtime flags can precede the test command" {
     try std.testing.expectEqualStrings("--conditions", normalized[3]);
     try std.testing.expectEqualStrings("shell", normalized[4]);
     try std.testing.expectEqualStrings("suite.test.ts", normalized[5]);
+}
+
+test "runtime user agent consumes its value" {
+    try std.testing.expect(runtimeFlagTakesValue("--user-agent"));
+    try std.testing.expect(!runtimeFlagTakesValue("--user-agent=Cottontail/1.0"));
 }
 
 test "test entrypoint names use supported test extensions" {
