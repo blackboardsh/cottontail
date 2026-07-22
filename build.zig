@@ -363,9 +363,28 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
         }),
         .flags = if (resolved_target.os.tag == .windows) &.{} else &.{"-fPIC"},
     });
-    step.root_module.addCSourceFile(.{
-        .file = b.path("src/jsc_runner.c"),
-        .flags = &[_][]const u8{
+    step.root_module.addCSourceFiles(.{
+        .root = b.path("."),
+        .files = &.{
+            "src/jsc_runner.c",
+            "src/native_bindings/registry.c",
+            "src/native_bindings/runtime.c",
+            "src/native_bindings/filesystem.c",
+            "src/native_bindings/process.c",
+            "src/native_bindings/http.c",
+            "src/native_bindings/tooling.c",
+            "src/native_bindings/memory_ffi.c",
+            "src/native_bindings/worker.c",
+            "src/native_bindings/system.c",
+            "src/native_bindings/compression.c",
+            "src/native_bindings/crypto.c",
+            "src/native_bindings/dns.c",
+            "src/native_bindings/sockets.c",
+            "src/native_bindings/tls.c",
+            "src/native_bindings/sqlite.c",
+            "src/native_bindings/platform.c",
+        },
+        .flags = &.{
             "-std=c11",
             "-Wno-deprecated-declarations",
             "-DSQLITE_ENABLE_COLUMN_METADATA",
