@@ -116,6 +116,18 @@ const runtimePackageReplacements = new Map([
     const namespace = require("../bun/utf-8-validate.js");
     return namespace.default ?? namespace;
   })],
+  ["ws", lazyBuiltin(() => {
+    const namespace = require("../vendor/ws.js");
+    return namespace.default ?? namespace;
+  })],
+  ["ws/lib/websocket", lazyBuiltin(() => {
+    const namespace = require("../vendor/ws.js");
+    return namespace.default ?? namespace;
+  })],
+  ["next/dist/compiled/ws", lazyBuiltin(() => {
+    const namespace = require("../vendor/ws.js");
+    return namespace.default ?? namespace;
+  })],
 ]);
 
 function hasRuntimePackageReplacement(name) {
@@ -2573,13 +2585,23 @@ function executeBundledCommonJsModule(module, filename, source) {
     }
     throw error;
   }
+  if (/(?<![.\w$])import\s*\((?!\s*\))/.test(bundled)) {
+    bundled = replaceCodePattern(
+      bundled,
+      /(?<![.\w$])import\s*\((?!\s*\))/g,
+      `${CJS_DYNAMIC_IMPORT_BINDING}(`,
+    );
+  }
   maybeRegisterSourceMap(filename, bundled);
   recordCompileCache(filename, bundled);
   const createFactory = cottontail.compileFunction(
-    `(function(__ctImportMeta) { return (\n${bundled}\n); })`,
+    `(function(__ctImportMeta, ${CJS_DYNAMIC_IMPORT_BINDING}) { return (\n${bundled}\n); })`,
     filename,
   );
-  const factory = createFactory(importMetaForModule(filename));
+  const factory = createFactory(
+    importMetaForModule(filename),
+    async (specifier, options) => globalThis.__cottontailImportModule(String(specifier), filename, options),
+  );
   if (typeof factory !== "function") {
     throw new TypeError(`Runtime bundle for '${filename}' did not produce a CommonJS wrapper`);
   }
