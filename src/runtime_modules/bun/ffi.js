@@ -2498,7 +2498,13 @@ function loadWorkerRuntimePrelude(tempDir, cwd, runtimeEntry, nonce) {
 
   if (runtimePrelude === undefined) {
     const preludeEntry = `${tempDir}/bun-worker-runtime-${nonce}.mjs`;
-    cottontail.writeFile(preludeEntry, `import ${JSON.stringify(runtimeEntry)};`);
+    // Prepared Node workers append their wrapper without rebundling it. Install
+    // the module loader before that wrapper imports node:worker_threads.
+    const moduleEntry = runtimeEntry.replace(/\/bun\/ffi\.js$/, "/node/module.js");
+    cottontail.writeFile(preludeEntry, [
+      `import ${JSON.stringify(runtimeEntry)};`,
+      `import ${JSON.stringify(moduleEntry)};`,
+    ].join("\n"));
     try {
       runtimePrelude = cottontail.bundleNative(preludeEntry, cottontail.cwd(), JSON.stringify({
         format: "esm",
