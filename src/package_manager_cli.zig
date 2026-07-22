@@ -8772,8 +8772,11 @@ const Manager = struct {
         const tarball_url = try resolveRegistryTarballURL(manager.allocator, configured_registry.url, tarball_value.string);
         return .{
             .name = if (metadata.object.get("name")) |value| if (value == .string) value.string else name else name,
-            .version = version_value,
-            .latest_version = latest_version,
+            .version = try normalizeRegistryVersion(manager.allocator, version_value),
+            .latest_version = if (latest_version) |latest|
+                try normalizeRegistryVersion(manager.allocator, latest)
+            else
+                null,
             .tarball = tarball_url,
             .integrity = integrity,
             .metadata = metadata,
@@ -11162,6 +11165,14 @@ fn encodePackageName(allocator: std.mem.Allocator, name: []const u8) ![]const u8
     if (!std.mem.startsWith(u8, name, "@")) return allocator.dupe(u8, name);
     const slash = std.mem.indexOfScalar(u8, name, '/') orelse return allocator.dupe(u8, name);
     return std.fmt.allocPrint(allocator, "{s}%2f{s}", .{ name[0..slash], name[slash + 1 ..] });
+}
+
+fn normalizeRegistryVersion(allocator: std.mem.Allocator, version_value: []const u8) ![]const u8 {
+    const parsed = Semver.Version.parseUTF8(version_value);
+    if (!parsed.valid) return version_value;
+    // COTTONTAIL-COMPAT: npm accepts loose manifest versions such as
+    // `0.0.2rc1`; Bun stores and displays the canonical `0.0.2-rc1` form.
+    return std.fmt.allocPrint(allocator, "{f}", .{parsed.version.min().fmt(version_value)});
 }
 
 fn semverSatisfies(allocator: std.mem.Allocator, range: []const u8, version_value: []const u8) bool {
