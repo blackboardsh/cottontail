@@ -6557,7 +6557,7 @@ const Manager = struct {
     }
 
     fn directDependencyWasAdded(manager: *const Manager, alias: []const u8) bool {
-        const graph = if (manager.lock_graph) |*value| value else return true;
+        const graph = if (manager.lock_graph) |*value| value else return !manager.initial_root_versions.contains(alias);
         return graph.rootDependencySpec(alias) == null;
     }
 
@@ -6914,7 +6914,7 @@ const Manager = struct {
                 manager.options.os,
             );
         }
-        if (!platform_matches and (optional or manager.options.cpu_overridden or manager.options.os_overridden)) {
+        if (!platform_matches) {
             const previous_resolution_only = manager.setResolutionOnly(true);
             defer manager.restoreResolutionOnly(previous_resolution_only);
             if (isTopLevelDestination(manager.root_dir, destination, alias)) {
@@ -7173,8 +7173,7 @@ const Manager = struct {
         }
         const skip_for_platform = package.kind == .npm and
             package.info != null and
-            !packageSupportsPlatform(package.info.?, manager.options.cpu, manager.options.os) and
-            (optional or manager.options.cpu_overridden or manager.options.os_overridden);
+            !packageSupportsPlatform(package.info.?, manager.options.cpu, manager.options.os);
         if (skip_for_platform) {
             const previous_resolution_only = manager.setResolutionOnly(true);
             defer manager.restoreResolutionOnly(previous_resolution_only);
@@ -12369,16 +12368,7 @@ fn packageSupportsPlatform(
     if (metadata.object.get("cpu")) |cpu| {
         if (!platformSetFromJson(Npm.Architecture, cpu).isMatch(cpu_target)) return false;
     }
-    if (metadata.object.get("libc")) |libc| {
-        const target = currentLibcName() orelse return false;
-        if (!platformFieldMatches(libc, target)) return false;
-    }
     return true;
-}
-
-fn currentLibcName() ?[]const u8 {
-    if (builtin.os.tag != .linux) return null;
-    return if (std.mem.indexOf(u8, @tagName(builtin.abi), "musl") != null) "musl" else "glibc";
 }
 
 fn platformSetFromJson(comptime T: type, value: Value) T {
