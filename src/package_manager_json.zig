@@ -20,6 +20,47 @@ pub fn parseInstallPackageJSON(
     return parsePackageJSONImpl(allocator, path, contents, stderr, true);
 }
 
+pub fn printDuplicateWorkspaceName(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    duplicate_path: []const u8,
+    duplicate_contents: []const u8,
+    first_path: []const u8,
+    first_contents: []const u8,
+    stderr: *std.Io.Writer,
+) !bool {
+    compiler.install.initializeStore();
+    var log = compiler.logger.Log.init(allocator);
+    defer log.deinit();
+
+    const duplicate_source = compiler.logger.Source.initPathString(duplicate_path, duplicate_contents);
+    const duplicate_expression = compiler.json.parsePackageJSONUTF8(&duplicate_source, &log, allocator) catch return false;
+    const duplicate_name = duplicate_expression.asProperty("name") orelse return false;
+
+    const first_source = compiler.logger.Source.initPathString(first_path, first_contents);
+    const first_expression = compiler.json.parsePackageJSONUTF8(&first_source, &log, allocator) catch return false;
+    const first_name = first_expression.asProperty("name") orelse return false;
+
+    const notes = try allocator.alloc(compiler.logger.Data, 1);
+    notes[0] = .{
+        .text = "Package name is also declared here",
+        .location = compiler.logger.Location.initOrNull(
+            &first_source,
+            first_source.rangeOfString(first_name.loc),
+        ),
+    };
+    try log.addRangeErrorFmtWithNotes(
+        &duplicate_source,
+        duplicate_source.rangeOfString(duplicate_name.loc),
+        allocator,
+        notes,
+        "Workspace name \"{s}\" already exists",
+        .{name},
+    );
+    try log.print(stderr);
+    return true;
+}
+
 fn parsePackageJSONImpl(
     allocator: std.mem.Allocator,
     path: []const u8,

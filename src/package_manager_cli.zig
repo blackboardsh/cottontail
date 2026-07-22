@@ -10008,10 +10008,38 @@ const Manager = struct {
                 failed = true;
             },
             .duplicate_name => |duplicate| {
-                try manager.stderr.print(
-                    "error: Workspace name \"{s}\" already exists\nnote: first declared at {s}/package.json\nnote: duplicated at {s}/package.json\n",
-                    .{ duplicate.name, duplicate.first_path, duplicate.duplicate_path },
-                );
+                const first_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, duplicate.first_path, "package.json" });
+                const duplicate_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, duplicate.duplicate_path, "package.json" });
+                const first_source = std.Io.Dir.cwd().readFileAlloc(
+                    manager.init_data.io,
+                    first_path,
+                    manager.allocator,
+                    .limited(64 * 1024 * 1024),
+                ) catch null;
+                const duplicate_source = std.Io.Dir.cwd().readFileAlloc(
+                    manager.init_data.io,
+                    duplicate_path,
+                    manager.allocator,
+                    .limited(64 * 1024 * 1024),
+                ) catch null;
+                const printed = if (first_source != null and duplicate_source != null)
+                    try PackageJSON.printDuplicateWorkspaceName(
+                        manager.allocator,
+                        duplicate.name,
+                        duplicate_path,
+                        duplicate_source.?,
+                        first_path,
+                        first_source.?,
+                        manager.stderr,
+                    )
+                else
+                    false;
+                if (!printed) {
+                    try manager.stderr.print(
+                        "error: Workspace name \"{s}\" already exists\nnote: first declared at {s}/package.json\nnote: duplicated at {s}/package.json\n",
+                        .{ duplicate.name, duplicate.first_path, duplicate.duplicate_path },
+                    );
+                }
                 failed = true;
             },
         };
