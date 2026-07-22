@@ -2370,10 +2370,7 @@ const Manager = struct {
             !internal_bunx_install and
             manager.options.command == .install;
         if (install_header_printed) {
-            try manager.stdout.print("bun install v{s} (cottontail v{s})\n\n", .{
-                bun_compat_version,
-                version,
-            });
+            try manager.stdout.print("bun install v{s} (cottontail)\n\n", .{bun_compat_version});
             try manager.stdout.flush();
         }
 
@@ -2468,8 +2465,7 @@ const Manager = struct {
                     version,
                     if (manager.options.command == .link or
                         manager.options.command == .remove or
-                        manager.options.command == .outdated or
-                        manager.rootLifecycleScriptsWillRun()) "" else "\n",
+                        manager.options.command == .outdated) "" else "\n",
                 });
                 try manager.stdout.flush();
             }
@@ -3888,12 +3884,10 @@ const Manager = struct {
         } else {
             try std.Io.Dir.cwd().createDirPath(manager.init_data.io, node_modules);
         }
-        const install_reuses_lockfile = manager.options.command == .install and manager.lock_graph != null;
         const create_project_cache = if (manager.node_linker == .isolated)
             manager.options.command == .add
         else
-            !install_reuses_lockfile and
-                (manager.lock_graph == null or !node_modules_existed) and
+            (manager.lock_graph == null or !node_modules_existed) and
                 (manager.options.command == .add or manager.options.command == .install or manager.options.command == .update or
                     manager.options.cpu_overridden or manager.options.os_overridden);
         if (!uses_explicit_install_cache and create_project_cache) {
@@ -6432,19 +6426,9 @@ const Manager = struct {
         }
     }
 
-    fn rootLifecycleScriptsWillRun(manager: *const Manager) bool {
-        return manager.options.command == .install and
-            manager.root_selected and
-            !manager.options.ignore_scripts and
-            !manager.options.lockfile_only and
-            !manager.options.dry_run and
-            Scripts.rootHasLifecycleScripts(manager.init_data.io, manager.root_dir, manager.root_package_json.?);
-    }
-
     fn installSummarySeparator(manager: *const Manager) []const u8 {
         if (manager.options.command == .install and
-            manager.direct_install_reports.items.len == 0 and
-            !manager.rootLifecycleScriptsWillRun()) return "";
+            manager.direct_install_reports.items.len == 0) return "";
         return "\n";
     }
 
