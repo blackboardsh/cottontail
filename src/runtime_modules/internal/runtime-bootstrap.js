@@ -9,14 +9,23 @@ const bunSleepSetTimeout = globalThis.setTimeout.bind(globalThis);
 globalThis.__cottontailRemapStackString ??= remapStackString;
 globalThis.__cottontailSourceContextForLocation ??= sourceContextForLocation;
 globalThis.__cottontailFormatUncaughtException ??= (error) => {
+  let referenceErrorHeaders;
+  if (error?.name === "ReferenceError" && typeof error.message === "string" && error.message.startsWith("Can't find variable: ")) {
+    const normalizedMessage = `${error.message.slice("Can't find variable: ".length)} is not defined`;
+    referenceErrorHeaders = [`ReferenceError: ${error.message}`, `ReferenceError: ${normalizedMessage}`];
+    try { error.message = normalizedMessage; } catch {}
+  }
   if (error && typeof error.stack === "string") {
-    const stack = remapStackString(error.stack);
+    let stack = remapStackString(error.stack);
+    if (referenceErrorHeaders) stack = stack.replace(referenceErrorHeaders[0], referenceErrorHeaders[1]);
     let header = "";
     try {
       header = Error.prototype.toString.call(error);
     } catch {}
+    if (referenceErrorHeaders) header = referenceErrorHeaders[1];
     return header && !stack.includes(header) ? `${header}\n${stack}` : stack;
   }
+  if (referenceErrorHeaders) return referenceErrorHeaders[1];
   if (error?.message) return `${error.name || "Error"}: ${error.message}`;
   return String(error);
 };
