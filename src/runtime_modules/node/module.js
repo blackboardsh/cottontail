@@ -850,7 +850,16 @@ function bunModuleMockFor(...keys) {
 // require("fs/promises") === require("fs").promises, and fs.js exports its
 // `promises` property as the fs/promises default object; storing the raw
 // namespace here would break that identity (upstream fs tests assert it).
-const kUnwrapDefaultBuiltins = new Set(["fs/promises", "node:fs/promises"]);
+const kUnwrapDefaultBuiltins = new Set([
+  "fs/promises",
+  "node:fs/promises",
+  // Node's HTTP interceptors replace methods on the mutable CommonJS export.
+  // Keep require(), ESM default imports, and named wrappers on that one object.
+  "http",
+  "node:http",
+  "https",
+  "node:https",
+]);
 
 export function __setBuiltinModules(modules) {
   const globalMap = globalThis.__cottontailBuiltinModules ??= new Map();

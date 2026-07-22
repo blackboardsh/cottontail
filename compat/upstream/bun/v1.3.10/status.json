@@ -125,6 +125,11 @@
       "reason": "The copied Hono and Pino fixtures pass against the integrated Node HTTP, stream, filesystem, and logging compatibility runtime (two cases, seven assertions)."
     },
     {
+      "pattern": "^test/js/third_party/msw/msw\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "The copied MSW fixture intercepts Axios through the mutable Node HTTP module, returns its synthetic JSON response, and passes the upstream output assertion."
+    },
+    {
       "pattern": "^test/js/third_party/st/st\\.test\\.ts$",
       "status": "enabled",
       "reason": "The copied st fixture starts a Node-compatible HTTP static server, fetches its TypeScript source, and exits cleanly; stock-JSC child startup requires a larger per-case budget.",
