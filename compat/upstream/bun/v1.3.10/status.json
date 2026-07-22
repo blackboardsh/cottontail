@@ -2648,7 +2648,7 @@
     },
     "test/js/bun/typescript/type-export.test.ts": {
       "status": "expected-failure",
-      "reason": "All 52 active non-bytecode TypeScript export cases pass. The remaining 18 active cases require bun build --compile --bytecode and JSC cached-bytecode generation; 18 runtime variants are skipped by the copied upstream suite."
+      "reason": "Exact test-name splits pass 62 of 70 active cases: all 18 standalone ESM bytecode cases and 44 non-bytecode cases. Eight direct duplicate-export entrypoints still receive JSC's dependency SyntaxError instead of Bun's parser diagnostic; 18 runtime variants remain skipped upstream."
     },
     "test/js/bun/udp/udp_socket.test.ts": {
       "status": "enabled",
