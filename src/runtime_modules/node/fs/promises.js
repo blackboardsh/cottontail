@@ -7,7 +7,6 @@ import {
   chownSync,
   closeSync,
   copyFileSync,
-  cpSync,
   createReadStream,
   createWriteStream,
   Dirent,
@@ -57,6 +56,7 @@ import {
   runAbortable,
   validateAbortSignal,
 } from "./internal.js";
+import { cpPromiseImpl, normalizeCopyPath } from "./cp.js";
 
 // fs.constants must be the exact same object as fsPromises.constants. Because
 // fs.js and fs/promises.js form an import cycle whose evaluation order depends
@@ -220,8 +220,28 @@ export async function copyFile(source, destination, mode = 0) {
   return copyFileSync(source, destination, mode);
 }
 
-export async function cp(source, destination, options = {}) {
-  return cpSync(source, destination, options);
+export function cp(source, destination, options) {
+  return cpPromiseImpl(
+    normalizeCopyPath(source, "src"),
+    normalizeCopyPath(destination, "dest"),
+    options,
+    getCpOperations(),
+  );
+}
+
+function getCpOperations() {
+  return {
+    chmodSync,
+    copyFileSync,
+    lstatSync,
+    mkdirSync,
+    readlinkSync,
+    readdirSync,
+    statSync,
+    symlinkSync,
+    unlinkSync,
+    utimesSync,
+  };
 }
 
 export async function* glob(pattern, options) {

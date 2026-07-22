@@ -103,3 +103,105 @@ test("one signal cancels concurrent writes and releases shared state", async () 
   expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
   expect(targets.map(target => fs.existsSync(target))).toEqual([false, false]);
 });
+
+describe("cp and copyFile production behavior", () => {
+  test("copyFile uses clone fallback, preserves mode, and reports exclusive destinations", () => {
+    const source = path.join(root, "copy-source.txt");
+    const destination = path.join(root, "copy-destination.txt");
+    const cloneDestination = path.join(root, "copy-clone-destination.txt");
+    fs.writeFileSync(source, "copy-data");
+    if (process.platform !== "win32") fs.chmodSync(source, 0o640);
+
+    fs.copyFileSync(source, destination);
+    fs.copyFileSync(source, cloneDestination, fs.constants.COPYFILE_FICLONE);
+    expect(fs.readFileSync(destination, "utf8")).toBe("copy-data");
+    expect(fs.readFileSync(cloneDestination, "utf8")).toBe("copy-data");
+    if (process.platform !== "win32") {
+      expect(fs.statSync(destination).mode & 0o777).toBe(0o640);
+      expect(fs.statSync(cloneDestination).mode & 0o777).toBe(0o640);
+    }
+
+    fs.copyFileSync(source, source);
+    expect(fs.readFileSync(source, "utf8")).toBe("copy-data");
+    expect(() => fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL)).toThrow(
+      expect.objectContaining({
+        code: "EEXIST",
+        syscall: "copyfile",
+        path: source,
+        dest: destination,
+      }),
+    );
+  });
+
+  test("recursive fallback rejects self-subdirectories and preserves metadata", () => {
+    const source = path.join(root, "cp-metadata-source");
+    const destination = path.join(root, "cp-metadata-destination");
+    const nestedDestination = path.join(source, "nested-copy");
+    fs.mkdirSync(source);
+    const sourceFile = path.join(source, "readonly.txt");
+    fs.writeFileSync(sourceFile, "metadata");
+    const timestamp = new Date("2020-01-02T03:04:05.000Z");
+    fs.utimesSync(sourceFile, timestamp, timestamp);
+    if (process.platform !== "win32") fs.chmodSync(sourceFile, 0o440);
+
+    expect(() => fs.cpSync(source, nestedDestination, {
+      recursive: true,
+      preserveTimestamps: true,
+    })).toThrow(`cannot copy ${source} to a subdirectory of self ${nestedDestination}`);
+    expect(fs.existsSync(nestedDestination)).toBe(false);
+
+    fs.cpSync(source, destination, {
+      recursive: true,
+      preserveTimestamps: true,
+      force: true,
+    });
+    const copiedFile = path.join(destination, "readonly.txt");
+    expect(fs.readFileSync(copiedFile, "utf8")).toBe("metadata");
+    expect(Math.abs(fs.statSync(copiedFile).mtimeMs - timestamp.getTime())).toBeLessThan(1000);
+    if (process.platform !== "win32") {
+      expect(fs.statSync(copiedFile).mode & 0o777).toBe(0o440);
+    }
+  });
+
+  test("promise and callback cp await asynchronous filters", async () => {
+    const source = path.join(root, "cp-filter-source");
+    fs.mkdirSync(source);
+    fs.writeFileSync(path.join(source, "keep.txt"), "keep");
+    fs.writeFileSync(path.join(source, "drop.txt"), "drop");
+
+    const promiseDestination = path.join(root, "cp-filter-promise");
+    const seen: string[] = [];
+    await fsp.cp(source, promiseDestination, {
+      recursive: true,
+      filter: async (sourcePath) => {
+        await Promise.resolve();
+        seen.push(path.basename(sourcePath));
+        return !sourcePath.endsWith("drop.txt");
+      },
+    });
+    expect(fs.readdirSync(promiseDestination).sort()).toEqual(["keep.txt"]);
+    expect(seen.sort()).toEqual(["cp-filter-source", "drop.txt", "keep.txt"]);
+
+    const callbackDestination = path.join(root, "cp-filter-callback");
+    await new Promise<void>((resolve, reject) => {
+      fs.cp(source, callbackDestination, {
+        recursive: true,
+        filter: async sourcePath => !sourcePath.endsWith("drop.txt"),
+      }, error => error ? reject(error) : resolve());
+    });
+    expect(fs.readdirSync(callbackDestination).sort()).toEqual(["keep.txt"]);
+  });
+
+  test("sync cp rejects promise-returning filters before creating output", () => {
+    const source = path.join(root, "cp-sync-filter-source");
+    const destination = path.join(root, "cp-sync-filter-destination");
+    fs.mkdirSync(source);
+    fs.writeFileSync(path.join(source, "file.txt"), "data");
+
+    expect(() => fs.cpSync(source, destination, {
+      recursive: true,
+      filter: async () => true,
+    })).toThrow("Expected a boolean from the filter function, but got a promise");
+    expect(fs.existsSync(destination)).toBe(false);
+  });
+});

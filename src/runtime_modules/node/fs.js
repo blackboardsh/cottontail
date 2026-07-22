@@ -14,6 +14,7 @@ import {
   validateInteger,
   validatePosition,
 } from "./fs/internal.js";
+import { cpSyncImpl, normalizeCopyPath } from "./fs/cp.js";
 // Imported last so constants/path/stream are initialized before the circular
 // fs <-> fs/promises edge is evaluated. `fs.promises` must be the exact same
 // object as the fs/promises module namespace (Node/Bun behavior relied on by
@@ -138,6 +139,7 @@ const knownErrorCodes = [
   "EPERM", "ENOENT", "EIO", "EBADF", "EACCES", "EEXIST", "EXDEV", "ENOTDIR",
   "EISDIR", "EINVAL", "ENFILE", "EMFILE", "EROFS", "EPIPE", "ENOTEMPTY", "ELOOP",
   "ENAMETOOLONG", "ENOSPC", "EFBIG", "EAGAIN", "EBUSY", "EMLINK", "ENODEV", "ENXIO",
+  "ENOSYS", "ENOTSUP", "EOPNOTSUPP",
 ];
 
 const messageByCode = {
@@ -149,6 +151,9 @@ const messageByCode = {
   ENOTDIR: "not a directory",
   EISDIR: "illegal operation on a directory",
   EINVAL: "invalid argument",
+  ENOSYS: "function not implemented",
+  ENOTSUP: "operation not supported",
+  EOPNOTSUPP: "operation not supported",
 };
 
 function makeFsError(error, path, syscall = "open") {
@@ -168,6 +173,8 @@ function makeFsError(error, path, syscall = "open") {
     else if (source.includes("Directory not empty") || source.includes("DirNotEmpty")) code = "ENOTEMPTY";
     else if (source.includes("Bad file descriptor")) code = "EBADF";
     else if (source.includes("Device not configured") || source.includes("No such device or address") || source.includes("NoDevice")) code = "ENXIO";
+    else if (source.includes("Operation not supported") || source.includes("Not supported")) code = "ENOTSUP";
+    else if (source.includes("Function not implemented")) code = "ENOSYS";
     else code = "EIO";
   }
   const reason = messageByCode[code] ?? (source || code);
@@ -848,66 +855,129 @@ function makeCodedFsError(code, message, path, syscall) {
   return error;
 }
 
+function normalizeCopyMode(mode) {
+  if (mode == null) return 0;
+  if (typeof mode !== "number") {
+    const error = new TypeError("mode must be int32 or null/undefined");
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  if (!Number.isFinite(mode) || mode < 0 || mode > 7) {
+    const error = new RangeError("mode is out of range: >= 0 and <= 7");
+    error.code = "ERR_OUT_OF_RANGE";
+    throw error;
+  }
+  return Math.trunc(mode);
+}
+
+function makeCopyFileError(error, source, destination) {
+  const normalized = error?.code ? error : makeFsError(error, source, "copyfile");
+  const code = normalized.code || "EIO";
+  const reason = messageByCode[code] ?? String(normalized.message ?? code)
+    .replace(/^\w+:\s*/, "")
+    .replace(/,\s*\w+.*$/, "");
+  normalized.code = code;
+  normalized.errno ??= -(Number(constantsObject[code]) || 5);
+  normalized.syscall = "copyfile";
+  normalized.path = source;
+  normalized.dest = destination;
+  normalized.message = `${code}: ${reason}, copyfile '${source}' -> '${destination}'`;
+  return normalized;
+}
+
 export function copyFileSync(source, destination, mode = 0) {
+  validatePathArg(source, "src");
+  validatePathArg(destination, "dest");
+  mode = normalizeCopyMode(mode);
+  const sourceText = normalizePath(source);
   const destinationText = normalizePath(destination);
-  if ((Number(mode) & (constants.COPYFILE_EXCL ?? 1)) !== 0 && existsSync(destinationText)) {
-    throw makeCodedFsError("EEXIST", "file already exists", destinationText, "copyfile");
+  const exclusive = (mode & (constants.COPYFILE_EXCL ?? 1)) !== 0;
+  const forceClone = (mode & (constants.COPYFILE_FICLONE_FORCE ?? 4)) !== 0;
+  const preferClone = forceClone || (mode & (constants.COPYFILE_FICLONE ?? 2)) !== 0;
+
+  try {
+    const sourceStat = statSync(sourceText);
+    if (!sourceStat.isFile()) {
+      throw makeCodedFsError("ENOTSUP", "operation not supported", sourceText, "copyfile");
+    }
+
+    let destinationLinkStat;
+    try {
+      destinationLinkStat = lstatSync(destinationText);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    if (exclusive && destinationLinkStat) {
+      throw makeCodedFsError("EEXIST", "file already exists", destinationText, "copyfile");
+    }
+
+    if (!exclusive && destinationLinkStat) {
+      try {
+        const destinationStat = statSync(destinationText);
+        if (sourceStat.dev === destinationStat.dev && sourceStat.ino === destinationStat.ino && !forceClone) return;
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+    }
+
+    if (preferClone) {
+      try {
+        cottontail.cloneFileSync(sourceText, destinationText, exclusive);
+        return;
+      } catch (error) {
+        if (forceClone) throw error;
+      }
+    }
+
+    const sourceFd = openSync(sourceText, "r");
+    let destinationFd = -1;
+    try {
+      destinationFd = openSync(destinationText, exclusive ? "wx" : "w", Number(sourceStat.mode));
+      const buffer = new Uint8Array(64 * 1024);
+      for (;;) {
+        const bytesRead = readSync(sourceFd, buffer, 0, buffer.byteLength, null);
+        if (bytesRead === 0) break;
+        let written = 0;
+        while (written < bytesRead) {
+          const count = writeSync(destinationFd, buffer, written, bytesRead - written, null);
+          if (count === 0) throw makeCodedFsError("EIO", "short write", destinationText, "copyfile");
+          written += count;
+        }
+      }
+      fchmodSync(destinationFd, Number(sourceStat.mode));
+    } finally {
+      try {
+        if (destinationFd >= 0) closeSync(destinationFd);
+      } finally {
+        closeSync(sourceFd);
+      }
+    }
+  } catch (error) {
+    throw makeCopyFileError(error, sourceText, destinationText);
   }
-  writeFileSync(destinationText, readFileSync(source));
 }
 
-function stripTrailingSlashes(path) {
-  let text = String(path);
-  while (text.length > 1 && text.endsWith("/")) text = text.slice(0, -1);
-  return text;
-}
-
-function cpEntrySync(source, destination, options) {
-  if (options.filter && !options.filter(source, destination)) return;
-  const stats = lstatSync(source);
-  if (stats.isDirectory()) {
-    if (!options.recursive) {
-      const error = makeCodedFsError("EISDIR", "illegal operation on a directory", source, "cp");
-      throw error;
-    }
-    mkdirSync(destination, { recursive: true });
-    for (const entry of readdirSync(source, { withFileTypes: true })) {
-      cpEntrySync(join(source, String(entry.name)), join(destination, String(entry.name)), options);
-    }
-    return;
-  }
-
-  const destinationStats = lstatSync(destination, { throwIfNoEntry: false });
-  if (destinationStats && !options.force) {
-    if (options.errorOnExist) {
-      throw makeCodedFsError("EEXIST", "file already exists", destination, "cp");
-    }
-    return;
-  }
-
-  ensureParent(destination);
-  if (stats.isSymbolicLink()) {
-    if (destinationStats) unlinkSync(destination);
-    symlinkSync(readlinkSync(source), destination);
-  } else {
-    writeFileSync(destination, readFileSync(source));
-  }
-}
-
-export function cpSync(source, destination, options = {}) {
-  const opts = options ?? {};
-  cpEntrySync(
-    stripTrailingSlashes(normalizePath(source)),
-    stripTrailingSlashes(normalizePath(destination)),
-    {
-      recursive: Boolean(opts.recursive),
-      force: opts.force === undefined ? true : Boolean(opts.force),
-      errorOnExist: Boolean(opts.errorOnExist),
-      filter: typeof opts.filter === "function" ? opts.filter : null,
-      mode: opts.mode ?? 0,
-    },
+export function cpSync(source, destination, options) {
+  return cpSyncImpl(
+    normalizeCopyPath(source, "src"),
+    normalizeCopyPath(destination, "dest"),
+    options,
+    cpOperations,
   );
 }
+
+const cpOperations = {
+  chmodSync,
+  copyFileSync,
+  lstatSync,
+  mkdirSync,
+  readlinkSync,
+  readdirSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  utimesSync,
+};
 
 export function chmodSync(path, mode) {
   cottontail.chmodSync(normalizePath(path), parseMode(mode));
@@ -1692,8 +1762,17 @@ export function close(fd, callback = undefined) {
   });
 }
 export const copyFile = callbackify(copyFileSync);
-// Node names fs.cp's callback argument "cb" in its validation error.
-export const cp = callbackify(cpSync, "cb");
+export function cp(source, destination, options, callback) {
+  if (typeof options === "function") {
+    callback = options;
+    options = undefined;
+  }
+  if (typeof callback !== "function") throw makeInvalidCallbackError("cb", callback);
+  fsPromisesDefault.cp(source, destination, options).then(
+    () => callback(),
+    callback,
+  );
+}
 export const fchmod = callbackify(fchmodSync);
 export const fchown = callbackify(fchownSync);
 export const fdatasync = callbackify(fdatasyncSync);

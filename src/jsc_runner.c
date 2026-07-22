@@ -146,9 +146,11 @@ typedef unsigned int gid_t;
 #if defined(__APPLE__) || defined(__MACH__)
 #include <mach/mach.h>
 #include <net/if_dl.h>
+#include <sys/clonefile.h>
 #include <sys/mount.h>
 #include <sys/sysctl.h>
 #elif defined(__linux__)
+#include <linux/fs.h>
 #include <netpacket/packet.h>
 #include <sys/statvfs.h>
 #elif !defined(_WIN32)
@@ -20205,6 +20207,81 @@ static JSValueRef ct_open_fd(JSContextRef ctx, JSObjectRef function, JSObjectRef
     free(path);
     free(flags);
     return JSValueMakeNumber(ctx, fd);
+}
+
+static JSValueRef ct_clone_file_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "cloneFileSync(source, destination[, exclusive]) requires source and destination paths");
+        return JSValueMakeBoolean(ctx, false);
+    }
+
+    char *source = ct_value_to_string_copy(ctx, argv[0]);
+    char *destination = ct_value_to_string_copy(ctx, argv[1]);
+    bool exclusive = argc >= 3 && ct_value_to_bool(ctx, argv[2]);
+    if (source == NULL || destination == NULL) {
+        free(source);
+        free(destination);
+        ct_throw_message(ctx, exception, "Invalid path");
+        return JSValueMakeBoolean(ctx, false);
+    }
+
+    int status = -1;
+    int clone_error = 0;
+#if defined(__APPLE__) || defined(__MACH__)
+    (void)exclusive;
+    status = clonefile(source, destination, 0);
+    if (status != 0) clone_error = errno;
+#elif defined(__linux__)
+    int source_fd = open(source, O_RDONLY | O_CLOEXEC);
+    if (source_fd < 0) {
+        clone_error = errno;
+    } else {
+        struct stat source_stat;
+        if (fstat(source_fd, &source_stat) != 0) {
+            clone_error = errno;
+        } else if (!S_ISREG(source_stat.st_mode)) {
+            clone_error = ENOTSUP;
+        } else {
+            struct stat destination_stat;
+            if (stat(destination, &destination_stat) == 0 &&
+                source_stat.st_dev == destination_stat.st_dev &&
+                source_stat.st_ino == destination_stat.st_ino) {
+                clone_error = EEXIST;
+            } else {
+                int destination_flags = O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC;
+                if (exclusive) destination_flags |= O_EXCL;
+                int destination_fd = open(destination, destination_flags, 0666);
+                if (destination_fd < 0) {
+                    clone_error = errno;
+                } else {
+                    status = ioctl(destination_fd, FICLONE, source_fd);
+                    if (status == 0 && fchmod(destination_fd, source_stat.st_mode) != 0) status = -1;
+                    if (status != 0) clone_error = errno;
+                    close(destination_fd);
+                    if (status != 0) unlink(destination);
+                }
+            }
+        }
+        close(source_fd);
+    }
+#else
+    (void)exclusive;
+#if defined(ENOTSUP)
+    clone_error = ENOTSUP;
+#else
+    clone_error = ENOSYS;
+#endif
+#endif
+
+    free(source);
+    free(destination);
+    if (status != 0) {
+        ct_throw_message(ctx, exception, strerror(clone_error != 0 ? clone_error : EIO));
+        return JSValueMakeBoolean(ctx, false);
+    }
+    return JSValueMakeBoolean(ctx, true);
 }
 
 static JSValueRef ct_read_fd(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
