@@ -331,6 +331,14 @@ async function writeStandardCommonJS(result, filename) {
   return filename;
 }
 
+async function writeStandardESM(result, filename) {
+  const artifact = result.outputs.find(output => output.kind === "entry-point") ?? result.outputs[0];
+  if (!artifact) throw new Error(`Bake build did not emit ${filename}`);
+  mkdirSync(path.dirname(filename), { recursive: true });
+  writeFileSync(filename, await artifact.text());
+  return filename;
+}
+
 async function buildSsrFrameworkAliases(context) {
   const { framework, ssrOptions, serverPlugins, builtIns, tempRoot } = context;
   const aliases = {};
@@ -342,20 +350,20 @@ async function buildSsrFrameworkAliases(context) {
       ...ssrOptions,
       entrypoints: [wrapperPath],
       target: "bun",
-      format: "cjs",
+      format: "esm",
       conditions: [...new Set([...(ssrOptions.conditions ?? []), "node"])],
       define: productionDefines(ssrOptions, "server"),
       jsx: { ...(ssrOptions.jsx ?? {}), development: false },
       minify: false,
       serverComponents: false,
-      external: [...new Set([...(ssrOptions.external ?? []), "bun:bake/server"])],
+      external: [...new Set([...(ssrOptions.external ?? []), "bake/server", "bun:bake/server"])],
       write: false,
       throw: false,
       plugins: serverPlugins,
     }, builtIns, { [wrapperPath]: `export * from ${JSON.stringify(specifier)};` }));
     if (!result.success) throw new AggregateError(result.logs ?? [], `Failed to bundle SSR framework module ${specifier}`);
-    const filename = path.join(tempRoot, `framework-${index}.cjs`);
-    aliases[specifier] = await writeStandardCommonJS(result, filename);
+    const filename = path.join(tempRoot, `framework-${index}.mjs`);
+    aliases[specifier] = await writeStandardESM(result, filename);
   }
   return aliases;
 }
@@ -368,21 +376,21 @@ async function buildSsrComponents(context, route) {
       ...context.ssrOptions,
       entrypoints: [boundary.path],
       target: "bun",
-      format: "cjs",
+      format: "esm",
       conditions: [...new Set([...(context.ssrOptions.conditions ?? []), "node"])],
       define: productionDefines(context.ssrOptions, "server"),
       jsx: { ...(context.ssrOptions.jsx ?? {}), development: false },
       minify: false,
       serverComponents: false,
-      external: [...new Set([...(context.ssrOptions.external ?? []), "bun:bake/server"])],
+      external: [...new Set([...(context.ssrOptions.external ?? []), "bake/server", "bun:bake/server"])],
       write: false,
       throw: false,
       plugins: context.serverPlugins,
     }, context.builtIns));
     if (!build.success) throw new AggregateError(build.logs ?? [], `Failed to bundle SSR component ${boundary.path}`);
     const hash = BigInt.asUintN(64, globalThis.Bun.hash(`${route.index}:${boundary.id}`)).toString(16);
-    const filename = path.join(context.tempRoot, `component-${hash}.cjs`);
-    result.set(boundary.id, await writeStandardCommonJS(build, filename));
+    const filename = path.join(context.tempRoot, `component-${hash}.mjs`);
+    result.set(boundary.id, await writeStandardESM(build, filename));
   }
   return result;
 }
@@ -417,13 +425,13 @@ async function loadServerRoute(context, route) {
     ...context.serverOptions,
     entrypoints: [wrapperPath],
     target: "bun",
-    format: "cjs",
+    format: "esm",
     conditions,
     define: productionDefines(context.serverOptions, "server"),
     jsx: { ...(context.serverOptions.jsx ?? {}), development: false },
     minify: false,
     serverComponents: context.serverComponents !== null,
-    external: [...new Set([...(context.serverOptions.external ?? []), "bun:bake/server"])],
+    external: [...new Set([...(context.serverOptions.external ?? []), "bake/server", "bun:bake/server"])],
     metafile: true,
     write: false,
     throw: false,
@@ -443,7 +451,9 @@ async function loadServerRoute(context, route) {
     const url = await writePublicArtifact(context.outputRoot, output);
     if (isCssArtifact(output)) serverStyles.push(url);
   }
-  const exports = executeCommonJSArtifact(await artifact.text(), wrapperPath);
+  const filename = path.join(context.tempRoot, `route-${route.index}.mjs`);
+  await writeStandardESM(result, filename);
+  const exports = await import(pathToFileURL(filename).href);
   if (exports.framework === null || typeof exports.framework !== "object") {
     throw new TypeError(`Bake server entrypoint for ${route.page} did not produce a module namespace`);
   }
