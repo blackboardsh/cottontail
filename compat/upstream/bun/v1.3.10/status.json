@@ -1583,6 +1583,11 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
     },
+    "test/cli/run/syntax.test.ts": {
+      "status": "enabled",
+      "reason": "All 592 generated syntax cases pass across 296 file and 296 eval variants. The unchanged aggregate receives an extended runner budget because the same complete set was verified in six focused shards.",
+      "timeoutMs": 900000
+    },
     "test/cli/test/expectations.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
