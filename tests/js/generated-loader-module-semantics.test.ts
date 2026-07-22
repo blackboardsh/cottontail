@@ -135,3 +135,30 @@ test("package subpaths ending in condition names remain JavaScript modules", () 
   expect(child.stdout.toString()).toBe("browser-module\n");
   expect(child.stderr.toString()).toBe("");
 });
+
+test("commented destructuring declarations retain their named ESM exports", () => {
+  const dependency = join(root, "commented-destructuring-exports.mjs");
+  const entry = join(root, "commented-destructuring-entry.mjs");
+  writeFileSync(dependency, [
+    'const api = { launch: () => "launch-ok", connect: () => "connect-ok" };',
+    "export const {",
+    "  /** Launch a browser. */",
+    "  launch,",
+    "  /** Connect to a browser. */",
+    "  connect: renamedConnect,",
+    "} = api;",
+    "",
+  ].join("\n"));
+  writeFileSync(entry, [
+    'import { launch, renamedConnect } from "./commented-destructuring-exports.mjs";',
+    'if (launch() !== "launch-ok") throw new Error("missing shorthand export");',
+    'if (renamedConnect() !== "connect-ok") throw new Error("missing aliased export");',
+    'console.log("commented-exports-ok");',
+    "",
+  ].join("\n"));
+
+  const child = Bun.spawnSync({ cmd: [process.execPath, entry] });
+  expect(child.exitCode).toBe(0);
+  expect(child.stdout.toString()).toBe("commented-exports-ok\n");
+  expect(child.stderr.toString()).toBe("");
+});

@@ -2252,6 +2252,18 @@ function replaceCodePattern(source, pattern, replacer) {
   });
 }
 
+function codeOnlyText(source) {
+  const text = String(source);
+  const mask = codePositionMask(text);
+  const characters = text.split("");
+  for (let index = 0; index < characters.length; index += 1) {
+    if (mask[index] !== 1 && characters[index] !== "\n" && characters[index] !== "\r") {
+      characters[index] = " ";
+    }
+  }
+  return characters.join("");
+}
+
 function hasEsmSyntax(source) {
   const text = String(source);
   const mask = codePositionMask(text);
@@ -2270,6 +2282,18 @@ function hasCommonJsSyntax(source) {
   let match;
   while ((match = matcher.exec(text)) != null) {
     if (mask[match.index] === 1) return true;
+  }
+  return false;
+}
+
+function hasRuntimeDecoratorSyntax(source) {
+  const text = String(source);
+  const mask = codePositionMask(text);
+  const matcher = /(?:^|[\n;{}])\s*@[A-Za-z_$(\[]/g;
+  let match;
+  while ((match = matcher.exec(text)) != null) {
+    const decorator = match.index + match[0].lastIndexOf("@");
+    if (mask[decorator] === 1) return true;
   }
   return false;
 }
@@ -2304,7 +2328,7 @@ function maybeStripTypeScript(filename, source) {
 
 function maybeTransformRuntimeSyntax(filename, source) {
   const path = String(filename);
-  const needsTransform = /(?:^|[\n;{}])\s*@[A-Za-z_$([]/m.test(source);
+  const needsTransform = hasRuntimeDecoratorSyntax(source);
   if (!needsTransform || typeof cottontail.transpilerTransform !== "function") return source;
   const extension = path.toLowerCase().match(/\.([^.]+)$/)?.[1];
   const loader = extension === "tsx" ? "tsx"
@@ -2430,11 +2454,11 @@ function transpileExtensionSource(filename, loader, forceTransform = false, inpu
   };
   if (loader === "ts" && hasBunTranspiledPragma(source)) return finish(source);
   const extension = String(filename).toLowerCase().match(/\.[^.]+$/)?.[0];
-  const needsRuntimeTransform = /(?:^|[\n;{}])\s*@[A-Za-z_$([]/m.test(source);
+  const needsRuntimeTransform = hasRuntimeDecoratorSyntax(source);
   // Plain CommonJS JavaScript is already valid input for JSC. Keeping its
   // source layout intact preserves Node-compatible stack and source-map
   // coordinates instead of rewriting every require() through the transpiler.
-  if (!forceTransform && loader === "js" && (extension === ".js" || extension === ".cjs") && !needsRuntimeTransform) {
+  if (!forceTransform && loader === "js" && (extension == null || extension === ".js" || extension === ".cjs") && !needsRuntimeTransform) {
     return finish(source);
   }
   if (typeof cottontail.transpilerTransform !== "function") {
@@ -2842,7 +2866,7 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
   );
   output = replaceCodePattern(output, /\bexport\s+default\s+/g, `${ESM_EXPORTS_BINDING}.default = `);
   output = replaceCodePattern(output, /\bexport\s+(const|let|var)\s+\{([^}]*)\}\s*=/g, (_all, kind, bindings) => {
-    for (const part of String(bindings).split(",")) {
+    for (const part of codeOnlyText(bindings).split(",")) {
       const name = part.trim().replace(/^\.\.\./, "").split(/\s*:\s*|\s*=\s*/, 2).at(-1)?.trim();
       if (/^[A-Za-z_$][\w$]*$/.test(name ?? "")) {
         exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);

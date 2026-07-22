@@ -1584,6 +1584,14 @@ static CtAsyncProcess *ct_async_processes = NULL;
 static pthread_mutex_t ct_fd_watchers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtFdWatcher *ct_fd_watchers = NULL;
 static uint32_t ct_next_fd_watch_id = 1;
+
+static uint32_t ct_next_fd_event_id(void) {
+    pthread_mutex_lock(&ct_fd_watchers_mutex);
+    if (ct_next_fd_watch_id == 0 || ct_next_fd_watch_id >= 0x40000000u) ct_next_fd_watch_id = 1;
+    uint32_t id = ct_next_fd_watch_id++;
+    pthread_mutex_unlock(&ct_fd_watchers_mutex);
+    return id;
+}
 static pthread_mutex_t ct_tcp_connects_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtTcpConnect *ct_tcp_connects = NULL;
 static uint32_t ct_next_tcp_connect_id = 0x40000000u;
@@ -1971,7 +1979,6 @@ struct CtJscRuntime {
     size_t active_request_count;
     uint32_t next_process_id;
     uint32_t next_worker_id;
-    uint32_t next_fd_watch_id;
     uint32_t next_dns_request_id;
     CtDnsRequest *dns_requests;
     CtFsWatcher *fs_watchers;
@@ -27043,8 +27050,7 @@ static JSValueRef ct_fs_async_start(
         return JSValueMakeUndefined(ctx);
     }
     if (kind == CT_FS_ASYNC_WRITE && length > 0) memcpy(operation->owned_bytes, bytes + offset, length);
-    operation->id = ++runtime->next_fd_watch_id;
-    if (operation->id == 0) operation->id = ++runtime->next_fd_watch_id;
+    operation->id = ct_next_fd_event_id();
     operation->buffer = uv_buf_init((char *)operation->owned_bytes, (unsigned int)length);
     operation->request.data = operation;
     JSValueProtect(ctx, operation->buffer_value);
@@ -27534,10 +27540,7 @@ static JSValueRef ct_fd_watch_start(JSContextRef ctx, JSObjectRef function, JSOb
         return JSValueMakeUndefined(ctx);
     }
 
-    pthread_mutex_lock(&ct_fd_watchers_mutex);
-    watcher->id = ct_next_fd_watch_id++;
-    if (watcher->id == 0) watcher->id = ct_next_fd_watch_id++;
-    pthread_mutex_unlock(&ct_fd_watchers_mutex);
+    watcher->id = ct_next_fd_event_id();
     watcher->fd = fd;
     watcher->max_bytes = max_bytes;
     watcher->runtime = runtime;
@@ -27764,8 +27767,7 @@ static JSValueRef ct_fs_watch_start(JSContextRef ctx, JSObjectRef function, JSOb
     watcher->referenced = argc < 3 || ct_value_to_bool(ctx, argv[2]);
     watcher->root_is_directory = S_ISDIR(root_stat.st_mode);
     watcher->active = true;
-    watcher->id = ++runtime->next_fd_watch_id;
-    if (watcher->id == 0) watcher->id = ++runtime->next_fd_watch_id;
+    watcher->id = ct_next_fd_event_id();
     if (watcher->fallback_filename == NULL) {
         watcher->active = false;
         ct_fs_watcher_close(watcher);
