@@ -1599,7 +1599,7 @@
     },
     "test/js/bun/io/bun-write-leak.test.ts": {
       "status": "expected-failure",
-      "reason": "Not a leak: the fixture's RSS plateaus (~330MB stable across 100 Bun.write iterations of a 1MB payload). Cottontail's baseline RSS (~190MB from evaluating the 2.6MB bundled runtime modules in every process) already exceeds the fixture's 256MB cap on the first iteration."
+      "reason": "Exact embedded-module run fails the first unchanged 256MB RSS check at 1117MB. The write completes, but the one-shot launcher retains its BundleV2 startup graph for process lifetime, so the fixture cannot reach its payload-retention measurement."
     },
     "test/js/bun/io/bun-write.test.js": {
       "status": "enabled",
@@ -3564,6 +3564,10 @@
       "status": "enabled",
       "reason": "The copied body-parser integration coverage passes for iconv decoding, HTTP request bodies, and GET middleware behavior."
     },
+    "test/js/third_party/body-parser/express-memory-leak.test.ts": {
+      "status": "expected-failure",
+      "reason": "Exact embedded-module run hits all four copied 20s/20s/20s/40s case deadlines. An outer-only 120s diagnostic finishes in 100.53s with 0 passes; the first 50000-request sample reaches 1.5GB RSS, but no case reaches its second sample or memory-ratio assertion."
+    },
     "test/js/third_party/grpc-js/test-call-credentials.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (6 bun:test cases, 0 assertions)."
@@ -3791,6 +3795,10 @@
     "test/js/web/streams/streams.test.js": {
       "status": "enabled",
       "reason": "Readable, writable, transform, byte, and pipe stream behavior passes upstream coverage."
+    },
+    "test/js/web/streams/streams-leak.test.ts": {
+      "status": "expected-failure",
+      "reason": "Exact embedded-module run exceeds the unchanged 30000ms file budget before completing the 15000 pipe cycles or reaching either RSS assertion. Bun 1.3.10 also reaches its unchanged 5000ms case timeout at 5006ms on this host, while Cottontail remains above 30s."
     },
     "test/js/web/structured-clone-blob-file.test.ts": {
       "status": "enabled",

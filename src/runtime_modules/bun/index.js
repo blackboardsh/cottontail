@@ -4469,6 +4469,7 @@ function concatBuffers(left, right) {
 }
 
 function concatManyBuffers(chunks) {
+  if (chunks.length === 1) return asBuffer(chunks[0]);
   if (globalThis.Buffer?.concat) return globalThis.Buffer.concat(chunks.map(asBuffer));
   let length = 0;
   for (const chunk of chunks) length += asBuffer(chunk).length;

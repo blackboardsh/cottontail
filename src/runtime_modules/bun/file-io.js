@@ -450,20 +450,22 @@ function streamFile(state, chunkSize) {
   return stream;
 }
 
-function writeAllToFd(fd, bytes, target) {
-  let offset = 0;
-  while (offset < bytes.byteLength) {
-    const length = Math.min(DEFAULT_CHUNK_SIZE, bytes.byteLength - offset);
-    let written;
-    try {
-      written = Number(cottontail.fdWriteAt(fd, bytes, offset, length, null));
-    } catch (error) {
-      throw makeBunFileError(error, target, "write");
-    }
-    if (!(written > 0)) throw makeBunFileError(new Error("write returned zero bytes"), target, "write");
-    offset += written;
+function writeAllToFd(fd, source, target) {
+  const isString = typeof source === "string";
+  const requestedLength = isString ? source.length * 3 : source.byteLength;
+  if (requestedLength === 0) return 0;
+  let written;
+  try {
+    // The native boundary owns UTF-8 conversion and loops until the regular
+    // file write is complete, matching Bun's single write-task ownership.
+    written = Number(cottontail.fdWriteAt(fd, source, 0, requestedLength, null));
+  } catch (error) {
+    throw makeBunFileError(error, target, "write");
   }
-  return offset;
+  if (!(written > 0) || (!isString && written !== source.byteLength)) {
+    throw makeBunFileError(new Error("write returned zero bytes"), target, "write");
+  }
+  return written;
 }
 
 async function writeAllToFdAsync(fd, bytes, target) {
@@ -811,8 +813,8 @@ function normalizeWriteDestination(destination, options) {
   return { kind: descriptor.kind, state: null, ...descriptor };
 }
 
-function immediateSourceBytes(data) {
-  if (typeof data === "string" || data instanceof String) return new TextEncoder().encode(String(data));
+function immediateSource(data) {
+  if (typeof data === "string" || data instanceof String) return String(data);
   if (isBufferSource(data)) return bytesFromBufferSource(data);
   if (typeof data === "symbol") throw invalidArgumentType("Bun.write expects a Blob-y thing to write");
   if (data == null) return null;
@@ -849,8 +851,9 @@ function closeWriteDestination(opened) {
   opened.owned = false;
 }
 
-function writeImmediate(destination, bytes, options) {
+function writeImmediate(destination, source, options) {
   if (destination.kind === "stream") {
+    const bytes = typeof source === "string" ? new TextEncoder().encode(source) : source;
     destination.stream.write(bytes);
     return bytes.byteLength;
   }
@@ -859,15 +862,17 @@ function writeImmediate(destination, bytes, options) {
   let regular = true;
   try { regular = statIsRegularFile(cottontail.fstatSync(opened.fd)); } catch {}
 
-  if (!regular && bytes.byteLength > 0) {
+  const sourceLength = typeof source === "string" ? source.length : source.byteLength;
+  if (!regular && sourceLength > 0) {
+    const bytes = typeof source === "string" ? new TextEncoder().encode(source) : source;
     return writeAllToFdAsync(opened.fd, bytes, target).finally(() => closeWriteDestination(opened));
   }
   try {
-    if (bytes.byteLength === 0 && destination.kind === "fd") {
+    if (sourceLength === 0 && destination.kind === "fd") {
       if (regular) cottontail.ftruncateSync?.(destination.fd, 0);
       return 0;
     }
-    return writeAllToFd(opened.fd, bytes, target);
+    return writeAllToFd(opened.fd, source, target);
   } finally {
     closeWriteDestination(opened);
   }
@@ -1023,7 +1028,7 @@ export function write(destinationValue, data, optionsValue = undefined) {
   }
   const options = normalizeWriteOptions(optionsValue);
   const destination = normalizeWriteDestination(destinationValue, options);
-  const immediate = immediateSourceBytes(data);
+  const immediate = immediateSource(data);
   if (immediate !== undefined) {
     try {
       return Promise.resolve(writeImmediate(destination, immediate, options));

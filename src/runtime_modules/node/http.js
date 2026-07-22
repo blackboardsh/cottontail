@@ -3528,7 +3528,7 @@ export function _attachHttpConnection(server, socket) {
       }
       processNext();
     };
-    const requestResource = new AsyncResource("HTTPINCOMINGMESSAGE");
+    const requestResource = new AsyncResource("HTTPINCOMINGMESSAGE", { requireManualDestroy: true });
     try {
       const expect = String(message.headers.expect ?? "").toLowerCase();
       if (expect === "100-continue") {
@@ -3553,6 +3553,8 @@ export function _attachHttpConnection(server, socket) {
       // machinery (and bun:test failure capture) sees them instead of the
       // socket read dispatcher.
       setTimeout(() => { throw error; }, 0);
+    } finally {
+      requestResource.emitDestroy();
     }
   };
 

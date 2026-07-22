@@ -16,7 +16,12 @@ let nextTickDrainScheduled = false;
 let nextTickPriorityArmed = true;
 const promiseAsyncIds = new WeakMap();
 const gcTrackedAsyncResourceIds = new Set();
-const destroyedAsyncResourceIds = new Set();
+const asyncResourceFinalizer = typeof FinalizationRegistry === "function"
+  ? new FinalizationRegistry((asyncId) => {
+    if (!gcTrackedAsyncResourceIds.delete(asyncId)) return;
+    emitHook("destroy", asyncId);
+  })
+  : null;
 
 function syncNextTickHostState() {
   globalThis.cottontail?.nextTickState?.(
@@ -124,7 +129,11 @@ export class AsyncResource {
     // runInAsyncScope/bind re-enter that context.
     this._storageSnapshot = captureStorageSnapshot();
     this.requireManualDestroy = typeof options === "object" && options?.requireManualDestroy === true;
-    if (!this.requireManualDestroy) gcTrackedAsyncResourceIds.add(this.asyncIdValue);
+    this._destroyed = false;
+    if (!this.requireManualDestroy) {
+      gcTrackedAsyncResourceIds.add(this.asyncIdValue);
+      asyncResourceFinalizer?.register(this, this.asyncIdValue, this);
+    }
     emitHook("init", this.asyncIdValue, this.type, this.triggerAsyncIdValue, this);
   }
 
@@ -160,8 +169,9 @@ export class AsyncResource {
   }
 
   emitDestroy() {
-    if (destroyedAsyncResourceIds.has(this.asyncIdValue)) return;
-    destroyedAsyncResourceIds.add(this.asyncIdValue);
+    if (this._destroyed) return;
+    this._destroyed = true;
+    asyncResourceFinalizer?.unregister(this);
     gcTrackedAsyncResourceIds.delete(this.asyncIdValue);
     emitHook("destroy", this.asyncIdValue);
   }
@@ -358,12 +368,11 @@ for (const [name, value] of [
 
 Object.defineProperty(globalThis, "__cottontailAsyncHooksOnGc", {
   value: () => {
-  for (const asyncId of [...gcTrackedAsyncResourceIds]) {
-    if (destroyedAsyncResourceIds.has(asyncId)) continue;
-    destroyedAsyncResourceIds.add(asyncId);
-    gcTrackedAsyncResourceIds.delete(asyncId);
-    emitHook("destroy", asyncId);
-  }
+    if (asyncResourceFinalizer != null) return;
+    for (const asyncId of [...gcTrackedAsyncResourceIds]) {
+      gcTrackedAsyncResourceIds.delete(asyncId);
+      emitHook("destroy", asyncId);
+    }
   },
   configurable: true,
   writable: true,

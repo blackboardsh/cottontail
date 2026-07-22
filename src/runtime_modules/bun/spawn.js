@@ -183,7 +183,7 @@ class ProcessReadable {
       read() {
         if (cancelled || released) return Promise.resolve({ done: true, value: undefined });
         if (owner._chunks.length > 0) {
-          return Promise.resolve({ done: false, value: owner._concatChunks(owner._chunks.splice(0)) });
+          return Promise.resolve({ done: false, value: owner._chunks.shift() });
         }
         if (owner._ended) return Promise.resolve({ done: true, value: undefined });
         return new Promise(resolve => owner._readRequests.push(resolve));
@@ -330,6 +330,7 @@ class ProcessWritable {
   _failWrites(error) {
     this._queuedBytes = 0;
     for (const item of this._queue.splice(0)) {
+      item.bytes = null;
       item.reject(error);
       item.callback?.(error);
     }
@@ -350,8 +351,11 @@ class ProcessWritable {
         while (this._queue.length > 0) {
           const item = this._queue[0];
           while (item.offset < item.bytes.byteLength) {
-            const end = Math.min(item.offset + 16 * 1024, item.bytes.byteLength);
-            if (this._host.spawnWrite?.(this._processId, item.bytes.subarray(item.offset, end)) !== true) {
+            const end = Math.min(item.offset + 1024 * 1024, item.bytes.byteLength);
+            const chunk = item.offset === 0 && end === item.bytes.byteLength
+              ? item.bytes
+              : item.bytes.subarray(item.offset, end);
+            if (this._host.spawnWrite?.(this._processId, chunk) !== true) {
               throw new Error("write failed");
             }
             const count = end - item.offset;
@@ -365,7 +369,9 @@ class ProcessWritable {
             }
           }
           this._queue.shift();
-          item.resolve(item.bytes.byteLength);
+          const written = item.bytes.byteLength;
+          item.bytes = null;
+          item.resolve(written);
           item.callback?.(null);
         }
       } catch (error) {

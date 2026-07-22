@@ -1443,6 +1443,8 @@ typedef struct CtAsyncProcess {
     struct CtAsyncProcess *next;
 } CtAsyncProcess;
 
+enum { CT_PROCESS_PIPE_READ_CHUNK_SIZE = 512 * 1024 };
+
 typedef struct CtFdWatcher {
     uint32_t id;
     int fd;
@@ -4064,6 +4066,19 @@ static JSValueRef ct_array_buffer_from_copy(JSContextRef ctx, const char *bytes,
     }
     if (len > 0) memcpy(copy, bytes, len);
     return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, copy, len, ct_array_buffer_free, NULL, exception);
+}
+
+static JSValueRef ct_array_buffer_take_owned_bytes(JSContextRef ctx, char **bytes, size_t len, JSValueRef *exception) {
+    JSObjectRef result = JSObjectMakeArrayBufferWithBytesNoCopy(
+        ctx,
+        *bytes,
+        len,
+        ct_array_buffer_free,
+        NULL,
+        exception
+    );
+    if (result != NULL) *bytes = NULL;
+    return result != NULL ? result : JSValueMakeUndefined(ctx);
 }
 
 static JSValueRef ct_uint8_array_from_owned_bytes(JSContextRef ctx, uint8_t *bytes, size_t len, JSValueRef *exception) {
@@ -22613,7 +22628,13 @@ fail:
     return false;
 }
 
-static bool ct_windows_drain_process_pipe(CtAsyncProcess *process, int *fd, const char *type) {
+static bool ct_windows_drain_process_pipe(
+    CtAsyncProcess *process,
+    int *fd,
+    const char *type,
+    char *buffer,
+    size_t buffer_capacity
+) {
     if (*fd < 0) return false;
     intptr_t raw_handle = _get_osfhandle(*fd);
     if (raw_handle == -1) {
@@ -22632,8 +22653,7 @@ static bool ct_windows_drain_process_pipe(CtAsyncProcess *process, int *fd, cons
         return false;
     }
     if (available == 0) return false;
-    char buffer[16384];
-    unsigned int amount = available < sizeof(buffer) ? (unsigned int)available : (unsigned int)sizeof(buffer);
+    unsigned int amount = available < buffer_capacity ? (unsigned int)available : (unsigned int)buffer_capacity;
     int count = read(*fd, buffer, amount);
     if (count > 0) {
         ct_async_process_queue_text(process, type, buffer, (size_t)count);
@@ -22687,6 +22707,16 @@ static void ct_async_process_apply_output_close_requests(CtAsyncProcess *process
 
 static void *ct_async_process_thread(void *opaque) {
     CtAsyncProcess *process = (CtAsyncProcess *)opaque;
+    char fallback_read_buffer[16 * 1024];
+    char *pipe_read_buffer = fallback_read_buffer;
+    size_t pipe_read_buffer_capacity = sizeof(fallback_read_buffer);
+    if (process->stdout_fd >= 0 || process->stderr_fd >= 0) {
+        char *allocated = (char *)malloc(CT_PROCESS_PIPE_READ_CHUNK_SIZE);
+        if (allocated != NULL) {
+            pipe_read_buffer = allocated;
+            pipe_read_buffer_capacity = CT_PROCESS_PIPE_READ_CHUNK_SIZE;
+        }
+    }
 #if defined(_WIN32)
     bool exited = false;
     bool exit_queued = false;
@@ -22696,8 +22726,12 @@ static void *ct_async_process_thread(void *opaque) {
     while (!exited || process->stdout_fd >= 0 || process->stderr_fd >= 0) {
         ct_async_process_apply_output_close_requests(process);
         bool read_data = false;
-        read_data |= ct_windows_drain_process_pipe(process, &process->stdout_fd, "stdout");
-        read_data |= ct_windows_drain_process_pipe(process, &process->stderr_fd, "stderr");
+        read_data |= ct_windows_drain_process_pipe(
+            process, &process->stdout_fd, "stdout", pipe_read_buffer, pipe_read_buffer_capacity
+        );
+        read_data |= ct_windows_drain_process_pipe(
+            process, &process->stderr_fd, "stderr", pipe_read_buffer, pipe_read_buffer_capacity
+        );
         if (!exited && WaitForSingleObject(process->process_handle, 0) == WAIT_OBJECT_0) {
             exited = true;
             GetExitCodeProcess(process->process_handle, &exit_code);
@@ -22706,8 +22740,12 @@ static void *ct_async_process_thread(void *opaque) {
             exit_queued = true;
         }
         if (exited && !read_data) {
-            ct_windows_drain_process_pipe(process, &process->stdout_fd, "stdout");
-            ct_windows_drain_process_pipe(process, &process->stderr_fd, "stderr");
+            ct_windows_drain_process_pipe(
+                process, &process->stdout_fd, "stdout", pipe_read_buffer, pipe_read_buffer_capacity
+            );
+            ct_windows_drain_process_pipe(
+                process, &process->stderr_fd, "stderr", pipe_read_buffer, pipe_read_buffer_capacity
+            );
             if (process->stdout_fd >= 0) {
                 ct_async_process_queue_simple(process, "stdout_end");
                 close(process->stdout_fd);
@@ -22740,6 +22778,7 @@ static void *ct_async_process_thread(void *opaque) {
     CloseHandle(process->process_handle);
     ct_async_process_remove(process);
     pthread_mutex_destroy(&process->event_mutex);
+    if (pipe_read_buffer != fallback_read_buffer) free(pipe_read_buffer);
     free(process);
     return NULL;
 #else
@@ -22862,11 +22901,10 @@ static void *ct_async_process_thread(void *opaque) {
                     }
                     continue;
                 }
-                char buffer[64 * 1024];
                 for (;;) {
-                    ssize_t n = read(fds[index].fd, buffer, sizeof(buffer));
+                    ssize_t n = read(fds[index].fd, pipe_read_buffer, pipe_read_buffer_capacity);
                     if (n > 0) {
-                        ct_async_process_queue_text(process, types[index], buffer, (size_t)n);
+                        ct_async_process_queue_text(process, types[index], pipe_read_buffer, (size_t)n);
                         continue;
                     }
                     if (n == 0) {
@@ -22945,6 +22983,7 @@ static void *ct_async_process_thread(void *opaque) {
     if (process->start_gate_fd >= 0) close(process->start_gate_fd);
     ct_async_process_remove(process);
     pthread_mutex_destroy(&process->event_mutex);
+    if (pipe_read_buffer != fallback_read_buffer) free(pipe_read_buffer);
     free(process);
     return NULL;
 #endif
@@ -24728,16 +24767,13 @@ static JSValueRef ct_dispatch_spawn_events(JSContextRef ctx, CtJscRuntime *runti
         ct_set_property(ctx, item, "id", JSValueMakeNumber(ctx, event->process_id), exception);
         ct_set_property(ctx, item, "type", ct_make_string(ctx, event->type != NULL ? event->type : ""), exception);
         if (event->data != NULL) {
-            JSValueRef data = JSObjectMakeArrayBufferWithBytesNoCopy(
+            ct_set_property(
                 ctx,
-                event->data,
-                event->data_len,
-                ct_array_buffer_free,
-                NULL,
+                item,
+                "data",
+                ct_array_buffer_take_owned_bytes(ctx, &event->data, event->data_len, exception),
                 exception
             );
-            event->data = NULL;
-            ct_set_property(ctx, item, "data", data, exception);
         }
         if (strcmp(event->type != NULL ? event->type : "", "ipc") == 0) {
             if (event->has_fd) {
@@ -26811,9 +26847,8 @@ static JSValueRef ct_fd_write_at(JSContextRef ctx, JSObjectRef function, JSObjec
     size_t bytes_len = 0;
     char *text = NULL;
     if (ct_get_bytes(ctx, argv[1], &bytes, &bytes_len) != 0) {
-        text = ct_value_to_string_copy(ctx, argv[1]);
+        text = ct_value_to_utf8_copy(ctx, argv[1], &bytes_len);
         bytes = (uint8_t *)text;
-        bytes_len = text != NULL ? strlen(text) : 0;
     }
     if (fd < 0 || bytes == NULL) {
         free(text);
