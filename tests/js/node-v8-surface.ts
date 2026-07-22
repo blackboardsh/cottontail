@@ -258,14 +258,25 @@ assert(promiseEvents.settled >= 1, "promiseHooks settled was not observed");
 assert(promiseEvents.parent, "promiseHooks init parent was not observed");
 expectThrows(() => promiseHooks.onInit(undefined as never), "ERR_INVALID_ARG_TYPE", "promiseHooks validation");
 
-const profiler = new GCProfiler();
-expectThrows(() => profiler.start(), "ERR_NOT_SUPPORTED", "GCProfiler.start");
-assert(profiler.stop() === undefined, "GCProfiler.stop without start mismatch");
-
 setFlagsFromString("--expose-gc");
 assert(typeof (globalThis as { gc?: unknown }).gc === "function", "setFlagsFromString --expose-gc mismatch");
 expectThrows(() => setFlagsFromString("--trace-gc"), "ERR_NOT_SUPPORTED", "setFlagsFromString unsupported flag");
 expectThrows(() => setFlagsFromString(1 as never), "ERR_INVALID_ARG_TYPE", "setFlagsFromString validation");
+
+const profiler = new GCProfiler();
+assert(profiler.stop() === undefined, "GCProfiler.stop without start mismatch");
+assert(profiler.start() === undefined, "GCProfiler.start mismatch");
+(globalThis as { gc: () => void }).gc();
+const gcProfile = profiler.stop();
+assert(gcProfile?.version === 1 && gcProfile.startTime <= gcProfile.endTime, "GCProfiler report mismatch");
+assert(gcProfile.statistics.length >= 1, "GCProfiler did not observe full JSC GC");
+const gcStatistic = gcProfile.statistics[0];
+assert(gcStatistic.gcType === "MarkSweepCompact", "GCProfiler type mismatch");
+assert(gcStatistic.cost >= 0, "GCProfiler cost mismatch");
+assert(gcStatistic.beforeGC.heapStatistics.usedHeapSize >= 0, "GCProfiler before stats mismatch");
+assert(gcStatistic.afterGC.heapSpaceStatistics[0].spaceName === "jsc_heap", "GCProfiler space stats mismatch");
+assert(profiler.stop() === undefined, "GCProfiler repeated stop mismatch");
+
 expectThrows(() => setHeapSnapshotNearHeapLimit(2), "ERR_NOT_SUPPORTED", "setHeapSnapshotNearHeapLimit");
 expectThrows(() => setHeapSnapshotNearHeapLimit(0), "ERR_OUT_OF_RANGE", "setHeapSnapshotNearHeapLimit validation");
 
@@ -284,13 +295,19 @@ queryObjectGlobal.__cottontailV8QueryObjectRoots = queryObjectRoots;
 const queryObjectCount = queryObjects(QueryObjectTarget, { format: "count" });
 assert(Number.isInteger(queryObjectCount) && queryObjectCount >= queryObjectRoots.length,
   "queryObjects count mismatch");
+const repeatedQueryObjectCount = queryObjects(QueryObjectTarget, { format: "count" });
+assert(Number.isInteger(repeatedQueryObjectCount) && repeatedQueryObjectCount >= queryObjectRoots.length,
+  "queryObjects repeated count mismatch");
 assert(prototypeTrapCalls === 0, "queryObjects invoked a prototype trap");
+const queryObjectSummaries = queryObjects(QueryObjectTarget, { format: "summary" });
+assert(queryObjectSummaries.length >= queryObjectRoots.length &&
+  queryObjectSummaries.every((value) => typeof value === "string"),
+  "queryObjects summary mismatch");
 delete queryObjectGlobal.__cottontailV8QueryObjectRoots;
 
 assert(queryObjects(() => {}) === 0, "queryObjects prototype-less constructor mismatch");
 assert((queryObjects(() => {}, { format: "summary" }) as unknown[]).length === 0,
   "queryObjects prototype-less summary mismatch");
-expectThrows(() => queryObjects(QueryObjectTarget, { format: "summary" }), "ERR_NOT_SUPPORTED", "queryObjects summary");
 expectThrows(() => queryObjects(null as never), "ERR_INVALID_ARG_TYPE", "queryObjects validation");
 expectThrows(() => queryObjects(QueryObjectTarget, null as never), "ERR_INVALID_ARG_TYPE", "queryObjects options validation");
 expectThrows(() => queryObjects(QueryObjectTarget, { format: "invalid" as never }), "ERR_INVALID_ARG_VALUE", "queryObjects format validation");

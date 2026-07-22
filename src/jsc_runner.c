@@ -34,7 +34,7 @@ extern JSObjectRef ct_jsc_create_test_coverage_collector(JSContextRef context);
 extern bool ct_jsc_enable_control_flow_profiler(JSContextRef context);
 extern uint32_t ct_jsc_cached_data_version_tag(void);
 extern char *ct_jsc_heap_snapshot(JSContextRef context, int gc_debugging);
-extern size_t ct_jsc_query_objects_count(JSContextRef context, JSObjectRef prototype);
+extern JSObjectRef *ct_jsc_query_objects(JSContextRef context, JSObjectRef prototype, size_t *count_out);
 extern size_t ct_jsc_heap_footprint(JSContextRef context);
 extern bool ct_jsc_value_is_rope(JSContextRef context, JSValueRef value);
 extern bool ct_jsc_set_time_zone(JSContextRef context, const char *time_zone);
@@ -23922,19 +23922,23 @@ static JSValueRef ct_jsc_heap_snapshot_for_debugging_host(JSContextRef ctx, JSOb
     return ct_jsc_heap_snapshot_host_impl(ctx, exception, true);
 }
 
-static JSValueRef ct_jsc_query_objects_count_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+static JSValueRef ct_jsc_query_objects_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
     if (argc < 1 || !JSValueIsObject(ctx, argv[0])) {
-        ct_throw_type_error(ctx, exception, "cottontail.jscQueryObjectsCount(prototype) requires an object prototype");
+        ct_throw_type_error(ctx, exception, "cottontail.jscQueryObjects(prototype) requires an object prototype");
         return JSValueMakeUndefined(ctx);
     }
-    size_t count = ct_jsc_query_objects_count(ctx, (JSObjectRef)argv[0]);
+    size_t count = 0;
+    JSObjectRef *objects = ct_jsc_query_objects(ctx, (JSObjectRef)argv[0], &count);
     if (count == SIZE_MAX) {
         ct_throw_message(ctx, exception, "stock JSC heap analyzer ABI is unavailable");
         return JSValueMakeUndefined(ctx);
     }
-    return JSValueMakeNumber(ctx, (double)count);
+    JSObjectRef result = JSObjectMakeArray(ctx, count, (const JSValueRef *)objects, exception);
+    for (size_t index = 0; index < count; index++) JSValueUnprotect(ctx, objects[index]);
+    free(objects);
+    return result;
 }
 
 static JSValueRef ct_jsc_string_is_8_bit_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {

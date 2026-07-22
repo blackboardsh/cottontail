@@ -1,6 +1,7 @@
 import { Buffer } from "./buffer.js";
 import { Readable } from "./stream.js";
 import { createHook as createAsyncHook } from "./async_hooks.js";
+import { inspect } from "./util.js";
 import { captureV8HeapSnapshot } from "./internal/heap_snapshot.js";
 import {
   DefaultDeserializer,
@@ -12,6 +13,7 @@ import {
 } from "./internal/v8_serializer.js";
 
 const maxUint32 = 0xffffffff;
+const activeGCProfilers = new Set();
 
 export {
   DefaultDeserializer,
@@ -191,18 +193,30 @@ export function cachedDataVersionTag() {
 }
 
 function exposeGc() {
-  if (typeof globalThis.gc === "function") return;
   if (typeof cottontail.gc !== "function") {
     throw unsupported("--expose-gc", "the JSC garbage collector bridge is unavailable");
   }
+  if (globalThis.gc?.__cottontailV8ProfilerWrapper === true) return;
+
+  const gc = (options = undefined) => {
+    const profilers = activeGCProfilers.size === 0 ? undefined : [...activeGCProfilers];
+    const startTime = profilers === undefined ? 0 : finiteNonNegative(globalThis.performance?.now?.(), Date.now());
+    // cottontail.gc(true) is JSC's synchronous full collector, so this scope
+    // can be measured without claiming visibility into automatic collections.
+    const result = cottontail.gc(true);
+    if (profilers !== undefined) {
+      const endTime = finiteNonNegative(globalThis.performance?.now?.(), Date.now());
+      const afterGC = gcProfilerSnapshot();
+      for (const profiler of profilers) profiler._recordFullGC(startTime, endTime, afterGC);
+    }
+    globalThis.__cottontailAsyncHooksOnGc?.();
+    if (options && typeof options === "object" && options.execution === "async") return Promise.resolve(result);
+    return result;
+  };
+  Object.defineProperty(gc, "__cottontailV8ProfilerWrapper", { value: true });
   Object.defineProperty(globalThis, "gc", {
     configurable: true,
-    value: (options = undefined) => {
-      const result = cottontail.gc(true);
-      globalThis.__cottontailAsyncHooksOnGc?.();
-      if (options && typeof options === "object" && options.execution === "async") return Promise.resolve(result);
-      return result;
-    },
+    value: gc,
     writable: true,
   });
 }
@@ -226,7 +240,7 @@ export function setHeapSnapshotNearHeapLimit(limit) {
   if (limit < 1 || limit > maxUint32) throw outOfRange("limit", limit, ">= 1 && <= 4294967295");
   throw unsupported(
     "setHeapSnapshotNearHeapLimit()",
-    "JSC's max-heap option has no embeddable near-limit callback or rearm contract",
+    "stock JSC does not export its adaptive heap limit or a pre-limit callback/rearm contract",
   );
 }
 
@@ -309,16 +323,75 @@ export const promiseHooks = {
   },
 };
 
+function gcProfilerSnapshot() {
+  const heap = getHeapStatistics();
+  return {
+    heapStatistics: {
+      externalMemory: heap.external_memory,
+      heapSizeLimit: heap.heap_size_limit,
+      mallocedMemory: heap.malloced_memory,
+      peakMallocedMemory: heap.peak_malloced_memory,
+      totalAvailableSize: heap.total_available_size,
+      totalGlobalHandlesSize: heap.total_global_handles_size,
+      totalHeapSize: heap.total_heap_size,
+      totalHeapSizeExecutable: heap.total_heap_size_executable,
+      totalPhysicalSize: heap.total_physical_size,
+      usedGlobalHandlesSize: heap.used_global_handles_size,
+      usedHeapSize: heap.used_heap_size,
+    },
+    heapSpaceStatistics: getHeapSpaceStatistics().map((space) => ({
+      physicalSpaceSize: space.physical_space_size,
+      spaceAvailableSize: space.space_available_size,
+      spaceName: space.space_name,
+      spaceSize: space.space_size,
+      spaceUsedSize: space.space_used_size,
+    })),
+  };
+}
+
 export class GCProfiler {
+  constructor() {
+    this._active = false;
+    this._startTime = 0;
+    this._statistics = [];
+    this._previousSnapshot = undefined;
+  }
+
+  _recordFullGC(startTime, endTime, afterGC) {
+    if (!this._active) return;
+    this._statistics.push({
+      gcType: "MarkSweepCompact",
+      beforeGC: this._previousSnapshot,
+      cost: Math.max(0, endTime - startTime) * 1000,
+      afterGC,
+    });
+    this._previousSnapshot = afterGC;
+  }
+
   start() {
-    throw unsupported(
-      "GCProfiler.start()",
-      "JSC's HeapObserver registration is a private inline API absent from the stock JSCOnly SDK",
-    );
+    if (this._active) activeGCProfilers.delete(this);
+    exposeGc();
+    this._active = true;
+    this._startTime = Date.now();
+    this._statistics = [];
+    this._previousSnapshot = gcProfilerSnapshot();
+    activeGCProfilers.add(this);
   }
 
   stop() {
-    return undefined;
+    if (!this._active) return undefined;
+
+    this._active = false;
+    activeGCProfilers.delete(this);
+    const result = {
+      version: 1,
+      startTime: this._startTime,
+      statistics: this._statistics.slice(),
+      endTime: Date.now(),
+    };
+    this._statistics = [];
+    this._previousSnapshot = undefined;
+    return result;
   }
 }
 
@@ -342,16 +415,13 @@ export function queryObjects(constructor, options = undefined) {
   if ((typeof prototype !== "object" && typeof prototype !== "function") || prototype === null) {
     return format === "summary" ? [] : 0;
   }
-  if (format === "summary") {
-    throw unsupported(
-      "queryObjects(..., { format: 'summary' })",
-      "stock JSC exposes live cells but no side-effect-free object preview formatter",
-    );
-  }
-  if (typeof cottontail.jscQueryObjectsCount !== "function") {
+  if (typeof cottontail.jscQueryObjects !== "function") {
     throw unsupported("queryObjects()", "the JSC live-cell enumeration bridge is unavailable");
   }
-  return cottontail.jscQueryObjectsCount(prototype);
+  const objects = cottontail.jscQueryObjects(prototype);
+  return format === "summary"
+    ? objects.map((object) => inspect(object, { depth: 0 }))
+    : objects.length;
 }
 
 export const startupSnapshot = {

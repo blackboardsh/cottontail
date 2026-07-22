@@ -22,6 +22,7 @@
 #include <optional>
 #include <span>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <wtf/Function.h>
@@ -657,31 +658,78 @@ extern "C" uint32_t ct_jsc_cached_data_version_tag()
     return JSC::computeJSCBytecodeCacheVersion();
 }
 
+struct CtQueryObjectsInternalEdges {
+    JSC::JSCell* values[3] { nullptr, nullptr, nullptr };
+    size_t count { 0 };
+};
+
+struct CtQueryObjectsGraph {
+    std::vector<JSC::JSCell*> cells;
+    std::unordered_map<JSC::JSCell*, CtQueryObjectsInternalEdges> internal_edges;
+};
+
 class CtQueryObjectsAnalyzer final : public JSC::HeapAnalyzer {
 public:
     void analyzeNode(JSC::JSCell* cell) final
     {
         std::lock_guard lock(m_mutex);
-        m_cells.push_back(cell);
+        recordCell(cell);
     }
 
-    void analyzeEdge(JSC::JSCell*, JSC::JSCell*, JSC::RootMarkReason) final { }
-    void analyzePropertyNameEdge(JSC::JSCell*, JSC::JSCell*, UniquedStringImpl*) final { }
-    void analyzeVariableNameEdge(JSC::JSCell*, JSC::JSCell*, UniquedStringImpl*) final { }
-    void analyzeIndexEdge(JSC::JSCell*, JSC::JSCell*, uint32_t) final { }
+    void analyzeEdge(JSC::JSCell* from, JSC::JSCell* to, JSC::RootMarkReason) final
+    {
+        std::lock_guard lock(m_mutex);
+        recordCell(from);
+        recordCell(to);
+        if (from == nullptr || to == nullptr)
+            return;
+        auto& edges = m_internal_edges[from];
+        if (edges.count < std::size(edges.values))
+            edges.values[edges.count++] = to;
+    }
+
+    void analyzePropertyNameEdge(JSC::JSCell* from, JSC::JSCell* to, UniquedStringImpl*) final
+    {
+        recordNamedEdge(from, to);
+    }
+
+    void analyzeVariableNameEdge(JSC::JSCell* from, JSC::JSCell* to, UniquedStringImpl*) final
+    {
+        recordNamedEdge(from, to);
+    }
+
+    void analyzeIndexEdge(JSC::JSCell* from, JSC::JSCell* to, uint32_t) final
+    {
+        recordNamedEdge(from, to);
+    }
+
     void setOpaqueRootReachabilityReasonForCell(JSC::JSCell*, ASCIILiteral) final { }
     void setWrappedObjectForCell(JSC::JSCell*, void*) final { }
     void setLabelForCell(JSC::JSCell*, const WTF::String&) final { }
 
-    std::vector<JSC::JSCell*> takeCells()
+    CtQueryObjectsGraph takeGraph()
     {
         std::lock_guard lock(m_mutex);
-        return std::move(m_cells);
+        return { std::move(m_cells), std::move(m_internal_edges) };
     }
 
 private:
+    void recordCell(JSC::JSCell* cell)
+    {
+        if (cell != nullptr)
+            m_cells.push_back(cell);
+    }
+
+    void recordNamedEdge(JSC::JSCell* from, JSC::JSCell* to)
+    {
+        std::lock_guard lock(m_mutex);
+        recordCell(from);
+        recordCell(to);
+    }
+
     std::mutex m_mutex;
     std::vector<JSC::JSCell*> m_cells;
+    std::unordered_map<JSC::JSCell*, CtQueryObjectsInternalEdges> m_internal_edges;
 };
 
 class CtActiveHeapAnalyzerScope {
@@ -718,15 +766,43 @@ private:
     JSC::Heap& m_heap;
 };
 
-extern "C" size_t ct_jsc_query_objects_count(JSContextRef context, JSObjectRef prototype)
+static JSC::JSCell* ct_jsc_query_objects_direct_prototype(
+    JSContextRef context,
+    const CtQueryObjectsGraph& graph,
+    JSC::JSCell* object)
 {
+    auto object_edges = graph.internal_edges.find(object);
+    if (object_edges == graph.internal_edges.end() || object_edges->second.count == 0)
+        return nullptr;
+
+    // JSCell::visitChildren first emits the object's Structure. For an object
+    // Structure, Structure::visitChildren then emits its own Structure, its
+    // global object, and its stored prototype in that order. Reading those GC
+    // edges preserves JSC's direct [[Prototype]] identity without invoking
+    // Proxy getPrototypeOf traps through the public C API.
+    auto structure_edges = graph.internal_edges.find(object_edges->second.values[0]);
+    if (structure_edges == graph.internal_edges.end() || structure_edges->second.count < 3)
+        return nullptr;
+    auto* prototype = structure_edges->second.values[2];
+    auto value = reinterpret_cast<JSValueRef>(prototype);
+    return JSValueIsObject(context, value) ? prototype : nullptr;
+}
+
+extern "C" JSObjectRef* ct_jsc_query_objects(
+    JSContextRef context,
+    JSObjectRef prototype,
+    size_t* count_out)
+{
+    if (count_out == nullptr)
+        return nullptr;
+    *count_out = SIZE_MAX;
     if (context == nullptr || prototype == nullptr)
-        return SIZE_MAX;
+        return nullptr;
     auto* vm = ct_jsc_vm(context);
     JSC::JSLockHolder lock(*vm);
     auto* profiler = ct_jsc_heap_profiler(vm);
     if (profiler == nullptr)
-        return SIZE_MAX;
+        return nullptr;
 
     JSValueProtect(context, prototype);
     CtQueryObjectsAnalyzer analyzer;
@@ -741,33 +817,48 @@ extern "C" size_t ct_jsc_query_objects_count(JSContextRef context, JSObjectRef p
         heap->collectNow(JSC::Sync, JSC::GCRequest(JSC::CollectionScope::Full));
     }
 
-    auto cells = analyzer.takeCells();
+    auto graph = analyzer.takeGraph();
+    auto& cells = graph.cells;
     std::sort(cells.begin(), cells.end(), [](auto* left, auto* right) {
         return reinterpret_cast<uintptr_t>(left) < reinterpret_cast<uintptr_t>(right);
     });
     cells.erase(std::unique(cells.begin(), cells.end()), cells.end());
 
-    size_t count = 0;
+    std::vector<JSObjectRef> matches;
     for (auto* cell : cells) {
         auto value = reinterpret_cast<JSValueRef>(cell);
         if (!JSValueIsObject(context, value))
             continue;
 
-        auto object = reinterpret_cast<JSObjectRef>(cell);
+        auto* object = cell;
         size_t remaining_prototypes = cells.size();
         while (remaining_prototypes-- > 0) {
-            auto next = JSObjectGetPrototype(context, object);
-            if (next == prototype) {
-                ++count;
+            auto* next = ct_jsc_query_objects_direct_prototype(context, graph, object);
+            if (next == reinterpret_cast<JSC::JSCell*>(prototype)) {
+                matches.push_back(reinterpret_cast<JSObjectRef>(cell));
                 break;
             }
-            if (!JSValueIsObject(context, next))
+            if (next == nullptr)
                 break;
-            object = reinterpret_cast<JSObjectRef>(const_cast<OpaqueJSValue*>(next));
+            object = next;
+        }
+    }
+
+    JSObjectRef* result = nullptr;
+    if (!matches.empty()) {
+        result = static_cast<JSObjectRef*>(std::malloc(matches.size() * sizeof(JSObjectRef)));
+        if (result == nullptr) {
+            JSValueUnprotect(context, prototype);
+            return nullptr;
+        }
+        for (size_t index = 0; index < matches.size(); ++index) {
+            result[index] = matches[index];
+            JSValueProtect(context, result[index]);
         }
     }
     JSValueUnprotect(context, prototype);
-    return count;
+    *count_out = matches.size();
+    return result;
 }
 
 extern "C" char* ct_jsc_heap_snapshot(JSContextRef context, int gc_debugging)
