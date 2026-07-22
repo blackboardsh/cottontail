@@ -1,6 +1,7 @@
 import { basename, dirname, isAbsolute, join, resolve } from "./path.js";
 import { fileURLToPath, pathToFileURL } from "./url.js";
 import { parse as parseTOML } from "../bun/toml.js";
+import { openRuntimeTranspilerCache } from "../internal/runtime-transpiler-cache.js";
 import * as assert from "./assert.js";
 import * as assertStrict from "./assert/strict.js";
 import * as asyncHooks from "./async_hooks.js";
@@ -2328,19 +2329,25 @@ function executeCommonJsSource(module, filename, source) {
   return module.exports;
 }
 
-function transpileExtensionSource(filename, loader, forceTransform = false) {
-  const source = readModuleFile(filename).replace(/^#![^\n]*(\n|$)/, "");
-  if (loader === "ts" && hasBunTranspiledPragma(source)) return source;
+function transpileExtensionSource(filename, loader, forceTransform = false, inputSource = undefined) {
+  const source = (inputSource ?? readModuleFile(filename)).replace(/^#![^\n]*(\n|$)/, "");
+  const cache = openRuntimeTranspilerCache(source, `${loader}:${forceTransform ? 1 : 0}`);
+  if (cache?.hit) return cache.output;
+  const finish = output => {
+    cache?.store(output);
+    return output;
+  };
+  if (loader === "ts" && hasBunTranspiledPragma(source)) return finish(source);
   const extension = String(filename).toLowerCase().match(/\.[^.]+$/)?.[0];
   const needsRuntimeTransform = /(?:^|[\n;{}])\s*@[A-Za-z_$([]/m.test(source);
   // Plain CommonJS JavaScript is already valid input for JSC. Keeping its
   // source layout intact preserves Node-compatible stack and source-map
   // coordinates instead of rewriting every require() through the transpiler.
   if (!forceTransform && loader === "js" && (extension === ".js" || extension === ".cjs") && !needsRuntimeTransform) {
-    return source;
+    return finish(source);
   }
   if (typeof cottontail.transpilerTransform !== "function") {
-    return maybeTransformRuntimeSyntax(filename, maybeStripTypeScript(filename, source));
+    return finish(maybeTransformRuntimeSyntax(filename, maybeStripTypeScript(filename, source)));
   }
   try {
     // Bun's parser canonicalizes `module === require.main` through its
@@ -2348,7 +2355,7 @@ function transpileExtensionSource(filename, loader, forceTransform = false) {
     // semantics so that node remains the original entry Module instead of
     // emitting import.meta into the CommonJS function wrapper.
     const target = /\brequire\.main\b/.test(source) ? "node" : "bun";
-    return String(cottontail.transpilerTransform(
+    return finish(String(cottontail.transpilerTransform(
       source,
       JSON.stringify({
         target,
@@ -2364,7 +2371,7 @@ function transpileExtensionSource(filename, loader, forceTransform = false) {
         },
       }),
       loader,
-    ));
+    )));
   } catch (error) {
     throw markModuleCompileError(error, filename, source, 0);
   }
@@ -2458,7 +2465,7 @@ function executeDefaultExtension(module, filename, loader) {
     return executeBundledCommonJsModule(module, filename, originalSource);
   }
   const compileOverridden = module._compile !== Module.prototype._compile;
-  const source = transpileExtensionSource(filename, loader, compileOverridden);
+  const source = transpileExtensionSource(filename, loader, compileOverridden, originalSource);
   // Bun's synchronous ESM path does not call an overridden module._compile.
   if (hasEsmSyntax(source)) return executeCommonJsSource(module, filename, source);
   return module._compile(formatExtensionCompileSource(source, compileOverridden), filename);

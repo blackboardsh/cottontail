@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const compiler = @import("cottontail_compiler");
+const cli_run_execution = @import("cli_run_execution.zig");
 const runtime = @import("runtime.zig");
 const heap_profiler = @import("heap_profiler.zig");
 const icu_bootstrap = @import("icu_bootstrap.zig");
@@ -4280,18 +4281,39 @@ fn bundleScriptNative(
             exec_args,
             script_args,
         );
+    const startup_options = try cli_run_execution.StartupOptions.parse(ctx.allocator, exec_args);
+    const sql_module_path = if (startup_options.sql_preconnect)
+        try runtimeModulePath(ctx, &.{ "bun", "sql.js" })
+    else
+        null;
+    var cli_startup_imports: std.ArrayList(u8) = .empty;
+    try startup_options.appendSource(ctx.allocator, &cli_startup_imports, sql_module_path);
     const cli_preload_imports = try buildCliPreloadImports(ctx, script_abs, exec_args, true);
     const test_preload_imports = if (is_test_cli_execution)
         try buildCliPreloadImports(ctx, script_abs, script_args, false)
     else
         "";
-    const preload_imports = try std.mem.concat(ctx.allocator, u8, &.{ bunfig_preload_imports, cli_preload_imports, test_preload_imports });
-    const is_common_js_entrypoint = !is_wasm_entrypoint and try shouldBundleCommonJsEntrypoint(ctx, script_abs);
+    const preload_imports = try std.mem.concat(ctx.allocator, u8, &.{ bunfig_preload_imports, cli_startup_imports.items, cli_preload_imports, test_preload_imports });
+    const requires_full_runtime_preloads = bunfig_preload_imports.len > 0 or
+        cli_preload_imports.len > 0 or
+        test_preload_imports.len > 0 or
+        startup_options.requiresFullRuntime();
+    const runtime_transpiler_cache_enabled = cli_run_execution.runtimeTranspilerCacheEnabled(ctx.environ_map);
+    const runtime_cache_common_js_entrypoint = if (runtime_transpiler_cache_enabled and !is_wasm_entrypoint)
+        try runtimeCacheCanUseCommonJsLoader(ctx, script_abs)
+    else
+        false;
+    const detected_common_js_entrypoint = if (is_wasm_entrypoint)
+        false
+    else
+        try shouldBundleCommonJsEntrypoint(ctx, script_abs);
+    const is_common_js_entrypoint = detected_common_js_entrypoint or runtime_cache_common_js_entrypoint;
     if (is_common_js_entrypoint) try validateCommonJsTestSyntax(ctx, script_abs);
-    const runtime_bootstrap_mode: RuntimeBootstrapMode = if (reload_dependencies_out == null and
+    const runtime_bootstrap_mode: RuntimeBootstrapMode = if (!runtime_cache_common_js_entrypoint and
+        reload_dependencies_out == null and
         !standalone_compile and
         build_options == null and
-        preload_imports.len == 0 and
+        !requires_full_runtime_preloads and
         !is_wasm_entrypoint)
         try entrypointRuntimeBootstrapMode(ctx, script_entry_abs)
     else
@@ -5423,6 +5445,29 @@ fn shouldBundleCommonJsEntrypoint(ctx: *const Context, script_abs: []const u8) !
     return !(try nearestPackageTypeIsModule(ctx, script_dir));
 }
 
+fn runtimeCacheCanUseCommonJsLoader(ctx: *const Context, script_abs: []const u8) !bool {
+    const extension = std.fs.path.extension(script_abs);
+    const explicit_common_js = std.mem.eql(u8, extension, ".cjs") or
+        std.mem.eql(u8, extension, ".cts");
+    if (!explicit_common_js and
+        !std.mem.eql(u8, extension, ".js") and
+        !std.mem.eql(u8, extension, ".jsx") and
+        !std.mem.eql(u8, extension, ".ts") and
+        !std.mem.eql(u8, extension, ".tsx"))
+    {
+        return false;
+    }
+    const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
+    if (!explicit_common_js and try nearestPackageTypeIsModule(ctx, script_dir)) return false;
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        script_abs,
+        ctx.allocator,
+        .limited(16 * 1024 * 1024),
+    ) catch return false;
+    return !sourceLooksEsm(source);
+}
+
 const EntrypointModuleSyntax = struct {
     has_top_level_await: bool,
     exports_kind: enum { none, cjs, esm },
@@ -6033,28 +6078,6 @@ fn appendCliPreloadKind(
 fn buildCliPreloadImports(ctx: *const Context, script_abs: []const u8, exec_args: []const [:0]const u8, include_inspect_preload: bool) ![]const u8 {
     var output: std.ArrayList(u8) = .empty;
     _ = script_abs;
-    var index: usize = 0;
-    while (index < exec_args.len) : (index += 1) {
-        const arg = exec_args[index];
-        var preconnect_url: ?[]const u8 = null;
-
-        if (std.mem.eql(u8, arg, "--sql-preconnect")) {
-            try output.appendSlice(ctx.allocator, "void globalThis.Bun.sql.connect();\n");
-        } else if (std.mem.eql(u8, arg, "--fetch-preconnect")) {
-            if (index + 1 < exec_args.len) {
-                index += 1;
-                preconnect_url = exec_args[index];
-            }
-        } else if (std.mem.startsWith(u8, arg, "--fetch-preconnect=")) {
-            preconnect_url = arg["--fetch-preconnect=".len..];
-        }
-
-        if (preconnect_url) |url| {
-            try output.appendSlice(ctx.allocator, "globalThis.fetch.preconnect(");
-            try output.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, url));
-            try output.appendSlice(ctx.allocator, ");\n");
-        }
-    }
     try appendCliPreloadKind(ctx, &output, exec_args, .preload);
     try appendCliPreloadKind(ctx, &output, exec_args, .require);
     try appendCliPreloadKind(ctx, &output, exec_args, .import);

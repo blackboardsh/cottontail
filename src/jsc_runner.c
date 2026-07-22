@@ -17132,6 +17132,51 @@ static void ct_write_fatal_diagnostic(const char *reason) {
     fflush(stderr);
 }
 
+static void ct_report_intentional_crash(const char *kind, bool out_of_memory) {
+    const char *base_url = getenv("BUN_CRASH_REPORT_URL");
+    if (ct_crash_reporting_suppressed || base_url == NULL || base_url[0] == '\0') return;
+
+    size_t base_length = strlen(base_url);
+    while (base_length > 0 && base_url[base_length - 1] == '/') base_length--;
+    if (base_length == 0 || base_length > 3500) return;
+
+    char report_url[4096];
+    int report_length = snprintf(
+        report_url,
+        sizeof(report_url),
+        "%.*s/cottontail/v1/%s",
+        (int)base_length,
+        base_url,
+        kind
+    );
+    if (report_length <= 0 || (size_t)report_length >= sizeof(report_url) - sizeof("/ack")) return;
+
+    if (out_of_memory) {
+        fprintf(stderr, "%s\n", report_url);
+    } else {
+        fprintf(stderr,
+                "oh no: Bun has crashed. This indicates a bug in Bun, not your code\n%s\n",
+                report_url);
+    }
+    fflush(stderr);
+
+    char ack_url[4096];
+    int ack_length = snprintf(ack_url, sizeof(ack_url), "%s/ack", report_url);
+    if (ack_length <= 0 || (size_t)ack_length >= sizeof(ack_url)) return;
+
+#if defined(_WIN32)
+    (void)_spawnlp(_P_NOWAIT, "curl", "curl", "-fsSL", ack_url, NULL);
+#else
+    pid_t child = fork();
+    if (child == 0) {
+        (void)close(STDIN_FILENO);
+        (void)close(STDOUT_FILENO);
+        execlp("curl", "curl", "-fsSL", ack_url, (char *)NULL);
+        _exit(0);
+    }
+#endif
+}
+
 static JSValueRef ct_internal_crash(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -17147,6 +17192,8 @@ static JSValueRef ct_internal_crash(JSContextRef ctx, JSObjectRef function, JSOb
 
     if (strcmp(kind, "segfault") == 0) {
         free(kind);
+        ct_report_intentional_crash("segfault", false);
+        ct_crash_reporting_suppressed = 1;
 #if defined(_WIN32)
         ct_write_fatal_diagnostic("segmentation fault");
 #endif
@@ -17157,6 +17204,7 @@ static JSValueRef ct_internal_crash(JSContextRef ctx, JSObjectRef function, JSOb
     if (strcmp(kind, "panic") == 0) {
         free(kind);
         ct_write_fatal_diagnostic("panic: invoked crash handler");
+        ct_report_intentional_crash("panic", false);
         ct_crash_reporting_suppressed = 1;
         abort();
     }
@@ -17169,6 +17217,7 @@ static JSValueRef ct_internal_crash(JSContextRef ctx, JSObjectRef function, JSOb
     if (strcmp(kind, "outOfMemory") == 0) {
         free(kind);
         ct_write_fatal_diagnostic("out of memory");
+        ct_report_intentional_crash("out-of-memory", true);
         ct_crash_reporting_suppressed = 1;
         abort();
     }

@@ -7723,7 +7723,9 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
     if (!headerNames.has("connection")) headerLines.push("Connection: keep-alive");
     if (!headerNames.has("accept")) headerLines.push("Accept: */*");
     if (!headerNames.has("accept-encoding")) headerLines.push("Accept-Encoding: gzip, deflate, br, zstd");
-    if (!headerNames.has("user-agent")) headerLines.push(`User-Agent: Bun/${BunObject.version ?? "1.0.0"}`);
+    if (!headerNames.has("user-agent")) {
+      headerLines.push(`User-Agent: ${globalThis.__cottontailDefaultUserAgent ?? globalThis.navigator?.userAgent ?? `Bun/${BunObject.version ?? "1.0.0"}`}`);
+    }
     if (body.byteLength > 0 && !headerNames.has("content-length") && !headerNames.has("transfer-encoding")) {
       headerLines.push(`Content-Length: ${body.byteLength}`);
     } else if (

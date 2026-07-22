@@ -20,6 +20,7 @@ const native_bindings = @import("native_bindings.zig");
 const cli_create_source = @import("cli_create_source.zig");
 const cli_init = @import("cli_init.zig");
 const cli_run = @import("cli_run.zig");
+const cli_run_execution = @import("cli_run_execution.zig");
 const script_runner = @import("script_runner.zig");
 const standalone_executable = @import("standalone_executable.zig");
 
@@ -272,6 +273,7 @@ fn runCommandFlagTakesValue(arg: []const u8) bool {
 
 fn runtimeFlagTakesValue(arg: []const u8) bool {
     if (std.mem.indexOfScalar(u8, arg, '=') != null) return false;
+    if (cli_run_execution.flagTakesValue(arg)) return true;
     const value_flags = [_][]const u8{
         "-r",
         "--require",
