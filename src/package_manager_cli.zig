@@ -2525,7 +2525,11 @@ const Manager = struct {
             }
         }
 
-        if (manager.deferred_install_error == null and !manager.options.dry_run and !manager.options.no_save) {
+        if (manager.deferred_install_error == null and
+            !manager.options.production and
+            !manager.options.dry_run and
+            !manager.options.no_save)
+        {
             if (manager.records.items.len == 0 and !hasAnyDependencies(&root)) {
                 const had_lockfile = manager.hasExistingLockfile();
                 manager.deleteLockfiles();
@@ -4516,6 +4520,10 @@ const Manager = struct {
                 manager.hidden_hoist_pattern = try Isolated.HoistPattern.init(manager.allocator, patterns);
             }
         }
+        if (parseNpmrcValue(source_text, "omit")) |value| {
+            var omitted = std.mem.tokenizeAny(u8, value, ", \t");
+            while (omitted.next()) |dependency_type| try applyOmit(&manager.options, dependency_type);
+        }
     }
 
     fn authorizationForRegistry(manager: *Manager, configured: compiler.schema.api.NpmRegistry) !?[]const u8 {
@@ -4810,10 +4818,14 @@ const Manager = struct {
     ) !void {
         try manager.installDependencyObject(package_json, "dependencies", parent_dir, direct, false);
         try manager.installOptionalDependencies(package_json, parent_dir, direct);
-        if (!manager.options.production and !manager.options.omit_dev) {
+        if (manager.options.production or manager.options.omit_dev) {
+            try manager.resolveOmittedDependencyObject(package_json, "devDependencies", parent_dir, direct, false);
+        } else {
             try manager.installDependencyObject(package_json, "devDependencies", parent_dir, direct, false);
         }
-        if (!manager.options.omit_peer) {
+        if (manager.options.omit_peer) {
+            try manager.resolveOmittedDependencyObject(package_json, "peerDependencies", parent_dir, direct, false);
+        } else {
             try manager.installDependencyObject(package_json, "peerDependencies", parent_dir, direct, false);
         }
     }
@@ -4828,12 +4840,23 @@ const Manager = struct {
             return manager.installDependencyObject(package_json, "optionalDependencies", parent_dir, direct, true);
         }
 
+        return manager.resolveOmittedDependencyObject(package_json, "optionalDependencies", parent_dir, direct, true);
+    }
+
+    fn resolveOmittedDependencyObject(
+        manager: *Manager,
+        package_json: *Value,
+        key: []const u8,
+        parent_dir: []const u8,
+        direct: bool,
+        optional: bool,
+    ) !void {
         const previous_report_direct = manager.report_direct_installs;
         manager.report_direct_installs = false;
         defer manager.report_direct_installs = previous_report_direct;
         const previous_resolution_only = manager.setResolutionOnly(true);
         defer manager.restoreResolutionOnly(previous_resolution_only);
-        try manager.installDependencyObject(package_json, "optionalDependencies", parent_dir, direct, true);
+        try manager.installDependencyObject(package_json, key, parent_dir, direct, optional);
     }
 
     fn setResolutionOnly(manager: *Manager, enabled: bool) struct { bool, bool } {
@@ -10237,8 +10260,16 @@ const Manager = struct {
             defer manager.restoreResolutionOnly(previous);
             try manager.installDependencyObject(workspace.package_json, "dependencies", workspace.path, false, false);
             try manager.installOptionalDependencies(workspace.package_json, workspace.path, false);
-            try manager.installOrLinkPeerDependencies(workspace.package_json, workspace.path, workspace.path, workspace.path);
-            if (!manager.options.production) try manager.installDependencyObject(workspace.package_json, "devDependencies", workspace.path, false, false);
+            if (manager.options.omit_peer) {
+                try manager.resolveOmittedDependencyObject(workspace.package_json, "peerDependencies", workspace.path, false, false);
+            } else {
+                try manager.installOrLinkPeerDependencies(workspace.package_json, workspace.path, workspace.path, workspace.path);
+            }
+            if (manager.options.production or manager.options.omit_dev) {
+                try manager.resolveOmittedDependencyObject(workspace.package_json, "devDependencies", workspace.path, false, false);
+            } else {
+                try manager.installDependencyObject(workspace.package_json, "devDependencies", workspace.path, false, false);
+            }
             try manager.queuePackageScripts(workspace.name, workspace.name, workspace.version, workspace.path, .workspace, true, false, true);
         }
     }

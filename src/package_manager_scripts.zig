@@ -139,6 +139,7 @@ pub const Queue = struct {
                 try stderr.writeAll(state.diagnostics.written());
                 if (state.failure) |err| {
                     if (!state.task.optional) return err;
+                    std.Io.Dir.cwd().deleteTree(process_init.io, state.task.cwd) catch {};
                 }
             }
             offset = end;
