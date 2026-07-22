@@ -94,6 +94,8 @@ const Options = struct {
     config_path: ?[]const u8 = null,
     filters: []const []const u8 = &.{},
     registry: ?[]const u8 = null,
+    ca: []const []const u8 = &.{},
+    ca_file_name: ?[]const u8 = null,
     production: bool = false,
     ignore_scripts: bool = false,
     trust: bool = false,
@@ -300,6 +302,13 @@ const FetchLogLevel = enum {
         };
     }
 };
+
+fn packageManagerFetchErrorName(err: anyerror) []const u8 {
+    return switch (err) {
+        error.TlsCertificateNotVerified => "DEPTH_ZERO_SELF_SIGNED_CERT",
+        else => @errorName(err),
+    };
+}
 
 const RegistryManifestFetch = struct {
     io: std.Io,
@@ -659,6 +668,7 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
     };
     var positionals = std.array_list.Managed([]const u8).init(allocator);
     var filters = std.array_list.Managed([]const u8).init(allocator);
+    var certificate_authorities = std.array_list.Managed([]const u8).init(allocator);
     var cpu_override = Npm.Architecture.none.negatable();
     var os_override = Npm.OperatingSystem.none.negatable();
 
@@ -702,6 +712,22 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
             options.registry = args[index];
         } else if (std.mem.startsWith(u8, arg, "--registry=")) {
             options.registry = arg["--registry=".len..];
+        } else if (std.mem.eql(u8, arg, "--ca")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            try certificate_authorities.append(args[index]);
+        } else if (std.mem.startsWith(u8, arg, "--ca=")) {
+            const value = arg["--ca=".len..];
+            if (value.len == 0) return error.MissingOptionValue;
+            try certificate_authorities.append(value);
+        } else if (std.mem.eql(u8, arg, "--cafile")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            options.ca_file_name = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--cafile=")) {
+            const value = arg["--cafile=".len..];
+            if (value.len == 0) return error.MissingOptionValue;
+            options.ca_file_name = value;
         } else if (std.mem.eql(u8, arg, "--cpu")) {
             index += 1;
             if (index >= args.len) return error.MissingOptionValue;
@@ -943,6 +969,7 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
     }
     options.positionals = try positionals.toOwnedSlice();
     options.filters = try filters.toOwnedSlice();
+    options.ca = try certificate_authorities.toOwnedSlice();
     if (options.cpu_overridden) options.cpu = cpu_override.combine();
     if (options.os_overridden) options.os = os_override.combine();
     if ((options.command == .patch or options.command == .patch_commit) and options.positionals.len == 0) {
@@ -1016,6 +1043,8 @@ fn printPackageManagerHelp(command: Command, writer: *std.Io.Writer) !void {
         \\
         \\  --cwd <path>             Set the working directory
         \\  --registry <url>         Override the package registry
+        \\  --ca <certificate>       Add a trusted certificate authority
+        \\  --cafile <path>          Add trusted certificate authorities from a file
         \\  --cpu <architecture>     Override target CPU (repeatable; * selects all)
         \\  --os <operating-system>  Override target OS (repeatable; * selects all)
         \\  -p, --production         Omit devDependencies
@@ -2086,6 +2115,8 @@ const Manager = struct {
     registry_source: []const u8 = default_registry,
     registry_authorization: ?[]const u8 = null,
     registry_scopes: std.StringHashMap(RegistryConfig),
+    certificate_authorities: []const []const u8 = &.{},
+    certificate_authority_file: ?[]const u8 = null,
     cache_directory: ?[]const u8 = null,
     save_text_lockfile: bool = true,
     save_text_lockfile_configured: bool = false,
@@ -2170,6 +2201,8 @@ const Manager = struct {
             .options = options,
             .stdout = stdout,
             .stderr = stderr,
+            .certificate_authorities = options.ca,
+            .certificate_authority_file = options.ca_file_name,
             .client = .{ .allocator = std.heap.smp_allocator, .io = init_data.io },
             .records = std.array_list.Managed(PackageRecord).init(allocator),
             .workspaces = std.StringHashMap(Workspace).init(allocator),
@@ -3941,6 +3974,123 @@ const Manager = struct {
         };
     }
 
+    const CertificateFileStatus = enum { valid, missing, invalid };
+
+    fn inspectCertificateFile(manager: *Manager, path: []const u8) !CertificateFileStatus {
+        const source = std.Io.Dir.cwd().readFileAlloc(
+            manager.init_data.io,
+            path,
+            manager.allocator,
+            .limited(16 * 1024 * 1024),
+        ) catch |err| switch (err) {
+            error.FileNotFound => return .missing,
+            error.OutOfMemory => return err,
+            else => return .invalid,
+        };
+        if (std.mem.findPos(u8, source, 0, "-----BEGIN CERTIFICATE-----") == null) return .invalid;
+
+        var bundle: std.crypto.Certificate.Bundle = .empty;
+        defer bundle.deinit(manager.client.allocator);
+        const now = std.Io.Clock.real.now(manager.init_data.io);
+        bundle.addCertsFromFilePathAbsolute(
+            manager.client.allocator,
+            manager.init_data.io,
+            now,
+            path,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return .missing,
+            error.OutOfMemory => return err,
+            else => return .invalid,
+        };
+        return .valid;
+    }
+
+    fn certificateAuthorityTempFile(manager: *Manager, index: usize) ![]const u8 {
+        const environment = manager.init_data.environ_map;
+        const temp_dir = environment.get("BUN_TMPDIR") orelse
+            environment.get("TMPDIR") orelse
+            environment.get("TEMP") orelse
+            environment.get("TMP") orelse
+            if (builtin.os.tag == .windows) "." else "/tmp";
+        if (!manager.pathExists(temp_dir)) {
+            try std.Io.Dir.cwd().createDirPath(manager.init_data.io, temp_dir);
+        }
+        const nonce: u128 = @bitCast(manager.started_ns);
+        const path = try std.fmt.allocPrint(
+            manager.allocator,
+            "{s}/cottontail-ca-{x}-{x}-{d}.pem",
+            .{ temp_dir, nonce, std.hash.Wyhash.hash(0, manager.root_dir), index },
+        );
+        return absolutePathFrom(manager.allocator, manager.invocation_dir, path);
+    }
+
+    fn reportCertificateFileError(manager: *Manager, status: CertificateFileStatus, path: []const u8) !void {
+        switch (status) {
+            .missing => try manager.stderr.print("HTTPThread: could not find CA file: '{s}'\n", .{path}),
+            .invalid => try manager.stderr.print("HTTPThread: invalid CA file: '{s}'\n", .{path}),
+            .valid => unreachable,
+        }
+    }
+
+    fn configureCertificateAuthorities(manager: *Manager) !void {
+        if (manager.certificate_authorities.len == 0 and manager.certificate_authority_file == null) return;
+
+        const ca_file_path = if (manager.certificate_authority_file) |path|
+            try absolutePathFrom(manager.allocator, manager.invocation_dir, path)
+        else
+            null;
+        if (ca_file_path) |path| {
+            const status = try manager.inspectCertificateFile(path);
+            if (status != .valid) {
+                try manager.reportCertificateFileError(status, path);
+                return error.PackageManagerErrorReported;
+            }
+        }
+
+        var temporary_files = std.array_list.Managed([]const u8).init(manager.allocator);
+        defer {
+            for (temporary_files.items) |path| {
+                std.Io.Dir.cwd().deleteFile(manager.init_data.io, path) catch {};
+            }
+            temporary_files.deinit();
+        }
+        for (manager.certificate_authorities, 0..) |certificate, index| {
+            const path = try manager.certificateAuthorityTempFile(index);
+            try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = path, .data = certificate });
+            try temporary_files.append(path);
+            if (try manager.inspectCertificateFile(path) != .valid) {
+                try manager.stderr.writeAll("HTTPThread: the CA is invalid\n");
+                return error.PackageManagerErrorReported;
+            }
+        }
+
+        const now = std.Io.Clock.real.now(manager.init_data.io);
+        try manager.client.ca_bundle.rescan(manager.client.allocator, manager.init_data.io, now);
+        if (ca_file_path) |path| {
+            manager.client.ca_bundle.addCertsFromFilePathAbsolute(
+                manager.client.allocator,
+                manager.init_data.io,
+                now,
+                path,
+            ) catch {
+                try manager.stderr.print("HTTPThread: invalid CA file: '{s}'\n", .{path});
+                return error.PackageManagerErrorReported;
+            };
+        }
+        for (temporary_files.items) |path| {
+            manager.client.ca_bundle.addCertsFromFilePathAbsolute(
+                manager.client.allocator,
+                manager.init_data.io,
+                now,
+                path,
+            ) catch {
+                try manager.stderr.writeAll("HTTPThread: the CA is invalid\n");
+                return error.PackageManagerErrorReported;
+            };
+        }
+        manager.client.now = now;
+    }
+
     fn loadConfiguration(manager: *Manager) !void {
         var registry = manager.options.registry;
         var configured_linker = manager.options.linker;
@@ -4040,6 +4190,7 @@ const Manager = struct {
 
         manager.registry_source = try manager.allocator.dupe(u8, registry orelse default_registry);
         manager.registry = try normalizeRegistryUrl(manager.allocator, manager.registry_source);
+        try manager.configureCertificateAuthorities();
     }
 
     fn loadGlobalBunfigInstallConfiguration(
@@ -4104,6 +4255,38 @@ const Manager = struct {
         const root = try compiler.interchange.toml.TOML.parse(&source, &log, manager.allocator, true);
         const install = root.get("install") orelse return null;
         var default_registry_config: ?RegistryConfig = null;
+        if (install.get("cafile")) |cafile| {
+            const value = cafile.asString(manager.allocator) orelse {
+                try manager.stderr.print("{s}: Invalid cafile. Expected a string.\n", .{path});
+                return error.PackageManagerErrorReported;
+            };
+            if (manager.options.ca_file_name == null) manager.certificate_authority_file = value;
+        }
+        if (install.get("ca")) |ca| {
+            const configured: []const []const u8 = switch (ca.data) {
+                .e_string => blk: {
+                    const values = try manager.allocator.alloc([]const u8, 1);
+                    values[0] = ca.asString(manager.allocator) orelse unreachable;
+                    break :blk values;
+                },
+                .e_array => |array| blk: {
+                    const items = array.items.slice();
+                    const values = try manager.allocator.alloc([]const u8, items.len);
+                    for (items, 0..) |item, index| {
+                        values[index] = item.asString(manager.allocator) orelse {
+                            try manager.stderr.print("{s}: Invalid CA. Expected a string.\n", .{path});
+                            return error.PackageManagerErrorReported;
+                        };
+                    }
+                    break :blk values;
+                },
+                else => {
+                    try manager.stderr.print("{s}: Invalid CA. Expected a string or an array of strings.\n", .{path});
+                    return error.PackageManagerErrorReported;
+                },
+            };
+            if (manager.options.ca.len == 0) manager.certificate_authorities = configured;
+        }
         if (install.get("registry")) |registry_value| {
             var configured = std.mem.zeroes(compiler.schema.api.NpmRegistry);
             switch (registry_value.data) {
@@ -9217,7 +9400,7 @@ const Manager = struct {
                 .extra_headers = headers,
             }) catch |err| {
                 if (attempt == manager.max_retry_count) {
-                    try manager.stderr.print("{s}: GET {s} - {s}\n", .{ log_level.label(), url, @errorName(err) });
+                    try manager.stderr.print("{s}: GET {s} - {s}\n", .{ log_level.label(), url, packageManagerFetchErrorName(err) });
                     return error.PackageManagerErrorReported;
                 }
                 continue;
@@ -9258,7 +9441,7 @@ const Manager = struct {
                 .extra_headers = headers_buffer[0..header_count],
             }) catch |err| {
                 if (attempt == manager.max_retry_count) {
-                    try manager.stderr.print("error: GET {s} - {s}\n", .{ url, @errorName(err) });
+                    try manager.stderr.print("error: GET {s} - {s}\n", .{ url, packageManagerFetchErrorName(err) });
                     try manager.stderr.flush();
                     return null;
                 }
