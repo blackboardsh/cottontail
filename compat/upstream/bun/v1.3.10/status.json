@@ -73,6 +73,18 @@
       "reason": "Serially confirmed after unclassified discovery: grpc-js propagation and client/server deadline behavior pass 13 copied upstream cases."
     },
     {
+      "pattern": "^test/js/third_party/(?:hono/hello-world-fixture\\.test\\.ts|pino/pino\\.test\\.js)$",
+      "status": "enabled",
+      "reason": "The copied Hono and Pino fixtures pass against the integrated Node HTTP, stream, filesystem, and logging compatibility runtime (two cases, seven assertions)."
+    },
+    {
+      "pattern": "^test/js/third_party/st/st\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "The copied st fixture starts a Node-compatible HTTP static server, fetches its TypeScript source, and exits cleanly; stock-JSC child startup requires a larger per-case budget.",
+      "args": ["--timeout=20000"],
+      "timeoutMs": 30000
+    },
+    {
       "pattern": "^test/js/bun/.*\\.test\\.(?:js|mjs|cjs|ts|tsx|mts|cts)$",
       "status": "enabled",
       "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
@@ -187,6 +199,18 @@
       "pattern": "^test/regression/issue/(?:24593|26125|26225|5344)\\.test\\.ts$",
       "status": "enabled",
       "reason": "Exact copied regressions pass under the integrated runtime: compressed WebSocket publish, mTLS client-certificate switching, node-fetch form-data streams, and split re-export linking (11 cases, 52 assertions)."
+    },
+    {
+      "pattern": "^test/regression/issue/24385\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "All 14 copied Redis and Valkey environment URL variants load and duplicate the lazy client without protocol errors (42 assertions); stock-JSC subprocess startup requires a larger file budget.",
+      "args": ["--timeout=30000"],
+      "timeoutMs": 240000
+    },
+    {
+      "pattern": "^test/regression/issue/26286\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Bun.Terminal delivers PTY data callbacks and preserves AsyncLocalStorage state in both copied regression cases (4 assertions)."
     },
     {
       "pattern": "^test/regression/issue/20753\\.test\\.js$",
