@@ -2794,24 +2794,15 @@ function bundleLoaderForPath(path) {
   }
 }
 
-function scanBundleImports(source) {
-  const found = new Map();
-  const push = (specifier, kind) => {
-    if (specifier && !found.has(specifier)) found.set(specifier, kind);
-  };
-  const text = String(source);
-  for (const match of text.matchAll(/(?:^|[^\w$.])import\s*(?:[\w$*{},\s]+?from\s*)?["']([^"'\n]+)["']/g)) push(match[1], "import-statement");
-  for (const match of text.matchAll(/(?:^|[^\w$.])export\s*(?:\*(?:\s+as\s+[\w$]+)?|\{[^}]*\})\s*from\s*["']([^"'\n]+)["']/g)) push(match[1], "import-statement");
-  for (const match of text.matchAll(/(?:^|[^\w$.])import\s*\(\s*["']([^"'\n]+)["']\s*[,)]/g)) push(match[1], "dynamic-import");
-  for (const match of text.matchAll(/(?:^|[^\w$])require\s*\.\s*resolve\s*\(\s*["']([^"'\n]+)["']\s*\)/g)) push(match[1], "require-resolve");
-  for (const match of text.matchAll(/(?:^|[^\w$.])require\s*\(\s*["']([^"'\n]+)["']\s*\)/g)) push(match[1], "require-call");
-  return [...found].map(([specifier, kind]) => ({ specifier, kind }));
-}
-
 function scanBundleImportsForLoader(source, loader) {
-  if (loader === "html") {
-    return JSON.parse(cottontail.transpilerScanImports(String(source), "{}", "html"))
-      .map(({ path, kind }) => ({ specifier: path, kind }));
+  if (loader === "html" || loader === "js" || loader === "jsx" || loader === "ts" || loader === "tsx") {
+    try {
+      return JSON.parse(cottontail.transpilerScanImports(String(source), "{}", loader))
+        .map(({ path, kind }) => ({ specifier: path, kind }));
+    } catch {
+      // The delegated native build reports parser errors with full locations.
+      return [];
+    }
   }
   if (loader === "css") {
     const found = new Map();
@@ -2827,7 +2818,7 @@ function scanBundleImportsForLoader(source, loader) {
     }
     return [...found].map(([specifier, kind]) => ({ specifier, kind }));
   }
-  return scanBundleImports(source);
+  return [];
 }
 
 function ctBuildPluginInitialOptions(options) {
