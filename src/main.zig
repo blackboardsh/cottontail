@@ -7,9 +7,11 @@ const cottontail_hash = @import("cottontail_hash.zig");
 const cottontail_markdown = @import("cottontail_markdown.zig");
 const cottontail_password = @import("cottontail_password.zig");
 const package_manager_bun_lockfile = @import("package_manager_bun_lockfile.zig");
+const package_manager_lockfile = @import("package_manager_lockfile.zig");
 const package_manager_bunx = @import("package_manager_bunx.zig");
 const package_manager_cli = @import("package_manager_cli.zig");
 const package_manager_create = @import("package_manager_create.zig");
+const cli_script_command = @import("cli_script_command.zig");
 const repl = @import("repl.zig");
 const cottontail_transpiler = @import("cottontail_transpiler.zig");
 const completions = @import("completions.zig");
@@ -577,7 +579,10 @@ const PackageScripts = struct {
     pre: ?[]const u8,
     main: []const u8,
     post: ?[]const u8,
-    name: []const u8,
+    script_name: []const u8,
+    package_name: []const u8,
+    package_version: []const u8,
+    package_json: []const u8,
     config: []const PackageConfigEntry,
 };
 
@@ -622,34 +627,41 @@ fn findPackageScripts(
                 .limited(16 * 1024 * 1024),
             ) catch null;
             if (source) |contents| {
-                const parsed = std.json.parseFromSlice(std.json.Value, allocator, contents, .{}) catch null;
-                if (parsed) |document| {
-                    const root = document.value;
-                    if (root == .object) {
-                        if (root.object.get("scripts")) |scripts| {
-                            if (scripts == .object) {
-                                if (jsonScriptValue(scripts, name)) |main_command| {
-                                    const pre_name = try std.mem.concat(allocator, u8, &.{ "pre", name });
-                                    const post_name = try std.mem.concat(allocator, u8, &.{ "post", name });
-                                    var config_entries = std.array_list.Managed(PackageConfigEntry).init(allocator);
-                                    if (root.object.get("config")) |config| {
-                                        if (config == .object) {
-                                            for (config.object.keys(), config.object.values()) |key, value| {
-                                                try config_entries.append(.{
-                                                    .name = try std.fmt.allocPrint(allocator, "npm_package_config_{s}", .{key}),
-                                                    .value = try packageConfigValue(allocator, value),
-                                                });
+                const normalized = package_manager_lockfile.normalizeJsonc(allocator, contents) catch null;
+                if (normalized) |json| {
+                    const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{
+                        .duplicate_field_behavior = .use_last,
+                    }) catch null;
+                    if (parsed) |root| {
+                        if (root == .object) {
+                            if (root.object.get("scripts")) |scripts| {
+                                if (scripts == .object) {
+                                    if (jsonScriptValue(scripts, name)) |main_command| {
+                                        const pre_name = try std.mem.concat(allocator, u8, &.{ "pre", name });
+                                        const post_name = try std.mem.concat(allocator, u8, &.{ "post", name });
+                                        var config_entries = std.array_list.Managed(PackageConfigEntry).init(allocator);
+                                        if (root.object.get("config")) |config| {
+                                            if (config == .object) {
+                                                for (config.object.keys(), config.object.values()) |key, value| {
+                                                    try config_entries.append(.{
+                                                        .name = try std.fmt.allocPrint(allocator, "npm_package_config_{s}", .{key}),
+                                                        .value = try packageConfigValue(allocator, value),
+                                                    });
+                                                }
                                             }
                                         }
+                                        return .{
+                                            .dir = try allocator.dupe(u8, current),
+                                            .pre = jsonScriptValue(scripts, pre_name),
+                                            .main = try allocator.dupe(u8, main_command),
+                                            .post = jsonScriptValue(scripts, post_name),
+                                            .script_name = name,
+                                            .package_name = if (root.object.get("name")) |value| if (value == .string) value.string else "" else "",
+                                            .package_version = if (root.object.get("version")) |value| if (value == .string) value.string else "" else "",
+                                            .package_json = package_json,
+                                            .config = try config_entries.toOwnedSlice(),
+                                        };
                                     }
-                                    return .{
-                                        .dir = try allocator.dupe(u8, current),
-                                        .pre = jsonScriptValue(scripts, pre_name),
-                                        .main = try allocator.dupe(u8, main_command),
-                                        .post = jsonScriptValue(scripts, post_name),
-                                        .name = name,
-                                        .config = try config_entries.toOwnedSlice(),
-                                    };
                                 }
                             }
                         }
@@ -771,8 +783,13 @@ fn runOnePackageScript(
         try stderr.print("$ {s}\n", .{command});
         try stderr.flush();
     }
+    const rewritten_command = try cli_script_command.replacePackageManagerRun(init.arena.allocator(), init.io, command);
+    const shell_args: []const []const u8 = if (builtin.os.tag == .windows)
+        &.{ "cmd.exe", "/d", "/s", "/c", rewritten_command }
+    else
+        &.{ "/bin/sh", "-c", rewritten_command };
     var child = try std.process.spawn(init.io, .{
-        .argv = &.{ "/bin/sh", "-c", command },
+        .argv = shell_args,
         .cwd = .{ .path = dir },
         .environ_map = env,
         .stdin = .inherit,
@@ -792,17 +809,24 @@ fn runPackageScripts(
 ) !u8 {
     const allocator = init.arena.allocator();
     var env = try init.environ_map.clone(allocator);
+    defer env.deinit();
     const executable = try std.process.executablePathAlloc(init.io, allocator);
     try env.put("BUN", executable);
     try env.put("npm_execpath", executable);
     try env.put("npm_node_execpath", executable);
     const init_cwd = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
     try env.put("INIT_CWD", init_cwd);
+    try env.put("npm_command", "run-script");
+    try env.put("npm_config_local_prefix", init_cwd);
+    try env.put("npm_config_user_agent", "bun/1.3.10 npm/? node/? cottontail");
+    if (pkg.package_name.len > 0) try env.put("npm_package_name", pkg.package_name);
+    if (pkg.package_version.len > 0) try env.put("npm_package_version", pkg.package_version);
+    try env.put("npm_package_json", pkg.package_json);
     try prependAncestorBinPaths(allocator, &env, pkg.dir);
     for (pkg.config) |entry| try env.put(entry.name, entry.value);
 
     if (pkg.pre) |pre_command| {
-        const code = try runOnePackageScript(init, &env, pkg.dir, try std.mem.concat(allocator, u8, &.{ "pre", pkg.name }), pre_command, flags.silent);
+        const code = try runOnePackageScript(init, &env, pkg.dir, try std.mem.concat(allocator, u8, &.{ "pre", pkg.script_name }), pre_command, flags.silent);
         if (code != 0) return code;
     }
 
@@ -816,11 +840,11 @@ fn runPackageScripts(
         }
         main_command = buffer.items;
     }
-    const main_code = try runOnePackageScript(init, &env, pkg.dir, pkg.name, main_command, flags.silent);
+    const main_code = try runOnePackageScript(init, &env, pkg.dir, pkg.script_name, main_command, flags.silent);
     if (main_code != 0) return main_code;
 
     if (pkg.post) |post_command| {
-        const code = try runOnePackageScript(init, &env, pkg.dir, try std.mem.concat(allocator, u8, &.{ "post", pkg.name }), post_command, flags.silent);
+        const code = try runOnePackageScript(init, &env, pkg.dir, try std.mem.concat(allocator, u8, &.{ "post", pkg.script_name }), post_command, flags.silent);
         if (code != 0) return code;
     }
     return 0;

@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const Lockfile = @import("package_manager_lockfile.zig");
+const script_command = @import("cli_script_command.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -28,6 +30,8 @@ const Package = struct {
     dir: []const u8,
     relative_dir: []const u8,
     name: []const u8,
+    version: []const u8,
+    package_json: []const u8,
     scripts: ?std.json.ObjectMap,
     dependencies: []const []const u8,
     config: []const ConfigEntry,
@@ -40,6 +44,7 @@ const Package = struct {
 const Stage = struct {
     name: []const u8,
     command: []const u8,
+    original_command: []const u8,
 };
 
 const GroupResult = struct {
@@ -54,6 +59,10 @@ const Group = struct {
     package_label: []const u8,
     script_name: []const u8,
     cwd: []const u8,
+    init_cwd: []const u8,
+    package_name: []const u8,
+    package_version: []const u8,
+    package_json: []const u8,
     stages: []const Stage,
     config: []const ConfigEntry,
     package_index: usize = 0,
@@ -291,8 +300,14 @@ fn configureEnvironment(
     try env.put("npm_execpath", executable);
     try env.put("npm_node_execpath", executable);
     try env.put("npm_lifecycle_event", stage.name);
-    try env.put("npm_lifecycle_script", stage.command);
-    try env.put("INIT_CWD", group.cwd);
+    try env.put("npm_lifecycle_script", stage.original_command);
+    try env.put("npm_command", "run-script");
+    try env.put("INIT_CWD", group.init_cwd);
+    try env.put("npm_config_local_prefix", group.init_cwd);
+    try env.put("npm_config_user_agent", "bun/1.3.10 npm/? node/? cottontail");
+    if (group.package_name.len > 0) try env.put("npm_package_name", group.package_name);
+    if (group.package_version.len > 0) try env.put("npm_package_version", group.package_version);
+    if (group.package_json.len > 0) try env.put("npm_package_json", group.package_json);
     for (group.config) |entry| try env.put(entry.name, entry.value);
 
     var path_parts: std.ArrayList([]const u8) = .empty;
@@ -643,13 +658,20 @@ fn readPackage(
 ) !?Package {
     const package_json = try std.fs.path.join(allocator, &.{ dir, "package.json" });
     const source = std.Io.Dir.cwd().readFileAlloc(io, package_json, allocator, .limited(16 * 1024 * 1024)) catch return null;
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, source, .{}) catch {
+    const normalized = Lockfile.normalizeJsonc(allocator, source) catch {
         if (warn_on_error) std.Io.File.stderr().writeStreamingAll(io, "warning: Failed to read package.json\n") catch {};
         return null;
     };
-    if (parsed.value != .object) return null;
-    const root = parsed.value.object;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, normalized, .{
+        .duplicate_field_behavior = .use_last,
+    }) catch {
+        if (warn_on_error) std.Io.File.stderr().writeStreamingAll(io, "warning: Failed to read package.json\n") catch {};
+        return null;
+    };
+    if (parsed != .object) return null;
+    const root = parsed.object;
     const name = if (root.get("name")) |value| if (value == .string) value.string else "" else "";
+    const version = if (root.get("version")) |value| if (value == .string) value.string else "" else "";
     const scripts = if (root.get("scripts")) |value| if (value == .object) value.object else null else null;
 
     var dependencies = std.array_list.Managed([]const u8).init(allocator);
@@ -683,6 +705,8 @@ fn readPackage(
         .dir = dir,
         .relative_dir = relative_dir,
         .name = name,
+        .version = version,
+        .package_json = package_json,
         .scripts = scripts,
         .dependencies = try dependencies.toOwnedSlice(),
         .config = try config.toOwnedSlice(),
@@ -718,10 +742,14 @@ fn findWorkspaceRoot(io: std.Io, allocator: Allocator, cwd: []const u8) !Workspa
     while (true) {
         const path = try std.fs.path.join(allocator, &.{ current, "package.json" });
         if (std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024)) catch null) |source| {
-            if (std.json.parseFromSlice(std.json.Value, allocator, source, .{}) catch null) |parsed| {
-                if (parsed.value == .object) {
-                    if (try workspacePatterns(allocator, parsed.value.object)) |patterns| {
-                        return .{ .dir = current, .patterns = patterns, .configured = true };
+            if (Lockfile.normalizeJsonc(allocator, source) catch null) |normalized| {
+                if (std.json.parseFromSliceLeaky(std.json.Value, allocator, normalized, .{
+                    .duplicate_field_behavior = .use_last,
+                }) catch null) |parsed| {
+                    if (parsed == .object) {
+                        if (try workspacePatterns(allocator, parsed.object)) |patterns| {
+                            return .{ .dir = current, .patterns = patterns, .configured = true };
+                        }
                     }
                 }
             }
@@ -770,6 +798,8 @@ fn discoverPackages(init: std.process.Init, root: WorkspaceRoot) ![]Package {
 
     std.mem.sort(Package, packages.items, {}, struct {
         fn lessThan(_: void, lhs: Package, rhs: Package) bool {
+            const label_order = std.mem.order(u8, lhs.label(), rhs.label());
+            if (label_order != .eq) return label_order == .lt;
             return std.mem.order(u8, lhs.relative_dir, rhs.relative_dir) == .lt;
         }
     }.lessThan);
@@ -824,26 +854,42 @@ fn shellEscape(allocator: Allocator, value: []const u8) ![]const u8 {
     return result.items;
 }
 
-fn stagesForScript(allocator: Allocator, package: Package, name: []const u8) ![]const Stage {
+fn appendScriptStage(
+    stages: *std.array_list.Managed(Stage),
+    allocator: Allocator,
+    io: std.Io,
+    name: []const u8,
+    command: []const u8,
+) !void {
+    try stages.append(.{
+        .name = name,
+        .command = try script_command.replacePackageManagerRun(allocator, io, command),
+        .original_command = command,
+    });
+}
+
+fn stagesForScript(allocator: Allocator, io: std.Io, package: Package, name: []const u8) ![]const Stage {
     const main = scriptValue(package, name) orelse return &.{};
     var stages = std.array_list.Managed(Stage).init(allocator);
     const pre_name = try std.mem.concat(allocator, u8, &.{ "pre", name });
     const post_name = try std.mem.concat(allocator, u8, &.{ "post", name });
-    if (scriptValue(package, pre_name)) |command| try stages.append(.{ .name = pre_name, .command = command });
-    try stages.append(.{ .name = name, .command = main });
-    if (scriptValue(package, post_name)) |command| try stages.append(.{ .name = post_name, .command = command });
+    if (scriptValue(package, pre_name)) |command| try appendScriptStage(&stages, allocator, io, pre_name, command);
+    try appendScriptStage(&stages, allocator, io, name, main);
+    if (scriptValue(package, post_name)) |command| try appendScriptStage(&stages, allocator, io, post_name, command);
     return try stages.toOwnedSlice();
 }
 
 fn appendPackageGroup(
-    allocator: Allocator,
+    init: std.process.Init,
     groups: *std.array_list.Managed(Group),
     package: Package,
     package_index: usize,
     script_name: []const u8,
     workspace_label: bool,
+    init_cwd: []const u8,
 ) !void {
-    const stages = try stagesForScript(allocator, package, script_name);
+    const allocator = init.arena.allocator();
+    const stages = try stagesForScript(allocator, init.io, package, script_name);
     if (stages.len == 0) return;
     const label = if (workspace_label)
         try std.mem.concat(allocator, u8, &.{ package.label(), ":", script_name })
@@ -854,6 +900,10 @@ fn appendPackageGroup(
         .package_label = package.label(),
         .script_name = script_name,
         .cwd = package.dir,
+        .init_cwd = init_cwd,
+        .package_name = package.name,
+        .package_version = package.version,
+        .package_json = package.package_json,
         .stages = stages,
         .config = package.config,
         .package_index = package_index,
@@ -883,7 +933,16 @@ fn nearestPackage(init: std.process.Init, cwd: []const u8) !Package {
         if (std.mem.eql(u8, parent, current)) break;
         current = parent;
     }
-    return .{ .dir = cwd, .relative_dir = "", .name = "", .scripts = null, .dependencies = &.{}, .config = &.{} };
+    return .{
+        .dir = cwd,
+        .relative_dir = "",
+        .name = "",
+        .version = "",
+        .package_json = "",
+        .scripts = null,
+        .dependencies = &.{},
+        .config = &.{},
+    };
 }
 
 fn runnableFile(io: std.Io, path: []const u8) bool {
@@ -911,12 +970,16 @@ fn appendRawGroup(init: std.process.Init, groups: *std.array_list.Managed(Group)
         });
     }
     const stages = try allocator.alloc(Stage, 1);
-    stages[0] = .{ .name = request, .command = command };
+    stages[0] = .{ .name = request, .command = command, .original_command = request };
     try groups.append(.{
         .label = request,
         .package_label = request,
         .script_name = request,
         .cwd = cwd,
+        .init_cwd = cwd,
+        .package_name = "",
+        .package_version = "",
+        .package_json = "",
         .stages = stages,
         .config = &.{},
     });
@@ -950,9 +1013,9 @@ fn runRootMulti(init: std.process.Init, invocation: Invocation, cwd: []const u8)
                 try std.Io.File.stderr().writeStreamingAll(init.io, message);
                 return 1;
             }
-            for (matches) |name| try appendPackageGroup(allocator, &groups, package, 0, name, false);
+            for (matches) |name| try appendPackageGroup(init, &groups, package, 0, name, false, cwd);
         } else if (scriptValue(package, request) != null) {
-            try appendPackageGroup(allocator, &groups, package, 0, request, false);
+            try appendPackageGroup(init, &groups, package, 0, request, false, cwd);
         } else {
             try appendRawGroup(init, &groups, cwd, request);
         }
@@ -1042,9 +1105,9 @@ fn runWorkspaces(init: std.process.Init, invocation: Invocation, cwd: []const u8
             if (hasGlob(request)) {
                 const matches = try matchingScriptNames(allocator, package, request);
                 if (matches.len == 0 and invocation.workspaces and !invocation.if_present) missing_workspace_script = request;
-                for (matches) |name| try appendPackageGroup(allocator, &groups, package, package_index, name, true);
+                for (matches) |name| try appendPackageGroup(init, &groups, package, package_index, name, true, cwd);
             } else if (scriptValue(package, request) != null) {
-                try appendPackageGroup(allocator, &groups, package, package_index, request, true);
+                try appendPackageGroup(init, &groups, package, package_index, request, true, cwd);
             } else if (invocation.workspaces and !invocation.if_present) {
                 missing_workspace_script = request;
             }
