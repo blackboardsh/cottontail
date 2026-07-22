@@ -1,7 +1,7 @@
 import path from "../node/path.js";
-import { mkdirSync, rmSync, statSync, writeFileSync } from "../node/fs.js";
+import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "../node/fs.js";
 import { pathToFileURL } from "../node/url.js";
-import { __setBuiltinModules } from "../node/module.js";
+import { SourceMap, __setBuiltinModules } from "../node/module.js";
 import {
   bakeGraphAttributeFiles,
   copyStaticRouters,
@@ -18,6 +18,7 @@ import {
 import { FrameworkRouter } from "./bake-framework-router.js";
 
 const sourceExtensions = [".tsx", ".ts", ".jsx", ".js", ".mts", ".mjs", ".cts", ".cjs"];
+const dynamicErrorSourceSymbol = Symbol.for("cottontail.dynamicErrorSource");
 
 function executeCommonJSArtifact(source, filename) {
   const sourceUrl = pathToFileURL(filename).href.replaceAll("\n", "");
@@ -351,6 +352,109 @@ async function writeStandardESM(result, filename) {
   return filename;
 }
 
+function inlineSourceMap(source) {
+  const pattern = /\/\/# sourceMappingURL=data:application\/json(?:;charset=[^;,]+)?;base64,([A-Za-z0-9+/=]+)/g;
+  let match = null;
+  for (const candidate of String(source).matchAll(pattern)) match = candidate;
+  if (match === null) return null;
+  try {
+    const bytes = Uint8Array.from(atob(match[1]), character => character.charCodeAt(0));
+    return { generatedSource: source.slice(0, match.index), payload: JSON.parse(new TextDecoder().decode(bytes)) };
+  } catch {
+    return null;
+  }
+}
+
+function offsetPosition(source, offset) {
+  const before = source.slice(0, offset);
+  const line = before.split("\n").length - 1;
+  const lineStart = before.lastIndexOf("\n") + 1;
+  return { column: offset - lineStart, line };
+}
+
+function generatedErrorPosition(source, error) {
+  const message = String(error?.message ?? "");
+  let best = null;
+  if (message.length > 0) {
+    for (let offset = source.indexOf(message); offset >= 0; offset = source.indexOf(message, offset + message.length)) {
+      const lineStart = source.lastIndexOf("\n", offset) + 1;
+      const lineEnd = source.indexOf("\n", offset);
+      const line = source.slice(lineStart, lineEnd < 0 ? source.length : lineEnd);
+      const score = (line.includes("throw") ? 2 : 0) + (/\bError\s*\(/.test(line) ? 1 : 0);
+      if (best === null || score > best.score) best = { offset, score };
+    }
+  }
+  if (best !== null) return offsetPosition(source, best.offset);
+
+  const names = String(error?.stack ?? "").split(/\r?\n/).flatMap(line => {
+    const jsc = /^([^@]+)@/.exec(line.trim());
+    const v8 = /^at\s+([^\s(]+)/.exec(line.trim());
+    const name = jsc?.[1] ?? v8?.[1];
+    return name && !["apply", "construct", "unknown"].includes(name) ? [name] : [];
+  });
+  for (const name of names) {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = new RegExp(`\\bfunction\\s+${escaped}\\s*\\(`).exec(source);
+    if (match) return offsetPosition(source, match.index);
+  }
+  return null;
+}
+
+function sourceMapContent(payload, originalSource, projectRoot, mapFilename) {
+  const sourceRoot = String(payload.sourceRoot ?? "");
+  const index = (payload.sources ?? []).findIndex(source =>
+    String(source) === originalSource || `${sourceRoot}${source}` === originalSource
+  );
+  if (index >= 0 && typeof payload.sourcesContent?.[index] === "string") {
+    return { filename: originalSource, source: payload.sourcesContent[index] };
+  }
+  const candidates = path.isAbsolute(originalSource)
+    ? [originalSource]
+    : [path.resolve(projectRoot, originalSource), path.resolve(path.dirname(mapFilename), originalSource)];
+  for (const filename of candidates) {
+    try {
+      return { filename, source: readFileSync(filename, "utf8") };
+    } catch {}
+  }
+  return null;
+}
+
+function formatBakeProductionError(error, projectRoot) {
+  const metadata = error?.[dynamicErrorSourceSymbol];
+  if (typeof metadata?.source !== "string" || typeof metadata?.filename !== "string") return;
+  const inline = inlineSourceMap(metadata.source);
+  if (inline === null) return;
+  const generated = generatedErrorPosition(inline.generatedSource, error);
+  if (generated === null) return;
+  const entry = new SourceMap(inline.payload).findEntry(generated.line, generated.column);
+  if (typeof entry.originalSource !== "string" || !Number.isFinite(entry.originalLine)) return;
+  const original = sourceMapContent(inline.payload, entry.originalSource, projectRoot, metadata.filename);
+  if (original === null) return;
+
+  const lines = original.source.split(/\r?\n/);
+  const target = Math.max(0, Math.min(lines.length - 1, entry.originalLine));
+  const start = Math.max(0, target - 2);
+  const end = Math.min(lines.length, target + 3);
+  const width = String(end).length;
+  const frame = [];
+  for (let index = start; index < end; index += 1) {
+    frame.push(`${String(index + 1).padStart(width)} | ${lines[index]}`);
+  }
+  const column = Math.max(0, Number(entry.originalColumn) || 0);
+  frame.push(`${" ".repeat(width + 3 + column)}^`);
+  frame.push(`error: ${String(error.message ?? error)}`);
+  frame.push(`    at ${original.filename}:${target + 1}:${column + 1}`);
+  Object.defineProperty(error, "stack", {
+    configurable: true,
+    value: frame.join("\n"),
+    writable: true,
+  });
+  Object.defineProperty(error, "__cottontailFormattedStack", {
+    configurable: true,
+    value: true,
+  });
+}
+
 async function buildSsrFrameworkAliases(context) {
   const { framework, ssrOptions, serverPlugins, builtIns, tempRoot } = context;
   const aliases = {};
@@ -600,7 +704,11 @@ async function prerenderRoute(context, initialRoute, params) {
         () => callback(metadata),
       );
     } catch (error) {
-      if (!(error instanceof Response) || error.status === 302) throw error;
+      if (!(error instanceof Response)) {
+        formatBakeProductionError(error, context.projectRoot);
+        throw error;
+      }
+      if (error.status === 302) throw error;
       const location = error.headers.get("location");
       if (!location) throw new Error("Response.render(...) was expected to have a Location header");
       const matched = matchProductionRoute(context, location);

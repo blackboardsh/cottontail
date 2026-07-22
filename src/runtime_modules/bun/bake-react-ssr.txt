@@ -166,6 +166,9 @@ export function renderToStaticHtml(rscPayload: Readable, bootstrapModules: reado
     // Only begin flowing HTML once all of it is ready. This tells React
     // to not emit the flight chunks, just the entire HTML.
     onAllReady: () => pipe(stream),
+    // COTTONTAIL-COMPAT: Bun's native static renderer always settles on an
+    // RSC failure. Explicitly reject the adapter result under stock JSC.
+    onError: error => stream.destroy(error),
   });
   return stream.result;
 }

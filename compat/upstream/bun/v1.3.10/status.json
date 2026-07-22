@@ -719,6 +719,10 @@
       "status": "enabled",
       "reason": "Bake passes request cookie state and the original Request object through React server rendering (2 cases, 4 assertions)."
     },
+    "test/bake/dev/production.test.ts": {
+      "status": "enabled",
+      "reason": "Bake production routing, import.meta inlining, React server/client boundaries, static output pruning, build diagnostics, and source-mapped render failures pass all 8 copied cases with 61 assertions."
+    },
     "test/bake/dev/response-to-bake-response.test.ts": {
       "status": "enabled",
       "reason": "Bake Response lowering, server-component option propagation, target validation, and syntax transforms pass all 5 copied cases (24 assertions)."
