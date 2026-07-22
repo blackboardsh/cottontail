@@ -1083,6 +1083,12 @@
       "args": ["--timeout", "30000"],
       "timeoutMs": 180000
     },
+    "test/cli/install/bun-install-security-provider.test.ts": {
+      "status": "enabled",
+      "reason": "Install security providers load local scanners, validate scanner and advisory contracts, report progress and fatal advisories, handle large responses, and scan multiple package forms across all 42 copied cases (468 assertions).",
+      "args": ["--timeout", "60000"],
+      "timeoutMs": 600000
+    },
     "test/cli/install/bun-pm-scan.test.ts": {
       "status": "enabled",
       "reason": "Configured local and package scanners, payload validation, advisories, process exits, lockfile requirements, and scanner installation behavior pass all 17 copied cases (44 assertions).",
