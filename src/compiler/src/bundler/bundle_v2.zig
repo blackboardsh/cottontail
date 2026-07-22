@@ -965,7 +965,8 @@ pub const BundleV2 = struct {
         // Bake keeps every export available for future module dependencies.
         // Coverage likewise needs unused source to reach JSC's profiler.
         if (this.transpiler.options.output_format == .internal_bake_dev or
-            this.transpiler.options.code_coverage)
+            this.transpiler.options.code_coverage or
+            !this.transpiler.options.dead_code_elimination)
         {
             this.transpiler.options.tree_shaking = false;
             this.transpiler.resolver.opts.tree_shaking = false;
@@ -2887,10 +2888,10 @@ pub const BundleV2 = struct {
 
     /// Returns true when barrel optimization is enabled. Barrel optimization
     /// can apply to any package with sideEffects: false or listed in
-    /// optimize_imports, so it is always enabled during bundling.
+    /// optimize_imports. It must stay disabled when the caller explicitly
+    /// disables tree shaking because it defers otherwise-executable imports.
     fn isBarrelOptimizationEnabled(this: *const BundleV2) bool {
-        _ = this;
-        return true;
+        return this.transpiler.options.tree_shaking;
     }
 
     // TODO: remove ResolveQueue
@@ -3761,7 +3762,9 @@ pub const BundleV2 = struct {
         var process_log = true;
 
         if (parse_result.value == .success) {
-            this.applyBarrelOptimization(parse_result);
+            if (this.isBarrelOptimizationEnabled()) {
+                this.applyBarrelOptimization(parse_result);
+            }
 
             resolve_queue = runResolutionForParseTask(parse_result, this);
             if (parse_result.value == .err) {

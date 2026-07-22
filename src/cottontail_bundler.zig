@@ -66,6 +66,9 @@ pub const BundleOptions = struct {
     no_macros: bool = false,
     ignore_dce_annotations: bool = false,
     emit_dce_annotations: ?bool = null,
+    /// Runtime module compilation must retain the complete module body even
+    /// when package metadata marks files as side-effect-free.
+    tree_shaking: ?bool = null,
     /// Test coverage must retain otherwise-unused source so JSC can profile it.
     code_coverage: bool = false,
     production: bool = false,
@@ -874,6 +877,10 @@ pub fn bundleEntryPointGraphWithOptions(
         .all;
     transpiler.options.ignore_dce_annotations = options.ignore_dce_annotations;
     transpiler.options.emit_dce_annotations = options.emit_dce_annotations orelse !options.minify_whitespace;
+    if (options.tree_shaking) |enabled| {
+        transpiler.options.tree_shaking = enabled;
+        if (!enabled) transpiler.options.dead_code_elimination = false;
+    }
     transpiler.options.code_coverage = options.code_coverage;
     if (options.code_coverage) transpiler.options.dead_code_elimination = false;
     // Runtime execution bundles modules into one linker scope. Preserve each
@@ -1362,6 +1369,9 @@ pub fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator)
     };
     if (object.get("ignoreDCEAnnotations")) |value| {
         if (value == .bool) options.ignore_dce_annotations = value.bool;
+    }
+    if (object.get("treeShaking")) |value| {
+        if (value == .bool) options.tree_shaking = value.bool;
     }
     if (object.get("emitDCEAnnotations")) |value| {
         if (value == .bool) options.emit_dce_annotations = value.bool;
@@ -2242,6 +2252,10 @@ pub fn buildEntryPointsJson(
         .all;
     transpiler.options.ignore_dce_annotations = options.ignore_dce_annotations;
     transpiler.options.emit_dce_annotations = options.emit_dce_annotations orelse !options.minify_whitespace;
+    if (options.tree_shaking) |enabled| {
+        transpiler.options.tree_shaking = enabled;
+        if (!enabled) transpiler.options.dead_code_elimination = false;
+    }
     transpiler.options.code_coverage = options.code_coverage;
     if (options.code_coverage) transpiler.options.dead_code_elimination = false;
     transpiler.options.setProduction(options.production);
