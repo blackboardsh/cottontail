@@ -4357,7 +4357,7 @@
     },
     "test/regression/issue/02499/02499.test.ts": {
       "status": "expected-failure",
-      "reason": "Semantics pass, but the test spawns 40 server subprocesses under a hard internal 10s timeout; Cottontail per-process startup (esbuild bundling) is currently too slow for that budget."
+      "reason": "Semantics pass, but the copied case runs 40 server subprocesses under its explicit 30-second deadline; focused validation completed only 24 iterations before that unchanged deadline."
     },
     "test/regression/issue/03091.test.ts": {
       "status": "enabled",
@@ -4649,6 +4649,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
     },
+    "test/regression/issue/20875.test.ts": {
+      "status": "enabled",
+      "reason": "The copied gRPC streaming regression passes all 6 cases and 33 assertions under focused validation."
+    },
     "test/regression/issue/21137-minify-typeof-comma.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (2 bun:test cases, 23 assertions)."
@@ -4676,6 +4680,14 @@
     "test/regression/issue/22003.test.ts": {
       "status": "enabled",
       "reason": "Source maps correctly escape tab characters in filenames (1 case, 5 assertions)."
+    },
+    "test/regression/issue/22157.test.ts": {
+      "status": "enabled",
+      "reason": "Both compiled-executable argv cases pass all 8 assertions; the extended case deadline accommodates Cottontail's compile startup cost without changing assertions.",
+      "args": [
+        "--timeout=15000"
+      ],
+      "timeoutMs": 60000
     },
     "test/regression/issue/22243.test.ts": {
       "status": "enabled",
@@ -4789,6 +4801,10 @@
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (6 bun:test cases, 17 assertions)."
     },
+    "test/regression/issue/24131.test.ts": {
+      "status": "enabled",
+      "reason": "Interactive package update selects the requested package and passes its 4 copied assertions."
+    },
     "test/regression/issue/24129.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (2 bun:test cases, 12 assertions)."
@@ -4812,6 +4828,10 @@
     "test/regression/issue/24338.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (11 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/24364.test.ts": {
+      "status": "expected-failure",
+      "reason": "The copied template installs unpinned current TypeScript, whose TS5102 removal of baseUrl now fails this case under both Bun 1.3.10 and Cottontail."
     },
     "test/regression/issue/24388.test.ts": {
       "status": "enabled",
@@ -4897,6 +4917,10 @@
       "status": "enabled",
       "reason": "File is Docker-gated upstream (describeWithContainer/isDockerEnabled); without Docker it registers no tests and exits 0, matching Bun CI behavior."
     },
+    "test/regression/issue/26058.test.ts": {
+      "status": "enabled",
+      "reason": "The REPL startup regression passes its copied package-download and timing checks (1 case, 4 assertions)."
+    },
     "test/regression/issue/26063.test.ts": {
       "status": "enabled",
       "reason": "File is Docker-gated upstream (describeWithContainer/isDockerEnabled); without Docker it registers no tests and exits 0, matching Bun CI behavior."
@@ -4946,8 +4970,12 @@
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 3 assertions)."
     },
     "test/regression/issue/26460.test.ts": {
-      "status": "expected-failure",
-      "reason": "All four shell cwd cases exceed their copied 5-second deadlines in focused integrated validation."
+      "status": "enabled",
+      "reason": "All four shell cwd forms pass 12 assertions; the extended case and file deadlines accommodate Cottontail startup while preserving the copied checks.",
+      "args": [
+        "--timeout=30000"
+      ],
+      "timeoutMs": 120000
     },
     "test/regression/issue/26631.test.ts": {
       "status": "enabled",

@@ -90,6 +90,27 @@ test.skipIf(process.platform === "win32")("OS signals emit their name and number
   expect(result.stdout).toBe(`SIGUSR1 ${process.binding("constants").os.signals.SIGUSR1}\n`);
 });
 
+test.skipIf(process.platform === "win32")("self-signals are queued without OS coalescing", async () => {
+  const result = await runSource(`
+    const expected = 64;
+    let count = 0;
+    const deadline = setTimeout(() => process.exit(2), 2000);
+    const handler = () => {
+      count++;
+      if (count === expected) {
+        clearTimeout(deadline);
+        process.off("SIGINT", handler);
+        process.exit(0);
+      }
+    };
+    process.on("SIGINT", handler);
+    for (let index = 0; index < expected; index++) process.kill(process.pid, "SIGINT");
+  `);
+
+  expect(result.exitCode).toBe(0);
+  expect(result.stderr).toBe("");
+});
+
 test("memoryUsage arrayBuffers grows with ArrayBuffer backing stores", () => {
   const initial = process.memoryUsage().arrayBuffers;
   const buffer = new ArrayBuffer(16 * 1024 * 1024);

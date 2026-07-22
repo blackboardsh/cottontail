@@ -6301,7 +6301,8 @@ fn writeCottontailEntryWrapper(
         \\try {{
         \\{s}
         \\{s}  globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
-        \\  const __ctEntryNamespace = await import({s});
+        \\  const __ctPluginEntry = await globalThis.__cottontailResolvePluginEntrypoint?.({s}, {s});
+        \\  const __ctEntryNamespace = __ctPluginEntry?.matched ? await __ctPluginEntry.value : await import({s});
         \\  __ctStartDefaultApp(__ctEntryNamespace);
         \\}} finally {{
         \\  globalThis.__cottontailLoadingTestModules = false;
@@ -6324,6 +6325,8 @@ fn writeCottontailEntryWrapper(
             test_header_signal,
             cpu_profiler_start_statement,
             preload_imports,
+            script_literal,
+            script_literal,
             script_import_literal,
         },
     );
@@ -8752,9 +8755,17 @@ fn writeCommonJsEntryWrapper(
     else
         "";
     const main_action = if (bundle_entry)
-        try std.fmt.allocPrint(ctx.allocator, "await import({s});", .{script_literal})
+        try std.fmt.allocPrint(ctx.allocator,
+            \\const __ctPluginEntry = await globalThis.__cottontailResolvePluginEntrypoint?.({s}, {s});
+            \\if (__ctPluginEntry?.matched) await __ctPluginEntry.value;
+            \\else await import({s});
+        , .{ script_literal, script_literal, script_literal })
     else
-        "(moduleModule.default ?? moduleModule.Module).runMain();";
+        try std.fmt.allocPrint(ctx.allocator,
+            \\const __ctPluginEntry = await globalThis.__cottontailResolvePluginEntrypoint?.({s}, {s});
+            \\if (__ctPluginEntry?.matched) await __ctPluginEntry.value;
+            \\else (moduleModule.default ?? moduleModule.Module).runMain();
+        , .{ script_literal, script_literal });
     const main_statement = try std.fmt.allocPrint(ctx.allocator,
         \\globalThis.__cottontailLoadDotenv?.();
         \\await globalThis.__cottontailLoadStandaloneBunfig?.();

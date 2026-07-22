@@ -89,6 +89,34 @@ test("runtime onResolve rejects pending promises", async () => {
   expect(String(error)).toContain("onResolve() doesn't support pending promises yet");
 });
 
+test("CLI entrypoints await rejected async onResolve hooks", () => {
+  const directory = mkdtempSync(join(tmpdir(), "cottontail-plugin-entrypoint-"));
+  writeFileSync(join(directory, "plugin.js"), `
+    Bun.plugin({
+      name: "entrypoint-rejection",
+      setup(build) {
+        build.onResolve({ filter: /index\\.js$/ }, async () => {
+          throw new Error("entrypoint onResolve sentinel");
+        });
+      },
+    });
+  `);
+  writeFileSync(join(directory, "index.js"), 'console.log("entrypoint ran");\n');
+  try {
+    const result = Bun.spawnSync({
+      cmd: [process.execPath, "--preload", "./plugin.js", "./index.js"],
+      cwd: directory,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout.toString()).not.toContain("entrypoint ran");
+    expect(result.stderr.toString()).toContain("entrypoint onResolve sentinel");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("clearAll does not recache pending virtual modules", async () => {
   Bun.plugin.clearAll();
   const id = "cottontail-plugin-pending-generation";

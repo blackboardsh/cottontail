@@ -1403,6 +1403,16 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         try stderr.flush();
         return 1;
     }
+    if (options.transform_only) {
+        for (entries.items) |entry| {
+            const extension = std.fs.path.extension(entry);
+            if (std.ascii.eqlIgnoreCase(extension, ".html") or std.ascii.eqlIgnoreCase(extension, ".htm")) {
+                try stderr.writeAll("error: HTML imports are only supported when bundling\n");
+                try stderr.flush();
+                return 1;
+            }
+        }
+    }
     if (!compile and (compile_exec_argv != null or compile_executable_path != null or
         compile_autoload_dotenv != null or compile_autoload_bunfig != null or
         compile_autoload_tsconfig != null or compile_autoload_package_json != null))

@@ -8056,6 +8056,30 @@ function beginFetchBodyConsumption(request) {
   request._bodyUsed = true;
 }
 
+function fetchVerboseMode(init) {
+  const configured = init?.verbose ?? globalThis.process?.env?.BUN_CONFIG_VERBOSE_FETCH ?? cottontail.env?.()?.BUN_CONFIG_VERBOSE_FETCH;
+  if (configured === true) return "curl";
+  return configured == null ? "" : String(configured).toLowerCase();
+}
+
+function curlQuote(value) {
+  return JSON.stringify(String(value));
+}
+
+function logVerboseFetchRequest(request, mode) {
+  if (mode !== "curl") return;
+  const command = [`curl --http1.1 ${curlQuote(request.url)}`];
+  if (request.method !== "GET") command.push(`-X ${request.method}`);
+  for (const [name, value] of request.headers) {
+    command.push(`-H ${curlQuote(`${name}: ${value}`)}`);
+  }
+  if (request.headers.has("accept-encoding")) command.push("--compressed");
+  if (typeof request._body === "string") command.push(`--data-raw ${curlQuote(request._body)}`);
+  const line = `${command.join(" ")}\n`;
+  if (typeof globalThis.process?.stderr?.write === "function") globalThis.process.stderr.write(line);
+  else console.error(line.trimEnd());
+}
+
 function fetchImpl(request, init = {}, upgradeStreamBody = null) {
   if (
     upgradeStreamBody == null &&
@@ -8081,8 +8105,7 @@ function fetchImpl(request, init = {}, upgradeStreamBody = null) {
     throw new TypeError(`Invalid redirect mode: ${redirectMode}`);
   }
   const timeout = init?.timeout;
-  const verbose = init?.verbose;
-  void verbose;
+  const verboseMode = fetchVerboseMode(init);
   if (timeout != null) {
     const delay = Number(timeout);
     if (!Number.isFinite(delay) || delay < 0) throw new TypeError("fetch() timeout must be a non-negative number");
@@ -8146,6 +8169,10 @@ function fetchImpl(request, init = {}, upgradeStreamBody = null) {
     if (customTlsConfig.checkServerIdentity != null && typeof customTlsConfig.checkServerIdentity !== "function") {
       throw new TypeError("fetch() tls.checkServerIdentity must be a function");
     }
+  }
+  if (verboseMode === "curl") {
+    applyDefaultFetchHeaders(request, fetchUsesKeepalive(request));
+    logVerboseFetchRequest(request, verboseMode);
   }
   beginFetchBodyConsumption(request);
   const activeServer = activeServerForFetchUrl(request.url);
@@ -15091,6 +15118,39 @@ function callNativeTranspiler(callback) {
 }
 
 const transpilerLogLevels = new Set(["verbose", "debug", "info", "warn", "error"]);
+const transpilerTransformCache = new Map();
+const transpilerTransformCacheMaxBytes = 8 * 1024 * 1024;
+const transpilerTransformCacheMaxEntries = 32;
+const transpilerTransformCacheMaxSourceBytes = 512 * 1024;
+let transpilerTransformCacheBytes = 0;
+
+function transformWithCache(source, optionsJson, loader, cacheable) {
+  const sourceText = transpilerSourceText(source);
+  if (!cacheable || sourceText.length > transpilerTransformCacheMaxSourceBytes) {
+    return callNativeTranspiler(() => cottontail.transpilerTransform(sourceText, optionsJson, loader));
+  }
+  const key = `${optionsJson.length}:${optionsJson}${loader.length}:${loader}${sourceText}`;
+  if (transpilerTransformCache.has(key)) {
+    const cached = transpilerTransformCache.get(key);
+    transpilerTransformCache.delete(key);
+    transpilerTransformCache.set(key, cached);
+    return cached.value;
+  }
+  const value = callNativeTranspiler(() => cottontail.transpilerTransform(sourceText, optionsJson, loader));
+  const bytes = (key.length + value.length) * 2;
+  if (bytes <= transpilerTransformCacheMaxBytes) {
+    transpilerTransformCache.set(key, { value, bytes });
+    transpilerTransformCacheBytes += bytes;
+    while (transpilerTransformCache.size > transpilerTransformCacheMaxEntries ||
+        transpilerTransformCacheBytes > transpilerTransformCacheMaxBytes) {
+      const oldestKey = transpilerTransformCache.keys().next().value;
+      const oldest = transpilerTransformCache.get(oldestKey);
+      transpilerTransformCache.delete(oldestKey);
+      transpilerTransformCacheBytes -= oldest.bytes;
+    }
+  }
+  return value;
+}
 
 export class Transpiler {
   constructor(options = {}) {
@@ -15105,22 +15165,25 @@ export class Transpiler {
     }
     this.options = options;
     this.optionsJson = JSON.stringify({ ...options, _cottontailStructuredErrors: true });
+    this.cacheableTransform = options.macro == null;
   }
   transformSync(source, loader = undefined) {
     if (this.options.replMode) return transformReplSource(source);
-    return callNativeTranspiler(() => cottontail.transpilerTransform(
-      transpilerSourceText(source),
+    return transformWithCache(
+      source,
       this.optionsJson,
       typeof loader === "string" ? loader : "",
-    ));
+      this.cacheableTransform,
+    );
   }
   async transform(source, loader = undefined) {
     if (this.options.replMode) return transformReplSource(source);
-    return callNativeTranspiler(() => cottontail.transpilerTransform(
-      transpilerSourceText(source),
+    return transformWithCache(
+      source,
       this.optionsJson,
       typeof loader === "string" ? loader : "",
-    ));
+      this.cacheableTransform,
+    );
   }
   scan(source) {
     return JSON.parse(callNativeTranspiler(() => cottontail.transpilerScan(transpilerSourceText(source), this.optionsJson, "")));

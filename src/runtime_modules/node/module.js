@@ -475,6 +475,64 @@ function resolveWithRuntimePlugins(specifier, importer = "", kind = "import") {
   return null;
 }
 
+async function resolveRuntimePluginEntrypoint(specifier, importer = "") {
+  const text = String(specifier);
+  const base = String(importer || cottontail.cwd());
+  let descriptor = null;
+  if (runtimePluginVirtualModules.has(text)) {
+    descriptor = trackRuntimePluginDescriptor(
+      { namespace: "virtual", path: text, key: text, virtual: true },
+      text,
+      true,
+    );
+  } else if (runtimePluginCouldResolve(text)) {
+    const initial = splitRuntimePluginSpecifier(text);
+    for (const rule of runtimePluginOnResolve) {
+      if (rule.namespace !== initial.namespace || !runtimePluginFilterMatches(rule.filter, initial.path)) continue;
+      let result;
+      try {
+        result = await Reflect.apply(rule.callback, undefined, [{ path: initial.path, importer: base }]);
+      } catch (error) {
+        throw normalizeRuntimePluginThrownError(error);
+      }
+      descriptor = normalizeRuntimePluginResolution(result, base, text, initial.namespace);
+      if (descriptor) break;
+    }
+    if (!descriptor && initial.namespace !== "" && runtimePluginRuleFor(runtimePluginOnLoad, initial.namespace, initial.path)) {
+      descriptor = trackRuntimePluginDescriptor(
+        { ...initial, key: runtimePluginKey(initial.namespace, initial.path) },
+        text,
+        true,
+      );
+      runtimePluginResolvedModules.set(descriptor.key, descriptor);
+    }
+  }
+  if (!descriptor) {
+    let resolved;
+    try {
+      resolved = resolveRequest(text, base, true, "import");
+    } catch {
+      return null;
+    }
+    const fileDescriptor = {
+      namespace: "file",
+      path: String(resolved),
+      key: String(resolved),
+      requestKey: text,
+      invalidatable: false,
+    };
+    if (!runtimePluginCallback(fileDescriptor)) return null;
+    descriptor = fileDescriptor;
+  }
+
+  const value = importRuntimePlugin(descriptor);
+  if (value !== undefined) return { matched: true, value };
+  if (descriptor.namespace === "file") {
+    return { matched: true, value: importResolvedRuntimeModule(descriptor.path) };
+  }
+  throw moduleNotFoundError(descriptor.key, false);
+}
+
 function runtimePluginDefaultLoader(path) {
   const extension = String(path).replace(/[?#].*$/, "").toLowerCase().match(/\.[^.\\/]+$/)?.[0];
   if (extension === ".jsx") return "jsx";
@@ -804,6 +862,8 @@ globalThis.__cottontailImportPluginModule = (specifier, referrer, options, resol
     return { matched: true, value: Promise.reject(error) };
   }
 };
+
+globalThis.__cottontailResolvePluginEntrypoint = resolveRuntimePluginEntrypoint;
 
 globalThis.__cottontailApplyCommonJSModuleMock = (specifier, value) => {
   let resolved = String(specifier);
@@ -2870,6 +2930,47 @@ function executeDynamicImportSource(resolved, source, format) {
   return namespace;
 }
 
+function importResolvedRuntimeModule(resolved, options = undefined) {
+  const cachedPluginModule = commonJsCache.get(resolved);
+  if (cachedPluginModule && Object.hasOwn(cachedPluginModule, "__cottontailPluginNamespace")) {
+    return cachedPluginModule.__cottontailPluginNamespace;
+  }
+  const loader = options?.with?.type ?? options?.assert?.type ?? options?.type;
+  if (loader === "text") {
+    return { default: readModuleFile(splitSpecifierSuffix(resolved).bare) };
+  }
+  if (loader === "file") {
+    return { default: splitSpecifierSuffix(resolved).bare };
+  }
+  const resolvedMock = bunModuleMockFor(resolved);
+  if (resolvedMock.found) return namespaceFromCommonJs(resolvedMock.value);
+  const resolvedByHook = hookResolvedFormats.has(resolved);
+  const loadResult = runLoadHooks(resolved);
+  if (loadResult !== undefined) {
+    return executeDynamicImportSource(resolved, loadResult.source, loadResult.format);
+  }
+  if (builtinModuleMap.has(resolved) || hasRuntimePackageReplacement(resolved)) {
+    return namespaceFromBuiltin(resolved, loadBuiltinOrReplacement(resolved));
+  }
+  const resolvedPath = splitSpecifierSuffix(resolved).bare;
+  if (/\.html?$/i.test(resolvedPath)) {
+    return { default: { index: resolvedPath, files: null } };
+  }
+  const embedded = standaloneFileEntry(resolvedPath);
+  if (embedded.found && hasEsmSyntax(embedded.value)) {
+    return executeDynamicImportSource(resolved, embedded.value, "module");
+  }
+  const resolvedFormat = resolvedByHook ? hookResolvedFormats.get(resolved) : formatForResolved(resolved);
+  if (resolvedFormat === "commonjs") {
+    if (/\.(?:js|jsx|ts|tsx)$/i.test(resolvedPath)) {
+      const source = embedded.found ? embedded.value : readModuleFile(resolvedPath);
+      if (hasEsmSyntax(source)) return executeDynamicImportSource(resolved, source, "module");
+    }
+    return namespaceFromCommonJs(loadCommonJsModule(resolved));
+  }
+  return executeDynamicImportSource(resolved, readModuleFile(resolvedPath), resolvedFormat);
+}
+
 export function __importModule(specifier, referrer = undefined, options = undefined) {
   const directMock = bunModuleMockFor(specifier);
   if (directMock.found) {
@@ -2927,44 +3028,7 @@ export function __importModule(specifier, referrer = undefined, options = undefi
     throw dynamicResolveMessage(`Cannot find module '${specifierText}' from '${parent}'`);
   }
   const resolved = pluginAttempt?.resolved ?? resolveRequest(String(specifier), parent, true, "import");
-  const cachedPluginModule = commonJsCache.get(resolved);
-  if (cachedPluginModule && Object.hasOwn(cachedPluginModule, "__cottontailPluginNamespace")) {
-    return cachedPluginModule.__cottontailPluginNamespace;
-  }
-  const loader = options?.with?.type ?? options?.assert?.type ?? options?.type;
-  if (loader === "text") {
-    return { default: readModuleFile(splitSpecifierSuffix(resolved).bare) };
-  }
-  if (loader === "file") {
-    return { default: splitSpecifierSuffix(resolved).bare };
-  }
-  const resolvedMock = bunModuleMockFor(resolved);
-  if (resolvedMock.found) return namespaceFromCommonJs(resolvedMock.value);
-  const resolvedByHook = hookResolvedFormats.has(resolved);
-  const loadResult = runLoadHooks(resolved);
-  if (loadResult !== undefined) {
-    return executeDynamicImportSource(resolved, loadResult.source, loadResult.format);
-  }
-  if (builtinModuleMap.has(resolved) || hasRuntimePackageReplacement(resolved)) {
-    return namespaceFromBuiltin(resolved, loadBuiltinOrReplacement(resolved));
-  }
-  const resolvedPath = splitSpecifierSuffix(resolved).bare;
-  if (/\.html?$/i.test(resolvedPath)) {
-    return { default: { index: resolvedPath, files: null } };
-  }
-  const embedded = standaloneFileEntry(resolvedPath);
-  if (embedded.found && hasEsmSyntax(embedded.value)) {
-    return executeDynamicImportSource(resolved, embedded.value, "module");
-  }
-  const resolvedFormat = resolvedByHook ? hookResolvedFormats.get(resolved) : formatForResolved(resolved);
-  if (resolvedFormat === "commonjs") {
-    if (/\.(?:js|jsx|ts|tsx)$/i.test(resolvedPath)) {
-      const source = embedded.found ? embedded.value : readModuleFile(resolvedPath);
-      if (hasEsmSyntax(source)) return executeDynamicImportSource(resolved, source, "module");
-    }
-    return namespaceFromCommonJs(loadCommonJsModule(resolved));
-  }
-  return executeDynamicImportSource(resolved, readModuleFile(resolvedPath), resolvedFormat);
+  return importResolvedRuntimeModule(resolved, options);
 }
 
 // The native dynamic-import shim (cottontail.importModule) stringifies any
