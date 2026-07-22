@@ -5621,14 +5621,18 @@ const Manager = struct {
 
     fn packageWasTrustedInLoadedLock(manager: *const Manager, package_name: []const u8, npm_package: bool) bool {
         const graph = if (manager.lock_graph) |*value| value else return false;
+        // An explicit trustedDependencies list replaces the default list. When
+        // that mode changes, packages named explicitly must run their scripts
+        // again even if they were previously covered by Bun's defaults.
+        const loaded_defaults_apply = npm_package and manager.manifest_policy.?.trusted_dependencies == null;
         if (manager.loaded_binary_lockfile) {
             return Manifest.Policy.wasTrustedInLockHashes(
                 manager.binary_lockfile_trusted_dependency_hashes,
                 package_name,
-                npm_package,
+                loaded_defaults_apply,
             );
         }
-        return Manifest.Policy.wasTrustedInLock(&graph.document, package_name, npm_package);
+        return Manifest.Policy.wasTrustedInLock(&graph.document, package_name, loaded_defaults_apply);
     }
 
     fn installDependency(
