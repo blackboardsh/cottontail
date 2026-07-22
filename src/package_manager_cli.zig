@@ -202,8 +202,15 @@ const OutdatedPackage = struct {
     update_version: []const u8,
     latest_version: []const u8,
     dependency_type: []const u8,
+    workspace_name: []const u8,
+    catalog_name: ?[]const u8,
     update_filtered: bool,
     latest_filtered: bool,
+};
+
+const RenderedOutdatedPackage = struct {
+    package: OutdatedPackage,
+    workspace_display: []const u8,
 };
 
 const InteractiveTerminalMode = if (builtin.os.tag == .windows) struct {
@@ -1754,6 +1761,11 @@ fn runPmWhoami(
     try manager.loadConfiguration();
     manager.client.initDefaultProxies(manager.allocator, manager.init_data.environ_map) catch {};
 
+    if (manager.registry_username) |username| {
+        try stdout.print("{s}\n", .{username});
+        try stdout.flush();
+        return 0;
+    }
     if (manager.registry_authorization == null) {
         try stderr.writeAll("error: missing authentication (run `bunx npm login`)\n");
         try stderr.flush();
@@ -2122,6 +2134,7 @@ const Manager = struct {
     registry: []const u8 = default_registry,
     registry_source: []const u8 = default_registry,
     registry_authorization: ?[]const u8 = null,
+    registry_username: ?[]const u8 = null,
     registry_scopes: std.StringHashMap(RegistryConfig),
     certificate_authorities: []const []const u8 = &.{},
     certificate_authority_file: ?[]const u8 = null,
@@ -2444,6 +2457,7 @@ const Manager = struct {
                     version,
                     if (manager.options.command == .link or
                         manager.options.command == .remove or
+                        manager.options.command == .outdated or
                         manager.rootLifecycleScriptsWillRun()) "" else "\n",
                 });
                 try manager.stdout.flush();
@@ -4195,6 +4209,7 @@ const Manager = struct {
             manager.registry_authorization = try std.fmt.allocPrint(manager.allocator, "Bearer {s}", .{token});
         } else if (manager.init_data.environ_map.get("BUN_CONFIG_USERNAME")) |username| {
             if (manager.init_data.environ_map.get("BUN_CONFIG_PASSWORD")) |password| {
+                manager.registry_username = username;
                 const credentials = try std.fmt.allocPrint(manager.allocator, "{s}:{s}", .{ username, password });
                 const encoded_len = std.base64.standard.Encoder.calcSize(credentials.len);
                 const encoded = try manager.allocator.alloc(u8, encoded_len);
@@ -4410,6 +4425,7 @@ const Manager = struct {
                 else => {},
             }
             if (configured.url.len > 0) {
+                if (configured.username.len > 0) manager.registry_username = configured.username;
                 default_registry_config = .{
                     .url = configured.url,
                     .source_url = configured.url,
@@ -4558,6 +4574,7 @@ const Manager = struct {
 
         if (install.default_registry) |configured| {
             if (registry.* == null) registry.* = configured.url;
+            if (configured.username.len > 0) manager.registry_username = configured.username;
             if (manager.registry_authorization == null) {
                 manager.registry_authorization = try manager.authorizationForRegistry(configured);
             }
@@ -4845,10 +4862,24 @@ const Manager = struct {
 
     fn configureInstallFilters(manager: *Manager, root: *const Value) !void {
         const filters_apply = manager.options.command == .install or
+            manager.options.command == .outdated or
             (manager.options.command == .update and manager.options.interactive);
         if (!filters_apply or manager.options.filters.len == 0) return;
         manager.install_filter_active = true;
         const root_name = jsonString(root, "name") orelse "";
+        if (manager.options.command == .outdated) {
+            manager.root_selected = try manager.outdatedFilterSelects(root_name, manager.root_dir);
+
+            var outdated_workspaces = manager.workspaces.iterator();
+            while (outdated_workspaces.next()) |entry| {
+                const workspace = entry.value_ptr.*;
+                if (try manager.outdatedFilterSelects(workspace.name, workspace.path)) {
+                    try manager.filtered_workspaces.put(workspace.name, {});
+                }
+            }
+            return;
+        }
+
         manager.root_selected = try manager.filterSelects(root_name, "");
 
         var workspaces = manager.workspaces.iterator();
@@ -4863,6 +4894,37 @@ const Manager = struct {
         }
 
         if (manager.root_selected) try manager.includeWorkspaceFilterClosure(root, manager.root_dir);
+    }
+
+    fn outdatedFilterSelects(manager: *Manager, name: []const u8, path: []const u8) !bool {
+        var has_positive = false;
+        for (manager.options.filters) |raw_pattern| {
+            const pattern = std.mem.trim(u8, raw_pattern, " \t\r\n");
+            if (pattern.len > 0 and pattern[0] != '!') has_positive = true;
+        }
+
+        var selected = !has_positive;
+        for (manager.options.filters) |raw_pattern| {
+            var pattern = std.mem.trim(u8, raw_pattern, " \t\r\n");
+            if (pattern.len == 0) continue;
+            const include = pattern[0] != '!';
+            if (!include) pattern = std.mem.trim(u8, pattern[1..], " \t\r\n");
+            if (pattern.len == 0) continue;
+
+            const path_pattern = std.mem.startsWith(u8, pattern, ".") or std.fs.path.isAbsolute(pattern);
+            const matches = if (!path_pattern and (std.mem.eql(u8, pattern, "*") or std.mem.eql(u8, pattern, "**")))
+                true
+            else if (path_pattern) blk: {
+                const absolute_pattern = try absolutePathFrom(manager.allocator, manager.invocation_dir, pattern);
+                const normalized_pattern = try manager.allocator.dupe(u8, absolute_pattern);
+                const normalized_path = try manager.allocator.dupe(u8, path);
+                std.mem.replaceScalar(u8, normalized_pattern, '\\', '/');
+                std.mem.replaceScalar(u8, normalized_path, '\\', '/');
+                break :blk Workspaces.globMatch(normalized_pattern, normalized_path);
+            } else Workspaces.globMatch(pattern, name);
+            if (matches) selected = include;
+        }
+        return selected;
     }
 
     fn workspaceSelected(manager: *const Manager, workspace: Workspace) bool {
@@ -5235,13 +5297,24 @@ const Manager = struct {
         manager.refresh_direct_registry = true;
         defer manager.refresh_direct_registry = previous_refresh;
 
-        try manager.collectOutdatedPackages(package_json, parent_dir, &packages);
-        if (manager.options.recursive) {
+        if (manager.install_filter_active) {
+            if (manager.root_selected) {
+                try manager.collectOutdatedPackages(manager.root_package_json.?, manager.root_dir, &packages);
+            }
             var workspaces = manager.workspaces.iterator();
             while (workspaces.next()) |entry| {
-                if (std.mem.eql(u8, entry.value_ptr.path, parent_dir)) continue;
+                if (manager.filtered_workspaces.contains(entry.value_ptr.name)) {
+                    try manager.collectOutdatedPackages(entry.value_ptr.package_json, entry.value_ptr.path, &packages);
+                }
+            }
+        } else if (manager.options.recursive) {
+            try manager.collectOutdatedPackages(manager.root_package_json.?, manager.root_dir, &packages);
+            var workspaces = manager.workspaces.iterator();
+            while (workspaces.next()) |entry| {
                 try manager.collectOutdatedPackages(entry.value_ptr.package_json, entry.value_ptr.path, &packages);
             }
+        } else {
+            try manager.collectOutdatedPackages(package_json, parent_dir, &packages);
         }
 
         std.sort.pdq(OutdatedPackage, packages.items, {}, struct {
@@ -5252,40 +5325,7 @@ const Manager = struct {
             }
         }.lessThan);
 
-        if (packages.items.len == 0) {
-            try manager.stdout.flush();
-            return 0;
-        }
-
-        try manager.stdout.writeAll("Package\tCurrent\tUpdate\tLatest\n");
-        var has_filtered_versions = false;
-        for (packages.items) |package| {
-            const dependency_suffix = if (std.mem.eql(u8, package.dependency_type, "devDependencies"))
-                " (dev)"
-            else if (std.mem.eql(u8, package.dependency_type, "peerDependencies"))
-                " (peer)"
-            else if (std.mem.eql(u8, package.dependency_type, "optionalDependencies"))
-                " (optional)"
-            else
-                "";
-            const update_suffix = if (package.update_filtered) " *" else "";
-            const latest_suffix = if (package.latest_filtered) " *" else "";
-            has_filtered_versions = has_filtered_versions or package.update_filtered or package.latest_filtered;
-            try manager.stdout.print("{s}{s}\t{s}\t{s}{s}\t{s}{s}\n", .{
-                package.alias,
-                dependency_suffix,
-                package.current_version,
-                package.update_version,
-                update_suffix,
-                package.latest_version,
-                latest_suffix,
-            });
-        }
-        if (has_filtered_versions) {
-            try manager.stdout.writeAll("\n* Versions excluded by the configured minimum release age are filtered.\n");
-        }
-        try manager.stdout.flush();
-        return 0;
+        return manager.printOutdatedTable(&packages);
     }
 
     fn collectOutdatedPackages(
@@ -5308,7 +5348,7 @@ const Manager = struct {
             for (section.object.keys(), section.object.values()) |alias, spec_value| {
                 if (seen.contains(alias) or spec_value != .string) continue;
                 try seen.put(alias, {});
-                if (manager.options.positionals.len > 0 and !interactiveRequestContains(manager.options.positionals, alias)) continue;
+                if (manager.options.positionals.len > 0 and !outdatedRequestContains(manager.options.positionals, alias)) continue;
 
                 const original_spec = spec_value.string;
                 if (manager.isWorkspaceDependency(alias, original_spec)) continue;
@@ -5337,11 +5377,146 @@ const Manager = struct {
                     .update_version = if (target) |resolved| resolved.version else selection.package.version,
                     .latest_version = latest.version,
                     .dependency_type = dependency_section.name,
+                    .workspace_name = jsonString(package_json, "name") orelse "",
+                    .catalog_name = if (std.mem.startsWith(u8, original_spec, "catalog:")) original_spec["catalog:".len..] else null,
                     .update_filtered = if (target) |resolved| resolved.age_filtered else false,
                     .latest_filtered = latest.age_filtered,
                 });
             }
         }
+    }
+
+    fn printOutdatedTable(
+        manager: *Manager,
+        packages: *std.array_list.Managed(OutdatedPackage),
+    ) !u8 {
+        if (packages.items.len == 0) {
+            try manager.stdout.flush();
+            return 0;
+        }
+
+        var rendered = std.array_list.Managed(RenderedOutdatedPackage).init(manager.allocator);
+        defer rendered.deinit();
+        var has_catalog = false;
+        for (packages.items) |package| {
+            if (package.catalog_name) |catalog_name| {
+                has_catalog = true;
+                var already_grouped = false;
+                for (rendered.items) |existing| {
+                    if (sameOutdatedCatalog(existing.package, package)) {
+                        already_grouped = true;
+                        break;
+                    }
+                }
+                if (already_grouped) continue;
+
+                var workspace_names: std.Io.Writer.Allocating = .init(manager.allocator);
+                try workspace_names.writer.writeAll("catalog");
+                if (catalog_name.len > 0) try workspace_names.writer.print(":{s}", .{catalog_name});
+                try workspace_names.writer.writeAll(" (");
+                var first = true;
+                for (packages.items) |candidate| {
+                    if (!sameOutdatedCatalog(package, candidate)) continue;
+                    if (!first) try workspace_names.writer.writeAll(", ");
+                    try workspace_names.writer.writeAll(candidate.workspace_name);
+                    first = false;
+                }
+                try workspace_names.writer.writeByte(')');
+                try rendered.append(.{
+                    .package = package,
+                    .workspace_display = workspace_names.written(),
+                });
+            } else {
+                try rendered.append(.{
+                    .package = package,
+                    .workspace_display = package.workspace_name,
+                });
+            }
+        }
+
+        const show_workspace = manager.install_filter_active or manager.options.recursive or has_catalog;
+        var widths = [_]usize{ "Packages".len, "Current".len, "Update".len, "Latest".len, "Workspace".len };
+        var has_filtered_versions = false;
+        for (rendered.items) |item| {
+            const package = item.package;
+            widths[0] = @max(widths[0], package.alias.len + outdatedDependencySuffix(package.dependency_type).len);
+            widths[1] = @max(widths[1], package.current_version.len);
+            widths[2] = @max(widths[2], package.update_version.len + @as(usize, if (package.update_filtered) 2 else 0));
+            widths[3] = @max(widths[3], package.latest_version.len + @as(usize, if (package.latest_filtered) 2 else 0));
+            widths[4] = @max(widths[4], item.workspace_display.len);
+            has_filtered_versions = has_filtered_versions or package.update_filtered or package.latest_filtered;
+        }
+
+        const force_color = manager.init_data.environ_map.get("FORCE_COLOR");
+        const ansi = if (force_color) |value|
+            !std.mem.eql(u8, value, "0")
+        else
+            false;
+        const column_count: usize = if (show_workspace) 5 else 4;
+        const active_widths = widths[0..column_count];
+        const labels = [_][]const u8{ "Package", "Current", "Update", "Latest", "Workspace" };
+
+        try writeOutdatedBorder(manager.stdout, active_widths, ansi, .top);
+        for (labels[0..column_count], active_widths) |label, width| {
+            try writeOutdatedCellStart(manager.stdout, ansi);
+            if (ansi) try manager.stdout.writeAll("\x1b[1m\x1b[34m");
+            try manager.stdout.writeAll(label);
+            if (ansi) try manager.stdout.writeAll("\x1b[0m");
+            try manager.stdout.splatByteAll(' ', width - label.len + 1);
+        }
+        try writeOutdatedRowEnd(manager.stdout, ansi);
+
+        for (rendered.items) |item| {
+            const package = item.package;
+            try writeOutdatedBorder(manager.stdout, active_widths, ansi, .middle);
+
+            const dependency_suffix = outdatedDependencySuffix(package.dependency_type);
+            try writeOutdatedCellStart(manager.stdout, ansi);
+            try manager.stdout.writeAll(package.alias);
+            if (ansi) try manager.stdout.writeAll("\x1b[2m");
+            try manager.stdout.writeAll(dependency_suffix);
+            if (ansi) try manager.stdout.writeAll("\x1b[0m");
+            try manager.stdout.splatByteAll(' ', widths[0] - package.alias.len - dependency_suffix.len + 1);
+
+            try writeOutdatedCellStart(manager.stdout, ansi);
+            try manager.stdout.writeAll(package.current_version);
+            try manager.stdout.splatByteAll(' ', widths[1] - package.current_version.len + 1);
+
+            try writeOutdatedCellStart(manager.stdout, ansi);
+            try writeOutdatedVersion(
+                manager.stdout,
+                package.current_version,
+                package.update_version,
+                package.update_filtered,
+                ansi,
+            );
+            const update_len = package.update_version.len + @as(usize, if (package.update_filtered) 2 else 0);
+            try manager.stdout.splatByteAll(' ', widths[2] - update_len + 1);
+
+            try writeOutdatedCellStart(manager.stdout, ansi);
+            try writeOutdatedVersion(
+                manager.stdout,
+                package.current_version,
+                package.latest_version,
+                package.latest_filtered,
+                ansi,
+            );
+            const latest_len = package.latest_version.len + @as(usize, if (package.latest_filtered) 2 else 0);
+            try manager.stdout.splatByteAll(' ', widths[3] - latest_len + 1);
+
+            if (show_workspace) {
+                try writeOutdatedCellStart(manager.stdout, ansi);
+                try manager.stdout.writeAll(item.workspace_display);
+                try manager.stdout.splatByteAll(' ', widths[4] - item.workspace_display.len + 1);
+            }
+            try writeOutdatedRowEnd(manager.stdout, ansi);
+        }
+        try writeOutdatedBorder(manager.stdout, active_widths, ansi, .bottom);
+        if (has_filtered_versions) {
+            try manager.stdout.writeAll("Note: The * indicates that version isn't true latest due to minimum release age\n");
+        }
+        try manager.stdout.flush();
+        return 0;
     }
 
     fn interactiveCatalogValue(root: *Value, alias: []const u8, reference: []const u8) ?*Value {
@@ -6097,14 +6272,16 @@ const Manager = struct {
                 return left.sequence < right.sequence;
             }
         }.lessThan);
-        if (manager.rootLifecycleScriptsWillRun()) try manager.stdout.writeByte('\n');
         for (manager.direct_install_reports.items) |report| {
             if (manager.options.dry_run) {
                 try manager.stdout.print(" {s}@{s}", .{ report.alias, report.display });
             } else {
                 try manager.stdout.print("+ {s}@{s}", .{ report.alias, report.display });
                 if (report.latest_version) |latest| {
-                    if (semverVersionLessThan(report.display, latest)) {
+                    const record = manager.directRecord(report.alias);
+                    const is_alias = if (record) |resolved| !std.mem.eql(u8, report.alias, resolved.name) else false;
+                    const is_prerelease = std.mem.indexOfScalar(u8, report.display, '-') != null;
+                    if (!is_alias and !is_prerelease and semverVersionLessThan(report.display, latest)) {
                         try manager.stdout.print(" (v{s} available)", .{latest});
                     }
                 }
@@ -6308,6 +6485,7 @@ const Manager = struct {
         if (isLocalSpec(resolution_spec)) {
             if (protocol_patch_paths.len > 0) return error.UnsupportedPatchResolution;
             const local = manager.resolveLocalPackage(resolution_spec, parent_dir) catch |err| {
+                if (err == error.MissingPackageJSON and !direct) return resolution_spec;
                 if (err == error.MissingPackageJSON and !optional and !peer) {
                     try manager.stderr.print(
                         "note: error occurred while resolving {s}@{s}\n",
@@ -11073,6 +11251,105 @@ const Manager = struct {
     }
 };
 
+const OutdatedBorder = enum { top, middle, bottom };
+
+fn sameOutdatedCatalog(left: OutdatedPackage, right: OutdatedPackage) bool {
+    const left_catalog = left.catalog_name orelse return false;
+    const right_catalog = right.catalog_name orelse return false;
+    return std.mem.eql(u8, left.alias, right.alias) and
+        std.mem.eql(u8, left.dependency_type, right.dependency_type) and
+        std.mem.eql(u8, left_catalog, right_catalog);
+}
+
+fn outdatedDependencySuffix(dependency_type: []const u8) []const u8 {
+    if (std.mem.eql(u8, dependency_type, "devDependencies")) return " (dev)";
+    if (std.mem.eql(u8, dependency_type, "peerDependencies")) return " (peer)";
+    if (std.mem.eql(u8, dependency_type, "optionalDependencies")) return " (optional)";
+    return "";
+}
+
+fn writeOutdatedBorder(
+    writer: *std.Io.Writer,
+    widths: []const usize,
+    ansi: bool,
+    border: OutdatedBorder,
+) !void {
+    if (!ansi and border != .middle) {
+        var total: usize = widths.len - 1;
+        for (widths) |width| total += width + 2;
+        try writer.writeByte('|');
+        try writer.splatByteAll('-', total);
+        try writer.writeAll("|\n");
+        return;
+    }
+
+    const left = if (!ansi)
+        "|"
+    else switch (border) {
+        .top => "\xe2\x94\x8c",
+        .middle => "\xe2\x94\x9c",
+        .bottom => "\xe2\x94\x94",
+    };
+    const join = if (!ansi)
+        "|"
+    else switch (border) {
+        .top => "\xe2\x94\xac",
+        .middle => "\xe2\x94\xbc",
+        .bottom => "\xe2\x94\xb4",
+    };
+    const right = if (!ansi)
+        "|"
+    else switch (border) {
+        .top => "\xe2\x94\x90",
+        .middle => "\xe2\x94\xa4",
+        .bottom => "\xe2\x94\x98",
+    };
+    const horizontal = if (ansi) "\xe2\x94\x80" else "-";
+
+    try writer.writeAll(left);
+    for (widths, 0..) |width, index| {
+        for (0..width + 2) |_| try writer.writeAll(horizontal);
+        try writer.writeAll(if (index + 1 == widths.len) right else join);
+    }
+    try writer.writeByte('\n');
+}
+
+fn writeOutdatedCellStart(writer: *std.Io.Writer, ansi: bool) !void {
+    try writer.writeAll(if (ansi) "\xe2\x94\x82 " else "| ");
+}
+
+fn writeOutdatedRowEnd(writer: *std.Io.Writer, ansi: bool) !void {
+    try writer.writeAll(if (ansi) "\xe2\x94\x82\n" else "|\n");
+}
+
+fn writeOutdatedVersion(
+    writer: *std.Io.Writer,
+    current: []const u8,
+    value: []const u8,
+    filtered: bool,
+    ansi: bool,
+) !void {
+    if (!ansi) {
+        try writer.writeAll(value);
+        if (filtered) try writer.writeAll(" *");
+        return;
+    }
+
+    if (std.mem.eql(u8, current, value)) {
+        try writer.print("\x1b[2m{s}\x1b[0m", .{value});
+    } else {
+        var common: usize = 0;
+        while (common < current.len and common < value.len and current[common] == value[common]) : (common += 1) {}
+        if (common > 0) {
+            try writer.print("\x1b[2m{s}\x1b[0m", .{value[0..common]});
+        } else {
+            try writer.writeAll("\x1b[0m");
+        }
+        try writer.print("\x1b[1m\x1b[31m{s}\x1b[0m", .{value[common..]});
+    }
+    if (filtered) try writer.writeAll(" \x1b[34m*\x1b[0m");
+}
+
 fn splitPackageSpec(input: []const u8) PackageSpec {
     if (std.mem.startsWith(u8, input, "@")) {
         const slash = std.mem.indexOfScalar(u8, input, '/') orelse return .{ .name = input, .spec = "latest" };
@@ -11132,6 +11409,14 @@ fn interactiveRequestContains(requests: []const []const u8, alias: []const u8) b
         if (parsed.name) |name| {
             if (std.mem.eql(u8, name, alias)) return true;
         }
+    }
+    return false;
+}
+
+fn outdatedRequestContains(requests: []const []const u8, alias: []const u8) bool {
+    for (requests) |request| {
+        const pattern = splitPackageSpec(request).name orelse continue;
+        if (Workspaces.globMatch(pattern, alias)) return true;
     }
     return false;
 }
@@ -11302,6 +11587,7 @@ fn localSpecPath(spec: []const u8) []const u8 {
 
 fn directLocalDisplay(spec: []const u8) []const u8 {
     const path = localSpecPath(spec);
+    if (std.fs.path.isAbsolute(path)) return std.fs.path.basename(path);
     return if (std.mem.startsWith(u8, path, "./")) path[2..] else path;
 }
 
@@ -11809,7 +12095,8 @@ pub fn extractTarballArchive(
         .diagnostics = &diagnostics,
     });
     while (try iterator.next()) |entry| {
-        const path_len = sanitizeTarPath(&sanitized_path_buffer, entry.name, 1) catch continue;
+        const strip_components: u32 = if (std.mem.startsWith(u8, entry.name, "./")) 0 else 1;
+        const path_len = sanitizeTarPath(&sanitized_path_buffer, entry.name, strip_components) catch continue;
         if (path_len == 0 and entry.kind != .directory) continue;
         const path = sanitized_path_buffer[0..path_len];
         var links = symlink_paths.keyIterator();
@@ -11819,7 +12106,9 @@ pub fn extractTarballArchive(
         _ = symlink_paths.remove(path);
 
         switch (entry.kind) {
-            .directory => if (path.len > 0) try ensureTarDirectory(io, destination, path),
+            // npm extraction does not preserve empty directories. Parent
+            // directories are materialized when a file or symlink needs them.
+            .directory => {},
             .file => {
                 try removeTarDestination(io, destination, path);
                 if (std.fs.path.dirname(path)) |parent| try destination.createDirPath(io, parent);
@@ -12354,26 +12643,44 @@ fn writePackageJSON(
     value: Value,
     trailing_newline: bool,
 ) !void {
+    const indent = if (try readOptionalFile(io, allocator, path, 64 * 1024 * 1024)) |source|
+        packageJSONIndent(source)
+    else
+        "  ";
     var output: std.Io.Writer.Allocating = .init(allocator);
-    try writePrettyPackageJSON(&output.writer, value, 0);
+    try writePrettyPackageJSON(&output.writer, value, indent, 0);
     if (trailing_newline) try output.writer.writeByte('\n');
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = output.written() });
 }
 
-fn writePrettyPackageJSON(writer: *std.Io.Writer, value: Value, depth: usize) !void {
+fn packageJSONIndent(source: []const u8) []const u8 {
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        const content = std.mem.trimStart(u8, line, " \t\r");
+        if (content.len == line.len or content.len == 0 or content[0] != '"') continue;
+        return line[0 .. line.len - content.len];
+    }
+    return "  ";
+}
+
+fn writeJSONIndent(writer: *std.Io.Writer, indent: []const u8, depth: usize) !void {
+    for (0..depth) |_| try writer.writeAll(indent);
+}
+
+fn writePrettyPackageJSON(writer: *std.Io.Writer, value: Value, indent: []const u8, depth: usize) !void {
     switch (value) {
         .object => |object| {
             try writer.writeByte('{');
             for (object.keys(), object.values(), 0..) |key, item, index| {
                 try writer.writeAll(if (index == 0) "\n" else ",\n");
-                try writer.splatByteAll(' ', (depth + 1) * 2);
+                try writeJSONIndent(writer, indent, depth + 1);
                 try writeJSONString(writer, key);
                 try writer.writeAll(": ");
-                try writePrettyPackageJSON(writer, item, depth + 1);
+                try writePrettyPackageJSON(writer, item, indent, depth + 1);
             }
             if (object.count() > 0) {
                 try writer.writeByte('\n');
-                try writer.splatByteAll(' ', depth * 2);
+                try writeJSONIndent(writer, indent, depth);
             }
             try writer.writeByte('}');
         },

@@ -2518,7 +2518,7 @@ function which(command, options = undefined) {
     for (const ext of extensions) {
       const candidate = pathJoin(dir, `${value}${ext}`);
       if (isExecutableFile(candidate)) {
-        try { return cottontail.realpathSync(candidate); } catch { return candidate; }
+        return candidate;
       }
     }
   }
