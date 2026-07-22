@@ -1196,6 +1196,7 @@ function normalizeBlobType(type = "") {
 
 function snapshotBlobPart(part, snapshots) {
   if (part == null) return [new Uint8Array(0)];
+  if (typeof part === "symbol") throw new TypeError("Cannot convert a symbol to a string");
   if (Array.isArray(part?._blobChunks)) return part._blobChunks;
   if (typeof part === "string") return [bytesFromString(part)];
   if (part instanceof ArrayBuffer) {

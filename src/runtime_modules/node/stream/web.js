@@ -56,6 +56,152 @@ export const TransformStreamDefaultController = whatwg.TransformStreamDefaultCon
 export const ByteLengthQueuingStrategy = whatwg.ByteLengthQueuingStrategy;
 export const CountQueuingStrategy = whatwg.CountQueuingStrategy;
 
+function streamTypeError(code, message) {
+  const error = new TypeError(message);
+  error.code = code;
+  return error;
+}
+
+function addStreamErrorCode(error, code) {
+  if (error && typeof error === "object" && error.code === undefined) error.code = code;
+  return error;
+}
+
+function isObjectLike(value) {
+  return value !== null && (typeof value === "object" || typeof value === "function");
+}
+
+// Node's copied WHATWG byte-stream tests assert the public ERR_* contract.
+// The polyfill supplies the stream algorithms; these wrappers only adapt its
+// validation errors to the stock-JSC runtime's Node/Bun surface.
+{
+  const prototype = whatwg.ReadableStream.prototype;
+  const descriptor = Object.getOwnPropertyDescriptor(prototype, "getReader");
+  Object.defineProperty(prototype, "getReader", {
+    ...descriptor,
+    value: function getReader(options = undefined) {
+      if (options !== undefined && !isObjectLike(options)) {
+        throw streamTypeError(
+          "ERR_INVALID_ARG_TYPE",
+          "The ReadableStream.getReader first argument must be an object",
+        );
+      }
+      const mode = options == null ? undefined : options.mode;
+      if (mode === undefined) return descriptor.value.call(this);
+      const normalized = String(mode);
+      if (normalized !== "byob") {
+        throw streamTypeError("ERR_INVALID_ARG_VALUE", `The argument 'mode' must be 'byob'. Received ${String(mode)}`);
+      }
+      return descriptor.value.call(this, { mode: normalized });
+    },
+  });
+}
+
+{
+  const prototype = whatwg.ReadableStreamBYOBRequest.prototype;
+  const viewDescriptor = Object.getOwnPropertyDescriptor(prototype, "view");
+  const respondDescriptor = Object.getOwnPropertyDescriptor(prototype, "respond");
+  const newViewDescriptor = Object.getOwnPropertyDescriptor(prototype, "respondWithNewView");
+  const assertThis = value => {
+    if (!(value instanceof whatwg.ReadableStreamBYOBRequest)) {
+      throw streamTypeError("ERR_INVALID_THIS", "Value of this must be of type ReadableStreamBYOBRequest");
+    }
+  };
+  const callWithStateCode = (callback) => {
+    try {
+      return callback();
+    } catch (error) {
+      if (error instanceof TypeError && /invalidated|detached|state/i.test(error.message)) {
+        throw addStreamErrorCode(error, "ERR_INVALID_STATE");
+      }
+      throw error;
+    }
+  };
+  Object.defineProperty(prototype, "view", {
+    ...viewDescriptor,
+    get() {
+      assertThis(this);
+      return viewDescriptor.get.call(this);
+    },
+  });
+  Object.defineProperty(prototype, "respond", {
+    ...respondDescriptor,
+    value: function respond(bytesWritten) {
+      assertThis(this);
+      return callWithStateCode(() => respondDescriptor.value.call(this, bytesWritten));
+    },
+  });
+  Object.defineProperty(prototype, "respondWithNewView", {
+    ...newViewDescriptor,
+    value: function respondWithNewView(view) {
+      assertThis(this);
+      if (!ArrayBuffer.isView(view)) {
+        throw streamTypeError("ERR_INVALID_ARG_TYPE", "The view argument must be an ArrayBufferView");
+      }
+      return callWithStateCode(() => newViewDescriptor.value.call(this, view));
+    },
+  });
+}
+
+{
+  const prototype = whatwg.ReadableStreamBYOBReader.prototype;
+  for (const name of ["read", "cancel"]) {
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+    Object.defineProperty(prototype, name, {
+      ...descriptor,
+      value: function byobReaderOperation(...args) {
+        let result;
+        try {
+          result = descriptor.value.apply(this, args);
+        } catch (error) {
+          throw addStreamErrorCode(error, "ERR_INVALID_STATE");
+        }
+        return Promise.resolve(result).catch(error => {
+          if (error instanceof TypeError && /released reader|reader was released/i.test(error.message)) {
+            throw addStreamErrorCode(error, "ERR_INVALID_STATE");
+          }
+          throw error;
+        });
+      },
+    });
+  }
+}
+
+{
+  const prototype = whatwg.ReadableByteStreamController.prototype;
+  const enqueueDescriptor = Object.getOwnPropertyDescriptor(prototype, "enqueue");
+  const closeDescriptor = Object.getOwnPropertyDescriptor(prototype, "close");
+  Object.defineProperty(prototype, "enqueue", {
+    ...enqueueDescriptor,
+    value: function enqueue(chunk) {
+      if (!ArrayBuffer.isView(chunk)) {
+        throw streamTypeError("ERR_INVALID_ARG_TYPE", "The chunk argument must be an ArrayBufferView");
+      }
+      try {
+        return enqueueDescriptor.value.call(this, chunk);
+      } catch (error) {
+        if (error instanceof TypeError && /closed|draining|state|enqueued/i.test(error.message)) {
+          throw addStreamErrorCode(error, "ERR_INVALID_STATE");
+        }
+        throw error;
+      }
+    },
+  });
+  Object.defineProperty(prototype, "close", {
+    ...closeDescriptor,
+    value: function close() {
+      try {
+        return closeDescriptor.value.call(this);
+      } catch (error) {
+        if (error instanceof TypeError && /closed|state/i.test(error.message)) {
+          throw addStreamErrorCode(error, "ERR_INVALID_STATE");
+        }
+        throw error;
+      }
+    },
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Bun extension: "direct" ReadableStream. The underlying source's pull()
 // receives a sink with write()/flush()/end()/close() that feeds bytes
