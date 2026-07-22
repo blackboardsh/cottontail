@@ -6269,9 +6269,7 @@ const Manager = struct {
                 if (!manager.resolving.contains(cycle_key)) {
                     try manager.resolving.put(cycle_key, {});
                     defer _ = manager.resolving.remove(cycle_key);
-                    try manager.installDependencyObject(local.package_json, "dependencies", local.path, false, false);
-                    try manager.installOptionalDependencies(local.package_json, local.path, false);
-                    try manager.installOrLinkPeerDependencies(local.package_json, local.path, destination, parent_dir);
+                    try manager.installFolderPackageDependencies(local.package_json, local.path, destination, parent_dir);
                 }
             }
             if (placement_kind != .root) {
@@ -6817,7 +6815,7 @@ const Manager = struct {
                 try manager.rememberPackageMetadata(local.path, package.info orelse local.package_json);
                 const source_context = try manager.pushIsolatedSourceContext(local.path, selection.destination);
                 defer manager.popIsolatedSourceContext(source_context) catch {};
-                try manager.installLockedDependencies(package, local.path, selection.destination, parent_dir);
+                try manager.installFolderPackageDependencies(local.package_json, local.path, selection.destination, parent_dir);
                 try manager.queuePackageScripts(alias, local.name, local.version, selection.destination, .local, direct, optional, newly_installed);
                 return local.version;
             },
@@ -6921,6 +6919,23 @@ const Manager = struct {
         try manager.installDependencyObject(@constCast(info), "dependencies", dependency_parent_dir, false, false);
         try manager.installOptionalDependencies(@constCast(info), dependency_parent_dir, false);
         try manager.installOrLinkPeerDependencies(info, dependency_parent_dir, package_dir, peer_parent_dir);
+    }
+
+    fn installFolderPackageDependencies(
+        manager: *Manager,
+        package_json: *Value,
+        dependency_parent_dir: []const u8,
+        package_dir: []const u8,
+        peer_parent_dir: []const u8,
+    ) !void {
+        try manager.installDependencyObject(package_json, "dependencies", dependency_parent_dir, false, false);
+        try manager.installOptionalDependencies(package_json, dependency_parent_dir, false);
+        if (manager.options.production or manager.options.omit_dev) {
+            try manager.resolveOmittedDependencyObject(package_json, "devDependencies", dependency_parent_dir, false, false);
+        } else {
+            try manager.installDependencyObject(package_json, "devDependencies", dependency_parent_dir, false, false);
+        }
+        try manager.installOrLinkPeerDependencies(package_json, dependency_parent_dir, package_dir, peer_parent_dir);
     }
 
     fn installedPackageMatches(manager: *Manager, destination: []const u8, name: []const u8, version_value: []const u8) !bool {
@@ -10518,7 +10533,7 @@ const Manager = struct {
                 try writer.writeAll(", ");
                 try writeJSONString(writer, record.tarball);
                 try writer.writeAll(", ");
-                try manager.writePackageInfo(writer, record.metadata, false);
+                try manager.writePackageInfo(writer, record.metadata, false, false);
                 try writer.writeAll(", ");
                 try writeJSONString(writer, record.integrity);
             },
@@ -10536,14 +10551,14 @@ const Manager = struct {
                 });
                 try writeJSONString(writer, resolution);
                 try writer.writeAll(", ");
-                try manager.writePackageInfo(writer, record.metadata, false);
+                try manager.writePackageInfo(writer, record.metadata, false, true);
             },
             .local_tarball, .remote_tarball => {
                 const source = if (record.resolution.len > 0) record.resolution else record.tarball;
                 const resolution = try std.fmt.allocPrint(manager.allocator, "{s}@{s}", .{ record.name, source });
                 try writeJSONString(writer, resolution);
                 try writer.writeAll(", ");
-                try manager.writePackageInfo(writer, record.metadata, false);
+                try manager.writePackageInfo(writer, record.metadata, false, false);
                 if (record.integrity.len > 0) {
                     try writer.writeAll(", ");
                     try writeJSONString(writer, record.integrity);
@@ -10554,7 +10569,7 @@ const Manager = struct {
                 const resolution = try std.fmt.allocPrint(manager.allocator, "{s}@{s}", .{ record.name, source });
                 try writeJSONString(writer, resolution);
                 try writer.writeAll(", ");
-                try manager.writePackageInfo(writer, record.metadata, true);
+                try manager.writePackageInfo(writer, record.metadata, true, false);
                 try writer.writeAll(", ");
                 try writeJSONString(writer, record.git_resolved);
                 if (record.integrity.len > 0) {
@@ -10566,7 +10581,7 @@ const Manager = struct {
                 const resolution = try std.fmt.allocPrint(manager.allocator, "{s}@root:", .{record.name});
                 try writeJSONString(writer, resolution);
                 try writer.writeAll(", ");
-                try manager.writePackageInfo(writer, record.metadata, false);
+                try manager.writePackageInfo(writer, record.metadata, false, false);
             },
         }
         try writer.writeByte(']');
@@ -10593,6 +10608,7 @@ const Manager = struct {
         writer: *std.Io.Writer,
         metadata: ?*const Value,
         all_peers_optional: bool,
+        include_dev_dependencies: bool,
     ) !void {
         const value = metadata orelse {
             try writer.writeAll("{}");
@@ -10604,6 +10620,7 @@ const Manager = struct {
         }
         const fields = [_][]const u8{
             "dependencies",
+            "devDependencies",
             "optionalDependencies",
             "peerDependencies",
             "os",
@@ -10616,6 +10633,7 @@ const Manager = struct {
         try writer.writeByte('{');
         var first = true;
         for (fields) |field| {
+            if (std.mem.eql(u8, field, "devDependencies") and !include_dev_dependencies) continue;
             const field_value = value.object.get(field) orelse continue;
             if (!first) try writer.writeAll(", ");
             first = false;
