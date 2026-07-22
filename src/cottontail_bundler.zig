@@ -865,6 +865,7 @@ pub fn bundleEntryPointGraphWithOptions(
     // patched SourceProvider ABI and cannot describe that runtime source.
     transpiler.options.bytecode = false;
     transpiler.options.inline_import_meta_properties = options.inline_import_meta_properties;
+    transpiler.options.inline_entrypoint_import_meta_main = options.compile;
     transpiler.options.minify_whitespace = options.minify_whitespace;
     transpiler.options.minify_identifiers = options.minify_identifiers;
     transpiler.options.minify_syntax = options.minify_syntax;

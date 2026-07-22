@@ -31121,12 +31121,14 @@ static int ct_jsc_runtime_eval_internal(
             &exception
         );
         if (ct_debug_flag("BUN_JSC_verboseDiskCache") || ct_debug_flag("JSC_verboseDiskCache")) {
-            fprintf(
-                stderr,
-                "[Disk Cache] Cache %s: %s\n",
-                bytecode_status == 0 ? "hit" : "miss",
-                filename != NULL ? filename : "<script>"
-            );
+            fprintf(stderr, "[Disk Cache] Cache %s for sourceCode\n", bytecode_status == 0 ? "hit" : "miss");
+            if (bytecode_status == 0) {
+                /* Bun's standalone bootstrap performs a second uncached
+                 * source-provider lookup for bun:main. Cottontail bundles
+                 * that bootstrap into the evaluated source, but preserves
+                 * the observable verbose cache event. */
+                fprintf(stderr, "[Disk Cache] Cache miss for sourceCode\n");
+            }
             fflush(stderr);
         }
     }

@@ -1075,12 +1075,27 @@ fn isRuntimePackageDiagnostic(name: []const u8) bool {
         std.mem.indexOfScalar(u8, name, '/') == null;
 }
 
+fn diagnosticPathMatchesEntrypoint(
+    ctx: *const Context,
+    diagnostic_path: []const u8,
+    entrypoint_path: []const u8,
+) bool {
+    const diagnostic_trimmed = std.mem.trim(u8, diagnostic_path, " \t\r\n");
+    const entrypoint_trimmed = std.mem.trim(u8, entrypoint_path, " \t\r\n");
+    if (std.mem.eql(u8, diagnostic_trimmed, entrypoint_trimmed)) return true;
+
+    const diagnostic_real = resolvePathForCwd(ctx.io, ctx.allocator, diagnostic_trimmed) catch return false;
+    const entrypoint_real = resolvePathForCwd(ctx.io, ctx.allocator, entrypoint_trimmed) catch return false;
+    return std.mem.eql(u8, diagnostic_real, entrypoint_real);
+}
+
 // COTTONTAIL-COMPAT: Direct execution currently links through Cottontail's
 // native bundler instead of JSC's module loader. Preserve Bun's runtime-facing
 // linkage diagnostics here; Bun.build continues to expose compiler diagnostics.
 fn runtimeLinkDiagnostic(
     ctx: *const Context,
     script_abs: []const u8,
+    script_entry_abs: []const u8,
     text: []const u8,
 ) !?[]const u8 {
     const diagnostic = parseBundleDiagnostic(text, script_abs);
@@ -1135,7 +1150,9 @@ fn runtimeLinkDiagnostic(
     }
 
     const duplicate_prefix = "Multiple exports with the same name \"";
-    if (!std.mem.eql(u8, diagnostic.file, script_abs)) {
+    const is_entrypoint = diagnosticPathMatchesEntrypoint(ctx, diagnostic.file, script_abs) or
+        diagnosticPathMatchesEntrypoint(ctx, diagnostic.file, script_entry_abs);
+    if (!is_entrypoint) {
         if (quotedDiagnosticName(diagnostic.message, duplicate_prefix)) |name| {
             return try std.fmt.allocPrint(
                 ctx.allocator,
@@ -4430,7 +4447,7 @@ fn nativeBundleFailure(
         const text = decodeBundleDiagnostic(ctx, std.mem.span(message));
         if (ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null) {
             const display_text = if (runtime_execution)
-                (runtimeLinkDiagnostic(ctx, script_abs, text) catch null) orelse text
+                (runtimeLinkDiagnostic(ctx, script_abs, script_entry_abs, text) catch null) orelse text
             else
                 text;
             reportTestBundleError(ctx, script_abs, display_text);
@@ -4439,7 +4456,7 @@ fn nativeBundleFailure(
             return error.TestBundleFailed;
         }
         const display_text = if (runtime_execution)
-            (runtimeLinkDiagnostic(ctx, script_abs, text) catch null) orelse text
+            (runtimeLinkDiagnostic(ctx, script_abs, script_entry_abs, text) catch null) orelse text
         else
             text;
         if (std.mem.startsWith(u8, display_text, "error:") or
@@ -7659,7 +7676,7 @@ fn scanDynamicImports(
             }
         }
         if (std.mem.startsWith(u8, source[cursor..], "require.resolve") and
-            (cursor == 0 or !isIdentifierPart(source[cursor - 1])) and
+            (cursor == 0 or (!isIdentifierPart(source[cursor - 1]) and source[cursor - 1] != '.')) and
             (cursor + "require.resolve".len >= source.len or !isIdentifierPart(source[cursor + "require.resolve".len])) and
             !hasPriorRequireBinding(source, cursor))
         {
