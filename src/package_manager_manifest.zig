@@ -1,4 +1,5 @@
 const std = @import("std");
+const compiler = @import("cottontail_compiler");
 
 const Value = std.json.Value;
 
@@ -90,18 +91,45 @@ pub const Policy = struct {
     }
 
     pub fn matchesLockDocument(policy: *const Policy, document: *const Value) bool {
+        if (!policy.matchesLockDocumentWithoutTrustedDependencies(document)) return false;
+
+        const lock_trusted = document.object.get("trustedDependencies");
+        if (policy.trusted_dependencies) |trusted| {
+            if (lock_trusted == null or lock_trusted.? != .array or lock_trusted.?.array.items.len != trusted.count()) return false;
+            for (lock_trusted.?.array.items) |entry| {
+                if (entry != .string or !trusted.contains(entry.string)) return false;
+            }
+            return true;
+        }
+        return lock_trusted == null;
+    }
+
+    pub fn matchesLockDocumentWithoutTrustedDependencies(policy: *const Policy, document: *const Value) bool {
         if (document.* != .object) return false;
         if (!stringMapMatchesValue(&policy.overrides, document.object.get("overrides"))) return false;
         if (!policy.patchesMatchLockDocument(document)) return false;
         if (!stringMapMatchesValue(&policy.default_catalog, document.object.get("catalog"))) return false;
         if (!catalogGroupsMatchValue(&policy.catalog_groups, document.object.get("catalogs"))) return false;
+        return true;
+    }
 
-        const trusted_count = if (policy.trusted_dependencies) |trusted| trusted.count() else 0;
-        const lock_trusted = document.object.get("trustedDependencies");
-        if (trusted_count == 0) return lock_trusted == null or (lock_trusted.? == .array and lock_trusted.?.array.items.len == 0);
-        if (lock_trusted == null or lock_trusted.? != .array or lock_trusted.?.array.items.len != trusted_count) return false;
-        for (lock_trusted.?.array.items) |entry| {
-            if (entry != .string or !policy.trusted_dependencies.?.contains(entry.string)) return false;
+    pub fn matchesTrustedDependencyHashes(
+        policy: *const Policy,
+        lock_hashes: ?[]const compiler.install.TruncatedPackageNameHash,
+    ) bool {
+        const trusted = policy.trusted_dependencies orelse return lock_hashes == null;
+        const hashes = lock_hashes orelse return false;
+
+        var trusted_names = trusted.keyIterator();
+        while (trusted_names.next()) |name| {
+            const hash: compiler.install.TruncatedPackageNameHash = @truncate(compiler.Semver.String.Builder.stringHash(name.*));
+            if (std.mem.indexOfScalar(compiler.install.TruncatedPackageNameHash, hashes, hash) == null) return false;
+        }
+        for (hashes) |hash| {
+            var matching_name = trusted.keyIterator();
+            while (matching_name.next()) |name| {
+                if (hash == @as(compiler.install.TruncatedPackageNameHash, @truncate(compiler.Semver.String.Builder.stringHash(name.*)))) break;
+            } else return false;
         }
         return true;
     }
@@ -113,16 +141,17 @@ pub const Policy = struct {
 
     pub fn writeLockFields(policy: *const Policy, writer: *std.Io.Writer) !void {
         if (policy.trusted_dependencies) |trusted| {
+            try writer.writeAll(",\n  \"trustedDependencies\": [");
             if (trusted.count() > 0) {
-                try writer.writeAll(",\n  \"trustedDependencies\": [");
                 const names = try sortedKeys(void, policy.allocator, &trusted);
                 defer policy.allocator.free(names);
                 for (names, 0..) |name, index| {
                     try writer.writeAll(if (index == 0) "\n    " else ",\n    ");
                     try writeJSONString(writer, name);
                 }
-                try writer.writeAll("\n  ]");
+                try writer.writeAll("\n  ");
             }
+            try writer.writeByte(']');
         }
         if (policy.patched_dependencies.count() > 0) {
             try writeStringMapField(writer, policy.allocator, "patchedDependencies", &policy.patched_dependencies, 2);
@@ -437,4 +466,39 @@ test "trusted dependency updates are a sorted union" {
     try std.testing.expectEqualStrings("a-package", names[0]);
     try std.testing.expectEqualStrings("m-package", names[1]);
     try std.testing.expectEqualStrings("z-package", names[2]);
+}
+
+test "manifest policy preserves trusted dependency presence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const absent_root = try std.json.parseFromSliceLeaky(Value, allocator, "{}", .{});
+    const empty_root = try std.json.parseFromSliceLeaky(Value, allocator, "{\"trustedDependencies\":[]}", .{});
+    const named_root = try std.json.parseFromSliceLeaky(Value, allocator, "{\"trustedDependencies\":[\"not-installed\"]}", .{});
+    const absent_lock = try std.json.parseFromSliceLeaky(Value, allocator, "{}", .{});
+    const empty_lock = try std.json.parseFromSliceLeaky(Value, allocator, "{\"trustedDependencies\":[]}", .{});
+
+    var absent_policy = try Policy.init(allocator, &absent_root);
+    defer absent_policy.deinit();
+    var empty_policy = try Policy.init(allocator, &empty_root);
+    defer empty_policy.deinit();
+    var named_policy = try Policy.init(allocator, &named_root);
+    defer named_policy.deinit();
+
+    try std.testing.expect(absent_policy.matchesLockDocument(&absent_lock));
+    try std.testing.expect(!absent_policy.matchesLockDocument(&empty_lock));
+    try std.testing.expect(empty_policy.matchesLockDocument(&empty_lock));
+    try std.testing.expect(!empty_policy.matchesLockDocument(&absent_lock));
+
+    const named_hash: compiler.install.TruncatedPackageNameHash = @truncate(compiler.Semver.String.Builder.stringHash("not-installed"));
+    try std.testing.expect(absent_policy.matchesTrustedDependencyHashes(null));
+    try std.testing.expect(!absent_policy.matchesTrustedDependencyHashes(&.{named_hash}));
+    try std.testing.expect(empty_policy.matchesTrustedDependencyHashes(&.{}));
+    try std.testing.expect(!empty_policy.matchesTrustedDependencyHashes(null));
+    try std.testing.expect(named_policy.matchesTrustedDependencyHashes(&.{named_hash}));
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    try empty_policy.writeLockFields(&output.writer);
+    try std.testing.expectEqualStrings(",\n  \"trustedDependencies\": []", output.written());
 }

@@ -6092,7 +6092,8 @@ fn writeEvalEntrypoint(
             \\(async () => {{
             \\{s}
             \\}})().catch((error) => {{
-            \\  console.error(error?.stack ?? error);
+            \\  const message = globalThis.__cottontailFormatUncaughtException?.(error) ?? error?.stack ?? error;
+            \\  console.error(typeof message === "string" && message.startsWith("Error:") ? "error:" + message.slice("Error:".length) : message);
             \\  process.exitCode = 1;
             \\}});
             \\
@@ -6142,7 +6143,7 @@ fn writeEvalEntrypoint(
     const process_eval_source = if (expose_process_eval)
         try std.fmt.allocPrint(
             ctx.allocator,
-            "Object.defineProperty(process, \"_eval\", {{ value: {s}, writable: true, configurable: true }});\n",
+            "Object.defineProperty(globalThis[\"process\"], \"_eval\", {{ value: {s}, writable: true, configurable: true }});\n",
             .{source_literal},
         )
     else

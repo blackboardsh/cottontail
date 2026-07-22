@@ -219,10 +219,19 @@ pub fn textToBinaryAtRoot(
 pub const BinaryText = struct {
     text: []u8,
     migrated_from_v2: bool,
+    trusted_dependency_hashes: ?[]compiler.install.TruncatedPackageNameHash,
+
+    pub fn deinit(converted: *BinaryText, allocator: std.mem.Allocator) void {
+        allocator.free(converted.text);
+        if (converted.trusted_dependency_hashes) |hashes| allocator.free(hashes);
+        converted.* = undefined;
+    }
 };
 
 pub fn binaryToText(allocator: std.mem.Allocator, binary: []const u8) ![]u8 {
-    return (try binaryToTextWithMetadata(allocator, binary)).text;
+    const converted = try binaryToTextWithMetadata(allocator, binary);
+    if (converted.trusted_dependency_hashes) |hashes| allocator.free(hashes);
+    return converted.text;
 }
 
 pub fn binaryToTextWithMetadata(allocator: std.mem.Allocator, binary: []const u8) !BinaryText {
@@ -242,6 +251,11 @@ pub fn binaryToTextWithMetadata(allocator: std.mem.Allocator, binary: []const u8
         .err => |failure| return failure.value,
         .not_found => return error.InvalidBinaryLockfile,
     };
+    const trusted_dependency_hashes = if (lockfile.trusted_dependencies) |trusted|
+        try allocator.dupe(compiler.install.TruncatedPackageNameHash, trusted.keys())
+    else
+        null;
+    errdefer if (trusted_dependency_hashes) |hashes| allocator.free(hashes);
 
     const options: StandaloneOptions = .{ .config_version = lockfile.saved_config_version };
 
@@ -258,6 +272,7 @@ pub fn binaryToTextWithMetadata(allocator: std.mem.Allocator, binary: []const u8
     return .{
         .text = try output.toOwnedSlice(),
         .migrated_from_v2 = migrated_from_v2,
+        .trusted_dependency_hashes = trusted_dependency_hashes,
     };
 }
 
@@ -409,5 +424,29 @@ test "Bun binary lockfile round trip uses the vendored serializer" {
     try std.testing.expectEqualStrings(
         "3F296CFD62CDE82E-c5b05d496e93f30d-0720DF6CAF175FD2-aee4fb8089a37d9a",
         hash_output.written(),
+    );
+}
+
+test "binary lockfile metadata preserves unknown trusted dependency hashes" {
+    const allocator = std.testing.allocator;
+    const text =
+        \\{
+        \\  "lockfileVersion": 1,
+        \\  "configVersion": 1,
+        \\  "workspaces": { "": {} },
+        \\  "trustedDependencies": ["not-installed"],
+        \\  "packages": {}
+        \\}
+    ;
+    const binary = try textToBinary(allocator, text);
+    defer allocator.free(binary);
+
+    var converted = try binaryToTextWithMetadata(allocator, binary);
+    defer converted.deinit(allocator);
+    const trusted_hashes = converted.trusted_dependency_hashes orelse return error.MissingTrustedDependencyMetadata;
+    try std.testing.expectEqual(@as(usize, 1), trusted_hashes.len);
+    try std.testing.expectEqual(
+        @as(compiler.install.TruncatedPackageNameHash, @truncate(compiler.Semver.String.Builder.stringHash("not-installed"))),
+        trusted_hashes[0],
     );
 }

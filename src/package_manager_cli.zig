@@ -4255,7 +4255,8 @@ const Manager = struct {
             if (manager.lock_graph.?.config_version == null) manager.changed = true;
             manager.patch_policy_changed = !manager.manifest_policy.?.patchesMatchLockDocument(&manager.lock_graph.?.document);
             if (!manager.lock_graph.?.rootMatchesPackageJSON(root) or
-                !manager.manifest_policy.?.matchesLockDocument(&manager.lock_graph.?.document))
+                !manager.manifest_policy.?.matchesLockDocumentWithoutTrustedDependencies(&manager.lock_graph.?.document) or
+                !manager.manifest_policy.?.matchesTrustedDependencyHashes(converted.trusted_dependency_hashes))
             {
                 if (manager.options.frozen_lockfile) return error.FrozenLockfileChanged;
                 manager.changed = true;
