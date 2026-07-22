@@ -5133,7 +5133,7 @@ const Tokenizer = struct {
         }
 
         const int_value: ?i32 = if (is_integer)
-            bun.intFromFloat(i32, value)
+            intFromFloat(i32, value)
         else
             null;
 
@@ -6772,7 +6772,7 @@ pub const serializer = struct {
     pub fn serializeDimension(value: f32, unit: []const u8, dest: *Printer) PrintErr!void {
         // Check if the value is an integer - use Rust-compatible conversion
         const int_value: ?i32 = if (fract(value) == 0.0)
-            bun.intFromFloat(i32, value)
+            intFromFloat(i32, value)
         else
             null;
         const token = Token{ .dimension = .{
@@ -7298,6 +7298,79 @@ fn restrict_prec(buf: []u8, comptime prec: u8) struct { []u8, Notation } {
 
 pub inline fn fract(val: f32) f32 {
     return val - @trunc(val);
+}
+
+/// Convert CSS numeric values without trapping when malformed or generated
+/// input exceeds the integer range used by token metadata and color channels.
+pub fn intFromFloat(comptime Int: type, value: anytype) Int {
+    const Float = @TypeOf(value);
+    comptime {
+        if (@typeInfo(Int) != .int) {
+            @compileError("intFromFloat: result must be an integer");
+        }
+        if (Float != f32 and Float != f64) {
+            @compileError("intFromFloat: value must be f32 or f64");
+        }
+    }
+
+    return std.math.lossyCast(Int, value);
+}
+
+test "CSS float-to-integer conversion saturates without trapping" {
+    try std.testing.expectEqual(std.math.maxInt(i32), intFromFloat(i32, @as(f32, 2_147_483_648.0)));
+    try std.testing.expectEqual(std.math.minInt(i32), intFromFloat(i32, @as(f32, -2_147_483_649.0)));
+    try std.testing.expectEqual(std.math.maxInt(u8), intFromFloat(u8, @as(f32, 300.0)));
+    try std.testing.expectEqual(@as(u8, 0), intFromFloat(u8, @as(f32, -50.0)));
+    try std.testing.expectEqual(@as(i32, 20), intFromFloat(i32, @as(f32, 20.75)));
+    try std.testing.expectEqual(@as(i32, 0), intFromFloat(i32, std.math.nan(f32)));
+    try std.testing.expectEqual(std.math.maxInt(i32), intFromFloat(i32, std.math.inf(f32)));
+    try std.testing.expectEqual(std.math.minInt(i32), intFromFloat(i32, -std.math.inf(f32)));
+    try std.testing.expectEqual(std.math.maxInt(i64), intFromFloat(i64, @as(f64, 9_223_372_036_854_775_808.0)));
+}
+
+test "CSS numeric tokens serialize bounded dimensions and percentages" {
+    const TestCase = struct {
+        token: Token,
+        expected: []const u8,
+    };
+    const cases = [_]TestCase{
+        .{
+            .token = .{ .dimension = .{
+                .num = .{ .value = std.math.inf(f32), .int_value = null, .has_sign = false },
+                .unit = "px",
+            } },
+            .expected = "3.40282e38px",
+        },
+        .{
+            .token = .{ .dimension = .{
+                .num = .{ .value = -std.math.inf(f32), .int_value = null, .has_sign = true },
+                .unit = "px",
+            } },
+            .expected = "-3.40282e38px",
+        },
+        .{
+            .token = .{ .dimension = .{
+                .num = .{ .value = 2_147_483_648.0, .int_value = std.math.maxInt(i32), .has_sign = false },
+                .unit = "px",
+            } },
+            .expected = "2147480000px",
+        },
+        .{
+            .token = .{ .percentage = .{
+                .unit_value = std.math.inf(f32),
+                .int_value = null,
+                .has_sign = false,
+            } },
+            .expected = "3.40282e38%",
+        },
+    };
+
+    for (cases) |case| {
+        var buf: [64]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buf);
+        try case.token.format(&writer);
+        try std.testing.expectEqualStrings(case.expected, writer.buffered());
+    }
 }
 
 pub fn f32_length_with_5_digits(n_input: f32) usize {

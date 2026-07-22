@@ -27,7 +27,7 @@ pub const Percentage = struct {
     pub fn toCss(this: *const @This(), dest: *Printer) PrintErr!void {
         const x = this.v * 100.0;
         const int_value: ?i32 = if ((x - @trunc(x)) == 0.0)
-            bun.intFromFloat(i32, this.v)
+            css.intFromFloat(i32, this.v)
         else
             null;
 

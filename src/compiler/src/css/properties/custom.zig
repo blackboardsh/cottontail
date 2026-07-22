@@ -791,7 +791,7 @@ pub const UnresolvedColor = union(enum) {
     ) PrintErr!void {
         const Helper = struct {
             pub fn conv(c: f32) i32 {
-                return bun.intFromFloat(i32, bun.clamp(@round(c * 255.0), 0.0, 255.0));
+                return css.intFromFloat(i32, bun.clamp(@round(c * 255.0), 0.0, 255.0));
             }
         };
 
