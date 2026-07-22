@@ -3564,8 +3564,8 @@
       "reason": "Passes on the native-bundler pipeline after stabilization (1 bun:test cases, 2 assertions)."
     },
     "test/js/third_party/duckdb/duckdb-basic-usage.test.ts": {
-      "status": "enabled",
-      "reason": "The copied basic-usage case loads DuckDB 1.3.1's installed platform addon and executes a real in-memory query through its callback N-API path."
+      "status": "expected-failure",
+      "reason": "The copied test requires DuckDB 1.3.1's platform-specific duckdb.node fixture; the snapshot dependency install does not currently produce that addon reproducibly."
     },
     "test/js/third_party/es-module-lexer/es-module-lexer.test.ts": {
       "status": "enabled",
