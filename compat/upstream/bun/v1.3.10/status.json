@@ -5070,6 +5070,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
     },
+    "test/regression/issue/25628.test.ts": {
+      "status": "enabled",
+      "reason": "Compiled full-stack HTML manifests expose both the main browser entry and dynamically split lazy chunks through frontend.files (1 case, 4 assertions)."
+    },
     "test/regression/issue/25639.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (4 bun:test cases, 9 assertions)."
