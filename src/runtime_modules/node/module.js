@@ -1052,7 +1052,7 @@ function resolveAsDirectory(candidate, kind = "require") {
   const packagePath = join(candidate, "package.json");
   const packageJson = isFile(packagePath) ? readPackageJson(packagePath) : null;
   if (packageJsonValue(packageJson, "exports") != null) {
-    const exported = resolvePackageExports(candidate, packageJson, "", kind);
+    const exported = resolvePackageTargetPath(candidate, resolvePackageExports(candidate, packageJson, "", kind), kind);
     if (exported) return exported;
   }
   const packageMain = packageJsonValue(packageJson, "main");
@@ -1077,8 +1077,24 @@ function requestRequiresDirectory(request) {
   return /[\\/]$/.test(request) || /(?:^|[\\/])\.{1,2}$/.test(request);
 }
 
-const packageTargetUndefined = Symbol("packageTargetUndefined");
-const packageTargetNull = Symbol("packageTargetNull");
+const packageTargetStatus = Object.freeze({
+  undefined: "undefined",
+  null: "null",
+  exact: "exact",
+  inexact: "inexact",
+  packageResolve: "package-resolve",
+  invalidModuleSpecifier: "invalid-module-specifier",
+  invalidPackageConfiguration: "invalid-package-configuration",
+  invalidPackageTarget: "invalid-package-target",
+  packagePathNotExported: "package-path-not-exported",
+  packagePathDisabled: "package-path-disabled",
+  packageImportNotDefined: "package-import-not-defined",
+  unsupportedDirectoryImport: "unsupported-directory-import",
+});
+
+function packageTargetResult(status, path = "", trailingSlash = false) {
+  return { status, path, trailingSlash };
+}
 
 function customResolverConditions() {
   const conditions = [];
@@ -1113,83 +1129,196 @@ function conditionsFromHookContext(context, kind) {
   return new Set([...context.conditions, "default"]);
 }
 
-// Ported from Bun's ESModule.resolveTarget: condition objects preserve
-// package.json key order, arrays advance past null/invalid alternatives, and
-// a matched condition whose nested target is undefined may fall through to a
-// later condition.
-function packageTargetForConditions(target, conditions) {
-  if (typeof target === "string") return target;
-  if (target === null) return packageTargetNull;
-  if (Array.isArray(target)) {
-    for (const item of target) {
-      const resolved = packageTargetForConditions(item, conditions);
-      if (typeof resolved === "string") return resolved;
-    }
-    return packageTargetNull;
+// Bun resolves package targets against a logical "/" URL first. Keeping the
+// package root out of this stage avoids decoding percent bytes in real paths.
+function packageMapShape(map) {
+  let keysStartWithDot;
+  for (const key of Object.keys(map)) {
+    const startsWithDot = key.startsWith(".");
+    if (keysStartWithDot === undefined) keysStartWithDot = startsWithDot;
+    else if (keysStartWithDot !== startsWithDot) return "invalid";
   }
-  if (target && typeof target === "object") {
-    for (const [condition, value] of Object.entries(target)) {
-      if (!conditions.has(condition)) continue;
-      const resolved = packageTargetForConditions(value, conditions);
-      if (resolved !== packageTargetUndefined) return resolved;
-    }
-  }
-  return packageTargetUndefined;
+  return keysStartWithDot ? "subpaths" : "conditions";
 }
 
-function resolvePackageTarget(root, target, kind = "require") {
-  if (typeof target !== "string" || !target.startsWith("./")) return null;
-  const candidate = resolve(root, target);
-  if (candidate !== root && !candidate.startsWith(`${root}/`) && !candidate.startsWith(`${root}\\`)) return null;
+function findInvalidPackageSegment(value) {
+  const firstSeparator = String(value).search(/[\\/]/);
+  if (firstSeparator < 0) return "";
+  for (const segment of String(value).slice(firstSeparator + 1).split(/[\\/]/)) {
+    if (segment === "." || segment === ".." || segment.toLowerCase() === "node_modules") return segment;
+  }
+  return null;
+}
+
+function packageMapKeyCompare(left, right) {
+  const leftStar = left.indexOf("*");
+  const rightStar = right.indexOf("*");
+  const leftBaseLength = leftStar < 0 ? left.length : leftStar;
+  const rightBaseLength = rightStar < 0 ? right.length : rightStar;
+  if (leftBaseLength !== rightBaseLength) return rightBaseLength - leftBaseLength;
+  if (leftStar < 0 && rightStar >= 0) return 1;
+  if (rightStar < 0 && leftStar >= 0) return -1;
+  return right.length - left.length;
+}
+
+function packageMapExpansionKeys(map) {
+  return Object.keys(map)
+    .filter((key) => key.endsWith("/") || key.includes("*"))
+    .sort(packageMapKeyCompare);
+}
+
+function resolvePackageTarget(target, subpath, conditions, internal, pattern) {
+  if (typeof target === "string") {
+    if (!pattern && subpath && !target.endsWith("/")) {
+      return packageTargetResult(packageTargetStatus.invalidModuleSpecifier, target);
+    }
+
+    if (!target.startsWith("./")) {
+      if (internal && !target.startsWith("../") && !target.startsWith("/")) {
+        const packagePath = pattern
+          ? target.replace(/\*/g, subpath)
+          : pathPosix.join(target, subpath);
+        return packageTargetResult(packageTargetStatus.packageResolve, packagePath);
+      }
+      return packageTargetResult(packageTargetStatus.invalidPackageTarget, target);
+    }
+
+    if (findInvalidPackageSegment(target) != null) {
+      return packageTargetResult(packageTargetStatus.invalidPackageTarget, target);
+    }
+
+    const resolvedTarget = pathPosix.join("/", target);
+    if (findInvalidPackageSegment(resolvedTarget) != null) {
+      return packageTargetResult(packageTargetStatus.invalidModuleSpecifier, target);
+    }
+
+    if (pattern) {
+      const path = resolvedTarget.replace(/\*/g, subpath);
+      return packageTargetResult(packageTargetStatus.exact, path, /[\\/]$/.test(path));
+    }
+
+    const path = pathPosix.join(resolvedTarget, subpath);
+    const trailingSlash = /[\\/]$/.test(subpath || target);
+    return packageTargetResult(packageTargetStatus.exact, path, trailingSlash);
+  }
+
+  if (target === null) return packageTargetResult(packageTargetStatus.null);
+
+  if (Array.isArray(target)) {
+    if (target.length === 0) return packageTargetResult(packageTargetStatus.null);
+    let lastResult = packageTargetResult(packageTargetStatus.undefined);
+    for (const value of target) {
+      const result = resolvePackageTarget(value, subpath, conditions, internal, pattern);
+      if (result.status !== packageTargetStatus.undefined) return result;
+      lastResult = result;
+    }
+    return lastResult;
+  }
+
+  if (target && typeof target === "object") {
+    if (packageMapShape(target) === "invalid") {
+      return packageTargetResult(packageTargetStatus.invalidPackageTarget);
+    }
+    for (const [condition, value] of Object.entries(target)) {
+      if (!conditions.has(condition)) continue;
+      const result = resolvePackageTarget(value, subpath, conditions, internal, pattern);
+      if (result.status !== packageTargetStatus.undefined) return result;
+    }
+    return packageTargetResult(packageTargetStatus.undefined);
+  }
+
+  return packageTargetResult(packageTargetStatus.invalidPackageTarget);
+}
+
+function resolvePackageImportsExports(matchKey, matchMap, conditions, internal) {
+  if (!matchKey.endsWith("/") && !matchKey.includes("*") && Object.hasOwn(matchMap, matchKey)) {
+    return resolvePackageTarget(matchMap[matchKey], "", conditions, internal, false);
+  }
+
+  for (const expansionKey of packageMapExpansionKeys(matchMap)) {
+    const star = expansionKey.indexOf("*");
+    if (star >= 0) {
+      const patternBase = expansionKey.slice(0, star);
+      const patternTrailer = expansionKey.slice(star + 1);
+      if (!matchKey.startsWith(patternBase)) continue;
+      if (patternTrailer && (!matchKey.endsWith(patternTrailer) || matchKey.length < expansionKey.length)) continue;
+      const subpath = matchKey.slice(patternBase.length, matchKey.length - patternTrailer.length);
+      return resolvePackageTarget(matchMap[expansionKey], subpath, conditions, internal, true);
+    }
+
+    if (matchKey.startsWith(expansionKey)) {
+      const subpath = matchKey.slice(expansionKey.length);
+      const result = resolvePackageTarget(matchMap[expansionKey], subpath, conditions, internal, false);
+      if (result.status === packageTargetStatus.exact) result.status = packageTargetStatus.inexact;
+      return result;
+    }
+  }
+
+  return packageTargetResult(packageTargetStatus.null);
+}
+
+function finalizePackageTarget(result) {
+  if (result.status !== packageTargetStatus.exact && result.status !== packageTargetStatus.inexact) return result;
+  let path;
+  try {
+    path = decodeURIComponent(result.path);
+  } catch {
+    return packageTargetResult(packageTargetStatus.invalidModuleSpecifier, result.path);
+  }
+  if (result.trailingSlash || /[\\/]$/.test(path)) {
+    return packageTargetResult(packageTargetStatus.unsupportedDirectoryImport, path);
+  }
+  return packageTargetResult(result.status, path);
+}
+
+function resolvePackageTargetPath(root, resolution, kind = "require") {
+  if (resolution.status !== packageTargetStatus.exact && resolution.status !== packageTargetStatus.inexact) return null;
+  const candidate = resolve(root, resolution.path.replace(/^[\\/]+/, ""));
+  if (resolution.status === packageTargetStatus.exact) return isFile(candidate) ? candidate : null;
   return resolveAsFile(candidate) || resolveAsDirectory(candidate, kind);
 }
 
-function packageMapPatternMatches(map, specifier) {
-  const matches = [];
-  for (const [key, target] of Object.entries(map)) {
-    const star = key.indexOf("*");
-    if (star >= 0) {
-      const prefix = key.slice(0, star);
-      const trailer = key.slice(star + 1);
-      if (!specifier.startsWith(prefix) || !specifier.endsWith(trailer)) continue;
-      if (specifier.length < prefix.length + trailer.length) continue;
-      matches.push({ key, target, subpath: specifier.slice(prefix.length, specifier.length - trailer.length), prefixLength: prefix.length });
-    } else if (key.endsWith("/") && specifier.startsWith(key)) {
-      matches.push({ key, target, subpath: specifier.slice(key.length), prefixLength: key.length });
-    }
-  }
-  matches.sort((a, b) => b.prefixLength - a.prefixLength || b.key.length - a.key.length);
-  return matches;
-}
-
 function resolvePackageExports(root, packageJson, suffix = "", kind = "require") {
+  void root;
   const exportsField = packageJsonValue(packageJson, "exports");
-  if (exportsField == null) return null;
   const subpath = suffix ? `./${suffix}` : ".";
   const conditions = resolverConditions(kind);
-  if (typeof exportsField === "string" || Array.isArray(exportsField)) {
-    if (subpath !== ".") return null;
-    return resolvePackageTarget(root, packageTargetForConditions(exportsField, conditions), kind);
+
+  if (exportsField !== null && typeof exportsField !== "string" && !Array.isArray(exportsField) &&
+      (typeof exportsField !== "object" || exportsField === null)) {
+    return packageTargetResult(packageTargetStatus.invalidPackageConfiguration);
   }
-  if (typeof exportsField !== "object") return null;
-  // "exports" sugar: an object whose keys are all conditions (none start
-  // with ".") is the conditions target for the root subpath, e.g.
-  // { "require": "./index.js", "import": "./esm/wrapper.js" }.
-  if (!Object.keys(exportsField).some((key) => key.startsWith("."))) {
-    if (subpath !== ".") return null;
-    return resolvePackageTarget(root, packageTargetForConditions(exportsField, conditions), kind);
+
+  let shape = "conditions";
+  if (exportsField && typeof exportsField === "object" && !Array.isArray(exportsField)) {
+    shape = packageMapShape(exportsField);
+    if (shape === "invalid") return packageTargetResult(packageTargetStatus.invalidPackageConfiguration);
   }
-  if (Object.prototype.hasOwnProperty.call(exportsField, subpath)) {
-    return resolvePackageTarget(root, packageTargetForConditions(exportsField[subpath], conditions), kind);
+
+  if (subpath === ".") {
+    let mainExport;
+    if (typeof exportsField === "string" || Array.isArray(exportsField) || shape === "conditions") {
+      mainExport = exportsField;
+    } else if (Object.hasOwn(exportsField, ".")) {
+      mainExport = exportsField["."];
+    }
+    if (mainExport !== undefined && mainExport !== null) {
+      const result = resolvePackageTarget(mainExport, "", conditions, false, false);
+      if (result.status !== packageTargetStatus.null && result.status !== packageTargetStatus.undefined) {
+        return finalizePackageTarget(result);
+      }
+    }
+  } else if (shape === "subpaths") {
+    const result = resolvePackageImportsExports(subpath, exportsField, conditions, false);
+    if (result.status !== packageTargetStatus.null && result.status !== packageTargetStatus.undefined) {
+      return finalizePackageTarget(result);
+    }
+    if (result.status === packageTargetStatus.null) {
+      return packageTargetResult(packageTargetStatus.packagePathDisabled);
+    }
   }
-  for (const { key, target, subpath: matched } of packageMapPatternMatches(exportsField, subpath)) {
-    const resolvedTarget = packageTargetForConditions(target, conditions);
-    const mapped = typeof resolvedTarget !== "string" ? null
-      : key.includes("*") ? resolvedTarget.replace(/\*/g, matched) : `${resolvedTarget}${matched}`;
-    const resolved = mapped == null ? null : resolvePackageTarget(root, mapped, kind);
-    if (resolved) return resolved;
-  }
-  return null;
+
+  return packageTargetResult(packageTargetStatus.packagePathNotExported);
 }
 
 function isPromiseLike(value) {
@@ -1443,32 +1572,24 @@ function resolvePackageImports(specifier, basePath, kind, seen = new Set()) {
   if (seen.has(cycleKey)) throw packageImportNotDefinedError(specifier, basePath);
   seen.add(cycleKey);
 
-  let rawTarget = Object.prototype.hasOwnProperty.call(imports, specifier)
-    ? imports[specifier]
-    : packageTargetUndefined;
-  let matched = "";
-  let patternMatched = false;
-  if (rawTarget === packageTargetUndefined) {
-    const pattern = packageMapPatternMatches(imports, specifier)[0];
-    if (pattern) {
-      rawTarget = pattern.target;
-      matched = pattern.subpath;
-      patternMatched = true;
-    }
+  let resolution = packageMapShape(imports) === "invalid"
+    ? packageTargetResult(packageTargetStatus.invalidPackageConfiguration)
+    : resolvePackageImportsExports(specifier, imports, resolverConditions(kind), true);
+  if (resolution.status === packageTargetStatus.null || resolution.status === packageTargetStatus.undefined) {
+    resolution = packageTargetResult(packageTargetStatus.packageImportNotDefined);
+  } else {
+    resolution = finalizePackageTarget(resolution);
   }
-  const selected = packageTargetForConditions(rawTarget, resolverConditions(kind));
-  if (typeof selected !== "string") throw packageImportNotDefinedError(specifier, basePath);
-  const target = patternMatched ? selected.replace(/\*/g, matched) : selected;
 
-  if (target.startsWith("./")) {
-    const resolved = resolvePackageTarget(scope.dir, target, kind);
-    if (resolved) return resolved;
-    throw moduleNotFoundError(target);
+  if (resolution.status === packageTargetStatus.packageResolve) {
+    return resolveRequestCore(resolution.path, scope.packageJsonPath, kind, seen);
   }
-  if (target.startsWith("../") || isAbsolute(target) || target.startsWith("file:")) {
-    throw packageImportNotDefinedError(specifier, basePath);
+  const resolved = resolvePackageTargetPath(scope.dir, resolution, kind);
+  if (resolved) return resolved;
+  if (resolution.status === packageTargetStatus.exact || resolution.status === packageTargetStatus.inexact) {
+    throw moduleNotFoundError(specifier, kind === "import", basePath);
   }
-  return resolveRequestCore(target, scope.packageJsonPath, kind, seen);
+  throw packageImportNotDefinedError(specifier, basePath);
 }
 
 function invalidHookReturnProperty(property, hook, value) {
@@ -1595,12 +1716,16 @@ function resolveRequestCore(request, basePath, kind = "require", packageImportSe
   const packageJsonPath = join(root, "package.json");
   const packageJson = modulePathExists(packageJsonPath) ? readPackageJson(packageJsonPath) : null;
   if (packageJsonValue(packageJson, "exports") != null) {
-    let exported = resolvePackageExports(root, packageJson, packageSuffix, kind);
+    let exported = resolvePackageTargetPath(root, resolvePackageExports(root, packageJson, packageSuffix, kind), kind);
     // Bun permits package.json reads and TypeScript-style redundant .js
     // suffixes even when the exports map omits those spellings.
     if (!exported && packageSuffix === "package.json" && isFile(packageJsonPath)) exported = packageJsonPath;
     if (!exported && packageSuffix.endsWith(".js")) {
-      exported = resolvePackageExports(root, packageJson, packageSuffix.slice(0, -3), kind);
+      exported = resolvePackageTargetPath(
+        root,
+        resolvePackageExports(root, packageJson, packageSuffix.slice(0, -3), kind),
+        kind,
+      );
     }
     if (exported) return withSpecifierSuffix(exported, suffix);
     const error = new Error(`Package subpath '${packageSuffix ? `./${packageSuffix}` : "."}' is not defined by "exports" in ${join(root, "package.json")}`);

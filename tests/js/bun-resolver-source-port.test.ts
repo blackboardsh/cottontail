@@ -20,11 +20,19 @@ writeFileSync(join(root, "package.json"), JSON.stringify({
   imports: {
     "#local": "./lib/local.cjs",
     "#features/*": "./lib/*.cjs",
+    "#exact-no-extension": "./lib/extensionless",
+    "#legacy/": "./legacy/",
+    "#blocked": [null, "./lib/local.cjs"],
+    "#invalid-segment": "./lib/../lib/local.cjs",
+    "#encoded": "./lib/local%2Ecjs",
     "#events": "node:events",
   },
 }));
 write(join(root, "lib", "local.cjs"), "module.exports = { value: 'local' };\n");
 write(join(root, "lib", "alpha.cjs"), "module.exports = { value: 'alpha' };\n");
+write(join(root, "lib", "extensionless.js"), "module.exports = { value: 'extensionless' };\n");
+write(join(root, "legacy", "value.js"), "module.exports = { value: 'legacy-file' };\n");
+write(join(root, "legacy", "folder", "index.js"), "module.exports = { value: 'legacy-directory' };\n");
 
 const conditional = join(root, "node_modules", "conditional-resolver");
 mkdirSync(conditional, { recursive: true });
@@ -43,6 +51,42 @@ writeFileSync(join(conditional, "package.json"), JSON.stringify({
 write(join(conditional, "import.cjs"), "module.exports = { value: 'import' };\n");
 write(join(conditional, "require.cjs"), "module.exports = { value: 'require' };\n");
 write(join(conditional, "fallback.cjs"), "module.exports = { value: 'fallback' };\n");
+
+const packageTargets = join(root, "node_modules", "package-target-parity");
+mkdirSync(packageTargets, { recursive: true });
+writeFileSync(join(packageTargets, "package.json"), JSON.stringify({
+  name: "package-target-parity",
+  exports: {
+    ".": "./index.cjs",
+    "./exact-no-extension": "./lib/extensionless",
+    "./exact-directory": "./lib/directory",
+    "./legacy/": "./lib/legacy/",
+    "./condition-null": { require: null, default: "./lib/fallback.cjs" },
+    "./array-null": [null, "./lib/fallback.cjs"],
+    "./invalid-segment": "./lib/../lib/fallback.cjs",
+    "./encoded": "./lib/fallback%2Ecjs",
+    "./single-decode": "./lib/fallback%252Ecjs",
+    "./feature/*-suffix": "./lib/special.cjs",
+    "./feature/*": "./lib/pattern/*.cjs",
+  },
+}));
+write(join(packageTargets, "index.cjs"), "module.exports = { value: 'root' };\n");
+write(join(packageTargets, "lib", "extensionless.js"), "module.exports = { value: 'extensionless' };\n");
+write(join(packageTargets, "lib", "directory", "index.cjs"), "module.exports = { value: 'directory' };\n");
+write(join(packageTargets, "lib", "legacy", "value.js"), "module.exports = { value: 'legacy-file' };\n");
+write(join(packageTargets, "lib", "legacy", "folder", "index.js"), "module.exports = { value: 'legacy-directory' };\n");
+write(join(packageTargets, "lib", "fallback.cjs"), "module.exports = { value: 'fallback' };\n");
+write(join(packageTargets, "lib", "fallback%2Ecjs"), "module.exports = { value: 'single-decode' };\n");
+write(join(packageTargets, "lib", "special.cjs"), "module.exports = { value: 'special' };\n");
+write(join(packageTargets, "lib", "pattern", "-suffix.cjs"), "module.exports = { value: 'general' };\n");
+
+const mixedExports = join(root, "node_modules", "mixed-exports-parity");
+mkdirSync(mixedExports, { recursive: true });
+writeFileSync(join(mixedExports, "package.json"), JSON.stringify({
+  name: "mixed-exports-parity",
+  exports: { ".": "./index.cjs", require: "./index.cjs" },
+}));
+write(join(mixedExports, "index.cjs"), "module.exports = { value: 'mixed' };\n");
 
 const mainEntry = join(root, "module-main", "entry.cjs");
 write(join(root, "module-main", "child.cjs"), [
@@ -72,6 +116,44 @@ test("package imports resolve exact, wildcard, and builtin targets", () => {
   expect(require("#features/alpha").value).toBe("alpha");
   expect(require("#events")).toBe(require("node:events"));
   expect(Bun.resolveSync("#features/alpha", root)).toBe(join(root, "lib", "alpha.cjs"));
+});
+
+test("package imports distinguish exact targets from legacy prefix expansion", () => {
+  const require = createRequire(entry);
+  expect(() => require("#exact-no-extension")).toThrow();
+  expect(() => Bun.resolveSync("#exact-no-extension", root)).toThrow();
+  expect(require("#legacy/value").value).toBe("legacy-file");
+  expect(require("#legacy/folder").value).toBe("legacy-directory");
+  expect(require("#encoded").value).toBe("local");
+});
+
+test("package imports preserve blocked and invalid target states", () => {
+  const require = createRequire(entry);
+  expect(() => require("#blocked")).toThrow();
+  expect(() => Bun.resolveSync("#blocked", root)).toThrow();
+  expect(() => require("#invalid-segment")).toThrow();
+});
+
+test("package exports use exact lookup except for trailing-slash maps", () => {
+  const require = createRequire(entry);
+  expect(() => require("package-target-parity/exact-no-extension")).toThrow();
+  expect(() => require("package-target-parity/exact-directory")).toThrow();
+  expect(() => Bun.resolveSync("package-target-parity/exact-no-extension", root)).toThrow();
+  expect(require("package-target-parity/legacy/value").value).toBe("legacy-file");
+  expect(require("package-target-parity/legacy/folder").value).toBe("legacy-directory");
+});
+
+test("package exports preserve target status, decoding, and pattern specificity", () => {
+  const require = createRequire(entry);
+  expect(() => require("package-target-parity/condition-null")).toThrow();
+  expect(Bun.resolveSync("package-target-parity/condition-null", root))
+    .toEndWith(join("node_modules", "package-target-parity", "lib", "fallback.cjs"));
+  expect(() => require("package-target-parity/array-null")).toThrow();
+  expect(() => require("package-target-parity/invalid-segment")).toThrow();
+  expect(require("package-target-parity/encoded").value).toBe("fallback");
+  expect(require("package-target-parity/single-decode").value).toBe("single-decode");
+  expect(require("package-target-parity/feature/-suffix").value).toBe("general");
+  expect(() => require("mixed-exports-parity")).toThrow();
 });
 
 test("condition maps distinguish import and require while preserving custom conditions", () => {
