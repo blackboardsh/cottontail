@@ -4603,7 +4603,7 @@ const Manager = struct {
             manager.removeDependencyFromOtherSections(package_json, name, target_section);
             try section.put(manager.allocator, try manager.allocator.dupe(u8, name), .{ .string = try manager.allocator.dupe(u8, saved_spec) });
             manager.changed = true;
-            if (!manager.options.silent) {
+            if (!manager.options.silent and !manager.options.no_summary) {
                 if (manager.direct_bins.items.len == 0) {
                     try added_output.writer.print("installed {s}@{s}\n", .{ name, display_resolution });
                 } else {
@@ -4613,7 +4613,7 @@ const Manager = struct {
             }
         }
         try manager.installRoot(manager.root_package_json.?, true);
-        if (!manager.options.silent) {
+        if (!manager.options.silent and !manager.options.no_summary) {
             if ((manager.options.command == .link or manager.direct_install_reports.items.len > 0) and
                 added_output.written().len > 0)
             {
@@ -5453,7 +5453,7 @@ const Manager = struct {
         result: UpdateResult,
         requested: bool,
     ) !void {
-        if (manager.options.silent) return;
+        if (manager.options.silent or manager.options.no_summary) return;
         if (requested) {
             if (manager.direct_bins.items.len == 0) {
                 try writer.print("installed {s}@{s}\n", .{ alias, result.resolved_version });
@@ -5490,7 +5490,7 @@ const Manager = struct {
             if (std.mem.eql(u8, key, "peerDependencies") and
                 (objectSectionContains(package_json, "dependencies", alias) or
                     objectSectionContains(package_json, "optionalDependencies", alias) or
-                    (!manager.options.production and !manager.options.omit_dev and
+                    (direct and !manager.options.production and !manager.options.omit_dev and
                         objectSectionContains(package_json, "devDependencies", alias)))) continue;
             const optional_peer = std.mem.eql(u8, key, "peerDependencies") and peerDependencyIsOptional(package_json, alias);
             if (optional_peer) continue;
@@ -6940,7 +6940,7 @@ const Manager = struct {
             return manager.linkPeerDependencies(metadata, package_dir, peer_parent_dir);
         }
         const package_json = metadata orelse return;
-        try manager.installDependencyObject(@constCast(package_json), "peerDependencies", dependency_parent_dir, false, true);
+        try manager.installDependencyObject(@constCast(package_json), "peerDependencies", dependency_parent_dir, false, false);
     }
 
     fn reconcileIsolatedPeerGraph(manager: *Manager) !void {
@@ -8490,7 +8490,7 @@ const Manager = struct {
                     try manager.appendRegistryDependencySection(&next, resolved.metadata, "optionalDependencies", true);
                 }
                 if (!manager.options.omit_peer and manager.node_linker == .hoisted) {
-                    try manager.appendRegistryDependencySection(&next, resolved.metadata, "peerDependencies", true);
+                    try manager.appendRegistryDependencySection(&next, resolved.metadata, "peerDependencies", false);
                 }
             }
 
