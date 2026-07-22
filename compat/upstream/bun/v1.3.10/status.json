@@ -63,6 +63,13 @@
       "reason": "Serially confirmed after unclassified discovery: Unicode script names and arguments pass both copied upstream cases with two assertions."
     },
     {
+      "pattern": "^test/cli/bunfig-test-options\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Bunfig test randomization, seeded ordering, invalid seed combinations, rerunEach, and combined test options pass all five copied cases; subprocess-heavy stock-JSC startup requires a larger per-case budget.",
+      "args": ["--timeout=30000"],
+      "timeoutMs": 120000
+    },
+    {
       "pattern": "^test/cli/init/init\\.test\\.ts$",
       "status": "enabled",
       "reason": "The copied Bun init corpus passes with interactive and noninteractive defaults, JavaScript/TypeScript choices, deterministic package metadata, overwrite handling, and generated file contents (10 cases, 76 assertions)."
