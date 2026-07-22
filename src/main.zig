@@ -669,7 +669,8 @@ fn runHtmlEntrypoints(init: std.process.Init, invocation: CliInvocation) !?u8 {
 
     var source: std.ArrayList(u8) = .empty;
     try source.appendSlice(allocator,
-        \\const startedAt = performance.now();
+        \\const now = globalThis.performance?.now?.bind(globalThis.performance) ?? Date.now;
+        \\const startedAt = now();
         \\const development = process.env.NODE_ENV !== "production";
         \\const server = Bun.serve({
         \\  development,
@@ -696,7 +697,7 @@ fn runHtmlEntrypoints(init: std.process.Init, invocation: CliInvocation) !?u8 {
     try source.appendSlice(allocator,
         \\  },
         \\});
-        \\const elapsed = (performance.now() - startedAt).toFixed(2);
+        \\const elapsed = (now() - startedAt).toFixed(2);
         \\console.log(`Bun v${Bun.version}${development ? " dev server" : ""} ready in ${elapsed} ms`);
         \\console.log(`url: ${server.url}`);
         \\

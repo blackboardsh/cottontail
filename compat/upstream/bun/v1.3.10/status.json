@@ -269,6 +269,12 @@
       "reason": "The copied 129-directory hot-reload stress case passes all three simultaneous update cycles and exits cleanly (1 case, 6 assertions)."
     },
     {
+      "pattern": "^test/cli/create/create-jsx\\.test\\.ts$",
+      "status": "expected-failure",
+      "reason": "The copied assertions remain exact, but the file is not currently promotable: its committed bun.sh/HMR snapshots and live npm/shadcn@canary results have drifted from current Bun 1.3.10 behavior. The larger harness cap only allows all original 5-second cases to report.",
+      "timeoutMs": 240000
+    },
+    {
       "pattern": "^test/cli/inspect/",
       "status": "expected-failure",
       "reason": "Requires Bun's WebKit inspector protocol server, which Cottontail does not expose yet."
