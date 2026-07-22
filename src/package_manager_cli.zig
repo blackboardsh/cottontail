@@ -3900,7 +3900,8 @@ const Manager = struct {
         }
         const install_reuses_lockfile = manager.options.command == .install and
             manager.lock_graph != null and
-            !manager.changed;
+            !manager.changed and
+            !(manager.options.production and manager.workspaces.count() > 0);
         const create_project_cache = if (manager.node_linker == .isolated)
             manager.options.command == .add
         else
@@ -11530,17 +11531,19 @@ const Manager = struct {
                     if (scripts == .object) {
                         var wrote_script = false;
                         inline for (BunLockfile.lifecycle_script_names) |script_name| {
-                            const command = scripts.object.get(script_name) orelse continue;
-                            if (command != .string) continue;
-                            if (!wrote_script) {
-                                try writer.writeAll("\n      \"scripts\": {");
-                                wrote_script = true;
+                            if (scripts.object.get(script_name)) |command| {
+                                if (command == .string) {
+                                    if (!wrote_script) {
+                                        try writer.writeAll("\n      \"scripts\": {");
+                                        wrote_script = true;
+                                    }
+                                    try writer.writeAll("\n        ");
+                                    try writeJSONString(writer, script_name);
+                                    try writer.writeAll(": ");
+                                    try writeJSONString(writer, command.string);
+                                    try writer.writeByte(',');
+                                }
                             }
-                            try writer.writeAll("\n        ");
-                            try writeJSONString(writer, script_name);
-                            try writer.writeAll(": ");
-                            try writeJSONString(writer, command.string);
-                            try writer.writeByte(',');
                         }
                         if (wrote_script) {
                             try writer.writeAll("\n      },");

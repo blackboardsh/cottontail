@@ -1222,6 +1222,13 @@
       "args": ["--timeout", "60000"],
       "timeoutMs": 600000
     },
+    "test/cli/install/bun-install.test.ts": {
+      "status": "enabled",
+      "reason": "All 171 active copied install cases pass across registry and Git resolution, workspaces, lockfiles, lifecycle scripts, production installs, aliases, peer dependencies, bin linking, and diagnostics (5 snapshots, 1995 assertions); two upstream todos remain.",
+      "serial": true,
+      "args": ["--max-concurrency=1", "--timeout=300000"],
+      "timeoutMs": 300000
+    },
     "test/cli/install/bun-pm-scan.test.ts": {
       "status": "enabled",
       "reason": "Configured local and package scanners, payload validation, advisories, process exits, lockfile requirements, and scanner installation behavior pass all 17 copied cases (44 assertions).",
