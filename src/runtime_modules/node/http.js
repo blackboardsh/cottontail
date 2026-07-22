@@ -3116,6 +3116,11 @@ export class ClientRequest extends OutgoingMessage {
       this.destroyed = true;
       cleanup();
       const failure = fromSocket ? socketError(error, socket) : error;
+      if (!socket.destroyed) {
+        const absorbLateSocketError = () => {};
+        socket.on?.("error", absorbLateSocketError);
+        socket.once?.("close", () => socket.off?.("error", absorbLateSocketError));
+      }
       if (responseMessage && !responseMessage.complete) {
         const absorbTerminalResponseError = () => {};
         responseMessage.on?.("error", absorbTerminalResponseError);
@@ -3123,7 +3128,10 @@ export class ClientRequest extends OutgoingMessage {
         responseMessage.destroy?.(failure);
       }
       socket.destroy?.();
-      this.emit("error", failure);
+      // Once headers have produced an IncomingMessage, Node assigns transport
+      // truncation to that response stream. The ClientRequest only closes;
+      // emitting the same failure there creates a second, ownerless error.
+      if (!this._responseEmitted) this.emit("error", failure);
       this._emitClose();
     };
     const onConnect = () => {

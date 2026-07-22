@@ -8161,6 +8161,7 @@ function createIncomingMessageBodyTransport(message, signal, expectedBytes) {
       message.once?.("aborted", onAborted);
       signal?.addEventListener?.("abort", onAbort, { once: true });
       if (signal?.aborted) onAbort();
+      else if (message.aborted || (message.destroyed && !message.complete)) onAborted();
       else message.resume?.();
     },
   };
