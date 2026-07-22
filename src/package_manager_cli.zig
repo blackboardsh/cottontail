@@ -1966,6 +1966,7 @@ const Manager = struct {
     workspaces: std.StringHashMap(Workspace),
     root_versions: std.StringHashMap([]const u8),
     resolving: std.StringHashMap(void),
+    expanded_lock_packages: std.StringHashMap(void),
     registry_manifests: std.StringHashMap(*Value),
     refreshed_update_manifests: std.StringHashMap(void),
     direct_bins: std.array_list.Managed([]const u8),
@@ -2030,6 +2031,7 @@ const Manager = struct {
             .workspaces = std.StringHashMap(Workspace).init(allocator),
             .root_versions = std.StringHashMap([]const u8).init(allocator),
             .resolving = std.StringHashMap(void).init(allocator),
+            .expanded_lock_packages = std.StringHashMap(void).init(allocator),
             .registry_manifests = std.StringHashMap(*Value).init(allocator),
             .refreshed_update_manifests = std.StringHashMap(void).init(allocator),
             .registry_scopes = std.StringHashMap(RegistryConfig).init(allocator),
@@ -5623,15 +5625,42 @@ const Manager = struct {
         while (true) {
             const destination = try packageDestination(manager.allocator, base, alias);
             if (try manager.workspaceLockKeyForDestination(destination)) |workspace_key| {
-                if (graph.get(workspace_key)) |package| return .{ .package = package, .destination = destination };
+                if (graph.get(workspace_key)) |package| {
+                    if (try manager.lockedSelectionMatchesRootDependency(package, alias, parent_dir, base)) {
+                        return .{ .package = package, .destination = destination };
+                    }
+                }
             }
             if (manager.lockKeyForDestination(destination) catch null) |key| {
-                if (graph.get(key)) |package| return .{ .package = package, .destination = destination };
+                if (graph.get(key)) |package| {
+                    if (try manager.lockedSelectionMatchesRootDependency(package, alias, parent_dir, base)) {
+                        return .{ .package = package, .destination = destination };
+                    }
+                }
             }
             if (std.mem.eql(u8, base, manager.root_dir)) break;
             base = parentPackageBase(manager.root_dir, base) orelse break;
         }
         return null;
+    }
+
+    fn lockedSelectionMatchesRootDependency(
+        manager: *Manager,
+        package: *const Lockfile.Package,
+        alias: []const u8,
+        parent_dir: []const u8,
+        candidate_base: []const u8,
+    ) !bool {
+        if (std.mem.eql(u8, parent_dir, manager.root_dir) or
+            !std.mem.eql(u8, candidate_base, manager.root_dir)) return true;
+        const root_spec = manager.rootDependencySpec(alias) orelse return true;
+        const workspace_package = manager.isWorkspaceDependency(alias, root_spec);
+        const effective_spec = manager.manifest_policy.?.resolveDependency(alias, root_spec, workspace_package) catch root_spec;
+        const resolution_spec = if (try Patch.Spec.parseProtocol(manager.allocator, alias, effective_spec)) |protocol|
+            protocol.base_spec
+        else
+            effective_spec;
+        return manager.lockedPackageMatches(package, alias, resolution_spec, manager.root_dir);
     }
 
     fn lockedPackageMatches(
@@ -5799,11 +5828,14 @@ const Manager = struct {
                 try manager.rememberPackageMetadata(selection.destination, package_metadata);
                 if (package_metadata) |info| {
                     try manager.registerBundledPackages(record_key, info, selection.destination);
-                    try manager.installDependencyObject(@constCast(info), "dependencies", selection.destination, false, false);
-                    if (!manager.options.omit_optional) {
-                        try manager.installDependencyObject(@constCast(info), "optionalDependencies", selection.destination, false, true);
+                    const expansion = try manager.expanded_lock_packages.getOrPut(package.key);
+                    if (!expansion.found_existing) {
+                        try manager.installDependencyObject(@constCast(info), "dependencies", selection.destination, false, false);
+                        if (!manager.options.omit_optional) {
+                            try manager.installDependencyObject(@constCast(info), "optionalDependencies", selection.destination, false, true);
+                        }
+                        try manager.installOrLinkPeerDependencies(info, selection.destination, selection.destination, parent_dir);
                     }
-                    try manager.installOrLinkPeerDependencies(info, selection.destination, selection.destination, parent_dir);
                 }
                 try manager.queuePackageScripts(alias, package.name, package.version, selection.destination, .npm, direct, optional, !installed);
                 return package.version;

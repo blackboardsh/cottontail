@@ -1294,6 +1294,15 @@
       "status": "enabled",
       "reason": "Bun.serve TypeScript surface fixtures pass the copied integration corpus (53 bun:test cases, 231 assertions)."
     },
+    "test/integration/esbuild/esbuild.test.ts": {
+      "status": "enabled",
+      "reason": "Cottontail preserves distinct direct and transitive esbuild versions across a changed root manifest; both copied integration cases pass with 28 assertions."
+    },
+    "test/integration/expo-app/expo.test.ts": {
+      "status": "enabled",
+      "reason": "The copied Expo Router application installs its full lock graph and completes the static export workflow (1 bun:test case, 2 assertions).",
+      "timeoutMs": 600000
+    },
     "test/integration/jsdom/jsdom.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (3 bun:test cases, 3 assertions)."
