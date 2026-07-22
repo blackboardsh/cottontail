@@ -2492,7 +2492,7 @@ const Manager = struct {
         try manager.relinkNativeDependencyBins(&root);
 
         if ((manager.options.command == .add or manager.options.command == .remove or manager.options.command == .update or manager.options.command == .link) and
-            !manager.options.no_save and !manager.options.dry_run and
+            !manager.options.production and !manager.options.no_save and !manager.options.dry_run and
             (manager.options.command != .update or manager.update_package_json_changed))
         {
             if (manager.interactive_update_prepared) {
@@ -4891,6 +4891,10 @@ const Manager = struct {
 
     fn addPackages(manager: *Manager, package_json: *Value, parent_dir: []const u8) !void {
         if (manager.options.positionals.len == 0) return error.MissingPackageName;
+        if (manager.options.production) {
+            try manager.validateProductionInstallRequests();
+            return manager.installRoot(manager.root_package_json.?, true);
+        }
         var added_output: std.Io.Writer.Allocating = .init(manager.allocator);
 
         for (manager.options.positionals) |raw_spec| {
@@ -4989,6 +4993,43 @@ const Manager = struct {
                 try manager.stdout.writeByte('\n');
             }
             try manager.stdout.writeAll(added_output.written());
+        }
+    }
+
+    fn validateProductionInstallRequests(manager: *Manager) !void {
+        for (manager.options.positionals) |raw_spec| {
+            const parsed = splitPackageSpec(raw_spec);
+            const alias = parsed.name orelse {
+                try manager.stderr.print("error: Failed to resolve root prod dependency '{s}'\n", .{raw_spec});
+                return error.PackageManagerErrorReported;
+            };
+            const declared_spec = manager.rootDependencySpec(alias) orelse {
+                try manager.stderr.print("error: Failed to resolve root prod dependency '{s}'\n", .{alias});
+                return error.PackageManagerErrorReported;
+            };
+            if (!packageSpecHasExplicitSpecifier(raw_spec)) continue;
+
+            const workspace_package = manager.isWorkspaceDependency(alias, declared_spec);
+            const effective_declared = manager.manifest_policy.?.resolveDependency(alias, declared_spec, workspace_package) catch declared_spec;
+            if (isGitSpec(effective_declared) or isTarballSpec(effective_declared) or isLocalSpec(effective_declared) or
+                std.mem.startsWith(u8, effective_declared, "workspace:"))
+            {
+                if (std.mem.eql(u8, effective_declared, parsed.spec)) continue;
+            } else if (!isGitSpec(parsed.spec) and !isTarballSpec(parsed.spec) and !isLocalSpec(parsed.spec) and
+                !std.mem.startsWith(u8, parsed.spec, "workspace:"))
+            {
+                const declared_name, const declared_range = parseNpmAlias(alias, effective_declared);
+                const requested_name, const requested_range = parseNpmAlias(alias, parsed.spec);
+                if (std.mem.eql(u8, declared_name, requested_name)) {
+                    const requested = manager.resolveRegistryPackage(requested_name, requested_range) catch null;
+                    if (requested) |resolved| {
+                        if (semverSatisfies(manager.allocator, declared_range, resolved.version)) continue;
+                    }
+                }
+            }
+
+            try manager.stderr.print("error: Failed to resolve root prod dependency '{s}'\n", .{alias});
+            return error.PackageManagerErrorReported;
         }
     }
 
@@ -6131,9 +6172,6 @@ const Manager = struct {
                 if (manager.options.frozen_lockfile) return error.FrozenLockfileChanged;
             } else if (manager.options.frozen_lockfile) {
                 return error.FrozenLockfilePackageMissing;
-            } else if (manager.lock_graph != null and manager.options.production and direct and !optional) {
-                try manager.stderr.print("error: Failed to resolve root prod dependency '{s}'\n", .{alias});
-                return error.PackageManagerErrorReported;
             }
         }
 
