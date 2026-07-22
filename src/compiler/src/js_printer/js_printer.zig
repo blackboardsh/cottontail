@@ -211,7 +211,7 @@ pub fn writePreQuotedString(text_in: []const u8, comptime Writer: type, writer: 
         }
         switch (c) {
             0x07 => {
-                try writer.writeAll("\\x07");
+                try writer.writeAll(if (json) "\\u0007" else "\\x07");
                 i += 1;
             },
             0x08 => {
@@ -236,7 +236,7 @@ pub fn writePreQuotedString(text_in: []const u8, comptime Writer: type, writer: 
             },
             // \v
             std.ascii.control_code.vt => {
-                try writer.writeAll("\\v");
+                try writer.writeAll(if (json) "\\u000B" else "\\v");
                 i += 1;
             },
             // "\\"
@@ -345,6 +345,14 @@ pub fn quoteForJSON(text: []const u8, bytes: *MutableString, comptime ascii_only
     try bytes.appendChar('"');
     try writePreQuotedString(text, @TypeOf(writer), writer, '"', ascii_only, true, .utf8);
     bytes.appendChar('"') catch unreachable;
+}
+
+test "quoteForJSON uses valid JSON escapes for BEL and vertical tab" {
+    var output = MutableString.initEmpty(std.testing.allocator);
+    defer output.deinit();
+
+    try quoteForJSON("\x07\x0B", &output, false);
+    try std.testing.expectEqualStrings("\"\\u0007\\u000B\"", output.list.items);
 }
 
 pub fn writeJSONString(input: []const u8, comptime Writer: type, writer: Writer, comptime encoding: strings.Encoding) !void {
