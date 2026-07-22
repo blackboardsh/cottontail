@@ -2172,6 +2172,11 @@ fn isExplicitTestPath(path: []const u8) bool {
             (std.mem.startsWith(u8, path, ".\\") or std.mem.startsWith(u8, path, "..\\")));
 }
 
+fn isTestPathArgument(io: std.Io, path: []const u8) bool {
+    return isExplicitTestPath(path) or
+        (isTestEntrypoint(std.fs.path.basename(path)) and pathIsFile(io, path));
+}
+
 fn isGeneratedTestEntrypoint(path: []const u8) bool {
     return std.mem.startsWith(u8, path, ".cottontail-tmp/test-aggregate-") or
         std.mem.startsWith(u8, path, ".cottontail-tmp\\test-aggregate-");
@@ -2277,7 +2282,7 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
 
     explicit_entrypoint_count = positionals.items.len;
     const path_mode = for (positionals.items) |path| {
-        if (isExplicitTestPath(path)) break true;
+        if (isTestPathArgument(init.io, path)) break true;
     } else false;
 
     if (positionals.items.len == 0 or !path_mode) {
