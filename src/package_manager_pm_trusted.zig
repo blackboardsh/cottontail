@@ -161,7 +161,7 @@ pub fn runTrust(
                 .optional = false,
             });
         }
-        queue.run(init, project.root_dir, stderr) catch {
+        queue.run(init, project.root_dir, null, stderr) catch {
             queue.deinit();
             try stderr.flush();
             return 1;

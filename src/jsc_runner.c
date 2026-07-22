@@ -30337,7 +30337,7 @@ int ct_jsc_generate_bytecode(
     if (error_out != NULL) *error_out = NULL;
     if (bytecode_out == NULL || bytecode_len_out == NULL) return -1;
 
-    char *wrapped = ct_prepare_wrapped_source(source, source_len, filename);
+    char *wrapped = ct_prepare_wrapped_source(source, source_len, filename, NULL, NULL);
     if (wrapped == NULL) {
         ct_set_error_out(error_out, ct_duplicate_bytes("Out of memory", 13));
         return -1;
