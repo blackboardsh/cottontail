@@ -1096,6 +1096,14 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
   const pendingNativeEvents = [];
   const handleNativeSpawnEvent = (event) => {
     if (!event) return;
+    if (ipcRequested && (event.type === "ipc_end" || event.type === "exit" || event.type === "close")) {
+      traceChildProcess(`parent-${event.type}`, {
+        id: child._nativeId,
+        pid: child.pid,
+        exitCode: event.exitCode,
+        signalCode: event.signalCode,
+      });
+    }
     if (event.type === "stdout") {
       const bytes = new Uint8Array(event.data ?? new ArrayBuffer(0));
       if (bytes.length > 0) deliverStreamData(child.stdout, stdoutListeners, streamChunk(child.stdout, bytes));
@@ -1332,6 +1340,21 @@ execFile[kChildProcessPromisify] = (file, args = undefined, options = undefined)
 const ipcPrefix = "__COTTONTAIL_IPC__";
 const ipcEnvelopeKey = "__cottontailIpcEnvelope";
 const inheritedNodeIpcSymbol = Symbol.for("cottontail.inheritedNodeIpc");
+const childProcessTraceEnabled = globalThis.process?.env?.COTTONTAIL_CHILD_PROCESS_TRACE === "1";
+
+function traceChildProcess(event, details = undefined) {
+  if (!childProcessTraceEnabled) return;
+  try {
+    const suffix = details == null ? "" : ` ${JSON.stringify(details)}`;
+    globalThis.process?.stderr?.write?.(`[cottontail:child_process:${globalThis.process?.pid ?? 0}] ${event}${suffix}\n`);
+  } catch {}
+}
+
+function ipcMessageSummary(message) {
+  if (Array.isArray(message)) return { shape: "array", type: message[0], length: message.length };
+  if (message === null) return { shape: "null" };
+  return { shape: typeof message };
+}
 
 function encodeIpcMessage(message, mode = "json") {
   if (mode === "advanced") return `A:${Buffer.from(serializeJscValue(message)).toString("base64")}`;
@@ -1467,6 +1490,10 @@ function decodeNativeIpcPayload(payload, receivedFd = undefined) {
     rememberAdoptedIpcHandle(decoded.handleSeq, handle);
     return { message: decoded.message, handle };
   }
+  if (decoded && typeof decoded === "object" && decoded[ipcEnvelopeKey] === 2) {
+    if (Number.isInteger(receivedFd) && receivedFd >= 0) cottontail.closeFd?.(receivedFd);
+    return { control: "ready" };
+  }
   if (decoded && typeof decoded === "object" && decoded[ipcEnvelopeKey] === 3) {
     if (Number.isInteger(receivedFd) && receivedFd >= 0) cottontail.closeFd?.(receivedFd);
     deliverAdoptedHandleData(decoded.handleSeq, decoded.data);
@@ -1494,7 +1521,16 @@ function writeNativeIpc(fd, message, mode, sendHandle = undefined, finish = unde
     // 'data' emit) and can be forwarded to the receiver below.
     try { sendHandle?.pause?.(); } catch {}
   }
-  const ok = cottontail.ipcSend?.(Number(fd), encodeNativeIpcPayload(message, mode, handleInfo, handleSeq), handleInfo?.fd ?? -1) === true;
+  const payload = encodeNativeIpcPayload(message, mode, handleInfo, handleSeq);
+  const ok = cottontail.ipcSend?.(Number(fd), payload, handleInfo?.fd ?? -1) === true;
+  traceChildProcess("ipc-write", {
+    fd: Number(fd),
+    mode,
+    bytes: Buffer.byteLength(payload),
+    ok,
+    handle: handleInfo?.type,
+    message: ipcMessageSummary(message),
+  });
   if (handleInfo != null && ok) {
     setTimeout(() => {
       try {
@@ -1526,11 +1562,13 @@ function installNativeIpcReader(fd, onFrame, onDisconnect, onError, closeFd = tr
         const event = cottontail.ipcRecv(fd, 64 * 1024);
         if (event == null) return;
         if (event.end) {
+          traceChildProcess("child-ipc-end", { fd });
           close();
           onDisconnect?.();
           return;
         }
         const chunk = Buffer.from(event.data ?? new ArrayBuffer(0)).toString("utf8");
+        traceChildProcess("child-ipc-read", { fd, bytes: Buffer.byteLength(chunk) });
         let pendingFd = Number.isInteger(event.fd) ? Number(event.fd) : undefined;
         buffer += chunk;
         for (;;) {
@@ -1545,7 +1583,10 @@ function installNativeIpcReader(fd, onFrame, onDisconnect, onError, closeFd = tr
             continue;
           }
           const frame = decodeNativeIpcPayload(line.slice(ipcPrefix.length), frameFd);
-          if (frame != null) onFrame(frame.message, frame.handle);
+          if (frame != null) {
+            traceChildProcess("child-ipc-message", { fd, message: ipcMessageSummary(frame.message) });
+            onFrame(frame.message, frame.handle);
+          }
         }
         if (Number.isInteger(pendingFd) && pendingFd >= 0) cottontail.closeFd?.(pendingFd);
       }
@@ -1612,6 +1653,61 @@ function installParentIpcChannel(child, serialization = undefined, nodeProtocol 
   child._channel = channel;
   child._ipcBuffer = "";
   let nativeIpcPendingFd = undefined;
+  let nativeIpcReady = nodeProtocol;
+  const pendingNativeIpcSends = [];
+
+  const failPendingNativeIpcSends = (error) => {
+    for (const pending of pendingNativeIpcSends.splice(0)) {
+      if (pending.callback) queueMicrotask(() => pending.callback(error));
+      else if (!child.killed) emitChildProcessError(child, error);
+    }
+  };
+
+  const sendIpcNow = (message, normalizedSend, sendCallback) => {
+    let ok = false;
+    try {
+      traceChildProcess("parent-ipc-send", {
+        id: child._nativeId,
+        pid: child.pid,
+        mode: child.serialization,
+        message: ipcMessageSummary(message),
+      });
+      if (nodeProtocol) {
+        if (normalizedSend.sendHandle != null) {
+          throw new Error("IPC handle passing to external runtimes is not available");
+        }
+        ok = cottontail.ipcSend?.(Number(child._ipcFd), `${JSON.stringify(message)}\n`, -1) === true;
+        if (sendCallback) queueMicrotask(() => sendCallback(ok ? null : new Error("write failed")));
+      } else {
+        ok = writeNativeIpc(child._ipcFd, message, child.serialization, normalizedSend.sendHandle,
+          sendCallback ? () => sendCallback(ok ? null : new Error("write failed")) : undefined);
+      }
+    } catch (error) {
+      if (sendCallback) queueMicrotask(() => sendCallback(error));
+      else emitChildProcessError(child, error);
+      return false;
+    }
+    return ok;
+  };
+
+  const markNativeIpcReady = () => {
+    if (nativeIpcReady) return;
+    nativeIpcReady = true;
+    traceChildProcess("parent-ipc-ready", {
+      id: child._nativeId,
+      pid: child.pid,
+      queued: pendingNativeIpcSends.length,
+    });
+    for (const pending of pendingNativeIpcSends.splice(0)) {
+      if (!child.connected) {
+        const error = makeChannelClosedError();
+        if (pending.callback) queueMicrotask(() => pending.callback(error));
+        else emitChildProcessError(child, error);
+        continue;
+      }
+      sendIpcNow(pending.message, pending.normalizedSend, pending.callback);
+    }
+  };
 
   child._handleIpcEvent = (event) => {
     try {
@@ -1620,7 +1716,13 @@ function installParentIpcChannel(child, serialization = undefined, nodeProtocol 
         if (Number.isInteger(nativeIpcPendingFd) && nativeIpcPendingFd >= 0) cottontail.closeFd?.(nativeIpcPendingFd);
         nativeIpcPendingFd = eventFd;
       }
-      child._ipcBuffer += Buffer.from(event.data ?? new ArrayBuffer(0)).toString("utf8");
+      const chunk = Buffer.from(event.data ?? new ArrayBuffer(0)).toString("utf8");
+      child._ipcBuffer += chunk;
+      traceChildProcess("parent-ipc-read", {
+        id: child._nativeId,
+        pid: child.pid,
+        bytes: Buffer.byteLength(chunk),
+      });
       for (;;) {
         const newlineIndex = child._ipcBuffer.indexOf("\n");
         if (newlineIndex < 0) break;
@@ -1638,7 +1740,16 @@ function installParentIpcChannel(child, serialization = undefined, nodeProtocol 
           if (Number.isInteger(frameFd) && frameFd >= 0) cottontail.closeFd?.(frameFd);
           continue;
         }
-        if (frame != null) emitChildMessage(child, frame.message, "message", frame.handle);
+        if (frame?.control === "ready") {
+          markNativeIpcReady();
+        } else if (frame != null) {
+          traceChildProcess("parent-ipc-message", {
+            id: child._nativeId,
+            pid: child.pid,
+            message: ipcMessageSummary(frame.message),
+          });
+          emitChildMessage(child, frame.message, "message", frame.handle);
+        }
       }
     } catch (error) {
       emitChildProcessError(child, error);
@@ -1653,6 +1764,7 @@ function installParentIpcChannel(child, serialization = undefined, nodeProtocol 
     child._handleIpcEvent = null;
     child.channel = null;
     child._channel = null;
+    failPendingNativeIpcSends(makeChannelClosedError());
     if (Number.isInteger(nativeIpcPendingFd) && nativeIpcPendingFd >= 0) {
       cottontail.closeFd?.(nativeIpcPendingFd);
       nativeIpcPendingFd = undefined;
@@ -1669,24 +1781,18 @@ function installParentIpcChannel(child, serialization = undefined, nodeProtocol 
       else emitChildProcessError(child, error);
       return false;
     }
-    let ok = false;
-    try {
-      if (nodeProtocol) {
-        if (normalizedSend.sendHandle != null) {
-          throw new Error("IPC handle passing to external runtimes is not available");
-        }
-        ok = cottontail.ipcSend?.(Number(child._ipcFd), `${JSON.stringify(message)}\n`, -1) === true;
-        if (sendCallback) queueMicrotask(() => sendCallback(ok ? null : new Error("write failed")));
-      } else {
-        ok = writeNativeIpc(child._ipcFd, message, child.serialization, normalizedSend.sendHandle,
-          sendCallback ? () => sendCallback(ok ? null : new Error("write failed")) : undefined);
-      }
-    } catch (error) {
-      if (sendCallback) queueMicrotask(() => sendCallback(error));
-      else emitChildProcessError(child, error);
-      return false;
+    if (!nativeIpcReady) {
+      pendingNativeIpcSends.push({ message, normalizedSend, callback: sendCallback });
+      traceChildProcess("parent-ipc-queue", {
+        id: child._nativeId,
+        pid: child.pid,
+        mode: child.serialization,
+        queued: pendingNativeIpcSends.length,
+        message: ipcMessageSummary(message),
+      });
+      return true;
     }
-    return ok;
+    return sendIpcNow(message, normalizedSend, sendCallback);
   };
 
   child.disconnect = () => {
@@ -1789,6 +1895,13 @@ export function fork(modulePath, args = [], options = {}) {
     // runtimes cannot consume it, and their fd 3 IPC channel is ready at exec.
     __deferStart: !nodeIpcProtocol,
     __nodeIpcProtocol: nodeIpcProtocol,
+  });
+  traceChildProcess("fork", {
+    id: child._nativeId,
+    pid: child.pid,
+    modulePath: String(modulePath),
+    mode: serialization,
+    execArgv,
   });
 
   if (typeof child.send === "function" && Number.isInteger(child._ipcFd) && child._ipcFd >= 0) {
@@ -1894,9 +2007,16 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
   const inheritedState = inheritedIpc?.detach?.();
   const nativeFd = Number(processObject.env?.COTTONTAIL_IPC_FD ?? fd);
   const hasNativeIpc = Number.isInteger(nativeFd) && nativeFd >= 0 && typeof cottontail.ipcSend === "function" && typeof cottontail.ipcRecv === "function";
+  traceChildProcess("child-ipc-bootstrap", { fd: nativeFd, mode: serializationMode, native: hasNativeIpc });
 
   processObject.connected = true;
   let stopNativeIpc = null;
+  let readySent = false;
+  const announceReady = () => {
+    if (!hasNativeIpc || !processObject.connected || readySent) return;
+    readySent = writeNativeIpc(nativeFd, { [ipcEnvelopeKey]: 2 }, serializationMode);
+    traceChildProcess("child-ipc-ready", { fd: nativeFd, mode: serializationMode, ok: readySent });
+  };
 
   processObject.send = function send(message, sendHandleOrCallback = undefined, optionsOrCallback = undefined, callback = undefined) {
     validateIpcMessage(message, arguments.length);
@@ -1911,6 +2031,7 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
     }
     let ok = false;
     try {
+      traceChildProcess("child-ipc-send", { fd: nativeFd, mode: serializationMode, message: ipcMessageSummary(message) });
       if (hasNativeIpc) {
         ok = writeNativeIpc(nativeFd, message, serializationMode, normalizedSend.sendHandle,
           sendCallback ? () => sendCallback(ok ? null : new Error("write failed")) : undefined);
@@ -1971,7 +2092,10 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
             if (typeof original !== "function") continue;
             processObject[methodName] = function (name, ...rest) {
               const result = original.call(this, name, ...rest);
-              if (channelEventNames.has(name)) reader.ref();
+              if (channelEventNames.has(name)) {
+                reader.ref();
+                if (name === "message") announceReady();
+              }
               return result;
             };
           }
@@ -1986,6 +2110,7 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
           }
         } catch {}
         updateChannelRef();
+        if ((processObject.listenerCount?.("message") ?? 0) > 0) announceReady();
       });
     }
   } else {

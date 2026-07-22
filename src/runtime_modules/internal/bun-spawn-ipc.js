@@ -6,6 +6,21 @@ const jsonPrefix = "J:";
 const advancedEnvelopeKey = "__cottontailBunSpawnIpcAdvanced";
 const nodeIpcEnvelopeKey = "__cottontailIpcEnvelope";
 const inheritedNodeIpcSymbol = Symbol.for("cottontail.inheritedNodeIpc");
+const childProcessTraceEnabled = globalThis.process?.env?.COTTONTAIL_CHILD_PROCESS_TRACE === "1";
+
+function traceInheritedNodeIpc(event, details = undefined) {
+  if (!childProcessTraceEnabled) return;
+  try {
+    const suffix = details == null ? "" : ` ${JSON.stringify(details)}`;
+    globalThis.process?.stderr?.write?.(`[cottontail:child_process:${globalThis.process?.pid ?? 0}] ${event}${suffix}\n`);
+  } catch {}
+}
+
+function ipcMessageSummary(message) {
+  if (Array.isArray(message)) return { shape: "array", type: message[0], length: message.length };
+  if (message === null) return { shape: "null" };
+  return { shape: typeof message };
+}
 
 function nodeNetConstructors() {
   const runtimeRequire = globalThis.__ctMetaRequire ?? globalThis.require;
@@ -363,6 +378,14 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
   const decoder = new TextDecoder();
   const adoptedHandles = new Map();
   const channelEvents = new Set(["message", "disconnect", "internalMessage"]);
+  let readySent = false;
+
+  const announceReady = () => {
+    if (!nativeProtocol || !connected || readySent) return;
+    const payload = encodeBunSpawnIpc({ [nodeIpcEnvelopeKey]: 2 }, false, serialization);
+    readySent = host.ipcSend(fd, payload, -1) === true;
+    traceInheritedNodeIpc("child-ipc-ready", { fd, mode: serialization, ok: readySent });
+  };
 
   const channel = {
     ref() {
@@ -408,6 +431,11 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
 
   const poll = () => {
     if (!connected) return;
+    updateChannelRef();
+    if ((processObject.listenerCount?.("message") ?? 0) +
+        (processObject.listenerCount?.("internalMessage") ?? 0) > 0) {
+      announceReady();
+    }
     try {
       for (;;) {
         const event = host.ipcRecv(fd, 64 * 1024);
@@ -426,6 +454,10 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
           pendingFd = Number(event.fd);
         }
         buffer += decoder.decode(event.data ?? new ArrayBuffer(0), { stream: true });
+        traceInheritedNodeIpc("child-ipc-read", {
+          fd,
+          bytes: Number(event.data?.byteLength ?? 0),
+        });
         for (;;) {
           const newline = buffer.indexOf("\n");
           if (newline < 0) break;
@@ -446,6 +478,7 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
             throw error;
           }
           if (frame == null) continue;
+          traceInheritedNodeIpc("child-ipc-message", { fd, message: ipcMessageSummary(frame.message) });
           if (frame.message?.cmd?.startsWith?.("NODE_")) {
             processObject.emit?.("internalMessage", frame.message, frame.handle);
           } else {
@@ -487,6 +520,7 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
     }
     let ok = false;
     try {
+      traceInheritedNodeIpc("child-ipc-send", { fd, mode: serialization, message: ipcMessageSummary(message) });
       // External Node advanced IPC requires V8's binary wire format. Native
       // Cottontail children use the stock-JSC structured value codec instead.
       if (nativeProtocol) {
@@ -516,7 +550,6 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
   };
 
   timer = setInterval(poll, 1);
-  channel.unref();
   const updateChannelRef = () => {
     let count = 0;
     for (const name of channelEvents) count += Number(processObject.listenerCount?.(name) ?? 0);
@@ -528,7 +561,10 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
     if (typeof original !== "function") continue;
     const wrapper = function (name, ...args) {
       const result = original.call(this, name, ...args);
-      if (channelEvents.has(name)) channel.ref();
+      if (channelEvents.has(name)) {
+        channel.ref();
+        if (name === "message" || name === "internalMessage") announceReady();
+      }
       return result;
     };
     processObject[methodName] = wrapper;
