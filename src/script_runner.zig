@@ -673,18 +673,33 @@ const BundleDiagnostic = struct {
     message: []const u8,
 };
 
+fn extractCompilerDiagnosticMessage(text: []const u8) []const u8 {
+    const prefix = "error: ";
+    const line_prefix = "\n" ++ prefix;
+    const start = if (std.mem.lastIndexOf(u8, text, line_prefix)) |marker|
+        marker + line_prefix.len
+    else if (std.mem.startsWith(u8, text, prefix))
+        prefix.len
+    else
+        return text;
+    const message = text[start..];
+    const end = std.mem.indexOfScalar(u8, message, '\n') orelse message.len;
+    return std.mem.trimEnd(u8, message[0..end], "\r");
+}
+
 fn parseBundleDiagnosticLocation(location: []const u8, message: []const u8, fallback_file: []const u8) BundleDiagnostic {
+    const extracted_message = extractCompilerDiagnosticMessage(message);
     const column_separator = std.mem.lastIndexOfScalar(u8, location, ':') orelse return .{
         .file = fallback_file,
         .line = 1,
         .column = 1,
-        .message = message,
+        .message = extracted_message,
     };
     const line_separator = std.mem.lastIndexOfScalar(u8, location[0..column_separator], ':') orelse return .{
         .file = fallback_file,
         .line = 1,
         .column = 1,
-        .message = message,
+        .message = extracted_message,
     };
     const line = std.fmt.parseUnsigned(usize, location[line_separator + 1 .. column_separator], 10) catch 1;
     const column = std.fmt.parseUnsigned(usize, location[column_separator + 1 ..], 10) catch 1;
@@ -692,7 +707,7 @@ fn parseBundleDiagnosticLocation(location: []const u8, message: []const u8, fall
         .file = if (line_separator > 0) location[0..line_separator] else fallback_file,
         .line = @max(line, 1),
         .column = @max(column, 1),
-        .message = message,
+        .message = extracted_message,
     };
 }
 
@@ -1028,6 +1043,24 @@ test "parse Bun and legacy compiler diagnostics" {
     try std.testing.expectEqualStrings("C:\\project\\source.ts", legacy.file);
     try std.testing.expectEqual(@as(usize, 2), legacy.line);
     try std.testing.expectEqual(@as(usize, 7), legacy.column);
+
+    const formatted_missing_export = parseBundleDiagnostic(
+        "1 | import { type_only } from './types.ts';\n             ^\nerror: No matching export in \"types.ts\" for import \"type_only\"\n    at /tmp/source.ts:1:10",
+        "fallback.ts",
+    );
+    try std.testing.expectEqualStrings(
+        "No matching export in \"types.ts\" for import \"type_only\"",
+        formatted_missing_export.message,
+    );
+    try std.testing.expectEqualStrings("/tmp/source.ts", formatted_missing_export.file);
+    try std.testing.expectEqual(@as(usize, 1), formatted_missing_export.line);
+    try std.testing.expectEqual(@as(usize, 10), formatted_missing_export.column);
+
+    const formatted_resolution = parseBundleDiagnostic(
+        "2 | import { add } from '@utils/math';\n                        ^\nerror: Could not resolve: \"@utils/math\"\n    at /tmp/math.test.ts:2:21",
+        "fallback.ts",
+    );
+    try std.testing.expectEqualStrings("Could not resolve: \"@utils/math\"", formatted_resolution.message);
 }
 
 test "runtime missing-package diagnostics follow Bun's resolver classification" {
