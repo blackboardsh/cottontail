@@ -289,6 +289,18 @@ const RegistryConfig = struct {
     authorization: ?[]const u8 = null,
 };
 
+const FetchLogLevel = enum {
+    err,
+    warn,
+
+    fn label(level: FetchLogLevel) []const u8 {
+        return switch (level) {
+            .err => "error",
+            .warn => "warn",
+        };
+    }
+};
+
 const RegistryManifestFetch = struct {
     io: std.Io,
     environment: *const std.process.Environ.Map,
@@ -2118,6 +2130,7 @@ const Manager = struct {
     removed_count: usize = 0,
     network_task_count: usize = 0,
     changed: bool = false,
+    deferred_install_error: ?anyerror = null,
     update_package_json_changed: bool = false,
     interactive_update_prepared: bool = false,
     interactive_changed_manifests: std.ArrayList(InteractiveChangedManifest) = .empty,
@@ -2479,7 +2492,7 @@ const Manager = struct {
             }
         }
 
-        if (!manager.options.dry_run and !manager.options.no_save) {
+        if (manager.deferred_install_error == null and !manager.options.dry_run and !manager.options.no_save) {
             if (manager.records.items.len == 0 and !hasAnyDependencies(&root)) {
                 const had_lockfile = manager.hasExistingLockfile();
                 manager.deleteLockfiles();
@@ -2498,7 +2511,7 @@ const Manager = struct {
 
         if (!manager.options.ignore_scripts and !manager.options.dry_run and !manager.options.lockfile_only) {
             try manager.script_queue.run(manager.init_data, manager.root_dir, manager.options.concurrent_scripts, manager.stderr);
-            if (manager.options.command == .install and manager.root_selected) {
+            if (manager.deferred_install_error == null and manager.options.command == .install and manager.root_selected) {
                 try Scripts.runRoot(manager.init_data, manager.root_dir, &root, manager.options.silent, manager.stderr);
             }
         }
@@ -2606,6 +2619,7 @@ const Manager = struct {
         }
         try manager.stdout.flush();
         try manager.stderr.flush();
+        if (manager.deferred_install_error) |err| return err;
         return 0;
     }
 
@@ -4612,15 +4626,31 @@ const Manager = struct {
         direct: bool,
     ) !void {
         try manager.installDependencyObject(package_json, "dependencies", parent_dir, direct, false);
-        if (!manager.options.omit_optional) {
-            try manager.installDependencyObject(package_json, "optionalDependencies", parent_dir, direct, true);
-        }
+        try manager.installOptionalDependencies(package_json, parent_dir, direct);
         if (!manager.options.production and !manager.options.omit_dev) {
             try manager.installDependencyObject(package_json, "devDependencies", parent_dir, direct, false);
         }
         if (!manager.options.omit_peer) {
             try manager.installDependencyObject(package_json, "peerDependencies", parent_dir, direct, false);
         }
+    }
+
+    fn installOptionalDependencies(
+        manager: *Manager,
+        package_json: *Value,
+        parent_dir: []const u8,
+        direct: bool,
+    ) !void {
+        if (!manager.options.omit_optional) {
+            return manager.installDependencyObject(package_json, "optionalDependencies", parent_dir, direct, true);
+        }
+
+        const previous_report_direct = manager.report_direct_installs;
+        manager.report_direct_installs = false;
+        defer manager.report_direct_installs = previous_report_direct;
+        const previous_resolution_only = manager.setResolutionOnly(true);
+        defer manager.restoreResolutionOnly(previous_resolution_only);
+        try manager.installDependencyObject(package_json, "optionalDependencies", parent_dir, direct, true);
     }
 
     fn setResolutionOnly(manager: *Manager, enabled: bool) struct { bool, bool } {
@@ -5658,6 +5688,10 @@ const Manager = struct {
             const resolved_version = manager.installDependency(alias, spec_value.string, parent_dir, direct, edge_optional) catch |err| {
                 if (manager.options.command == .link and !direct and err == error.MissingPackageJSON) continue;
                 if (edge_optional) continue;
+                if (direct and manager.options.command == .install and err == error.PackageManagerErrorReported) {
+                    if (manager.deferred_install_error == null) manager.deferred_install_error = err;
+                    continue;
+                }
                 return err;
             };
             const workspace_display = if (manager.report_direct_installs)
@@ -5980,7 +6014,7 @@ const Manager = struct {
             });
             try manager.rememberPackageMetadata(destination, local.package_json);
             try manager.rememberPackageMetadata(local.path, local.package_json);
-            manager.installed_count += 1;
+            if (!manager.options.lockfile_only and !manager.options.dry_run) manager.installed_count += 1;
             if (placement_kind != .root) {
                 const source_context = try manager.pushIsolatedSourceContext(local.path, destination);
                 defer manager.popIsolatedSourceContext(source_context) catch {};
@@ -5989,9 +6023,7 @@ const Manager = struct {
                     try manager.resolving.put(cycle_key, {});
                     defer _ = manager.resolving.remove(cycle_key);
                     try manager.installDependencyObject(local.package_json, "dependencies", local.path, false, false);
-                    if (!manager.options.omit_optional) {
-                        try manager.installDependencyObject(local.package_json, "optionalDependencies", local.path, false, true);
-                    }
+                    try manager.installOptionalDependencies(local.package_json, local.path, false);
                     try manager.installOrLinkPeerDependencies(local.package_json, local.path, destination, parent_dir);
                 }
             }
@@ -6041,7 +6073,8 @@ const Manager = struct {
             if (try manager.findInstalledVersion(alias, resolution_spec, parent_dir, direct, protocol_patch_paths)) |installed| return installed;
         }
 
-        const resolved = manager.resolveRegistryPackage(registry_name, selected_registry_spec) catch |err| {
+        const fetch_log_level: FetchLogLevel = if (optional) .warn else .err;
+        const resolved = manager.resolveRegistryPackageWithLogLevel(registry_name, selected_registry_spec, fetch_log_level) catch |err| {
             if (err == error.InvalidRegistryURL or err == error.UnsupportedRegistryScheme) {
                 const configured = manager.registryConfigForPackage(registry_name);
                 const source_url = configured.source_url orelse configured.url;
@@ -6140,9 +6173,7 @@ const Manager = struct {
             // dependencies must still be resolvable when the same lockfile is
             // consumed on a matching platform.
             try manager.installDependencyObject(@constCast(resolved.metadata), "dependencies", destination, false, false);
-            if (!manager.options.omit_optional) {
-                try manager.installDependencyObject(@constCast(resolved.metadata), "optionalDependencies", destination, false, true);
-            }
+            try manager.installOptionalDependencies(@constCast(resolved.metadata), destination, false);
             try manager.installOrLinkPeerDependencies(resolved.metadata, destination, destination, parent_dir);
             return resolved.version;
         }
@@ -6152,7 +6183,7 @@ const Manager = struct {
                 try manager.installedPackageMatches(destination, resolved.name, resolved.version) and
                 try manager.packagePatchStateMatches(destination, protocol_patch_paths);
             if (!installed) {
-                const archive = try manager.fetchRegistryArchive(resolved.archive());
+                const archive = try manager.fetchRegistryArchive(resolved.archive(), fetch_log_level);
                 deletePath(manager.init_data.io, destination);
                 try std.Io.Dir.cwd().createDirPath(manager.init_data.io, destination);
                 var destination_dir = try std.Io.Dir.cwd().openDir(manager.init_data.io, destination, .{});
@@ -6189,9 +6220,7 @@ const Manager = struct {
         manager.changed = true;
 
         try manager.installDependencyObject(@constCast(package_metadata), "dependencies", destination, false, false);
-        if (!manager.options.omit_optional) {
-            try manager.installDependencyObject(@constCast(package_metadata), "optionalDependencies", destination, false, true);
-        }
+        try manager.installOptionalDependencies(@constCast(package_metadata), destination, false);
         try manager.installOrLinkPeerDependencies(package_metadata, destination, destination, parent_dir);
         try manager.queuePackageScripts(alias, resolved.name, resolved.version, destination, .npm, direct, optional, !installed);
         return resolved.version;
@@ -6419,7 +6448,7 @@ const Manager = struct {
                             .tarball = tarball_url,
                             .integrity = if (package.integrity.len > 0) package.integrity else null,
                             .authorization = manager.authorizationForPackageURL(package.name, tarball_url),
-                        });
+                        }, if (optional) .warn else .err);
                         deletePath(manager.init_data.io, selection.destination);
                         try std.Io.Dir.cwd().createDirPath(manager.init_data.io, selection.destination);
                         var destination_dir = try std.Io.Dir.cwd().openDir(manager.init_data.io, selection.destination, .{});
@@ -6456,9 +6485,7 @@ const Manager = struct {
                     const expansion = try manager.expanded_lock_packages.getOrPut(package.key);
                     if (!expansion.found_existing) {
                         try manager.installDependencyObject(@constCast(info), "dependencies", selection.destination, false, false);
-                        if (!manager.options.omit_optional) {
-                            try manager.installDependencyObject(@constCast(info), "optionalDependencies", selection.destination, false, true);
-                        }
+                        try manager.installOptionalDependencies(@constCast(info), selection.destination, false);
                         try manager.installOrLinkPeerDependencies(info, selection.destination, selection.destination, parent_dir);
                     }
                 }
@@ -6494,9 +6521,7 @@ const Manager = struct {
                     try manager.linkBins(alias, selection.destination, workspace.package_json, direct, parent_dir);
                 }
                 try manager.installDependencyObject(workspace.package_json, "dependencies", workspace.path, false, false);
-                if (!manager.options.omit_optional) {
-                    try manager.installDependencyObject(workspace.package_json, "optionalDependencies", workspace.path, false, true);
-                }
+                try manager.installOptionalDependencies(workspace.package_json, workspace.path, false);
                 try manager.installOrLinkPeerDependencies(workspace.package_json, workspace.path, workspace.path, parent_dir);
                 return workspace.version;
             },
@@ -6647,9 +6672,7 @@ const Manager = struct {
     ) !void {
         const info = package.info orelse return;
         try manager.installDependencyObject(@constCast(info), "dependencies", dependency_parent_dir, false, false);
-        if (!manager.options.omit_optional) {
-            try manager.installDependencyObject(@constCast(info), "optionalDependencies", dependency_parent_dir, false, true);
-        }
+        try manager.installOptionalDependencies(@constCast(info), dependency_parent_dir, false);
         try manager.installOrLinkPeerDependencies(info, dependency_parent_dir, package_dir, peer_parent_dir);
     }
 
@@ -7956,7 +7979,7 @@ const Manager = struct {
                     try copyDirectoryTree(manager.init_data.io, manager.allocator, install_source_path, final_destination);
                     try manager.applyPackagePatch(package_name, package_version, final_destination, protocol_patch_paths);
                 }
-                manager.installed_count += 1;
+                if (!manager.options.lockfile_only and !manager.options.dry_run) manager.installed_count += 1;
             }
         }
 
@@ -7991,9 +8014,7 @@ const Manager = struct {
         if (locked_selection == null) manager.changed = true;
 
         try manager.installDependencyObject(metadata, "dependencies", final_destination, false, false);
-        if (!manager.options.omit_optional) {
-            try manager.installDependencyObject(metadata, "optionalDependencies", final_destination, false, true);
-        }
+        try manager.installOptionalDependencies(metadata, final_destination, false);
         if (manager.node_linker == .isolated) {
             try manager.linkPeerDependencies(metadata, final_destination, parent_dir);
         }
@@ -8379,13 +8400,11 @@ const Manager = struct {
             .install_dir = destination,
         });
         try manager.rememberPackageMetadata(destination, metadata);
-        manager.installed_count += 1;
+        if (!manager.options.lockfile_only and !manager.options.dry_run) manager.installed_count += 1;
         manager.changed = true;
 
         try manager.installDependencyObject(metadata, "dependencies", destination, false, false);
-        if (!manager.options.omit_optional) {
-            try manager.installDependencyObject(metadata, "optionalDependencies", destination, false, true);
-        }
+        try manager.installOptionalDependencies(metadata, destination, false);
         try manager.installOrLinkPeerDependencies(metadata, destination, destination, parent_dir);
         try manager.queuePackageScripts(alias, package_name, package_version, destination, .local, direct, optional, true);
         return .{
@@ -8525,9 +8544,7 @@ const Manager = struct {
                 try manager.rememberPackageMetadata(placement.package_dir, record.metadata);
                 if (record.metadata) |metadata| {
                     try manager.installDependencyObject(@constCast(metadata), "dependencies", placement.package_dir, false, false);
-                    if (!manager.options.omit_optional) {
-                        try manager.installDependencyObject(@constCast(metadata), "optionalDependencies", placement.package_dir, false, true);
-                    }
+                    try manager.installOptionalDependencies(@constCast(metadata), placement.package_dir, false);
                 }
                 try manager.installOrLinkPeerDependencies(record.metadata, placement.package_dir, placement.package_dir, parent_dir);
                 return record.version;
@@ -8714,11 +8731,20 @@ const Manager = struct {
     }
 
     fn resolveRegistryPackage(manager: *Manager, name: []const u8, spec: []const u8) !RegistryPackage {
+        return manager.resolveRegistryPackageWithLogLevel(name, spec, .err);
+    }
+
+    fn resolveRegistryPackageWithLogLevel(
+        manager: *Manager,
+        name: []const u8,
+        spec: []const u8,
+        fetch_log_level: FetchLogLevel,
+    ) !RegistryPackage {
         const refresh_manifest = manager.refresh_direct_registry and
             !manager.refreshed_update_manifests.contains(name);
         const cached_manifest: ?*Value = if (refresh_manifest) null else manager.registry_manifests.get(name);
         const manifest = cached_manifest orelse blk: {
-            if (!refresh_manifest and manager.registry_manifest_failures.contains(name)) {
+            if (!refresh_manifest and fetch_log_level == .err and manager.registry_manifest_failures.contains(name)) {
                 return error.RegistryManifestRequestFailed;
             }
             const encoded_name = try encodePackageName(manager.allocator, name);
@@ -8738,11 +8764,18 @@ const Manager = struct {
                 }
             }
             const manifest_url = try joinRegistryPackageURL(manager.allocator, configured_registry, encoded_name);
-            const bytes = try manager.fetchBytesWithAuthorization(manifest_url, true, max_manifest_bytes, configured_registry.authorization);
+            const bytes = try manager.fetchBytesWithAuthorizationLogLevel(
+                manifest_url,
+                true,
+                max_manifest_bytes,
+                configured_registry.authorization,
+                fetch_log_level,
+            );
             const parsed = (try manager.parseRegistryManifest(bytes)) orelse return error.InvalidRegistryManifest;
             if (cache_path) |path| {
                 try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = path, .data = bytes });
             }
+            _ = manager.registry_manifest_failures.remove(name);
             try manager.registry_manifests.put(try manager.allocator.dupe(u8, name), parsed);
             if (refresh_manifest) try manager.refreshed_update_manifests.put(try manager.allocator.dupe(u8, name), {});
             break :blk parsed;
@@ -9149,6 +9182,17 @@ const Manager = struct {
         limit: usize,
         authorization: ?[]const u8,
     ) ![]const u8 {
+        return manager.fetchBytesWithAuthorizationLogLevel(url, manifest, limit, authorization, .err);
+    }
+
+    fn fetchBytesWithAuthorizationLogLevel(
+        manager: *Manager,
+        url: []const u8,
+        manifest: bool,
+        limit: usize,
+        authorization: ?[]const u8,
+        log_level: FetchLogLevel,
+    ) ![]const u8 {
         var headers_buffer: [3]std.http.Header = undefined;
         var header_count: usize = 0;
         if (manifest) {
@@ -9173,7 +9217,7 @@ const Manager = struct {
                 .extra_headers = headers,
             }) catch |err| {
                 if (attempt == manager.max_retry_count) {
-                    try manager.stderr.print("error: GET {s} - {s}\n", .{ url, @errorName(err) });
+                    try manager.stderr.print("{s}: GET {s} - {s}\n", .{ log_level.label(), url, @errorName(err) });
                     return error.PackageManagerErrorReported;
                 }
                 continue;
@@ -9186,7 +9230,7 @@ const Manager = struct {
             output.deinit();
             const retryable = status >= 500 or status == 429;
             if (!retryable or attempt == manager.max_retry_count) {
-                try manager.stderr.print("error: GET {s} - {d}\n", .{ url, status });
+                try manager.stderr.print("{s}: GET {s} - {d}\n", .{ log_level.label(), url, status });
                 return error.PackageManagerErrorReported;
             }
         }
@@ -9234,7 +9278,7 @@ const Manager = struct {
         unreachable;
     }
 
-    fn fetchRegistryArchive(manager: *Manager, package: RegistryArchive) ![]const u8 {
+    fn fetchRegistryArchive(manager: *Manager, package: RegistryArchive, log_level: FetchLogLevel) ![]const u8 {
         if (manager.registry_archives.get(package.tarball)) |archive| {
             if (manager.options.verify_integrity) try verifyIntegrity(archive, package.integrity);
             return archive;
@@ -9256,7 +9300,13 @@ const Manager = struct {
             }
         }
 
-        const archive = try manager.fetchBytesWithAuthorization(package.tarball, false, max_tarball_bytes, package.authorization);
+        const archive = try manager.fetchBytesWithAuthorizationLogLevel(
+            package.tarball,
+            false,
+            max_tarball_bytes,
+            package.authorization,
+            log_level,
+        );
         if (manager.options.verify_integrity) try verifyIntegrity(archive, package.integrity);
         if (cache_path) |path| {
             try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = path, .data = archive });
@@ -9939,6 +9989,7 @@ const Manager = struct {
     }
 
     fn countRegistryInstall(manager: *Manager, name: []const u8, version_value: []const u8, tarball: []const u8) !void {
+        if (manager.options.lockfile_only or manager.options.dry_run) return;
         const key = try std.fmt.allocPrint(manager.allocator, "{s}\x00{s}\x00{s}", .{ name, version_value, tarball });
         const entry = try manager.installed_registry_packages.getOrPut(key);
         if (!entry.found_existing) manager.installed_count += 1;
@@ -10002,9 +10053,7 @@ const Manager = struct {
             const previous = manager.setResolutionOnly(!manager.workspaceSelected(workspace));
             defer manager.restoreResolutionOnly(previous);
             try manager.installDependencyObject(workspace.package_json, "dependencies", workspace.path, false, false);
-            if (!manager.options.omit_optional) {
-                try manager.installDependencyObject(workspace.package_json, "optionalDependencies", workspace.path, false, true);
-            }
+            try manager.installOptionalDependencies(workspace.package_json, workspace.path, false);
             try manager.installOrLinkPeerDependencies(workspace.package_json, workspace.path, workspace.path, workspace.path);
             if (!manager.options.production) try manager.installDependencyObject(workspace.package_json, "devDependencies", workspace.path, false, false);
             try manager.queuePackageScripts(workspace.name, workspace.name, workspace.version, workspace.path, .workspace, true, false, true);
@@ -10129,17 +10178,20 @@ const Manager = struct {
 
     fn addRecord(manager: *Manager, record: PackageRecord) !void {
         const record_key = if (record.key.len > 0) record.key else record.alias;
+        for (manager.records.items, 0..) |existing, index| {
+            const existing_key = if (existing.key.len > 0) existing.key else existing.alias;
+            if (std.mem.eql(u8, existing_key, record_key)) {
+                // A package reached through any enabled edge remains eligible
+                // for materialization when an omitted edge reaches it later.
+                if (!manager.filter_resolution_only) _ = manager.resolution_only_records.remove(record_key);
+                manager.records.items[index] = record;
+                return;
+            }
+        }
         if (manager.filter_resolution_only) {
             try manager.resolution_only_records.put(try manager.allocator.dupe(u8, record_key), {});
         } else {
             _ = manager.resolution_only_records.remove(record_key);
-        }
-        for (manager.records.items, 0..) |existing, index| {
-            const existing_key = if (existing.key.len > 0) existing.key else existing.alias;
-            if (std.mem.eql(u8, existing_key, record_key)) {
-                manager.records.items[index] = record;
-                return;
-            }
         }
         try manager.records.append(record);
     }
