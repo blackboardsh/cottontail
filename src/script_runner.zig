@@ -185,6 +185,17 @@ const Context = struct {
     }
 };
 
+const RuntimeArtifact = struct {
+    path: []const u8,
+    lease_file: ?std.Io.File = null,
+
+    fn deinit(self: *RuntimeArtifact, ctx: *const Context) void {
+        if (self.lease_file) |file| file.close(ctx.io);
+        cleanupRunnableDirectory(ctx, self.path);
+        self.* = undefined;
+    }
+};
+
 pub fn run(init: std.process.Init, script_path: [:0]const u8, script_args: []const [:0]const u8) !u8 {
     const empty_exec_args: [0][:0]const u8 = .{};
     return try runWithExecArgv(init, script_path, script_args, empty_exec_args[0..]);
@@ -237,7 +248,7 @@ pub fn runWithExecArgvDisplay(
 
     if (try rejectInvalidBunCjsPragma(&ctx, entrypoint_path)) return 1;
 
-    const runnable_path = bundleScriptNative(&ctx, entrypoint_path, exec_args, script_args, null, null, null, false) catch |err| {
+    var runnable = bundleScriptNative(&ctx, entrypoint_path, exec_args, script_args, null, null, null, false) catch |err| {
         if (err == error.TestBundleFailed) return 1;
         if (err == error.SyntaxError) {
             ctx.writeStderr("error: Syntax Error\n", .{});
@@ -245,9 +256,9 @@ pub fn runWithExecArgvDisplay(
         }
         return err;
     };
-    defer cleanupRunnableDirectory(&ctx, runnable_path);
+    defer runnable.deinit(&ctx);
 
-    const runnable_path_z = try allocator.dupeZ(u8, runnable_path);
+    const runnable_path_z = try allocator.dupeZ(u8, runnable.path);
     const process_args = try allocator.alloc([:0]const u8, script_args.len + 1);
     const canonical_script_path = resolvePathForCwd(ctx.io, allocator, script_path) catch
         try absolutePathForCwd(ctx.io, allocator, script_path);
@@ -1077,13 +1088,13 @@ pub fn runEval(
     const eval_entry = try writeEvalEntrypoint(&ctx, ctx.project_root, executable_source, print_result, module_input, "[eval]", true, .omit_entrypoint);
     defer std.Io.Dir.cwd().deleteFile(ctx.io, eval_entry.entry_path) catch {};
     defer if (eval_entry.source_path) |path| std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
-    const runnable_path = try bundleScriptNative(&ctx, eval_entry.entry_path, exec_args, script_args, ctx.project_root, null, null, false);
-    canonicalizeEvalSourceMap(&ctx, runnable_path, eval_entry.source_path orelse eval_entry.entry_path) catch |err| switch (err) {
+    var runnable = try bundleScriptNative(&ctx, eval_entry.entry_path, exec_args, script_args, ctx.project_root, null, null, false);
+    defer runnable.deinit(&ctx);
+    canonicalizeEvalSourceMap(&ctx, runnable.path, eval_entry.source_path orelse eval_entry.entry_path) catch |err| switch (err) {
         error.EvalSourceMissingFromSourceMap => {},
         else => return err,
     };
-    defer cleanupRunnableDirectory(&ctx, runnable_path);
-    const runnable_path_z = try init.arena.allocator().dupeZ(u8, runnable_path);
+    const runnable_path_z = try init.arena.allocator().dupeZ(u8, runnable.path);
     const process_args = try init.arena.allocator().alloc([:0]const u8, script_args.len + 1);
     process_args[0] = try init.arena.allocator().dupeZ(u8, eval_entry.entry_path);
     for (script_args, 0..) |arg, index| process_args[index + 1] = arg;
@@ -1493,7 +1504,7 @@ pub fn compileStandaloneSource(
     standalone_options.entry_naming = "index.js";
     if (standalone_options.source_map != .none) standalone_options.source_map = .linked;
     var graph: native_bundler.BundleGraphOutput = undefined;
-    const runnable_path = try bundleScriptNative(
+    var runnable = try bundleScriptNative(
         &ctx,
         script_path,
         empty_args[0..],
@@ -1503,10 +1514,10 @@ pub fn compileStandaloneSource(
         &graph,
         true,
     );
+    defer runnable.deinit(&ctx);
     defer graph.deinit();
-    defer cleanupRunnableDirectory(&ctx, runnable_path);
     if (standalone_options.code_splitting) {
-        try bundleStandaloneBootstrap(&ctx, runnable_path, &graph, build_options.source_map != .none);
+        try bundleStandaloneBootstrap(&ctx, runnable.path, &graph, build_options.source_map != .none);
     }
     const entry = graph.entryPoint() orelse return error.MissingStandaloneEntryPoint;
     const source = try init.arena.allocator().dupe(u8, entry.contents);
@@ -1714,14 +1725,14 @@ pub fn runStdin(
     const stdin_entry = try writeEvalEntrypoint(&ctx, ctx.project_root, source_z, false, module_input, "[stdin]", true, .stdin);
     defer std.Io.Dir.cwd().deleteFile(ctx.io, stdin_entry.entry_path) catch {};
     defer if (stdin_entry.source_path) |path| std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
-    const runnable_path = try bundleScriptNative(&ctx, stdin_entry.entry_path, exec_args, script_args, ctx.project_root, null, null, false);
-    canonicalizeVirtualSourceMap(&ctx, runnable_path, stdin_entry.source_path orelse stdin_entry.entry_path, "[stdin]") catch |err| switch (err) {
+    var runnable = try bundleScriptNative(&ctx, stdin_entry.entry_path, exec_args, script_args, ctx.project_root, null, null, false);
+    defer runnable.deinit(&ctx);
+    canonicalizeVirtualSourceMap(&ctx, runnable.path, stdin_entry.source_path orelse stdin_entry.entry_path, "[stdin]") catch |err| switch (err) {
         error.EvalSourceMissingFromSourceMap => {},
         else => return err,
     };
-    defer cleanupRunnableDirectory(&ctx, runnable_path);
 
-    const runnable_path_z = try allocator.dupeZ(u8, runnable_path);
+    const runnable_path_z = try allocator.dupeZ(u8, runnable.path);
     const process_args = try allocator.alloc([:0]const u8, script_args.len + 1);
     process_args[0] = try allocator.dupeZ(u8, stdin_entry.entry_path);
     @memcpy(process_args[1..], script_args);
@@ -1730,9 +1741,12 @@ pub fn runStdin(
 
 fn makeContext(init: std.process.Init) !Context {
     const allocator = init.arena.allocator();
-    const process_args = try init.minimal.args.toSlice(allocator);
-    const executable_arg = if (process_args.len > 0) process_args[0] else "cottontail";
-    const executable_path = std.Io.Dir.cwd().realPathFileAlloc(init.io, executable_arg, allocator) catch executable_arg;
+    const discovered_executable_path = try std.process.executablePathAlloc(init.io, allocator);
+    const executable_path = std.Io.Dir.cwd().realPathFileAlloc(
+        init.io,
+        discovered_executable_path,
+        allocator,
+    ) catch discovered_executable_path;
     const executable_stamp = if (std.Io.Dir.cwd().statFile(init.io, executable_path, .{})) |stat|
         try std.fmt.allocPrint(allocator, "{s}:{d}:{d}", .{ executable_path, stat.size, stat.mtime.nanoseconds })
     else |_|
@@ -2984,7 +2998,7 @@ fn bundleScriptNative(
     build_options: ?native_bundler.BundleOptions,
     graph_out: ?*native_bundler.BundleGraphOutput,
     standalone_compile: bool,
-) ![]const u8 {
+) !RuntimeArtifact {
     const tmp_dir = try ensureTempDir(ctx);
     errdefer std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
 
@@ -3094,6 +3108,7 @@ fn bundleScriptNative(
     var error_message: ?[*:0]u8 = null;
     var options = build_options orelse native_bundler.BundleOptions{};
     if (build_options == null) {
+        options.skip_teardown = true;
         options.externalize_runtime_require_resolve = true;
         // COTTONTAIL-COMPAT: Runtime HTML imports are lazy HTMLBundle values.
         // Bake owns the browser graph build so client errors remain recoverable.
@@ -3155,9 +3170,9 @@ fn bundleScriptNative(
         null;
     defer if (launcher_cache) |*cache| cache.lock_file.close(ctx.io);
     if (launcher_cache) |cache| {
-        if (try launcherCacheHit(ctx, &cache)) |cached_bundle_path| {
+        if (try launcherCacheHit(ctx, &cache)) |cached_artifact| {
             std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
-            return cached_bundle_path;
+            return cached_artifact;
         }
     }
 
@@ -3187,7 +3202,7 @@ fn bundleScriptNative(
             const source_map_path = try std.mem.concat(ctx.allocator, u8, &.{ bundle_path, ".map" });
             try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = source_map_path, .data = source_map.contents });
         }
-        return bundle_path;
+        return .{ .path = bundle_path };
     }
 
     var output = native_bundler.bundleEntryPointGraphWithOptions(
@@ -3225,35 +3240,35 @@ fn bundleScriptNative(
         try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = source_map_path, .data = source_map });
     }
     if (launcher_cache) |cache| {
-        if (cache.can_install) {
-            const cached_bundle_path = installLauncherCache(
-                ctx,
-                &cache,
-                wrapped_entry,
-                script_entry_abs,
-                if (use_esm_bundle_cache) script_abs else null,
-                runtime_code,
-                runtime_source_map,
-                output.input_files,
-            ) catch return bundle_path;
-            std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
-            return cached_bundle_path;
-        }
+        const cached_artifact = installLauncherCache(
+            ctx,
+            &cache,
+            wrapped_entry,
+            script_entry_abs,
+            if (use_esm_bundle_cache) script_abs else null,
+            runtime_code,
+            runtime_source_map,
+            output.input_files,
+        ) catch return .{ .path = bundle_path };
+        std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
+        return cached_artifact;
     }
-    return bundle_path;
+    return .{ .path = bundle_path };
 }
 
 const LauncherCache = struct {
     cache_root: []const u8,
     cache_name: []const u8,
     manifest_path: []const u8,
+    stale_path: []const u8,
     key: [64]u8,
     lock_file: std.Io.File,
-    can_install: bool,
 };
 
-const launcher_cache_magic = "CTLCACH2";
+const launcher_cache_magic = "CTLCACH3";
 const launcher_cache_manifest_limit = 16 * 1024 * 1024;
+const launcher_cache_stale_limit = 64;
+const launcher_cache_cleanup_scan_limit = 256;
 
 const LauncherCacheDependencyKind = enum(u8) {
     file = 1,
@@ -3272,6 +3287,8 @@ const LauncherCacheDependency = struct {
 const LauncherCacheManifest = struct {
     bytes: []u8,
     artifact_id: [64]u8,
+    code_digest: [32]u8,
+    source_map_digest: [32]u8,
 };
 
 fn acquireLauncherCache(
@@ -3282,7 +3299,7 @@ fn acquireLauncherCache(
     key_material_path: ?[]const u8,
 ) !?LauncherCache {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("cottontail-launcher-v3\x00");
+    hasher.update("cottontail-launcher-v4\x00");
     hasher.update(cache_name);
     hasher.update("\x00");
     hasher.update(ctx.executable_stamp);
@@ -3325,22 +3342,22 @@ fn acquireLauncherCache(
         .truncate = false,
     }) catch return null;
     errdefer lock_file.close(ctx.io);
-    const can_install = lock_file.tryLock(ctx.io, .exclusive) catch {
+    const locked = lock_file.tryLock(ctx.io, .exclusive) catch {
         lock_file.close(ctx.io);
         return null;
     };
-    if (!can_install) lock_file.lock(ctx.io, .shared) catch {
+    if (!locked) {
         lock_file.close(ctx.io);
         return null;
-    };
+    }
 
     return .{
         .cache_root = cache_root,
         .cache_name = cache_name,
         .manifest_path = try std.fs.path.join(ctx.allocator, &.{ cache_root, try std.fmt.allocPrint(ctx.allocator, "{s}.manifest", .{cache_name}) }),
+        .stale_path = try std.fs.path.join(ctx.allocator, &.{ cache_root, try std.fmt.allocPrint(ctx.allocator, "{s}.stale", .{cache_name}) }),
         .key = std.fmt.bytesToHex(digest, .lower),
         .lock_file = lock_file,
-        .can_install = can_install,
     };
 }
 
@@ -3383,6 +3400,29 @@ fn launcherCacheSourceMapPath(ctx: *const Context, bundle_path: []const u8) ![]c
     return try std.mem.concat(ctx.allocator, u8, &.{ bundle_path, ".map" });
 }
 
+fn launcherCacheLeasePath(ctx: *const Context, bundle_path: []const u8) ![]const u8 {
+    return try std.mem.concat(ctx.allocator, u8, &.{ bundle_path, ".lease" });
+}
+
+fn writeLauncherCacheFileAtomic(ctx: *const Context, path: []const u8, data: []const u8) !void {
+    var atomic_file = try std.Io.Dir.cwd().createFileAtomic(ctx.io, path, .{ .replace = true });
+    defer atomic_file.deinit(ctx.io);
+
+    var buffer: [16 * 1024]u8 = undefined;
+    var writer = atomic_file.file.writer(ctx.io, &buffer);
+    try writer.interface.writeAll(data);
+    try writer.interface.flush();
+    try atomic_file.replace(ctx.io);
+}
+
+fn hashLauncherCacheBytes(bytes: []const u8) [32]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(bytes);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
 fn hashLauncherCacheFile(ctx: *const Context, path: []const u8) ![32]u8 {
     const file = try std.Io.Dir.cwd().openFile(ctx.io, path, .{});
     defer file.close(ctx.io);
@@ -3399,6 +3439,161 @@ fn hashLauncherCacheFile(ctx: *const Context, path: []const u8) ![32]u8 {
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     return digest;
+}
+
+fn launcherCacheFileMatches(
+    ctx: *const Context,
+    path: []const u8,
+    expected_size: u64,
+    expected_digest: *const [32]u8,
+) bool {
+    const stat = std.Io.Dir.cwd().statFile(ctx.io, path, .{}) catch return false;
+    if (stat.kind != .file or stat.size != expected_size) return false;
+    const actual_digest = hashLauncherCacheFile(ctx, path) catch return false;
+    return std.mem.eql(u8, &actual_digest, expected_digest);
+}
+
+fn acquireLauncherCacheArtifactLease(ctx: *const Context, bundle_path: []const u8) !?std.Io.File {
+    const lease_path = try launcherCacheLeasePath(ctx, bundle_path);
+    const lease_file = std.Io.Dir.cwd().createFile(ctx.io, lease_path, .{
+        .read = true,
+        .truncate = false,
+    }) catch return null;
+    errdefer lease_file.close(ctx.io);
+    if (!try lease_file.tryLock(ctx.io, .shared)) {
+        lease_file.close(ctx.io);
+        return null;
+    }
+    return lease_file;
+}
+
+const LauncherCacheRemoval = enum { removed, busy, unmanaged };
+
+fn removeLauncherCacheArtifact(
+    ctx: *const Context,
+    cache: *const LauncherCache,
+    artifact_id: []const u8,
+) LauncherCacheRemoval {
+    const bundle_path = launcherCacheArtifactPath(ctx, cache, artifact_id) catch return .unmanaged;
+    const source_map_path = launcherCacheSourceMapPath(ctx, bundle_path) catch return .unmanaged;
+    const lease_path = launcherCacheLeasePath(ctx, bundle_path) catch return .unmanaged;
+    const lease_file = std.Io.Dir.cwd().openFile(ctx.io, lease_path, .{ .mode = .read_write }) catch
+        return .unmanaged;
+
+    const locked = lease_file.tryLock(ctx.io, .exclusive) catch false;
+    if (!locked) {
+        lease_file.close(ctx.io);
+        return .busy;
+    }
+    std.Io.Dir.cwd().deleteFile(ctx.io, bundle_path) catch {};
+    std.Io.Dir.cwd().deleteFile(ctx.io, source_map_path) catch {};
+    lease_file.close(ctx.io);
+    std.Io.Dir.cwd().deleteFile(ctx.io, lease_path) catch {};
+    return .removed;
+}
+
+fn queueStaleLauncherCacheArtifact(
+    ctx: *const Context,
+    cache: *const LauncherCache,
+    artifact_id: []const u8,
+) void {
+    if (!launcherCacheHexIdValid(artifact_id)) return;
+    const existing = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        cache.stale_path,
+        ctx.allocator,
+        .limited((64 + 1) * launcher_cache_stale_limit),
+    ) catch "";
+
+    var output: std.ArrayList(u8) = .empty;
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, existing, '\n');
+    while (lines.next()) |line| {
+        if (!launcherCacheHexIdValid(line)) continue;
+        if (std.mem.eql(u8, line, artifact_id)) return;
+        if (count >= launcher_cache_stale_limit - 1) continue;
+        output.appendSlice(ctx.allocator, line) catch return;
+        output.append(ctx.allocator, '\n') catch return;
+        count += 1;
+    }
+    output.appendSlice(ctx.allocator, artifact_id) catch return;
+    output.append(ctx.allocator, '\n') catch return;
+    writeLauncherCacheFileAtomic(ctx, cache.stale_path, output.items) catch {};
+}
+
+fn cleanupQueuedLauncherCacheArtifacts(ctx: *const Context, cache: *const LauncherCache) void {
+    const existing = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        cache.stale_path,
+        ctx.allocator,
+        .limited((64 + 1) * launcher_cache_stale_limit),
+    ) catch return;
+
+    var remaining: std.ArrayList(u8) = .empty;
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, existing, '\n');
+    while (lines.next()) |artifact_id| {
+        if (!launcherCacheHexIdValid(artifact_id) or count >= launcher_cache_stale_limit) continue;
+        count += 1;
+        if (removeLauncherCacheArtifact(ctx, cache, artifact_id) != .busy) continue;
+        remaining.appendSlice(ctx.allocator, artifact_id) catch return;
+        remaining.append(ctx.allocator, '\n') catch return;
+    }
+    if (remaining.items.len == 0) {
+        std.Io.Dir.cwd().deleteFile(ctx.io, cache.stale_path) catch {};
+    } else {
+        writeLauncherCacheFileAtomic(ctx, cache.stale_path, remaining.items) catch {};
+    }
+}
+
+fn launcherCacheManifestArtifactId(manifest: []const u8) ?[]const u8 {
+    const header_len = launcher_cache_magic.len + 64 + 64;
+    if (manifest.len < header_len or
+        !std.mem.eql(u8, manifest[0..launcher_cache_magic.len], launcher_cache_magic))
+    {
+        return null;
+    }
+    const artifact_id = manifest[launcher_cache_magic.len + 64 .. header_len];
+    return if (launcherCacheHexIdValid(artifact_id)) artifact_id else null;
+}
+
+fn discardLauncherCacheManifest(
+    ctx: *const Context,
+    cache: *const LauncherCache,
+    manifest: []const u8,
+) void {
+    std.Io.Dir.cwd().deleteFile(ctx.io, cache.manifest_path) catch {};
+    const artifact_id = launcherCacheManifestArtifactId(manifest) orelse return;
+    if (removeLauncherCacheArtifact(ctx, cache, artifact_id) == .busy) {
+        queueStaleLauncherCacheArtifact(ctx, cache, artifact_id);
+    }
+}
+
+fn cleanupLauncherCacheArtifacts(
+    ctx: *const Context,
+    cache: *const LauncherCache,
+    keep_artifact_id: []const u8,
+) void {
+    var directory = std.Io.Dir.cwd().openDir(ctx.io, cache.cache_root, .{ .iterate = true }) catch return;
+    defer directory.close(ctx.io);
+
+    const prefix = std.fmt.allocPrint(ctx.allocator, "{s}-", .{cache.cache_name}) catch return;
+    var scanned: usize = 0;
+    var iterator = directory.iterate();
+    while (scanned < launcher_cache_cleanup_scan_limit) : (scanned += 1) {
+        const entry = (iterator.next(ctx.io) catch return) orelse break;
+        if (entry.kind != .file or
+            !std.mem.startsWith(u8, entry.name, prefix) or
+            !std.mem.endsWith(u8, entry.name, ".mjs"))
+        {
+            continue;
+        }
+        const artifact_id = entry.name[prefix.len .. entry.name.len - ".mjs".len];
+        if (!launcherCacheHexIdValid(artifact_id) or std.mem.eql(u8, artifact_id, keep_artifact_id)) continue;
+        if (removeLauncherCacheArtifact(ctx, cache, artifact_id) == .busy) {
+            queueStaleLauncherCacheArtifact(ctx, cache, artifact_id);
+        }
+    }
 }
 
 const LauncherCacheDirectoryEntry = struct {
@@ -3610,10 +3805,18 @@ fn buildLauncherCacheManifest(
     ctx: *const Context,
     cache: *const LauncherCache,
     dependencies: []LauncherCacheDependency,
+    code: []const u8,
+    source_map: []const u8,
 ) !LauncherCacheManifest {
     std.mem.sort(LauncherCacheDependency, dependencies, {}, launcherCacheDependencyLessThan);
 
+    const code_digest = hashLauncherCacheBytes(code);
+    const source_map_digest = hashLauncherCacheBytes(source_map);
     var payload: std.ArrayList(u8) = .empty;
+    try appendLauncherCacheInt(&payload, ctx.allocator, u64, @intCast(code.len));
+    try payload.appendSlice(ctx.allocator, &code_digest);
+    try appendLauncherCacheInt(&payload, ctx.allocator, u64, @intCast(source_map.len));
+    try payload.appendSlice(ctx.allocator, &source_map_digest);
     try appendLauncherCacheInt(&payload, ctx.allocator, u32, @intCast(dependencies.len));
     for (dependencies) |dependency| {
         try payload.append(ctx.allocator, @intFromEnum(dependency.kind));
@@ -3639,6 +3842,8 @@ fn buildLauncherCacheManifest(
     return .{
         .bytes = try manifest.toOwnedSlice(ctx.allocator),
         .artifact_id = artifact_id,
+        .code_digest = code_digest,
+        .source_map_digest = source_map_digest,
     };
 }
 
@@ -3677,15 +3882,14 @@ fn validateLauncherCacheDependency(
     };
 }
 
-fn launcherCacheHit(ctx: *const Context, cache: *const LauncherCache) !?[]const u8 {
-    const manifest = std.Io.Dir.cwd().readFileAlloc(
-        ctx.io,
-        cache.manifest_path,
-        ctx.allocator,
-        .limited(launcher_cache_manifest_limit),
-    ) catch return null;
+fn validateLauncherCacheManifest(
+    ctx: *const Context,
+    cache: *const LauncherCache,
+    manifest: []const u8,
+) !?RuntimeArtifact {
+    const fixed_metadata_len = @sizeOf(u64) + 32 + @sizeOf(u64) + 32;
     const header_len = launcher_cache_magic.len + cache.key.len + 64;
-    if (manifest.len < header_len + @sizeOf(u32) or
+    if (manifest.len < header_len + fixed_metadata_len + @sizeOf(u32) or
         !std.mem.eql(u8, manifest[0..launcher_cache_magic.len], launcher_cache_magic) or
         !std.mem.eql(u8, manifest[launcher_cache_magic.len..][0..cache.key.len], &cache.key))
     {
@@ -3694,7 +3898,27 @@ fn launcherCacheHit(ctx: *const Context, cache: *const LauncherCache) !?[]const 
     const artifact_id = manifest[launcher_cache_magic.len + cache.key.len .. header_len];
     if (!launcherCacheHexIdValid(artifact_id)) return null;
 
+    var artifact_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    artifact_hasher.update(&cache.key);
+    artifact_hasher.update(manifest[header_len..]);
+    var artifact_digest: [32]u8 = undefined;
+    artifact_hasher.final(&artifact_digest);
+    const expected_artifact_id = std.fmt.bytesToHex(artifact_digest, .lower);
+    if (!std.mem.eql(u8, artifact_id, &expected_artifact_id)) return null;
+
     var cursor = header_len;
+    const code_size = readLauncherCacheInt(u64, manifest, &cursor) orelse return null;
+    const code_digest_end = std.math.add(usize, cursor, 32) catch return null;
+    if (code_digest_end > manifest.len) return null;
+    const code_digest: *const [32]u8 = @ptrCast(manifest[cursor..code_digest_end].ptr);
+    cursor = code_digest_end;
+    const source_map_size = readLauncherCacheInt(u64, manifest, &cursor) orelse return null;
+    const source_map_digest_end = std.math.add(usize, cursor, 32) catch return null;
+    if (source_map_digest_end > manifest.len) return null;
+    const source_map_digest: *const [32]u8 = @ptrCast(manifest[cursor..source_map_digest_end].ptr);
+    cursor = source_map_digest_end;
+    if (code_size == 0 or source_map_size == 0) return null;
+
     const dependency_count = readLauncherCacheInt(u32, manifest, &cursor) orelse return null;
     for (0..@as(usize, @intCast(dependency_count))) |_| {
         if (cursor >= manifest.len) return null;
@@ -3721,12 +3945,24 @@ fn launcherCacheHit(ctx: *const Context, cache: *const LauncherCache) !?[]const 
     if (cursor != manifest.len) return null;
 
     const bundle_path = try launcherCacheArtifactPath(ctx, cache, artifact_id);
-    const bundle_stat = std.Io.Dir.cwd().statFile(ctx.io, bundle_path, .{}) catch return null;
-    if (bundle_stat.kind != .file or bundle_stat.size == 0) return null;
+    if (!launcherCacheFileMatches(ctx, bundle_path, code_size, code_digest)) return null;
     const source_map_path = try launcherCacheSourceMapPath(ctx, bundle_path);
-    const source_map_stat = std.Io.Dir.cwd().statFile(ctx.io, source_map_path, .{}) catch return null;
-    if (source_map_stat.kind != .file or source_map_stat.size == 0) return null;
-    return bundle_path;
+    if (!launcherCacheFileMatches(ctx, source_map_path, source_map_size, source_map_digest)) return null;
+    const lease_file = (try acquireLauncherCacheArtifactLease(ctx, bundle_path)) orelse return null;
+    return .{ .path = bundle_path, .lease_file = lease_file };
+}
+
+fn launcherCacheHit(ctx: *const Context, cache: *const LauncherCache) !?RuntimeArtifact {
+    cleanupQueuedLauncherCacheArtifacts(ctx, cache);
+    const manifest = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        cache.manifest_path,
+        ctx.allocator,
+        .limited(launcher_cache_manifest_limit),
+    ) catch return null;
+    const artifact = try validateLauncherCacheManifest(ctx, cache, manifest);
+    if (artifact == null) discardLauncherCacheManifest(ctx, cache, manifest);
+    return artifact;
 }
 
 fn installLauncherCache(
@@ -3738,7 +3974,7 @@ fn installLauncherCache(
     code: []const u8,
     source_map: ?[]const u8,
     input_files: []const native_bundler.GraphInputFile,
-) ![]const u8 {
+) !RuntimeArtifact {
     const map = source_map orelse return error.MissingLauncherSourceMap;
     const dependencies = try collectLauncherCacheDependencies(
         ctx,
@@ -3747,26 +3983,25 @@ fn installLauncherCache(
         original_entry,
         input_files,
     );
-    const manifest = try buildLauncherCacheManifest(ctx, cache, dependencies);
+    const manifest = try buildLauncherCacheManifest(ctx, cache, dependencies, code, map);
     const bundle_path = try launcherCacheArtifactPath(ctx, cache, &manifest.artifact_id);
     const source_map_path = try launcherCacheSourceMapPath(ctx, bundle_path);
 
-    const bundle_ready = if (std.Io.Dir.cwd().statFile(ctx.io, bundle_path, .{})) |stat|
-        stat.kind == .file and stat.size == @as(u64, @intCast(code.len))
-    else |_|
-        false;
-    if (!bundle_ready) try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = bundle_path, .data = code });
-
-    const map_ready = if (std.Io.Dir.cwd().statFile(ctx.io, source_map_path, .{})) |stat|
-        stat.kind == .file and stat.size == @as(u64, @intCast(map.len))
-    else |_|
-        false;
-    if (!map_ready) try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = source_map_path, .data = map });
+    if (!launcherCacheFileMatches(ctx, bundle_path, @intCast(code.len), &manifest.code_digest)) {
+        try writeLauncherCacheFileAtomic(ctx, bundle_path, code);
+    }
+    if (!launcherCacheFileMatches(ctx, source_map_path, @intCast(map.len), &manifest.source_map_digest)) {
+        try writeLauncherCacheFileAtomic(ctx, source_map_path, map);
+    }
+    const lease_file = (try acquireLauncherCacheArtifactLease(ctx, bundle_path)) orelse
+        return error.LauncherArtifactBusy;
+    errdefer lease_file.close(ctx.io);
 
     // The fixed manifest is the generation index. Publish it only after both
     // immutable artifact files are complete.
-    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = cache.manifest_path, .data = manifest.bytes });
-    return bundle_path;
+    try writeLauncherCacheFileAtomic(ctx, cache.manifest_path, manifest.bytes);
+    cleanupLauncherCacheArtifacts(ctx, cache, &manifest.artifact_id);
+    return .{ .path = bundle_path, .lease_file = lease_file };
 }
 
 fn tsconfigOverridePath(ctx: *const Context, exec_args: []const [:0]const u8) !?[]const u8 {
@@ -7105,7 +7340,10 @@ fn writeCommonJsEntryWrapper(
         const bundle_map_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs.map" });
         break :blk try jsonStringLiteral(ctx, bundle_map_path);
     };
-    const bundle_source_root_literal = try jsonStringLiteral(ctx, ctx.project_root);
+    const bundle_source_root_literal = try jsonStringLiteral(
+        ctx,
+        if (stable_source_map_path) runtime_virtual_root else ctx.project_root,
+    );
     const test_header_signal = if (test_cli_execution)
         "globalThis.__cottontailBunTestHeaderPrinted = true;"
     else

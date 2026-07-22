@@ -1,5 +1,6 @@
 import { afterAll, expect, test } from "bun:test";
 import {
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -21,7 +22,7 @@ const defaultCacheDirectory = join(defaultCacheHome, ".cache", "cottontail", "ca
 mkdirSync(project, { recursive: true });
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-function runCommand(args: string[], cwd = project, defaultCache = false) {
+function runCommand(args: string[], cwd = project, defaultCache = false, argv0?: string) {
   return Bun.spawnSync({
     cmd: [process.execPath, ...args],
     cwd,
@@ -32,13 +33,14 @@ function runCommand(args: string[], cwd = project, defaultCache = false) {
       LOCALAPPDATA: defaultCache ? "" : process.env.LOCALAPPDATA,
       XDG_CACHE_HOME: defaultCache ? "" : process.env.XDG_CACHE_HOME,
     },
+    argv0,
     stdout: "pipe",
     stderr: "pipe",
   });
 }
 
-function run(entry: string) {
-  return runCommand([entry]);
+function run(entry: string, argv0?: string) {
+  return runCommand([entry], project, false, argv0);
 }
 
 function artifactNames(directory = cacheDirectory) {
@@ -71,18 +73,44 @@ test("embedded runtime bundle artifacts are reused and content-invalidated", asy
   const manifest = readdirSync(cacheDirectory).find(name => name.startsWith("esm-entry-") && name.endsWith(".manifest"));
   expect(manifest).toBeTruthy();
   const manifestPath = join(cacheDirectory, manifest!);
-  expect(readFileSync(manifestPath).subarray(0, 8).toString()).toBe("CTLCACH2");
+  expect(readFileSync(manifestPath).subarray(0, 8).toString()).toBe("CTLCACH3");
   const firstManifestMtime = statSync(manifestPath).mtimeMs;
   const firstArtifacts = artifactNames();
   expect(firstArtifacts.length).toBe(1);
 
   await Bun.sleep(25);
-  const second = run(entry);
+  const second = run(entry, "caller-controlled-argv0");
   expect(second.exitCode).toBe(0);
   expect(second.stdout.toString()).toBe("one-tla\n");
   expect(second.stderr.toString()).toBe("");
   expect(artifactNames()).toEqual(firstArtifacts);
   expect(statSync(manifestPath).mtimeMs).toBe(firstManifestMtime);
+
+  await Bun.sleep(25);
+  const artifactPath = join(cacheDirectory, firstArtifacts[0]);
+  const originalArtifact = readFileSync(artifactPath);
+  writeFileSync(artifactPath, Buffer.alloc(originalArtifact.length, 0x20));
+  const repaired = run(entry, "different-caller-argv0");
+  expect(repaired.exitCode).toBe(0);
+  expect(repaired.stdout.toString()).toBe("one-tla\n");
+  expect(repaired.stderr.toString()).toBe("");
+  const repairedArtifacts = artifactNames();
+  expect(repairedArtifacts.length).toBe(1);
+  expect(readFileSync(join(cacheDirectory, repairedArtifacts[0]))).not.toEqual(
+    Buffer.alloc(originalArtifact.length, 0x20),
+  );
+  const repairedManifestMtime = statSync(manifestPath).mtimeMs;
+  expect(repairedManifestMtime).toBeGreaterThan(firstManifestMtime);
+
+  await Bun.sleep(25);
+  writeFileSync(manifestPath, "corrupt manifest");
+  const recovered = run(entry);
+  expect(recovered.exitCode).toBe(0);
+  expect(recovered.stdout.toString()).toBe("one-tla\n");
+  expect(recovered.stderr.toString()).toBe("");
+  expect(readFileSync(manifestPath).subarray(0, 8).toString()).toBe("CTLCACH3");
+  const recoveredArtifacts = artifactNames();
+  expect(recoveredArtifacts.length).toBe(1);
 
   await Bun.sleep(25);
   writeFileSync(dependency, [
@@ -95,9 +123,60 @@ test("embedded runtime bundle artifacts are reused and content-invalidated", asy
   expect(invalidated.exitCode).toBe(0);
   expect(invalidated.stdout.toString()).toBe("two-tla\n");
   expect(invalidated.stderr.toString()).toBe("");
-  expect(artifactNames().length).toBe(firstArtifacts.length + 1);
-  expect(statSync(manifestPath).mtimeMs).toBeGreaterThan(firstManifestMtime);
-});
+  expect(artifactNames().length).toBe(recoveredArtifacts.length);
+  expect(artifactNames()).not.toEqual(recoveredArtifacts);
+  expect(statSync(manifestPath).mtimeMs).toBeGreaterThan(repairedManifestMtime);
+}, 60_000);
+
+test("stale generations remain leased until their process exits", async () => {
+  const dependency = join(project, "leased-dependency.mjs");
+  const entry = join(project, "leased-entry.mjs");
+  const ready = join(project, "leased-entry.ready");
+  const baselineArtifacts = artifactNames().length;
+  writeFileSync(dependency, 'export const value = "leased-one";\n');
+  writeFileSync(entry, [
+    'import { writeFileSync } from "node:fs";',
+    'import { value } from "./leased-dependency.mjs";',
+    `writeFileSync(${JSON.stringify(ready)}, "ready");`,
+    "console.log(value);",
+    'if (process.env.COTTONTAIL_LEASE_HOLD === "1") await Bun.sleep(30_000);',
+    "",
+  ].join("\n"));
+
+  const child = Bun.spawn({
+    cmd: [process.execPath, entry],
+    cwd: project,
+    env: { ...process.env, COTTONTAIL_TMP_DIR: cacheRoot, COTTONTAIL_LEASE_HOLD: "1" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  try {
+    const deadline = Date.now() + 5_000;
+    while (!existsSync(ready) && Date.now() < deadline) await Bun.sleep(10);
+    expect(existsSync(ready)).toBe(true);
+    expect(artifactNames().length).toBe(baselineArtifacts + 1);
+
+    writeFileSync(dependency, 'export const value = "leased-two";\n');
+    const replacement = run(entry);
+    expect(replacement.exitCode).toBe(0);
+    expect(replacement.stdout.toString()).toBe("leased-two\n");
+    expect(replacement.stderr.toString()).toBe("");
+    expect(artifactNames().length).toBe(baselineArtifacts + 2);
+
+    child.kill();
+    await child.exited;
+    expect(await new Response(child.stdout).text()).toBe("leased-one\n");
+    expect(await new Response(child.stderr).text()).toBe("");
+
+    const cleaned = run(entry);
+    expect(cleaned.exitCode).toBe(0);
+    expect(cleaned.stdout.toString()).toBe("leased-two\n");
+    expect(cleaned.stderr.toString()).toBe("");
+    expect(artifactNames().length).toBe(baselineArtifacts + 1);
+  } finally {
+    child.kill();
+  }
+}, 30_000);
 
 test("cached runtime artifact stacks retain original source locations", () => {
   const entry = join(project, "cached-stack.mjs");
@@ -157,4 +236,4 @@ test("plain CommonJS entries and eval share one dynamic runtime artifact", async
   expect(evaluated.exitCode).toBe(0);
   expect(evaluated.stdout.toString()).toBe("eval-runtime\n");
   expect(artifactNames(defaultCacheDirectory).filter(name => name.startsWith("commonjs-runtime-"))).toEqual(runtimeArtifacts);
-});
+}, 30_000);
