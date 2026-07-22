@@ -826,9 +826,11 @@ class WebSocketServer extends EventEmitter {
     let protocol = "";
     if (protocols.size > 0) {
       const defaultProtocol = protocols.values().next().value;
-      protocol = this.options.handleProtocols ? this.options.handleProtocols(protocols, request) : defaultProtocol;
+      const selectedProtocol = this.options.handleProtocols
+        ? this.options.handleProtocols(protocols, request)
+        : defaultProtocol;
+      protocol = selectedProtocol ? String(selectedProtocol) : defaultProtocol;
     }
-    protocol = protocol ? String(protocol) : "";
     const headers = [
       "HTTP/1.1 101 Switching Protocols",
       "Upgrade: websocket",

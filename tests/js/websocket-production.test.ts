@@ -255,6 +255,59 @@ test("Bun.serve rejects unmasked client frames before dispatching message", asyn
   }
 });
 
+test("ws server falls back to the first protocol when handleProtocols returns empty", async () => {
+  let wss!: WebSocketServer;
+  await deadline(new Promise<void>((resolve, reject) => {
+    wss = new WebSocketServer({
+      host: "127.0.0.1",
+      port: 0,
+      handleProtocols: () => "",
+    }, resolve);
+    wss.once("error", reject);
+  }), "ws protocol fallback server listen");
+
+  let socket: ReturnType<typeof netConnect> | null = null;
+  try {
+    const address = wss.address();
+    if (address == null || typeof address === "string") throw new Error("expected a ws IP listener");
+    const serverProtocol = new Promise<string>((resolve) => {
+      wss.once("connection", (ws) => resolve(ws.protocol));
+    });
+    const responseHeaders = await deadline(new Promise<string>((resolve, reject) => {
+      socket = netConnect(address.port, "127.0.0.1");
+      let response = "";
+      socket.once("error", reject);
+      socket.on("data", (chunk) => {
+        response += chunk.toString("latin1");
+        const headerEnd = response.indexOf("\r\n\r\n");
+        if (headerEnd < 0) return;
+        resolve(response.slice(0, headerEnd));
+        socket?.destroy();
+      });
+      socket.once("connect", () => {
+        socket?.write([
+          "GET /socket HTTP/1.1",
+          `Host: 127.0.0.1:${address.port}`,
+          "Upgrade: websocket",
+          "Connection: Upgrade",
+          "Sec-WebSocket-Key: MDEyMzQ1Njc4OWFiY2RlZg==",
+          "Sec-WebSocket-Version: 13",
+          "Sec-WebSocket-Protocol: custom-protocol, second-protocol",
+          "",
+          "",
+        ].join("\r\n"));
+      });
+    }), "ws protocol fallback handshake");
+
+    expect(responseHeaders).toContain("HTTP/1.1 101 Switching Protocols");
+    expect(responseHeaders).toContain("Sec-WebSocket-Protocol: custom-protocol");
+    expect(await deadline(serverProtocol, "ws protocol fallback connection")).toBe("custom-protocol");
+  } finally {
+    socket?.destroy();
+    await deadline(new Promise<void>((resolve) => wss.close(() => resolve())), "ws protocol fallback server close");
+  }
+});
+
 test("ws client and server negotiate permessage-deflate and close cleanly", async () => {
   let wss!: WebSocketServer;
   await deadline(new Promise<void>((resolve, reject) => {

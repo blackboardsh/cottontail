@@ -3414,14 +3414,25 @@ export function _attachHttpConnection(server, socket) {
     headersTimer = null;
     requestTimer = null;
   };
+  const endParserSocket = (response) => {
+    socket.on?.("error", () => {});
+    if (socket.destroyed || socket.writable === false) {
+      socket.destroy?.();
+      return;
+    }
+    try {
+      socket.end(response, () => socket.destroy?.());
+    } catch {
+      socket.destroy?.();
+    }
+  };
   const failParserTimeout = (message) => {
     const error = new Error(message);
     error.code = "ERR_HTTP_REQUEST_TIMEOUT";
     clearParserTimers();
     if (server.listenerCount("clientError") > 0) server.emit("clientError", error, socket);
     else {
-      try { socket.end("HTTP/1.1 408 Request Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"); } catch {}
-      socket.destroy?.();
+      endParserSocket("HTTP/1.1 408 Request Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
     }
   };
   const refreshHeadersTimer = () => {
@@ -3462,8 +3473,7 @@ export function _attachHttpConnection(server, socket) {
       server.emit("clientError", error, socket);
       if (socket.destroyed || socket.writableEnded || socket.writable === false) return;
     }
-    socket.on?.("error", () => {});
-    try { socket.end(`HTTP/1.1 ${statusLine}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`); } catch {}
+    endParserSocket(`HTTP/1.1 ${statusLine}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
   };
 
   const dispatchTunnel = () => {
