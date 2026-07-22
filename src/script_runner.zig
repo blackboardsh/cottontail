@@ -820,22 +820,24 @@ fn extractCompilerDiagnosticMessage(text: []const u8) []const u8 {
 
 fn parseBundleDiagnosticLocation(location: []const u8, message: []const u8, fallback_file: []const u8) BundleDiagnostic {
     const extracted_message = extractCompilerDiagnosticMessage(message);
-    const column_separator = std.mem.lastIndexOfScalar(u8, location, ':') orelse return .{
+    const location_line_end = std.mem.indexOfAny(u8, location, "\r\n") orelse location.len;
+    const location_line = std.mem.trim(u8, location[0..location_line_end], " \t");
+    const column_separator = std.mem.lastIndexOfScalar(u8, location_line, ':') orelse return .{
         .file = fallback_file,
         .line = 1,
         .column = 1,
         .message = extracted_message,
     };
-    const line_separator = std.mem.lastIndexOfScalar(u8, location[0..column_separator], ':') orelse return .{
+    const line_separator = std.mem.lastIndexOfScalar(u8, location_line[0..column_separator], ':') orelse return .{
         .file = fallback_file,
         .line = 1,
         .column = 1,
         .message = extracted_message,
     };
-    const line = std.fmt.parseUnsigned(usize, location[line_separator + 1 .. column_separator], 10) catch 1;
-    const column = std.fmt.parseUnsigned(usize, location[column_separator + 1 ..], 10) catch 1;
+    const line = std.fmt.parseUnsigned(usize, location_line[line_separator + 1 .. column_separator], 10) catch 1;
+    const column = std.fmt.parseUnsigned(usize, location_line[column_separator + 1 ..], 10) catch 1;
     return .{
-        .file = if (line_separator > 0) location[0..line_separator] else fallback_file,
+        .file = if (line_separator > 0) location_line[0..line_separator] else fallback_file,
         .line = @max(line, 1),
         .column = @max(column, 1),
         .message = extracted_message,
@@ -1209,6 +1211,15 @@ test "parse Bun and legacy compiler diagnostics" {
         "fallback.ts",
     );
     try std.testing.expectEqualStrings("Could not resolve: \"@utils/math\"", formatted_resolution.message);
+
+    const diagnostic_with_context = parseBundleDiagnostic(
+        "error: Multiple exports with the same name \"value\"\n    at /tmp/a.js:1:36\n\n1 | export {value};",
+        "fallback.ts",
+    );
+    try std.testing.expectEqualStrings("Multiple exports with the same name \"value\"", diagnostic_with_context.message);
+    try std.testing.expectEqualStrings("/tmp/a.js", diagnostic_with_context.file);
+    try std.testing.expectEqual(@as(usize, 1), diagnostic_with_context.line);
+    try std.testing.expectEqual(@as(usize, 36), diagnostic_with_context.column);
 }
 
 test "runtime missing-package diagnostics follow Bun's resolver classification" {
@@ -1742,10 +1753,12 @@ fn prepareStandaloneNativeAssets(
     files: ?[]const u8,
 ) !StandaloneNativeAssets {
     const graph = files orelse return .{ .source = source };
-    const magic = "CTGRAPH1";
-    if (graph.len < magic.len + @sizeOf(u32) or !std.mem.eql(u8, graph[0..magic.len], magic)) {
+    const v1_magic = "CTGRAPH1";
+    const v2_magic = "CTGRAPH2";
+    const graph_v2 = graph.len >= v2_magic.len and std.mem.eql(u8, graph[0..v2_magic.len], v2_magic);
+    const magic = if (graph_v2) v2_magic else v1_magic;
+    if (graph.len < magic.len + @sizeOf(u32) or !std.mem.eql(u8, graph[0..magic.len], magic))
         return error.InvalidStandaloneGraph;
-    }
 
     const allocator = init.arena.allocator();
     var cursor: usize = magic.len;
@@ -1759,10 +1772,12 @@ fn prepareStandaloneNativeAssets(
     };
 
     for (0..@as(usize, @intCast(file_count))) |_| {
-        const header_end = std.math.add(usize, cursor, 1 + @sizeOf(u32) + @sizeOf(u64)) catch
+        const metadata_len: usize = if (graph_v2) 1 else 0;
+        const header_end = std.math.add(usize, cursor, 1 + metadata_len + @sizeOf(u32) + @sizeOf(u64)) catch
             return error.InvalidStandaloneGraph;
         if (header_end > graph.len) return error.InvalidStandaloneGraph;
         cursor += 1; // Encoding is only needed by the JavaScript file map.
+        if (graph_v2) cursor += 1; // Runtime metadata is consumed by the JavaScriptCore bridge.
         const path_len = readLauncherCacheInt(u32, graph, &cursor) orelse return error.InvalidStandaloneGraph;
         const contents_len_u64 = readLauncherCacheInt(u64, graph, &cursor) orelse return error.InvalidStandaloneGraph;
         const contents_len = std.math.cast(usize, contents_len_u64) orelse return error.InvalidStandaloneGraph;
@@ -2384,7 +2399,7 @@ fn serializeStandaloneGraph(
     const entry_index = graph.entry_point_file_index orelse return error.MissingStandaloneEntryPoint;
     const entry_path = graph.files[entry_index].path;
     var bytes: std.ArrayList(u8) = .empty;
-    try bytes.appendSlice(ctx.allocator, "CTGRAPH1");
+    try bytes.appendSlice(ctx.allocator, "CTGRAPH2");
     try bytes.appendNTimes(ctx.allocator, 0, @sizeOf(u32));
     var file_count: u32 = 0;
 
@@ -2396,12 +2411,22 @@ fn serializeStandaloneGraph(
         // is installed separately at the canonical virtual entry path.
         if (index != entry_index) {
             const path = try standaloneVirtualPath(ctx, file.path);
-            try appendStandaloneGraphFile(&bytes, ctx.allocator, path, file.contents);
+            const appears_in_embedded_files = (file.side != null and file.side.? == .client) or
+                !file.loader.isJavaScriptLike();
+            const is_bytecode_entry = file.entry_point_index != null and file.loader.isJavaScriptLike();
+            try appendStandaloneGraphFile(
+                &bytes,
+                ctx.allocator,
+                path,
+                file.contents,
+                appears_in_embedded_files,
+                is_bytecode_entry,
+            );
             file_count += 1;
         }
         if (file.source_map) |source_map| {
             const map_path = try standaloneVirtualPath(ctx, source_map.path);
-            try appendStandaloneGraphFile(&bytes, ctx.allocator, map_path, source_map.contents);
+            try appendStandaloneGraphFile(&bytes, ctx.allocator, map_path, source_map.contents, false, false);
             file_count += 1;
         }
     }
@@ -2417,12 +2442,16 @@ fn appendStandaloneGraphFile(
     allocator: std.mem.Allocator,
     path: []const u8,
     contents: []const u8,
+    appears_in_embedded_files: bool,
+    is_bytecode_entry: bool,
 ) !void {
     if (path.len > std.math.maxInt(u32)) return error.StandaloneGraphPathTooLong;
-    var header: [1 + @sizeOf(u32) + @sizeOf(u64)]u8 = undefined;
+    var header: [2 + @sizeOf(u32) + @sizeOf(u64)]u8 = undefined;
     header[0] = if (std.unicode.utf8ValidateSlice(contents)) 0 else 1;
-    std.mem.writeInt(u32, header[1 .. 1 + @sizeOf(u32)], @intCast(path.len), .little);
-    std.mem.writeInt(u64, header[1 + @sizeOf(u32) ..], @intCast(contents.len), .little);
+    header[1] = @as(u8, @intFromBool(appears_in_embedded_files)) |
+        (@as(u8, @intFromBool(is_bytecode_entry)) << 1);
+    std.mem.writeInt(u32, header[2 .. 2 + @sizeOf(u32)], @intCast(path.len), .little);
+    std.mem.writeInt(u64, header[2 + @sizeOf(u32) ..], @intCast(contents.len), .little);
     try bytes.appendSlice(allocator, &header);
     try bytes.appendSlice(allocator, path);
     try bytes.appendSlice(allocator, contents);
@@ -4700,7 +4729,8 @@ fn bundleScriptNative(
         try writeCommonJsEntryWrapper(
             ctx,
             tmp_dir,
-            script_abs,
+            script_entry_abs,
+            script_identity_abs,
             bundle_common_js_entrypoint,
             preload_imports,
             is_test_cli_execution,
@@ -7063,7 +7093,9 @@ fn writeBunCompatTransformedSource(
 
     var import_meta_main_source: ?[]u8 = null;
     defer if (import_meta_main_source) |value| std.heap.c_allocator.free(value);
-    if (std.mem.indexOf(u8, transformed_source, "import.meta.main") != null) {
+    if (std.mem.indexOf(u8, transformed_source, "import.meta.main") != null or
+        std.mem.indexOf(u8, transformed_source, "require.main") != null)
+    {
         if (transpilerLoaderForPath(script_abs)) |loader| {
             const transformed = try native_transpiler.transformEntrypointImportMetaMain(transformed_source, loader);
             import_meta_main_source = transformed;
@@ -8863,6 +8895,7 @@ fn rewriteNamespaceEsModuleAssignments(allocator: std.mem.Allocator, source: []c
 fn writeCommonJsEntryWrapper(
     ctx: *const Context,
     tmp_dir: []const u8,
+    script_import_abs: []const u8,
     script_abs: []const u8,
     bundle_entry: bool,
     preload_imports: []const u8,
@@ -8875,7 +8908,7 @@ fn writeCommonJsEntryWrapper(
     if (bootstrap_mode != .full) return writeMinimalRuntimeEntryWrapper(
         ctx,
         tmp_dir,
-        script_abs,
+        script_import_abs,
         script_abs,
         preload_imports,
         test_cli_execution,
@@ -9096,6 +9129,7 @@ fn writeCommonJsEntryWrapper(
         },
     );
     const script_literal = try jsonStringLiteral(ctx, script_abs);
+    const script_import_literal = try jsonStringLiteral(ctx, script_import_abs);
     const bundle_map_literal = if (stable_source_map_path)
         "\"\""
     else blk: {
@@ -9121,7 +9155,7 @@ fn writeCommonJsEntryWrapper(
             \\const __ctPluginEntry = await globalThis.__cottontailResolvePluginEntrypoint?.({s}, {s});
             \\if (__ctPluginEntry?.matched) await __ctPluginEntry.value;
             \\else await import({s});
-        , .{ script_literal, script_literal, script_literal })
+        , .{ script_literal, script_literal, script_import_literal })
     else
         try std.fmt.allocPrint(ctx.allocator,
             \\const __ctPluginEntry = await globalThis.__cottontailResolvePluginEntrypoint?.({s}, {s});

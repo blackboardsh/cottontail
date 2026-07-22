@@ -120,6 +120,49 @@ function validatePath(path) {
   return path;
 }
 
+function normalizeStandalonePath(path) {
+  let text = String(path).replace(/\\/g, "/");
+  const drive = text.match(/^([A-Za-z]):\//);
+  const rooted = drive != null || text.startsWith("/");
+  const prefix = drive ? `${drive[1].toUpperCase()}:/` : rooted ? "/" : "";
+  const rest = drive ? text.slice(3) : rooted ? text.slice(1) : text;
+  const parts = [];
+  for (const part of rest.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (parts.length > 0 && parts[parts.length - 1] !== "..") parts.pop();
+      else if (!rooted) parts.push(part);
+      continue;
+    }
+    parts.push(part);
+  }
+  return `${prefix}${parts.join("/")}` || (rooted ? prefix : ".");
+}
+
+function standaloneFileValue(path) {
+  const files = globalThis.__cottontailStandaloneFiles;
+  if (files == null) return undefined;
+  const text = String(path);
+  const normalized = normalizeStandalonePath(text);
+  for (const candidate of normalized === text ? [text] : [text, normalized]) {
+    if (typeof files.has === "function" && typeof files.get === "function") {
+      if (files.has(candidate)) return files.get(candidate);
+    } else if (typeof files === "object" && Object.prototype.hasOwnProperty.call(files, candidate)) {
+      return files[candidate];
+    }
+  }
+  return undefined;
+}
+
+function standaloneFileBytes(path) {
+  const value = standaloneFileValue(path);
+  if (value === undefined) return null;
+  if (typeof value === "string") return new TextEncoder().encode(value);
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  return new TextEncoder().encode(String(value));
+}
+
 function pathFromBufferSource(value) {
   return validatePath(new TextDecoder().decode(bytesFromBufferSource(value)));
 }
@@ -178,6 +221,18 @@ function normalizedContentType(value, fallback) {
 }
 
 function currentStat(state) {
+  if (state.descriptor.kind === "path") {
+    const bytes = standaloneFileBytes(state.descriptor.path);
+    if (bytes != null) {
+      return {
+        size: bytes.byteLength,
+        mode: 0o100644,
+        mtimeMs: 0,
+        isFile: true,
+        isFIFO: false,
+      };
+    }
+  }
   return state.descriptor.kind === "fd"
     ? cottontail.fstatSync(state.descriptor.fd)
     : cottontail.statSync(state.descriptor.path, true);
@@ -379,6 +434,16 @@ function createFileReader(state, chunkSize = DEFAULT_CHUNK_SIZE) {
 }
 
 async function readFileBytes(state) {
+  if (state.descriptor.kind === "path") {
+    const embedded = standaloneFileBytes(state.descriptor.path);
+    if (embedded != null) {
+      const start = Math.min(state.start, embedded.byteLength);
+      const end = state.length == null
+        ? embedded.byteLength
+        : Math.min(embedded.byteLength, start + state.length);
+      return embedded.slice(start, end);
+    }
+  }
   const reader = createFileReader(state);
   const chunks = [];
   let length = 0;
@@ -400,6 +465,27 @@ function streamFile(state, chunkSize) {
     throw invalidArgumentType("chunkSize must be a number");
   }
   const normalizedChunkSize = Math.max(1, Math.trunc(Number(chunkSize)) || DEFAULT_CHUNK_SIZE);
+  if (state.descriptor.kind === "path") {
+    const embedded = standaloneFileBytes(state.descriptor.path);
+    if (embedded != null) {
+      const start = Math.min(state.start, embedded.byteLength);
+      const end = state.length == null
+        ? embedded.byteLength
+        : Math.min(embedded.byteLength, start + state.length);
+      let cursor = start;
+      return new ReadableStream({
+        pull(controller) {
+          if (cursor >= end) {
+            controller.close();
+            return;
+          }
+          const next = Math.min(end, cursor + normalizedChunkSize);
+          controller.enqueue(embedded.slice(cursor, next));
+          cursor = next;
+        },
+      });
+    }
+  }
   if (state.descriptor.kind === "fd" && state.cachedStream) return state.cachedStream;
 
   const reader = createFileReader(state, normalizedChunkSize);

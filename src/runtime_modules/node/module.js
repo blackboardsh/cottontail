@@ -1018,6 +1018,15 @@ function readModuleFile(path) {
   return String(embedded.value);
 }
 
+function standaloneFileBytes(value) {
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  return new TextEncoder().encode(String(value));
+}
+
 function modulePathExists(path) {
   if (standaloneFileEntry(path).found || standaloneDirectoryExists(path)) return true;
   try {
@@ -3026,11 +3035,19 @@ function importResolvedRuntimeModule(resolved, options = undefined, forceAsync =
     return cachedPluginModule.__cottontailPluginNamespace;
   }
   const loader = options?.with?.type ?? options?.assert?.type ?? options?.type;
+  const resolvedPath = splitSpecifierSuffix(resolved).bare;
   if (loader === "text") {
-    return { default: readModuleFile(splitSpecifierSuffix(resolved).bare) };
+    return { default: readModuleFile(resolvedPath) };
   }
   if (loader === "file") {
-    return { default: splitSpecifierSuffix(resolved).bare };
+    return { default: resolvedPath };
+  }
+  if (loader === "sqlite" || loader === "sqlite_embedded") {
+    const sqliteModule = loadBuiltinOrReplacement("bun:sqlite");
+    const Database = sqliteModule?.Database ?? sqliteModule?.default;
+    const embedded = standaloneFileEntry(resolvedPath);
+    const db = new Database(embedded.found ? standaloneFileBytes(embedded.value) : resolvedPath);
+    return { db, default: db, __esModule: true };
   }
   const resolvedMock = bunModuleMockFor(resolved);
   if (resolvedMock.found) return namespaceFromCommonJs(resolvedMock.value);
@@ -3042,7 +3059,6 @@ function importResolvedRuntimeModule(resolved, options = undefined, forceAsync =
   if (builtinModuleMap.has(resolved) || hasRuntimePackageReplacement(resolved)) {
     return namespaceFromBuiltin(resolved, loadBuiltinOrReplacement(resolved));
   }
-  const resolvedPath = splitSpecifierSuffix(resolved).bare;
   if (/\.html?$/i.test(resolvedPath)) {
     return { default: { index: resolvedPath, files: null } };
   }

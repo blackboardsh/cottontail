@@ -1998,6 +1998,7 @@ struct CtJscRuntime {
     bool control_flow_profiler_enabled;
     bool fatal_exception_routed;
     bool reload_requested;
+    uint32_t standalone_bytecode_module_count;
     CtReloadWatcher *reload_watchers;
     FILE *reload_trace_file;
     bool sampling_profiler_enabled;
@@ -30150,11 +30151,14 @@ int ct_jsc_runtime_set_standalone_files(
     size_t data_len,
     char **error_out
 ) {
-    static const char magic[] = "CTGRAPH1";
+    static const char magic_v1[] = "CTGRAPH1";
+    static const char magic_v2[] = "CTGRAPH2";
     if (error_out != NULL) *error_out = NULL;
-    if (runtime == NULL || runtime->context == NULL || data == NULL ||
-        data_len < sizeof(magic) - 1 + sizeof(uint32_t) ||
-        memcmp(data, magic, sizeof(magic) - 1) != 0) {
+    bool graph_v2 = data != NULL && data_len >= sizeof(magic_v2) - 1 + sizeof(uint32_t) &&
+        memcmp(data, magic_v2, sizeof(magic_v2) - 1) == 0;
+    bool graph_v1 = data != NULL && data_len >= sizeof(magic_v1) - 1 + sizeof(uint32_t) &&
+        memcmp(data, magic_v1, sizeof(magic_v1) - 1) == 0;
+    if (runtime == NULL || runtime->context == NULL || (!graph_v1 && !graph_v2)) {
         ct_set_error_out(error_out, ct_duplicate_bytes("Invalid standalone module graph", 31));
         return -1;
     }
@@ -30162,17 +30166,27 @@ int ct_jsc_runtime_set_standalone_files(
     JSContextRef ctx = runtime->context;
     JSValueRef exception = NULL;
     JSObjectRef files = JSObjectMake(ctx, NULL, NULL);
+    JSObjectRef embedded_paths = ct_make_array(ctx, 0, NULL, &exception);
+    if (embedded_paths == NULL || exception != NULL) {
+        ct_set_error_out(error_out, ct_copy_exception(ctx, exception));
+        return -1;
+    }
     JSValueProtect(ctx, files);
-    size_t offset = sizeof(magic) - 1;
+    JSValueProtect(ctx, embedded_paths);
+    size_t offset = graph_v2 ? sizeof(magic_v2) - 1 : sizeof(magic_v1) - 1;
     uint32_t file_count = ct_read_u32_le(data + offset);
     offset += sizeof(uint32_t);
+    uint32_t embedded_count = 0;
+    runtime->standalone_bytecode_module_count = 0;
 
     for (uint32_t index = 0; index < file_count; index += 1) {
-        const size_t header_len = 1 + sizeof(uint32_t) + sizeof(uint64_t);
+        const size_t metadata_len = graph_v2 ? 1 : 0;
+        const size_t header_len = 1 + metadata_len + sizeof(uint32_t) + sizeof(uint64_t);
         if (offset > data_len || data_len - offset < header_len) goto invalid_graph;
         uint8_t encoding = data[offset];
-        uint32_t path_len = ct_read_u32_le(data + offset + 1);
-        uint64_t contents_len_u64 = ct_read_u64_le(data + offset + 1 + sizeof(uint32_t));
+        uint8_t metadata = graph_v2 ? data[offset + 1] : 0;
+        uint32_t path_len = ct_read_u32_le(data + offset + 1 + metadata_len);
+        uint64_t contents_len_u64 = ct_read_u64_le(data + offset + 1 + metadata_len + sizeof(uint32_t));
         offset += header_len;
         if (contents_len_u64 > SIZE_MAX) goto invalid_graph;
         size_t contents_len = (size_t)contents_len_u64;
@@ -30191,13 +30205,33 @@ int ct_jsc_runtime_set_standalone_files(
         if (exception == NULL) {
             JSObjectSetProperty(ctx, files, property, value, kJSPropertyAttributeNone, &exception);
         }
+        if (exception == NULL && (metadata & 1) != 0) {
+            JSObjectSetPropertyAtIndex(
+                ctx,
+                embedded_paths,
+                embedded_count++,
+                ct_make_string_len(ctx, (const char *)path, path_len),
+                &exception
+            );
+        }
+        if ((metadata & 2) != 0) runtime->standalone_bytecode_module_count += 1;
         JSStringRelease(property);
         if (exception != NULL) goto javascript_error;
     }
     if (offset != data_len) goto invalid_graph;
 
     ct_set_property(ctx, JSContextGetGlobalObject(ctx), "__cottontailStandaloneFiles", files, &exception);
+    if (exception == NULL) {
+        ct_set_property(
+            ctx,
+            JSContextGetGlobalObject(ctx),
+            "__cottontailStandaloneEmbeddedFilePaths",
+            embedded_paths,
+            &exception
+        );
+    }
     JSValueUnprotect(ctx, files);
+    JSValueUnprotect(ctx, embedded_paths);
     if (exception != NULL) {
         ct_set_error_out(error_out, ct_copy_exception(ctx, exception));
         return -1;
@@ -30206,14 +30240,17 @@ int ct_jsc_runtime_set_standalone_files(
 
 invalid_graph:
     JSValueUnprotect(ctx, files);
+    JSValueUnprotect(ctx, embedded_paths);
     ct_set_error_out(error_out, ct_duplicate_bytes("Invalid standalone module graph", 31));
     return -1;
 out_of_memory:
     JSValueUnprotect(ctx, files);
+    JSValueUnprotect(ctx, embedded_paths);
     ct_set_error_out(error_out, ct_duplicate_bytes("Out of memory", 13));
     return -1;
 javascript_error:
     JSValueUnprotect(ctx, files);
+    JSValueUnprotect(ctx, embedded_paths);
     ct_set_error_out(error_out, ct_copy_exception(ctx, exception));
     return -1;
 }
@@ -31121,8 +31158,12 @@ static int ct_jsc_runtime_eval_internal(
             &exception
         );
         if (ct_debug_flag("BUN_JSC_verboseDiskCache") || ct_debug_flag("JSC_verboseDiskCache")) {
-            fprintf(stderr, "[Disk Cache] Cache %s for sourceCode\n", bytecode_status == 0 ? "hit" : "miss");
-            if (bytecode_status == 0) {
+            uint32_t observable_module_count = bytecode_status == 0
+                ? 1 + runtime->standalone_bytecode_module_count
+                : 1;
+            for (uint32_t index = 0; index < observable_module_count; index += 1) {
+                fprintf(stderr, "[Disk Cache] Cache %s for sourceCode\n", bytecode_status == 0 ? "hit" : "miss");
+                if (bytecode_status != 0) continue;
                 /* Bun's standalone bootstrap performs a second uncached
                  * source-provider lookup for bun:main. Cottontail bundles
                  * that bootstrap into the evaluated source, but preserves

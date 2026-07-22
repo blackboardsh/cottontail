@@ -581,7 +581,7 @@ fn process(
     parser_options.features.dead_code_elimination = config.dead_code_elimination;
     parser_options.features.trim_unused_imports = config.trim_unused_imports;
     parser_options.features.replace_exports = config.replace_exports;
-    parser_options.features.inlining = config.inlining or config.minify_syntax;
+    parser_options.features.inlining = config.inlining or config.minify_syntax or config.import_meta_main != null;
     parser_options.features.minify_syntax = config.minify_syntax;
     parser_options.features.minify_identifiers = config.minify_identifiers;
     parser_options.features.minify_whitespace = config.minify_whitespace;

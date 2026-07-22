@@ -17218,7 +17218,27 @@ export const markdown = {
     return renderMarkdownReact(markdownInput(input), components, options);
   },
 };
-export const embeddedFiles = [];
+function standaloneEmbeddedFileName(path) {
+  const normalized = String(path).replace(/\\/g, "/");
+  for (const prefix of ["/$bunfs/root/", "B:/~BUN/root/"]) {
+    if (normalized.startsWith(prefix)) return normalized.slice(prefix.length);
+  }
+  const separator = normalized.lastIndexOf("/");
+  return separator >= 0 ? normalized.slice(separator + 1) : normalized;
+}
+
+export const embeddedFiles = Array.from(
+  globalThis.__cottontailStandaloneEmbeddedFilePaths ?? [],
+  path => String(path),
+).sort().map(path => {
+  const embedded = file(path);
+  Object.defineProperty(embedded, "name", {
+    value: standaloneEmbeddedFileName(path),
+    configurable: true,
+    enumerable: true,
+  });
+  return embedded;
+});
 let gcAggressionLevelValue = 0;
 export const unsafe = {
   arrayBufferToString(value) {
