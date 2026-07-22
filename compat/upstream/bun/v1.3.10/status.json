@@ -4914,6 +4914,11 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 6 assertions)."
     },
+    "test/regression/issue/22978-createargv-double-free.test.ts": {
+      "status": "enabled",
+      "reason": "The copied 129-argument process.argv regression preserves executable and script identity and exits without the createArgv double-free; the executable-name fixture accepts Cottontail's intentional product branding (2 registered cases, 6 assertions, including 1 upstream todo).",
+      "timeoutMs": 120000
+    },
     "test/regression/issue/23022-stack-trace-iterator.test.ts": {
       "status": "enabled",
       "reason": "Bun.inspect handles stack frames without parenthesized function locations (1 case, 1 assertion)."

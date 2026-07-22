@@ -15,8 +15,9 @@ test("process.argv with many arguments doesn't double-free", async () => {
         length: argv.length,
         // Check that all arguments are present and valid
         hasAllArgs: argv.slice(2).every((arg, i) => arg === \`arg\${i}\`),
-        // The first two should be the executable and script path
-        hasExe: argv[0].includes("bun"),
+        // COTTONTAIL-COMPAT: Preserve the executable identity assertion while
+        // accepting this runtime's intentional product name.
+        hasExe: argv[0].includes("bun") || argv[0].includes("cottontail"),
         hasScript: argv[1].endsWith("check-argv.js")
       }));
     `,
