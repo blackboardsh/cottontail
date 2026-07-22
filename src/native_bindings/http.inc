@@ -1,0 +1,8 @@
+CT_NATIVE_BINDING("httpServerStart", ct_http_server_start)
+CT_NATIVE_BINDING("httpServerPoll", ct_http_server_poll)
+CT_NATIVE_BINDING("httpServerRespond", ct_http_server_respond)
+CT_NATIVE_BINDING("httpServerResponseStart", ct_http_server_response_start)
+CT_NATIVE_BINDING("httpServerResponseWrite", ct_http_server_response_write)
+CT_NATIVE_BINDING("httpServerResponseEnd", ct_http_server_response_end)
+CT_NATIVE_BINDING("httpServerResponseAbort", ct_http_server_response_abort)
+CT_NATIVE_BINDING("httpServerStop", ct_http_server_stop)

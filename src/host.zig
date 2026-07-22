@@ -82,23 +82,6 @@ pub fn configure(io: std.Io) void {
     host_io = io;
 }
 
-pub fn forceLink() void {
-    _ = &ct_host_string_free;
-    _ = &ct_host_buffer_free;
-    _ = &ct_host_exists;
-    _ = &ct_host_mkdir;
-    _ = &ct_host_rm;
-    _ = &ct_host_rmdir;
-    _ = &ct_host_unlink;
-    _ = &ct_host_chmod;
-    _ = &ct_host_spawn_sync;
-    _ = &ct_semver_order;
-    _ = &ct_semver_satisfies;
-    _ = &ct_hosted_git_info_parse_url;
-    _ = &ct_hosted_git_info_from_url;
-    _ = &ct_package_manager_parse_lockfile;
-}
-
 pub fn getIo() std.Io {
     return host_io orelse @panic("cottontail host IO is not configured");
 }
@@ -205,7 +188,7 @@ fn allocBuffer(bytes: []const u8) ?[*]u8 {
     return ptr;
 }
 
-export fn ct_semver_order(
+pub export fn ct_semver_order(
     left_ptr: [*]const u8,
     left_len: usize,
     right_ptr: [*]const u8,
@@ -242,7 +225,7 @@ export fn ct_semver_order(
     return 0;
 }
 
-export fn ct_semver_satisfies(
+pub export fn ct_semver_satisfies(
     version_ptr: [*]const u8,
     version_len: usize,
     range_ptr: [*]const u8,
@@ -288,7 +271,7 @@ export fn ct_semver_satisfies(
     return 0;
 }
 
-export fn ct_hosted_git_info_parse_url(
+pub export fn ct_hosted_git_info_parse_url(
     input_ptr: [*]const u8,
     input_len: usize,
     output_len: *usize,
@@ -310,7 +293,7 @@ export fn ct_hosted_git_info_parse_url(
     };
 }
 
-export fn ct_hosted_git_info_from_url(
+pub export fn ct_hosted_git_info_from_url(
     input_ptr: [*]const u8,
     input_len: usize,
     output_len: *usize,
@@ -357,7 +340,7 @@ export fn ct_hosted_git_info_from_url(
     };
 }
 
-export fn ct_package_manager_parse_lockfile(
+pub export fn ct_package_manager_parse_lockfile(
     cwd_ptr: [*]const u8,
     cwd_len: usize,
     output_len: *usize,
@@ -798,19 +781,19 @@ fn waitForConstrainedChild(
     }
 }
 
-export fn ct_host_string_free(value: ?[*:0]u8) void {
+pub export fn ct_host_string_free(value: ?[*:0]u8) void {
     if (value) |ptr| {
         c.free(@ptrCast(ptr));
     }
 }
 
-export fn ct_host_buffer_free(value: ?[*]u8) void {
+pub export fn ct_host_buffer_free(value: ?[*]u8) void {
     if (value) |ptr| {
         c.free(@ptrCast(ptr));
     }
 }
 
-export fn ct_host_exists(path: [*:0]const u8) bool {
+pub export fn ct_host_exists(path: [*:0]const u8) bool {
     const sub_path = std.mem.span(path);
     if (comptime builtin.os.tag == .windows) {
         return windowsPathAttributes(sub_path) != null;
@@ -819,7 +802,7 @@ export fn ct_host_exists(path: [*:0]const u8) bool {
     return true;
 }
 
-export fn ct_host_mkdir(path: [*:0]const u8, recursive: bool, error_out: *?[*:0]u8) c_int {
+pub export fn ct_host_mkdir(path: [*:0]const u8, recursive: bool, error_out: *?[*:0]u8) c_int {
     error_out.* = null;
 
     const cwd = std.Io.Dir.cwd();
@@ -840,7 +823,7 @@ export fn ct_host_mkdir(path: [*:0]const u8, recursive: bool, error_out: *?[*:0]
     return 0;
 }
 
-export fn ct_host_rm(
+pub export fn ct_host_rm(
     path: [*:0]const u8,
     recursive: bool,
     force: bool,
@@ -870,7 +853,7 @@ export fn ct_host_rm(
     return 0;
 }
 
-export fn ct_host_rmdir(path: [*:0]const u8, error_out: *?[*:0]u8) c_int {
+pub export fn ct_host_rmdir(path: [*:0]const u8, error_out: *?[*:0]u8) c_int {
     error_out.* = null;
 
     std.Io.Dir.cwd().deleteDir(getIo(), std.mem.span(path)) catch |err| {
@@ -881,7 +864,7 @@ export fn ct_host_rmdir(path: [*:0]const u8, error_out: *?[*:0]u8) c_int {
     return 0;
 }
 
-export fn ct_host_unlink(path: [*:0]const u8, error_out: *?[*:0]u8) c_int {
+pub export fn ct_host_unlink(path: [*:0]const u8, error_out: *?[*:0]u8) c_int {
     error_out.* = null;
 
     const cwd = std.Io.Dir.cwd();
@@ -911,7 +894,7 @@ export fn ct_host_unlink(path: [*:0]const u8, error_out: *?[*:0]u8) c_int {
     return 0;
 }
 
-export fn ct_host_chmod(path: [*:0]const u8, mode: c_uint, error_out: *?[*:0]u8) c_int {
+pub export fn ct_host_chmod(path: [*:0]const u8, mode: c_uint, error_out: *?[*:0]u8) c_int {
     error_out.* = null;
 
     const permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode"))
@@ -927,7 +910,7 @@ export fn ct_host_chmod(path: [*:0]const u8, mode: c_uint, error_out: *?[*:0]u8)
     return 0;
 }
 
-export fn ct_host_spawn_sync(
+pub export fn ct_host_spawn_sync(
     file: [*:0]const u8,
     args_ptr: ?[*]const [*:0]const u8,
     arg_count: usize,
