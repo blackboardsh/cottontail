@@ -1683,11 +1683,18 @@ struct CtJscRuntime {
     bool next_tick_priority_armed;
     bool fatal_exception_routed;
     bool execution_time_limit_installed;
+    CtJscShouldTerminateCallback should_terminate_callback;
+    void *should_terminate_context;
 #if !defined(_WIN32)
     CtSignalWatcher signal_watchers[CT_SIGNAL_WATCHER_CAPACITY];
     size_t signal_watcher_count;
 #endif
 };
+
+static bool ct_jsc_runtime_should_terminate(CtJscRuntime *runtime) {
+    return runtime != NULL && runtime->should_terminate_callback != NULL &&
+        runtime->should_terminate_callback(runtime->context, runtime->should_terminate_context);
+}
 
 static void ct_uv_wake_callback(uv_async_t *handle) {
     (void)handle;
@@ -20320,10 +20327,18 @@ static JSValueRef ct_worker_post_message_to(JSContextRef ctx, JSObjectRef functi
     }
 
     pthread_mutex_lock(&worker->mutex);
-    int status = ct_worker_queue_push_locked(&worker->parent_to_worker_head, &worker->parent_to_worker_tail, json);
+    bool available = !worker->terminate_requested && !worker->finishing && !worker->finished;
+    int status = available
+        ? ct_worker_queue_push_locked(&worker->parent_to_worker_head, &worker->parent_to_worker_tail, json)
+        : 0;
+    if (available && status == 0) ct_runtime_wake(worker->runtime);
     pthread_mutex_unlock(&worker->mutex);
     free(json);
 
+    if (!available) {
+        ct_throw_message(ctx, exception, "worker not found");
+        return JSValueMakeUndefined(ctx);
+    }
     if (status != 0) {
         ct_throw_message(ctx, exception, "Out of memory");
         return JSValueMakeUndefined(ctx);
@@ -24060,6 +24075,8 @@ static CtJscRuntime *ct_jsc_runtime_create_internal(
     if (runtime == NULL) return NULL;
     runtime->start_time_ns = uv_hrtime();
     runtime->next_tick_priority_armed = true;
+    runtime->should_terminate_callback = terminate_callback;
+    runtime->should_terminate_context = terminate_context;
     /* Expose the native SuppressedError global (explicit resource management).
      * JSC latches options from the environment at first VM creation. */
     const char *explicit_resource_option = getenv("JSC_useExplicitResourceManagement");
@@ -25320,6 +25337,7 @@ int ct_jsc_runtime_emit_process_shutdown(
 static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_out, char **error_out) {
     if (error_out != NULL) *error_out = NULL;
     if (delay_ms_out != NULL) *delay_ms_out = 16;
+    if (ct_jsc_runtime_should_terminate(runtime)) return -1;
     JSContextRef ctx = runtime->context;
     ct_jsc_run_loop_cycle();
     if (runtime->uv_loop_initialized) (void)ct_runtime_uv_run(runtime, UV_RUN_NOWAIT);

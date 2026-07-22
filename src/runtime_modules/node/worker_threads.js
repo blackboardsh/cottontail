@@ -23,11 +23,29 @@ const typedArrayConstructors = {
 const environmentData = new Map();
 const markedUntransferable = new WeakSet();
 const markedUncloneable = new WeakSet();
-const broadcastChannelBrand = new WeakSet();
+const crossThreadMessagingStateKey = Symbol.for("cottontail.worker_threads.crossThreadMessagingState");
+let crossThreadMessagingState = globalThis[crossThreadMessagingStateKey];
+if (!crossThreadMessagingState) {
+  crossThreadMessagingState = {
+    broadcastChannelBrand: new WeakSet(),
+    broadcastChannels: new Map(),
+    broadcastChannelIds: new Map(),
+    broadcastSubscriptions: new Map(),
+    threadMessageRequests: new Map(),
+    nextBroadcastChannelId: 1,
+    nextThreadMessageRequestId: 1,
+  };
+  Object.defineProperty(globalThis, crossThreadMessagingStateKey, {
+    configurable: true,
+    value: crossThreadMessagingState,
+  });
+}
+const broadcastChannelBrand = crossThreadMessagingState.broadcastChannelBrand;
 const workerInstances = new Map();
-const broadcastChannels = new Map();
-const broadcastChannelIds = new Map();
-const broadcastSubscriptions = new Map();
+const broadcastChannels = crossThreadMessagingState.broadcastChannels;
+const broadcastChannelIds = crossThreadMessagingState.broadcastChannelIds;
+const broadcastSubscriptions = crossThreadMessagingState.broadcastSubscriptions;
+const threadMessageRequests = crossThreadMessagingState.threadMessageRequests;
 const transferredPortPeers = new Map();
 const transferredPortRoutes = new Map();
 const transferredPortTargets = new Map();
@@ -38,14 +56,11 @@ const workerControlEnvelopeKey = "__cottontailWorkerThreadsControl";
 const messagePortBrand = Symbol.for("cottontail.worker_threads.MessagePort");
 const createMessagePortToken = {};
 let nextPortId = 1;
-let nextBroadcastChannelId = 1;
 let nextWorkerControlRequestId = 1;
-let nextThreadMessageRequestId = 1;
 let nextSharedEnvironmentGroupId = 1;
 let activeSharedEnvironmentGroupId = null;
 let sharedEnvironmentProxyInstalled = false;
 let applyingSharedEnvironmentUpdate = false;
-const threadMessageRequests = new Map();
 const inheritedUncaughtExceptionListeners = new Set(globalThis.process?.listeners?.("uncaughtException") ?? []);
 let workerUserCaptureCallbackInstalled = false;
 
@@ -1590,7 +1605,7 @@ export class BroadcastChannel extends EventEmitter {
     super();
     broadcastChannelBrand.add(this);
     this._name = String(name);
-    this._id = `${threadId}:${nextBroadcastChannelId++}`;
+    this._id = `${threadId}:${crossThreadMessagingState.nextBroadcastChannelId++}`;
     this.onmessage = null;
     this.onmessageerror = null;
     this._closed = false;
@@ -2272,7 +2287,7 @@ export function postMessageToThread(targetThreadId, value, transferList = undefi
     return Promise.reject(invalidArgumentType("timeout", "a non-negative number", timeout));
   }
 
-  const requestId = `${threadId}:${nextThreadMessageRequestId++}`;
+  const requestId = `${threadId}:${crossThreadMessagingState.nextThreadMessageRequestId++}`;
   let encoded;
   try {
     encoded = encodeWireMessage({
