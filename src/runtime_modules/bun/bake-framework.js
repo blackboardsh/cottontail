@@ -330,6 +330,10 @@ export function discoverClientBoundaries({
     if (visited.has(filename)) return;
     visited.add(filename);
 
+    // Custom loaders are scanned after plugin onLoad callbacks have produced
+    // JavaScript in pluginClientBoundaryReplacements().
+    if (!javascriptExtensions.includes(path.extname(filename).toLowerCase())) return;
+
     let source;
     try {
       source = readModuleSource(filename, files, builtInSources);
