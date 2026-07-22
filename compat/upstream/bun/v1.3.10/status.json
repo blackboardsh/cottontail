@@ -103,6 +103,13 @@
       "reason": "The copied Bun init corpus passes with interactive and noninteractive defaults, JavaScript/TypeScript choices, deterministic package metadata, overwrite handling, and generated file contents (10 cases, 76 assertions)."
     },
     {
+      "pattern": "^test/cli/heap-prof\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "All seven copied profiling cases pass with Bun-compatible option validation, naming, directories, lifecycle flushing, and truthful stock-JSC sampling-profiler failure handling (55 assertions).",
+      "args": ["--timeout=20000"],
+      "timeoutMs": 180000
+    },
+    {
       "pattern": "^test/js/node/(?:cluster\\.test\\.ts|util/node-inspect-tests/parallel/util-inspect-getters-accessing-this\\.test\\.js)$",
       "status": "enabled",
       "reason": "Serially confirmed after unclassified discovery: Node cluster compatibility and util.inspect getter receiver behavior pass four copied upstream cases."
