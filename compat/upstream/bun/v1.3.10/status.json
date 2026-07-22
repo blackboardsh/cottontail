@@ -731,6 +731,10 @@
       "status": "enabled",
       "reason": "Bake React rendering, redirects, JSX response options, streaming fallbacks, rewrites, dynamic routes, and concurrent request isolation pass all 11 copied cases (109 assertions)."
     },
+    "test/bake/dev/react-spa.test.ts": {
+      "status": "enabled",
+      "reason": "Bake React HTML routes, refresh registration, hook-state preservation, custom hooks, and mutually recursive components pass all 6 copied cases (13 assertions)."
+    },
     "test/bake/dev/sourcemap.test.ts": {
       "status": "enabled",
       "reason": "Bake client source maps preserve original sources across primary and hot-reload chunks (2 cases, 6 assertions)."
