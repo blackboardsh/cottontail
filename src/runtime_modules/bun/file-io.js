@@ -828,7 +828,10 @@ function immediateSource(data) {
 
 function ensureDestinationParent(destination, options) {
   if (destination.kind !== "path" || !options.createPath) return;
-  try { cottontail.mkdirSync(pathDirname(destination.path), true); } catch (error) {
+  const parent = pathDirname(destination.path);
+  try {
+    if (!cottontail.existsSync(parent)) cottontail.mkdirSync(parent, true);
+  } catch (error) {
     throw makeBunFileError(error, destination.path, "mkdir");
   }
 }

@@ -537,7 +537,10 @@ const NodeGypWrapper = struct {
     fn create(init: std.process.Init) !NodeGypWrapper {
         const allocator = init.arena.allocator();
         const base = temporaryDirectory(init.environ_map);
-        try std.Io.Dir.cwd().createDirPath(init.io, base);
+        std.Io.Dir.cwd().access(init.io, base, .{}) catch |err| switch (err) {
+            error.FileNotFound => try std.Io.Dir.cwd().createDirPath(init.io, base),
+            else => return err,
+        };
 
         var directory: []const u8 = undefined;
         for (0..8) |_| {

@@ -103,6 +103,7 @@ export const W_OK = constants.W_OK ?? 2;
 export const X_OK = constants.X_OK ?? 1;
 
 function normalizePath(path) {
+  if (path instanceof String) path = String(path);
   if (path instanceof Uint8Array) {
     const decoded = decoder.decode(path);
     if (decoded.includes("\0")) throw invalidArgValue("path", decoded, "must be a string without null bytes");

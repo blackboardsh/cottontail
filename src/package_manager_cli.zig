@@ -2585,7 +2585,9 @@ const Manager = struct {
             environment.get("TEMP") orelse
             environment.get("TMP") orelse
             if (builtin.os.tag == .windows) "." else "/tmp";
-        try std.Io.Dir.cwd().createDirPath(manager.init_data.io, temp_dir);
+        if (!manager.pathExists(temp_dir)) {
+            try std.Io.Dir.cwd().createDirPath(manager.init_data.io, temp_dir);
+        }
         const path = try std.fmt.allocPrint(
             manager.allocator,
             "{s}/cottontail-security-runtime-{x}-{x}.mjs",
