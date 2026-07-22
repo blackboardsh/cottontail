@@ -1012,6 +1012,15 @@
       "status": "enabled",
       "reason": "Bun pack file selection, workspaces, lifecycle scripts, bundled dependencies, metadata rewriting, destination flags, permissions, Unicode paths, and tarball integrity pass all 69 copied cases with 524 assertions."
     },
+    "test/cli/install/bun-update.test.ts": {
+      "status": "enabled",
+      "reason": "Dependency updates, missing node_modules restoration, no-change lockfile preservation, catalogs, and recursive workspace updates pass all 5 copied cases (139 assertions)."
+    },
+    "test/cli/install/bun-upgrade.test.ts": {
+      "status": "enabled",
+      "reason": "Self-upgrade argument diagnostics, help and stable/profile flags, and mocked insecure-TLS release discovery pass all 6 copied cases (11 assertions); concurrent binary-copy subprocesses require a larger outer budget.",
+      "timeoutMs": 120000
+    },
     "test/cli/install/lockfile-only.test.ts": {
       "status": "enabled",
       "reason": "Text and binary lockfile-only installs fetch package metadata without downloading tarballs and report the selected output format correctly (2 bun:test cases, 20 assertions)."

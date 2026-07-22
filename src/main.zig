@@ -11,6 +11,7 @@ const package_manager_lockfile = @import("package_manager_lockfile.zig");
 const package_manager_bunx = @import("package_manager_bunx.zig");
 const package_manager_cli = @import("package_manager_cli.zig");
 const package_manager_create = @import("package_manager_create.zig");
+const package_manager_upgrade = @import("package_manager_upgrade.zig");
 const cli_script_command = @import("cli_script_command.zig");
 const repl = @import("repl.zig");
 const signal_forwarding = @import("signal_forwarding.zig");
@@ -2909,6 +2910,12 @@ pub fn main(init: std.process.Init) !void {
                 return;
             }
         }
+    }
+
+    if (std.mem.eql(u8, arg, "upgrade")) {
+        const exit_code = try package_manager_upgrade.run(init, args, stdout, stderr);
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
     }
 
     if (package_manager_cli.recognizes(arg)) {

@@ -1066,7 +1066,7 @@ fn runPublish(
         };
     }
     if (!options.silent) {
-        try stdout.print("bun publish v{s} (cottontail v{s})\n", .{ bun_compat_version, version });
+        try stdout.print("bun publish v{s} (cottontail)\n", .{bun_compat_version});
         try stdout.flush();
     }
 
@@ -3601,7 +3601,7 @@ const Manager = struct {
             manager.options.command == .add
         else
             manager.workspaces.count() == 0 and
-                (manager.options.command == .add or manager.options.command == .install or
+                (manager.options.command == .add or manager.options.command == .install or manager.options.command == .update or
                     manager.options.cpu_overridden or manager.options.os_overridden);
         if (!uses_explicit_install_cache and create_project_cache) {
             const cache = try std.fs.path.join(manager.allocator, &.{ node_modules, ".cache" });
@@ -3790,7 +3790,8 @@ const Manager = struct {
             linker_explicit,
         );
 
-        const bunfig_path = manager.options.config_path orelse "bunfig.toml";
+        const bunfig_path = manager.options.config_path orelse
+            try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "bunfig.toml" });
         const bunfig: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(
             manager.init_data.io,
             bunfig_path,
@@ -5141,6 +5142,7 @@ const Manager = struct {
         var handled = std.StringHashMap(void).init(manager.allocator);
         defer handled.deinit();
         var update_output: std.Io.Writer.Allocating = .init(manager.allocator);
+        var reinstalled_output: std.Io.Writer.Allocating = .init(manager.allocator);
 
         for (update_dependency_sections) |dependency_section| {
             const section_value = package_json.object.getPtr(dependency_section.name) orelse continue;
@@ -5193,7 +5195,14 @@ const Manager = struct {
                         manager.changed = previous_changed;
                     }
                 }
-                try manager.appendUpdateOutput(&update_output.writer, name, result, request != null);
+                const was_reinstalled = manager.installed_count > previous_installed_count and
+                    result.previous_version != null and
+                    std.mem.eql(u8, result.previous_version.?, result.resolved_version);
+                if (request == null and was_reinstalled) {
+                    try reinstalled_output.writer.print("+ {s}@{s}\n", .{ name, result.resolved_version });
+                } else {
+                    try manager.appendUpdateOutput(&update_output.writer, name, result, request != null);
+                }
             }
         }
 
@@ -5239,7 +5248,13 @@ const Manager = struct {
         }
 
         try manager.installRoot(manager.root_package_json.?, true);
-        if (!manager.options.silent) try manager.stdout.writeAll(update_output.written());
+        if (!manager.options.silent) {
+            try manager.stdout.writeAll(update_output.written());
+            if (update_output.written().len > 0 and reinstalled_output.written().len > 0) {
+                try manager.stdout.writeByte('\n');
+            }
+            try manager.stdout.writeAll(reinstalled_output.written());
+        }
     }
 
     fn parseUpdateRequests(manager: *Manager) ![]const UpdateRequest {
@@ -5477,7 +5492,7 @@ const Manager = struct {
             } else {
                 try manager.stdout.print("+ {s}@{s}", .{ report.alias, report.display });
                 if (report.latest_version) |latest| {
-                    if (!std.mem.eql(u8, latest, report.display)) {
+                    if (semverVersionLessThan(report.display, latest)) {
                         try manager.stdout.print(" (v{s} available)", .{latest});
                     }
                 }
