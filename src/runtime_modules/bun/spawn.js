@@ -646,6 +646,7 @@ export function createBunSpawnRuntime(deps) {
   function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined) {
     const [file, args, options] = normalizeCommand(command, maybeArgsOrOptions, maybeOptions);
     validateInput(file, args, options);
+    const deferStart = isCurrentExecutable(file);
     const nativeOptions = prepareNativeOptions(
       file,
       normalizeOptions(options, { stdin: "ignore", stdout: "pipe", stderr: "inherit" }, false),
@@ -826,6 +827,7 @@ export function createBunSpawnRuntime(deps) {
         argv0: nativeOptions.argv0,
         detached: nativeOptions.detached,
         terminalFd: terminalSpawnFd(terminal),
+        deferStart,
       });
     } catch (error) {
       if (readableInput != null && !readableInput.finished) void readableInput.cancel(error);
@@ -1012,6 +1014,10 @@ export function createBunSpawnRuntime(deps) {
         if (event.type === "close") completeClose();
       });
     });
+
+    // A Cottontail child can publish IPC or exit before the host listener is
+    // registered. Release it only after this listener owns every process event.
+    if (deferStart) host.spawnRelease?.(native.id);
 
     if (nativeOptions.signal != null) {
       abortHandler = () => {

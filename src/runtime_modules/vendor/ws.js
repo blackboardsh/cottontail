@@ -129,7 +129,26 @@ function eventTargetMessageData(data, isBinary) {
 }
 
 function createEvent(type, target, properties = undefined) {
-  return Object.assign({ type, target, currentTarget: target }, properties);
+  const init = properties ?? {};
+  let event;
+  try {
+    if (type === "message" || type === "ping" || type === "pong") {
+      event = new MessageEvent(type, { data: init.data });
+    } else if (type === "close") {
+      event = new CloseEvent(type, init);
+    } else if (type === "error") {
+      event = new ErrorEvent(type, init);
+    } else {
+      event = new Event(type);
+    }
+    Object.defineProperties(event, {
+      target: { configurable: true, value: target },
+      currentTarget: { configurable: true, value: target },
+    });
+    return event;
+  } catch {
+    return Object.assign({ type, target, currentTarget: target }, init);
+  }
 }
 
 function callEventListener(listener, target, event) {
@@ -296,36 +315,42 @@ class WebSocket extends EventEmitter {
   }
 
   ping(data, mask, callback) {
+    if (this.readyState === CONNECTING) {
+      throw new Error("WebSocket is not open: readyState 0 (CONNECTING)");
+    }
     if (typeof data === "function") {
       callback = data;
       data = undefined;
     } else if (typeof mask === "function") {
       callback = mask;
     }
-    if (typeof data === "number") data = String(data);
+    if (data == null || typeof data === "number") data = String(data);
     try {
       this._ws.ping(data);
       if (typeof callback === "function") callback();
     } catch (error) {
       if (typeof callback === "function") callback(error);
-      else throw error;
+      else this.emit("error", error);
     }
   }
 
   pong(data, mask, callback) {
+    if (this.readyState === CONNECTING) {
+      throw new Error("WebSocket is not open: readyState 0 (CONNECTING)");
+    }
     if (typeof data === "function") {
       callback = data;
       data = undefined;
     } else if (typeof mask === "function") {
       callback = mask;
     }
-    if (typeof data === "number") data = String(data);
+    if (data == null || typeof data === "number") data = String(data);
     try {
       this._ws.pong(data);
       if (typeof callback === "function") callback();
     } catch (error) {
       if (typeof callback === "function") callback(error);
-      else throw error;
+      else this.emit("error", error);
     }
   }
 
@@ -354,7 +379,7 @@ class WebSocket extends EventEmitter {
   get binaryType() { return this._binaryType; }
   set binaryType(value) {
     if (value !== "nodebuffer" && value !== "arraybuffer" && value !== "fragments") {
-      throw new TypeError(`Invalid binaryType: ${value}`);
+      throw new Error(`Invalid binaryType: ${value}`);
     }
     this._binaryType = value;
     this._fragments = value === "fragments";
@@ -364,12 +389,18 @@ class WebSocket extends EventEmitter {
   addEventListener(type, listener, options = undefined) {
     type = String(type);
     if (typeof listener !== "function" && typeof listener?.handleEvent !== "function") return;
+    const signal = options && typeof options === "object" ? options.signal : undefined;
+    if (signal?.aborted) return;
     let listeners = this._eventListeners.get(type);
     if (!listeners) this._eventListeners.set(type, listeners = new Map());
     if (listeners.has(listener)) return;
-    const once = options === true || options?.once === true;
+    const once = options && typeof options === "object" && options.once === true;
+    let abortListener;
     const invoke = (event) => {
-      if (once) listeners.delete(listener);
+      if (once) {
+        listeners.delete(listener);
+        if (abortListener) signal.removeEventListener("abort", abortListener);
+      }
       callEventListener(listener, this, event);
     };
     let wrapped;
@@ -390,15 +421,23 @@ class WebSocket extends EventEmitter {
       wrapped = () => invoke(createEvent(type, this));
     }
     listeners.set(listener, wrapped);
+    if (signal?.addEventListener) {
+      abortListener = () => this.removeEventListener(type, listener);
+      wrapped._eventTargetSignal = signal;
+      wrapped._eventTargetAbortListener = abortListener;
+      signal.addEventListener("abort", abortListener, { once: true });
+    }
     if (once) this.once(type, wrapped);
     else this.on(type, wrapped);
   }
 
   removeEventListener(type, listener) {
+    type = String(type);
     const listeners = this._eventListeners.get(type);
     const wrapped = listeners?.get(listener);
     if (!wrapped) return;
     this.off(type, wrapped);
+    wrapped._eventTargetSignal?.removeEventListener?.("abort", wrapped._eventTargetAbortListener);
     listeners.delete(listener);
   }
 

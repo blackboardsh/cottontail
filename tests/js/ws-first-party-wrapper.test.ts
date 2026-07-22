@@ -57,7 +57,10 @@ test("ws forwards client options through its finishRequest facade", async () => 
 test("ws EventTarget listeners receive browser-shaped text and close events", async () => {
   const server = new WebSocketServer({ port: 0 });
   await once(server, "listening");
-  server.once("connection", (socket) => socket.send("hello", { binary: false }));
+  server.once("connection", (socket) => {
+    socket.send("hello", { binary: false });
+    socket.send("again", { binary: false });
+  });
 
   const address = server.address();
   if (address == null || typeof address === "string") throw new Error("expected an IP listener");
@@ -65,6 +68,25 @@ test("ws EventTarget listeners receive browser-shaped text and close events", as
 
   try {
     expect(client.url.startsWith("ws://")).toBe(true);
+    expect(() => client.ping()).toThrow("WebSocket is not open: readyState 0 (CONNECTING)");
+    try {
+      client.binaryType = "invalid";
+      throw new Error("expected binaryType assignment to fail");
+    } catch (error) {
+      expect(error?.name).toBe("Error");
+      expect(error?.message).toBe("Invalid binaryType: invalid");
+    }
+    const aborted = new AbortController();
+    let abortedCalls = 0;
+    client.addEventListener("message", () => abortedCalls++, { signal: aborted.signal });
+    aborted.abort();
+    const persistentMessages = new Promise<string[]>((resolve) => {
+      const values: string[] = [];
+      client.addEventListener("message", (event) => {
+        values.push(event.data);
+        if (values.length === 2) resolve(values);
+      }, true);
+    });
     const message = await new Promise<MessageEvent>((resolve) => {
       client.addEventListener("message", {
         handleEvent(event) {
@@ -72,9 +94,12 @@ test("ws EventTarget listeners receive browser-shaped text and close events", as
         },
       }, { once: true });
     });
+    expect(message).toBeInstanceOf(MessageEvent);
     expect(message.data).toBe("hello");
     expect(message.target).toBe(client);
     expect(message.currentTarget).toBe(client);
+    expect(await persistentMessages).toEqual(["hello", "again"]);
+    expect(abortedCalls).toBe(0);
 
     const close = new Promise<CloseEvent>((resolve) => client.addEventListener("close", resolve, { once: true }));
     client.close(1000, "done");
@@ -82,6 +107,40 @@ test("ws EventTarget listeners receive browser-shaped text and close events", as
     expect(event.code).toBe(1000);
     expect(event.reason).toBe("done");
     expect(event.wasClean).toBe(true);
+  } finally {
+    client.terminate();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("ws coerces nullish ping and pong payloads like Bun", async () => {
+  const server = new WebSocketServer({ port: 0 });
+  await once(server, "listening");
+  const controls = new Promise<{ pings: string[]; pongs: string[] }>((resolve) => {
+    server.once("connection", (socket) => {
+      const pings: string[] = [];
+      const pongs: string[] = [];
+      const finish = () => {
+        if (pings.length === 2 && pongs.length === 2) resolve({ pings, pongs });
+      };
+      socket.on("ping", (data) => { pings.push(data.toString()); finish(); });
+      socket.on("pong", (data) => { pongs.push(data.toString()); finish(); });
+    });
+  });
+  const address = server.address();
+  if (address == null || typeof address === "string") throw new Error("expected an IP listener");
+  const client = new WebSocket(`ws://127.0.0.1:${address.port}/controls`);
+
+  try {
+    await once(client, "open");
+    client.ping();
+    client.ping(null);
+    client.pong();
+    client.pong(null);
+    expect(await controls).toEqual({
+      pings: ["undefined", "null"],
+      pongs: ["undefined", "null"],
+    });
   } finally {
     client.terminate();
     await new Promise<void>((resolve) => server.close(() => resolve()));

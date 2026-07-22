@@ -213,6 +213,24 @@ test("Bun.spawn advanced IPC round-trips through a subprocess", async () => {
   expect(await child.exited).toBe(0);
 });
 
+test("Bun.spawn observes immediate child IPC and exit", async () => {
+  let resolveMessage!: (message: unknown) => void;
+  const message = new Promise<unknown>((resolve) => {
+    resolveMessage = resolve;
+  });
+  const child = Bun.spawn({
+    cmd: [process.execPath, "-e", 'process.send({ ready: true }); process.exit(0)'],
+    serialization: "json",
+    ipc: resolveMessage,
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "inherit",
+  });
+
+  expect(await message).toEqual({ ready: true });
+  expect(await child.exited).toBe(0);
+});
+
 test("node:child_process advanced IPC is available before the child imports modules", async () => {
   const childPath = join(import.meta.dir, "fixtures", "child-process-ipc-bootstrap-child.js");
   const child = fork(childPath, [], { serialization: "advanced", silent: true });
