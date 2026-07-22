@@ -59,11 +59,18 @@ const ScriptExecution = struct {
     process_args: []const [:0]const u8,
     process_user_arg_offset: usize,
     exec_args: []const [:0]const u8,
+    inspector: ?InspectorLaunch = null,
     embedded_source: ?[]const u8 = null,
     embedded_source_map: ?[]const u8 = null,
     embedded_files: ?[]const u8 = null,
     exit_cleanup_path: ?[:0]const u8 = null,
     exit_code: u8 = 1,
+};
+
+const InspectorLaunch = struct {
+    options: runtime.InspectorOptions,
+    wait_for_connection: bool = false,
+    automatic: bool = false,
 };
 
 const WindowsScriptThread = struct {
@@ -1799,6 +1806,156 @@ fn applyRuntimeEnvFlags(io: std.Io, allocator: std.mem.Allocator, exec_args: []c
     return true;
 }
 
+const InspectorFlag = struct {
+    address: []const u8,
+    wait_for_connection: bool,
+    pause_on_start: bool,
+};
+
+fn inspectorFlagValue(exec_args: []const [:0]const u8, name: []const u8) ?[]const u8 {
+    for (exec_args, 0..) |arg_z, index| {
+        const arg: []const u8 = arg_z;
+        if (std.mem.eql(u8, arg, name)) {
+            if (index + 1 < exec_args.len and !std.mem.startsWith(u8, exec_args[index + 1], "-"))
+                return exec_args[index + 1];
+            return "";
+        }
+        if (arg.len > name.len and std.mem.startsWith(u8, arg, name) and arg[name.len] == '=')
+            return arg[name.len + 1 ..];
+    }
+    return null;
+}
+
+fn inspectorFlag(exec_args: []const [:0]const u8) ?InspectorFlag {
+    if (inspectorFlagValue(exec_args, "--inspect")) |address| return .{
+        .address = address,
+        .wait_for_connection = false,
+        .pause_on_start = false,
+    };
+    if (inspectorFlagValue(exec_args, "--inspect-wait")) |address| return .{
+        .address = address,
+        .wait_for_connection = true,
+        .pause_on_start = false,
+    };
+    if (inspectorFlagValue(exec_args, "--inspect-brk")) |address| return .{
+        .address = address,
+        .wait_for_connection = true,
+        .pause_on_start = true,
+    };
+    return null;
+}
+
+fn parseInspectorPort(text: []const u8) !u16 {
+    if (text.len == 0) return error.InvalidInspectorAddress;
+    return std.fmt.parseUnsigned(u16, text, 10) catch error.InvalidInspectorAddress;
+}
+
+fn parseInspectorAuthority(authority: []const u8, default_port: u16) !struct { host: []const u8, port: u16 } {
+    if (authority.len == 0) return .{ .host = "localhost", .port = default_port };
+    if (authority[0] == '[') {
+        const closing = std.mem.indexOfScalar(u8, authority, ']') orelse return error.InvalidInspectorAddress;
+        if (closing == 1) return error.InvalidInspectorAddress;
+        const host = authority[1..closing];
+        if (closing + 1 == authority.len) return .{ .host = host, .port = default_port };
+        if (authority[closing + 1] != ':') return error.InvalidInspectorAddress;
+        return .{ .host = host, .port = try parseInspectorPort(authority[closing + 2 ..]) };
+    }
+    if (std.mem.lastIndexOfScalar(u8, authority, ':')) |colon| {
+        if (std.mem.indexOfScalar(u8, authority[0..colon], ':') != null)
+            return error.InvalidInspectorAddress;
+        return .{
+            .host = if (colon == 0) "localhost" else authority[0..colon],
+            .port = try parseInspectorPort(authority[colon + 1 ..]),
+        };
+    }
+    if (std.ascii.isDigit(authority[0])) {
+        var all_digits = true;
+        for (authority) |byte| {
+            if (!std.ascii.isDigit(byte)) {
+                all_digits = false;
+                break;
+            }
+        }
+        if (all_digits) return .{ .host = "localhost", .port = try parseInspectorPort(authority) };
+    }
+    return .{ .host = authority, .port = default_port };
+}
+
+fn parseInspectorLaunch(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    raw_address: []const u8,
+    wait_for_connection: bool,
+    pause_on_start: bool,
+    automatic: bool,
+) !InspectorLaunch {
+    var address = raw_address;
+    var wait = wait_for_connection;
+    var pause = pause_on_start;
+    if (std.mem.endsWith(u8, address, "?break=1")) {
+        address = address[0 .. address.len - "?break=1".len];
+        wait = true;
+        pause = true;
+    } else if (std.mem.endsWith(u8, address, "?wait=1")) {
+        address = address[0 .. address.len - "?wait=1".len];
+        wait = true;
+    }
+
+    if (std.mem.startsWith(u8, address, "unix:") or
+        std.mem.startsWith(u8, address, "fd:") or
+        std.mem.startsWith(u8, address, "tcp:") or
+        std.mem.startsWith(u8, address, "ws+unix:"))
+        return error.UnsupportedInspectorTransport;
+
+    const explicit_websocket = std.mem.startsWith(u8, address, "ws://");
+    const shorthand = if (explicit_websocket) address["ws://".len..] else address;
+    const slash = std.mem.indexOfScalar(u8, shorthand, '/');
+    const authority = if (slash) |index| shorthand[0..index] else shorthand;
+    const path_text: ?[]const u8 = if (slash) |index| shorthand[index..] else null;
+    const parsed = try parseInspectorAuthority(authority, if (explicit_websocket) 0 else 6499);
+    if (parsed.host.len == 0) return error.InvalidInspectorAddress;
+
+    const generated_path = if (path_text) |path|
+        path
+    else if (explicit_websocket)
+        "/"
+    else generated: {
+        var random: [8]u8 = undefined;
+        io.random(&random);
+        const suffix = std.fmt.bytesToHex(random, .lower);
+        break :generated try std.fmt.allocPrint(allocator, "/{s}", .{&suffix});
+    };
+    const host_z = try allocator.dupeZ(u8, parsed.host);
+    const path_z = try allocator.dupeZ(u8, generated_path);
+    return .{
+        .options = .{
+            .host = host_z,
+            .port = parsed.port,
+            .path = path_z,
+            .pause_on_start = pause,
+        },
+        .wait_for_connection = wait,
+        .automatic = automatic,
+    };
+}
+
+fn inspectorLaunchFromArgs(ctx: *const Context, exec_args: []const [:0]const u8) !?InspectorLaunch {
+    if (inspectorFlag(exec_args)) |flag|
+        return try parseInspectorLaunch(
+            ctx.io,
+            ctx.allocator,
+            flag.address,
+            flag.wait_for_connection,
+            flag.pause_on_start,
+            false,
+        );
+    if (ctx.environ_map.get("BUN_INSPECT")) |address| {
+        if (address.len > 0)
+            return try parseInspectorLaunch(ctx.io, ctx.allocator, address, false, false, true);
+    }
+    return null;
+}
+
 fn runPrepared(
     init: std.process.Init,
     ctx: *const Context,
@@ -1812,6 +1969,10 @@ fn runPrepared(
 ) !u8 {
     const allocator = init.arena.allocator();
     if (!applyRuntimeEnvFlags(init.io, allocator, exec_args)) return 1;
+    const inspector = inspectorLaunchFromArgs(ctx, exec_args) catch |err| {
+        ctx.writeStderr("cottontail: invalid inspector endpoint: {s}\n", .{@errorName(err)});
+        return 1;
+    };
     icu_bootstrap.ensure(init) catch |err| {
         ctx.writeStderr("cottontail: failed to initialize ICU: {s}\n", .{@errorName(err)});
         return 1;
@@ -1823,6 +1984,7 @@ fn runPrepared(
         .process_args = process_args,
         .process_user_arg_offset = process_user_arg_offset,
         .exec_args = exec_args,
+        .inspector = inspector,
         .embedded_source = embedded_source,
         .embedded_source_map = embedded_source_map,
         .embedded_files = embedded_files,
@@ -1985,6 +2147,32 @@ fn runScriptExecution(execution: *ScriptExecution) void {
         execution.exit_code = 1;
         return;
     };
+
+    if (execution.inspector) |inspector| {
+        const inspector_url = js_runtime.startInspector(inspector.options) catch {
+            writeStderr(execution.io, "cottontail: failed to start inspector\n", .{});
+            execution.exit_code = 1;
+            return;
+        };
+        if (!inspector.automatic) {
+            const browser_target = if (std.mem.startsWith(u8, inspector_url, "ws://"))
+                inspector_url["ws://".len..]
+            else
+                inspector_url;
+            writeStderr(
+                execution.io,
+                "--------------------- Bun Inspector ---------------------\nListening:\n  {s}\nInspect in browser:\n  https://debug.bun.sh/#{s}\n--------------------- Bun Inspector ---------------------\n",
+                .{ inspector_url, browser_target },
+            );
+        }
+        if (inspector.wait_for_connection) {
+            js_runtime.waitForInspector() catch {
+                writeStderr(execution.io, "cottontail: inspector stopped before a debugger connected\n", .{});
+                execution.exit_code = 1;
+                return;
+            };
+        }
+    }
 
     // Cached runtime artifacts keep their external map beside the immutable
     // generated source. Install its stable path and let the stack remapper load

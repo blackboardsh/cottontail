@@ -35,6 +35,18 @@ int ct_jsc_runtime_eval(
 );
 int ct_jsc_runtime_exit_code(CtJscRuntime *runtime);
 int ct_jsc_runtime_tick(CtJscRuntime *runtime, char **error_out);
+int ct_jsc_runtime_start_inspector(
+    CtJscRuntime *runtime,
+    const char *host,
+    uint16_t port,
+    const char *path,
+    bool pause_on_start,
+    char **url_out,
+    char **error_out
+);
+void ct_jsc_runtime_stop_inspector(CtJscRuntime *runtime);
+char *ct_jsc_runtime_inspector_url(CtJscRuntime *runtime);
+int ct_jsc_runtime_wait_for_inspector(CtJscRuntime *runtime);
 bool ct_jsc_runtime_enable_sampling_profiler(CtJscRuntime *runtime);
 char *ct_jsc_runtime_take_sampling_profiler(CtJscRuntime *runtime);
 char *ct_jsc_runtime_take_heap_snapshot(CtJscRuntime *runtime, bool gc_debugging);

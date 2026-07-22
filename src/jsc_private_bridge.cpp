@@ -20,6 +20,7 @@
 #include <span>
 #include <utility>
 #include <vector>
+#include <wtf/Function.h>
 #include <wtf/ThreadSafeRefCounted.h>
 #if defined(_WIN32)
 #include <wtf/MainThread.h>
@@ -39,6 +40,8 @@ void initializeMainThread();
 class RunLoop {
 public:
     enum class CycleResult { Continue, Stop };
+    static RunLoop& currentSingleton();
+    void dispatch(Function<void()>&&);
     static CycleResult cycle(unsigned mode);
 };
 
@@ -215,6 +218,20 @@ extern "C" JSStringRef ct_jsc_string_create_external_utf16(
 extern "C" void ct_jsc_run_loop_cycle()
 {
     WTF::RunLoop::cycle(0);
+}
+
+extern "C" void* ct_jsc_run_loop_current()
+{
+    return &WTF::RunLoop::currentSingleton();
+}
+
+extern "C" void ct_jsc_run_loop_dispatch(void* run_loop, void (*callback)(void*), void* context)
+{
+    if (run_loop == nullptr || callback == nullptr)
+        return;
+    static_cast<WTF::RunLoop*>(run_loop)->dispatch([callback, context] {
+        callback(context);
+    });
 }
 
 #if defined(_WIN32) || defined(__linux__)

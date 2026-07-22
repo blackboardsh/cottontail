@@ -21,12 +21,16 @@ strictEqual(typeof inspector.NetworkResources.put, "function", "inspector Networ
 strictEqual(typeof inspector.console.log, "function", "inspector console should be exported");
 strictEqual(inspector.url(), undefined, "inspector url should be undefined without a server");
 
+inspector.open(0, "127.0.0.1", false);
+ok(/^ws:\/\/127\.0\.0\.1:\d+\//.test(inspector.url() ?? ""), "inspector.open should expose its bound URL");
 try {
-  inspector.open();
-  throw new Error("inspector.open should throw without a server implementation");
+  inspector.open(0, "127.0.0.1", false);
+  throw new Error("inspector.open should reject duplicate activation");
 } catch (error) {
-  strictEqual((error as Error & { code?: string }).code, "ERR_INSPECTOR_NOT_AVAILABLE", "inspector.open error code mismatch");
+  strictEqual((error as Error & { code?: string }).code, "ERR_INSPECTOR_ALREADY_ACTIVATED", "duplicate inspector.open error code mismatch");
 }
+inspector.close();
+strictEqual(inspector.url(), undefined, "inspector.close should clear the inspector URL");
 
 try {
   inspector.waitForDebugger();
@@ -73,8 +77,10 @@ strictEqual(protocolError.code, "ERR_INSPECTOR_COMMAND", "inspector unknown meth
 session.disconnect();
 
 const promiseSession = new inspectorPromises.Session();
+promiseSession.connect();
 const promiseResult = await promiseSession.post("Runtime.evaluate", { expression: "6 * 7" });
 strictEqual(promiseResult.result.value, 42, "inspector/promises Runtime.evaluate mismatch");
 await promiseSession.post("Runtime.enable");
+promiseSession.disconnect();
 
 console.log("node inspector surface passed");

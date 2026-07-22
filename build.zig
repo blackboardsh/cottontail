@@ -369,6 +369,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             "src/jsc_runner.c",
             "src/native_bindings/registry.c",
             "src/native_bindings/runtime.c",
+            "src/native_bindings/inspector.c",
             "src/native_bindings/filesystem.c",
             "src/native_bindings/process.c",
             "src/native_bindings/http.c",
@@ -398,6 +399,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
     if (resolved_target.os.tag == .linux) {
         inline for (&.{
             .{ "src/jsc_private_bridge.cpp", "jsc_private_bridge.o" },
+            .{ "src/inspector_bridge.cpp", "inspector_bridge.o" },
             .{ "src/jsc_stock_bridge.cpp", "jsc_stock_bridge.o" },
             .{ "src/napi_bridge.cpp", "napi_bridge.o" },
         }) |bridge| {
@@ -420,6 +422,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             &.{ "-std=c++20", "-DJS_NO_EXPORT=1" };
         inline for (&.{
             "src/jsc_private_bridge.cpp",
+            "src/inspector_bridge.cpp",
             "src/jsc_stock_bridge.cpp",
             "src/napi_bridge.cpp",
         }) |source| {

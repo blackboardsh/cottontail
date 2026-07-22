@@ -32,6 +32,28 @@ extern bool ct_jsc_value_is_rope(JSContextRef context, JSValueRef value);
 extern bool ct_jsc_set_time_zone(JSContextRef context, const char *time_zone);
 extern size_t ct_jsc_copy_protected_objects(JSContextRef context, JSValueRef *values, size_t capacity);
 
+typedef struct CtJscInspector CtJscInspector;
+extern CtJscInspector *ct_jsc_inspector_create(JSGlobalContextRef context, char **error_out);
+extern void ct_jsc_inspector_destroy(CtJscInspector *inspector);
+extern int ct_jsc_inspector_start_server(
+    CtJscInspector *inspector,
+    const char *host,
+    uint16_t port,
+    const char *path,
+    bool pause_on_start,
+    char **url_out,
+    char **error_out
+);
+extern void ct_jsc_inspector_stop_server(CtJscInspector *inspector);
+extern char *ct_jsc_inspector_copy_url(CtJscInspector *inspector);
+extern bool ct_jsc_inspector_has_server(CtJscInspector *inspector);
+extern int ct_jsc_inspector_wait_for_connection(CtJscInspector *inspector);
+extern uint64_t ct_jsc_inspector_connect_local(CtJscInspector *inspector);
+extern int ct_jsc_inspector_send_local(CtJscInspector *inspector, uint64_t id, const char *message);
+extern char **ct_jsc_inspector_take_local_messages(CtJscInspector *inspector, uint64_t id, size_t *count_out);
+extern void ct_jsc_inspector_free_messages(char **messages, size_t count);
+extern void ct_jsc_inspector_disconnect_local(CtJscInspector *inspector, uint64_t id);
+
 /* These stable C APIs are exported by JSCOnly but are not installed in its
  * public headers. Keep the bridge here instead of depending on JSC internals. */
 extern bool JSContextGroupEnableSamplingProfiler(JSContextGroupRef group);
@@ -1704,6 +1726,7 @@ typedef struct CtSignalWatcher {
 struct CtJscRuntime {
     JSGlobalContextRef context;
     JSObjectRef host_object;
+    CtJscInspector *inspector;
     char *exit_cleanup_path;
     JSObjectRef spawn_event_handler;
     JSObjectRef fd_event_handler;
@@ -1755,6 +1778,7 @@ struct CtJscRuntime {
     bool next_tick_pending;
     bool next_tick_priority_armed;
     bool fatal_exception_routed;
+    bool sampling_profiler_enabled;
     bool execution_time_limit_installed;
     CtJscShouldTerminateCallback should_terminate_callback;
     void *should_terminate_context;
@@ -21401,6 +21425,179 @@ static JSValueRef ct_gc(JSContextRef ctx, JSObjectRef function, JSObjectRef this
     return JSValueMakeUndefined(ctx);
 }
 
+static bool ct_runtime_ensure_inspector(CtJscRuntime *runtime, char **error_out) {
+    if (error_out != NULL) *error_out = NULL;
+    if (runtime == NULL || runtime->context == NULL) {
+        ct_set_error_out(error_out, ct_duplicate_string("JavaScriptCore runtime is unavailable"));
+        return false;
+    }
+    if (runtime->inspector != NULL) return true;
+    runtime->inspector = ct_jsc_inspector_create(runtime->context, error_out);
+    return runtime->inspector != NULL;
+}
+
+static JSValueRef ct_inspector_open_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "inspectorOpen(host, port, path[, pause]) requires three arguments");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *host = ct_value_to_string_copy(ctx, argv[0]);
+    char *path = ct_value_to_string_copy(ctx, argv[2]);
+    int port = 0;
+    if (host == NULL || path == NULL ||
+        !ct_value_to_int_checked(ctx, argv[1], 0, 65535, &port, exception, "Inspector port must be between 0 and 65535")) {
+        free(host);
+        free(path);
+        if (exception != NULL && *exception == NULL) ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *url = NULL;
+    char *error = NULL;
+    int status = ct_jsc_runtime_start_inspector(
+        runtime,
+        host,
+        (uint16_t)port,
+        path,
+        argc >= 4 && JSValueToBoolean(ctx, argv[3]),
+        &url,
+        &error
+    );
+    free(host);
+    free(path);
+    if (status != 0) {
+        ct_throw_message(ctx, exception, error != NULL ? error : "Unable to start inspector server");
+        free(error);
+        free(url);
+        return JSValueMakeUndefined(ctx);
+    }
+    JSValueRef result = ct_make_string(ctx, url != NULL ? url : "");
+    free(url);
+    free(error);
+    return result;
+}
+
+static JSValueRef ct_inspector_close_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    (void)exception;
+    ct_jsc_runtime_stop_inspector(ct_callback_runtime(function));
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_inspector_url_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    (void)exception;
+    char *url = ct_jsc_runtime_inspector_url(ct_callback_runtime(function));
+    if (url == NULL) return JSValueMakeUndefined(ctx);
+    JSValueRef result = ct_make_string(ctx, url);
+    free(url);
+    return result;
+}
+
+static JSValueRef ct_inspector_wait_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    if (ct_jsc_runtime_wait_for_inspector(ct_callback_runtime(function)) != 0) {
+        ct_throw_message(ctx, exception, "Inspector is not active");
+    }
+    return JSValueMakeUndefined(ctx);
+}
+
+static bool ct_inspector_session_id(JSContextRef ctx, JSValueRef value, uint64_t *id_out, JSValueRef *exception) {
+    JSValueRef conversion_exception = NULL;
+    double id = JSValueToNumber(ctx, value, &conversion_exception);
+    if (conversion_exception != NULL) {
+        if (exception != NULL) *exception = conversion_exception;
+        return false;
+    }
+    if (!isfinite(id) || id < 1 || id > 9007199254740991.0 || floor(id) != id) {
+        ct_throw_message(ctx, exception, "Invalid inspector session");
+        return false;
+    }
+    *id_out = (uint64_t)id;
+    return true;
+}
+
+static JSValueRef ct_inspector_session_connect_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    char *error = NULL;
+    if (!ct_runtime_ensure_inspector(runtime, &error)) {
+        ct_throw_message(ctx, exception, error != NULL ? error : "Inspector is unavailable");
+        free(error);
+        return JSValueMakeUndefined(ctx);
+    }
+    uint64_t id = ct_jsc_inspector_connect_local(runtime->inspector);
+    if (id == 0) {
+        ct_throw_message(ctx, exception, "Unable to connect inspector session");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeNumber(ctx, (double)id);
+}
+
+static JSValueRef ct_inspector_session_send_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    uint64_t id = 0;
+    if (runtime == NULL || runtime->inspector == NULL || argc < 2 ||
+        !ct_inspector_session_id(ctx, argc > 0 ? argv[0] : NULL, &id, exception)) {
+        if (exception != NULL && *exception == NULL) ct_throw_message(ctx, exception, "Inspector session is not connected");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *message = ct_value_to_string_copy(ctx, argv[1]);
+    if (message == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    int status = ct_jsc_inspector_send_local(runtime->inspector, id, message);
+    free(message);
+    if (status != 0) ct_throw_message(ctx, exception, "Inspector session is not connected");
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_inspector_session_take_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    uint64_t id = 0;
+    if (runtime == NULL || runtime->inspector == NULL || argc < 1 ||
+        !ct_inspector_session_id(ctx, argc > 0 ? argv[0] : NULL, &id, exception)) {
+        if (exception != NULL && *exception == NULL) ct_throw_message(ctx, exception, "Inspector session is not connected");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t count = 0;
+    char **messages = ct_jsc_inspector_take_local_messages(runtime->inspector, id, &count);
+    JSValueRef *values = count > 0 ? (JSValueRef *)calloc(count, sizeof(JSValueRef)) : NULL;
+    if (count > 0 && values == NULL) {
+        ct_jsc_inspector_free_messages(messages, count);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    for (size_t index = 0; index < count; index += 1) values[index] = ct_make_string(ctx, messages[index]);
+    JSObjectRef result = ct_make_array(ctx, count, values, exception);
+    free(values);
+    ct_jsc_inspector_free_messages(messages, count);
+    return result;
+}
+
+static JSValueRef ct_inspector_session_disconnect_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    uint64_t id = 0;
+    if (runtime != NULL && runtime->inspector != NULL && argc >= 1 &&
+        ct_inspector_session_id(ctx, argv[0], &id, exception)) {
+        ct_jsc_inspector_disconnect_local(runtime->inspector, id);
+    }
+    return JSValueMakeUndefined(ctx);
+}
+
 static JSValueRef ct_start_sampling_profiler(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
     (void)argc;
@@ -21408,7 +21605,8 @@ static JSValueRef ct_start_sampling_profiler(JSContextRef ctx, JSObjectRef funct
     (void)exception;
     CtJscRuntime *runtime = ct_callback_runtime(function);
     bool enabled = runtime != NULL && runtime->context != NULL &&
-        JSContextGroupEnableSamplingProfiler(JSContextGetGroup(runtime->context));
+        (runtime->sampling_profiler_enabled || JSContextGroupEnableSamplingProfiler(JSContextGetGroup(runtime->context)));
+    if (enabled) runtime->sampling_profiler_enabled = true;
     return JSValueMakeBoolean(ctx, enabled);
 }
 
@@ -25882,6 +26080,14 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
             JSContextGroupClearExecutionTimeLimit(JSContextGetGroup(ctx));
             runtime->execution_time_limit_installed = false;
         }
+        if (runtime->inspector != NULL) {
+            ct_jsc_inspector_destroy(runtime->inspector);
+            runtime->inspector = NULL;
+        }
+        if (runtime->sampling_profiler_enabled) {
+            JSContextGroupDisableSamplingProfiler(JSContextGetGroup(ctx));
+            runtime->sampling_profiler_enabled = false;
+        }
         if (runtime->napi_env != NULL) {
             ct_napi_env_destroy(runtime->napi_env);
             runtime->napi_env = NULL;
@@ -27099,13 +27305,16 @@ int ct_jsc_runtime_tick(CtJscRuntime *runtime, char **error_out) {
 
 bool ct_jsc_runtime_enable_sampling_profiler(CtJscRuntime *runtime) {
     if (runtime == NULL || runtime->context == NULL) return false;
-    return JSContextGroupEnableSamplingProfiler(JSContextGetGroup(runtime->context));
+    if (runtime->sampling_profiler_enabled) return true;
+    runtime->sampling_profiler_enabled = JSContextGroupEnableSamplingProfiler(JSContextGetGroup(runtime->context));
+    return runtime->sampling_profiler_enabled;
 }
 
 char *ct_jsc_runtime_take_sampling_profiler(CtJscRuntime *runtime) {
     if (runtime == NULL || runtime->context == NULL) return NULL;
     JSContextGroupRef group = JSContextGetGroup(runtime->context);
     JSContextGroupDisableSamplingProfiler(group);
+    runtime->sampling_profiler_enabled = false;
     JSStringRef samples = JSContextGroupTakeSamplesFromSamplingProfiler(group);
     if (samples == NULL) return NULL;
 
@@ -27114,6 +27323,45 @@ char *ct_jsc_runtime_take_sampling_profiler(CtJscRuntime *runtime) {
     if (result != NULL) JSStringGetUTF8CString(samples, result, capacity);
     JSStringRelease(samples);
     return result;
+}
+
+int ct_jsc_runtime_start_inspector(
+    CtJscRuntime *runtime,
+    const char *host,
+    uint16_t port,
+    const char *path,
+    bool pause_on_start,
+    char **url_out,
+    char **error_out
+) {
+    if (url_out != NULL) *url_out = NULL;
+    if (error_out != NULL) *error_out = NULL;
+    if (!ct_runtime_ensure_inspector(runtime, error_out)) return -1;
+    return ct_jsc_inspector_start_server(
+        runtime->inspector,
+        host,
+        port,
+        path,
+        pause_on_start,
+        url_out,
+        error_out
+    );
+}
+
+void ct_jsc_runtime_stop_inspector(CtJscRuntime *runtime) {
+    if (runtime == NULL || runtime->inspector == NULL) return;
+    ct_jsc_inspector_stop_server(runtime->inspector);
+}
+
+char *ct_jsc_runtime_inspector_url(CtJscRuntime *runtime) {
+    if (runtime == NULL || runtime->inspector == NULL) return NULL;
+    return ct_jsc_inspector_copy_url(runtime->inspector);
+}
+
+int ct_jsc_runtime_wait_for_inspector(CtJscRuntime *runtime) {
+    if (runtime == NULL || runtime->inspector == NULL ||
+        !ct_jsc_inspector_has_server(runtime->inspector)) return -1;
+    return ct_jsc_inspector_wait_for_connection(runtime->inspector);
 }
 
 char *ct_jsc_runtime_take_heap_snapshot(CtJscRuntime *runtime, bool gc_debugging) {

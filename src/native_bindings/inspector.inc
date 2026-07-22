@@ -1,0 +1,8 @@
+CT_NATIVE_BINDING("inspectorOpen", ct_inspector_open_host)
+CT_NATIVE_BINDING("inspectorClose", ct_inspector_close_host)
+CT_NATIVE_BINDING("inspectorUrl", ct_inspector_url_host)
+CT_NATIVE_BINDING("inspectorWait", ct_inspector_wait_host)
+CT_NATIVE_BINDING("inspectorSessionConnect", ct_inspector_session_connect_host)
+CT_NATIVE_BINDING("inspectorSessionSend", ct_inspector_session_send_host)
+CT_NATIVE_BINDING("inspectorSessionTake", ct_inspector_session_take_host)
+CT_NATIVE_BINDING("inspectorSessionDisconnect", ct_inspector_session_disconnect_host)

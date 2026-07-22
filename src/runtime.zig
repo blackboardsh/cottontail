@@ -5,6 +5,13 @@ const c = @cImport({
     @cInclude("jsc_runner.h");
 });
 
+pub const InspectorOptions = struct {
+    host: [:0]const u8,
+    port: u16,
+    path: [:0]const u8,
+    pause_on_start: bool = false,
+};
+
 extern fn ct_jsc_runtime_emit_process_shutdown(
     runtime: *c.CtJscRuntime,
     include_before_exit: c_int,
@@ -330,6 +337,36 @@ pub const Runtime = struct {
 
     pub fn enableSamplingProfiler(self: *Runtime) bool {
         return c.ct_jsc_runtime_enable_sampling_profiler(self.handle);
+    }
+
+    pub fn startInspector(self: *Runtime, options: InspectorOptions) ![]u8 {
+        var url: [*c]u8 = null;
+        var inspector_error: [*c]u8 = null;
+        if (c.ct_jsc_runtime_start_inspector(
+            self.handle,
+            options.host.ptr,
+            options.port,
+            options.path.ptr,
+            options.pause_on_start,
+            &url,
+            &inspector_error,
+        ) != 0) {
+            defer if (inspector_error != null) c.ct_jsc_string_free(inspector_error);
+            if (inspector_error != null) self.writeStderrLine(std.mem.span(inspector_error));
+            return error.InspectorStartFailed;
+        }
+        if (url == null) return error.InspectorStartFailed;
+        defer c.ct_jsc_string_free(url);
+        return try self.allocator.dupe(u8, std.mem.span(url));
+    }
+
+    pub fn waitForInspector(self: *Runtime) !void {
+        if (c.ct_jsc_runtime_wait_for_inspector(self.handle) != 0)
+            return error.InspectorNotActive;
+    }
+
+    pub fn stopInspector(self: *Runtime) void {
+        c.ct_jsc_runtime_stop_inspector(self.handle);
     }
 
     pub fn takeSamplingProfile(self: *Runtime) !?[]u8 {
