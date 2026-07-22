@@ -177,9 +177,20 @@ const InteractiveUpdatePackage = struct {
     target_version: []const u8,
     latest_version: []const u8,
     dependency_type: []const u8,
+    spec_value: *Value,
+    manifest: *Value,
+    manifest_dir: []const u8,
     selected: bool = false,
     use_latest: bool = false,
 };
+
+const InteractiveChangedManifest = struct {
+    package_json: *Value,
+    path: []const u8,
+    had_trailing_newline: bool,
+};
+
+const InteractivePromptResult = enum { selected, empty, cancelled };
 
 const OutdatedPackage = struct {
     alias: []const u8,
@@ -2020,6 +2031,8 @@ const Manager = struct {
     removed_count: usize = 0,
     changed: bool = false,
     update_package_json_changed: bool = false,
+    interactive_update_prepared: bool = false,
+    interactive_changed_manifests: std.ArrayList(InteractiveChangedManifest) = .empty,
     patch_policy_changed: bool = false,
     omit_pnpm_workspace_versions: bool = false,
     root_package_json: ?*Value = null,
@@ -2285,7 +2298,7 @@ const Manager = struct {
         }
 
         if (manager.options.command == .update and manager.options.interactive) {
-            if (!try manager.prepareInteractiveUpdate(command_package_json, manager.invocation_package_dir)) return 0;
+            if (!try manager.prepareInteractiveUpdate(&root, command_package_json, manager.invocation_package_dir)) return 0;
         }
 
         try manager.validateCatalogReferences(&root);
@@ -2327,21 +2340,33 @@ const Manager = struct {
             !manager.options.no_save and !manager.options.dry_run and
             (manager.options.command != .update or manager.update_package_json_changed))
         {
-            try writePackageJSON(
-                manager.init_data.io,
-                manager.allocator,
-                command_package_json_path,
-                command_package_json.*,
-                command_package_json_had_trailing_newline,
-            );
-            if (manager.options.trust and command_package_json != &root) {
+            if (manager.interactive_update_prepared) {
+                for (manager.interactive_changed_manifests.items) |manifest| {
+                    try writePackageJSON(
+                        manager.init_data.io,
+                        manager.allocator,
+                        manifest.path,
+                        manifest.package_json.*,
+                        manifest.had_trailing_newline,
+                    );
+                }
+            } else {
                 try writePackageJSON(
                     manager.init_data.io,
                     manager.allocator,
-                    package_json_path,
-                    root,
-                    had_trailing_newline,
+                    command_package_json_path,
+                    command_package_json.*,
+                    command_package_json_had_trailing_newline,
                 );
+                if (manager.options.trust and command_package_json != &root) {
+                    try writePackageJSON(
+                        manager.init_data.io,
+                        manager.allocator,
+                        package_json_path,
+                        root,
+                        had_trailing_newline,
+                    );
+                }
             }
         }
 
@@ -4326,7 +4351,9 @@ const Manager = struct {
     }
 
     fn configureInstallFilters(manager: *Manager, root: *const Value) !void {
-        if (manager.options.command != .install or manager.options.filters.len == 0) return;
+        const filters_apply = manager.options.command == .install or
+            (manager.options.command == .update and manager.options.interactive);
+        if (!filters_apply or manager.options.filters.len == 0) return;
         manager.install_filter_active = true;
         const root_name = jsonString(root, "name") orelse "";
         manager.root_selected = try manager.filterSelects(root_name, "");
@@ -4720,20 +4747,88 @@ const Manager = struct {
         }
     }
 
-    fn prepareInteractiveUpdate(manager: *Manager, package_json: *Value, parent_dir: []const u8) !bool {
-        if (manager.lock_graph == null) {
-            try manager.stderr.writeAll("error: missing lockfile, nothing outdated\n");
-            return error.PackageManagerErrorReported;
+    fn interactiveCatalogValue(root: *Value, alias: []const u8, reference: []const u8) ?*Value {
+        if (root.* != .object or !std.mem.startsWith(u8, reference, "catalog:")) return null;
+        var source = root;
+        if (root.object.getPtr("workspaces")) |workspaces| {
+            if (workspaces.* == .object and
+                (workspaces.object.get("catalog") != null or workspaces.object.get("catalogs") != null))
+            {
+                source = workspaces;
+            }
+        }
+        if (source.* != .object) return null;
+
+        const catalog_name = std.mem.trim(u8, reference["catalog:".len..], " \t\r\n");
+        const catalog = if (catalog_name.len == 0) blk: {
+            const value = source.object.getPtr("catalog") orelse return null;
+            if (value.* != .object) return null;
+            break :blk value;
+        } else blk: {
+            const catalogs = source.object.getPtr("catalogs") orelse return null;
+            if (catalogs.* != .object) return null;
+            const value = catalogs.object.getPtr(catalog_name) orelse return null;
+            if (value.* != .object) return null;
+            break :blk value;
+        };
+        const value = catalog.object.getPtr(alias) orelse return null;
+        return if (value.* == .string) value else null;
+    }
+
+    fn appendInteractiveUpdateCandidate(
+        manager: *Manager,
+        packages: *std.array_list.Managed(InteractiveUpdatePackage),
+        alias: []const u8,
+        effective_spec: []const u8,
+        dependency_type: []const u8,
+        resolution_dir: []const u8,
+        spec_value: *Value,
+        manifest: *Value,
+        manifest_dir: []const u8,
+    ) !void {
+        for (packages.items) |existing| {
+            if (existing.spec_value == spec_value) return;
         }
 
-        var packages = std.array_list.Managed(InteractiveUpdatePackage).init(manager.allocator);
-        defer packages.deinit();
+        const selection = try manager.findLockedSelection(alias, resolution_dir) orelse return;
+        if (selection.package.kind != .npm) return;
+        const registry_name, const registry_spec = parseNpmAlias(alias, effective_spec);
+        const target = manager.resolveRegistryPackage(registry_name, registry_spec) catch |err| switch (err) {
+            error.NoMatchingVersion, error.PackageNotFound, error.TooRecentVersion, error.AllVersionsTooRecent => return,
+            else => return err,
+        };
+        const latest = manager.resolveRegistryPackage(registry_name, "latest") catch |err| switch (err) {
+            error.NoMatchingVersion, error.PackageNotFound, error.TooRecentVersion, error.AllVersionsTooRecent => return,
+            else => return err,
+        };
+        const current_version = selection.package.version;
+        const latest_version = latest.latest_version orelse latest.version;
+        if (std.mem.eql(u8, current_version, target.version) and
+            std.mem.eql(u8, current_version, latest_version)) return;
+
+        try packages.append(.{
+            .alias = try manager.allocator.dupe(u8, alias),
+            .current_version = try manager.allocator.dupe(u8, current_version),
+            .target_version = try manager.allocator.dupe(u8, target.version),
+            .latest_version = try manager.allocator.dupe(u8, latest_version),
+            .dependency_type = dependency_type,
+            .spec_value = spec_value,
+            .manifest = manifest,
+            .manifest_dir = manifest_dir,
+            .use_latest = manager.options.latest,
+        });
+    }
+
+    fn collectInteractiveUpdateCandidates(
+        manager: *Manager,
+        root: *Value,
+        package_json: *Value,
+        parent_dir: []const u8,
+        packages: *std.array_list.Managed(InteractiveUpdatePackage),
+    ) !void {
+        if (package_json.* != .object) return;
         var seen = std.StringHashMap(void).init(manager.allocator);
         defer seen.deinit();
-
-        const previous_refresh = manager.refresh_direct_registry;
-        manager.refresh_direct_registry = true;
-        defer manager.refresh_direct_registry = previous_refresh;
 
         for (update_dependency_sections) |dependency_section| {
             if (std.mem.eql(u8, dependency_section.name, "devDependencies") and
@@ -4741,45 +4836,127 @@ const Manager = struct {
             if (std.mem.eql(u8, dependency_section.name, "optionalDependencies") and manager.options.omit_optional) continue;
             if (std.mem.eql(u8, dependency_section.name, "peerDependencies") and manager.options.omit_peer) continue;
 
-            const section = package_json.object.get(dependency_section.name) orelse continue;
-            if (section != .object) continue;
-            for (section.object.keys(), section.object.values()) |alias, spec_value| {
-                if (seen.contains(alias) or spec_value != .string) continue;
-                try seen.put(try manager.allocator.dupe(u8, alias), {});
+            const section = package_json.object.getPtr(dependency_section.name) orelse continue;
+            if (section.* != .object) continue;
+            for (section.object.keys(), section.object.values()) |alias, *spec_value| {
+                if (spec_value.* != .string) continue;
                 if (manager.options.positionals.len > 0 and !interactiveRequestContains(manager.options.positionals, alias)) continue;
 
                 const original_spec = spec_value.string;
-                if (std.mem.startsWith(u8, original_spec, "catalog:") or
-                    manager.isWorkspaceDependency(alias, original_spec)) continue;
+                const is_catalog = std.mem.startsWith(u8, original_spec, "catalog:");
+                if (!is_catalog) {
+                    if (seen.contains(alias)) continue;
+                    try seen.put(try manager.allocator.dupe(u8, alias), {});
+                    if (manager.isWorkspaceDependency(alias, original_spec)) continue;
+                }
+
                 const effective_spec = manager.manifest_policy.?.resolveDependency(alias, original_spec, false) catch |err| switch (err) {
                     error.CatalogDependencyNotFound, error.InvalidCatalogDependency => continue,
                 };
                 if (!isRegistryUpdateSpecifier(effective_spec)) continue;
 
-                const selection = try manager.findLockedSelection(alias, parent_dir) orelse continue;
-                if (selection.package.kind != .npm) continue;
-                const registry_name, const registry_spec = parseNpmAlias(alias, effective_spec);
-                const target = manager.resolveRegistryPackage(registry_name, registry_spec) catch |err| switch (err) {
-                    error.NoMatchingVersion, error.PackageNotFound, error.TooRecentVersion, error.AllVersionsTooRecent => continue,
-                    else => return err,
-                };
-                const latest = manager.resolveRegistryPackage(registry_name, "latest") catch |err| switch (err) {
-                    error.NoMatchingVersion, error.PackageNotFound, error.TooRecentVersion, error.AllVersionsTooRecent => continue,
-                    else => return err,
-                };
-                const current_version = selection.package.version;
-                if (std.mem.eql(u8, current_version, target.version) and
-                    std.mem.eql(u8, current_version, latest.version)) continue;
-
-                try packages.append(.{
-                    .alias = try manager.allocator.dupe(u8, alias),
-                    .current_version = try manager.allocator.dupe(u8, current_version),
-                    .target_version = try manager.allocator.dupe(u8, target.version),
-                    .latest_version = try manager.allocator.dupe(u8, latest.version),
-                    .dependency_type = dependency_section.name,
-                    .use_latest = manager.options.latest,
-                });
+                if (is_catalog) {
+                    const catalog_value = interactiveCatalogValue(root, alias, original_spec) orelse continue;
+                    try manager.appendInteractiveUpdateCandidate(
+                        packages,
+                        alias,
+                        effective_spec,
+                        dependency_section.name,
+                        parent_dir,
+                        catalog_value,
+                        root,
+                        manager.root_dir,
+                    );
+                } else {
+                    try manager.appendInteractiveUpdateCandidate(
+                        packages,
+                        alias,
+                        effective_spec,
+                        dependency_section.name,
+                        parent_dir,
+                        spec_value,
+                        package_json,
+                        parent_dir,
+                    );
+                }
             }
+        }
+    }
+
+    fn preserveInteractiveVersionSpec(
+        manager: *Manager,
+        original_spec: []const u8,
+        target_version: []const u8,
+    ) ![]const u8 {
+        var range = original_spec;
+        const alias_prefix = npmAliasPrefix(original_spec);
+        if (alias_prefix) |prefix| {
+            if (original_spec.len > prefix.len and original_spec[prefix.len] == '@') {
+                range = original_spec[prefix.len + 1 ..];
+            }
+        }
+
+        var operator: []const u8 = "";
+        if (range.len > 0 and (range[0] == '^' or range[0] == '~' or range[0] == '>' or range[0] == '<' or range[0] == '=')) {
+            const operator_len: usize = if (range.len > 1 and
+                (range[0] == '>' or range[0] == '<') and range[1] == '=') 2 else 1;
+            operator = range[0..operator_len];
+        }
+        const version_spec = try std.fmt.allocPrint(manager.allocator, "{s}{s}", .{ operator, target_version });
+        if (alias_prefix) |prefix| {
+            return std.fmt.allocPrint(manager.allocator, "{s}@{s}", .{ prefix, version_spec });
+        }
+        return version_spec;
+    }
+
+    fn recordInteractiveChangedManifest(manager: *Manager, package_json: *Value, parent_dir: []const u8) !void {
+        for (manager.interactive_changed_manifests.items) |manifest| {
+            if (manifest.package_json == package_json) return;
+        }
+        const path = try std.fs.path.join(manager.allocator, &.{ parent_dir, "package.json" });
+        const source = try std.Io.Dir.cwd().readFileAlloc(
+            manager.init_data.io,
+            path,
+            manager.allocator,
+            .limited(64 * 1024 * 1024),
+        );
+        try manager.interactive_changed_manifests.append(manager.allocator, .{
+            .package_json = package_json,
+            .path = path,
+            .had_trailing_newline = source.len > 0 and source[source.len - 1] == '\n',
+        });
+    }
+
+    fn prepareInteractiveUpdate(manager: *Manager, root: *Value, package_json: *Value, parent_dir: []const u8) !bool {
+        if (manager.lock_graph == null) {
+            try manager.stderr.writeAll("error: missing lockfile, nothing outdated\n");
+            return error.PackageManagerErrorReported;
+        }
+
+        var packages = std.array_list.Managed(InteractiveUpdatePackage).init(manager.allocator);
+        defer packages.deinit();
+
+        const previous_refresh = manager.refresh_direct_registry;
+        manager.refresh_direct_registry = true;
+        defer manager.refresh_direct_registry = previous_refresh;
+
+        if (manager.options.filters.len > 0) {
+            if (manager.root_selected) try manager.collectInteractiveUpdateCandidates(root, root, manager.root_dir, &packages);
+            var workspaces = manager.workspaces.iterator();
+            while (workspaces.next()) |entry| {
+                const workspace = entry.value_ptr.*;
+                if (!manager.workspaceSelected(workspace)) continue;
+                try manager.collectInteractiveUpdateCandidates(root, workspace.package_json, workspace.path, &packages);
+            }
+        } else if (manager.options.recursive) {
+            try manager.collectInteractiveUpdateCandidates(root, root, manager.root_dir, &packages);
+            var workspaces = manager.workspaces.iterator();
+            while (workspaces.next()) |entry| {
+                const workspace = entry.value_ptr.*;
+                try manager.collectInteractiveUpdateCandidates(root, workspace.package_json, workspace.path, &packages);
+            }
+        } else {
+            try manager.collectInteractiveUpdateCandidates(root, package_json, parent_dir, &packages);
         }
 
         std.sort.pdq(InteractiveUpdatePackage, packages.items, {}, struct {
@@ -4787,7 +4964,9 @@ const Manager = struct {
                 const left_priority = interactiveDependencyPriority(left.dependency_type);
                 const right_priority = interactiveDependencyPriority(right.dependency_type);
                 if (left_priority != right_priority) return left_priority < right_priority;
-                return std.mem.order(u8, left.alias, right.alias) == .lt;
+                const alias_order = std.mem.order(u8, left.alias, right.alias);
+                if (alias_order != .eq) return alias_order == .lt;
+                return std.mem.order(u8, left.manifest_dir, right.manifest_dir) == .lt;
             }
         }.lessThan);
 
@@ -4796,27 +4975,55 @@ const Manager = struct {
             try manager.stdout.flush();
             return false;
         }
-        if (!try manager.promptInteractiveUpdates(packages.items)) {
-            try manager.stdout.writeAll("No packages selected for update\n");
+        switch (try manager.promptInteractiveUpdates(packages.items)) {
+            .cancelled => {
+                try manager.stdout.writeAll("Cancelled\n");
+                try manager.stdout.flush();
+                return false;
+            },
+            .empty => {
+                try manager.stdout.writeAll("No packages selected for update\n");
+                try manager.stdout.flush();
+                return false;
+            },
+            .selected => {},
+        }
+
+        var selected_count: usize = 0;
+        for (packages.items) |package| selected_count += @intFromBool(package.selected);
+        try manager.stdout.print("Selected {d} package{s} to update\n", .{
+            selected_count,
+            if (selected_count == 1) "" else "s",
+        });
+        if (manager.options.dry_run) {
+            try manager.stdout.writeAll("Dry run complete - no changes made\n");
             try manager.stdout.flush();
             return false;
         }
 
-        var requests = std.array_list.Managed([]const u8).init(manager.allocator);
+        try manager.stdout.writeAll("\nInstalling updates...\n");
         for (packages.items) |package| {
             if (!package.selected) continue;
-            const request = if (package.use_latest)
-                try std.fmt.allocPrint(manager.allocator, "{s}@latest", .{package.alias})
-            else
-                try manager.allocator.dupe(u8, package.alias);
-            try requests.append(request);
+            const target_version = if (package.use_latest) package.latest_version else package.target_version;
+            if (std.mem.eql(u8, package.current_version, target_version)) continue;
+            const original_spec = package.spec_value.string;
+            const updated_spec = try manager.preserveInteractiveVersionSpec(original_spec, target_version);
+            if (std.mem.eql(u8, original_spec, updated_spec)) continue;
+            package.spec_value.* = .{ .string = updated_spec };
+            try manager.recordInteractiveChangedManifest(package.manifest, package.manifest_dir);
         }
-        manager.options.positionals = try requests.toOwnedSlice();
-        manager.options.latest = false;
-        return manager.options.positionals.len > 0;
+        if (manager.interactive_changed_manifests.items.len == 0) return false;
+
+        if (manager.manifest_policy) |*policy| policy.deinit();
+        manager.manifest_policy = try Manifest.Policy.init(manager.allocator, root);
+        manager.interactive_update_prepared = true;
+        manager.update_package_json_changed = true;
+        manager.changed = true;
+        try manager.stdout.flush();
+        return true;
     }
 
-    fn promptInteractiveUpdates(manager: *Manager, packages: []InteractiveUpdatePackage) !bool {
+    fn promptInteractiveUpdates(manager: *Manager, packages: []InteractiveUpdatePackage) !InteractivePromptResult {
         var cursor: usize = 0;
         var toggle_all = false;
         const terminal_mode = InteractiveTerminalMode.enter();
@@ -4827,13 +5034,13 @@ const Manager = struct {
         const reader = &reader_file.interface;
         while (true) {
             try manager.renderInteractiveUpdates(packages, cursor, terminal_mode.is_tty);
-            const byte = reader.takeByte() catch return false;
+            const byte = reader.takeByte() catch return .cancelled;
             switch (byte) {
                 '\n', '\r', 'y', 'Y' => {
-                    for (packages) |package| if (package.selected) return true;
-                    return false;
+                    for (packages) |package| if (package.selected) return .selected;
+                    return .empty;
                 },
-                3, 4, 'q', 'Q' => return false,
+                3, 4, 'q', 'Q' => return .cancelled,
                 ' ' => {
                     packages[cursor].selected = !packages[cursor].selected;
                     if (std.mem.eql(u8, packages[cursor].current_version, packages[cursor].target_version)) {
@@ -4876,9 +5083,9 @@ const Manager = struct {
                     toggle_all = false;
                 },
                 27 => {
-                    const bracket = reader.takeByte() catch return false;
+                    const bracket = reader.takeByte() catch return .cancelled;
                     if (bracket != '[') continue;
-                    const arrow = reader.takeByte() catch return false;
+                    const arrow = reader.takeByte() catch return .cancelled;
                     switch (arrow) {
                         'A' => cursor = if (cursor > 0) cursor - 1 else packages.len - 1,
                         'B' => cursor = if (cursor + 1 < packages.len) cursor + 1 else 0,
@@ -4926,6 +5133,10 @@ const Manager = struct {
     }
 
     fn updatePackages(manager: *Manager, package_json: *Value, parent_dir: []const u8) !void {
+        if (manager.interactive_update_prepared) {
+            try manager.installRoot(manager.root_package_json.?, true);
+            return;
+        }
         const requests = try manager.parseUpdateRequests();
         var handled = std.StringHashMap(void).init(manager.allocator);
         defer handled.deinit();

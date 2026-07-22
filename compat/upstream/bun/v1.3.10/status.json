@@ -63,6 +63,12 @@
       "reason": "Serially confirmed after unclassified discovery: Unicode script names and arguments pass both copied upstream cases with two assertions."
     },
     {
+      "pattern": "^test/cli/update_interactive_formatting\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "All 31 copied interactive update cases pass across selection and navigation, dry-run and cancellation, recursive and filtered workspaces, catalog layouts, semver prefix preservation, package installation, and lockfile persistence (163 assertions).",
+      "timeoutMs": 30000
+    },
+    {
       "pattern": "^test/cli/run/sql-preconnect\\.test\\.ts$",
       "status": "enabled",
       "reason": "The copied SQL preconnect fixture passes both local-loopback cases: startup connects when DATABASE_URL and --sql-preconnect are present and does not connect without the flag (4 assertions).",
