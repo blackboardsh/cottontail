@@ -3628,6 +3628,7 @@ static char *ct_copy_exception(JSContextRef ctx, JSValueRef exception) {
         "var hook=globalThis.__cottontailFormatUncaughtException;"
         "if(typeof hook==='function'){try{var hooked=hook(e);if(typeof hooked==='string')return hooked;}catch(_){}}"
         "if(e&&e.__cottontailFormattedStack&&e.stack)return String(e.stack);"
+        "if(e&&e.name==='ResolveMessage'&&e.message)return 'error: '+String(e.message);"
         "var head='';"
         "if(e&&e.message)head=(e.name?String(e.name):'Error')+': '+String(e.message);"
         "if(e&&e.stack){var stack=String(e.stack);return head&&stack.indexOf(head)<0?head+'\\n'+stack:stack;}"

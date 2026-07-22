@@ -9,6 +9,7 @@ const native_bundler = @import("cottontail_bundler.zig");
 const native_transpiler = @import("cottontail_transpiler.zig");
 const embedded_runtime_modules = @import("embedded_runtime_modules.zig");
 const standalone_executable = @import("standalone_executable.zig");
+const package_manager_bun_lockfile = @import("package_manager_bun_lockfile.zig");
 
 const script_thread_stack_size = 128 * 1024 * 1024;
 const script_js_stack_size = 96 * 1024 * 1024;
@@ -676,20 +677,105 @@ fn createAutoInstallSymlink(ctx: *const Context, target: []const u8, link_path: 
     };
 }
 
+fn copyAutoInstallDirectory(ctx: *const Context, source: []const u8, destination: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(ctx.io, destination);
+    var source_dir = try std.Io.Dir.cwd().openDir(ctx.io, source, .{ .iterate = true });
+    defer source_dir.close(ctx.io);
+    var iterator = source_dir.iterate();
+    while (try iterator.next(ctx.io)) |entry| {
+        const source_path = try std.fs.path.join(ctx.allocator, &.{ source, entry.name });
+        const destination_path = try std.fs.path.join(ctx.allocator, &.{ destination, entry.name });
+        switch (entry.kind) {
+            .directory => try copyAutoInstallDirectory(ctx, source_path, destination_path),
+            .file => try std.Io.Dir.copyFileAbsolute(source_path, destination_path, ctx.io, .{ .replace = true, .make_path = true }),
+            .sym_link => {
+                var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const target_len = try std.Io.Dir.readLinkAbsolute(ctx.io, source_path, &target_buffer);
+                if (std.fs.path.dirname(destination_path)) |parent| try std.Io.Dir.cwd().createDirPath(ctx.io, parent);
+                const target_stat = std.Io.Dir.cwd().statFile(ctx.io, source_path, .{}) catch null;
+                std.Io.Dir.cwd().symLink(ctx.io, target_buffer[0..target_len], destination_path, .{
+                    .is_directory = target_stat != null and target_stat.?.kind == .directory,
+                }) catch |err| switch (err) {
+                    error.PathAlreadyExists => {},
+                    else => return err,
+                };
+            },
+            else => {},
+        }
+    }
+}
+
+fn findAutoInstallBunfig(ctx: *const Context, start_dir: []const u8) !?[]const u8 {
+    var current = start_dir;
+    while (true) {
+        const path = try std.fs.path.join(ctx.allocator, &.{ current, "bunfig.toml" });
+        if (std.Io.Dir.cwd().statFile(ctx.io, path, .{})) |stat| {
+            if (stat.kind == .file) return path;
+        } else |_| {}
+        const parent = std.fs.path.dirname(current) orelse return null;
+        if (std.mem.eql(u8, parent, current)) return null;
+        current = parent;
+    }
+}
+
+fn autoInstallRegistryHostname(
+    ctx: *const Context,
+    staging_root: []const u8,
+    package_name: []const u8,
+) !?[]const u8 {
+    const binary_path = try std.fs.path.join(ctx.allocator, &.{ staging_root, "bun.lockb" });
+    const binary = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        binary_path,
+        ctx.allocator,
+        .limited(256 * 1024 * 1024),
+    ) catch return null;
+    const url = try package_manager_bun_lockfile.packageResolutionURLFromBinary(ctx.allocator, binary, package_name) orelse
+        return null;
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return null;
+    const authority_start = scheme_end + 3;
+    const authority_end = std.mem.indexOfAnyPos(u8, url, authority_start, "/?#") orelse url.len;
+    var authority = url[authority_start..authority_end];
+    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |index| authority = authority[index + 1 ..];
+    if (authority.len == 0) return null;
+    if (authority[0] == '[') {
+        const end = std.mem.indexOfScalar(u8, authority, ']') orelse return null;
+        return authority[1..end];
+    }
+    const port = std.mem.indexOfScalar(u8, authority, ':') orelse authority.len;
+    const hostname = authority[0..port];
+    if (std.mem.eql(u8, hostname, "registry.npmjs.org")) return null;
+    return hostname;
+}
+
 fn exposeAutoInstalledPackage(
     ctx: *const Context,
     cache_root: []const u8,
+    staging_root: []const u8,
     staging_node_modules: []const u8,
     request: AutoInstallRequest,
+    custom_registry: bool,
 ) !void {
     const installed_dir = try std.fs.path.join(ctx.allocator, &.{ staging_node_modules, request.package_name });
     if (!autoInstallPathIsDirectory(ctx, installed_dir)) return error.AutoInstallFailed;
     const version = installedAutoPackageVersion(ctx, installed_dir) orelse request.requested_version orelse "latest";
     const cache_package_dir = try std.fs.path.join(ctx.allocator, &.{ cache_root, request.package_name });
     try std.Io.Dir.cwd().createDirPath(ctx.io, cache_package_dir);
-    const cache_entry_name = try std.fmt.allocPrint(ctx.allocator, "{s}@@@1", .{version});
+    const registry_hostname = if (custom_registry)
+        try autoInstallRegistryHostname(ctx, staging_root, request.package_name)
+    else
+        null;
+    const cache_entry_name = if (registry_hostname) |hostname|
+        try std.fmt.allocPrint(ctx.allocator, "{s}@@{s}@@@1", .{ version, hostname })
+    else
+        try std.fmt.allocPrint(ctx.allocator, "{s}@@@1", .{version});
+    const canonical_entry_name = try std.fmt.allocPrint(ctx.allocator, "{s}@{s}", .{ request.package_name, cache_entry_name });
+    const canonical_entry = try std.fs.path.join(ctx.allocator, &.{ cache_root, canonical_entry_name });
+    if (!autoInstallPathIsDirectory(ctx, canonical_entry)) {
+        try copyAutoInstallDirectory(ctx, installed_dir, canonical_entry);
+    }
     const cache_entry = try std.fs.path.join(ctx.allocator, &.{ cache_package_dir, cache_entry_name });
-    try createAutoInstallSymlink(ctx, installed_dir, cache_entry);
+    try createAutoInstallSymlink(ctx, canonical_entry, cache_entry);
 
     if (!std.mem.eql(u8, request.install_specifier, request.package_name)) {
         const alias = try std.fs.path.join(ctx.allocator, &.{ staging_node_modules, request.install_specifier });
@@ -698,6 +784,21 @@ fn exposeAutoInstalledPackage(
 }
 
 fn maybeAutoInstall(ctx: *const Context, entrypoint_path: []const u8, exec_args: []const [:0]const u8) !void {
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        entrypoint_path,
+        ctx.allocator,
+        .limited(16 * 1024 * 1024),
+    ) catch return;
+    return maybeAutoInstallSource(ctx, entrypoint_path, source, exec_args);
+}
+
+fn maybeAutoInstallSource(
+    ctx: *const Context,
+    entrypoint_path: []const u8,
+    source: []const u8,
+    exec_args: []const [:0]const u8,
+) !void {
     const mode = autoInstallMode(exec_args);
     if (mode == .disable) return;
     const entry_dir = std.fs.path.dirname(entrypoint_path) orelse ctx.project_root;
@@ -714,18 +815,14 @@ fn maybeAutoInstall(ctx: *const Context, entrypoint_path: []const u8, exec_args:
         try std.fs.path.join(ctx.allocator, &.{ root, "node_modules" })
     else
         null;
+    const bunfig_path = try findAutoInstallBunfig(ctx, entry_dir);
+    const custom_registry = bunfig_path != null or ctx.environ_map.get("BUN_CONFIG_REGISTRY") != null;
     if (staging_node_modules) |node_modules| {
         if (autoInstallPathIsDirectory(ctx, node_modules)) try prependAutoInstallNodePath(ctx, node_modules);
     }
     if (mode == .auto and directoryHasNodeModules(ctx, entry_dir)) return;
 
     const loader = transpilerLoaderForPath(entrypoint_path) orelse return;
-    const source = std.Io.Dir.cwd().readFileAlloc(
-        ctx.io,
-        entrypoint_path,
-        ctx.allocator,
-        .limited(16 * 1024 * 1024),
-    ) catch return;
     // COTTONTAIL-COMPAT: Bun discovers missing packages during its normal
     // parser pass. Avoid a redundant compiler pass when no module-loading
     // token exists; large generated scripts otherwise miss Bun's test deadline.
@@ -743,7 +840,7 @@ fn maybeAutoInstall(ctx: *const Context, entrypoint_path: []const u8, exec_args:
         if (staging_node_modules) |node_modules| {
             const installed_alias = try std.fs.path.join(ctx.allocator, &.{ node_modules, request.install_specifier });
             if (autoInstallPathIsDirectory(ctx, installed_alias)) {
-                try exposeAutoInstalledPackage(ctx, cache_root.?, node_modules, request);
+                try exposeAutoInstalledPackage(ctx, cache_root.?, staging_root.?, node_modules, request, custom_registry);
                 continue;
             }
         }
@@ -760,7 +857,8 @@ fn maybeAutoInstall(ctx: *const Context, entrypoint_path: []const u8, exec_args:
 
     const executable = try std.process.executablePathAlloc(ctx.io, ctx.allocator);
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(ctx.allocator, &.{ executable, "add", "--no-save", "--silent" });
+    try argv.appendSlice(ctx.allocator, &.{ executable, "add", "--silent" });
+    if (bunfig_path) |path| try argv.appendSlice(ctx.allocator, &.{ "--config", path });
     if (mode == .force) try argv.append(ctx.allocator, "--force");
     for (packages.items) |request| try argv.append(ctx.allocator, request.install_specifier);
     const install_cwd = staging_root orelse entry_dir;
@@ -785,7 +883,9 @@ fn maybeAutoInstall(ctx: *const Context, entrypoint_path: []const u8, exec_args:
     }
     if (staging_node_modules) |node_modules| {
         try prependAutoInstallNodePath(ctx, node_modules);
-        for (packages.items) |request| try exposeAutoInstalledPackage(ctx, cache_root.?, node_modules, request);
+        for (packages.items) |request| {
+            try exposeAutoInstalledPackage(ctx, cache_root.?, staging_root.?, node_modules, request, custom_registry);
+        }
     }
 }
 
@@ -1399,6 +1499,7 @@ pub fn runEval(
     const eval_entry = try writeEvalEntrypoint(&ctx, ctx.project_root, executable_source, print_result, module_input, "[eval]", true, .omit_entrypoint);
     defer std.Io.Dir.cwd().deleteFile(ctx.io, eval_entry.entry_path) catch {};
     defer if (eval_entry.source_path) |path| std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
+    maybeAutoInstallSource(&ctx, eval_entry.entry_path, executable_source, exec_args) catch {};
     var runnable = try bundleScriptNative(&ctx, eval_entry.entry_path, exec_args, script_args, ctx.project_root, null, null, false, null, false);
     defer runnable.deinit(&ctx);
     canonicalizeEvalSourceMap(&ctx, runnable.path, eval_entry.source_path orelse eval_entry.entry_path) catch |err| switch (err) {

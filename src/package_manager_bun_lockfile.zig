@@ -465,6 +465,35 @@ pub fn writeYarnFromBinary(allocator: std.mem.Allocator, binary: []const u8, wri
     try compiler.install.YarnLockfilePrinter.print(&view, *std.Io.Writer, writer);
 }
 
+pub fn packageResolutionURLFromBinary(
+    allocator: std.mem.Allocator,
+    binary: []const u8,
+    package_name: []const u8,
+) !?[]u8 {
+    var log = compiler.logger.Log.init(allocator);
+    defer deinitLog(&log, allocator);
+
+    const mutable = try allocator.dupe(u8, binary);
+    var lockfile: BunLockfile = undefined;
+    const load_result = lockfile.loadFromBytesStandalone(mutable, allocator, &log);
+    switch (load_result) {
+        .ok => {},
+        .err => |failure| return failure.value,
+        .not_found => return error.InvalidBinaryLockfile,
+    }
+    defer lockfile.deinit();
+
+    const string_buf = lockfile.buffers.string_bytes.items;
+    var packages = lockfile.packages.slice();
+    for (packages.items(.name), packages.items(.resolution)) |name, resolution| {
+        if (!std.mem.eql(u8, name.slice(string_buf), package_name) or resolution.tag != .npm) continue;
+        const url = resolution.value.npm.url.slice(string_buf);
+        if (url.len == 0) return null;
+        return try allocator.dupe(u8, url);
+    }
+    return null;
+}
+
 pub fn writeYarnFromText(allocator: std.mem.Allocator, text: []const u8, writer: *std.Io.Writer) !void {
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();

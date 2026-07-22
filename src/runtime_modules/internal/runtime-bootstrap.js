@@ -12,6 +12,9 @@ globalThis.__cottontailFormatUncaughtException ??= (error) => {
   if (error?.__cottontailFormattedStack === true && typeof error.stack === "string") {
     return error.stack;
   }
+  if (error?.name === "ResolveMessage" && typeof error.message === "string") {
+    return `error: ${error.message}`;
+  }
   let referenceErrorHeaders;
   if (error?.name === "ReferenceError" && typeof error.message === "string" && error.message.startsWith("Can't find variable: ")) {
     const normalizedMessage = `${error.message.slice("Can't find variable: ".length)} is not defined`;
