@@ -8856,8 +8856,9 @@ const Manager = struct {
                 }
             } else if (bin_value == .object) {
                 for (bin_value.object.keys(), bin_value.object.values()) |name, path_value| {
-                    if (path_value == .string and try manager.linkBin(bin_dir, normalizedBinName(name), package_dir, path_value.string)) {
-                        if (report_direct) try manager.direct_bins.append(normalizedBinName(name));
+                    const bin_name = normalizedBinObjectName(name);
+                    if (path_value == .string and try manager.linkBin(bin_dir, bin_name, package_dir, path_value.string)) {
+                        if (report_direct) try manager.direct_bins.append(bin_name);
                     }
                 }
             }
@@ -8892,7 +8893,7 @@ const Manager = struct {
             if (bin_value == .string) {
                 manager.unlinkBin(bin_dir, normalizedBinName(alias));
             } else if (bin_value == .object) {
-                for (bin_value.object.keys()) |name| manager.unlinkBin(bin_dir, normalizedBinName(name));
+                for (bin_value.object.keys()) |name| manager.unlinkBin(bin_dir, normalizedBinObjectName(name));
             }
             return;
         }
@@ -8927,6 +8928,9 @@ const Manager = struct {
         try std.Io.Dir.cwd().createDirPath(manager.init_data.io, bin_dir);
         const destination = try std.fs.path.join(manager.allocator, &.{ bin_dir, name });
         deletePath(manager.init_data.io, destination);
+        if (std.fs.path.dirname(destination)) |destination_parent| {
+            try std.Io.Dir.cwd().createDirPath(manager.init_data.io, destination_parent);
+        }
         if (builtin.os.tag == .windows) {
             const command_path = try std.fmt.allocPrint(manager.allocator, "{s}.cmd", .{destination});
             const executable = try std.process.executablePathAlloc(manager.init_data.io, manager.allocator);
@@ -10344,6 +10348,21 @@ fn pathsEquivalent(io: std.Io, allocator: std.mem.Allocator, left: []const u8, r
 
 fn normalizedBinName(name: []const u8) []const u8 {
     if (std.mem.lastIndexOfAny(u8, name, "/\\:")) |index| return name[index + 1 ..];
+    return name;
+}
+
+fn normalizedBinObjectName(name: []const u8) []const u8 {
+    if (builtin.os.tag == .windows or name.len == 0 or std.fs.path.isAbsolute(name) or
+        std.mem.indexOfAny(u8, name, "\\:") != null)
+    {
+        return normalizedBinName(name);
+    }
+    var segments = std.mem.splitScalar(u8, name, '/');
+    while (segments.next()) |segment| {
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) {
+            return normalizedBinName(name);
+        }
+    }
     return name;
 }
 
