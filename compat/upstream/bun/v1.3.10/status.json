@@ -704,6 +704,10 @@
       "status": "enabled",
       "reason": "Bake Response lowering, server-component option propagation, target validation, and syntax transforms pass all 5 copied cases (24 assertions)."
     },
+    "test/bake/dev/stress.test.ts": {
+      "status": "enabled",
+      "reason": "Bake survives the default crash #18910 smoke cycle of rapid source rewrites and serves the final updated binding (1 case, 2 assertions)."
+    },
     "test/bake/framework-router.test.ts": {
       "status": "enabled",
       "reason": "Bake framework-router route matching, parameter extraction, optional and catch-all segments, route precedence, and style matching pass all 35 copied cases (59 assertions)."
