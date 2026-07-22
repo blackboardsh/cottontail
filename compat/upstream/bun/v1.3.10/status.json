@@ -70,6 +70,27 @@
       "timeoutMs": 30000
     },
     {
+      "pattern": "^test/cli/run/env\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "The copied environment corpus passes 62 active cases covering precedence, parsing, expansion, --env-file, NODE_ENV, large files, and environment APIs.",
+      "args": ["--timeout=30000"],
+      "timeoutMs": 240000
+    },
+    {
+      "pattern": "^test/cli/user-agent\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Both copied user-agent cases pass: the final duplicate option wins and explicit fetch headers override the configured default.",
+      "args": ["--timeout=30000"],
+      "timeoutMs": 90000
+    },
+    {
+      "pattern": "^test/config/bunfig/preload\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "All 18 active copied preload cases pass with early process bootstrap and Bun-compatible preload ordering; two upstream skips and one todo remain.",
+      "args": ["--timeout=30000"],
+      "timeoutMs": 180000
+    },
+    {
       "pattern": "^test/cli/bunfig-test-options\\.test\\.ts$",
       "status": "enabled",
       "reason": "Bunfig test randomization, seeded ordering, invalid seed combinations, rerunEach, and combined test options pass all five copied cases; subprocess-heavy stock-JSC startup requires a larger per-case budget.",
