@@ -81,6 +81,7 @@ function splitBuildOptions(framework, app, side) {
   const frameworkOptions = framework.bundlerOptions ?? {};
   const appOptions = app.bundlerOptions ?? {};
   const options = {
+    sourcemap: "external",
     ...frameworkOptions,
     ...(frameworkOptions[side] ?? {}),
     ...appOptions,
@@ -305,7 +306,10 @@ async function writeClientGraph(context, route) {
   const modulepreload = [];
   const styles = [];
   for (const artifact of result.outputs) {
-    if (artifact.kind === "sourcemap") continue;
+    if (artifact.kind === "sourcemap") {
+      await writePublicArtifact(outputRoot, artifact);
+      continue;
+    }
     const url = await writePublicArtifact(outputRoot, artifact);
     if (isCssArtifact(artifact)) {
       styles.push(url);
@@ -357,6 +361,7 @@ async function buildSsrFrameworkAliases(context) {
       entrypoints: [wrapperPath],
       target: "bun",
       format: "esm",
+      sourcemap: "inline",
       conditions: [...new Set([...(ssrOptions.conditions ?? []), "node"])],
       define: productionDefines(ssrOptions, "server"),
       jsx: { ...(ssrOptions.jsx ?? {}), development: false },
@@ -383,6 +388,7 @@ async function buildSsrComponents(context, route) {
       entrypoints: [boundary.path],
       target: "bun",
       format: "esm",
+      sourcemap: "inline",
       conditions: [...new Set([...(context.ssrOptions.conditions ?? []), "node"])],
       define: productionDefines(context.ssrOptions, "server"),
       jsx: { ...(context.ssrOptions.jsx ?? {}), development: false },
@@ -432,6 +438,7 @@ async function loadServerRoute(context, route) {
     entrypoints: [wrapperPath],
     target: "bun",
     format: "esm",
+    sourcemap: "inline",
     conditions,
     define: productionDefines(context.serverOptions, "server"),
     jsx: { ...(context.serverOptions.jsx ?? {}), development: false },
