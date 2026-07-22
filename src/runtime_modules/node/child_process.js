@@ -239,9 +239,8 @@ function checkExecSyncResult(result, args = undefined, command = undefined) {
   return error;
 }
 
-// Classify one spawnSync stdio entry. Arbitrary descriptors and
-// stream objects still need capture-and-forward; pipe/inherit/ignore are sent
-// directly to the native per-fd spawner.
+// Classify one spawnSync stdio entry. Open descriptors are routed directly;
+// stream-like objects without an fd still use capture-and-forward.
 function classifySyncStdio(value, parentFd) {
   if (value === undefined || value === null || value === "pipe" || value === "overlapped") {
     return { capture: true };
@@ -261,7 +260,8 @@ function classifySyncStdio(value, parentFd) {
 function nativeSyncStdioMode(target, parentFd) {
   if (target.capture) return "pipe";
   if (target.targetFd === parentFd) return "inherit";
-  if (target.targetFd != null || target.targetStream) return "pipe";
+  if (target.targetFd != null) return target.targetFd;
+  if (target.targetStream) return "pipe";
   return "ignore";
 }
 
@@ -308,6 +308,7 @@ export function spawnSync(file, args = [], options = {}) {
       timeout,
       maxBuffer,
       killSignal,
+      argv0: normalized.options.argv0,
     });
   } catch (error) {
     return makeSpawnFailureResult(file, error, command.args);
@@ -487,6 +488,15 @@ function normalizeStdio(value, fallback) {
   return fallback;
 }
 
+function stdioSourceFd(value) {
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0) return value;
+  if (value != null && typeof value === "object" &&
+      typeof value.fd === "number" && Number.isInteger(value.fd) && value.fd >= 0) {
+    return value.fd;
+  }
+  return undefined;
+}
+
 // Node surfaces exec failures (missing file, not executable) as an async
 // 'error' event with ENOENT/EACCES rather than an exit code; approximate the
 // spawn syscall's checks for direct paths before handing off to the native
@@ -562,16 +572,25 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
   let stdinMode = "pipe";
   let stdoutMode = "pipe";
   let stderrMode = "pipe";
+  let stdinOption;
+  let stdoutOption;
+  let stderrOption;
   if (Array.isArray(options.stdio)) {
-    stdinMode = normalizeStdio(options.stdio[0], stdinMode);
-    stdoutMode = normalizeStdio(options.stdio[1], stdoutMode);
-    stderrMode = normalizeStdio(options.stdio[2], stderrMode);
+    stdinOption = options.stdio[0];
+    stdoutOption = options.stdio[1];
+    stderrOption = options.stdio[2];
   } else if (typeof options.stdio === "string") {
-    stdinMode = stdoutMode = stderrMode = normalizeStdio(options.stdio, "pipe");
+    stdinOption = stdoutOption = stderrOption = options.stdio;
   }
-  stdinMode = normalizeStdio(options.stdin, stdinMode);
-  stdoutMode = normalizeStdio(options.stdout, stdoutMode);
-  stderrMode = normalizeStdio(options.stderr, stderrMode);
+  if (options.stdin !== undefined) stdinOption = options.stdin;
+  if (options.stdout !== undefined) stdoutOption = options.stdout;
+  if (options.stderr !== undefined) stderrOption = options.stderr;
+  stdinMode = normalizeStdio(stdinOption, stdinMode);
+  stdoutMode = normalizeStdio(stdoutOption, stdoutMode);
+  stderrMode = normalizeStdio(stderrOption, stderrMode);
+  const stdinSourceFd = stdioSourceFd(stdinOption);
+  const stdoutSourceFd = stdioSourceFd(stdoutOption);
+  const stderrSourceFd = stdioSourceFd(stderrOption);
   const ipcRequested = options.ipc === true || (Array.isArray(options.stdio) && options.stdio.some((item) => item === "ipc"));
   const nodeIpcProtocol = options.__nodeIpcProtocol === true;
 
@@ -836,9 +855,9 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
         cwd: normalizeCwdOption(options.cwd),
         env: nativeOptions.env,
         clearEnv: nativeOptions.clearEnv,
-        stdin: stdinMode,
-        stdout: stdoutMode,
-        stderr: stderrMode,
+        stdin: stdinSourceFd ?? stdinMode,
+        stdout: stdoutSourceFd ?? stdoutMode,
+        stderr: stderrSourceFd ?? stderrMode,
         ipc: ipcRequested,
         argv0: options.argv0 != null ? String(options.argv0) : undefined,
         deferStart,

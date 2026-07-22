@@ -38,7 +38,9 @@ files.push({
   ]),
   path: 'bun/wrap.js',
 });
-files.push({ file: bufferFallbackPath, path: 'node/internal/buffer-polyfill.js' });
+if (!files.some(entry => entry.path === 'node/internal/buffer-polyfill.js')) {
+  files.push({ file: bufferFallbackPath, path: 'node/internal/buffer-polyfill.js' });
+}
 files.push({ file: base64FallbackPath, path: 'node/internal/vendor/base64-js.js' });
 files.push({ file: ieee754FallbackPath, path: 'node/internal/vendor/ieee754.js' });
 files.sort((a, b) => a.path.localeCompare(b.path));

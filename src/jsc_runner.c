@@ -979,12 +979,16 @@ typedef struct {
 
 typedef struct {
     const char *cwd;
+    const char *argv0;
     const CtHostEnvEntry *env_entries;
     size_t env_count;
     bool clear_env;
     int stdin_mode;
     int stdout_mode;
     int stderr_mode;
+    int stdin_fd;
+    int stdout_fd;
+    int stderr_fd;
     bool input_present;
     const uint8_t *input_ptr;
     size_t input_len;
@@ -1359,6 +1363,15 @@ typedef enum {
     CT_PROCESS_STDIO_INHERIT,
     CT_PROCESS_STDIO_IGNORE,
 } CtProcessStdioMode;
+
+typedef struct {
+    int target_fd;
+    int source_fd;
+    int action_source_fd;
+    int parent_fd;
+    int child_fd;
+    CtProcessStdioMode mode;
+} CtProcessExtraStdio;
 
 static pthread_mutex_t ct_async_processes_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtAsyncProcess *ct_async_processes = NULL;
@@ -17153,14 +17166,19 @@ static int ct_spawn_sync_parse_stdio_value(
     JSContextRef ctx,
     JSValueRef value,
     int *mode,
+    int *source_fd,
     JSValueRef *exception
 ) {
     if (value == NULL || JSValueIsUndefined(ctx, value)) return 0;
     if (JSValueIsNull(ctx, value)) {
         *mode = CT_PROCESS_STDIO_IGNORE;
+        *source_fd = -1;
         return 0;
     }
     if (JSValueIsNumber(ctx, value)) {
+        if (!ct_value_to_int_checked(ctx, value, 0, INT_MAX, source_fd, exception, "invalid spawn file descriptor")) {
+            return -1;
+        }
         *mode = CT_PROCESS_STDIO_INHERIT;
         return 0;
     }
@@ -17172,10 +17190,13 @@ static int ct_spawn_sync_parse_stdio_value(
     }
     if (strcmp(text, "pipe") == 0 || strcmp(text, "overlapped") == 0) {
         *mode = CT_PROCESS_STDIO_PIPE;
+        *source_fd = -1;
     } else if (strcmp(text, "inherit") == 0) {
         *mode = CT_PROCESS_STDIO_INHERIT;
+        *source_fd = -1;
     } else if (strcmp(text, "ignore") == 0) {
         *mode = CT_PROCESS_STDIO_IGNORE;
+        *source_fd = -1;
     } else {
         free(text);
         ct_throw_message(ctx, exception, "spawn stdio must be 'pipe', 'inherit', or 'ignore'");
@@ -17232,6 +17253,10 @@ static int ct_parse_spawn_sync_native_options(
     options->stdin_mode = capture_output ? CT_PROCESS_STDIO_IGNORE : CT_PROCESS_STDIO_INHERIT;
     options->stdout_mode = capture_output ? CT_PROCESS_STDIO_PIPE : CT_PROCESS_STDIO_INHERIT;
     options->stderr_mode = capture_output ? CT_PROCESS_STDIO_PIPE : CT_PROCESS_STDIO_INHERIT;
+    options->stdin_fd = -1;
+    options->stdout_fd = -1;
+    options->stderr_fd = -1;
+    options->argv0 = NULL;
     options->timeout_enabled = false;
     options->timeout_ms = 0;
     options->max_buffer_enabled = false;
@@ -17242,32 +17267,39 @@ static int ct_parse_spawn_sync_native_options(
     if (value != NULL && !JSValueIsUndefined(ctx, value) && !JSValueIsNull(ctx, value) && JSValueIsObject(ctx, value)) {
         JSObjectRef object = (JSObjectRef)value;
         JSValueRef stdio_value = ct_get_property(ctx, object, "stdio", exception);
+        JSValueRef argv0_value = ct_get_property(ctx, object, "argv0", exception);
         if (exception != NULL && *exception != NULL) return -1;
+        options->argv0 = ct_value_to_optional_string(ctx, argv0_value);
 
         if (!JSValueIsUndefined(ctx, stdio_value) && !JSValueIsNull(ctx, stdio_value)) {
             if (JSValueIsObject(ctx, stdio_value) && !JSValueIsString(ctx, stdio_value)) {
                 JSObjectRef stdio_array = (JSObjectRef)stdio_value;
                 int *modes[] = { &options->stdin_mode, &options->stdout_mode, &options->stderr_mode };
+                int *source_fds[] = { &options->stdin_fd, &options->stdout_fd, &options->stderr_fd };
                 for (unsigned index = 0; index < 3; index += 1) {
                     JSValueRef entry = JSObjectGetPropertyAtIndex(ctx, stdio_array, index, exception);
                     if (exception != NULL && *exception != NULL) return -1;
-                    if (ct_spawn_sync_parse_stdio_value(ctx, entry, modes[index], exception) != 0) return -1;
+                    if (ct_spawn_sync_parse_stdio_value(ctx, entry, modes[index], source_fds[index], exception) != 0) return -1;
                 }
             } else {
                 int mode = CT_PROCESS_STDIO_PIPE;
-                if (ct_spawn_sync_parse_stdio_value(ctx, stdio_value, &mode, exception) != 0) return -1;
+                int source_fd = -1;
+                if (ct_spawn_sync_parse_stdio_value(ctx, stdio_value, &mode, &source_fd, exception) != 0) return -1;
                 options->stdin_mode = mode;
                 options->stdout_mode = mode;
                 options->stderr_mode = mode;
+                options->stdin_fd = source_fd;
+                options->stdout_fd = source_fd;
+                options->stderr_fd = source_fd;
             }
         } else {
             JSValueRef stdin_value = ct_get_property(ctx, object, "stdin", exception);
             JSValueRef stdout_value = ct_get_property(ctx, object, "stdout", exception);
             JSValueRef stderr_value = ct_get_property(ctx, object, "stderr", exception);
             if (exception != NULL && *exception != NULL) return -1;
-            if (ct_spawn_sync_parse_stdio_value(ctx, stdin_value, &options->stdin_mode, exception) != 0 ||
-                ct_spawn_sync_parse_stdio_value(ctx, stdout_value, &options->stdout_mode, exception) != 0 ||
-                ct_spawn_sync_parse_stdio_value(ctx, stderr_value, &options->stderr_mode, exception) != 0) {
+            if (ct_spawn_sync_parse_stdio_value(ctx, stdin_value, &options->stdin_mode, &options->stdin_fd, exception) != 0 ||
+                ct_spawn_sync_parse_stdio_value(ctx, stdout_value, &options->stdout_mode, &options->stdout_fd, exception) != 0 ||
+                ct_spawn_sync_parse_stdio_value(ctx, stderr_value, &options->stderr_mode, &options->stderr_fd, exception) != 0) {
                 return -1;
             }
         }
@@ -17309,7 +17341,10 @@ static int ct_parse_spawn_sync_native_options(
         }
     }
 
-    if (input_present) options->stdin_mode = CT_PROCESS_STDIO_PIPE;
+    if (input_present) {
+        options->stdin_mode = CT_PROCESS_STDIO_PIPE;
+        options->stdin_fd = -1;
+    }
     if (options->stdin_mode == CT_PROCESS_STDIO_PIPE && !input_present) {
         /* Bun closes an empty synchronous stdin pipe immediately. */
         options->stdin_mode = CT_PROCESS_STDIO_IGNORE;
@@ -17325,10 +17360,10 @@ static void ct_process_close_fd(int *fd) {
 }
 
 #if !defined(_WIN32)
-static int ct_process_relocate_standard_fds(int fds[2]) {
+static int ct_process_relocate_fds(int fds[2], int minimum_fd) {
     for (size_t index = 0; index < 2; index += 1) {
-        if (fds[index] < 0 || fds[index] > STDERR_FILENO) continue;
-        int relocated = fcntl(fds[index], F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+        if (fds[index] < 0 || fds[index] >= minimum_fd) continue;
+        int relocated = fcntl(fds[index], F_DUPFD_CLOEXEC, minimum_fd);
         if (relocated < 0) return -1;
         close(fds[index]);
         fds[index] = relocated;
@@ -17341,15 +17376,65 @@ static void ct_process_set_close_on_exec(int fd) {
     int flags = fcntl(fd, F_GETFD);
     if (flags >= 0) (void)fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
+
+static bool ct_process_duplicate_stdio_sources(const int source_fds[3], int action_fds[3], int minimum_fd) {
+    for (int target_fd = 0; target_fd < 3; target_fd += 1) {
+        action_fds[target_fd] = source_fds[target_fd];
+        if (source_fds[target_fd] < 0 || source_fds[target_fd] == target_fd) continue;
+        int duplicate = fcntl(source_fds[target_fd], F_DUPFD_CLOEXEC, minimum_fd);
+        if (duplicate < 0) {
+            for (int cleanup = 0; cleanup < target_fd; cleanup += 1) {
+                if (action_fds[cleanup] >= minimum_fd && action_fds[cleanup] != source_fds[cleanup]) {
+                    close(action_fds[cleanup]);
+                }
+            }
+            return false;
+        }
+        action_fds[target_fd] = duplicate;
+    }
+    return true;
+}
+
+static void ct_process_close_stdio_action_fds(const int source_fds[3], int action_fds[3], int minimum_fd) {
+    for (int target_fd = 0; target_fd < 3; target_fd += 1) {
+        if (action_fds[target_fd] >= minimum_fd && action_fds[target_fd] != source_fds[target_fd]) {
+            close(action_fds[target_fd]);
+        }
+        action_fds[target_fd] = -1;
+    }
+}
+
+static void ct_process_close_extra_stdio(CtProcessExtraStdio *entries, size_t count, bool close_parent) {
+    for (size_t index = 0; index < count; index += 1) {
+        if (entries[index].action_source_fd >= 0 && entries[index].action_source_fd != entries[index].source_fd) {
+            close(entries[index].action_source_fd);
+        }
+        entries[index].action_source_fd = -1;
+        if (entries[index].child_fd >= 0) close(entries[index].child_fd);
+        entries[index].child_fd = -1;
+        if (close_parent && entries[index].parent_fd >= 0) close(entries[index].parent_fd);
+        if (close_parent) entries[index].parent_fd = -1;
+    }
+}
 #endif
 
-static int ct_process_parse_stdio_value(JSContextRef ctx, JSValueRef value, CtProcessStdioMode *out, JSValueRef *exception) {
+static int ct_process_parse_stdio_value(
+    JSContextRef ctx,
+    JSValueRef value,
+    CtProcessStdioMode *out,
+    int *source_fd,
+    JSValueRef *exception
+) {
     if (JSValueIsUndefined(ctx, value)) return 0;
     if (JSValueIsNull(ctx, value)) {
         *out = CT_PROCESS_STDIO_IGNORE;
+        *source_fd = -1;
         return 0;
     }
     if (JSValueIsNumber(ctx, value)) {
+        if (!ct_value_to_int_checked(ctx, value, 0, INT_MAX, source_fd, exception, "invalid spawn file descriptor")) {
+            return -1;
+        }
         *out = CT_PROCESS_STDIO_INHERIT;
         return 0;
     }
@@ -17362,10 +17447,13 @@ static int ct_process_parse_stdio_value(JSContextRef ctx, JSValueRef value, CtPr
 
     if (strcmp(mode, "pipe") == 0) {
         *out = CT_PROCESS_STDIO_PIPE;
+        *source_fd = -1;
     } else if (strcmp(mode, "inherit") == 0) {
         *out = CT_PROCESS_STDIO_INHERIT;
+        *source_fd = -1;
     } else if (strcmp(mode, "ignore") == 0) {
         *out = CT_PROCESS_STDIO_IGNORE;
+        *source_fd = -1;
     } else {
         free(mode);
         ct_throw_message(ctx, exception, "spawn stdio must be 'pipe', 'inherit', or 'ignore'");
@@ -17381,11 +17469,57 @@ static int ct_process_parse_stdio_mode(
     JSObjectRef options,
     const char *name,
     CtProcessStdioMode *mode,
+    int *source_fd,
     JSValueRef *exception
 ) {
     JSValueRef value = ct_get_property(ctx, options, name, exception);
     if (exception != NULL && *exception != NULL) return -1;
-    return ct_process_parse_stdio_value(ctx, value, mode, exception);
+    return ct_process_parse_stdio_value(ctx, value, mode, source_fd, exception);
+}
+
+static int ct_process_parse_extra_stdio(
+    JSContextRef ctx,
+    JSValueRef value,
+    CtProcessExtraStdio **entries_out,
+    size_t *count_out,
+    JSValueRef *exception
+) {
+    *entries_out = NULL;
+    *count_out = 0;
+    if (value == NULL || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value)) return 0;
+    if (!JSValueIsObject(ctx, value)) {
+        ct_throw_message(ctx, exception, "extraStdio must be an array");
+        return -1;
+    }
+    JSObjectRef array = (JSObjectRef)value;
+    JSValueRef length_value = ct_get_property(ctx, array, "length", exception);
+    int count = 0;
+    if (exception != NULL && *exception != NULL) return -1;
+    if (!ct_value_to_int_checked(ctx, length_value, 0, 1024, &count, exception, "invalid extraStdio length")) return -1;
+    if (count == 0) return 0;
+
+    CtProcessExtraStdio *entries = (CtProcessExtraStdio *)calloc((size_t)count, sizeof(*entries));
+    if (entries == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return -1;
+    }
+    for (int index = 0; index < count; index += 1) {
+        entries[index].target_fd = index + 3;
+        entries[index].source_fd = -1;
+        entries[index].action_source_fd = -1;
+        entries[index].parent_fd = -1;
+        entries[index].child_fd = -1;
+        entries[index].mode = CT_PROCESS_STDIO_IGNORE;
+        JSValueRef entry = JSObjectGetPropertyAtIndex(ctx, array, (unsigned)index, exception);
+        if ((exception != NULL && *exception != NULL) ||
+            ct_process_parse_stdio_value(ctx, entry, &entries[index].mode, &entries[index].source_fd, exception) != 0) {
+            free(entries);
+            return -1;
+        }
+    }
+    *entries_out = entries;
+    *count_out = (size_t)count;
+    return 0;
 }
 
 static int ct_open_dev_null(int flags) {
@@ -17449,6 +17583,7 @@ static JSValueRef ct_spawn_sync(JSContextRef ctx, JSObjectRef function, JSObject
     }
     CtHostSpawnOptions host_options = {
         .cwd = cwd,
+        .argv0 = NULL,
         .env_entries = env_entries,
         .env_count = env_count,
         .clear_env = clear_env,
@@ -17466,6 +17601,7 @@ static JSValueRef ct_spawn_sync(JSContextRef ctx, JSObjectRef function, JSObject
         free(file);
         ct_free_string_array(args, arg_count);
         free(cwd);
+        free((void *)host_options.argv0);
         ct_free_env_entries(env_entries, env_count);
         return JSValueMakeUndefined(ctx);
     }
@@ -17499,6 +17635,7 @@ static JSValueRef ct_spawn_sync(JSContextRef ctx, JSObjectRef function, JSObject
     free(file);
     ct_free_string_array(args, arg_count);
     free(cwd);
+    free((void *)host_options.argv0);
     ct_free_env_entries(env_entries, env_count);
     return response;
 }
@@ -18428,6 +18565,9 @@ static bool ct_windows_spawn_process(
     CtProcessStdioMode stdin_mode,
     CtProcessStdioMode stdout_mode,
     CtProcessStdioMode stderr_mode,
+    int stdin_source_fd,
+    int stdout_source_fd,
+    int stderr_source_fd,
     bool detached,
     bool suspended,
     HANDLE *process_out,
@@ -18464,11 +18604,17 @@ static bool ct_windows_spawn_process(
     if (stdin_mode == CT_PROCESS_STDIO_PIPE && !ct_windows_create_pipe(&parent_stdin, &child_stdin, true)) goto handles_fail;
     if (stdout_mode == CT_PROCESS_STDIO_PIPE && !ct_windows_create_pipe(&parent_stdout, &child_stdout, false)) goto handles_fail;
     if (stderr_mode == CT_PROCESS_STDIO_PIPE && !ct_windows_create_pipe(&parent_stderr, &child_stderr, false)) goto handles_fail;
-    if (stdin_mode == CT_PROCESS_STDIO_INHERIT) child_stdin = GetStdHandle(STD_INPUT_HANDLE);
+    if (stdin_mode == CT_PROCESS_STDIO_INHERIT) child_stdin = stdin_source_fd >= 0
+        ? (HANDLE)_get_osfhandle(stdin_source_fd)
+        : GetStdHandle(STD_INPUT_HANDLE);
     else if (stdin_mode == CT_PROCESS_STDIO_IGNORE) child_stdin = ct_windows_null_handle(GENERIC_READ);
-    if (stdout_mode == CT_PROCESS_STDIO_INHERIT) child_stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (stdout_mode == CT_PROCESS_STDIO_INHERIT) child_stdout = stdout_source_fd >= 0
+        ? (HANDLE)_get_osfhandle(stdout_source_fd)
+        : GetStdHandle(STD_OUTPUT_HANDLE);
     else if (stdout_mode == CT_PROCESS_STDIO_IGNORE) child_stdout = ct_windows_null_handle(GENERIC_WRITE);
-    if (stderr_mode == CT_PROCESS_STDIO_INHERIT) child_stderr = GetStdHandle(STD_ERROR_HANDLE);
+    if (stderr_mode == CT_PROCESS_STDIO_INHERIT) child_stderr = stderr_source_fd >= 0
+        ? (HANDLE)_get_osfhandle(stderr_source_fd)
+        : GetStdHandle(STD_ERROR_HANDLE);
     else if (stderr_mode == CT_PROCESS_STDIO_IGNORE) child_stderr = ct_windows_null_handle(GENERIC_WRITE);
     if (child_stdin == INVALID_HANDLE_VALUE || child_stdout == INVALID_HANDLE_VALUE || child_stderr == INVALID_HANDLE_VALUE) goto handles_fail;
 
@@ -18900,12 +19046,25 @@ static char *ct_resolve_spawn_executable(const char *file, char *const *envp, co
 /// Builds the child environment array for posix_spawn: the parent environ
 /// (unless clear_env) with `env_entries` overrides applied, plus the IPC fd
 /// variable when IPC is enabled.
-static char **ct_build_spawn_envp(const CtHostEnvEntry *env_entries, size_t env_count, bool clear_env, bool ipc_enabled) {
+static bool ct_spawn_ipc_env_name(const char *name, bool node_ipc_protocol) {
+    if (strcmp(name, "COTTONTAIL_IPC_FD") == 0) return true;
+    return node_ipc_protocol &&
+        (strcmp(name, "NODE_CHANNEL_FD") == 0 || strcmp(name, "NODE_CHANNEL_SERIALIZATION_MODE") == 0);
+}
+
+static char **ct_build_spawn_envp(
+    const CtHostEnvEntry *env_entries,
+    size_t env_count,
+    bool clear_env,
+    int ipc_target_fd,
+    bool node_ipc_protocol
+) {
+    bool ipc_enabled = ipc_target_fd >= 0;
     size_t inherited_count = 0;
     if (!clear_env && environ != NULL) {
         while (environ[inherited_count] != NULL) inherited_count += 1;
     }
-    char **envp = (char **)calloc(inherited_count + env_count + 2, sizeof(char *));
+    char **envp = (char **)calloc(inherited_count + env_count + 4, sizeof(char *));
     if (envp == NULL) return NULL;
     size_t out = 0;
     if (!clear_env && environ != NULL) {
@@ -18915,7 +19074,10 @@ static char **ct_build_spawn_envp(const CtHostEnvEntry *env_entries, size_t env_
                 overridden = ct_env_entry_matches(environ[index], env_entries[entry].name);
             }
             if (ipc_enabled && !overridden) {
-                overridden = ct_env_entry_matches(environ[index], "COTTONTAIL_IPC_FD");
+                overridden = ct_env_entry_matches(environ[index], "COTTONTAIL_IPC_FD") ||
+                    (node_ipc_protocol &&
+                     (ct_env_entry_matches(environ[index], "NODE_CHANNEL_FD") ||
+                      ct_env_entry_matches(environ[index], "NODE_CHANNEL_SERIALIZATION_MODE")));
             }
             if (overridden) continue;
             envp[out] = strdup(environ[index]);
@@ -18927,7 +19089,7 @@ static char **ct_build_spawn_envp(const CtHostEnvEntry *env_entries, size_t env_
         }
     }
     for (size_t entry = 0; entry < env_count; entry += 1) {
-        if (ipc_enabled && strcmp(env_entries[entry].name, "COTTONTAIL_IPC_FD") == 0) continue;
+        if (ipc_enabled && ct_spawn_ipc_env_name(env_entries[entry].name, node_ipc_protocol)) continue;
         envp[out] = ct_format_env_entry(env_entries[entry].name, env_entries[entry].value);
         if (envp[out] == NULL) {
             ct_free_spawn_envp(envp);
@@ -18936,12 +19098,29 @@ static char **ct_build_spawn_envp(const CtHostEnvEntry *env_entries, size_t env_
         out += 1;
     }
     if (ipc_enabled) {
-        envp[out] = ct_format_env_entry("COTTONTAIL_IPC_FD", "3");
-        if (envp[out] == NULL) {
-            ct_free_spawn_envp(envp);
-            return NULL;
+        char fd_text[32];
+        snprintf(fd_text, sizeof(fd_text), "%d", ipc_target_fd);
+        if (node_ipc_protocol) {
+            envp[out] = ct_format_env_entry("NODE_CHANNEL_FD", fd_text);
+            if (envp[out] == NULL) {
+                ct_free_spawn_envp(envp);
+                return NULL;
+            }
+            out += 1;
+            envp[out] = ct_format_env_entry("NODE_CHANNEL_SERIALIZATION_MODE", "json");
+            if (envp[out] == NULL) {
+                ct_free_spawn_envp(envp);
+                return NULL;
+            }
+            out += 1;
+        } else {
+            envp[out] = ct_format_env_entry("COTTONTAIL_IPC_FD", fd_text);
+            if (envp[out] == NULL) {
+                ct_free_spawn_envp(envp);
+                return NULL;
+            }
+            out += 1;
         }
-        out += 1;
     }
     envp[out] = NULL;
     return envp;
@@ -18964,11 +19143,17 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     bool clear_env = false;
     bool capture_output = true;
     bool ipc_enabled = false;
+    bool node_ipc_protocol = false;
     bool defer_start = false;
     int terminal_fd = -1;
     CtProcessStdioMode stdin_mode = CT_PROCESS_STDIO_IGNORE;
     CtProcessStdioMode stdout_mode = CT_PROCESS_STDIO_PIPE;
     CtProcessStdioMode stderr_mode = CT_PROCESS_STDIO_INHERIT;
+    int stdin_source_fd = -1;
+    int stdout_source_fd = -1;
+    int stderr_source_fd = -1;
+    CtProcessExtraStdio *extra_stdio = NULL;
+    size_t extra_stdio_count = 0;
     if (ct_parse_string_array(ctx, argc >= 2 ? argv[1] : NULL, &args, &arg_count, exception) != 0 ||
         ct_parse_spawn_options(ctx, argc >= 3 ? argv[2] : NULL, &cwd, &env_entries, &env_count, &clear_env, &capture_output, NULL, NULL, NULL, exception) != 0) {
         free(file);
@@ -18983,9 +19168,11 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         JSObjectRef options = (JSObjectRef)argv[2];
         JSValueRef stdio_value = ct_get_property(ctx, options, "stdio", exception);
         JSValueRef ipc_value = ct_get_property(ctx, options, "ipc", exception);
+        JSValueRef node_ipc_value = ct_get_property(ctx, options, "nodeIpc", exception);
         JSValueRef argv0_value = ct_get_property(ctx, options, "argv0", exception);
         JSValueRef defer_start_value = ct_get_property(ctx, options, "deferStart", exception);
         JSValueRef terminal_fd_value = ct_get_property(ctx, options, "terminalFd", exception);
+        JSValueRef extra_stdio_value = ct_get_property(ctx, options, "extraStdio", exception);
         if (exception != NULL && *exception != NULL) {
             free(file);
             ct_free_string_array(args, arg_count);
@@ -18994,6 +19181,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
             return JSValueMakeUndefined(ctx);
         }
         ipc_enabled = JSValueToBoolean(ctx, ipc_value);
+        node_ipc_protocol = JSValueToBoolean(ctx, node_ipc_value);
         defer_start = JSValueToBoolean(ctx, defer_start_value);
         argv0 = ct_value_to_optional_string(ctx, argv0_value);
         if (!JSValueIsUndefined(ctx, terminal_fd_value) && !JSValueIsNull(ctx, terminal_fd_value) &&
@@ -19008,7 +19196,8 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
 
         if (!JSValueIsUndefined(ctx, stdio_value)) {
             CtProcessStdioMode stdio_mode = stdout_mode;
-            if (ct_process_parse_stdio_value(ctx, stdio_value, &stdio_mode, exception) != 0) {
+            int stdio_source_fd = -1;
+            if (ct_process_parse_stdio_value(ctx, stdio_value, &stdio_mode, &stdio_source_fd, exception) != 0) {
                 free(file);
                 ct_free_string_array(args, arg_count);
                 free(cwd);
@@ -19019,11 +19208,22 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
             stdin_mode = stdio_mode;
             stdout_mode = stdio_mode;
             stderr_mode = stdio_mode;
+            stdin_source_fd = stdio_source_fd;
+            stdout_source_fd = stdio_source_fd;
+            stderr_source_fd = stdio_source_fd;
         }
 
-        if (ct_process_parse_stdio_mode(ctx, options, "stdin", &stdin_mode, exception) != 0 ||
-            ct_process_parse_stdio_mode(ctx, options, "stdout", &stdout_mode, exception) != 0 ||
-            ct_process_parse_stdio_mode(ctx, options, "stderr", &stderr_mode, exception) != 0) {
+        if (ct_process_parse_stdio_mode(ctx, options, "stdin", &stdin_mode, &stdin_source_fd, exception) != 0 ||
+            ct_process_parse_stdio_mode(ctx, options, "stdout", &stdout_mode, &stdout_source_fd, exception) != 0 ||
+            ct_process_parse_stdio_mode(ctx, options, "stderr", &stderr_mode, &stderr_source_fd, exception) != 0) {
+            free(file);
+            ct_free_string_array(args, arg_count);
+            free(cwd);
+            free(argv0);
+            ct_free_env_entries(env_entries, env_count);
+            return JSValueMakeUndefined(ctx);
+        }
+        if (ct_process_parse_extra_stdio(ctx, extra_stdio_value, &extra_stdio, &extra_stdio_count, exception) != 0) {
             free(file);
             ct_free_string_array(args, arg_count);
             free(cwd);
@@ -19036,12 +19236,23 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     uint32_t id = ++runtime->next_process_id;
 
 #if defined(_WIN32)
+    if (extra_stdio_count > 0) {
+        ct_throw_message(ctx, exception, "extra stdio descriptors are unavailable on this platform");
+        free(file);
+        ct_free_string_array(args, arg_count);
+        free(cwd);
+        free(argv0);
+        free(extra_stdio);
+        ct_free_env_entries(env_entries, env_count);
+        return JSValueMakeUndefined(ctx);
+    }
     if (terminal_fd >= 0) {
         ct_throw_message(ctx, exception, "PTY not supported on this platform");
         free(file);
         ct_free_string_array(args, arg_count);
         free(cwd);
         free(argv0);
+        free(extra_stdio);
         ct_free_env_entries(env_entries, env_count);
         return JSValueMakeUndefined(ctx);
     }
@@ -19051,6 +19262,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         ct_free_string_array(args, arg_count);
         free(cwd);
         free(argv0);
+        free(extra_stdio);
         ct_free_env_entries(env_entries, env_count);
         return JSValueMakeUndefined(ctx);
     }
@@ -19061,13 +19273,16 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     int stdout_fd = -1;
     int stderr_fd = -1;
     if (!ct_windows_spawn_process(file, args, arg_count, argv0, cwd, env_entries, env_count, clear_env,
-                                  stdin_mode, stdout_mode, stderr_mode, false, defer_start, &process_handle, &start_thread, &pid,
+                                  stdin_mode, stdout_mode, stderr_mode,
+                                  stdin_source_fd, stdout_source_fd, stderr_source_fd,
+                                  false, defer_start, &process_handle, &start_thread, &pid,
                                   &stdin_fd, &stdout_fd, &stderr_fd)) {
         ct_throw_message(ctx, exception, "CreateProcessW failed");
         free(file);
         ct_free_string_array(args, arg_count);
         free(cwd);
         free(argv0);
+        free(extra_stdio);
         ct_free_env_entries(env_entries, env_count);
         return JSValueMakeUndefined(ctx);
     }
@@ -19084,6 +19299,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         ct_free_string_array(args, arg_count);
         free(cwd);
         free(argv0);
+        free(extra_stdio);
         ct_free_env_entries(env_entries, env_count);
         return JSValueMakeUndefined(ctx);
     }
@@ -19113,27 +19329,33 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     ct_free_string_array(args, arg_count);
     free(cwd);
     free(argv0);
+    free(extra_stdio);
     ct_free_env_entries(env_entries, env_count);
     return response;
 #else
+    int ipc_target_fd = ipc_enabled ? (int)extra_stdio_count + 3 : -1;
+    int reserved_fd_max = ipc_enabled ? ipc_target_fd : (int)extra_stdio_count + 2;
+    int safe_fd_minimum = reserved_fd_max + 1;
     int stdin_pipe[2] = { -1, -1 };
     int stdout_pipe[2] = { -1, -1 };
     int stderr_pipe[2] = { -1, -1 };
     int ipc_socket[2] = { -1, -1 };
     int start_gate[2] = { -1, -1 };
     if (terminal_fd < 0 && stdin_mode == CT_PROCESS_STDIO_PIPE &&
-        (pipe(stdin_pipe) != 0 || ct_process_relocate_standard_fds(stdin_pipe) != 0)) {
+        (pipe(stdin_pipe) != 0 || ct_process_relocate_fds(stdin_pipe, safe_fd_minimum) != 0)) {
         ct_process_close_fd(&stdin_pipe[0]);
         ct_process_close_fd(&stdin_pipe[1]);
         ct_throw_message(ctx, exception, strerror(errno));
         free(file);
         ct_free_string_array(args, arg_count);
         free(cwd);
+        free(argv0);
+        free(extra_stdio);
         ct_free_env_entries(env_entries, env_count);
         return JSValueMakeUndefined(ctx);
     }
     if (terminal_fd < 0 && stdout_mode == CT_PROCESS_STDIO_PIPE &&
-        (pipe(stdout_pipe) != 0 || ct_process_relocate_standard_fds(stdout_pipe) != 0)) {
+        (pipe(stdout_pipe) != 0 || ct_process_relocate_fds(stdout_pipe, safe_fd_minimum) != 0)) {
         ct_process_close_fd(&stdin_pipe[0]);
         ct_process_close_fd(&stdin_pipe[1]);
         ct_process_close_fd(&stdout_pipe[0]);
@@ -19142,11 +19364,13 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         free(file);
         ct_free_string_array(args, arg_count);
         free(cwd);
+        free(argv0);
+        free(extra_stdio);
         ct_free_env_entries(env_entries, env_count);
         return JSValueMakeUndefined(ctx);
     }
     if (terminal_fd < 0 && stderr_mode == CT_PROCESS_STDIO_PIPE &&
-        (pipe(stderr_pipe) != 0 || ct_process_relocate_standard_fds(stderr_pipe) != 0)) {
+        (pipe(stderr_pipe) != 0 || ct_process_relocate_fds(stderr_pipe, safe_fd_minimum) != 0)) {
         ct_process_close_fd(&stdin_pipe[0]);
         ct_process_close_fd(&stdin_pipe[1]);
         ct_process_close_fd(&stdout_pipe[0]);
@@ -19157,23 +19381,66 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         free(file);
         ct_free_string_array(args, arg_count);
         free(cwd);
+        free(argv0);
+        free(extra_stdio);
+        ct_free_env_entries(env_entries, env_count);
+        return JSValueMakeUndefined(ctx);
+    }
+    bool extra_stdio_ok = true;
+    for (size_t index = 0; index < extra_stdio_count; index += 1) {
+        CtProcessExtraStdio *entry = &extra_stdio[index];
+        if (entry->mode == CT_PROCESS_STDIO_PIPE) {
+            int pair[2] = { -1, -1 };
+            if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0 ||
+                ct_process_relocate_fds(pair, safe_fd_minimum) != 0) {
+                ct_process_close_fd(&pair[0]);
+                ct_process_close_fd(&pair[1]);
+                extra_stdio_ok = false;
+                break;
+            }
+            entry->parent_fd = pair[0];
+            entry->child_fd = pair[1];
+            ct_process_set_close_on_exec(entry->parent_fd);
+        } else if (entry->mode == CT_PROCESS_STDIO_INHERIT && entry->source_fd < 0 &&
+                   fcntl(entry->target_fd, F_GETFD) < 0) {
+            extra_stdio_ok = false;
+            break;
+        }
+    }
+    if (!extra_stdio_ok) {
+        ct_process_close_fd(&stdin_pipe[0]);
+        ct_process_close_fd(&stdin_pipe[1]);
+        ct_process_close_fd(&stdout_pipe[0]);
+        ct_process_close_fd(&stdout_pipe[1]);
+        ct_process_close_fd(&stderr_pipe[0]);
+        ct_process_close_fd(&stderr_pipe[1]);
+        ct_process_close_extra_stdio(extra_stdio, extra_stdio_count, true);
+        ct_throw_message(ctx, exception, strerror(errno));
+        free(file);
+        ct_free_string_array(args, arg_count);
+        free(cwd);
+        free(argv0);
+        free(extra_stdio);
         ct_free_env_entries(env_entries, env_count);
         return JSValueMakeUndefined(ctx);
     }
 #if !defined(_WIN32)
     if (ipc_enabled &&
         (socketpair(AF_UNIX, SOCK_STREAM, 0, ipc_socket) != 0 ||
-         ct_process_relocate_standard_fds(ipc_socket) != 0)) {
+         ct_process_relocate_fds(ipc_socket, safe_fd_minimum) != 0)) {
         ct_process_close_fd(&stdin_pipe[0]);
         ct_process_close_fd(&stdin_pipe[1]);
         ct_process_close_fd(&stdout_pipe[0]);
         ct_process_close_fd(&stdout_pipe[1]);
         ct_process_close_fd(&stderr_pipe[0]);
         ct_process_close_fd(&stderr_pipe[1]);
+        ct_process_close_extra_stdio(extra_stdio, extra_stdio_count, true);
         ct_throw_message(ctx, exception, strerror(errno));
         free(file);
         ct_free_string_array(args, arg_count);
         free(cwd);
+        free(argv0);
+        free(extra_stdio);
         ct_free_env_entries(env_entries, env_count);
         return JSValueMakeUndefined(ctx);
     }
@@ -19194,7 +19461,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     }
 #endif
 
-    if (defer_start && pipe(start_gate) != 0) {
+    if (defer_start && (pipe(start_gate) != 0 || ct_process_relocate_fds(start_gate, safe_fd_minimum) != 0)) {
         ct_process_close_fd(&stdin_pipe[0]);
         ct_process_close_fd(&stdin_pipe[1]);
         ct_process_close_fd(&stdout_pipe[0]);
@@ -19203,10 +19470,53 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         ct_process_close_fd(&stderr_pipe[1]);
         ct_process_close_fd(&ipc_socket[0]);
         ct_process_close_fd(&ipc_socket[1]);
+        ct_process_close_extra_stdio(extra_stdio, extra_stdio_count, true);
         ct_throw_message(ctx, exception, strerror(errno));
         free(file);
         ct_free_string_array(args, arg_count);
         free(cwd);
+        free(argv0);
+        free(extra_stdio);
+        ct_free_env_entries(env_entries, env_count);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    int stdio_source_fds[3] = { stdin_source_fd, stdout_source_fd, stderr_source_fd };
+    int stdio_action_fds[3] = { -1, -1, -1 };
+    bool descriptor_sources_ok = terminal_fd >= 0 ||
+        ct_process_duplicate_stdio_sources(stdio_source_fds, stdio_action_fds, safe_fd_minimum);
+    if (descriptor_sources_ok && terminal_fd < 0) {
+        for (size_t index = 0; index < extra_stdio_count; index += 1) {
+            CtProcessExtraStdio *entry = &extra_stdio[index];
+            if (entry->mode != CT_PROCESS_STDIO_INHERIT || entry->source_fd < 0) continue;
+            entry->action_source_fd = entry->source_fd;
+            if (entry->source_fd == entry->target_fd) continue;
+            entry->action_source_fd = fcntl(entry->source_fd, F_DUPFD_CLOEXEC, safe_fd_minimum);
+            if (entry->action_source_fd < 0) {
+                descriptor_sources_ok = false;
+                break;
+            }
+        }
+    }
+    if (!descriptor_sources_ok) {
+        ct_process_close_fd(&stdin_pipe[0]);
+        ct_process_close_fd(&stdin_pipe[1]);
+        ct_process_close_fd(&stdout_pipe[0]);
+        ct_process_close_fd(&stdout_pipe[1]);
+        ct_process_close_fd(&stderr_pipe[0]);
+        ct_process_close_fd(&stderr_pipe[1]);
+        ct_process_close_fd(&ipc_socket[0]);
+        ct_process_close_fd(&ipc_socket[1]);
+        ct_process_close_fd(&start_gate[0]);
+        ct_process_close_fd(&start_gate[1]);
+        ct_process_close_stdio_action_fds(stdio_source_fds, stdio_action_fds, safe_fd_minimum);
+        ct_process_close_extra_stdio(extra_stdio, extra_stdio_count, true);
+        ct_throw_message(ctx, exception, strerror(errno));
+        free(file);
+        ct_free_string_array(args, arg_count);
+        free(cwd);
+        free(argv0);
+        free(extra_stdio);
         ct_free_env_entries(env_entries, env_count);
         return JSValueMakeUndefined(ctx);
     }
@@ -19221,7 +19531,13 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     size_t gate_arg_count = defer_start ? 1 : 0;
     char **argv_exec = (char **)calloc(arg_count + gate_arg_count + 2, sizeof(char *));
     char gate_arg[64] = { 0 };
-    char **envp_exec = ct_build_spawn_envp(env_entries, env_count, clear_env, ipc_enabled);
+    char **envp_exec = ct_build_spawn_envp(
+        env_entries,
+        env_count,
+        clear_env,
+        ipc_target_fd,
+        node_ipc_protocol
+    );
     posix_spawn_file_actions_t spawn_actions;
     bool spawn_actions_ok = posix_spawn_file_actions_init(&spawn_actions) == 0;
     pid_t pid = -1;
@@ -19244,18 +19560,35 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         } else {
             if (stdin_mode == CT_PROCESS_STDIO_PIPE && stdin_pipe[0] >= 0) {
                 posix_spawn_file_actions_adddup2(&spawn_actions, stdin_pipe[0], STDIN_FILENO);
+            } else if (stdin_mode == CT_PROCESS_STDIO_INHERIT && stdin_source_fd >= 0 && stdin_source_fd != STDIN_FILENO) {
+                posix_spawn_file_actions_adddup2(&spawn_actions, stdio_action_fds[0], STDIN_FILENO);
             } else if (stdin_mode != CT_PROCESS_STDIO_INHERIT) {
                 posix_spawn_file_actions_addopen(&spawn_actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
             }
             if (stdout_mode == CT_PROCESS_STDIO_PIPE && stdout_pipe[1] >= 0) {
                 posix_spawn_file_actions_adddup2(&spawn_actions, stdout_pipe[1], STDOUT_FILENO);
+            } else if (stdout_mode == CT_PROCESS_STDIO_INHERIT && stdout_source_fd >= 0 && stdout_source_fd != STDOUT_FILENO) {
+                posix_spawn_file_actions_adddup2(&spawn_actions, stdio_action_fds[1], STDOUT_FILENO);
             } else if (stdout_mode != CT_PROCESS_STDIO_INHERIT) {
                 posix_spawn_file_actions_addopen(&spawn_actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
             }
             if (stderr_mode == CT_PROCESS_STDIO_PIPE && stderr_pipe[1] >= 0) {
                 posix_spawn_file_actions_adddup2(&spawn_actions, stderr_pipe[1], STDERR_FILENO);
+            } else if (stderr_mode == CT_PROCESS_STDIO_INHERIT && stderr_source_fd >= 0 && stderr_source_fd != STDERR_FILENO) {
+                posix_spawn_file_actions_adddup2(&spawn_actions, stdio_action_fds[2], STDERR_FILENO);
             } else if (stderr_mode != CT_PROCESS_STDIO_INHERIT) {
                 posix_spawn_file_actions_addopen(&spawn_actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+            }
+        }
+        for (size_t index = 0; index < extra_stdio_count; index += 1) {
+            CtProcessExtraStdio *entry = &extra_stdio[index];
+            if (entry->mode == CT_PROCESS_STDIO_PIPE) {
+                posix_spawn_file_actions_adddup2(&spawn_actions, entry->child_fd, entry->target_fd);
+            } else if (entry->mode == CT_PROCESS_STDIO_INHERIT &&
+                       entry->source_fd >= 0 && entry->source_fd != entry->target_fd) {
+                posix_spawn_file_actions_adddup2(&spawn_actions, entry->action_source_fd, entry->target_fd);
+            } else if (entry->mode == CT_PROCESS_STDIO_IGNORE) {
+                posix_spawn_file_actions_addopen(&spawn_actions, entry->target_fd, "/dev/null", O_RDWR, 0);
             }
         }
         // Close the parent's pipe ends and the child's already-dup2'd pipe
@@ -19269,14 +19602,27 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         if (stdout_pipe[1] > STDERR_FILENO) posix_spawn_file_actions_addclose(&spawn_actions, stdout_pipe[1]);
         if (stderr_pipe[1] > STDERR_FILENO) posix_spawn_file_actions_addclose(&spawn_actions, stderr_pipe[1]);
         if (terminal_fd > STDERR_FILENO) posix_spawn_file_actions_addclose(&spawn_actions, terminal_fd);
+        for (int target_fd = 0; target_fd < 3; target_fd += 1) {
+            if (stdio_action_fds[target_fd] >= safe_fd_minimum && stdio_action_fds[target_fd] != stdio_source_fds[target_fd]) {
+                posix_spawn_file_actions_addclose(&spawn_actions, stdio_action_fds[target_fd]);
+            }
+        }
+        for (size_t index = 0; index < extra_stdio_count; index += 1) {
+            CtProcessExtraStdio *entry = &extra_stdio[index];
+            if (entry->parent_fd >= 0) posix_spawn_file_actions_addclose(&spawn_actions, entry->parent_fd);
+            if (entry->child_fd >= safe_fd_minimum) posix_spawn_file_actions_addclose(&spawn_actions, entry->child_fd);
+            if (entry->action_source_fd >= safe_fd_minimum && entry->action_source_fd != entry->source_fd) {
+                posix_spawn_file_actions_addclose(&spawn_actions, entry->action_source_fd);
+            }
+        }
         if (start_gate[1] >= 0) posix_spawn_file_actions_addclose(&spawn_actions, start_gate[1]);
         if (ipc_enabled) {
             if (ipc_socket[0] >= 0 && ipc_socket[0] != ipc_socket[1]) {
                 posix_spawn_file_actions_addclose(&spawn_actions, ipc_socket[0]);
             }
-            if (ipc_socket[1] >= 0 && ipc_socket[1] != 3) {
-                posix_spawn_file_actions_adddup2(&spawn_actions, ipc_socket[1], 3);
-                if (ipc_socket[1] > 3) posix_spawn_file_actions_addclose(&spawn_actions, ipc_socket[1]);
+            if (ipc_socket[1] >= 0 && ipc_socket[1] != ipc_target_fd) {
+                posix_spawn_file_actions_adddup2(&spawn_actions, ipc_socket[1], ipc_target_fd);
+                if (ipc_socket[1] >= safe_fd_minimum) posix_spawn_file_actions_addclose(&spawn_actions, ipc_socket[1]);
             }
         }
 
@@ -19319,6 +19665,8 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         }
     }
     if (spawn_actions_ok) posix_spawn_file_actions_destroy(&spawn_actions);
+    ct_process_close_stdio_action_fds(stdio_source_fds, stdio_action_fds, safe_fd_minimum);
+    ct_process_close_extra_stdio(extra_stdio, extra_stdio_count, false);
     free(argv_exec);
     ct_free_spawn_envp(envp_exec);
 
@@ -19334,10 +19682,12 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         ct_process_close_fd(&stderr_pipe[0]);
         ct_process_close_fd(&ipc_socket[0]);
         ct_process_close_fd(&start_gate[1]);
+        ct_process_close_extra_stdio(extra_stdio, extra_stdio_count, true);
         ct_throw_message(ctx, exception, strerror(errno));
         free(file);
         ct_free_string_array(args, arg_count);
         free(cwd);
+        free(extra_stdio);
         ct_free_env_entries(env_entries, env_count);
         return JSValueMakeUndefined(ctx);
     }
@@ -19349,10 +19699,12 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         ct_process_close_fd(&stderr_pipe[0]);
         ct_process_close_fd(&ipc_socket[0]);
         ct_process_close_fd(&start_gate[1]);
+        ct_process_close_extra_stdio(extra_stdio, extra_stdio_count, true);
         ct_throw_message(ctx, exception, "Out of memory");
         free(file);
         ct_free_string_array(args, arg_count);
         free(cwd);
+        free(extra_stdio);
         ct_free_env_entries(env_entries, env_count);
         return JSValueMakeUndefined(ctx);
     }
@@ -19372,7 +19724,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     process->wake_write_fd = -1;
     int wake_pipe[2] = { -1, -1 };
     if (pipe(wake_pipe) == 0) {
-        if (ct_process_relocate_standard_fds(wake_pipe) == 0) {
+        if (ct_process_relocate_fds(wake_pipe, STDERR_FILENO + 1) == 0) {
             process->wake_read_fd = wake_pipe[0];
             process->wake_write_fd = wake_pipe[1];
             ct_process_set_close_on_exec(process->wake_read_fd);
@@ -19397,10 +19749,29 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     ct_set_property(ctx, response, "id", JSValueMakeNumber(ctx, id), exception);
     ct_set_property(ctx, response, "pid", JSValueMakeNumber(ctx, pid), exception);
     if (process->ipc_fd >= 0) ct_set_property(ctx, response, "ipcFd", JSValueMakeNumber(ctx, process->ipc_fd), exception);
+    if (extra_stdio_count > 0) {
+        JSValueRef *extra_values = (JSValueRef *)calloc(extra_stdio_count, sizeof(*extra_values));
+        if (extra_values != NULL) {
+            for (size_t index = 0; index < extra_stdio_count; index += 1) {
+                CtProcessExtraStdio *entry = &extra_stdio[index];
+                int exposed_fd = entry->mode == CT_PROCESS_STDIO_PIPE
+                    ? entry->parent_fd
+                    : entry->mode == CT_PROCESS_STDIO_INHERIT
+                        ? (entry->source_fd >= 0 ? entry->source_fd : entry->target_fd)
+                        : -1;
+                extra_values[index] = exposed_fd >= 0
+                    ? JSValueMakeNumber(ctx, exposed_fd)
+                    : JSValueMakeNull(ctx);
+            }
+            ct_set_property(ctx, response, "extraFds", ct_make_array(ctx, extra_stdio_count, extra_values, exception), exception);
+            free(extra_values);
+        }
+    }
 
     free(file);
     ct_free_string_array(args, arg_count);
     free(cwd);
+    free(extra_stdio);
     ct_free_env_entries(env_entries, env_count);
     return response;
 #endif
@@ -19615,6 +19986,7 @@ static JSValueRef ct_spawn_detached(JSContextRef ctx, JSObjectRef function, JSOb
     int stdin_fd = -1, stdout_fd = -1, stderr_fd = -1;
     if (!ct_windows_spawn_process(file, args, arg_count, NULL, cwd, env_entries, env_count, clear_env,
                                   CT_PROCESS_STDIO_IGNORE, CT_PROCESS_STDIO_IGNORE, CT_PROCESS_STDIO_IGNORE,
+                                  -1, -1, -1,
                                   true, false, &process_handle, &start_thread, &pid, &stdin_fd, &stdout_fd, &stderr_fd)) {
         ct_throw_message(ctx, exception, "CreateProcessW failed");
         pid = 0;

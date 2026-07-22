@@ -1,14 +1,23 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const compiler = @import("cottontail_compiler");
-const c = @cImport({
+const c = if (builtin.os.tag == .windows) @cImport({
     @cInclude("stdlib.h");
+}) else @cImport({
+    @cDefine("_GNU_SOURCE", "1");
+    @cInclude("errno.h");
+    @cInclude("fcntl.h");
+    @cInclude("spawn.h");
+    @cInclude("stdlib.h");
+    @cInclude("unistd.h");
 });
 
 const Semver = compiler.Semver;
 const HostedGitInfo = compiler.install.HostedGitInfo;
 const BunLockfile = compiler.install.Lockfile;
 const PackageManagerBunLockfile = @import("package_manager_bun_lockfile.zig");
+
+extern "c" fn _get_osfhandle(fd: c_int) isize;
 
 pub const CtHostEnvEntry = extern struct {
     name: [*:0]const u8,
@@ -17,12 +26,16 @@ pub const CtHostEnvEntry = extern struct {
 
 pub const CtHostSpawnOptions = extern struct {
     cwd: ?[*:0]const u8,
+    argv0: ?[*:0]const u8,
     env_entries: ?[*]const CtHostEnvEntry,
     env_count: usize,
     clear_env: bool,
     stdin_mode: c_int,
     stdout_mode: c_int,
     stderr_mode: c_int,
+    stdin_fd: c_int,
+    stdout_fd: c_int,
+    stderr_fd: c_int,
     input_present: bool,
     input_ptr: ?[*]const u8,
     input_len: usize,
@@ -451,11 +464,206 @@ fn cwdOption(path: ?[*:0]const u8) std.process.Child.Cwd {
         .inherit;
 }
 
-fn spawnStdioOption(mode: c_int) std.process.SpawnOptions.StdIo {
+fn spawnFileForDescriptor(fd: c_int) std.Io.File {
+    if (comptime builtin.os.tag == .windows) {
+        const handle = windowsFileHandle(fd);
+        return .{ .handle = handle };
+    }
+    return .{ .handle = @intCast(fd), .flags = .{ .nonblocking = false } };
+}
+
+fn windowsFileHandle(fd: c_int) std.os.windows.HANDLE {
+    const raw = _get_osfhandle(fd);
+    return @ptrFromInt(@as(usize, @bitCast(raw)));
+}
+
+fn spawnStdioOption(mode: c_int, source_fd: c_int) std.process.SpawnOptions.StdIo {
+    if (source_fd >= 0) return .{ .file = spawnFileForDescriptor(source_fd) };
     return switch (@as(SpawnStdio, @enumFromInt(mode))) {
         .pipe => .pipe,
         .inherit => .inherit,
         .ignore => .ignore,
+    };
+}
+
+fn posixSpawnError(code: c_int) std.process.SpawnError {
+    return switch (code) {
+        c.EACCES => error.AccessDenied,
+        c.EPERM => error.PermissionDenied,
+        c.ENOENT => error.FileNotFound,
+        c.ENOTDIR => error.NotDir,
+        c.ENOEXEC => error.InvalidExe,
+        c.ENOMEM => error.SystemResources,
+        c.EMFILE => error.ProcessFdQuotaExceeded,
+        c.ENFILE => error.SystemFdQuotaExceeded,
+        else => error.Unexpected,
+    };
+}
+
+fn checkPosixSpawnResult(code: c_int) std.process.SpawnError!void {
+    if (code != 0) return posixSpawnError(code);
+}
+
+fn closePosixSpawnFd(fd: *c_int) void {
+    if (fd.* >= 0) {
+        _ = c.close(fd.*);
+        fd.* = -1;
+    }
+}
+
+fn createPosixSpawnPipe() std.process.SpawnError![2]c_int {
+    var fds = [2]c_int{ -1, -1 };
+    if (c.pipe(&fds) != 0) return error.Unexpected;
+    errdefer {
+        closePosixSpawnFd(&fds[0]);
+        closePosixSpawnFd(&fds[1]);
+    }
+    for (&fds) |*fd| {
+        if (fd.* <= std.posix.STDERR_FILENO) {
+            const relocated = c.fcntl(fd.*, c.F_DUPFD_CLOEXEC, @as(c_int, std.posix.STDERR_FILENO + 1));
+            if (relocated < 0) return error.Unexpected;
+            _ = c.close(fd.*);
+            fd.* = relocated;
+        } else {
+            const flags = c.fcntl(fd.*, c.F_GETFD);
+            if (flags < 0 or c.fcntl(fd.*, c.F_SETFD, flags | c.FD_CLOEXEC) < 0) return error.Unexpected;
+        }
+    }
+    return fds;
+}
+
+fn addPosixSpawnStdioAction(
+    actions: *c.posix_spawn_file_actions_t,
+    option: std.process.SpawnOptions.StdIo,
+    pipe_fd: c_int,
+    action_fd: c_int,
+    target_fd: c_int,
+    input: bool,
+) std.process.SpawnError!void {
+    switch (option) {
+        .inherit => {},
+        .file => |file| {
+            const source_fd: c_int = if (action_fd >= 0) action_fd else @intCast(file.handle);
+            if (source_fd != target_fd) try checkPosixSpawnResult(c.posix_spawn_file_actions_adddup2(actions, source_fd, target_fd));
+        },
+        .ignore => try checkPosixSpawnResult(c.posix_spawn_file_actions_addopen(
+            actions,
+            target_fd,
+            "/dev/null",
+            if (input) c.O_RDONLY else c.O_WRONLY,
+            0,
+        )),
+        .pipe => try checkPosixSpawnResult(c.posix_spawn_file_actions_adddup2(actions, pipe_fd, target_fd)),
+        .close => try checkPosixSpawnResult(c.posix_spawn_file_actions_addclose(actions, target_fd)),
+    }
+}
+
+fn spawnPosixWithArgv0(
+    executable: [*:0]const u8,
+    argv: []const []const u8,
+    cwd: ?[*:0]const u8,
+    env_map: ?*const std.process.Environ.Map,
+    stdin_option: std.process.SpawnOptions.StdIo,
+    stdout_option: std.process.SpawnOptions.StdIo,
+    stderr_option: std.process.SpawnOptions.StdIo,
+) std.process.SpawnError!std.process.Child {
+    const gpa = std.heap.c_allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const argv_z = try arena.allocSentinel(?[*:0]u8, argv.len, null);
+    for (argv, 0..) |arg, index| argv_z[index] = (try arena.dupeZ(u8, arg)).ptr;
+
+    var env_block: ?std.process.Environ.PosixBlock = null;
+    defer if (env_block) |block| block.deinit(gpa);
+    const envp: [*:null]?[*:0]u8 = if (env_map) |map| block: {
+        const block_value = try map.createPosixBlock(gpa, .{});
+        env_block = block_value;
+        break :block @ptrCast(@constCast(block_value.slice.ptr));
+    } else std.c.environ;
+
+    var stdin_pipe = if (stdin_option == .pipe) try createPosixSpawnPipe() else [2]c_int{ -1, -1 };
+    errdefer {
+        closePosixSpawnFd(&stdin_pipe[0]);
+        closePosixSpawnFd(&stdin_pipe[1]);
+    }
+    var stdout_pipe = if (stdout_option == .pipe) try createPosixSpawnPipe() else [2]c_int{ -1, -1 };
+    errdefer {
+        closePosixSpawnFd(&stdout_pipe[0]);
+        closePosixSpawnFd(&stdout_pipe[1]);
+    }
+    var stderr_pipe = if (stderr_option == .pipe) try createPosixSpawnPipe() else [2]c_int{ -1, -1 };
+    errdefer {
+        closePosixSpawnFd(&stderr_pipe[0]);
+        closePosixSpawnFd(&stderr_pipe[1]);
+    }
+
+    var actions: c.posix_spawn_file_actions_t = undefined;
+    try checkPosixSpawnResult(c.posix_spawn_file_actions_init(&actions));
+    defer _ = c.posix_spawn_file_actions_destroy(&actions);
+
+    const stdio_options = [_]std.process.SpawnOptions.StdIo{ stdin_option, stdout_option, stderr_option };
+    var stdio_action_fds = [_]c_int{ -1, -1, -1 };
+    defer for (&stdio_action_fds) |*fd| closePosixSpawnFd(fd);
+    for (stdio_options, 0..) |option, target_fd| {
+        switch (option) {
+            .file => |file| {
+                const source_fd: c_int = @intCast(file.handle);
+                if (source_fd == target_fd) continue;
+                stdio_action_fds[target_fd] = c.fcntl(
+                    source_fd,
+                    c.F_DUPFD_CLOEXEC,
+                    @as(c_int, std.posix.STDERR_FILENO + 1),
+                );
+                if (stdio_action_fds[target_fd] < 0) return error.Unexpected;
+            },
+            else => {},
+        }
+    }
+
+    if (cwd) |cwd_path| try checkPosixSpawnResult(c.posix_spawn_file_actions_addchdir_np(&actions, cwd_path));
+    try addPosixSpawnStdioAction(&actions, stdin_option, stdin_pipe[0], stdio_action_fds[0], std.posix.STDIN_FILENO, true);
+    try addPosixSpawnStdioAction(&actions, stdout_option, stdout_pipe[1], stdio_action_fds[1], std.posix.STDOUT_FILENO, false);
+    try addPosixSpawnStdioAction(&actions, stderr_option, stderr_pipe[1], stdio_action_fds[2], std.posix.STDERR_FILENO, false);
+
+    if (stdin_pipe[1] >= 0) try checkPosixSpawnResult(c.posix_spawn_file_actions_addclose(&actions, stdin_pipe[1]));
+    if (stdout_pipe[0] >= 0) try checkPosixSpawnResult(c.posix_spawn_file_actions_addclose(&actions, stdout_pipe[0]));
+    if (stderr_pipe[0] >= 0) try checkPosixSpawnResult(c.posix_spawn_file_actions_addclose(&actions, stderr_pipe[0]));
+    if (stdin_pipe[0] >= 0) try checkPosixSpawnResult(c.posix_spawn_file_actions_addclose(&actions, stdin_pipe[0]));
+    if (stdout_pipe[1] >= 0) try checkPosixSpawnResult(c.posix_spawn_file_actions_addclose(&actions, stdout_pipe[1]));
+    if (stderr_pipe[1] >= 0) try checkPosixSpawnResult(c.posix_spawn_file_actions_addclose(&actions, stderr_pipe[1]));
+    for (stdio_action_fds) |fd| {
+        if (fd >= 0) try checkPosixSpawnResult(c.posix_spawn_file_actions_addclose(&actions, fd));
+    }
+
+    var resolved_executable: ?[:0]u8 = null;
+    defer if (resolved_executable) |path| gpa.free(path);
+    if (cwd) |cwd_path| {
+        const executable_slice = std.mem.span(executable);
+        if (!std.fs.path.isAbsolute(executable_slice) and std.mem.indexOfScalar(u8, executable_slice, '/') != null) {
+            resolved_executable = try std.fs.path.joinZ(gpa, &.{ std.mem.span(cwd_path), executable_slice });
+        }
+    }
+    const spawn_file = if (resolved_executable) |path| path.ptr else executable;
+    var pid: std.posix.pid_t = -1;
+    const spawn_result = if (resolved_executable != null or std.mem.indexOfScalar(u8, std.mem.span(executable), '/') != null)
+        c.posix_spawn(&pid, spawn_file, &actions, null, @ptrCast(argv_z.ptr), @ptrCast(envp))
+    else
+        c.posix_spawnp(&pid, spawn_file, &actions, null, @ptrCast(argv_z.ptr), @ptrCast(envp));
+    try checkPosixSpawnResult(spawn_result);
+
+    closePosixSpawnFd(&stdin_pipe[0]);
+    closePosixSpawnFd(&stdout_pipe[1]);
+    closePosixSpawnFd(&stderr_pipe[1]);
+
+    return .{
+        .id = pid,
+        .thread_handle = {},
+        .stdin = if (stdin_option == .pipe) .{ .handle = stdin_pipe[1], .flags = .{ .nonblocking = false } } else null,
+        .stdout = if (stdout_option == .pipe) .{ .handle = stdout_pipe[0], .flags = .{ .nonblocking = false } } else null,
+        .stderr = if (stderr_option == .pipe) .{ .handle = stderr_pipe[0], .flags = .{ .nonblocking = false } } else null,
+        .request_resource_usage_statistics = true,
     };
 }
 
@@ -953,7 +1161,7 @@ pub export fn ct_host_spawn_sync(
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
 
-    argv.append(gpa, std.mem.span(file)) catch {
+    argv.append(gpa, if (options.argv0) |argv0| std.mem.span(argv0) else std.mem.span(file)) catch {
         setErrorOut(error_out, "OutOfMemory");
         return -1;
     };
@@ -1017,17 +1225,17 @@ pub export fn ct_host_spawn_sync(
     const stdin_option: std.process.SpawnOptions.StdIo = if (stdin_memfd) |file_handle|
         .{ .file = file_handle }
     else
-        spawnStdioOption(options.stdin_mode);
+        spawnStdioOption(options.stdin_mode, options.stdin_fd);
     const stdout_option: std.process.SpawnOptions.StdIo = if (stdout_memfd) |file_handle|
         .{ .file = file_handle }
     else
-        spawnStdioOption(options.stdout_mode);
+        spawnStdioOption(options.stdout_mode, options.stdout_fd);
     const stderr_option: std.process.SpawnOptions.StdIo = if (stderr_memfd) |file_handle|
         .{ .file = file_handle }
     else
-        spawnStdioOption(options.stderr_mode);
+        spawnStdioOption(options.stderr_mode, options.stderr_fd);
 
-    var child = std.process.spawn(io, .{
+    const spawn_options: std.process.SpawnOptions = .{
         .argv = argv.items,
         .cwd = child_cwd,
         .environ_map = env_map_ptr,
@@ -1036,7 +1244,23 @@ pub export fn ct_host_spawn_sync(
         .stderr = stderr_option,
         .request_resource_usage_statistics = true,
         .create_no_window = shouldCreateNoWindow(options.stdin_mode, options.stdout_mode, options.stderr_mode),
-    }) catch |err| {
+    };
+    const child_result = if (comptime builtin.os.tag != .windows)
+        if (options.argv0 != null or options.stdin_fd >= 0 or options.stdout_fd >= 0 or options.stderr_fd >= 0)
+            spawnPosixWithArgv0(
+                file,
+                argv.items,
+                options.cwd,
+                env_map_ptr,
+                stdin_option,
+                stdout_option,
+                stderr_option,
+            )
+        else
+            std.process.spawn(io, spawn_options)
+    else
+        std.process.spawn(io, spawn_options);
+    var child = child_result catch |err| {
         setErrorOut(error_out, @errorName(err));
         return -1;
     };

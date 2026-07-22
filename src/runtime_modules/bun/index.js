@@ -3683,12 +3683,32 @@ function stdioFileDescriptor(value) {
 }
 
 function normalizeStdio(value, fallback, index, details) {
-  if (value === undefined) return fallback;
-  if (value === null) return "ignore";
+  const recordExtra = normalized => {
+    if (index <= 2) return;
+    details.extraStdio ??= [];
+    details.extraStdio[index - 3] = normalized;
+  };
+  if (value === undefined) {
+    recordExtra(fallback);
+    return fallback;
+  }
+  if (value === null) {
+    recordExtra("ignore");
+    return "ignore";
+  }
   if (typeof value === "string") {
-    if (value === "overlapped") return "pipe";
-    if (value === "pipe" || value === "inherit" || value === "ignore") return value;
-    if (value === "ipc" && index > 2) return "pipe";
+    if (value === "overlapped") {
+      recordExtra("pipe");
+      return "pipe";
+    }
+    if (value === "pipe" || value === "inherit" || value === "ignore") {
+      recordExtra(value);
+      return value;
+    }
+    if (value === "ipc" && index > 2) {
+      recordExtra("pipe");
+      return "pipe";
+    }
     throw new TypeError("stdio must be an array of 'inherit', 'pipe', 'ignore', Bun.file(pathOrFd), number, or null");
   }
 
@@ -3701,11 +3721,8 @@ function normalizeStdio(value, fallback, index, details) {
     if ((index === 1 || index === 2) && fd === 0) {
       throw new TypeError("stdin cannot be used for stdout or stderr");
     }
-    details[`${index === 0 ? "stdin" : index === 1 ? "stdout" : "stderr"}Fd`] = fd;
-    // COTTONTAIL-COMPAT: Bun.spawn fd routing - the native spawn hooks need an
-    // ordered stdio descriptor array with dup2(source, target), extra pipe
-    // creation, owned-fd lifetimes, and returned handles for descriptors > 2.
-    // Matching standard inherited descriptors are exact with today's hook.
+    if (index > 2) recordExtra(fd);
+    else details[`${index === 0 ? "stdin" : index === 1 ? "stdout" : "stderr"}Fd`] = fd;
     return "inherit";
   }
 
@@ -3768,6 +3785,9 @@ function normalizeSpawnOptions(options = {}, defaults = {}, sync = false) {
       for (let index = 3; index < options.stdio.length; index += 1) {
         normalizeStdio(options.stdio[index], "ignore", index, details);
       }
+      while (details.extraStdio?.length > 0 && details.extraStdio[details.extraStdio.length - 1] === "ignore") {
+        details.extraStdio.pop();
+      }
     } else if (options.stdio !== null) {
       throw new TypeError("stdio must be an array");
     }
@@ -3824,6 +3844,10 @@ function normalizeSpawnOptions(options = {}, defaults = {}, sync = false) {
     stderrFilePath: details.stderrFilePath,
     stdoutBuffer: details.stdoutBuffer,
     stderrBuffer: details.stderrBuffer,
+    stdinFd: details.stdinFd,
+    stdoutFd: details.stdoutFd,
+    stderrFd: details.stderrFd,
+    extraStdio: details.extraStdio,
     stdinFileBacked,
     input: input != null && input !== "pipe" && input !== "inherit" && input !== "ignore" ? input : undefined,
     killSignal: killSignalNumber,
@@ -4313,14 +4337,15 @@ export function spawnSync(command, maybeArgsOrOptions = {}, maybeOptions = undef
       cwd: nativeOptions.cwd,
       env: nativeOptions.env,
       clearEnv: nativeOptions.clearEnv,
-      stdin: nativeOptions.stdin,
-      stdout: nativeOptions.stdout,
-      stderr: nativeOptions.stderr,
+      stdout: nativeOptions.stdoutFd ?? nativeOptions.stdout,
+      stderr: nativeOptions.stderrFd ?? nativeOptions.stderr,
+      stdin: nativeOptions.stdinFd ?? nativeOptions.stdin,
       input: nativeOptions.input,
       timeout: nativeOptions.timeout,
       maxBuffer: nativeOptions.maxBuffer,
       killSignal: nativeOptions.killSignal,
       signal: nativeOptions.signal,
+      argv0: nativeOptions.argv0,
     });
   } catch (error) {
     throw normalizeBunSpawnError(error, file, nativeOptions.cwd);
@@ -4349,10 +4374,14 @@ export function spawnSync(command, maybeArgsOrOptions = {}, maybeOptions = undef
   }
   const response = {
     exitCode,
-    stdout: nativeOptions.stdout === "pipe" && nativeOptions.stdoutFilePath == null && nativeOptions.stdoutBuffer == null
+    stdout: nativeOptions.stdoutFd != null && nativeOptions.stdoutFd !== 1
+      ? nativeOptions.stdoutFd
+      : nativeOptions.stdout === "pipe" && nativeOptions.stdoutFilePath == null && nativeOptions.stdoutBuffer == null
       ? rawStdout
       : undefined,
-    stderr: nativeOptions.stderr === "pipe" && nativeOptions.stderrFilePath == null && nativeOptions.stderrBuffer == null
+    stderr: nativeOptions.stderrFd != null && nativeOptions.stderrFd !== 2
+      ? nativeOptions.stderrFd
+      : nativeOptions.stderr === "pipe" && nativeOptions.stderrFilePath == null && nativeOptions.stderrBuffer == null
       ? rawStderr
       : undefined,
     success: exitCode === 0,
@@ -4887,17 +4916,24 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
   let disconnected = false;
   let disconnectNotified = false;
   let nodeIpcProtocol = false;
+  let extraFds = [];
   const terminal = nativeOptions.terminal;
 
   const child = {
     pid: 0,
-    stdin: terminal ? null : undefined,
-    stdout: terminal ? null : nativeOptions.stdout === "pipe" && nativeOptions.stdoutFilePath == null && nativeOptions.stdoutBuffer == null
+    stdin: terminal ? null : nativeOptions.stdinFd != null && nativeOptions.stdinFd !== 0
+      ? nativeOptions.stdinFd
+      : undefined,
+    stdout: terminal ? null : nativeOptions.stdoutFd != null && nativeOptions.stdoutFd !== 1
+      ? nativeOptions.stdoutFd
+      : nativeOptions.stdout === "pipe" && nativeOptions.stdoutFilePath == null && nativeOptions.stdoutBuffer == null
       ? new ProcessReadable(
         () => cottontail.spawnCloseOutput?.(child._id, 1),
       )
       : undefined,
-    stderr: terminal ? null : nativeOptions.stderr === "pipe" && nativeOptions.stderrFilePath == null && nativeOptions.stderrBuffer == null
+    stderr: terminal ? null : nativeOptions.stderrFd != null && nativeOptions.stderrFd !== 2
+      ? nativeOptions.stderrFd
+      : nativeOptions.stderr === "pipe" && nativeOptions.stderrFilePath == null && nativeOptions.stderrBuffer == null
       ? new ProcessReadable(
         () => cottontail.spawnCloseOutput?.(child._id, 2),
       )
@@ -4909,7 +4945,7 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
       return child.stdin;
     },
     get stdio() {
-      return [null, null, null];
+      return [null, null, null, ...extraFds];
     },
     terminal,
     get exitCode() {
@@ -4950,11 +4986,9 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
     },
     ref() {
       unregisterSpawnListener?.ref?.();
-      return child;
     },
     unref() {
       unregisterSpawnListener?.unref?.();
-      return child;
     },
     send(message) {
       if (!nativeOptions.ipc || disconnected || !Number.isInteger(child._ipcFd) || child._ipcFd < 0) return false;
@@ -4999,28 +5033,21 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
   }
 
   function finishOutput(stream) {
-    if (!stream || stream._ended) return;
+    if (!stream || typeof stream.emit !== "function" || stream._ended) return;
     stream.emit("end");
     stream.emit("close");
   }
 
-  let spawnFile = file;
-  let spawnArgs = args;
-  if (
-    nativeOptions.ipc &&
-    !isCurrentCottontailExecutable(file) &&
-    cottontail.platform?.() !== "win32"
-  ) {
-    // Bridge the host IPC pipe to node's IPC protocol so `process.send` works
-    // in non-cottontail children (node writes bare JSON lines on the fd).
-    spawnFile = "/bin/sh";
-    spawnArgs = ["-c", 'NODE_CHANNEL_FD="$COTTONTAIL_IPC_FD" exec "$@"', "sh", file, ...args];
-    nodeIpcProtocol = true;
-  }
+  nodeIpcProtocol = nativeOptions.ipc && !isCurrentCottontailExecutable(file);
   let native;
   try {
-    native = cottontail.spawnStart(spawnFile, spawnArgs, {
+    native = cottontail.spawnStart(file, args, {
       ...nativeOptions,
+      stdin: nativeOptions.stdinFd ?? nativeOptions.stdin,
+      stdout: nativeOptions.stdoutFd ?? nativeOptions.stdout,
+      stderr: nativeOptions.stderrFd ?? nativeOptions.stderr,
+      extraStdio: nativeOptions.extraStdio,
+      nodeIpc: nodeIpcProtocol,
       argv0: nativeOptions.argv0,
       detached: nativeOptions.detached,
       terminalFd: terminalSpawnFd(terminal),
@@ -5031,9 +5058,13 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
   }
   child._id = native.id;
   child._ipcFd = native.ipcFd == null ? -1 : Number(native.ipcFd);
+  extraFds = Array.isArray(native.extraFds) ? native.extraFds : [];
+  while (extraFds.length > 0 && extraFds[extraFds.length - 1] == null) extraFds.pop();
   child.pid = native.pid;
   child.stdin = terminal
     ? null
+    : nativeOptions.stdinFd != null && nativeOptions.stdinFd !== 0
+    ? nativeOptions.stdinFd
     : readableInput != null
     ? nativeOptions.input
     : nativeOptions.stdin === "pipe" && nativeOptions.input === undefined
