@@ -3,10 +3,13 @@
 import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'fs';
 import { spawn, spawnSync } from 'child_process';
 import os from 'os';
-import { delimiter, join, relative, resolve } from 'path';
+import { delimiter, join, relative, resolve, sep } from 'path';
 
 const rootDir = process.cwd();
-const targetsPath = join(rootDir, 'compat', 'upstream', 'targets.json');
+const targetsPath = resolve(
+  rootDir,
+  process.env.COTTONTAIL_UPSTREAM_TARGETS_PATH ?? join('compat', 'upstream', 'targets.json'),
+);
 let binaryPath = resolve(
   rootDir,
   process.env.COTTONTAIL_UPSTREAM_BINARY ??
@@ -22,6 +25,7 @@ const defaultBunJobs = Math.max(1, Math.min(4, os.availableParallelism?.() ?? os
 const bundlerTestDiscoveryPrefix = 'COTTONTAIL_BUNDLER_TEST_ID:';
 const activeChildren = new Set();
 const snapshotArtifactRoots = new Map();
+const readOnlySnapshotRoots = new Set();
 const bunSnapshotSourceNames = new Set([
   'LICENSE.md',
   'manifest.json',
@@ -37,6 +41,7 @@ function removeTemp(path) {
 }
 
 function removeSnapshotArtifacts(snapshotRoot, runtime) {
+  if (readOnlySnapshotRoots.has(snapshotRoot)) return;
   const installedDependencies = join(snapshotRoot, 'test', 'node_modules');
   const stack = [snapshotRoot];
   while (stack.length > 0) {
@@ -99,6 +104,13 @@ function readJson(path) {
   return JSON.parse(readFileSync(path, 'utf8'));
 }
 
+function targetSnapshotRoot(runtime, target) {
+  const override = process.env[`COTTONTAIL_UPSTREAM_${runtime.toUpperCase()}_SNAPSHOT`];
+  const snapshotRoot = resolve(rootDir, override ?? target.snapshot);
+  if (override != null) readOnlySnapshotRoots.add(snapshotRoot);
+  return snapshotRoot;
+}
+
 function usage() {
   console.log([
     'Usage: node scripts/run-upstream-tests.js [node|bun|all] [options]',
@@ -115,6 +127,11 @@ function usage() {
     '  --no-serial-retry            Do not retry parallel failures serially (useful for discovery).',
     '  --only-status <status>       Select enabled, expected-failure, or not-enabled tests.',
     '  --test <relative-path>        Run one copied upstream test path.',
+    '',
+    'Snapshot overrides:',
+    '  COTTONTAIL_UPSTREAM_TARGETS_PATH   Read target metadata from this JSON file.',
+    '  COTTONTAIL_UPSTREAM_BUN_SNAPSHOT   Run against this read-only Bun snapshot.',
+    '  COTTONTAIL_UPSTREAM_NODE_SNAPSHOT  Run against this read-only Node snapshot.',
   ].join('\n'));
 }
 
@@ -196,12 +213,15 @@ function parseArgs(argv) {
 }
 
 function countFiles(dir) {
-  const tracked = spawnSync('git', ['ls-files', '-z', '--', relative(rootDir, dir)], {
-    cwd: rootDir,
-    encoding: 'utf8',
-  });
-  if (tracked.status === 0) {
-    return tracked.stdout.split('\0').filter(Boolean).length;
+  const trackedPath = relative(rootDir, dir);
+  if (trackedPath !== '..' && !trackedPath.startsWith(`..${sep}`)) {
+    const tracked = spawnSync('git', ['ls-files', '-z', '--', trackedPath], {
+      cwd: rootDir,
+      encoding: 'utf8',
+    });
+    if (tracked.status === 0) {
+      return tracked.stdout.split('\0').filter(Boolean).length;
+    }
   }
 
   let count = 0;
@@ -354,7 +374,7 @@ function selectedTests(status, options, snapshotRoot, runtime = 'node') {
 
 function makeEnv(runtime, target, runTemp = tempRoot, overrides = undefined) {
   const upstreamNodeModules = runtime === 'bun'
-    ? resolve(rootDir, target.snapshot, 'test', 'node_modules')
+    ? join(targetSnapshotRoot(runtime, target), 'test', 'node_modules')
     : null;
   return {
     ...process.env,
@@ -627,7 +647,7 @@ function classifyResult(runtime, entry, result, options) {
 }
 
 async function runBunEntries(runtime, target, entries, options) {
-  const snapshotRoot = resolve(rootDir, target.snapshot);
+  const snapshotRoot = targetSnapshotRoot(runtime, target);
   entries = expandBunEntries(entries, snapshotRoot, target, options);
   if (options.jobs <= 1) {
     const results = [];
@@ -735,7 +755,7 @@ function runNode(runtime, target, status, entries, snapshotRoot, options) {
 }
 
 function runOne(runtime, target, entry) {
-  const snapshotRoot = resolve(rootDir, target.snapshot);
+  const snapshotRoot = targetSnapshotRoot(runtime, target);
   const scriptPath = join(snapshotRoot, entry.path);
   if (!existsSync(scriptPath)) {
     return { runtime, entry, ok: false, unexpected: true, message: `missing copied upstream test: ${entry.path}` };
@@ -794,7 +814,7 @@ let unexpected = 0;
 for (const name of runtimeTargets(runtime, targets)) {
   const target = targets[name];
   if (!target) fail(`Missing upstream target: ${name}`);
-  const snapshotRoot = resolve(rootDir, target.snapshot);
+  const snapshotRoot = targetSnapshotRoot(name, target);
   snapshotArtifactRoots.set(snapshotRoot, name);
   removeSnapshotArtifacts(snapshotRoot, name);
   const statusPath = join(snapshotRoot, 'status.json');
