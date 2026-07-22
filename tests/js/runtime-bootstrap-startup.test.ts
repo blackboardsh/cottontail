@@ -101,6 +101,22 @@ test("selective bootstrap initializes process before transitive runtime modules"
   expect(argv.slice(2)).toEqual(userArguments);
 });
 
+test("wrapped node shebang entrypoints remain valid JavaScript", () => {
+  const fixture = join(temporaryDirectory, "vite-bin-smoke.js");
+  writeFileSync(
+    fixture,
+    "#!/usr/bin/env node\nconsole.log(JSON.stringify({ platform: process.platform, argv: process.argv.slice(2) }));\n",
+  );
+
+  const result = run([fixture, "vite-smoke"]);
+  expect(String(result.stderr)).toBe("");
+  expect(result.exitCode).toBe(0);
+  expect(JSON.parse(String(result.stdout))).toEqual({
+    platform: process.platform,
+    argv: ["vite-smoke"],
+  });
+});
+
 test("cold readline process bootstrap completes within Bun's spawn timeout", () => {
   const fixture = join(import.meta.dir, "fixtures", "runtime-bootstrap-readline-close.mjs");
   const coldRoot = join(temporaryDirectory, "cold-readline");

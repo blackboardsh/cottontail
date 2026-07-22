@@ -1,4 +1,10 @@
-const sep = globalThis.process?.platform === "win32" ? "\\" : "/";
+// Picomatch reads `process` while this shim is being evaluated. The selective
+// runtime enriches this same object later in its bootstrap sequence.
+const runtimeProcess = globalThis.process ??= {};
+runtimeProcess.platform ??= globalThis.cottontail?.platform?.() ?? "linux";
+runtimeProcess.version ??= "v24.11.1";
+
+const sep = runtimeProcess.platform === "win32" ? "\\" : "/";
 
 function basename(value) {
   let text = String(value);
