@@ -3,28 +3,13 @@
 // that runner starts so preload hooks, source order, filtering, and seeded
 // randomization observe Bun's collection semantics.
 
-import { bunTestConfig } from "./bun-test-config.js";
+import { bunTestRuntimeOptions } from "./bun-test-config.js";
 
-const argv = Array.from(globalThis.process?.argv ?? []).slice(2).map(String);
-
-function cliOption(name) {
-  const equals = argv.find((argument) => argument.startsWith(`${name}=`));
-  if (equals != null) return equals.slice(name.length + 1);
-  const index = argv.indexOf(name);
-  return index >= 0 ? argv[index + 1] : undefined;
-}
-
-const testConfig = bunTestConfig();
-const cliSeed = cliOption("--seed");
-const configuredSeed = cliSeed ?? testConfig.seed;
-const cliRandomize = argv.includes("--randomize") || argv.some((argument) => argument.startsWith("--randomize="));
-if (cliSeed === undefined && testConfig.seed !== undefined && testConfig.randomize !== true) {
-  throw new Error('"seed" can only be used when "randomize" is true');
-}
-const randomizationEnabled = cliRandomize || testConfig.randomize === true || cliSeed !== undefined;
-const parsedSeed = Number(configuredSeed);
+const testOptions = bunTestRuntimeOptions();
+const randomizationEnabled = testOptions.randomize;
+const parsedSeed = Number(testOptions.seed);
 const randomizationSeed = randomizationEnabled
-  ? (Number.isFinite(parsedSeed) && configuredSeed !== "" ? Math.trunc(parsedSeed) >>> 0 : Math.floor(Math.random() * 0x100000000) >>> 0)
+  ? (Number.isFinite(parsedSeed) && testOptions.seed !== null ? Math.trunc(parsedSeed) >>> 0 : Math.floor(Math.random() * 0x100000000) >>> 0)
   : null;
 
 let rootScope;

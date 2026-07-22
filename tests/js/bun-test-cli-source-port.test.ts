@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -37,6 +37,79 @@ test("Bun CLI validates bail and timeout before discovery", () => {
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("Bun CLI validates retry and rerun-each options", () => {
+  const directory = fixture({ "sample.test.ts": `import { test } from "bun:test"; test("ok", () => {});` });
+  try {
+    const invalidRetry = run(directory, ["--retry", "nope"]);
+    expect(invalidRetry.exitCode).toBe(1);
+    expect(invalidRetry.stderrText).toContain("--retry expects a number");
+
+    const invalidRerun = run(directory, ["--rerun-each", "nope"]);
+    expect(invalidRerun.exitCode).toBe(1);
+    expect(invalidRerun.stderrText).toContain("--rerun-each expects a number");
+
+    const conflict = run(directory, ["--retry", "1", "--rerun-each", "2"]);
+    expect(conflict.exitCode).toBe(1);
+    expect(conflict.stderrText).toContain("--retry cannot be used with --rerun-each");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}, { timeout: 30_000 });
+
+test("bunfig rejects conflicting retry and rerunEach options", () => {
+  const directory = fixture({
+    "sample.test.ts": `import { test } from "bun:test"; test("ok", () => {});`,
+    "bunfig.toml": `[test]\nretry = 2\nrerunEach = 2\n`,
+  });
+  try {
+    const result = run(directory, []);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderrText).toContain('"retry" cannot be used with "rerunEach"');
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("bunfig validates concurrentTestGlob", () => {
+  const directory = fixture({
+    "sample.test.ts": `import { test } from "bun:test"; test("ok", () => {});`,
+    "bunfig.toml": `[test]\nconcurrentTestGlob = ""\n`,
+  });
+  try {
+    const result = run(directory, []);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderrText).toContain("concurrentTestGlob cannot be an empty string");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("bunfig reporter options honor a custom config path", () => {
+  const dotsDirectory = fixture({
+    "sample.test.ts": `import { test } from "bun:test"; test("ok", () => {});`,
+    "custom.toml": `[test.reporter]\ndots = true\n`,
+  });
+  const junitDirectory = fixture({
+    "sample.test.ts": `import { test } from "bun:test"; test("ok", () => {});`,
+    "custom.toml": `[test.reporter]\njunit = "report.xml"\n`,
+  });
+  try {
+    const dots = run(dotsDirectory, ["--config", "custom.toml"]);
+    expect(dots.exitCode).toBe(0);
+    expect(dots.stderrText).toMatch(/(?:^|\n)\.(?:\n|$)/);
+    expect(dots.stderrText).not.toContain("(pass) ok");
+
+    const junit = run(junitDirectory, ["--config=custom.toml"]);
+    expect(junit.exitCode).toBe(0);
+    const reportPath = join(junitDirectory, "report.xml");
+    expect(existsSync(reportPath)).toBe(true);
+    expect(readFileSync(reportPath, "utf8")).toContain('<testsuites name="bun test"');
+  } finally {
+    rmSync(dotsDirectory, { recursive: true, force: true });
+    rmSync(junitDirectory, { recursive: true, force: true });
+  }
+}, { timeout: 30_000 });
 
 test("Bun CLI bail stops pending tests at the requested failure count", () => {
   const directory = fixture({

@@ -315,8 +315,10 @@ fn isRuntimeFlag(arg: []const u8) bool {
 fn testFlagTakesValue(arg: []const u8) bool {
     if (std.mem.indexOfScalar(u8, arg, '=') != null) return false;
     const value_flags = [_][]const u8{
+        "-c",
         "-t",
         "--bail",
+        "--config",
         "--coverage-dir",
         "--coverage-reporter",
         "--feature",

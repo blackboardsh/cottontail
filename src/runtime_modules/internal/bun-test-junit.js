@@ -1,18 +1,11 @@
 import { writeFileSync } from "../node/fs.js";
 
-function optionValue(args, name) {
-  const inline = args.find((arg) => String(arg).startsWith(`${name}=`));
-  if (inline != null) return String(inline).slice(name.length + 1);
-  const index = args.indexOf(name);
-  return index >= 0 ? args[index + 1] : undefined;
-}
-
-export function junitReporterOptions(args) {
-  const reporter = optionValue(args, "--reporter");
-  if (reporter !== "junit") return null;
-  const outfile = optionValue(args, "--reporter-outfile");
-  if (!outfile) throw new Error("--reporter=junit requires --reporter-outfile [file] to specify where to save the XML report");
-  return { outfile: String(outfile) };
+export function junitReporterOptions(testOptions) {
+  if (!testOptions.reporters.junit) return null;
+  if (!testOptions.reporterOutfile) {
+    throw new Error("--reporter=junit requires --reporter-outfile [file] to specify where to save the XML report");
+  }
+  return { outfile: String(testOptions.reporterOutfile) };
 }
 
 function normalizePath(value) {

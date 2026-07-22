@@ -1,4 +1,4 @@
-import { readFileSync } from "../node/fs.js";
+import { bunTestRuntimeOptions } from "./bun-test-config.js";
 
 // Mirrors Bun's per-file default_concurrent decision before test collection.
 let configuredPatterns;
@@ -6,17 +6,7 @@ const fileMatches = new Map();
 
 function concurrentTestPatterns() {
   if (configuredPatterns !== undefined) return configuredPatterns;
-  configuredPatterns = [];
-  try {
-    const cwd = String(globalThis.process?.cwd?.() ?? ".");
-    const source = readFileSync(`${cwd}/bunfig.toml`, "utf8");
-    const config = globalThis.Bun?.TOML?.parse?.(source);
-    const value = config?.test?.concurrentTestGlob;
-    if (typeof value === "string" && value.length > 0) configuredPatterns = [value];
-    else if (Array.isArray(value)) {
-      configuredPatterns = value.filter((pattern) => typeof pattern === "string" && pattern.length > 0);
-    }
-  } catch {}
+  configuredPatterns = bunTestRuntimeOptions().concurrentTestGlob;
   return configuredPatterns;
 }
 

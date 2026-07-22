@@ -13,7 +13,7 @@ import {
   githubErrorAnnotation,
   githubTimeoutAnnotation,
 } from "../internal/bun-test-github.js";
-import { bunTestConfig } from "../internal/bun-test-config.js";
+import { bunTestRuntimeOptions } from "../internal/bun-test-config.js";
 
 const tests = [];
 const events = [];
@@ -71,16 +71,17 @@ const failures = [];
 const selectedRecords = new Set();
 
 const testCliArgs = Array.from(globalThis.process?.argv ?? []).slice(2);
+const testRuntimeOptions = bunTestRuntimeOptions(testCliArgs);
 function testCliModeEnabled() {
   return globalThis.process?.env?.COTTONTAIL_TEST_CLI_HEADER_PRINTED === "1" ||
     globalThis.__cottontailBunTestHeaderPrinted === true;
 }
-const forceConcurrent = testCliArgs.includes("--concurrent");
-const runTodoTests = testCliArgs.includes("--todo");
-const dotsMode = testCliArgs.includes("--dots");
-const globalOnlyMode = testCliArgs.includes("--only") || testCliArgs.includes("--test-only");
-const passWithNoTests = testCliArgs.includes("--pass-with-no-tests");
-const junitOptions = junitReporterOptions(testCliArgs);
+const forceConcurrent = testRuntimeOptions.concurrent;
+const runTodoTests = testRuntimeOptions.runTodo;
+const dotsMode = testRuntimeOptions.reporters.dots;
+const globalOnlyMode = testRuntimeOptions.only;
+const passWithNoTests = testRuntimeOptions.passWithNoTests;
+const junitOptions = junitReporterOptions(testRuntimeOptions);
 const testFileCount = Math.max(1, Number(globalThis.process?.env?.COTTONTAIL_TEST_FILE_COUNT ?? 1) || 1);
 
 function cliOption(name, fallback = undefined) {
@@ -90,43 +91,12 @@ function cliOption(name, fallback = undefined) {
   return index >= 0 ? testCliArgs[index + 1] : fallback;
 }
 
-function configuredMaxConcurrency() {
-  const value = Number(cliOption("--max-concurrency", 20));
-  if (!Number.isFinite(value) || value < 0) return 20;
-  return value === 0 ? Infinity : Math.max(1, Math.trunc(value));
-}
-
-function configuredDefaultTimeout() {
-  const value = Number(cliOption("--timeout", 5000));
-  return Number.isFinite(value) && value >= 0 ? value : 5000;
-}
-
-function bunfigOnlyFailures() {
-  try {
-    const source = String(readFileSync(`${runnerCwd()}/bunfig.toml`, "utf8"));
-    return /\bonlyFailures\s*=\s*true\b/.test(source);
-  } catch {
-    return false;
-  }
-}
-
-const maxConcurrency = configuredMaxConcurrency();
-defaultTimeout = configuredDefaultTimeout();
-const onlyFailures = testCliArgs.includes("--only-failures") || bunfigOnlyFailures();
+const maxConcurrency = testRuntimeOptions.maxConcurrency;
+defaultTimeout = testRuntimeOptions.timeout;
+const onlyFailures = testRuntimeOptions.reporters.onlyFailures;
 const runnerDateNow = Date.now.bind(Date);
 
-function configuredBailLimit() {
-  const equals = testCliArgs.find((argument) => String(argument).startsWith("--bail="));
-  if (equals != null) {
-    return Math.max(1, Math.trunc(Number(String(equals).slice("--bail=".length)) || 1));
-  }
-  const index = testCliArgs.indexOf("--bail");
-  if (index < 0) return Infinity;
-  const value = Number(testCliArgs[index + 1]);
-  return Number.isInteger(value) && value > 0 ? value : 1;
-}
-
-const bailLimit = configuredBailLimit();
+const bailLimit = testRuntimeOptions.bail;
 let bailReported = false;
 
 function bailReached() {
@@ -144,7 +114,7 @@ function stopPendingTestsForBail() {
 }
 
 function configuredTestNamePattern() {
-  const source = cliOption("-t") ?? cliOption("--test-name-pattern");
+  const source = testRuntimeOptions.namePattern;
   if (source == null) return null;
   return new RegExp(String(source));
 }
@@ -210,32 +180,8 @@ function isTruthyEnvValue(value) {
 const agentQuietMode = isTruthyEnvValue(globalThis.process?.env?.CLAUDECODE) &&
   globalThis.process?.env?.AGENT === undefined;
 
-function bunfigTestSection() {
-  try {
-    const source = String(readFileSync(`${runnerCwd()}/bunfig.toml`, "utf8"));
-    const match = /(?:^|\n)\[test\]([^]*?)(?=\n\[|$)/.exec(source);
-    return match ? match[1] : "";
-  } catch {
-    return "";
-  }
-}
-
-function configuredRetry() {
-  const cli = Number(cliOption("--retry"));
-  if (Number.isFinite(cli) && cli >= 0) return Math.trunc(cli);
-  const match = /(?:^|\n)\s*retry\s*=\s*(\d+)/.exec(bunfigTestSection());
-  return match ? Number(match[1]) : 0;
-}
-
-const defaultRetry = configuredRetry();
-
-function configuredRerunEach() {
-  const cliValue = cliOption("--rerun-each");
-  const value = Number(cliValue ?? bunTestConfig().rerunEach ?? 1);
-  return Number.isFinite(value) && value > 1 ? Math.trunc(value) : 1;
-}
-
-const rerunEach = configuredRerunEach();
+const defaultRetry = testRuntimeOptions.retry;
+const rerunEach = testRuntimeOptions.rerunEach;
 let completedRerunCount = 0;
 const completedRuns = [];
 
