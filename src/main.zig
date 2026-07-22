@@ -510,9 +510,9 @@ fn appendRecursiveHtmlEntrypointPattern(
     matches: *std.ArrayList([:0]const u8),
 ) !bool {
     const globstar_index = std.mem.indexOf(u8, requested, "**") orelse return false;
-    const directory_prefix = std.mem.trimRight(u8, requested[0..globstar_index], "/\\");
+    const directory_prefix = std.mem.trimEnd(u8, requested[0..globstar_index], "/\\");
     const directory_path = if (directory_prefix.len == 0) "." else directory_prefix;
-    const remaining_pattern = std.mem.trimLeft(u8, requested[globstar_index + 2 ..], "/\\");
+    const remaining_pattern = std.mem.trimStart(u8, requested[globstar_index + 2 ..], "/\\");
 
     var directory = if (std.fs.path.isAbsolute(directory_path))
         std.Io.Dir.openDirAbsolute(init.io, directory_path, .{ .iterate = true }) catch return true
