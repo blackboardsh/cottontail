@@ -8744,8 +8744,6 @@ const Manager = struct {
             }
             if (locked_selection == null) {
                 peer_context = try manager.peerContextForPackage(metadata, parent_dir, true);
-            } else {
-                _ = try manager.peerContextForPackage(metadata, parent_dir, true);
             }
             final_destination = if (locked_selection) |selection|
                 selection.destination
@@ -8786,9 +8784,17 @@ const Manager = struct {
             }
         }
 
-        if (installed) _ = try manager.peerContextForPackage(metadata, parent_dir, true);
+        if (installed and locked_selection == null) {
+            _ = try manager.peerContextForPackage(metadata, parent_dir, true);
+        }
 
         const alias = alias_hint orelse package_name;
+        // A loaded lock owns dependency edges; checkout metadata is still used
+        // for materialization details such as package identity, bins, and scripts.
+        const resolution_metadata: ?*const Value = if (locked_selection) |selection|
+            selection.package.info
+        else
+            metadata;
         if (!manager.options.lockfile_only and !manager.options.dry_run) {
             try manager.ensureIsolatedLinks(alias, parent_dir, final_destination);
             const bin_metadata = (try manager.metadataForInstalledPackage(final_destination, metadata)).?;
@@ -8809,17 +8815,21 @@ const Manager = struct {
             .git_resolved = git_resolved_name,
             .resolution = resolved_source,
             .kind = if (spec.kind == .github) .github else .git,
-            .metadata = metadata,
+            .metadata = resolution_metadata,
             .peer_hash = peer_context.hash,
             .install_dir = final_destination,
         });
-        try manager.rememberPackageMetadata(final_destination, metadata);
+        try manager.rememberPackageMetadata(final_destination, resolution_metadata);
         if (locked_selection == null) manager.changed = true;
 
-        try manager.installDependencyObject(metadata, "dependencies", final_destination, false, false);
-        try manager.installOptionalDependencies(metadata, final_destination, false);
-        if (manager.node_linker == .isolated) {
-            try manager.linkPeerDependencies(metadata, final_destination, parent_dir);
+        if (locked_selection) |selection| {
+            try manager.installLockedDependencies(selection.package, final_destination, final_destination, parent_dir);
+        } else {
+            try manager.installDependencyObject(metadata, "dependencies", final_destination, false, false);
+            try manager.installOptionalDependencies(metadata, final_destination, false);
+            if (manager.node_linker == .isolated) {
+                try manager.linkPeerDependencies(metadata, final_destination, parent_dir);
+            }
         }
         try manager.queuePackageScripts(alias, package_name, package_version, final_destination, .git, direct, optional, !installed);
         return .{
