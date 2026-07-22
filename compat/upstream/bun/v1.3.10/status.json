@@ -97,6 +97,13 @@
       "timeoutMs": 30000
     },
     {
+      "pattern": "^test/js/third_party/pg-gateway/pglite\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "The copied PGlite fixture loads through the integrated PostgreSQL/Node compatibility runtime and completes a real embedded SQL query (one case, 16 assertions); initialization requires a larger stock-JSC budget.",
+      "args": ["--timeout=30000"],
+      "timeoutMs": 60000
+    },
+    {
       "pattern": "^test/js/bun/.*\\.test\\.(?:js|mjs|cjs|ts|tsx|mts|cts)$",
       "status": "enabled",
       "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
