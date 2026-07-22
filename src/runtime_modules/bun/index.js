@@ -51,7 +51,7 @@ import { URL, URLSearchParams } from "../vendor/whatwg-url.js";
 import { URLPattern as CottontailURLPattern } from "../vendor/urlpattern.js";
 import { S3Client, s3 } from "./s3.js";
 import { RedisClient, redis } from "./redis.js";
-import { SQL } from "./sql.js";
+import { SQL, postgres as postgresSQL, sql } from "./sql.js";
 import { color as bunColor } from "./color.js";
 import * as bunTestModule from "./test.js";
 import * as bunJscModule from "./jsc.js";
@@ -13439,8 +13439,7 @@ export const stdin = {
 };
 export const stdout = globalThis.process?.stdout;
 export const stderr = globalThis.process?.stderr;
-export { SQL };
-export const sql = SQLiteDatabase;
+export { SQL, sql };
 export function jest(_source = undefined) {
   const inTestRunner = globalThis.__cottontailRegisteringTestFile != null ||
     globalThis.__cottontailCurrentTestFile?.() != null ||
@@ -18626,7 +18625,7 @@ export class Terminal {
 }
 export { S3Client, s3 };
 export { RedisClient, redis };
-export const postgres = null;
+export const postgres = postgresSQL;
 function secretsError(message, code = "ERR_INVALID_ARG_TYPE") {
   const error = new TypeError(message);
   error.code = code;

@@ -5498,7 +5498,9 @@ fn buildCliPreloadImports(ctx: *const Context, script_abs: []const u8, exec_args
         const arg = exec_args[index];
         var preconnect_url: ?[]const u8 = null;
 
-        if (std.mem.eql(u8, arg, "--fetch-preconnect")) {
+        if (std.mem.eql(u8, arg, "--sql-preconnect")) {
+            try output.appendSlice(ctx.allocator, "void globalThis.Bun.sql.connect();\n");
+        } else if (std.mem.eql(u8, arg, "--fetch-preconnect")) {
             if (index + 1 < exec_args.len) {
                 index += 1;
                 preconnect_url = exec_args[index];

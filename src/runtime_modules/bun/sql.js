@@ -9,8 +9,12 @@ import { existsSync } from "../node/fs.js";
 import {
   constants as cryptoConstants,
   createHash,
+  createHmac,
   createPublicKey,
+  pbkdf2Sync,
   publicEncrypt,
+  randomBytes,
+  timingSafeEqual,
 } from "../node/crypto.js";
 
 function md5hex(...parts) {
@@ -19,30 +23,23 @@ function md5hex(...parts) {
   return hash.digest("hex");
 }
 
-function escapeValue(value) {
-  if (value === null || value === undefined) return "NULL";
-  if (typeof value === "number") {
-    return Number.isFinite(value) ? String(value) : `'${value}'`;
-  }
-  if (typeof value === "bigint") return value.toString();
-  if (typeof value === "boolean") return value ? "TRUE" : "FALSE";
-  if (value instanceof Date) return `'${value.toISOString()}'`;
-  if (Array.isArray(value)) {
-    return `ARRAY[${value.map(escapeValue).join(",")}]`;
-  }
-  const text = String(value).replace(/\0/g, "");
-  if (/[\\]/.test(text)) {
-    return `E'${text.replace(/\\/g, "\\\\").replace(/'/g, "''")}'`;
-  }
-  return `'${text.replace(/'/g, "''")}'`;
-}
-
 function buildStartupMessage(options) {
   const params = [
     "user", options.username,
     "database", options.database,
     "client_encoding", "UTF8",
   ];
+  if (options.query) {
+    const extra = String(options.query).split("\0");
+    for (let index = 0; index + 1 < extra.length; index += 2) {
+      if (extra[index]) params.push(extra[index], extra[index + 1]);
+    }
+  }
+  for (const parameter of params) {
+    if (String(parameter).includes("\0")) {
+      throw postgresProtocolError("PostgreSQL startup parameters cannot contain null bytes", "ERR_POSTGRES_INVALID_CREDENTIALS");
+    }
+  }
   const body = Buffer.concat([
     ...params.map((p) => Buffer.concat([Buffer.from(String(p), "utf8"), Buffer.from([0])])),
     Buffer.from([0]),
@@ -83,219 +80,1597 @@ function parseErrorFields(body) {
   return fields;
 }
 
-class PostgresError extends Error {
-  constructor(fields) {
-    super(fields.M || "PostgreSQL error");
-    this.name = "PostgresError";
-    if (fields.C) this.code = fields.C;
-    if (fields.S) this.severity = fields.S;
-    if (fields.D) this.detail = fields.D;
-    if (fields.H) this.hint = fields.H;
+class SQLError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "SQLError";
   }
 }
 
-function runPostgresQuery(options, statement, sockets) {
-  return new Promise((resolve, reject) => {
-    for (const [name, value] of [
-      ["username", options.username],
-      ["password", options.password],
-      ["database", options.database],
+class PostgresError extends SQLError {
+  constructor(message, options = {}) {
+    super(message || "PostgreSQL error");
+    this.name = "PostgresError";
+    this.code = options.code ?? "ERR_POSTGRES_UNKNOWN";
+    for (const key of [
+      "errno",
+      "detail",
+      "hint",
+      "severity",
+      "position",
+      "internalPosition",
+      "internalQuery",
+      "where",
+      "schema",
+      "table",
+      "column",
+      "dataType",
+      "constraint",
+      "file",
+      "line",
+      "routine",
     ]) {
-      if (typeof value === "string" && value.includes("\0")) {
-        reject(new Error(`PostgreSQL ${name} cannot contain null bytes`));
-        return;
-      }
+      if (options[key] !== undefined) this[key] = options[key];
     }
+  }
+}
 
-    // A unix socket path containing null bytes is invalid: drop it and fall
-    // back to TCP rather than silently connecting to a truncated path.
-    let path = options.path;
-    if (typeof path === "string" && path.includes("\0")) path = undefined;
+function postgresProtocolError(message, code = "ERR_POSTGRES_PROTOCOL_ERROR") {
+  return new PostgresError(message, { code });
+}
 
-    let settled = false;
-    let timer = null;
-    const socket = path
-      ? net.connect(path)
-      : net.connect(options.port, options.hostname);
-    sockets.add(socket);
-
-    const finish = (error, result) => {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      sockets.delete(socket);
-      try {
-        socket.destroy();
-      } catch {}
-      if (error) reject(error);
-      else resolve(result);
-    };
-
-    const connectionTimeout = options.connectionTimeout ?? 30_000;
-    if (connectionTimeout > 0) {
-      timer = setTimeout(() => {
-        finish(new Error(`Connection timeout after ${connectionTimeout / 1000}s`));
-      }, connectionTimeout);
-      if (typeof timer?.unref === "function") timer.unref();
-    }
-
-    socket.on("error", (error) => finish(error));
-    socket.on("close", () => finish(new Error("Connection closed by server")));
-
-    socket.on("connect", () => {
-      try {
-        socket.write(buildStartupMessage(options));
-      } catch (error) {
-        finish(error);
-      }
-    });
-
-    let buffered = Buffer.alloc(0);
-    let queryError = null;
-    const rows = [];
-    let columns = [];
-    let command = "";
-    let querySent = false;
-
-    const handleMessage = (type, body) => {
-      switch (type) {
-        case "R": {
-          const authType = body.length >= 4 ? body.readInt32BE(0) : 0;
-          if (authType === 0) break; // AuthenticationOk
-          if (authType === 3) {
-            socket.write(typedMessage("p", cstringBuffer(options.password)));
-          } else if (authType === 5) {
-            const salt = body.subarray(4, 8);
-            const inner = md5hex(options.password, options.username);
-            const digest = `md5${md5hex(inner, salt)}`;
-            socket.write(typedMessage("p", cstringBuffer(digest)));
-          } else {
-            finish(new Error(`Unsupported PostgreSQL authentication method: ${authType}`));
-          }
-          break;
-        }
-        case "E": {
-          const error = new PostgresError(parseErrorFields(body));
-          if (querySent) queryError = error;
-          else finish(error);
-          break;
-        }
-        case "Z": {
-          if (!querySent) {
-            querySent = true;
-            socket.write(typedMessage("Q", cstringBuffer(statement)));
-          } else if (queryError) {
-            finish(queryError);
-          } else {
-            const result = rows;
-            result.command = command;
-            result.count = rows.length;
-            finish(null, result);
-          }
-          break;
-        }
-        case "T": {
-          columns = [];
-          if (body.length >= 2) {
-            const count = body.readInt16BE(0);
-            let offset = 2;
-            for (let i = 0; i < count && offset < body.length; i++) {
-              let end = body.indexOf(0, offset);
-              if (end < 0) end = body.length;
-              columns.push(body.toString("utf8", offset, end));
-              offset = end + 1 + 18; // skip fixed-size field metadata
-            }
-          }
-          break;
-        }
-        case "D": {
-          if (body.length < 2) break;
-          const count = body.readInt16BE(0);
-          let offset = 2;
-          const row = {};
-          for (let i = 0; i < count && offset + 4 <= body.length; i++) {
-            const length = body.readInt32BE(offset);
-            offset += 4;
-            let value = null;
-            if (length >= 0) {
-              value = body.toString("utf8", offset, offset + length);
-              offset += length;
-            }
-            row[columns[i] ?? String(i)] = value;
-          }
-          rows.push(row);
-          break;
-        }
-        case "C": {
-          command = body.toString("utf8", 0, Math.max(0, body.length - 1)).split(" ")[0];
-          break;
-        }
-        default:
-          break; // S (ParameterStatus), K (BackendKeyData), N (Notice), ...
-      }
-    };
-
-    socket.on("data", (chunk) => {
-      buffered = buffered.length === 0 ? chunk : Buffer.concat([buffered, chunk]);
-      while (!settled && buffered.length >= 5) {
-        const type = String.fromCharCode(buffered[0]);
-        const length = buffered.readInt32BE(1);
-        if (length < 4 || buffered.length < 1 + length) break;
-        const body = buffered.subarray(5, 1 + length);
-        buffered = buffered.subarray(1 + length);
-        try {
-          handleMessage(type, body);
-        } catch (error) {
-          finish(error);
-          return;
-        }
-      }
-    });
+function postgresServerError(body) {
+  const fields = parseErrorFields(body);
+  let message = fields.M || "PostgreSQL error";
+  if (fields.D) message += `\n${fields.D}`;
+  if (fields.H) message += `\n${fields.H}`;
+  return new PostgresError(message, {
+    code: fields.C === "42601" ? "ERR_POSTGRES_SYNTAX_ERROR" : "ERR_POSTGRES_SERVER_ERROR",
+    errno: fields.C,
+    severity: fields.V || fields.S,
+    detail: fields.D,
+    hint: fields.H,
+    position: fields.P,
+    internalPosition: fields.p,
+    internalQuery: fields.q,
+    where: fields.W,
+    schema: fields.s,
+    table: fields.t,
+    column: fields.c,
+    dataType: fields.d,
+    constraint: fields.n,
+    file: fields.F,
+    line: fields.L,
+    routine: fields.R,
   });
 }
 
-function interpolateQuery(strings, values) {
-  if (typeof strings === "string") return strings;
-  let statement = "";
-  for (let i = 0; i < strings.length; i++) {
-    statement += strings[i];
-    if (i < values.length) statement += escapeValue(values[i]);
+class PostgresMessageStream {
+  constructor(socket, onActivity = null, onFailure = null) {
+    this.socket = null;
+    this.buffer = Buffer.alloc(0);
+    this.messages = [];
+    this.waiters = [];
+    this.failure = null;
+    this.closed = false;
+    this.onActivity = onActivity;
+    this.onFailure = onFailure;
+    this._onData = chunk => {
+      this.onActivity?.();
+      const bytes = Buffer.from(chunk);
+      this.buffer = this.buffer.length === 0 ? bytes : Buffer.concat([this.buffer, bytes]);
+      this._drain();
+    };
+    this._onError = error => this.fail(error);
+    this._onClose = () => {
+      if (!this.closed) {
+        this.fail(new PostgresError("Connection closed", { code: "ERR_POSTGRES_CONNECTION_CLOSED" }));
+      }
+    };
+    this.attach(socket);
   }
-  return statement;
+
+  attach(socket) {
+    this.detach();
+    this.socket = socket;
+    socket.on("data", this._onData);
+    socket.on("error", this._onError);
+    socket.on("close", this._onClose);
+  }
+
+  detach() {
+    if (!this.socket) return;
+    this.socket.removeListener("data", this._onData);
+    this.socket.removeListener("error", this._onError);
+    this.socket.removeListener("close", this._onClose);
+    this.socket = null;
+  }
+
+  _drain() {
+    while (this.buffer.length >= 5) {
+      const length = this.buffer.readInt32BE(1);
+      if (length < 4) {
+        this.fail(postgresProtocolError(`Invalid PostgreSQL message length: ${length}`));
+        return;
+      }
+      if (this.buffer.length < length + 1) return;
+      const message = {
+        type: String.fromCharCode(this.buffer[0]),
+        body: Buffer.from(this.buffer.subarray(5, length + 1)),
+      };
+      this.buffer = this.buffer.subarray(length + 1);
+      const waiter = this.waiters.shift();
+      if (waiter) waiter.resolve(message);
+      else this.messages.push(message);
+    }
+  }
+
+  readMessage() {
+    const message = this.messages.shift();
+    if (message) return Promise.resolve(message);
+    if (this.failure) return Promise.reject(this.failure);
+    return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
+  }
+
+  write(type, body = Buffer.alloc(0)) {
+    if (!this.socket || this.closed || this.failure) {
+      throw this.failure ?? new PostgresError("Connection closed", { code: "ERR_POSTGRES_CONNECTION_CLOSED" });
+    }
+    this.socket.write(typedMessage(type, body));
+  }
+
+  fail(error) {
+    if (this.failure || this.closed) return;
+    this.failure = error instanceof Error ? error : new Error(String(error));
+    for (const waiter of this.waiters.splice(0)) waiter.reject(this.failure);
+    try {
+      this.onFailure?.(this.failure);
+    } catch {}
+  }
+
+  close(error = null) {
+    if (this.closed) return;
+    if (error) this.fail(error);
+    this.closed = true;
+    const socket = this.socket;
+    this.detach();
+    try {
+      socket?.destroy();
+    } catch {}
+    const closedError = error ?? new PostgresError("Connection closed", {
+      code: "ERR_POSTGRES_CONNECTION_CLOSED",
+    });
+    for (const waiter of this.waiters.splice(0)) waiter.reject(closedError);
+  }
 }
 
-function createPostgresSQL(input) {
-  const options = input;
-  const sockets = new Set();
-  let closed = false;
+function readSocketByte(socket) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      socket.removeListener("data", onData);
+      socket.removeListener("error", onError);
+      socket.removeListener("close", onClose);
+    };
+    const onData = chunk => {
+      cleanup();
+      const bytes = Buffer.from(chunk);
+      if (bytes.length !== 1) {
+        reject(postgresProtocolError("Invalid PostgreSQL TLS negotiation response"));
+      } else {
+        resolve(bytes[0]);
+      }
+    };
+    const onError = error => {
+      cleanup();
+      reject(error);
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new PostgresError("Connection closed", { code: "ERR_POSTGRES_CONNECTION_CLOSED" }));
+    };
+    socket.once("data", onData);
+    socket.once("error", onError);
+    socket.once("close", onClose);
+  });
+}
 
-  const sql = (strings, ...values) => {
-    if (closed) return Promise.reject(new Error("Connection closed"));
-    const statement = interpolateQuery(strings, values);
-    return runPostgresQuery(options, statement, sockets);
+function postgresTLSOptions(options, socket) {
+  const configured = options.tls && typeof options.tls === "object" ? { ...options.tls } : {};
+  const servername = configured.servername ?? configured.serverName ?? options.hostname;
+  delete configured.serverName;
+  const verify = options.sslMode >= SSL_MODE_VERIFY_CA;
+  const tlsOptions = {
+    ...configured,
+    socket,
+    host: options.hostname,
+    servername,
+    rejectUnauthorized: configured.rejectUnauthorized ?? verify,
+  };
+  if (options.sslMode === SSL_MODE_VERIFY_CA && configured.checkServerIdentity == null) {
+    tlsOptions.checkServerIdentity = () => undefined;
+  }
+  return tlsOptions;
+}
+
+function parseSCRAMAttributes(value) {
+  const attributes = {};
+  for (const part of String(value).split(",")) {
+    const equals = part.indexOf("=");
+    if (equals > 0) attributes[part.slice(0, equals)] = part.slice(equals + 1);
+  }
+  return attributes;
+}
+
+function startSCRAM() {
+  const nonce = randomBytes(18).toString("base64").replace(/=+$/, "");
+  const clientFirstBare = `n=*,r=${nonce}`;
+  return {
+    nonce,
+    clientFirstBare,
+    initial: `n,,${clientFirstBare}`,
+    serverSignature: null,
+  };
+}
+
+function continueSCRAM(scram, serverFirst, password) {
+  const attributes = parseSCRAMAttributes(serverFirst);
+  if (!attributes.r || !attributes.r.startsWith(scram.nonce) || attributes.r.length <= scram.nonce.length) {
+    throw postgresProtocolError("Invalid SCRAM server nonce", "ERR_POSTGRES_INVALID_SERVER_SIGNATURE");
+  }
+  const iterations = Number(attributes.i);
+  if (!Number.isSafeInteger(iterations) || iterations <= 0 || !attributes.s) {
+    throw postgresProtocolError("Invalid SCRAM authentication parameters", "ERR_POSTGRES_AUTHENTICATION_FAILED_PBKDF2");
+  }
+
+  let salt;
+  try {
+    salt = Buffer.from(attributes.s, "base64");
+  } catch {
+    throw postgresProtocolError("Invalid SCRAM salt", "ERR_POSTGRES_SASL_SIGNATURE_INVALID_BASE64");
+  }
+  const saltedPassword = pbkdf2Sync(String(password), salt, iterations, 32, "sha256");
+  const clientKey = createHmac("sha256", saltedPassword).update("Client Key").digest();
+  const storedKey = createHash("sha256").update(clientKey).digest();
+  const finalWithoutProof = `c=biws,r=${attributes.r}`;
+  const authMessage = `${scram.clientFirstBare},${serverFirst},${finalWithoutProof}`;
+  const clientSignature = createHmac("sha256", storedKey).update(authMessage).digest();
+  const proof = Buffer.alloc(clientKey.length);
+  for (let index = 0; index < proof.length; index++) proof[index] = clientKey[index] ^ clientSignature[index];
+  const serverKey = createHmac("sha256", saltedPassword).update("Server Key").digest();
+  scram.serverSignature = createHmac("sha256", serverKey).update(authMessage).digest();
+  return `${finalWithoutProof},p=${proof.toString("base64")}`;
+}
+
+function finishSCRAM(scram, serverFinal) {
+  const attributes = parseSCRAMAttributes(serverFinal);
+  if (attributes.e) {
+    throw postgresProtocolError(`SCRAM authentication failed: ${attributes.e}`, "ERR_POSTGRES_AUTHENTICATION_FAILED");
+  }
+  let signature;
+  try {
+    signature = Buffer.from(attributes.v ?? "", "base64");
+  } catch {
+    signature = Buffer.alloc(0);
+  }
+  if (
+    !scram.serverSignature ||
+    signature.length !== scram.serverSignature.length ||
+    !timingSafeEqual(signature, scram.serverSignature)
+  ) {
+    throw postgresProtocolError("The server did not return the correct signature", "ERR_POSTGRES_SASL_SIGNATURE_MISMATCH");
+  }
+}
+
+function buildSASLInitialResponse(scram) {
+  const mechanism = cstringBuffer("SCRAM-SHA-256");
+  const data = Buffer.from(scram.initial);
+  const length = Buffer.alloc(4);
+  length.writeInt32BE(data.length);
+  return Buffer.concat([mechanism, length, data]);
+}
+
+function escapePostgresIdentifier(value) {
+  return '"' + String(value).replaceAll('"', '""').replaceAll(".", '"."') + '"';
+}
+
+function postgresParameterOID(value) {
+  if (value === null || value === undefined) return 0;
+  if (typeof value === "boolean") return 16;
+  if (typeof value === "bigint") return 20;
+  if (typeof value === "number") {
+    if (Number.isInteger(value) && value >= -0x80000000 && value <= 0x7fffffff) return 23;
+    if (Number.isSafeInteger(value)) return 20;
+    return 701;
+  }
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return 17;
+  return 0;
+}
+
+function serializePostgresParameter(value) {
+  if (value === null || value === undefined) return null;
+  switch (typeof value) {
+    case "string":
+      return Buffer.from(value);
+    case "boolean":
+      return Buffer.from(value ? "t" : "f");
+    case "number":
+      return Buffer.from(String(value));
+    case "bigint":
+      if (value < -(2n ** 63n) || value > 2n ** 63n - 1n) {
+        throw new RangeError("The value is out of range. It must fit in a PostgreSQL signed 64-bit integer");
+      }
+      return Buffer.from(value.toString());
+    case "function":
+    case "symbol":
+      throw new TypeError("Cannot bind this type to a PostgreSQL query parameter");
+    case "object":
+      break;
+    default:
+      return Buffer.from(String(value));
+  }
+
+  if (value instanceof SQLArrayParameter) return Buffer.from(String(value.serializedValues));
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) throw new TypeError("Invalid Date cannot be bound to a PostgreSQL query");
+    return Buffer.from(value.toISOString());
+  }
+  if (value instanceof ArrayBuffer) value = new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) {
+    const bytes = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    return Buffer.from(`\\x${bytes.toString("hex")}`);
+  }
+  const json = JSON.stringify(value);
+  if (json === undefined) throw new TypeError("Cannot serialize PostgreSQL query parameter");
+  return Buffer.from(json);
+}
+
+function buildPostgresExtendedQuery(statement, values) {
+  const parseParts = [cstringBuffer(""), cstringBuffer(statement)];
+  const parameterCount = Buffer.alloc(2);
+  parameterCount.writeUInt16BE(values.length);
+  parseParts.push(parameterCount);
+  for (const value of values) {
+    const oid = Buffer.alloc(4);
+    oid.writeUInt32BE(postgresParameterOID(value));
+    parseParts.push(oid);
+  }
+
+  const bindParts = [cstringBuffer(""), cstringBuffer("")];
+  const noFormats = Buffer.alloc(2);
+  bindParts.push(noFormats);
+  const bindCount = Buffer.alloc(2);
+  bindCount.writeUInt16BE(values.length);
+  bindParts.push(bindCount);
+  for (const value of values) {
+    const bytes = serializePostgresParameter(value);
+    const length = Buffer.alloc(4);
+    length.writeInt32BE(bytes === null ? -1 : bytes.length);
+    bindParts.push(length);
+    if (bytes !== null) bindParts.push(bytes);
+  }
+  bindParts.push(Buffer.alloc(2));
+
+  const describe = Buffer.from([0x50, 0]);
+  const execute = Buffer.alloc(5);
+  execute[0] = 0;
+  execute.writeUInt32BE(0, 1);
+  return Buffer.concat([
+    typedMessage("P", Buffer.concat(parseParts)),
+    typedMessage("B", Buffer.concat(bindParts)),
+    typedMessage("D", describe),
+    typedMessage("E", execute),
+    typedMessage("S"),
+  ]);
+}
+
+function parsePostgresRowDescription(body) {
+  if (body.length < 2) throw postgresProtocolError("Truncated PostgreSQL row description");
+  const count = body.readUInt16BE(0);
+  const columns = [];
+  let offset = 2;
+  for (let index = 0; index < count; index++) {
+    const end = body.indexOf(0, offset);
+    if (end < 0 || end + 19 > body.length) {
+      throw postgresProtocolError("Truncated PostgreSQL field description");
+    }
+    const name = body.toString("utf8", offset, end);
+    offset = end + 1;
+    const tableOID = body.readUInt32BE(offset);
+    offset += 4;
+    const attribute = body.readUInt16BE(offset);
+    offset += 2;
+    const typeOID = body.readUInt32BE(offset);
+    offset += 4;
+    const typeSize = body.readInt16BE(offset);
+    offset += 2;
+    const typeModifier = body.readInt32BE(offset);
+    offset += 4;
+    const format = body.readUInt16BE(offset);
+    offset += 2;
+    columns.push({ name, tableOID, attribute, typeOID, typeSize, typeModifier, format });
+  }
+  return columns;
+}
+
+const POSTGRES_ARRAY_ELEMENTS = {
+  143: 142,
+  199: 114,
+  629: 628,
+  651: 650,
+  719: 718,
+  775: 774,
+  791: 790,
+  1000: 16,
+  1001: 17,
+  1002: 18,
+  1003: 19,
+  1005: 21,
+  1006: 22,
+  1007: 23,
+  1009: 25,
+  1010: 27,
+  1011: 28,
+  1012: 29,
+  1014: 1042,
+  1015: 1043,
+  1016: 20,
+  1017: 600,
+  1018: 601,
+  1019: 602,
+  1020: 603,
+  1021: 700,
+  1022: 701,
+  1027: 604,
+  1028: 26,
+  1034: 1033,
+  1040: 829,
+  1041: 869,
+  1115: 1114,
+  1182: 1082,
+  1183: 1083,
+  1185: 1184,
+  1187: 1186,
+  1231: 1700,
+  1270: 1266,
+  1561: 1560,
+  1563: 1562,
+  3807: 3802,
+  4073: 4072,
+  10052: 1248,
+  12052: 1248,
+};
+
+function parsePostgresArray(text, elementOID, options) {
+  const equals = text.indexOf("=");
+  if (text[0] === "[" && equals !== -1) text = text.slice(equals + 1);
+  let offset = 0;
+
+  const parseLevel = () => {
+    if (text[offset++] !== "{") throw postgresProtocolError("Unsupported PostgreSQL array format");
+    const values = [];
+    let token = "";
+    let quoted = false;
+    let escaped = false;
+    let tokenWasQuoted = false;
+
+    const pushToken = () => {
+      if (!tokenWasQuoted && token === "NULL") values.push(null);
+      else values.push(parsePostgresTextValue(token, elementOID, options));
+      token = "";
+      tokenWasQuoted = false;
+    };
+
+    while (offset < text.length) {
+      const character = text[offset++];
+      if (escaped) {
+        token += character;
+        escaped = false;
+        continue;
+      }
+      if (quoted) {
+        if (character === "\\") escaped = true;
+        else if (character === '"') quoted = false;
+        else token += character;
+        continue;
+      }
+      if (character === '"') {
+        quoted = true;
+        tokenWasQuoted = true;
+        continue;
+      }
+      if (character === "{") {
+        offset--;
+        values.push(parseLevel());
+        token = "";
+        tokenWasQuoted = false;
+        continue;
+      }
+      if (character === "," || character === ";") {
+        if (token.length > 0 || tokenWasQuoted) pushToken();
+        continue;
+      }
+      if (character === "}") {
+        if (token.length > 0 || tokenWasQuoted) pushToken();
+        return values;
+      }
+      token += character;
+    }
+    throw postgresProtocolError("Unterminated PostgreSQL array value");
   };
 
-  sql.unsafe = (statement) => {
-    if (closed) return Promise.reject(new Error("Connection closed"));
-    return runPostgresQuery(options, String(statement), sockets);
-  };
-  sql.close = (_options) => {
-    closed = true;
-    for (const socket of sockets) {
+  return parseLevel();
+}
+
+function parsePostgresTimestamp(text, withTimezone) {
+  if (text === "infinity" || text === "-infinity") return text;
+  let normalized = text.replace(" ", "T");
+  if (!withTimezone && !/[zZ]|[+-]\d\d(?::?\d\d)?$/.test(normalized)) normalized += "Z";
+  return new Date(normalized);
+}
+
+function parsePostgresTextValue(text, oid, options) {
+  switch (oid) {
+    case 16:
+      return text === "t" || text === "true" || text === "1";
+    case 17:
+      if (text.startsWith("\\x")) return Buffer.from(text.slice(2), "hex");
+      return Buffer.from(text.replace(/\\\\/g, "\\"));
+    case 20:
+      return options.bigint ? BigInt(text) : text;
+    case 21:
+    case 22:
+    case 23:
+    case 26:
+    case 28:
+    case 29:
+      return Number(text);
+    case 700:
+    case 701:
+      return Number(text);
+    case 1082:
+      return parsePostgresTimestamp(`${text}T00:00:00`, false);
+    case 1114:
+      return parsePostgresTimestamp(text, false);
+    case 1184:
+      return parsePostgresTimestamp(text, true);
+    case 114:
+    case 3802:
+      return JSON.parse(text);
+    default:
+      if (POSTGRES_ARRAY_ELEMENTS[oid] !== undefined) {
+        const values = parsePostgresArray(text, POSTGRES_ARRAY_ELEMENTS[oid], options);
+        if (oid === 1007 && values.every(value => typeof value === "number")) return Int32Array.from(values);
+        if (oid === 1021 && values.every(value => typeof value === "number")) return Float32Array.from(values);
+        return values;
+      }
+      return text;
+  }
+}
+
+function parsePostgresValue(bytes, column, options, raw) {
+  if (bytes === null) return null;
+  if (raw) return Buffer.from(bytes);
+  if (column.format !== 0) {
+    throw postgresProtocolError(`Unsupported PostgreSQL binary result for type ${column.typeOID}`);
+  }
+  return parsePostgresTextValue(bytes.toString("utf8"), column.typeOID, options);
+}
+
+function setSQLRowValue(row, name, value) {
+  Object.defineProperty(row, name, {
+    value,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
+}
+
+function parsePostgresDataRow(body, columns, options, mode) {
+  if (body.length < 2) throw postgresProtocolError("Truncated PostgreSQL data row");
+  const count = body.readUInt16BE(0);
+  let offset = 2;
+  const values = [];
+  for (let index = 0; index < count; index++) {
+    if (offset + 4 > body.length) throw postgresProtocolError("Truncated PostgreSQL data row value");
+    const length = body.readInt32BE(offset);
+    offset += 4;
+    let bytes = null;
+    if (length >= 0) {
+      if (offset + length > body.length) throw postgresProtocolError("Truncated PostgreSQL data row value");
+      bytes = body.subarray(offset, offset + length);
+      offset += length;
+    }
+    const column = columns[index] ?? { typeOID: 25, format: 0, name: String(index) };
+    values.push(parsePostgresValue(bytes, column, options, mode === "raw"));
+  }
+  if (mode === "values" || mode === "raw") return values;
+  const row = {};
+  for (let index = 0; index < values.length; index++) {
+    setSQLRowValue(row, columns[index]?.name ?? String(index), values[index]);
+  }
+  return row;
+}
+
+function parsePostgresCommandTag(tag, result) {
+  const parts = String(tag).split(" ");
+  const known = ["INSERT", "DELETE", "UPDATE", "MERGE", "SELECT", "MOVE", "FETCH", "COPY"];
+  if (known.includes(parts[0])) {
+    result.command = parts[0];
+    const count = Number(parts[0] === "INSERT" ? parts[2] : parts[1]);
+    result.count = Number.isSafeInteger(count) ? count : 0;
+  } else {
+    result.command = String(tag);
+    result.count = 0;
+  }
+  if (["INSERT", "DELETE", "UPDATE", "MERGE", "COPY"].includes(parts[0])) {
+    result.affectedRows = result.count;
+  }
+}
+
+class PostgresSession {
+  constructor(client) {
+    this.client = client;
+    this.options = client.options;
+    this.socket = null;
+    this.stream = null;
+    this.openPromise = null;
+    this.connected = false;
+    this.secure = false;
+    this.closed = false;
+    this.queue = Promise.resolve();
+    this.closeReason = null;
+    this.parameters = {};
+    this.backendProcessId = 0;
+    this.backendSecretKey = 0;
+    this.transactionStatus = "I";
+    this._idleTimer = null;
+    this._lifetimeTimer = null;
+    client.sessions.add(this);
+  }
+
+  open() {
+    if (this.connected) return Promise.resolve(this);
+    if (this.closed) {
+      return Promise.reject(new PostgresError("Connection closed", { code: "ERR_POSTGRES_CONNECTION_CLOSED" }));
+    }
+    if (!this.openPromise) {
+      this.openPromise = this._open().then(
+        () => {
+          this.connected = true;
+          this._resetIdleTimer();
+          if (this.options.maxLifetime > 0) {
+            this._lifetimeTimer = setTimeout(() => {
+              this.close(new PostgresError("Max lifetime timeout reached", {
+                code: "ERR_POSTGRES_LIFETIME_TIMEOUT",
+              }));
+            }, this.options.maxLifetime);
+            this._lifetimeTimer.unref?.();
+          }
+          try {
+            this.options.onconnect?.(null);
+          } catch {}
+          return this;
+        },
+        error => {
+          this.close(error);
+          throw error;
+        },
+      );
+    }
+    return this.openPromise;
+  }
+
+  async _open() {
+    let password = this.options.password;
+    if (typeof password === "function") password = password();
+    password = await password;
+    this.options = { ...this.options, password: password ?? "" };
+    for (const [name, value] of [
+      ["username", this.options.username],
+      ["password", this.options.password],
+      ["database", this.options.database],
+    ]) {
+      if (String(value ?? "").includes("\0")) {
+        throw postgresProtocolError(`PostgreSQL ${name} cannot contain null bytes`, "ERR_POSTGRES_INVALID_CREDENTIALS");
+      }
+    }
+
+    let path = this.options.path;
+    if (typeof path === "string" && path.includes("\0")) path = undefined;
+    const socket = path ? net.connect(path) : net.connect(this.options.port, this.options.hostname);
+    this.socket = socket;
+
+    let timer = null;
+    const timeout = this.options.connectionTimeout ?? 30_000;
+    if (timeout > 0) {
+      timer = setTimeout(() => {
+        const error = new PostgresError(`Connection timeout after ${timeout / 1000}s (during authentication)`, {
+          code: "ERR_POSTGRES_CONNECTION_TIMEOUT",
+        });
+        this.stream?.fail(error);
+        try {
+          this.socket?.destroy(error);
+        } catch {}
+      }, timeout);
+      timer.unref?.();
+    }
+
+    try {
+      await waitForSocketConnect(socket);
+      const wantsTLS = this.options.sslMode !== SSL_MODE_DISABLE || Boolean(this.options.tls);
+      if (wantsTLS) {
+        const sslRequest = Buffer.alloc(8);
+        sslRequest.writeInt32BE(8, 0);
+        sslRequest.writeInt32BE(80877103, 4);
+        socket.write(sslRequest);
+        const response = await readSocketByte(socket);
+        if (response === 0x53) {
+          const secureSocket = tls.connect(postgresTLSOptions(this.options, socket));
+          this.socket = secureSocket;
+          await waitForSecureConnect(secureSocket);
+          this.secure = true;
+        } else if (response === 0x4e) {
+          if (this.options.sslMode >= SSL_MODE_REQUIRE) {
+            throw postgresProtocolError("PostgreSQL server does not support TLS", "ERR_POSTGRES_TLS_NOT_AVAILABLE");
+          }
+        } else {
+          throw postgresProtocolError("Invalid PostgreSQL TLS negotiation response");
+        }
+      }
+
+      this.stream = new PostgresMessageStream(
+        this.socket,
+        () => this._resetIdleTimer(),
+        error => this.close(error),
+      );
+      this.socket.write(buildStartupMessage(this.options));
+      await this._authenticate();
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  async _authenticate() {
+    let scram = null;
+    for (;;) {
+      const { type, body } = await this.stream.readMessage();
+      switch (type) {
+        case "R": {
+          if (body.length < 4) throw postgresProtocolError("Truncated PostgreSQL authentication message");
+          const method = body.readInt32BE(0);
+          if (method === 0) break;
+          if (method === 3) {
+            this.stream.write("p", cstringBuffer(this.options.password));
+          } else if (method === 5) {
+            if (body.length < 8) throw postgresProtocolError("Truncated PostgreSQL MD5 authentication message");
+            const inner = md5hex(this.options.password, this.options.username);
+            this.stream.write("p", cstringBuffer(`md5${md5hex(inner, body.subarray(4, 8))}`));
+          } else if (method === 10) {
+            const mechanisms = body.toString("utf8", 4).split("\0");
+            if (!mechanisms.includes("SCRAM-SHA-256")) {
+              throw postgresProtocolError(
+                "PostgreSQL server does not offer SCRAM-SHA-256 authentication",
+                "ERR_POSTGRES_UNSUPPORTED_AUTHENTICATION_METHOD",
+              );
+            }
+            scram = startSCRAM();
+            this.stream.write("p", buildSASLInitialResponse(scram));
+          } else if (method === 11) {
+            if (!scram) throw postgresProtocolError("Unexpected PostgreSQL SCRAM continuation");
+            const response = continueSCRAM(scram, body.toString("utf8", 4), this.options.password);
+            this.stream.write("p", Buffer.from(response));
+          } else if (method === 12) {
+            if (!scram) throw postgresProtocolError("Unexpected PostgreSQL SCRAM final message");
+            finishSCRAM(scram, body.toString("utf8", 4));
+          } else {
+            throw postgresProtocolError(
+              `Unsupported PostgreSQL authentication method: ${method}`,
+              "ERR_POSTGRES_UNSUPPORTED_AUTHENTICATION_METHOD",
+            );
+          }
+          break;
+        }
+        case "S": {
+          const name = readNullTerminated(body, 0);
+          const value = readNullTerminated(body, name.offset);
+          this.parameters[name.value] = value.value;
+          break;
+        }
+        case "K":
+          if (body.length >= 8) {
+            this.backendProcessId = body.readUInt32BE(0);
+            this.backendSecretKey = body.readUInt32BE(4);
+          }
+          break;
+        case "E":
+          throw postgresServerError(body);
+        case "Z":
+          this.transactionStatus = body.length > 0 ? String.fromCharCode(body[0]) : "I";
+          return;
+        default:
+          break;
+      }
+    }
+  }
+
+  query(statement, values = [], mode = "objects", simple = false) {
+    const operation = this.queue.then(async () => {
+      await this.open();
+      if (this.closed) {
+        throw new PostgresError("Connection closed", { code: "ERR_POSTGRES_CONNECTION_CLOSED" });
+      }
+      if (statement.includes("\0")) {
+        throw postgresProtocolError("PostgreSQL queries cannot contain null bytes", "ERR_POSTGRES_INVALID_QUERY_BINDING");
+      }
+      this._resetIdleTimer();
+      if (simple) {
+        if (values.length > 0) {
+          throw postgresProtocolError("Simple PostgreSQL queries cannot have parameters", "ERR_POSTGRES_INVALID_QUERY_BINDING");
+        }
+        this.stream.write("Q", cstringBuffer(statement));
+      } else {
+        this.socket.write(buildPostgresExtendedQuery(statement, values));
+      }
       try {
-        socket.destroy();
+        return await this._readQueryResults(mode);
+      } catch (error) {
+        if (
+          error?.code !== "ERR_POSTGRES_SERVER_ERROR" &&
+          error?.code !== "ERR_POSTGRES_SYNTAX_ERROR"
+        ) {
+          this.close(error);
+        }
+        throw error;
+      }
+    });
+    this.queue = operation.catch(() => undefined);
+    return operation;
+  }
+
+  _resetIdleTimer() {
+    if (this._idleTimer) clearTimeout(this._idleTimer);
+    this._idleTimer = null;
+    if (!this.connected || this.closed || !(this.options.idleTimeout > 0)) return;
+    this._idleTimer = setTimeout(() => {
+      this.close(new PostgresError("Idle timeout reached", {
+        code: "ERR_POSTGRES_IDLE_TIMEOUT",
+      }));
+    }, this.options.idleTimeout);
+    this._idleTimer.unref?.();
+  }
+
+  async _readQueryResults(mode) {
+    const results = [];
+    let columns = [];
+    let rows = [];
+    let queryError = null;
+    for (;;) {
+      const { type, body } = await this.stream.readMessage();
+      switch (type) {
+        case "T":
+          columns = parsePostgresRowDescription(body);
+          rows = [];
+          break;
+        case "D":
+          rows.push(parsePostgresDataRow(body, columns, this.options, mode));
+          break;
+        case "C": {
+          const result = new SQLResultArray(rows);
+          const tag = body.toString("utf8", 0, Math.max(0, body.length - 1));
+          parsePostgresCommandTag(tag, result);
+          results.push(result);
+          columns = [];
+          rows = [];
+          break;
+        }
+        case "I": {
+          const result = new SQLResultArray();
+          result.command = "";
+          result.count = 0;
+          results.push(result);
+          break;
+        }
+        case "E":
+          queryError = postgresServerError(body);
+          break;
+        case "S": {
+          const name = readNullTerminated(body, 0);
+          const value = readNullTerminated(body, name.offset);
+          this.parameters[name.value] = value.value;
+          break;
+        }
+        case "K":
+          if (body.length >= 8) {
+            this.backendProcessId = body.readUInt32BE(0);
+            this.backendSecretKey = body.readUInt32BE(4);
+          }
+          break;
+        case "Z":
+          this.transactionStatus = body.length > 0 ? String.fromCharCode(body[0]) : "I";
+          if (queryError) throw queryError;
+          if (results.length === 0) return new SQLResultArray();
+          return results.length === 1 ? results[0] : results;
+        default:
+          break;
+      }
+    }
+  }
+
+  close(error = null) {
+    if (this.closed) return;
+    this.closed = true;
+    if (this._idleTimer) clearTimeout(this._idleTimer);
+    if (this._lifetimeTimer) clearTimeout(this._lifetimeTimer);
+    this._idleTimer = null;
+    this._lifetimeTimer = null;
+    this.closeReason = error;
+    if (this.connected && !error) {
+      try {
+        this.stream?.write("X");
       } catch {}
     }
-    sockets.clear();
-    return Promise.resolve();
+    this.connected = false;
+    this.stream?.close(error);
+    if (!this.stream) {
+      try {
+        this.socket?.destroy();
+      } catch {}
+    }
+    this.client.sessionClosed(this);
+    try {
+      this.options.onclose?.(error);
+    } catch {}
+  }
+}
+
+function normalizePostgresQuery(strings, values, bindingIndex = 1) {
+  if (typeof strings === "string") return [strings, values ?? []];
+  if (!Array.isArray(strings)) {
+    throw new SyntaxError("Invalid query: SQL Fragment cannot be executed or was misused");
+  }
+
+  let query = "";
+  const bindings = [];
+  for (let index = 0; index < strings.length; index++) {
+    if (typeof strings[index] !== "string") {
+      throw new SyntaxError("Invalid query: SQL Fragment cannot be executed or was misused");
+    }
+    query += strings[index];
+    if (index >= values.length) continue;
+    const value = values[index];
+
+    if (value instanceof PostgresQuery) {
+      const [fragment, fragmentBindings] = normalizePostgresQuery(value._strings, value._values, bindingIndex);
+      query += fragment;
+      bindings.push(...fragmentBindings);
+      bindingIndex += fragmentBindings.length;
+      continue;
+    }
+    if (value instanceof SQLArrayParameter) {
+      query += `$${bindingIndex++}::${value.arrayType}[] `;
+      bindings.push(value.serializedValues);
+      continue;
+    }
+    if (!(value instanceof SQLHelper)) {
+      query += `$${bindingIndex++} `;
+      bindings.push(typeof value === "undefined" ? null : value);
+      continue;
+    }
+
+    const command = parseSQLQuery(query).helperCommand;
+    if (command === "none" || command === "where") {
+      throw new SyntaxError("Helpers are only allowed for INSERT, UPDATE and IN commands");
+    }
+    const items = value.value;
+    const columns = value.columns;
+    if (columns.length === 0 && command !== "in") {
+      throw new SyntaxError("Cannot " + helperCommandName(command) + " with no columns");
+    }
+
+    if (command === "insert") {
+      const rows = Array.isArray(items) ? items : [items];
+      const definedColumns = columns.filter(column =>
+        rows.some(row => row != null && typeof row[column] !== "undefined"),
+      );
+      if (definedColumns.length === 0) {
+        throw new SyntaxError("Insert needs to have at least one column with a defined value");
+      }
+      query += `(${definedColumns.map(escapePostgresIdentifier).join(", ")}) VALUES`;
+      for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+        const row = rows[rowIndex];
+        query += "(";
+        for (let columnIndex = 0; columnIndex < definedColumns.length; columnIndex++) {
+          if (columnIndex > 0) query += ", ";
+          query += `$${bindingIndex++}`;
+          const columnValue = row?.[definedColumns[columnIndex]];
+          bindings.push(typeof columnValue === "undefined" ? null : columnValue);
+        }
+        query += rowIndex + 1 < rows.length ? ")," : ") ";
+      }
+      continue;
+    }
+
+    if (command === "in") {
+      if (!Array.isArray(items)) throw new SyntaxError("An array of values is required for WHERE IN helper");
+      if (columns.length > 1) throw new SyntaxError("Cannot use WHERE IN helper with multiple columns");
+      query += "(";
+      for (let rowIndex = 0; rowIndex < items.length; rowIndex++) {
+        if (rowIndex > 0) query += ", ";
+        query += `$${bindingIndex++}`;
+        const item = items[rowIndex];
+        const binding = columns.length === 0 ? item : item?.[columns[0]];
+        bindings.push(typeof binding === "undefined" ? null : binding);
+      }
+      query += ") ";
+      continue;
+    }
+
+    const rows = Array.isArray(items) ? items : [items];
+    if (rows.length > 1) throw new SyntaxError("Cannot use array of objects for UPDATE");
+    if (command === "update") query += " SET ";
+    let added = 0;
+    for (const column of columns) {
+      const columnValue = rows[0]?.[column];
+      if (typeof columnValue === "undefined") continue;
+      if (added > 0) query += ", ";
+      query += `${escapePostgresIdentifier(column)} = $${bindingIndex++}`;
+      bindings.push(columnValue);
+      added++;
+    }
+    if (added === 0) throw new SyntaxError("Update needs to have at least one column");
+    query += " ";
+  }
+  return [query, bindings];
+}
+
+class PostgresQuery extends Promise {
+  constructor(client, strings, values, options = {}) {
+    let resolvePromise;
+    let rejectPromise;
+    super((resolve, reject) => {
+      resolvePromise = resolve;
+      rejectPromise = reject;
+    });
+    this._client = client;
+    this._strings = strings;
+    this._values = values;
+    this._notTagged = options.notTagged === true;
+    this._fixedSession = options.session ?? null;
+    this._context = options.context ?? null;
+    this._resolvePromise = resolvePromise;
+    this._rejectPromise = rejectPromise;
+    this._mode = "objects";
+    this._simple = options.simple === true;
+    this._started = false;
+    this._cancelled = false;
+    this._session = null;
+    this.active = false;
+  }
+
+  static get [Symbol.species]() {
+    return Promise;
+  }
+
+  _buildStatement(bindingIndex = 1) {
+    return normalizePostgresQuery(this._strings, this._values, bindingIndex);
+  }
+
+  _start() {
+    if (this._started || this._cancelled) return;
+    this._started = true;
+    if (this._notTagged) {
+      this._rejectPromise(new PostgresError("Query not called as a tagged template literal", {
+        code: "ERR_POSTGRES_NOT_TAGGED_CALL",
+      }));
+      this._context?.queries.delete(this);
+      return;
+    }
+    this._context?.queries.add(this);
+    this.active = true;
+    Promise.resolve()
+      .then(() => this._client.execute(this))
+      .then(this._resolvePromise, this._rejectPromise)
+      .finally(() => {
+        this.active = false;
+        this._context?.queries.delete(this);
+      });
+  }
+
+  execute() {
+    this._start();
+    return this;
+  }
+
+  async run() {
+    if (this._notTagged) {
+      throw new PostgresError("Query not called as a tagged template literal", {
+        code: "ERR_POSTGRES_NOT_TAGGED_CALL",
+      });
+    }
+    this._start();
+    return await this;
+  }
+
+  values() {
+    if (!this._started) this._mode = "values";
+    return this;
+  }
+
+  raw() {
+    if (!this._started) this._mode = "raw";
+    return this;
+  }
+
+  simple() {
+    if (!this._started) this._simple = true;
+    return this;
+  }
+
+  cancel() {
+    if (this._cancelled) return this;
+    this._cancelled = true;
+    const error = new PostgresError("Query cancelled", { code: "ERR_POSTGRES_QUERY_CANCELLED" });
+    if (this.active) this._session?.close(error);
+    this._rejectPromise(error);
+    this._context?.queries.delete(this);
+    return this;
+  }
+
+  then(...arguments_) {
+    this._start();
+    return super.then(...arguments_);
+  }
+
+  catch(...arguments_) {
+    if (this._notTagged) {
+      throw new PostgresError("Query not called as a tagged template literal", {
+        code: "ERR_POSTGRES_NOT_TAGGED_CALL",
+      });
+    }
+    this._start();
+    return super.catch(...arguments_);
+  }
+
+  finally(...arguments_) {
+    if (this._notTagged) {
+      throw new PostgresError("Query not called as a tagged template literal", {
+        code: "ERR_POSTGRES_NOT_TAGGED_CALL",
+      });
+    }
+    this._start();
+    return super.finally(...arguments_);
+  }
+}
+
+class PostgresClient {
+  constructor(options) {
+    this.options = options;
+    this.sessions = new Set();
+    this.available = [];
+    this.inUse = new Set();
+    this.waiters = [];
+    this.closed = false;
+    this.closePromise = null;
+    this.closeResolve = null;
+    this.closeTimer = null;
+  }
+
+  _take(session) {
+    session._resetIdleTimer();
+    this.inUse.add(session);
+    return session;
+  }
+
+  acquire() {
+    if (this.closed) {
+      return Promise.reject(new PostgresError("Connection closed", { code: "ERR_POSTGRES_CONNECTION_CLOSED" }));
+    }
+    while (this.available.length > 0) {
+      const session = this.available.pop();
+      if (session.closed) continue;
+      if (session.stream?.failure) {
+        session.close(session.stream.failure);
+        continue;
+      }
+      return Promise.resolve(this._take(session));
+    }
+    if (this.sessions.size < this.options.max) return Promise.resolve(this._take(new PostgresSession(this)));
+    return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
+  }
+
+  release(session) {
+    if (!session) return;
+    this.inUse.delete(session);
+    if (session.closed) {
+      this._finishCloseIfIdle();
+      return;
+    }
+    if (this.closed) {
+      session.close();
+      this._finishCloseIfIdle();
+      return;
+    }
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter.resolve(this._take(session));
+      return;
+    }
+    if (!this.available.includes(session)) this.available.push(session);
+    session._resetIdleTimer();
+  }
+
+  sessionClosed(session) {
+    this.sessions.delete(session);
+    this.inUse.delete(session);
+    const index = this.available.indexOf(session);
+    if (index !== -1) this.available.splice(index, 1);
+    if (!this.closed && this.waiters.length > 0 && this.sessions.size < this.options.max) {
+      const waiter = this.waiters.shift();
+      waiter.resolve(this._take(new PostgresSession(this)));
+    }
+    this._finishCloseIfIdle();
+  }
+
+  async execute(query) {
+    const [statement, values] = query._buildStatement();
+    if (
+      !query._fixedSession &&
+      this.options.max !== 1 &&
+      /^\s*(?:BEGIN\b|START\s+TRANSACTION\b)/i.test(statement)
+    ) {
+      throw new PostgresError("Only use sql.begin, sql.reserved or max: 1", {
+        code: "ERR_POSTGRES_UNSAFE_TRANSACTION",
+      });
+    }
+    if (query._fixedSession) {
+      if (query._context?.closed) {
+        throw new PostgresError("Connection closed", { code: "ERR_POSTGRES_CONNECTION_CLOSED" });
+      }
+      query._session = query._fixedSession;
+      if (query._cancelled) {
+        throw new PostgresError("Query cancelled", { code: "ERR_POSTGRES_QUERY_CANCELLED" });
+      }
+      return await query._fixedSession.query(statement, values, query._mode, query._simple);
+    }
+    const session = await this.acquire();
+    query._session = session;
+    try {
+      if (query._cancelled) {
+        throw new PostgresError("Query cancelled", { code: "ERR_POSTGRES_QUERY_CANCELLED" });
+      }
+      return await session.query(statement, values, query._mode, query._simple);
+    } finally {
+      if (session.stream?.failure) session.close(session.stream.failure);
+      else this.release(session);
+    }
+  }
+
+  _finishCloseIfIdle() {
+    if (!this.closed || this.inUse.size > 0 || !this.closeResolve) return;
+    const resolve = this.closeResolve;
+    this.closeResolve = null;
+    if (this.closeTimer) clearTimeout(this.closeTimer);
+    this.closeTimer = null;
+    for (const session of [...this.sessions]) session.close();
+    resolve();
+  }
+
+  close(options = {}) {
+    if (this.closePromise) return this.closePromise;
+    let timeout = options?.timeout;
+    if (timeout !== undefined) {
+      timeout = Number(timeout);
+      if (timeout > 2 ** 31 || timeout < 0 || Number.isNaN(timeout)) {
+        return Promise.reject(invalidSQLArgument(
+          "options.timeout",
+          timeout,
+          "must be a non-negative integer less than 2^31",
+        ));
+      }
+    }
+    this.closed = true;
+    const closedError = new PostgresError("Connection closed", { code: "ERR_POSTGRES_CONNECTION_CLOSED" });
+    for (const waiter of this.waiters.splice(0)) waiter.reject(closedError);
+    for (const session of [...this.available]) session.close();
+    this.available.length = 0;
+
+    if (this.inUse.size === 0 || timeout === 0) {
+      for (const session of [...this.sessions]) session.close();
+      return (this.closePromise = Promise.resolve());
+    }
+
+    this.closePromise = new Promise(resolve => {
+      this.closeResolve = resolve;
+      if (timeout > 0) {
+        this.closeTimer = setTimeout(() => {
+          const closeResolve = this.closeResolve;
+          this.closeResolve = null;
+          this.closeTimer = null;
+          for (const session of [...this.sessions]) session.close(closedError);
+          closeResolve?.();
+        }, timeout * 1000);
+        this.closeTimer.unref?.();
+      }
+    });
+    return this.closePromise;
+  }
+}
+
+function validatePostgresDistributedName(name) {
+  if (typeof name !== "string") throw invalidSQLArgument("name", name, "must be a string");
+  if (name.includes("'")) throw new Error("Distributed transaction name cannot contain single quotes.");
+  return name;
+}
+
+async function waitForPostgresQueries(context) {
+  while (context.queries.size > 0 || context.savepoints?.size > 0) {
+    await Promise.all([...context.queries, ...(context.savepoints ?? [])]);
+  }
+}
+
+async function runPostgresSavepoint(client, session, callback, name = "") {
+  if (typeof callback !== "function") throw new TypeError("fn must be a function");
+  const identifier = `s${client.nextSavepoint++}${name ? `_${name}` : ""}`;
+  const escaped = escapePostgresIdentifier(identifier);
+  await session.query(`SAVEPOINT ${escaped}`);
+  const context = { closed: false, queries: new Set(), savepoints: new Set() };
+  const sql = createPostgresSQLFunction(client, session, "transaction", context);
+  try {
+    let result = await callback(sql);
+    if (Array.isArray(result)) result = await Promise.all(result);
+    await waitForPostgresQueries(context);
+    await session.query(`RELEASE SAVEPOINT ${escaped}`);
+    return result;
+  } catch (error) {
+    try {
+      await session.query(`ROLLBACK TO SAVEPOINT ${escaped}`);
+      await session.query(`RELEASE SAVEPOINT ${escaped}`);
+    } catch {}
+    throw error;
+  } finally {
+    context.closed = true;
+  }
+}
+
+async function runPostgresTransaction(client, optionsOrCallback, maybeCallback, fixedSession = null, distributed = false) {
+  let options = optionsOrCallback;
+  let callback = maybeCallback;
+  if (typeof optionsOrCallback === "function") {
+    callback = optionsOrCallback;
+    options = undefined;
+  }
+  if (typeof callback !== "function") throw new TypeError("fn must be a function");
+  if (options !== undefined && typeof options !== "string") {
+    throw invalidSQLArgument("options", options, "must be a string");
+  }
+  if (distributed) options = validatePostgresDistributedName(options);
+
+  const session = fixedSession ?? await client.acquire();
+  const context = { closed: false, queries: new Set(), savepoints: new Set() };
+  try {
+    await session.query(distributed ? "BEGIN" : `BEGIN${options ? ` ${options}` : ""}`);
+    const transactionSQL = createPostgresSQLFunction(client, session, distributed ? "distributed" : "transaction", context);
+    try {
+      let result = await callback(transactionSQL);
+      if (Array.isArray(result)) result = await Promise.all(result);
+      await waitForPostgresQueries(context);
+      if (distributed) await session.query(`PREPARE TRANSACTION '${options}'`);
+      else await session.query("COMMIT");
+      return result;
+    } catch (error) {
+      try {
+        await session.query("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+  } finally {
+    context.closed = true;
+    if (!fixedSession) client.release(session);
+  }
+}
+
+function serializePostgresArray(values, type) {
+  if (!Array.isArray(values) && !(ArrayBuffer.isView(values) && !Buffer.isBuffer(values))) return values;
+  if (values.length === 0) return "{}";
+  const numericTypes = new Set([
+    "BIT", "VARBIT", "SMALLINT", "INT2VECTOR", "INTEGER", "INT", "BIGINT", "REAL",
+    "DOUBLE PRECISION", "NUMERIC", "MONEY",
+  ]);
+  const json = type === "JSON" || type === "JSONB";
+  const delimiter = type === "BOX" ? ";" : ",";
+  const escape = value => String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const encode = value => {
+    if (Array.isArray(value) || (ArrayBuffer.isView(value) && !Buffer.isBuffer(value))) {
+      return `{${Array.from(value, encode).join(delimiter)}}`;
+    }
+    if (value === null || value === undefined) return "NULL";
+    if (typeof value === "boolean") {
+      if (type === "BOOLEAN") return value ? "t" : "f";
+      if (json) return value ? "true" : "false";
+      if (numericTypes.has(type)) return value ? "1" : "0";
+      return `"${value}"`;
+    }
+    if (typeof value === "number" || typeof value === "bigint") {
+      if (numericTypes.has(type) || json) return String(value);
+      return `"${value}"`;
+    }
+    if (value instanceof Date) value = value.toISOString();
+    else if (Buffer.isBuffer(value)) value = type === "BYTEA" ? `\\x${value.toString("hex")}` : value.toString("hex");
+    else if (typeof value === "object") return `"${escape(JSON.stringify(value))}"`;
+    if (json) value = JSON.stringify(value);
+    return `"${escape(value)}"`;
   };
+  return `{${Array.from(values, encode).join(delimiter)}}`;
+}
+
+function createPostgresSQLFunction(client, session = null, state = "root", context = null) {
+  function sql(strings, ...values) {
+    const isTaggedTemplate = Array.isArray(strings) && Array.isArray(strings.raw);
+    if (Array.isArray(strings) && !isTaggedTemplate) return new SQLHelper(strings, values);
+    if (
+      !Array.isArray(strings) &&
+      strings != null &&
+      typeof strings === "object" &&
+      !(strings instanceof PostgresQuery) &&
+      !(strings instanceof SQLHelper)
+    ) {
+      return new SQLHelper([strings], values);
+    }
+    if (typeof strings === "string") {
+      return new PostgresQuery(client, escapePostgresIdentifier(strings), [], {
+        notTagged: true,
+        session,
+        context,
+      });
+    }
+    return new PostgresQuery(client, strings, values, { session, context });
+  }
+
+  sql.unsafe = (statement, arguments_ = []) => {
+    arguments_ ??= [];
+    return new PostgresQuery(client, String(statement), arguments_, {
+      session,
+      context,
+      simple: arguments_.length === 0,
+    });
+  };
+  sql.file = async (path, arguments_ = []) => {
+    const text = await globalThis.Bun.file(String(path)).text();
+    return await sql.unsafe(text, arguments_);
+  };
+  sql.connect = async () => {
+    if (context?.closed || client.closed) {
+      throw new PostgresError("Connection closed", { code: "ERR_POSTGRES_CONNECTION_CLOSED" });
+    }
+    if (session) {
+      await session.open();
+      return sql;
+    }
+    const connection = await client.acquire();
+    try {
+      await connection.open();
+    } finally {
+      client.release(connection);
+    }
+    return sql;
+  };
+  sql.array = (values, typeNameOrID = "JSON") => {
+    const byOID = {
+      143: "XML", 199: "JSON", 629: "LINE", 651: "CIDR", 719: "CIRCLE", 775: "MACADDR8",
+      791: "MONEY", 1000: "BOOLEAN", 1001: "BYTEA", 1002: "CHAR", 1003: "NAME",
+      1005: "SMALLINT", 1006: "INT2VECTOR", 1007: "INTEGER", 1009: "TEXT", 1010: "TID",
+      1011: "XID", 1012: "CID", 1014: "CHAR", 1015: "VARCHAR", 1016: "BIGINT",
+      1017: "POINT", 1018: "LSEG", 1019: "PATH", 1020: "BOX", 1021: "REAL",
+      1022: "DOUBLE PRECISION", 1027: "POLYGON", 1028: "OID", 1034: "ACLITEM",
+      1040: "MACADDR", 1041: "INET", 1115: "TIMESTAMP", 1182: "DATE", 1183: "TIME",
+      1185: "TIMESTAMPTZ", 1187: "INTERVAL", 1231: "NUMERIC", 1270: "TIMETZ",
+      1561: "BIT", 1563: "VARBIT", 3802: "JSONB", 3807: "JSONB", 4072: "JSONPATH",
+      4073: "JSONPATH", 10052: "PG_DATABASE", 12052: "PG_DATABASE",
+    };
+    const type = typeof typeNameOrID === "number" ? byOID[typeNameOrID] ?? "JSON" : String(typeNameOrID).toUpperCase();
+    return new SQLArrayParameter(serializePostgresArray(values, type), type);
+  };
+  sql.flush = () => undefined;
+
+  if (state === "root") {
+    sql.reserve = async () => {
+      const reserved = await client.acquire();
+      try {
+        await reserved.open();
+      } catch (error) {
+        reserved.close(error);
+        throw error;
+      }
+      const reservedContext = { closed: false, queries: new Set(), savepoints: new Set() };
+      return createPostgresSQLFunction(client, reserved, "reserved", reservedContext);
+    };
+    sql.begin = (optionsOrCallback, callback) =>
+      runPostgresTransaction(client, optionsOrCallback, callback);
+    sql.beginDistributed = (name, callback) =>
+      runPostgresTransaction(client, name, callback, null, true);
+    sql.commitDistributed = name => sql.unsafe(`COMMIT PREPARED '${validatePostgresDistributedName(name)}'`);
+    sql.rollbackDistributed = name => sql.unsafe(`ROLLBACK PREPARED '${validatePostgresDistributedName(name)}'`);
+    sql.close = options => client.close(options);
+  } else if (state === "reserved") {
+    sql.reserve = () => createPostgresSQLFunction(client).reserve();
+    sql.begin = (optionsOrCallback, callback) =>
+      runPostgresTransaction(client, optionsOrCallback, callback, session);
+    sql.beginDistributed = (name, callback) =>
+      runPostgresTransaction(client, name, callback, session, true);
+    sql.commitDistributed = name => sql.unsafe(`COMMIT PREPARED '${validatePostgresDistributedName(name)}'`);
+    sql.rollbackDistributed = name => sql.unsafe(`ROLLBACK PREPARED '${validatePostgresDistributedName(name)}'`);
+    sql.release = async () => {
+      if (context.closed) {
+        throw new PostgresError("Connection closed", { code: "ERR_POSTGRES_CONNECTION_CLOSED" });
+      }
+      context.closed = true;
+      client.release(session);
+    };
+    sql.close = async () => {
+      if (context.closed) return;
+      context.closed = true;
+      session.close();
+    };
+    sql[Symbol.dispose] = () => sql.release();
+  } else {
+    sql.reserve = () => createPostgresSQLFunction(client).reserve();
+    sql.begin = () => {
+      throw new PostgresError(
+        state === "distributed"
+          ? "cannot call begin inside a distributed transaction"
+          : "cannot call begin inside a transaction use savepoint() instead",
+        { code: "ERR_POSTGRES_INVALID_TRANSACTION_STATE" },
+      );
+    };
+    sql.beginDistributed = () => {
+      throw new PostgresError("cannot call beginDistributed inside a transaction", {
+        code: "ERR_POSTGRES_INVALID_TRANSACTION_STATE",
+      });
+    };
+    sql.commitDistributed = name => sql.unsafe(`COMMIT PREPARED '${validatePostgresDistributedName(name)}'`);
+    sql.rollbackDistributed = name => sql.unsafe(`ROLLBACK PREPARED '${validatePostgresDistributedName(name)}'`);
+    sql.savepoint = (callbackOrName, nameOrCallback = "") => {
+      if (state === "distributed") {
+        return Promise.reject(new PostgresError("cannot call savepoint inside a distributed transaction", {
+          code: "ERR_POSTGRES_INVALID_TRANSACTION_STATE",
+        }));
+      }
+      let callback = callbackOrName;
+      let name = nameOrCallback;
+      if (typeof nameOrCallback === "function") {
+        callback = nameOrCallback;
+        name = typeof callbackOrName === "string" ? callbackOrName : "";
+      }
+      const savepoint = runPostgresSavepoint(client, session, callback, name);
+      context.savepoints?.add(savepoint);
+      savepoint.then(
+        () => context.savepoints?.delete(savepoint),
+        () => context.savepoints?.delete(savepoint),
+      );
+      return savepoint;
+    };
+    sql.close = async () => {
+      context.closed = true;
+    };
+  }
+
+  sql.transaction = sql.begin;
+  sql.distributed = sql.beginDistributed;
   sql.end = sql.close;
-  sql.options = options;
-  sql[Symbol.asyncDispose] = () => sql.close();
+  sql.options = client.options;
+  sql[Symbol.asyncDispose] = () => state === "reserved" ? sql.release() : sql.close();
   return sql;
 }
 
+function createPostgresSQL(options) {
+  const client = new PostgresClient(options);
+  client.nextSavepoint = 0;
+  return createPostgresSQLFunction(client);
+}
+
 class SQLResultArray extends Array {
+  static [Symbol.toStringTag] = "SQLResults";
+
   constructor(values = []) {
     super();
     this.push(...values);
@@ -338,6 +1713,21 @@ class SQLHelper {
   }
 }
 
+class SQLArrayParameter {
+  constructor(serializedValues, arrayType) {
+    this.serializedValues = serializedValues;
+    this.arrayType = arrayType;
+  }
+
+  toString() {
+    return this.serializedValues;
+  }
+
+  toJSON() {
+    return this.serializedValues;
+  }
+}
+
 const MYSQL_CAP_LONG_PASSWORD = 1 << 0;
 const MYSQL_CAP_LONG_FLAG = 1 << 2;
 const MYSQL_CAP_CONNECT_WITH_DB = 1 << 3;
@@ -369,7 +1759,7 @@ const MYSQL_ERROR_NAMES = {
   1452: "ER_NO_REFERENCED_ROW_2",
 };
 
-class MySQLError extends Error {
+class MySQLError extends SQLError {
   constructor(message, options = {}) {
     super(message);
     this.name = "MySQLError";
@@ -838,7 +2228,9 @@ function parseMySQLRow(payload, columns, options, mode) {
   );
   if (mode === "values" || mode === "raw") return values;
   const row = {};
-  for (let index = 0; index < columns.length; index++) row[columns[index].name || String(index)] = values[index];
+  for (let index = 0; index < columns.length; index++) {
+    setSQLRowValue(row, columns[index].name || String(index), values[index]);
+  }
   return row;
 }
 
@@ -2031,6 +3423,10 @@ function normalizeNetworkOptions(urlValue, options, sslModeFromEnvironment) {
   if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
     throw invalidSQLArgument("port", port, "must be a non-negative integer between 1 and 65535");
   }
+  if (adapter === "postgres" && path && !path.includes("/.s.PGSQL.")) {
+    const socketPath = `${path}/.s.PGSQL.${port}`;
+    if (existsSync(socketPath)) path = socketPath;
+  }
 
   const normalized = {
     adapter,
@@ -2715,4 +4111,53 @@ export function SQL(first = undefined, second = {}) {
 }
 
 SQL.SQLiteError = SQLiteError;
+SQL.SQLError = SQLError;
+SQL.PostgresError = PostgresError;
 SQL.MySQLError = MySQLError;
+
+// The sqlite module predates Bun.SQL's shared error base in Cottontail.
+// Reparenting preserves its constructor and fields while matching Bun's
+// instanceof hierarchy.
+Object.setPrototypeOf(SQLiteError.prototype, SQLError.prototype);
+
+let lazyDefaultSQL;
+
+function ensureDefaultSQL() {
+  if (!lazyDefaultSQL) lazyDefaultSQL = SQL();
+  return lazyDefaultSQL;
+}
+
+export const sql = function sql(strings, ...values) {
+  if (new.target) return SQL(strings);
+  return ensureDefaultSQL()(strings, ...values);
+};
+
+for (const method of [
+  "reserve",
+  "array",
+  "commitDistributed",
+  "rollbackDistributed",
+  "beginDistributed",
+  "connect",
+  "unsafe",
+  "file",
+  "begin",
+  "close",
+  "flush",
+]) {
+  sql[method] = (...arguments_) => ensureDefaultSQL()[method](...arguments_);
+}
+sql.transaction = sql.begin;
+sql.distributed = sql.beginDistributed;
+sql.end = sql.close;
+Object.defineProperties(sql, {
+  options: {
+    get: () => ensureDefaultSQL().options,
+  },
+  [Symbol.asyncDispose]: {
+    get: () => ensureDefaultSQL()[Symbol.asyncDispose],
+  },
+});
+
+export const postgres = sql;
+export { MySQLError, PostgresError, SQLError };
