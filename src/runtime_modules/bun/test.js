@@ -4,6 +4,7 @@ import { AsyncLocalStorage } from "../node/async_hooks.js";
 import { applyBunFileConcurrency } from "../internal/bun-test-concurrency.js";
 import { formatBunEachLabel, validateBunEachTable } from "../internal/bun-test-each.js";
 import { captureTestRegistrationLine } from "../internal/bun-test-junit.js";
+import { createBunScopeFunction } from "../internal/bun-test-scope-functions.js";
 import {
   bunTestFilterIsActive,
   bunTestNameMatches,
@@ -3726,21 +3727,6 @@ function wrapBunLifecycleHook(callback, suite) {
   };
 }
 
-function makeEach(base) {
-  return (table) => {
-    const rows = validateBunEachTable(table);
-    return (name, options, callback) => {
-      const parsed = parseCallbackArgs([name, options, callback]);
-      rows.forEach((row, index) => {
-        const values = normalizeEachValues(row);
-        const testCallback = parsed.callback?.bind(row, ...values);
-        base(formatBunEachLabel(parsed.name, values, index), parsed.options, testCallback);
-      });
-      return undefined;
-    };
-  };
-}
-
 function makeBunTestFunction(base) {
   const register = (args, extraOptions = {}, apiName = "test") => {
     globalThis.__cottontailBunTestUsed = true;
@@ -3768,32 +3754,21 @@ function makeBunTestFunction(base) {
       wrapTestCallback(parsed.callback),
     ));
   };
-  const variant = (extraOptions, apiName) => {
-    const result = (...args) => register(args, extraOptions, apiName);
-    result.each = makeEach(result);
-    result.skipIf = (condition) => condition ? variant({ ...extraOptions, skip: true }, `${apiName}.skip`) : result;
-    result.todoIf = (condition) => condition ? variant({ ...extraOptions, todo: true }, `${apiName}.todo`) : result;
-    result.if = (condition) => condition ? result : variant({ ...extraOptions, skip: true }, `${apiName}.skip`);
-    Object.defineProperty(result, "only", { get: () => variant({ ...extraOptions, only: true }, `${apiName}.only`) });
-    Object.defineProperty(result, "failing", { get: () => variant({ ...extraOptions, failing: true }, `${apiName}.failing`) });
-    Object.defineProperty(result, "skip", { get: () => variant({ ...extraOptions, skip: true }, `${apiName}.skip`) });
-    Object.defineProperty(result, "todo", { get: () => variant({ ...extraOptions, todo: true }, `${apiName}.todo`) });
-    Object.defineProperty(result, "concurrent", { get: () => variant({ ...extraOptions, concurrent: true }, `${apiName}.concurrent`) });
-    Object.defineProperty(result, "serial", { get: () => variant({ ...extraOptions, serial: true }, `${apiName}.serial`) });
-    return result;
-  };
-  const fn = (...args) => register(args, {}, "test");
-  fn.each = makeEach(fn);
-  fn.only = variant({ only: true }, "test.only");
-  fn.failing = variant({ failing: true }, "test.failing");
-  fn.skip = variant({ skip: true }, "test.skip");
-  fn.todo = variant({ todo: true }, "test.todo");
-  fn.skipIf = (condition) => condition ? fn.skip : fn;
-  fn.todoIf = (condition) => condition ? fn.todo : fn;
-  fn.if = (condition) => condition ? fn : fn.skip;
-  fn.concurrent = variant({ concurrent: true }, "test.concurrent");
-  fn.serial = variant({ serial: true }, "test.serial");
-  return fn;
+  return createBunScopeFunction({
+    kind: "test",
+    validateEachTable: validateBunEachTable,
+    assertOnlyAllowed,
+    invoke(args, extraOptions, apiName, rows) {
+      if (rows === undefined) return register(args, extraOptions, apiName);
+      const parsed = parseCallbackArgs(args);
+      rows.forEach((row, index) => {
+        const values = normalizeEachValues(row);
+        const testCallback = parsed.callback?.bind(row, ...values);
+        register([formatBunEachLabel(parsed.name, values, index), parsed.options, testCallback], extraOptions, apiName);
+      });
+      return undefined;
+    },
+  });
 }
 
 function makeBunDescribe(base) {
@@ -3823,30 +3798,21 @@ function makeBunDescribe(base) {
       wrapBunDescribeCallback(parsed.callback, suite),
     ));
   };
-  const fn = (...args) => register(args);
-  fn.each = makeEach(fn);
-  const variant = (extraOptions, apiName) => {
-    const result = (...args) => register(args, extraOptions, apiName);
-    result.each = makeEach(result);
-    result.skipIf = (condition) => condition ? variant({ ...extraOptions, skip: true }, `${apiName}.skip`) : result;
-    result.todoIf = (condition) => condition ? variant({ ...extraOptions, todo: true }, `${apiName}.todo`) : result;
-    result.if = (condition) => condition ? result : variant({ ...extraOptions, skip: true }, `${apiName}.skip`);
-    Object.defineProperty(result, "only", { get: () => variant({ ...extraOptions, only: true }, `${apiName}.only`) });
-    Object.defineProperty(result, "skip", { get: () => variant({ ...extraOptions, skip: true }, `${apiName}.skip`) });
-    Object.defineProperty(result, "todo", { get: () => variant({ ...extraOptions, todo: true }, `${apiName}.todo`) });
-    Object.defineProperty(result, "concurrent", { get: () => variant({ ...extraOptions, concurrent: true }, `${apiName}.concurrent`) });
-    Object.defineProperty(result, "serial", { get: () => variant({ ...extraOptions, serial: true }, `${apiName}.serial`) });
-    return result;
-  };
-  fn.only = variant({ only: true }, "describe.only");
-  fn.skip = variant({ skip: true }, "describe.skip");
-  fn.todo = variant({ todo: true }, "describe.todo");
-  fn.skipIf = (condition) => condition ? fn.skip : fn;
-  fn.todoIf = (condition) => condition ? fn.todo : fn;
-  fn.if = (condition) => condition ? fn : fn.skip;
-  fn.concurrent = variant({ concurrent: true }, "describe.concurrent");
-  fn.serial = variant({ serial: true }, "describe.serial");
-  return fn;
+  return createBunScopeFunction({
+    kind: "describe",
+    validateEachTable: validateBunEachTable,
+    assertOnlyAllowed,
+    invoke(args, extraOptions, apiName, rows) {
+      if (rows === undefined) return register(args, extraOptions, apiName);
+      const parsed = parseDescribeArgs(args);
+      rows.forEach((row, index) => {
+        const values = normalizeEachValues(row);
+        const describeCallback = parsed.callback?.bind(row, ...values);
+        register([formatBunEachLabel(parsed.name, values, index), parsed.options, describeCallback], extraOptions, apiName);
+      });
+      return undefined;
+    },
+  });
 }
 
 function markBunTestUsed() {

@@ -127,7 +127,7 @@ export function formatBunEachLabel(label, functionArguments, testIndex) {
 
 export function validateBunEachTable(table) {
   if (!Array.isArray(table)) {
-    throw new TypeError(`Expected array, got ${inspectLabelValue(table)}`);
+    throw new Error(`Expected array, got ${inspectLabelValue(table)}`);
   }
   return table;
 }
