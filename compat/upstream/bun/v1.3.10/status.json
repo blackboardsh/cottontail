@@ -771,7 +771,7 @@
     },
     "test/bundler/bundler_compile.test.ts": {
       "status": "expected-failure",
-      "reason": "48 of 51 generated standalone compile cases pass in exact isolation; Bun.embeddedFiles and the two source-map diagnostic cases remain expected-failure.",
+      "reason": "49 of 51 generated standalone compile cases pass in exact isolation; the two source-map diagnostic cases remain expected-failure.",
       "splitBundlerTests": true,
       "includeBundlerFileTests": true,
       "enabledBundlerTests": {
@@ -793,6 +793,7 @@
         "compile/ESMBytecode+MultipleDynamicImports+minify": "Minified ESM bytecode loads multiple separate dynamic modules.",
         "compile/WorkerBytecodeESM": "A separately emitted worker entry executes from an ESM bytecode standalone graph.",
         "compile/WorkerRelativePathTSExtensionBytecode": "A bytecode standalone worker resolves a relative TypeScript entry from the embedded graph.",
+        "compile/Bun.embeddedFiles": "Standalone file-loader assets populate Bun.embeddedFiles and resolve through both createRequire and import.meta.require after source files are removed.",
         "compile/EmbeddedFileOutfile": "A file-loader asset remains readable from a nested standalone outfile.",
         "compile/ResolveEmbeddedFileOutfile": "Runtime resolution keeps an embedded file readable from a nested standalone outfile.",
         "compile/WorkerRelativePathNoExtension": "A standalone worker resolves a relative extensionless entry from the embedded graph.",

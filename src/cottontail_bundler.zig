@@ -898,7 +898,10 @@ pub fn bundleEntryPointGraphWithOptions(
     // of becoming an additional output file (which single-output in-memory
     // bundles cannot emit).
     transpiler.options.externalize_runtime_require_resolve = options.externalize_runtime_require_resolve;
-    transpiler.options.runtime_file_loader_paths = options.runtime_file_loader_paths or options.include_runtime_modules;
+    // COTTONTAIL-COMPAT: Runtime execution opts into source paths explicitly.
+    // Standalone compilation also embeds the runtime modules, but its user
+    // file-loader outputs must remain assets in the serialized graph.
+    transpiler.options.runtime_file_loader_paths = options.runtime_file_loader_paths;
     transpiler.options.preserve_external_require_name = options.preserve_external_require_name;
     transpiler.options.rewrite_jest_for_tests = options.rewrite_jest_for_tests;
     transpiler.options.server_components = options.server_components;

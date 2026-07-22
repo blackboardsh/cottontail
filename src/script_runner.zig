@@ -6789,6 +6789,8 @@ fn writeCottontailEntryWrapper(
         break :blk try jsonStringLiteral(ctx, bundle_map_path);
     };
     const bundle_source_root_literal = try jsonStringLiteral(ctx, ctx.project_root);
+    // COTTONTAIL-COMPAT: Standalone import-meta resolution starts at the
+    // serialized graph entry; ordinary runs retain the source entry path.
     const source = try std.fmt.allocPrint(
         ctx.allocator,
         \\import __ctBunModule from {s};
@@ -6801,6 +6803,7 @@ fn writeCottontailEntryWrapper(
         \\globalThis.__filename ??= {s};
         \\globalThis.__dirname ??= {s};
         \\globalThis.Loader ??= {{ registry: new Map() }};
+        \\const __ctImportMetaBase = globalThis.__cottontailStandaloneFiles == null ? {s} : import.meta.path;
         \\const __ctImportMetaParentDir = (parent) => {{
         \\  let text = String(parent);
         \\  if (text.startsWith("file:")) text = __ctBunModule.fileURLToPath(text);
@@ -6819,7 +6822,7 @@ fn writeCottontailEntryWrapper(
         \\  }}
         \\  return undefined;
         \\}};
-        \\globalThis.__cottontailImportMetaResolveSync = (specifier, parent = {s}) => {{
+        \\globalThis.__cottontailImportMetaResolveSync = (specifier, parent = __ctImportMetaBase) => {{
         \\  const text = String(specifier);
         \\  if (text.startsWith("node:") || text.startsWith("bun:")) return text;
         \\  try {{ return __ctBunModule.resolveSync(text, __ctImportMetaParentDir(parent)); }}
@@ -6830,7 +6833,7 @@ fn writeCottontailEntryWrapper(
         \\    throw error;
         \\  }}
         \\}};
-        \\globalThis.__cottontailImportMetaResolve = (specifier, parent = {s}) => {{
+        \\globalThis.__cottontailImportMetaResolve = (specifier, parent = __ctImportMetaBase) => {{
         \\  const text = String(specifier);
         \\  if (text.startsWith("node:") || text.startsWith("bun:") || text.startsWith("file:")) return text;
         \\  if (text.startsWith(".") || text.startsWith("/")) {{
@@ -6839,10 +6842,10 @@ fn writeCottontailEntryWrapper(
         \\  const resolved = __ctBunModule.resolveSync(text, __ctImportMetaParentDir(parent));
         \\  return resolved.startsWith("/") ? __ctBunModule.pathToFileURL(resolved).href : resolved;
         \\}};
-        \\globalThis.__ctMetaRequire ??= __ctCreateRequire({s});
+        \\globalThis.__ctMetaRequire ??= __ctCreateRequire(__ctImportMetaBase);
         \\globalThis.require = globalThis.__ctMetaRequire;
-        \\globalThis.__ctMetaResolveSync = (specifier, parent = {s}) => globalThis.__cottontailImportMetaResolveSync(specifier, parent);
-        \\globalThis.__ctMetaResolve = (specifier, parent = {s}) => globalThis.__cottontailImportMetaResolve(specifier, parent);
+        \\globalThis.__ctMetaResolveSync = (specifier, parent = __ctImportMetaBase) => globalThis.__cottontailImportMetaResolveSync(specifier, parent);
+        \\globalThis.__ctMetaResolve = (specifier, parent = __ctImportMetaBase) => globalThis.__cottontailImportMetaResolve(specifier, parent);
         \\{s}
         \\globalThis.__cottontailLoadDotenv?.();
         \\await globalThis.__cottontailLoadStandaloneBunfig?.();
@@ -6867,10 +6870,6 @@ fn writeCottontailEntryWrapper(
             bundle_source_root_literal,
             script_literal,
             script_dir_literal,
-            script_literal,
-            script_literal,
-            script_literal,
-            script_literal,
             script_literal,
             test_header_signal,
             cpu_profiler_start_statement,
@@ -8036,10 +8035,13 @@ fn scanDynamicImports(
                 if (target_path) |path| inferredLoaderForTarget(path) else inferredLoaderForImportSpecifier(prefix)
             else
                 null;
-            if (preserve_static_html_imports and
-                inferred_loader != null and
-                std.mem.eql(u8, inferred_loader.?, "html"))
+            if (preserve_static_html_imports and inferred_loader != null and
+                (std.mem.eql(u8, inferred_loader.?, "html") or
+                    std.mem.eql(u8, inferred_loader.?, "file")))
             {
+                // COTTONTAIL-COMPAT: Standalone compilation must leave native
+                // asset imports in the compiler graph so they are serialized
+                // into the executable instead of becoming disk-backed loaders.
                 cursor = semicolon + 1;
                 continue;
             }
