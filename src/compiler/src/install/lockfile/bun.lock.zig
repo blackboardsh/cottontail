@@ -2275,9 +2275,9 @@ fn parseAppendDependencies(
 
     const end = lockfile.buffers.dependencies.items.len;
 
-    // COTTONTAIL-COMPAT: Bun's migration snapshots preserve root package.json
-    // dependency order; nested package dependencies remain canonicalized.
-    if (comptime !is_root or !@hasDecl(bun, "standalone_lockfile_conversion")) {
+    // COTTONTAIL-COMPAT: The standalone adapter builds Bun's binary graph from
+    // source-ordered package metadata, so retain that order for every package.
+    if (comptime !@hasDecl(bun, "standalone_lockfile_conversion")) {
         std.sort.pdq(
             Dependency,
             lockfile.buffers.dependencies.items[off..],

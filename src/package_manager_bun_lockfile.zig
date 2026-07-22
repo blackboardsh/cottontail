@@ -219,6 +219,8 @@ pub fn textToBinaryAtRoot(
         }
     }
 
+    _ = try lockfile.hasMetaHashChanged(false, lockfile.packages.len);
+
     const options: StandaloneOptions = .{ .config_version = lockfile.saved_config_version };
 
     var bytes = std.Io.Writer.Allocating.init(allocator);

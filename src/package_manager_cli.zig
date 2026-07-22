@@ -11283,6 +11283,8 @@ const Manager = struct {
             "binDir",
             "bundled",
         };
+        const dependencies = value.object.get("dependencies");
+        const optional_dependencies = value.object.get("optionalDependencies");
         try writer.writeByte('{');
         var first = true;
         for (fields) |field| {
@@ -11304,6 +11306,14 @@ const Manager = struct {
             try writer.writeAll(": ");
             if (std.mem.eql(u8, field, "bin")) {
                 try writeCompactPackageJSON(writer, field_value);
+            } else if (std.mem.eql(u8, field, "dependencies")) {
+                try writePackageDependencyObject(writer, field_value, &.{optional_dependencies});
+            } else if (std.mem.eql(u8, field, "peerDependencies")) {
+                try writePackageDependencyObject(writer, field_value, &.{ dependencies, optional_dependencies });
+            } else if (std.mem.eql(u8, field, "devDependencies") or
+                std.mem.eql(u8, field, "optionalDependencies"))
+            {
+                try writePackageDependencyObject(writer, field_value, &.{});
             } else {
                 try writeCanonicalJSON(manager.allocator, writer, field_value);
             }
@@ -13174,6 +13184,36 @@ fn writeCompactPackageJSON(writer: *std.Io.Writer, value: Value) !void {
 
 fn writeJSONString(writer: *std.Io.Writer, value: []const u8) !void {
     try std.json.Stringify.value(value, .{}, writer);
+}
+
+fn writePackageDependencyObject(
+    writer: *std.Io.Writer,
+    value: Value,
+    excluded_objects: []const ?Value,
+) !void {
+    if (value != .object) {
+        try std.json.Stringify.value(value, .{}, writer);
+        return;
+    }
+
+    try writer.writeByte('{');
+    var first = true;
+    for (value.object.keys(), value.object.values()) |key, item| {
+        var excluded = false;
+        for (excluded_objects) |candidate| {
+            if (candidate != null and candidate.? == .object and candidate.?.object.get(key) != null) {
+                excluded = true;
+                break;
+            }
+        }
+        if (excluded) continue;
+        if (!first) try writer.writeAll(", ");
+        first = false;
+        try writeJSONString(writer, key);
+        try writer.writeAll(": ");
+        try std.json.Stringify.value(item, .{}, writer);
+    }
+    try writer.writeByte('}');
 }
 
 fn writeCanonicalJSON(
