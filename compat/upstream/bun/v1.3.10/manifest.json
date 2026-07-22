@@ -20,6 +20,7 @@
     "The minimal root package.json preserves Bun's repository package boundary so ancestor package discovery cannot escape into Cottontail's own package.json.",
     "The root tsconfig.base.json is required by test/tsconfig.json and is part of the executable Astro fixture graph.",
     "The bun-plugin-svelte snapshot excludes its own tests and examples; bun-types package metadata is copied to exercise the plugin's local development dependency without vendoring unused declarations.",
+    "The Cottontail-owned compat/upstream/cottontail-bun-test-preload.ts gives direct Cottontail test runs an isolated temp root; the importer reapplies its Bunfig reference after refreshing copied files.",
     "Do not edit copied upstream tests in place unless intentionally forking them; document local ownership changes in status.json."
   ]
 }

@@ -39,8 +39,14 @@ const bunSnapshotSourceNames = new Set([
   'tsconfig.base.json',
 ]);
 
+function shouldKeepTemp() {
+  return process.env.COTTONTAIL_UPSTREAM_KEEP_TEMP === '1' ||
+    process.env.COTTONTAIL_KEEP_TEMP !== undefined ||
+    process.env.DEBUG === '1';
+}
+
 function removeTemp(path) {
-  if (process.env.COTTONTAIL_UPSTREAM_KEEP_TEMP === '1') return;
+  if (shouldKeepTemp()) return;
   try { rmSync(path, { recursive: true, force: true }); } catch {}
 }
 
@@ -83,7 +89,7 @@ function removeAllSnapshotArtifacts() {
 
 process.on('exit', () => {
   removeAllSnapshotArtifacts();
-  if (process.env.COTTONTAIL_UPSTREAM_KEEP_TEMP === '1') {
+  if (shouldKeepTemp()) {
     console.error(`kept upstream temp root: ${tempRoot}`);
     return;
   }
@@ -402,6 +408,9 @@ function makeEnv(runtime, target, runTemp = tempRoot, overrides = undefined) {
       NODE_PATH: [upstreamNodeModules, process.env.NODE_PATH].filter(Boolean).join(delimiter),
     } : {}),
     COTTONTAIL_TMP_DIR: runTemp,
+    COTTONTAIL_UPSTREAM_TEMP_OWNER: 'launcher',
+    BUN_TMPDIR: runTemp,
+    TEST_TMPDIR: runTemp,
     TMPDIR: runTemp,
     TMP: runTemp,
     TEMP: runTemp,

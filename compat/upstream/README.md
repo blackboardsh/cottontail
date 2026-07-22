@@ -1,5 +1,17 @@
 # Upstream Test Dependencies
 
+## Temporary directories
+
+Run copied tests through `scripts/run-upstream-tests.js` when possible. Like Bun's own
+repository runner, it gives every child an owned temp root through `BUN_TMPDIR`,
+`TEST_TMPDIR`, `TMPDIR`, `TMP`, and `TEMP`, then removes that root after the child exits.
+Direct Cottontail runs of the Bun snapshot get the same containment from the snapshot's
+Cottontail-only preload.
+
+Set `COTTONTAIL_UPSTREAM_KEEP_TEMP=1`, `COTTONTAIL_KEEP_TEMP`, or `DEBUG=1` to preserve
+the run's root for inspection. Cleanup never scans for `bun.test.*` names; it can
+only remove the exact root created for that run.
+
 The copied upstream snapshots do not track `node_modules` or native binaries. Restore the
 Bun snapshot's JavaScript dependencies without lifecycle scripts from its checked-in lockfile:
 

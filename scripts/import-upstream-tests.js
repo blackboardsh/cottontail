@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { spawnSync } from 'child_process';
 import os from 'os';
 import { join, resolve } from 'path';
@@ -19,6 +19,22 @@ const copySpecs = {
     paths: ['test', 'tsconfig.base.json', 'LICENSE.md'],
   },
 };
+
+function installCottontailBunPreload(snapshotRoot) {
+  const bunfigPath = join(snapshotRoot, 'test', 'bunfig.toml');
+  const source = readFileSync(bunfigPath, 'utf8');
+  const upstreamSetting = 'preload = "./preload.ts"';
+  if (!source.includes(upstreamSetting)) {
+    fail(`Cannot install the Cottontail Bun test preload: ${bunfigPath} has an unexpected preload setting.`);
+  }
+  writeFileSync(
+    bunfigPath,
+    source.replace(
+      upstreamSetting,
+      'preload = ["../../../cottontail-bun-test-preload.ts", "./preload.ts"]',
+    ),
+  );
+}
 
 function fail(message) {
   console.error(message);
@@ -74,6 +90,7 @@ function importRuntime(runtime) {
       verbatimSymlinks: true,
     });
   }
+  if (runtime === 'bun') installCottontailBunPreload(snapshotRoot);
   console.log(`imported ${runtime} ${target.version} from ${target.tag} (${target.commit.slice(0, 12)})`);
 }
 

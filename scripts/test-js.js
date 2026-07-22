@@ -118,6 +118,12 @@ try {
       stdoutIncludes: ['9 pass', '0 fail'],
     },
     {
+      name: 'upstream-test-temp-cleanup-regressions',
+      argv: ['test', join(rootDir, 'tests', 'js', 'upstream-test-temp-cleanup.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['5 pass', '0 fail'],
+    },
+    {
       name: 'internal-runtime-bindings',
       argv: ['test', join(rootDir, 'tests', 'js', 'internal-runtime-bindings.test.ts')],
       expectExitCode: 0,

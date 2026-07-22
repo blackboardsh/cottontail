@@ -1,5 +1,5 @@
 [test]
-preload = "./preload.ts"
+preload = ["../../../cottontail-bun-test-preload.ts", "./preload.ts"]
 
 [install]
 linker = "isolated"
