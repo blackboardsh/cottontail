@@ -152,7 +152,16 @@ function validateSnapshotOptions(options) {
 
 export function getHeapSnapshot(options = undefined) {
   validateSnapshotOptions(options);
-  return Readable.from([Buffer.from(captureV8HeapSnapshot())]);
+  const snapshot = Buffer.from(captureV8HeapSnapshot());
+  let emitted = false;
+  return new Readable({
+    read() {
+      if (emitted) return;
+      emitted = true;
+      this.push(snapshot);
+      this.push(null);
+    },
+  });
 }
 
 function defaultHeapSnapshotPath() {
