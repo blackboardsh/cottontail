@@ -2093,6 +2093,9 @@ const Manager = struct {
     expanded_lock_packages: std.StringHashMap(void),
     registry_manifests: std.StringHashMap(*Value),
     registry_manifest_failures: std.StringHashMap(void),
+    registry_archives: std.StringHashMap([]const u8),
+    installed_registry_packages: std.StringHashMap(void),
+    linked_bins: std.StringHashMap(void),
     refreshed_update_manifests: std.StringHashMap(void),
     direct_bins: std.array_list.Managed([]const u8),
     explicit_adds: std.StringHashMap(void),
@@ -2163,6 +2166,9 @@ const Manager = struct {
             .expanded_lock_packages = std.StringHashMap(void).init(allocator),
             .registry_manifests = std.StringHashMap(*Value).init(allocator),
             .registry_manifest_failures = std.StringHashMap(void).init(allocator),
+            .registry_archives = std.StringHashMap([]const u8).init(allocator),
+            .installed_registry_packages = std.StringHashMap(void).init(allocator),
+            .linked_bins = std.StringHashMap(void).init(allocator),
             .refreshed_update_manifests = std.StringHashMap(void).init(allocator),
             .registry_scopes = std.StringHashMap(RegistryConfig).init(allocator),
             .direct_bins = std.array_list.Managed([]const u8).init(allocator),
@@ -2196,6 +2202,9 @@ const Manager = struct {
         manager.registry_scopes.deinit();
         manager.initial_root_versions.deinit();
         manager.refreshed_update_manifests.deinit();
+        manager.linked_bins.deinit();
+        manager.installed_registry_packages.deinit();
+        manager.registry_archives.deinit();
         manager.registry_manifest_failures.deinit();
         manager.registry_manifests.deinit();
         manager.resolution_only_records.deinit();
@@ -3741,6 +3750,7 @@ const Manager = struct {
             try std.Io.Dir.cwd().createDirPath(manager.init_data.io, install_cache);
         }
         const node_modules = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules" });
+        const node_modules_existed = manager.pathExists(node_modules);
         const uses_explicit_install_cache = manager.init_data.environ_map.get("BUN_INSTALL_CACHE_DIR") != null;
         if (manager.node_linker == .isolated) {
             // Bun establishes the project cache before converting an add to
@@ -3760,7 +3770,7 @@ const Manager = struct {
         const create_project_cache = if (manager.node_linker == .isolated)
             manager.options.command == .add
         else
-            manager.lock_graph == null and
+            (manager.lock_graph == null or !node_modules_existed) and
                 (manager.options.command == .add or manager.options.command == .install or manager.options.command == .update or
                     manager.options.cpu_overridden or manager.options.os_overridden);
         if (!uses_explicit_install_cache and create_project_cache) {
@@ -5735,7 +5745,7 @@ const Manager = struct {
             const record = manager.directRecord(report.alias) orelse continue;
             for (manager.direct_install_reports.items[0..index]) |previous_report| {
                 const previous = manager.directRecord(previous_report.alias) orelse continue;
-                if (packageRecordsHaveSameIdentity(record, previous)) {
+                if (record.kind != .npm and packageRecordsHaveSameIdentity(record, previous)) {
                     duplicates += 1;
                     break;
                 }
@@ -6167,7 +6177,7 @@ const Manager = struct {
         });
         try manager.rememberPackageMetadata(destination, package_metadata);
         try manager.registerBundledPackages(record_key, package_metadata, destination);
-        if (!installed) manager.installed_count += 1;
+        if (!installed) try manager.countRegistryInstall(resolved.name, resolved.version, resolved.tarball);
         manager.changed = true;
 
         try manager.installDependencyObject(@constCast(package_metadata), "dependencies", destination, false, false);
@@ -6408,7 +6418,7 @@ const Manager = struct {
                         defer destination_dir.close(manager.init_data.io);
                         try extractTarballArchive(manager.init_data.io, manager.allocator, destination_dir, archive);
                         try manager.applyPatchPaths(selection.destination, patch_paths);
-                        manager.installed_count += 1;
+                        try manager.countRegistryInstall(package.name, package.version, tarball_url);
                     }
                     try manager.ensureIsolatedLinks(alias, parent_dir, selection.destination);
                     if (package.info) |info| {
@@ -8583,9 +8593,13 @@ const Manager = struct {
             for (manager.records.items) |record| {
                 if (record.kind != .npm or
                     !std.mem.eql(u8, record.alias, alias) or
-                    !std.mem.eql(u8, record.name, registry_name) or
                     !std.mem.eql(u8, recordLogicalKey(record), destination_key) or
                     !semverSatisfies(manager.allocator, registry_spec, record.version)) continue;
+                const explicitly_aliased = std.mem.startsWith(u8, spec, "npm:");
+                // COTTONTAIL-COMPAT: Bun remembers explicit npm aliases. A
+                // later plain range for that alias reuses its real package.
+                if (!std.mem.eql(u8, record.name, registry_name) and
+                    (explicitly_aliased or std.mem.eql(u8, record.name, record.alias))) continue;
                 if (!manager.options.lockfile_only and !manager.options.dry_run) {
                     const patch_paths = try manager.packagePatchPaths(record.name, record.version, protocol_patch_paths);
                     if (!try manager.packagePatchStateMatches(destination, patch_paths)) continue;
@@ -9213,6 +9227,11 @@ const Manager = struct {
     }
 
     fn fetchRegistryArchive(manager: *Manager, package: RegistryArchive) ![]const u8 {
+        if (manager.registry_archives.get(package.tarball)) |archive| {
+            if (manager.options.verify_integrity) try verifyIntegrity(archive, package.integrity);
+            return archive;
+        }
+
         const cache_path = try manager.registryArchiveCachePath(package.name, package.version, package.tarball);
 
         if (cache_path) |path| {
@@ -9221,7 +9240,10 @@ const Manager = struct {
                     verifyIntegrity(cached, package.integrity) catch break :blk false;
                     break :blk true;
                 } else true;
-                if (valid) return cached;
+                if (valid) {
+                    try manager.registry_archives.put(try manager.allocator.dupe(u8, package.tarball), cached);
+                    return cached;
+                }
                 std.Io.Dir.cwd().deleteFile(manager.init_data.io, path) catch {};
             }
         }
@@ -9231,6 +9253,7 @@ const Manager = struct {
         if (cache_path) |path| {
             try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = path, .data = archive });
         }
+        try manager.registry_archives.put(try manager.allocator.dupe(u8, package.tarball), archive);
         return archive;
     }
 
@@ -9433,8 +9456,10 @@ const Manager = struct {
         const stat = std.Io.Dir.cwd().statFile(manager.init_data.io, target, .{}) catch return false;
         if (stat.kind != .file) return false;
         if (builtin.os.tag != .windows) try manager.preparePosixBin(target, stat);
-        try std.Io.Dir.cwd().createDirPath(manager.init_data.io, bin_dir);
         const destination = try std.fs.path.join(manager.allocator, &.{ bin_dir, name });
+        const seen = try manager.linked_bins.getOrPut(destination);
+        if (seen.found_existing) return false;
+        try std.Io.Dir.cwd().createDirPath(manager.init_data.io, bin_dir);
         deletePath(manager.init_data.io, destination);
         const destination_parent = std.fs.path.dirname(destination) orelse bin_dir;
         try std.Io.Dir.cwd().createDirPath(manager.init_data.io, destination_parent);
@@ -9903,6 +9928,12 @@ const Manager = struct {
                 try manager.allocator.dupe(u8, resolved.version),
             );
         }
+    }
+
+    fn countRegistryInstall(manager: *Manager, name: []const u8, version_value: []const u8, tarball: []const u8) !void {
+        const key = try std.fmt.allocPrint(manager.allocator, "{s}\x00{s}\x00{s}", .{ name, version_value, tarball });
+        const entry = try manager.installed_registry_packages.getOrPut(key);
+        if (!entry.found_existing) manager.installed_count += 1;
     }
 
     fn countWorkspaceInstall(manager: *Manager, workspace: Workspace, newly_linked: bool) !void {
