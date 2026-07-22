@@ -4172,6 +4172,11 @@ const Manager = struct {
                 }
             }
         }
+        if (install.get("optional")) |optional| {
+            if (optional.asBool()) |enabled| {
+                if (!enabled) manager.options.omit_optional = true;
+            }
+        }
         if (install.get("security")) |security| {
             if (security.get("scanner")) |scanner| {
                 if (scanner.asString(manager.allocator)) |value| {
