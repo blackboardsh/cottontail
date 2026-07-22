@@ -1751,6 +1751,14 @@
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (2 bun:test cases, 1 assertions)."
     },
+    "test/integration/vite-build/vite-build.test.ts": {
+      "status": "enabled",
+      "reason": "The unchanged Vite/SvelteKit production build passes through Cottontail's package install, dynamic ESM graph loader, and process lifecycle (1 case, 3 assertions).",
+      "env": {
+        "COTTONTAIL_TEST_TIMEOUT_SCALE": "4"
+      },
+      "timeoutMs": 180000
+    },
     "test/internal/highlighter.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
