@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Pack = @import("package_manager_pack.zig");
+const PackageJSON = @import("package_manager_json.zig");
 const Scripts = @import("package_manager_scripts.zig");
 
 const Value = std.json.Value;
@@ -227,7 +228,7 @@ pub fn prepareTarball(
     }
 
     const source = package_json orelse return error.MissingPackageJSON;
-    const manifest = std.json.parseFromSliceLeaky(Value, allocator, source, .{}) catch return error.InvalidPackageJSON;
+    const manifest = PackageJSON.parsePackageJSON(allocator, absolute_path, source) catch return error.InvalidPackageJSON;
     try applyPublishConfig(options, &manifest);
     if (options.tag.len > 0) try validateDistTag(options.tag);
     const identity = try validateManifest(&manifest, options.access);
@@ -342,7 +343,7 @@ const Identity = struct {
 
 fn readManifest(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Value {
     const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_package_json_bytes));
-    return std.json.parseFromSliceLeaky(Value, allocator, source, .{}) catch return error.InvalidPackageJSON;
+    return PackageJSON.parsePackageJSON(allocator, path, source) catch return error.InvalidPackageJSON;
 }
 
 fn applyPublishConfig(options: *Options, manifest: *const Value) !void {
@@ -534,6 +535,8 @@ fn normalizeBin(
         var normalized: std.json.ObjectMap = .empty;
         for (archive_paths) |path| {
             if (!std.mem.startsWith(u8, path, prefix) or path.len <= prefix.len or path[prefix.len] != '/') continue;
+            const relative = path[prefix.len + 1 ..];
+            try normalized.put(allocator, relative, .{ .string = path });
             try normalized.put(allocator, std.fs.path.basename(path), .{ .string = path });
         }
         try manifest.object.put(allocator, "bin", .{ .object = normalized });

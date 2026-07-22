@@ -9111,7 +9111,7 @@ function prepareServeResponseResult(value, request, options = {}) {
 
 function runFetchFallback(options, request, server) {
   if (typeof options.fetch === "function") {
-    const value = options.fetch(request, server);
+    const value = options.fetch.call(server, request, server);
     const prepare = (resolved) => prepareServeResponseResult(
       resolved instanceof Response
         ? resolved

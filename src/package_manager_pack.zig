@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const compiler = @import("cottontail_compiler");
 const Scripts = @import("package_manager_scripts.zig");
 const Workspaces = @import("package_manager_workspaces.zig");
+const PackageJSON = @import("package_manager_json.zig");
 
 const Value = std.json.Value;
 const fixed_mtime = 499162500;
@@ -245,7 +246,7 @@ fn readManifest(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Man
     const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 * 1024 * 1024));
     return .{
         .source = source,
-        .value = try std.json.parseFromSliceLeaky(Value, allocator, source, .{}),
+        .value = try PackageJSON.parsePackageJSON(allocator, path, source),
     };
 }
 
