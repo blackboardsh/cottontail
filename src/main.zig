@@ -245,7 +245,9 @@ fn normalizeLeadingPackageManagerConfig(
 ) ![]const [:0]const u8 {
     if (args.len < 3) return args;
     const first = args[1];
-    const command_index: usize = if (std.mem.startsWith(u8, first, "-c=") or
+    const command_index: usize = if (std.mem.eql(u8, first, "--save"))
+        2
+    else if (std.mem.startsWith(u8, first, "-c=") or
         std.mem.startsWith(u8, first, "--config="))
         2
     else if ((std.mem.eql(u8, first, "-c") or std.mem.eql(u8, first, "--config")) and args.len > 3)
