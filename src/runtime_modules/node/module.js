@@ -2557,7 +2557,7 @@ function isAsyncModuleBundleFailure(error, filename, source) {
   return sourceRequiresAsyncModuleExecution(filename, source);
 }
 
-function executeBundledCommonJsModule(module, filename, source) {
+function executeBundledCommonJsModule(module, filename, source, loader) {
   let bundled;
   try {
     bundled = String(cottontail.bundleNative(
@@ -2614,6 +2614,8 @@ function executeBundledCommonJsModule(module, filename, source) {
       (typeof module.exports === "object" || typeof module.exports === "function") &&
       Object.hasOwn(module.exports, "module.exports")) {
     module.exports = module.exports["module.exports"];
+  } else {
+    module.exports = requiredBundledEsmNamespace(module.exports, source, loader);
   }
   module.loaded = true;
   return module.exports;
@@ -2649,7 +2651,7 @@ function executeDefaultExtension(module, filename, loader) {
   if (hasEsmSyntax(originalSource) &&
       !standaloneFileEntry(filename).found &&
       typeof cottontail.bundleNative === "function") {
-    return executeBundledCommonJsModule(module, filename, originalSource);
+    return executeBundledCommonJsModule(module, filename, originalSource, loader);
   }
   const compileOverridden = module._compile !== defaultModuleCompile;
   const source = transpileExtensionSource(filename, loader, compileOverridden, originalSource);
@@ -2805,9 +2807,51 @@ function applyLoadHooks(resolved) {
   return executeHookSource(resolved, result.source, result.format);
 }
 
+const moduleNamespaceEsmMarkers = new WeakMap();
+const moduleNamespacePrototype = Object.create(null);
+Object.defineProperty(moduleNamespacePrototype, "__esModule", {
+  enumerable: false,
+  configurable: false,
+  get() {
+    return moduleNamespaceEsmMarkers.get(this);
+  },
+  set(value) {
+    if (value === true) moduleNamespaceEsmMarkers.set(this, true);
+    else moduleNamespaceEsmMarkers.delete(this);
+  },
+});
+
 function createModuleNamespace() {
-  const namespace = {};
+  const namespace = Object.create(moduleNamespacePrototype);
   Object.defineProperty(namespace, Symbol.toStringTag, { value: "Module" });
+  return namespace;
+}
+
+function sourceExportsEsmMarker(source, loader) {
+  if (typeof cottontail.transpilerScan !== "function") return false;
+  try {
+    const scan = JSON.parse(cottontail.transpilerScan(String(source), "{}", loader));
+    return Array.isArray(scan?.exports) && scan.exports.includes("__esModule");
+  } catch {
+    return false;
+  }
+}
+
+function requiredBundledEsmNamespace(value, source, loader) {
+  if (value == null || (typeof value !== "object" && typeof value !== "function")) return value;
+  const marker = Object.getOwnPropertyDescriptor(value, "__esModule");
+  if (sourceExportsEsmMarker(source, loader) ||
+      marker?.value !== true || marker.enumerable || marker.configurable || marker.writable) {
+    return value;
+  }
+
+  const namespace = createModuleNamespace();
+  for (const key of Reflect.ownKeys(value)) {
+    if (key === "__esModule" || key === Symbol.toStringTag) continue;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor) Object.defineProperty(namespace, key, descriptor);
+  }
+  moduleNamespaceEsmMarkers.set(namespace, true);
   return namespace;
 }
 
