@@ -15,6 +15,7 @@ import {
   pluginBoundaryResolverPlugin,
   pluginClientBoundaryReplacements,
   resolveBakeImport,
+  resolveFrameworkRuntimeImports,
   serverBoundaryFiles,
   ssrGraphBridgePrefix,
   staticRouterFile,
@@ -1511,11 +1512,12 @@ function rewriteHmrDependencies(modules, replacements) {
 function createFrameworkDispatcher(config) {
   const app = config.app;
   if (!app || app.framework == null) return null;
-  const framework = normalizeBakeFramework(app.framework);
   ensureBakeResponseInstalled();
 
   const projectRoot = globalThis.process?.cwd?.() ?? ".";
-  const builtIns = normalizeBuiltInModules(framework, projectRoot);
+  const normalizedFramework = normalizeBakeFramework(app.framework);
+  const builtIns = normalizeBuiltInModules(normalizedFramework, projectRoot);
+  const framework = resolveFrameworkRuntimeImports(normalizedFramework, projectRoot, builtIns);
   const staticRouters = normalizeStaticRouters(framework, projectRoot);
   const componentServerManifest = Object.create(null);
   const componentSsrManifest = Object.create(null);

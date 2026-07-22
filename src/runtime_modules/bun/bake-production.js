@@ -12,6 +12,7 @@ import {
   normalizeBuiltInModules,
   normalizeStaticRouters,
   resolveBakeImport,
+  resolveFrameworkRuntimeImports,
   serverBoundaryFiles,
 } from "./bake-framework.js";
 import { FrameworkRouter } from "./bake-framework-router.js";
@@ -660,8 +661,9 @@ export async function buildBakeProduction({ entrypoint, outdir = "dist" } = {}, 
   const tempRoot = path.join(outputRoot, ".cottontail-bake-server");
   const config = await loadProductionConfig(projectRoot, entrypoint);
   const app = config.app;
-  const framework = normalizeBakeFramework(app.framework);
-  const builtIns = normalizeBuiltInModules(framework, projectRoot);
+  const normalizedFramework = normalizeBakeFramework(app.framework);
+  const builtIns = normalizeBuiltInModules(normalizedFramework, projectRoot);
+  const framework = resolveFrameworkRuntimeImports(normalizedFramework, projectRoot, builtIns);
   const configuredPlugins = [...(framework.plugins ?? []), ...(app.plugins ?? [])];
   const serverManifest = Object.create(null);
   const ssrManifest = Object.create(null);

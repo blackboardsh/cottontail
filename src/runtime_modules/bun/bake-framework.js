@@ -71,6 +71,28 @@ export function normalizeBakeFramework(value) {
   return value;
 }
 
+export function resolveFrameworkRuntimeImports(framework, projectRoot, builtIns) {
+  const serverComponents = framework.serverComponents;
+  if (serverComponents === null || typeof serverComponents !== "object") return framework;
+
+  const source = serverComponents.serverRuntimeImportSource;
+  if (typeof source !== "string" || source.length === 0) return framework;
+
+  let resolved = builtIns.alias[source];
+  if (resolved === undefined && /^\.\.?[\\/]/.test(source)) {
+    resolved = path.resolve(projectRoot, source);
+  }
+  if (resolved === undefined || resolved === source) return framework;
+
+  return {
+    ...framework,
+    serverComponents: {
+      ...serverComponents,
+      serverRuntimeImportSource: resolved,
+    },
+  };
+}
+
 function sourceText(value) {
   if (typeof value === "string") return value;
   if (value instanceof ArrayBuffer) return new TextDecoder().decode(value);
