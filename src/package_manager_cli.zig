@@ -47,6 +47,7 @@ const Command = enum {
     unlink,
     patch,
     patch_commit,
+    publish,
     pm,
     pm_list,
     pm_info,
@@ -367,6 +368,7 @@ fn commandFromString(command: []const u8) ?Command {
     if (std.mem.eql(u8, command, "unlink")) return .unlink;
     if (std.mem.eql(u8, command, "patch")) return .patch;
     if (std.mem.eql(u8, command, "patch-commit")) return .patch_commit;
+    if (std.mem.eql(u8, command, "publish")) return .publish;
     if (std.mem.eql(u8, command, "pm")) return .pm;
     if (std.mem.eql(u8, command, "list")) return .pm_list;
     if (std.mem.eql(u8, command, "info")) return .pm_info;
@@ -420,6 +422,12 @@ pub fn run(
         try printPackageManagerHelp(options.command, stdout);
         try stdout.flush();
         return 0;
+    }
+
+    if (options.command == .publish) {
+        try stderr.writeAll("error: bun publish is not implemented yet\n");
+        try stderr.flush();
+        return 1;
     }
 
     if (options.cwd) |cwd| {
@@ -756,6 +764,7 @@ fn printPackageManagerHelp(command: Command, writer: *std.Io.Writer) !void {
         \\  --no-save                Do not update package.json or bun.lock
         \\  --no-verify              Skip package integrity verification
         \\  -f, --force              Re-resolve and reinstall dependencies
+        \\  --dry-run                Perform a dry run without making changes
         \\  --patches-dir <path>     Set the generated patch directory
         \\
     , .{@tagName(command)});
@@ -1795,7 +1804,10 @@ const Manager = struct {
                     manager.rootLifecycleScriptsWillRun()) "" else "\n",
             });
             try manager.stdout.flush();
-            if (manager.options.command == .install and manager.patch_policy_changed) {
+            const fresh_patched_install = manager.options.command == .install and
+                manager.lock_graph == null and
+                manager.manifest_policy.?.patched_dependencies.count() > 0;
+            if (manager.options.command == .install and (manager.patch_policy_changed or fresh_patched_install)) {
                 try manager.stderr.writeAll("Resolving dependencies\n");
             }
         }
@@ -1846,7 +1858,7 @@ const Manager = struct {
             .update => try manager.updatePackages(command_package_json, manager.invocation_package_dir),
             .link => try manager.addPackages(command_package_json, manager.invocation_package_dir),
             .unlink => unreachable,
-            .patch, .patch_commit => unreachable,
+            .patch, .patch_commit, .publish => unreachable,
             .audit, .pm, .pm_list, .pm_info, .pm_whoami, .pm_why => unreachable,
         }
 
@@ -3907,7 +3919,15 @@ const Manager = struct {
 
         if (isLocalSpec(resolution_spec)) {
             if (protocol_patch_paths.len > 0) return error.UnsupportedPatchResolution;
-            const local = try manager.resolveLocalPackage(resolution_spec, parent_dir);
+            const local = manager.resolveLocalPackage(resolution_spec, parent_dir) catch |err| {
+                if (err == error.MissingPackageJSON and !optional) {
+                    try manager.stderr.print(
+                        "note: error occurred while resolving {s}@{s}\n",
+                        .{ alias, resolution_spec },
+                    );
+                }
+                return err;
+            };
             if (isGlobalLinkSpec(resolution_spec) and !manager.options.lockfile_only and !manager.options.dry_run) {
                 const cache = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules", ".cache" });
                 try std.Io.Dir.cwd().createDirPath(manager.init_data.io, cache);
@@ -4635,13 +4655,17 @@ const Manager = struct {
     ) anyerror {
         const path = if (patch_paths.len > 0) patch_paths[0] else "";
         if (diagnostic) |detail| {
-            // COTTONTAIL-COMPAT: Bun reports the concrete I/O failure before the patchfile summary.
-            manager.stderr.print("error: failed applying patch file: {f}\n", .{detail}) catch {};
+            if (detail.operation) |_| {
+                // COTTONTAIL-COMPAT: Bun reports the concrete I/O failure before the patchfile summary.
+                manager.stderr.print("error: failed applying patch file: {f}\n", .{detail}) catch {};
+            } else {
+                manager.stderr.print("error: failed to parse patchfile: {f}\n", .{detail}) catch {};
+            }
         }
         switch (err) {
             error.PatchFileNotFound => manager.stderr.print("error: Couldn't find patch file: '{s}'\n", .{path}) catch {},
             error.EmptyPatchFile => manager.stderr.print("error: patchfile '{s}' is empty, please restore or delete it.\n", .{path}) catch {},
-            error.InvalidPatchFile => manager.stderr.print("error: failed to parse patchfile ({s})\n", .{path}) catch {},
+            error.InvalidPatchFile => manager.stderr.print("error: failed to apply patchfile ({s})\n", .{path}) catch {},
             error.PatchApplyFailed => manager.stderr.print("error: failed to apply patchfile ({s})\n", .{path}) catch {},
             else => manager.stderr.print("error: failed to apply patchfile ({s}): {s}\n", .{ path, @errorName(err) }) catch {},
         }

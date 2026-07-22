@@ -8,11 +8,15 @@ const max_patch_bytes = 256 * 1024 * 1024;
 
 pub const ApplyDiagnostic = struct {
     cause: anyerror,
-    operation: []const u8,
+    operation: ?[]const u8,
 
     pub fn format(diagnostic: ApplyDiagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const operation = diagnostic.operation orelse {
+            try writer.writeAll(@errorName(diagnostic.cause));
+            return;
+        };
         const detail = systemErrorDetail(diagnostic.cause);
-        try writer.print("{s}: {s} ({s}())", .{ detail.code, detail.message, diagnostic.operation });
+        try writer.print("{s}: {s} ({s}())", .{ detail.code, detail.message, operation });
     }
 };
 
@@ -71,7 +75,10 @@ pub fn apply(
         hasher.update(source);
 
         const parse_source = std.mem.trimEnd(u8, source, "\r\n");
-        var patch_file = compiler.patch.parsePatchFile(parse_source) catch return error.InvalidPatchFile;
+        var patch_file = compiler.patch.parsePatchFile(parse_source) catch |err| {
+            diagnostic.* = .{ .cause = err, .operation = null };
+            return error.InvalidPatchFile;
+        };
         defer patch_file.deinit(compiler.default_allocator);
         try applyParsedPatch(allocator, io, package_dir, &patch_file, diagnostic);
     }
@@ -306,21 +313,21 @@ fn applyFilePatch(
 
     for (file_patch.hunks.items) |hunk| {
         var line_cursor: usize = hunk.header.patched.start -| 1;
-        if (line_cursor > lines.items.len) return applyFailure(diagnostic, "patch", error.InvalidArgument);
+        if (line_cursor > lines.items.len) return applyFailure(diagnostic, "stat", error.InvalidArgument);
         for (hunk.parts.items) |part| switch (part.type) {
             .context => {
-                if (line_cursor + part.lines.items.len > lines.items.len) return applyFailure(diagnostic, "patch", error.InvalidArgument);
+                if (line_cursor + part.lines.items.len > lines.items.len) return applyFailure(diagnostic, "stat", error.InvalidArgument);
                 line_cursor += part.lines.items.len;
             },
             .insertion => {
-                if (line_cursor > lines.items.len) return applyFailure(diagnostic, "patch", error.InvalidArgument);
+                if (line_cursor > lines.items.len) return applyFailure(diagnostic, "stat", error.InvalidArgument);
                 const inserted = try lines.addManyAt(allocator, line_cursor, part.lines.items.len);
                 @memcpy(inserted, part.lines.items);
                 line_cursor += part.lines.items.len;
                 if (part.no_newline_at_end_of_file and lines.items.len > 0) _ = lines.pop();
             },
             .deletion => {
-                if (line_cursor + part.lines.items.len > lines.items.len) return applyFailure(diagnostic, "patch", error.InvalidArgument);
+                if (line_cursor + part.lines.items.len > lines.items.len) return applyFailure(diagnostic, "stat", error.InvalidArgument);
                 try lines.replaceRange(allocator, line_cursor, part.lines.items.len, &.{});
                 if (part.no_newline_at_end_of_file) try lines.append(allocator, "");
             },
