@@ -184,6 +184,11 @@
       "reason": "Copied build production mode, runtime API, raw Date header, and SNI TLS-array regressions pass under Cottontail."
     },
     {
+      "pattern": "^test/regression/issue/(?:24593|26125|26225|5344)\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Exact copied regressions pass under the integrated runtime: compressed WebSocket publish, mTLS client-certificate switching, node-fetch form-data streams, and split re-export linking (11 cases, 52 assertions)."
+    },
+    {
       "pattern": "^test/regression/issue/20753\\.test\\.js$",
       "status": "enabled",
       "reason": "Node child_process execFile reports normalized asynchronous ENOENT/EACCES errors and preserves encoded stdout/stderr for callbacks and promisification."
