@@ -1,5 +1,6 @@
 import { EventEmitter } from "./events.js";
 import { _wrapAsyncCallback } from "./async_hooks.js";
+import { Duplex } from "./stream.js";
 
 const kConnectionCount = Symbol("connectionCount");
 // Allow a stock-JSC host-loop turn for bytes racing a graceful destroy to
@@ -271,17 +272,18 @@ function connectionException(rawError, options, host, port) {
   return error;
 }
 
-class SocketImpl extends EventEmitter {
+class SocketImpl extends Duplex {
   constructor(options = {}) {
-    super();
-    trackHeapObject(new.target?.name === "TLSSocket" ? "TLSSocket" : "TCPSocket", this);
     if (options == null) options = {};
     if (typeof options !== "object") throw invalidArgType("options", "of type object", options);
     for (const name of ["objectMode", "readableObjectMode", "writableObjectMode"]) {
       if (options[name]) throw invalidArgValue(`options.${name}`, options[name], "is not supported");
     }
-    if (options.fd !== undefined && (!Number.isInteger(options.fd) || options.fd < 0 || options.fd > 0x7fffffff)) {
-      throw outOfRange("options.fd", ">= 0 && <= 2147483647", options.fd);
+    if (options.fd !== undefined) {
+      if (typeof options.fd !== "number") throw invalidArgType("options.fd", "of type number", options.fd);
+      if (!Number.isInteger(options.fd) || options.fd < 0 || options.fd > 0x7fffffff) {
+        throw outOfRange("options.fd", ">= 0 && <= 2147483647", options.fd);
+      }
     }
     if (options.onread != null) {
       if (typeof options.onread !== "object") throw invalidArgType("options.onread", "of type object", options.onread);
@@ -291,12 +293,23 @@ class SocketImpl extends EventEmitter {
     if (options.blockList !== undefined && !BlockList.isBlockList(options.blockList)) {
       throw invalidArgType("options.blockList", "an instance of net.BlockList", options.blockList);
     }
-    this.fd = options.fd ?? null;
+    const allowHalfOpen = options.allowHalfOpen === true;
+    const writableHighWaterMark = normalizeHighWaterMark(options.writableHighWaterMark ?? options.highWaterMark);
+    const readableHighWaterMark = normalizeHighWaterMark(options.readableHighWaterMark ?? options.highWaterMark);
+    super({
+      allowHalfOpen,
+      readable: options.readable !== false,
+      writable: options.writable !== false,
+      readableHighWaterMark,
+      writableHighWaterMark,
+      emitClose: false,
+      autoDestroy: true,
+      decodeStrings: false,
+    });
+    trackHeapObject(new.target?.name === "TLSSocket" ? "TLSSocket" : "TCPSocket", this);
+    this.fd = null;
     this.connecting = false;
-    this.destroyed = false;
     this.encrypted = false;
-    this.readable = true;
-    this.writable = true;
     this.remoteAddress = undefined;
     this.remoteFamily = undefined;
     this.remotePort = undefined;
@@ -307,32 +320,35 @@ class SocketImpl extends EventEmitter {
     this._bytesDispatchedValue = 0;
     this.timeout = 0;
     this._timeoutValue = 0;
-    this.allowHalfOpen = options.allowHalfOpen === true;
-    this.writableHighWaterMark = normalizeHighWaterMark(options.writableHighWaterMark ?? options.highWaterMark);
-    this.readableHighWaterMark = normalizeHighWaterMark(options.readableHighWaterMark ?? options.highWaterMark);
-    this.writableLength = 0;
-    this.writableNeedDrain = false;
+    this.allowHalfOpen = allowHalfOpen;
     this._encoding = null;
     this._timeoutTimer = null;
     this._watchId = 0;
     this._unregisterWatch = null;
     this._isPipe = options.pipe === true || options.path != null;
     this._path = options.path;
-    this._paused = Boolean(options.pauseOnConnect);
+    this._paused = Boolean(options.pauseOnConnect || options.readable === false);
     this._pendingData = [];
     this._pendingEnd = false;
     this._pendingWrites = [];
     this._outboundWrites = [];
     this._writeRetryTimer = null;
+    this._watchWriteOnly = false;
+    this._nativeReadPaused = false;
+    this._nativeShutdownSent = false;
+    this._destroyImmediateRequested = false;
+    this._readEndSignaled = false;
+    this._nativeHandleTransferred = false;
+    this._adoptedRawHandle = null;
+    this._pendingFinalCallback = null;
+    this._pendingFinalCleanup = null;
     this._destroyCloseTimer = null;
     this._destroyFinalize = null;
-    this._drainQueued = false;
     this._ending = false;
     this._endEmitted = false;
     this._finishEmitted = false;
     this._closeEmitted = false;
     this._hadError = false;
-    this._pipes = new Map();
     this._onread = options.onread && typeof options.onread === "object" && typeof options.onread.callback === "function"
       ? options.onread
       : null;
@@ -355,8 +371,13 @@ class SocketImpl extends EventEmitter {
     this.isServer = false;
     this.pauseOnConnect = Boolean(options.pauseOnConnect);
     this.blockList = options.blockList;
+    this.on("end", () => {
+      if (!this.allowHalfOpen && this.writable && !this.destroyed) this.end();
+    });
     if (options.signal) this._setupAbortSignal(options.signal);
-    if (this.fd != null) this._attachFd(this.fd, options.local, options.remote, false);
+    if (options.handle != null) this._adoptHandle(options.handle, options);
+    else if (options.fd != null) this._attachFd(options.fd, options.local, options.remote, false);
+    if (this._paused) this.pause();
   }
 
   // Bun creates a detached socket handle as soon as connect() starts, before
@@ -367,16 +388,17 @@ class SocketImpl extends EventEmitter {
     if (this.__handleOverride !== undefined) return this.__handleOverride;
     if (this.fd == null && !this.connecting) return null;
     if (this.__handleWrap == null) {
-      const self = this;
       this.__handleWrap = {
-        get fd() { return self.fd ?? -1; },
-        get owner() { return self; },
-        setNoDelay(value = true) { self.setNoDelay(value); return 0; },
-        setKeepAlive(value = false, delay = 0) { self.setKeepAlive(value, Number(delay) * 1000); return 0; },
-        close(callback) { self.destroy(); if (typeof callback === "function") queueMicrotask(callback); },
-        ref() { self.ref(); },
-        unref() { self.unref(); },
-        hasRef() { return self._refed; },
+        _owner: this,
+        get fd() { return this._owner?.fd ?? -1; },
+        get owner() { return this._owner; },
+        set owner(value) { this._owner = value; },
+        setNoDelay(value = true) { this._owner?.setNoDelay(value); return 0; },
+        setKeepAlive(value = false, delay = 0) { this._owner?.setKeepAlive(value, Number(delay) * 1000); return 0; },
+        close(callback) { this._owner?.destroy(); if (typeof callback === "function") queueMicrotask(callback); },
+        ref() { this._owner?.ref(); },
+        unref() { this._owner?.unref(); },
+        hasRef() { return this._owner?._refed !== false; },
       };
     }
     return this.__handleWrap;
@@ -384,6 +406,55 @@ class SocketImpl extends EventEmitter {
 
   set _handle(value) {
     this.__handleOverride = value;
+  }
+
+  _adoptHandle(handle, options = {}) {
+    if (handle == null || typeof handle !== "object") {
+      throw invalidArgType("options.handle", "an object with a file descriptor", handle);
+    }
+
+    let fd = Number(handle.fd);
+    let local = options.local;
+    let remote = options.remote;
+    const previousOwner = handle.owner;
+    if (previousOwner instanceof SocketImpl && previousOwner !== this) {
+      fd = previousOwner._releaseHandleForAdoption(handle);
+      local ??= previousOwner._sockname ?? (previousOwner.localAddress == null ? undefined : {
+        address: previousOwner.localAddress,
+        port: previousOwner.localPort,
+        family: previousOwner.localFamily,
+      });
+      remote ??= previousOwner._peername ?? (previousOwner.remoteAddress == null ? undefined : {
+        address: previousOwner.remoteAddress,
+        port: previousOwner.remotePort,
+        family: previousOwner.remoteFamily,
+      });
+    }
+    local ??= handle._address ?? handle.local;
+    remote ??= handle._remote ?? handle.remote;
+    if (!Number.isInteger(fd) || fd < 0 || fd > 0x7fffffff) {
+      throw invalidArgValue("options.handle", handle, "does not reference an open socket");
+    }
+
+    this.__handleWrap = handle;
+    this.__handleOverride = undefined;
+    try { handle.owner = this; } catch {}
+    this._adoptedRawHandle = handle;
+    this._attachFd(fd, local, remote, false);
+  }
+
+  _releaseHandleForAdoption(handle) {
+    if (this.fd == null || (this.__handleWrap != null && this.__handleWrap !== handle)) {
+      throw invalidArgValue("options.handle", handle, "does not reference this socket's open handle");
+    }
+    const fd = this.fd;
+    this._stopRead();
+    this._clearTimeoutTimer();
+    this.fd = null;
+    this._nativeHandleTransferred = true;
+    this._destroyImmediateRequested = true;
+    Duplex.prototype.destroy.call(this);
+    return fd;
   }
 
   _setAddressInfo(local = undefined, remote = undefined) {
@@ -446,16 +517,18 @@ class SocketImpl extends EventEmitter {
 
   _attachFd(fd, local = undefined, remote = undefined, emitConnect = false) {
     this.fd = Number(fd);
-    this.destroyed = false;
-    this.readable = true;
-    this.writable = !this._ending;
+    this._nativeShutdownSent = false;
+    this._nativeReadPaused = false;
+    if (this._adoptedRawHandle && "fd" in this._adoptedRawHandle) {
+      try { this._adoptedRawHandle.fd = this.fd; } catch {}
+    }
     this._setAddressInfo(local, remote);
     this._applySocketOptions();
     if (emitConnect) {
       this.connecting = false;
       if (this.destroyed) return this;
       this._startRead();
-      this._flushPendingWrites();
+      this._flushOutboundWrites();
       this.emit("connect");
       this._readyEmitted = true;
       this.emit("ready");
@@ -467,20 +540,39 @@ class SocketImpl extends EventEmitter {
     return this;
   }
 
-  _flushPendingWrites(error = undefined) {
-    const pending = this._pendingWrites.splice(0);
-    for (const entry of pending) {
-      if (error) {
-        if (typeof entry.callback === "function") entry.callback(error);
-        continue;
-      }
-      this._outboundWrites.push(entry);
+  _startWriteWatch() {
+    if (this._watchId || this.fd == null || this.destroyed || typeof cottontail.fdWatchStart !== "function") return false;
+    const fdWatchListeners = installFdWatchDispatcher();
+    let watch;
+    try {
+      watch = cottontail.fdWatchStart(this.fd, 1, this._refed, true, true);
+    } catch {
+      return false;
     }
-    if (!error) this._flushOutboundWrites();
+    const watchId = Number(watch?.id || 0);
+    if (!watchId) return false;
+    this._watchId = watchId;
+    this._watchWriteOnly = true;
+    fdWatchListeners.set(watchId, _wrapAsyncCallback((event) => {
+      if (this._watchId !== watchId || this.destroyed) return;
+      if (event.type === "writable") {
+        this._flushOutboundWrites();
+        return;
+      }
+      if (event.type === "error") {
+        const error = new Error(event.message || "socket write failed");
+        if (event.code != null) error.code = String(event.code);
+        if (event.errno != null) error.errno = Number(event.errno);
+        this._failOutboundWrites(error);
+      }
+    }));
+    this._unregisterWatch = () => fdWatchListeners.delete(watchId);
+    return true;
   }
 
   _scheduleOutboundFlush() {
     if (this.destroyed) return;
+    if (!this._watchId) this._startWriteWatch();
     if (this._watchId && typeof cottontail.fdWatchSetWritable === "function") {
       if (cottontail.fdWatchSetWritable(this._watchId, true) === true) {
         if (this._writeRetryTimer != null) {
@@ -522,32 +614,29 @@ class SocketImpl extends EventEmitter {
         const count = Math.min(remaining.byteLength, Math.trunc(written));
         entry.offset += count;
         this._bytesDispatchedValue += count;
-        this.writableLength = Math.max(0, this.writableLength - count);
         this._refreshTimeout();
         if (entry.offset < entry.bytes.byteLength) continue;
         this._outboundWrites.shift();
         if (typeof entry.callback === "function") queueMicrotask(() => entry.callback());
       }
     } catch (error) {
-      this.destroy(error);
+      this._failOutboundWrites(error);
       return;
     }
 
-    if (this._watchId) cottontail.fdWatchSetWritable?.(this._watchId, false);
+    if (this._watchWriteOnly) {
+      this._stopRead();
+    } else if (this._watchId) {
+      cottontail.fdWatchSetWritable?.(this._watchId, false);
+    }
+  }
 
-    if (this.writableNeedDrain && this.writableLength === 0 && !this._drainQueued) {
-      this._drainQueued = true;
-      queueMicrotask(() => {
-        this._drainQueued = false;
-        if (this.destroyed || this.writableLength !== 0) return;
-        this.writableNeedDrain = false;
-        this.emit("drain");
-      });
+  _failOutboundWrites(error) {
+    const pending = this._outboundWrites.splice(0);
+    for (const entry of pending) {
+      if (typeof entry.callback === "function") queueMicrotask(() => entry.callback(error));
     }
-    if (this._ending && this.fd != null) {
-      try { cottontail.tcpSocketShutdown?.(this.fd); } catch {}
-    }
-    this._maybeEmitFinish();
+    if (pending.length === 0 && !this.destroyed) this.destroy(error);
   }
 
   _stopRead() {
@@ -555,6 +644,8 @@ class SocketImpl extends EventEmitter {
     this._watchId = 0;
     if (this._unregisterWatch) this._unregisterWatch();
     this._unregisterWatch = null;
+    this._watchWriteOnly = false;
+    this._nativeReadPaused = false;
     if (watchId) cottontail.fdWatchStop?.(watchId);
   }
 
@@ -576,12 +667,12 @@ class SocketImpl extends EventEmitter {
       throw error;
     }
     this._flushOutboundWrites();
-    if (this._pendingWrites.length > 0 || this._outboundWrites.length > 0) {
+    if (this.writableLength > 0 || this._outboundWrites.length > 0) {
       const error = new Error("Socket still has pending writes");
       error.code = "ERR_SOCKET_CLOSED";
       throw error;
     }
-    if (this._pendingData.length > 0) {
+    if (this.readableLength > 0 || this._pendingData.length > 0) {
       const error = new Error("Socket has unread data and cannot be upgraded to TLS");
       error.code = "ERR_SSL_INTERNAL_ERROR";
       throw error;
@@ -603,6 +694,13 @@ class SocketImpl extends EventEmitter {
   }
 
   _emitData(chunk) {
+    if (!this.encrypted) {
+      if (this.push(chunk) === false && this._watchId && !this._watchWriteOnly) {
+        this._nativeReadPaused = true;
+        cottontail.fdWatchSetPaused?.(this._watchId, true);
+      }
+      return;
+    }
     if (this._paused || this._pendingData.length > 0 || this.listenerCount("readable") > 0) {
       this._pendingData.push(chunk);
       if (this.listenerCount("readable") > 0) this.emit("readable");
@@ -613,6 +711,7 @@ class SocketImpl extends EventEmitter {
   }
 
   unshift(chunk) {
+    if (!this.encrypted) return super.unshift(chunk);
     if (chunk == null) return this;
     const bytes = typeof chunk === "string" ? bytesFrom(chunk, this._encoding ?? undefined) : chunk;
     const wrapped = globalThis.Buffer?.isBuffer?.(bytes) ? bytes : chunkFromBytes(bytes, this._encoding);
@@ -621,7 +720,8 @@ class SocketImpl extends EventEmitter {
     return this;
   }
 
-  read(_size = undefined) {
+  read(size = undefined) {
+    if (!this.encrypted) return super.read(size);
     if (this._pendingData.length === 0) return null;
     const chunks = this._pendingData.splice(0);
     if (this._encoding) return chunks.join("");
@@ -631,76 +731,19 @@ class SocketImpl extends EventEmitter {
     return merged;
   }
 
-  pipe(destination, options = {}) {
-    const onData = (chunk) => {
-      if (destination.destroyed || destination.writable === false) return;
-      const ok = destination.write(chunk);
-      if (ok === false) {
-        this.pause();
-        destination.once?.("drain", onDrain);
-      }
-    };
-    const onDrain = () => this.resume();
-    const onEnd = () => {
-      if (options.end !== false) destination.end?.();
-    };
-    const onClose = () => this.unpipe(destination);
-    this.on("data", onData);
-    this.on("end", onEnd);
-    destination.on?.("close", onClose);
-    this._pipes.set(destination, { onData, onDrain, onEnd, onClose });
-    destination.emit?.("pipe", this);
-    this.resume();
-    return destination;
-  }
-
-  unpipe(destination = undefined) {
-    const targets = destination ? [destination] : Array.from(this._pipes.keys());
-    for (const target of targets) {
-      const handlers = this._pipes.get(target);
-      if (!handlers) continue;
-      this._pipes.delete(target);
-      this.off("data", handlers.onData);
-      this.off("end", handlers.onEnd);
-      target.off?.("drain", handlers.onDrain);
-      target.off?.("close", handlers.onClose);
-      target.emit?.("unpipe", this);
-    }
-    return this;
-  }
-
-  cork() { return this; }
-  uncork() { return this; }
-
   get bufferSize() {
     return this.writableLength;
   }
 
-  get _readableState() {
-    let length = 0;
-    for (const chunk of this._pendingData) length += Number(chunk?.byteLength ?? chunk?.length ?? 0);
-    return {
-      endEmitted: this._endEmitted,
-      ended: this._endEmitted || this._pendingEnd,
-      flowing: this._paused ? false : true,
-      length,
-      destroyed: this.destroyed,
-    };
-  }
-
-  get _writableState() {
-    return {
-      length: this.writableLength,
-      needDrain: this.writableNeedDrain,
-      corked: 0,
-      ended: !this.writable,
-      finished: this._finishEmitted,
-      errorEmitted: false,
-      destroyed: this.destroyed,
-    };
-  }
-
   _emitEnd() {
+    if (!this.encrypted) {
+      if (!this.readableEnded && !this._readEndSignaled) {
+        this._readEndSignaled = true;
+        this.push(null);
+        if (this.readableLength === 0) this.read(0);
+      }
+      return;
+    }
     if (this._paused || this._pendingData.length > 0) {
       this._pendingEnd = true;
       return;
@@ -713,6 +756,7 @@ class SocketImpl extends EventEmitter {
   }
 
   _maybeClose() {
+    if (!this.encrypted) return;
     // Once both directions are done (FIN received and FIN sent) the socket
     // closes, even with allowHalfOpen.
     if (this._finishEmitted && this._endEmitted && !this.destroyed) {
@@ -723,6 +767,7 @@ class SocketImpl extends EventEmitter {
   }
 
   _flushPendingData() {
+    if (!this.encrypted) return;
     while (!this._paused && this._pendingData.length > 0) {
       this.emit("data", this._pendingData.shift());
     }
@@ -763,7 +808,7 @@ class SocketImpl extends EventEmitter {
   _startRead() {
     if (this.fd == null || this.destroyed || typeof cottontail.fdWatchStart !== "function") return this;
     if (this._watchId) {
-      cottontail.fdWatchSetPaused?.(this._watchId, this._paused);
+      cottontail.fdWatchSetPaused?.(this._watchId, this._paused || this._nativeReadPaused);
       cottontail.fdWatchSetRef?.(this._watchId, this._refed);
       return this;
     }
@@ -790,7 +835,7 @@ class SocketImpl extends EventEmitter {
           this._deliverOnread(event.data ?? new ArrayBuffer(0));
           return;
         }
-        const chunk = chunkFromBytes(event.data ?? new ArrayBuffer(0), this._encoding);
+        const chunk = chunkFromBytes(event.data ?? new ArrayBuffer(0), this.encrypted ? this._encoding : null);
         const length = Number(chunk?.byteLength ?? chunk?.length ?? 0);
         if (length > 0) {
           this.bytesRead += length;
@@ -800,9 +845,9 @@ class SocketImpl extends EventEmitter {
         return;
       }
       if (event.type === "end") {
-        this.readable = false;
         this._stopRead();
         this._emitEnd();
+        if (this._outboundWrites.length > 0) this._scheduleOutboundFlush();
         return;
       }
       if (event.type === "error") {
@@ -821,6 +866,14 @@ class SocketImpl extends EventEmitter {
     return this;
   }
 
+  _read() {
+    if (this.destroyed || this.fd == null || this.encrypted) return;
+    this._nativeReadPaused = false;
+    this._paused = false;
+    if (this._watchId && !this._watchWriteOnly) cottontail.fdWatchSetPaused?.(this._watchId, false);
+    else this._startRead();
+  }
+
   _cancelConnectAttempts() {
     this._connectGeneration += 1;
     for (const timer of this._connectAttemptTimers) clearTimeout(timer);
@@ -834,8 +887,7 @@ class SocketImpl extends EventEmitter {
   }
 
   _resetCompletedConnection() {
-    const completed = this.destroyed || this._ending || this._endEmitted ||
-      this._finishEmitted || this._closeEmitted;
+    const completed = this.destroyed || this.writableEnded || this.readableEnded || this._closeEmitted;
     if (!completed) return;
 
     // A finish callback can run before the peer FIN has driven the socket
@@ -843,9 +895,7 @@ class SocketImpl extends EventEmitter {
     if (!this.destroyed && (this.fd != null || this._watchId)) this._destroyImmediately();
     this._finishDeferredDestroy();
 
-    this.destroyed = false;
-    this.readable = true;
-    this.writable = true;
+    this._undestroy();
     this.connecting = false;
     this.fd = null;
     this.remoteAddress = undefined;
@@ -856,9 +906,6 @@ class SocketImpl extends EventEmitter {
     this.localFamily = undefined;
     this.bytesRead = 0;
     this._bytesDispatchedValue = 0;
-    this.writableLength = 0;
-    this.writableNeedDrain = false;
-    this._drainQueued = false;
     this._pendingData = [];
     this._pendingEnd = false;
     this._pendingWrites = [];
@@ -869,6 +916,11 @@ class SocketImpl extends EventEmitter {
     this._closeEmitted = false;
     this._hadError = false;
     this._readyEmitted = false;
+    this._readEndSignaled = false;
+    this._nativeReadPaused = false;
+    this._nativeShutdownSent = false;
+    this._destroyImmediateRequested = false;
+    this._nativeHandleTransferred = false;
     this.autoSelectFamilyAttemptedAddresses = undefined;
     this._peername = null;
     this._sockname = null;
@@ -1232,93 +1284,94 @@ class SocketImpl extends EventEmitter {
   }
 
   write(chunk, encoding = undefined, callback = undefined) {
-    return this._write(chunk, encoding, callback);
+    if (chunk === null) {
+      throw makeNodeError(TypeError, "May not write null values to stream", "ERR_STREAM_NULL_VALUES");
+    }
+    if (typeof chunk !== "string" && !ArrayBuffer.isView(chunk)) {
+      throw invalidArgType("chunk", "of type string, Buffer, TypedArray, or DataView", chunk);
+    }
+    return super.write(chunk, encoding, callback);
   }
 
   _write(chunk, encoding = undefined, callback = undefined) {
-    if (typeof encoding === "function") {
-      callback = encoding;
-      encoding = undefined;
-    }
-    if (callback !== undefined && typeof callback !== "function") throw invalidArgType("callback", "of type function", callback);
-    if (chunk === null) throw makeNodeError(TypeError, "May not write null values to stream", "ERR_STREAM_NULL_VALUES");
-    if (typeof chunk !== "string" && !(chunk instanceof ArrayBuffer) && !ArrayBuffer.isView(chunk)) {
-      throw invalidArgType("chunk", "of type string or an instance of Buffer, TypedArray, or DataView", chunk);
-    }
-    if (this._ending || !this.writable) {
-      const error = makeNodeError(Error, "write after end", "ERR_STREAM_WRITE_AFTER_END");
-      queueMicrotask(() => {
-        if (typeof callback === "function") callback(error);
-        if (!this.destroyed) this.destroy(error);
-      });
-      return false;
-    }
     const bytes = bytesFrom(chunk, encoding ?? this._defaultEncoding);
-    this.writableLength += bytes.byteLength;
     const entry = { bytes, offset: 0, callback };
-    const overHighWaterMark = this.writableLength >= this.writableHighWaterMark;
-    if (overHighWaterMark) this.writableNeedDrain = true;
-    if (this.connecting && this.fd == null && !this.destroyed && this.writable) {
-      this._pendingWrites.push(entry);
-      return !overHighWaterMark;
+    if (this.connecting && this.fd == null && !this.destroyed) {
+      this._outboundWrites.push(entry);
+      return;
     }
-    if (this.destroyed || this.fd == null || !this.writable) {
-      this.writableLength = Math.max(0, this.writableLength - bytes.byteLength);
+    if (this.destroyed || this.fd == null) {
       const error = makeNodeError(Error, "Socket is closed", "ERR_SOCKET_CLOSED");
-      if (typeof callback === "function") queueMicrotask(() => callback(error));
-      queueMicrotask(() => {
-        if (!this.destroyed) this.destroy(error);
-        else if (this.listenerCount("error") > 0) this.emit("error", error);
-      });
-      return false;
+      queueMicrotask(() => callback(error));
+      return;
     }
     this._outboundWrites.push(entry);
     this._flushOutboundWrites();
-    return !overHighWaterMark;
   }
 
-  _maybeEmitFinish() {
-    if (!this._ending || this._finishEmitted || this._outboundWrites.length > 0) return;
-    this._finishEmitted = true;
-    this.emit("finish");
-    this._maybeClose();
+  _writev(chunks, callback) {
+    if (chunks.length === 1) {
+      const { chunk, encoding } = chunks[0];
+      this._write(chunk, encoding, callback);
+      return;
+    }
+    const parts = chunks.map(({ chunk, encoding }) => bytesFrom(chunk, encoding ?? this._defaultEncoding));
+    const total = parts.reduce((length, part) => length + part.byteLength, 0);
+    const combined = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) {
+      combined.set(part, offset);
+      offset += part.byteLength;
+    }
+    this._write(combined, "buffer", callback);
   }
 
-  end(chunk, encoding, callback) {
-    if (typeof chunk === "function") {
-      callback = chunk;
-      chunk = undefined;
-    } else if (typeof encoding === "function") {
-      callback = encoding;
-      encoding = undefined;
-    }
-    if (typeof callback === "function") {
-      if (this._finishEmitted) queueMicrotask(callback);
-      else this.once("finish", callback);
-    }
-    if (this._ending) {
-      if (chunk != null) this.write(chunk, encoding, callback);
-      return this;
-    }
-    if (chunk != null) this.write(chunk, encoding);
+  _final(callback) {
     this._ending = true;
-    this.writable = false;
-    if (this.fd != null && this._outboundWrites.length === 0) {
-      try { cottontail.tcpSocketShutdown?.(this.fd); } catch {}
+    if (this.connecting) {
+      let settled = false;
+      const cleanup = () => {
+        this.removeListener("connect", onConnect);
+        this.removeListener("close", onClose);
+      };
+      const onConnect = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        this._shutdownNativeWrite(callback);
+      };
+      const onClose = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        callback(makeNodeError(Error, "Socket closed before the connection was established", "ERR_SOCKET_CLOSED_BEFORE_CONNECTION"));
+      };
+      this.once("connect", onConnect);
+      this.once("close", onClose);
+      this._pendingFinalCleanup = cleanup;
+      this._pendingFinalCallback = callback;
+      return;
     }
-    if (this._outboundWrites.length === 0) this._maybeEmitFinish();
-    return this;
+    this._shutdownNativeWrite(callback);
+  }
+
+  _shutdownNativeWrite(callback) {
+    this._pendingFinalCleanup?.();
+    this._pendingFinalCleanup = null;
+    this._pendingFinalCallback = null;
+    if (!this._nativeShutdownSent && this.fd != null) {
+      this._nativeShutdownSent = true;
+      try {
+        cottontail.tcpSocketShutdown?.(this.fd);
+      } catch (error) {
+        queueMicrotask(() => callback(error));
+        return;
+      }
+    }
+    queueMicrotask(callback);
   }
 
   destroy(error) {
-    return this._destroySocket(error, false);
-  }
-
-  _destroyImmediately(error) {
-    return this._destroySocket(error, true);
-  }
-
-  _destroySocket(error, immediate) {
     if (this._tlsOwner) {
       const tlsOwner = this._tlsOwner;
       this._tlsOwner = null;
@@ -1329,51 +1382,60 @@ class SocketImpl extends EventEmitter {
       }
       return this;
     }
-    if (this.destroyed) return this;
+    return super.destroy(error);
+  }
+
+  _destroyImmediately(error) {
+    this._destroyImmediateRequested = true;
+    return super.destroy(error);
+  }
+
+  _destroy(error, callback) {
+    const immediate = this._destroyImmediateRequested;
+    this._destroyImmediateRequested = false;
+    const wasConnecting = this.connecting;
     this._cancelConnectAttempts();
-    this.destroyed = true;
     this.connecting = false;
-    this.readable = false;
-    this.writable = false;
     this._hadError = Boolean(error);
     this._clearTimeoutTimer();
-    this._flushPendingWrites(error ?? new Error("Socket is closed"));
     if (this._writeRetryTimer != null) {
       clearTimeout(this._writeRetryTimer);
       this._writeRetryTimer = null;
     }
-    const writeError = error ?? new Error("Socket is closed");
-    for (const entry of this._outboundWrites.splice(0)) {
-      if (typeof entry.callback === "function") queueMicrotask(() => entry.callback(writeError));
+    const writeError = error ?? (wasConnecting
+      ? makeNodeError(Error, "Socket closed before the connection was established", "ERR_SOCKET_CLOSED_BEFORE_CONNECTION")
+      : makeNodeError(Error, "Cannot call write after a stream was destroyed", "ERR_STREAM_DESTROYED"));
+    this._failOutboundWrites(writeError);
+    if (this._pendingFinalCallback != null) {
+      const finalCallback = this._pendingFinalCallback;
+      this._pendingFinalCleanup?.();
+      this._pendingFinalCleanup = null;
+      this._pendingFinalCallback = null;
+      queueMicrotask(() => finalCallback(error));
     }
-    this.writableLength = 0;
     const fd = this.fd;
     this.fd = null;
-    const emitClose = () => {
+    if (this._adoptedRawHandle && "fd" in this._adoptedRawHandle) {
+      try { this._adoptedRawHandle.fd = null; } catch {}
+    }
+    const closeHandle = () => {
       this._stopRead();
-      if (fd != null) {
+      if (fd != null && !this._nativeHandleTransferred) {
         try { cottontail.closeFd?.(fd); } catch {}
       }
+      this._nativeHandleTransferred = false;
       if (!this._closeEmitted) {
         this._closeEmitted = true;
-        this.emit("close", Boolean(error));
+        const closeTimer = setTimeout(() => this.emit("close", Boolean(error)), 0);
+        if (!this._refed) closeTimer.unref?.();
       }
     };
-    if (error) {
-      this._stopRead();
-      if (fd != null) {
-        try { cottontail.closeFd?.(fd); } catch {}
-      }
-      this.emit("error", error);
-      if (!this._closeEmitted) {
-        this._closeEmitted = true;
-        this.emit("close", true);
-      }
-    } else if (!immediate && fd != null && this._watchId && !this._endEmitted) {
+    callback(error);
+    if (!error && !immediate && fd != null && this._watchId && !this.readableEnded) {
       // Match Bun's deferred handle close: let one poll turn drain bytes that
       // raced with destroy(), then close even if the peer stays open.
       try { cottontail.tcpSocketShutdown?.(fd); } catch {}
-      this._destroyFinalize = emitClose;
+      this._destroyFinalize = closeHandle;
       this._destroyCloseTimer = setTimeout(() => {
         this._destroyCloseTimer = null;
         const finalize = this._destroyFinalize;
@@ -1382,9 +1444,8 @@ class SocketImpl extends EventEmitter {
       }, gracefulDestroyDrainMilliseconds);
       if (!this._refed) this._destroyCloseTimer.unref?.();
     } else {
-      emitClose();
+      closeHandle();
     }
-    return this;
   }
 
   address() {
@@ -1394,7 +1455,7 @@ class SocketImpl extends EventEmitter {
   }
   setEncoding(encoding = "utf8") {
     this._encoding = String(encoding || "utf8").toLowerCase();
-    return this;
+    return super.setEncoding(this._encoding);
   }
   setKeepAlive(enable = false, initialDelay = 0) {
     this._keepAlive = Boolean(enable);
@@ -1423,28 +1484,29 @@ class SocketImpl extends EventEmitter {
   }
   pause() {
     this._paused = true;
+    super.pause();
     if (this._watchId) cottontail.fdWatchSetPaused?.(this._watchId, true);
     return this;
   }
   isPaused() {
-    return this._paused;
+    return super.isPaused();
   }
   resume() {
     this._paused = false;
-    this._flushPendingData();
+    super.resume();
     if (!this.destroyed && this.fd != null) {
-      if (this._watchId) cottontail.fdWatchSetPaused?.(this._watchId, false);
+      if (this._watchId && !this._watchWriteOnly) cottontail.fdWatchSetPaused?.(this._watchId, false);
       else this._startRead();
     }
     return this;
   }
   setDefaultEncoding(encoding = "utf8") {
     this._defaultEncoding = String(encoding || "utf8").toLowerCase();
-    return this;
+    return super.setDefaultEncoding(this._defaultEncoding);
   }
   destroySoon() {
     if (this.writable) this.end();
-    if (this._finishEmitted) this.destroy();
+    if (this.writableFinished) this.destroy();
     else this.once("finish", () => this.destroy());
     return this;
   }
@@ -1460,6 +1522,7 @@ class SocketImpl extends EventEmitter {
     const fd = this.fd;
     this._stopRead();
     this.fd = null;
+    this._destroyImmediateRequested = true;
     if (fd != null) {
       try { cottontail.tcpSocketReset?.(fd); } catch (error) {
         this.destroy(error);
@@ -1490,12 +1553,17 @@ class SocketImpl extends EventEmitter {
     return this;
   }
 
-  get bytesWritten() { return this._bytesDispatchedValue + this.writableLength; }
+  get bytesWritten() {
+    if (this._bytesDispatchedValue === undefined || !Array.isArray(this._outboundWrites)) return undefined;
+    if (this.encrypted) return this._bytesDispatchedValue + this.writableLength;
+    let pending = 0;
+    for (const entry of this._outboundWrites) pending += Math.max(0, entry.bytes.byteLength - entry.offset);
+    const buffered = this._writableState?.getBuffer?.() ?? [];
+    for (const entry of buffered) pending += bytesFrom(entry.chunk, entry.encoding ?? this._defaultEncoding).byteLength;
+    return this._bytesDispatchedValue + pending;
+  }
   get _bytesDispatched() { return this._bytesDispatchedValue; }
   get pending() { return this.fd == null || this.connecting; }
-  get writableEnded() { return this._ending; }
-  get writableFinished() { return this._finishEmitted; }
-  get readableEnded() { return this._endEmitted; }
   get closed() { return this._closeEmitted; }
   get readyState() {
     if (this.connecting) return "opening";
@@ -1514,32 +1582,6 @@ class SocketImpl extends EventEmitter {
     });
   }
 
-  async *[Symbol.asyncIterator]() {
-    for (;;) {
-      const chunk = this.read();
-      if (chunk !== null) {
-        yield chunk;
-        continue;
-      }
-      if (this._endEmitted || this.destroyed) return;
-      const result = await new Promise((resolve, reject) => {
-        const cleanup = () => {
-          this.removeListener("readable", onReadable);
-          this.removeListener("end", onEnd);
-          this.removeListener("close", onEnd);
-          this.removeListener("error", onError);
-        };
-        const onReadable = () => { cleanup(); resolve("readable"); };
-        const onEnd = () => { cleanup(); resolve("end"); };
-        const onError = (error) => { cleanup(); reject(error); };
-        this.once("readable", onReadable);
-        this.once("end", onEnd);
-        this.once("close", onEnd);
-        this.once("error", onError);
-      });
-      if (result === "end") return;
-    }
-  }
 }
 
 Object.defineProperty(SocketImpl, "name", { value: "Socket", configurable: true });
@@ -1941,11 +1983,18 @@ export class TCP {
   }
 
   open(fd) {
+    if (this.owner instanceof SocketImpl) throw invalidArgValue("fd", fd, "cannot replace an adopted socket handle");
     this.fd = Number(fd);
     return 0;
   }
 
   close(callback = undefined) {
+    if (this.owner instanceof SocketImpl && this.owner._adoptedRawHandle === this) {
+      const owner = this.owner;
+      if (typeof callback === "function") owner.once("close", callback);
+      owner.destroy();
+      return;
+    }
     stopAcceptWatch(this);
     this.reading = false;
     if (this.fd != null) {
@@ -1956,18 +2005,27 @@ export class TCP {
   }
 
   ref() {
+    if (this.owner instanceof SocketImpl && this.owner._adoptedRawHandle === this) {
+      this.owner.ref();
+      return this;
+    }
     this._refed = true;
     this._acceptTimer?.ref?.();
     if (this._acceptWatchId) cottontail.fdWatchSetRef?.(this._acceptWatchId, true);
     return this;
   }
   unref() {
+    if (this.owner instanceof SocketImpl && this.owner._adoptedRawHandle === this) {
+      this.owner.unref();
+      return this;
+    }
     this._refed = false;
     this._acceptTimer?.unref?.();
     if (this._acceptWatchId) cottontail.fdWatchSetRef?.(this._acceptWatchId, false);
     return this;
   }
   hasRef() {
+    if (this.owner instanceof SocketImpl && this.owner._adoptedRawHandle === this) return this.owner._refed;
     return this._refed;
   }
 
@@ -1992,6 +2050,10 @@ export class TCP {
   }
 
   setKeepAlive(enable = false, initialDelay = 0) {
+    if (this.owner instanceof SocketImpl && this.owner._adoptedRawHandle === this) {
+      this.owner.setKeepAlive(enable, Number(initialDelay) * 1000);
+      return 0;
+    }
     if (this.fd != null && typeof cottontail.tcpSocketSetKeepAlive === "function") {
       cottontail.tcpSocketSetKeepAlive(this.fd, Boolean(enable), Number(initialDelay) || 0);
     }
@@ -1999,6 +2061,10 @@ export class TCP {
   }
 
   setNoDelay(noDelay = true) {
+    if (this.owner instanceof SocketImpl && this.owner._adoptedRawHandle === this) {
+      this.owner.setNoDelay(noDelay);
+      return 0;
+    }
     if (this.fd != null && typeof cottontail.tcpSocketSetNoDelay === "function") {
       cottontail.tcpSocketSetNoDelay(this.fd, Boolean(noDelay));
     }
@@ -2006,16 +2072,28 @@ export class TCP {
   }
 
   readStart() {
+    if (this.owner instanceof SocketImpl && this.owner._adoptedRawHandle === this) {
+      this.owner.resume();
+      return 0;
+    }
     this.reading = true;
     return 0;
   }
 
   readStop() {
+    if (this.owner instanceof SocketImpl && this.owner._adoptedRawHandle === this) {
+      this.owner.pause();
+      return 0;
+    }
     this.reading = false;
     return 0;
   }
 
   reset() {
+    if (this.owner instanceof SocketImpl && this.owner._adoptedRawHandle === this) {
+      this.owner.resetAndDestroy();
+      return 0;
+    }
     this.close();
     return 0;
   }

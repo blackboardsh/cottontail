@@ -574,6 +574,12 @@ try {
       stdoutIncludes: ['6 pass', '0 fail'],
     },
     {
+      name: 'node-net-duplex',
+      argv: ['test', join(rootDir, 'tests', 'js', 'node-net-duplex.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['7 pass', '0 fail'],
+    },
+    {
       name: 'node-readline',
       scriptPath: join(rootDir, 'tests', 'js', 'node-readline.ts'),
       expectExitCode: 0,
