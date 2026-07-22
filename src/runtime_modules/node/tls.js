@@ -337,6 +337,21 @@ function tlsCredentialOptions(options) {
   };
 }
 
+function validateNativeServerContext(options, credentials = tlsCredentialOptions(options), protocols = tlsProtocolOptions(options)) {
+  cottontail.tlsValidateServerContext?.(
+    credentials.cert,
+    credentials.key,
+    credentials.passphrase,
+    credentials.ca,
+    options?.ciphers,
+    Boolean(options?.requestCert),
+    options?.rejectUnauthorized !== false,
+    protocols.minVersion,
+    protocols.maxVersion,
+    protocols.secureOptions,
+  );
+}
+
 function bytesFrom(chunk, encoding = undefined) {
   if (chunk == null) return new Uint8Array(0);
   if (typeof chunk === "string") return Buffer.from(chunk, encoding ?? "utf8");
@@ -726,6 +741,8 @@ export class TLSSocket extends Socket {
     }
     this._maxSendFragment = null;
     this._tlsWriteBlocked = false;
+    this._tlsNativeWriteBlocked = false;
+    this._tlsTransportWriteBlocked = false;
     this._tlsShutdownSent = false;
     this._renegotiationDisabled = false;
     this.isServer = options?.isServer === true;
@@ -790,6 +807,8 @@ export class TLSSocket extends Socket {
       try {
         cottontail.tlsConnectionFeedMemory(this._tlsId, bytesFrom(chunk));
         this._refreshTimeout?.();
+        this._tlsNativeWriteBlocked = false;
+        this._tlsWriteBlocked = this._tlsTransportWriteBlocked;
         if (this.connecting) this._driveMemoryHandshake(connectedEvent);
         else if (this._secureEventsEmitted) {
           this._drainMemoryPlaintext();
@@ -804,7 +823,8 @@ export class TLSSocket extends Socket {
     const onClose = () => this._endMemoryTransport();
     const onError = (error) => this.destroy(normalizeTlsError(error));
     const onDrain = () => {
-      this._tlsWriteBlocked = false;
+      this._tlsTransportWriteBlocked = false;
+      this._tlsWriteBlocked = this._tlsNativeWriteBlocked;
       this._flushTlsPendingWrites();
       if (this.writableNeedDrain && this.writableLength === 0) {
         this.writableNeedDrain = false;
@@ -1181,6 +1201,12 @@ export class TLSSocket extends Socket {
         this._handleRenegotiationSecure();
         return;
       }
+      if (event.type === "writable") {
+        this._tlsNativeWriteBlocked = false;
+        this._tlsWriteBlocked = this._tlsTransportWriteBlocked;
+        this._flushTlsPendingWrites();
+        return;
+      }
       if (event.type === "end") {
         if (this._tlsReadEndTimer != null) return;
         const tlsId = this._tlsId;
@@ -1224,32 +1250,36 @@ export class TLSSocket extends Socket {
     if (this.destroyed || this.connecting || this._tlsId == null) return false;
     while (this._pendingWrites.length > 0) {
       const entry = this._pendingWrites[0];
-      let ok;
-      let transportWritable = true;
+      const offset = entry.offset ?? 0;
+      const remaining = offset === 0 ? entry.bytes : entry.bytes.subarray(offset);
+      let result;
       try {
-        ok = cottontail.tlsConnectionWrite(this._tlsId, entry.bytes) === true;
-        if (this._memoryTransport != null) transportWritable = this._flushMemoryCiphertext();
+        result = this._writeTlsChunkSome(remaining);
       } catch (error) {
         this.destroy(normalizeTlsError(error, "TLS socket write failed"));
         return false;
       }
-      if (!ok) {
-        if (this._memoryTransport != null) {
-          this._tlsWriteBlocked = true;
-          this.writableNeedDrain = true;
-          return false;
-        }
+      if (result.written < 0) {
         this.destroy(tlsError("TLS socket write failed", "EPIPE"));
         return false;
       }
-      this._pendingWrites.shift();
-      this._tlsWriteBlocked = false;
-      this.writableLength = Math.max(0, this.writableLength - entry.bytes.byteLength);
-      this._bytesDispatchedValue += entry.bytes.byteLength;
-      this._refreshTimeout?.();
-      if (typeof entry.callback === "function") queueMicrotask(() => entry.callback());
-      if (!transportWritable) {
-        this._tlsWriteBlocked = true;
+
+      if (result.written > 0) {
+        entry.offset = offset + result.written;
+        this.writableLength = Math.max(0, this.writableLength - result.written);
+        this._bytesDispatchedValue += result.written;
+        this._refreshTimeout?.();
+      }
+
+      if ((entry.offset ?? offset) >= entry.bytes.byteLength) {
+        this._pendingWrites.shift();
+        if (typeof entry.callback === "function") queueMicrotask(() => entry.callback());
+      }
+
+      this._tlsNativeWriteBlocked = (entry.offset ?? offset) < entry.bytes.byteLength;
+      this._tlsTransportWriteBlocked = !result.transportWritable;
+      this._tlsWriteBlocked = this._tlsNativeWriteBlocked || this._tlsTransportWriteBlocked;
+      if (this._tlsWriteBlocked) {
         this.writableNeedDrain = true;
         return false;
       }
@@ -1263,6 +1293,47 @@ export class TLSSocket extends Socket {
     }
     this._finishTlsWritable();
     return true;
+  }
+
+  _writeTlsChunkSome(bytes) {
+    let written = Number(cottontail.tlsConnectionWrite(this._tlsId, bytes));
+    if (!Number.isFinite(written)) written = -1;
+    written = Math.trunc(written);
+    if (written >= 0) written = Math.min(bytes.byteLength, written);
+    const transportWritable = this._memoryTransport == null || this._flushMemoryCiphertext();
+    return { written, transportWritable };
+  }
+
+  _writeBunTlsBytesSome(chunk) {
+    if (this.destroyed || this.connecting || this._tlsId == null || !this.writable) return -1;
+    if (this._tlsWriteBlocked) return 0;
+    const bytes = bytesFrom(chunk);
+    let result;
+    try {
+      result = this._writeTlsChunkSome(bytes);
+    } catch (error) {
+      queueMicrotask(() => {
+        if (!this.destroyed) this.destroy(normalizeTlsError(error, "TLS socket write failed"));
+      });
+      return -1;
+    }
+    if (result.written < 0) {
+      queueMicrotask(() => {
+        if (!this.destroyed) this.destroy(tlsError("TLS socket write failed", "EPIPE"));
+      });
+      return -1;
+    }
+    if (result.written > 0) {
+      this._bytesDispatchedValue += result.written;
+      this._refreshTimeout?.();
+    }
+    this._tlsNativeWriteBlocked = result.written < bytes.byteLength;
+    this._tlsTransportWriteBlocked = !result.transportWritable;
+    this._tlsWriteBlocked = this._tlsNativeWriteBlocked || this._tlsTransportWriteBlocked;
+    if (this._tlsWriteBlocked) {
+      this.writableNeedDrain = true;
+    }
+    return result.written;
   }
 
   _finishTlsWritable() {
@@ -1307,7 +1378,7 @@ export class TLSSocket extends Socket {
     }
     const bytes = bytesFrom(chunk, encoding ?? this._defaultEncoding);
     this.writableLength += bytes.byteLength;
-    this._pendingWrites.push({ bytes, callback });
+    this._pendingWrites.push({ bytes, callback, offset: 0 });
     const overHighWaterMark = this.writableLength >= this.writableHighWaterMark;
     if (overHighWaterMark) this.writableNeedDrain = true;
     const flushed = this.connecting ? true : this._flushTlsPendingWrites();
@@ -1766,20 +1837,7 @@ class ServerImpl extends NetServer {
       }
     }
     try {
-      const credentials = tlsCredentialOptions(this._tlsOptions);
-      const protocols = tlsProtocolOptions(this._tlsOptions);
-      cottontail.tlsValidateServerContext?.(
-        credentials.cert,
-        credentials.key,
-        credentials.passphrase,
-        credentials.ca,
-        this._tlsOptions.ciphers,
-        Boolean(this._tlsOptions.requestCert),
-        this._tlsOptions.rejectUnauthorized !== false,
-        protocols.minVersion,
-        protocols.maxVersion,
-        protocols.secureOptions,
-      );
+      validateNativeServerContext(this._tlsOptions);
     } catch (error) {
       queueMicrotask(() => this.emit("error", normalizeTlsError(error)));
       return this;
@@ -2041,6 +2099,7 @@ export function _upgradeServerSocket(parentSocket, options = {}) {
   const credentials = tlsCredentialOptions(options);
   const alpnProtocols = prepareALPNProtocols(options.ALPNProtocols);
   const protocolOptions = tlsProtocolOptions(options);
+  validateNativeServerContext(options, credentials, protocolOptions);
   const contexts = [];
   if (options.contexts && typeof options.SNICallback !== "function") {
     for (const [hostname, secureContext] of options.contexts) {

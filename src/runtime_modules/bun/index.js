@@ -8,6 +8,7 @@ import * as nodeNet from "../node/net.js";
 import { Readable as NodeReadable } from "../node/stream.js";
 import {
   _connectMemoryTransport as nodeTlsConnectMemoryTransport,
+  _upgradeServerSocket as nodeTlsUpgradeServerSocket,
   connect as nodeTlsConnect,
   createServer as nodeTlsCreateServer,
 } from "../node/tls.js";
@@ -14494,11 +14495,9 @@ function bunSocketUpgradeTlsError(error) {
 function upgradeBunSocketToTls(socket, options) {
   if (socket.destroyed || socket.connecting || !socket.readable || !socket.writable) return undefined;
   if (socket._isPipe) return undefined;
-  if (socket.listener != null) {
-    throw new TypeError("Server-side upgradeTLS is not supported. Use upgradeDuplexToTLS with isServer: true instead.");
-  }
   if (options === null || typeof options !== "object") throw new TypeError("Expected options object");
-  const handlerState = createBunSocketHandlerState(options.socket, false);
+  const isServer = socket.listener != null;
+  const handlerState = createBunSocketHandlerState(options.socket, isServer);
   const tls = options.tls;
   if (tls !== true && (tls === null || typeof tls !== "object" || Object.keys(tls).length === 0)) {
     throw new TypeError('Expected "tls" option');
@@ -14508,15 +14507,24 @@ function upgradeBunSocketToTls(socket, options) {
     hostname: String(socket._host ?? socket.remoteAddress ?? "localhost"),
     port: Number(socket.remotePort ?? 0),
   };
-  const tlsOptions = bunSocketTlsOptions(tls, normalized);
-  const transport = bunSocketTlsTransport(socket);
+  const tlsOptions = bunSocketTlsOptions(tls, normalized, isServer);
   let tlsSocket;
   try {
-    tlsSocket = nodeTlsConnectMemoryTransport(transport, {
-      ...tlsOptions,
-      host: normalized.hostname,
-      port: normalized.port,
-    });
+    if (isServer) {
+      tlsSocket = nodeTlsUpgradeServerSocket(socket, {
+        ...tlsOptions,
+        isServer: true,
+        allowHalfOpen: socket.allowHalfOpen === true,
+      });
+      tlsSocket.listener = socket.listener;
+    } else {
+      const transport = bunSocketTlsTransport(socket);
+      tlsSocket = nodeTlsConnectMemoryTransport(transport, {
+        ...tlsOptions,
+        host: normalized.hostname,
+        port: normalized.port,
+      });
+    }
   } catch (error) {
     throw bunSocketUpgradeTlsError(error);
   }
@@ -14524,7 +14532,7 @@ function upgradeBunSocketToTls(socket, options) {
   tlsSocket.allowHalfOpen = socket.allowHalfOpen === true;
   const attached = attachBunSocketHandlers(tlsSocket, handlerState, options.data);
   if (typeof attached.handlers.handshake === "function") attached.call("open", tlsSocket);
-  tlsSocket.once("secureConnect", () => {
+  tlsSocket.once(isServer ? "secure" : "secureConnect", () => {
     completeBunTlsHandshake(attached);
     if (typeof attached.handlers.drain === "function") {
       queueMicrotask(() => {
@@ -14608,8 +14616,15 @@ function writeBunSocketBytes(socket, bytes) {
   if (socket.destroyed || !socket.writable) return -1;
   if (socket.encrypted) {
     if (socket._tlsId == null && !socket.connecting) return -1;
-    socket.__cottontailNodeWrite(bytes);
-    return bytes.byteLength;
+    if (socket.connecting) {
+      const accepted = socket.__cottontailNodeWrite(bytes);
+      if (accepted === false) socket.__cottontailBunNeedsDrain = true;
+      return bytes.byteLength;
+    }
+    const written = Number(socket._writeBunTlsBytesSome?.(bytes) ?? -1);
+    if (!Number.isFinite(written) || written < 0) return -1;
+    if (written < bytes.byteLength || socket._tlsWriteBlocked) socket.__cottontailBunNeedsDrain = true;
+    return Math.min(bytes.byteLength, Math.trunc(written));
   }
   if (socket.fd == null) return -1;
   if (bytes.byteLength === 0) return 0;
@@ -14681,7 +14696,7 @@ function attachBunSocketHandlers(socket, handlerState, data = undefined, connect
       const bytes = bunSocketWriteArguments(arguments, "end");
       const written = writeBunSocketBytes(socket, bytes);
       if (written < 0) return written;
-      if (socket.encrypted || written === bytes.byteLength) {
+      if (written === bytes.byteLength) {
         nodeEnd();
         socket.__cottontailBunShutdown = true;
       } else {
@@ -14836,6 +14851,12 @@ function attachBunSocketHandlers(socket, handlerState, data = undefined, connect
       return;
     }
     socket.__cottontailBunNeedsDrain = false;
+    if (socket.__cottontailBunEndAfterDrain) {
+      socket.__cottontailBunEndAfterDrain = false;
+      socket.__cottontailNodeEnd?.();
+      socket.__cottontailBunShutdown = true;
+      return;
+    }
     call("drain", socket);
   });
   socket.on("end", () => call("end", socket));
@@ -15172,6 +15193,7 @@ export function listen(options) {
       path: normalized.unix || undefined,
       ownsPipePath: Boolean(normalized.unix),
       allowHalfOpen: normalized.allowHalfOpen,
+      pauseOnConnect: true,
     });
   }
   let stopped = false;
@@ -15186,7 +15208,11 @@ export function listen(options) {
       tlsConnections.set(socket, attached);
       if (typeof attached.handlers?.handshake === "function") callBunSocketOpen(attached);
     } else {
+      // Keep accepted bytes in the kernel until the synchronous open callback
+      // has had a chance to replace the fd with a TLS transport.
+      socket._paused = false;
       callBunSocketOpen(attached);
+      if (!socket.destroyed && !socket._paused) socket.resume();
     }
   });
   if (useTls) {

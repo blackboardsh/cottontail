@@ -485,3 +485,186 @@ test("Socket.upgradeTLS preserves raw bytes and exposes plaintext", async () => 
     await server.stop(true);
   }
 }, 15_000);
+
+test("server-side Socket.upgradeTLS accepts a TLS client", async () => {
+  const response = Promise.withResolvers<string>();
+  let upgradedSocket: Bun.Socket | undefined;
+  const server = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: {
+      open(rawSocket) {
+        try {
+          const [raw, secure] = rawSocket.upgradeTLS({
+            tls,
+            socket: {
+              handshake(_socket, success, error) {
+                if (!success) response.reject(error ?? new Error("server TLS handshake failed"));
+              },
+              data(socket, data) {
+                if (data.toString() !== "ping") {
+                  response.reject(new Error(`unexpected server payload: ${data}`));
+                  return;
+                }
+                socket.end("pong");
+              },
+              error(_socket, error) {
+                response.reject(error);
+              },
+            },
+          });
+          expect(raw).toBe(rawSocket);
+          upgradedSocket = secure;
+        } catch (error) {
+          response.reject(error);
+        }
+      },
+      data() {},
+      error(_socket, error) {
+        response.reject(error);
+      },
+    },
+  });
+
+  let client: Bun.Socket | undefined;
+  try {
+    client = await Bun.connect({
+      hostname: "127.0.0.1",
+      port: server.port,
+      tls: { rejectUnauthorized: false },
+      socket: {
+        handshake(socket, success, error) {
+          if (!success) {
+            response.reject(error ?? new Error("client TLS handshake failed"));
+            return;
+          }
+          socket.write("ping");
+        },
+        data(socket, data) {
+          response.resolve(data.toString());
+          socket.end();
+        },
+        error(_socket, error) {
+          response.reject(error);
+        },
+      },
+    });
+    expect(await withTimeout(response.promise)).toBe("pong");
+    expect(upgradedSocket?.listener).toBe(server);
+  } finally {
+    client?.terminate();
+    upgradedSocket?.terminate();
+    server.stop(true);
+  }
+});
+
+test("encrypted Bun socket writes report native partial progress and drain the remainder", async () => {
+  const payload = Buffer.alloc(16 * 1024 * 1024, 0x5a);
+  const firstWrite = Promise.withResolvers<number>();
+  const received = Promise.withResolvers<number>();
+  let upgradedSocket: Bun.Socket | undefined;
+  let writeStarted = false;
+  let writeOffset = 0;
+  let drainCalls = 0;
+  let receivedBytes = 0;
+
+  const fail = (error: unknown) => {
+    firstWrite.reject(error);
+    received.reject(error);
+  };
+  const writeRemaining = (socket: Bun.Socket) => {
+    const written = socket.write(payload.subarray(writeOffset));
+    if (written < 0) {
+      fail(new Error("encrypted socket write failed"));
+      return written;
+    }
+    writeOffset += written;
+    if (writeOffset === payload.byteLength) socket.end();
+    return written;
+  };
+
+  const server = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: {
+      open(rawSocket) {
+        try {
+          [, upgradedSocket] = rawSocket.upgradeTLS({
+            tls,
+            socket: {
+              data(socket, data) {
+                if (writeStarted) return;
+                if (data.toString() !== "ready") {
+                  fail(new Error(`unexpected readiness payload: ${data}`));
+                  return;
+                }
+                writeStarted = true;
+                firstWrite.resolve(writeRemaining(socket));
+              },
+              drain(socket) {
+                if (!writeStarted || writeOffset === payload.byteLength) return;
+                drainCalls += 1;
+                while (writeOffset < payload.byteLength && writeRemaining(socket) > 0) {}
+              },
+              error(_socket, error) {
+                fail(error);
+              },
+            },
+          });
+        } catch (error) {
+          fail(error);
+        }
+      },
+      data() {},
+      error(_socket, error) {
+        fail(error);
+      },
+    },
+  });
+
+  let client: Bun.Socket | undefined;
+  try {
+    client = await Bun.connect({
+      hostname: "127.0.0.1",
+      port: server.port,
+      tls: { rejectUnauthorized: false },
+      socket: {
+        handshake(socket, success, error) {
+          if (!success) {
+            fail(error ?? new Error("client TLS handshake failed"));
+            return;
+          }
+          socket.pause();
+          socket.write("ready");
+        },
+        data(_socket, data) {
+          if (data.byteLength > 0 && (data[0] !== 0x5a || data[data.byteLength - 1] !== 0x5a)) {
+            fail(new Error("encrypted payload was corrupted"));
+            return;
+          }
+          receivedBytes += data.byteLength;
+          if (receivedBytes > payload.byteLength) {
+            fail(new Error("encrypted payload exceeded the accepted byte count"));
+          } else if (receivedBytes === payload.byteLength) {
+            received.resolve(receivedBytes);
+          }
+        },
+        error(_socket, error) {
+          fail(error);
+        },
+      },
+    });
+
+    const initial = await withTimeout(firstWrite.promise);
+    expect(initial).toBeGreaterThanOrEqual(0);
+    expect(initial).toBeLessThan(payload.byteLength);
+    client.resume();
+    expect(await withTimeout(received.promise, 15_000)).toBe(payload.byteLength);
+    expect(writeOffset).toBe(payload.byteLength);
+    expect(drainCalls).toBeGreaterThan(0);
+  } finally {
+    client?.terminate();
+    upgradedSocket?.terminate();
+    server.stop(true);
+  }
+}, 20_000);

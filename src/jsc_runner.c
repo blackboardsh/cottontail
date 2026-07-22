@@ -1615,6 +1615,8 @@ typedef struct CtTlsConnection {
     bool client_hello_resolved;
     bool client_hello_rejected;
     bool renegotiation_disabled;
+    bool write_wanted;
+    bool write_wants_read;
     bool renegotiating;
     bool renegotiation_wants_write;
     bool renegotiation_completed;
@@ -12345,6 +12347,12 @@ static void ct_tls_init_once(void) {
     OpenSSL_add_ssl_algorithms();
 }
 
+static void ct_tls_enable_partial_writes(SSL *ssl) {
+    if (ssl != NULL) {
+        SSL_set_mode(ssl, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    }
+}
+
 static char *ct_tls_error_message(const char *fallback) {
     unsigned long code = ERR_get_error();
     if (code == 0) return ct_duplicate_string(fallback != NULL ? fallback : "TLS operation failed");
@@ -12680,14 +12688,6 @@ static bool ct_tls_connection_is_active(CtTlsConnection *connection) {
     active = connection->active;
     pthread_mutex_unlock(&connection->mutex);
     return active;
-}
-
-static bool ct_tls_connection_read_is_paused(CtTlsConnection *connection) {
-    bool paused = false;
-    pthread_mutex_lock(&connection->mutex);
-    paused = connection->read_paused;
-    pthread_mutex_unlock(&connection->mutex);
-    return paused;
 }
 
 static void ct_tls_connection_set_active(CtTlsConnection *connection, bool active) {
@@ -13654,6 +13654,7 @@ static void *ct_tls_server_thread(void *opaque) {
             close(fd);
             continue;
         }
+        ct_tls_enable_partial_writes(ssl);
         SSL_set_fd(ssl, fd);
         if (SSL_accept(ssl) != 1) {
             SSL_free(ssl);
@@ -13689,16 +13690,20 @@ static void *ct_tls_read_thread(void *opaque) {
     size_t pending_capacity = 0;
     while (ct_tls_connection_is_active(connection)) {
         pthread_mutex_lock(&connection->mutex);
+        bool read_paused = connection->read_paused;
+        bool write_wanted = connection->write_wanted;
+        bool write_wants_read = connection->write_wants_read;
         bool renegotiating = connection->renegotiating;
         bool renegotiation_wants_write = connection->renegotiation_wants_write;
         pthread_mutex_unlock(&connection->mutex);
-        if (ct_tls_connection_read_is_paused(connection) && !renegotiating) {
+        if (read_paused && !renegotiating && !write_wanted) {
             usleep(1000);
             continue;
         }
         struct pollfd poll_fd;
         poll_fd.fd = connection->fd;
         poll_fd.events = POLLIN | POLLHUP | POLLERR;
+        if (write_wanted && !write_wants_read) poll_fd.events |= POLLOUT;
         if (renegotiating && renegotiation_wants_write) poll_fd.events |= POLLOUT;
         poll_fd.revents = 0;
         int ready = poll(&poll_fd, 1, 50);
@@ -13712,6 +13717,29 @@ static void *ct_tls_read_thread(void *opaque) {
         if ((poll_fd.revents & POLLNVAL) != 0) {
             ct_queue_fd_error(connection->runtime, connection->id, EBADF, "invalid TLS socket");
             break;
+        }
+
+        bool notify_writable = false;
+        pthread_mutex_lock(&connection->mutex);
+        if (connection->write_wanted) {
+            bool writable_ready = connection->write_wants_read
+                ? (poll_fd.revents & POLLIN) != 0
+                : (poll_fd.revents & POLLOUT) != 0;
+            if (writable_ready) {
+                connection->write_wanted = false;
+                connection->write_wants_read = false;
+                notify_writable = true;
+            }
+        }
+        read_paused = connection->read_paused;
+        renegotiating = connection->renegotiating;
+        pthread_mutex_unlock(&connection->mutex);
+        if (notify_writable) ct_queue_fd_simple(connection->runtime, connection->id, "writable", NULL);
+
+        bool terminal_ready = (poll_fd.revents & (POLLHUP | POLLERR)) != 0;
+        if ((poll_fd.revents & (POLLIN | POLLHUP | POLLERR)) == 0 ||
+            (read_paused && !renegotiating && !terminal_ready)) {
+            continue;
         }
 
         bool terminal = false;
@@ -13918,6 +13946,7 @@ static JSValueRef ct_tls_client_connect_owned_fd(
         free(message);
         return JSValueMakeUndefined(ctx);
     }
+    ct_tls_enable_partial_writes(ssl);
     if (ct_tls_apply_session(ctx, ssl, session_bytes, session_len, exception) != 0) {
         SSL_free(ssl);
         SSL_CTX_free(ssl_ctx);
@@ -14316,6 +14345,7 @@ static JSValueRef ct_tls_client_connect_memory(JSContextRef ctx, JSObjectRef fun
     SSL_CTX_set_session_cache_mode(ssl_ctx, SSL_SESS_CACHE_CLIENT);
     SSL_CTX_sess_set_new_cb(ssl_ctx, ct_tls_new_session_callback);
     SSL *ssl = SSL_new(ssl_ctx);
+    ct_tls_enable_partial_writes(ssl);
     if (ssl != NULL && ct_tls_apply_session(ctx, ssl, session_bytes, session_len, exception) != 0) {
         SSL_free(ssl);
         SSL_CTX_free(ssl_ctx);
@@ -14635,6 +14665,7 @@ static JSValueRef ct_tls_server_upgrade_fd(JSContextRef ctx, JSObjectRef functio
         free(message);
         return JSValueMakeUndefined(ctx);
     }
+    ct_tls_enable_partial_writes(connection->ssl);
     SSL_set_app_data(connection->ssl, connection);
     ct_set_nonblocking_fd(fd);
     SSL_set_fd(connection->ssl, fd);
@@ -15685,10 +15716,10 @@ static JSValueRef ct_tls_connection_write(JSContextRef ctx, JSObjectRef function
     (void)thisObject;
     if (argc < 2) {
         ct_throw_message(ctx, exception, "tlsConnectionWrite(id, data) requires connection id and data");
-        return JSValueMakeBoolean(ctx, false);
+        return JSValueMakeNumber(ctx, -1);
     }
     CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (connection == NULL) return JSValueMakeBoolean(ctx, false);
+    if (connection == NULL) return JSValueMakeNumber(ctx, -1);
     uint8_t *bytes = NULL;
     size_t len = 0;
     char *text = NULL;
@@ -15698,31 +15729,48 @@ static JSValueRef ct_tls_connection_write(JSContextRef ctx, JSObjectRef function
         len = text != NULL ? strlen(text) : 0;
     }
     size_t written_total = 0;
-    bool ok = true;
+    char *write_error = NULL;
     while (written_total < len) {
         size_t remaining = len - written_total;
         int chunk_len = remaining > INT_MAX ? INT_MAX : (int)remaining;
         pthread_mutex_lock(&connection->mutex);
-        int written = SSL_write(connection->ssl, bytes + written_total, chunk_len);
-        int ssl_error = written <= 0 ? SSL_get_error(connection->ssl, written) : SSL_ERROR_NONE;
+        ERR_clear_error();
+        errno = 0;
+        int written = connection->ssl != NULL
+            ? SSL_write(connection->ssl, bytes + written_total, chunk_len)
+            : -1;
+        int write_errno = errno;
+        int ssl_error = written <= 0 && connection->ssl != NULL
+            ? SSL_get_error(connection->ssl, written)
+            : SSL_ERROR_SYSCALL;
+        if (written > 0) {
+            connection->write_wanted = false;
+            connection->write_wants_read = false;
+        } else if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE ||
+                   (ssl_error == SSL_ERROR_SYSCALL && (write_errno == EAGAIN || write_errno == EWOULDBLOCK))) {
+            connection->write_wanted = !connection->memory_bio;
+            connection->write_wants_read = !connection->memory_bio && ssl_error == SSL_ERROR_WANT_READ;
+        } else if (!(ssl_error == SSL_ERROR_SYSCALL && write_errno == EINTR)) {
+            connection->write_wanted = false;
+            connection->write_wants_read = false;
+            write_error = ct_tls_error_message("TLS socket write failed");
+        }
         pthread_mutex_unlock(&connection->mutex);
         if (written > 0) {
             written_total += (size_t)written;
             continue;
         }
-        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
-            if (connection->memory_bio) {
-                ok = false;
-                break;
-            }
-            usleep(1000);
-            continue;
-        }
-        ok = false;
+        if (ssl_error == SSL_ERROR_SYSCALL && write_errno == EINTR) continue;
         break;
     }
     free(text);
-    return JSValueMakeBoolean(ctx, ok);
+    bool write_failed = write_error != NULL;
+    if (write_failed && written_total > 0 && !connection->memory_bio) {
+        ct_queue_fd_simple(connection->runtime, connection->id, "error", write_error);
+    }
+    free(write_error);
+    if (written_total == 0 && write_failed) return JSValueMakeNumber(ctx, -1);
+    return JSValueMakeNumber(ctx, (double)written_total);
 }
 
 static JSValueRef ct_tls_connection_close(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
