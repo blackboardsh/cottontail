@@ -807,6 +807,23 @@ test("in-process TLS keepalive peers are stable and separated by config", async 
   expect(separate).not.toBe(first);
 });
 
+test("Bun.serve accepts top-level TLS options", async () => {
+  using server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    cert,
+    key,
+    fetch() {
+      return new Response("secure");
+    },
+  });
+
+  expect(server.url.protocol).toBe("https:");
+  expect(await fetch(server.url, { tls: { ca: cert, rejectUnauthorized: false } }).then(response => response.text())).toBe(
+    "secure",
+  );
+});
+
 test("Bun.connect settles before a plain HTTP peer rejects TLS", async () => {
   let requests = 0;
   using server = Bun.serve({

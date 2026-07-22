@@ -11649,7 +11649,8 @@ export function serve(options) {
   if (websocketHandlers != null && typeof websocketHandlers !== "object") {
     throw new TypeError("Expected websocket to be an object");
   }
-  const tlsConfigs = validateServeTls(options.tls);
+  const legacyTls = options.cert != null || options.key != null ? options : null;
+  const tlsConfigs = validateServeTls(options.tls ?? legacyTls);
   const configuredMaxRequestBodySize = Number(options.maxRequestBodySize ?? 128 * 1024 * 1024);
   if (websocketHandlers != null || tlsConfigs != null || hostname.includes(":")) {
     return serveNodeBacked(options, { hostname, unixPath, tlsConfigs, inspectorReload });
