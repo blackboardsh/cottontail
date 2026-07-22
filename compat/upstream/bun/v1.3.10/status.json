@@ -458,6 +458,20 @@
       "pattern": "^test/js/(?:bun/http/bun-serve-html(?:-entry|-manifest)?\\.test\\.ts|node/http/node-http-with-ws\\.test\\.ts)$",
       "status": "enabled",
       "reason": "Focused batch validation confirms Bun HTML serving, generated manifests/assets, CLI HTML entrypoints, and Node HTTP/WebSocket interoperability."
+    },
+    {
+      "pattern": "^test/regression/issue/(?:08093|21907|22003|23474|23649)\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Exact copied regressions pass package hardlink installation, large CSS-number parsing, sourcemap filename escaping, WebSocket upgrade cookies, and malformed async-function diagnostics (7 cases, 40 assertions)."
+    },
+    {
+      "pattern": "^test/regression/issue/12548\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Both copied BunPlugin TypeScript loader and type-import regressions pass; stock-JSC compilation requires a larger per-file budget (2 cases, 6 assertions).",
+      "args": [
+        "--timeout=30000"
+      ],
+      "timeoutMs": 45000
     }
   ],
   "tests": {
