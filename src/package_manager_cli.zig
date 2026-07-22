@@ -96,6 +96,7 @@ const Options = struct {
     registry: ?[]const u8 = null,
     ca: []const []const u8 = &.{},
     ca_file_name: ?[]const u8 = null,
+    global: bool = false,
     production: bool = false,
     ignore_scripts: bool = false,
     trust: bool = false,
@@ -748,6 +749,9 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
             if (value.len == 0) return error.MissingOptionValue;
             options.os_overridden = true;
             if (!applyPlatformOverride(Npm.OperatingSystem, &os_override, value)) options.invalid_os = value;
+        } else if (std.mem.eql(u8, arg, "--global") or std.mem.eql(u8, arg, "-g")) {
+            if (options.command != .install and options.command != .add) return error.InvalidPackageManagerOption;
+            options.global = true;
         } else if (std.mem.eql(u8, arg, "--production") or std.mem.eql(u8, arg, "--prod") or std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "-P")) {
             options.production = true;
         } else if (std.mem.eql(u8, arg, "--ignore-scripts")) {
@@ -2117,6 +2121,8 @@ const Manager = struct {
     registry_scopes: std.StringHashMap(RegistryConfig),
     certificate_authorities: []const []const u8 = &.{},
     certificate_authority_file: ?[]const u8 = null,
+    global_install_directory: ?[]const u8 = null,
+    global_bin_directory: ?[]const u8 = null,
     cache_directory: ?[]const u8 = null,
     save_text_lockfile: bool = true,
     save_text_lockfile_configured: bool = false,
@@ -2292,7 +2298,19 @@ const Manager = struct {
             manager.options.command = .add;
         }
         manager.invocation_dir = try absolutePath(manager.init_data.io, manager.allocator, ".");
-        if (manager.options.command == .patch or manager.options.command == .patch_commit) {
+        if (manager.options.global) {
+            if (manager.options.config_path) |config_path| {
+                manager.options.config_path = try absolutePathFrom(manager.allocator, manager.invocation_dir, config_path);
+            } else {
+                const invocation_bunfig = try std.fs.path.join(manager.allocator, &.{ manager.invocation_dir, "bunfig.toml" });
+                if (std.Io.Dir.cwd().access(manager.init_data.io, invocation_bunfig, .{})) |_| {
+                    manager.options.config_path = invocation_bunfig;
+                } else |_| {}
+            }
+            manager.root_dir = try manager.resolveGlobalInstallRoot();
+            try std.Io.Dir.cwd().createDirPath(manager.init_data.io, manager.root_dir);
+            manager.invocation_package_dir = manager.root_dir;
+        } else if (manager.options.command == .patch or manager.options.command == .patch_commit) {
             manager.root_dir = try findPatchProjectRoot(manager.init_data.io, manager.allocator, manager.invocation_dir);
             manager.invocation_package_dir = manager.root_dir;
         } else {
@@ -4095,6 +4113,49 @@ const Manager = struct {
         manager.client.now = now;
     }
 
+    fn globalDirectoryFromBunfig(manager: *Manager, path: []const u8) !?[]const u8 {
+        const source_text = (try readOptionalFile(manager.init_data.io, manager.allocator, path, 1024 * 1024)) orelse return null;
+        var ast_memory_allocator: compiler.ast.ASTMemoryAllocator = undefined;
+        var ast_scope = ast_memory_allocator.enter(manager.allocator);
+        defer ast_scope.exit();
+
+        var log = compiler.logger.Log.init(manager.allocator);
+        defer log.deinit();
+        const source = compiler.logger.Source.initPathString(path, source_text);
+        const root = compiler.interchange.toml.TOML.parse(&source, &log, manager.allocator, true) catch return null;
+        if (log.hasErrors()) return null;
+        const install = root.get("install") orelse return null;
+        const global_dir = install.get("globalDir") orelse return null;
+        return global_dir.asString(manager.allocator);
+    }
+
+    fn resolveGlobalInstallRoot(manager: *Manager) ![]const u8 {
+        if (manager.init_data.environ_map.get("BUN_INSTALL_GLOBAL_DIR")) |path| {
+            return absolutePathFrom(manager.allocator, manager.invocation_dir, path);
+        }
+
+        var configured: ?[]const u8 = null;
+        if (manager.init_data.environ_map.get("XDG_CONFIG_HOME") orelse manager.init_data.environ_map.get("HOME")) |home| {
+            const global_bunfig = try std.fs.path.join(manager.allocator, &.{ home, ".bunfig.toml" });
+            configured = try manager.globalDirectoryFromBunfig(global_bunfig);
+        }
+        if (manager.options.config_path) |config_path| {
+            configured = (try manager.globalDirectoryFromBunfig(config_path)) orelse configured;
+        }
+        if (configured) |path| return absolutePathFrom(manager.allocator, manager.invocation_dir, path);
+
+        if (manager.init_data.environ_map.get("BUN_INSTALL")) |home| {
+            return std.fs.path.join(manager.allocator, &.{ home, "install", "global" });
+        }
+        if (manager.init_data.environ_map.get("XDG_CACHE_HOME") orelse manager.init_data.environ_map.get("HOME")) |home| {
+            return std.fs.path.join(manager.allocator, &.{ home, ".bun", "install", "global" });
+        }
+        if (manager.init_data.environ_map.get("USERPROFILE")) |home| {
+            return std.fs.path.join(manager.allocator, &.{ home, ".bun", "install", "global" });
+        }
+        return error.MissingGlobalInstallDirectory;
+    }
+
     fn loadConfiguration(manager: *Manager) !void {
         var registry = manager.options.registry;
         var configured_linker = manager.options.linker;
@@ -4194,6 +4255,14 @@ const Manager = struct {
 
         manager.registry_source = try manager.allocator.dupe(u8, registry orelse default_registry);
         manager.registry = try normalizeRegistryUrl(manager.allocator, manager.registry_source);
+        if (manager.options.global) {
+            const configured_bin = if (manager.init_data.environ_map.get("BUN_INSTALL_BIN") != null)
+                null
+            else
+                manager.global_bin_directory;
+            const bin_path = configured_bin orelse try globalBinPath(manager.init_data, manager.allocator);
+            manager.global_bin_directory = try absolutePathFrom(manager.allocator, manager.root_dir, bin_path);
+        }
         try manager.configureCertificateAuthorities();
     }
 
@@ -4259,6 +4328,12 @@ const Manager = struct {
         const root = try compiler.interchange.toml.TOML.parse(&source, &log, manager.allocator, true);
         const install = root.get("install") orelse return null;
         var default_registry_config: ?RegistryConfig = null;
+        if (install.get("globalDir")) |global_dir| {
+            if (global_dir.asString(manager.allocator)) |value| manager.global_install_directory = value;
+        }
+        if (install.get("globalBinDir")) |global_bin_dir| {
+            if (global_bin_dir.asString(manager.allocator)) |value| manager.global_bin_directory = value;
+        }
         if (install.get("cafile")) |cafile| {
             const value = cafile.asString(manager.allocator) orelse {
                 try manager.stderr.print("{s}: Invalid cafile. Expected a string.\n", .{path});
@@ -9694,7 +9769,9 @@ const Manager = struct {
             try manager.isolatedConsumerModules(parent_dir)
         else
             "";
-        const bin_dir = if (manager.node_linker == .isolated)
+        const bin_dir = if (manager.options.global and report_direct)
+            manager.global_bin_directory orelse return error.MissingGlobalBinDirectory
+        else if (manager.node_linker == .isolated)
             try std.fs.path.join(manager.allocator, &.{ consumer_modules, ".bin" })
         else
             try manager.binDirectoryForPackage(package_dir);
