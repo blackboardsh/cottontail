@@ -653,8 +653,8 @@
       "reason": "Bake HTML development routing, script/style injection, and response behavior pass all 7 copied cases with 26 assertions."
     },
     "test/bake/dev/import-meta-inline.test.ts": {
-      "status": "expected-failure",
-      "reason": "Five of six focused cases pass; the client-runtime case does not complete within the copied test's 10-second deadline in the integrated runtime."
+      "status": "enabled",
+      "reason": "Bake inlines server import.meta properties and preserves client runtime values across static, dynamic, nested, and catch-all routes (6 cases, 68 assertions)."
     },
     "test/bake/dev/import-meta-inline-negative.test.ts": {
       "status": "enabled",
@@ -663,6 +663,10 @@
     "test/bake/dev/incremental-graph-edge-deletion.test.ts": {
       "status": "enabled",
       "reason": "Bake's incremental graph retains sibling dependency edges through rapid deletion and recreation updates (1 case, 1 assertion)."
+    },
+    "test/bake/dev/request-cookies.test.ts": {
+      "status": "enabled",
+      "reason": "Bake passes request cookie state and the original Request object through React server rendering (2 cases, 4 assertions)."
     },
     "test/bake/dev/response-to-bake-response.test.ts": {
       "status": "enabled",
