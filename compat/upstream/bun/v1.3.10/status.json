@@ -2306,8 +2306,9 @@
       "reason": "Bun.hash and its Wyhash, Adler-32, CRC-32, CityHash, xxHash, Murmur, and RapidHash variants pass exact upstream vectors and 64-bit seed coverage through Zig implementations."
     },
     "test/js/bun/util/heap-snapshot.test.ts": {
-      "status": "expected-failure",
-      "reason": "The heap-snapshot file passes in its original lane but does not complete within the owned 30-second file deadline after integration."
+      "status": "enabled",
+      "reason": "All eight native-size heap snapshot cases pass on the integrated stock-JSC runtime; the larger real JSC graph needs a 60-second file budget.",
+      "timeoutMs": 60000
     },
     "test/js/bun/util/v8-heap-snapshot.test.ts": {
       "status": "enabled",
