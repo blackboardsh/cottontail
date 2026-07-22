@@ -2491,9 +2491,11 @@ function executeBundledCommonJsModule(module, filename, source) {
         target: "bun",
         preserveExternalRequireName: true,
         runtimeFileLoaderPaths: true,
-        // Keep JavaScript dependencies in createRequire()'s shared module
-        // cache. Bundling them into each required ESM entry creates duplicate
-        // module instances and breaks ESM live bindings across re-exports.
+        // Keep packages and JavaScript dependencies in createRequire()'s
+        // shared module cache. Inlining a package while externalizing its
+        // relative files also moves those require() calls under the entry's
+        // directory and gives them the wrong referrer.
+        packages: "external",
         external: ["*.js", "*.mjs", "*.cjs"],
         define: {
           "import.meta": "__ctImportMeta",

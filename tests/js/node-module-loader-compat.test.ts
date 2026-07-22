@@ -25,6 +25,33 @@ test("require uses an ESM module.exports export as its direct result", () => {
   expect(require(namespace).value).toBe(42);
 });
 
+test("synchronous ESM entries preserve package-relative import referrers", () => {
+  const { createRequire } = require("node:module");
+  const packageDir = join(root, "node_modules", "loader-referrer-package");
+  const entry = join(root, "package-referrer-entry.mjs");
+  require("node:fs").mkdirSync(packageDir, { recursive: true });
+  writeFileSync(join(packageDir, "package.json"), JSON.stringify({
+    name: "loader-referrer-package",
+    type: "module",
+    exports: "./index.js",
+  }));
+  writeFileSync(join(packageDir, "index.js"), 'export { encode } from "./hex.js";\n');
+  writeFileSync(join(packageDir, "hex.js"), [
+    "export function encode(value) {",
+    '  return Array.from(value, character => character.charCodeAt(0).toString(16).padStart(2, "0")).join("");',
+    "}",
+    "",
+  ].join("\n"));
+  writeFileSync(entry, [
+    'import { encode } from "loader-referrer-package";',
+    'export const encoded = encode("ok");',
+    "",
+  ].join("\n"));
+
+  const localRequire = createRequire(join(root, "package-referrer-require.cjs"));
+  expect(localRequire(entry).encoded).toBe("6f6b");
+});
+
 test("a failed synchronous TLA require is evicted before dynamic import", async () => {
   const { createRequire } = require("node:module");
   const { pathToFileURL } = require("node:url");
