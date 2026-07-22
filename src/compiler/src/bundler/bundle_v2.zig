@@ -3302,7 +3302,8 @@ pub const BundleV2 = struct {
                                         .{
                                             import_record.kind.errorLabel(),
                                             import_record.path.text,
-                                            if (this.transpiler.options.dev_server == null)
+                                            if (this.transpiler.options.dev_server == null and
+                                                this.transpiler.options.output_format != .internal_bake_dev)
                                                 ". To use Node.js builtins, set target to 'node' or 'bun'"
                                             else
                                                 "",
@@ -3319,7 +3320,8 @@ pub const BundleV2 = struct {
                                         .{
                                             import_record.kind.errorLabel(),
                                             import_record.path.text,
-                                            if (this.transpiler.options.dev_server == null)
+                                            if (this.transpiler.options.dev_server == null and
+                                                this.transpiler.options.output_format != .internal_bake_dev)
                                                 ". When bundling for Bun, set target to 'bun'"
                                             else
                                                 "",
@@ -3336,7 +3338,8 @@ pub const BundleV2 = struct {
                                         .{
                                             import_record.kind.errorLabel(),
                                             import_record.path.text,
-                                            if (this.transpiler.options.dev_server == null)
+                                            if (this.transpiler.options.dev_server == null and
+                                                this.transpiler.options.output_format != .internal_bake_dev)
                                                 ". When bundling for Bun, set target to 'bun'"
                                             else
                                                 "",
@@ -3401,23 +3404,27 @@ pub const BundleV2 = struct {
                 continue;
             }
 
-            if (this.transpiler.options.dev_server) |dev_server| brk: {
-                if (path.loader(&this.transpiler.options.loaders) == .html and (import_record.loader == null or import_record.loader.? == .html)) {
-                    // This use case is currently not supported. This error
-                    // blocks an assertion failure because the DevServer
-                    // reserves the HTML file's spot in IncrementalGraph for the
-                    // route definition.
-                    const log = this.logForResolutionFailures(source.path.text, bake_graph);
-                    log.addRangeErrorFmt(
-                        source,
-                        import_record.range,
-                        this.allocator(),
-                        "Browser builds cannot import HTML files.",
-                        .{},
-                    ) catch |err| bun.handleOom(err);
-                    continue;
-                }
+            // COTTONTAIL-COMPAT: Cottontail's JavaScript-hosted Bake server
+            // requests the internal format without installing Bun's native
+            // DevServer pointer. Preserve the same graph-specific HTML import
+            // diagnostic while still allowing explicit non-HTML loaders.
+            if ((this.transpiler.options.dev_server != null or
+                this.transpiler.options.output_format == .internal_bake_dev) and
+                path.loader(&this.transpiler.options.loaders) == .html and
+                (import_record.loader == null or import_record.loader.? == .html))
+            {
+                const log = this.logForResolutionFailures(source.path.text, bake_graph);
+                log.addRangeErrorFmt(
+                    source,
+                    import_record.range,
+                    this.allocator(),
+                    "Browser builds cannot import HTML files.",
+                    .{},
+                ) catch |err| bun.handleOom(err);
+                continue;
+            }
 
+            if (this.transpiler.options.dev_server) |dev_server| brk: {
                 if (loader == .css) {
                     // Do not use cached files for CSS.
                     break :brk;

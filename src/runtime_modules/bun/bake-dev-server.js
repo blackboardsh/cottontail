@@ -513,6 +513,16 @@ function bakeRegistryModules(source) {
   return (0, eval)(`({${bakeRegistrySource(source)}\n})`);
 }
 
+function addBakeBundleConfig(source, property, value) {
+  const configStart = source.lastIndexOf("\n}, {\n  main: ");
+  const configEnd = source.lastIndexOf("\n});");
+  if (configStart < 0 || configEnd <= configStart) {
+    throw new SyntaxError("Bake's internal browser bundle is missing its configuration trailer");
+  }
+  if (source.slice(configStart, configEnd).includes(`\n  ${property}: `)) return source;
+  return `${source.slice(0, configEnd)},\n  ${property}: ${JSON.stringify(value)}${source.slice(configEnd)}`;
+}
+
 function rewriteBakeClientBuiltins(source) {
   return source
     .replaceAll('"bake/client"', '"bun:bake/client"')
@@ -520,7 +530,23 @@ function rewriteBakeClientBuiltins(source) {
 }
 
 function bakeModuleDefinitionSource(value) {
-  if (typeof value === "function") return value.toString();
+  if (typeof value === "function") {
+    const source = Function.prototype.toString.call(value);
+    if (source.includes("=>") || /^(?:async\s+)?function\b|^class\b/.test(source)) return source;
+
+    // COTTONTAIL-COMPAT: The internal Bake bundle registry uses object-method
+    // factories. Function#toString preserves that method syntax, which is not
+    // a valid expression after the HMR packet's `moduleId:` property prefix.
+    const parameters = source.indexOf("(");
+    if (parameters >= 0) {
+      let method = source.slice(0, parameters).trim();
+      const isAsync = method.startsWith("async ");
+      if (isAsync) method = method.slice("async ".length).trimStart();
+      const isGenerator = method.startsWith("*");
+      return `${isAsync ? "async " : ""}function${isGenerator ? "*" : ""}${source.slice(parameters)}`;
+    }
+    return source;
+  }
   if (Array.isArray(value)) return `[${value.map(bakeModuleDefinitionSource).join(",")}]`;
   if (value === undefined) return "undefined";
   return JSON.stringify(value);
@@ -1246,6 +1272,12 @@ function createFrameworkDispatcher(config) {
     : [];
   const reactFastRefresh = framework.reactFastRefresh === true ||
     (framework.reactFastRefresh !== null && typeof framework.reactFastRefresh === "object");
+  const reactFastRefreshImportSource = typeof framework.reactFastRefresh?.importSource === "string"
+    ? framework.reactFastRefresh.importSource
+    : "react-refresh/runtime";
+  const clientAlias = reactFastRefresh && reactFastRefreshImportSource !== "react-refresh/runtime"
+    ? { ...(clientOptions.alias ?? {}), "react-refresh/runtime": reactFastRefreshImportSource }
+    : clientOptions.alias;
   const development = globalThis.process?.env?.NODE_ENV !== "production";
   const bundles = new Map();
   const wrapperPaths = new Map();
@@ -1435,6 +1467,7 @@ function createFrameworkDispatcher(config) {
     const boundaryPlugins = boundaries.length > 0 ? [pluginBoundaryResolverPlugin(boundaries)] : [];
     const result = await Bun.build(frameworkBuildOptions({
       ...clientOptions,
+      alias: clientAlias,
       entrypoints: [wrapperPath],
       format: development ? "internal_bake_dev" : "esm",
       minify: development ? false : clientOptions.minify,
@@ -1459,13 +1492,32 @@ function createFrameworkDispatcher(config) {
     if (!artifact) throw new Error(`Bake's client build did not emit ${router.clientEntryPoint ?? wrapperPath}`);
 
     const originalSource = rewriteBakeClientBuiltins(await artifact.text());
+    const clientModules = development ? bakeRegistryModules(originalSource) : null;
     const url = bakeRouteClientUrl(record.id, record.generation);
     let servedSource = originalSource;
+    if (development && reactFastRefresh) {
+      const refreshPath = resolveBakeImport(wrapperPath, "react-refresh/runtime", {
+        alias: { ...(clientAlias ?? {}), ...builtIns.alias },
+        files: { ...(clientOptions.files ?? {}), ...builtIns.files },
+      });
+      const refreshId = refreshPath === null ? null : moduleIdForPath(projectRoot, refreshPath);
+      if (refreshId === null || !Object.prototype.hasOwnProperty.call(clientModules, refreshId)) {
+        throw new Error(`Bake's client build did not emit React Fast Refresh runtime ${reactFastRefreshImportSource}`);
+      }
+      // COTTONTAIL-COMPAT: Bun's native IncrementalGraph adds this field to
+      // the initial response. Cottontail's JS-hosted graph must point the same
+      // embedded HMR runtime at the bundled refresh module before loading main.
+      servedSource = addBakeBundleConfig(servedSource, "refresh", refreshId);
+    }
     const sourceMap = artifact.sourcemap ?? result.outputs.find(output => output.kind === "sourcemap");
     if (sourceMap) {
       const sourceMapComment = `//# sourceMappingURL=${url}.map`;
-      servedSource = /\/\/# sourceMappingURL=[^\r\n]*/.test(servedSource)
-        ? servedSource.replace(/\/\/# sourceMappingURL=[^\r\n]*/g, sourceMapComment)
+      // COTTONTAIL-COMPAT: Only rewrite a standalone output directive. React
+      // contains sourceMappingURL text inside template literals; treating that
+      // JavaScript as a directive corrupts the emitted Bake client bundle.
+      const sourceMapDirective = /^[\t ]*\/\/# sourceMappingURL=[^`\r\n]*[\t ]*$/m;
+      servedSource = sourceMapDirective.test(servedSource)
+        ? servedSource.replace(sourceMapDirective, sourceMapComment)
         : `${servedSource}\n${sourceMapComment}\n`;
       assets.set(`${url}.map`, {
         body: sourceMap,
@@ -1481,7 +1533,7 @@ function createFrameworkDispatcher(config) {
     retiredClientEntries.delete(url);
     assets.set(url, { body: servedSource, type: "text/javascript; charset=utf-8" });
     return {
-      modules: development ? bakeRegistryModules(originalSource) : null,
+      modules: clientModules,
       styles: await collectBuildAssets(result),
       url,
     };

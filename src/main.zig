@@ -1234,7 +1234,11 @@ fn runStandaloneIfPresent(
 fn runBakeProductionBuild(init: std.process.Init, entrypoint: []const u8, outdir: []const u8) !u8 {
     const allocator = init.arena.allocator();
     var source: std.ArrayList(u8) = .empty;
+    // COTTONTAIL-COMPAT: Referencing a non-minimal Bun API makes the eval
+    // launcher install the full runtime, which owns the Bake production
+    // builder. This is equivalent to Bun entering its native Bake build path.
     try source.appendSlice(allocator,
+        \\void Bun.build;
         \\const __ctBuildBakeProduction = globalThis[Symbol.for("cottontail.internal.buildBakeProduction")];
         \\if (typeof __ctBuildBakeProduction !== "function") throw new Error("Bake production builder is unavailable");
         \\await __ctBuildBakeProduction({ entrypoint:

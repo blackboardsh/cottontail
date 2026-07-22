@@ -1305,8 +1305,17 @@ fn runWithSourceCode(
     // For files that are not user-specified entrypoints, set `import.meta.main` to `false`.
     // Entrypoints will have `import.meta.main` set as "unknown", unless we use `--compile`,
     // in which we inline `true`.
-    if (transpiler.options.inline_entrypoint_import_meta_main or !task.is_entry_point) {
-        opts.import_meta_main_value = task.is_entry_point and transpiler.options.dev_server == null;
+    if (transpiler.options.inline_entrypoint_import_meta_main or
+        !task.is_entry_point or
+        output_format == .internal_bake_dev)
+    {
+        // COTTONTAIL-COMPAT: Cottontail hosts Bake's dev server in JavaScript,
+        // so there is no native DevServer pointer even though this is a Bake
+        // graph. Like Bun's in-process DevServer, every graph entry observes
+        // import.meta.main as false because there is no single entry point.
+        opts.import_meta_main_value = task.is_entry_point and
+            transpiler.options.dev_server == null and
+            output_format != .internal_bake_dev;
     } else if (target == .node) {
         opts.lower_import_meta_main_for_node_js = true;
     }
