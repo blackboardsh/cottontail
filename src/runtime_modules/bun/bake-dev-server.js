@@ -2,7 +2,7 @@ import path from "../node/path.js";
 import { readFileSync, readdirSync, statSync, writeFileSync } from "../node/fs.js";
 import { pathToFileURL } from "../node/url.js";
 import { __setBuiltinModules } from "../node/module.js";
-import { Bun, HTMLRewriter, serve } from "./index.js";
+import { Bun, HTMLRewriter, Response as RuntimeResponse, serve } from "./index.js";
 import {
   bakeGraphAttributeFiles,
   contentTypeForStaticFile,
@@ -96,7 +96,7 @@ function decorateControlResponse(response) {
 
 function ensureBakeResponseInstalled() {
   if (BakeResponse !== null) return BakeResponse;
-  const WebResponse = globalThis.Response;
+  const WebResponse = RuntimeResponse;
   if (typeof WebResponse !== "function") {
     throw new TypeError("The Web Response constructor is not installed");
   }
