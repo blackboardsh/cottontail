@@ -47,6 +47,47 @@ function normalizeData(data, options) {
   return data;
 }
 
+function normalizeWebSocketUrl(value) {
+  let parsed;
+  try {
+    parsed = value instanceof URL ? new URL(value.href) : new URL(String(value));
+  } catch {
+    throw new SyntaxError(`Invalid URL: ${value}`);
+  }
+  if (parsed.protocol === "http:") parsed.protocol = "ws:";
+  else if (parsed.protocol === "https:") parsed.protocol = "wss:";
+  if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
+    throw new SyntaxError('The URL\'s protocol must be one of "ws:", "wss:", "http:", or "https:"');
+  }
+  if (parsed.hash) throw new SyntaxError("The URL contains a fragment identifier");
+  return parsed;
+}
+
+function normalizeProtocols(protocols) {
+  const values = protocols == null ? [] : Array.isArray(protocols) ? protocols : [protocols];
+  const seen = new Set();
+  return values.map((protocol) => {
+    if (typeof protocol !== "string" || !tokenPattern.test(protocol) || seen.has(protocol)) {
+      throw new SyntaxError("An invalid or duplicated subprotocol was specified");
+    }
+    seen.add(protocol);
+    return protocol;
+  });
+}
+
+function cloneHeaders(input) {
+  if (input == null) return null;
+  const headers = Object.create(null);
+  const entries = typeof input.entries === "function" ? input.entries() : Object.entries(input);
+  for (const [name, value] of entries) headers[String(name)] = value;
+  return headers;
+}
+
+function hasHeader(headers, name) {
+  const wanted = String(name).toLowerCase();
+  return headers != null && Object.keys(headers).some((header) => header.toLowerCase() === wanted);
+}
+
 function extractAgentOptions(agent) {
   const connectOptions = agent?.connectOpts || agent?.options;
   let tls = null;
@@ -83,6 +124,7 @@ function replacePropertyListener(target, name, listener, wrap) {
 }
 
 class WebSocket extends EventEmitter {
+  static [Symbol.toStringTag] = "WebSocket";
   static CONNECTING = CONNECTING;
   static OPEN = OPEN;
   static CLOSING = CLOSING;
@@ -90,8 +132,9 @@ class WebSocket extends EventEmitter {
 
   constructor(url, protocols = undefined, options = undefined) {
     super();
+    const parsedUrl = normalizeWebSocketUrl(url);
     this._ws = null;
-    this._url = String(url);
+    this._url = parsedUrl.href;
     this._binaryType = "nodebuffer";
     this._fragments = false;
     this._paused = false;
@@ -107,7 +150,7 @@ class WebSocket extends EventEmitter {
         protocols = [protocols];
       }
     }
-    if (!Array.isArray(protocols)) protocols = [protocols];
+    protocols = normalizeProtocols(protocols);
     options = options && typeof options === "object" ? options : {};
 
     let proxy = options.proxy;
@@ -118,7 +161,15 @@ class WebSocket extends EventEmitter {
       if (!tls) tls = extracted.tls;
     }
 
-    let headers = options.headers;
+    let headers = cloneHeaders(options.headers);
+    if (options.origin != null && !hasHeader(headers, "origin")) {
+      headers ??= Object.create(null);
+      headers.Origin = String(options.origin);
+    }
+    if (options.auth != null && !hasHeader(headers, "authorization")) {
+      headers ??= Object.create(null);
+      headers.Authorization = `Basic ${Buffer.from(String(options.auth)).toString("base64")}`;
+    }
     const connect = () => {
       if (this._ws) return;
       const runtimeOptions = { protocols };
@@ -126,7 +177,7 @@ class WebSocket extends EventEmitter {
       if (proxy) runtimeOptions.proxy = proxy;
       if (tls) runtimeOptions.tls = tls;
       if ("perMessageDeflate" in options && !options.perMessageDeflate) runtimeOptions.perMessageDeflate = false;
-      this._attach(new RuntimeWebSocket(url, runtimeOptions));
+      this._attach(new RuntimeWebSocket(parsedUrl, runtimeOptions));
     };
 
     if (typeof options.finishRequest === "function") {
@@ -146,29 +197,49 @@ class WebSocket extends EventEmitter {
     }
     updateHeaders(headers);
     let ended = false;
-    return {
+    const request = new EventEmitter();
+    Object.assign(request, {
       setHeader(name, value) { headers[String(name).toLowerCase()] = value; },
       getHeader(name) { return headers[String(name).toLowerCase()]; },
       removeHeader(name) { delete headers[String(name).toLowerCase()]; },
       hasHeader(name) { return Object.prototype.hasOwnProperty.call(headers, String(name).toLowerCase()); },
       getHeaders() { return { ...headers }; },
-      get rawHeaders() {
-        const raw = [];
-        for (const [name, value] of Object.entries(headers)) raw.push(name, value);
-        return raw;
-      },
       method: "GET",
       path: this._url,
       headersSent: false,
+      finished: false,
+      aborted: false,
+      socket: undefined,
+      rawTrailers: [],
+      trailers: null,
+      _header: null,
+      _headerSent: false,
+      _last: null,
       abort() {},
       write() { return true; },
+      writeHead() { return request; },
       end() {
         if (ended) return;
         ended = true;
+        request.finished = true;
+        request.headersSent = true;
+        request._headerSent = true;
         connect();
       },
-      [Symbol.toStringTag]: "ClientRequest",
-    };
+    });
+    Object.defineProperties(request, {
+      rawHeaders: {
+        configurable: true,
+        enumerable: true,
+        get() {
+          const raw = [];
+          for (const [name, value] of Object.entries(headers)) raw.push(name, value);
+          return raw;
+        },
+      },
+      [Symbol.toStringTag]: { configurable: true, value: "ClientRequest" },
+    });
+    return request;
   }
 
   _attach(ws) {
