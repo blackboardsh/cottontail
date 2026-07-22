@@ -1,4 +1,5 @@
 const std = @import("std");
+const PackageJSON = @import("package_manager_json.zig");
 
 const Value = std.json.Value;
 
@@ -108,7 +109,7 @@ pub fn discover(
             continue;
         };
         const package_json = try allocator.create(Value);
-        package_json.* = std.json.parseFromSliceLeaky(Value, allocator, source, .{}) catch {
+        package_json.* = PackageJSON.parsePackageJSON(allocator, package_json_path, source) catch {
             try diagnostics.append(.{ .invalid_package_json = relative_path });
             continue;
         };

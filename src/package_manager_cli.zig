@@ -18,6 +18,7 @@ const Workspaces = @import("package_manager_workspaces.zig");
 const Analyzer = @import("package_manager_analyzer.zig");
 const Audit = @import("package_manager_audit.zig");
 const MinimumReleaseAge = @import("package_manager_minimum_release_age.zig");
+const PackageJSON = @import("package_manager_json.zig");
 const Pack = @import("package_manager_pack.zig");
 const ScriptRunner = @import("script_runner.zig");
 const Publish = @import("package_manager_publish.zig");
@@ -1368,7 +1369,7 @@ fn readProjectPackageName(
 ) !?[]const u8 {
     const path = try std.fs.path.join(allocator, &.{ package_dir, "package.json" });
     const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 * 1024 * 1024));
-    const manifest = try std.json.parseFromSliceLeaky(Value, allocator, source, .{});
+    const manifest = try PackageJSON.parsePackageJSON(allocator, path, source);
     if (manifest != .object) return null;
     const name = manifest.object.get("name") orelse return null;
     if (name != .string or name.string.len == 0) return null;
@@ -1454,7 +1455,7 @@ fn packageNameForInfo(
 ) ![]const u8 {
     const package_json_path = try std.fs.path.join(allocator, &.{ package_dir, "package.json" });
     if (try readOptionalFile(io, allocator, package_json_path, 4 * 1024 * 1024)) |source| {
-        const package_json = std.json.parseFromSliceLeaky(Value, allocator, source, .{}) catch null;
+        const package_json = PackageJSON.parsePackageJSON(allocator, package_json_path, source) catch null;
         if (package_json) |value| {
             if (jsonString(&value, "name")) |name| {
                 if (name.len > 0) return name;
@@ -1537,7 +1538,7 @@ fn runPmMigrate(
     var root: Value = if (std.mem.trim(u8, package_source, " \t\r\n").len == 0)
         .{ .object = .empty }
     else
-        try std.json.parseFromSliceLeaky(Value, allocator, package_source, .{});
+        try PackageJSON.parsePackageJSON(allocator, package_json_path, package_source);
     var install_options = options;
     install_options.command = .install;
     install_options.positionals = &.{};
@@ -1796,7 +1797,7 @@ fn pmDisplayResolution(
     }
     const package_json_path = try std.fs.path.join(allocator, &.{ root_dir, "node_modules", alias, "package.json" });
     const source = try std.Io.Dir.cwd().readFileAlloc(io, package_json_path, allocator, .limited(4 * 1024 * 1024));
-    const package_json = try std.json.parseFromSliceLeaky(Value, allocator, source, .{});
+    const package_json = try PackageJSON.parsePackageJSON(allocator, package_json_path, source);
     return jsonString(&package_json, "version") orelse jsonString(&package_json, "name") orelse "unknown";
 }
 
@@ -2204,7 +2205,7 @@ const Manager = struct {
         var root: Value = if (std.mem.trim(u8, package_source, " \t\r\n").len == 0)
             .{ .object = .empty }
         else
-            try std.json.parseFromSliceLeaky(Value, manager.allocator, package_source, .{});
+            try PackageJSON.parsePackageJSON(manager.allocator, package_json_path, package_source);
         if (root != .object) return error.InvalidPackageJSON;
         manager.root_package_json = &root;
         manager.manifest_policy = try Manifest.Policy.init(manager.allocator, &root);
@@ -2533,7 +2534,7 @@ const Manager = struct {
             },
             else => return err,
         };
-        var root = try std.json.parseFromSliceLeaky(Value, manager.allocator, package_source, .{});
+        var root = try PackageJSON.parsePackageJSON(manager.allocator, package_json_path, package_source);
         if (root != .object) return error.InvalidPackageJSON;
         manager.root_package_json = &root;
         manager.manifest_policy = try Manifest.Policy.init(manager.allocator, &root);
@@ -3289,7 +3290,7 @@ const Manager = struct {
             return error.PackageManagerErrorReported;
         };
         const package_json = try manager.allocator.create(Value);
-        package_json.* = std.json.parseFromSliceLeaky(Value, manager.allocator, source, .{}) catch {
+        package_json.* = PackageJSON.parsePackageJSON(manager.allocator, path, source) catch {
             try manager.stderr.print("error: invalid package.json in \"{s}\"\n", .{manager.invocation_package_dir});
             return error.PackageManagerErrorReported;
         };
@@ -6406,7 +6407,7 @@ const Manager = struct {
             manager.allocator,
             .limited(4 * 1024 * 1024),
         ) catch return false;
-        const package_json = std.json.parseFromSliceLeaky(Value, manager.allocator, source, .{}) catch return false;
+        const package_json = PackageJSON.parsePackageJSON(manager.allocator, package_json_path, source) catch return false;
         return package_json == .object and
             std.mem.eql(u8, jsonString(&package_json, "name") orelse "", name) and
             std.mem.eql(u8, jsonString(&package_json, "version") orelse "", version_value);
@@ -7814,7 +7815,7 @@ const Manager = struct {
             .limited(16 * 1024 * 1024),
         ) catch return error.MissingPackageJSON;
         const package_json = try manager.allocator.create(Value);
-        package_json.* = try std.json.parseFromSliceLeaky(Value, manager.allocator, source, .{});
+        package_json.* = try PackageJSON.parsePackageJSON(manager.allocator, package_json_path, source);
         if (package_json.* != .object) return error.InvalidPackageJSON;
         return package_json;
     }
@@ -8032,7 +8033,7 @@ const Manager = struct {
             var contents: std.Io.Writer.Allocating = .init(manager.allocator);
             try iterator.streamRemaining(entry, &contents.writer);
             const package_json = try manager.allocator.create(Value);
-            package_json.* = try std.json.parseFromSliceLeaky(Value, manager.allocator, contents.written(), .{});
+            package_json.* = try PackageJSON.parsePackageJSON(manager.allocator, entry.name, contents.written());
             if (package_json.* != .object) return error.InvalidPackageJSON;
             return package_json;
         }
@@ -8224,7 +8225,7 @@ const Manager = struct {
                 .limited(4 * 1024 * 1024),
             ) catch continue;
             const value = try manager.allocator.create(Value);
-            value.* = std.json.parseFromSliceLeaky(Value, manager.allocator, source, .{}) catch continue;
+            value.* = PackageJSON.parsePackageJSON(manager.allocator, package_json, source) catch continue;
             if (value.* != .object) continue;
             const version_value = value.object.get("version") orelse continue;
             if (version_value != .string) continue;
@@ -8883,7 +8884,7 @@ const Manager = struct {
             return error.MissingPackageJSON;
         };
         const package_json = try manager.allocator.create(Value);
-        package_json.* = try std.json.parseFromSliceLeaky(Value, manager.allocator, source, .{});
+        package_json.* = try PackageJSON.parsePackageJSON(manager.allocator, package_json_path, source);
         if (package_json.* != .object) return error.InvalidPackageJSON;
         const name = jsonString(package_json, "name") orelse return error.InvalidPackageName;
         return .{
@@ -10417,7 +10418,7 @@ fn findInstallProject(io: std.Io, allocator: std.mem.Allocator, start: []const u
             .limited(64 * 1024 * 1024),
         ) catch null;
         if (source) |contents| {
-            const manifest = std.json.parseFromSliceLeaky(Value, allocator, contents, .{}) catch null;
+            const manifest = PackageJSON.parsePackageJSON(allocator, package_json_path, contents) catch null;
             if (manifest) |value| {
                 if (value == .object) {
                     const relative = try std.fs.path.relative(allocator, current, null, current, package_dir);
