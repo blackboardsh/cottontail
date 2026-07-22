@@ -664,6 +664,12 @@ try {
       stdoutIncludes: ['node http https surface passed'],
     },
     {
+      name: 'websocket-production',
+      argv: ['test', join(rootDir, 'tests', 'js', 'websocket-production.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['5 pass', '0 fail'],
+    },
+    {
       name: 'node-dns-surface',
       scriptPath: join(rootDir, 'tests', 'js', 'node-dns-surface.ts'),
       expectExitCode: 0,

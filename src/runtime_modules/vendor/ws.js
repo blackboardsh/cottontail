@@ -4,9 +4,18 @@ import { Duplex } from "../node/stream.js";
 import {
   STATUS_CODES,
   WebSocket as RuntimeWebSocket,
+  consumeWebSocketDataFrame,
+  createWebSocketClosePayload,
+  createWebSocketMessageState,
   createServer as createHttpServer,
+  decodeWebSocketText,
   parseWebSocketFrames,
+  parseWebSocketClosePayload,
+  parseWebSocketExtensions,
+  resetWebSocketMessageState,
   websocketAcceptKey,
+  websocketDeflateCompress,
+  websocketDeflateDecompress,
   websocketFrame,
 } from "../node/http.js";
 
@@ -85,6 +94,7 @@ class WebSocket extends EventEmitter {
     this._url = String(url);
     this._binaryType = "nodebuffer";
     this._fragments = false;
+    this._paused = false;
     this._eventListeners = new Map();
 
     if (protocols === undefined) {
@@ -189,7 +199,7 @@ class WebSocket extends EventEmitter {
       options = undefined;
     }
     try {
-      this._ws.send(normalizeData(data, options));
+      this._ws.send(normalizeData(data, options), options?.compress);
       if (typeof callback === "function") process.nextTick(callback, null);
     } catch (error) {
       if (typeof callback === "function") process.nextTick(callback, error);
@@ -232,8 +242,18 @@ class WebSocket extends EventEmitter {
   close(code, reason) { this._ws?.close(code, reason); }
   terminate() { this._ws?.terminate(); }
 
-  pause() { this._paused = true; }
-  resume() { this._paused = false; }
+  pause() {
+    if (this.readyState === CONNECTING || this.readyState === CLOSED) return this;
+    this._paused = true;
+    this._ws?._socket?.pause?.();
+    return this;
+  }
+  resume() {
+    if (this.readyState === CONNECTING || this.readyState === CLOSED) return this;
+    this._paused = false;
+    this._ws?._socket?.resume?.();
+    return this;
+  }
   get isPaused() { return this._paused === true; }
   get url() { return this._ws?.url ?? this._url; }
   get readyState() { return this._ws?.readyState ?? CONNECTING; }
@@ -311,9 +331,10 @@ class ServerWebSocketConnection extends EventEmitter {
     this._request = request;
     this._options = options;
     this._buffer = Buffer.alloc(0);
-    this._fragments = [];
-    this._fragmentOpcode = 0;
+    this._messageState = createWebSocketMessageState();
     this._closed = false;
+    this._pendingClose = null;
+    this._paused = false;
     this._eventListeners = new Map();
     this.readyState = OPEN;
     this.binaryType = "nodebuffer";
@@ -324,21 +345,36 @@ class ServerWebSocketConnection extends EventEmitter {
     socket.on("error", (error) => {
       if (this.listenerCount("error") > 0) this.emit("error", error);
     });
-    socket.on("close", () => this._finishClose(1006, "", false));
+    socket.on("close", () => {
+      const close = this._pendingClose;
+      this._finishClose(close?.code ?? 1006, close?.reason ?? "", close?.wasClean ?? false);
+    });
     if (head?.byteLength) queueMicrotask(() => this._handleData(head));
   }
 
-  _protocolError(reason) {
-    if (this.readyState === OPEN) {
-      const reasonBytes = Buffer.from(reason);
-      const payload = Buffer.alloc(2 + reasonBytes.byteLength);
-      payload.writeUInt16BE(1002, 0);
-      payload.set(reasonBytes, 2);
-      try { this._socket.write(websocketFrame(0x8, payload, false)); } catch {}
-    }
+  _beginTransportClose(code, reason, wasClean, payload) {
+    if (this._closed) return;
     this.readyState = CLOSING;
-    try { this._socket.end(); } catch {}
-    this._finishClose(1002, reason, false);
+    this._pendingClose = { code, reason, wasClean };
+    try {
+      if (payload == null) this._socket.end();
+      else this._socket.end(websocketFrame(0x8, payload, false));
+    } catch {
+      this._finishClose(code, reason, wasClean);
+      return;
+    }
+    if (this._closeTimer) clearTimeout(this._closeTimer);
+    this._closeTimer = setTimeout(() => this.terminate(), 30_000);
+    this._closeTimer?.unref?.();
+  }
+
+  _protocolError(reason, code = 1002) {
+    const error = new Error(reason);
+    error.code = "WS_ERR_INVALID_FRAME";
+    error.closeCode = code;
+    if (this.listenerCount("error") > 0) this.emit("error", error);
+    const payload = createWebSocketClosePayload(code, reason, { truncateReason: true });
+    this._beginTransportClose(code, reason, false, payload);
   }
 
   _handleData(chunk) {
@@ -347,40 +383,37 @@ class ServerWebSocketConnection extends EventEmitter {
     this._buffer = this._buffer.byteLength === 0 ? bytes : Buffer.concat([this._buffer, bytes]);
     let parsed;
     try {
-      parsed = parseWebSocketFrames(this._buffer);
+      const maxPayload = this._options.maxPayload > 0 ? this._options.maxPayload : Number.MAX_SAFE_INTEGER;
+      parsed = parseWebSocketFrames(this._buffer, {
+        allowCompression: this._options.deflate != null,
+        expectMasked: true,
+        maxFramePayloadLength: maxPayload,
+      });
     } catch (error) {
-      this._protocolError(error?.message ?? "Invalid WebSocket frame");
+      this._protocolError(error?.message ?? "Invalid WebSocket frame", error?.closeCode ?? 1002);
       return;
     }
     this._buffer = parsed.remaining;
     for (const frame of parsed.frames) {
       if (this._closed) return;
+      const wasOpen = this.readyState === OPEN;
       this._handleFrame(frame);
+      if (wasOpen && this.readyState !== OPEN) return;
     }
   }
 
   _handleFrame(frame) {
-    if (!frame.masked) {
-      this._protocolError("Client frames must be masked");
-      return;
-    }
-    if (frame.rsv1 || frame.rsv2 || frame.rsv3) {
-      this._protocolError("Invalid RSV bits");
-      return;
-    }
-    if (frame.opcode >= 0x8 && (!frame.fin || frame.payload.byteLength > 125)) {
-      this._protocolError("Invalid control frame");
-      return;
-    }
+    if (this.readyState === CLOSING && frame.opcode !== 0x8 && frame.opcode !== 0xA) return;
     if (frame.opcode === 0x8) {
-      const code = frame.payload.byteLength >= 2 ? frame.payload.readUInt16BE(0) : 1000;
-      const reason = frame.payload.byteLength > 2 ? frame.payload.subarray(2).toString("utf8") : "";
-      if (this.readyState === OPEN) {
-        this.readyState = CLOSING;
-        try { this._socket.write(websocketFrame(0x8, frame.payload, false)); } catch {}
+      let close;
+      try {
+        close = parseWebSocketClosePayload(frame.payload, { emptyCode: 1005 });
+      } catch (error) {
+        this._protocolError(error?.message ?? "Invalid close frame", error?.closeCode ?? 1002);
+        return;
       }
-      try { this._socket.end(); } catch {}
-      this._finishClose(code, reason, true);
+      const reply = this.readyState === OPEN ? frame.payload : null;
+      this._beginTransportClose(close.code, close.reason, true, reply);
       return;
     }
     if (frame.opcode === 0x9) {
@@ -394,31 +427,37 @@ class ServerWebSocketConnection extends EventEmitter {
       this.emit("pong", convertBinary(this.binaryType, frame.payload));
       return;
     }
-    if (frame.opcode === 0x1 || frame.opcode === 0x2) {
-      if (this._fragmentOpcode !== 0) {
-        this._protocolError("Unexpected data frame");
+    let message;
+    try {
+      const maxPayload = this._options.maxPayload > 0 ? this._options.maxPayload : Number.MAX_SAFE_INTEGER;
+      message = consumeWebSocketDataFrame(this._messageState, frame, { maxPayloadLength: maxPayload });
+    } catch (error) {
+      this._protocolError(error?.message ?? "Invalid WebSocket message", error?.closeCode ?? 1002);
+      return;
+    }
+    if (message == null) return;
+    let payload = message.payload;
+    if (message.compressed) {
+      try {
+        const maxPayload = this._options.maxPayload > 0 ? this._options.maxPayload : Number.MAX_SAFE_INTEGER;
+        payload = websocketDeflateDecompress(payload, maxPayload);
+      } catch (error) {
+        this._protocolError(
+          error?.code === "WS_MESSAGE_TOO_BIG" ? "Message too big" : "Invalid compressed data",
+          error?.code === "WS_MESSAGE_TOO_BIG" ? 1009 : 1007,
+        );
         return;
       }
-      this._fragmentOpcode = frame.opcode;
-      this._fragments = [frame.payload];
-    } else if (frame.opcode === 0x0 && this._fragmentOpcode !== 0) {
-      this._fragments.push(frame.payload);
-    } else {
-      this._protocolError("Invalid opcode");
-      return;
     }
-    const length = this._fragments.reduce((total, part) => total + part.byteLength, 0);
-    if (length > this._options.maxPayload) {
-      this.close(1009, "Message too big");
-      return;
+    if (message.opcode === 0x1 && !this._options.skipUTF8Validation) {
+      try { decodeWebSocketText(payload); }
+      catch (error) {
+        this._protocolError(error?.message ?? "Invalid UTF-8 in text frame", error?.closeCode ?? 1007);
+        return;
+      }
     }
-    if (!frame.fin) return;
-    const opcode = this._fragmentOpcode;
-    const payload = this._fragments.length === 1 ? this._fragments[0] : Buffer.concat(this._fragments, length);
-    this._fragmentOpcode = 0;
-    this._fragments = [];
-    const isBinary = opcode === 0x2;
-    const data = isBinary ? convertBinary(this.binaryType, payload) : convertBinary(this.binaryType, payload);
+    const isBinary = message.opcode === 0x2;
+    const data = convertBinary(this.binaryType, payload);
     this.emit("message", data, isBinary);
   }
 
@@ -426,6 +465,8 @@ class ServerWebSocketConnection extends EventEmitter {
     if (this._closed) return;
     this._closed = true;
     this.readyState = CLOSED;
+    this._pendingClose = null;
+    resetWebSocketMessageState(this._messageState);
     if (this._closeTimer) clearTimeout(this._closeTimer);
     this.emit("close", code, reason, wasClean);
   }
@@ -444,7 +485,17 @@ class ServerWebSocketConnection extends EventEmitter {
     const normalized = normalizeData(data, options);
     const opcode = options?.binary === false || (typeof normalized === "string" && options?.binary !== true) ? 0x1 : 0x2;
     try {
-      this._socket.write(websocketFrame(opcode, normalized, false), () => {
+      let payload = normalized;
+      let rsv1 = false;
+      if (this._options.deflate != null && options?.compress !== false) {
+        const bytes = bytesFromData(payload);
+        const threshold = this._options.deflate.threshold;
+        if (bytes.byteLength >= threshold) {
+          payload = websocketDeflateCompress(bytes, this._options.deflate.serverWindowBits);
+          rsv1 = true;
+        }
+      }
+      this._socket.write(websocketFrame(opcode, payload, false, rsv1), () => {
         if (typeof callback === "function") callback(null);
       });
     } catch (error) {
@@ -484,11 +535,8 @@ class ServerWebSocketConnection extends EventEmitter {
 
   close(code = 1000, reason = "") {
     if (this.readyState === CLOSED || this.readyState === CLOSING) return;
+    const payload = createWebSocketClosePayload(Number(code) || 1000, reason, { validateCode: true });
     this.readyState = CLOSING;
-    const reasonBytes = Buffer.from(String(reason ?? ""));
-    const payload = Buffer.alloc(2 + reasonBytes.byteLength);
-    payload.writeUInt16BE(Number(code) || 1000, 0);
-    payload.set(reasonBytes, 2);
     try { this._socket.write(websocketFrame(0x8, payload, false)); } catch {}
     this._closeTimer = setTimeout(() => this.terminate(), 30_000);
     this._closeTimer?.unref?.();
@@ -501,6 +549,19 @@ class ServerWebSocketConnection extends EventEmitter {
   }
 
   get bufferedAmount() { return this._socket?.writableLength ?? 0; }
+  get isPaused() { return this._paused; }
+  pause() {
+    if (this.readyState === CONNECTING || this.readyState === CLOSED) return this;
+    this._paused = true;
+    this._socket?.pause?.();
+    return this;
+  }
+  resume() {
+    if (this.readyState === CONNECTING || this.readyState === CLOSED) return this;
+    this._paused = false;
+    this._socket?.resume?.();
+    return this;
+  }
   get onopen() { return this._onopen ?? null; }
   set onopen(value) {
     this._onopen = typeof value === "function" ? value : null;
@@ -557,6 +618,54 @@ function parseProtocols(header) {
     result.add(protocol);
   }
   return result;
+}
+
+function negotiatePerMessageDeflate(option, header) {
+  if (!option || header == null) return null;
+  const offer = parseWebSocketExtensions(header).find((extension) => extension.name === "permessage-deflate");
+  if (!offer) return null;
+
+  const allowed = new Set([
+    "client_max_window_bits",
+    "client_no_context_takeover",
+    "server_max_window_bits",
+    "server_no_context_takeover",
+  ]);
+  for (const [name, value] of Object.entries(offer.params)) {
+    if (!allowed.has(name)) throw new SyntaxError(`Unsupported permessage-deflate parameter "${name}"`);
+    if (name.endsWith("no_context_takeover") && value !== true) {
+      throw new SyntaxError(`Invalid permessage-deflate parameter "${name}"`);
+    }
+    if (name === "server_max_window_bits" && value === true) {
+      throw new SyntaxError(`Invalid permessage-deflate parameter "${name}"`);
+    }
+    if (name.endsWith("max_window_bits") && value !== true) {
+      const bits = Number(value);
+      if (!Number.isInteger(bits) || bits < 8 || bits > 15) {
+        throw new SyntaxError(`Invalid permessage-deflate parameter "${name}"`);
+      }
+    }
+  }
+
+  const config = option === true || typeof option !== "object" ? {} : option;
+  const threshold = Math.max(0, Number(config.threshold ?? 1024) || 0);
+  const response = ["permessage-deflate", "client_no_context_takeover", "server_no_context_takeover"];
+  let serverWindowBits = 15;
+  const offeredServerBits = offer.params.server_max_window_bits;
+  if (offeredServerBits !== undefined) {
+    serverWindowBits = Number(offeredServerBits);
+    const configuredBits = Number(config.serverMaxWindowBits);
+    if (Number.isInteger(configuredBits) && configuredBits >= 8 && configuredBits <= 15) {
+      serverWindowBits = Math.min(serverWindowBits, configuredBits);
+    }
+    response.push(`server_max_window_bits=${serverWindowBits}`);
+  }
+  return {
+    extension: "permessage-deflate",
+    header: response.join("; "),
+    serverWindowBits,
+    threshold,
+  };
 }
 
 function abortHandshake(server, request, socket, code, message = STATUS_CODES[code] ?? "Error", headers = {}) {
@@ -682,7 +791,14 @@ class WebSocketServer extends EventEmitter {
       catch { return abortHandshake(this, request, socket, 400, "Invalid Sec-WebSocket-Protocol header"); }
     }
 
-    const finish = () => this._completeUpgrade(key, protocols, request, socket, head, callback);
+    let deflate = null;
+    try {
+      deflate = negotiatePerMessageDeflate(this.options.perMessageDeflate, request.headers["sec-websocket-extensions"]);
+    } catch {
+      return abortHandshake(this, request, socket, 400, "Invalid or unacceptable Sec-WebSocket-Extensions header");
+    }
+
+    const finish = () => this._completeUpgrade(key, protocols, request, socket, head, callback, deflate);
     const verify = this.options.verifyClient;
     if (typeof verify === "function") {
       const info = {
@@ -702,16 +818,17 @@ class WebSocketServer extends EventEmitter {
     finish();
   }
 
-  _completeUpgrade(key, protocols, request, socket, head, callback) {
+  _completeUpgrade(key, protocols, request, socket, head, callback, deflate) {
+    if (this._upgradedSockets.has(socket)) {
+      throw new Error("server.handleUpgrade() was called more than once with the same socket");
+    }
     this._upgradedSockets.add(socket);
     let protocol = "";
     if (protocols.size > 0) {
       const defaultProtocol = protocols.values().next().value;
       protocol = this.options.handleProtocols ? this.options.handleProtocols(protocols, request) : defaultProtocol;
-      // Bun's ws adapter omits the explicit protocol header for an empty
-      // selection, after which Bun.serve falls back to the first offer.
-      if (!protocol) protocol = defaultProtocol;
     }
+    protocol = protocol ? String(protocol) : "";
     const headers = [
       "HTTP/1.1 101 Switching Protocols",
       "Upgrade: websocket",
@@ -719,6 +836,7 @@ class WebSocketServer extends EventEmitter {
       `Sec-WebSocket-Accept: ${websocketAcceptKey(String(key))}`,
     ];
     if (protocol) headers.push(`Sec-WebSocket-Protocol: ${protocol}`);
+    if (deflate) headers.push(`Sec-WebSocket-Extensions: ${deflate.header}`);
     this.emit("headers", headers, request);
     headers.push("", "");
     try { socket.write(headers.join("\r\n")); }
@@ -730,7 +848,9 @@ class WebSocketServer extends EventEmitter {
     const ws = new ServerWebSocketConnection(socket, request, head, {
       maxPayload: Number(this.options.maxPayload) || 0,
       protocol,
-      extensions: "",
+      extensions: deflate?.extension ?? "",
+      deflate,
+      skipUTF8Validation: Boolean(this.options.skipUTF8Validation),
     });
     if (this.clients) {
       this.clients.add(ws);
@@ -793,16 +913,38 @@ class Receiver extends EventEmitter {
     super();
     this._buffer = Buffer.alloc(0);
     this._options = options;
+    this._messageState = createWebSocketMessageState();
   }
   write(chunk, callback) {
-    this._buffer = Buffer.concat([this._buffer, bytesFromData(chunk)]);
-    const parsed = parseWebSocketFrames(this._buffer);
-    this._buffer = parsed.remaining;
-    for (const frame of parsed.frames) {
-      if (frame.opcode === 0x1 || frame.opcode === 0x2) this.emit("message", frame.payload, frame.opcode === 0x2);
-      else if (frame.opcode === 0x9) this.emit("ping", frame.payload);
-      else if (frame.opcode === 0xA) this.emit("pong", frame.payload);
-      else if (frame.opcode === 0x8) this.emit("conclude", frame.payload.byteLength >= 2 ? frame.payload.readUInt16BE(0) : 1000, frame.payload.subarray(2));
+    try {
+      this._buffer = Buffer.concat([this._buffer, bytesFromData(chunk)]);
+      const maxPayload = Number(this._options.maxPayload ?? 0);
+      const parsed = parseWebSocketFrames(this._buffer, {
+        expectMasked: this._options.isServer === true ? true : this._options.isServer === false ? false : undefined,
+        maxFramePayloadLength: maxPayload > 0 ? maxPayload : Number.MAX_SAFE_INTEGER,
+      });
+      this._buffer = parsed.remaining;
+      for (const frame of parsed.frames) {
+        if (frame.opcode === 0x1 || frame.opcode === 0x2 || frame.opcode === 0x0) {
+          const message = consumeWebSocketDataFrame(this._messageState, frame, {
+            maxPayloadLength: maxPayload > 0 ? maxPayload : Number.MAX_SAFE_INTEGER,
+          });
+          if (message == null) continue;
+          if (message.opcode === 0x1 && !this._options.skipUTF8Validation) decodeWebSocketText(message.payload);
+          this.emit("message", message.payload, message.opcode === 0x2);
+        } else if (frame.opcode === 0x9) {
+          this.emit("ping", frame.payload);
+        } else if (frame.opcode === 0xA) {
+          this.emit("pong", frame.payload);
+        } else if (frame.opcode === 0x8) {
+          const close = parseWebSocketClosePayload(frame.payload, { emptyCode: 1005 });
+          this.emit("conclude", close.code, frame.payload.subarray(2));
+        }
+      }
+    } catch (error) {
+      if (typeof callback === "function") callback(error);
+      if (this.listenerCount("error") > 0) this.emit("error", error);
+      return false;
     }
     if (typeof callback === "function") callback();
     return true;

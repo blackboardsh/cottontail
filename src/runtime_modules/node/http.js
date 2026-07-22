@@ -1125,8 +1125,113 @@ function readUInt64BE(bytes, offset = 0) {
   return value;
 }
 
+export class WebSocketProtocolError extends Error {
+  constructor(message, closeCode = 1002) {
+    super(message);
+    this.name = "WebSocketProtocolError";
+    this.code = "WS_PROTOCOL_ERROR";
+    this.closeCode = closeCode;
+  }
+}
+
+export function isValidWebSocketUTF8(data) {
+  const bytes = Buffer.from(bytesFromBody(data));
+  for (let index = 0; index < bytes.byteLength;) {
+    const first = bytes[index++];
+    if (first <= 0x7f) continue;
+
+    if (first >= 0xc2 && first <= 0xdf) {
+      if (index >= bytes.byteLength || (bytes[index++] & 0xc0) !== 0x80) return false;
+      continue;
+    }
+
+    if (first >= 0xe0 && first <= 0xef) {
+      if (index + 1 >= bytes.byteLength) return false;
+      const second = bytes[index++];
+      const third = bytes[index++];
+      if ((third & 0xc0) !== 0x80) return false;
+      if (first === 0xe0) {
+        if (second < 0xa0 || second > 0xbf) return false;
+      } else if (first === 0xed) {
+        if (second < 0x80 || second > 0x9f) return false;
+      } else if ((second & 0xc0) !== 0x80) {
+        return false;
+      }
+      continue;
+    }
+
+    if (first >= 0xf0 && first <= 0xf4) {
+      if (index + 2 >= bytes.byteLength) return false;
+      const second = bytes[index++];
+      const third = bytes[index++];
+      const fourth = bytes[index++];
+      if ((third & 0xc0) !== 0x80 || (fourth & 0xc0) !== 0x80) return false;
+      if (first === 0xf0) {
+        if (second < 0x90 || second > 0xbf) return false;
+      } else if (first === 0xf4) {
+        if (second < 0x80 || second > 0x8f) return false;
+      } else if ((second & 0xc0) !== 0x80) {
+        return false;
+      }
+      continue;
+    }
+
+    return false;
+  }
+  return true;
+}
+
+export function decodeWebSocketText(payload, message = "Invalid UTF-8 in text frame") {
+  if (!isValidWebSocketUTF8(payload)) throw new WebSocketProtocolError(message, 1007);
+  return Buffer.from(payload).toString("utf8");
+}
+
+export function isValidWebSocketCloseCode(code) {
+  return (code >= 1000 && code <= 1014 && code !== 1004 && code !== 1005 && code !== 1006) ||
+    (code >= 3000 && code <= 4999);
+}
+
+export function parseWebSocketClosePayload(payload, options = {}) {
+  const bytes = Buffer.from(payload);
+  if (bytes.byteLength === 0) return { code: Number(options.emptyCode ?? 1005), reason: "" };
+  if (bytes.byteLength === 1) throw new WebSocketProtocolError("Invalid close frame payload");
+
+  const code = readUInt16BE(bytes, 0);
+  if (!isValidWebSocketCloseCode(code)) {
+    throw new WebSocketProtocolError(`Invalid WebSocket close code ${code}`);
+  }
+  const reasonBytes = bytes.subarray(2);
+  const reason = decodeWebSocketText(reasonBytes, "Invalid UTF-8 in close frame");
+  return { code, reason };
+}
+
+export function createWebSocketClosePayload(code = 1000, reason = "", options = {}) {
+  const closeCode = Number(code);
+  if (!Number.isInteger(closeCode) || closeCode < 0 || closeCode > 0xffff ||
+      (options.validateCode === true && !isValidWebSocketCloseCode(closeCode))) {
+    throw new RangeError(`Invalid WebSocket close code ${code}`);
+  }
+
+  let reasonBytes = Buffer.from(String(reason));
+  if (reasonBytes.byteLength > 123) {
+    if (options.truncateReason !== true) throw new SyntaxError("WebSocket close message is too long");
+    reasonBytes = reasonBytes.subarray(0, 123);
+    while (reasonBytes.byteLength > 0 && !isValidWebSocketUTF8(reasonBytes)) {
+      reasonBytes = reasonBytes.subarray(0, reasonBytes.byteLength - 1);
+    }
+  }
+  const payload = Buffer.alloc(2 + reasonBytes.byteLength);
+  payload[0] = (closeCode >> 8) & 0xff;
+  payload[1] = closeCode & 0xff;
+  payload.set(reasonBytes, 2);
+  return payload;
+}
+
 export function websocketFrame(opcode, payload = Buffer.alloc(0), masked = true, rsv1 = false) {
   const body = Buffer.from(bytesFromBody(payload));
+  if ((opcode & 0x08) !== 0 && body.byteLength > 125) {
+    throw new RangeError("WebSocket control frame payload must not exceed 125 bytes");
+  }
   const header = [];
   header.push(0x80 | (rsv1 ? 0x40 : 0) | (opcode & 0x0f));
   if (body.byteLength < 126) {
@@ -1146,8 +1251,13 @@ export function websocketFrame(opcode, payload = Buffer.alloc(0), masked = true,
   return Buffer.concat([Buffer.from(header), mask, output]);
 }
 
-export function parseWebSocketFrames(buffer) {
+export function parseWebSocketFrames(buffer, options = {}) {
   const frames = [];
+  const expectMasked = options.expectMasked;
+  const allowCompression = options.allowCompression === true;
+  const maxFramePayloadLength = options.maxFramePayloadLength == null
+    ? Number.MAX_SAFE_INTEGER
+    : Math.max(0, Number(options.maxFramePayloadLength));
   let offset = 0;
   while (buffer.byteLength - offset >= 2) {
     const frameStart = offset;
@@ -1160,17 +1270,41 @@ export function parseWebSocketFrames(buffer) {
     const opcode = first & 0x0f;
     const masked = (second & 0x80) !== 0;
     let length = second & 0x7f;
+
+    if (rsv2 || rsv3) throw new WebSocketProtocolError("Invalid RSV bits");
+    if (opcode !== 0x0 && opcode !== 0x1 && opcode !== 0x2 && opcode !== 0x8 && opcode !== 0x9 && opcode !== 0xA) {
+      throw new WebSocketProtocolError(`Invalid WebSocket opcode ${opcode}`);
+    }
+    if (rsv1 && (!allowCompression || opcode === 0x0 || opcode >= 0x8)) {
+      throw new WebSocketProtocolError("Invalid RSV1 bit");
+    }
+    if (opcode >= 0x8 && (!fin || length > 125)) {
+      throw new WebSocketProtocolError("Invalid control frame");
+    }
+    if (expectMasked === true && !masked) {
+      throw new WebSocketProtocolError("Client frames must be masked");
+    }
+    if (expectMasked === false && masked) {
+      throw new WebSocketProtocolError("Server frames must not be masked");
+    }
+
     if (length === 126) {
       if (buffer.byteLength - offset < 2) return { frames, remaining: buffer.subarray(frameStart) };
       length = readUInt16BE(buffer, offset);
       offset += 2;
+      if (length < 126) throw new WebSocketProtocolError("Non-canonical WebSocket payload length");
     } else if (length === 127) {
       if (buffer.byteLength - offset < 8) return { frames, remaining: buffer.subarray(frameStart) };
+      if ((buffer[offset] & 0x80) !== 0) throw new WebSocketProtocolError("Invalid 64-bit WebSocket payload length");
       const bigLength = readUInt64BE(buffer, offset);
-      if (bigLength > BigInt(Number.MAX_SAFE_INTEGER)) throw new RangeError("WebSocket frame too large");
+      if (bigLength <= 0xffffn) throw new WebSocketProtocolError("Non-canonical WebSocket payload length");
+      if (bigLength > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new WebSocketProtocolError("WebSocket frame too large", 1009);
+      }
       length = Number(bigLength);
       offset += 8;
     }
+    if (length > maxFramePayloadLength) throw new WebSocketProtocolError("WebSocket frame too large", 1009);
     if (masked && buffer.byteLength - offset < 4) return { frames, remaining: buffer.subarray(frameStart) };
     const mask = masked ? buffer.subarray(offset, offset + 4) : null;
     if (masked) offset += 4;
@@ -1183,6 +1317,55 @@ export function parseWebSocketFrames(buffer) {
     frames.push({ fin, rsv1, rsv2, rsv3, opcode, masked, payload });
   }
   return { frames, remaining: buffer.subarray(offset) };
+}
+
+export function createWebSocketMessageState() {
+  return {
+    opcode: 0,
+    compressed: false,
+    fragments: [],
+    length: 0,
+  };
+}
+
+export function resetWebSocketMessageState(state) {
+  state.opcode = 0;
+  state.compressed = false;
+  state.fragments = [];
+  state.length = 0;
+}
+
+export function consumeWebSocketDataFrame(state, frame, options = {}) {
+  if (frame.opcode !== 0x0 && frame.opcode !== 0x1 && frame.opcode !== 0x2) return null;
+
+  if (frame.opcode === 0x0) {
+    if (state.opcode === 0) throw new WebSocketProtocolError("Unexpected continuation frame");
+  } else {
+    if (state.opcode !== 0) throw new WebSocketProtocolError("Unexpected data frame");
+    state.opcode = frame.opcode;
+    state.compressed = frame.rsv1 === true;
+  }
+
+  state.fragments.push(frame.payload);
+  state.length += frame.payload.byteLength;
+  const maxPayloadLength = options.maxPayloadLength == null
+    ? Number.MAX_SAFE_INTEGER
+    : Math.max(0, Number(options.maxPayloadLength));
+  if (state.length > maxPayloadLength) {
+    resetWebSocketMessageState(state);
+    throw new WebSocketProtocolError("Message too big", 1009);
+  }
+  if (!frame.fin) return null;
+
+  const message = {
+    opcode: state.opcode,
+    compressed: state.compressed,
+    payload: state.fragments.length === 1
+      ? state.fragments[0]
+      : Buffer.concat(state.fragments, state.length),
+  };
+  resetWebSocketMessageState(state);
+  return message;
 }
 
 // ---------------------------------------------------------------------------
@@ -3780,11 +3963,10 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
     this.onmessage = null;
     this._socket = null;
     this._buffer = Buffer.alloc(0);
-    this._fragments = [];
-    this._fragmentOpcode = 0;
-    this._messageCompressed = false;
+    this._messageState = createWebSocketMessageState();
     this._deflate = null;
     this._aborted = false;
+    this._pendingClose = null;
     this._pendingWriteFrames = [];
     this._pendingWriteBytes = 0;
     this._writeFlushScheduled = false;
@@ -3889,12 +4071,17 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
 
   _attachTransportGuards(socket) {
     socket.on("error", (error) => this._fail(error));
-    socket.on("close", () => {
-      if (this.readyState !== WebSocket.CLOSED) {
-        if (this.readyState === WebSocket.CONNECTING) this._fail(new Error("Connection closed before handshake completed"));
-        else this._close(1006, "", false);
-      }
-    });
+    socket.on("close", () => this._handleTransportClose(socket));
+  }
+
+  _handleTransportClose(socket) {
+    if (this._socket !== socket || this.readyState === WebSocket.CLOSED) return;
+    if (this.readyState === WebSocket.CONNECTING) {
+      this._fail(new Error("Connection closed before handshake completed"));
+      return;
+    }
+    const pending = this._pendingClose;
+    this._close(pending?.code ?? 1006, pending?.reason ?? "", pending?.wasClean ?? false);
   }
 
   _connectViaProxy(proxy, tlsOptions) {
@@ -4002,11 +4189,7 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
     if (!socket.listenerCount || socket.listenerCount("error") === 0) {
       socket.on("error", (error) => this._fail(error));
     }
-    socket.on("close", () => {
-      if (this._socket !== socket) return;
-      if (this.readyState === WebSocket.CONNECTING) this._fail(new Error("Connection closed before handshake completed"));
-      else if (this.readyState !== WebSocket.CLOSED) this._close(1006, "", false);
-    });
+    socket.on("close", () => this._handleTransportClose(socket));
 
     const { parsed, host, explicitPort } = this._target;
     const path = `${parsed.pathname || "/"}${parsed.search || ""}`;
@@ -4158,25 +4341,57 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
     if (this.readyState === WebSocket.CLOSED) return;
     let parsed;
     try {
-      parsed = parseWebSocketFrames(this._buffer);
+      parsed = parseWebSocketFrames(this._buffer, {
+        allowCompression: this._deflate != null,
+        expectMasked: false,
+        maxFramePayloadLength: WEBSOCKET_MAX_DECOMPRESSED_LENGTH,
+      });
     } catch (error) {
-      this._fail(error);
+      this._protocolError(error?.message ?? "Invalid WebSocket frame", error?.closeCode ?? 1002);
       return;
     }
     this._buffer = parsed.remaining;
     for (const frame of parsed.frames) {
       if (this.readyState === WebSocket.CLOSED) return;
+      const wasOpen = this.readyState === WebSocket.OPEN;
       this._handleFrame(frame);
+      if (wasOpen && this.readyState !== WebSocket.OPEN) return;
     }
   }
 
-  _protocolError(reason = "Protocol error") {
-    const payload = Buffer.alloc(2 + Buffer.byteLength(reason));
-    payload.writeUInt16BE(1002, 0);
-    payload.set(Buffer.from(reason), 2);
+  _finishClosingTransport(code, reason, wasClean, replyPayload = null) {
+    if (this.readyState === WebSocket.CLOSED) return;
+    this.readyState = WebSocket.CLOSING;
+    this._pendingClose = { code, reason, wasClean };
     this._flushWriteFrames();
-    try { this._socket?.write?.(websocketFrame(0x8, payload)); } catch {}
-    this._close(1002, reason, false);
+    const socket = this._socket;
+    if (!socket || socket.destroyed) {
+      this._close(code, reason, wasClean);
+      return;
+    }
+    const finish = () => this._close(code, reason, wasClean);
+    try {
+      if (replyPayload == null) socket.end(finish);
+      else socket.end(websocketFrame(0x8, replyPayload), finish);
+    } catch {
+      finish();
+      return;
+    }
+    if (this._closeTimer != null) clearTimeout(this._closeTimer);
+    this._closeTimer = setTimeout(finish, 5_000);
+    this._closeTimer?.unref?.();
+  }
+
+  _protocolError(reason = "Protocol error", code = 1002) {
+    let payload;
+    try {
+      payload = createWebSocketClosePayload(code, reason, { truncateReason: true });
+    } catch {
+      payload = createWebSocketClosePayload(1002, "Protocol error");
+      code = 1002;
+      reason = "Protocol error";
+    }
+    this._finishClosingTransport(code, reason, false, payload);
   }
 
   _abortHandshake(code, reason) {
@@ -4187,19 +4402,20 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
   }
 
   _handleFrame(frame) {
+    if (this.readyState === WebSocket.CLOSING && frame.opcode !== 0x8 && frame.opcode !== 0xA) return;
     if (frame.opcode >= 0x8) {
-      if (!frame.fin || frame.payload.byteLength > 125 || frame.rsv1 || frame.rsv2 || frame.rsv3) {
-        this._protocolError("Invalid control frame");
-        return;
-      }
       if (frame.opcode === 0x8) {
-        const code = frame.payload.byteLength >= 2 ? readUInt16BE(frame.payload, 0) : 1000;
-        const reason = frame.payload.byteLength > 2 ? frame.payload.subarray(2).toString("utf8") : "";
-        if (this.readyState === WebSocket.OPEN) {
-          this._flushWriteFrames();
-          this._socket?.write?.(websocketFrame(0x8, frame.payload));
+        let close;
+        try {
+          close = parseWebSocketClosePayload(frame.payload, { emptyCode: 1000 });
+        } catch (error) {
+          this._protocolError(error?.message ?? "Invalid close frame", error?.closeCode ?? 1002);
+          return;
         }
-        this._close(code, reason, true);
+        const replyPayload = this.readyState === WebSocket.OPEN
+          ? (frame.payload.byteLength === 0 ? createWebSocketClosePayload(1000) : frame.payload)
+          : null;
+        this._finishClosingTransport(close.code, close.reason, true, replyPayload);
         return;
       }
       if (frame.opcode === 0x9) {
@@ -4223,54 +4439,40 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
       return;
     }
 
-    if (frame.rsv2 || frame.rsv3) {
-      this._protocolError("Invalid RSV bits");
+    let message;
+    try {
+      message = consumeWebSocketDataFrame(this._messageState, frame, {
+        maxPayloadLength: WEBSOCKET_MAX_DECOMPRESSED_LENGTH,
+      });
+    } catch (error) {
+      this._protocolError(error?.message ?? "Invalid WebSocket message", error?.closeCode ?? 1002);
       return;
     }
-    if (frame.opcode === 0x1 || frame.opcode === 0x2) {
-      if (frame.rsv1 && this._deflate == null) {
-        this._protocolError("Unexpected compressed frame");
-        return;
-      }
-      this._fragmentOpcode = frame.opcode;
-      this._fragments = [frame.payload];
-      this._messageCompressed = frame.rsv1 === true;
-    } else if (frame.opcode === 0x0 && this._fragmentOpcode) {
-      if (frame.rsv1) {
-        this._protocolError("Invalid RSV bits");
-        return;
-      }
-      this._fragments.push(frame.payload);
-    } else {
-      return;
-    }
-    if (!frame.fin) return;
+    if (message == null) return;
 
-    let payload = Buffer.concat(this._fragments);
-    const opcode = this._fragmentOpcode;
-    const compressed = this._messageCompressed;
-    this._fragments = [];
-    this._fragmentOpcode = 0;
-    this._messageCompressed = false;
-    if (compressed) {
+    let payload = message.payload;
+    if (message.compressed) {
       try {
         payload = websocketDeflateDecompress(payload);
       } catch (error) {
         if (error?.code === "WS_MESSAGE_TOO_BIG") {
-          const reason = "Message too big";
-          this._close(1009, reason, false);
+          this._protocolError("Message too big", 1009);
         } else {
           this._protocolError("Invalid compressed data");
         }
         return;
       }
     }
-    this._deliverMessage(opcode, payload);
+    try {
+      this._deliverMessage(message.opcode, payload);
+    } catch (error) {
+      this._protocolError(error?.message ?? "Invalid WebSocket message", error?.closeCode ?? 1002);
+    }
   }
 
   _deliverMessage(opcode, payload) {
     const data = opcode === 0x1
-      ? payload.toString("utf8")
+      ? decodeWebSocketText(payload)
       : this.binaryType === "arraybuffer"
         ? payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength)
         : payload;
@@ -4304,6 +4506,8 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
   _close(code = 1000, reason = "", wasClean = true) {
     if (this.readyState === WebSocket.CLOSED) return;
     this.readyState = WebSocket.CLOSED;
+    this._pendingClose = null;
+    resetWebSocketMessageState(this._messageState);
     if (this._closeTimer != null) clearTimeout(this._closeTimer);
     this._closeTimer = null;
     try { this._socket?.destroy?.(); } catch {}
@@ -4341,12 +4545,12 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
     });
   }
 
-  send(data) {
+  send(data, compress = undefined) {
     if (this.readyState !== WebSocket.OPEN) throw new Error("WebSocket is not open");
     const opcode = typeof data === "string" ? 0x1 : 0x2;
     let payload = data;
     let rsv1 = false;
-    if (this._deflate != null) {
+    if (this._deflate != null && compress !== false) {
       const bytes = Buffer.from(bytesFromBody(data));
       if (bytes.byteLength >= WEBSOCKET_COMPRESS_THRESHOLD) {
         payload = websocketDeflateCompress(bytes, this._deflate.clientWindowBits);
@@ -4386,12 +4590,9 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
       this._abortHandshake(1006, "");
       return;
     }
-    this.readyState = WebSocket.CLOSING;
-    const payload = Buffer.alloc(2 + Buffer.byteLength(String(reason)));
     const closeCode = Number(code) || 1000;
-    payload[0] = (closeCode >> 8) & 0xff;
-    payload[1] = closeCode & 0xff;
-    payload.set(Buffer.from(String(reason)), 2);
+    const payload = createWebSocketClosePayload(closeCode, reason);
+    this.readyState = WebSocket.CLOSING;
     this._flushWriteFrames();
     this._socket?.write?.(websocketFrame(0x8, payload));
     this._closeTimer = setTimeout(() => this._close(1006, "", false), 30_000);

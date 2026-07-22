@@ -9885,46 +9885,6 @@ function encodeServerWebSocketFrame(opcode, payload, rsv1 = false) {
   return Buffer.concat([header, body]);
 }
 
-function decodeWebSocketFrames(buffer) {
-  const frames = [];
-  let offset = 0;
-  while (buffer.byteLength - offset >= 2) {
-    const frameStart = offset;
-    const first = buffer[offset++];
-    const second = buffer[offset++];
-    const fin = (first & 0x80) !== 0;
-    const rsv1 = (first & 0x40) !== 0;
-    const rsv2 = (first & 0x20) !== 0;
-    const rsv3 = (first & 0x10) !== 0;
-    const opcode = first & 0x0f;
-    const masked = (second & 0x80) !== 0;
-    let length = second & 0x7f;
-    if (length === 126) {
-      if (buffer.byteLength - offset < 2) return { frames, remaining: buffer.subarray(frameStart) };
-      length = (buffer[offset] << 8) | buffer[offset + 1];
-      offset += 2;
-    } else if (length === 127) {
-      if (buffer.byteLength - offset < 8) return { frames, remaining: buffer.subarray(frameStart) };
-      let big = 0n;
-      for (let index = 0; index < 8; index += 1) big = (big << 8n) | BigInt(buffer[offset + index]);
-      if (big > BigInt(Number.MAX_SAFE_INTEGER)) throw new RangeError("WebSocket frame too large");
-      length = Number(big);
-      offset += 8;
-    }
-    if (masked && buffer.byteLength - offset < 4) return { frames, remaining: buffer.subarray(frameStart) };
-    const mask = masked ? buffer.subarray(offset, offset + 4) : null;
-    if (masked) offset += 4;
-    if (buffer.byteLength - offset < length) return { frames, remaining: buffer.subarray(frameStart) };
-    const payload = Buffer.from(buffer.subarray(offset, offset + length));
-    offset += length;
-    if (mask) {
-      for (let index = 0; index < payload.byteLength; index += 1) payload[index] ^= mask[index % 4];
-    }
-    frames.push({ fin, rsv1, rsv2, rsv3, opcode, payload });
-  }
-  return { frames, remaining: buffer.subarray(offset) };
-}
-
 function serveHandlerErrorDiagnostic(error) {
   if (!(error instanceof Error) || typeof error.stack !== "string") return null;
   const frame = error.stack.match(/(?:^|\n)\s*at [^\n]*?\(?([^()\n]+):(\d+):(\d+)\)?/);
@@ -9954,12 +9914,29 @@ function invokeWebSocketHandler(state, name, ...args) {
   if (typeof handler !== "function") return undefined;
   try {
     const result = handler(...args);
-    if (isPromiseLike(result)) result.then(undefined, reportServeHandlerError);
+    if (isPromiseLike(result)) {
+      result.then(undefined, (error) => reportWebSocketHandlerError(state, error, name));
+    }
     return result;
   } catch (error) {
-    reportServeHandlerError(error);
+    reportWebSocketHandlerError(state, error, name);
     return undefined;
   }
+}
+
+function reportWebSocketHandlerError(state, error, sourceName) {
+  const onError = state.getHandlers()?.error;
+  if (sourceName !== "error" && typeof onError === "function") {
+    try {
+      const result = onError(error);
+      if (isPromiseLike(result)) result.then(undefined, reportServeHandlerError);
+      return;
+    } catch (handlerError) {
+      reportServeHandlerError(handlerError);
+      return;
+    }
+  }
+  reportServeHandlerError(error);
 }
 
 function assertWebSocketCompressFlag(compress, name) {
@@ -10056,6 +10033,10 @@ function finalizeServerWebSocket(state, code, reason) {
   if (state.finalized) return;
   state.finalized = true;
   state.readyState = 3;
+  if (state.closeTimer != null) clearTimeout(state.closeTimer);
+  state.closeTimer = null;
+  state.serverState.websockets.delete(state);
+  nodeHttp.resetWebSocketMessageState(state.messageState);
   unsubscribeServerWebSocketAll(state);
   const server = state.serverState.server;
   if (server && server.pendingWebSockets > 0) server.pendingWebSockets -= 1;
@@ -10063,30 +10044,45 @@ function finalizeServerWebSocket(state, code, reason) {
   invokeWebSocketHandler(state, "close", state.ws, code, reason);
 }
 
-function closeServerWebSocket(state, code, reason) {
-  if (state.readyState !== 1) return;
-  state.readyState = 2;
+function beginServerWebSocketClose(state, code, reason, payload) {
+  if (state.finalized || state.readyState !== 1) return;
+  state.readyState = 3;
+  state.pendingClose = { code, reason: String(reason ?? "") };
   const socket = state.socket;
   if (socket && !socket.destroyed && socket.writable) {
-    const reasonBytes = Buffer.from(String(reason ?? ""));
-    const payload = Buffer.alloc(2 + reasonBytes.byteLength);
-    payload[0] = (code >> 8) & 0xff;
-    payload[1] = code & 0xff;
-    payload.set(reasonBytes, 2);
     flushServerWebSocketFrames(state);
-    try { socket.write(encodeServerWebSocketFrame(0x8, payload)); } catch {}
-    try { socket.end(); } catch {}
+    try {
+      socket.end(encodeServerWebSocketFrame(0x8, payload));
+      state.closeTimer = setTimeout(() => terminateServerWebSocket(state), 30_000);
+      state.closeTimer?.unref?.();
+      return;
+    } catch {}
   }
   finalizeServerWebSocket(state, code, String(reason ?? ""));
+}
+
+function closeServerWebSocket(state, code, reason) {
+  if (state.readyState !== 1) return;
+  const payload = nodeHttp.createWebSocketClosePayload(code, reason);
+  beginServerWebSocketClose(state, code, reason, payload);
+}
+
+function failServerWebSocket(state, code, reason) {
+  if (state.readyState !== 1) return;
+  const payload = nodeHttp.createWebSocketClosePayload(code, reason, { truncateReason: true });
+  beginServerWebSocketClose(state, code, reason, payload);
 }
 
 function terminateServerWebSocket(state) {
   if (state.readyState === 3 && state.finalized) return;
   state.readyState = 3;
+  state.pendingClose = { code: 1006, reason: "" };
   state.pendingFrames = [];
   state.pendingFrameBytes = 0;
   try { state.socket?.destroy?.(); } catch {}
-  finalizeServerWebSocket(state, 1006, "");
+  queueMicrotask(() => {
+    if (!state.finalized && state.socket?.destroyed) finalizeServerWebSocket(state, 1006, "");
+  });
 }
 
 function publishToWebSocketTopic(serverState, topic, data, opcode, excludeState, compress = false) {
@@ -10117,6 +10113,7 @@ class ServerWebSocket {
   }
 
   get remoteAddress() {
+    if (this._state.readyState !== 1) return undefined;
     return this._state.remoteAddress ?? this._state.socket?.remoteAddress ?? "";
   }
 
@@ -10172,7 +10169,7 @@ class ServerWebSocket {
   subscribe(topic) {
     const name = String(topic ?? "");
     if (name.length === 0) throw new TypeError("subscribe requires a non-empty topic name");
-    if (this._state.readyState !== 1) return false;
+    if (this._state.readyState !== 1) return true;
     this._state.topics.add(name);
     let set = this._state.serverState.topics.get(name);
     if (!set) {
@@ -10247,19 +10244,19 @@ function attachServerWebSocket(serverState, socket, head, data, deflate = null) 
     binaryType: "nodebuffer",
     topics: new Set(),
     buffer: Buffer.alloc(0),
-    fragments: [],
-    fragmentOpcode: 0,
-    fragmentCompressed: false,
+    messageState: nodeHttp.createWebSocketMessageState(),
     wantDrain: false,
     pendingFrames: [],
     pendingFrameBytes: 0,
     frameFlushScheduled: false,
     finalized: false,
     opened: false,
+    pendingClose: null,
+    closeTimer: null,
     remoteAddress: socket.remoteAddress,
     config: {
       maxPayloadLength: Number(websocketOptions.maxPayloadLength ?? 16 * 1024 * 1024),
-      backpressureLimit: Number(websocketOptions.backpressureLimit ?? 1024 * 1024),
+      backpressureLimit: Number(websocketOptions.backpressureLimit ?? 16 * 1024 * 1024),
       closeOnBackpressureLimit: Boolean(websocketOptions.closeOnBackpressureLimit),
       publishToSelf: Boolean(websocketOptions.publishToSelf),
     },
@@ -10279,15 +10276,14 @@ function attachServerWebSocket(serverState, socket, head, data, deflate = null) 
 
   const handleFrame = (frame) => {
     if (frame.opcode === 0x8) {
-      const code = frame.payload.byteLength >= 2 ? ((frame.payload[0] << 8) | frame.payload[1]) : 1000;
-      const reason = frame.payload.byteLength > 2 ? frame.payload.subarray(2).toString("utf8") : "";
-      if (state.readyState === 1) {
-        state.readyState = 2;
-        flushServerWebSocketFrames(state);
-        try { socket.write(encodeServerWebSocketFrame(0x8, frame.payload)); } catch {}
+      let close;
+      try {
+        close = nodeHttp.parseWebSocketClosePayload(frame.payload, { emptyCode: 1000 });
+      } catch (error) {
+        failServerWebSocket(state, error?.closeCode ?? 1002, error?.message ?? "Invalid close frame");
+        return;
       }
-      try { socket.end(); } catch {}
-      finalizeServerWebSocket(state, code, reason);
+      beginServerWebSocketClose(state, close.code, close.reason, frame.payload);
       return;
     }
     if (frame.opcode === 0x9) {
@@ -10302,68 +10298,71 @@ function attachServerWebSocket(serverState, socket, head, data, deflate = null) 
       invokeWebSocketHandler(state, "pong", ws, convertWebSocketBinary(state, frame.payload));
       return;
     }
-    if (frame.opcode === 0x1 || frame.opcode === 0x2) {
-      if (frame.rsv1 && state.deflate == null) {
-        closeServerWebSocket(state, 1002, "Unexpected compressed frame");
-        return;
-      }
-      state.fragmentOpcode = frame.opcode;
-      state.fragments = [frame.payload];
-      state.fragmentCompressed = frame.rsv1 === true;
-    } else if (frame.opcode === 0x0 && state.fragmentOpcode) {
-      state.fragments.push(frame.payload);
-    } else {
+    let message;
+    try {
+      message = nodeHttp.consumeWebSocketDataFrame(state.messageState, frame, {
+        maxPayloadLength: state.config.maxPayloadLength,
+      });
+    } catch (error) {
+      if (error?.closeCode === 1009) terminateServerWebSocket(state);
+      else failServerWebSocket(state, error?.closeCode ?? 1002, error?.message ?? "Invalid WebSocket message");
       return;
     }
-    const totalLength = state.fragments.reduce((sum, part) => sum + part.byteLength, 0);
-    if (totalLength > state.config.maxPayloadLength) {
-      terminateServerWebSocket(state);
-      return;
-    }
-    if (!frame.fin) return;
-    let payload = state.fragments.length === 1 ? state.fragments[0] : Buffer.concat(state.fragments);
-    const opcode = state.fragmentOpcode;
-    const compressed = state.fragmentCompressed;
-    state.fragments = [];
-    state.fragmentOpcode = 0;
-    state.fragmentCompressed = false;
-    if (compressed) {
+    if (message == null) return;
+    let payload = message.payload;
+    if (message.compressed) {
       try {
         payload = nodeHttp.websocketDeflateDecompress(payload, state.config.maxPayloadLength);
       } catch (error) {
-        if (error?.code === "WS_MESSAGE_TOO_BIG") closeServerWebSocket(state, 1009, "Message too big");
-        else closeServerWebSocket(state, 1007, "Invalid compressed data");
+        if (error?.code === "WS_MESSAGE_TOO_BIG") terminateServerWebSocket(state);
+        else failServerWebSocket(state, 1007, "Invalid compressed data");
         return;
       }
     }
-    const message = opcode === 0x1 ? payload.toString("utf8") : convertWebSocketBinary(state, payload);
-    invokeWebSocketHandler(state, "message", ws, message);
+    let value;
+    try {
+      value = message.opcode === 0x1
+        ? nodeHttp.decodeWebSocketText(payload)
+        : convertWebSocketBinary(state, payload);
+    } catch (error) {
+      failServerWebSocket(state, error?.closeCode ?? 1007, error?.message ?? "Invalid UTF-8 in text frame");
+      return;
+    }
+    invokeWebSocketHandler(state, "message", ws, value);
   };
 
   const handleData = (chunk) => {
-    if (state.finalized) return;
+    if (state.finalized || state.readyState !== 1) return;
     invokeOpen();
     const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     state.buffer = state.buffer.byteLength === 0 ? incoming : Buffer.concat([state.buffer, incoming]);
     let parsed;
     try {
-      parsed = decodeWebSocketFrames(state.buffer);
-    } catch {
-      terminateServerWebSocket(state);
+      parsed = nodeHttp.parseWebSocketFrames(state.buffer, {
+        allowCompression: state.deflate != null,
+        expectMasked: true,
+        maxFramePayloadLength: state.config.maxPayloadLength,
+      });
+    } catch (error) {
+      if (error?.closeCode === 1009) terminateServerWebSocket(state);
+      else failServerWebSocket(state, error?.closeCode ?? 1002, error?.message ?? "Invalid WebSocket frame");
       return;
     }
     state.buffer = parsed.remaining;
     for (const frame of parsed.frames) {
-      if (state.finalized) return;
+      if (state.finalized || state.readyState !== 1) return;
       handleFrame(frame);
+      if (state.readyState !== 1) return;
     }
   };
 
   socket.on("data", handleData);
   socket.on("error", () => {});
   socket.on("close", () => {
-    serverState.websockets.delete(state);
-    if (!state.finalized) finalizeServerWebSocket(state, 1006, "");
+    if (!state.finalized) {
+      const close = state.pendingClose;
+      finalizeServerWebSocket(state, close?.code ?? 1006, close?.reason ?? "");
+    }
   });
   socket.on("drain", () => scheduleServerWebSocketDrain(state));
 
@@ -10449,7 +10448,9 @@ function encodeMaskedWebSocketFrame(opcode, data) {
   const sendControlFrame = (ws, opcode, data) => {
     if (ws.readyState !== 1) return;
     const write = (payload) => {
-      try { ws._socket?.write?.(encodeMaskedWebSocketFrame(opcode, payload)); } catch {}
+      let bytes = websocketPayloadBytes(payload);
+      if (bytes.byteLength > 125) bytes = bytes.subarray(0, 125);
+      try { ws._socket?.write?.(encodeMaskedWebSocketFrame(opcode, bytes)); } catch {}
     };
     if (data != null && typeof data === "object" && typeof data.arrayBuffer === "function") {
       data.arrayBuffer().then((buffer) => write(new Uint8Array(buffer)), () => {});
@@ -10466,19 +10467,19 @@ function encodeMaskedWebSocketFrame(opcode, data) {
   };
 
   const originalSend = proto.send;
-  proto.send = function send(data) {
+  proto.send = function send(data, ...args) {
     if (data != null && typeof data === "object" && typeof data.arrayBuffer === "function" &&
         !(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data)) {
       // Blob-like payloads are read asynchronously and sent as binary frames.
       data.arrayBuffer().then(
         (buffer) => {
-          try { originalSend.call(this, new Uint8Array(buffer)); } catch {}
+          try { Reflect.apply(originalSend, this, [new Uint8Array(buffer), ...args]); } catch {}
         },
         () => {},
       );
       return;
     }
-    return originalSend.call(this, data);
+    return Reflect.apply(originalSend, this, [data, ...args]);
   };
 
   const originalHandleFrame = proto._handleFrame;
@@ -10499,7 +10500,7 @@ function encodeMaskedWebSocketFrame(opcode, data) {
   // only understands "arraybuffer" vs Buffer).
   proto._deliverMessage = function (opcode, payload) {
     const MessageEventClass = globalThis.MessageEvent ?? nodeHttp.MessageEvent;
-    const data = opcode === 0x1 ? payload.toString("utf8") : convertClientBinary(this, payload);
+    const data = opcode === 0x1 ? nodeHttp.decodeWebSocketText(payload) : convertClientBinary(this, payload);
     this.dispatchEvent(new MessageEventClass("message", {
       data,
       origin: this.url,
@@ -11196,7 +11197,7 @@ export function serve(options) {
     ? { ...options.websocket }
     : options.websocket;
   if (wrappedWebSocket && typeof wrappedWebSocket === "object") {
-    for (const name of ["open", "message", "close", "drain", "ping", "pong"]) {
+    for (const name of ["open", "message", "close", "drain", "error", "ping", "pong"]) {
       if (typeof wrappedWebSocket[name] === "function") {
         wrappedWebSocket[name] = _wrapAsyncCallback(wrappedWebSocket[name]);
       }
