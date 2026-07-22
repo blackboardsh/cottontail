@@ -471,13 +471,18 @@ extern "C" char* ct_jsc_heap_snapshot(JSContextRef context, int gc_debugging)
         return nullptr;
 
     profiler->clearSnapshots();
-    const auto snapshot_type = gc_debugging
-        ? JSC::HeapSnapshotBuilder::GCDebuggingSnapshot
-        : JSC::HeapSnapshotBuilder::InspectorSnapshot;
-    JSC::HeapSnapshotBuilder builder(*profiler, snapshot_type);
-    builder.buildSnapshot();
-    auto json = builder.json();
-    return ct_jsc_copy_utf8(json);
+    char* result = nullptr;
+    {
+        const auto snapshot_type = gc_debugging
+            ? JSC::HeapSnapshotBuilder::GCDebuggingSnapshot
+            : JSC::HeapSnapshotBuilder::InspectorSnapshot;
+        JSC::HeapSnapshotBuilder builder(*profiler, snapshot_type);
+        builder.buildSnapshot();
+        auto json = builder.json();
+        result = ct_jsc_copy_utf8(json);
+    }
+    profiler->clearSnapshots();
+    return result;
 }
 
 static JSC::JSGlobalObject* ct_jsc_global_object(JSContextRef context)

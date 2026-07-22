@@ -25845,11 +25845,6 @@ char *ct_jsc_runtime_take_sampling_profiler(CtJscRuntime *runtime) {
 
 char *ct_jsc_runtime_take_heap_snapshot(CtJscRuntime *runtime, bool gc_debugging) {
     if (runtime == NULL || runtime->context == NULL) return NULL;
-#if defined(__APPLE__)
-    JSSynchronousGarbageCollectForDebugging(runtime->context);
-#else
-    JSGarbageCollect(runtime->context);
-#endif
     return ct_jsc_heap_snapshot(runtime->context, gc_debugging ? 1 : 0);
 }
 

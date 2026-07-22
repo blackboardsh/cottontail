@@ -80,10 +80,10 @@ const HeapEdge = struct {
 const HeapGraph = struct {
     nodes: []HeapNode,
     edges: []HeapEdge,
-    class_names: []const std.json.Value,
-    edge_types: []const std.json.Value,
-    edge_names: []const std.json.Value,
-    labels: []const std.json.Value,
+    class_names: []const []const u8,
+    edge_types: []const []const u8,
+    edge_names: []const []const u8,
+    labels: []const []const u8,
     outgoing_offsets: []usize,
     outgoing_edges: []usize,
     incoming_offsets: []usize,
@@ -126,62 +126,384 @@ const TypeStats = struct {
     largest_instance_id: u64 = 0,
 };
 
-fn jsonUnsigned(value: std.json.Value) ?u64 {
-    return switch (value) {
-        .integer => |number| if (number >= 0) @intCast(number) else null,
-        .float => |number| if (std.math.isFinite(number) and number >= 0 and number < @as(f64, @floatFromInt(std.math.maxInt(u64))))
-            @intFromFloat(number)
-        else
-            null,
-        .number_string => |number| std.fmt.parseUnsigned(u64, number, 10) catch null,
+fn stringAt(values: []const []const u8, index: usize) ?[]const u8 {
+    if (index >= values.len) return null;
+    return values[index];
+}
+
+const JsonSpan = struct {
+    bytes: []const u8,
+};
+
+const JsonStringRange = struct {
+    bytes: []const u8,
+    escaped: bool,
+};
+
+fn hexDigit(byte: u8) ?u32 {
+    return switch (byte) {
+        '0'...'9' => byte - '0',
+        'a'...'f' => byte - 'a' + 10,
+        'A'...'F' => byte - 'A' + 10,
         else => null,
     };
 }
 
-fn stringValues(value: ?std.json.Value) []const std.json.Value {
-    const actual = value orelse return &.{};
-    return if (actual == .array) actual.array.items else &.{};
+fn decodeHex4(bytes: []const u8) !u32 {
+    if (bytes.len < 4) return error.InvalidHeapSnapshot;
+    var value: u32 = 0;
+    for (bytes[0..4]) |byte| value = value * 16 + (hexDigit(byte) orelse return error.InvalidHeapSnapshot);
+    return value;
 }
 
-fn stringAt(values: []const std.json.Value, index: usize) ?[]const u8 {
-    if (index >= values.len or values[index] != .string) return null;
-    return values[index].string;
+fn appendUtf8(output: []u8, output_index: *usize, codepoint: u32) !void {
+    const index = output_index.*;
+    if (codepoint <= 0x7f) {
+        output[index] = @intCast(codepoint);
+        output_index.* += 1;
+    } else if (codepoint <= 0x7ff) {
+        output[index] = @intCast(0xc0 | (codepoint >> 6));
+        output[index + 1] = @intCast(0x80 | (codepoint & 0x3f));
+        output_index.* += 2;
+    } else if (codepoint <= 0xffff) {
+        output[index] = @intCast(0xe0 | (codepoint >> 12));
+        output[index + 1] = @intCast(0x80 | ((codepoint >> 6) & 0x3f));
+        output[index + 2] = @intCast(0x80 | (codepoint & 0x3f));
+        output_index.* += 3;
+    } else if (codepoint <= 0x10ffff) {
+        output[index] = @intCast(0xf0 | (codepoint >> 18));
+        output[index + 1] = @intCast(0x80 | ((codepoint >> 12) & 0x3f));
+        output[index + 2] = @intCast(0x80 | ((codepoint >> 6) & 0x3f));
+        output[index + 3] = @intCast(0x80 | (codepoint & 0x3f));
+        output_index.* += 4;
+    } else return error.InvalidHeapSnapshot;
 }
 
-fn parseGraph(allocator: std.mem.Allocator, source: []const u8) !HeapGraph {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, source, .{});
-    if (parsed.value != .object) return error.InvalidHeapSnapshot;
-    const object = parsed.value.object;
-    const node_values = object.get("nodes") orelse return error.InvalidHeapSnapshot;
-    const edge_values = object.get("edges") orelse return error.InvalidHeapSnapshot;
-    if (node_values != .array or edge_values != .array) return error.InvalidHeapSnapshot;
+fn decodeJsonString(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    const output = try allocator.alloc(u8, raw.len);
+    var input_index: usize = 0;
+    var output_index: usize = 0;
+    while (input_index < raw.len) {
+        const byte = raw[input_index];
+        input_index += 1;
+        if (byte != '\\') {
+            output[output_index] = byte;
+            output_index += 1;
+            continue;
+        }
+        if (input_index >= raw.len) return error.InvalidHeapSnapshot;
+        const escape = raw[input_index];
+        input_index += 1;
+        switch (escape) {
+            '"', '\\', '/' => {
+                output[output_index] = escape;
+                output_index += 1;
+            },
+            'b' => {
+                output[output_index] = 8;
+                output_index += 1;
+            },
+            'f' => {
+                output[output_index] = 12;
+                output_index += 1;
+            },
+            'n' => {
+                output[output_index] = '\n';
+                output_index += 1;
+            },
+            'r' => {
+                output[output_index] = '\r';
+                output_index += 1;
+            },
+            't' => {
+                output[output_index] = '\t';
+                output_index += 1;
+            },
+            'u' => {
+                var codepoint = try decodeHex4(raw[input_index..]);
+                input_index += 4;
+                if (codepoint >= 0xd800 and codepoint <= 0xdbff) {
+                    if (input_index + 6 > raw.len or raw[input_index] != '\\' or raw[input_index + 1] != 'u') {
+                        return error.InvalidHeapSnapshot;
+                    }
+                    const low = try decodeHex4(raw[input_index + 2 ..]);
+                    if (low < 0xdc00 or low > 0xdfff) return error.InvalidHeapSnapshot;
+                    input_index += 6;
+                    codepoint = 0x10000 + ((codepoint - 0xd800) << 10) + (low - 0xdc00);
+                } else if (codepoint >= 0xdc00 and codepoint <= 0xdfff) return error.InvalidHeapSnapshot;
+                try appendUtf8(output, &output_index, codepoint);
+            },
+            else => return error.InvalidHeapSnapshot,
+        }
+    }
+    return output[0..output_index];
+}
 
-    const type_value = object.get("type");
-    const gc_debugging = type_value != null and type_value.? == .string and
-        std.mem.eql(u8, type_value.?.string, "GCDebugging");
-    const node_stride: usize = if (gc_debugging) 7 else 4;
-    if (node_values.array.items.len % node_stride != 0 or edge_values.array.items.len % 4 != 0) {
+const JsonCursor = struct {
+    source: []const u8,
+    index: usize = 0,
+
+    fn skipWhitespace(self: *@This()) void {
+        while (self.index < self.source.len) {
+            switch (self.source[self.index]) {
+                ' ', '\t', '\r', '\n' => self.index += 1,
+                else => return,
+            }
+        }
+    }
+
+    fn consume(self: *@This(), expected: u8) bool {
+        self.skipWhitespace();
+        if (self.index >= self.source.len or self.source[self.index] != expected) return false;
+        self.index += 1;
+        return true;
+    }
+
+    fn expect(self: *@This(), expected: u8) !void {
+        if (!self.consume(expected)) return error.InvalidHeapSnapshot;
+    }
+
+    fn parseStringRange(self: *@This()) !JsonStringRange {
+        self.skipWhitespace();
+        if (self.index >= self.source.len or self.source[self.index] != '"') return error.InvalidHeapSnapshot;
+        self.index += 1;
+        const start = self.index;
+        var escaped = false;
+        while (self.index < self.source.len) {
+            const byte = self.source[self.index];
+            self.index += 1;
+            switch (byte) {
+                '"' => return .{ .bytes = self.source[start .. self.index - 1], .escaped = escaped },
+                '\\' => {
+                    escaped = true;
+                    if (self.index >= self.source.len) return error.InvalidHeapSnapshot;
+                    const escape = self.source[self.index];
+                    self.index += 1;
+                    switch (escape) {
+                        '"', '\\', '/', 'b', 'f', 'n', 'r', 't' => {},
+                        'u' => {
+                            if (self.index + 4 > self.source.len) return error.InvalidHeapSnapshot;
+                            _ = try decodeHex4(self.source[self.index..]);
+                            self.index += 4;
+                        },
+                        else => return error.InvalidHeapSnapshot,
+                    }
+                },
+                0...31 => return error.InvalidHeapSnapshot,
+                else => {},
+            }
+        }
         return error.InvalidHeapSnapshot;
     }
 
-    const class_names = stringValues(object.get("nodeClassNames"));
-    const labels = stringValues(object.get("labels"));
-    const node_count = node_values.array.items.len / node_stride;
-    var nodes = try allocator.alloc(HeapNode, node_count);
+    fn parseString(self: *@This(), allocator: std.mem.Allocator) ![]const u8 {
+        const range = try self.parseStringRange();
+        return if (range.escaped) try decodeJsonString(allocator, range.bytes) else range.bytes;
+    }
+
+    fn skipValue(self: *@This()) !void {
+        self.skipWhitespace();
+        if (self.index >= self.source.len) return error.InvalidHeapSnapshot;
+        if (self.source[self.index] == '"') {
+            _ = try self.parseStringRange();
+            return;
+        }
+        if (self.source[self.index] == '[' or self.source[self.index] == '{') {
+            var depth: usize = 0;
+            while (self.index < self.source.len) {
+                switch (self.source[self.index]) {
+                    '"' => _ = try self.parseStringRange(),
+                    '[', '{' => {
+                        depth += 1;
+                        self.index += 1;
+                    },
+                    ']', '}' => {
+                        if (depth == 0) return error.InvalidHeapSnapshot;
+                        depth -= 1;
+                        self.index += 1;
+                        if (depth == 0) return;
+                    },
+                    else => self.index += 1,
+                }
+            }
+            return error.InvalidHeapSnapshot;
+        }
+        const start = self.index;
+        while (self.index < self.source.len) : (self.index += 1) {
+            switch (self.source[self.index]) {
+                ',', ']', '}', ' ', '\t', '\r', '\n' => break,
+                else => {},
+            }
+        }
+        if (self.index == start) return error.InvalidHeapSnapshot;
+    }
+};
+
+const SnapshotFields = struct {
+    gc_debugging: bool,
+    nodes: JsonSpan,
+    edges: JsonSpan,
+    class_names: ?JsonSpan = null,
+    edge_types: ?JsonSpan = null,
+    edge_names: ?JsonSpan = null,
+    labels: ?JsonSpan = null,
+    roots: ?JsonSpan = null,
+};
+
+fn parseSnapshotFields(allocator: std.mem.Allocator, source: []const u8) !SnapshotFields {
+    var cursor = JsonCursor{ .source = source };
+    try cursor.expect('{');
+    var snapshot_type: ?[]const u8 = null;
+    var nodes: ?JsonSpan = null;
+    var edges: ?JsonSpan = null;
+    var class_names: ?JsonSpan = null;
+    var edge_types: ?JsonSpan = null;
+    var edge_names: ?JsonSpan = null;
+    var labels: ?JsonSpan = null;
+    var roots: ?JsonSpan = null;
+    var first = true;
+    while (true) {
+        cursor.skipWhitespace();
+        if (cursor.consume('}')) break;
+        if (!first) try cursor.expect(',');
+        first = false;
+        const key = try cursor.parseString(allocator);
+        try cursor.expect(':');
+        if (std.mem.eql(u8, key, "type")) {
+            snapshot_type = try cursor.parseString(allocator);
+            continue;
+        }
+        cursor.skipWhitespace();
+        const start = cursor.index;
+        try cursor.skipValue();
+        const span = JsonSpan{ .bytes = source[start..cursor.index] };
+        if (span.bytes.len == 0 or span.bytes[0] != '[') {
+            if (std.mem.eql(u8, key, "nodes") or std.mem.eql(u8, key, "edges")) return error.InvalidHeapSnapshot;
+            continue;
+        }
+        if (std.mem.eql(u8, key, "nodes")) nodes = span else if (std.mem.eql(u8, key, "edges")) edges = span else if (std.mem.eql(u8, key, "nodeClassNames")) class_names = span else if (std.mem.eql(u8, key, "edgeTypes")) edge_types = span else if (std.mem.eql(u8, key, "edgeNames")) edge_names = span else if (std.mem.eql(u8, key, "labels")) labels = span else if (std.mem.eql(u8, key, "roots")) roots = span;
+    }
+    cursor.skipWhitespace();
+    if (cursor.index != source.len) return error.InvalidHeapSnapshot;
+    const actual_type = snapshot_type orelse return error.InvalidHeapSnapshot;
+    const gc_debugging = std.mem.eql(u8, actual_type, "GCDebugging");
+    if (!gc_debugging and !std.mem.eql(u8, actual_type, "Inspector")) return error.InvalidHeapSnapshot;
+    return .{
+        .gc_debugging = gc_debugging,
+        .nodes = nodes orelse return error.InvalidHeapSnapshot,
+        .edges = edges orelse return error.InvalidHeapSnapshot,
+        .class_names = class_names,
+        .edge_types = edge_types,
+        .edge_names = edge_names,
+        .labels = labels,
+        .roots = roots,
+    };
+}
+
+fn numberArrayCount(span: JsonSpan) !usize {
+    if (span.bytes.len < 2 or span.bytes[0] != '[' or span.bytes[span.bytes.len - 1] != ']') return error.InvalidHeapSnapshot;
+    const body = std.mem.trim(u8, span.bytes[1 .. span.bytes.len - 1], " \t\r\n");
+    return if (body.len == 0) 0 else std.mem.count(u8, body, ",") + 1;
+}
+
+const UnsignedArrayParser = struct {
+    cursor: JsonCursor,
+    consumed: usize = 0,
+
+    fn init(span: JsonSpan) !@This() {
+        var result = @This(){ .cursor = .{ .source = span.bytes } };
+        try result.cursor.expect('[');
+        return result;
+    }
+
+    fn next(self: *@This()) !u64 {
+        if (self.consumed > 0) try self.cursor.expect(',');
+        self.cursor.skipWhitespace();
+        const start = self.cursor.index;
+        var result: u64 = 0;
+        while (self.cursor.index < self.cursor.source.len) {
+            const byte = self.cursor.source[self.cursor.index];
+            if (byte < '0' or byte > '9') break;
+            result = std.math.mul(u64, result, 10) catch return error.InvalidHeapSnapshot;
+            result = std.math.add(u64, result, byte - '0') catch return error.InvalidHeapSnapshot;
+            self.cursor.index += 1;
+        }
+        if (self.cursor.index == start) return error.InvalidHeapSnapshot;
+        self.consumed += 1;
+        return result;
+    }
+
+    fn skip(self: *@This()) !void {
+        if (self.consumed > 0) try self.cursor.expect(',');
+        try self.cursor.skipValue();
+        self.consumed += 1;
+    }
+
+    fn finish(self: *@This()) !void {
+        try self.cursor.expect(']');
+        self.cursor.skipWhitespace();
+        if (self.cursor.index != self.cursor.source.len) return error.InvalidHeapSnapshot;
+    }
+};
+
+fn stringArrayCount(span: JsonSpan) !usize {
+    var cursor = JsonCursor{ .source = span.bytes };
+    try cursor.expect('[');
+    if (cursor.consume(']')) return 0;
+    var count: usize = 0;
+    while (true) {
+        if (count > 0) try cursor.expect(',');
+        _ = try cursor.parseStringRange();
+        count += 1;
+        if (cursor.consume(']')) break;
+    }
+    cursor.skipWhitespace();
+    if (cursor.index != cursor.source.len) return error.InvalidHeapSnapshot;
+    return count;
+}
+
+fn parseStringArray(allocator: std.mem.Allocator, optional_span: ?JsonSpan) ![]const []const u8 {
+    const span = optional_span orelse return &.{};
+    const count = try stringArrayCount(span);
+    const values = try allocator.alloc([]const u8, count);
+    var cursor = JsonCursor{ .source = span.bytes };
+    try cursor.expect('[');
+    for (values, 0..) |*value, index| {
+        if (index > 0) try cursor.expect(',');
+        value.* = try cursor.parseString(allocator);
+    }
+    try cursor.expect(']');
+    cursor.skipWhitespace();
+    if (cursor.index != cursor.source.len) return error.InvalidHeapSnapshot;
+    return values;
+}
+
+fn parseGraph(allocator: std.mem.Allocator, source: []const u8) !HeapGraph {
+    const fields = try parseSnapshotFields(allocator, source);
+    const node_stride: usize = if (fields.gc_debugging) 7 else 4;
+    const node_value_count = try numberArrayCount(fields.nodes);
+    const edge_value_count = try numberArrayCount(fields.edges);
+    if (node_value_count % node_stride != 0 or edge_value_count % 4 != 0) return error.InvalidHeapSnapshot;
+
+    const node_count = node_value_count / node_stride;
+    const nodes = try allocator.alloc(HeapNode, node_count);
     var id_to_index: std.AutoHashMapUnmanaged(u64, usize) = .empty;
     const hash_capacity = std.math.cast(u32, node_count) orelse return error.HeapSnapshotTooLarge;
     try id_to_index.ensureTotalCapacity(allocator, hash_capacity);
+    var node_values = try UnsignedArrayParser.init(fields.nodes);
     for (nodes, 0..) |*node, index| {
-        const offset = index * node_stride;
-        const id = jsonUnsigned(node_values.array.items[offset]) orelse return error.InvalidHeapSnapshot;
-        const size = jsonUnsigned(node_values.array.items[offset + 1]) orelse return error.InvalidHeapSnapshot;
-        const class_name_index = std.math.cast(usize, jsonUnsigned(node_values.array.items[offset + 2]) orelse return error.InvalidHeapSnapshot) orelse
-            return error.InvalidHeapSnapshot;
-        const flags = jsonUnsigned(node_values.array.items[offset + 3]) orelse return error.InvalidHeapSnapshot;
-        const label_index = if (gc_debugging)
-            std.math.cast(usize, jsonUnsigned(node_values.array.items[offset + 4]) orelse return error.InvalidHeapSnapshot)
+        const id = try node_values.next();
+        const size = try node_values.next();
+        const class_name_index = std.math.cast(usize, try node_values.next()) orelse return error.InvalidHeapSnapshot;
+        const flags = try node_values.next();
+        const label_index = if (fields.gc_debugging)
+            std.math.cast(usize, try node_values.next()) orelse return error.InvalidHeapSnapshot
         else
             null;
+        if (fields.gc_debugging) {
+            try node_values.skip();
+            try node_values.skip();
+        }
         node.* = .{
             .id = id,
             .size = size,
@@ -191,21 +513,21 @@ fn parseGraph(allocator: std.mem.Allocator, source: []const u8) !HeapGraph {
         };
         try id_to_index.put(allocator, id, index);
     }
+    try node_values.finish();
 
-    const edge_count = edge_values.array.items.len / 4;
+    const edge_count = edge_value_count / 4;
     const edges = try allocator.alloc(HeapEdge, edge_count);
     const outgoing_offsets = try allocator.alloc(usize, node_count + 1);
     const incoming_offsets = try allocator.alloc(usize, node_count + 1);
     @memset(outgoing_offsets, 0);
     @memset(incoming_offsets, 0);
     var linked_edge_count: usize = 0;
-    for (edges, 0..) |*edge, index| {
-        const offset = index * 4;
-        const from_id = jsonUnsigned(edge_values.array.items[offset]) orelse return error.InvalidHeapSnapshot;
-        const to_id = jsonUnsigned(edge_values.array.items[offset + 1]) orelse return error.InvalidHeapSnapshot;
-        const type_index = std.math.cast(usize, jsonUnsigned(edge_values.array.items[offset + 2]) orelse return error.InvalidHeapSnapshot) orelse
-            return error.InvalidHeapSnapshot;
-        const data_index = jsonUnsigned(edge_values.array.items[offset + 3]) orelse return error.InvalidHeapSnapshot;
+    var edge_values = try UnsignedArrayParser.init(fields.edges);
+    for (edges) |*edge| {
+        const from_id = try edge_values.next();
+        const to_id = try edge_values.next();
+        const type_index = std.math.cast(usize, try edge_values.next()) orelse return error.InvalidHeapSnapshot;
+        const data_index = try edge_values.next();
         const from_index = id_to_index.get(from_id);
         const to_index = id_to_index.get(to_id);
         edge.* = .{
@@ -222,6 +544,7 @@ fn parseGraph(allocator: std.mem.Allocator, source: []const u8) !HeapGraph {
             linked_edge_count += 1;
         }
     }
+    try edge_values.finish();
 
     for (0..node_count) |index| {
         outgoing_offsets[index + 1] += outgoing_offsets[index];
@@ -239,23 +562,25 @@ fn parseGraph(allocator: std.mem.Allocator, source: []const u8) !HeapGraph {
         incoming_cursor[edge.to_index.?] += 1;
     }
 
-    if (object.get("roots")) |roots| {
-        if (roots == .array) {
-            var offset: usize = 0;
-            while (offset < roots.array.items.len) : (offset += 3) {
-                const id = jsonUnsigned(roots.array.items[offset]) orelse continue;
-                if (id_to_index.get(id)) |index| nodes[index].is_gc_root = true;
+    if (fields.roots) |roots| {
+        const root_value_count = try numberArrayCount(roots);
+        var root_values = try UnsignedArrayParser.init(roots);
+        for (0..root_value_count) |offset| {
+            const value = try root_values.next();
+            if (offset % 3 == 0) {
+                if (id_to_index.get(value)) |index| nodes[index].is_gc_root = true;
             }
         }
+        try root_values.finish();
     }
 
     return .{
         .nodes = nodes,
         .edges = edges,
-        .class_names = class_names,
-        .edge_types = stringValues(object.get("edgeTypes")),
-        .edge_names = stringValues(object.get("edgeNames")),
-        .labels = labels,
+        .class_names = try parseStringArray(allocator, fields.class_names),
+        .edge_types = try parseStringArray(allocator, fields.edge_types),
+        .edge_names = try parseStringArray(allocator, fields.edge_names),
+        .labels = try parseStringArray(allocator, fields.labels),
         .outgoing_offsets = outgoing_offsets,
         .outgoing_edges = outgoing_edges,
         .incoming_offsets = incoming_offsets,
@@ -387,8 +712,7 @@ pub fn convertJscToV8(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
         .edges = edges.items,
         .strings = strings.items,
     };
-    const json = try std.json.Stringify.valueAlloc(arena, output, .{});
-    return try allocator.dupe(u8, json);
+    return try std.json.Stringify.valueAlloc(allocator, output, .{});
 }
 
 const DfsFrame = struct {
@@ -606,7 +930,10 @@ pub fn buildMarkdown(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     for (largest_objects, 0..) |*item, index| item.* = index;
     std.mem.sort(usize, largest_objects, graph.nodes, objectRetainedLessThan);
 
-    var output = std.array_list.Managed(u8).init(arena);
+    var output = std.array_list.Managed(u8).init(allocator);
+    errdefer output.deinit();
+    const estimated_output_size = std.math.mul(usize, source.len, 3) catch source.len;
+    try output.ensureTotalCapacity(estimated_output_size);
     try output.appendSlice(
         "# Bun Heap Profile\n\n" ++
             "Generated by `bun --heap-prof-md`. This profile contains complete heap data in markdown format.\n\n" ++
@@ -777,14 +1104,14 @@ pub fn buildMarkdown(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     try output.appendSlice("\n</details>\n\n");
 
     try output.print("## Property Names\n\n<details>\n<summary>Click to expand all {d} property/variable names</summary>\n\n| Index | Name |\n|------:|------|\n", .{graph.edge_names.len});
-    for (graph.edge_names, 0..) |name_value, index| {
-        if (name_value != .string or name_value.string.len == 0) continue;
+    for (graph.edge_names, 0..) |name, index| {
+        if (name.len == 0) continue;
         try output.print("| {d} | `", .{index});
-        try appendEscaped(&output, name_value.string, null);
+        try appendEscaped(&output, name, null);
         try output.appendSlice("` |\n");
     }
     try output.appendSlice("\n</details>\n\n---\n\n*End of heap profile*\n");
-    return try allocator.dupe(u8, output.items);
+    return try output.toOwnedSlice();
 }
 
 test "converts JSC inspector snapshots to V8 format" {
@@ -798,6 +1125,13 @@ test "converts JSC inspector snapshots to V8 format" {
     try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("snapshot").?.object.get("node_count").?.integer);
     try std.testing.expectEqual(@as(usize, 21), parsed.value.object.get("nodes").?.array.items.len);
     try std.testing.expectEqual(@as(usize, 6), parsed.value.object.get("edges").?.array.items.len);
+}
+
+test "decodes escaped snapshot strings" {
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const decoded = try decodeJsonString(scratch.allocator(), "Obj\\u0065ct\\n\\ud83c\\udf0d");
+    try std.testing.expect(std.mem.eql(u8, decoded, "Object\n\xf0\x9f\x8c\x8d"));
 }
 
 test "builds markdown from JSC GC debugging snapshots" {
