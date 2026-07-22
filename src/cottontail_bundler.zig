@@ -1545,6 +1545,7 @@ const BuildResultJson = struct {
     success: bool,
     logs: []const BuildLogJson,
     outputs: []const BuildOutputJson,
+    inputs: []const []const u8 = &.{},
     metafile: ?[]const u8 = null,
     metafileMarkdown: ?[]const u8 = null,
 };
@@ -2224,10 +2225,17 @@ pub fn buildEntryPointsJson(
         try compiler.bundle_v2.LinkerContext.MetafileBuilder.generateMarkdown(arena_allocator, result.metafile.?)
     else
         null;
+    var inputs: std.ArrayList([]const u8) = .empty;
+    if (bundle) |value| {
+        for (value.graph.input_files.items(.source)) |source| {
+            if (source.path.text.len > 0) try inputs.append(arena_allocator, source.path.text);
+        }
+    }
     const result_json = BuildResultJson{
         .success = true,
         .logs = try buildLogsFromLogger(arena_allocator, &log, false),
         .outputs = outputs.items,
+        .inputs = inputs.items,
         .metafile = result.metafile,
         .metafileMarkdown = metafile_markdown,
     };

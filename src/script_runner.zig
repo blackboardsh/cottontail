@@ -2940,6 +2940,18 @@ fn configureRuntimeInspector(execution: *const ScriptExecution, js_runtime: *run
     return true;
 }
 
+fn reloadProcessArgv(init: std.process.Init, allocator: std.mem.Allocator) ![]const [:0]const u8 {
+    const args = try init.minimal.args.toSlice(allocator);
+    if (comptime builtin.os.tag == .windows) return args;
+    const spawn_gate_prefix = "--cottontail-spawn-gate=";
+    if (args.len < 2 or !std.mem.startsWith(u8, args[1], spawn_gate_prefix)) return args;
+
+    const visible = try allocator.alloc([:0]const u8, args.len - 1);
+    visible[0] = args[0];
+    @memcpy(visible[1..], args[2..]);
+    return visible;
+}
+
 fn runReloadPrepared(
     init: std.process.Init,
     ctx: *const Context,
@@ -2979,7 +2991,7 @@ fn runReloadPrepared(
         .reload = .{
             .ctx = ctx.*,
             .entrypoint_path = entrypoint_path,
-            .process_argv = try init.minimal.args.toSlice(allocator),
+            .process_argv = try reloadProcessArgv(init, allocator),
             .mode = mode,
             .clear_screen = clear_screen,
         },
@@ -3348,7 +3360,12 @@ fn runReloadGeneration(
             try js_runtime.waitForReload();
             break :result .reload;
         },
-        .exited => |code| .{ .exit = code },
+        .exited => |code| result: {
+            if (code != 0) break :result .{ .exit = code };
+            try js_runtime.waitForReload();
+            if (reload.mode == .hot) try js_runtime.prepareHotReload();
+            break :result .reload;
+        },
     };
 }
 
@@ -4423,6 +4440,10 @@ const RuntimeBootstrapMode = enum {
 
 fn entrypointRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBootstrapMode {
     if (!try entrypointImportsOnlyRuntimeAliases(ctx, path)) return .full;
+    return sourceRuntimeBootstrapMode(ctx, path);
+}
+
+fn sourceRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBootstrapMode {
     const loader = transpilerLoaderForPath(path) orelse return .full;
     _ = loader;
     const source = std.Io.Dir.cwd().readFileAlloc(
@@ -4459,6 +4480,107 @@ fn entrypointRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !Runtim
         }
     }
     return mode;
+}
+
+const ReloadRuntimeImport = union(enum) {
+    script: []const u8,
+    asset,
+};
+
+fn resolveReloadRuntimeImport(
+    ctx: *const Context,
+    importer: []const u8,
+    specifier: []const u8,
+) !?ReloadRuntimeImport {
+    if (!std.fs.path.isAbsolute(specifier) and !std.mem.startsWith(u8, specifier, ".")) return null;
+    const importer_dir = std.fs.path.dirname(importer) orelse ctx.project_root;
+    const base = if (std.fs.path.isAbsolute(specifier))
+        specifier
+    else
+        try std.fs.path.resolve(ctx.allocator, &.{ importer_dir, specifier });
+
+    if (pathExists(ctx.io, base)) {
+        if (transpilerLoaderForPath(base) != null) return .{ .script = base };
+        return .asset;
+    }
+
+    const extension = std.fs.path.extension(base);
+    const suffixes: []const []const u8 = if (extension.len == 0)
+        &.{ ".js", ".jsx", ".ts", ".tsx", ".mjs", ".mts", ".cjs", ".cts", ".json", ".css" }
+    else if (std.mem.eql(u8, extension, ".js") or std.mem.eql(u8, extension, ".jsx"))
+        &.{ ".ts", ".tsx", ".mts" }
+    else if (std.mem.eql(u8, extension, ".mjs"))
+        &.{".mts"}
+    else
+        &.{};
+    const stem = base[0 .. base.len - extension.len];
+    for (suffixes) |suffix| {
+        const candidate = try std.mem.concat(ctx.allocator, u8, &.{ stem, suffix });
+        if (!pathExists(ctx.io, candidate)) continue;
+        if (transpilerLoaderForPath(candidate) != null) return .{ .script = candidate };
+        return .asset;
+    }
+
+    for ([_][]const u8{ "index.js", "index.jsx", "index.ts", "index.tsx", "index.mjs", "index.mts", "index.cjs", "index.cts", "index.json" }) |name| {
+        const candidate = try std.fs.path.join(ctx.allocator, &.{ base, name });
+        if (!pathExists(ctx.io, candidate)) continue;
+        if (transpilerLoaderForPath(candidate) != null) return .{ .script = candidate };
+        return .asset;
+    }
+    return null;
+}
+
+fn mergeRuntimeBootstrapMode(left: RuntimeBootstrapMode, right: RuntimeBootstrapMode) RuntimeBootstrapMode {
+    if (left == .full or right == .full) return .full;
+    if (left == .process or right == .process) return .process;
+    return .minimal;
+}
+
+fn reloadRuntimeBootstrapModeVisit(
+    ctx: *const Context,
+    path: []const u8,
+    visited: *std.StringHashMapUnmanaged(void),
+) !RuntimeBootstrapMode {
+    const canonical = resolvePathForCwd(ctx.io, ctx.allocator, path) catch path;
+    if (visited.contains(canonical)) return .minimal;
+    try visited.put(ctx.allocator, canonical, {});
+
+    var mode = try sourceRuntimeBootstrapMode(ctx, canonical);
+    if (mode == .full) return .full;
+    const loader = transpilerLoaderForPath(canonical) orelse return .full;
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        canonical,
+        ctx.allocator,
+        .limited(4 * 1024 * 1024),
+    ) catch return .full;
+    const imports_json = native_transpiler.scanImportsJson(source, loader) catch return .full;
+    defer std.heap.c_allocator.free(imports_json);
+    const ScannedImport = struct {
+        path: []const u8,
+        kind: []const u8,
+    };
+    const parsed = std.json.parseFromSlice([]const ScannedImport, ctx.allocator, imports_json, .{}) catch return .full;
+    defer parsed.deinit();
+
+    for (parsed.value) |item| {
+        if (!std.mem.eql(u8, item.kind, "import-statement") or item.path.len == 0) return .full;
+        if (isMinimalRuntimeAliasSpecifier(item.path)) continue;
+        const resolved = try resolveReloadRuntimeImport(ctx, canonical, item.path) orelse return .full;
+        switch (resolved) {
+            .asset => {},
+            .script => |dependency| {
+                mode = mergeRuntimeBootstrapMode(mode, try reloadRuntimeBootstrapModeVisit(ctx, dependency, visited));
+                if (mode == .full) return .full;
+            },
+        }
+    }
+    return mode;
+}
+
+fn reloadRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBootstrapMode {
+    var visited: std.StringHashMapUnmanaged(void) = .empty;
+    return reloadRuntimeBootstrapModeVisit(ctx, path, &visited);
 }
 
 fn nativeBundleFailure(
@@ -4665,12 +4787,14 @@ fn bundleScriptNative(
     if (is_common_js_entrypoint) try validateCommonJsTestSyntax(ctx, script_abs);
     const runtime_bootstrap_mode: RuntimeBootstrapMode = if (!runtime_package_bin_entrypoint and
         !runtime_cache_common_js_entrypoint and
-        reload_dependencies_out == null and
         !standalone_compile and
         build_options == null and
         !requires_full_runtime_preloads and
         !is_wasm_entrypoint)
-        try entrypointRuntimeBootstrapMode(ctx, script_entry_abs)
+        if (reload_dependencies_out != null)
+            try reloadRuntimeBootstrapMode(ctx, script_entry_abs)
+        else
+            try entrypointRuntimeBootstrapMode(ctx, script_entry_abs)
     else
         .full;
     const use_selective_runtime = runtime_bootstrap_mode != .full;

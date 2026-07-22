@@ -43,6 +43,11 @@ const bun_compat_version = "1.3.10";
 const revision_suffix = "cottontail";
 const completion_commands = [_][]const u8{ "run", "test", "build", "init", "create", "repl", "x", "exec", "completions", "getcompletes" };
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "kernel32" fn GetCurrentProcess() callconv(.winapi) std.os.windows.HANDLE;
+extern "kernel32" fn TerminateProcess(
+    process: std.os.windows.HANDLE,
+    exit_code: u32,
+) callconv(.winapi) i32;
 
 fn testRunnerDisplayVersion(init: std.process.Init) []const u8 {
     return init.environ_map.get("COTTONTAIL_UPSTREAM_VERSION") orelse bun_compat_version;
@@ -1285,6 +1290,137 @@ fn compileAutoloadArgument(arg: []const u8) ?CompileAutoloadArgument {
     return null;
 }
 
+const BuildWatchStamp = struct {
+    exists: bool = false,
+    inode: std.Io.File.INode = 0,
+    size: u64 = 0,
+    mtime: i96 = 0,
+    ctime: i96 = 0,
+    kind: std.Io.File.Kind = .unknown,
+};
+
+fn buildWatchStamp(io: std.Io, path: []const u8) BuildWatchStamp {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return .{};
+    return .{
+        .exists = true,
+        .inode = stat.inode,
+        .size = stat.size,
+        .mtime = stat.mtime.nanoseconds,
+        .ctime = stat.ctime.nanoseconds,
+        .kind = stat.kind,
+    };
+}
+
+const BuildWatchState = struct {
+    paths: []const []const u8,
+    stamps: []BuildWatchStamp,
+
+    fn appendPath(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        cwd_abs: []const u8,
+        paths: *std.ArrayList([]const u8),
+        seen: *std.StringHashMapUnmanaged(void),
+        path: []const u8,
+        include_missing: bool,
+    ) !void {
+        if (path.len == 0) return;
+        const absolute = if (std.fs.path.isAbsolute(path))
+            try allocator.dupe(u8, path)
+        else
+            try std.fs.path.resolve(allocator, &.{ cwd_abs, path });
+        if (seen.contains(absolute)) return;
+        const stamp = buildWatchStamp(io, absolute);
+        if (!stamp.exists and !include_missing) return;
+        try seen.put(allocator, absolute, {});
+        try paths.append(allocator, absolute);
+    }
+
+    fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        cwd_abs: []const u8,
+        entries: []const []const u8,
+        inputs: []const []const u8,
+        include_entry_directories: bool,
+    ) !BuildWatchState {
+        var paths: std.ArrayList([]const u8) = .empty;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (entries) |entry| {
+            try appendPath(allocator, io, cwd_abs, &paths, &seen, entry, true);
+            if (include_entry_directories) {
+                const absolute = if (std.fs.path.isAbsolute(entry)) entry else try std.fs.path.resolve(allocator, &.{ cwd_abs, entry });
+                if (std.fs.path.dirname(absolute)) |directory| {
+                    try appendPath(allocator, io, cwd_abs, &paths, &seen, directory, false);
+                }
+            }
+        }
+        for (inputs) |input| {
+            try appendPath(allocator, io, cwd_abs, &paths, &seen, input, false);
+        }
+
+        const owned_paths = try paths.toOwnedSlice(allocator);
+        const stamps = try allocator.alloc(BuildWatchStamp, owned_paths.len);
+        for (owned_paths, stamps) |path, *stamp| stamp.* = buildWatchStamp(io, path);
+        return .{ .paths = owned_paths, .stamps = stamps };
+    }
+
+    fn wait(self: *const BuildWatchState, io: std.Io) void {
+        while (true) {
+            for (self.paths, self.stamps) |path, stamp| {
+                if (!std.meta.eql(stamp, buildWatchStamp(io, path))) return;
+            }
+            std.Io.sleep(io, .fromMilliseconds(25), .awake) catch {};
+        }
+    }
+};
+
+fn replaceBuildWatchProcess(init: std.process.Init, args: []const [:0]const u8) !void {
+    if (comptime builtin.os.tag == .windows) {
+        if (TerminateProcess(
+            GetCurrentProcess(),
+            @intCast(cottontail_compiler.windows.watcher_reload_exit),
+        ) == 0) return error.BuildWatchProcessReplacementFailed;
+        while (true) std.atomic.spinLoopHint();
+    }
+
+    if (comptime builtin.os.tag == .macos or builtin.os.tag == .linux) {
+        const allocator = std.heap.c_allocator;
+        const executable = try std.process.executablePathAlloc(init.io, allocator);
+        defer allocator.free(executable);
+        const argv = try allocator.allocSentinel(?[*:0]const u8, args.len, null);
+        defer allocator.free(argv);
+        for (args, 0..) |arg, index| argv[index] = arg.ptr;
+        if (std.c.execve(executable.ptr, @ptrCast(argv.ptr), @ptrCast(std.c.environ)) != 0) {
+            return error.BuildWatchProcessReplacementFailed;
+        }
+        unreachable;
+    }
+
+    return error.BuildWatchProcessReplacementUnsupported;
+}
+
+fn waitForBuildWatchAndReplace(
+    init: std.process.Init,
+    args: []const [:0]const u8,
+    cwd_abs: []const u8,
+    entries: []const []const u8,
+    inputs: []const []const u8,
+    include_entry_directories: bool,
+) !void {
+    var state = try BuildWatchState.init(
+        init.arena.allocator(),
+        init.io,
+        cwd_abs,
+        entries,
+        inputs,
+        include_entry_directories,
+    );
+    state.wait(init.io);
+    try replaceBuildWatchProcess(init, args);
+    unreachable;
+}
+
 fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
     const allocator = init.arena.allocator();
     var stdout_buffer: [1024]u8 = undefined;
@@ -1317,6 +1453,7 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
     var compile_autoload_tsconfig: ?bool = null;
     var compile_autoload_package_json: ?bool = null;
     var app = false;
+    var watch = false;
     var index: usize = 2;
     while (index < args.len) : (index += 1) {
         const arg: []const u8 = args[index];
@@ -1347,6 +1484,8 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
             setting.* = autoload.enabled;
         } else if (std.mem.eql(u8, arg, "--app")) {
             app = true;
+        } else if (std.mem.eql(u8, arg, "--watch")) {
+            watch = true;
         } else if (std.mem.eql(u8, arg, "--bundle")) {
             options.transform_only = false;
         } else if (std.mem.eql(u8, arg, "--no-bundle")) {
@@ -1600,6 +1739,11 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         try stderr.flush();
         return 1;
     }
+    if (comptime builtin.os.tag == .windows) {
+        if (watch and !cottontail_compiler.windows.isWatcherChild()) {
+            cottontail_compiler.windows.becomeWatcherManager(allocator);
+        }
+    }
     if (options.transform_only) {
         for (entries.items) |entry| {
             const extension = std.fs.path.extension(entry);
@@ -1615,6 +1759,11 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         compile_autoload_tsconfig != null or compile_autoload_package_json != null))
     {
         try stderr.writeAll("error: compile-specific options require --compile\n");
+        try stderr.flush();
+        return 1;
+    }
+    if (compile and watch) {
+        try stderr.writeAll("error: --watch is not supported with --compile\n");
         try stderr.flush();
         return 1;
     }
@@ -1718,6 +1867,7 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         std.Io.Dir.cwd().access(init.io, entry_abs, .{}) catch {
             try stderr.print("error: Module not found \"{s}\"\n", .{entry});
             try stderr.flush();
+            if (watch) try waitForBuildWatchAndReplace(init, args, cwd_abs, entries.items, &.{}, true);
             return 1;
         };
     }
@@ -1803,6 +1953,7 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
             try stderr.print("error: build failed: {s}\n", .{@errorName(err)});
         }
         try stderr.flush();
+        if (watch) try waitForBuildWatchAndReplace(init, args, cwd_abs, entries.items, &.{}, true);
         return 1;
     };
     defer cottontail_bundler.ct_bundle_free(result_json.ptr, result_json.len);
@@ -1860,8 +2011,27 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
                 };
             }
             try stderr.flush();
+            if (watch) try waitForBuildWatchAndReplace(init, args, cwd_abs, entries.items, &.{}, true);
             return 1;
         }
+    }
+
+    var build_watch_state: ?BuildWatchState = null;
+    if (watch) {
+        var inputs: std.ArrayList([]const u8) = .empty;
+        if (result.get("inputs")) |input_values| {
+            if (input_values == .array) for (input_values.array.items) |input| {
+                if (input == .string) try inputs.append(allocator, input.string);
+            };
+        }
+        build_watch_state = try BuildWatchState.init(
+            allocator,
+            init.io,
+            cwd_abs,
+            entries.items,
+            inputs.items,
+            false,
+        );
     }
 
     if (result.get("logs")) |logs| {
@@ -1963,6 +2133,11 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         try stdout.writeByte('\n');
     }
     try stdout.flush();
+    if (build_watch_state) |*state| {
+        state.wait(init.io);
+        try replaceBuildWatchProcess(init, args);
+        unreachable;
+    }
     return 0;
 }
 

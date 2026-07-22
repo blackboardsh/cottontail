@@ -439,7 +439,7 @@ pub const Runtime = struct {
         }
         if (status != 0) {
             if (eval_error != null) {
-                self.writeStderrLine(std.mem.span(eval_error));
+                self.writeReloadError(std.mem.span(eval_error));
             } else if (status != -13) {
                 self.writeStderrLine("Unknown JavaScript exception");
             }
@@ -639,6 +639,25 @@ pub const Runtime = struct {
             "cottontail: failed to load script {s}: {s}\n",
             .{ script_path, @errorName(err) },
         ) catch {};
+        stderr.flush() catch {};
+    }
+
+    fn writeReloadError(self: *Runtime, message: []const u8) void {
+        var stderr_buffer: [1024]u8 = undefined;
+        var stderr_writer = std.Io.File.stderr().writer(self.io, &stderr_buffer);
+        const stderr = &stderr_writer.interface;
+
+        var lines = std.mem.splitScalar(u8, message, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0 and lines.index == message.len) break;
+            if (std.mem.startsWith(u8, line, "Error:")) {
+                stderr.print("error:{s}\n", .{line["Error:".len..]}) catch {};
+            } else if (std.mem.startsWith(u8, line, "@")) {
+                stderr.print("      at {s}\n", .{line[1..]}) catch {};
+            } else {
+                stderr.print("{s}\n", .{line}) catch {};
+            }
+        }
         stderr.flush() catch {};
     }
 

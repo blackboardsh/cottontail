@@ -439,6 +439,13 @@ export function sourceContextForLocation(source, line, column) {
 function preferConstructedErrorCallSite(state, generatedLine, generatedColumn, mapped) {
   const sourceLines = state.sourceLines[mapped.sourceIndex];
   const currentSource = sourceLines?.[mapped.line - 1] ?? "";
+  const currentConstructor = /\bnew\s+((?:Aggregate|Eval|Range|Reference|Syntax|Type|URI)?Error)\b/.exec(currentSource);
+  if (currentConstructor) {
+    const constructorColumn = currentConstructor.index + currentConstructor[0].lastIndexOf(currentConstructor[1]);
+    if (mapped.column > constructorColumn + 1) {
+      return { ...mapped, column: constructorColumn + 1 };
+    }
+  }
   if (/\.stack\b/.test(currentSource)) {
     for (let line = generatedLine - 1; line >= Math.max(1, generatedLine - 8); line -= 1) {
       const segments = state.lines[line - 1] ?? [];
