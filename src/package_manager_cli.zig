@@ -3894,10 +3894,14 @@ const Manager = struct {
         } else {
             try std.Io.Dir.cwd().createDirPath(manager.init_data.io, node_modules);
         }
+        const install_reuses_lockfile = manager.options.command == .install and
+            manager.lock_graph != null and
+            !manager.changed;
         const create_project_cache = if (manager.node_linker == .isolated)
             manager.options.command == .add
         else
-            (manager.lock_graph == null or !node_modules_existed) and
+            !install_reuses_lockfile and
+                (manager.lock_graph == null or !node_modules_existed) and
                 (manager.options.command == .add or manager.options.command == .install or manager.options.command == .update or
                     manager.options.cpu_overridden or manager.options.os_overridden);
         if (!uses_explicit_install_cache and create_project_cache) {
