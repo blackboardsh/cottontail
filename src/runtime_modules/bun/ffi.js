@@ -2579,8 +2579,9 @@ g.Worker ??= class Worker {
     }
   }
   _postSerialized(serialized) {
+    if (this._terminated) return;
     if (!this.handle) {
-      if (!this._terminated) this._pendingMessages.push(serialized);
+      this._pendingMessages.push(serialized);
       return;
     }
     cottontail.workerPostMessageTo(this.id, serialized);
@@ -2589,12 +2590,12 @@ g.Worker ??= class Worker {
     return this._postSerialized(serializeWorkerMessage(message));
   }
   terminate() {
+    if (this._terminated) return;
     if (this._pollTimer != null) clearInterval(this._pollTimer);
     this._terminated = true;
     this._refed = false;
     this._pendingMessages.length = 0;
     if (this.handle) {
-      workerInstances.delete(this.id);
       cottontail.workerTerminate(this.id);
     }
   }

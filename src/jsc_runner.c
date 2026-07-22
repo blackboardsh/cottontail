@@ -37,6 +37,14 @@ extern size_t ct_jsc_copy_protected_objects(JSContextRef context, JSValueRef *va
 extern bool JSContextGroupEnableSamplingProfiler(JSContextGroupRef group);
 extern void JSContextGroupDisableSamplingProfiler(JSContextGroupRef group);
 extern JSStringRef JSContextGroupTakeSamplesFromSamplingProfiler(JSContextGroupRef group);
+typedef bool (*CtJscShouldTerminateCallback)(JSContextRef context, void *opaque);
+extern void JSContextGroupSetExecutionTimeLimit(
+    JSContextGroupRef group,
+    double limit,
+    CtJscShouldTerminateCallback callback,
+    void *opaque
+);
+extern void JSContextGroupClearExecutionTimeLimit(JSContextGroupRef group);
 extern void JSGlobalContextSetUnhandledRejectionCallback(
     JSGlobalContextRef context,
     JSObjectRef function,
@@ -926,6 +934,7 @@ extern void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx);
 
 #define CT_FFI_MAX_ARGS 64
 #define CT_WORKER_STACK_SIZE (32u * 1024u * 1024u)
+#define CT_WORKER_TERMINATION_POLL_SECONDS 0.05
 #define CT_TLS_CONNECTION_EVENT_ID_BASE 0x20000000u
 #define CT_TLS_SERVER_EVENT_ID_BASE 0x80000000u
 
@@ -1244,7 +1253,10 @@ typedef struct CtWorkerEvent {
 struct CtWorker {
     uint32_t id;
     pthread_t thread;
-    bool terminated;
+    bool terminate_requested;
+    bool termination_watchdog_armed;
+    bool finishing;
+    bool finished;
     bool referenced;
     bool exit_event_sent;
     int exit_code;
@@ -1253,6 +1265,7 @@ struct CtWorker {
     uint64_t performance_last_ns;
     pthread_mutex_t mutex;
     CtJscRuntime *parent_runtime;
+    CtJscRuntime *runtime;
     CtWorkerMessage *parent_to_worker_head;
     CtWorkerMessage *parent_to_worker_tail;
     CtWorkerMessage *worker_to_parent_head;
@@ -1657,6 +1670,7 @@ struct CtJscRuntime {
     bool next_tick_pending;
     bool next_tick_priority_armed;
     bool fatal_exception_routed;
+    bool execution_time_limit_installed;
 #if !defined(_WIN32)
     CtSignalWatcher signal_watchers[CT_SIGNAL_WATCHER_CAPACITY];
     size_t signal_watcher_count;
@@ -1818,6 +1832,11 @@ static int ct_jsc_runtime_eval_internal(
     const char *filename,
     bool wait_for_active_handles,
     char **error_out
+);
+static CtJscRuntime *ct_jsc_runtime_create_internal(
+    size_t stack_size,
+    CtJscShouldTerminateCallback terminate_callback,
+    void *terminate_context
 );
 static int ct_jsc_runtime_has_active_handles(CtJscRuntime *runtime, bool *has_active_handles_out, char **error_out);
 static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_out, char **error_out);
@@ -19430,7 +19449,7 @@ static bool ct_workers_has_referenced_runtime(CtJscRuntime *runtime) {
     pthread_mutex_lock(&ct_workers_mutex);
     for (CtWorker *worker = ct_workers; worker != NULL; worker = worker->next) {
         pthread_mutex_lock(&worker->mutex);
-        found = worker->parent_runtime == runtime && !worker->terminated && worker->referenced;
+        found = worker->parent_runtime == runtime && !worker->finished && worker->referenced;
         pthread_mutex_unlock(&worker->mutex);
         if (found) break;
     }
@@ -19445,7 +19464,8 @@ static void ct_workers_detach_runtime(CtJscRuntime *runtime) {
         if (worker->parent_runtime == runtime) {
             worker->parent_runtime = NULL;
             worker->referenced = false;
-            worker->terminated = true;
+            worker->terminate_requested = true;
+            ct_runtime_wake(worker->runtime);
         }
         pthread_mutex_unlock(&worker->mutex);
     }
@@ -19655,15 +19675,14 @@ static JSValueRef ct_worker_terminate(JSContextRef ctx, JSObjectRef function, JS
     CtWorker *worker = ct_worker_find(id);
     if (worker == NULL) return JSValueMakeBoolean(ctx, false);
     pthread_mutex_lock(&worker->mutex);
-    worker->terminated = true;
-    worker->referenced = false;
-    worker->exit_code = 1;
-    if (!worker->exit_event_sent) {
-        worker->exit_event_sent = true;
-        ct_worker_queue_parent_event_locked(worker, "exit", NULL);
+    bool accepted = !worker->finishing && !worker->finished;
+    if (accepted && !worker->terminate_requested) {
+        worker->terminate_requested = true;
+        worker->exit_code = worker->termination_watchdog_armed ? 1 : 0;
     }
+    ct_runtime_wake(worker->runtime);
     pthread_mutex_unlock(&worker->mutex);
-    return JSValueMakeBoolean(ctx, true);
+    return JSValueMakeBoolean(ctx, accepted);
 }
 
 static JSValueRef ct_worker_set_ref(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -19677,11 +19696,11 @@ static JSValueRef ct_worker_set_ref(JSContextRef ctx, JSObjectRef function, JSOb
     if (worker == NULL) return JSValueMakeBoolean(ctx, false);
 
     pthread_mutex_lock(&worker->mutex);
-    if (!worker->terminated) {
+    if (!worker->terminate_requested && !worker->finished) {
         worker->referenced = referenced;
         if (referenced && worker->parent_runtime != NULL) ct_runtime_wake(worker->parent_runtime);
     }
-    bool effective = !worker->terminated && worker->referenced;
+    bool effective = !worker->terminate_requested && !worker->finished && worker->referenced;
     pthread_mutex_unlock(&worker->mutex);
     return JSValueMakeBoolean(ctx, effective);
 }
@@ -19696,7 +19715,7 @@ static JSValueRef ct_worker_has_ref(JSContextRef ctx, JSObjectRef function, JSOb
     if (worker == NULL) return JSValueMakeBoolean(ctx, false);
 
     pthread_mutex_lock(&worker->mutex);
-    bool referenced = !worker->terminated && worker->referenced;
+    bool referenced = !worker->terminate_requested && !worker->finished && worker->referenced;
     pthread_mutex_unlock(&worker->mutex);
     return JSValueMakeBoolean(ctx, referenced);
 }
@@ -19714,11 +19733,11 @@ static JSValueRef ct_worker_performance(JSContextRef ctx, JSObjectRef function, 
     uint64_t started_ns = worker->performance_started_ns;
     uint64_t active_ns = worker->performance_active_ns;
     uint64_t last_ns = worker->performance_last_ns;
-    bool terminated = worker->terminated;
+    bool finished = worker->finished;
     pthread_mutex_unlock(&worker->mutex);
     if (started_ns == 0) return JSValueMakeNull(ctx);
 
-    uint64_t now_ns = terminated ? last_ns : ct_timer_now_ns();
+    uint64_t now_ns = finished ? last_ns : ct_timer_now_ns();
     uint64_t elapsed_ns = now_ns > started_ns ? now_ns - started_ns : 0;
     if (active_ns > elapsed_ns) active_ns = elapsed_ns;
     uint64_t idle_ns = elapsed_ns - active_ns;
@@ -19745,9 +19764,23 @@ static JSValueRef ct_worker_set_event_handler(JSContextRef ctx, JSObjectRef func
     return JSValueMakeUndefined(ctx);
 }
 
+static bool ct_worker_should_terminate(JSContextRef context, void *opaque) {
+    (void)context;
+    CtWorker *worker = (CtWorker *)opaque;
+    if (worker == NULL) return true;
+
+    pthread_mutex_lock(&worker->mutex);
+    bool should_terminate = worker->terminate_requested && worker->termination_watchdog_armed;
+    pthread_mutex_unlock(&worker->mutex);
+    return should_terminate;
+}
+
 static void ct_worker_finish(CtWorkerStart *start, CtJscRuntime *runtime, const char *error_message) {
     if (start == NULL) return;
     pthread_mutex_lock(&start->worker->mutex);
+    start->worker->finishing = true;
+    start->worker->termination_watchdog_armed = false;
+    if (start->worker->runtime == runtime) start->worker->runtime = NULL;
     if (error_message != NULL) {
         ct_worker_queue_parent_event_locked(start->worker, "error", error_message);
     }
@@ -19755,7 +19788,8 @@ static void ct_worker_finish(CtWorkerStart *start, CtJscRuntime *runtime, const 
     if (runtime != NULL) ct_jsc_runtime_destroy(runtime);
     pthread_mutex_lock(&start->worker->mutex);
     start->worker->performance_last_ns = ct_timer_now_ns();
-    start->worker->terminated = true;
+    start->worker->finishing = false;
+    start->worker->finished = true;
     start->worker->referenced = false;
     if (!start->worker->exit_event_sent) {
         start->worker->exit_event_sent = true;
@@ -19776,13 +19810,13 @@ static void *ct_worker_entry(void *opaque) {
     pthread_mutex_lock(&start->worker->mutex);
     start->worker->performance_started_ns = initial_active_started_ns;
     start->worker->performance_last_ns = initial_active_started_ns;
-    bool terminated_before_start = start->worker->terminated;
+    bool terminated_before_start = start->worker->terminate_requested;
     pthread_mutex_unlock(&start->worker->mutex);
     if (terminated_before_start) {
         ct_worker_finish(start, NULL, NULL);
         return NULL;
     }
-    CtJscRuntime *runtime = ct_jsc_runtime_create();
+    CtJscRuntime *runtime = ct_jsc_runtime_create_internal(0, ct_worker_should_terminate, start->worker);
     char *source = NULL;
     size_t source_len = 0;
     char *error = NULL;
@@ -19852,7 +19886,8 @@ static void *ct_worker_entry(void *opaque) {
     }
     runtime->worker = start->worker;
     pthread_mutex_lock(&start->worker->mutex);
-    bool terminated_after_runtime_start = start->worker->terminated;
+    bool terminated_after_runtime_start = start->worker->terminate_requested;
+    if (!terminated_after_runtime_start) start->worker->runtime = runtime;
     pthread_mutex_unlock(&start->worker->mutex);
     if (terminated_after_runtime_start) {
         ct_worker_finish(start, runtime, NULL);
@@ -19896,8 +19931,14 @@ static void *ct_worker_entry(void *opaque) {
     }
 
     pthread_mutex_lock(&start->worker->mutex);
-    if (!start->worker->terminated) ct_worker_queue_parent_event_locked(start->worker, "open", NULL);
+    bool terminated_before_eval = start->worker->terminate_requested;
+    start->worker->termination_watchdog_armed = true;
+    if (!terminated_before_eval) ct_worker_queue_parent_event_locked(start->worker, "open", NULL);
     pthread_mutex_unlock(&start->worker->mutex);
+    if (terminated_before_eval) {
+        ct_worker_finish(start, runtime, NULL);
+        return NULL;
+    }
 
     source = start->script_source;
     source_len = start->script_source_len;
@@ -19906,7 +19947,7 @@ static void *ct_worker_entry(void *opaque) {
 
     if (ct_jsc_runtime_eval(runtime, (const uint8_t *)source, source_len, start->script_path, &error) != 0) {
         pthread_mutex_lock(&start->worker->mutex);
-        bool terminated_during_eval = start->worker->terminated;
+        bool terminated_during_eval = start->worker->terminate_requested;
         pthread_mutex_unlock(&start->worker->mutex);
         if (!terminated_during_eval) {
             fprintf(stderr, "%s\n", error != NULL ? error : "cottontail: worker script failed");
@@ -19934,7 +19975,7 @@ static void *ct_worker_entry(void *opaque) {
     while (true) {
         bool terminated = false;
         pthread_mutex_lock(&start->worker->mutex);
-        terminated = start->worker->terminated;
+        terminated = start->worker->terminate_requested;
         pthread_mutex_unlock(&start->worker->mutex);
         if (terminated) break;
 
@@ -19942,7 +19983,7 @@ static void *ct_worker_entry(void *opaque) {
         int delay_ms = 16;
         if (ct_jsc_runtime_tick_with_delay(runtime, &delay_ms, &error) != 0) {
             pthread_mutex_lock(&start->worker->mutex);
-            bool terminated_during_tick = start->worker->terminated;
+            bool terminated_during_tick = start->worker->terminate_requested;
             pthread_mutex_unlock(&start->worker->mutex);
             if (!terminated_during_tick) {
                 fprintf(stderr, "%s\n", error != NULL ? error : "cottontail: worker tick failed");
@@ -20061,7 +20102,7 @@ static JSValueRef ct_worker_spawn(JSContextRef ctx, JSObjectRef function, JSObje
     int attr_status = pthread_attr_init(&attr);
     if (attr_status != 0) {
         pthread_mutex_lock(&worker->mutex);
-        worker->terminated = true;
+        worker->finished = true;
         pthread_mutex_unlock(&worker->mutex);
         free(start->script_path);
         free(start->script_source);
@@ -20083,7 +20124,7 @@ static JSValueRef ct_worker_spawn(JSContextRef ctx, JSObjectRef function, JSObje
     if (attr_status != 0) {
         pthread_attr_destroy(&attr);
         pthread_mutex_lock(&worker->mutex);
-        worker->terminated = true;
+        worker->finished = true;
         pthread_mutex_unlock(&worker->mutex);
         free(start->script_path);
         free(start->script_source);
@@ -20099,7 +20140,7 @@ static JSValueRef ct_worker_spawn(JSContextRef ctx, JSObjectRef function, JSObje
 #endif
     if (create_status != 0) {
         pthread_mutex_lock(&worker->mutex);
-        worker->terminated = true;
+        worker->finished = true;
         pthread_mutex_unlock(&worker->mutex);
         free(start->script_path);
         free(start->script_source);
@@ -22742,7 +22783,7 @@ static JSValueRef ct_exit(JSContextRef ctx, JSObjectRef function, JSObjectRef th
     if (runtime != NULL && runtime->worker != NULL) {
         pthread_mutex_lock(&runtime->worker->mutex);
         runtime->worker->exit_code = code;
-        runtime->worker->terminated = true;
+        runtime->worker->terminate_requested = true;
         pthread_mutex_unlock(&runtime->worker->mutex);
         return JSValueMakeUndefined(ctx);
     }
@@ -23078,10 +23119,18 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
 }
 
 CtJscRuntime *ct_jsc_runtime_create(void) {
-    return ct_jsc_runtime_create_with_stack_size(0);
+    return ct_jsc_runtime_create_internal(0, NULL, NULL);
 }
 
 CtJscRuntime *ct_jsc_runtime_create_with_stack_size(size_t stack_size) {
+    return ct_jsc_runtime_create_internal(stack_size, NULL, NULL);
+}
+
+static CtJscRuntime *ct_jsc_runtime_create_internal(
+    size_t stack_size,
+    CtJscShouldTerminateCallback terminate_callback,
+    void *terminate_context
+) {
     (void)stack_size;
 #if defined(_WIN32)
     if (ct_windows_ensure_winsock() != 0) return NULL;
@@ -23139,6 +23188,18 @@ CtJscRuntime *ct_jsc_runtime_create_with_stack_size(size_t stack_size) {
         unsetenv("JSC_useShadowRealm");
     }
 #endif
+    if (runtime->context != NULL && terminate_callback != NULL) {
+        /* Stock JSC only guarantees watchdog interruption when the limit is
+         * installed before script execution. A false callback result rearms
+         * the same interval, so workers pay no polling cost while JSC is idle. */
+        JSContextGroupSetExecutionTimeLimit(
+            JSContextGetGroup(runtime->context),
+            CT_WORKER_TERMINATION_POLL_SECONDS,
+            terminate_callback,
+            terminate_context
+        );
+        runtime->execution_time_limit_installed = true;
+    }
     if (previous_explicit_resource_option != NULL) {
         setenv("JSC_useExplicitResourceManagement", previous_explicit_resource_option, 1);
         free(previous_explicit_resource_option);
@@ -23200,6 +23261,10 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
 
     JSContextRef ctx = runtime->context;
     if (ctx != NULL) {
+        if (runtime->execution_time_limit_installed) {
+            JSContextGroupClearExecutionTimeLimit(JSContextGetGroup(ctx));
+            runtime->execution_time_limit_installed = false;
+        }
         if (runtime->napi_env != NULL) {
             ct_napi_env_destroy(runtime->napi_env);
             runtime->napi_env = NULL;

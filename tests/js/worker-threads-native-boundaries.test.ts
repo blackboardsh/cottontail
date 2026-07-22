@@ -85,9 +85,33 @@ test("natural worker exit emits beforeExit and propagates process.exitCode", asy
   expect((await exit)[0]).toBe(23);
 });
 
-test.todo("COTTONTAIL-COMPAT: hard termination needs a native JSC interrupt for non-cooperative JavaScript", async () => {
-  const worker = new Worker(`for (;;) {}`, { eval: true });
-  expect(await worker.terminate()).toBe(1);
+test("hard termination interrupts non-cooperative JavaScript before reporting exit", async () => {
+  const progress = new Int32Array(new SharedArrayBuffer(8));
+  const worker = new Worker(
+    `const { parentPort, workerData } = require("node:worker_threads");
+     const progress = new Int32Array(workerData);
+     Atomics.store(progress, 0, 1);
+     parentPort.postMessage("running");
+     let spin = 0;
+     for (;;) {
+       spin = (spin + 1) | 0;
+       if ((spin & 0xfffff) === 0) Atomics.add(progress, 1, 1);
+     }`,
+    { eval: true, workerData: progress.buffer },
+  );
+  expect((await once(worker, "message"))[0]).toBe("running");
+  while (Atomics.load(progress, 1) === 0) await Bun.sleep(5);
+
+  const exit = once(worker, "exit");
+  const first = worker.terminate();
+  expect(worker.terminate()).toBe(first);
+  expect(await first).toBe(1);
+  expect((await exit)[0]).toBe(1);
+  expect(worker.threadId).toBe(-1);
+
+  const stoppedAt = Atomics.load(progress, 1);
+  await Bun.sleep(100);
+  expect(Atomics.load(progress, 1)).toBe(stoppedAt);
 });
 
 test("postMessageToThread rejects when the destination has no listener", async () => {

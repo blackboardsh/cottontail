@@ -991,13 +991,10 @@ export class Worker extends EventEmitter {
     this._exitCode = undefined;
     this._reportedExitCode = undefined;
     this._onlineEmitted = false;
-    this._bootstrapReady = false;
     this._refed = true;
     this._controlRequests = new Map();
     this._terminationPromise = null;
     this._terminationResolve = null;
-    this._terminationFallback = null;
-    this._terminationDeferred = false;
     this._sharedEnvironmentGroupId = sharedEnvironmentGroupId;
 
     this._worker = new globalThis.Worker(wrapper, {
@@ -1092,19 +1089,10 @@ export class Worker extends EventEmitter {
       return;
     }
     if (control.type === "exitCode") {
-      this._reportedExitCode = Number(control.code) || 0;
+      if (!this._terminationPromise) this._reportedExitCode = Number(control.code) || 0;
       return;
     }
     if (control.type === "ready") {
-      this._bootstrapReady = true;
-      if (this._terminationDeferred) {
-        this._terminationDeferred = false;
-        if (this._terminationFallback !== null) clearTimeout(this._terminationFallback);
-        this._terminationFallback = setTimeout(() => {
-          this._terminationFallback = null;
-          this._sendTerminationControl();
-        }, 25);
-      }
       return;
     }
     if (control.type === "stdio") {
@@ -1130,7 +1118,8 @@ export class Worker extends EventEmitter {
     this._exitEmitted = true;
     this._running = false;
     this._refed = false;
-    this._exitCode = this._reportedExitCode ?? (Number(code) || 0);
+    const nativeExitCode = Number(code) || 0;
+    this._exitCode = this._terminationPromise ? nativeExitCode : (this._reportedExitCode ?? nativeExitCode);
     workerInstances.delete(this._nativeThreadId);
     unregisterSharedEnvironmentWorker(this._sharedEnvironmentGroupId, this._nativeThreadId);
     if (isMainThread) {
@@ -1147,10 +1136,6 @@ export class Worker extends EventEmitter {
     this.threadId = -1;
     this.threadName = null;
     this.resourceLimits = {};
-    if (this._terminationFallback !== null) {
-      clearTimeout(this._terminationFallback);
-      this._terminationFallback = null;
-    }
     for (const request of this._controlRequests.values()) request.reject(workerNotRunningError());
     this._controlRequests.clear();
     this.stdout?.push(null);
@@ -1191,31 +1176,7 @@ export class Worker extends EventEmitter {
 
   _forceTerminate() {
     if (!this._running) return;
-    if (typeof cottontail.workerTerminate === "function") {
-      cottontail.workerTerminate(this._nativeThreadId);
-    } else {
-      this._worker.terminate();
-      queueMicrotask(() => this._emitExit(0));
-    }
-  }
-
-  _armTerminationFallback(delay) {
-    if (this._terminationFallback !== null) clearTimeout(this._terminationFallback);
-    this._terminationFallback = setTimeout(() => {
-      this._terminationFallback = null;
-      this._forceTerminate();
-    }, delay);
-  }
-
-  _sendTerminationControl() {
-    if (!this._running) return;
-    try {
-      this._postControl({ type: "terminate" });
-    } catch {
-      this._forceTerminate();
-      return;
-    }
-    this._armTerminationFallback(1000);
+    this._worker.terminate();
   }
 
   terminate(callback = undefined) {
@@ -1238,15 +1199,7 @@ export class Worker extends EventEmitter {
       this._terminationPromise = new Promise(resolve => {
         this._terminationResolve = resolve;
       });
-      if (!this._onlineEmitted && typeof cottontail.workerTerminate === "function") {
-        this._forceTerminate();
-        this._armTerminationFallback(1000);
-      } else if (!this._bootstrapReady) {
-        this._terminationDeferred = true;
-        this._armTerminationFallback(5000);
-      } else {
-        this._sendTerminationControl();
-      }
+      this._forceTerminate();
     }
     if (callback) this._terminationPromise.then(code => callback(null, code));
     return this._terminationPromise;
@@ -2675,10 +2628,9 @@ try {
   });
 } catch {}
 
-// COTTONTAIL-COMPAT: node:worker_threads native boundaries - hard interruption of
-// running JSC, resource-limit enforcement and OS thread
-// naming, per-thread CPU/profilers, live SHARE_ENV, and native stdio backpressure
-// need host support. The JavaScript implementation does
+// COTTONTAIL-COMPAT: node:worker_threads native boundaries - resource-limit
+// enforcement, per-thread CPU/profilers, and native stdio backpressure need
+// additional host support. The JavaScript implementation does
 // not synthesize those measurements or claim enforcement; focused boundary tests
 // encode each remaining contract.
 
