@@ -3171,10 +3171,11 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
     dynamicEsmFactoryCache.set(factoryCacheKey, { source: originalSource, run });
   }
   try {
+    const moduleRecord = { exports: namespace };
     run(
       namespace,
-      createRequire(hookRequireBase(resolvedPath)),
-      { exports: namespace },
+      createEsmRequire(hookRequireBase(resolvedPath), moduleRecord),
+      moduleRecord,
       importMetaForHookModule(resolvedPath, suffix),
       dynamicModuleErrorConstructor(resolvedPath, originalSource),
     );

@@ -68,6 +68,35 @@ test("a dynamically imported module can statically import its awaiting parent", 
   expect(child.stderr.toString()).toBe("");
 });
 
+test("dynamic ESM static imports use package import conditions", () => {
+  const packageRoot = join(root, "node_modules", "import-only-subpath");
+  const dependency = join(root, "import-condition-dependency.mjs");
+  const entry = join(root, "import-condition-entry.js");
+  mkdirSync(packageRoot, { recursive: true });
+  writeFileSync(join(packageRoot, "package.json"), JSON.stringify({
+    name: "import-only-subpath",
+    exports: {
+      "./node": { import: "./node.cjs" },
+    },
+  }));
+  writeFileSync(join(packageRoot, "node.cjs"), "exports.value = 'import-condition-ok';\n");
+  writeFileSync(dependency, [
+    'import { value } from "import-only-subpath/node";',
+    "export { value };",
+    "",
+  ].join("\n"));
+  writeFileSync(entry, [
+    'const namespace = await import("./import-condition-dependency.mjs");',
+    "console.log(namespace.value);",
+    "",
+  ].join("\n"));
+
+  const child = Bun.spawnSync({ cmd: [process.execPath, entry] });
+  expect(child.exitCode).toBe(0);
+  expect(child.stdout.toString()).toBe("import-condition-ok\n");
+  expect(child.stderr.toString()).toBe("");
+});
+
 test("self-import and self-require share Bun's virtual ESM marker", () => {
   const entry = join(root, "esm-marker-self-import.js");
   writeFileSync(entry, [
