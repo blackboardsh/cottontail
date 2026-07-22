@@ -12,8 +12,11 @@ import {
   normalizeBakeFramework,
   normalizeBuiltInModules,
   normalizeStaticRouters,
+  pluginBoundaryResolverPlugin,
+  pluginClientBoundaryReplacements,
   resolveBakeImport,
   serverBoundaryFiles,
+  ssrGraphBridgePrefix,
   staticRouterFile,
 } from "./bake-framework.js";
 import { FrameworkRouter } from "./bake-framework-router.js";
@@ -172,7 +175,8 @@ function normalizeDefaultServerConfig(config) {
 
 function isHtmlAsset(value) {
   return (typeof value === "string" && /\.html?$/i.test(value)) ||
-    (value && typeof value === "object" && typeof value.index === "string" && Array.isArray(value.files));
+    (value && typeof value === "object" && typeof value.index === "string" &&
+      (Array.isArray(value.files) || (value.files == null && /\.html?$/i.test(value.index))));
 }
 
 function isBakeConfig(config) {
@@ -412,6 +416,22 @@ function sourceEntryForMetafileArtifact(metafile, artifact, outdir, projectRoot,
   return null;
 }
 
+function developmentBuildDefines(options, side) {
+  return {
+    "import.meta.env.DEV": "true",
+    "import.meta.env.PROD": "false",
+    "import.meta.env.MODE": '"development"',
+    "import.meta.env.SSR": side === "client" ? "false" : "true",
+    "import.meta.env.STATIC": "false",
+    ...(options?.define ?? {}),
+  };
+}
+
+function developmentBuildConditions(options, extras = []) {
+  const configured = Array.isArray(options?.conditions) ? options.conditions : [];
+  return [...new Set([...configured, "development", ...extras])];
+}
+
 async function buildInternalBakeEntry(entryPath, outdir, buildConfig) {
   const result = await Bun.build({
     entrypoints: [entryPath],
@@ -422,8 +442,10 @@ async function buildInternalBakeEntry(entryPath, outdir, buildConfig) {
     format: "internal_bake_dev",
     minify: false,
     sourcemap: "external",
-    define: buildConfig.define,
+    define: developmentBuildDefines(buildConfig, "client"),
     env: buildConfig.env,
+    conditions: developmentBuildConditions(buildConfig),
+    jsx: { ...(buildConfig.jsx ?? {}), development: true },
     throw: false,
   });
   if (!result.success) {
@@ -593,8 +615,10 @@ function createHtmlDispatcher(config, development) {
         write: false,
         minify: buildConfig.minify ?? !development,
         sourcemap: development ? "external" : "none",
-        define: buildConfig.define,
+        define: development ? developmentBuildDefines(buildConfig, "client") : buildConfig.define,
         env: buildConfig.env,
+        conditions: development ? developmentBuildConditions(buildConfig) : buildConfig.conditions,
+        jsx: development ? { ...(buildConfig.jsx ?? {}), development: true } : buildConfig.jsx,
         metafile: true,
         throw: false,
       });
@@ -648,8 +672,15 @@ function createHtmlDispatcher(config, development) {
               }
               throw error;
             }
-            const source = await internalArtifact.text();
-            servedArtifact = internalArtifact;
+            let source = await internalArtifact.text();
+            if (internalArtifact.sourcemap) {
+              const sourceMapPath = `${assetPath}.map`;
+              source += `\n//# sourceMappingURL=${sourceMapPath}\n`;
+              assets.set(sourceMapPath, internalArtifact.sourcemap);
+              servedArtifact = new Blob([source], { type: internalArtifact.type });
+            } else {
+              servedArtifact = internalArtifact;
+            }
             hmrEntries.push({
               entryPath,
               assetPath,
@@ -1012,15 +1043,41 @@ function moduleDependencyIds(definition) {
 }
 
 function hmrImportWrapperSource(imports) {
-  return imports.map((specifier, index) => `import * as __ctGraph${index} from ${JSON.stringify(specifier)};`).join("\n") ||
-    "export {};";
+  if (imports.length === 0) return "export {};";
+  const declarations = imports
+    .map((specifier, index) => `import * as __ctGraph${index} from ${JSON.stringify(specifier)};`)
+    .join("\n");
+  const names = imports.map((_, index) => `__ctGraph${index}`).join(", ");
+  return `${declarations}\nexport const __cottontailBakeGraph = [${names}];`;
+}
+
+function rewriteHmrLoader(loader, mapId) {
+  return function rewrittenHmrLoader(hmr, ...args) {
+    const facade = new Proxy(hmr, {
+      get(target, property) {
+        if (property === "require") return id => target.require(mapId(id));
+        if (property === "requireResolve") return id => target.requireResolve(mapId(id));
+        if (property === "dynamicImport") return (id, ...options) => target.dynamicImport(mapId(id), ...options);
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+      set(target, property, value) {
+        return Reflect.set(target, property, value, target);
+      },
+    });
+    return loader(facade, ...args);
+  };
 }
 
 function prefixHmrGraph(parsed, prefix) {
   const sourceIds = new Set(Object.keys(parsed.modules));
   const modules = {};
   for (const [id, definition] of Object.entries(parsed.modules)) {
-    const next = [...definition];
+    const next = Array.isArray(definition)
+      ? [...definition]
+      : typeof definition === "function"
+        ? rewriteHmrLoader(definition, id => sourceIds.has(id) ? `${prefix}${id}` : id)
+        : definition;
     const encoded = Array.isArray(definition?.[0]) ? [...definition[0]] : null;
     if (encoded !== null) {
       for (let index = 0; index < encoded.length;) {
@@ -1038,7 +1095,12 @@ function rewriteHmrDependencies(modules, replacements) {
   if (replacements.size === 0) return modules;
   const rewritten = {};
   for (const [id, definition] of Object.entries(modules)) {
-    const next = [...definition];
+    const mapId = dependency => replacements.get(dependency) ?? dependency;
+    const next = Array.isArray(definition)
+      ? [...definition]
+      : typeof definition === "function"
+        ? rewriteHmrLoader(definition, mapId)
+        : definition;
     const encoded = Array.isArray(definition?.[0]) ? [...definition[0]] : null;
     if (encoded !== null) {
       for (let index = 0; index < encoded.length;) {
@@ -1081,6 +1143,10 @@ function createFrameworkDispatcher(config) {
   const serverComponents = framework.serverComponents && typeof framework.serverComponents === "object"
     ? framework.serverComponents
     : null;
+  const ssrGraphEntryPoints = serverComponents?.separateSSRGraph === true &&
+    Array.isArray(framework.__cottontailSsrEntryPoints)
+    ? framework.__cottontailSsrEntryPoints.map(String)
+    : [];
   const reactFastRefresh = framework.reactFastRefresh === true ||
     (framework.reactFastRefresh !== null && typeof framework.reactFastRefresh === "object");
   const development = globalThis.process?.env?.NODE_ENV !== "production";
@@ -1196,7 +1262,7 @@ function createFrameworkDispatcher(config) {
 
   async function buildSsrRoute(record, boundaries) {
     if (serverComponents === null) return null;
-    const configuredRoots = framework.__cottontailSsrEntryPoints ?? [];
+    const configuredRoots = ssrGraphEntryPoints;
     const roots = configuredRoots.map(source => resolveImportSource(projectRoot, source));
     const imports = [...roots, ...boundaries.map(boundary => boundary.path)];
     if (imports.length === 0) return null;
@@ -1206,7 +1272,7 @@ function createFrameworkDispatcher(config) {
       wrapperPath = path.join(projectRoot, `.cottontail-bake-ssr-${record.id}.js`);
       ssrWrapperPaths.set(record.page, wrapperPath);
     }
-    const configuredConditions = Array.isArray(ssrOptions.conditions) ? ssrOptions.conditions : [];
+    const boundaryPlugins = boundaries.length > 0 ? [pluginBoundaryResolverPlugin(boundaries)] : [];
     const result = await Bun.build(frameworkBuildOptions({
       ...ssrOptions,
       entrypoints: [wrapperPath],
@@ -1215,12 +1281,14 @@ function createFrameworkDispatcher(config) {
       target: "bun",
       sourcemap: "external",
       serverComponents: false,
-      conditions: [...new Set([...configuredConditions, "node"])],
+      conditions: developmentBuildConditions(ssrOptions, ["node"]),
+      define: developmentBuildDefines(ssrOptions, "server"),
+      jsx: { ...(ssrOptions.jsx ?? {}), development: true },
       external: [...new Set([...(ssrOptions.external ?? []), "bun:bake/server"])],
       metafile: true,
       write: false,
       throw: false,
-      plugins: serverPlugins,
+      plugins: [...boundaryPlugins, ...serverPlugins],
     }, builtIns, { [wrapperPath]: hmrImportWrapperSource(imports) }));
     if (!result.success || result.outputs.length === 0) {
       throw new AggregateError(result.logs ?? [], `Failed to bundle Bake SSR graph for ${record.page}`);
@@ -1228,16 +1296,29 @@ function createFrameworkDispatcher(config) {
     const artifact = result.outputs.find(output => output.kind === "entry-point") ?? result.outputs[0];
     const parsed = parseHmrArtifact(await artifact.text());
     const prefixed = prefixHmrGraph(parsed, "ssr:");
-    const rootIds = roots.map(source => {
+    const rootIds = moduleDependencyIds(parsed.modules[parsed.bundleConfig.main]).slice(0, roots.length);
+    const rootReplacements = roots.flatMap((source, index) => {
       const resolved = resolveBakeImport(wrapperPath, source, {
         alias: { ...(ssrOptions.alias ?? {}), ...builtIns.alias },
         files: { ...(ssrOptions.files ?? {}), ...builtIns.files },
       });
-      return resolved === null ? null : moduleIdForPath(projectRoot, resolved);
-    }).filter(id => id !== null && Object.prototype.hasOwnProperty.call(parsed.modules, id));
+      if (resolved === null) return [];
+      const id = [rootIds[index], resolved, moduleIdForPath(projectRoot, resolved), source]
+        .find(candidate => candidate && Object.prototype.hasOwnProperty.call(parsed.modules, candidate));
+      if (!id) return [];
+      const target = `ssr:${id}`;
+      return [...new Set([
+        `${ssrGraphBridgePrefix}${configuredRoots[index]}`,
+        `${ssrGraphBridgePrefix}${source}`,
+        configuredRoots[index],
+        source,
+        resolved,
+        id,
+      ])].map(value => [value, target]);
+    });
     return {
       modules: rewriteHmrDependencies(prefixed.modules, new Map([["bake/server", "bun:bake/server"]])),
-      roots: rootIds,
+      rootReplacements,
       styles: await collectBuildAssets(result),
     };
   }
@@ -1253,6 +1334,7 @@ function createFrameworkDispatcher(config) {
       ...boundaries.map(boundary => boundary.path),
     ];
     const source = hmrImportWrapperSource(imports);
+    const boundaryPlugins = boundaries.length > 0 ? [pluginBoundaryResolverPlugin(boundaries)] : [];
     const result = await Bun.build(frameworkBuildOptions({
       ...clientOptions,
       entrypoints: [wrapperPath],
@@ -1263,11 +1345,14 @@ function createFrameworkDispatcher(config) {
       sourcemap: development ? "external" : "none",
       reactFastRefresh: development && reactFastRefresh,
       serverComponents: false,
+      conditions: developmentBuildConditions(clientOptions),
+      define: developmentBuildDefines(clientOptions, "client"),
+      jsx: { ...(clientOptions.jsx ?? {}), development: true },
       external: [...new Set([...(clientOptions.external ?? []), "bun:bake/client"])],
       metafile: true,
       write: false,
       throw: false,
-      plugins: clientPlugins,
+      plugins: [...boundaryPlugins, ...clientPlugins],
     }, builtIns, { [wrapperPath]: source }));
     if (!result.success || result.outputs.length === 0) {
       throw new AggregateError(result.logs ?? [], `Failed to bundle Bake client entry ${router.clientEntryPoint ?? wrapperPath}`);
@@ -1311,10 +1396,10 @@ function createFrameworkDispatcher(config) {
         wrapperPath = path.join(projectRoot, `.cottontail-bake-route-${wrapperId++}.ts`);
         wrapperPaths.set(page, wrapperPath);
       }
-      const configuredConditions = Array.isArray(serverOptions.conditions) ? serverOptions.conditions : [];
-      const conditions = serverComponents === null
-        ? configuredConditions
-        : [...new Set([...configuredConditions, "react-server"])];
+      const conditions = developmentBuildConditions(
+        serverOptions,
+        serverComponents === null ? ["node"] : ["node", "react-server"],
+      );
       const graph = serverComponents === null
         ? { boundaries: [] }
         : discoverClientBoundaries({
@@ -1333,7 +1418,10 @@ function createFrameworkDispatcher(config) {
       });
       const graphAttributeFiles = serverComponents === null
         ? {}
-        : bakeGraphAttributeFiles([serverEntryFile, ...graph.visited], graphFiles);
+        : bakeGraphAttributeFiles([serverEntryFile, ...graph.visited], graphFiles, {
+            sources: builtIns.sources,
+            ssrBridge: serverComponents.separateSSRGraph === true,
+          });
       const result = await Bun.build(frameworkBuildOptions({
         ...serverOptions,
         entrypoints: [wrapperPath],
@@ -1344,11 +1432,25 @@ function createFrameworkDispatcher(config) {
         sourcemap: development ? "external" : serverOptions.sourcemap,
         serverComponents: serverComponents !== null,
         conditions,
-        external: [...new Set([...(serverOptions.external ?? []), "bun:bake/server"])],
+        define: developmentBuildDefines(serverOptions, "server"),
+        jsx: { ...(serverOptions.jsx ?? {}), development: true },
+        external: [...new Set([
+          ...(serverOptions.external ?? []),
+          "bun:bake/server",
+          ...ssrGraphEntryPoints.map(source => `${ssrGraphBridgePrefix}${source}`),
+        ])],
         metafile: true,
         write: false,
         throw: false,
         plugins: serverPlugins,
+        __cottontailPluginGraph: serverComponents === null
+          ? undefined
+          : modules => pluginClientBoundaryReplacements({
+              projectRoot,
+              modules,
+              boundaries: graph.boundaries,
+              serverComponents,
+            }),
       }, builtIns, {
         ...graphAttributeFiles,
         ...boundaryFiles,
@@ -1380,7 +1482,7 @@ function createFrameworkDispatcher(config) {
 
         const replacements = new Map([
           ["bake/server", "bun:bake/server"],
-          ...(ssr?.roots ?? []).map(id => [id, `ssr:${id}`]),
+          ...(ssr?.rootReplacements ?? []),
         ]);
         const serverModules = rewriteHmrDependencies(parsed.modules, replacements);
         const allModules = { ...serverModules, ...(ssr?.modules ?? {}) };
@@ -1391,7 +1493,6 @@ function createFrameworkDispatcher(config) {
           hmrDefinitions.set(id, signature);
           changedModules[id] = definition;
         }
-
         const previousBoundaries = new Map((record.route?.boundaries ?? []).map(item => [item.id, item]));
         const nextBoundaries = new Map(graph.boundaries.map(item => [item.id, item]));
         const changedBoundaryIds = graph.boundaries

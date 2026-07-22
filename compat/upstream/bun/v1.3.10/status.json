@@ -618,8 +618,8 @@
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 8 assertions)."
     },
     "test/bake/dev/incremental-graph-edge-deletion.test.ts": {
-      "status": "expected-failure",
-      "reason": "The focused file does not complete within the owned 30-second file deadline in the integrated runtime."
+      "status": "enabled",
+      "reason": "Bake's incremental graph retains sibling dependency edges through rapid deletion and recreation updates (1 case, 1 assertion)."
     },
     "test/bake/dev/response-to-bake-response.test.ts": {
       "status": "enabled",
