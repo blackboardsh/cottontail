@@ -704,6 +704,7 @@ export function formatUncaughtBundleError(error) {
   return false;
 }
 
+globalThis.__cottontailFormatUncaughtBundleError ??= formatUncaughtBundleError;
 globalThis.__cottontailFormatUncaughtModuleError ??= formatUncaughtBundleError;
 
 export default {

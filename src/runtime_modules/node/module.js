@@ -3990,11 +3990,16 @@ function bunUncaughtCodeFrame(location, message) {
   return frame.join("\n");
 }
 
-const formatUncaughtBundleError = globalThis.__cottontailFormatUncaughtModuleError;
+const previousUncaughtModuleErrorFormatter = globalThis.__cottontailFormatUncaughtModuleError;
+function formatUncaughtBundleError(error) {
+  const formatter = previousUncaughtModuleErrorFormatter ??
+    globalThis.__cottontailFormatUncaughtBundleError;
+  return formatter?.(error);
+}
 globalThis.__cottontailFormatUncaughtModuleError = error => {
   try {
     const metadata = error?.__ctModuleErrorMetadata;
-    if (!metadata) return formatUncaughtBundleError?.(error);
+    if (!metadata) return formatUncaughtBundleError(error);
     const location = originalErrorLocation(error, metadata);
     const codeFrame = bunUncaughtCodeFrame(location, error?.message);
     if (codeFrame && location) {
@@ -4008,7 +4013,7 @@ globalThis.__cottontailFormatUncaughtModuleError = error => {
       return;
     }
   } catch {}
-  return formatUncaughtBundleError?.(error);
+  return formatUncaughtBundleError(error);
 };
 
 export const _cache = commonJsCacheObject;
