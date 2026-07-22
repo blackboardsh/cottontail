@@ -429,6 +429,11 @@ const PackageRecord = struct {
     install_dir: []const u8 = "",
 };
 
+const InstalledIsolatedDependency = struct {
+    alias: []const u8,
+    spec: []const u8,
+};
+
 const Workspace = Workspaces.Entry;
 
 const LockedSelection = struct {
@@ -7820,6 +7825,131 @@ const Manager = struct {
         return package_json;
     }
 
+    fn appendInstalledIsolatedDependency(
+        manager: *Manager,
+        dependencies: *std.array_list.Managed(InstalledIsolatedDependency),
+        package_dir: []const u8,
+        alias: []const u8,
+        dependency_path: []const u8,
+        kind_hint: std.Io.File.Kind,
+    ) !void {
+        if (!manager.isManagedDirectoryLink(dependency_path, kind_hint)) return;
+        const resolved_path = std.Io.Dir.cwd().realPathFileAlloc(
+            manager.init_data.io,
+            dependency_path,
+            manager.allocator,
+        ) catch return;
+        if (std.mem.eql(u8, resolved_path, package_dir)) return;
+
+        const identity = manager.readInstalledPackageJSON(resolved_path) catch return;
+        const installed_name = jsonString(identity, "name") orelse alias;
+        const version_value = jsonString(identity, "version") orelse return;
+        try dependencies.append(.{
+            .alias = try manager.allocator.dupe(u8, alias),
+            .spec = if (std.mem.eql(u8, alias, installed_name))
+                try manager.allocator.dupe(u8, version_value)
+            else
+                try std.fmt.allocPrint(manager.allocator, "npm:{s}@{s}", .{ installed_name, version_value }),
+        });
+    }
+
+    fn metadataForInstalledIsolatedPackage(
+        manager: *Manager,
+        package_dir: []const u8,
+        identity: *const Value,
+    ) !*Value {
+        const metadata = try manager.allocator.create(Value);
+        metadata.* = .{ .object = .empty };
+        for (identity.object.keys(), identity.object.values()) |field, value| {
+            if (containsString(&all_dependency_sections, field)) continue;
+            try metadata.object.put(
+                manager.allocator,
+                try manager.allocator.dupe(u8, field),
+                value,
+            );
+        }
+
+        const package_parent = std.fs.path.dirname(package_dir) orelse return metadata;
+        const modules_dir = if (std.mem.startsWith(u8, std.fs.path.basename(package_parent), "@"))
+            std.fs.path.dirname(package_parent) orelse return metadata
+        else
+            package_parent;
+        var dependencies = std.array_list.Managed(InstalledIsolatedDependency).init(manager.allocator);
+        defer dependencies.deinit();
+        var directory = std.Io.Dir.cwd().openDir(
+            manager.init_data.io,
+            modules_dir,
+            .{ .iterate = true },
+        ) catch return metadata;
+        defer directory.close(manager.init_data.io);
+
+        var iterator = directory.iterate();
+        while (try iterator.next(manager.init_data.io)) |entry| {
+            if (entry.name.len == 0 or entry.name[0] == '.') continue;
+            const entry_path = try std.fs.path.join(manager.allocator, &.{ modules_dir, entry.name });
+            if (entry.name[0] != '@') {
+                try manager.appendInstalledIsolatedDependency(
+                    &dependencies,
+                    package_dir,
+                    entry.name,
+                    entry_path,
+                    entry.kind,
+                );
+                continue;
+            }
+            if (entry.kind != .directory) continue;
+
+            var scope = std.Io.Dir.cwd().openDir(
+                manager.init_data.io,
+                entry_path,
+                .{ .iterate = true },
+            ) catch continue;
+            defer scope.close(manager.init_data.io);
+            var scope_iterator = scope.iterate();
+            while (try scope_iterator.next(manager.init_data.io)) |package_entry| {
+                if (package_entry.name.len == 0 or package_entry.name[0] == '.') continue;
+                const alias = try std.fmt.allocPrint(
+                    manager.allocator,
+                    "{s}/{s}",
+                    .{ entry.name, package_entry.name },
+                );
+                const dependency_path = try std.fs.path.join(
+                    manager.allocator,
+                    &.{ entry_path, package_entry.name },
+                );
+                try manager.appendInstalledIsolatedDependency(
+                    &dependencies,
+                    package_dir,
+                    alias,
+                    dependency_path,
+                    package_entry.kind,
+                );
+            }
+        }
+
+        std.sort.pdq(InstalledIsolatedDependency, dependencies.items, {}, struct {
+            fn lessThan(_: void, left: InstalledIsolatedDependency, right: InstalledIsolatedDependency) bool {
+                return std.mem.order(u8, left.alias, right.alias) == .lt;
+            }
+        }.lessThan);
+        if (dependencies.items.len > 0) {
+            var dependency_object: Value = .{ .object = .empty };
+            for (dependencies.items) |dependency| {
+                try dependency_object.object.put(
+                    manager.allocator,
+                    dependency.alias,
+                    .{ .string = dependency.spec },
+                );
+            }
+            try metadata.object.put(
+                manager.allocator,
+                try manager.allocator.dupe(u8, "dependencies"),
+                dependency_object,
+            );
+        }
+        return metadata;
+    }
+
     fn metadataForInstalledPackage(
         manager: *Manager,
         package_dir: []const u8,
@@ -8150,52 +8280,63 @@ const Manager = struct {
                 return record.version;
             }
 
-            if (manager.isSecurityResolution()) {
-                const consumer_modules = try manager.isolatedConsumerModules(parent_dir);
-                const destination = try std.fs.path.join(manager.allocator, &.{ consumer_modules, alias });
-                if (!manager.pathIsWorkspace(destination)) {
-                    const metadata = manager.readInstalledPackageJSON(destination) catch return null;
-                    const installed_name = jsonString(metadata, "name") orelse alias;
-                    const installed_version = jsonString(metadata, "version") orelse return null;
-                    if (std.mem.eql(u8, installed_name, registry_name) and
-                        (tagged_version or semverSatisfies(manager.allocator, registry_spec, installed_version)))
-                    {
-                        const installed_path = std.Io.Dir.cwd().realPathFileAlloc(
-                            manager.init_data.io,
-                            destination,
-                            manager.allocator,
-                        ) catch destination;
-                        const patch_paths = try manager.packagePatchPaths(installed_name, installed_version, protocol_patch_paths);
-                        if (!try manager.packagePatchStateMatches(installed_path, patch_paths)) return null;
+            const consumer_modules = try manager.isolatedConsumerModules(parent_dir);
+            const destination = try std.fs.path.join(manager.allocator, &.{ consumer_modules, alias });
+            if (!manager.pathIsWorkspace(destination)) {
+                const identity = manager.readInstalledPackageJSON(destination) catch return null;
+                const installed_name = jsonString(identity, "name") orelse alias;
+                const installed_version = jsonString(identity, "version") orelse return null;
+                if (std.mem.eql(u8, installed_name, registry_name) and
+                    (tagged_version or semverSatisfies(manager.allocator, registry_spec, installed_version)))
+                {
+                    const installed_path = std.Io.Dir.cwd().realPathFileAlloc(
+                        manager.init_data.io,
+                        destination,
+                        manager.allocator,
+                    ) catch destination;
+                    const patch_paths = try manager.packagePatchPaths(installed_name, installed_version, protocol_patch_paths);
+                    if (!try manager.packagePatchStateMatches(installed_path, patch_paths)) return null;
+                    // Registry dependency metadata can differ from the
+                    // package.json packed in a tarball. The isolated links
+                    // are the authoritative record of the resolved graph.
+                    const metadata = try manager.metadataForInstalledIsolatedPackage(
+                        installed_path,
+                        identity,
+                    );
 
-                        const logical_key = try manager.dependencyLockKey(parent_dir, alias);
-                        const modules_dir = std.fs.path.dirname(installed_path) orelse return null;
-                        try manager.isolated_parent_modules.put(
-                            try manager.allocator.dupe(u8, installed_path),
-                            try manager.allocator.dupe(u8, modules_dir),
-                        );
-                        try manager.isolated_parent_keys.put(
-                            try manager.allocator.dupe(u8, installed_path),
-                            try manager.allocator.dupe(u8, logical_key),
-                        );
-                        try manager.root_versions.put(try manager.allocator.dupe(u8, alias), installed_version);
-                        try manager.addRecord(.{
-                            .key = logical_key,
-                            .alias = alias,
-                            .name = installed_name,
-                            .version = installed_version,
-                            .resolution = registry_spec,
-                            .metadata = metadata,
-                            .install_dir = installed_path,
-                        });
-                        try manager.rememberPackageMetadata(installed_path, metadata);
-                        try manager.installDependencyObject(metadata, "dependencies", installed_path, false, false);
-                        if (!manager.options.omit_optional) {
-                            try manager.installDependencyObject(metadata, "optionalDependencies", installed_path, false, true);
-                        }
-                        try manager.installOrLinkPeerDependencies(metadata, installed_path, installed_path, parent_dir);
-                        return installed_version;
+                    const logical_key = try manager.dependencyLockKey(parent_dir, alias);
+                    const package_parent = std.fs.path.dirname(installed_path) orelse return null;
+                    const modules_dir = if (std.mem.startsWith(u8, std.fs.path.basename(package_parent), "@"))
+                        std.fs.path.dirname(package_parent) orelse return null
+                    else
+                        package_parent;
+                    try manager.isolated_parent_modules.put(
+                        try manager.allocator.dupe(u8, installed_path),
+                        try manager.allocator.dupe(u8, modules_dir),
+                    );
+                    try manager.isolated_parent_keys.put(
+                        try manager.allocator.dupe(u8, installed_path),
+                        try manager.allocator.dupe(u8, logical_key),
+                    );
+                    try manager.ensureIsolatedLinks(alias, parent_dir, installed_path);
+                    if (!manager.options.lockfile_only and !manager.options.dry_run) {
+                        try manager.linkBins(alias, installed_path, identity, direct, parent_dir);
                     }
+                    try manager.root_versions.put(try manager.allocator.dupe(u8, alias), installed_version);
+                    try manager.addRecord(.{
+                        .key = logical_key,
+                        .alias = alias,
+                        .name = installed_name,
+                        .version = installed_version,
+                        .resolution = registry_spec,
+                        .metadata = metadata,
+                        .install_dir = installed_path,
+                    });
+                    try manager.rememberPackageMetadata(installed_path, metadata);
+                    try manager.registerBundledPackages(logical_key, identity, installed_path);
+                    try manager.installDependencyObject(metadata, "dependencies", installed_path, false, false);
+                    try manager.installOrLinkPeerDependencies(metadata, installed_path, installed_path, parent_dir);
+                    return installed_version;
                 }
             }
             return null;
