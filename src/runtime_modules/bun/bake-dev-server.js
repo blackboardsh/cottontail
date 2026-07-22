@@ -314,10 +314,38 @@ socket.addEventListener("message", event => {
 });
 </script>`;
 
+const bakeFrameworkHmrBootstrap = `<script type="module" data-cottontail-bake-bootstrap>
+const NativeWebSocket = globalThis.WebSocket;
+const socketUrl = new URL("/_bun/hmr", location.href);
+socketUrl.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+const socket = new NativeWebSocket(socketUrl);
+socket.binaryType = "arraybuffer";
+const originalInfo = console.info;
+socket.addEventListener("open", () => {
+  originalInfo.call(console, "[Bun] Hot-module-reloading socket connected, waiting for changes...");
+}, { once: true });
+console.info = function(...args) {
+  if (args[0]?.startsWith("[Bun] Hot-module-reloading socket connected")) {
+    console.info = originalInfo;
+    socket.close();
+  }
+  return originalInfo.apply(this, args);
+};
+</script>`;
+
 function withBakeLiveReloadClient(html) {
   const insertion = html.search(/<\/body\s*>/i);
   if (insertion >= 0) return `${html.slice(0, insertion)}${bakeLiveReloadClient}${html.slice(insertion)}`;
   return `${html}${bakeLiveReloadClient}`;
+}
+
+function withBakeFrameworkHmrBootstrap(response) {
+  if (!response.headers.get("content-type")?.toLowerCase().startsWith("text/html")) return response;
+  return new HTMLRewriter().on("head", {
+    element(element) {
+      element.prepend(bakeFrameworkHmrBootstrap, { html: true });
+    },
+  }).transform(response);
 }
 
 async function loadBakeStaticConfig(projectRoot) {
@@ -2312,12 +2340,13 @@ function createFrameworkDispatcher(config) {
     record.pathname = pathname;
     const route = await bundleRoute(found.router, found.matched);
     if (route === null) return new Response("Not Found", { status: 404 });
-    return route.render(request, {
+    const response = await route.render(request, {
       params: found.matched.params,
       modules: [route.hmrArgs?.clientEntryUrl ?? ""],
       modulepreload: [],
       styles: route.hmrArgs?.styles ?? [],
     });
+    return development ? withBakeFrameworkHmrBootstrap(response) : response;
   };
   dispatchFrameworkRequest.projectRoot = projectRoot;
   dispatchFrameworkRequest.sourceMapForPath = pathname => sourceMaps.get(pathname) ?? null;

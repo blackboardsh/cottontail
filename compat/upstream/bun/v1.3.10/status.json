@@ -739,6 +739,14 @@
       "status": "enabled",
       "reason": "Bake client source maps preserve original sources across primary and hot-reload chunks (2 cases, 6 assertions)."
     },
+    "test/bake/dev/ssg-pages-router.test.ts": {
+      "status": "enabled",
+      "reason": "Bake SSG pages routing passes static, dynamic, nested, catch-all, async-data, file-loading, named-import, and hot-reload coverage across all 9 copied cases with 40 assertions.",
+      "env": {
+        "COTTONTAIL_TEST_TIMEOUT_SCALE": "3"
+      },
+      "timeoutMs": 180000
+    },
     "test/bake/dev/stress.test.ts": {
       "status": "enabled",
       "reason": "Bake survives the default crash #18910 smoke cycle of rapid source rewrites and serves the final updated binding (1 case, 2 assertions)."
