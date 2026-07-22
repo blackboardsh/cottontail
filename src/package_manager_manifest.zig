@@ -80,14 +80,26 @@ pub const Policy = struct {
         return policy.patched_dependencies.get(key);
     }
 
-    pub fn wasTrustedInLock(document: *const Value, package_name: []const u8) bool {
+    pub fn wasTrustedInLock(document: *const Value, package_name: []const u8, npm_package: bool) bool {
         if (document.* != .object) return false;
-        const trusted = document.object.get("trustedDependencies") orelse return false;
+        const trusted = document.object.get("trustedDependencies") orelse
+            return npm_package and isDefaultTrustedDependency(package_name);
         if (trusted != .array) return false;
         for (trusted.array.items) |entry| {
             if (entry == .string and std.mem.eql(u8, entry.string, package_name)) return true;
         }
         return false;
+    }
+
+    pub fn wasTrustedInLockHashes(
+        trusted_hashes: ?[]const compiler.install.TruncatedPackageNameHash,
+        package_name: []const u8,
+        npm_package: bool,
+    ) bool {
+        const hashes = trusted_hashes orelse return npm_package and isDefaultTrustedDependency(package_name);
+        const package_hash: compiler.install.TruncatedPackageNameHash =
+            @truncate(compiler.Semver.String.Builder.stringHash(package_name));
+        return std.mem.indexOfScalar(compiler.install.TruncatedPackageNameHash, hashes, package_hash) != null;
     }
 
     pub fn matchesLockDocument(policy: *const Policy, document: *const Value) bool {
@@ -478,6 +490,7 @@ test "manifest policy preserves trusted dependency presence" {
     const named_root = try std.json.parseFromSliceLeaky(Value, allocator, "{\"trustedDependencies\":[\"not-installed\"]}", .{});
     const absent_lock = try std.json.parseFromSliceLeaky(Value, allocator, "{}", .{});
     const empty_lock = try std.json.parseFromSliceLeaky(Value, allocator, "{\"trustedDependencies\":[]}", .{});
+    const named_lock = try std.json.parseFromSliceLeaky(Value, allocator, "{\"trustedDependencies\":[\"not-installed\"]}", .{});
 
     var absent_policy = try Policy.init(allocator, &absent_root);
     defer absent_policy.deinit();
@@ -491,12 +504,21 @@ test "manifest policy preserves trusted dependency presence" {
     try std.testing.expect(empty_policy.matchesLockDocument(&empty_lock));
     try std.testing.expect(!empty_policy.matchesLockDocument(&absent_lock));
 
+    try std.testing.expect(Policy.wasTrustedInLock(&absent_lock, "electron", true));
+    try std.testing.expect(!Policy.wasTrustedInLock(&absent_lock, "electron", false));
+    try std.testing.expect(!Policy.wasTrustedInLock(&named_lock, "electron", true));
+    try std.testing.expect(Policy.wasTrustedInLock(&named_lock, "not-installed", true));
+
     const named_hash: compiler.install.TruncatedPackageNameHash = @truncate(compiler.Semver.String.Builder.stringHash("not-installed"));
     try std.testing.expect(absent_policy.matchesTrustedDependencyHashes(null));
     try std.testing.expect(!absent_policy.matchesTrustedDependencyHashes(&.{named_hash}));
     try std.testing.expect(empty_policy.matchesTrustedDependencyHashes(&.{}));
     try std.testing.expect(!empty_policy.matchesTrustedDependencyHashes(null));
     try std.testing.expect(named_policy.matchesTrustedDependencyHashes(&.{named_hash}));
+    try std.testing.expect(Policy.wasTrustedInLockHashes(null, "electron", true));
+    try std.testing.expect(!Policy.wasTrustedInLockHashes(null, "electron", false));
+    try std.testing.expect(!Policy.wasTrustedInLockHashes(&.{named_hash}, "electron", true));
+    try std.testing.expect(Policy.wasTrustedInLockHashes(&.{named_hash}, "not-installed", true));
 
     var output: std.Io.Writer.Allocating = .init(allocator);
     try empty_policy.writeLockFields(&output.writer);

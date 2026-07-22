@@ -2000,6 +2000,7 @@ const Manager = struct {
     loaded_text_lockfile: bool = false,
     loaded_binary_lockfile: bool = false,
     binary_lockfile_needs_migration: bool = false,
+    binary_lockfile_trusted_dependency_hashes: ?[]const compiler.install.TruncatedPackageNameHash = null,
     lockfile_config_version: Lockfile.ConfigVersion = .current,
     linker_configured: bool = false,
     max_retry_count: u16 = 5,
@@ -4250,6 +4251,7 @@ const Manager = struct {
             const converted = try BunLockfile.binaryToTextWithMetadata(manager.allocator, bytes);
             manager.loaded_binary_lockfile = true;
             manager.binary_lockfile_needs_migration = converted.migrated_from_v2;
+            manager.binary_lockfile_trusted_dependency_hashes = converted.trusted_dependency_hashes;
             manager.lock_graph = try Lockfile.parseText(manager.allocator, converted.text);
             manager.lockfile_config_version = manager.lock_graph.?.config_version orelse .v0;
             if (manager.lock_graph.?.config_version == null) manager.changed = true;
@@ -5609,6 +5611,18 @@ const Manager = struct {
         return null;
     }
 
+    fn packageWasTrustedInLoadedLock(manager: *const Manager, package_name: []const u8, npm_package: bool) bool {
+        const graph = if (manager.lock_graph) |*value| value else return false;
+        if (manager.loaded_binary_lockfile) {
+            return Manifest.Policy.wasTrustedInLockHashes(
+                manager.binary_lockfile_trusted_dependency_hashes,
+                package_name,
+                npm_package,
+            );
+        }
+        return Manifest.Policy.wasTrustedInLock(&graph.document, package_name, npm_package);
+    }
+
     fn installDependency(
         manager: *Manager,
         alias: []const u8,
@@ -5652,10 +5666,9 @@ const Manager = struct {
             } else alias;
             for (manager.records.items) |record| {
                 if (std.mem.eql(u8, record.alias, alias) and std.mem.eql(u8, recordLogicalKey(record), direct_key)) {
-                    const newly_trusted = manager.manifest_policy.?.trusted_dependencies != null and
-                        manager.manifest_policy.?.isTrusted(alias, record.kind == .npm) and
-                        (manager.lock_graph == null or
-                            !Manifest.Policy.wasTrustedInLock(&manager.lock_graph.?.document, alias));
+                    const npm_package = record.kind == .npm;
+                    const newly_trusted = manager.manifest_policy.?.isTrusted(alias, npm_package) and
+                        !manager.packageWasTrustedInLoadedLock(alias, npm_package);
                     if (!newly_trusted) return record.version;
                 }
             }
@@ -9509,11 +9522,7 @@ const Manager = struct {
         }
 
         if (!newly_installed and !explicitly_trusted) {
-            if (manager.manifest_policy.?.trusted_dependencies == null) return;
-            const graph = if (manager.lock_graph) |*value| value else null;
-            if (graph) |locked| {
-                if (Manifest.Policy.wasTrustedInLock(&locked.document, alias)) return;
-            }
+            if (manager.packageWasTrustedInLoadedLock(alias, npm_package)) return;
         }
 
         try manager.script_queue.add(.{
