@@ -2364,7 +2364,12 @@ const Manager = struct {
         var root: Value = if (std.mem.trim(u8, package_source, " \t\r\n").len == 0)
             .{ .object = .empty }
         else
-            try PackageJSON.parsePackageJSON(manager.allocator, package_json_path, package_source);
+            try PackageJSON.parseInstallPackageJSON(
+                manager.allocator,
+                package_json_path,
+                package_source,
+                manager.stderr,
+            );
         if (root != .object) return error.InvalidPackageJSON;
         manager.root_package_json = &root;
         manager.manifest_policy = try Manifest.Policy.init(manager.allocator, &root);
