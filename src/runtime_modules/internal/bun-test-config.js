@@ -67,7 +67,122 @@ function validateConcurrentTestGlob(value) {
   });
 }
 
-function validateConfig(config) {
+function configPropertyLocation(source, name) {
+  const lines = String(source).split("\n");
+  let section = "";
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].replace(/\r$/, "");
+    const sectionMatch = /^\s*\[([^\]]+)\]\s*(?:#.*)?$/.exec(line);
+    if (sectionMatch) {
+      section = sectionMatch[1].trim();
+      continue;
+    }
+    if (section !== "test") continue;
+    const propertyMatch = new RegExp(`^(\\s*${name}\\s*=\\s*)`).exec(line);
+    if (!propertyMatch) continue;
+    return {
+      line: index + 1,
+      lineText: line,
+      valueColumn: propertyMatch[1].length + 1,
+      valueText: line.slice(propertyMatch[1].length),
+    };
+  }
+  return null;
+}
+
+function arrayItemOffsets(source) {
+  const offsets = [];
+  let quote = "";
+  let escaped = false;
+  let squareDepth = 0;
+  let braceDepth = 0;
+  let expectingItem = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (quote === '"' && character === "\\" && !escaped) {
+        escaped = true;
+        continue;
+      }
+      if (character === quote && !escaped) quote = "";
+      escaped = false;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      if (expectingItem && squareDepth === 1 && braceDepth === 0) {
+        offsets.push(index);
+        expectingItem = false;
+      }
+      quote = character;
+      continue;
+    }
+    if (character === "[") {
+      squareDepth += 1;
+      if (squareDepth === 1) expectingItem = true;
+      continue;
+    }
+    if (character === "]") {
+      squareDepth -= 1;
+      continue;
+    }
+    if (character === "{") braceDepth += 1;
+    if (character === "}") braceDepth -= 1;
+    if (character === "," && squareDepth === 1 && braceDepth === 0) {
+      expectingItem = true;
+      continue;
+    }
+    if (expectingItem && squareDepth === 1 && braceDepth === 0 && !/\s/.test(character)) {
+      offsets.push(index);
+      expectingItem = false;
+    }
+  }
+  return offsets;
+}
+
+function failInvalidBunfig(source, path, name, message, itemIndex = null) {
+  const location = configPropertyLocation(source, name);
+  if (!location) throw new TypeError(message);
+  const itemOffset = itemIndex == null ? 0 : (arrayItemOffsets(location.valueText)[itemIndex] ?? 0);
+  const column = location.valueColumn + itemOffset;
+  const prefix = `${location.line} | `;
+  const diagnostic = [
+    `${prefix}${location.lineText}`,
+    `${" ".repeat(prefix.length + column - 1)}^`,
+    `error: ${message}`,
+    `    at ${path}:${location.line}:${column}`,
+    "",
+    "Invalid Bunfig: failed to load bunfig",
+  ].join("\n");
+  globalThis.process?.stderr?.write?.(`${diagnostic}\n`);
+  if (typeof globalThis.process?.exit === "function") globalThis.process.exit(1);
+  throw new TypeError(message);
+}
+
+function validateCoverageConfig(config, source, path) {
+  if (!Object.hasOwn(config, "coveragePathIgnorePatterns")) return;
+  const value = config.coveragePathIgnorePatterns;
+  if (typeof value === "string") return;
+  if (!Array.isArray(value)) {
+    failInvalidBunfig(
+      source,
+      path,
+      "coveragePathIgnorePatterns",
+      "coveragePathIgnorePatterns must be a string or array of strings",
+    );
+  }
+  const invalidIndex = value.findIndex((pattern) => typeof pattern !== "string");
+  if (invalidIndex >= 0) {
+    failInvalidBunfig(
+      source,
+      path,
+      "coveragePathIgnorePatterns",
+      "coveragePathIgnorePatterns array must contain only strings",
+      invalidIndex,
+    );
+  }
+}
+
+function validateConfig(config, source, path) {
   if (Object.hasOwn(config, "randomize")) expectType(config.randomize, "boolean", "randomize");
   if (Object.hasOwn(config, "seed")) configU32(config.seed, "seed");
   if (Object.hasOwn(config, "rerunEach")) configU32(config.rerunEach, "rerunEach");
@@ -82,6 +197,7 @@ function validateConfig(config) {
     if (Object.hasOwn(config.reporter, "dots")) expectType(config.reporter.dots, "boolean", "reporter.dots");
     if (Object.hasOwn(config.reporter, "dot")) expectType(config.reporter.dot, "boolean", "reporter.dot");
   }
+  validateCoverageConfig(config, source, path);
   return config;
 }
 
@@ -90,11 +206,12 @@ export function bunTestConfig() {
   const cwd = String(globalThis.process?.cwd?.() ?? ".");
   const path = resolve(cwd, configuredPath());
   try {
-    const document = parseTOML(String(readFileSync(path, "utf8")));
+    const source = String(readFileSync(path, "utf8"));
+    const document = parseTOML(source);
     const config = document?.test && typeof document.test === "object"
       ? document.test
       : Object.create(null);
-    cachedConfig = validateConfig(config);
+    cachedConfig = validateConfig(config, source, path);
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
     cachedConfig = Object.create(null);

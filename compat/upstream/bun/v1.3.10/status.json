@@ -1333,6 +1333,11 @@
       "status": "enabled",
       "reason": "Bun test discovers concurrent glob inputs and reports all four copied cases with 11 assertions."
     },
+    "test/cli/test/coverage.test.ts": {
+      "status": "enabled",
+      "reason": "All 12 copied coverage cases pass text and LCOV reporting, source-map line accounting, test and node_modules exclusion, ignore patterns, and exact bunfig diagnostics (10 snapshots, 27 assertions).",
+      "timeoutMs": 180000
+    },
     "test/cli/test/pass-with-no-tests.test.ts": {
       "status": "enabled",
       "reason": "Bun test implements human and agent-mode empty-discovery policy with --pass-with-no-tests (5 bun:test cases, 7 assertions)."

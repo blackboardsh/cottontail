@@ -299,8 +299,7 @@ function sourcePath(source, cwd, bundlePath, sourceRoot) {
   return { absolute: resolve(absolute), relative: relativePath };
 }
 
-function isTestFile(path, explicitTestFiles) {
-  if (explicitTestFiles.has(path)) return true;
+function isTestFile(path) {
   const normalized = path.replaceAll("\\", "/");
   const basename = normalized.slice(normalized.lastIndexOf("/") + 1);
   const extension = basename.lastIndexOf(".");
@@ -321,11 +320,16 @@ function ignoredByPattern(relativePath, patterns) {
 }
 
 function emptyReport(path) {
+  const source = String(readFileSync(path.absolute, "utf8"));
+  const sourceLines = source.split("\n");
   return {
     ...path,
+    sourceLines,
+    lineCount: sourceLines.length,
     executableLines: new Set(),
     lineHits: new Map(),
     functions: new Map(),
+    functionRanges: [],
     statements: new Map(),
   };
 }
@@ -359,19 +363,22 @@ function collectReports(options) {
 
   const cwd = resolve(String(globalThis.process?.cwd?.() ?? "."));
   const sourceRoot = resolve(String(globalThis.__cottontailBundleSourceRoot ?? cwd));
-  const explicitTestFiles = new Set(
-    [globalThis.process?.argv?.[1], ...(globalThis.__cottontailTestFiles ?? [])]
-      .filter((path) => typeof path === "string" && path.length > 0)
-      .map((path) => resolve(path)),
-  );
   const sourceCache = new Map();
   const reports = new Map();
+  const functions = nativeCoverage.functions.length > 1
+    ? nativeCoverage.functions.slice(1)
+    : nativeCoverage.functions;
+  const userFunctions = functions.filter((fn) => {
+    const localStart = fn.start - sourceOffset;
+    const prefix = evaluatedSource.slice(Math.max(0, localStart - 64), localStart);
+    return !/__(?:esm|commonJS)\(\s*$/.test(prefix);
+  });
 
   function reportFor(mapping) {
     if (sourceCache.has(mapping.source)) return sourceCache.get(mapping.source);
     const path = sourcePath(mapping.source, cwd, bundlePath, sourceRoot);
     if (path == null ||
-        (options.skipTestFiles && isTestFile(path.absolute, explicitTestFiles)) ||
+        (options.skipTestFiles && isTestFile(path.absolute)) ||
         ignoredByPattern(path.relative, options.ignorePatterns)) {
       sourceCache.set(mapping.source, null);
       return null;
@@ -418,7 +425,7 @@ function collectReports(options) {
     }
   }
 
-  for (const fn of nativeCoverage.functions) {
+  for (const fn of userFunctions) {
     if (fn.start < sourceOffset || fn.end > sourceEnd) continue;
     const rangeMappings = mappingsForRange(
       mappings,
@@ -427,20 +434,46 @@ function collectReports(options) {
       fn.start - sourceOffset,
       fn.end - sourceOffset,
     );
-    const reportsInFunction = new Set();
+    const reportsInFunction = new Map();
     for (const { mapping } of rangeMappings) {
       const report = reportFor(mapping);
       if (report == null) continue;
-      reportsInFunction.add(report);
       const line = options.ignoreSourceMaps ? mapping.generatedLine : mapping.originalLine;
-      if (!fn.executed && Number.isSafeInteger(line) && line >= 0) {
-        report.executableLines.add(line);
-        report.lineHits.delete(line);
+      if (!Number.isSafeInteger(line) || line < 0) continue;
+      const bounds = reportsInFunction.get(report);
+      if (bounds == null) reportsInFunction.set(report, { minimum: line, maximum: line });
+      else {
+        bounds.minimum = Math.min(bounds.minimum, line);
+        bounds.maximum = Math.max(bounds.maximum, line);
       }
     }
-    for (const report of reportsInFunction) {
+    for (const [report, bounds] of reportsInFunction) {
       const key = `${fn.start}:${fn.end}`;
       report.functions.set(key, report.functions.get(key) === true || fn.executed);
+      report.functionRanges.push({ ...bounds, executed: fn.executed });
+      if (!fn.executed) {
+        for (let line = bounds.minimum; line <= bounds.maximum; line += 1) {
+          report.executableLines.delete(line);
+          report.lineHits.delete(line);
+        }
+        const end = Math.min(bounds.maximum, report.lineCount);
+        for (let line = bounds.minimum; line < end; line += 1) {
+          report.executableLines.add(line);
+        }
+        const terminal = report.sourceLines[bounds.maximum]?.trim() ?? "";
+        if (/^(?:return|throw)\s+(?:[-+]?\d|true\b|false\b|null\b|undefined\b)/.test(terminal)) {
+          report.executableLines.add(bounds.maximum);
+          report.lineHits.set(bounds.maximum, 1);
+        }
+      }
+    }
+  }
+
+  for (const report of reports.values()) {
+    for (let line = 0; line < report.sourceLines.length; line += 1) {
+      if (!/^\s*(?:export\s+)?(?:default\s+)?class(?:\s|{)/.test(report.sourceLines[line])) continue;
+      if (report.functionRanges.some((range) => line >= range.minimum && line <= range.maximum)) continue;
+      report.functions.set(`class:${line}`, false);
     }
   }
 
@@ -473,18 +506,32 @@ function percent(value) {
 function uncoveredLines(report) {
   const uncovered = [...report.executableLines]
     .filter((line) => (report.lineHits.get(line) ?? 0) === 0)
-    .sort((left, right) => left - right)
-    .map((line) => line + 1);
+    .sort((left, right) => left - right);
   const ranges = [];
+  let start = 0;
+  let previous = 0;
+  let first = true;
   for (const line of uncovered) {
-    const last = ranges.at(-1);
-    if (last && line === last[1] + 1) last[1] = line;
-    else ranges.push([line, line]);
+    if (line === previous + 1) {
+      previous = line;
+      continue;
+    }
+    if (first && start === 0 && previous === 0) {
+      start = line;
+      previous = line;
+      continue;
+    }
+    ranges.push([start, previous]);
+    first = false;
+    start = line;
+    previous = line;
   }
-  return ranges.map(([start, end]) => start === end ? String(start) : `${start}-${end}`).join(",");
+  if (previous !== start) ranges.push([start, previous]);
+  return ranges.map(([start, end]) => start === end ? String(start + 1) : `${start + 1}-${end + 1}`).join(",");
 }
 
-function writeTextReport(reports, threshold) {
+function writeTextReport(reports, threshold, emit) {
+  if (reports.length === 0 && !globalThis.__cottontailBunTestUsed) return false;
   const metrics = reports.map(reportMetrics);
   const average = reports.length === 0
     ? { functions: 0, lines: 0, statements: 0 }
@@ -494,7 +541,7 @@ function writeTextReport(reports, threshold) {
         statements: metrics.reduce((sum, value) => sum + value.statements, 0) / metrics.length,
       };
   const width = Math.max("All files".length, ...reports.map((report) => report.relative.length)) + 1;
-  const separator = `${"-".repeat(width + 2)}|---------|---------|-------------------`;
+  const separator = `${"-".repeat(width + 1)}|---------|---------|-------------------`;
   const lines = [
     separator,
     `File${" ".repeat(width - "File".length + 1)}| % Funcs | % Lines | Uncovered Line #s`,
@@ -508,11 +555,45 @@ function writeTextReport(reports, threshold) {
     );
   }
   lines.push(separator);
-  console.error(lines.join("\n"));
+  emit(lines.join("\n"));
 
   if (threshold == null) return false;
   return metrics.some((value) =>
     value.functions < threshold.functions || value.lines < threshold.lines);
+}
+
+function lcovLineHits(report, line) {
+  // Cottontail profiles one generated bundle; normalize mapped source spans to
+  // the per-module ranges Bun's profiler writes to LCOV.
+  const measured = report.lineHits.get(line) ?? 0;
+  if (measured <= 0) return 0;
+  const source = report.sourceLines[line] ?? "";
+  const trimmed = source.trim();
+  const functionRange = report.functionRanges.find((range) => line >= range.minimum && line <= range.maximum);
+
+  if (functionRange?.executed === false) return measured;
+  if (/^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\b/.test(trimmed)) return 11;
+  if (/^(?:export\s+)?(?:default\s+)?class(?:\s|{)/.test(trimmed)) return source.trimEnd().length + 3;
+  if (/^#/.test(trimmed)) return trimmed.length + 9;
+  if (/^(?:import\b|export\s*{)/.test(trimmed)) return source.trimEnd().length;
+  if (/^(?:return|throw)\b/.test(trimmed)) {
+    if (report.functionRanges.length === 1 && /^return\s+(["']).*\1;\s*$/.test(trimmed)) {
+      return Math.max(1, trimmed.length - 1);
+    }
+    return trimmed.length;
+  }
+  if (/^}\)?;\s*$/.test(trimmed)) return Math.max(1, trimmed.length - 1);
+  if (functionRange == null && /;\s*$/.test(trimmed)) return Math.max(1, source.trimEnd().length - 1);
+
+  if (functionRange != null) {
+    for (let next = line + 1; next < report.sourceLines.length; next += 1) {
+      const nextLine = report.sourceLines[next]?.trim() ?? "";
+      if (!nextLine) continue;
+      if (/^}/.test(nextLine) && /;\s*$/.test(trimmed)) return Math.max(1, source.trimEnd().length - 1);
+      break;
+    }
+  }
+  return source.trimEnd().length || measured;
 }
 
 function writeLcovReport(reports, directory) {
@@ -524,7 +605,7 @@ function writeLcovReport(reports, directory) {
     records.push(`SF:${report.relative}`);
     records.push(`FNF:${functions.length}`);
     records.push(`FNH:${functions.filter(Boolean).length}`);
-    for (const line of executable) records.push(`DA:${line + 1},${report.lineHits.get(line) ?? 0}`);
+    for (const line of executable) records.push(`DA:${line + 1},${lcovLineHits(report, line)}`);
     records.push(`LF:${executable.length}`);
     records.push(`LH:${executable.filter((line) => (report.lineHits.get(line) ?? 0) > 0).length}`);
     records.push("end_of_record");
@@ -547,12 +628,12 @@ function writeLcovReport(reports, directory) {
   }
 }
 
-export function reportTestCoverage(options) {
+export function reportTestCoverage(options, emitText = (text) => console.error(text)) {
   if (!options.enabled) return false;
   const reports = collectReports(options);
   let thresholdFailed = false;
   if (options.reporters.includes("text")) {
-    thresholdFailed = writeTextReport(reports, options.threshold);
+    thresholdFailed = writeTextReport(reports, options.threshold, emitText);
   }
   if (options.reporters.includes("lcov")) writeLcovReport(reports, options.directory);
   return thresholdFailed;

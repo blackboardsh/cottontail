@@ -88,6 +88,7 @@ const globalOnlyMode = testRuntimeOptions.only;
 const passWithNoTests = testRuntimeOptions.passWithNoTests;
 const junitOptions = junitReporterOptions(testRuntimeOptions);
 const testCoverageOptions = configuredCoverageOptions(testCliArgs, bunTestConfig());
+let coverageReportText = "";
 const testReporterFinalizers = [
   {
     name: "snapshot writer",
@@ -95,7 +96,7 @@ const testReporterFinalizers = [
   },
   {
     name: "coverage reporter",
-    finalize: () => reportTestCoverage(testCoverageOptions),
+    finalize: () => reportTestCoverage(testCoverageOptions, (text) => { coverageReportText = text; }),
   },
   {
     name: "JUnit reporter",
@@ -1544,8 +1545,11 @@ function appendRunFileGroups(lines, views, extraFailures, runIndex, runCount) {
 
 function reportResults() {
   const reportEmptyGithubFile = testCliModeEnabled() && githubActionsEnabled();
+  const reportEmptyCoverageFile = testCliModeEnabled() && testCoverageOptions.enabled &&
+    globalThis.__cottontailTestEntrypointLoaded;
+  const reportEmptyFile = reportEmptyGithubFile || reportEmptyCoverageFile;
   if (resultsReported ||
-      (tests.length === 0 && failures.length === 0 && !globalThis.__cottontailBunTestUsed && !reportEmptyGithubFile)) return;
+      (tests.length === 0 && failures.length === 0 && !globalThis.__cottontailBunTestUsed && !reportEmptyFile)) return;
   resultsReported = true;
   const lines = [""];
   const currentViews = tests
@@ -1558,7 +1562,7 @@ function reportResults() {
   const hasVisibleRunOutput = runs.some((views) => agentQuietMode
     ? views.some((view) => view.status === "fail")
     : views.length > 0);
-  if (hasVisibleRunOutput || failures.length > 0 || labelFilterMatchedNoTests || reportEmptyGithubFile) {
+  if (hasVisibleRunOutput || failures.length > 0 || labelFilterMatchedNoTests || reportEmptyFile) {
     runs.forEach((views, index) => {
       const extraFailures = index === runs.length - 1
         ? failures.filter(({ record }) => !tests.includes(record))
@@ -1566,6 +1570,7 @@ function reportResults() {
       appendRunFileGroups(lines, views, extraFailures, index, runs.length);
     });
   }
+  if (coverageReportText) lines.push(...coverageReportText.split("\n"));
   if (labelFilterMatchedNoTests) {
     const pattern = String(cliOption("-t") ?? cliOption("--test-name-pattern") ?? "");
     lines.push("");
