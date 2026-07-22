@@ -1,6 +1,6 @@
 import { Buffer } from "./buffer.js";
 import { EventEmitter } from "./events.js";
-import { IncomingMessage, ServerResponse } from "./http.js";
+import { IncomingMessage, ServerResponse, _attachHttpConnection, _configureHttpServer } from "./http.js";
 import { connect as netConnect, createServer as createNetServer, isIP } from "./net.js";
 import { Duplex } from "./stream.js";
 import { _upgradeServerSocket, connect as tlsConnect, createServer as createTlsServer } from "./tls.js";
@@ -2773,10 +2773,17 @@ class Http2Server extends EventEmitter {
     this._secure = secure;
     this._server = null;
     this._sessions = new Set();
+    this._http1Connections = new Set();
     this._pendingContexts = [];
     this._closing = false;
     this._serverClosed = false;
     this._closeEmitted = false;
+    this.maxRequestsPerSocket = 0;
+    _configureHttpServer(this, {
+      ...options,
+      IncomingMessage: options.Http1IncomingMessage ?? IncomingMessage,
+      ServerResponse: options.Http1ServerResponse ?? ServerResponse,
+    });
     if (typeof listener === "function") this.on("request", listener);
   }
 
@@ -2806,7 +2813,17 @@ class Http2Server extends EventEmitter {
       secureSocket.once("error", (error) => this.emit("tlsClientError", error, secureSocket));
       return;
     }
-    if (this._secure && socket?.alpnProtocol && socket.alpnProtocol !== "h2") {
+    if (this._secure && socket?.alpnProtocol !== "h2") {
+      const isHttp1 = socket.alpnProtocol === "http/1.1" || !socket.alpnProtocol;
+      if (this._options.allowHTTP1 === true && isHttp1) {
+        this._http1Connections.add(socket);
+        socket.once("close", () => {
+          this._http1Connections.delete(socket);
+          this._maybeEmitClose();
+        });
+        _attachHttpConnection(this, socket);
+        return;
+      }
       if (!this.emit("unknownProtocol", socket)) socket?.destroy?.();
       return;
     }
@@ -2948,6 +2965,7 @@ class Http2Server extends EventEmitter {
     this._closing = true;
     this.listening = false;
     for (const session of [...this._sessions]) session.close();
+    this.closeIdleConnections();
     if (this._server) {
       this._server.once("close", () => {
         this._serverClosed = true;
@@ -2962,18 +2980,23 @@ class Http2Server extends EventEmitter {
   }
 
   _maybeEmitClose() {
-    if (!this._closing || !this._serverClosed || this._sessions.size > 0 || this._closeEmitted) return;
+    if (!this._closing || !this._serverClosed || this._sessions.size > 0 ||
+        this._http1Connections.size > 0 || this._closeEmitted) return;
     this._closeEmitted = true;
     this.emit("close");
   }
 
   closeAllConnections() {
     for (const session of [...this._sessions]) session.destroy();
+    for (const socket of [...this._http1Connections]) socket.destroy?.();
   }
 
   closeIdleConnections() {
     for (const session of [...this._sessions]) {
       if (session._streams.size === 0) session.close();
+    }
+    for (const socket of [...this._http1Connections]) {
+      if (socket._httpMessage == null) socket.destroy?.();
     }
   }
 
@@ -3133,7 +3156,7 @@ Object.defineProperty(connect, Symbol.for("nodejs.util.promisify.custom"), {
   configurable: true,
 });
 
-// COTTONTAIL-COMPAT: node:http2 native TLS boundary - h2c and TLS sessions, ALPN, HPACK decoding, CONTINUATION, settings, stream/session state, trailers, file responses, outbound flow control, and compatibility request/response APIs are implemented in the portable runtime. HTTP/1 fallback and native zero-copy sendfile remain transport-boundary work; HPACK encoding is deliberately interoperable but stateless.
+// COTTONTAIL-COMPAT: node:http2 native TLS boundary - h2c and TLS sessions, ALPN, HPACK decoding, CONTINUATION, settings, stream/session state, trailers, file responses, outbound flow control, HTTP/1 fallback, and compatibility request/response APIs are implemented in the portable runtime. Native zero-copy sendfile remains transport-boundary work; HPACK encoding is deliberately interoperable but stateless.
 
 export default {
   Http2Stream,
