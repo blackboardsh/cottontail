@@ -179,9 +179,13 @@ typedef unsigned int gid_t;
 #include <sys/sysctl.h>
 #elif defined(__linux__)
 #include <linux/fs.h>
+#include <linux/stat.h>
 #include <netpacket/packet.h>
 #include <sys/syscall.h>
 #include <sys/statvfs.h>
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH 0x1000
+#endif
 #elif !defined(_WIN32)
 #include <sys/statvfs.h>
 #endif
@@ -1267,6 +1271,8 @@ typedef struct CtFdEvent {
     char *message;
     int error_code;
     bool has_error_code;
+    int64_t result;
+    bool has_result;
     struct CtFdEvent *next;
 } CtFdEvent;
 
@@ -1415,6 +1421,26 @@ struct CtFsWatcher {
     bool closing;
     struct CtFsWatcher *next;
 };
+
+typedef enum {
+    CT_FS_ASYNC_READ,
+    CT_FS_ASYNC_WRITE,
+} CtFsAsyncKind;
+
+typedef struct CtFsAsyncRequest {
+    uv_fs_t request;
+    CtJscRuntime *runtime;
+    JSValueRef buffer_value;
+    uv_buf_t buffer;
+    uint8_t *owned_bytes;
+    size_t buffer_offset;
+    size_t buffer_length;
+    uint32_t id;
+    CtFsAsyncKind kind;
+    bool canceled;
+    bool suppress_event;
+    struct CtFsAsyncRequest *next;
+} CtFsAsyncRequest;
 
 typedef struct CtTcpConnect {
     uint32_t id;
@@ -1852,6 +1878,7 @@ struct CtJscRuntime {
     uint32_t next_dns_request_id;
     CtDnsRequest *dns_requests;
     CtFsWatcher *fs_watchers;
+    CtFsAsyncRequest *fs_async_requests;
     CtTimer **timer_heap;
     size_t timer_heap_len;
     size_t timer_heap_cap;
@@ -11587,6 +11614,11 @@ static const char *ct_socket_error_code(int error_code) {
         case EAFNOSUPPORT: return "EAFNOSUPPORT";
         case EALREADY: return "EALREADY";
         case EBADF: return "EBADF";
+        case EEXIST: return "EEXIST";
+        case EFBIG: return "EFBIG";
+        case EINTR: return "EINTR";
+        case EIO: return "EIO";
+        case EISDIR: return "EISDIR";
         case ECONNABORTED: return "ECONNABORTED";
         case ECONNREFUSED: return "ECONNREFUSED";
         case ECONNRESET: return "ECONNRESET";
@@ -11594,11 +11626,24 @@ static const char *ct_socket_error_code(int error_code) {
         case EINPROGRESS: return "EINPROGRESS";
         case EINVAL: return "EINVAL";
         case EISCONN: return "EISCONN";
+        case EMFILE: return "EMFILE";
+        case ENAMETOOLONG: return "ENAMETOOLONG";
         case ENETDOWN: return "ENETDOWN";
         case ENETUNREACH: return "ENETUNREACH";
         case ENOBUFS: return "ENOBUFS";
+        case ENOENT: return "ENOENT";
+        case ENOMEM: return "ENOMEM";
+        case ENOSPC: return "ENOSPC";
+        case ENOTDIR: return "ENOTDIR";
         case ENOTCONN: return "ENOTCONN";
+        case ENXIO: return "ENXIO";
         case EPIPE: return "EPIPE";
+#ifdef EROFS
+        case EROFS: return "EROFS";
+#endif
+#ifdef ECANCELED
+        case ECANCELED: return "ECANCELED";
+#endif
         case ETIMEDOUT: return "ETIMEDOUT";
         default: return "EIO";
     }
@@ -18998,6 +19043,29 @@ static CtStatTimestamp ct_stat_birthtime(const struct stat *stat_value) {
 #endif
 }
 
+#if defined(__linux__) && defined(SYS_statx)
+static bool ct_statx_birthtime_for_path(const char *path, bool follow, CtStatTimestamp *birthtime) {
+    struct statx statx_value;
+    int flags = follow ? 0 : AT_SYMLINK_NOFOLLOW;
+    memset(&statx_value, 0, sizeof(statx_value));
+    if (syscall(SYS_statx, AT_FDCWD, path, flags, STATX_BTIME, &statx_value) != 0) return false;
+    if ((statx_value.stx_mask & STATX_BTIME) == 0) return false;
+    birthtime->seconds = (int64_t)statx_value.stx_btime.tv_sec;
+    birthtime->nanoseconds = statx_value.stx_btime.tv_nsec;
+    return true;
+}
+
+static bool ct_statx_birthtime_for_fd(int fd, CtStatTimestamp *birthtime) {
+    struct statx statx_value;
+    memset(&statx_value, 0, sizeof(statx_value));
+    if (syscall(SYS_statx, fd, "", AT_EMPTY_PATH, STATX_BTIME, &statx_value) != 0) return false;
+    if ((statx_value.stx_mask & STATX_BTIME) == 0) return false;
+    birthtime->seconds = (int64_t)statx_value.stx_btime.tv_sec;
+    birthtime->nanoseconds = statx_value.stx_btime.tv_nsec;
+    return true;
+}
+#endif
+
 static void ct_set_stat_unsigned_string(
     JSContextRef ctx,
     JSObjectRef object,
@@ -19022,11 +19090,17 @@ static void ct_set_stat_signed_string(
     ct_set_property(ctx, object, name, ct_make_string(ctx, text), exception);
 }
 
-static void ct_define_stat_fields(JSContextRef ctx, JSObjectRef object, const struct stat *stat_value, JSValueRef *exception) {
+static void ct_define_stat_fields(
+    JSContextRef ctx,
+    JSObjectRef object,
+    const struct stat *stat_value,
+    const CtStatTimestamp *birthtime_override,
+    JSValueRef *exception
+) {
     CtStatTimestamp atime = ct_stat_atime(stat_value);
     CtStatTimestamp mtime = ct_stat_mtime(stat_value);
     CtStatTimestamp ctime = ct_stat_ctime(stat_value);
-    CtStatTimestamp birthtime = ct_stat_birthtime(stat_value);
+    CtStatTimestamp birthtime = birthtime_override != NULL ? *birthtime_override : ct_stat_birthtime(stat_value);
     ct_set_property(ctx, object, "dev", JSValueMakeNumber(ctx, (double)stat_value->st_dev), exception);
     ct_set_property(ctx, object, "ino", JSValueMakeNumber(ctx, (double)stat_value->st_ino), exception);
     ct_set_property(ctx, object, "size", JSValueMakeNumber(ctx, (double)stat_value->st_size), exception);
@@ -19090,9 +19164,14 @@ static JSValueRef ct_stat_sync(JSContextRef ctx, JSObjectRef function, JSObjectR
         free(path);
         return JSValueMakeUndefined(ctx);
     }
+    const CtStatTimestamp *birthtime_override = NULL;
+#if defined(__linux__) && defined(SYS_statx)
+    CtStatTimestamp birthtime;
+    if (ct_statx_birthtime_for_path(path, follow, &birthtime)) birthtime_override = &birthtime;
+#endif
     free(path);
     JSObjectRef result = ct_make_object(ctx);
-    ct_define_stat_fields(ctx, result, &stat_value, exception);
+    ct_define_stat_fields(ctx, result, &stat_value, birthtime_override, exception);
     return result;
 }
 
@@ -20039,6 +20118,20 @@ static void ct_queue_fd_simple_with_code(
 
 static void ct_queue_fd_simple(CtJscRuntime *runtime, uint32_t id, const char *type, const char *message) {
     ct_queue_fd_simple_with_code(runtime, id, type, message, 0, false);
+}
+
+static void ct_queue_fd_result(CtJscRuntime *runtime, uint32_t id, const char *type, int64_t result) {
+    CtFdEvent *event = (CtFdEvent *)calloc(1, sizeof(CtFdEvent));
+    if (event == NULL) return;
+    event->watch_id = id;
+    event->type = ct_duplicate_bytes(type, strlen(type));
+    event->result = result;
+    event->has_result = true;
+    if (event->type == NULL) {
+        free(event);
+        return;
+    }
+    ct_queue_fd_event(runtime, event);
 }
 
 static void ct_queue_fd_error(CtJscRuntime *runtime, uint32_t id, int error_code, const char *message) {
@@ -22998,6 +23091,9 @@ static JSValueRef ct_dispatch_fd_events(JSContextRef ctx, CtJscRuntime *runtime,
             ct_set_property(ctx, item, "errno", JSValueMakeNumber(ctx, event->error_code), exception);
             ct_set_property(ctx, item, "code", ct_make_string(ctx, ct_socket_error_code(event->error_code)), exception);
         }
+        if (event->has_result) {
+            ct_set_property(ctx, item, "result", JSValueMakeNumber(ctx, (double)event->result), exception);
+        }
         if (ct_debug_flag("COTTONTAIL_FD_DEBUG")) {
             fprintf(stderr, "[cottontail:fd] dispatch %s id=%u\n", event->type != NULL ? event->type : "", event->watch_id);
             fflush(stderr);
@@ -25014,6 +25110,170 @@ static JSValueRef ct_fd_write_at(JSContextRef ctx, JSObjectRef function, JSObjec
     return JSValueMakeNumber(ctx, (double)written_total);
 }
 
+static void ct_fs_async_remove(CtFsAsyncRequest *operation) {
+    CtFsAsyncRequest **cursor = &operation->runtime->fs_async_requests;
+    while (*cursor != NULL) {
+        if (*cursor == operation) {
+            *cursor = operation->next;
+            operation->next = NULL;
+            return;
+        }
+        cursor = &(*cursor)->next;
+    }
+}
+
+static void ct_fs_async_complete(uv_fs_t *request) {
+    CtFsAsyncRequest *operation = request != NULL ? (CtFsAsyncRequest *)request->data : NULL;
+    if (operation == NULL) return;
+    CtJscRuntime *runtime = operation->runtime;
+    ct_fs_async_remove(operation);
+    bool read_copy_failed = false;
+    if (!operation->canceled && operation->kind == CT_FS_ASYNC_READ && request->result > 0) {
+        uint8_t *target = NULL;
+        size_t target_len = 0;
+        if (ct_get_bytes(runtime->context, operation->buffer_value, &target, &target_len) != 0 ||
+            operation->buffer_offset > target_len ||
+            (size_t)request->result > operation->buffer_length ||
+            (size_t)request->result > target_len - operation->buffer_offset) {
+            read_copy_failed = true;
+        } else {
+            memcpy(target + operation->buffer_offset, operation->owned_bytes, (size_t)request->result);
+        }
+    }
+    if (!operation->suppress_event) {
+        if (operation->canceled) {
+            ct_queue_fd_result(runtime, operation->id, "fs-cancel", 0);
+        } else if (read_copy_failed) {
+            ct_queue_fd_error(runtime, operation->id, EINVAL, "file I/O buffer was detached during the operation");
+        } else if (request->result < 0) {
+            ct_queue_fd_error(runtime, operation->id, (int)-request->result, uv_strerror((int)request->result));
+        } else {
+            ct_queue_fd_result(
+                runtime,
+                operation->id,
+                operation->kind == CT_FS_ASYNC_READ ? "fs-read" : "fs-write",
+                (int64_t)request->result
+            );
+        }
+    }
+    uv_fs_req_cleanup(request);
+    JSValueUnprotect(runtime->context, operation->buffer_value);
+    free(operation->owned_bytes);
+    free(operation);
+}
+
+static JSValueRef ct_fs_async_start(
+    JSContextRef ctx,
+    JSObjectRef function,
+    size_t argc,
+    const JSValueRef argv[],
+    JSValueRef *exception,
+    CtFsAsyncKind kind
+) {
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 5) {
+        ct_throw_message(ctx, exception, "async file I/O requires fd, buffer, offset, length, and position");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    uint8_t *bytes = NULL;
+    size_t bytes_len = 0;
+    if (fd < 0 || ct_get_bytes(ctx, argv[1], &bytes, &bytes_len) != 0) {
+        ct_throw_message(ctx, exception, "invalid fd or file I/O buffer");
+        return JSValueMakeUndefined(ctx);
+    }
+    double offset_number = ct_value_to_number(ctx, argv[2]);
+    double length_number = ct_value_to_number(ctx, argv[3]);
+    if (offset_number < 0 || length_number < 0 || offset_number > (double)SIZE_MAX || length_number > (double)UINT_MAX) {
+        ct_throw_message(ctx, exception, "invalid async file I/O buffer range");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t offset = (size_t)offset_number;
+    size_t length = (size_t)length_number;
+    if (offset > bytes_len || length > bytes_len - offset) {
+        ct_throw_message(ctx, exception, "invalid async file I/O buffer range");
+        return JSValueMakeUndefined(ctx);
+    }
+    int64_t position = -1;
+    if (!JSValueIsUndefined(ctx, argv[4]) && !JSValueIsNull(ctx, argv[4])) {
+        double position_number = ct_value_to_number(ctx, argv[4]);
+        if (position_number < 0 || position_number > (double)INT64_MAX) {
+            ct_throw_message(ctx, exception, "invalid async file I/O position");
+            return JSValueMakeUndefined(ctx);
+        }
+        position = (int64_t)position_number;
+    }
+
+    CtFsAsyncRequest *operation = (CtFsAsyncRequest *)calloc(1, sizeof(CtFsAsyncRequest));
+    if (operation == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    operation->runtime = runtime;
+    operation->buffer_value = argv[1];
+    operation->kind = kind;
+    operation->buffer_offset = offset;
+    operation->buffer_length = length;
+    operation->owned_bytes = (uint8_t *)malloc(length > 0 ? length : 1);
+    if (operation->owned_bytes == NULL) {
+        free(operation);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (kind == CT_FS_ASYNC_WRITE && length > 0) memcpy(operation->owned_bytes, bytes + offset, length);
+    operation->id = ++runtime->next_fd_watch_id;
+    if (operation->id == 0) operation->id = ++runtime->next_fd_watch_id;
+    operation->buffer = uv_buf_init((char *)operation->owned_bytes, (unsigned int)length);
+    operation->request.data = operation;
+    JSValueProtect(ctx, operation->buffer_value);
+    int status = kind == CT_FS_ASYNC_READ
+        ? uv_fs_read(&runtime->uv_loop, &operation->request, fd, &operation->buffer, 1, position, ct_fs_async_complete)
+        : uv_fs_write(&runtime->uv_loop, &operation->request, fd, &operation->buffer, 1, position, ct_fs_async_complete);
+    if (status < 0) {
+        uv_fs_req_cleanup(&operation->request);
+        JSValueUnprotect(ctx, operation->buffer_value);
+        free(operation->owned_bytes);
+        free(operation);
+        ct_throw_message(ctx, exception, uv_strerror(status));
+        return JSValueMakeUndefined(ctx);
+    }
+    operation->next = runtime->fs_async_requests;
+    runtime->fs_async_requests = operation;
+    return JSValueMakeNumber(ctx, operation->id);
+}
+
+static JSValueRef ct_fs_async_read_start(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    return ct_fs_async_start(ctx, function, argc, argv, exception, CT_FS_ASYNC_READ);
+}
+
+static JSValueRef ct_fs_async_write_start(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    return ct_fs_async_start(ctx, function, argc, argv, exception, CT_FS_ASYNC_WRITE);
+}
+
+static JSValueRef ct_fs_async_cancel(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)exception;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    uint32_t id = argc >= 1 ? (uint32_t)ct_value_to_number(ctx, argv[0]) : 0;
+    for (CtFsAsyncRequest *operation = runtime != NULL ? runtime->fs_async_requests : NULL; operation != NULL; operation = operation->next) {
+        if (operation->id != id || operation->canceled) continue;
+        operation->canceled = true;
+        (void)uv_cancel((uv_req_t *)&operation->request);
+        return JSValueMakeBoolean(ctx, true);
+    }
+    return JSValueMakeBoolean(ctx, false);
+}
+
+static void ct_fs_async_cancel_runtime(CtJscRuntime *runtime) {
+    for (CtFsAsyncRequest *operation = runtime != NULL ? runtime->fs_async_requests : NULL; operation != NULL; operation = operation->next) {
+        operation->canceled = true;
+        operation->suppress_event = true;
+        (void)uv_cancel((uv_req_t *)&operation->request);
+    }
+}
+
 static JSValueRef ct_fstat_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -25021,13 +25281,19 @@ static JSValueRef ct_fstat_sync(JSContextRef ctx, JSObjectRef function, JSObject
         ct_throw_message(ctx, exception, "fstatSync(fd) requires a file descriptor");
         return JSValueMakeUndefined(ctx);
     }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
     struct stat stat_value;
-    if (fstat((int)ct_value_to_number(ctx, argv[0]), &stat_value) != 0) {
+    if (fstat(fd, &stat_value) != 0) {
         ct_throw_message(ctx, exception, strerror(errno));
         return JSValueMakeUndefined(ctx);
     }
+    const CtStatTimestamp *birthtime_override = NULL;
+#if defined(__linux__) && defined(SYS_statx)
+    CtStatTimestamp birthtime;
+    if (ct_statx_birthtime_for_fd(fd, &birthtime)) birthtime_override = &birthtime;
+#endif
     JSObjectRef result = ct_make_object(ctx);
-    ct_define_stat_fields(ctx, result, &stat_value, exception);
+    ct_define_stat_fields(ctx, result, &stat_value, birthtime_override, exception);
     return result;
 }
 
@@ -27806,6 +28072,7 @@ int ct_jsc_runtime_prepare_hot_reload(CtJscRuntime *runtime, char **error_out) {
     ct_tcp_connects_stop_runtime(runtime);
     ct_fs_watchers_stop_runtime(runtime);
     ct_fd_watchers_wait_for_runtime(runtime);
+    ct_fs_async_cancel_runtime(runtime);
 #if CT_HAS_OPENSSL
     ct_tls_servers_stop_runtime(runtime);
     ct_tls_connections_stop_runtime(runtime);

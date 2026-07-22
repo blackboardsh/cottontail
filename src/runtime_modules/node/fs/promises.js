@@ -32,7 +32,6 @@ import {
   readSync,
   readdirSync,
   readlinkSync,
-  readvSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -45,8 +44,6 @@ import {
   utimesSync,
   watch as watchSync,
   writeFileSync,
-  writeSync,
-  writevSync,
 } from "../fs.js";
 import { ReadableStream as WebReadableStream } from "../stream/web.js";
 import {
@@ -55,6 +52,9 @@ import {
   invalidArgType,
   runAbortable,
   validateAbortSignal,
+  validateBufferRange,
+  validateFd,
+  validatePosition,
 } from "./internal.js";
 import { cpPromiseImpl, normalizeCopyPath } from "./cp.js";
 
@@ -133,13 +133,157 @@ if (Symbol.asyncDispose == null) {
   Object.defineProperty(Symbol, "asyncDispose", { value: symbolAsyncDispose, configurable: true });
 }
 
+function installNativeFsDispatcher() {
+  const listeners = globalThis.__cottontailFdWatchListeners ??= new Map();
+  if (!globalThis.__cottontailFdWatchHandlerInstalled && typeof cottontail.fdSetEventHandler === "function") {
+    globalThis.__cottontailFdWatchHandlerInstalled = true;
+    cottontail.fdSetEventHandler((event) => {
+      const connectListener = globalThis.__cottontailTcpConnectListeners?.get?.(Number(event?.id));
+      if (typeof connectListener === "function") {
+        connectListener(event);
+        return;
+      }
+      const fdListener = globalThis.__cottontailFdWatchListeners?.get?.(Number(event?.id));
+      if (typeof fdListener === "function") {
+        fdListener(event);
+        return;
+      }
+      const tlsListener = globalThis.__cottontailTlsListeners?.get?.(Number(event?.id));
+      if (typeof tlsListener === "function") tlsListener(event);
+    });
+  }
+  return listeners;
+}
+
+function nativeFsError(event, fd, syscall) {
+  const code = event?.code || "EIO";
+  const error = new Error(event?.message || `${code}: ${syscall}`);
+  error.code = code;
+  error.errno = event?.errno == null ? undefined : -Math.abs(Number(event.errno));
+  error.syscall = syscall;
+  error.fd = fd;
+  return error;
+}
+
+function nativeFdRequest(kind, fd, buffer, offset, length, position, signal = null) {
+  fd = validateFd(fd);
+  position = validatePosition(position);
+  signal = validateAbortSignal(signal);
+  if (signal?.aborted) return Promise.reject(abortReason(signal));
+  if (length === 0) return Promise.resolve(0);
+
+  const start = kind === "read" ? cottontail.fsAsyncReadStart : cottontail.fsAsyncWriteStart;
+  if (typeof start !== "function" || typeof cottontail.fsAsyncCancel !== "function") {
+    const error = new Error("Native asynchronous file I/O is unavailable");
+    error.code = "ENOSYS";
+    return Promise.reject(error);
+  }
+
+  return new Promise((resolve, reject) => {
+    let id;
+    let settled = false;
+    let aborted = false;
+    let abortError;
+    const listeners = installNativeFsDispatcher();
+    const cleanup = () => {
+      if (id !== undefined) listeners.delete(id);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+    const onAbort = () => {
+      if (settled || aborted) return;
+      aborted = true;
+      abortError = abortReason(signal);
+      if (id !== undefined) cottontail.fsAsyncCancel(id);
+    };
+    try {
+      id = Number(start(fd, buffer, offset, length, position));
+      listeners.set(id, event => {
+        if (aborted) finish(reject, abortError);
+        else if (event?.type === "error") finish(reject, nativeFsError(event, fd, kind));
+        else finish(resolve, Number(event?.result ?? 0));
+      });
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+    } catch (error) {
+      finish(reject, error);
+    }
+  });
+}
+
+function bytesForNativeWrite(data, encoding = "utf8") {
+  if (typeof data === "string") {
+    return globalThis.Buffer?.from
+      ? globalThis.Buffer.from(data, encoding === "buffer" ? "utf8" : encoding)
+      : new TextEncoder().encode(data);
+  }
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (ArrayBuffer.isView(data)) return data;
+  throw invalidArgType("data", "of type string or an instance of Buffer, TypedArray, or DataView", data);
+}
+
+async function writeAllNative(fd, data, encoding, signal = null) {
+  const buffer = bytesForNativeWrite(data, encoding);
+  let offset = 0;
+  while (offset < buffer.byteLength) {
+    const written = await nativeFdRequest("write", fd, buffer, offset, buffer.byteLength - offset, null, signal);
+    if (written <= 0) break;
+    offset += written;
+  }
+  return offset;
+}
+
+async function readFileFdNative(fd, options = undefined) {
+  const encoding = encodingFromOptions(options);
+  const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
+  if (signal?.aborted) throw abortReason(signal);
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const chunk = globalThis.Buffer?.allocUnsafe?.(64 * 1024) ?? new Uint8Array(64 * 1024);
+    const bytesRead = await nativeFdRequest("read", fd, chunk, 0, chunk.byteLength, null, signal);
+    if (bytesRead === 0) break;
+    chunks.push(chunk.subarray(0, bytesRead));
+    total += bytesRead;
+  }
+  const output = globalThis.Buffer?.allocUnsafe?.(total) ?? new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  if (encoding && encoding !== "buffer") {
+    return globalThis.Buffer?.from ? globalThis.Buffer.from(output).toString(encoding) : new TextDecoder().decode(output);
+  }
+  return globalThis.Buffer?.from ? globalThis.Buffer.from(output) : output;
+}
+
+async function writeFileFdNative(fd, data, options = undefined) {
+  const encoding = encodingFromOptions(options, "utf8");
+  const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
+  const flush = options && typeof options === "object" && options.flush != null ? options.flush : false;
+  if (typeof flush !== "boolean") throw invalidArgType("flush", "of type boolean", flush);
+  if (signal?.aborted) throw abortReason(signal);
+  await writeAllNative(fd, data, encoding, signal);
+  if (flush) fsyncSync(fd);
+}
+
 export async function access(path, mode = constants.F_OK) {
   return accessSync(path, mode);
 }
 
 export async function appendFile(path, data, options = undefined) {
   const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
-  return runAbortable(() => appendFileSync(fileDescriptorFrom(path), data, options), signal);
+  if (path instanceof FileHandle) {
+    return path._withRef("writeFile", () => writeFileFdNative(path.fd, data, options));
+  }
+  if (typeof path === "number") return writeFileFdNative(path, data, options);
+  return runAbortable(() => appendFileSync(path, data, options), signal);
 }
 
 export async function chmod(path, mode) {
@@ -191,7 +335,8 @@ export async function read(fd, bufferOrOptions = undefined, offset = 0, length =
     length = options.length ?? buffer.byteLength - offset;
     position = options.position ?? null;
   }
-  const bytesRead = readSync(fd, buffer, offset, length, position);
+  const range = validateBufferRange(buffer, offset, length);
+  const bytesRead = await nativeFdRequest("read", fd, range.buffer, range.offset, range.length, position);
   return { bytesRead, buffer };
 }
 
@@ -200,20 +345,43 @@ export async function write(fd, data, offsetOrPosition = undefined, lengthOrEnco
     const stringPosition = typeof offsetOrPosition === "number" || typeof offsetOrPosition === "bigint"
       ? offsetOrPosition
       : null;
-    const encoding = typeof lengthOrEncoding === "string" ? lengthOrEncoding : "utf8";
-    return { bytesWritten: writeSync(fd, data, stringPosition, encoding), buffer: data };
+    const encoding = encodingFromOptions(typeof lengthOrEncoding === "string" ? lengthOrEncoding : "utf8", "utf8");
+    const bytes = bytesForNativeWrite(data, encoding);
+    const bytesWritten = await nativeFdRequest("write", fd, bytes, 0, bytes.byteLength, stringPosition);
+    return { bytesWritten, buffer: data };
   }
   const offset = offsetOrPosition ?? 0;
-  const bytesWritten = writeSync(fd, data, offset, lengthOrEncoding, position);
+  const range = validateBufferRange(data, offset, lengthOrEncoding);
+  const bytesWritten = await nativeFdRequest("write", fd, range.buffer, range.offset, range.length, position);
   return { bytesWritten, buffer: data };
 }
 
 export async function readv(fd, buffers, position = null) {
-  return { bytesRead: readvSync(fd, buffers, position), buffers };
+  if (!Array.isArray(buffers)) throw invalidArgType("buffers", "an ArrayBufferView[]", buffers);
+  position = validatePosition(position);
+  let bytesRead = 0;
+  for (const buffer of buffers) {
+    const range = validateBufferRange(buffer);
+    const count = await nativeFdRequest("read", fd, range.buffer, 0, range.length, position);
+    bytesRead += count;
+    if (position !== null) position += count;
+    if (count < range.length) break;
+  }
+  return { bytesRead, buffers };
 }
 
 export async function writev(fd, buffers, position = null) {
-  return { bytesWritten: writevSync(fd, buffers, position), buffers };
+  if (!Array.isArray(buffers)) throw invalidArgType("buffers", "an ArrayBufferView[]", buffers);
+  position = validatePosition(position);
+  let bytesWritten = 0;
+  for (const buffer of buffers) {
+    const range = validateBufferRange(buffer);
+    const count = await nativeFdRequest("write", fd, range.buffer, 0, range.length, position);
+    bytesWritten += count;
+    if (position !== null) position += count;
+    if (count < range.length) break;
+  }
+  return { bytesWritten, buffers };
 }
 
 export async function copyFile(source, destination, mode = 0) {
@@ -283,14 +451,6 @@ export async function mkdtempDisposable(prefix) {
 }
 
 let nextFileHandleAsyncId = 1;
-
-function fileDescriptorFrom(value) {
-  if (value instanceof FileHandle) {
-    value._assertOpen("open");
-    return value.fd;
-  }
-  return value;
-}
 
 function badFileDescriptor(syscall) {
   const error = new Error("Bad file descriptor");
@@ -447,10 +607,7 @@ class FileHandle extends EventEmitter {
       length ??= buffer.byteLength - offset;
       position ??= null;
     }
-    return this._withRef("read", () => ({
-      bytesRead: readSync(this.fd, buffer, offset, length, position),
-      buffer,
-    }));
+    return this._withRef("read", () => read(this.fd, buffer, offset, length, position));
   }
   readFile(options = undefined) { return this._withRef("readFile", () => readFile(this.fd, options)); }
   readLines(options = {}) {
@@ -476,7 +633,7 @@ class FileHandle extends EventEmitter {
     });
   }
   readv(buffers, position = null) {
-    return this._withRef("readv", () => ({ bytesRead: readvSync(this.fd, buffers, position), buffers }));
+    return this._withRef("readv", () => readv(this.fd, buffers, position));
   }
   stat(options = undefined) { return this._withRef("fstat", () => fstatSync(this.fd, options)); }
   sync() { return this._withRef("fsync", () => fsyncSync(this.fd)); }
@@ -486,9 +643,9 @@ class FileHandle extends EventEmitter {
     if (typeof data === "string") {
       // write(string[, position[, encoding]]): default position null writes at
       // the current file offset (so append-mode handles keep appending).
-      const stringPosition = typeof offsetOrOptions === "number" ? offsetOrOptions : null;
+      const stringPosition = typeof offsetOrOptions === "number" || typeof offsetOrOptions === "bigint" ? offsetOrOptions : null;
       const encoding = typeof length === "string" ? length : "utf8";
-      return this._withRef("write", () => ({ bytesWritten: writeSync(this.fd, data, stringPosition, encoding), buffer: data }));
+      return this._withRef("write", () => write(this.fd, data, stringPosition, encoding));
     }
     let offset = offsetOrOptions;
     if (offset !== null && typeof offset === "object") {
@@ -496,10 +653,7 @@ class FileHandle extends EventEmitter {
       length = offset.length;
       offset = offset.offset ?? 0;
     }
-    return this._withRef("write", () => ({
-      bytesWritten: writeSync(this.fd, data, offset ?? 0, length, position ?? null),
-      buffer: data,
-    }));
+    return this._withRef("write", () => write(this.fd, data, offset ?? 0, length, position ?? null));
   }
   writeFile(data, options = undefined) {
     return this._withRef("writeFile", () => writeFile(this.fd, data, {
@@ -509,7 +663,7 @@ class FileHandle extends EventEmitter {
     }));
   }
   writev(buffers, position = null) {
-    return this._withRef("writev", () => ({ bytesWritten: writevSync(this.fd, buffers, position), buffers }));
+    return this._withRef("writev", () => writev(this.fd, buffers, position));
   }
   [symbolAsyncDispose]() { return this.close(); }
 }
@@ -526,7 +680,11 @@ export function readFile(path, options = undefined) {
   try {
     const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
     if (signal?.aborted) return Promise.reject(abortReason(signal));
-    return runAbortable(() => readFileSync(fileDescriptorFrom(path), options), signal);
+    if (path instanceof FileHandle) {
+      return path._withRef("readFile", () => readFileFdNative(path.fd, options));
+    }
+    if (typeof path === "number") return readFileFdNative(path, options);
+    return runAbortable(() => readFileSync(path, options), signal);
   } catch (error) {
     return Promise.reject(error);
   }
@@ -694,13 +852,13 @@ function isStreamLikeData(data) {
     (typeof data.pipe === "function" && typeof data.on === "function");
 }
 
-function writeChunkToFd(fd, chunk, encoding) {
+async function writeChunkToFd(fd, chunk, encoding, signal) {
   if (typeof chunk === "string") {
-    writeSync(fd, chunk, null, encoding);
+    await writeAllNative(fd, chunk, encoding, signal);
     return;
   }
   if (ArrayBuffer.isView(chunk) || chunk instanceof ArrayBuffer) {
-    writeSync(fd, chunk);
+    await writeAllNative(fd, chunk, encoding, signal);
     return;
   }
   const error = new TypeError(
@@ -724,7 +882,7 @@ async function writeFileIterable(path, data, options, encoding, signal) {
   try {
     for await (const chunk of data) {
       if (signal?.aborted) throw abortReason(signal);
-      writeChunkToFd(fd, chunk, encoding);
+      await writeChunkToFd(fd, chunk, encoding, signal);
     }
   } finally {
     if (ownsFd) closeSync(fd);
@@ -736,8 +894,14 @@ export function writeFile(path, data, options = undefined) {
     const encoding = encodingFromOptions(options, "utf8");
     const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
     if (signal?.aborted) return Promise.reject(abortReason(signal));
+    if (path instanceof FileHandle) {
+      return path._withRef("writeFile", () => isStreamLikeData(data)
+        ? writeFileIterable(path.fd, data, options, encoding, signal)
+        : writeFileFdNative(path.fd, data, options));
+    }
     if (isStreamLikeData(data)) return writeFileIterable(path, data, options, encoding, signal);
-    return runAbortable(() => writeFileSync(fileDescriptorFrom(path), data, options), signal);
+    if (typeof path === "number") return writeFileFdNative(path, data, options);
+    return runAbortable(() => writeFileSync(path, data, options), signal);
   } catch (error) {
     return Promise.reject(error);
   }

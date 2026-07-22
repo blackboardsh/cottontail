@@ -210,6 +210,64 @@ test("glob uses Bun grammar and Node fs validation", () => {
   expect(() => fs.globSync("*", { cwd, withFileTypes: true } as any)).toThrow(
     "fs.glob does not support options.withFileTypes yet",
   );
+
+  fs.mkdirSync(path.join(cwd, "nested"));
+  fs.writeFileSync(path.join(cwd, "nested", "deep.txt"), "deep");
+  expect(fs.globSync(".hidden.js", { cwd })).toEqual([".hidden.js"]);
+  expect(fs.globSync(".*", { cwd })).toEqual([]);
+  expect(fs.globSync("!*", { cwd })).toEqual([]);
+  const negative = fs.globSync("!*.js", { cwd });
+  expect(negative).not.toContain("a.js");
+  expect(negative).not.toContain(".hidden.js");
+  expect(negative.every(value => !value.includes(path.sep))).toBe(true);
+
+  const absolute = fs.globSync(path.join(cwd, "*.{js,ts}"));
+  expect(absolute).toEqual([path.join(cwd, "a.js"), path.join(cwd, "b.ts")]);
+  expect(fs.globSync("a.js", { cwd, absolute: true } as any)).toEqual(["a.js"]);
+
+  const excluded: string[] = [];
+  expect(fs.globSync("*.js", {
+    cwd,
+    exclude(value) {
+      excluded.push(value);
+      return false;
+    },
+  })).toEqual(["a.js"]);
+  expect(excluded).toEqual(["a.js"]);
+  expect(() => (fs.glob as any)("*.js", { cwd }, undefined)).toThrow(
+    expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }),
+  );
+});
+
+test("fs flags, modes, and encoding aliases follow Bun validation", () => {
+  const target = path.join(root, "validation-options.txt");
+  fs.writeFileSync(target, "initial");
+
+  const upperFd = fs.openSync(target, "R" as any);
+  fs.closeSync(upperFd);
+  const numericFd = fs.openSync(target, -1 as any);
+  fs.closeSync(numericFd);
+  expect(() => fs.openSync(target, "Rw" as any)).toThrow(expect.objectContaining({
+    code: "ERR_INVALID_ARG_TYPE",
+  }));
+  expect(() => fs.openSync(target, "0o644" as any)).toThrow(expect.objectContaining({
+    code: "ERR_INVALID_ARG_TYPE",
+  }));
+
+  const modeTarget = path.join(root, "octal-mode.txt");
+  const modeFd = fs.openSync(modeTarget, "w", "0600" as any);
+  fs.closeSync(modeFd);
+  if (process.platform !== "win32") expect(fs.statSync(modeTarget).mode & 0o777).toBe(0o600);
+  expect(() => fs.openSync(modeTarget, "r", "08" as any)).toThrow(expect.objectContaining({
+    code: "ERR_INVALID_ARG_VALUE",
+  }));
+
+  fs.writeFileSync(target, "alias", { encoding: "UTF16-LE" as any });
+  expect(fs.readFileSync(target, { encoding: "utf16-le" as any })).toBe("alias");
+  expect(fs.readFileSync(target, { encoding: false as any })).toBeInstanceOf(Buffer);
+  expect(() => fs.readFileSync(target, { encoding: "utf-16le" as any })).toThrow(
+    expect.objectContaining({ code: "ERR_INVALID_ARG_VALUE" }),
+  );
 });
 
 test("BigIntStats preserves exact integer fields and nanosecond components", () => {
@@ -241,6 +299,35 @@ test("aborted writes remove their signal listener", async () => {
     error => expect(error).toBe(controller.signal.reason),
   );
   expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+});
+
+test("FileHandle native requests retain the descriptor until abort completion", async () => {
+  const writeTarget = path.join(root, "native-abort-write.bin");
+  const writeHandle = await fsp.open(writeTarget, "w+");
+  const writeController = new AbortController();
+  const writeReason = new Error("cancel native write");
+  const pendingWrite = writeHandle.writeFile(Buffer.alloc(2 * 1024 * 1024, 0x61), {
+    signal: writeController.signal,
+  });
+  expect(getEventListeners(writeController.signal, "abort")).toHaveLength(1);
+  writeController.abort(writeReason);
+  await expect(pendingWrite).rejects.toBe(writeReason);
+  expect(getEventListeners(writeController.signal, "abort")).toHaveLength(0);
+  await writeHandle.close();
+  expect(writeHandle.fd).toBe(-1);
+
+  const readTarget = path.join(root, "native-abort-read.bin");
+  fs.writeFileSync(readTarget, Buffer.alloc(2 * 1024 * 1024, 0x62));
+  const readHandle = await fsp.open(readTarget, "r");
+  const readController = new AbortController();
+  const readReason = new Error("cancel native read");
+  const pendingRead = readHandle.readFile({ signal: readController.signal });
+  expect(getEventListeners(readController.signal, "abort")).toHaveLength(1);
+  readController.abort(readReason);
+  await expect(pendingRead).rejects.toBe(readReason);
+  expect(getEventListeners(readController.signal, "abort")).toHaveLength(0);
+  await readHandle.close();
+  expect(readHandle.fd).toBe(-1);
 });
 
 test("one signal cancels concurrent writes and releases shared state", async () => {

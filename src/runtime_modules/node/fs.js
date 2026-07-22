@@ -2,7 +2,7 @@ import "../bun/ffi.js";
 import picomatch from "../vendor/picomatch.js";
 import constantsObject from "./constants.js";
 import { EventEmitter } from "./events.js";
-import { dirname, join, resolve } from "./path.js";
+import { dirname, isAbsolute, join, relative, resolve } from "./path.js";
 import { Readable, Writable } from "./stream.js";
 import {
   encodingFromOptions,
@@ -380,7 +380,19 @@ class FileBlob {
 }
 
 function parseMode(mode) {
-  return typeof mode === "string" ? parseInt(mode, 8) : Number(mode);
+  if (typeof mode === "number") return validateOpenInteger(mode, "mode") & 0o777;
+  if (typeof mode !== "string") throw invalidArgType("mode", "of type number", mode);
+  const octal = mode.startsWith("0o") ? mode.slice(2) : mode;
+  if (!/^[0-7]+$/.test(octal)) {
+    const error = new TypeError(
+      `The argument 'mode' must be a 32-bit unsigned integer or an octal string. Received ${mode}`,
+    );
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
+  }
+  const value = Number.parseInt(octal, 8);
+  if (value > 0xffffffff) throw outOfRange("mode", ">= 0 and <= 4294967295", value);
+  return value & 0o777;
 }
 
 function validateOpenInteger(value, name) {
@@ -398,16 +410,40 @@ function validateOpenInteger(value, name) {
 }
 
 function normalizeOpenFlags(flags) {
-  if (typeof flags === "string") return flags;
-  if (typeof flags !== "number") throw invalidArgType("flags", "of type string or number", flags);
-  return validateOpenInteger(flags, "flags");
+  if (typeof flags === "number") {
+    if (!Number.isInteger(flags) || flags < -0x80000000 || flags > 0x7fffffff) {
+      throw outOfRange("flags", "an integer", flags);
+    }
+    return Math.max(flags, 0);
+  }
+  if (typeof flags !== "string") return "r";
+  const help = "Learn more at https://nodejs.org/api/fs.html#fs_file_system_flags";
+  if (flags.length === 0) {
+    const error = new TypeError(`Expected flags to be a non-empty string. ${help}`);
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  if (/^[0-9]+$/.test(flags)) {
+    const value = Number(flags);
+    if (Number.isSafeInteger(value) && value <= 0x7fffffff) return value;
+  }
+  const normalized = flags === flags.toUpperCase() ? flags.toLowerCase() : flags;
+  if (!openFlagNames.has(normalized)) {
+    const error = new TypeError(`Invalid flag '${flags}'. ${help}`);
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  return normalized;
 }
 
+const openFlagNames = new Set([
+  "r", "rs", "sr", "r+", "rs+", "sr+",
+  "w", "wx", "xw", "w+", "wx+", "xw+",
+  "a", "ax", "xa", "as", "sa", "a+", "ax+", "xa+", "as+", "sa+",
+]);
+
 function normalizeOpenMode(mode) {
-  if (typeof mode !== "number" && typeof mode !== "string") {
-    throw invalidArgType("mode", "of type number or string", mode);
-  }
-  return validateOpenInteger(parseMode(mode), "mode");
+  return parseMode(mode);
 }
 
 function ensureParent(path) {
@@ -2441,10 +2477,11 @@ function validateGlobPatterns(pattern) {
 }
 
 function createGlobMatcher(pattern) {
+  if (pattern === "") return () => false;
   return picomatch(pattern, {
     dot: false,
     noext: true,
-    nonegate: true,
+    nonegate: false,
     windows: false,
   });
 }
@@ -2455,18 +2492,24 @@ function globPathOutput(relativePath) {
 
 function makeExcludeMatcher(exclude) {
   if (exclude == null) return () => false;
-  if (typeof exclude === "function") return entry => Boolean(exclude(globPathOutput(entry.relative)));
-  if (!Array.isArray(exclude)) throw invalidArgType("options.exclude", "an array or function", exclude);
+  if (typeof exclude === "function") return path => Boolean(exclude(path));
+  if (!Array.isArray(exclude)) {
+    const error = new TypeError(
+      `The "options.exclude" property must be of type function. Received ${describeReceived(exclude)}`,
+    );
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
   const patterns = exclude.flatMap(pattern => {
-    if (typeof pattern !== "string") throw invalidArgType("options.exclude", "an array of strings", pattern);
+    if (typeof pattern !== "string") throw new TypeError("Glob.constructor: first argument is not a string");
     const normalized = normalizeGlobPattern(pattern).replace(/\/+$/, "");
     return [normalized, `${normalized}/**`];
   });
   const matchers = patterns.map(createGlobMatcher);
-  return entry => matchers.some(matcher => matcher(entry.relative));
+  return path => matchers.some(matcher => matcher(path.replaceAll("\\", "/")));
 }
 
-function walkGlobEntries(root, prefix = "", seenDirectories = new Set(), exclude = () => false) {
+function walkGlobEntries(root, prefix = "", seenDirectories = new Set()) {
   const out = [];
   for (const dirent of readdirSync(root, { withFileTypes: true })) {
     const name = String(dirent.name);
@@ -2480,8 +2523,7 @@ function walkGlobEntries(root, prefix = "", seenDirectories = new Set(), exclude
       relative,
       stats: lstat,
     };
-    const excluded = exclude(entry);
-    if (!excluded) out.push(entry);
+    out.push(entry);
 
     let descend = lstat.isDirectory();
     if (!descend && lstat.isSymbolicLink()) {
@@ -2495,14 +2537,56 @@ function walkGlobEntries(root, prefix = "", seenDirectories = new Set(), exclude
     try { real = realpathSync(fullPath); } catch {}
     if (seenDirectories.has(real)) continue;
     seenDirectories.add(real);
-    out.push(...walkGlobEntries(fullPath, relative, seenDirectories, exclude));
+    out.push(...walkGlobEntries(fullPath, relative, seenDirectories));
   }
   return out;
 }
 
+function hasHiddenGlobSegment(path) {
+  return path.split("/").some(segment => segment.length > 1 && segment[0] === "." && segment !== "..");
+}
+
+function globEntriesForPattern(pattern, cwd) {
+  const scan = picomatch.scan(pattern, { scanToEnd: true });
+  const patternBody = pattern.slice(scan.prefix.length);
+  const absolute = isAbsolute(patternBody);
+  const base = scan.base || (absolute ? "/" : ".");
+  const root = normalizePath(resolve(cwd, scan.isGlob ? base : dirname(patternBody)));
+  const outputPrefix = absolute ? "" : normalizeGlobPattern(relative(cwd, root));
+  const prefix = outputPrefix === "." ? "" : outputPrefix;
+  const seenDirectories = new Set();
+  try { seenDirectories.add(realpathSync(root)); } catch {}
+  let entries;
+  try {
+    entries = walkGlobEntries(root, prefix, seenDirectories);
+  } catch (error) {
+    if (root !== cwd && (error?.code === "ENOENT" || error?.code === "ENOTDIR")) return [];
+    throw error;
+  }
+  const hiddenBase = normalizeGlobPattern(scan.base || "").replace(/\/+$/, "");
+  const negatedDepth = scan.negated && !scan.isGlobstar && !scan.glob.includes("**")
+    ? (scan.isGlob ? Math.max(1, scan.glob.split("/").length) : 1)
+    : Infinity;
+  return entries
+    .map(entry => {
+      const candidate = absolute ? normalizeGlobPattern(resolve(entry.fullPath)) : entry.relative;
+      const traversalPath = normalizeGlobPattern(relative(root, entry.fullPath));
+      let dynamicPath = candidate;
+      if (!absolute && hiddenBase && (candidate === hiddenBase || candidate.startsWith(`${hiddenBase}/`))) {
+        dynamicPath = candidate.slice(hiddenBase.length).replace(/^\/+/, "");
+      } else if (absolute) {
+        dynamicPath = normalizeGlobPattern(relative(root, entry.fullPath));
+      }
+      return { candidate, dynamicPath, traversalPath };
+    })
+    .sort((left, right) => left.candidate < right.candidate ? -1 : left.candidate > right.candidate ? 1 : 0)
+    .filter(entry => entry.traversalPath.split("/").length <= negatedDepth)
+    .filter(entry => !(scan.isGlob || scan.negated) || !hasHiddenGlobSegment(entry.dynamicPath));
+}
+
 export function globSync(pattern, options) {
   const patterns = validateGlobPatterns(pattern);
-  if (options == null) options = {};
+  if (!options) options = {};
   if (typeof options !== "object" || Array.isArray(options)) {
     throw invalidArgType("options", "of type object", options);
   }
@@ -2510,19 +2594,18 @@ export function globSync(pattern, options) {
     throw new TypeError("fs.glob does not support options.withFileTypes yet. Please open an issue on GitHub.");
   }
   const cwdValue = options.cwd ?? globalThis.process?.cwd?.() ?? ".";
-  if (typeof cwdValue !== "string") throw invalidArgType("options.cwd", "of type string", cwdValue);
+  if (typeof cwdValue !== "string") throw new TypeError("scanSync: invalid `cwd`, not a string");
   const cwd = normalizePath(cwdValue);
+  const cwdStats = statSync(cwd);
+  if (!cwdStats.isDirectory()) readdirSync(cwd);
   const exclude = makeExcludeMatcher(options.exclude);
-  const seenDirectories = new Set();
-  try { seenDirectories.add(realpathSync(cwd)); } catch {}
-  const entries = walkGlobEntries(cwd, "", seenDirectories, exclude)
-    .sort((left, right) => left.relative < right.relative ? -1 : left.relative > right.relative ? 1 : 0);
   const matches = [];
   for (const pattern of patterns) {
     const matcher = createGlobMatcher(pattern);
-    for (const entry of entries) {
-      if (!matcher(entry.relative)) continue;
-      matches.push(options.absolute ? resolve(cwd, entry.relative) : globPathOutput(entry.relative));
+    for (const entry of globEntriesForPattern(pattern, cwd)) {
+      if (!matcher(entry.candidate)) continue;
+      const output = globPathOutput(entry.candidate);
+      if (!exclude(output)) matches.push(output);
     }
   }
   return matches;

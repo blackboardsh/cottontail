@@ -1,17 +1,17 @@
-const validEncodings = new Set([
-  "ascii",
-  "base64",
-  "base64url",
-  "binary",
-  "buffer",
-  "hex",
-  "latin1",
-  "ucs2",
-  "ucs-2",
-  "utf8",
-  "utf-8",
-  "utf16le",
-  "utf-16le",
+const canonicalEncodings = new Map([
+  ["ascii", "ascii"],
+  ["base64", "base64"],
+  ["base64url", "base64url"],
+  ["binary", "latin1"],
+  ["buffer", "buffer"],
+  ["hex", "hex"],
+  ["latin1", "latin1"],
+  ["ucs2", "utf16le"],
+  ["ucs-2", "utf16le"],
+  ["utf8", "utf8"],
+  ["utf-8", "utf8"],
+  ["utf16le", "utf16le"],
+  ["utf16-le", "utf16le"],
 ]);
 
 function describeReceived(value) {
@@ -50,14 +50,14 @@ export function encodingFromOptions(options, fallback = undefined) {
     : options && typeof options === "object" && options.encoding != null
       ? options.encoding
       : fallback;
-  if (encoding == null) return encoding;
-  if (typeof encoding !== "string") {
-    throw invalidArgType("encoding", "of type string", encoding);
+  if (!encoding) return fallback;
+  const normalized = typeof encoding === "string" ? canonicalEncodings.get(encoding.toLowerCase()) : undefined;
+  if (normalized === undefined) {
+    const error = new TypeError(`encoding '${String(encoding)}' is an invalid encoding`);
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
   }
-  if (!validEncodings.has(encoding.toLowerCase())) {
-    throw invalidArgValue("encoding", encoding);
-  }
-  return encoding;
+  return normalized;
 }
 
 export function validateAbortSignal(signal, name = "options.signal") {
