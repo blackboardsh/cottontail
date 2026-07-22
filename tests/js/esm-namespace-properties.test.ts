@@ -27,8 +27,12 @@ test("required ESM namespaces keep Bun's virtual marker out of export enumeratio
       const { parentPort } = require("node:worker_threads");
       const config = require(${JSON.stringify(config)});
       const node = config.default.node;
+      const configPrototype = Object.getPrototypeOf(config);
       parentPort.postMessage({
         configKeys: Object.keys(config),
+        configTag: Object.prototype.toString.call(config),
+        configPrototypeKeys: Reflect.ownKeys(configPrototype).map(String),
+        configPrototypeParentIsNull: Object.getPrototypeOf(configPrototype) === null,
         configMarker: config.__esModule,
         configMarkerIn: "__esModule" in config,
         configMarkerOwn: Object.hasOwn(config, "__esModule"),
@@ -49,6 +53,9 @@ test("required ESM namespaces keep Bun's virtual marker out of export enumeratio
 
   expect(result).toEqual({
     configKeys: ["default"],
+    configTag: "[object Module]",
+    configPrototypeKeys: ["__esModule"],
+    configPrototypeParentIsNull: true,
     configMarker: true,
     configMarkerIn: true,
     configMarkerOwn: false,
