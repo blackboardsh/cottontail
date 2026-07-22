@@ -22268,19 +22268,13 @@ static void ct_async_process_remove(CtAsyncProcess *process) {
     pthread_mutex_unlock(&ct_async_processes_mutex);
 }
 
-static CtAsyncProcess *ct_async_process_find(uint32_t id) {
-    CtAsyncProcess *result = NULL;
-    pthread_mutex_lock(&ct_async_processes_mutex);
+static CtAsyncProcess *ct_async_process_find_locked(CtJscRuntime *runtime, uint32_t id) {
     CtAsyncProcess *cursor = ct_async_processes;
     while (cursor != NULL) {
-        if (cursor->id == id) {
-            result = cursor;
-            break;
-        }
+        if (cursor->runtime == runtime && cursor->id == id) return cursor;
         cursor = cursor->next;
     }
-    pthread_mutex_unlock(&ct_async_processes_mutex);
-    return result;
+    return NULL;
 }
 
 static bool ct_async_processes_has_runtime(CtJscRuntime *runtime) {
@@ -23875,10 +23869,10 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
 }
 
 static JSValueRef ct_spawn_write(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
     (void)thisObject;
     (void)exception;
     if (argc < 2) return JSValueMakeBoolean(ctx, false);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
     uint8_t *bytes = NULL;
     size_t len = 0;
@@ -23891,8 +23885,7 @@ static JSValueRef ct_spawn_write(JSContextRef ctx, JSObjectRef function, JSObjec
     bool ok = false;
     int stdin_fd = -1;
     pthread_mutex_lock(&ct_async_processes_mutex);
-    CtAsyncProcess *process = ct_async_processes;
-    while (process != NULL && process->id != id) process = process->next;
+    CtAsyncProcess *process = ct_async_process_find_locked(runtime, id);
     if (process != NULL && process->stdin_fd >= 0) {
         // COTTONTAIL-COMPAT: A child can block on stdout while stdin accepts a
         // large write. Do not hold the process registry lock across that I/O,
@@ -23927,14 +23920,13 @@ static JSValueRef ct_spawn_write(JSContextRef ctx, JSObjectRef function, JSObjec
 }
 
 static JSValueRef ct_spawn_close_stdin(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
     (void)thisObject;
     (void)exception;
     if (argc < 1) return JSValueMakeUndefined(ctx);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
     pthread_mutex_lock(&ct_async_processes_mutex);
-    CtAsyncProcess *process = ct_async_processes;
-    while (process != NULL && process->id != id) process = process->next;
+    CtAsyncProcess *process = ct_async_process_find_locked(runtime, id);
     if (process != NULL && process->stdin_fd >= 0) {
         close(process->stdin_fd);
         process->stdin_fd = -1;
@@ -23944,16 +23936,15 @@ static JSValueRef ct_spawn_close_stdin(JSContextRef ctx, JSObjectRef function, J
 }
 
 static JSValueRef ct_spawn_close_output(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
     (void)thisObject;
     (void)exception;
     if (argc < 2) return JSValueMakeBoolean(ctx, false);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
     int fd = (int)ct_value_to_number(ctx, argv[1]);
     bool found = false;
     pthread_mutex_lock(&ct_async_processes_mutex);
-    CtAsyncProcess *process = ct_async_processes;
-    while (process != NULL && process->id != id) process = process->next;
+    CtAsyncProcess *process = ct_async_process_find_locked(runtime, id);
     if (process != NULL && (fd == STDOUT_FILENO || fd == STDERR_FILENO)) {
         if (fd == STDOUT_FILENO) process->close_stdout_requested = true;
         else process->close_stderr_requested = true;
@@ -23972,15 +23963,14 @@ static JSValueRef ct_spawn_close_output(JSContextRef ctx, JSObjectRef function, 
 }
 
 static JSValueRef ct_spawn_release(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
     (void)thisObject;
     (void)exception;
     if (argc < 1) return JSValueMakeBoolean(ctx, false);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
     bool found = false;
     pthread_mutex_lock(&ct_async_processes_mutex);
-    CtAsyncProcess *process = ct_async_processes;
-    while (process != NULL && process->id != id) process = process->next;
+    CtAsyncProcess *process = ct_async_process_find_locked(runtime, id);
     if (process != NULL) {
         if (process->close_stdout_requested) {
             if (process->stdout_fd >= 0) close(process->stdout_fd);
@@ -24019,14 +24009,13 @@ static JSValueRef ct_spawn_release(JSContextRef ctx, JSObjectRef function, JSObj
 }
 
 static JSValueRef ct_spawn_close_ipc(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
     (void)thisObject;
     (void)exception;
     if (argc < 1) return JSValueMakeUndefined(ctx);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
     pthread_mutex_lock(&ct_async_processes_mutex);
-    CtAsyncProcess *process = ct_async_processes;
-    while (process != NULL && process->id != id) process = process->next;
+    CtAsyncProcess *process = ct_async_process_find_locked(runtime, id);
     if (process != NULL && process->ipc_fd >= 0) {
         process->close_ipc_requested = true;
 #if defined(_WIN32)
@@ -24043,16 +24032,15 @@ static JSValueRef ct_spawn_close_ipc(JSContextRef ctx, JSObjectRef function, JSO
 }
 
 static JSValueRef ct_spawn_set_referenced(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
     (void)thisObject;
     (void)exception;
     if (argc < 2) return JSValueMakeBoolean(ctx, false);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
     bool referenced = JSValueToBoolean(ctx, argv[1]);
     bool found = false;
     pthread_mutex_lock(&ct_async_processes_mutex);
-    CtAsyncProcess *process = ct_async_processes;
-    while (process != NULL && process->id != id) process = process->next;
+    CtAsyncProcess *process = ct_async_process_find_locked(runtime, id);
     if (process != NULL) {
         process->referenced = referenced;
         found = true;
@@ -24062,16 +24050,15 @@ static JSValueRef ct_spawn_set_referenced(JSContextRef ctx, JSObjectRef function
 }
 
 static JSValueRef ct_spawn_kill(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
     (void)thisObject;
     (void)exception;
     if (argc < 1) return JSValueMakeBoolean(ctx, false);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
     int signal_number = argc >= 2 ? (int)ct_value_to_number(ctx, argv[1]) : SIGTERM;
     bool ok = false;
     pthread_mutex_lock(&ct_async_processes_mutex);
-    CtAsyncProcess *process = ct_async_processes;
-    while (process != NULL && process->id != id) process = process->next;
+    CtAsyncProcess *process = ct_async_process_find_locked(runtime, id);
     if (process != NULL) {
         ok = kill(process->pid, signal_number) == 0;
         if (ok && signal_number != 0) process->killed = true;

@@ -3564,8 +3564,36 @@
       "reason": "Passes on the native-bundler pipeline after stabilization (1 bun:test cases, 2 assertions)."
     },
     "test/js/third_party/duckdb/duckdb-basic-usage.test.ts": {
-      "status": "expected-failure",
-      "reason": "The copied test requires its platform-specific duckdb.node fixture, which is not present in the vendored upstream snapshot."
+      "status": "enabled",
+      "reason": "The copied basic-usage case loads DuckDB 1.3.1's installed platform addon and executes a real in-memory query through its callback N-API path."
+    },
+    "test/js/third_party/es-module-lexer/es-module-lexer.test.ts": {
+      "status": "enabled",
+      "reason": "The copied event-loop regression completes ten real es-module-lexer child launches and validates every parse and exit result; stock-JSC child startup requires a larger per-case budget (1 case, 20 assertions).",
+      "args": [
+        "--timeout=300000"
+      ],
+      "timeoutMs": 360000
+    },
+    "test/js/third_party/esbuild/esbuild-child_process.test.ts": {
+      "status": "enabled",
+      "reason": "The copied fixture runs esbuild 0.17.11's real service process across asynchronous and synchronous transform/build operations; nested stock-JSC startup requires a larger per-case budget (1 case, 1 assertion).",
+      "args": [
+        "--timeout=120000"
+      ],
+      "timeoutMs": 180000
+    },
+    "test/js/third_party/prisma/prisma.test.ts": {
+      "status": "enabled",
+      "reason": "The copied Bun CI path runs real Prisma 5.1.1 SQLite/Postgres client generation and native-engine dependency loading before its upstream-authored CI skips; database and leak cases remain skipped exactly as under Bun CI.",
+      "args": [
+        "--timeout=120000"
+      ],
+      "timeoutMs": 240000,
+      "env": {
+        "CI": "1",
+        "TLS_POSTGRES_DATABASE_URL": "postgresql://cottontail:cottontail@127.0.0.1:1/cottontail"
+      }
     },
     "test/js/third_party/body-parser/express-body-parser-test.test.ts": {
       "status": "enabled",

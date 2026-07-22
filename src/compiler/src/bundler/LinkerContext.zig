@@ -66,6 +66,7 @@ pub const LinkerContext = struct {
         minify_syntax: bool = false,
         minify_identifiers: bool = false,
         preserve_external_require_name: bool = false,
+        runtime_dynamic_imports: bool = false,
         banner: []const u8 = "",
         footer: []const u8 = "",
         css_chunking: bool = false,
@@ -1358,6 +1359,8 @@ pub const LinkerContext = struct {
             .module_type = c.options.output_format,
             .print_dce_annotations = c.options.emit_dce_annotations,
             .has_run_symbol_renamer = true,
+            .source_path = source.path,
+            .runtime_dynamic_imports = c.options.runtime_dynamic_imports,
 
             .allocator = alloc,
             .source_map_allocator = if (c.dev_server != null and

@@ -387,6 +387,9 @@ pub const Options = struct {
     runtime_imports: runtime.Runtime.Imports = runtime.Runtime.Imports{},
     module_hash: u32 = 0,
     source_path: ?fs.Path = null,
+    /// Runtime execution bundles must resolve import() from the original source
+    /// module instead of the generated bundle's directory.
+    runtime_dynamic_imports: bool = false,
     allocator: std.mem.Allocator = default_allocator,
     source_map_allocator: ?std.mem.Allocator = null,
     source_map_handler: ?SourceMapHandler = null,
@@ -1853,13 +1856,19 @@ fn NewPrinter(
             p.printSpaceBeforeIdentifier();
 
             if (record.flags.use_runtime_dynamic_import) {
-                p.print("globalThis.__cottontailImportModule(");
+                p.print("globalThis.Promise.resolve(globalThis.__cottontailImportModule(");
                 p.printImportRecordPath(record);
+                p.print(",");
+                if (p.options.source_path) |source_path| {
+                    p.printStringLiteralUTF8(source_path.text, false);
+                } else {
+                    p.print("void 0");
+                }
                 if (!import_options.isMissing()) {
-                    p.print(",void 0,");
+                    p.print(",");
                     p.printExpr(import_options, .comma, .{});
                 }
-                p.print(")");
+                p.print("))");
                 return;
             }
 
@@ -2426,6 +2435,11 @@ fn NewPrinter(
                     // Handle non-string expressions
                     if (e.isImportRecordNull()) {
                         const wrap = level.gte(.new) or flags.contains(.forbid_call);
+                        const runtime_referrer = if (p.options.runtime_dynamic_imports and
+                            p.options.module_type != .internal_bake_dev)
+                            p.options.source_path
+                        else
+                            null;
                         if (wrap) {
                             p.print("(");
                         }
@@ -2435,6 +2449,8 @@ fn NewPrinter(
                         if (p.options.module_type == .internal_bake_dev) {
                             p.printSymbol(p.options.hmr_ref);
                             p.print(".dynamicImport(");
+                        } else if (runtime_referrer != null) {
+                            p.print("globalThis.Promise.resolve(globalThis.__cottontailImportModule(");
                         } else {
                             p.print("import(");
                         }
@@ -2449,6 +2465,11 @@ fn NewPrinter(
                         // }
                         p.printExpr(e.expr, .comma, ExprFlag.None());
 
+                        if (runtime_referrer) |source_path| {
+                            p.print(",");
+                            p.printSpace();
+                            p.printStringLiteralUTF8(source_path.text, false);
+                        }
                         if (!e.options.isMissing()) {
                             p.printWhitespacer(ws(", "));
                             p.printExpr(e.options, .comma, .{});
@@ -2461,6 +2482,7 @@ fn NewPrinter(
                         //     p.printIndent();
                         // }
                         p.print(")");
+                        if (runtime_referrer != null) p.print(")");
                         if (wrap) {
                             p.print(")");
                         }

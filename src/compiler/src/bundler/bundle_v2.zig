@@ -981,6 +981,7 @@ pub const BundleV2 = struct {
         this.linker.options.minify_identifiers = transpiler.options.minify_identifiers;
         this.linker.options.minify_whitespace = transpiler.options.minify_whitespace;
         this.linker.options.preserve_external_require_name = transpiler.options.preserve_external_require_name;
+        this.linker.options.runtime_dynamic_imports = transpiler.options.externalize_runtime_require_resolve;
         this.linker.options.emit_dce_annotations = transpiler.options.emit_dce_annotations;
         this.linker.options.ignore_dce_annotations = transpiler.options.ignore_dce_annotations;
         this.linker.options.banner = transpiler.options.banner;
@@ -3281,6 +3282,9 @@ pub const BundleV2 = struct {
                             import_record.path.is_disabled = false;
                             import_record.source_index = Index.invalid;
                             import_record.flags.is_external_without_side_effects = true;
+                            if (import_record.kind == .dynamic) {
+                                import_record.flags.use_runtime_dynamic_import = true;
+                            }
                             continue :outer;
                         }
 
