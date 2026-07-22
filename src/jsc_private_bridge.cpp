@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -347,6 +348,40 @@ private:
 // private headers. These opaque declarations are pinned to the vendored
 // WebKit release, just like the CallFrame and OpaqueJSString ABI bridges in
 // this file. The storage deliberately exceeds the private class layouts.
+enum class CollectionScope : uint8_t {
+    Eden,
+    Full,
+};
+
+enum Synchronousness {
+    Async,
+    Sync,
+};
+
+struct GCRequest {
+    explicit GCRequest(CollectionScope requested_scope)
+        : scope(requested_scope)
+    {
+    }
+
+    // The real trailing member is a null RefPtr for this call. A non-trivial
+    // destructor preserves GCRequest's indirect C++ calling convention.
+    ~GCRequest() { }
+
+    std::optional<CollectionScope> scope;
+    void* did_finish_end_phase { nullptr };
+};
+
+static_assert(sizeof(GCRequest) == 2 * sizeof(void*));
+static_assert(offsetof(GCRequest, did_finish_end_phase) == sizeof(void*));
+
+class Heap {
+public:
+    void allowCollection();
+    void collectNow(Synchronousness, GCRequest);
+    void preventCollection();
+};
+
 class HeapProfiler {
 public:
     explicit HeapProfiler(VM&);
@@ -554,6 +589,23 @@ private:
     JSC::HeapProfiler& m_profiler;
 };
 
+class CtPreventCollectionScope {
+public:
+    explicit CtPreventCollectionScope(JSC::Heap& heap)
+        : m_heap(heap)
+    {
+        m_heap.preventCollection();
+    }
+
+    ~CtPreventCollectionScope()
+    {
+        m_heap.allowCollection();
+    }
+
+private:
+    JSC::Heap& m_heap;
+};
+
 extern "C" size_t ct_jsc_query_objects_count(JSContextRef context, JSObjectRef prototype)
 {
     if (context == nullptr || prototype == nullptr)
@@ -566,11 +618,15 @@ extern "C" size_t ct_jsc_query_objects_count(JSContextRef context, JSObjectRef p
 
     JSValueProtect(context, prototype);
     CtQueryObjectsAnalyzer analyzer;
+    constexpr ptrdiff_t vm_heap_offset = 0xf8;
+    auto* heap = reinterpret_cast<JSC::Heap*>(
+        reinterpret_cast<unsigned char*>(vm) + vm_heap_offset);
     {
+        CtPreventCollectionScope prevent_collection(*heap);
         CtActiveHeapAnalyzerScope active_analyzer(*profiler, analyzer);
-        // The public operation is a synchronous full collection in the pinned
-        // JSC release, matching HeapSnapshotBuilder::buildSnapshot().
-        JSGarbageCollect(context);
+        // Match HeapSnapshotBuilder::buildSnapshot(): public JSGarbageCollect
+        // does not activate HeapAnalyzer callbacks in the pinned JSC release.
+        heap->collectNow(JSC::Sync, JSC::GCRequest(JSC::CollectionScope::Full));
     }
 
     auto cells = analyzer.takeCells();
