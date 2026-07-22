@@ -768,11 +768,12 @@
     },
     "test/bundler/bundler_compile.test.ts": {
       "status": "expected-failure",
-      "reason": "40 of 51 generated standalone compile cases pass in exact isolation; the remaining cases stay expected-failure for their specific compiler or runtime gaps.",
+      "reason": "48 of 51 generated standalone compile cases pass in exact isolation; Bun.embeddedFiles and the two source-map diagnostic cases remain expected-failure.",
       "splitBundlerTests": true,
       "includeBundlerFileTests": true,
       "enabledBundlerTests": {
         "compile/HelloWorld": "Basic CLI standalone compilation and execution matches Bun.",
+        "compile/HelloWorldBytecode": "CommonJS bytecode standalone compilation executes and reports its cache diagnostics.",
         "compile/HelloWorldWithProcessVersionsBun": "Standalone process.platform, process.arch, and process.versions.bun defines match Bun.",
         "compile/HelloWorldWithProcessVersionsBunAPI": "Bun.build standalone compilation preserves plugins and Bun target defines.",
         "compile/ESMBytecode+HelloWorld": "ESM bytecode executes the basic entry module.",
@@ -788,13 +789,18 @@
         "compile/ESMBytecode+MultipleDynamicImports": "ESM bytecode loads multiple separate dynamic modules.",
         "compile/ESMBytecode+MultipleDynamicImports+minify": "Minified ESM bytecode loads multiple separate dynamic modules.",
         "compile/WorkerBytecodeESM": "A separately emitted worker entry executes from an ESM bytecode standalone graph.",
+        "compile/WorkerRelativePathTSExtensionBytecode": "A bytecode standalone worker resolves a relative TypeScript entry from the embedded graph.",
         "compile/EmbeddedFileOutfile": "A file-loader asset remains readable from a nested standalone outfile.",
+        "compile/ResolveEmbeddedFileOutfile": "Runtime resolution keeps an embedded file readable from a nested standalone outfile.",
         "compile/WorkerRelativePathNoExtension": "A standalone worker resolves a relative extensionless entry from the embedded graph.",
         "compile/WorkerRelativePathTSExtension": "A standalone worker resolves a relative TypeScript entry from the embedded graph.",
         "compile/pathToFileURLWorks": "Standalone import.meta path and URL identity matches Bun's virtual executable entry.",
         "compile/VariousBunAPIs": "Standalone SQLite, server, fetch, and bun:jsc APIs execute together.",
         "compile/ReactSSR+cjs": "CJS React SSR standalone output executes.",
         "compile/ReactSSR+cjs+minify": "Minified CJS React SSR standalone output executes.",
+        "compile/ReactSSR+bytecode+cjs+minify": "Minified CommonJS React SSR bytecode standalone output executes.",
+        "compile/ReactSSR+bytecode+esm": "ESM React SSR bytecode standalone output executes.",
+        "compile/ReactSSR+bytecode+esm+minify": "Minified ESM React SSR bytecode standalone output executes.",
         "compile/ReactSSR+esm": "ESM React SSR standalone output executes.",
         "compile/ReactSSR+esm+minify": "Minified ESM React SSR standalone output executes.",
         "compile/DynamicRequire": "Runtime dynamic requires resolve external packages from the standalone working directory.",
@@ -810,6 +816,8 @@
         "compile/10344+sourcemap=inline": "Inline source maps coexist with embedded file assets.",
         "compile/10344+sourcemap=none": "Standalone assets execute without source maps.",
         "compile/EmbeddedSqlite": "An embedded SQLite database can be opened and queried at runtime.",
+        "compile/sqlite-file": "A SQLite import attribute opens the embedded database from standalone bytes.",
+        "compile/ImportMetaMain": "Standalone entrypoint inlining makes import.meta.main and require.main comparisons observable as true.",
         "compile/Utf8": "Standalone compilation preserves UTF-8 source and output.",
         "compile/BunBeBunEnvVar": "Standalone execution keeps the runtime Bun version independent of the BUN_BE_BUN environment variable."
       },
@@ -2699,8 +2707,8 @@
       "reason": "Bun.Transpiler replMode passes expression results, top-level await, persistent declarations, object literals, destructuring, and TypeScript stripping coverage."
     },
     "test/js/bun/typescript/type-export.test.ts": {
-      "status": "expected-failure",
-      "reason": "Exact test-name splits pass 62 of 70 active cases: all 18 standalone ESM bytecode cases and 44 non-bytecode cases. Eight direct duplicate-export entrypoints still receive JSC's dependency SyntaxError instead of Bun's parser diagnostic; 18 runtime variants remain skipped upstream."
+      "status": "enabled",
+      "reason": "All 70 active type-export cases pass, including the eight duplicate-export entrypoints and all 18 standalone ESM bytecode cases; 18 runtime variants remain skipped upstream."
     },
     "test/js/bun/udp/udp_socket.test.ts": {
       "status": "enabled",
