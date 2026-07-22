@@ -18168,6 +18168,7 @@ Object.defineProperty(CottontailDOMException, "name", {
 
 const eventState = new WeakMap();
 const eventTargetWeakHandler = Symbol.for("nodejs.internal.event_target.kWeakHandler");
+const eventTargetResistStopPropagation = Symbol.for("nodejs.internal.event_target.kResistStopPropagation");
 const NativeWeakRef = globalThis.WeakRef;
 
 function internalWeakRef(target) {
@@ -18497,6 +18498,7 @@ class CottontailEventTarget {
         capture,
         once: Boolean(opts.once),
         weak: Boolean(opts[eventTargetWeakHandler]),
+        resistStopPropagation: Boolean(opts[eventTargetResistStopPropagation]),
         order: ++eventListenerOrder,
       });
       if (signal != null && typeof signal.addEventListener === "function") {
@@ -18535,7 +18537,7 @@ class CottontailEventTarget {
       }
       list.sort((a, b) => a.order - b.order);
       for (const entry of list) {
-        if (state.stopImmediate) break;
+        if (state.stopImmediate && !entry.resistStopPropagation) continue;
         const listener = entry.listener;
         if (entry.once) this.removeEventListener(state.type, listener, { capture: entry.capture });
         if (typeof listener === "function") listener.call(this, event);

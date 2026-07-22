@@ -1777,8 +1777,9 @@ export class BroadcastChannel extends EventEmitter {
     return this._refed;
   }
 
-  [Symbol.for("nodejs.util.inspect.custom")](_depth, options = undefined) {
+  [Symbol.for("nodejs.util.inspect.custom")](depth, options = undefined) {
     assertBroadcastChannel(this);
+    if (depth < 0) return "BroadcastChannel";
     return `BroadcastChannel { name: ${inspectValue(this._name, options)}, active: ${!this._closed} }`;
   }
 }
