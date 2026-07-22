@@ -9482,6 +9482,7 @@ function finalizeServeInspector(server, options, reloadState = null) {
       hotReloadId: inspectorState.hotReloadId + 1,
       port: server.port,
     });
+    server.stop(true);
   });
   return server;
 }
