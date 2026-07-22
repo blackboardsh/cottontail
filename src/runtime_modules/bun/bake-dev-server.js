@@ -22,6 +22,12 @@ import {
 import { FrameworkRouter } from "./bake-framework-router.js";
 import { handleBakeErrorReport } from "./bake-error-report.js";
 import { buildBakeProduction } from "./bake-production.js";
+import {
+  composeBakeClientHotUpdateSourceMap,
+  createBakeSourceMapRecord,
+  normalizeBakeClientSourceMap,
+  registerBakeServerPatch,
+} from "./bake-source-map.js";
 
 let responseOptionsAsyncLocalStorage = null;
 let BakeResponse = null;
@@ -529,6 +535,19 @@ async function sourceEntryForArtifact(artifact, projectRoot) {
   return null;
 }
 
+async function sourceMapRecordForArtifact(artifact, outputs, generatedSource, projectRoot) {
+  const sourceMap = artifact.sourcemap ?? outputs?.find(output => output.kind === "sourcemap");
+  if (!sourceMap) return null;
+  try {
+    return createBakeSourceMapRecord(generatedSource, await sourceMap.text(), {
+      mapPath: sourceMap.path,
+      projectRoot,
+    });
+  } catch {
+    return null;
+  }
+}
+
 function metafileInputPath(projectRoot, inputPath) {
   return path.isAbsolute(inputPath) ? path.normalize(inputPath) : path.resolve(projectRoot, inputPath);
 }
@@ -623,10 +642,13 @@ function rewriteBakeClientBuiltins(source) {
     .replaceAll("'bake/client'", "'bun:bake/client'");
 }
 
-function bakeModuleDefinitionSource(value) {
+function bakeModuleDefinitionSource(value, onFunction = null, outputOffset = 0) {
   if (typeof value === "function") {
     const source = Function.prototype.toString.call(value);
-    if (source.includes("=>") || /^(?:async\s+)?function\b|^class\b/.test(source)) return source;
+    if (source.includes("=>") || /^(?:async\s+)?function\b|^class\b/.test(source)) {
+      onFunction?.({ length: source.length, originalOffset: 0, originalText: source, outputStart: outputOffset });
+      return source;
+    }
 
     // COTTONTAIL-COMPAT: The internal Bake bundle registry uses object-method
     // factories. Function#toString preserves that method syntax, which is not
@@ -637,11 +659,26 @@ function bakeModuleDefinitionSource(value) {
       const isAsync = method.startsWith("async ");
       if (isAsync) method = method.slice("async ".length).trimStart();
       const isGenerator = method.startsWith("*");
-      return `${isAsync ? "async " : ""}function${isGenerator ? "*" : ""}${source.slice(parameters)}`;
+      const prefix = `${isAsync ? "async " : ""}function${isGenerator ? "*" : ""}`;
+      onFunction?.({
+        length: source.length - parameters,
+        originalOffset: parameters,
+        originalText: source,
+        outputStart: outputOffset + prefix.length,
+      });
+      return `${prefix}${source.slice(parameters)}`;
     }
+    onFunction?.({ length: source.length, originalOffset: 0, originalText: source, outputStart: outputOffset });
     return source;
   }
-  if (Array.isArray(value)) return `[${value.map(bakeModuleDefinitionSource).join(",")}]`;
+  if (Array.isArray(value)) {
+    let source = "[";
+    for (let index = 0; index < value.length; index += 1) {
+      if (index > 0) source += ",";
+      source += bakeModuleDefinitionSource(value[index], onFunction, outputOffset + source.length);
+    }
+    return `${source}]`;
+  }
   if (value === undefined) return "undefined";
   return JSON.stringify(value);
 }
@@ -707,22 +744,40 @@ function createBakeFrameworkUpdatePacket(serverRouteIds, routeStyles, cssMutatio
   return packet;
 }
 
-function createBakeHotUpdatePacket(modules, scriptId) {
-  const registry = Object.entries(modules)
-    .map(([id, definition]) => `${JSON.stringify(id)}:${bakeModuleDefinitionSource(definition)}`)
-    .join(",\n");
-  return createBakeJavaScriptPacket(
-    `globalThis[Symbol.for("bun:hmr")]({${registry}\n}, ${JSON.stringify(scriptId)})\n` +
-    `//# sourceMappingURL=/_bun/client/${scriptId}.js.map\n`,
-  );
+function createBakeHotUpdatePacket(modules, sourceMapRecords, scriptId) {
+  let source = `globalThis[Symbol.for("bun:hmr")]({`;
+  const fragments = [];
+  let first = true;
+  for (const [id, definition] of Object.entries(modules)) {
+    if (!first) source += ",\n";
+    first = false;
+    source += `${JSON.stringify(id)}:`;
+    source += bakeModuleDefinitionSource(definition, fragment => {
+      fragments.push({
+        ...fragment,
+        moduleId: id,
+        record: sourceMapRecords?.get(id) ?? null,
+      });
+    }, source.length);
+  }
+  source += `\n}, ${JSON.stringify(scriptId)})\n`;
+  source += `//# sourceMappingURL=/_bun/client/${scriptId}.js.map\n`;
+  return {
+    packet: createBakeJavaScriptPacket(source),
+    scriptId,
+    sourceMap: composeBakeClientHotUpdateSourceMap(source, fragments),
+  };
 }
 
 function createBakeErrorUpdatePacket(errors, scriptId) {
-  return createBakeJavaScriptPacket(
-    `${bakeSetErrorsClientSource}(${JSON.stringify(errors)});\n` +
+  const source = `${bakeSetErrorsClientSource}(${JSON.stringify(errors)});\n` +
     `globalThis[Symbol.for("bun:hmr")]?.({}, ${JSON.stringify(scriptId)});\n` +
-    `//# sourceMappingURL=/_bun/client/${scriptId}.js.map\n`,
-  );
+    `//# sourceMappingURL=/_bun/client/${scriptId}.js.map\n`;
+  return {
+    packet: createBakeJavaScriptPacket(source),
+    scriptId,
+    sourceMap: composeBakeClientHotUpdateSourceMap(source, []),
+  };
 }
 
 function changedPathMatchesModule(projectRoot, changedPaths, moduleId) {
@@ -755,6 +810,7 @@ function createHtmlDispatcher(config, development) {
   const successfulBundles = new Map();
   const assets = new Map();
   const sourceMaps = new Map();
+  const retainedSourceMapAssets = new Map();
   const retiredAssets = new Set();
   const staticConfig = loadBakeStaticConfig(projectRoot);
   let buildId = 0;
@@ -763,6 +819,20 @@ function createHtmlDispatcher(config, development) {
   function nextHotUpdateId() {
     hotUpdateId = (hotUpdateId + 1) >>> 0;
     return hotUpdateId.toString(16).padStart(16, "0");
+  }
+
+  function retainHotUpdate(packets, update) {
+    const scriptPath = `/_bun/client/${update.scriptId}.js`;
+    const mapPath = `${scriptPath}.map`;
+    const body = JSON.stringify(update.sourceMap);
+    retainedSourceMapAssets.set(mapPath, new Blob([body], { type: "application/json; charset=utf-8" }));
+    sourceMaps.set(scriptPath, {
+      body,
+      bundlePath: scriptPath,
+      mapPath: path.join(projectRoot, ".cottontail-tmp", "bake-hmr", `${update.scriptId}.js.map`),
+      sourceRoot: projectRoot,
+    });
+    packets.push(update.packet);
   }
 
   async function buildDeferredHtmlHmr(sourceText, htmlPath, outdir, buildConfig) {
@@ -779,12 +849,19 @@ function createHtmlDispatcher(config, development) {
       }
 
       let source = await artifact.text();
+      const sourceMapRecord = await sourceMapRecordForArtifact(artifact, [artifact], source, projectRoot);
       if (artifact.sourcemap) {
         const sourceMapPath = `${assetPath}.map`;
         source += `\n//# sourceMappingURL=${sourceMapPath}\n`;
-        assets.set(sourceMapPath, artifact.sourcemap);
+        const sourceMapBody = sourceMapRecord === null
+          ? await artifact.sourcemap.text()
+          : JSON.stringify(normalizeBakeClientSourceMap(sourceMapRecord, {
+              leadingSources: [htmlPath],
+              preferredSources: [entryPath],
+            }));
+        assets.set(sourceMapPath, new Blob([sourceMapBody], { type: "application/json; charset=utf-8" }));
         sourceMaps.set(assetPath, {
-          body: artifact.sourcemap,
+          body: sourceMapBody,
           bundlePath: assetPath,
           mapPath: path.join(outdir, sourceMapPath.replace(/^\//, "")),
           sourceRoot: outdir,
@@ -796,6 +873,7 @@ function createHtmlDispatcher(config, development) {
         assetPath,
         source,
         modules: bakeRegistryModules(source),
+        sourceMapRecord,
       });
     }
 
@@ -913,12 +991,24 @@ function createHtmlDispatcher(config, development) {
               throw error;
             }
             let source = await internalArtifact.text();
+            const sourceMapRecord = await sourceMapRecordForArtifact(
+              internalArtifact,
+              [internalArtifact],
+              source,
+              projectRoot,
+            );
             if (internalArtifact.sourcemap) {
               const sourceMapPath = `${assetPath}.map`;
               source += `\n//# sourceMappingURL=${sourceMapPath}\n`;
-              assets.set(sourceMapPath, internalArtifact.sourcemap);
+              const sourceMapBody = sourceMapRecord === null
+                ? await internalArtifact.sourcemap.text()
+                : JSON.stringify(normalizeBakeClientSourceMap(sourceMapRecord, {
+                    leadingSources: [htmlPath],
+                    preferredSources: [entryPath],
+                  }));
+              assets.set(sourceMapPath, new Blob([sourceMapBody], { type: "application/json; charset=utf-8" }));
               sourceMaps.set(assetPath, {
-                body: internalArtifact.sourcemap,
+                body: sourceMapBody,
                 bundlePath: assetPath,
                 mapPath: path.join(outdir, sourceMapPath.replace(/^\//, "")),
                 sourceRoot: outdir,
@@ -932,6 +1022,7 @@ function createHtmlDispatcher(config, development) {
               assetPath,
               source,
               modules: bakeRegistryModules(source),
+              sourceMapRecord,
             });
           }
         }
@@ -964,7 +1055,7 @@ function createHtmlDispatcher(config, development) {
 
   const dispatchHtmlRequest = async request => {
     const pathname = new URL(request.url).pathname;
-    const asset = assets.get(pathname);
+    const asset = assets.get(pathname) ?? retainedSourceMapAssets.get(pathname);
     if (asset) {
       return new Response(asset, {
         headers: { "content-type": asset.type || "application/octet-stream" },
@@ -993,7 +1084,6 @@ function createHtmlDispatcher(config, development) {
     bundles.clear();
     for (const assetPath of assets.keys()) retiredAssets.add(assetPath);
     assets.clear();
-    sourceMaps.clear();
   };
   dispatchHtmlRequest.update = async (changedPaths = []) => {
     const activePaths = [...bundles.keys()];
@@ -1011,7 +1101,7 @@ function createHtmlDispatcher(config, development) {
       const next = await buildHtml(htmlPath);
       if (next.buildError) {
         if (!previous?.buildError || JSON.stringify(previous.errors) !== JSON.stringify(next.errors)) {
-          packets.push(createBakeErrorUpdatePacket(next.errors, nextHotUpdateId()));
+          retainHotUpdate(packets, createBakeErrorUpdatePacket(next.errors, nextHotUpdateId()));
         }
         continue;
       }
@@ -1024,7 +1114,7 @@ function createHtmlDispatcher(config, development) {
         continue;
       }
       if (previous?.buildError) {
-        packets.push(createBakeErrorUpdatePacket([], nextHotUpdateId()));
+        retainHotUpdate(packets, createBakeErrorUpdatePacket([], nextHotUpdateId()));
       }
 
       const previousCssIds = [...previousSuccessful.css.keys()];
@@ -1050,15 +1140,21 @@ function createHtmlDispatcher(config, development) {
             continue;
           }
           const changedModules = {};
+          const changedSourceMapRecords = new Map();
           for (const [id, definition] of Object.entries(entry.modules)) {
             const previousDefinition = previousEntry.modules[id];
             if (changedPathMatchesModule(projectRoot, changedPaths, id) ||
                 moduleDefinitionSignature(previousDefinition) !== moduleDefinitionSignature(definition)) {
               changedModules[id] = definition;
+              if (entry.sourceMapRecord) changedSourceMapRecords.set(id, entry.sourceMapRecord);
             }
           }
           if (Object.keys(changedModules).length > 0) {
-            packets.push(createBakeHotUpdatePacket(changedModules, nextHotUpdateId()));
+            retainHotUpdate(packets, createBakeHotUpdatePacket(
+              changedModules,
+              changedSourceMapRecords,
+              nextHotUpdateId(),
+            ));
           }
         }
       }
@@ -1302,16 +1398,27 @@ function hmrRouteWrapperSource(serverEntryPoint, page, layouts) {
 export const __cottontailBakeModules = [${moduleNames.join(", ")}];`;
 }
 
-function parseHmrArtifact(source) {
+function parseHmrArtifact(source, sourceMapRecord = null, patchId = null) {
   const registryStart = source.indexOf("\n  // ", 8);
   if (registryStart < 0) throw new SyntaxError("Bake's HMR bundle is missing its module registry");
+  const registration = sourceMapRecord === null
+    ? null
+    : registerBakeServerPatch(source, sourceMapRecord, patchId);
   const factory = (0, eval)(source.slice(0, registryStart));
   if (typeof factory !== "function") throw new TypeError("Bake's HMR runtime did not produce a factory");
+  if (registration !== null) {
+    return {
+      factory,
+      modules: registration.modules,
+      bundleConfig: registration.bundleConfig,
+      sourceMapRegistration: registration,
+    };
+  }
   const registrySource = source.slice(registryStart);
   const invocationEnd = registrySource.lastIndexOf(");");
   if (invocationEnd < 0) throw new SyntaxError("Bake's HMR bundle is missing its invocation trailer");
   const [modules, bundleConfig] = (0, eval)(`[{${registrySource.slice(0, invocationEnd)}]`);
-  return { factory, modules, bundleConfig };
+  return { factory, modules, bundleConfig, sourceMapRegistration: null };
 }
 
 function moduleDefinitionSignature(value) {
@@ -1452,10 +1559,13 @@ function createFrameworkDispatcher(config) {
   const routeRecordByPage = new Map();
   const assets = new Map();
   const sourceMaps = new Map();
+  const retainedSourceMapAssets = new Map();
+  const serverSourceMapRegistrations = new Map();
   const retiredClientEntries = new Set();
   let hmrRuntime = null;
   let wrapperId = 0;
   let hotUpdateId = 0;
+  let serverPatchId = 0;
   let hadBuildErrors = false;
   const routerTypes = framework.fileSystemRouterTypes ?? [];
   const graphAlias = { ...(serverOptions.alias ?? {}), ...builtIns.alias };
@@ -1484,6 +1594,32 @@ function createFrameworkDispatcher(config) {
   function nextHotUpdateId() {
     hotUpdateId = (hotUpdateId + 1) >>> 0;
     return hotUpdateId.toString(16).padStart(16, "0");
+  }
+
+  function nextServerPatchId() {
+    serverPatchId = (serverPatchId + 1) >>> 0;
+    return serverPatchId.toString(16).padStart(16, "0");
+  }
+
+  function retainHotUpdate(packets, update) {
+    const scriptPath = `/_bun/client/${update.scriptId}.js`;
+    const mapPath = `${scriptPath}.map`;
+    const body = JSON.stringify(update.sourceMap);
+    retainedSourceMapAssets.set(mapPath, {
+      body,
+      type: "application/json; charset=utf-8",
+    });
+    sourceMaps.set(scriptPath, {
+      body,
+      bundlePath: scriptPath,
+      mapPath: path.join(projectRoot, ".cottontail-tmp", "bake-hmr", `${update.scriptId}.js.map`),
+      sourceRoot: projectRoot,
+    });
+    packets.push(update.packet);
+  }
+
+  function retainServerSourceMap(registration) {
+    if (registration !== null) serverSourceMapRegistrations.set(registration.filename, registration);
   }
 
   function randomGeneration() {
@@ -1588,7 +1724,15 @@ function createFrameworkDispatcher(config) {
       throw new AggregateError(result.logs ?? [], `Failed to bundle Bake SSR graph for ${record.page}`);
     }
     const artifact = result.outputs.find(output => output.kind === "entry-point") ?? result.outputs[0];
-    const parsed = parseHmrArtifact(await artifact.text());
+    const generatedSource = await artifact.text();
+    const sourceMapRecord = await sourceMapRecordForArtifact(
+      artifact,
+      result.outputs,
+      generatedSource,
+      projectRoot,
+    );
+    const parsed = parseHmrArtifact(generatedSource, sourceMapRecord, nextServerPatchId());
+    retainServerSourceMap(parsed.sourceMapRegistration);
     const prefixed = prefixHmrGraph(parsed, "ssr:");
     const rootIds = moduleDependencyIds(parsed.modules[parsed.bundleConfig.main]).slice(0, roots.length);
     const rootReplacements = roots.flatMap((source, index) => {
@@ -1655,7 +1799,14 @@ function createFrameworkDispatcher(config) {
     const artifact = result.outputs.find(isJavaScriptEntry);
     if (!artifact) throw new Error(`Bake's client build did not emit ${router.clientEntryPoint ?? wrapperPath}`);
 
-    const originalSource = rewriteBakeClientBuiltins(await artifact.text());
+    const generatedSource = await artifact.text();
+    const sourceMapRecord = await sourceMapRecordForArtifact(
+      artifact,
+      result.outputs,
+      generatedSource,
+      projectRoot,
+    );
+    const originalSource = rewriteBakeClientBuiltins(generatedSource);
     const clientModules = development ? bakeRegistryModules(originalSource) : null;
     const url = bakeRouteClientUrl(record.id, record.generation);
     let servedSource = originalSource;
@@ -1683,12 +1834,17 @@ function createFrameworkDispatcher(config) {
       servedSource = sourceMapDirective.test(servedSource)
         ? servedSource.replace(sourceMapDirective, sourceMapComment)
         : `${servedSource}\n${sourceMapComment}\n`;
+      const sourceMapBody = sourceMapRecord === null
+        ? sourceMap
+        : JSON.stringify(normalizeBakeClientSourceMap(sourceMapRecord, {
+            preferredSources: [wrapperPath],
+          }));
       assets.set(`${url}.map`, {
-        body: sourceMap,
+        body: sourceMapBody,
         type: "application/json; charset=utf-8",
       });
       sourceMaps.set(url, {
-        body: sourceMap,
+        body: sourceMapBody,
         bundlePath: url,
         mapPath: path.join(projectRoot, `${url.replace(/^\//, "")}.map`),
         sourceRoot: projectRoot,
@@ -1698,6 +1854,7 @@ function createFrameworkDispatcher(config) {
     assets.set(url, { body: servedSource, type: "text/javascript; charset=utf-8" });
     return {
       modules: clientModules,
+      sourceMapRecord,
       styles: await collectBuildAssets(result),
       url,
     };
@@ -1782,12 +1939,17 @@ function createFrameworkDispatcher(config) {
         throw new AggregateError(result.logs ?? [], `Failed to bundle Bake route ${page}`);
       }
       const artifact = result.outputs.find(output => output.kind === "entry-point") ?? result.outputs[0];
+      const generatedServerSource = development ? await artifact.text() : null;
+      const serverSourceMapRecord = development
+        ? await sourceMapRecordForArtifact(artifact, result.outputs, generatedServerSource, projectRoot)
+        : null;
       const serverStyles = await collectBuildAssets(result);
       const client = await buildClientRoute(record, router, graph.boundaries);
       const ssr = development ? await buildSsrRoute(record, graph.boundaries) : null;
       const styles = new Map([...serverStyles, ...(ssr?.styles ?? []), ...client.styles]);
       if (development) {
-        const parsed = parseHmrArtifact(await artifact.text());
+        const parsed = parseHmrArtifact(generatedServerSource, serverSourceMapRecord, nextServerPatchId());
+        retainServerSourceMap(parsed.sourceMapRegistration);
         if (hmrRuntime === null) {
           hmrRuntime = parsed.factory(serverComponents?.separateSSRGraph === true, {
             require: globalThis.require,
@@ -1835,6 +1997,7 @@ function createFrameworkDispatcher(config) {
         if (!serverId || !pageId) throw new TypeError("Bake's HMR route bundle is missing framework modules");
         const route = {
           clientModules: client.modules,
+          clientSourceMapRecord: client.sourceMapRecord,
           boundaries: graph.boundaries,
           css: styles,
           matched,
@@ -1869,6 +2032,7 @@ function createFrameworkDispatcher(config) {
       }
       return {
         clientModules: null,
+        clientSourceMapRecord: null,
         boundaries: graph.boundaries,
         css: styles,
         matched,
@@ -1943,7 +2107,7 @@ function createFrameworkDispatcher(config) {
 
   const dispatchFrameworkRequest = async function dispatchFrameworkRequest(request) {
     const pathname = new URL(request.url).pathname;
-    const asset = assets.get(pathname);
+    const asset = assets.get(pathname) ?? retainedSourceMapAssets.get(pathname);
     if (asset) {
       return new Response(asset.body, {
         headers: {
@@ -2019,6 +2183,7 @@ function createFrameworkDispatcher(config) {
     const routeStyles = new Map();
     const cssMutations = new Map();
     const changedClientModules = {};
+    const changedClientSourceMapRecords = new Map();
     let hardReload = false;
     let buildFailed = false;
 
@@ -2027,7 +2192,7 @@ function createFrameworkDispatcher(config) {
     } catch (error) {
       routers = previousRouters;
       const errors = bakeBuildErrors(error?.errors ?? [error], projectRoot);
-      packets.push(createBakeErrorUpdatePacket(errors, nextHotUpdateId()));
+      retainHotUpdate(packets, createBakeErrorUpdatePacket(errors, nextHotUpdateId()));
       hadBuildErrors = true;
       return { hardReload: false, packets };
     }
@@ -2046,7 +2211,7 @@ function createFrameworkDispatcher(config) {
         next = await bundleRoute(found.router, found.matched, true);
       } catch (error) {
         const errors = bakeBuildErrors(error?.errors ?? [error], record.page);
-        packets.push(createBakeErrorUpdatePacket(errors, nextHotUpdateId()));
+        retainHotUpdate(packets, createBakeErrorUpdatePacket(errors, nextHotUpdateId()));
         buildFailed = true;
         continue;
       }
@@ -2069,6 +2234,7 @@ function createFrameworkDispatcher(config) {
           if (changedPathMatchesModule(projectRoot, changedPaths, id) ||
               moduleDefinitionSignature(previousClientModules[id]) !== moduleDefinitionSignature(definition)) {
             changedClientModules[id] = definition;
+            if (next.clientSourceMapRecord) changedClientSourceMapRecords.set(id, next.clientSourceMapRecord);
           }
         }
 
@@ -2089,7 +2255,7 @@ function createFrameworkDispatcher(config) {
       routers = previousRouters;
       hadBuildErrors = true;
     } else if (hadBuildErrors) {
-      packets.push(createBakeErrorUpdatePacket([], nextHotUpdateId()));
+      retainHotUpdate(packets, createBakeErrorUpdatePacket([], nextHotUpdateId()));
       hadBuildErrors = false;
     }
     if (serverRouteIds.length > 0 || routeStyles.size > 0 || cssMutations.size > 0) {
@@ -2100,7 +2266,11 @@ function createFrameworkDispatcher(config) {
       ));
     }
     if (Object.keys(changedClientModules).length > 0) {
-      packets.push(createBakeHotUpdatePacket(changedClientModules, nextHotUpdateId()));
+      retainHotUpdate(packets, createBakeHotUpdatePacket(
+        changedClientModules,
+        changedClientSourceMapRecords,
+        nextHotUpdateId(),
+      ));
     }
     return { hardReload, packets };
   };

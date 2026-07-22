@@ -1210,6 +1210,12 @@ extern uint8_t *ct_bundle_build(
     size_t *out_len,
     char **error_out
 );
+extern uint8_t *ct_bake_source_map_relocate(
+    const uint8_t *request,
+    size_t request_len,
+    size_t *out_len,
+    char **error_out
+);
 extern void ct_bundle_free(uint8_t *value, size_t len);
 extern void ct_bundle_string_free(char *value);
 extern uint8_t *ct_compile_build(
@@ -28965,6 +28971,40 @@ static JSValueRef ct_build_native(JSContextRef ctx, JSObjectRef function, JSObje
     free(working_dir);
     if (output == NULL) {
         ct_throw_message(ctx, exception, error != NULL ? error : "JavaScript bundle failed");
+        if (error != NULL) ct_bundle_string_free(error);
+        return JSValueMakeUndefined(ctx);
+    }
+    JSValueRef result = ct_make_string_len(ctx, (const char *)output, output_len);
+    ct_bundle_free(output, output_len);
+    return result;
+}
+
+static JSValueRef ct_bake_source_map_relocate_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "bakeSourceMapRelocate(requestJson) requires one argument");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t request_len = 0;
+    char *request = ct_value_to_utf8_copy(ctx, argv[0], &request_len);
+    if (request == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t output_len = 0;
+    char *error = NULL;
+    uint8_t *output = ct_bake_source_map_relocate(
+        (const uint8_t *)request,
+        request_len,
+        &output_len,
+        &error
+    );
+    free(request);
+    if (output == NULL) {
+        ct_throw_message(ctx, exception, error != NULL ? error : "Bake source-map relocation failed");
         if (error != NULL) ct_bundle_string_free(error);
         return JSValueMakeUndefined(ctx);
     }

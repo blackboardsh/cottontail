@@ -1549,6 +1549,182 @@ const BuildResultJson = struct {
     metafileMarkdown: ?[]const u8 = null,
 };
 
+const BakeSourceMapFragmentJson = struct {
+    inputStartLine: i32,
+    inputStartColumn: i32,
+    inputEndLine: i32,
+    inputEndColumn: i32,
+    outputStartLine: i32,
+    outputStartColumn: i32,
+};
+
+const BakeSourceMapRelocateInput = struct {
+    mappings: []const u8,
+    sourceCount: i32,
+    sourceRemap: []const i32,
+    fragments: []const BakeSourceMapFragmentJson = &.{},
+};
+
+const BakeSourceMapRelocateRequest = struct {
+    inputs: []const BakeSourceMapRelocateInput,
+    addRuntimeMapping: bool = false,
+};
+
+const BakeSourceMapRelocateResponse = struct {
+    mappings: []const u8,
+};
+
+// The JS-hosted Bake path only sees flattened Bun.build output after the
+// IncrementalGraph is gone. Keep VLQ parsing and emission in Bun's compiler.
+fn sourceMapPositionBefore(line: i32, column: i32, other_line: i32, other_column: i32) bool {
+    return line < other_line or (line == other_line and column < other_column);
+}
+
+fn sourceMapFragmentContains(fragment: BakeSourceMapFragmentJson, line: i32, column: i32) bool {
+    return !sourceMapPositionBefore(line, column, fragment.inputStartLine, fragment.inputStartColumn) and
+        sourceMapPositionBefore(line, column, fragment.inputEndLine, fragment.inputEndColumn);
+}
+
+fn encodeSourceMapMappings(allocator: std.mem.Allocator, mappings: *const compiler.SourceMap.Mapping.List) !compiler.MutableString {
+    var output = compiler.SourceMap.Chunk.VLQSourceMap.init(allocator, false);
+    errdefer output.data.deinit();
+    var previous: compiler.SourceMap.SourceMapState = .{};
+    var generated_line: i32 = 0;
+    const generated = mappings.generated();
+    const original = mappings.original();
+    const source_indexes = mappings.sourceIndex();
+
+    for (generated, original, source_indexes) |generated_position, original_position, source_index| {
+        const current_line = generated_position.lines.zeroBased();
+        while (generated_line < current_line) : (generated_line += 1) {
+            try output.appendLineSeparator();
+            previous.generated_column = 0;
+        }
+        const current: compiler.SourceMap.SourceMapState = .{
+            .generated_line = current_line,
+            .generated_column = generated_position.columns.zeroBased(),
+            .source_index = source_index,
+            .original_line = original_position.lines.zeroBased(),
+            .original_column = original_position.columns.zeroBased(),
+        };
+        try output.append(current, previous);
+        previous = current;
+    }
+    return output.takeBuffer();
+}
+
+fn relocateBakeSourceMapMappings(request_json: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    const parsed_request = try std.json.parseFromSlice(
+        BakeSourceMapRelocateRequest,
+        allocator,
+        request_json,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed_request.deinit();
+    const request = parsed_request.value;
+
+    var relocated: compiler.SourceMap.Mapping.List = .{};
+    defer relocated.deinit(allocator);
+
+    if (request.addRuntimeMapping) {
+        try relocated.append(allocator, &.{
+            .generated = .{
+                .lines = compiler.Ordinal.fromZeroBased(0),
+                .columns = compiler.Ordinal.fromZeroBased(0),
+            },
+            .original = .{
+                .lines = compiler.Ordinal.fromZeroBased(0),
+                .columns = compiler.Ordinal.fromZeroBased(0),
+            },
+            .source_index = 0,
+        });
+    }
+
+    for (request.inputs) |input| {
+        if (input.sourceCount < 0 or input.sourceRemap.len < @as(usize, @intCast(input.sourceCount))) {
+            return error.InvalidSourceMapRemap;
+        }
+        var parsed = switch (compiler.SourceMap.Mapping.parse(
+            allocator,
+            input.mappings,
+            null,
+            input.sourceCount,
+            0,
+            .{ .allow_names = false, .sort = true },
+        )) {
+            .success => |value| value,
+            .fail => return error.InvalidSourceMapMappings,
+        };
+        defer parsed.mappings.deinit(allocator);
+
+        const generated = parsed.mappings.generated();
+        const original = parsed.mappings.original();
+        const source_indexes = parsed.mappings.sourceIndex();
+        for (generated, original, source_indexes) |generated_position, original_position, old_source_index| {
+            if (old_source_index < 0 or old_source_index >= input.sourceCount) return error.InvalidSourceMapRemap;
+            const new_source_index = input.sourceRemap[@intCast(old_source_index)];
+            if (new_source_index < 0) continue;
+
+            const input_line = generated_position.lines.zeroBased();
+            const input_column = generated_position.columns.zeroBased();
+            var output_line = input_line;
+            var output_column = input_column;
+            if (input.fragments.len > 0) {
+                const fragment = for (input.fragments) |candidate| {
+                    if (sourceMapFragmentContains(candidate, input_line, input_column)) break candidate;
+                } else continue;
+                output_line = fragment.outputStartLine + (input_line - fragment.inputStartLine);
+                output_column = if (input_line == fragment.inputStartLine)
+                    fragment.outputStartColumn + (input_column - fragment.inputStartColumn)
+                else
+                    input_column;
+                if (output_line < 0 or output_column < 0) return error.InvalidSourceMapFragment;
+            }
+
+            try relocated.append(allocator, &.{
+                .generated = .{
+                    .lines = compiler.Ordinal.fromZeroBased(output_line),
+                    .columns = compiler.Ordinal.fromZeroBased(output_column),
+                },
+                .original = original_position,
+                .source_index = new_source_index,
+            });
+        }
+    }
+    relocated.sort();
+    var mappings = try encodeSourceMapMappings(allocator, &relocated);
+    defer mappings.deinit();
+    return std.json.Stringify.valueAlloc(allocator, BakeSourceMapRelocateResponse{ .mappings = mappings.list.items }, .{});
+}
+
+test "Bake source-map relocation uses compiler mappings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const request =
+        \\{
+        \\  "inputs": [{
+        \\    "mappings": "AAAA;AACA",
+        \\    "sourceCount": 1,
+        \\    "sourceRemap": [2],
+        \\    "fragments": [{
+        \\      "inputStartLine": 0,
+        \\      "inputStartColumn": 0,
+        \\      "inputEndLine": 2,
+        \\      "inputEndColumn": 0,
+        \\      "outputStartLine": 2,
+        \\      "outputStartColumn": 3
+        \\    }]
+        \\  }],
+        \\  "addRuntimeMapping": true
+        \\}
+    ;
+    const response = try relocateBakeSourceMapMappings(request, allocator);
+    const parsed = try std.json.parseFromSlice(BakeSourceMapRelocateResponse, allocator, response, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("AAAA;;GEAA;AACA", parsed.value.mappings);
+}
+
 // COTTONTAIL-COMPAT: Bun CSS internals - stock JSC cannot consume Bun's
 // $newZigFunction bindings, so the existing native build bridge carries the
 // same vendored Zig parser/minifier inputs and results as structured JSON.
@@ -2299,6 +2475,32 @@ pub export fn ct_bundle_build(
     return output.ptr;
 }
 
+pub export fn ct_bake_source_map_relocate(
+    request_ptr: ?[*]const u8,
+    request_len: usize,
+    out_len: *usize,
+    error_out: *?[*:0]u8,
+) ?[*]u8 {
+    out_len.* = 0;
+    error_out.* = null;
+    const request_json = if (request_ptr) |ptr| ptr[0..request_len] else {
+        setError(error_out, "Bake source-map relocation request is required", .{});
+        return null;
+    };
+    var arena = std.heap.ArenaAllocator.init(c_allocator);
+    defer arena.deinit();
+    const result = relocateBakeSourceMapMappings(request_json, arena.allocator()) catch |err| {
+        setError(error_out, "Bake source-map relocation failed: {s}", .{@errorName(err)});
+        return null;
+    };
+    const output = c_allocator.dupe(u8, result) catch {
+        setError(error_out, "Bake source-map relocation failed: OutOfMemory", .{});
+        return null;
+    };
+    out_len.* = output.len;
+    return output.ptr;
+}
+
 pub export fn ct_bundle_free(ptr: ?[*]u8, len: usize) void {
     if (ptr) |value| c_allocator.free(value[0..len]);
 }
@@ -2311,6 +2513,7 @@ pub fn forceLink() void {
     _ = &ct_bundle_entry_point;
     _ = &ct_bundle_entry_point_options;
     _ = &ct_bundle_build;
+    _ = &ct_bake_source_map_relocate;
     _ = &ct_bundle_free;
     _ = &ct_bundle_string_free;
 }
