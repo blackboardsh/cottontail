@@ -213,6 +213,7 @@ export const builtinModules = [
 ];
 
 const commonJsCache = new Map();
+const commonJsWrapperFactoryCache = new Map();
 const builtinModuleMap = new Map();
 const builtinNamespaceEntries = new Set();
 let modulePathCache = Object.create(null);
@@ -243,6 +244,7 @@ if (globalThis.__cottontailHotReloadHooks == null) {
 }
 hotReloadHooks.add(() => {
   commonJsCache.clear();
+  commonJsWrapperFactoryCache.clear();
   builtinModuleMap.clear();
   builtinNamespaceEntries.clear();
   for (const key of Object.keys(modulePathCache)) delete modulePathCache[key];
@@ -2078,7 +2080,7 @@ function makeModule(filename, parent = null, isMain = false) {
   module.filename = filename;
   module.path = dirname(filename);
   module.paths = _nodeModulePaths(module.path);
-  refreshModuleRequire(module);
+  if (isMain) refreshModuleRequire(module);
   return module;
 }
 
@@ -2087,15 +2089,7 @@ function refreshModuleRequire(module) {
     return Module.prototype.require.call(module, request);
   };
   const moduleBase = module.filename || (isAbsolute(module.id) ? module.id : cottontail.cwd());
-  const helper = createRequire(moduleBase, module);
-  require.resolve = helper.resolve;
-  require.cache = helper.cache;
-  require.extensions = helper.extensions;
-  Object.defineProperty(require, "main", {
-    configurable: true,
-    enumerable: true,
-    get() { return mainModule; },
-  });
+  configureRequireProperties(require, moduleBase, () => module, true);
   module.require = require;
   return require;
 }
@@ -2382,6 +2376,14 @@ function compilePublicCommonJsWrapper(source, filename) {
   const prefix = String(activeWrapper?.[0]);
   const suffix = String(activeWrapper?.[1]);
   const internalArgs = [CJS_FILENAME_BINDING, CJS_DIRNAME_BINDING, CJS_DYNAMIC_IMPORT_BINDING];
+  const cacheKey = String(filename);
+  const cached = commonJsWrapperFactoryCache.get(cacheKey);
+  if (cached?.source === source
+    && cached.moduleWrapper === activeWrapper
+    && cached.prefix === prefix
+    && cached.suffix === suffix) {
+    return cached.wrapper;
+  }
   const factorySource = `(function(${internalArgs.join(",")}) { return ${prefix}${source}${suffix}\n})`;
   let createWrapper;
   try {
@@ -2391,11 +2393,19 @@ function compilePublicCommonJsWrapper(source, filename) {
   } catch (error) {
     throw markModuleCompileError(error, filename, source, 1);
   }
-  return createWrapper(
+  const compiledWrapper = createWrapper(
     filename,
     dirname(filename),
     async (specifier, options) => globalThis.__cottontailImportModule(String(specifier), filename, options),
   );
+  commonJsWrapperFactoryCache.set(cacheKey, {
+    source,
+    moduleWrapper: activeWrapper,
+    prefix,
+    suffix,
+    wrapper: compiledWrapper,
+  });
+  return compiledWrapper;
 }
 
 function executeCommonJsSource(module, filename, source) {
@@ -2613,11 +2623,13 @@ function executeDefaultExtension(module, filename, loader) {
       typeof cottontail.bundleNative === "function") {
     return executeBundledCommonJsModule(module, filename, originalSource);
   }
-  const compileOverridden = module._compile !== Module.prototype._compile;
+  const compileOverridden = module._compile !== defaultModuleCompile;
   const source = transpileExtensionSource(filename, loader, compileOverridden, originalSource);
   // Bun's synchronous ESM path does not call an overridden module._compile.
   if (hasEsmSyntax(source)) return executeCommonJsSource(module, filename, source);
-  return module._compile(formatExtensionCompileSource(source, compileOverridden), filename);
+  const compileSource = formatExtensionCompileSource(source, compileOverridden);
+  if (compileOverridden) return module._compile(compileSource, filename);
+  return executeCommonJsSource(module, filename, compileSource);
 }
 
 function loaderExtensionFor(filename) {
@@ -3447,6 +3459,46 @@ function invalidCreateRequireFilename(value) {
   return error;
 }
 
+function configureRequireProperties(require, normalizedBasePath, resolutionParentForCall, dynamicMain = false) {
+  require.resolve = (request, options = undefined) => {
+    if (typeof request !== "string") throw invalidRequestType(request);
+    const activeParent = resolutionParentForCall();
+    if (options !== undefined && options !== null && options.paths !== undefined) {
+      // Route through Module._resolveFilename so user overrides and the
+      // options.paths semantics both apply (matches Node).
+      return Module._resolveFilename(request, activeParent, false, options);
+    }
+    const text = request;
+    if (text.startsWith("node:") && !builtinModuleMap.has(text) && !builtinModuleMap.has(text.slice(5))) {
+      throw packageNotFoundError(text, normalizedBasePath);
+    }
+    return Module._resolveFilename(text, activeParent, false);
+  };
+  require.resolve.paths = (request) => {
+    if (typeof request !== "string") throw invalidRequestType(request);
+    const text = request;
+    if (isBuiltin(text)) return null;
+    const activeBasePath = resolutionParentForCall().filename ?? normalizedBasePath;
+    if (text === "." || text === ".." || text.startsWith("./") || text.startsWith("../") || isAbsolute(text)) {
+      return [activeBasePath.endsWith("/") ? activeBasePath.slice(0, -1) : dirname(activeBasePath)];
+    }
+    return _nodeModulePaths(activeBasePath.endsWith("/") ? activeBasePath : dirname(activeBasePath));
+  };
+  require.cache = commonJsCacheObject;
+  require.extensions = extensionsForRequire(normalizedBasePath);
+  Object.defineProperty(require, "main", dynamicMain ? {
+    configurable: true,
+    enumerable: true,
+    get() { return mainModule; },
+  } : {
+    configurable: true,
+    enumerable: true,
+    writable: true,
+    value: mainModule,
+  });
+  return require;
+}
+
 export function createRequire(basePath, parentModule = null) {
   let normalizedBasePath;
   if (typeof basePath === "string") {
@@ -3511,39 +3563,7 @@ export function createRequire(basePath, parentModule = null) {
     if (resolvedMock.found) return resolvedMock.value;
     return loadCommonJsModule(resolved, parentModule);
   };
-  require.resolve = (request, options = undefined) => {
-    if (typeof request !== "string") throw invalidRequestType(request);
-    const activeParent = resolutionParentForCall();
-    if (options !== undefined && options !== null && options.paths !== undefined) {
-      // Route through Module._resolveFilename so user overrides and the
-      // options.paths semantics both apply (matches Node).
-      return Module._resolveFilename(request, activeParent, false, options);
-    }
-    const text = request;
-    if (text.startsWith("node:") && !builtinModuleMap.has(text) && !builtinModuleMap.has(text.slice(5))) {
-      throw packageNotFoundError(text, normalizedBasePath);
-    }
-    return Module._resolveFilename(text, activeParent, false);
-  };
-  require.resolve.paths = (request) => {
-    if (typeof request !== "string") throw invalidRequestType(request);
-    const text = request;
-    if (isBuiltin(text)) return null;
-    const activeBasePath = resolutionParentForCall().filename ?? normalizedBasePath;
-    if (text === "." || text === ".." || text.startsWith("./") || text.startsWith("../") || isAbsolute(text)) {
-      return [activeBasePath.endsWith("/") ? activeBasePath.slice(0, -1) : dirname(activeBasePath)];
-    }
-    return _nodeModulePaths(activeBasePath.endsWith("/") ? activeBasePath : dirname(activeBasePath));
-  };
-  require.cache = commonJsCacheObject;
-  require.extensions = extensionsForRequire(normalizedBasePath);
-  Object.defineProperty(require, "main", {
-    configurable: true,
-    enumerable: true,
-    writable: true,
-    value: mainModule,
-  });
-  return require;
+  return configureRequireProperties(require, normalizedBasePath, resolutionParentForCall);
 }
 
 const blockedExtensionMutationPattern = /(?:^|[\\/])node_modules[\\/](?:next[\\/]dist[\\/]build[\\/]next-config-ts[\\/]index\.js|@meteorjs[\\/]babel[\\/]index\.js)$/;
@@ -3753,6 +3773,8 @@ export class Module {
     return undefined;
   }
 }
+
+const defaultModuleCompile = Module.prototype._compile;
 
 function sourceMapPayloadTypeText(payload) {
   if (payload === undefined) return "undefined";

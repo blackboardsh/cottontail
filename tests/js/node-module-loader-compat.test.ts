@@ -153,6 +153,68 @@ test("CommonJS compilation honors Module.wrapper mutations", () => {
   }
 });
 
+test("CommonJS wrapper compilation preserves reload semantics", async () => {
+  const Module = require("node:module");
+  const originalWrapper = Module.wrapper;
+  const host = (globalThis as any).cottontail;
+  const originalCompileFunction = host.compileFunction;
+  const target = join(root, "wrapper-reload.cjs");
+  let compileCount = 0;
+  const source = version => [
+    `module.exports = { version: ${version}, evaluation: ++globalThis.__loaderEvaluationCount,`,
+    '  basename: async () => (await import("node:path")).basename("/tmp/reloaded") };',
+    "",
+  ].join("\n");
+  const loadFresh = () => {
+    const value = require(target);
+    delete require.cache[target];
+    return value;
+  };
+  globalThis.__loaderEvaluationCount = 0;
+  globalThis.__loaderWrapperMarks = [];
+  host.compileFunction = (...args) => {
+    compileCount++;
+    return originalCompileFunction(...args);
+  };
+
+  try {
+    const activeWrapper = { ...originalWrapper };
+    activeWrapper[0] += 'globalThis.__loaderWrapperMarks.push("initial");';
+    Module.wrapper = activeWrapper;
+    writeFileSync(target, source(1));
+
+    const first = loadFresh();
+    const second = loadFresh();
+    expect(second).not.toBe(first);
+    expect([first.evaluation, second.evaluation]).toEqual([1, 2]);
+    expect(await second.basename()).toBe("reloaded");
+
+    writeFileSync(target, source(2));
+    expect(loadFresh()).toMatchObject({ version: 2, evaluation: 3 });
+
+    activeWrapper[0] = `${originalWrapper[0]}globalThis.__loaderWrapperMarks.push("mutated");`;
+    expect(loadFresh()).toMatchObject({ version: 2, evaluation: 4 });
+
+    Module.wrapper = { ...originalWrapper };
+    Module.wrapper[0] += 'globalThis.__loaderWrapperMarks.push("replacement");';
+    expect(loadFresh()).toMatchObject({ version: 2, evaluation: 5 });
+    expect(globalThis.__loaderWrapperMarks).toEqual([
+      "initial",
+      "initial",
+      "initial",
+      "mutated",
+      "replacement",
+    ]);
+    expect(compileCount).toBe(4);
+  } finally {
+    host.compileFunction = originalCompileFunction;
+    Module.wrapper = originalWrapper;
+    delete globalThis.__loaderEvaluationCount;
+    delete globalThis.__loaderWrapperMarks;
+    delete require.cache[target];
+  }
+});
+
 test("resolver handles bare files, NUL requests, and private node prefixes", () => {
   const modules = join(root, "node_modules");
   const entry = join(root, "entry.cjs");
