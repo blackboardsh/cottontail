@@ -2697,6 +2697,10 @@ const Manager = struct {
         return selected.toOwnedSlice();
     }
 
+    fn isSecurityResolution(manager: *const Manager) bool {
+        return manager.init_data.environ_map.get(security_resolution_output_env) != null;
+    }
+
     fn buildSecurityMatrix(
         manager: *Manager,
         root: *const Value,
@@ -4563,6 +4567,12 @@ const Manager = struct {
             const target_section = manager.sectionForAdd(package_json, name);
             const section = try ensureObjectProperty(manager.allocator, &package_json.object, target_section.key());
 
+            if (manager.isSecurityResolution() and !packageSpecHasExplicitSpecifier(raw_spec)) {
+                if (section.get(name)) |current| {
+                    if (current == .string) requested = current.string;
+                }
+            }
+
             if (manager.options.only_missing and section.get(name) != null) continue;
             if (!isTarballSpec(requested) and !isGitSpec(requested)) {
                 resolved_version = manager.installDependency(name, requested, parent_dir, true, false) catch |err| {
@@ -5628,7 +5638,7 @@ const Manager = struct {
             !isTarballSpec(resolution_spec) and
             !isLocalSpec(resolution_spec) and
             (manager.refresh_direct_registry or
-                (manager.options.command == .add and !manager.report_direct_installs));
+                (manager.options.command == .add and !manager.report_direct_installs and !manager.isSecurityResolution()));
         const refresh_direct_source = direct and manager.refresh_direct_source and
             (workspace_package or isGitSpec(resolution_spec) or isTarballSpec(resolution_spec) or
                 isLocalSpec(resolution_spec) or std.mem.startsWith(u8, effective_spec, "patch:"));
@@ -8070,12 +8080,13 @@ const Manager = struct {
         // Dist-tags are manifest pointers, not semver ranges. An already
         // installed version cannot satisfy one without resolving the current
         // manifest first.
-        if (Semver.Version.isTaggedVersionOnly(registry_spec)) return null;
+        const tagged_version = Semver.Version.isTaggedVersionOnly(registry_spec);
+        if (tagged_version and !(manager.node_linker == .isolated and manager.isSecurityResolution())) return null;
         if (manager.node_linker == .isolated) {
             for (manager.records.items) |record| {
                 if (record.kind != .npm or
                     !std.mem.eql(u8, record.name, registry_name) or
-                    !semverSatisfies(manager.allocator, registry_spec, record.version)) continue;
+                    (!tagged_version and !semverSatisfies(manager.allocator, registry_spec, record.version))) continue;
                 const peer_context = try manager.peerContextForPackage(record.metadata, parent_dir, false);
                 if (peer_context.hash != record.peer_hash) continue;
                 const placement = try manager.packagePlacementWithPeerContext(
@@ -8120,6 +8131,49 @@ const Manager = struct {
                 }
                 try manager.installOrLinkPeerDependencies(record.metadata, placement.package_dir, placement.package_dir, parent_dir);
                 return record.version;
+            }
+
+            if (manager.isSecurityResolution()) {
+                const destination = try packageDestination(manager.allocator, parent_dir, alias);
+                if (!manager.pathIsWorkspace(destination)) {
+                    const metadata = manager.readInstalledPackageJSON(destination) catch return null;
+                    const installed_name = jsonString(metadata, "name") orelse alias;
+                    const installed_version = jsonString(metadata, "version") orelse return null;
+                    if (std.mem.eql(u8, installed_name, registry_name) and
+                        (tagged_version or semverSatisfies(manager.allocator, registry_spec, installed_version)))
+                    {
+                        const patch_paths = try manager.packagePatchPaths(installed_name, installed_version, protocol_patch_paths);
+                        if (!try manager.packagePatchStateMatches(destination, patch_paths)) return null;
+
+                        const logical_key = try manager.dependencyLockKey(parent_dir, alias);
+                        const modules_dir = try std.fs.path.join(manager.allocator, &.{ destination, "node_modules" });
+                        try manager.isolated_parent_modules.put(
+                            try manager.allocator.dupe(u8, destination),
+                            try manager.allocator.dupe(u8, modules_dir),
+                        );
+                        try manager.isolated_parent_keys.put(
+                            try manager.allocator.dupe(u8, destination),
+                            try manager.allocator.dupe(u8, logical_key),
+                        );
+                        try manager.root_versions.put(try manager.allocator.dupe(u8, alias), installed_version);
+                        try manager.addRecord(.{
+                            .key = logical_key,
+                            .alias = alias,
+                            .name = installed_name,
+                            .version = installed_version,
+                            .resolution = registry_spec,
+                            .metadata = metadata,
+                            .install_dir = destination,
+                        });
+                        try manager.rememberPackageMetadata(destination, metadata);
+                        try manager.installDependencyObject(metadata, "dependencies", destination, false, false);
+                        if (!manager.options.omit_optional) {
+                            try manager.installDependencyObject(metadata, "optionalDependencies", destination, false, true);
+                        }
+                        try manager.installOrLinkPeerDependencies(metadata, destination, destination, parent_dir);
+                        return installed_version;
+                    }
+                }
             }
             return null;
         }
