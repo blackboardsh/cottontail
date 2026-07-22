@@ -5340,7 +5340,7 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
       const resultSignalNumber = Number(result.signalCode ?? 0);
       signalCode = resultSignalNumber > 0 ? signalName(resultSignalNumber) ?? String(resultSignalNumber) : null;
       exitCode = resultSignalNumber > 0 || result.exitCode == null ? null : Number(result.exitCode);
-      killed = result.killed === true || (killRequested && resultSignalNumber > 0);
+      killed = result.killed === true || resultSignalNumber > 0;
       resourceUsage = normalizeSpawnResourceUsage(result.resourceUsage);
       try {
         terminalProcessExited(terminal, exitCode, signalCode);
