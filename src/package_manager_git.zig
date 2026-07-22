@@ -33,33 +33,11 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !?Spec {
 
     if (githubPathFromURL(source)) |path| return try githubSpec(allocator, path, split.fragment);
 
-    const github_scp_prefix = "git@github.com:";
-    if (std.mem.startsWith(u8, source, github_scp_prefix)) {
-        const path = std.mem.trim(u8, source[github_scp_prefix.len..], "/");
-        const slash = std.mem.indexOfScalar(u8, path, '/') orelse return null;
-        if (slash == 0 or slash + 1 >= path.len) return null;
-        const owner = path[0..slash];
-        var repository = path[slash + 1 ..];
-        if (std.mem.endsWith(u8, repository, ".git")) repository = repository[0 .. repository.len - ".git".len];
-        if (repository.len == 0 or std.mem.indexOfScalar(u8, repository, '/') != null) return null;
-        return .{
-            .kind = .github,
-            .clone_url = try std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}.git", .{ owner, repository }),
-            .lock_prefix = try allocator.dupe(u8, source),
-            .committish = try allocator.dupe(u8, split.fragment),
-        };
-    }
-
     if (githubScpPath(source)) |scp| {
-        const lock_prefix = if (std.mem.startsWith(u8, source, "git+ssh://") or
-            std.mem.startsWith(u8, source, "ssh://"))
-            try allocator.dupe(u8, source)
-        else
-            try std.fmt.allocPrint(allocator, "git+ssh://{s}", .{source});
         return .{
             .kind = .git,
             .clone_url = try std.fmt.allocPrint(allocator, "https://github.com/{s}.git", .{scp.path}),
-            .lock_prefix = lock_prefix,
+            .lock_prefix = try genericLockPrefix(allocator, source),
             .committish = try allocator.dupe(u8, split.fragment),
         };
     }
@@ -79,9 +57,9 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !?Spec {
         else
             try std.fmt.allocPrint(allocator, "{s}/{s}", .{ user, hosted.project });
         return .{
-            .kind = if (hosted.host_provider == .github) .github else .git,
+            .kind = if (hosted.host_provider == .github and hosted.default_representation == .shortcut) .github else .git,
             .clone_url = try std.fmt.allocPrint(allocator, "https://{s}/{s}.git", .{ host, path }),
-            .lock_prefix = try allocator.dupe(u8, source),
+            .lock_prefix = try genericLockPrefix(allocator, source),
             .committish = try allocator.dupe(u8, hosted.committish orelse split.fragment),
         };
     }
@@ -92,11 +70,15 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !?Spec {
         std.mem.startsWith(u8, source, "git@") or
         isScpLike(source))
     {
-        const clone_url = if (std.mem.startsWith(u8, source, "git+")) source["git+".len..] else source;
+        const raw_clone_url = if (std.mem.startsWith(u8, source, "git+")) source["git+".len..] else source;
+        const clone_url = if (std.mem.indexOf(u8, raw_clone_url, "://") == null and isScpLike(raw_clone_url))
+            try scpHttpsURL(allocator, raw_clone_url)
+        else
+            try allocator.dupe(u8, raw_clone_url);
         return .{
             .kind = .git,
-            .clone_url = try allocator.dupe(u8, clone_url),
-            .lock_prefix = try allocator.dupe(u8, source),
+            .clone_url = clone_url,
+            .lock_prefix = try genericLockPrefix(allocator, source),
             .committish = try allocator.dupe(u8, split.fragment),
         };
     }
@@ -163,8 +145,6 @@ pub fn checkout(
     const commit = std.mem.trim(u8, result.stdout, " \t\r\n");
     if (commit.len == 0) return error.GitCommitNotFound;
 
-    const metadata_dir = try std.fs.path.join(allocator, &.{ destination, ".git" });
-    deletePath(io, metadata_dir);
     return .{
         .path = destination,
         .commit = try allocator.dupe(u8, commit),
@@ -226,9 +206,7 @@ fn githubPathFromURL(source: []const u8) ?[]const u8 {
         "http://github.com/",
         "git://github.com/",
         "git+https://github.com/",
-        "git+https://git@github.com/",
-        "git+ssh://git@github.com/",
-        "ssh://git@github.com/",
+        "git+http://github.com/",
     };
     for (prefixes) |prefix| {
         if (std.mem.startsWith(u8, source, prefix)) return source[prefix.len..];
@@ -263,6 +241,26 @@ fn isScpLike(source: []const u8) bool {
         (std.mem.indexOfScalar(u8, source[0..colon], '@') != null or std.mem.indexOfScalar(u8, source[colon + 1 ..], '/') != null);
 }
 
+fn genericLockPrefix(allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
+    if (std.mem.startsWith(u8, source, "git+")) return allocator.dupe(u8, source);
+    if (std.mem.indexOf(u8, source, "://") != null) {
+        return std.fmt.allocPrint(allocator, "git+{s}", .{source});
+    }
+    if (isScpLike(source)) return std.fmt.allocPrint(allocator, "git+ssh://{s}", .{source});
+    return std.fmt.allocPrint(allocator, "git+{s}", .{source});
+}
+
+fn scpHttpsURL(allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
+    const colon = std.mem.indexOfScalar(u8, source, ':') orelse return error.InvalidGitDependency;
+    const authority = source[0..colon];
+    const path = source[colon + 1 ..];
+    var host = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority[at + 1 ..] else authority;
+    if (std.mem.eql(u8, host, "bitbucket")) host = "bitbucket.org";
+    if (std.mem.eql(u8, host, "github")) host = "github.com";
+    if (std.mem.eql(u8, host, "gitlab")) host = "gitlab.com";
+    return std.fmt.allocPrint(allocator, "https://{s}/{s}", .{ host, path });
+}
+
 fn isCommitishHash(value: []const u8) bool {
     if (value.len < 7 or value.len > 40) return false;
     for (value) |byte| if (!std.ascii.isHex(byte)) return false;
@@ -291,9 +289,9 @@ test "parse GitHub and generic git dependency forms" {
     try std.testing.expect(try matches(allocator, "git+https://example.com/owner/repo.git#abcdef012345", "git+https://example.com/owner/repo.git#abcdef0"));
 
     const scp = (try parse(allocator, "git@github.com:owner/repo.git#main")).?;
-    try std.testing.expectEqual(Kind.github, scp.kind);
+    try std.testing.expectEqual(Kind.git, scp.kind);
     try std.testing.expectEqualStrings("https://github.com/owner/repo.git", scp.clone_url);
-    try std.testing.expectEqualStrings("git@github.com:owner/repo.git", scp.lock_prefix);
+    try std.testing.expectEqualStrings("git+ssh://git@github.com:owner/repo.git", scp.lock_prefix);
 
     const custom_user_scp = (try parse(allocator, "bun@github.com:owner/repo.git#main")).?;
     try std.testing.expectEqual(Kind.git, custom_user_scp.kind);

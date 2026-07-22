@@ -8496,18 +8496,32 @@ const Manager = struct {
                 const project_cache_dir = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules", ".cache" });
                 try std.Io.Dir.cwd().createDirPath(manager.init_data.io, project_cache_dir);
                 const cache_name = try gitCacheFolderName(manager.allocator, spec, requested, commit);
-                const project_cache_path = try std.fs.path.join(manager.allocator, &.{ project_cache_dir, cache_name });
                 const bun_tag_path = try std.fs.path.join(manager.allocator, &.{ checkout.path, ".bun-tag" });
                 try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = bun_tag_path, .data = commit });
-                deletePath(manager.init_data.io, project_cache_path);
-                try copyDirectoryTree(manager.init_data.io, manager.allocator, checkout.path, project_cache_path);
-                if (!std.mem.eql(u8, alias, package_name)) {
-                    const alias_cache_dir = try std.fs.path.join(manager.allocator, &.{ project_cache_dir, alias });
-                    try std.Io.Dir.cwd().createDirPath(manager.init_data.io, alias_cache_dir);
-                    const alias_cache_link = try std.fs.path.join(manager.allocator, &.{ alias_cache_dir, gitCacheAliasName(cache_name) });
-                    try manager.linkDirectoryAt(alias_cache_link, project_cache_path);
+                if (spec.kind == .github) {
+                    const project_cache_path = try std.fs.path.join(manager.allocator, &.{ project_cache_dir, cache_name });
+                    deletePath(manager.init_data.io, project_cache_path);
+                    try copyDirectoryTree(manager.init_data.io, manager.allocator, checkout.path, project_cache_path);
+                    if (!std.mem.eql(u8, alias, package_name)) {
+                        const alias_cache_dir = try std.fs.path.join(manager.allocator, &.{ project_cache_dir, alias });
+                        try std.Io.Dir.cwd().createDirPath(manager.init_data.io, alias_cache_dir);
+                        const alias_cache_link = try std.fs.path.join(manager.allocator, &.{ alias_cache_dir, gitCacheAliasName(cache_name) });
+                        try manager.linkDirectoryAt(alias_cache_link, project_cache_path);
+                    }
+                    install_source_path = project_cache_path;
+                } else {
+                    const clone_cache_path = try std.fs.path.join(manager.allocator, &.{ project_cache_dir, cache_name });
+                    const metadata_path = try std.fs.path.join(manager.allocator, &.{ checkout.path, ".git" });
+                    deletePath(manager.init_data.io, clone_cache_path);
+                    try copyDirectoryTree(manager.init_data.io, manager.allocator, metadata_path, clone_cache_path);
+                    deletePath(manager.init_data.io, metadata_path);
+
+                    const checkout_cache_name = try std.fmt.allocPrint(manager.allocator, "@G@{s}", .{commit});
+                    const checkout_cache_path = try std.fs.path.join(manager.allocator, &.{ project_cache_dir, checkout_cache_name });
+                    deletePath(manager.init_data.io, checkout_cache_path);
+                    try copyDirectoryTree(manager.init_data.io, manager.allocator, checkout.path, checkout_cache_path);
+                    install_source_path = checkout_cache_path;
                 }
-                install_source_path = project_cache_path;
             }
             if (locked_selection == null) {
                 peer_context = try manager.peerContextForPackage(metadata, parent_dir, true);
@@ -8614,37 +8628,40 @@ const Manager = struct {
                 return error.InvalidGitMetadata;
             reference = jsonString(&metadata, "default_branch") orelse "HEAD";
         }
-        const abbreviated = reference[0..@min(reference.len, 7)];
         const repository_slug = try manager.allocator.dupe(u8, repository);
         std.mem.replaceScalar(u8, repository_slug, '/', '-');
-        const resolved_name = try std.fmt.allocPrint(manager.allocator, "{s}-{s}", .{
+        const requested_name = try std.fmt.allocPrint(manager.allocator, "{s}-{s}", .{
             repository_slug,
-            abbreviated,
+            reference[0..@min(reference.len, 7)],
         });
         const cache_dir = try packageCachePath(manager.init_data, manager.allocator);
         try std.Io.Dir.cwd().createDirPath(manager.init_data.io, cache_dir);
-        const archive_path = try std.fs.path.join(manager.allocator, &.{ cache_dir, try std.fmt.allocPrint(manager.allocator, "{s}.tgz", .{resolved_name}) });
-        const archive = (try readOptionalFile(manager.init_data.io, manager.allocator, archive_path, max_tarball_bytes)) orelse blk: {
-            const archive_url = if (manager.init_data.environ_map.get("GITHUB_API_URL")) |configured_api|
-                try std.fmt.allocPrint(manager.allocator, "{s}/repos/{s}/tarball/{s}", .{ std.mem.trimEnd(u8, configured_api, "/"), repository, reference })
-            else
-                try std.fmt.allocPrint(manager.allocator, "https://codeload.github.com/{s}/tar.gz/{s}", .{ repository, reference });
+        const archive_path = try std.fs.path.join(manager.allocator, &.{ cache_dir, try std.fmt.allocPrint(manager.allocator, "{s}.tgz", .{requested_name}) });
+        var archive = try readOptionalFile(manager.init_data.io, manager.allocator, archive_path, max_tarball_bytes);
+        var archive_identity = if (archive) |bytes| try githubArchiveIdentity(manager.allocator, bytes) else null;
+        if (archive == null or archive_identity == null) {
+            const api_base = std.mem.trimEnd(u8, manager.init_data.environ_map.get("GITHUB_API_URL") orelse "https://api.github.com", "/");
+            const archive_url = try std.fmt.allocPrint(manager.allocator, "{s}/repos/{s}/tarball/{s}", .{ api_base, repository, reference });
             const downloaded = try manager.fetchBytes(archive_url, false, max_tarball_bytes);
             try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = archive_path, .data = downloaded });
-            break :blk downloaded;
-        };
-        if (manager.options.verify_integrity) try verifyIntegrity(archive, expected_integrity);
-        const integrity = try sha512Integrity(manager.allocator, archive);
+            archive = downloaded;
+            archive_identity = try githubArchiveIdentity(manager.allocator, downloaded);
+        }
+        const archive_bytes = archive.?;
+        if (manager.options.verify_integrity) try verifyIntegrity(archive_bytes, expected_integrity);
+        const integrity = try sha512Integrity(manager.allocator, archive_bytes);
+        const resolved_name = if (archive_identity) |identity| identity.root_name else requested_name;
+        const commit = if (archive_identity) |identity| identity.commit else reference;
 
         deletePath(manager.init_data.io, destination);
         try std.Io.Dir.cwd().createDirPath(manager.init_data.io, destination);
         var destination_dir = try std.Io.Dir.cwd().openDir(manager.init_data.io, destination, .{});
         defer destination_dir.close(manager.init_data.io);
-        try extractTarballArchive(manager.init_data.io, manager.allocator, destination_dir, archive);
+        try extractTarballArchive(manager.init_data.io, manager.allocator, destination_dir, archive_bytes);
         return .{
             .checkout = .{
                 .path = destination,
-                .commit = try manager.allocator.dupe(u8, reference),
+                .commit = try manager.allocator.dupe(u8, commit),
             },
             .integrity = integrity,
             .resolved_name = resolved_name,
@@ -11650,7 +11667,10 @@ fn directLocalDisplay(spec: []const u8) []const u8 {
 }
 
 fn isTarballSpec(spec: []const u8) bool {
-    return std.mem.endsWith(u8, spec, ".tgz") or std.mem.endsWith(u8, spec, ".tar.gz");
+    return std.mem.endsWith(u8, spec, ".tgz") or
+        std.mem.endsWith(u8, spec, ".tar.gz") or
+        ((std.mem.startsWith(u8, spec, "http://") or std.mem.startsWith(u8, spec, "https://")) and
+            !isGitSpec(spec));
 }
 
 fn isRemoteTarballSpec(spec: []const u8) bool {
@@ -11691,6 +11711,7 @@ fn isGitSpec(spec: []const u8) bool {
 }
 
 fn displayGitResolution(allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
+    if (!std.mem.startsWith(u8, source, "github:")) return source;
     const hash = std.mem.lastIndexOfScalar(u8, source, '#') orelse return source;
     const commit = source[hash + 1 ..];
     if (commit.len <= 7) return source;
@@ -11730,7 +11751,11 @@ fn gitCacheFolderName(allocator: std.mem.Allocator, spec: Git.Spec, requested: [
             std.mem.indexOfScalar(u8, scp_identity, ':') != null)
         {
             clone_identity = scp_identity;
+        } else {
+            clone_identity = clone_identity["git+".len..];
         }
+    } else if (std.mem.startsWith(u8, clone_identity, "git+")) {
+        clone_identity = clone_identity["git+".len..];
     }
     var hasher = compiler.Wyhash11.init(0);
     hasher.update(clone_identity);
@@ -12127,6 +12152,42 @@ fn verifyIntegrity(bytes: []const u8, integrity: ?[]const u8) !void {
     var actual: [64]u8 = undefined;
     std.crypto.hash.sha2.Sha512.hash(bytes, &actual, .{});
     if (!std.crypto.timing_safe.eql([64]u8, expected, actual)) return error.IntegrityCheckFailed;
+}
+
+const GithubArchiveIdentity = struct {
+    root_name: []const u8,
+    commit: []const u8,
+};
+
+fn githubArchiveIdentity(allocator: std.mem.Allocator, archive: []const u8) !?GithubArchiveIdentity {
+    var compressed_reader: std.Io.Reader = .fixed(archive);
+    var decompression_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompressor: std.compress.flate.Decompress = .init(&compressed_reader, .gzip, &decompression_buffer);
+    var file_name_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var link_name_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var diagnostics: std.tar.Diagnostics = .{ .allocator = allocator };
+    defer diagnostics.deinit();
+
+    var iterator: std.tar.Iterator = .init(&decompressor.reader, .{
+        .file_name_buffer = &file_name_buffer,
+        .link_name_buffer = &link_name_buffer,
+        .diagnostics = &diagnostics,
+    });
+    while (try iterator.next()) |entry| {
+        var path = std.mem.trimStart(u8, entry.name, "./");
+        if (path.len == 0) continue;
+        const slash = std.mem.indexOfScalar(u8, path, '/') orelse path.len;
+        path = path[0..slash];
+        const separator = std.mem.lastIndexOfScalar(u8, path, '-') orelse return null;
+        const commit = path[separator + 1 ..];
+        if (commit.len < 7 or commit.len > 40) return null;
+        for (commit) |byte| if (!std.ascii.isHex(byte)) return null;
+        return .{
+            .root_name = try allocator.dupe(u8, path),
+            .commit = try allocator.dupe(u8, commit),
+        };
+    }
+    return null;
 }
 
 pub fn extractTarballArchive(
