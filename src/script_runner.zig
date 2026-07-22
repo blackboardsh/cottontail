@@ -4795,6 +4795,8 @@ fn bundleScriptNative(
     const script_abs = try resolvePathForCwd(ctx.io, ctx.allocator, script_path);
     const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
     const is_test_cli_execution = ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null;
+    const is_test_runtime_execution = is_test_cli_execution or
+        ctx.environ_map.get("COTTONTAIL_TEST_FILE_COUNT") != null;
     var package_json_patch = try maybePatchEmptyPackageJsonForBundle(ctx, script_dir);
     defer restoreEmptyMetadataPatch(ctx, &package_json_patch);
 
@@ -4805,7 +4807,7 @@ fn bundleScriptNative(
         .has_graph_output = graph_out != null,
         .standalone_compile = standalone_compile,
         .tracks_reload_dependencies = reload_dependencies_out != null,
-        .test_cli_execution = is_test_cli_execution,
+        .test_cli_execution = is_test_runtime_execution,
         .wasm_entrypoint = is_wasm_entrypoint,
     });
     // CommonJS already has a runtime-only Module.runMain() launcher. Route
