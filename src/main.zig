@@ -310,6 +310,28 @@ fn runtimeFlagTakesValue(arg: []const u8) bool {
     return false;
 }
 
+fn missingProfilerOptionValue(args: []const [:0]const u8) ?[]const u8 {
+    if (args.len <= 1) return null;
+    var index: usize = if (std.mem.eql(u8, args[1], "run") or std.mem.eql(u8, args[1], "test")) 2 else 1;
+    while (index < args.len) {
+        const arg: []const u8 = args[index];
+        if (std.mem.eql(u8, arg, "--") or !std.mem.startsWith(u8, arg, "-")) return null;
+        const profiler_value_flag = std.mem.eql(u8, arg, "--cpu-prof-dir") or
+            std.mem.eql(u8, arg, "--cpu-prof-name") or
+            std.mem.eql(u8, arg, "--cpu-prof-interval") or
+            std.mem.eql(u8, arg, "--heap-prof-dir") or
+            std.mem.eql(u8, arg, "--heap-prof-name");
+        if (profiler_value_flag and
+            (index + 1 >= args.len or std.mem.startsWith(u8, args[index + 1], "-")))
+        {
+            return arg;
+        }
+        if (runtimeFlagTakesValue(arg) and index + 1 < args.len) index += 1;
+        index += 1;
+    }
+    return null;
+}
+
 fn isRuntimeFlag(arg: []const u8) bool {
     if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "-i")) return true;
     return std.mem.startsWith(u8, arg, "--");
@@ -2711,6 +2733,14 @@ pub fn main(init: std.process.Init) !void {
         try stdout.print("{s}+{s}\n", .{ commandDisplayVersion(init), revision_suffix });
         try stdout.flush();
         return;
+    }
+
+    if (missingProfilerOptionValue(args)) |flag| {
+        try printHelp(stdout);
+        try stdout.flush();
+        try stderr.print("error: The argument '{s}' requires a value but none was supplied.\n", .{flag});
+        try stderr.flush();
+        std.process.exit(1);
     }
 
     if (std.mem.eql(u8, arg, "init")) {

@@ -2876,6 +2876,7 @@ fn runScriptExecution(execution: *ScriptExecution) void {
     }
     const profiler_options = parseCpuProfileOptions(execution.exec_args);
     const heap_profile_options = parseHeapProfileOptions(execution.exec_args);
+    writeCpuProfileWarnings(execution.io, profiler_options);
     writeHeapProfileWarnings(execution.io, heap_profile_options);
     var js_runtime = runtime.Runtime.initWithStackSize(
         execution.io,
@@ -2887,6 +2888,14 @@ fn runScriptExecution(execution: *ScriptExecution) void {
         return;
     };
     defer js_runtime.deinit();
+
+    // COTTONTAIL-COMPAT: Stock JSCOnly can export the sampling API while being
+    // built without ENABLE(SAMPLING_PROFILER). Never synthesize a profile when
+    // the engine reports that sampling is unavailable.
+    const cpu_profiler_started = profiler_options.enabled() and js_runtime.enableSamplingProfiler();
+    if (profiler_options.enabled() and !cpu_profiler_started) {
+        writeStderr(execution.io, "cottontail: failed to enable the JSC sampling profiler\n", .{});
+    }
 
     if (execution.exit_cleanup_path) |path| {
         js_runtime.setExitCleanupPath(path) catch {
@@ -2952,7 +2961,7 @@ fn runScriptExecution(execution: *ScriptExecution) void {
         }
         break :blk js_runtime.runSource(source, execution.runnable_path);
     } else js_runtime.runFile(execution.runnable_path);
-    if (profiler_options.enabled()) {
+    if (cpu_profiler_started) {
         const raw_profile = js_runtime.takeSamplingProfile() catch |err| profile: {
             writeStderr(execution.io, "cottontail: failed to collect CPU profile: {s}\n", .{@errorName(err)});
             execution.exit_code = 1;
@@ -2967,6 +2976,8 @@ fn runScriptExecution(execution: *ScriptExecution) void {
             writeStderr(execution.io, "cottontail: JSC returned no CPU profile\n", .{});
             execution.exit_code = 1;
         }
+    } else if (profiler_options.enabled()) {
+        execution.exit_code = 1;
     }
     if (heap_profile_options.enabled()) {
         writeHeapProfile(execution, &js_runtime, heap_profile_options) catch |err| {
@@ -3034,10 +3045,7 @@ fn heapProfileDefaultName(
 ) ![]const u8 {
     const now_ns = std.Io.Clock.real.now(io).nanoseconds;
     const timestamp_us: u64 = @intCast(@max(0, @divTrunc(now_ns, 1000)));
-    const pid = if (builtin.os.tag == .windows)
-        std.os.windows.GetCurrentProcessId()
-    else
-        std.c.getpid();
+    const pid = profileProcessId();
     const extension = if (format == .markdown) "md" else "heapsnapshot";
     return try std.fmt.allocPrint(allocator, "Heap.{d}.{d}.{s}", .{ timestamp_us, pid, extension });
 }
@@ -3047,11 +3055,14 @@ fn heapProfilePath(
     allocator: std.mem.Allocator,
     options: HeapProfileOptions,
 ) ![]const u8 {
-    const name = options.name orelse try heapProfileDefaultName(io, allocator, options.format());
-    return if (options.dir) |dir|
-        try std.fs.path.join(allocator, &.{ dir, name })
+    const name = if (options.name) |configured|
+        if (configured.len > 0) configured else try heapProfileDefaultName(io, allocator, options.format())
     else
-        name;
+        try heapProfileDefaultName(io, allocator, options.format());
+    if (options.dir) |dir| {
+        if (dir.len > 0) return try std.fs.path.join(allocator, &.{ dir, name });
+    }
+    return name;
 }
 
 fn writeHeapProfile(
@@ -3081,7 +3092,8 @@ const CpuProfileOptions = struct {
     markdown: bool = false,
     dir: ?[]const u8 = null,
     name: ?[]const u8 = null,
-    interval_us: u64 = 1000,
+    interval_us: u32 = 1000,
+    interval_supplied: bool = false,
 
     fn enabled(self: CpuProfileOptions) bool {
         return self.json or self.markdown;
@@ -3111,13 +3123,27 @@ fn parseCpuProfileOptions(args: []const [:0]const u8) CpuProfileOptions {
         } else if (std.mem.eql(u8, arg, "--cpu-prof-name") and index + 1 < args.len) {
             options.name = args[index + 1];
         } else if (std.mem.startsWith(u8, arg, "--cpu-prof-interval=")) {
-            options.interval_us = std.fmt.parseUnsigned(u64, arg["--cpu-prof-interval=".len..], 10) catch options.interval_us;
+            options.interval_supplied = true;
+            options.interval_us = std.fmt.parseUnsigned(u32, arg["--cpu-prof-interval=".len..], 10) catch 1000;
         } else if (std.mem.eql(u8, arg, "--cpu-prof-interval") and index + 1 < args.len) {
-            options.interval_us = std.fmt.parseUnsigned(u64, args[index + 1], 10) catch options.interval_us;
+            options.interval_supplied = true;
+            options.interval_us = std.fmt.parseUnsigned(u32, args[index + 1], 10) catch 1000;
         }
     }
-    if (options.interval_us == 0) options.interval_us = 1000;
     return options;
+}
+
+fn writeCpuProfileWarnings(io: std.Io, options: CpuProfileOptions) void {
+    if (options.enabled()) return;
+    if (options.name != null) {
+        writeStderr(io, "warn: --cpu-prof-name requires --cpu-prof or --cpu-prof-md to be enabled\n", .{});
+    }
+    if (options.dir != null) {
+        writeStderr(io, "warn: --cpu-prof-dir requires --cpu-prof or --cpu-prof-md to be enabled\n", .{});
+    }
+    if (options.interval_supplied) {
+        writeStderr(io, "warn: --cpu-prof-interval requires --cpu-prof or --cpu-prof-md to be enabled\n", .{});
+    }
 }
 
 const CpuCallFrame = struct {
@@ -3194,7 +3220,7 @@ fn buildCpuProfile(
     io: std.Io,
     allocator: std.mem.Allocator,
     raw_profile: []const u8,
-    configured_interval_us: u64,
+    configured_interval_us: u32,
 ) !BuiltCpuProfile {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_profile, .{});
     if (parsed.value != .object) return error.InvalidCpuProfile;
@@ -3229,7 +3255,7 @@ fn buildCpuProfile(
 
     const raw_interval_seconds = if (raw_object.get("interval")) |value| jsonNumber(value) orelse 0.001 else 0.001;
     const interval_us: u64 = if (configured_interval_us != 1000)
-        configured_interval_us
+        @as(u64, configured_interval_us)
     else
         @max(1, @as(u64, @intFromFloat(@max(0.000001, raw_interval_seconds) * 1_000_000.0)));
     var first_timestamp: ?f64 = null;
@@ -3375,33 +3401,61 @@ fn cpuProfileMarkdown(allocator: std.mem.Allocator, profile: BuiltCpuProfile) ![
     return output.items;
 }
 
+fn profileProcessId() u32 {
+    return if (builtin.os.tag == .windows)
+        std.os.windows.GetCurrentProcessId()
+    else
+        @intCast(std.c.getpid());
+}
+
+fn cpuProfileDefaultName(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    markdown: bool,
+) ![]const u8 {
+    const now_ns = std.Io.Clock.real.now(io).nanoseconds;
+    const timestamp_us: u64 = @intCast(@max(0, @divTrunc(now_ns, 1000)));
+    const extension = if (markdown) "md" else "cpuprofile";
+    return try std.fmt.allocPrint(allocator, "CPU.{d}.{d}.{s}", .{ timestamp_us, profileProcessId(), extension });
+}
+
 fn cpuProfilePath(
+    io: std.Io,
     allocator: std.mem.Allocator,
     options: CpuProfileOptions,
-    default_name: []const u8,
-    use_custom_name: bool,
+    markdown: bool,
 ) ![]const u8 {
-    const name = if (use_custom_name) options.name orelse default_name else default_name;
-    if (options.dir) |dir| return try std.fs.path.join(allocator, &.{ dir, name });
+    const name = name: {
+        if (options.name) |configured| {
+            if (configured.len > 0) {
+                if (options.json and options.markdown) {
+                    const extension = if (markdown) ".md" else ".cpuprofile";
+                    break :name try std.fmt.allocPrint(allocator, "{s}{s}", .{ configured, extension });
+                }
+                break :name configured;
+            }
+        }
+        break :name try cpuProfileDefaultName(io, allocator, markdown);
+    };
+    if (options.dir) |dir| {
+        if (dir.len > 0) return try std.fs.path.join(allocator, &.{ dir, name });
+    }
     return name;
 }
 
 fn writeCpuProfiles(execution: *ScriptExecution, options: CpuProfileOptions, raw_profile: []const u8) !void {
     const profile = try buildCpuProfile(execution.io, execution.allocator, raw_profile, options.interval_us);
-    if (options.dir) |dir| try std.Io.Dir.cwd().createDirPath(execution.io, dir);
+    if (options.dir) |dir| {
+        if (dir.len > 0) try std.Io.Dir.cwd().createDirPath(execution.io, dir);
+    }
 
-    const suffix = try std.fmt.allocPrint(execution.allocator, "{d}", .{profile.chrome.endTime});
     if (options.json) {
-        const default_name = try std.fmt.allocPrint(execution.allocator, "CPU.{s}.cpuprofile", .{suffix});
-        const use_custom_name = options.name != null and (!options.markdown or std.mem.endsWith(u8, options.name.?, ".cpuprofile"));
-        const path = try cpuProfilePath(execution.allocator, options, default_name, use_custom_name);
+        const path = try cpuProfilePath(execution.io, execution.allocator, options, false);
         const json = try std.json.Stringify.valueAlloc(execution.allocator, profile.chrome, .{});
         try std.Io.Dir.cwd().writeFile(execution.io, .{ .sub_path = path, .data = json });
     }
     if (options.markdown) {
-        const default_name = try std.fmt.allocPrint(execution.allocator, "CPU.{s}.md", .{suffix});
-        const use_custom_name = options.name != null and (!options.json or std.mem.endsWith(u8, options.name.?, ".md"));
-        const path = try cpuProfilePath(execution.allocator, options, default_name, use_custom_name);
+        const path = try cpuProfilePath(execution.io, execution.allocator, options, true);
         const markdown = try cpuProfileMarkdown(execution.allocator, profile);
         try std.Io.Dir.cwd().writeFile(execution.io, .{ .sub_path = path, .data = markdown });
     }
