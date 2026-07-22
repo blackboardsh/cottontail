@@ -44,12 +44,14 @@ export class Session extends EventEmitter {
     this._polling = false;
   }
 
-  connect() {
+  _connect(mainThread) {
     if (this.connected) {
       throw inspectorError("The inspector session is already connected", "ERR_INSPECTOR_ALREADY_CONNECTED");
     }
     try {
-      this._nativeId = nativeInspector.inspectorSessionConnect();
+      this._nativeId = mainThread
+        ? nativeInspector.inspectorSessionConnectToMainThread()
+        : nativeInspector.inspectorSessionConnect();
     } catch (cause) {
       const error = inspectorError(cause?.message ?? String(cause), "ERR_INSPECTOR_NOT_AVAILABLE");
       error.cause = cause;
@@ -61,8 +63,12 @@ export class Session extends EventEmitter {
     this._pollTimer?.unref?.();
   }
 
+  connect() {
+    this._connect(false);
+  }
+
   connectToMainThread() {
-    this.connect();
+    this._connect(true);
   }
 
   _poll() {

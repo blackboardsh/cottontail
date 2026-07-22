@@ -19,6 +19,8 @@ extern bool ct_jsc_string_is_8_bit(JSStringRef string);
 extern void ct_jsc_initialize_main_thread(void);
 #endif
 extern void ct_jsc_run_loop_cycle(void);
+extern void *ct_jsc_run_loop_current(void);
+extern void ct_jsc_run_loop_dispatch(void *run_loop, void (*callback)(void *), void *context);
 extern void ct_jsc_drain_microtasks(JSContextRef context);
 extern void *ct_jsc_microtask_delay_begin(JSContextGroupRef group);
 extern void ct_jsc_microtask_delay_end(void *opaque_scope);
@@ -39,6 +41,8 @@ extern size_t ct_jsc_copy_protected_objects(JSContextRef context, JSValueRef *va
 typedef struct CtJscInspector CtJscInspector;
 extern CtJscInspector *ct_jsc_inspector_create(JSGlobalContextRef context, char **error_out);
 extern void ct_jsc_inspector_destroy(CtJscInspector *inspector);
+extern void ct_jsc_inspector_retain(CtJscInspector *inspector);
+extern void ct_jsc_inspector_release(CtJscInspector *inspector);
 extern int ct_jsc_inspector_start_server(
     CtJscInspector *inspector,
     const char *host,
@@ -48,9 +52,36 @@ extern int ct_jsc_inspector_start_server(
     char **url_out,
     char **error_out
 );
+extern int ct_jsc_inspector_start_unix_server(
+    CtJscInspector *inspector,
+    const char *unix_path,
+    bool pause_on_start,
+    char **url_out,
+    char **error_out
+);
+extern int ct_jsc_inspector_connect_tcp(
+    CtJscInspector *inspector,
+    const char *host,
+    uint16_t port,
+    bool pause_on_start,
+    char **error_out
+);
+extern int ct_jsc_inspector_connect_unix(
+    CtJscInspector *inspector,
+    const char *unix_path,
+    bool pause_on_start,
+    char **error_out
+);
+extern int ct_jsc_inspector_connect_fd(
+    CtJscInspector *inspector,
+    int fd,
+    bool pause_on_start,
+    char **error_out
+);
 extern void ct_jsc_inspector_stop_server(CtJscInspector *inspector);
 extern char *ct_jsc_inspector_copy_url(CtJscInspector *inspector);
 extern bool ct_jsc_inspector_has_server(CtJscInspector *inspector);
+extern bool ct_jsc_inspector_keeps_event_loop_alive(CtJscInspector *inspector);
 extern int ct_jsc_inspector_wait_for_connection(CtJscInspector *inspector);
 extern uint64_t ct_jsc_inspector_connect_local(CtJscInspector *inspector);
 extern int ct_jsc_inspector_send_local(CtJscInspector *inspector, uint64_t id, const char *message);
@@ -1280,6 +1311,13 @@ typedef struct CtFdEvent {
 
 typedef struct CtWorker CtWorker;
 
+typedef struct CtInspectorSessionRoute {
+    uint64_t id;
+    uint64_t inspector_id;
+    CtJscInspector *inspector;
+    struct CtInspectorSessionRoute *next;
+} CtInspectorSessionRoute;
+
 typedef struct CtSharedBuffer {
     uint32_t id;
     uint8_t *bytes;
@@ -1846,6 +1884,11 @@ struct CtJscRuntime {
     JSGlobalContextRef context;
     JSObjectRef host_object;
     CtJscInspector *inspector;
+    pthread_mutex_t inspector_mutex;
+    void *inspector_run_loop;
+    CtInspectorSessionRoute *inspector_sessions;
+    uint64_t next_inspector_session_id;
+    bool inspector_destroying;
     char *exit_cleanup_path;
     JSObjectRef spawn_event_handler;
     JSObjectRef fd_event_handler;
@@ -23218,6 +23261,119 @@ static bool ct_runtime_ensure_inspector(CtJscRuntime *runtime, char **error_out)
     return runtime->inspector != NULL;
 }
 
+typedef struct CtInspectorCreateRequest {
+    CtJscRuntime *runtime;
+    uv_sem_t completed;
+    char *error;
+} CtInspectorCreateRequest;
+
+static void ct_inspector_create_on_runtime(void *opaque) {
+    CtInspectorCreateRequest *request = (CtInspectorCreateRequest *)opaque;
+    (void)ct_runtime_ensure_inspector(request->runtime, &request->error);
+    uv_sem_post(&request->completed);
+}
+
+static CtJscInspector *ct_runtime_retain_session_inspector(
+    CtJscRuntime *runtime,
+    bool main_thread,
+    char **error_out
+) {
+    if (error_out != NULL) *error_out = NULL;
+    if (runtime == NULL) {
+        ct_set_error_out(error_out, ct_duplicate_string("Inspector is unavailable"));
+        return NULL;
+    }
+
+    if (!main_thread || runtime->worker == NULL) {
+        if (!ct_runtime_ensure_inspector(runtime, error_out)) return NULL;
+        ct_jsc_inspector_retain(runtime->inspector);
+        return runtime->inspector;
+    }
+
+    CtWorker *worker = runtime->worker;
+    pthread_mutex_lock(&worker->mutex);
+    CtJscRuntime *parent = worker->parent_runtime;
+    if (parent == NULL) {
+        pthread_mutex_unlock(&worker->mutex);
+        ct_set_error_out(error_out, ct_duplicate_string("Main thread inspector is unavailable"));
+        return NULL;
+    }
+    pthread_mutex_lock(&parent->inspector_mutex);
+    pthread_mutex_unlock(&worker->mutex);
+
+    if (parent->inspector_destroying) {
+        pthread_mutex_unlock(&parent->inspector_mutex);
+        ct_set_error_out(error_out, ct_duplicate_string("Main thread inspector is unavailable"));
+        return NULL;
+    }
+
+    if (parent->inspector == NULL) {
+        CtInspectorCreateRequest request = {
+            .runtime = parent,
+            .error = NULL,
+        };
+        if (uv_sem_init(&request.completed, 0) != 0) {
+            pthread_mutex_unlock(&parent->inspector_mutex);
+            ct_set_error_out(error_out, ct_duplicate_string("Unable to synchronize main thread inspector"));
+            return NULL;
+        }
+        ct_jsc_run_loop_dispatch(parent->inspector_run_loop, ct_inspector_create_on_runtime, &request);
+        ct_runtime_wake(parent);
+        uv_sem_wait(&request.completed);
+        uv_sem_destroy(&request.completed);
+        if (parent->inspector == NULL) {
+            pthread_mutex_unlock(&parent->inspector_mutex);
+            ct_set_error_out(error_out, request.error != NULL
+                ? request.error
+                : ct_duplicate_string("Main thread inspector is unavailable"));
+            return NULL;
+        }
+        free(request.error);
+    }
+
+    CtJscInspector *inspector = parent->inspector;
+    ct_jsc_inspector_retain(inspector);
+    pthread_mutex_unlock(&parent->inspector_mutex);
+    return inspector;
+}
+
+static CtInspectorSessionRoute *ct_inspector_session_route(
+    CtJscRuntime *runtime,
+    uint64_t id
+) {
+    if (runtime == NULL || id == 0) return NULL;
+    for (CtInspectorSessionRoute *route = runtime->inspector_sessions; route != NULL; route = route->next) {
+        if (route->id == id) return route;
+    }
+    return NULL;
+}
+
+static void ct_inspector_session_disconnect_route(
+    CtJscRuntime *runtime,
+    uint64_t id
+) {
+    if (runtime == NULL || id == 0) return;
+    CtInspectorSessionRoute **cursor = &runtime->inspector_sessions;
+    while (*cursor != NULL) {
+        CtInspectorSessionRoute *route = *cursor;
+        if (route->id != id) {
+            cursor = &route->next;
+            continue;
+        }
+        *cursor = route->next;
+        ct_jsc_inspector_disconnect_local(route->inspector, route->inspector_id);
+        ct_jsc_inspector_release(route->inspector);
+        free(route);
+        return;
+    }
+}
+
+static void ct_inspector_sessions_disconnect_all(CtJscRuntime *runtime) {
+    if (runtime == NULL) return;
+    while (runtime->inspector_sessions != NULL)
+        ct_inspector_session_disconnect_route(runtime, runtime->inspector_sessions->id);
+}
+
 static JSValueRef ct_inspector_open_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
     CtJscRuntime *runtime = ct_callback_runtime(function);
@@ -23306,30 +23462,65 @@ static bool ct_inspector_session_id(JSContextRef ctx, JSValueRef value, uint64_t
     return true;
 }
 
-static JSValueRef ct_inspector_session_connect_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)thisObject;
-    (void)argc;
-    (void)argv;
+static JSValueRef ct_inspector_session_connect_impl(
+    JSContextRef ctx,
+    JSObjectRef function,
+    JSValueRef *exception,
+    bool main_thread
+) {
     CtJscRuntime *runtime = ct_callback_runtime(function);
     char *error = NULL;
-    if (!ct_runtime_ensure_inspector(runtime, &error)) {
+    CtJscInspector *inspector = ct_runtime_retain_session_inspector(runtime, main_thread, &error);
+    if (inspector == NULL) {
         ct_throw_message(ctx, exception, error != NULL ? error : "Inspector is unavailable");
         free(error);
         return JSValueMakeUndefined(ctx);
     }
-    uint64_t id = ct_jsc_inspector_connect_local(runtime->inspector);
-    if (id == 0) {
-        ct_throw_message(ctx, exception, "Unable to connect inspector session");
+    free(error);
+
+    uint64_t inspector_id = ct_jsc_inspector_connect_local(inspector);
+    CtInspectorSessionRoute *route = inspector_id != 0
+        ? (CtInspectorSessionRoute *)calloc(1, sizeof(CtInspectorSessionRoute))
+        : NULL;
+    if (route == NULL) {
+        if (inspector_id != 0) ct_jsc_inspector_disconnect_local(inspector, inspector_id);
+        ct_jsc_inspector_release(inspector);
+        ct_throw_message(ctx, exception, inspector_id == 0
+            ? "Unable to connect inspector session"
+            : "Out of memory connecting inspector session");
         return JSValueMakeUndefined(ctx);
     }
-    return JSValueMakeNumber(ctx, (double)id);
+
+    runtime->next_inspector_session_id += 1;
+    if (runtime->next_inspector_session_id == 0 || runtime->next_inspector_session_id > 9007199254740991ULL)
+        runtime->next_inspector_session_id = 1;
+    route->id = runtime->next_inspector_session_id;
+    route->inspector_id = inspector_id;
+    route->inspector = inspector;
+    route->next = runtime->inspector_sessions;
+    runtime->inspector_sessions = route;
+    return JSValueMakeNumber(ctx, (double)route->id);
+}
+
+static JSValueRef ct_inspector_session_connect_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    return ct_inspector_session_connect_impl(ctx, function, exception, false);
+}
+
+static JSValueRef ct_inspector_session_connect_to_main_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    return ct_inspector_session_connect_impl(ctx, function, exception, true);
 }
 
 static JSValueRef ct_inspector_session_send_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
     CtJscRuntime *runtime = ct_callback_runtime(function);
     uint64_t id = 0;
-    if (runtime == NULL || runtime->inspector == NULL || argc < 2 ||
+    if (runtime == NULL || argc < 2 ||
         !ct_inspector_session_id(ctx, argc > 0 ? argv[0] : NULL, &id, exception)) {
         if (exception != NULL && *exception == NULL) ct_throw_message(ctx, exception, "Inspector session is not connected");
         return JSValueMakeUndefined(ctx);
@@ -23339,7 +23530,10 @@ static JSValueRef ct_inspector_session_send_host(JSContextRef ctx, JSObjectRef f
         ct_throw_message(ctx, exception, "Out of memory");
         return JSValueMakeUndefined(ctx);
     }
-    int status = ct_jsc_inspector_send_local(runtime->inspector, id, message);
+    CtInspectorSessionRoute *route = ct_inspector_session_route(runtime, id);
+    int status = route != NULL
+        ? ct_jsc_inspector_send_local(route->inspector, route->inspector_id, message)
+        : -1;
     free(message);
     if (status != 0) ct_throw_message(ctx, exception, "Inspector session is not connected");
     return JSValueMakeUndefined(ctx);
@@ -23349,13 +23543,18 @@ static JSValueRef ct_inspector_session_take_host(JSContextRef ctx, JSObjectRef f
     (void)thisObject;
     CtJscRuntime *runtime = ct_callback_runtime(function);
     uint64_t id = 0;
-    if (runtime == NULL || runtime->inspector == NULL || argc < 1 ||
+    if (runtime == NULL || argc < 1 ||
         !ct_inspector_session_id(ctx, argc > 0 ? argv[0] : NULL, &id, exception)) {
         if (exception != NULL && *exception == NULL) ct_throw_message(ctx, exception, "Inspector session is not connected");
         return JSValueMakeUndefined(ctx);
     }
+    CtInspectorSessionRoute *route = ct_inspector_session_route(runtime, id);
+    if (route == NULL) {
+        ct_throw_message(ctx, exception, "Inspector session is not connected");
+        return JSValueMakeUndefined(ctx);
+    }
     size_t count = 0;
-    char **messages = ct_jsc_inspector_take_local_messages(runtime->inspector, id, &count);
+    char **messages = ct_jsc_inspector_take_local_messages(route->inspector, route->inspector_id, &count);
     JSValueRef *values = count > 0 ? (JSValueRef *)calloc(count, sizeof(JSValueRef)) : NULL;
     if (count > 0 && values == NULL) {
         ct_jsc_inspector_free_messages(messages, count);
@@ -23373,9 +23572,9 @@ static JSValueRef ct_inspector_session_disconnect_host(JSContextRef ctx, JSObjec
     (void)thisObject;
     CtJscRuntime *runtime = ct_callback_runtime(function);
     uint64_t id = 0;
-    if (runtime != NULL && runtime->inspector != NULL && argc >= 1 &&
+    if (runtime != NULL && argc >= 1 &&
         ct_inspector_session_id(ctx, argv[0], &id, exception)) {
-        ct_jsc_inspector_disconnect_local(runtime->inspector, id);
+        ct_inspector_session_disconnect_route(runtime, id);
     }
     return JSValueMakeUndefined(ctx);
 }
@@ -28581,6 +28780,8 @@ static CtJscRuntime *ct_jsc_runtime_create_internal(
     pthread_mutex_init(&runtime->fd_event_mutex, NULL);
     pthread_mutex_init(&runtime->worker_event_mutex, NULL);
     pthread_mutex_init(&runtime->callback_mutex, NULL);
+    pthread_mutex_init(&runtime->inspector_mutex, NULL);
+    runtime->inspector_run_loop = ct_jsc_run_loop_current();
     runtime->owner_thread = pthread_self();
     if (ct_runtime_uv_init(runtime) != 0) {
         ct_jsc_runtime_destroy(runtime);
@@ -28639,6 +28840,12 @@ int ct_jsc_runtime_prepare_hot_reload(CtJscRuntime *runtime, char **error_out) {
 
 void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
     if (runtime == NULL) return;
+    while (pthread_mutex_trylock(&runtime->inspector_mutex) != 0) {
+        ct_jsc_run_loop_cycle();
+        uv_sleep(0);
+    }
+    runtime->inspector_destroying = true;
+    pthread_mutex_unlock(&runtime->inspector_mutex);
     CtReloadWatcher *reload_watchers = runtime->reload_watchers;
     runtime->reload_watchers = NULL;
     ct_reload_watchers_close(runtime, reload_watchers);
@@ -28662,6 +28869,7 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
             JSContextGroupClearExecutionTimeLimit(JSContextGetGroup(ctx));
             runtime->execution_time_limit_installed = false;
         }
+        ct_inspector_sessions_disconnect_all(runtime);
         if (runtime->inspector != NULL) {
             ct_jsc_inspector_destroy(runtime->inspector);
             runtime->inspector = NULL;
@@ -28724,6 +28932,7 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
     pthread_mutex_destroy(&runtime->fd_event_mutex);
     pthread_mutex_destroy(&runtime->worker_event_mutex);
     pthread_mutex_destroy(&runtime->callback_mutex);
+    pthread_mutex_destroy(&runtime->inspector_mutex);
     free(runtime->exit_cleanup_path);
     free(runtime);
 }
@@ -29514,6 +29723,7 @@ static bool ct_runtime_has_pending_native_events(CtJscRuntime *runtime) {
 
     if (runtime->next_tick_pending) return true;
     if (runtime->referenced_timer_count > 0) return true;
+    if (runtime->inspector != NULL && ct_jsc_inspector_keeps_event_loop_alive(runtime->inspector)) return true;
     if (runtime->napi_env != NULL && ct_napi_env_has_pending_work(runtime->napi_env)) return true;
     if (runtime->uv_loop_initialized && uv_loop_alive(&runtime->uv_loop)) return true;
 #if !defined(_WIN32)
@@ -29975,6 +30185,59 @@ int ct_jsc_runtime_start_inspector(
         url_out,
         error_out
     );
+}
+
+int ct_jsc_runtime_start_inspector_unix(
+    CtJscRuntime *runtime,
+    const char *unix_path,
+    bool pause_on_start,
+    char **url_out,
+    char **error_out
+) {
+    if (url_out != NULL) *url_out = NULL;
+    if (error_out != NULL) *error_out = NULL;
+    if (!ct_runtime_ensure_inspector(runtime, error_out)) return -1;
+    return ct_jsc_inspector_start_unix_server(
+        runtime->inspector,
+        unix_path,
+        pause_on_start,
+        url_out,
+        error_out
+    );
+}
+
+int ct_jsc_runtime_connect_inspector_tcp(
+    CtJscRuntime *runtime,
+    const char *host,
+    uint16_t port,
+    bool pause_on_start,
+    char **error_out
+) {
+    if (error_out != NULL) *error_out = NULL;
+    if (!ct_runtime_ensure_inspector(runtime, error_out)) return -1;
+    return ct_jsc_inspector_connect_tcp(runtime->inspector, host, port, pause_on_start, error_out);
+}
+
+int ct_jsc_runtime_connect_inspector_unix(
+    CtJscRuntime *runtime,
+    const char *unix_path,
+    bool pause_on_start,
+    char **error_out
+) {
+    if (error_out != NULL) *error_out = NULL;
+    if (!ct_runtime_ensure_inspector(runtime, error_out)) return -1;
+    return ct_jsc_inspector_connect_unix(runtime->inspector, unix_path, pause_on_start, error_out);
+}
+
+int ct_jsc_runtime_connect_inspector_fd(
+    CtJscRuntime *runtime,
+    int fd,
+    bool pause_on_start,
+    char **error_out
+) {
+    if (error_out != NULL) *error_out = NULL;
+    if (!ct_runtime_ensure_inspector(runtime, error_out)) return -1;
+    return ct_jsc_inspector_connect_fd(runtime->inspector, fd, pause_on_start, error_out);
 }
 
 void ct_jsc_runtime_stop_inspector(CtJscRuntime *runtime) {

@@ -1,5 +1,6 @@
 import { ok, strictEqual } from "node:assert/strict";
 import { createRequire } from "node:module";
+import { Worker } from "node:worker_threads";
 import * as inspector from "node:inspector";
 import * as inspectorPromises from "node:inspector/promises";
 
@@ -20,6 +21,27 @@ strictEqual(typeof inspector.Network.requestWillBeSent, "function", "inspector N
 strictEqual(typeof inspector.NetworkResources.put, "function", "inspector NetworkResources should be exported");
 strictEqual(typeof inspector.console.log, "function", "inspector console should be exported");
 strictEqual(inspector.url(), undefined, "inspector url should be undefined without a server");
+
+(globalThis as Record<string, unknown>).__inspectorMainThreadMarker = 73;
+const worker = new Worker(
+  `const { parentPort } = require("node:worker_threads");
+   const { Session } = require("node:inspector");
+   const session = new Session();
+   session.connectToMainThread();
+   session.post("Runtime.evaluate", { expression: "globalThis.__inspectorMainThreadMarker" }, (error, result) => {
+     if (error) parentPort.postMessage({ error: error.message });
+     else parentPort.postMessage({ value: result.result.value });
+     session.disconnect();
+   });`,
+  { eval: true },
+);
+const workerResult = await new Promise<{ error?: string; value?: number }>((resolve, reject) => {
+  worker.once("message", resolve);
+  worker.once("error", reject);
+});
+strictEqual(workerResult.error, undefined, "worker main-thread inspector session failed");
+strictEqual(workerResult.value, 73, "connectToMainThread should target the parent JSC global");
+await worker.terminate();
 
 inspector.open(0, "127.0.0.1", false);
 ok(/^ws:\/\/127\.0\.0\.1:\d+\//.test(inspector.url() ?? ""), "inspector.open should expose its bound URL");

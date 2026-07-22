@@ -64,6 +64,34 @@ int ct_jsc_runtime_start_inspector(
     char **url_out,
     char **error_out
 );
+int ct_jsc_runtime_start_inspector_unix(
+    CtJscRuntime *runtime,
+    const char *unix_path,
+    bool pause_on_start,
+    char **url_out,
+    char **error_out
+);
+int ct_jsc_runtime_connect_inspector_tcp(
+    CtJscRuntime *runtime,
+    const char *host,
+    uint16_t port,
+    bool pause_on_start,
+    char **error_out
+);
+int ct_jsc_runtime_connect_inspector_unix(
+    CtJscRuntime *runtime,
+    const char *unix_path,
+    bool pause_on_start,
+    char **error_out
+);
+int ct_jsc_runtime_connect_inspector_fd(
+    CtJscRuntime *runtime,
+    int fd,
+    bool pause_on_start,
+    char **error_out
+);
+int ct_jsc_inspector_notify_tcp(const char *host, uint16_t port);
+int ct_jsc_inspector_notify_unix(const char *unix_path);
 void ct_jsc_runtime_stop_inspector(CtJscRuntime *runtime);
 char *ct_jsc_runtime_inspector_url(CtJscRuntime *runtime);
 int ct_jsc_runtime_wait_for_inspector(CtJscRuntime *runtime);

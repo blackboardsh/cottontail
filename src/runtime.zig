@@ -6,10 +6,23 @@ const c = @cImport({
     @cInclude("jsc_runner.h");
 });
 
+pub const InspectorTransport = union(enum) {
+    websocket: struct {
+        host: [:0]const u8,
+        port: u16,
+        path: [:0]const u8,
+    },
+    websocket_unix: [:0]const u8,
+    framed_tcp: struct {
+        host: [:0]const u8,
+        port: u16,
+    },
+    framed_unix: [:0]const u8,
+    framed_fd: c_int,
+};
+
 pub const InspectorOptions = struct {
-    host: [:0]const u8,
-    port: u16,
-    path: [:0]const u8,
+    transport: InspectorTransport,
     pause_on_start: bool = false,
 };
 
@@ -462,23 +475,52 @@ pub const Runtime = struct {
         return c.ct_jsc_runtime_enable_sampling_profiler(self.handle);
     }
 
-    pub fn startInspector(self: *Runtime, options: InspectorOptions) ![]u8 {
+    pub fn startInspector(self: *Runtime, options: InspectorOptions) !?[]u8 {
         var url: [*c]u8 = null;
         var inspector_error: [*c]u8 = null;
-        if (c.ct_jsc_runtime_start_inspector(
-            self.handle,
-            options.host.ptr,
-            options.port,
-            options.path.ptr,
-            options.pause_on_start,
-            &url,
-            &inspector_error,
-        ) != 0) {
+        const status = switch (options.transport) {
+            .websocket => |endpoint| c.ct_jsc_runtime_start_inspector(
+                self.handle,
+                endpoint.host.ptr,
+                endpoint.port,
+                endpoint.path.ptr,
+                options.pause_on_start,
+                &url,
+                &inspector_error,
+            ),
+            .websocket_unix => |path| c.ct_jsc_runtime_start_inspector_unix(
+                self.handle,
+                path.ptr,
+                options.pause_on_start,
+                &url,
+                &inspector_error,
+            ),
+            .framed_tcp => |endpoint| c.ct_jsc_runtime_connect_inspector_tcp(
+                self.handle,
+                endpoint.host.ptr,
+                endpoint.port,
+                options.pause_on_start,
+                &inspector_error,
+            ),
+            .framed_unix => |path| c.ct_jsc_runtime_connect_inspector_unix(
+                self.handle,
+                path.ptr,
+                options.pause_on_start,
+                &inspector_error,
+            ),
+            .framed_fd => |fd| c.ct_jsc_runtime_connect_inspector_fd(
+                self.handle,
+                fd,
+                options.pause_on_start,
+                &inspector_error,
+            ),
+        };
+        if (status != 0) {
             defer if (inspector_error != null) c.ct_jsc_string_free(inspector_error);
             if (inspector_error != null) self.writeStderrLine(std.mem.span(inspector_error));
             return error.InspectorStartFailed;
         }
-        if (url == null) return error.InspectorStartFailed;
+        if (url == null) return null;
         defer c.ct_jsc_string_free(url);
         return try self.allocator.dupe(u8, std.mem.span(url));
     }
@@ -490,6 +532,16 @@ pub const Runtime = struct {
 
     pub fn stopInspector(self: *Runtime) void {
         c.ct_jsc_runtime_stop_inspector(self.handle);
+    }
+
+    pub fn notifyInspectorTcp(self: *Runtime, host_name: [:0]const u8, port: u16) void {
+        _ = self;
+        _ = c.ct_jsc_inspector_notify_tcp(host_name.ptr, port);
+    }
+
+    pub fn notifyInspectorUnix(self: *Runtime, path: [:0]const u8) void {
+        _ = self;
+        _ = c.ct_jsc_inspector_notify_unix(path.ptr);
     }
 
     pub fn takeSamplingProfile(self: *Runtime) !?[]u8 {

@@ -97,8 +97,18 @@ const ScriptExecution = struct {
 
 const InspectorLaunch = struct {
     options: runtime.InspectorOptions,
+    display_address: []const u8,
+    notification: ?InspectorNotification = null,
     wait_for_connection: bool = false,
     automatic: bool = false,
+};
+
+const InspectorNotification = union(enum) {
+    unix: [:0]const u8,
+    tcp: struct {
+        host: [:0]const u8,
+        port: u16,
+    },
 };
 
 const WindowsScriptThread = struct {
@@ -2251,6 +2261,39 @@ fn parseInspectorAuthority(authority: []const u8, default_port: u16) !struct { h
     return .{ .host = authority, .port = default_port };
 }
 
+fn decodeInspectorSocketPath(allocator: std.mem.Allocator, encoded: []const u8) ![:0]const u8 {
+    if (encoded.len == 0) return error.InvalidInspectorAddress;
+    const storage = try allocator.dupe(u8, encoded);
+    const decoded = std.Uri.percentDecodeInPlace(storage);
+    if (decoded.len == 0 or std.mem.indexOfScalar(u8, decoded, 0) != null)
+        return error.InvalidInspectorAddress;
+    return try allocator.dupeZ(u8, decoded);
+}
+
+fn parseInspectorFd(address: []const u8) !c_int {
+    const value = if (std.mem.startsWith(u8, address, "fd://"))
+        address["fd://".len..]
+    else
+        address["fd:".len..];
+    const fd = std.fmt.parseInt(c_int, value, 10) catch return error.InvalidInspectorAddress;
+    if (fd < 0) return error.InvalidInspectorAddress;
+    return fd;
+}
+
+fn parseFramedTcp(allocator: std.mem.Allocator, address: []const u8) !runtime.InspectorTransport {
+    const endpoint = if (std.mem.startsWith(u8, address, "tcp://"))
+        address["tcp://".len..]
+    else
+        address["tcp:".len..];
+    if (std.mem.indexOfScalar(u8, endpoint, '/') != null) return error.InvalidInspectorAddress;
+    const parsed = try parseInspectorAuthority(endpoint, 6499);
+    if (parsed.host.len == 0 or parsed.port == 0) return error.InvalidInspectorAddress;
+    return .{ .framed_tcp = .{
+        .host = try allocator.dupeZ(u8, parsed.host),
+        .port = parsed.port,
+    } };
+}
+
 fn parseInspectorLaunch(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -2258,6 +2301,7 @@ fn parseInspectorLaunch(
     wait_for_connection: bool,
     pause_on_start: bool,
     automatic: bool,
+    connect_to: bool,
 ) !InspectorLaunch {
     var address = raw_address;
     var wait = wait_for_connection;
@@ -2271,11 +2315,75 @@ fn parseInspectorLaunch(
         wait = true;
     }
 
-    if (std.mem.startsWith(u8, address, "unix:") or
-        std.mem.startsWith(u8, address, "fd:") or
-        std.mem.startsWith(u8, address, "tcp:") or
-        std.mem.startsWith(u8, address, "ws+unix:"))
-        return error.UnsupportedInspectorTransport;
+    if (connect_to and std.fs.path.isAbsolute(address)) {
+        return .{
+            .options = .{
+                .transport = .{ .framed_unix = try allocator.dupeZ(u8, address) },
+                .pause_on_start = pause,
+            },
+            .display_address = address,
+            .wait_for_connection = wait,
+            .automatic = automatic,
+        };
+    }
+
+    if (std.mem.startsWith(u8, address, "unix://") or std.mem.startsWith(u8, address, "unix:")) {
+        const encoded_path = if (std.mem.startsWith(u8, address, "unix://"))
+            address["unix://".len..]
+        else
+            address["unix:".len..];
+        return .{
+            .options = .{
+                .transport = .{ .framed_unix = try decodeInspectorSocketPath(allocator, encoded_path) },
+                .pause_on_start = pause,
+            },
+            .display_address = address,
+            .wait_for_connection = wait,
+            .automatic = automatic,
+        };
+    }
+
+    if (std.mem.startsWith(u8, address, "fd://") or std.mem.startsWith(u8, address, "fd:")) {
+        return .{
+            .options = .{
+                .transport = .{ .framed_fd = try parseInspectorFd(address) },
+                .pause_on_start = pause,
+            },
+            .display_address = address,
+            .wait_for_connection = wait,
+            .automatic = automatic,
+        };
+    }
+
+    if (std.mem.startsWith(u8, address, "tcp://") or std.mem.startsWith(u8, address, "tcp:")) {
+        return .{
+            .options = .{
+                .transport = try parseFramedTcp(allocator, address),
+                .pause_on_start = pause,
+            },
+            .display_address = address,
+            .wait_for_connection = wait,
+            .automatic = automatic,
+        };
+    }
+
+    if (connect_to) return error.InvalidInspectorAddress;
+
+    if (std.mem.startsWith(u8, address, "ws+unix://") or std.mem.startsWith(u8, address, "ws+unix:")) {
+        const encoded_path = if (std.mem.startsWith(u8, address, "ws+unix://"))
+            address["ws+unix://".len..]
+        else
+            address["ws+unix:".len..];
+        return .{
+            .options = .{
+                .transport = .{ .websocket_unix = try decodeInspectorSocketPath(allocator, encoded_path) },
+                .pause_on_start = pause,
+            },
+            .display_address = address,
+            .wait_for_connection = wait,
+            .automatic = automatic,
+        };
+    }
 
     const explicit_websocket = std.mem.startsWith(u8, address, "ws://");
     const shorthand = if (explicit_websocket) address["ws://".len..] else address;
@@ -2299,31 +2407,72 @@ fn parseInspectorLaunch(
     const path_z = try allocator.dupeZ(u8, generated_path);
     return .{
         .options = .{
-            .host = host_z,
-            .port = parsed.port,
-            .path = path_z,
+            .transport = .{ .websocket = .{
+                .host = host_z,
+                .port = parsed.port,
+                .path = path_z,
+            } },
             .pause_on_start = pause,
         },
+        .display_address = address,
         .wait_for_connection = wait,
         .automatic = automatic,
     };
 }
 
+fn inspectorNotificationFromEnvironment(ctx: *const Context) !?InspectorNotification {
+    const address = ctx.environ_map.get("BUN_INSPECT_NOTIFY") orelse return null;
+    if (address.len == 0) return null;
+
+    if (std.mem.startsWith(u8, address, "unix://")) {
+        const path = try decodeInspectorSocketPath(ctx.allocator, address["unix://".len..]);
+        const absolute = try absolutePathForCwd(ctx.io, ctx.allocator, path);
+        return .{ .unix = try ctx.allocator.dupeZ(u8, absolute) };
+    }
+
+    const endpoint = if (std.mem.indexOf(u8, address, "://")) |scheme_end|
+        address[scheme_end + 3 ..]
+    else
+        address;
+    if (std.mem.indexOfScalar(u8, endpoint, '/') != null) return error.InvalidInspectorAddress;
+    const parsed = try parseInspectorAuthority(endpoint, 0);
+    if (parsed.host.len == 0 or parsed.port == 0) return error.InvalidInspectorAddress;
+    return .{ .tcp = .{
+        .host = try ctx.allocator.dupeZ(u8, parsed.host),
+        .port = parsed.port,
+    } };
+}
+
 fn inspectorLaunchFromArgs(ctx: *const Context, exec_args: []const [:0]const u8) !?InspectorLaunch {
-    if (inspectorFlag(exec_args)) |flag|
-        return try parseInspectorLaunch(
+    var launch: ?InspectorLaunch = null;
+    if (inspectorFlag(exec_args)) |flag| {
+        launch = try parseInspectorLaunch(
             ctx.io,
             ctx.allocator,
             flag.address,
             flag.wait_for_connection,
             flag.pause_on_start,
             false,
+            false,
         );
-    if (ctx.environ_map.get("BUN_INSPECT")) |address| {
-        if (address.len > 0)
-            return try parseInspectorLaunch(ctx.io, ctx.allocator, address, false, false, true);
+    } else {
+        if (ctx.environ_map.get("BUN_INSPECT")) |address| {
+            if (address.len > 0)
+                launch = try parseInspectorLaunch(ctx.io, ctx.allocator, address, false, false, true, false);
+        }
+        if (launch == null) {
+            if (ctx.environ_map.get("BUN_INSPECT_CONNECT_TO")) |address| {
+                if (address.len > 0)
+                    launch = try parseInspectorLaunch(ctx.io, ctx.allocator, address, false, false, true, true);
+            }
+        }
     }
-    return null;
+    if (launch) |*configured| {
+        configured.notification = try inspectorNotificationFromEnvironment(ctx);
+        if (configured.notification != null)
+            _ = setenv("BUN_INSPECT_NOTIFY", "", 1);
+    }
+    return launch;
 }
 
 fn runPrepared(
@@ -2374,18 +2523,38 @@ fn configureRuntimeInspector(execution: *const ScriptExecution, js_runtime: *run
         writeStderr(execution.io, "cottontail: failed to start inspector\n", .{});
         return false;
     };
-    defer js_runtime.allocator.free(inspector_url);
+    defer if (inspector_url) |url| js_runtime.allocator.free(url);
 
     if (!inspector.automatic) {
-        const browser_target = if (std.mem.startsWith(u8, inspector_url, "ws://"))
-            inspector_url["ws://".len..]
-        else
-            inspector_url;
-        writeStderr(
-            execution.io,
-            "--------------------- Bun Inspector ---------------------\nListening:\n  {s}\nInspect in browser:\n  https://debug.bun.sh/#{s}\n--------------------- Bun Inspector ---------------------\n",
-            .{ inspector_url, browser_target },
-        );
+        switch (inspector.options.transport) {
+            .websocket => {
+                const url = inspector_url orelse {
+                    writeStderr(execution.io, "cottontail: inspector did not report a listening URL\n", .{});
+                    return false;
+                };
+                const browser_target = if (std.mem.startsWith(u8, url, "ws://"))
+                    url["ws://".len..]
+                else
+                    url;
+                writeStderr(
+                    execution.io,
+                    "--------------------- Bun Inspector ---------------------\nListening:\n  {s}\nInspect in browser:\n  https://debug.bun.sh/#{s}\n--------------------- Bun Inspector ---------------------\n",
+                    .{ url, browser_target },
+                );
+            },
+            .websocket_unix => {},
+            else => writeStderr(
+                execution.io,
+                "--------------------- Bun Inspector ---------------------\nListening on {s}\n--------------------- Bun Inspector ---------------------\n",
+                .{inspector.display_address},
+            ),
+        }
+    }
+    if (inspector.notification) |notification| {
+        switch (notification) {
+            .unix => |path| js_runtime.notifyInspectorUnix(path),
+            .tcp => |endpoint| js_runtime.notifyInspectorTcp(endpoint.host, endpoint.port),
+        }
     }
     if (inspector.wait_for_connection) {
         js_runtime.waitForInspector() catch {

@@ -10,9 +10,11 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cerrno>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -26,6 +28,12 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 extern "C" void* ct_jsc_run_loop_current(void);
 extern "C" void ct_jsc_run_loop_dispatch(void*, void (*)(void*), void*);
@@ -120,6 +128,7 @@ public:
     void disconnectFrontend(FrontendChannel&);
     void dispatchMessageFromFrontend(const WTF::String&);
     void globalObjectDestroyed();
+    void setDidBeginCheckedPtrDeletion();
 
 private:
     alignas(std::max_align_t) unsigned char m_storage[4096];
@@ -133,9 +142,19 @@ constexpr size_t maxInspectorMessageSize = 16 * 1024 * 1024;
 constexpr size_t maxHttpHeaderSize = 64 * 1024;
 constexpr size_t maxQueuedOutputSize = 32 * 1024 * 1024;
 
+// WebKit-7624.2.5.10.6's private controller layout. Its registry teardown
+// leaves two CheckedPtrs targeting deleted agents, and the JSCOnly SDK omits
+// the types needed to clear them normally. Keep this with the pinned storage.
+constexpr size_t inspectorAgentCheckedPtrOffset = 0x48;
+constexpr size_t inspectorAgentCheckedPtrCountOffset = 0x18;
+constexpr size_t consoleClientOffset = 0x28;
+constexpr size_t consoleAgentCheckedPtrOffset = 0x28;
+constexpr size_t consoleAgentCheckedPtrCountOffset = 0x28;
+
 struct CtJscInspector;
 struct InspectorServer;
 struct InspectorClient;
+struct FramedInspectorClient;
 
 static JSC::VM* inspectorVM(JSContextRef context)
 {
@@ -147,6 +166,48 @@ static JSC::JSGlobalObject* inspectorGlobalObject(JSContextRef context)
 {
     return reinterpret_cast<JSC::JSGlobalObject*>(
         const_cast<OpaqueJSContext*>(context));
+}
+
+static void* pinnedPointerAt(void* owner, size_t offset)
+{
+    void* pointer = nullptr;
+    std::memcpy(&pointer, static_cast<unsigned char*>(owner) + offset, sizeof(pointer));
+    return pointer;
+}
+
+static void releasePinnedCheckedPtr(void* owner, size_t pointerOffset, size_t countOffset)
+{
+    if (!owner)
+        return;
+
+    auto* bytes = static_cast<unsigned char*>(owner);
+    void* target = pinnedPointerAt(owner, pointerOffset);
+    if (!target)
+        return;
+
+    auto* countAddress = static_cast<unsigned char*>(target) + countOffset;
+    uint32_t count = 0;
+    std::memcpy(&count, countAddress, sizeof(count));
+    if (!count)
+        std::abort();
+    --count;
+    std::memcpy(countAddress, &count, sizeof(count));
+
+    target = nullptr;
+    std::memcpy(bytes + pointerOffset, &target, sizeof(target));
+}
+
+static void releasePinnedInspectorCheckedPtrs(Inspector::JSGlobalObjectInspectorController* controller)
+{
+    static_assert(sizeof(void*) == 8);
+    releasePinnedCheckedPtr(
+        controller,
+        inspectorAgentCheckedPtrOffset,
+        inspectorAgentCheckedPtrCountOffset);
+    releasePinnedCheckedPtr(
+        pinnedPointerAt(controller, consoleClientOffset),
+        consoleAgentCheckedPtrOffset,
+        consoleAgentCheckedPtrCountOffset);
 }
 
 static char* duplicateCString(std::string_view value)
@@ -327,6 +388,20 @@ private:
     std::weak_ptr<InspectorClient> m_client;
 };
 
+class FramedMessageSink final : public MessageSink {
+public:
+    explicit FramedMessageSink(std::weak_ptr<FramedInspectorClient> client)
+        : m_client(std::move(client))
+    {
+    }
+
+    void send(std::string&&) final;
+    bool isRemoteDebugger() const final { return true; }
+
+private:
+    std::weak_ptr<FramedInspectorClient> m_client;
+};
+
 class InspectorFrontend final : public Inspector::FrontendChannel {
 public:
     InspectorFrontend(uint64_t id, std::shared_ptr<MessageSink> sink)
@@ -375,6 +450,7 @@ struct CtJscInspector {
     }
 
     JSGlobalContextRef context;
+    std::atomic<size_t> referenceCount { 1 };
     void* runLoop { nullptr };
     void* controllerMemory { nullptr };
     Inspector::JSGlobalObjectInspectorController* controller { nullptr };
@@ -388,6 +464,7 @@ struct CtJscInspector {
     std::mutex localSinkMutex;
     std::unordered_map<uint64_t, std::shared_ptr<LocalMessageSink>> localSinks;
     std::shared_ptr<InspectorServer> server;
+    std::shared_ptr<FramedInspectorClient> framedClient;
     std::string serverUrl;
     bool pauseOnStart { false };
     bool pauseConsumed { false };
@@ -416,6 +493,13 @@ struct CtJscInspector {
     void enqueue(InspectorEvent&& event);
     void processEvents();
     void destroyController();
+    bool hasTransport() const { return server || framedClient; }
+    void retain() { referenceCount.fetch_add(1, std::memory_order_relaxed); }
+    void release()
+    {
+        if (referenceCount.fetch_sub(1, std::memory_order_acq_rel) == 1)
+            delete this;
+    }
 };
 
 static void processInspectorEvents(void* opaque)
@@ -427,6 +511,8 @@ void CtJscInspector::enqueue(InspectorEvent&& event)
 {
     {
         std::lock_guard lock(eventMutex);
+        if (closing.load(std::memory_order_acquire))
+            return;
         events.push_back(std::move(event));
         if (eventTaskScheduled.exchange(true, std::memory_order_acq_rel))
             return;
@@ -512,7 +598,9 @@ void CtJscInspector::destroyController()
         controller->disconnectFrontend(*entry.second);
     frontends.clear();
     remoteConnectionCount.store(0, std::memory_order_release);
+    releasePinnedInspectorCheckedPtrs(controller);
     controller->globalObjectDestroyed();
+    controller->setDidBeginCheckedPtrDeletion();
     controller->~JSGlobalObjectInspectorController();
     std::free(controllerMemory);
     controllerMemory = nullptr;
@@ -526,16 +614,25 @@ struct InspectorWriteRequest {
     bool closeAfterWrite { false };
 };
 
+enum class InspectorStreamKind {
+    Tcp,
+    Pipe,
+};
+
 struct InspectorClient : public std::enable_shared_from_this<InspectorClient> {
-    InspectorClient(InspectorServer* server, uint64_t id)
+    InspectorClient(InspectorServer* server, uint64_t id, InspectorStreamKind streamKind)
         : server(server)
         , id(id)
+        , streamKind(streamKind)
     {
     }
 
     InspectorServer* server;
     uint64_t id;
-    uv_tcp_t handle { };
+    InspectorStreamKind streamKind;
+    uv_tcp_t tcpHandle { };
+    uv_pipe_t pipeHandle { };
+    uv_stream_t* stream { nullptr };
     bool upgraded { false };
     std::atomic<bool> closing { false };
     std::atomic<bool> closeRequested { false };
@@ -558,24 +655,43 @@ struct InspectorServer : public std::enable_shared_from_this<InspectorServer> {
     {
     }
 
+    InspectorServer(CtJscInspector* inspector, std::string unixPath)
+        : inspector(inspector)
+        , unixSocket(true)
+        , unixPath(std::move(unixPath))
+        , path("/")
+    {
+    }
+
     CtJscInspector* inspector;
+    bool unixSocket { false };
     std::string host;
-    uint16_t requestedPort;
+    uint16_t requestedPort { 0 };
     uint16_t boundPort { 0 };
+    std::string unixPath;
     std::string path;
     std::string url;
     std::string startupError;
     uv_loop_t loop { };
-    uv_tcp_t listener { };
+    uv_tcp_t tcpListener { };
+    uv_pipe_t pipeListener { };
     uv_async_t async { };
     uv_thread_t thread { };
     uv_sem_t started { };
     bool threadCreated { false };
     bool loopInitialized { false };
     bool listenerInitialized { false };
+    bool unixPathBound { false };
     std::atomic<bool> asyncInitialized { false };
     std::atomic<bool> stopRequested { false };
     std::unordered_map<InspectorClient*, std::shared_ptr<InspectorClient>> clients;
+
+    uv_stream_t* listenerStream()
+    {
+        return unixSocket
+            ? reinterpret_cast<uv_stream_t*>(&pipeListener)
+            : reinterpret_cast<uv_stream_t*>(&tcpListener);
+    }
 
     bool start();
     void stop();
@@ -588,7 +704,86 @@ struct InspectorServer : public std::enable_shared_from_this<InspectorServer> {
     void processFrames(const std::shared_ptr<InspectorClient>&);
 };
 
+enum class FramedTransportKind {
+    Tcp,
+    Unix,
+    FileDescriptor,
+};
+
+static void closeOwnedFd(int fd);
+
+struct FramedInspectorClient : public std::enable_shared_from_this<FramedInspectorClient> {
+    FramedInspectorClient(CtJscInspector* inspector, std::string host, uint16_t port)
+        : inspector(inspector)
+        , kind(FramedTransportKind::Tcp)
+        , host(std::move(host))
+        , port(port)
+    {
+    }
+
+    FramedInspectorClient(CtJscInspector* inspector, std::string unixPath)
+        : inspector(inspector)
+        , kind(FramedTransportKind::Unix)
+        , unixPath(std::move(unixPath))
+    {
+    }
+
+    FramedInspectorClient(CtJscInspector* inspector, int ownedFd)
+        : inspector(inspector)
+        , kind(FramedTransportKind::FileDescriptor)
+        , ownedFd(ownedFd)
+    {
+    }
+
+    ~FramedInspectorClient() { closeOwnedFd(ownedFd); }
+
+    CtJscInspector* inspector;
+    FramedTransportKind kind;
+    std::string host;
+    uint16_t port { 0 };
+    std::string unixPath;
+    int ownedFd { -1 };
+    uint64_t connectionId { 0 };
+    std::string startupError;
+    uv_loop_t loop { };
+    uv_tcp_t tcpHandle { };
+    uv_pipe_t pipeHandle { };
+    uv_stream_t* stream { nullptr };
+    uv_async_t async { };
+    uv_thread_t thread { };
+    uv_sem_t started { };
+    bool threadCreated { false };
+    bool loopInitialized { false };
+    bool streamInitialized { false };
+    bool startedPosted { false };
+    bool opened { false };
+    bool closeEventSent { false };
+    std::atomic<bool> asyncInitialized { false };
+    std::atomic<bool> stopRequested { false };
+    std::atomic<bool> closeRequested { false };
+    std::atomic<bool> closing { false };
+    std::mutex outputMutex;
+    std::deque<std::string> output;
+    size_t queuedOutputSize { 0 };
+    std::vector<unsigned char> input;
+
+    bool start();
+    void stop();
+    void enqueueOutput(std::string&&);
+    void flushOutput();
+    void processInput();
+    void connected(int status);
+    void closeOnLoop(bool notifyInspector = true);
+    void postStarted();
+};
+
 void WebSocketMessageSink::send(std::string&& message)
+{
+    if (auto client = m_client.lock())
+        client->enqueueOutput(std::move(message));
+}
+
+void FramedMessageSink::send(std::string&& message)
 {
     if (auto client = m_client.lock())
         client->enqueueOutput(std::move(message));
@@ -600,7 +795,7 @@ void InspectorClient::enqueueOutput(std::string&& message)
         return;
     {
         std::lock_guard lock(outputMutex);
-        if (queuedOutputSize + message.size() > maxQueuedOutputSize) {
+        if (message.size() > maxQueuedOutputSize - queuedOutputSize) {
             output.clear();
             queuedOutputSize = 0;
             closeRequested.store(true, std::memory_order_release);
@@ -630,15 +825,18 @@ static bool writeBytes(const std::shared_ptr<InspectorClient>& client, std::vect
 {
     if (!client || client->closing.load(std::memory_order_acquire))
         return false;
+    const size_t queued = uv_stream_get_write_queue_size(client->stream);
+    if (queued > maxQueuedOutputSize || bytes.size() > maxQueuedOutputSize - queued)
+        return false;
     auto* write = new (std::nothrow) InspectorWriteRequest;
     if (!write)
         return false;
     write->bytes = std::move(bytes);
     write->closeAfterWrite = closeAfter;
     if (closeAfter)
-        uv_read_stop(reinterpret_cast<uv_stream_t*>(&client->handle));
+        uv_read_stop(client->stream);
     uv_buf_t buffer = uv_buf_init(write->bytes.data(), static_cast<unsigned int>(write->bytes.size()));
-    const int status = uv_write(&write->request, reinterpret_cast<uv_stream_t*>(&client->handle), &buffer, 1, inspectorWriteComplete);
+    const int status = uv_write(&write->request, client->stream, &buffer, 1, inspectorWriteComplete);
     if (status < 0) {
         delete write;
         return false;
@@ -702,11 +900,12 @@ void InspectorServer::closeClient(const std::shared_ptr<InspectorClient>& client
 {
     if (!client || client->closing.exchange(true, std::memory_order_acq_rel))
         return;
-    uv_read_stop(reinterpret_cast<uv_stream_t*>(&client->handle));
+    uv_read_stop(client->stream);
     if (notifyInspector && client->upgraded)
         enqueue({ InspectorEventType::Close, client->id, nullptr, {} });
-    if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&client->handle)))
-        uv_close(reinterpret_cast<uv_handle_t*>(&client->handle), inspectorClientClosed);
+    auto* handle = reinterpret_cast<uv_handle_t*>(client->stream);
+    if (!uv_is_closing(handle))
+        uv_close(handle, inspectorClientClosed);
 }
 
 static void sendHttpResponse(
@@ -845,10 +1044,11 @@ void InspectorServer::processHttp(const std::shared_ptr<InspectorClient>& client
     if (target == "/json" || target == "/json/list") {
         std::string id = path.size() > 1 ? path.substr(1) : "cottontail";
         const std::string escapedUrl = jsonEscape(url);
+        const std::string devtoolsTarget = url.starts_with("ws://") ? url.substr(5) : url;
         const std::string body = "[{\"description\":\"Cottontail JavaScriptCore runtime\",\"id\":\""
             + jsonEscape(id) + "\",\"title\":\"Bun\",\"type\":\"node\",\"url\":\"file://\",\"webSocketDebuggerUrl\":\""
             + escapedUrl + "\",\"devtoolsFrontendUrl\":\"https://debug.bun.sh/#"
-            + jsonEscape(url.substr(5)) + "\"}]";
+            + jsonEscape(devtoolsTarget) + "\"}]";
         sendHttpResponse(client, 200, "OK", "application/json; charset=UTF-8", body);
         return;
     }
@@ -857,7 +1057,7 @@ void InspectorServer::processHttp(const std::shared_ptr<InspectorClient>& client
     const auto connection = headers.find("connection");
     const auto key = headers.find("sec-websocket-key");
     const auto version = headers.find("sec-websocket-version");
-    if (target != path) {
+    if (!unixSocket && target != path) {
         sendHttpResponse(client, 404, "Not Found", "text/plain", "Not Found\n");
         return;
     }
@@ -1080,16 +1280,23 @@ static void inspectorAccepted(uv_stream_t* listener, int status)
     if (!server || status < 0 || server->stopRequested.load(std::memory_order_acquire))
         return;
     const uint64_t id = server->inspector->nextConnectionId.fetch_add(1, std::memory_order_relaxed);
-    auto client = std::make_shared<InspectorClient>(server, id);
-    if (uv_tcp_init(&server->loop, &client->handle) < 0)
+    const auto streamKind = server->unixSocket ? InspectorStreamKind::Pipe : InspectorStreamKind::Tcp;
+    auto client = std::make_shared<InspectorClient>(server, id, streamKind);
+    const int initStatus = server->unixSocket
+        ? uv_pipe_init(&server->loop, &client->pipeHandle, 0)
+        : uv_tcp_init(&server->loop, &client->tcpHandle);
+    if (initStatus < 0)
         return;
-    client->handle.data = client.get();
+    client->stream = server->unixSocket
+        ? reinterpret_cast<uv_stream_t*>(&client->pipeHandle)
+        : reinterpret_cast<uv_stream_t*>(&client->tcpHandle);
+    client->stream->data = client.get();
     server->clients.emplace(client.get(), client);
-    if (uv_accept(listener, reinterpret_cast<uv_stream_t*>(&client->handle)) < 0) {
+    if (uv_accept(listener, client->stream) < 0) {
         server->closeClient(client, false);
         return;
     }
-    if (uv_read_start(reinterpret_cast<uv_stream_t*>(&client->handle), inspectorAllocate, inspectorRead) < 0)
+    if (uv_read_start(client->stream, inspectorAllocate, inspectorRead) < 0)
         server->closeClient(client, false);
 }
 
@@ -1105,8 +1312,9 @@ static void inspectorAsync(uv_async_t* handle)
             clients.push_back(entry.second);
         for (auto& client : clients)
             server->closeClient(client);
-        if (server->listenerInitialized && !uv_is_closing(reinterpret_cast<uv_handle_t*>(&server->listener)))
-            uv_close(reinterpret_cast<uv_handle_t*>(&server->listener), nullptr);
+        auto* listenerHandle = reinterpret_cast<uv_handle_t*>(server->listenerStream());
+        if (server->listenerInitialized && !uv_is_closing(listenerHandle))
+            uv_close(listenerHandle, nullptr);
         if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&server->async)))
             uv_close(reinterpret_cast<uv_handle_t*>(&server->async), nullptr);
         return;
@@ -1160,32 +1368,43 @@ static void inspectorThread(void* opaque)
     server->loopInitialized = true;
 
     ResolveResult resolved;
-    uv_getaddrinfo_t resolver { };
-    resolver.data = &resolved;
-    addrinfo hints { };
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-    const std::string service = std::to_string(server->requestedPort);
-    status = uv_getaddrinfo(&server->loop, &resolver, inspectorResolved, server->host.c_str(), service.c_str(), &hints);
-    if (status >= 0)
-        uv_run(&server->loop, UV_RUN_DEFAULT);
-    if (status < 0 || !resolved.resolved) {
-        server->startupError = status < 0 ? uv_strerror(status) : (resolved.error.empty() ? "Unable to resolve inspector host" : resolved.error);
-        uv_sem_post(&server->started);
-        uv_loop_close(&server->loop);
-        server->loopInitialized = false;
-        return;
-    }
+    if (server->unixSocket) {
+        status = uv_pipe_init(&server->loop, &server->pipeListener, 0);
+        if (status >= 0) {
+            server->listenerInitialized = true;
+            server->pipeListener.data = server;
+            status = uv_pipe_bind(&server->pipeListener, server->unixPath.c_str());
+            if (status >= 0)
+                server->unixPathBound = true;
+        }
+    } else {
+        uv_getaddrinfo_t resolver { };
+        resolver.data = &resolved;
+        addrinfo hints { };
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        const std::string service = std::to_string(server->requestedPort);
+        status = uv_getaddrinfo(&server->loop, &resolver, inspectorResolved, server->host.c_str(), service.c_str(), &hints);
+        if (status >= 0)
+            uv_run(&server->loop, UV_RUN_DEFAULT);
+        if (status < 0 || !resolved.resolved) {
+            server->startupError = status < 0 ? uv_strerror(status) : (resolved.error.empty() ? "Unable to resolve inspector host" : resolved.error);
+            uv_sem_post(&server->started);
+            uv_loop_close(&server->loop);
+            server->loopInitialized = false;
+            return;
+        }
 
-    status = uv_tcp_init(&server->loop, &server->listener);
-    if (status >= 0) {
-        server->listenerInitialized = true;
-        server->listener.data = server;
-        status = uv_tcp_bind(&server->listener, reinterpret_cast<const sockaddr*>(&resolved.address), 0);
+        status = uv_tcp_init(&server->loop, &server->tcpListener);
+        if (status >= 0) {
+            server->listenerInitialized = true;
+            server->tcpListener.data = server;
+            status = uv_tcp_bind(&server->tcpListener, reinterpret_cast<const sockaddr*>(&resolved.address), 0);
+        }
     }
     if (status >= 0)
-        status = uv_listen(reinterpret_cast<uv_stream_t*>(&server->listener), 128, inspectorAccepted);
+        status = uv_listen(server->listenerStream(), 128, inspectorAccepted);
     if (status >= 0) {
         status = uv_async_init(&server->loop, &server->async, inspectorAsync);
         if (status >= 0) {
@@ -1195,8 +1414,9 @@ static void inspectorThread(void* opaque)
     }
     if (status < 0) {
         server->startupError = uv_strerror(status);
-        if (server->listenerInitialized && !uv_is_closing(reinterpret_cast<uv_handle_t*>(&server->listener)))
-            uv_close(reinterpret_cast<uv_handle_t*>(&server->listener), nullptr);
+        auto* listenerHandle = reinterpret_cast<uv_handle_t*>(server->listenerStream());
+        if (server->listenerInitialized && !uv_is_closing(listenerHandle))
+            uv_close(listenerHandle, nullptr);
         uv_run(&server->loop, UV_RUN_DEFAULT);
         uv_sem_post(&server->started);
         uv_loop_close(&server->loop);
@@ -1204,18 +1424,22 @@ static void inspectorThread(void* opaque)
         return;
     }
 
-    sockaddr_storage socketAddress { };
-    int socketLength = sizeof(socketAddress);
-    if (uv_tcp_getsockname(&server->listener, reinterpret_cast<sockaddr*>(&socketAddress), &socketLength) == 0) {
-        if (socketAddress.ss_family == AF_INET)
-            server->boundPort = ntohs(reinterpret_cast<sockaddr_in*>(&socketAddress)->sin_port);
-        else if (socketAddress.ss_family == AF_INET6)
-            server->boundPort = ntohs(reinterpret_cast<sockaddr_in6*>(&socketAddress)->sin6_port);
+    if (server->unixSocket) {
+        server->url = "ws+unix://" + server->unixPath;
+    } else {
+        sockaddr_storage socketAddress { };
+        int socketLength = sizeof(socketAddress);
+        if (uv_tcp_getsockname(&server->tcpListener, reinterpret_cast<sockaddr*>(&socketAddress), &socketLength) == 0) {
+            if (socketAddress.ss_family == AF_INET)
+                server->boundPort = ntohs(reinterpret_cast<sockaddr_in*>(&socketAddress)->sin_port);
+            else if (socketAddress.ss_family == AF_INET6)
+                server->boundPort = ntohs(reinterpret_cast<sockaddr_in6*>(&socketAddress)->sin6_port);
+        }
+        std::string displayHost = server->host;
+        if (displayHost.find(':') != std::string::npos && (displayHost.empty() || displayHost.front() != '['))
+            displayHost = "[" + displayHost + "]";
+        server->url = "ws://" + displayHost + ":" + std::to_string(server->boundPort) + server->path;
     }
-    std::string displayHost = server->host;
-    if (displayHost.find(':') != std::string::npos && (displayHost.empty() || displayHost.front() != '['))
-        displayHost = "[" + displayHost + "]";
-    server->url = "ws://" + displayHost + ":" + std::to_string(server->boundPort) + server->path;
     uv_sem_post(&server->started);
 
     uv_run(&server->loop, UV_RUN_DEFAULT);
@@ -1243,6 +1467,10 @@ bool InspectorServer::start()
     if (!startupError.empty()) {
         uv_thread_join(&thread);
         threadCreated = false;
+        if (unixPathBound && !unixPath.empty()) {
+            std::remove(unixPath.c_str());
+            unixPathBound = false;
+        }
         return false;
     }
     return true;
@@ -1257,8 +1485,487 @@ void InspectorServer::stop()
         uv_async_send(&async);
     uv_thread_join(&thread);
     threadCreated = false;
+    if (unixPathBound && !unixPath.empty()) {
+        std::remove(unixPath.c_str());
+        unixPathBound = false;
+    }
 }
 
+struct FramedWriteRequest {
+    uv_write_t request;
+    std::vector<char> bytes;
+};
+
+static void closeOwnedFd(int fd)
+{
+    if (fd < 0)
+        return;
+#if defined(_WIN32)
+    _close(fd);
+#else
+    close(fd);
+#endif
+}
+
+void FramedInspectorClient::postStarted()
+{
+    if (startedPosted)
+        return;
+    startedPosted = true;
+    uv_sem_post(&started);
+}
+
+void FramedInspectorClient::closeOnLoop(bool notifyInspector)
+{
+    if (closing.exchange(true, std::memory_order_acq_rel))
+        return;
+    if (notifyInspector && opened && !closeEventSent) {
+        closeEventSent = true;
+        inspector->enqueue({ InspectorEventType::Close, connectionId, nullptr, {} });
+    }
+    if (streamInitialized) {
+        uv_read_stop(stream);
+        auto* handle = reinterpret_cast<uv_handle_t*>(stream);
+        if (!uv_is_closing(handle))
+            uv_close(handle, nullptr);
+    }
+    if (asyncInitialized.load(std::memory_order_acquire)) {
+        auto* handle = reinterpret_cast<uv_handle_t*>(&async);
+        if (!uv_is_closing(handle))
+            uv_close(handle, nullptr);
+    }
+}
+
+static void framedWriteComplete(uv_write_t* request, int status)
+{
+    auto* write = reinterpret_cast<FramedWriteRequest*>(request);
+    auto* client = static_cast<FramedInspectorClient*>(request->handle->data);
+    delete write;
+    if (status < 0 && client)
+        client->closeOnLoop();
+}
+
+void FramedInspectorClient::flushOutput()
+{
+    std::deque<std::string> messages;
+    {
+        std::lock_guard lock(outputMutex);
+        messages.swap(output);
+        queuedOutputSize = 0;
+    }
+    for (auto& message : messages) {
+        auto* write = new (std::nothrow) FramedWriteRequest;
+        if (!write) {
+            closeOnLoop();
+            return;
+        }
+        const uint32_t size = static_cast<uint32_t>(message.size());
+        write->bytes.reserve(message.size() + 4);
+        write->bytes.push_back(static_cast<char>((size >> 24) & 0xff));
+        write->bytes.push_back(static_cast<char>((size >> 16) & 0xff));
+        write->bytes.push_back(static_cast<char>((size >> 8) & 0xff));
+        write->bytes.push_back(static_cast<char>(size & 0xff));
+        write->bytes.insert(write->bytes.end(), message.begin(), message.end());
+        const size_t queued = uv_stream_get_write_queue_size(stream);
+        if (queued > maxQueuedOutputSize || write->bytes.size() > maxQueuedOutputSize - queued) {
+            delete write;
+            closeOnLoop();
+            return;
+        }
+        uv_buf_t buffer = uv_buf_init(write->bytes.data(), static_cast<unsigned int>(write->bytes.size()));
+        const int status = uv_write(&write->request, stream, &buffer, 1, framedWriteComplete);
+        if (status < 0) {
+            delete write;
+            closeOnLoop();
+            return;
+        }
+    }
+}
+
+void FramedInspectorClient::enqueueOutput(std::string&& message)
+{
+    if (closing.load(std::memory_order_acquire) || message.size() > maxInspectorMessageSize)
+        return;
+    {
+        std::lock_guard lock(outputMutex);
+        if (message.size() > maxQueuedOutputSize - queuedOutputSize) {
+            output.clear();
+            queuedOutputSize = 0;
+            closeRequested.store(true, std::memory_order_release);
+        } else {
+            queuedOutputSize += message.size();
+            output.push_back(std::move(message));
+        }
+    }
+    if (asyncInitialized.load(std::memory_order_acquire))
+        uv_async_send(&async);
+}
+
+void FramedInspectorClient::processInput()
+{
+    while (input.size() >= 4) {
+        const uint32_t length = (static_cast<uint32_t>(input[0]) << 24)
+            | (static_cast<uint32_t>(input[1]) << 16)
+            | (static_cast<uint32_t>(input[2]) << 8)
+            | static_cast<uint32_t>(input[3]);
+        if (length > maxInspectorMessageSize) {
+            closeOnLoop();
+            return;
+        }
+        const size_t frameLength = static_cast<size_t>(length) + 4;
+        if (input.size() < frameLength)
+            return;
+        std::string message(input.begin() + 4, input.begin() + frameLength);
+        input.erase(input.begin(), input.begin() + frameLength);
+        if (message.find('\0') != std::string::npos || !utf8IsValid(message)) {
+            closeOnLoop();
+            return;
+        }
+        inspector->enqueue({ InspectorEventType::Message, connectionId, nullptr, std::move(message) });
+    }
+}
+
+static void framedRead(uv_stream_t* stream, ssize_t count, const uv_buf_t* buffer)
+{
+    std::unique_ptr<char[]> storage(buffer->base);
+    auto* client = static_cast<FramedInspectorClient*>(stream->data);
+    if (!client)
+        return;
+    if (count <= 0) {
+        if (count < 0)
+            client->closeOnLoop();
+        return;
+    }
+    if (client->input.size() + static_cast<size_t>(count) > maxInspectorMessageSize + 4) {
+        client->closeOnLoop();
+        return;
+    }
+    const auto* bytes = reinterpret_cast<const unsigned char*>(buffer->base);
+    client->input.insert(client->input.end(), bytes, bytes + count);
+    client->processInput();
+}
+
+void FramedInspectorClient::connected(int status)
+{
+    if (status < 0) {
+        startupError = uv_strerror(status);
+        postStarted();
+        closeOnLoop(false);
+        return;
+    }
+    status = uv_read_start(stream, inspectorAllocate, framedRead);
+    if (status < 0) {
+        startupError = uv_strerror(status);
+        postStarted();
+        closeOnLoop(false);
+        return;
+    }
+    opened = true;
+    auto sink = std::make_shared<FramedMessageSink>(weak_from_this());
+    inspector->enqueue({ InspectorEventType::Open, connectionId, std::move(sink), {} });
+    postStarted();
+}
+
+static void framedConnected(uv_connect_t* request, int status)
+{
+    auto* client = static_cast<FramedInspectorClient*>(request->data);
+    delete request;
+    if (client)
+        client->connected(status);
+}
+
+static void framedAsync(uv_async_t* handle)
+{
+    auto* client = static_cast<FramedInspectorClient*>(handle->data);
+    if (!client)
+        return;
+    if (client->stopRequested.load(std::memory_order_acquire)
+        || client->closeRequested.load(std::memory_order_acquire)) {
+        client->closeOnLoop();
+        return;
+    }
+    client->flushOutput();
+}
+
+static void framedInspectorThread(void* opaque)
+{
+    auto* client = static_cast<FramedInspectorClient*>(opaque);
+    int status = uv_loop_init(&client->loop);
+    if (status < 0) {
+        client->startupError = uv_strerror(status);
+        client->postStarted();
+        closeOwnedFd(std::exchange(client->ownedFd, -1));
+        return;
+    }
+    client->loopInitialized = true;
+
+    ResolveResult resolved;
+    if (client->kind == FramedTransportKind::Tcp) {
+        uv_getaddrinfo_t resolver { };
+        resolver.data = &resolved;
+        addrinfo hints { };
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        const std::string service = std::to_string(client->port);
+        status = uv_getaddrinfo(&client->loop, &resolver, inspectorResolved, client->host.c_str(), service.c_str(), &hints);
+        if (status >= 0)
+            uv_run(&client->loop, UV_RUN_DEFAULT);
+        if (status < 0 || !resolved.resolved) {
+            client->startupError = status < 0 ? uv_strerror(status) : (resolved.error.empty() ? "Unable to resolve inspector host" : resolved.error);
+            client->postStarted();
+            uv_loop_close(&client->loop);
+            client->loopInitialized = false;
+            return;
+        }
+    }
+
+    if (client->kind == FramedTransportKind::Tcp) {
+        status = uv_tcp_init(&client->loop, &client->tcpHandle);
+        client->stream = reinterpret_cast<uv_stream_t*>(&client->tcpHandle);
+    } else {
+        status = uv_pipe_init(&client->loop, &client->pipeHandle, 0);
+        client->stream = reinterpret_cast<uv_stream_t*>(&client->pipeHandle);
+    }
+    if (status >= 0) {
+        client->streamInitialized = true;
+        client->stream->data = client;
+        status = uv_async_init(&client->loop, &client->async, framedAsync);
+    }
+    if (status >= 0) {
+        client->asyncInitialized.store(true, std::memory_order_release);
+        client->async.data = client;
+    }
+    if (status < 0) {
+        client->startupError = uv_strerror(status);
+        client->postStarted();
+        closeOwnedFd(std::exchange(client->ownedFd, -1));
+        client->closeOnLoop(false);
+        uv_run(&client->loop, UV_RUN_DEFAULT);
+        uv_loop_close(&client->loop);
+        client->loopInitialized = false;
+        return;
+    }
+
+    if (client->kind == FramedTransportKind::FileDescriptor) {
+        status = uv_pipe_open(&client->pipeHandle, client->ownedFd);
+        if (status >= 0)
+            client->ownedFd = -1;
+        client->connected(status);
+    } else {
+        auto* request = new (std::nothrow) uv_connect_t;
+        if (!request) {
+            client->startupError = "Out of memory connecting inspector transport";
+            client->postStarted();
+            client->closeOnLoop(false);
+        } else {
+            request->data = client;
+            if (client->kind == FramedTransportKind::Tcp) {
+                status = uv_tcp_connect(request, &client->tcpHandle, reinterpret_cast<const sockaddr*>(&resolved.address), framedConnected);
+                if (status < 0) {
+                    delete request;
+                    client->connected(status);
+                }
+            } else {
+                uv_pipe_connect(request, &client->pipeHandle, client->unixPath.c_str(), framedConnected);
+            }
+        }
+    }
+
+    uv_run(&client->loop, UV_RUN_DEFAULT);
+    closeOwnedFd(std::exchange(client->ownedFd, -1));
+    client->asyncInitialized.store(false, std::memory_order_release);
+    client->streamInitialized = false;
+    uv_loop_close(&client->loop);
+    client->loopInitialized = false;
+}
+
+bool FramedInspectorClient::start()
+{
+    connectionId = inspector->nextConnectionId.fetch_add(1, std::memory_order_relaxed);
+    if (uv_sem_init(&started, 0) < 0) {
+        startupError = "Unable to initialize inspector startup synchronization";
+        closeOwnedFd(std::exchange(ownedFd, -1));
+        return false;
+    }
+    const int status = uv_thread_create(&thread, framedInspectorThread, this);
+    if (status < 0) {
+        startupError = uv_strerror(status);
+        uv_sem_destroy(&started);
+        closeOwnedFd(std::exchange(ownedFd, -1));
+        return false;
+    }
+    threadCreated = true;
+    uv_sem_wait(&started);
+    uv_sem_destroy(&started);
+    if (!startupError.empty()) {
+        uv_thread_join(&thread);
+        threadCreated = false;
+        return false;
+    }
+    return true;
+}
+
+void FramedInspectorClient::stop()
+{
+    if (!threadCreated)
+        return;
+    stopRequested.store(true, std::memory_order_release);
+    if (asyncInitialized.load(std::memory_order_acquire))
+        uv_async_send(&async);
+    uv_thread_join(&thread);
+    threadCreated = false;
+}
+
+struct InspectorNotification {
+    uv_loop_t loop { };
+    uv_tcp_t tcpHandle { };
+    uv_pipe_t pipeHandle { };
+    uv_stream_t* stream { nullptr };
+    uv_connect_t connectRequest { };
+    uv_write_t writeRequest { };
+    uv_timer_t timer { };
+    bool streamInitialized { false };
+    bool timerInitialized { false };
+    bool finished { false };
+    bool delivered { false };
+};
+
+static void finishInspectorNotification(InspectorNotification* notification)
+{
+    if (!notification || notification->finished)
+        return;
+    notification->finished = true;
+    if (notification->timerInitialized) {
+        uv_timer_stop(&notification->timer);
+        auto* timer = reinterpret_cast<uv_handle_t*>(&notification->timer);
+        if (!uv_is_closing(timer))
+            uv_close(timer, nullptr);
+    }
+    if (notification->streamInitialized) {
+        auto* stream = reinterpret_cast<uv_handle_t*>(notification->stream);
+        if (!uv_is_closing(stream))
+            uv_close(stream, nullptr);
+    }
+}
+
+static void inspectorNotificationWritten(uv_write_t* request, int status)
+{
+    auto* notification = static_cast<InspectorNotification*>(request->data);
+    if (notification)
+        notification->delivered = status >= 0;
+    finishInspectorNotification(notification);
+}
+
+static void inspectorNotificationConnected(uv_connect_t* request, int status)
+{
+    auto* notification = static_cast<InspectorNotification*>(request->data);
+    if (!notification || notification->finished)
+        return;
+    if (status < 0) {
+        finishInspectorNotification(notification);
+        return;
+    }
+    static char byte = '1';
+    uv_buf_t buffer = uv_buf_init(&byte, 1);
+    notification->writeRequest.data = notification;
+    if (uv_write(&notification->writeRequest, notification->stream, &buffer, 1, inspectorNotificationWritten) < 0)
+        finishInspectorNotification(notification);
+}
+
+static void inspectorNotificationTimedOut(uv_timer_t* timer)
+{
+    finishInspectorNotification(static_cast<InspectorNotification*>(timer->data));
+}
+
+static int sendInspectorNotification(
+    const char* host,
+    uint16_t port,
+    const char* unixPath)
+{
+    InspectorNotification notification;
+    if (uv_loop_init(&notification.loop) < 0)
+        return -1;
+
+    ResolveResult resolved;
+    int status = 0;
+    if (!unixPath) {
+        uv_getaddrinfo_t resolver { };
+        resolver.data = &resolved;
+        addrinfo hints { };
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        const std::string service = std::to_string(port);
+        status = uv_getaddrinfo(&notification.loop, &resolver, inspectorResolved, host, service.c_str(), &hints);
+        if (status >= 0)
+            uv_run(&notification.loop, UV_RUN_DEFAULT);
+        if (status < 0 || !resolved.resolved) {
+            uv_loop_close(&notification.loop);
+            return -1;
+        }
+    }
+
+    if (unixPath) {
+        status = uv_pipe_init(&notification.loop, &notification.pipeHandle, 0);
+        notification.stream = reinterpret_cast<uv_stream_t*>(&notification.pipeHandle);
+    } else {
+        status = uv_tcp_init(&notification.loop, &notification.tcpHandle);
+        notification.stream = reinterpret_cast<uv_stream_t*>(&notification.tcpHandle);
+    }
+    if (status >= 0) {
+        notification.streamInitialized = true;
+        notification.stream->data = &notification;
+        status = uv_timer_init(&notification.loop, &notification.timer);
+    }
+    if (status >= 0) {
+        notification.timerInitialized = true;
+        notification.timer.data = &notification;
+        status = uv_timer_start(&notification.timer, inspectorNotificationTimedOut, 1000, 0);
+    }
+    if (status < 0) {
+        finishInspectorNotification(&notification);
+        uv_run(&notification.loop, UV_RUN_DEFAULT);
+        uv_loop_close(&notification.loop);
+        return -1;
+    }
+
+    notification.connectRequest.data = &notification;
+    if (unixPath) {
+        uv_pipe_connect(
+            &notification.connectRequest,
+            &notification.pipeHandle,
+            unixPath,
+            inspectorNotificationConnected);
+    } else {
+        status = uv_tcp_connect(
+            &notification.connectRequest,
+            &notification.tcpHandle,
+            reinterpret_cast<const sockaddr*>(&resolved.address),
+            inspectorNotificationConnected);
+        if (status < 0)
+            finishInspectorNotification(&notification);
+    }
+
+    uv_run(&notification.loop, UV_RUN_DEFAULT);
+    uv_loop_close(&notification.loop);
+    return notification.delivered ? 0 : -1;
+}
+
+}
+
+extern "C" int ct_jsc_inspector_notify_tcp(const char* host, uint16_t port)
+{
+    if (!host || !host[0] || !port)
+        return -1;
+    return sendInspectorNotification(host, port, nullptr);
+}
+
+extern "C" int ct_jsc_inspector_notify_unix(const char* unixPath)
+{
+    if (!unixPath || !unixPath[0])
+        return -1;
+    return sendInspectorNotification(nullptr, 0, unixPath);
 }
 
 extern "C" CtJscInspector* ct_jsc_inspector_create(JSGlobalContextRef context, char** errorOut)
@@ -1290,15 +1997,39 @@ extern "C" void ct_jsc_inspector_destroy(CtJscInspector* inspector)
 {
     if (!inspector)
         return;
-    inspector->closing.store(true, std::memory_order_release);
+    {
+        std::lock_guard lock(inspector->eventMutex);
+        if (inspector->closing.exchange(true, std::memory_order_acq_rel))
+            return;
+    }
     if (inspector->server) {
         inspector->server->stop();
         inspector->server.reset();
     }
+    if (inspector->framedClient) {
+        inspector->framedClient->stop();
+        inspector->framedClient.reset();
+    }
     while (inspector->eventTaskScheduled.load(std::memory_order_acquire))
         ct_jsc_run_loop_cycle();
+    {
+        std::lock_guard lock(inspector->localSinkMutex);
+        inspector->localSinks.clear();
+    }
     inspector->destroyController();
-    delete inspector;
+    inspector->release();
+}
+
+extern "C" void ct_jsc_inspector_retain(CtJscInspector* inspector)
+{
+    if (inspector)
+        inspector->retain();
+}
+
+extern "C" void ct_jsc_inspector_release(CtJscInspector* inspector)
+{
+    if (inspector)
+        inspector->release();
 }
 
 extern "C" int ct_jsc_inspector_start_server(
@@ -1314,14 +2045,14 @@ extern "C" int ct_jsc_inspector_start_server(
         *urlOut = nullptr;
     if (errorOut)
         *errorOut = nullptr;
-    if (!inspector || !host || !path || path[0] != '/') {
+    if (!inspector || inspector->closing.load(std::memory_order_acquire) || !host || !path || path[0] != '/') {
         if (errorOut)
             *errorOut = duplicateCString("Invalid inspector server configuration");
         return -1;
     }
-    if (inspector->server) {
+    if (inspector->hasTransport()) {
         if (errorOut)
-            *errorOut = duplicateCString("Inspector server is already active");
+            *errorOut = duplicateCString("Inspector transport is already active");
         return -1;
     }
     std::string error;
@@ -1345,12 +2076,156 @@ extern "C" int ct_jsc_inspector_start_server(
     return 0;
 }
 
+extern "C" int ct_jsc_inspector_start_unix_server(
+    CtJscInspector* inspector,
+    const char* unixPath,
+    bool pauseOnStart,
+    char** urlOut,
+    char** errorOut)
+{
+    if (urlOut)
+        *urlOut = nullptr;
+    if (errorOut)
+        *errorOut = nullptr;
+    if (!inspector || inspector->closing.load(std::memory_order_acquire) || !unixPath || !unixPath[0]) {
+        if (errorOut)
+            *errorOut = duplicateCString("Invalid inspector Unix server configuration");
+        return -1;
+    }
+    if (inspector->hasTransport()) {
+        if (errorOut)
+            *errorOut = duplicateCString("Inspector transport is already active");
+        return -1;
+    }
+    std::string error;
+    if (!inspector->ensureController(error)) {
+        if (errorOut)
+            *errorOut = duplicateCString(error);
+        return -1;
+    }
+    inspector->pauseOnStart = pauseOnStart;
+    inspector->pauseConsumed = false;
+    auto server = std::make_shared<InspectorServer>(inspector, unixPath);
+    if (!server->start()) {
+        if (errorOut)
+            *errorOut = duplicateCString(server->startupError);
+        return -1;
+    }
+    inspector->serverUrl = server->url;
+    inspector->server = std::move(server);
+    if (urlOut)
+        *urlOut = duplicateCString(inspector->serverUrl);
+    return 0;
+}
+
+static int startFramedInspectorClient(
+    CtJscInspector* inspector,
+    std::shared_ptr<FramedInspectorClient> client,
+    bool pauseOnStart,
+    char** errorOut)
+{
+    if (errorOut)
+        *errorOut = nullptr;
+    if (!inspector || inspector->closing.load(std::memory_order_acquire) || !client) {
+        if (errorOut)
+            *errorOut = duplicateCString("Invalid framed inspector configuration");
+        return -1;
+    }
+    if (inspector->hasTransport()) {
+        if (errorOut)
+            *errorOut = duplicateCString("Inspector transport is already active");
+        return -1;
+    }
+    std::string error;
+    if (!inspector->ensureController(error)) {
+        if (errorOut)
+            *errorOut = duplicateCString(error);
+        return -1;
+    }
+    inspector->pauseOnStart = pauseOnStart;
+    inspector->pauseConsumed = false;
+    if (!client->start()) {
+        if (errorOut)
+            *errorOut = duplicateCString(client->startupError);
+        return -1;
+    }
+    inspector->framedClient = std::move(client);
+    inspector->serverUrl.clear();
+    return 0;
+}
+
+extern "C" int ct_jsc_inspector_connect_tcp(
+    CtJscInspector* inspector,
+    const char* host,
+    uint16_t port,
+    bool pauseOnStart,
+    char** errorOut)
+{
+    if (!host || !host[0] || !port) {
+        if (errorOut)
+            *errorOut = duplicateCString("Invalid inspector TCP connection configuration");
+        return -1;
+    }
+    return startFramedInspectorClient(
+        inspector,
+        std::make_shared<FramedInspectorClient>(inspector, host, port),
+        pauseOnStart,
+        errorOut);
+}
+
+extern "C" int ct_jsc_inspector_connect_unix(
+    CtJscInspector* inspector,
+    const char* unixPath,
+    bool pauseOnStart,
+    char** errorOut)
+{
+    if (!unixPath || !unixPath[0]) {
+        if (errorOut)
+            *errorOut = duplicateCString("Invalid inspector Unix connection configuration");
+        return -1;
+    }
+    return startFramedInspectorClient(
+        inspector,
+        std::make_shared<FramedInspectorClient>(inspector, unixPath),
+        pauseOnStart,
+        errorOut);
+}
+
+extern "C" int ct_jsc_inspector_connect_fd(
+    CtJscInspector* inspector,
+    int fd,
+    bool pauseOnStart,
+    char** errorOut)
+{
+#if defined(_WIN32)
+    const int ownedFd = _dup(fd);
+#else
+    const int ownedFd = dup(fd);
+#endif
+    if (ownedFd < 0) {
+        if (errorOut)
+            *errorOut = duplicateCString(std::strerror(errno));
+        return -1;
+    }
+    return startFramedInspectorClient(
+        inspector,
+        std::make_shared<FramedInspectorClient>(inspector, ownedFd),
+        pauseOnStart,
+        errorOut);
+}
+
 extern "C" void ct_jsc_inspector_stop_server(CtJscInspector* inspector)
 {
-    if (!inspector || !inspector->server)
+    if (!inspector)
         return;
-    inspector->server->stop();
-    inspector->server.reset();
+    if (inspector->server) {
+        inspector->server->stop();
+        inspector->server.reset();
+    }
+    if (inspector->framedClient) {
+        inspector->framedClient->stop();
+        inspector->framedClient.reset();
+    }
     inspector->serverUrl.clear();
 }
 
@@ -1363,7 +2238,7 @@ extern "C" char* ct_jsc_inspector_copy_url(CtJscInspector* inspector)
 
 extern "C" bool ct_jsc_inspector_has_server(CtJscInspector* inspector)
 {
-    return inspector && inspector->server;
+    return inspector && inspector->hasTransport();
 }
 
 extern "C" bool ct_jsc_inspector_has_remote_connection(CtJscInspector* inspector)
@@ -1371,11 +2246,18 @@ extern "C" bool ct_jsc_inspector_has_remote_connection(CtJscInspector* inspector
     return inspector && inspector->remoteConnectionCount.load(std::memory_order_acquire) > 0;
 }
 
+extern "C" bool ct_jsc_inspector_keeps_event_loop_alive(CtJscInspector* inspector)
+{
+    return inspector && inspector->framedClient
+        && !inspector->framedClient->closing.load(std::memory_order_acquire);
+}
+
 extern "C" int ct_jsc_inspector_wait_for_connection(CtJscInspector* inspector)
 {
-    if (!inspector || !inspector->server)
+    if (!inspector || !inspector->hasTransport())
         return -1;
-    while (inspector->server && !inspector->closing.load(std::memory_order_acquire)
+    while (inspector->hasTransport() && !inspector->closing.load(std::memory_order_acquire)
+        && (!inspector->framedClient || !inspector->framedClient->closing.load(std::memory_order_acquire))
         && inspector->remoteConnectionCount.load(std::memory_order_acquire) == 0) {
         ct_jsc_run_loop_cycle();
         uv_sleep(1);
@@ -1385,12 +2267,14 @@ extern "C" int ct_jsc_inspector_wait_for_connection(CtJscInspector* inspector)
 
 extern "C" uint64_t ct_jsc_inspector_connect_local(CtJscInspector* inspector)
 {
-    if (!inspector || inspector->closing.load(std::memory_order_acquire))
+    if (!inspector)
         return 0;
     const uint64_t id = inspector->nextConnectionId.fetch_add(1, std::memory_order_relaxed);
     auto sink = std::make_shared<LocalMessageSink>();
     {
         std::lock_guard lock(inspector->localSinkMutex);
+        if (inspector->closing.load(std::memory_order_acquire))
+            return 0;
         inspector->localSinks.emplace(id, sink);
     }
     inspector->enqueue({ InspectorEventType::Open, id, std::move(sink), {} });
@@ -1403,7 +2287,7 @@ extern "C" int ct_jsc_inspector_send_local(CtJscInspector* inspector, uint64_t i
         return -1;
     {
         std::lock_guard lock(inspector->localSinkMutex);
-        if (!inspector->localSinks.contains(id))
+        if (inspector->closing.load(std::memory_order_acquire) || !inspector->localSinks.contains(id))
             return -1;
     }
     inspector->enqueue({ InspectorEventType::Message, id, nullptr, message });
@@ -1461,5 +2345,6 @@ extern "C" void ct_jsc_inspector_disconnect_local(CtJscInspector* inspector, uin
         std::lock_guard lock(inspector->localSinkMutex);
         inspector->localSinks.erase(id);
     }
-    inspector->enqueue({ InspectorEventType::Close, id, nullptr, {} });
+    if (!inspector->closing.load(std::memory_order_acquire))
+        inspector->enqueue({ InspectorEventType::Close, id, nullptr, {} });
 }
