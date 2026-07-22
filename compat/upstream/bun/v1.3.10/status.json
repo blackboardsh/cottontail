@@ -70,6 +70,13 @@
       "timeoutMs": 600000
     },
     {
+      "pattern": "^test/cli/run/transpiler-cache\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "All eight copied runtime transpiler-cache cases pass across enablement, version invalidation, content addressing, permissions, concurrent writers, and non-inlined environment values (116 assertions).",
+      "args": ["--timeout=180000"],
+      "timeoutMs": 600000
+    },
+    {
       "pattern": "^test/cli/update_interactive_formatting\\.test\\.ts$",
       "status": "enabled",
       "reason": "All 31 copied interactive update cases pass across selection and navigation, dry-run and cancellation, recursive and filtered workspaces, catalog layouts, semver prefix preservation, package installation, and lockfile persistence (163 assertions).",
