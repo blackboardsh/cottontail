@@ -21,6 +21,7 @@ const MinimumReleaseAge = @import("package_manager_minimum_release_age.zig");
 const Pack = @import("package_manager_pack.zig");
 const ScriptRunner = @import("script_runner.zig");
 const Publish = @import("package_manager_publish.zig");
+const DistTag = @import("package_manager_dist_tag.zig");
 
 const version = @import("version.zig").version;
 const Semver = compiler.Semver;
@@ -129,6 +130,7 @@ const Options = struct {
     tolerate_republish: bool = false,
     invalid_publish_access: ?[]const u8 = null,
     invalid_publish_auth_type: ?[]const u8 = null,
+    registry_auth_option_used: bool = false,
 };
 
 const PackageSpec = struct {
@@ -656,25 +658,29 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
             if (value.len == 0) return error.MissingOptionValue;
             options.publish_tag = value;
         } else if (std.mem.eql(u8, arg, "--otp")) {
-            if (options.command != .publish) return error.InvalidPackageManagerOption;
+            if (options.command != .publish and options.command != .pm) return error.InvalidPackageManagerOption;
             index += 1;
             if (index >= args.len) return error.MissingOptionValue;
             options.publish_otp = args[index];
+            options.registry_auth_option_used = true;
         } else if (std.mem.startsWith(u8, arg, "--otp=")) {
-            if (options.command != .publish) return error.InvalidPackageManagerOption;
+            if (options.command != .publish and options.command != .pm) return error.InvalidPackageManagerOption;
             options.publish_otp = arg["--otp=".len..];
+            options.registry_auth_option_used = true;
         } else if (std.mem.eql(u8, arg, "--auth-type")) {
-            if (options.command != .publish) return error.InvalidPackageManagerOption;
+            if (options.command != .publish and options.command != .pm) return error.InvalidPackageManagerOption;
             index += 1;
             if (index >= args.len) return error.MissingOptionValue;
             options.publish_auth_type = Publish.AuthType.parse(args[index]);
             if (options.publish_auth_type == null) options.invalid_publish_auth_type = args[index];
+            options.registry_auth_option_used = true;
         } else if (std.mem.startsWith(u8, arg, "--auth-type=")) {
-            if (options.command != .publish) return error.InvalidPackageManagerOption;
+            if (options.command != .publish and options.command != .pm) return error.InvalidPackageManagerOption;
             const value = arg["--auth-type=".len..];
             if (value.len == 0) return error.MissingOptionValue;
             options.publish_auth_type = Publish.AuthType.parse(value);
             if (options.publish_auth_type == null) options.invalid_publish_auth_type = value;
+            options.registry_auth_option_used = true;
         } else if (std.mem.eql(u8, arg, "--tolerate-republish")) {
             if (options.command != .publish) return error.InvalidPackageManagerOption;
             options.tolerate_republish = true;
@@ -781,6 +787,13 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
     if ((options.command == .patch or options.command == .patch_commit) and options.positionals.len == 0) {
         return error.MissingPatchTarget;
     }
+    if (options.command == .pm and options.registry_auth_option_used and
+        (options.positionals.len == 0 or
+            (!std.mem.eql(u8, options.positionals[0], "dist-tag") and
+                !std.mem.eql(u8, options.positionals[0], "dist-tags"))))
+    {
+        return error.InvalidPackageManagerOption;
+    }
     if (options.trust and options.command != .install and options.command != .add) {
         return error.InvalidPackageManagerOption;
     }
@@ -859,6 +872,15 @@ fn printPackageManagerHelp(command: Command, writer: *std.Io.Writer) !void {
             \\  --gzip-level <0-9>            Set tarball compression level
             \\
         );
+    } else if (command == .pm) {
+        try writer.writeAll(
+            \\Registry utilities:
+            \\
+            \\  dist-tag add <package@version> [tag]
+            \\  dist-tag rm <package> <tag>
+            \\  dist-tag ls [package]
+            \\
+        );
     }
 }
 
@@ -873,8 +895,14 @@ fn runPublish(
         try stderr.flush();
         return 1;
     }
+    if (options.publish_tag.len > 0) {
+        Publish.validateDistTag(options.publish_tag) catch |err| {
+            try reportPublishTagError(err, options.publish_tag, stderr);
+            return 1;
+        };
+    }
     if (!options.silent) {
-        try stdout.writeAll("bun publish v1.3.10 (cottontail)\n");
+        try stdout.print("bun publish v{s} (cottontail v{s})\n", .{ bun_compat_version, version });
         try stdout.flush();
     }
 
@@ -919,7 +947,13 @@ fn runPublish(
             stdout,
             stderr,
         )) catch |err| {
-        try reportPublishPreparationError(err, options.positionals.len == 1, options.positionals, stderr);
+        try reportPublishPreparationError(
+            err,
+            options.positionals.len == 1,
+            options.positionals,
+            publish_options.tag,
+            stderr,
+        );
         return 1;
     };
 
@@ -949,6 +983,7 @@ fn reportPublishPreparationError(
     err: anyerror,
     from_tarball: bool,
     positionals: []const []const u8,
+    tag: []const u8,
     stderr: *std.Io.Writer,
 ) !void {
     switch (err) {
@@ -967,9 +1002,19 @@ fn reportPublishPreparationError(
         error.PrivatePackage => try stderr.writeAll("error: attempted to publish a private package\n"),
         error.RestrictedUnscopedPackage => try stderr.writeAll("error: unable to restrict access to unscoped package\n"),
         error.InvalidPublishAccess => try stderr.writeAll("error: invalid `access` value in publishConfig\n"),
+        error.SemverDistTag, error.InvalidDistTag => try reportPublishTagError(err, tag, stderr),
         error.InvalidGzipLevel => try stderr.writeAll("error: compression level must be between 0 and 9\n"),
         error.WorkspaceVersionUnresolved, error.InvalidBundledDependencies, error.InvalidFiles, error.LifecycleScriptFailed => {},
         else => try stderr.print("error: failed to prepare package for publishing: {s}\n", .{@errorName(err)}),
+    }
+    try stderr.flush();
+}
+
+fn reportPublishTagError(err: anyerror, tag: []const u8, stderr: *std.Io.Writer) !void {
+    if (err == error.SemverDistTag) {
+        try stderr.print("error: Tag name must not be a valid SemVer range: {s}\n", .{tag});
+    } else {
+        try stderr.print("error: invalid publish dist-tag: {s}\n", .{tag});
     }
     try stderr.flush();
 }
@@ -1026,6 +1071,9 @@ fn runPm(
         return 0;
     }
     if (std.mem.eql(u8, subcommand, "migrate")) return runPmMigrate(init, options, stdout, stderr);
+    if (std.mem.eql(u8, subcommand, "dist-tag") or std.mem.eql(u8, subcommand, "dist-tags")) {
+        return runPmDistTag(init, options, stdout, stderr);
+    }
     if (std.mem.eql(u8, subcommand, "pack")) {
         const invocation_dir = try absolutePath(init.io, init.arena.allocator(), ".");
         const project = try findInstallProject(init.io, init.arena.allocator(), invocation_dir);
@@ -1101,6 +1149,85 @@ fn runPm(
     try stderr.writeAll("error: unsupported package-manager utility\n");
     try stderr.flush();
     return 1;
+}
+
+fn runPmDistTag(
+    init: std.process.Init,
+    options: Options,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !u8 {
+    const allocator = init.arena.allocator();
+    const invocation_dir = try absolutePath(init.io, allocator, ".");
+    const project: ?InstallProject = findInstallProject(init.io, allocator, invocation_dir) catch null;
+    const default_name = if (project) |found|
+        readProjectPackageName(init.io, allocator, found.package_dir) catch null
+    else
+        null;
+    const action = DistTag.parse(options.positionals[1..], default_name) catch |err| {
+        try reportDistTagUsageError(err, options.positionals[1..], stderr);
+        return 1;
+    };
+
+    var manager = Manager.init(init, options, stdout, stderr);
+    defer manager.deinit();
+    manager.invocation_dir = invocation_dir;
+    manager.root_dir = if (project) |found| found.root_dir else invocation_dir;
+    manager.invocation_package_dir = if (project) |found| found.package_dir else invocation_dir;
+    manager.loadConfiguration() catch |err| {
+        if (err != error.PackageManagerErrorReported) {
+            try stderr.print("error: failed to load package manager configuration: {s}\n", .{@errorName(err)});
+        }
+        try stderr.flush();
+        return 1;
+    };
+    manager.client.initDefaultProxies(manager.allocator, manager.init_data.environ_map) catch {};
+
+    const configured = manager.registryConfigForPackage(action.packageName());
+    return DistTag.run(
+        init,
+        &manager.client,
+        action,
+        .{ .url = configured.url, .authorization = configured.authorization },
+        .{ .otp = options.publish_otp, .auth_type = options.publish_auth_type },
+        stdout,
+        stderr,
+    );
+}
+
+fn readProjectPackageName(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    package_dir: []const u8,
+) !?[]const u8 {
+    const path = try std.fs.path.join(allocator, &.{ package_dir, "package.json" });
+    const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 * 1024 * 1024));
+    const manifest = try std.json.parseFromSliceLeaky(Value, allocator, source, .{});
+    if (manifest != .object) return null;
+    const name = manifest.object.get("name") orelse return null;
+    if (name != .string or name.string.len == 0) return null;
+    return name.string;
+}
+
+fn reportDistTagUsageError(
+    err: anyerror,
+    args: []const []const u8,
+    stderr: *std.Io.Writer,
+) !void {
+    switch (err) {
+        error.SemverDistTag => try stderr.print(
+            "error: Tag name must not be a valid SemVer range: {s}\n",
+            .{if (args.len > 0) args[args.len - 1] else ""},
+        ),
+        error.InvalidDistTag => try stderr.writeAll("error: invalid dist-tag name\n"),
+        error.InvalidDistTagPackage => try stderr.writeAll("error: invalid package name for dist-tag\n"),
+        error.InvalidDistTagVersion => try stderr.writeAll("error: invalid package version for dist-tag\n"),
+        error.MissingDistTagVersion => try stderr.writeAll("error: dist-tag add requires a package with a version\n"),
+        else => try stderr.writeAll(
+            "error: Usage: bun pm dist-tag add <package@version> [tag] | rm <package> <tag> | ls [package]\n",
+        ),
+    }
+    try stderr.flush();
 }
 
 fn runPmInfo(
@@ -1730,6 +1857,7 @@ const Manager = struct {
     installed_count: usize = 0,
     removed_count: usize = 0,
     changed: bool = false,
+    update_package_json_changed: bool = false,
     patch_policy_changed: bool = false,
     omit_pnpm_workspace_versions: bool = false,
     root_package_json: ?*Value = null,
@@ -2018,7 +2146,8 @@ const Manager = struct {
         try manager.relinkNativeDependencyBins(&root);
 
         if ((manager.options.command == .add or manager.options.command == .remove or manager.options.command == .update or manager.options.command == .link) and
-            !manager.options.no_save and !manager.options.dry_run)
+            !manager.options.no_save and !manager.options.dry_run and
+            (manager.options.command != .update or manager.update_package_json_changed))
         {
             try writePackageJSON(
                 manager.init_data.io,
@@ -2111,6 +2240,8 @@ const Manager = struct {
                     });
                 }
             } else if (manager.options.command == .add and reported_installed_count == 0) {
+                try manager.stdout.print("\n[{d:.2}ms] done\n", .{elapsed_ms});
+            } else if (manager.options.command == .update and reported_installed_count == 0) {
                 try manager.stdout.print("\n[{d:.2}ms] done\n", .{elapsed_ms});
             } else if (reported_installed_count == 1) {
                 try manager.stdout.print("{s}1 package installed [{d:.2}ms]\n", .{
@@ -4067,29 +4198,148 @@ const Manager = struct {
     }
 
     fn updatePackages(manager: *Manager, package_json: *Value, parent_dir: []const u8) !void {
-        const requested = manager.options.positionals;
-        const previous_force = manager.options.force;
-        manager.options.force = true;
-        defer manager.options.force = previous_force;
+        const UpdateRequest = struct {
+            name: []const u8,
+            spec: ?[]const u8,
+        };
+        var requests = std.array_list.Managed(UpdateRequest).init(manager.allocator);
+        defer requests.deinit();
+        for (manager.options.positionals) |raw_spec| {
+            if (hasUnknownURLScheme(raw_spec)) {
+                try manager.stderr.print("error: unrecognised dependency format: {s}\n", .{raw_spec});
+                return error.PackageManagerErrorReported;
+            }
+            const parsed = splitPackageSpec(raw_spec);
+            const name = parsed.name orelse {
+                try manager.stderr.print("error: unrecognised dependency format: {s}\n", .{raw_spec});
+                return error.PackageManagerErrorReported;
+            };
+            if (!compiler.strings.isNPMPackageName(name)) {
+                try manager.stderr.print("error: unrecognised dependency format: {s}\n", .{raw_spec});
+                return error.PackageManagerErrorReported;
+            }
+            try requests.append(.{
+                .name = name,
+                .spec = if (hasExplicitRange(raw_spec)) parsed.spec else null,
+            });
+        }
+
+        var handled = std.StringHashMap(void).init(manager.allocator);
+        defer handled.deinit();
+        var changed_output: std.Io.Writer.Allocating = .init(manager.allocator);
+        var installed_output: std.Io.Writer.Allocating = .init(manager.allocator);
+
         for (mutable_dependency_sections) |section_name| {
             const section_value = package_json.object.getPtr(section_name) orelse continue;
             if (section_value.* != .object) continue;
             for (section_value.object.keys(), section_value.object.values()) |name, *spec_value| {
-                if (requested.len > 0 and !containsString(requested, name)) continue;
-                if (spec_value.* != .string or isLocalSpec(spec_value.string)) continue;
+                var request: ?UpdateRequest = null;
+                for (requests.items) |candidate| {
+                    if (std.mem.eql(u8, candidate.name, name)) {
+                        request = candidate;
+                        break;
+                    }
+                }
+                if (requests.items.len > 0 and request == null) continue;
+                if (handled.contains(name)) continue;
+                try handled.put(try manager.allocator.dupe(u8, name), {});
+                if (spec_value.* != .string or !isUpdatableRegistrySpec(spec_value.string)) continue;
+
+                const original_spec = spec_value.string;
+                const resolution_spec = try updateResolutionSpec(
+                    manager.allocator,
+                    original_spec,
+                    if (request) |selected| selected.spec else null,
+                    manager.options.latest,
+                );
+                const previous_changed = manager.changed;
+                const previous_installed_count = manager.installed_count;
+                const previous_locked_version = if (try manager.findLockedSelection(name, parent_dir)) |selection|
+                    selection.package.version
+                else
+                    null;
+                manager.direct_bins.clearRetainingCapacity();
                 const resolved = try manager.installDependency(
                     name,
-                    if (manager.options.latest or requested.len > 0) "latest" else spec_value.string,
+                    resolution_spec,
                     parent_dir,
                     true,
                     false,
                 );
-                spec_value.* = .{ .string = if (manager.options.exact)
-                    resolved
-                else
-                    try std.fmt.allocPrint(manager.allocator, "^{s}", .{resolved}) };
-                manager.changed = true;
+                const rewrite_dist_tag = requests.items.len > 0 or manager.options.latest;
+                const saved_spec = try updatedDependencySpec(
+                    manager.allocator,
+                    original_spec,
+                    resolved,
+                    manager.options.exact,
+                    rewrite_dist_tag,
+                );
+                const manifest_changed = !std.mem.eql(u8, original_spec, saved_spec);
+                if (manifest_changed) {
+                    spec_value.* = .{ .string = saved_spec };
+                    manager.update_package_json_changed = true;
+                    manager.changed = true;
+                } else if (previous_locked_version) |locked| {
+                    if (std.mem.eql(u8, locked, resolved) and manager.installed_count == previous_installed_count) {
+                        manager.changed = previous_changed;
+                    }
+                }
+
+                if (!manager.options.silent) {
+                    if (requests.items.len > 0) {
+                        try printNamedUpdate(&installed_output.writer, name, resolved, manager.direct_bins.items);
+                    } else if (dependencyBaselineVersion(original_spec)) |previous| {
+                        if (!std.mem.eql(u8, previous, resolved)) {
+                            try changed_output.writer.print("^ {s} {s} -> {s}\n", .{ name, previous, resolved });
+                        } else {
+                            try installed_output.writer.print("+ {s}@{s}\n", .{ name, resolved });
+                        }
+                    } else {
+                        try installed_output.writer.print("+ {s}@{s}\n", .{ name, resolved });
+                    }
+                }
             }
+        }
+
+        if (requests.items.len > 0) {
+            var dependencies: ?*std.json.ObjectMap = null;
+            for (requests.items) |request| {
+                if (handled.contains(request.name)) continue;
+                if (dependencies == null) {
+                    dependencies = try ensureObjectProperty(manager.allocator, &package_json.object, "dependencies");
+                }
+                manager.direct_bins.clearRetainingCapacity();
+                const resolved = try manager.installDependency(
+                    request.name,
+                    request.spec orelse "latest",
+                    parent_dir,
+                    true,
+                    false,
+                );
+                const saved_spec = try newUpdateDependencySpec(
+                    manager.allocator,
+                    request.spec,
+                    resolved,
+                    manager.options.exact,
+                );
+                try dependencies.?.put(
+                    manager.allocator,
+                    try manager.allocator.dupe(u8, request.name),
+                    .{ .string = saved_spec },
+                );
+                try handled.put(try manager.allocator.dupe(u8, request.name), {});
+                manager.update_package_json_changed = true;
+                manager.changed = true;
+                if (!manager.options.silent) {
+                    try printNamedUpdate(&installed_output.writer, request.name, resolved, manager.direct_bins.items);
+                }
+            }
+        }
+
+        if (!manager.options.silent) {
+            if (changed_output.written().len > 0) try manager.stdout.writeAll(changed_output.written());
+            if (changed_output.written().len > 0 and installed_output.written().len > 0) try manager.stdout.writeByte('\n');
+            if (installed_output.written().len > 0) try manager.stdout.writeAll(installed_output.written());
         }
     }
 
@@ -4217,9 +4467,9 @@ const Manager = struct {
         } else effective_spec;
 
         const explicit_global_link = manager.options.command == .link and direct;
-        const refresh_direct_registry = manager.options.command == .add and
+        const refresh_direct_registry = (manager.options.command == .add or manager.options.command == .update) and
             direct and
-            !manager.report_direct_installs and
+            (manager.options.command == .update or !manager.report_direct_installs) and
             !workspace_package and
             !isGitSpec(resolution_spec) and
             !isTarballSpec(resolution_spec) and
@@ -8455,6 +8705,122 @@ fn parseNpmAlias(alias: []const u8, spec: []const u8) struct { []const u8, []con
 fn hasExplicitRange(input: []const u8) bool {
     const parsed = splitPackageSpec(input);
     return parsed.name != null and !std.mem.eql(u8, parsed.spec, "latest");
+}
+
+fn isUpdatableRegistrySpec(spec: []const u8) bool {
+    return !isLocalSpec(spec) and
+        !isGitSpec(spec) and
+        !isTarballSpec(spec) and
+        !std.mem.startsWith(u8, spec, "http://") and
+        !std.mem.startsWith(u8, spec, "https://") and
+        !std.mem.startsWith(u8, spec, "workspace:") and
+        !std.mem.startsWith(u8, spec, "catalog:") and
+        !std.mem.startsWith(u8, spec, "patch:");
+}
+
+const NpmAliasLiteral = struct {
+    prefix: []const u8,
+    version: []const u8,
+};
+
+fn npmAliasLiteral(spec: []const u8) ?NpmAliasLiteral {
+    if (!std.mem.startsWith(u8, spec, "npm:")) return null;
+    const at = std.mem.lastIndexOfScalar(u8, spec, '@') orelse return null;
+    if (at < "npm:".len or at + 1 >= spec.len) return null;
+    return .{ .prefix = spec[0 .. at + 1], .version = spec[at + 1 ..] };
+}
+
+fn updateResolutionSpec(
+    allocator: std.mem.Allocator,
+    original_spec: []const u8,
+    requested_spec: ?[]const u8,
+    latest: bool,
+) ![]const u8 {
+    const target = requested_spec orelse if (latest) "latest" else return original_spec;
+    if (npmAliasLiteral(original_spec)) |alias| {
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ alias.prefix, target });
+    }
+    return target;
+}
+
+fn updatedDependencySpec(
+    allocator: std.mem.Allocator,
+    original_spec: []const u8,
+    resolved: []const u8,
+    exact: bool,
+    rewrite_dist_tag: bool,
+) ![]const u8 {
+    const alias = npmAliasLiteral(original_spec);
+    const original_version = if (alias) |value| value.version else original_spec;
+    if (Semver.Version.isTaggedVersionOnly(original_version) and !rewrite_dist_tag) return original_spec;
+
+    const pinned: Semver.Version.PinnedVersion = if (exact)
+        .patch
+    else if (Semver.Version.isTaggedVersionOnly(original_version))
+        .major
+    else
+        Semver.Version.whichVersionIsPinned(original_version);
+    const saved_version = switch (pinned) {
+        .patch => try allocator.dupe(u8, resolved),
+        .minor => try std.fmt.allocPrint(allocator, "~{s}", .{resolved}),
+        .major => try std.fmt.allocPrint(allocator, "^{s}", .{resolved}),
+    };
+    if (alias) |value| return std.fmt.allocPrint(allocator, "{s}{s}", .{ value.prefix, saved_version });
+    return saved_version;
+}
+
+fn newUpdateDependencySpec(
+    allocator: std.mem.Allocator,
+    requested_spec: ?[]const u8,
+    resolved: []const u8,
+    exact: bool,
+) ![]const u8 {
+    if (requested_spec) |requested| {
+        if (npmAliasLiteral(requested)) |alias| {
+            if (isExactVersionLiteral(alias.version)) return allocator.dupe(u8, requested);
+            const saved_version = if (exact)
+                try allocator.dupe(u8, resolved)
+            else
+                try std.fmt.allocPrint(allocator, "^{s}", .{resolved});
+            return std.fmt.allocPrint(allocator, "{s}{s}", .{ alias.prefix, saved_version });
+        }
+        if (isExactVersionLiteral(requested)) return allocator.dupe(u8, requested);
+    }
+    if (exact) return allocator.dupe(u8, resolved);
+    return std.fmt.allocPrint(allocator, "^{s}", .{resolved});
+}
+
+fn isExactVersionLiteral(input: []const u8) bool {
+    var value = std.mem.trim(u8, input, " \t\r\n");
+    if (value.len > 0 and value[0] == '=') value = std.mem.trimLeft(u8, value[1..], " \t\r\n");
+    if (value.len > 1 and value[0] == 'v') value = value[1..];
+    if (std.SemanticVersion.parse(value)) |_| return true else |_| return false;
+}
+
+fn dependencyBaselineVersion(spec: []const u8) ?[]const u8 {
+    var value = if (npmAliasLiteral(spec)) |alias| alias.version else spec;
+    value = std.mem.trim(u8, value, " \t\r\n");
+    while (value.len > 0 and switch (value[0]) {
+        '^', '~', '=', '<', '>', 'v' => true,
+        else => false,
+    }) value = std.mem.trimLeft(u8, value[1..], " \t\r\n");
+    const parsed = Semver.Version.parseUTF8(value);
+    if (!parsed.valid or parsed.len == 0 or parsed.len > value.len) return null;
+    return value[0..parsed.len];
+}
+
+fn printNamedUpdate(
+    writer: *std.Io.Writer,
+    name: []const u8,
+    resolved: []const u8,
+    bins: []const []const u8,
+) !void {
+    if (bins.len == 0) {
+        try writer.print("installed {s}@{s}\n", .{ name, resolved });
+        return;
+    }
+    try writer.print("installed {s}@{s} with binaries:\n", .{ name, resolved });
+    for (bins) |bin| try writer.print(" - {s}\n", .{bin});
 }
 
 fn isLocalSpec(spec: []const u8) bool {

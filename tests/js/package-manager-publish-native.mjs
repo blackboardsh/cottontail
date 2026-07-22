@@ -162,6 +162,7 @@ try {
 
   const result = await runCottontail(["publish", "--tag", "beta", "--access", "public"], packageDir, env);
   assert.equal(result.status, 0, `publish failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+  assert.match(result.stdout, /^bun publish v1\.3\.10 \(cottontail v[^)]+\)/);
   assert.match(result.stdout, /Tag: beta/);
   assert.match(result.stdout, /Access: public/);
   assert.match(result.stdout, /\+ @scope\/native-publish-fixture@1\.2\.3/);
@@ -234,6 +235,11 @@ try {
   const invalid = await runCottontail(["publish", "--access", "team"], packageDir, env);
   assert.equal(invalid.status, 1);
   assert.match(invalid.stderr, /invalid `access` value: 'team'/);
+  assert.equal(requests.length, 3);
+
+  const invalidTag = await runCottontail(["publish", "--tag", "^1.2.3"], packageDir, env);
+  assert.equal(invalidTag.status, 1);
+  assert.match(invalidTag.stderr, /Tag name must not be a valid SemVer range: \^1\.2\.3/);
   assert.equal(requests.length, 3);
 
   const noAuthDir = path.join(tempDir, "no-auth");

@@ -47,6 +47,26 @@ pub const Registry = struct {
     authorization: ?[]const u8 = null,
 };
 
+pub const RegistryRequestOptions = struct {
+    auth_type: ?AuthType = null,
+    npm_command: []const u8 = "publish",
+    uses_workspaces: bool = false,
+};
+
+pub const RegistryResponse = struct {
+    status: u16,
+    body: []const u8,
+    www_authenticate: ?[]const u8 = null,
+    npm_notice: ?[]const u8 = null,
+    retry_after: ?[]const u8 = null,
+    x_local_cache: bool = false,
+};
+
+pub const AuthenticatedResponse = struct {
+    response: RegistryResponse,
+    otp_retry: bool = false,
+};
+
 pub const Readme = struct {
     filename: []const u8,
     contents: []const u8,
@@ -79,6 +99,7 @@ pub fn prepareWorkspace(
     const package_json_path = try std.fs.path.join(allocator, &.{ package_dir, "package.json" });
     const initial = try readManifest(init.io, allocator, package_json_path);
     try applyPublishConfig(options, &initial);
+    if (options.tag.len > 0) try validateDistTag(options.tag);
     _ = try validateManifest(&initial, options.access);
 
     if (!options.ignore_scripts) {
@@ -95,6 +116,7 @@ pub fn prepareWorkspace(
         stderr,
     );
     try applyPublishConfig(options, &built.manifest.value);
+    if (options.tag.len > 0) try validateDistTag(options.tag);
     const identity = try validateManifest(&built.manifest.value, options.access);
 
     if (!options.quiet) {
@@ -207,6 +229,7 @@ pub fn prepareTarball(
     const source = package_json orelse return error.MissingPackageJSON;
     const manifest = std.json.parseFromSliceLeaky(Value, allocator, source, .{}) catch return error.InvalidPackageJSON;
     try applyPublishConfig(options, &manifest);
+    if (options.tag.len > 0) try validateDistTag(options.tag);
     const identity = try validateManifest(&manifest, options.access);
 
     if (!options.quiet) {
@@ -245,14 +268,17 @@ pub fn publish(
 
     const version = versionWithoutBuild(prepared.package_version);
     const package_url = try packageURL(allocator, registry.url, prepared.package_name);
+    const request_options: RegistryRequestOptions = .{
+        .auth_type = options.auth_type,
+        .uses_workspaces = prepared.uses_workspaces,
+    };
     if (options.tolerate_republish and try packageVersionExists(
         allocator,
         client,
         package_url,
         registry,
         version,
-        options,
-        prepared.uses_workspaces,
+        request_options,
     )) {
         try stderr.print("warn: Registry already knows about version {s}; skipping.\n", .{version});
         try stderr.flush();
@@ -271,65 +297,26 @@ pub fn publish(
     if (options.dry_run) return 0;
 
     const body = try constructPublishBody(allocator, prepared, registry, options);
-    var response = request(
-        allocator,
+    const authenticated = requestWithOtp(
+        init,
         client,
         .PUT,
         package_url,
         registry,
-        options,
-        prepared.uses_workspaces,
+        request_options,
         if (options.otp.len > 0) options.otp else null,
         body,
-        init.environ_map,
+        stdout,
+        stderr,
     ) catch |err| {
+        if (err == error.RegistryAuthenticationReported) return 1;
         try stderr.print("error: failed to publish package: {s}\n", .{@errorName(err)});
         try stderr.flush();
         return 1;
     };
-
-    if (response.status < 400) return 0;
-    if (!isOtpChallenge(response)) {
-        try printRegistryError(stderr, "PUT", package_url, response, false);
-        return 1;
-    }
-
-    if (response.www_authenticate) |required| {
-        var parts = std.mem.splitScalar(u8, required, ',');
-        while (parts.next()) |raw| {
-            const part = std.mem.trim(u8, raw, " \t");
-            if (std.ascii.eqlIgnoreCase(part, "ipaddress")) {
-                try stderr.writeAll("error: login is not allowed from your IP address\n");
-                try stderr.flush();
-                return 1;
-            }
-        }
-    }
-    try printNotice(stderr, response);
-
-    const otp = getOtp(init, client, registry, options, prepared.uses_workspaces, response, stdout, stderr) catch |err| {
-        try stderr.print("error: failed to obtain one-time password: {s}\n", .{@errorName(err)});
-        try stderr.flush();
-        return 1;
-    };
-    response = request(
-        allocator,
-        client,
-        .PUT,
-        package_url,
-        registry,
-        options,
-        prepared.uses_workspaces,
-        otp,
-        body,
-        init.environ_map,
-    ) catch |err| {
-        try stderr.print("error: failed to publish package: {s}\n", .{@errorName(err)});
-        try stderr.flush();
-        return 1;
-    };
+    const response = authenticated.response;
     if (response.status >= 400) {
-        try printRegistryError(stderr, "PUT", package_url, response, true);
+        try printRegistryError(stderr, "PUT", package_url, response, authenticated.otp_retry);
         return 1;
     }
     try printNotice(stderr, response);
@@ -565,6 +552,69 @@ pub fn versionWithoutBuild(version: []const u8) []const u8 {
     return version[0..plus];
 }
 
+pub fn validateDistTag(tag: []const u8) !void {
+    if (tag.len == 0 or !std.mem.eql(u8, tag, std.mem.trim(u8, tag, " \t\r\n"))) {
+        return error.InvalidDistTag;
+    }
+    if (looksLikeSemverRange(tag)) return error.SemverDistTag;
+    for (tag) |byte| {
+        if (!isEncodeURIComponentSafe(byte)) return error.InvalidDistTag;
+    }
+}
+
+fn isEncodeURIComponentSafe(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or switch (byte) {
+        '-', '_', '.', '!', '~', '*', '\'', '(', ')' => true,
+        else => false,
+    };
+}
+
+fn looksLikeSemverRange(input: []const u8) bool {
+    if (std.SemanticVersion.parse(input)) |_| return true else |_| {}
+
+    var value = std.mem.trim(u8, input, " \t\r\n");
+    if (value.len == 0) return false;
+    while (value.len > 0 and switch (value[0]) {
+        '<', '>', '=', '~', '^' => true,
+        else => false,
+    }) value = std.mem.trimLeft(u8, value[1..], " \t\r\n");
+    if (value.len > 1 and value[0] == 'v' and std.ascii.isDigit(value[1])) value = value[1..];
+    if (value.len == 1 and (value[0] == '*' or value[0] == 'x' or value[0] == 'X')) return true;
+    if (value.len == 0 or !std.ascii.isDigit(value[0])) return false;
+
+    var index: usize = 0;
+    var components: usize = 0;
+    while (components < 3) : (components += 1) {
+        const start = index;
+        while (index < value.len and std.ascii.isDigit(value[index])) index += 1;
+        if (start == index) {
+            if (index < value.len and (value[index] == 'x' or value[index] == 'X' or value[index] == '*')) {
+                index += 1;
+            } else return false;
+        } else if (index - start > 1 and value[start] == '0') {
+            return false;
+        }
+        if (index == value.len) return true;
+        if (value[index] == '.') {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+
+    if (index < value.len and std.ascii.isWhitespace(value[index])) {
+        const remainder = std.mem.trimLeft(u8, value[index..], " \t\r\n");
+        if (remainder.len == 0) return true;
+        if (std.mem.startsWith(u8, remainder, "||")) return looksLikeSemverRange(remainder[2..]);
+        if (remainder[0] == '-') return looksLikeSemverRange(remainder[1..]);
+        return looksLikeSemverRange(remainder);
+    }
+    if (index + 1 < value.len and value[index] == '|' and value[index + 1] == '|') {
+        return looksLikeSemverRange(value[index + 2 ..]);
+    }
+    return false;
+}
+
 fn packageURL(allocator: std.mem.Allocator, registry_url: []const u8, package_name: []const u8) ![]const u8 {
     const encoded_name = if (package_name.len > 0 and package_name[0] == '@') blk: {
         const slash = std.mem.indexOfScalar(u8, package_name, '/') orelse break :blk package_name;
@@ -592,17 +642,15 @@ fn packageVersionExists(
     package_url: []const u8,
     registry: Registry,
     version: []const u8,
-    options: Options,
-    uses_workspaces: bool,
+    options: RegistryRequestOptions,
 ) !bool {
-    const response = request(
+    const response = registryRequest(
         allocator,
         client,
         .GET,
         package_url,
         registry,
         options,
-        uses_workspaces,
         null,
         null,
         null,
@@ -614,27 +662,17 @@ fn packageVersionExists(
     return versions == .object and versions.object.get(version) != null;
 }
 
-const HttpResponse = struct {
-    status: u16,
-    body: []const u8,
-    www_authenticate: ?[]const u8 = null,
-    npm_notice: ?[]const u8 = null,
-    retry_after: ?[]const u8 = null,
-    x_local_cache: bool = false,
-};
-
-fn request(
+pub fn registryRequest(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
     method: std.http.Method,
     url: []const u8,
     registry: Registry,
-    options: Options,
-    uses_workspaces: bool,
+    options: RegistryRequestOptions,
     otp: ?[]const u8,
     body: ?[]u8,
     maybe_environment: ?*const std.process.Environ.Map,
-) !HttpResponse {
+) !RegistryResponse {
     var headers = std.array_list.Managed(std.http.Header).init(allocator);
     try headers.append(.{ .name = "accept", .value = "*/*" });
     try headers.append(.{ .name = "accept-encoding", .value = "gzip,deflate" });
@@ -647,8 +685,8 @@ fn request(
         .value = if (otp != null) "legacy" else if (options.auth_type) |auth_type| @tagName(auth_type) else "web",
     });
     if (otp) |value| try headers.append(.{ .name = "npm-otp", .value = value });
-    try headers.append(.{ .name = "npm-command", .value = "publish" });
-    const user_agent = try publishUserAgent(allocator, maybe_environment, uses_workspaces);
+    try headers.append(.{ .name = "npm-command", .value = options.npm_command });
+    const user_agent = try registryUserAgent(allocator, maybe_environment, options.uses_workspaces);
     try headers.append(.{ .name = "user-agent", .value = user_agent });
 
     var req = try client.request(method, try std.Uri.parse(url), .{
@@ -672,7 +710,7 @@ fn request(
     if (response.head.content_length) |length| {
         if (length > max_response_bytes) return error.ResponseTooLarge;
     }
-    var result: HttpResponse = .{ .status = @intFromEnum(response.head.status), .body = "" };
+    var result: RegistryResponse = .{ .status = @intFromEnum(response.head.status), .body = "" };
     var header_iterator = response.head.iterateHeaders();
     while (header_iterator.next()) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "www-authenticate")) {
@@ -711,7 +749,7 @@ fn request(
     return result;
 }
 
-fn publishUserAgent(
+fn registryUserAgent(
     allocator: std.mem.Allocator,
     maybe_environment: ?*const std.process.Environ.Map,
     uses_workspaces: bool,
@@ -743,24 +781,94 @@ fn detectCIName(environment: *const std.process.Environ.Map) ?[]const u8 {
     return null;
 }
 
-fn isOtpChallenge(response: HttpResponse) bool {
-    if (response.status != 401) return false;
+const AuthenticationChallenge = union(enum) {
+    none,
+    otp,
+    ip_address,
+    unsupported: []const u8,
+};
+
+fn authenticationChallenge(response: RegistryResponse) AuthenticationChallenge {
+    if (response.status != 401) return .none;
     if (response.www_authenticate) |value| {
         var parts = std.mem.splitScalar(u8, value, ',');
-        while (parts.next()) |part| {
-            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, part, " \t"), "otp")) return true;
+        while (parts.next()) |raw| {
+            const part = std.mem.trim(u8, raw, " \t");
+            if (std.ascii.eqlIgnoreCase(part, "ipaddress")) return .ip_address;
+            if (std.ascii.eqlIgnoreCase(part, "otp")) return .otp;
         }
+        return .{ .unsupported = value };
     }
-    return std.mem.indexOf(u8, response.body, "one-time pass") != null;
+    return if (std.mem.indexOf(u8, response.body, "one-time pass") != null) .otp else .none;
+}
+
+pub fn requestWithOtp(
+    init: std.process.Init,
+    client: *std.http.Client,
+    method: std.http.Method,
+    url: []const u8,
+    registry: Registry,
+    options: RegistryRequestOptions,
+    supplied_otp: ?[]const u8,
+    body: ?[]u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !AuthenticatedResponse {
+    const allocator = init.arena.allocator();
+    var response = try registryRequest(
+        allocator,
+        client,
+        method,
+        url,
+        registry,
+        options,
+        supplied_otp,
+        body,
+        init.environ_map,
+    );
+    if (response.status < 400) return .{ .response = response };
+
+    switch (authenticationChallenge(response)) {
+        .none => return .{ .response = response },
+        .ip_address => {
+            try stderr.writeAll("error: login is not allowed from your IP address\n");
+            try stderr.flush();
+            return error.RegistryAuthenticationReported;
+        },
+        .unsupported => |required| {
+            try stderr.print("error: unable to authenticate, need: {s}\n", .{required});
+            try stderr.flush();
+            return error.RegistryAuthenticationReported;
+        },
+        .otp => {},
+    }
+
+    try printNotice(stderr, response);
+    const otp = getOtp(init, client, registry, options, response, stdout, stderr) catch |err| {
+        try stderr.print("error: failed to obtain one-time password: {s}\n", .{@errorName(err)});
+        try stderr.flush();
+        return error.RegistryAuthenticationReported;
+    };
+    response = try registryRequest(
+        allocator,
+        client,
+        method,
+        url,
+        registry,
+        options,
+        otp,
+        body,
+        init.environ_map,
+    );
+    return .{ .response = response, .otp_retry = true };
 }
 
 fn getOtp(
     init: std.process.Init,
     client: *std.http.Client,
     registry: Registry,
-    options: Options,
-    uses_workspaces: bool,
-    response: HttpResponse,
+    options: RegistryRequestOptions,
+    response: RegistryResponse,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) ![]const u8 {
@@ -773,14 +881,13 @@ fn getOtp(
             try stdout.print("\nAuthenticate your account at:\n\n{s}\n", .{auth_url.?.string});
             try stdout.flush();
             while (true) {
-                const done_response = try request(
+                const done_response = try registryRequest(
                     allocator,
                     client,
                     .GET,
                     done_url.?.string,
                     registry,
                     options,
-                    uses_workspaces,
                     null,
                     null,
                     init.environ_map,
@@ -817,7 +924,7 @@ fn getOtp(
     return try allocator.dupe(u8, otp);
 }
 
-fn printNotice(stderr: *std.Io.Writer, response: HttpResponse) !void {
+pub fn printNotice(stderr: *std.Io.Writer, response: RegistryResponse) !void {
     if (response.x_local_cache) return;
     if (response.npm_notice) |notice| {
         try stderr.print("\nnote: {s}\n", .{notice});
@@ -825,11 +932,11 @@ fn printNotice(stderr: *std.Io.Writer, response: HttpResponse) !void {
     }
 }
 
-fn printRegistryError(
+pub fn printRegistryError(
     stderr: *std.Io.Writer,
     method: []const u8,
     url: []const u8,
-    response: HttpResponse,
+    response: RegistryResponse,
     otp_response: bool,
 ) !void {
     var message: []const u8 = response.body;
