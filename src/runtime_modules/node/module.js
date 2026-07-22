@@ -226,12 +226,14 @@ export const builtinModules = [
 
 const commonJsCache = new Map();
 const commonJsWrapperFactoryCache = new Map();
+const bundledAsyncEsmGraphCache = new Map();
 const builtinModuleMap = new Map();
 const builtinNamespaceEntries = new Set();
 let modulePathCache = Object.create(null);
 const moduleHooks = [];
 const moduleHookIdKey = Symbol("cottontail.moduleHooksId");
 const moduleParentKey = Symbol("cottontail.moduleParent");
+const runtimeEsmSourceModuleKey = Symbol("cottontail.runtimeEsmSourceModule");
 const hookResolvedFormats = new Map();
 const sourceMapCache = new Map();
 let nextModuleHookId = 0;
@@ -239,6 +241,7 @@ let mainModule = null;
 let moduleParentWarningEmitted = false;
 let activeResolverConditions = null;
 let stripTypesWarningEmitted = false;
+let runtimeEsmSourceExecutionDepth = 0;
 
 const runtimePluginOnResolve = [];
 const runtimePluginOnLoad = [];
@@ -257,6 +260,7 @@ if (globalThis.__cottontailHotReloadHooks == null) {
 hotReloadHooks.add(() => {
   commonJsCache.clear();
   commonJsWrapperFactoryCache.clear();
+  bundledAsyncEsmGraphCache.clear();
   builtinModuleMap.clear();
   builtinNamespaceEntries.clear();
   for (const key of Object.keys(modulePathCache)) delete modulePathCache[key];
@@ -2420,14 +2424,14 @@ function compilePublicCommonJsWrapper(source, filename) {
   return compiledWrapper;
 }
 
-function executeCommonJsSource(module, filename, source) {
+function executeCommonJsSource(module, filename, source, requireOverride = undefined) {
   if (hasEsmSyntax(source)) {
     const transformed = transformEsmSourceForDynamicImport(source);
     maybeRegisterSourceMap(filename, transformed);
     recordCompileCache(filename, transformed);
     const run = compileModuleWrapper([ESM_EXPORTS_BINDING, "require", "module", "__ctImportMeta"], transformed, filename);
     try {
-      run(module.exports, module.require, module, importMetaForModule(filename));
+      run(module.exports, requireOverride ?? module.require, module, importMetaForModule(filename));
     } catch (error) {
       throw remapThrownModuleError(error, filename, FUNCTION_WRAPPER_LINE_OFFSET);
     }
@@ -2557,6 +2561,109 @@ function isAsyncModuleBundleFailure(error, filename, source) {
   return sourceRequiresAsyncModuleExecution(filename, source);
 }
 
+const runtimeEsmGraphExternalPatterns = Object.freeze([
+  "*.js",
+  "*.jsx",
+  "*.mjs",
+  "*.cjs",
+  "*.ts",
+  "*.tsx",
+  "*.mts",
+  "*.cts",
+]);
+
+function runtimeEsmGraphPathKey(filename) {
+  const path = splitSpecifierSuffix(String(filename)).bare;
+  let absolute = isAbsolute(path) ? path : resolve(cottontail.cwd(), path);
+  try { absolute = cottontail.realpathSync(absolute); } catch {}
+  return String(absolute).replace(/\\/g, "/");
+}
+
+function runtimeEsmSourceFingerprint(source) {
+  const text = String(source);
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash = Math.imul(hash ^ text.charCodeAt(index), 16777619) >>> 0;
+  }
+  return `${text.length.toString(36)}-${hash.toString(16)}`;
+}
+
+function runtimeEsmGraphLoader(filename) {
+  const extension = String(filename).toLowerCase().match(/\.([^.\\/]+)$/)?.[1];
+  if (extension === "tsx") return "tsx";
+  if (extension === "ts" || extension === "mts" || extension === "cts") return "ts";
+  if (extension === "jsx") return "jsx";
+  return "js";
+}
+
+function runtimeEsmRootHasBarePackageEdges(entryPath, entrySource) {
+  if (typeof cottontail.transpilerScanImports !== "function") return false;
+  try {
+    const imports = JSON.parse(cottontail.transpilerScanImports(
+      String(entrySource),
+      "{}",
+      runtimeEsmGraphLoader(entryPath),
+    ));
+    return Array.isArray(imports) && imports.some(item => {
+      if (item?.kind !== "import-statement" && item?.kind !== "require-call") return false;
+      const specifier = String(item?.path ?? "");
+      return specifier.length > 0 &&
+        !specifier.startsWith(".") &&
+        !specifier.startsWith("/") &&
+        !specifier.startsWith("file:") &&
+        !isBuiltin(specifier) &&
+        !hasRuntimePackageReplacement(specifier);
+    });
+  } catch {
+    return false;
+  }
+}
+
+function runtimeAsyncEsmGraph(entryPath, entrySource) {
+  if (typeof cottontail.bundleNative !== "function" ||
+      !runtimeEsmRootHasBarePackageEdges(entryPath, entrySource)) {
+    return null;
+  }
+  const sourceFingerprint = runtimeEsmSourceFingerprint(entrySource);
+  const cacheKey = `${runtimeEsmGraphPathKey(entryPath)}\0${sourceFingerprint}`;
+  const memoryCached = bundledAsyncEsmGraphCache.get(cacheKey);
+  if (memoryCached !== undefined) return memoryCached;
+
+  let bundled;
+  try {
+    bundled = String(cottontail.bundleNative(
+      splitSpecifierSuffix(String(entryPath)).bare,
+      dirname(entryPath),
+      JSON.stringify({
+        format: "esm",
+        target: "bun",
+        packages: "bundle",
+        external: ["*.node"],
+        inlineImportMetaProperties: true,
+      }),
+    ));
+  } catch {
+    bundledAsyncEsmGraphCache.set(cacheKey, null);
+    return null;
+  }
+  const record = {
+    sourceFingerprint,
+    source: bundled,
+    async: sourceRequiresAsyncModuleExecution(entryPath, bundled),
+  };
+  bundledAsyncEsmGraphCache.set(cacheKey, record);
+  return record;
+}
+
+function rewriteBundledEsmDynamicImports(source) {
+  if (!/(?<![.\w$])import\s*\((?!\s*\))/.test(source)) return source;
+  return replaceCodePattern(
+    source,
+    /(?<![.\w$])import\s*\((?!\s*\))/g,
+    `${CJS_DYNAMIC_IMPORT_BINDING}(`,
+  );
+}
+
 function executeBundledCommonJsModule(module, filename, source, loader) {
   let bundled;
   try {
@@ -2575,7 +2682,7 @@ function executeBundledCommonJsModule(module, filename, source, loader) {
         // relative files also moves those require() calls under the entry's
         // directory and gives them the wrong referrer.
         packages: "external",
-        external: ["*.js", "*.mjs", "*.cjs"],
+        external: runtimeEsmGraphExternalPatterns,
         define: {
           "import.meta": "__ctImportMeta",
         },
@@ -2587,20 +2694,14 @@ function executeBundledCommonJsModule(module, filename, source, loader) {
     }
     throw error;
   }
-  if (/(?<![.\w$])import\s*\((?!\s*\))/.test(bundled)) {
-    bundled = replaceCodePattern(
-      bundled,
-      /(?<![.\w$])import\s*\((?!\s*\))/g,
-      `${CJS_DYNAMIC_IMPORT_BINDING}(`,
-    );
-  }
+  bundled = rewriteBundledEsmDynamicImports(bundled);
   maybeRegisterSourceMap(filename, bundled);
   recordCompileCache(filename, bundled);
-  const createFactory = cottontail.compileFunction(
+  const buildFactory = cottontail.compileFunction(
     `(function(__ctImportMeta, ${CJS_DYNAMIC_IMPORT_BINDING}) { return (\n${bundled}\n); })`,
     filename,
   );
-  const factory = createFactory(
+  const factory = buildFactory(
     importMetaForModule(filename),
     async (specifier, options) => globalThis.__cottontailImportModule(String(specifier), filename, options),
   );
@@ -2648,8 +2749,21 @@ function createEsmRequire(basePath, parentModule) {
   return require;
 }
 
+function executeRuntimeEsmSourceModule(module, filename, originalSource, loader) {
+  if (sourceRequiresAsyncModuleExecution(filename, originalSource)) {
+    throw new TypeError(`require() async module "${filename}" is unsupported. use "await import()" instead.`);
+  }
+  const source = transpileExtensionSource(filename, loader, true, originalSource);
+  module.exports = createModuleNamespace();
+  module[runtimeEsmSourceModuleKey] = true;
+  return executeCommonJsSource(module, filename, source, createEsmRequire(filename, module));
+}
+
 function executeDefaultExtension(module, filename, loader) {
   const originalSource = readModuleFile(filename).replace(/^#![^\n]*(\n|$)/, "");
+  if (runtimeEsmSourceExecutionDepth > 0 && hasEsmSyntax(originalSource)) {
+    return executeRuntimeEsmSourceModule(module, filename, originalSource, loader);
+  }
   if (hasEsmSyntax(originalSource) &&
       !standaloneFileEntry(filename).found &&
       typeof cottontail.bundleNative === "function") {
@@ -3219,6 +3333,33 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
       "commonjs",
     ));
   }
+  if (!forceAsync &&
+      isAbsolute(resolvedPath) &&
+      modulePathExists(resolvedPath) &&
+      !standaloneFileEntry(resolvedPath).found &&
+      moduleHooks.length === 0 &&
+      runtimePluginOnResolve.length === 0 &&
+      runtimePluginOnLoad.length === 0) {
+    const asyncGraph = runtimeAsyncEsmGraph(resolvedPath, sourceText);
+    if (asyncGraph?.async === true) {
+      return executeAsyncDynamicImportSource(
+        resolved,
+        resolvedPath,
+        suffix,
+        asyncGraph.source,
+        asyncAncestors,
+      );
+    }
+    runtimeEsmSourceExecutionDepth += 1;
+    try {
+      return loadCommonJsModule(resolved);
+    } catch (error) {
+      if (!isAsyncModuleRequireError(error)) throw error;
+    } finally {
+      runtimeEsmSourceExecutionDepth -= 1;
+    }
+    return executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, sourceText, asyncAncestors);
+  }
   if (forceAsync) {
     return executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, sourceText, asyncAncestors);
   }
@@ -3266,6 +3407,7 @@ function importResolvedRuntimeModule(resolved, options = undefined, forceAsync =
   if (cachedPluginModule && Object.hasOwn(cachedPluginModule, "__cottontailPluginNamespace")) {
     return cachedPluginModule.__cottontailPluginNamespace;
   }
+  if (cachedPluginModule?.[runtimeEsmSourceModuleKey] === true) return cachedPluginModule.exports;
   const loader = options?.with?.type ?? options?.assert?.type ?? options?.type;
   const resolvedPath = splitSpecifierSuffix(resolved).bare;
   if (loader === "text") {
@@ -3428,7 +3570,16 @@ globalThis.__cottontailImportModule = (
 };
 
 function executeQueriedModule(module, filename, suffix) {
-  const source = maybeStripTypeScript(filename, readModuleFile(filename).replace(/^#![^\n]*(\n|$)/, ""));
+  const originalSource = readModuleFile(filename).replace(/^#![^\n]*(\n|$)/, "");
+  if (sourceRequiresAsyncModuleExecution(filename, originalSource)) {
+    throw new TypeError(`require() async module "${filename}" is unsupported. use "await import()" instead.`);
+  }
+  const source = transpileExtensionSource(
+    filename,
+    runtimeEsmGraphLoader(filename),
+    true,
+    originalSource,
+  );
   const transformed = transformEsmSourceForDynamicImport(source);
   maybeRegisterSourceMap(filename, transformed);
   recordCompileCache(filename, transformed);
@@ -3441,7 +3592,16 @@ function executeQueriedModule(module, filename, suffix) {
     "__ctImportMeta",
     `${transformed}\n//# sourceURL=${filename}${suffix}`,
   );
-  wrapper(module.exports, createRequire(filename), module, filename, dirname(filename), importMetaForModule(filename, suffix));
+  module.exports = createModuleNamespace();
+  module[runtimeEsmSourceModuleKey] = true;
+  wrapper(
+    module.exports,
+    createEsmRequire(filename, module),
+    module,
+    filename,
+    dirname(filename),
+    importMetaForModule(filename, suffix),
+  );
   module.loaded = true;
   return module.exports;
 }
