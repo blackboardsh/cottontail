@@ -344,11 +344,15 @@ class BuiltinReplEvaluator {
 
     if (!javascript.trim()) {
       const trimmed = original.trim();
-      if (/^(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\s*;?$/.test(trimmed)) return trimmed;
-      return "";
+      if (/^(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\s*;?$/.test(trimmed)) {
+        return { code: trimmed, unwrapResult: false };
+      }
+      return { code: "", unwrapResult: false };
     }
 
-    if (/\bawait\b/.test(javascript)) return this.repl.transformSync(javascript);
+    if (/\bawait\b/.test(javascript)) {
+      return { code: this.repl.transformSync(javascript), unwrapResult: true };
+    }
 
     // Global indirect eval preserves `var` and function declarations between
     // entries and permits Node-style redeclaration. Keep this post-TypeScript
@@ -358,9 +362,9 @@ class BuiltinReplEvaluator {
     javascript = javascript.replace(/^(?:const|let)\s/gm, "var ");
     javascript = javascript.replace(
       /^class\s+([A-Za-z_$][\w$]*)\b/gm,
-      (_match, name) => `globalThis[${JSON.stringify(name)}] = class ${name}`,
+      (_match, name) => `var ${name} = globalThis[${JSON.stringify(name)}] = class ${name}`,
     );
-    return javascript;
+    return { code: javascript, unwrapResult: false };
   }
 
   async evaluate(source) {
@@ -370,10 +374,10 @@ class BuiltinReplEvaluator {
     } catch (error) {
       throw normalizeReplError(error);
     }
-    if (!transformed.trim()) return undefined;
-    let result = (0, eval)(transformed);
+    if (!transformed.code.trim()) return undefined;
+    let result = (0, eval)(transformed.code);
     result = await result;
-    if (result !== null && (typeof result === "object" || typeof result === "function") &&
+    if (transformed.unwrapResult && result !== null && (typeof result === "object" || typeof result === "function") &&
         Object.prototype.hasOwnProperty.call(result, "value")) {
       result = result.value;
     }
@@ -396,6 +400,8 @@ class BuiltinReplSession {
     this.history = [];
     this.historyIndex = 0;
     this.temporaryLine = "";
+    this.historyPath = null;
+    this.historyModified = false;
     this.queue = [];
     this.processing = false;
     this.inputEnded = false;
@@ -420,11 +426,36 @@ class BuiltinReplSession {
 
   addHistory(code) {
     const value = String(code).replace(/\n$/, "");
-    if (!value || this.history[this.history.length - 1] === value) return;
+    if (!value) return;
+    if (this.history[this.history.length - 1] === value) {
+      this.historyIndex = this.history.length;
+      this.temporaryLine = "";
+      return;
+    }
     this.history.push(value);
     if (this.history.length > 1000) this.history.shift();
     this.historyIndex = this.history.length;
     this.temporaryLine = "";
+    this.historyModified = true;
+  }
+
+  loadHistory() {
+    const home = process.env.HOME;
+    if (!home) return;
+    this.historyPath = join(home, ".bun_repl_history");
+    try {
+      const entries = readFileSync(this.historyPath, "utf8").split(/\r?\n/).filter(Boolean);
+      this.history = entries.slice(-1000);
+    } catch {}
+    this.historyIndex = this.history.length;
+  }
+
+  saveHistory() {
+    if (!this.historyModified || !this.historyPath) return;
+    try {
+      writeFileSync(this.historyPath, `${this.history.join("\n")}${this.history.length ? "\n" : ""}`);
+      this.historyModified = false;
+    } catch {}
   }
 
   historyPrevious() {
@@ -453,7 +484,7 @@ class BuiltinReplSession {
   submitLine() {
     const line = this.line;
     this.line = "";
-    if (this.terminal) this.write("\n");
+    this.write("\n");
     this.queue.push({ type: "line", value: line });
     void this.processQueue();
   }
@@ -669,6 +700,7 @@ class BuiltinReplSession {
   finish() {
     if (this.closed) return;
     this.closed = true;
+    this.saveHistory();
     if (this.terminal) {
       try { cottontail.terminalSetRawMode?.(0, false); } catch {}
       this.input.isRaw = false;
@@ -682,6 +714,7 @@ class BuiltinReplSession {
 
   async run() {
     installReplGlobals();
+    this.loadHistory();
     if (this.terminal) {
       try { cottontail.terminalSetRawMode?.(0, true); } catch {}
       this.input.isRaw = true;
@@ -689,6 +722,7 @@ class BuiltinReplSession {
     this.onData = chunk => this.consume(Buffer.from(chunk).toString());
     this.onEnd = () => {
       this.inputEnded = true;
+      if (!this.closed) this.write("\n");
       if (!this.processing && this.queue.length === 0) this.finish();
     };
     this.onError = error => {
