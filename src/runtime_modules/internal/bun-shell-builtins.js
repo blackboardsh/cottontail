@@ -397,6 +397,80 @@ function touch(args, context) {
   return result(stderr ? 1 : 0, "", stderr);
 }
 
+const LS_FILE_TYPE_MASK = 0o170000;
+const LS_FILE_TYPES = new Map([
+  [0o040000, "d"],
+  [0o120000, "l"],
+  [0o060000, "b"],
+  [0o020000, "c"],
+  [0o010000, "p"],
+  [0o140000, "s"],
+]);
+const LS_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+function lsStatNumber(value, fallback = 0) {
+  if (typeof value === "bigint") return Number(value);
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function lsPermissions(mode) {
+  const bit = (mask, character) => mode & mask ? character : "-";
+  const ownerExecute = mode & 0o100;
+  const groupExecute = mode & 0o010;
+  const otherExecute = mode & 0o001;
+  return [
+    bit(0o400, "r"),
+    bit(0o200, "w"),
+    mode & 0o4000 ? ownerExecute ? "s" : "S" : ownerExecute ? "x" : "-",
+    bit(0o040, "r"),
+    bit(0o020, "w"),
+    mode & 0o2000 ? groupExecute ? "s" : "S" : groupExecute ? "x" : "-",
+    bit(0o004, "r"),
+    bit(0o002, "w"),
+    mode & 0o1000 ? otherExecute ? "t" : "T" : otherExecute ? "x" : "-",
+  ].join("");
+}
+
+function lsTimestamp(stat, nowSeconds) {
+  const rawSeconds = stat.mtimeMs != null
+    ? lsStatNumber(stat.mtimeMs) / 1000
+    : stat.mtime instanceof Date
+      ? stat.mtime.getTime() / 1000
+      : 0;
+  const seconds = Math.max(0, Math.trunc(rawSeconds));
+  const date = new Date(seconds * 1000);
+  if (Number.isNaN(date.getTime())) return "??? ?? ??:??";
+
+  const month = LS_MONTHS[date.getUTCMonth()] ?? "???";
+  const day = String(date.getUTCDate()).padStart(2, "0");
+  const sixMonths = 180 * 24 * 60 * 60;
+  const recent = seconds > nowSeconds - sixMonths && seconds <= nowSeconds + sixMonths;
+  if (recent) {
+    const hours = String(date.getUTCHours()).padStart(2, "0");
+    const minutes = String(date.getUTCMinutes()).padStart(2, "0");
+    return `${month} ${day} ${hours}:${minutes}`;
+  }
+  return `${month} ${day}  ${String(date.getUTCFullYear()).padStart(4, "0")}`;
+}
+
+function lsLongEntry(path, display, nowSeconds) {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch {
+    return `?????????? ? ? ? ?            ? ${display}\n`;
+  }
+
+  const mode = lsStatNumber(stat.mode);
+  const type = LS_FILE_TYPES.get(mode & LS_FILE_TYPE_MASK) ?? "-";
+  const links = String(Math.trunc(lsStatNumber(stat.nlink, 1))).padStart(3, " ");
+  const uid = String(Math.trunc(lsStatNumber(stat.uid))).padStart(5, " ");
+  const gid = String(Math.trunc(lsStatNumber(stat.gid))).padStart(5, " ");
+  const size = String(Math.trunc(lsStatNumber(stat.size))).padStart(8, " ");
+  return `${type}${lsPermissions(mode)} ${links} ${uid} ${gid} ${size} ${lsTimestamp(stat, nowSeconds)} ${display}\n`;
+}
+
 function listDirectory(path, display, options, context, output, errors, includeHeader) {
   let stat;
   try {
@@ -406,7 +480,9 @@ function listDirectory(path, display, options, context, output, errors, includeH
     return;
   }
   if (!stat.isDirectory() || options.directory) {
-    output.push(`${display}\n`);
+    output.push(options.long && !stat.isDirectory()
+      ? lsLongEntry(path, display, options.nowSeconds)
+      : `${display}\n`);
     return;
   }
   if ((Number(stat.mode) & 0o444) === 0) {
@@ -423,7 +499,11 @@ function listDirectory(path, display, options, context, output, errors, includeH
   }
   if (!options.all && !options.almostAll) names = names.filter(name => !name.startsWith("."));
   if (options.all) names = [".", "..", ...names];
-  for (const name of names) output.push(`${name}\n`);
+  for (const name of names) {
+    output.push(options.long
+      ? lsLongEntry(join(path, name), name, options.nowSeconds)
+      : `${name}\n`);
+  }
   if (!options.recursive) return;
   for (const name of names) {
     if (name === "." || name === "..") continue;
@@ -442,13 +522,15 @@ function listDirectory(path, display, options, context, output, errors, includeH
 }
 
 function ls(args, context) {
-  const parsed = parseFlags(args, "RAad1");
+  const parsed = parseFlags(args, "RAad1l");
   if (parsed.illegal) return result(1, "", `ls: illegal option -- ${parsed.illegal}\n`);
   const options = {
     recursive: parsed.flags.has("R"),
     all: parsed.flags.has("a"),
     almostAll: parsed.flags.has("A"),
     directory: parsed.flags.has("d"),
+    long: parsed.flags.has("l"),
+    nowSeconds: Math.trunc(Date.now() / 1000),
   };
   const operands = parsed.operands.length ? parsed.operands : ["."];
   const output = [];
