@@ -11233,14 +11233,18 @@ export function serve(options) {
   }
   const tlsConfigs = validateServeTls(options.tls);
   const configuredMaxRequestBodySize = Number(options.maxRequestBodySize ?? 128 * 1024 * 1024);
-  const needsStreamingRequestBody = configuredMaxRequestBodySize > 128 * 1024 * 1024;
-  if (websocketHandlers != null || tlsConfigs != null || hostname.includes(":") || needsStreamingRequestBody) {
+  if (websocketHandlers != null || tlsConfigs != null || hostname.includes(":")) {
     return serveNodeBacked(options, { hostname, unixPath, tlsConfigs });
   }
 
   let native;
   try {
-    native = cottontail.httpServerStart(hostname, defaultServePort(options), unixPath || undefined);
+    native = cottontail.httpServerStart(
+      hostname,
+      defaultServePort(options),
+      unixPath || undefined,
+      configuredMaxRequestBodySize,
+    );
   } catch (rawError) {
     if (rawError instanceof Error) throw rawError;
     const reason = String(rawError);
@@ -11353,6 +11357,99 @@ export function serve(options) {
     }
   };
 
+  const nativeConnectionClosedError = () => {
+    const error = new Error("The socket connection was closed unexpectedly.");
+    error.code = "ECONNRESET";
+    return error;
+  };
+
+  const createNativeRequestState = (item) => {
+    const abortController = new globalThis.AbortController();
+    let bodyController = null;
+    const state = {
+      item,
+      abortController,
+      lifecycleRequest: null,
+      body: null,
+      bodySettled: !item.hasBody,
+      wantsData: false,
+      polling: false,
+      cancelNativeBody() {
+        if (nativeClosed || !item.hasBody) return;
+        try { cottontail.httpServerRequestCancel(native.id, item.id); } catch {}
+      },
+      abortBody(reason, cancelNative = true) {
+        if (state.bodySettled) return;
+        state.bodySettled = true;
+        state.wantsData = false;
+        try { bodyController?.error(reason); } catch {}
+        if (cancelNative) state.cancelNativeBody();
+      },
+      abort(reason) {
+        state.abortBody(reason);
+      },
+      abortConnection() {
+        state.abortBody(new globalThis.DOMException("The operation was aborted.", "AbortError"), false);
+        if (!abortController.signal.aborted) abortController.abort(nativeConnectionClosedError());
+      },
+      forceAbort() {
+        state.abortBody(new globalThis.DOMException("The operation was aborted.", "AbortError"));
+        if (!abortController.signal.aborted) abortController.abort(nativeConnectionClosedError());
+      },
+      finishResponse(response = null) {
+        if (state.bodySettled || response?._body === state.body) return;
+        state.abortBody(activeServeUnreadBodyAbortError);
+      },
+      poll() {
+        if (nativeClosed || state.polling) return;
+        state.polling = true;
+        try {
+          const event = cottontail.httpServerRequestEventPoll(native.id, item.id, state.wantsData);
+          if (!event) return;
+          if (event.type === "abort") {
+            state.abortConnection();
+            return;
+          }
+          if (state.bodySettled) return;
+          if (event.type === "data") {
+            state.wantsData = false;
+            const bytes = new Uint8Array(event.data);
+            if (bytes.byteLength > 0) bodyController.enqueue(bytes);
+          } else if (event.type === "end") {
+            state.wantsData = false;
+            state.bodySettled = true;
+            bodyController.close();
+          }
+        } finally {
+          state.polling = false;
+        }
+      },
+    };
+
+    if (item.hasBody) {
+      state.body = new globalThis.ReadableStream({
+        start(controller) {
+          bodyController = controller;
+        },
+        pull() {
+          if (state.bodySettled) return undefined;
+          state.wantsData = true;
+          state.poll();
+          return undefined;
+        },
+        cancel() {
+          if (state.bodySettled) return undefined;
+          state.bodySettled = true;
+          state.wantsData = false;
+          state.cancelNativeBody();
+          return undefined;
+        },
+      }, new globalThis.ByteLengthQueuingStrategy({ highWaterMark: 0 }));
+      Object.defineProperty(state.body, activeServeRequestBodyStateSymbol, { value: state });
+    }
+    return state;
+  };
+
   const responseBody = (response) => {
     if (response instanceof Response) {
       const body = response._body;
@@ -11437,36 +11534,46 @@ export function serve(options) {
     return sendResponse(item, response);
   };
 
-  const handle = (item) => {
+  const handle = (item, state) => {
     const requestHeaders = parseHeadersText(item.headersText);
     const requestInit = {
       method: item.method,
       headers: requestHeaders,
+      signal: state.abortController.signal,
     };
     if (String(item.method).toUpperCase() !== "GET" && String(item.method).toUpperCase() !== "HEAD") {
-      requestInit.body = item.body;
+      requestInit.body = state.body;
     }
     const host = requestHeaders.get("host");
     const requestBase = host ? `http://${host}` : requestOrigin;
     const requestUrl = normalizeRequestUrl(/^https?:\/\//i.test(String(item.url)) ? String(item.url) : `${requestBase}${item.url}`);
     const request = new Request(requestUrl, requestInit);
     if (item.remote) serveRequestPeers.set(request, item.remote);
+    const sendHandledResponse = (response) => {
+      finishActiveServeRequestBody(request, response);
+      return sendResponse(item, response);
+    };
+    const sendHandledError = (error) => {
+      finishActiveServeRequestBody(request, null);
+      return handleError(item, error);
+    };
     try {
       const response = runServeHandler(activeOptions, request, server);
       if (isPromiseLike(response)) {
         return response
-          .then((resolvedResponse) => sendResponse(item, resolvedResponse))
-          .catch((error) => handleError(item, error));
+          .then(sendHandledResponse)
+          .catch(sendHandledError);
       }
-      return sendResponse(item, response);
+      return sendHandledResponse(response);
     } catch (error) {
-      return handleError(item, error);
+      return sendHandledError(error);
     }
   };
 
-  const finishNativeRequest = (item, lifecycleRequest) => {
+  const finishNativeRequest = (item, state) => {
+    state.finishResponse();
     nativeRequests.delete(item.id);
-    lifecycle.finishRequest(lifecycleRequest);
+    lifecycle.finishRequest(state.lifecycleRequest);
   };
 
   const maybeFinishNativeStop = () => {
@@ -11486,6 +11593,7 @@ export function serve(options) {
     for (const origin of originKeys) activeServeOrigins.delete(origin);
     if (force) {
       abortActiveServeRequests(server);
+      for (const state of nativeRequests.values()) state.forceAbort();
       nativeClosed = true;
       if (interval != null) {
         clearInterval(interval);
@@ -11501,10 +11609,15 @@ export function serve(options) {
   };
   lifecycle.configure(stopNativeTransport, () => stopNativeTransport(true));
 
+  const pollNativeRequestEvents = () => {
+    for (const state of nativeRequests.values()) state.poll();
+  };
+
   const pump = () => {
     if (nativeClosed || pumping) return;
     if (globalThis.__cottontailProcessIpcPending === true) return;
     pumping = true;
+    pollNativeRequestEvents();
     if ((globalThis.__cottontailPollProcessIpc?.() ?? 0) > 0) {
       cottontail.drainJobs?.();
       pumping = false;
@@ -11514,25 +11627,27 @@ export function serve(options) {
     while (!nativeClosed && server.pendingRequests < maxConcurrentNativeRequests) {
       const item = cottontail.httpServerPoll(native.id);
       if (!item) break;
-      const lifecycleRequest = lifecycle.beginRequest();
-      nativeRequests.set(item.id, lifecycleRequest);
-      const handled = handle(item);
+      const state = createNativeRequestState(item);
+      state.lifecycleRequest = lifecycle.beginRequest(() => state.forceAbort());
+      nativeRequests.set(item.id, state);
+      const handled = handle(item, state);
       if (isPromiseLike(handled)) {
         Promise.resolve(handled).then(
           () => {
-            finishNativeRequest(item, lifecycleRequest);
+            finishNativeRequest(item, state);
             pump();
           },
           (error) => {
             console.error(error instanceof Error ? error.stack || error.message : error);
-            finishNativeRequest(item, lifecycleRequest);
+            finishNativeRequest(item, state);
             pump();
           },
         );
       } else {
-        finishNativeRequest(item, lifecycleRequest);
+        finishNativeRequest(item, state);
       }
     }
+    pollNativeRequestEvents();
     pumping = false;
     maybeFinishNativeStop();
   };

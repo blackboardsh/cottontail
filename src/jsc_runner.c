@@ -1469,14 +1469,26 @@ typedef struct CtHttpRequest {
     char *method;
     char *url;
     char *headers_text;
-    char *body;
-    size_t body_len;
+    char *body_chunk;
+    size_t body_chunk_len;
+    size_t body_content_length;
+    size_t body_received;
+    size_t chunk_remaining;
+    bool body_chunked;
+    bool body_complete;
+    bool body_discard;
+    bool chunk_expect_crlf;
+    bool chunk_reading_trailers;
+    bool client_aborted;
+    bool abort_reported;
+    bool body_end_reported;
     bool keep_alive;
     bool ready;
     bool claimed;
     bool completed;
     bool response_started;
     bool response_streaming;
+    bool response_sent;
     int status;
     char *response_headers_text;
     char *response_body;
@@ -1490,6 +1502,7 @@ typedef struct CtHttpServer {
     uint32_t id;
     int listen_fd;
     uint16_t port;
+    size_t max_body_size;
     char *hostname;
     char *unix_path;
     bool stopping;
@@ -2293,9 +2306,20 @@ static void ct_http_clear_request(CtHttpRequest *request) {
     request->url = NULL;
     free(request->headers_text);
     request->headers_text = NULL;
-    free(request->body);
-    request->body = NULL;
-    request->body_len = 0;
+    free(request->body_chunk);
+    request->body_chunk = NULL;
+    request->body_chunk_len = 0;
+    request->body_content_length = 0;
+    request->body_received = 0;
+    request->chunk_remaining = 0;
+    request->body_chunked = false;
+    request->body_complete = false;
+    request->body_discard = false;
+    request->chunk_expect_crlf = false;
+    request->chunk_reading_trailers = false;
+    request->client_aborted = false;
+    request->abort_reported = false;
+    request->body_end_reported = false;
     free(request->response_headers_text);
     request->response_headers_text = NULL;
     free(request->response_body);
@@ -2307,6 +2331,7 @@ static void ct_http_clear_request(CtHttpRequest *request) {
     request->completed = false;
     request->response_started = false;
     request->response_streaming = false;
+    request->response_sent = false;
     request->status = 200;
 }
 
@@ -2403,8 +2428,8 @@ static bool ct_http_header_value_has_token(const char *value, const char *value_
 }
 
 #define CT_HTTP_MAX_HEADER_SIZE (2u * 1024u * 1024u)
-#define CT_HTTP_MAX_BUFFERED_BODY_SIZE (128u * 1024u * 1024u)
-#define CT_HTTP_MAX_BUFFERED_REQUEST_SIZE (CT_HTTP_MAX_HEADER_SIZE + CT_HTTP_MAX_BUFFERED_BODY_SIZE)
+#define CT_HTTP_BODY_CHUNK_SIZE (16u * 1024u)
+#define CT_HTTP_DEFAULT_MAX_BODY_SIZE (128u * 1024u * 1024u)
 
 static int ct_http_parse_head(
     const char *buffer,
@@ -2479,7 +2504,6 @@ static int ct_http_parse_head(
                 if (parsed > (SIZE_MAX - digit) / 10) return -1;
                 parsed = parsed * 10 + digit;
             }
-            if (parsed > CT_HTTP_MAX_BUFFERED_BODY_SIZE) return -1;
             if (has_content_length && parsed != content_len) return -1;
             has_content_length = true;
             content_len = parsed;
@@ -2514,118 +2538,31 @@ static const char *ct_http_find_crlf(const char *data, size_t len) {
     return NULL;
 }
 
-static int ct_http_decode_chunked(
-    const char *data,
-    size_t len,
-    char **out_body,
-    size_t *out_body_len,
-    size_t *out_consumed
-) {
-    size_t position = 0;
-    size_t decoded_len = 0;
-    char *decoded = (char *)malloc(len > 0 ? len : 1);
-    if (decoded == NULL) return -1;
-
-    while (true) {
-        const char *line_end = ct_http_find_crlf(data + position, len - position);
-        if (line_end == (const char *)-1) {
-            free(decoded);
-            return -1;
-        }
-        if (line_end == NULL) {
-            free(decoded);
-            return 1;
-        }
-        const char *line = data + position;
-        const char *size_end = memchr(line, ';', (size_t)(line_end - line));
-        if (size_end == NULL) size_end = line_end;
-        while (size_end > line && (size_end[-1] == ' ' || size_end[-1] == '\t')) size_end -= 1;
-        if (size_end == line) {
-            free(decoded);
-            return -1;
-        }
-
-        size_t chunk_size = 0;
-        for (const char *item = line; item < size_end; item += 1) {
-            unsigned char value = (unsigned char)*item;
-            size_t digit;
-            if (value >= '0' && value <= '9') digit = (size_t)(value - '0');
-            else if (value >= 'a' && value <= 'f') digit = (size_t)(value - 'a' + 10);
-            else if (value >= 'A' && value <= 'F') digit = (size_t)(value - 'A' + 10);
-            else {
-                free(decoded);
-                return -1;
-            }
-            if (chunk_size > (SIZE_MAX - digit) / 16) {
-                free(decoded);
-                return -1;
-            }
-            chunk_size = chunk_size * 16 + digit;
-        }
-        if (chunk_size > CT_HTTP_MAX_BUFFERED_BODY_SIZE ||
-            decoded_len > CT_HTTP_MAX_BUFFERED_BODY_SIZE - chunk_size) {
-            free(decoded);
-            return -1;
-        }
-        position = (size_t)(line_end - data) + 2;
-
-        if (chunk_size == 0) {
-            while (true) {
-                if (len - position < 2) {
-                    free(decoded);
-                    return 1;
-                }
-                const char *trailer_end = ct_http_find_crlf(data + position, len - position);
-                if (trailer_end == (const char *)-1) {
-                    free(decoded);
-                    return -1;
-                }
-                if (trailer_end == NULL) {
-                    free(decoded);
-                    return 1;
-                }
-                if (trailer_end == data + position) {
-                    *out_body = decoded;
-                    *out_body_len = decoded_len;
-                    *out_consumed = position + 2;
-                    return 0;
-                }
-                const char *colon = memchr(data + position, ':', (size_t)(trailer_end - (data + position)));
-                if (colon == NULL || colon == data + position) {
-                    free(decoded);
-                    return -1;
-                }
-                position = (size_t)(trailer_end - data) + 2;
-            }
-        }
-
-        if (len - position < chunk_size) {
-            free(decoded);
-            return 1;
-        }
-        if (len - position < chunk_size + 1) {
-            free(decoded);
-            return 1;
-        }
-        if (data[position + chunk_size] != '\r') {
-            free(decoded);
-            return -1;
-        }
-        if (len - position < chunk_size + 2) {
-            free(decoded);
-            return 1;
-        }
-        if (data[position + chunk_size + 1] != '\n') {
-            free(decoded);
-            return -1;
-        }
-        if (chunk_size > 0) memcpy(decoded + decoded_len, data + position, chunk_size);
-        decoded_len += chunk_size;
-        position += chunk_size + 2;
+static void ct_http_read_buffer_consume(CtHttpReadBuffer *input, size_t count) {
+    if (count >= input->len) {
+        input->len = 0;
+    } else {
+        input->len -= count;
+        memmove(input->data, input->data + count, input->len);
     }
+    if (input->data != NULL) input->data[input->len] = 0;
 }
 
-static int ct_http_read_request(int fd, CtHttpRequest *request, CtHttpReadBuffer *input) {
+static int ct_http_read_buffer_grow(CtHttpReadBuffer *input, size_t max_capacity) {
+    if (input->len < input->capacity) return 0;
+    if (input->capacity >= max_capacity) return -1;
+    size_t next_capacity = input->capacity > max_capacity / 2
+        ? max_capacity
+        : input->capacity * 2;
+    char *next = (char *)realloc(input->data, next_capacity + 1);
+    if (next == NULL) return -1;
+    input->data = next;
+    input->capacity = next_capacity;
+    return 0;
+}
+
+/* Returns 0 for a request, 1 for an oversized Content-Length, and -1 for an invalid request. */
+static int ct_http_read_request_head(int fd, CtHttpRequest *request, CtHttpReadBuffer *input, size_t max_body_size) {
     if (input->data == NULL) {
         input->capacity = 8192;
         input->data = (char *)malloc(input->capacity + 1);
@@ -2642,85 +2579,31 @@ static int ct_http_read_request(int fd, CtHttpRequest *request, CtHttpReadBuffer
             bool chunked = false;
             bool keep_alive = false;
             if (ct_http_parse_head(input->data, header_len, &content_len, &chunked, &keep_alive) != 0) return -1;
+            if (!chunked && content_len > max_body_size) return 1;
 
-            char *decoded_body = NULL;
-            size_t decoded_body_len = 0;
-            size_t chunked_consumed = 0;
-            bool complete = false;
-            if (chunked) {
-                int decode_status = ct_http_decode_chunked(
-                    input->data + header_len,
-                    input->len - header_len,
-                    &decoded_body,
-                    &decoded_body_len,
-                    &chunked_consumed
-                );
-                if (decode_status < 0) return -1;
-                complete = decode_status == 0;
-            } else {
-                complete = input->len >= header_len + content_len;
-            }
+            const char *request_line_end = strstr(input->data, "\r\n");
+            if (request_line_end == NULL || request_line_end > header_end) return -1;
+            const char *first_space = memchr(input->data, ' ', (size_t)(request_line_end - input->data));
+            const char *second_space = first_space == NULL
+                ? NULL
+                : memchr(first_space + 1, ' ', (size_t)(request_line_end - first_space - 1));
+            if (first_space == NULL || second_space == NULL) return -1;
 
-            if (!chunked && !complete) {
-                if (header_len > SIZE_MAX - content_len) return -1;
-                size_t required_capacity = header_len + content_len;
-                if (required_capacity > input->capacity) {
-                    char *next = (char *)realloc(input->data, required_capacity + 1);
-                    if (next == NULL) return -1;
-                    input->data = next;
-                    input->capacity = required_capacity;
-                }
-            }
+            request->method = ct_http_copy_range(input->data, (size_t)(first_space - input->data));
+            request->url = ct_http_copy_range(first_space + 1, (size_t)(second_space - first_space - 1));
+            request->headers_text = ct_http_copy_range(request_line_end + 2, (size_t)(header_end - request_line_end - 4));
+            request->body_content_length = content_len;
+            request->body_chunked = chunked;
+            request->body_complete = !chunked && content_len == 0;
+            request->keep_alive = keep_alive;
+            if (request->method == NULL || request->url == NULL || request->headers_text == NULL) return -1;
 
-            if (complete) {
-                const char *request_line_end = strstr(input->data, "\r\n");
-                if (request_line_end == NULL || request_line_end > header_end) {
-                    free(decoded_body);
-                    return -1;
-                }
-                const char *first_space = memchr(input->data, ' ', (size_t)(request_line_end - input->data));
-                const char *second_space = first_space == NULL
-                    ? NULL
-                    : memchr(first_space + 1, ' ', (size_t)(request_line_end - first_space - 1));
-                if (first_space == NULL || second_space == NULL) {
-                    free(decoded_body);
-                    return -1;
-                }
-
-                request->method = ct_http_copy_range(input->data, (size_t)(first_space - input->data));
-                request->url = ct_http_copy_range(first_space + 1, (size_t)(second_space - first_space - 1));
-                request->headers_text = ct_http_copy_range(request_line_end + 2, (size_t)(header_end - request_line_end - 4));
-                request->body_len = chunked ? decoded_body_len : content_len;
-                request->body = chunked ? decoded_body : (char *)malloc(content_len > 0 ? content_len : 1);
-                request->keep_alive = keep_alive;
-                if (request->method == NULL || request->url == NULL || request->headers_text == NULL || request->body == NULL) {
-                    return -1;
-                }
-                if (!chunked && content_len > 0) memcpy(request->body, input->data + header_len, content_len);
-
-                size_t consumed = header_len + (chunked ? chunked_consumed : content_len);
-                size_t remaining = input->len - consumed;
-                if (remaining > 0) memmove(input->data, input->data + consumed, remaining);
-                input->len = remaining;
-                input->data[remaining] = 0;
-                return 0;
-            }
+            ct_http_read_buffer_consume(input, header_len);
+            return 0;
         }
 
         if (header_end == NULL && input->len >= CT_HTTP_MAX_HEADER_SIZE) return -1;
-        if (input->len == input->capacity) {
-            size_t max_capacity = header_end == NULL
-                ? CT_HTTP_MAX_HEADER_SIZE
-                : CT_HTTP_MAX_BUFFERED_REQUEST_SIZE;
-            if (input->capacity >= max_capacity) return -1;
-            size_t next_capacity = input->capacity > max_capacity / 2
-                ? max_capacity
-                : input->capacity * 2;
-            char *next = (char *)realloc(input->data, next_capacity + 1);
-            if (next == NULL) return -1;
-            input->data = next;
-            input->capacity = next_capacity;
-        }
+        if (ct_http_read_buffer_grow(input, CT_HTTP_MAX_HEADER_SIZE) != 0) return -1;
         ssize_t read_count = recv(fd, input->data + input->len, input->capacity - input->len, 0);
         if (read_count < 0) {
             if (errno == EINTR) continue;
@@ -2730,6 +2613,181 @@ static int ct_http_read_request(int fd, CtHttpRequest *request, CtHttpReadBuffer
         input->len += (size_t)read_count;
         input->data[input->len] = 0;
     }
+}
+
+/* Returns a body piece (0), needs more socket data (1), is complete (2), invalid (-1), or too large (-2). */
+static int ct_http_take_body_piece(
+    CtHttpRequest *request,
+    CtHttpReadBuffer *input,
+    size_t max_body_size,
+    bool discard,
+    char **out_data,
+    size_t *out_len
+) {
+    *out_data = NULL;
+    *out_len = 0;
+    if (request->body_complete) return 2;
+
+    if (!request->body_chunked) {
+        if (request->body_received >= request->body_content_length) {
+            request->body_complete = true;
+            return 2;
+        }
+        if (input->len == 0) return 1;
+        size_t remaining = request->body_content_length - request->body_received;
+        size_t take = input->len < remaining ? input->len : remaining;
+        if (take > CT_HTTP_BODY_CHUNK_SIZE) take = CT_HTTP_BODY_CHUNK_SIZE;
+        if (take > max_body_size - request->body_received) return -2;
+        char *copy = NULL;
+        if (!discard) {
+            copy = (char *)malloc(take > 0 ? take : 1);
+            if (copy == NULL) return -1;
+            if (take > 0) memcpy(copy, input->data, take);
+        }
+        ct_http_read_buffer_consume(input, take);
+        request->body_received += take;
+        if (request->body_received == request->body_content_length) request->body_complete = true;
+        *out_data = copy;
+        *out_len = take;
+        return 0;
+    }
+
+    for (;;) {
+        if (request->chunk_reading_trailers) {
+            const char *line_end = ct_http_find_crlf(input->data, input->len);
+            if (line_end == (const char *)-1) return -1;
+            if (line_end == NULL) return input->len >= CT_HTTP_MAX_HEADER_SIZE ? -1 : 1;
+            size_t line_len = (size_t)(line_end - input->data);
+            if (line_len == 0) {
+                ct_http_read_buffer_consume(input, 2);
+                request->body_complete = true;
+                return 2;
+            }
+            const char *colon = memchr(input->data, ':', line_len);
+            if (colon == NULL || colon == input->data) return -1;
+            for (const char *item = input->data; item < colon; item += 1) {
+                if (!ct_http_is_token_char((unsigned char)*item)) return -1;
+            }
+            ct_http_read_buffer_consume(input, line_len + 2);
+            continue;
+        }
+
+        if (request->chunk_expect_crlf) {
+            if (input->len < 2) return 1;
+            if (input->data[0] != '\r' || input->data[1] != '\n') return -1;
+            ct_http_read_buffer_consume(input, 2);
+            request->chunk_expect_crlf = false;
+            continue;
+        }
+
+        if (request->chunk_remaining == 0) {
+            const char *line_end = ct_http_find_crlf(input->data, input->len);
+            if (line_end == (const char *)-1) return -1;
+            if (line_end == NULL) return input->len >= CT_HTTP_MAX_HEADER_SIZE ? -1 : 1;
+            const char *size_end = memchr(input->data, ';', (size_t)(line_end - input->data));
+            if (size_end == NULL) size_end = line_end;
+            while (size_end > input->data && (size_end[-1] == ' ' || size_end[-1] == '\t')) size_end -= 1;
+            if (size_end == input->data) return -1;
+
+            size_t chunk_size = 0;
+            for (const char *item = input->data; item < size_end; item += 1) {
+                unsigned char value = (unsigned char)*item;
+                size_t digit;
+                if (value >= '0' && value <= '9') digit = (size_t)(value - '0');
+                else if (value >= 'a' && value <= 'f') digit = (size_t)(value - 'a' + 10);
+                else if (value >= 'A' && value <= 'F') digit = (size_t)(value - 'A' + 10);
+                else return -1;
+                if (chunk_size > (SIZE_MAX - digit) / 16) return -1;
+                chunk_size = chunk_size * 16 + digit;
+            }
+            if (chunk_size > max_body_size - request->body_received) return -2;
+            ct_http_read_buffer_consume(input, (size_t)(line_end - input->data) + 2);
+            if (chunk_size == 0) {
+                request->chunk_reading_trailers = true;
+                continue;
+            }
+            request->chunk_remaining = chunk_size;
+        }
+
+        if (input->len == 0) return 1;
+        size_t take = input->len < request->chunk_remaining ? input->len : request->chunk_remaining;
+        if (take > CT_HTTP_BODY_CHUNK_SIZE) take = CT_HTTP_BODY_CHUNK_SIZE;
+        char *copy = NULL;
+        if (!discard) {
+            copy = (char *)malloc(take > 0 ? take : 1);
+            if (copy == NULL) return -1;
+            if (take > 0) memcpy(copy, input->data, take);
+        }
+        ct_http_read_buffer_consume(input, take);
+        request->body_received += take;
+        request->chunk_remaining -= take;
+        if (request->chunk_remaining == 0) request->chunk_expect_crlf = true;
+        *out_data = copy;
+        *out_len = take;
+        return 0;
+    }
+}
+
+static int ct_http_socket_read_ready(int fd, int timeout_ms) {
+    fd_set read_fds;
+    fd_set error_fds;
+    FD_ZERO(&read_fds);
+    FD_ZERO(&error_fds);
+#if defined(_WIN32)
+    SOCKET socket_value = ct_windows_socket_from_fd(fd);
+    FD_SET(socket_value, &read_fds);
+    FD_SET(socket_value, &error_fds);
+#else
+    FD_SET(fd, &read_fds);
+    FD_SET(fd, &error_fds);
+#endif
+    struct timeval timeout;
+    timeout.tv_sec = timeout_ms / 1000;
+    timeout.tv_usec = (timeout_ms % 1000) * 1000;
+    int result = select(
+#if defined(_WIN32)
+        0,
+#else
+        fd + 1,
+#endif
+        &read_fds,
+        NULL,
+        &error_fds,
+        &timeout
+    );
+#if defined(_WIN32)
+    if (result == SOCKET_ERROR) errno = ct_windows_socket_errno();
+#endif
+    return result;
+}
+
+/* Returns 1 after reading, 0 on timeout, and -1 on disconnect/error. */
+static int ct_http_read_more(int fd, CtHttpReadBuffer *input, int timeout_ms) {
+    if (ct_http_read_buffer_grow(input, CT_HTTP_MAX_HEADER_SIZE) != 0) return -1;
+    int ready = ct_http_socket_read_ready(fd, timeout_ms);
+    if (ready == 0) return 0;
+    if (ready < 0) return errno == EINTR ? 0 : -1;
+    size_t available = input->capacity - input->len;
+    if (available > CT_HTTP_BODY_CHUNK_SIZE) available = CT_HTTP_BODY_CHUNK_SIZE;
+    ssize_t read_count = recv(fd, input->data + input->len, available, 0);
+    if (read_count < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        return -1;
+    }
+    if (read_count == 0) return -1;
+    input->len += (size_t)read_count;
+    input->data[input->len] = 0;
+    return 1;
+}
+
+static bool ct_http_peer_disconnected(int fd, int timeout_ms) {
+    int ready = ct_http_socket_read_ready(fd, timeout_ms);
+    if (ready <= 0) return ready < 0 && errno != EINTR;
+    char byte = 0;
+    ssize_t peeked = recv(fd, &byte, 1, MSG_PEEK);
+    if (peeked == 0) return true;
+    if (peeked < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) return true;
+    return false;
 }
 
 static void ct_http_send_response(CtHttpRequest *request) {
@@ -2835,6 +2893,165 @@ static ssize_t ct_http_send_chunk(CtHttpRequest *request, const uint8_t *data, s
     return (ssize_t)len;
 }
 
+static void ct_http_send_status_response(int fd, int status, const char *reason, const char *body) {
+    size_t body_len = strlen(body);
+    int response_len = snprintf(
+        NULL,
+        0,
+        "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
+        status,
+        reason,
+        body_len,
+        body
+    );
+    if (response_len < 0) return;
+    char *response = (char *)malloc((size_t)response_len + 1);
+    if (response == NULL) return;
+    snprintf(
+        response,
+        (size_t)response_len + 1,
+        "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
+        status,
+        reason,
+        body_len,
+        body
+    );
+    ct_http_send_all(fd, response, (size_t)response_len);
+    free(response);
+}
+
+static void ct_http_request_mark_aborted(CtHttpRequest *request) {
+    pthread_mutex_lock(&request->mutex);
+    if (!request->client_aborted) {
+        request->client_aborted = true;
+        request->body_discard = true;
+        request->body_complete = true;
+        request->keep_alive = false;
+        free(request->body_chunk);
+        request->body_chunk = NULL;
+        request->body_chunk_len = 0;
+        pthread_cond_broadcast(&request->cond);
+    }
+    pthread_mutex_unlock(&request->mutex);
+}
+
+static bool ct_http_request_send_completed_response(CtHttpRequest *request) {
+    bool completed = false;
+    bool should_send = false;
+    pthread_mutex_lock(&request->mutex);
+    completed = request->completed;
+    if (completed) {
+        request->body_discard = true;
+        free(request->body_chunk);
+        request->body_chunk = NULL;
+        request->body_chunk_len = 0;
+        if (!request->response_sent) {
+            request->response_sent = true;
+            should_send = !request->response_streaming && !request->client_aborted;
+        }
+        pthread_cond_broadcast(&request->cond);
+    }
+    pthread_mutex_unlock(&request->mutex);
+    if (should_send) ct_http_send_response(request);
+    return completed;
+}
+
+static int ct_http_request_cond_wait(CtHttpRequest *request, int timeout_ms) {
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return pthread_cond_wait(&request->cond, &request->mutex);
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    return pthread_cond_timedwait(&request->cond, &request->mutex, &deadline);
+}
+
+static int ct_http_process_request_body(CtHttpServer *server, CtHttpRequest *request, CtHttpReadBuffer *input) {
+    for (;;) {
+        if (ct_http_server_is_stopped(server)) return -1;
+        ct_http_request_send_completed_response(request);
+
+        pthread_mutex_lock(&request->mutex);
+        while (request->body_chunk != NULL && !request->body_discard && !request->completed && !request->client_aborted) {
+            ct_http_request_cond_wait(request, 10);
+            if (request->body_chunk != NULL && !request->body_discard && !request->completed && !request->client_aborted) {
+                pthread_mutex_unlock(&request->mutex);
+                if (ct_http_peer_disconnected(request->client_fd, 0)) {
+                    ct_http_request_mark_aborted(request);
+                    return -1;
+                }
+                pthread_mutex_lock(&request->mutex);
+            }
+        }
+        if (request->client_aborted) {
+            pthread_mutex_unlock(&request->mutex);
+            return -1;
+        }
+
+        bool discard = request->body_discard || request->completed;
+        char *piece = NULL;
+        size_t piece_len = 0;
+        int body_status = ct_http_take_body_piece(
+            request,
+            input,
+            server->max_body_size,
+            discard,
+            &piece,
+            &piece_len
+        );
+        if (body_status == 0 && piece != NULL) {
+            if (request->body_discard || request->completed || request->client_aborted) {
+                free(piece);
+            } else {
+                request->body_chunk = piece;
+                request->body_chunk_len = piece_len;
+            }
+        }
+        pthread_mutex_unlock(&request->mutex);
+
+        if (body_status == 0) continue;
+        if (body_status == 2) return 0;
+        if (body_status < 0) {
+            pthread_mutex_lock(&request->mutex);
+            bool can_send_error = !request->response_sent;
+            request->response_sent = true;
+            pthread_mutex_unlock(&request->mutex);
+            if (can_send_error) {
+                if (body_status == -2) {
+                    ct_http_send_status_response(request->client_fd, 413, "Payload Too Large", "Payload Too Large");
+                } else {
+                    ct_http_send_status_response(request->client_fd, 400, "Bad Request", "Bad Request");
+                }
+            }
+            ct_http_request_mark_aborted(request);
+            return -1;
+        }
+
+        int read_status = ct_http_read_more(request->client_fd, input, 10);
+        if (read_status < 0) {
+            ct_http_request_mark_aborted(request);
+            return -1;
+        }
+    }
+}
+
+static void ct_http_wait_for_response(CtHttpServer *server, CtHttpRequest *request) {
+    for (;;) {
+        if (ct_http_server_is_stopped(server)) return;
+        if (ct_http_request_send_completed_response(request)) return;
+
+        pthread_mutex_lock(&request->mutex);
+        bool aborted = request->client_aborted;
+        if (!request->completed) ct_http_request_cond_wait(request, 10);
+        pthread_mutex_unlock(&request->mutex);
+        if (!aborted && ct_http_peer_disconnected(request->client_fd, 0)) {
+            ct_http_request_mark_aborted(request);
+        }
+    }
+}
+
 static bool ct_http_server_track_request(CtHttpServer *server, CtHttpRequest *request) {
     pthread_mutex_lock(&server->mutex);
     if (server->stopping || server->stopped) {
@@ -2871,11 +3088,24 @@ static void *ct_http_client_thread(void *opaque) {
     free(task);
 
     while (!ct_http_server_is_stopped(server)) {
-        if (ct_http_read_request(request->client_fd, request, &input) != 0) {
-            if (!ct_http_server_is_stopped(server) && input.len > 0) {
-                static const char bad_request[] =
-                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request";
-                ct_http_send_all(request->client_fd, bad_request, sizeof(bad_request) - 1);
+        int head_status = ct_http_read_request_head(
+            request->client_fd,
+            request,
+            &input,
+            server->max_body_size
+        );
+        if (head_status != 0) {
+            if (!ct_http_server_is_stopped(server) && (input.len > 0 || head_status == 1)) {
+                if (head_status == 1) {
+                    ct_http_send_status_response(
+                        request->client_fd,
+                        413,
+                        "Payload Too Large",
+                        "Payload Too Large"
+                    );
+                } else {
+                    ct_http_send_status_response(request->client_fd, 400, "Bad Request", "Bad Request");
+                }
             }
             break;
         }
@@ -2884,13 +3114,14 @@ static void *ct_http_client_thread(void *opaque) {
         request->ready = true;
         pthread_mutex_unlock(&server->mutex);
 
-        pthread_mutex_lock(&request->mutex);
-        while (!request->completed) pthread_cond_wait(&request->cond, &request->mutex);
-        pthread_mutex_unlock(&request->mutex);
+        int body_status = ct_http_process_request_body(server, request, &input);
+        ct_http_wait_for_response(server, request);
 
         if (ct_http_server_is_stopped(server)) break;
-        if (!request->response_streaming) ct_http_send_response(request);
-        if (!request->keep_alive || ct_http_server_is_stopping(server)) break;
+        pthread_mutex_lock(&request->mutex);
+        bool can_reuse = body_status == 0 && !request->client_aborted && request->keep_alive;
+        pthread_mutex_unlock(&request->mutex);
+        if (!can_reuse || ct_http_server_is_stopping(server)) break;
 
         pthread_mutex_lock(&ct_http_servers_mutex);
         uint32_t next_request_id = ct_next_http_request_id++;
@@ -24890,6 +25121,7 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
     char *hostname_arg = NULL;
     char *unix_path = NULL;
     int port_value = 0;
+    size_t max_body_size = CT_HTTP_DEFAULT_MAX_BODY_SIZE;
     if (argc >= 1 && !JSValueIsUndefined(ctx, argv[0]) && !JSValueIsNull(ctx, argv[0])) {
         hostname_arg = ct_value_to_string_copy(ctx, argv[0]);
         if (hostname_arg != NULL) hostname = hostname_arg;
@@ -24900,6 +25132,14 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
         if (unix_path != NULL && unix_path[0] == 0) {
             free(unix_path);
             unix_path = NULL;
+        }
+    }
+    if (argc >= 4) {
+        double configured_max_body_size = ct_value_to_number(ctx, argv[3]);
+        if (isfinite(configured_max_body_size) && configured_max_body_size > 0) {
+            max_body_size = configured_max_body_size >= (double)SIZE_MAX
+                ? SIZE_MAX
+                : (size_t)configured_max_body_size;
         }
     }
 
@@ -24991,6 +25231,7 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
     }
     server->listen_fd = listen_fd;
     server->port = bound_port;
+    server->max_body_size = max_body_size;
     server->hostname = unix_path == NULL ? ct_duplicate_string(hostname) : NULL;
     server->unix_path = unix_path;
     server->runtime = ct_callback_runtime(function);
@@ -25053,7 +25294,22 @@ static JSValueRef ct_http_server_poll(JSContextRef ctx, JSObjectRef function, JS
         ct_set_property(ctx, result, "method", ct_make_string(ctx, request->method != NULL ? request->method : "GET"), exception);
         ct_set_property(ctx, result, "url", ct_make_string(ctx, request->url != NULL ? request->url : "/"), exception);
         ct_set_property(ctx, result, "headersText", ct_make_string(ctx, request->headers_text != NULL ? request->headers_text : ""), exception);
-        ct_set_property(ctx, result, "body", ct_array_buffer_from_copy(ctx, request->body != NULL ? request->body : "", request->body_len, exception), exception);
+        ct_set_property(
+            ctx,
+            result,
+            "hasBody",
+            JSValueMakeBoolean(ctx, request->body_chunked || request->body_content_length > 0),
+            exception
+        );
+        if (!request->body_chunked) {
+            ct_set_property(
+                ctx,
+                result,
+                "bodyLength",
+                JSValueMakeNumber(ctx, (double)request->body_content_length),
+                exception
+            );
+        }
         if (server->unix_path == NULL) {
             JSValueRef address_exception = NULL;
             JSObjectRef remote = ct_tcp_address_object(ctx, request->client_fd, true, &address_exception);
@@ -25064,6 +25320,98 @@ static JSValueRef ct_http_server_poll(JSContextRef ctx, JSObjectRef function, JS
     }
     pthread_mutex_unlock(&server->mutex);
     return result != NULL ? result : JSValueMakeNull(ctx);
+}
+
+static JSValueRef ct_http_server_request_event_poll(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) return JSValueMakeNull(ctx);
+
+    uint32_t server_id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    uint32_t request_id = (uint32_t)ct_value_to_number(ctx, argv[1]);
+    bool wants_data = argc >= 3 && JSValueToBoolean(ctx, argv[2]);
+    int event_type = 0;
+    char *body_chunk = NULL;
+    size_t body_chunk_len = 0;
+
+    pthread_mutex_lock(&ct_http_servers_mutex);
+    CtHttpServer *server = ct_http_find_server(server_id);
+    if (server != NULL) pthread_mutex_lock(&server->mutex);
+    pthread_mutex_unlock(&ct_http_servers_mutex);
+    if (server == NULL) return JSValueMakeNull(ctx);
+
+    CtHttpRequest *request = server->requests;
+    while (request != NULL && request->id != request_id) request = request->next;
+    if (request != NULL) {
+        pthread_mutex_lock(&request->mutex);
+        if (request->client_aborted && !request->abort_reported) {
+            request->abort_reported = true;
+            event_type = 3;
+        } else if (wants_data && request->body_chunk != NULL) {
+            body_chunk = request->body_chunk;
+            body_chunk_len = request->body_chunk_len;
+            request->body_chunk = NULL;
+            request->body_chunk_len = 0;
+            event_type = 1;
+            pthread_cond_broadcast(&request->cond);
+        } else if (wants_data && request->body_complete && !request->body_end_reported) {
+            request->body_end_reported = true;
+            event_type = 2;
+        }
+        pthread_mutex_unlock(&request->mutex);
+    }
+    pthread_mutex_unlock(&server->mutex);
+
+    if (event_type == 0) return JSValueMakeNull(ctx);
+    JSObjectRef result = ct_make_object(ctx);
+    if (event_type == 1) {
+        ct_set_property(ctx, result, "type", ct_make_string(ctx, "data"), exception);
+        ct_set_property(
+            ctx,
+            result,
+            "data",
+            ct_array_buffer_from_copy(ctx, body_chunk != NULL ? body_chunk : "", body_chunk_len, exception),
+            exception
+        );
+        free(body_chunk);
+    } else if (event_type == 2) {
+        ct_set_property(ctx, result, "type", ct_make_string(ctx, "end"), exception);
+    } else {
+        ct_set_property(ctx, result, "type", ct_make_string(ctx, "abort"), exception);
+    }
+    return result;
+}
+
+static JSValueRef ct_http_server_request_cancel(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    if (argc < 2) return JSValueMakeBoolean(ctx, false);
+
+    uint32_t server_id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    uint32_t request_id = (uint32_t)ct_value_to_number(ctx, argv[1]);
+    bool found = false;
+
+    pthread_mutex_lock(&ct_http_servers_mutex);
+    CtHttpServer *server = ct_http_find_server(server_id);
+    if (server != NULL) pthread_mutex_lock(&server->mutex);
+    pthread_mutex_unlock(&ct_http_servers_mutex);
+    if (server == NULL) return JSValueMakeBoolean(ctx, false);
+
+    CtHttpRequest *request = server->requests;
+    while (request != NULL && request->id != request_id) request = request->next;
+    if (request != NULL) {
+        pthread_mutex_lock(&request->mutex);
+        request->body_discard = true;
+        free(request->body_chunk);
+        request->body_chunk = NULL;
+        request->body_chunk_len = 0;
+        pthread_cond_broadcast(&request->cond);
+        pthread_mutex_unlock(&request->mutex);
+        found = true;
+    }
+    pthread_mutex_unlock(&server->mutex);
+    return JSValueMakeBoolean(ctx, found);
 }
 
 static CtHttpRequest *ct_http_server_lock_request(uint32_t server_id, uint32_t request_id, const char **error_message) {
@@ -25197,6 +25545,7 @@ static JSValueRef ct_http_server_response_start(JSContextRef ctx, JSObjectRef fu
     request->response_headers_text = headers_text;
     request->response_started = true;
     request->response_streaming = true;
+    request->response_sent = true;
     if (ct_http_send_chunked_response_head(request) < 0) {
         ct_http_complete_failed_stream(request);
         pthread_mutex_unlock(&request->mutex);
@@ -25299,6 +25648,7 @@ static JSValueRef ct_http_server_response_abort(JSContextRef ctx, JSObjectRef fu
 
     request->keep_alive = false;
     request->completed = true;
+    request->response_sent = true;
     shutdown(request->client_fd, SHUT_RDWR);
     pthread_cond_signal(&request->cond);
     pthread_mutex_unlock(&request->mutex);
@@ -25319,8 +25669,11 @@ static void ct_http_server_stop_accepting(CtHttpServer *server) {
         close(server->listen_fd);
         CtHttpRequest *request = server->requests;
         while (request != NULL) {
+            pthread_mutex_lock(&request->mutex);
             request->keep_alive = false;
             if (!request->ready) shutdown(request->client_fd, SHUT_RDWR);
+            pthread_cond_broadcast(&request->cond);
+            pthread_mutex_unlock(&request->mutex);
             request = request->next;
         }
     }

@@ -18,6 +18,57 @@ function getNativeHttpText(url) {
   });
 }
 
+function withTimeout(promise, message, timeout = 3000) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeout);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+function readRawHttpResponse(socket) {
+  return new Promise((resolve, reject) => {
+    let buffered = Buffer.alloc(0);
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.off("data", onData);
+      socket.off("error", onError);
+      socket.off("close", onClose);
+    };
+    const finish = value => {
+      cleanup();
+      resolve(value);
+    };
+    const onData = chunk => {
+      buffered = Buffer.concat([buffered, Buffer.from(chunk)]);
+      const headerEnd = buffered.indexOf("\r\n\r\n");
+      if (headerEnd < 0) return;
+      const head = buffered.subarray(0, headerEnd).toString();
+      const contentLength = Number(/\r\ncontent-length:\s*(\d+)/i.exec(`\r\n${head}`)?.[1] ?? 0);
+      const bodyStart = headerEnd + 4;
+      if (buffered.byteLength - bodyStart < contentLength) return;
+      finish({ head, body: buffered.subarray(bodyStart, bodyStart + contentLength).toString() });
+    };
+    const onError = error => {
+      cleanup();
+      reject(error);
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new Error("socket closed before the HTTP response completed"));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("raw HTTP response timed out"));
+    }, 3000);
+    socket.on("data", onData);
+    socket.once("error", onError);
+    socket.once("close", onClose);
+  });
+}
+
 async function createForwardProxy(useTls = false) {
   const requests = [];
   const sockets = new Set();
@@ -309,6 +360,146 @@ test("native Bun.serve dispatches a nested request while its outer handler is pe
   try {
     expect(await getNativeHttpText(new URL("/outer", server.url))).toBe("outer:inner");
   } finally {
+    await server.stop(true);
+  }
+});
+
+test("native Bun.serve streams partial Content-Length and chunked request bodies", async () => {
+  for (const framing of ["content-length", "chunked"]) {
+    const dispatched = Promise.withResolvers();
+    const firstChunk = Promise.withResolvers();
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        dispatched.resolve();
+        const chunks = [];
+        for await (const chunk of request.body) {
+          chunks.push(Buffer.from(chunk));
+          firstChunk.resolve(Buffer.concat(chunks).toString());
+        }
+        return new Response(Buffer.concat(chunks));
+      },
+    });
+    const socket = net.connect(server.port, server.hostname);
+    socket.on("error", () => {});
+    try {
+      await once(socket, "connect");
+      const response = readRawHttpResponse(socket);
+      if (framing === "content-length") {
+        socket.write("POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 11\r\n\r\nhello");
+      } else {
+        socket.write("POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n");
+      }
+
+      await withTimeout(dispatched.promise, `${framing} request was not dispatched from headers`);
+      expect(await withTimeout(firstChunk.promise, `${framing} first body chunk was not streamed`)).toBe("hello");
+      socket.write(framing === "content-length" ? " world" : "6\r\n world\r\n0\r\n\r\n");
+
+      const result = await response;
+      expect(result.head).toStartWith("HTTP/1.1 200");
+      expect(result.body).toBe("hello world");
+    } finally {
+      socket.destroy();
+      await server.stop(true);
+    }
+  }
+});
+
+test("native Bun.serve aborts the request body and signal when an upload disconnects", async () => {
+  const firstChunk = Promise.withResolvers();
+  const observed = Promise.withResolvers();
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    maxRequestBodySize: 16 * 1024 * 1024 * 1024,
+    async fetch(request) {
+      let bodyError;
+      try {
+        for await (const chunk of request.body) firstChunk.resolve(chunk.byteLength);
+      } catch (error) {
+        bodyError = error;
+      }
+      observed.resolve({
+        bodyErrorName: bodyError?.name,
+        signalAborted: request.signal.aborted,
+        signalReasonCode: request.signal.reason?.code,
+      });
+      return new Response("disconnected");
+    },
+  });
+  const socket = net.connect(server.port, server.hostname);
+  socket.on("error", () => {});
+  try {
+    await once(socket, "connect");
+    socket.write("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048576\r\n\r\n");
+    socket.write(Buffer.alloc(32 * 1024, 0x61));
+    expect(await withTimeout(firstChunk.promise, "partial upload was not streamed")).toBeGreaterThan(0);
+    socket.end();
+
+    expect(await withTimeout(observed.promise, "upload disconnect was not propagated")).toEqual({
+      bodyErrorName: "AbortError",
+      signalAborted: true,
+      signalReasonCode: "ECONNRESET",
+    });
+  } finally {
+    socket.destroy();
+    await server.stop(true);
+  }
+});
+
+test("native Bun.serve errors an unread pending body read after responding", async () => {
+  const readResult = Promise.withResolvers();
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      request.body.getReader().read().then(
+        value => readResult.resolve({ value }),
+        error => readResult.resolve({ error }),
+      );
+      return new Response("ok");
+    },
+  });
+  const socket = net.connect(server.port, server.hostname);
+  socket.on("error", () => {});
+  try {
+    await once(socket, "connect");
+    const response = readRawHttpResponse(socket);
+    socket.write("POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 65536\r\n\r\n");
+
+    expect((await withTimeout(readResult.promise, "pending request body read did not settle")).error?.name).toBe("AbortError");
+    expect((await response).body).toBe("ok");
+  } finally {
+    socket.destroy();
+    await server.stop(true);
+  }
+});
+
+test("native Bun.serve rejects an oversized declared body before dispatch", async () => {
+  let calls = 0;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    maxRequestBodySize: 10,
+    fetch() {
+      calls += 1;
+      return new Response("unexpected");
+    },
+  });
+  const socket = net.connect(server.port, server.hostname);
+  socket.on("error", () => {});
+  try {
+    await once(socket, "connect");
+    const response = readRawHttpResponse(socket);
+    socket.write("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\n");
+
+    const result = await response;
+    expect(result.head).toStartWith("HTTP/1.1 413");
+    expect(result.body).toBe("Payload Too Large");
+    expect(calls).toBe(0);
+  } finally {
+    socket.destroy();
     await server.stop(true);
   }
 });
