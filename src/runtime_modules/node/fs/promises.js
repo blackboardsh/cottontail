@@ -369,8 +369,20 @@ class FileHandle extends EventEmitter {
   }
 
   _unref() {
+    if (this._refs <= 0) return;
     this._refs -= 1;
     this._finishClose();
+  }
+
+  _acquireStreamRef(syscall) {
+    const fd = this._assertOpen(syscall);
+    this._refs += 1;
+    return fd;
+  }
+
+  _releaseStreamRef() {
+    this._unref();
+    return this._closePromise;
   }
 
   _withRef(syscall, operation) {
@@ -384,14 +396,6 @@ class FileHandle extends EventEmitter {
       return Promise.reject(error);
     }
     return Promise.resolve(result).finally(() => this._unref());
-  }
-
-  _markClosedExternally() {
-    this.fd = -1;
-    this._closing = true;
-    this._refs = 0;
-    this._emitClose();
-    this._closeResolve?.();
   }
 
   appendFile(data, options = undefined) {
@@ -413,20 +417,12 @@ class FileHandle extends EventEmitter {
     return this._closePromise;
   }
   createReadStream(options = {}) {
-    const fd = this._assertOpen("createReadStream");
-    const stream = createReadStream(this.path, { highWaterMark: 64 * 1024, ...options, fd });
-    if (options?.autoClose !== false) stream.once("close", () => this._markClosedExternally());
-    return stream;
+    this._assertOpen("createReadStream");
+    return createReadStream(this.path, { highWaterMark: 64 * 1024, ...options, fd: this });
   }
   createWriteStream(options = {}) {
-    const fd = this._assertOpen("createWriteStream");
-    const stream = createWriteStream(this.path, { highWaterMark: 64 * 1024, ...options, fd });
-    if (options?.autoClose !== false) {
-      const markClosed = () => this._markClosedExternally();
-      stream.once("finish", markClosed);
-      stream.once("close", markClosed);
-    }
-    return stream;
+    this._assertOpen("createWriteStream");
+    return createWriteStream(this.path, { highWaterMark: 64 * 1024, ...options, fd: this });
   }
   datasync() { return this._withRef("fdatasync", () => fdatasyncSync(this.fd)); }
   getAsyncId() { return this._asyncId; }

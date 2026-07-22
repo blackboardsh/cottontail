@@ -75,6 +75,159 @@ describe("FileHandle stable-path behavior", () => {
     expect(text).toBe("abcdefghij");
     await nodeStreamHandle.close();
   });
+
+  test("FileHandle-backed streams retain ownership and dispatch patched methods", async () => {
+    const readTarget = path.join(root, "handle-stream-read.txt");
+    fs.writeFileSync(readTarget, "stream-data");
+    const readHandle = await fsp.open(readTarget, "r");
+    const originalRead = readHandle.read;
+    let readCalls = 0;
+    readHandle.read = function (...args: Parameters<typeof originalRead>) {
+      readCalls += 1;
+      return originalRead.apply(this, args);
+    };
+    let text = "";
+    for await (const chunk of fs.createReadStream(null, { fd: readHandle })) text += chunk;
+    expect(text).toBe("stream-data");
+    expect(readCalls).toBeGreaterThan(0);
+    expect(readHandle.fd).toBe(-1);
+
+    const writeTarget = path.join(root, "handle-stream-write.txt");
+    const writeHandle = await fsp.open(writeTarget, "w+");
+    const originalWrite = writeHandle.write;
+    let writeCalls = 0;
+    writeHandle.write = function (...args: Parameters<typeof originalWrite>) {
+      writeCalls += 1;
+      return originalWrite.apply(this, args);
+    };
+    const stream = fs.createWriteStream(null, { fd: writeHandle });
+    const closed = new Promise<void>((resolve, reject) => {
+      stream.once("error", reject);
+      stream.once("close", resolve);
+    });
+    stream.end("written-through-handle");
+    await closed;
+    expect(writeCalls).toBeGreaterThan(0);
+    expect(writeHandle.fd).toBe(-1);
+    expect(fs.readFileSync(writeTarget, "utf8")).toBe("written-through-handle");
+  });
+
+  test("closing a referenced FileHandle closes its stream and descriptor once", async () => {
+    const target = path.join(root, "handle-stream-close.txt");
+    fs.writeFileSync(target, "close-me");
+    const handle = await fsp.open(target, "r");
+    let handleCloseEvents = 0;
+    handle.on("close", () => handleCloseEvents += 1);
+    const stream = fs.createReadStream(null, { fd: handle, autoClose: false });
+    const streamClosed = new Promise<void>(resolve => stream.once("close", resolve));
+    await handle.close();
+    await streamClosed;
+    await handle.close();
+    expect(handle.fd).toBe(-1);
+    expect(handleCloseEvents).toBe(1);
+  });
+});
+
+describe("native fs.watch", () => {
+  test("delivers raw encoded filenames and closes idempotently", async () => {
+    const target = path.join(root, "watch-encoded-\u65b0\u5efa.txt");
+    fs.writeFileSync(target, "before");
+    const watcher = fs.watch(target, { encoding: "buffer" });
+    expect(watcher.constructor.name).toBe("FSWatcher");
+
+    let revision = 0;
+    const event = await new Promise<{ eventType: string; filename: Buffer }>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("timed out waiting for native file event")), 3000);
+      const interval = setInterval(() => fs.writeFileSync(target, `revision-${revision++}`), 25);
+      watcher.once("error", reject);
+      watcher.on("change", (eventType, filename) => {
+        clearTimeout(timeout);
+        clearInterval(interval);
+        resolve({ eventType, filename: filename as Buffer });
+      });
+    });
+    expect(event.eventType).toBe("change");
+    expect(event.filename).toBeInstanceOf(Buffer);
+    expect(event.filename.toString()).toBe(path.basename(target));
+
+    const closed = new Promise<void>(resolve => watcher.once("close", resolve));
+    watcher.close();
+    watcher.close();
+    await closed;
+  });
+
+  test("recursive directory events preserve the relative child path", async () => {
+    const watched = path.join(root, "watch-recursive");
+    const child = path.join(watched, "nested");
+    const target = path.join(child, "child.txt");
+    fs.mkdirSync(child, { recursive: true });
+    fs.writeFileSync(target, "before");
+    const watcher = fs.watch(watched, { recursive: true });
+
+    let revision = 0;
+    const filename = await new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("timed out waiting for recursive native event")), 3000);
+      const interval = setInterval(() => fs.writeFileSync(target, `revision-${revision++}`), 25);
+      watcher.once("error", reject);
+      watcher.on("change", (_eventType, changed) => {
+        if (path.basename(String(changed)) !== "child.txt") return;
+        clearTimeout(timeout);
+        clearInterval(interval);
+        resolve(String(changed));
+      });
+    });
+    expect(filename.replaceAll("\\", "/")).toBe("nested/child.txt");
+    watcher.close();
+  });
+
+  test("pre-aborted watchers report the custom reason and close once", async () => {
+    const reason = new Error("stop watching");
+    const watcher = fs.watch(path.join(root, "not-opened-after-abort"), {
+      signal: AbortSignal.abort(reason),
+    });
+    let closeEvents = 0;
+    watcher.on("close", () => closeEvents += 1);
+    const error = await new Promise<Error>(resolve => watcher.once("error", resolve));
+    await new Promise(resolve => queueMicrotask(resolve));
+    expect(error).toBe(reason);
+    expect(closeEvents).toBe(1);
+  });
+});
+
+test("glob uses Bun grammar and Node fs validation", () => {
+  const cwd = path.join(root, "glob-grammar");
+  fs.mkdirSync(cwd);
+  for (const name of ["a.js", "b.ts", "c.txt", ".hidden.js", "foo1.txt", "fooA.txt", "literal[.txt"]) {
+    fs.writeFileSync(path.join(cwd, name), name);
+  }
+
+  expect(fs.globSync("[ab].{js,ts}", { cwd })).toEqual(["a.js", "b.ts"]);
+  expect(fs.globSync("foo[0-9].txt", { cwd })).toEqual(["foo1.txt"]);
+  expect(fs.globSync("foo[^0-9].txt", { cwd })).toEqual(["fooA.txt"]);
+  expect(fs.globSync("literal\\[.txt", { cwd })).toEqual(["literal[.txt"]);
+  expect(fs.globSync("*", { cwd })).not.toContain(".hidden.js");
+  expect(() => fs.globSync(1 as any, { cwd })).toThrow(expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }));
+  expect(() => fs.globSync("*", { cwd, withFileTypes: true } as any)).toThrow(
+    "fs.glob does not support options.withFileTypes yet",
+  );
+});
+
+test("BigIntStats preserves exact integer fields and nanosecond components", () => {
+  const target = path.join(root, "stat-precision.txt");
+  fs.writeFileSync(target, "precision");
+  const numberStats = fs.statSync(target);
+  const bigintStats = fs.statSync(target, { bigint: true });
+
+  for (const field of ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "blksize", "blocks"] as const) {
+    if (Number.isSafeInteger(numberStats[field])) expect(bigintStats[field]).toBe(BigInt(numberStats[field]));
+  }
+  for (const field of ["atime", "mtime", "ctime", "birthtime"] as const) {
+    const milliseconds = bigintStats[`${field}Ms`];
+    const nanoseconds = bigintStats[`${field}Ns`];
+    expect(nanoseconds / 1000000n).toBe(milliseconds);
+    expect(nanoseconds).toBeGreaterThanOrEqual(milliseconds * 1000000n);
+    expect(nanoseconds).toBeLessThan(milliseconds * 1000000n + 1000000n);
+  }
 });
 
 test("aborted writes remove their signal listener", async () => {

@@ -1362,6 +1362,34 @@ typedef struct CtFdWatcher {
     struct CtFdWatcher *next;
 } CtFdWatcher;
 
+typedef struct CtFsWatcher CtFsWatcher;
+
+typedef struct CtFsWatchHandle {
+    uv_fs_event_t handle;
+    CtFsWatcher *watcher;
+    char *path;
+    char *prefix;
+    uint64_t scan_generation;
+    bool root;
+    struct CtFsWatchHandle *next;
+} CtFsWatchHandle;
+
+struct CtFsWatcher {
+    uint32_t id;
+    CtJscRuntime *runtime;
+    char *path;
+    char *fallback_filename;
+    CtFsWatchHandle *handles;
+    size_t pending_closes;
+    uint64_t scan_generation;
+    bool recursive;
+    bool root_is_directory;
+    bool referenced;
+    bool active;
+    bool closing;
+    struct CtFsWatcher *next;
+};
+
 typedef struct CtTcpConnect {
     uint32_t id;
     int fd;
@@ -1758,6 +1786,7 @@ struct CtJscRuntime {
     uint32_t next_fd_watch_id;
     uint32_t next_dns_request_id;
     CtDnsRequest *dns_requests;
+    CtFsWatcher *fs_watchers;
     CtTimer **timer_heap;
     size_t timer_heap_len;
     size_t timer_heap_cap;
@@ -18150,49 +18179,82 @@ static JSValueRef ct_exists_sync(JSContextRef ctx, JSObjectRef function, JSObjec
     return JSValueMakeBoolean(ctx, exists);
 }
 
-static double ct_stat_time_ms(time_t seconds, long nanoseconds) {
-    return ((double)seconds * 1000.0) + ((double)nanoseconds / 1000000.0);
+typedef struct CtStatTimestamp {
+    int64_t seconds;
+    long nanoseconds;
+} CtStatTimestamp;
+
+static double ct_stat_time_ms(CtStatTimestamp timestamp) {
+    return ((double)timestamp.seconds * 1000.0) + ((double)timestamp.nanoseconds / 1000000.0);
 }
 
-static double ct_stat_atime_ms(const struct stat *stat_value) {
+static CtStatTimestamp ct_stat_atime(const struct stat *stat_value) {
 #if defined(__APPLE__) || defined(__MACH__)
-    return ct_stat_time_ms(stat_value->st_atimespec.tv_sec, stat_value->st_atimespec.tv_nsec);
+    return (CtStatTimestamp){ (int64_t)stat_value->st_atimespec.tv_sec, stat_value->st_atimespec.tv_nsec };
 #elif defined(__linux__)
-    return ct_stat_time_ms(stat_value->st_atim.tv_sec, stat_value->st_atim.tv_nsec);
+    return (CtStatTimestamp){ (int64_t)stat_value->st_atim.tv_sec, stat_value->st_atim.tv_nsec };
 #else
-    return ct_stat_time_ms(stat_value->st_atime, 0);
+    return (CtStatTimestamp){ (int64_t)stat_value->st_atime, 0 };
 #endif
 }
 
-static double ct_stat_mtime_ms(const struct stat *stat_value) {
+static CtStatTimestamp ct_stat_mtime(const struct stat *stat_value) {
 #if defined(__APPLE__) || defined(__MACH__)
-    return ct_stat_time_ms(stat_value->st_mtimespec.tv_sec, stat_value->st_mtimespec.tv_nsec);
+    return (CtStatTimestamp){ (int64_t)stat_value->st_mtimespec.tv_sec, stat_value->st_mtimespec.tv_nsec };
 #elif defined(__linux__)
-    return ct_stat_time_ms(stat_value->st_mtim.tv_sec, stat_value->st_mtim.tv_nsec);
+    return (CtStatTimestamp){ (int64_t)stat_value->st_mtim.tv_sec, stat_value->st_mtim.tv_nsec };
 #else
-    return ct_stat_time_ms(stat_value->st_mtime, 0);
+    return (CtStatTimestamp){ (int64_t)stat_value->st_mtime, 0 };
 #endif
 }
 
-static double ct_stat_ctime_ms(const struct stat *stat_value) {
+static CtStatTimestamp ct_stat_ctime(const struct stat *stat_value) {
 #if defined(__APPLE__) || defined(__MACH__)
-    return ct_stat_time_ms(stat_value->st_ctimespec.tv_sec, stat_value->st_ctimespec.tv_nsec);
+    return (CtStatTimestamp){ (int64_t)stat_value->st_ctimespec.tv_sec, stat_value->st_ctimespec.tv_nsec };
 #elif defined(__linux__)
-    return ct_stat_time_ms(stat_value->st_ctim.tv_sec, stat_value->st_ctim.tv_nsec);
+    return (CtStatTimestamp){ (int64_t)stat_value->st_ctim.tv_sec, stat_value->st_ctim.tv_nsec };
 #else
-    return ct_stat_time_ms(stat_value->st_ctime, 0);
+    return (CtStatTimestamp){ (int64_t)stat_value->st_ctime, 0 };
 #endif
 }
 
-static double ct_stat_birthtime_ms(const struct stat *stat_value) {
+static CtStatTimestamp ct_stat_birthtime(const struct stat *stat_value) {
 #if defined(__APPLE__) || defined(__MACH__)
-    return ct_stat_time_ms(stat_value->st_birthtimespec.tv_sec, stat_value->st_birthtimespec.tv_nsec);
+    return (CtStatTimestamp){ (int64_t)stat_value->st_birthtimespec.tv_sec, stat_value->st_birthtimespec.tv_nsec };
 #else
-    return ct_stat_ctime_ms(stat_value);
+    return ct_stat_ctime(stat_value);
 #endif
+}
+
+static void ct_set_stat_unsigned_string(
+    JSContextRef ctx,
+    JSObjectRef object,
+    const char *name,
+    unsigned long long value,
+    JSValueRef *exception
+) {
+    char text[32];
+    snprintf(text, sizeof(text), "%llu", value);
+    ct_set_property(ctx, object, name, ct_make_string(ctx, text), exception);
+}
+
+static void ct_set_stat_signed_string(
+    JSContextRef ctx,
+    JSObjectRef object,
+    const char *name,
+    long long value,
+    JSValueRef *exception
+) {
+    char text[32];
+    snprintf(text, sizeof(text), "%lld", value);
+    ct_set_property(ctx, object, name, ct_make_string(ctx, text), exception);
 }
 
 static void ct_define_stat_fields(JSContextRef ctx, JSObjectRef object, const struct stat *stat_value, JSValueRef *exception) {
+    CtStatTimestamp atime = ct_stat_atime(stat_value);
+    CtStatTimestamp mtime = ct_stat_mtime(stat_value);
+    CtStatTimestamp ctime = ct_stat_ctime(stat_value);
+    CtStatTimestamp birthtime = ct_stat_birthtime(stat_value);
     ct_set_property(ctx, object, "dev", JSValueMakeNumber(ctx, (double)stat_value->st_dev), exception);
     ct_set_property(ctx, object, "ino", JSValueMakeNumber(ctx, (double)stat_value->st_ino), exception);
     ct_set_property(ctx, object, "size", JSValueMakeNumber(ctx, (double)stat_value->st_size), exception);
@@ -18208,10 +18270,33 @@ static void ct_define_stat_fields(JSContextRef ctx, JSObjectRef object, const st
     ct_set_property(ctx, object, "blksize", JSValueMakeNumber(ctx, 0), exception);
     ct_set_property(ctx, object, "blocks", JSValueMakeNumber(ctx, 0), exception);
 #endif
-    ct_set_property(ctx, object, "atimeMs", JSValueMakeNumber(ctx, ct_stat_atime_ms(stat_value)), exception);
-    ct_set_property(ctx, object, "mtimeMs", JSValueMakeNumber(ctx, ct_stat_mtime_ms(stat_value)), exception);
-    ct_set_property(ctx, object, "ctimeMs", JSValueMakeNumber(ctx, ct_stat_ctime_ms(stat_value)), exception);
-    ct_set_property(ctx, object, "birthtimeMs", JSValueMakeNumber(ctx, ct_stat_birthtime_ms(stat_value)), exception);
+    ct_set_property(ctx, object, "atimeMs", JSValueMakeNumber(ctx, ct_stat_time_ms(atime)), exception);
+    ct_set_property(ctx, object, "mtimeMs", JSValueMakeNumber(ctx, ct_stat_time_ms(mtime)), exception);
+    ct_set_property(ctx, object, "ctimeMs", JSValueMakeNumber(ctx, ct_stat_time_ms(ctime)), exception);
+    ct_set_property(ctx, object, "birthtimeMs", JSValueMakeNumber(ctx, ct_stat_time_ms(birthtime)), exception);
+    ct_set_property(ctx, object, "atimeSec", JSValueMakeNumber(ctx, (double)atime.seconds), exception);
+    ct_set_property(ctx, object, "atimeNsec", JSValueMakeNumber(ctx, (double)atime.nanoseconds), exception);
+    ct_set_property(ctx, object, "mtimeSec", JSValueMakeNumber(ctx, (double)mtime.seconds), exception);
+    ct_set_property(ctx, object, "mtimeNsec", JSValueMakeNumber(ctx, (double)mtime.nanoseconds), exception);
+    ct_set_property(ctx, object, "ctimeSec", JSValueMakeNumber(ctx, (double)ctime.seconds), exception);
+    ct_set_property(ctx, object, "ctimeNsec", JSValueMakeNumber(ctx, (double)ctime.nanoseconds), exception);
+    ct_set_property(ctx, object, "birthtimeSec", JSValueMakeNumber(ctx, (double)birthtime.seconds), exception);
+    ct_set_property(ctx, object, "birthtimeNsec", JSValueMakeNumber(ctx, (double)birthtime.nanoseconds), exception);
+    ct_set_stat_unsigned_string(ctx, object, "devBigInt", (unsigned long long)stat_value->st_dev, exception);
+    ct_set_stat_unsigned_string(ctx, object, "inoBigInt", (unsigned long long)stat_value->st_ino, exception);
+    ct_set_stat_unsigned_string(ctx, object, "modeBigInt", (unsigned long long)stat_value->st_mode, exception);
+    ct_set_stat_unsigned_string(ctx, object, "nlinkBigInt", (unsigned long long)stat_value->st_nlink, exception);
+    ct_set_stat_unsigned_string(ctx, object, "uidBigInt", (unsigned long long)stat_value->st_uid, exception);
+    ct_set_stat_unsigned_string(ctx, object, "gidBigInt", (unsigned long long)stat_value->st_gid, exception);
+    ct_set_stat_unsigned_string(ctx, object, "rdevBigInt", (unsigned long long)stat_value->st_rdev, exception);
+    ct_set_stat_signed_string(ctx, object, "sizeBigInt", (long long)stat_value->st_size, exception);
+#if defined(__APPLE__) || defined(__linux__)
+    ct_set_stat_signed_string(ctx, object, "blksizeBigInt", (long long)stat_value->st_blksize, exception);
+    ct_set_stat_signed_string(ctx, object, "blocksBigInt", (long long)stat_value->st_blocks, exception);
+#else
+    ct_set_stat_signed_string(ctx, object, "blksizeBigInt", 0, exception);
+    ct_set_stat_signed_string(ctx, object, "blocksBigInt", 0, exception);
+#endif
     ct_set_property(ctx, object, "isFile", JSValueMakeBoolean(ctx, S_ISREG(stat_value->st_mode)), exception);
     ct_set_property(ctx, object, "isDirectory", JSValueMakeBoolean(ctx, S_ISDIR(stat_value->st_mode)), exception);
     ct_set_property(ctx, object, "isSymbolicLink", JSValueMakeBoolean(ctx, S_ISLNK(stat_value->st_mode)), exception);
@@ -19193,6 +19278,300 @@ static void ct_queue_fd_error(CtJscRuntime *runtime, uint32_t id, int error_code
         error_code,
         true
     );
+}
+
+#if defined(__APPLE__) || defined(_WIN32)
+#define CT_FS_WATCH_NATIVE_RECURSIVE 1
+#else
+#define CT_FS_WATCH_NATIVE_RECURSIVE 0
+#endif
+
+static void ct_fs_watcher_close(CtFsWatcher *watcher);
+
+static void ct_queue_fs_watch_event(CtFsWatcher *watcher, const char *type, const char *filename) {
+    if (watcher == NULL || watcher->runtime == NULL || !watcher->active) return;
+    CtFdEvent *event = (CtFdEvent *)calloc(1, sizeof(CtFdEvent));
+    if (event == NULL) return;
+    event->watch_id = watcher->id;
+    event->type = ct_duplicate_bytes(type, strlen(type));
+    if (filename != NULL && filename[0] != '\0') {
+        event->data_len = strlen(filename);
+        event->data = ct_duplicate_bytes(filename, event->data_len);
+    }
+    if (event->type == NULL || (event->data_len > 0 && event->data == NULL)) {
+        free(event->type);
+        free(event->data);
+        free(event);
+        return;
+    }
+    ct_queue_fd_event(watcher->runtime, event);
+}
+
+static char *ct_fs_watch_basename(const char *path) {
+    if (path == NULL) return NULL;
+    const char *end = path + strlen(path);
+    while (end > path && (end[-1] == '/' || end[-1] == '\\')) end -= 1;
+    const char *start = end;
+    while (start > path && start[-1] != '/' && start[-1] != '\\') start -= 1;
+    return ct_duplicate_bytes(start, (size_t)(end - start));
+}
+
+static void ct_fs_watch_handle_closed(uv_handle_t *handle) {
+    CtFsWatchHandle *entry = handle != NULL ? (CtFsWatchHandle *)handle->data : NULL;
+    if (entry == NULL) return;
+    CtFsWatcher *watcher = entry->watcher;
+    free(entry->path);
+    free(entry->prefix);
+    free(entry);
+    if (watcher == NULL) return;
+    if (watcher->pending_closes > 0) watcher->pending_closes -= 1;
+    if (!watcher->closing || watcher->pending_closes != 0) return;
+    free(watcher->path);
+    free(watcher->fallback_filename);
+    free(watcher);
+}
+
+static void ct_fs_watch_handle_close(CtFsWatcher *watcher, CtFsWatchHandle *entry) {
+    if (watcher == NULL || entry == NULL) return;
+    (void)uv_fs_event_stop(&entry->handle);
+    if (!uv_is_closing((uv_handle_t *)&entry->handle)) {
+        watcher->pending_closes += 1;
+        uv_close((uv_handle_t *)&entry->handle, ct_fs_watch_handle_closed);
+    }
+}
+
+static void ct_fs_watch_remove_from_runtime(CtFsWatcher *watcher) {
+    if (watcher == NULL || watcher->runtime == NULL) return;
+    CtFsWatcher **cursor = &watcher->runtime->fs_watchers;
+    while (*cursor != NULL) {
+        if (*cursor == watcher) {
+            *cursor = watcher->next;
+            watcher->next = NULL;
+            return;
+        }
+        cursor = &(*cursor)->next;
+    }
+}
+
+static void ct_fs_watcher_close(CtFsWatcher *watcher) {
+    if (watcher == NULL || watcher->closing) return;
+    watcher->active = false;
+    watcher->closing = true;
+    ct_fs_watch_remove_from_runtime(watcher);
+    CtFsWatchHandle *entry = watcher->handles;
+    watcher->handles = NULL;
+    while (entry != NULL) {
+        CtFsWatchHandle *next = entry->next;
+        entry->next = NULL;
+        ct_fs_watch_handle_close(watcher, entry);
+        entry = next;
+    }
+    if (watcher->pending_closes == 0) {
+        free(watcher->path);
+        free(watcher->fallback_filename);
+        free(watcher);
+    }
+}
+
+static CtFsWatchHandle *ct_fs_watch_find_handle(CtFsWatcher *watcher, const char *path) {
+    for (CtFsWatchHandle *entry = watcher->handles; entry != NULL; entry = entry->next) {
+        if (strcmp(entry->path, path) == 0) return entry;
+    }
+    return NULL;
+}
+
+static char *ct_fs_watch_event_name(CtFsWatchHandle *entry, const char *filename) {
+    CtFsWatcher *watcher = entry->watcher;
+    if (filename == NULL || filename[0] == '\0') {
+        if (!watcher->root_is_directory) return ct_duplicate_string(watcher->fallback_filename);
+        if (entry->prefix != NULL && entry->prefix[0] != '\0') return ct_duplicate_string(entry->prefix);
+        return NULL;
+    }
+    if (entry->prefix == NULL || entry->prefix[0] == '\0') return ct_duplicate_string(filename);
+    size_t prefix_len = strlen(entry->prefix);
+    size_t filename_len = strlen(filename);
+    char *result = (char *)malloc(prefix_len + filename_len + 2);
+    if (result == NULL) return NULL;
+    memcpy(result, entry->prefix, prefix_len);
+    result[prefix_len] = '/';
+    memcpy(result + prefix_len + 1, filename, filename_len + 1);
+    return result;
+}
+
+#if !CT_FS_WATCH_NATIVE_RECURSIVE
+static int ct_fs_watcher_rescan(CtFsWatcher *watcher, bool strict);
+#endif
+
+static void ct_fs_watch_callback(uv_fs_event_t *handle, const char *filename, int events, int status) {
+    CtFsWatchHandle *entry = handle != NULL ? (CtFsWatchHandle *)handle->data : NULL;
+    CtFsWatcher *watcher = entry != NULL ? entry->watcher : NULL;
+    if (watcher == NULL || !watcher->active) return;
+    if (status < 0) {
+        ct_queue_fd_error(watcher->runtime, watcher->id, -status, uv_strerror(status));
+        ct_fs_watcher_close(watcher);
+        return;
+    }
+
+    const char *type = (events & UV_RENAME) != 0 ? "rename" : "change";
+    char *event_name = ct_fs_watch_event_name(entry, filename);
+    ct_queue_fs_watch_event(watcher, type, event_name);
+    free(event_name);
+
+#if !CT_FS_WATCH_NATIVE_RECURSIVE
+    if (watcher->recursive && watcher->root_is_directory && (events & UV_RENAME) != 0) {
+        int scan_status = ct_fs_watcher_rescan(watcher, false);
+        if (scan_status != 0 && watcher->active) {
+            ct_queue_fd_error(watcher->runtime, watcher->id, -scan_status, uv_strerror(scan_status));
+            ct_fs_watcher_close(watcher);
+        }
+    }
+#endif
+}
+
+static int ct_fs_watch_add_handle(
+    CtFsWatcher *watcher,
+    const char *path,
+    const char *prefix,
+    bool root,
+    unsigned int flags,
+    CtFsWatchHandle **entry_out
+) {
+    CtFsWatchHandle *entry = (CtFsWatchHandle *)calloc(1, sizeof(CtFsWatchHandle));
+    if (entry == NULL) return UV_ENOMEM;
+    entry->watcher = watcher;
+    entry->path = ct_duplicate_string(path);
+    entry->prefix = ct_duplicate_string(prefix != NULL ? prefix : "");
+    entry->root = root;
+    if (entry->path == NULL || entry->prefix == NULL) {
+        free(entry->path);
+        free(entry->prefix);
+        free(entry);
+        return UV_ENOMEM;
+    }
+
+    int status = uv_fs_event_init(&watcher->runtime->uv_loop, &entry->handle);
+    if (status != 0) {
+        free(entry->path);
+        free(entry->prefix);
+        free(entry);
+        return status;
+    }
+    entry->handle.data = entry;
+    status = uv_fs_event_start(&entry->handle, ct_fs_watch_callback, entry->path, flags);
+    if (status != 0) {
+        watcher->pending_closes += 1;
+        uv_close((uv_handle_t *)&entry->handle, ct_fs_watch_handle_closed);
+        return status;
+    }
+    if (!watcher->referenced) uv_unref((uv_handle_t *)&entry->handle);
+    entry->scan_generation = watcher->scan_generation;
+    entry->next = watcher->handles;
+    watcher->handles = entry;
+    if (entry_out != NULL) *entry_out = entry;
+    return 0;
+}
+
+#if !CT_FS_WATCH_NATIVE_RECURSIVE
+static char *ct_fs_watch_join_path(const char *left, const char *right) {
+    size_t left_len = strlen(left);
+    size_t right_len = strlen(right);
+    bool separator = left_len > 0 && left[left_len - 1] != '/';
+    char *result = (char *)malloc(left_len + right_len + (separator ? 2 : 1));
+    if (result == NULL) return NULL;
+    memcpy(result, left, left_len);
+    if (separator) result[left_len++] = '/';
+    memcpy(result + left_len, right, right_len + 1);
+    return result;
+}
+
+static int ct_fs_watch_scan_directory(CtFsWatcher *watcher, const char *path, const char *prefix, bool strict) {
+    DIR *directory = opendir(path);
+    if (directory == NULL) return strict ? uv_translate_sys_error(errno) : 0;
+    int result = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *item = readdir(directory);
+        if (item == NULL) {
+            if (errno != 0 && strict) result = uv_translate_sys_error(errno);
+            break;
+        }
+        if (strcmp(item->d_name, ".") == 0 || strcmp(item->d_name, "..") == 0) continue;
+
+        char *child_path = ct_fs_watch_join_path(path, item->d_name);
+        char *child_prefix = prefix[0] == '\0'
+            ? ct_duplicate_string(item->d_name)
+            : ct_fs_watch_join_path(prefix, item->d_name);
+        if (child_path == NULL || child_prefix == NULL) {
+            free(child_path);
+            free(child_prefix);
+            result = UV_ENOMEM;
+            break;
+        }
+        struct stat child_stat;
+        if (lstat(child_path, &child_stat) != 0 || !S_ISDIR(child_stat.st_mode)) {
+            free(child_path);
+            free(child_prefix);
+            continue;
+        }
+
+        CtFsWatchHandle *entry = ct_fs_watch_find_handle(watcher, child_path);
+        if (entry == NULL) {
+            int add_status = ct_fs_watch_add_handle(watcher, child_path, child_prefix, false, 0, &entry);
+            if (add_status == UV_ENOMEM) {
+                free(child_path);
+                free(child_prefix);
+                result = add_status;
+                break;
+            }
+        }
+        if (entry != NULL) entry->scan_generation = watcher->scan_generation;
+        int child_status = ct_fs_watch_scan_directory(watcher, child_path, child_prefix, false);
+        free(child_path);
+        free(child_prefix);
+        if (child_status != 0) {
+            result = child_status;
+            break;
+        }
+    }
+    closedir(directory);
+    return result;
+}
+
+static int ct_fs_watcher_rescan(CtFsWatcher *watcher, bool strict) {
+    watcher->scan_generation += 1;
+    if (watcher->scan_generation == 0) watcher->scan_generation = 1;
+    for (CtFsWatchHandle *entry = watcher->handles; entry != NULL; entry = entry->next) {
+        if (entry->root) entry->scan_generation = watcher->scan_generation;
+    }
+    int status = ct_fs_watch_scan_directory(watcher, watcher->path, "", strict);
+    if (status != 0) return status;
+
+    CtFsWatchHandle **cursor = &watcher->handles;
+    while (*cursor != NULL) {
+        CtFsWatchHandle *entry = *cursor;
+        if (entry->root || entry->scan_generation == watcher->scan_generation) {
+            cursor = &entry->next;
+            continue;
+        }
+        *cursor = entry->next;
+        entry->next = NULL;
+        ct_fs_watch_handle_close(watcher, entry);
+    }
+    return 0;
+}
+#endif
+
+static CtFsWatcher *ct_fs_watcher_find(CtJscRuntime *runtime, uint32_t id) {
+    for (CtFsWatcher *watcher = runtime->fs_watchers; watcher != NULL; watcher = watcher->next) {
+        if (watcher->id == id) return watcher;
+    }
+    return NULL;
+}
+
+static void ct_fs_watchers_stop_runtime(CtJscRuntime *runtime) {
+    while (runtime != NULL && runtime->fs_watchers != NULL) {
+        ct_fs_watcher_close(runtime->fs_watchers);
+    }
 }
 
 static bool ct_fd_watcher_is_active(CtFdWatcher *watcher) {
@@ -24176,6 +24555,108 @@ static JSValueRef ct_fd_watch_set_writable(JSContextRef ctx, JSObjectRef functio
     return JSValueMakeBoolean(ctx, found);
 }
 
+static void ct_throw_uv_error(JSContextRef ctx, JSValueRef *exception, int status) {
+    char message[512];
+    snprintf(message, sizeof(message), "%s: %s", uv_err_name(status), uv_strerror(status));
+    ct_throw_message(ctx, exception, message);
+}
+
+static JSValueRef ct_fs_watch_start(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 1) {
+        ct_throw_message(ctx, exception, "cottontail.fsWatchStart(path[, recursive[, persistent]]) requires a path");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    if (path == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    struct stat root_stat;
+    if (stat(path, &root_stat) != 0) {
+        int status = uv_translate_sys_error(errno);
+        free(path);
+        ct_throw_uv_error(ctx, exception, status);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtFsWatcher *watcher = (CtFsWatcher *)calloc(1, sizeof(CtFsWatcher));
+    if (watcher == NULL) {
+        free(path);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    watcher->runtime = runtime;
+    watcher->path = path;
+    watcher->fallback_filename = ct_fs_watch_basename(path);
+    watcher->recursive = argc >= 2 && ct_value_to_bool(ctx, argv[1]);
+    watcher->referenced = argc < 3 || ct_value_to_bool(ctx, argv[2]);
+    watcher->root_is_directory = S_ISDIR(root_stat.st_mode);
+    watcher->active = true;
+    watcher->id = ++runtime->next_fd_watch_id;
+    if (watcher->id == 0) watcher->id = ++runtime->next_fd_watch_id;
+    if (watcher->fallback_filename == NULL) {
+        watcher->active = false;
+        ct_fs_watcher_close(watcher);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    unsigned int flags = 0;
+#if CT_FS_WATCH_NATIVE_RECURSIVE
+    if (watcher->recursive && watcher->root_is_directory) flags |= UV_FS_EVENT_RECURSIVE;
+#endif
+    int status = ct_fs_watch_add_handle(watcher, watcher->path, "", true, flags, NULL);
+    if (status == 0) {
+#if !CT_FS_WATCH_NATIVE_RECURSIVE
+        if (watcher->recursive && watcher->root_is_directory) status = ct_fs_watcher_rescan(watcher, true);
+#endif
+    }
+    if (status != 0) {
+        ct_fs_watcher_close(watcher);
+        ct_throw_uv_error(ctx, exception, status);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    watcher->next = runtime->fs_watchers;
+    runtime->fs_watchers = watcher;
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, watcher->id), exception);
+    return result;
+}
+
+static JSValueRef ct_fs_watch_stop(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 1) return JSValueMakeBoolean(ctx, false);
+    int id_value;
+    if (!ct_value_to_int_checked(ctx, argv[0], 1, INT_MAX, &id_value, exception, "invalid filesystem watcher id")) {
+        return JSValueMakeUndefined(ctx);
+    }
+    CtFsWatcher *watcher = ct_fs_watcher_find(runtime, (uint32_t)id_value);
+    if (watcher == NULL) return JSValueMakeBoolean(ctx, false);
+    ct_fs_watcher_close(watcher);
+    return JSValueMakeBoolean(ctx, true);
+}
+
+static JSValueRef ct_fs_watch_set_ref(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)exception;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 2) return JSValueMakeBoolean(ctx, false);
+    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    CtFsWatcher *watcher = ct_fs_watcher_find(runtime, id);
+    if (watcher == NULL || !watcher->active) return JSValueMakeBoolean(ctx, false);
+    watcher->referenced = ct_value_to_bool(ctx, argv[1]);
+    for (CtFsWatchHandle *entry = watcher->handles; entry != NULL; entry = entry->next) {
+        if (watcher->referenced) uv_ref((uv_handle_t *)&entry->handle);
+        else uv_unref((uv_handle_t *)&entry->handle);
+    }
+    return JSValueMakeBoolean(ctx, true);
+}
+
 static JSValueRef ct_fd_set_event_handler(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
     (void)exception;
@@ -26077,6 +26558,7 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
     ct_workers_detach_runtime(runtime);
     ct_async_processes_wait_for_runtime(runtime);
     ct_tcp_connects_stop_runtime(runtime);
+    ct_fs_watchers_stop_runtime(runtime);
     ct_fd_watchers_wait_for_runtime(runtime);
 #if CT_HAS_OPENSSL
     ct_tls_servers_stop_runtime(runtime);

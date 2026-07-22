@@ -1,5 +1,7 @@
 import "../bun/ffi.js";
+import picomatch from "../vendor/picomatch.js";
 import constantsObject from "./constants.js";
+import { EventEmitter } from "./events.js";
 import { dirname, join, resolve } from "./path.js";
 import { Readable, Writable } from "./stream.js";
 import {
@@ -463,24 +465,24 @@ export class Stats {
 
 class BigIntStats {
   constructor(result = {}) {
-    this.dev = toBigIntStat(result.dev);
-    this.ino = toBigIntStat(result.ino);
-    this.mode = toBigIntStat(result.mode);
-    this.nlink = toBigIntStat(result.nlink);
-    this.uid = toBigIntStat(result.uid);
-    this.gid = toBigIntStat(result.gid);
-    this.rdev = toBigIntStat(result.rdev);
-    this.size = toBigIntStat(result.size);
-    this.blksize = toBigIntStat(result.blksize);
-    this.blocks = toBigIntStat(result.blocks);
-    this.atimeMs = toBigIntStat(result.atimeMs);
-    this.mtimeMs = toBigIntStat(result.mtimeMs);
-    this.ctimeMs = toBigIntStat(result.ctimeMs);
-    this.birthtimeMs = toBigIntStat(result.birthtimeMs);
-    this.atimeNs = msToNs(result.atimeMs);
-    this.mtimeNs = msToNs(result.mtimeMs);
-    this.ctimeNs = msToNs(result.ctimeMs);
-    this.birthtimeNs = msToNs(result.birthtimeMs);
+    this.dev = exactBigIntStat(result, "dev");
+    this.ino = exactBigIntStat(result, "ino");
+    this.mode = exactBigIntStat(result, "mode");
+    this.nlink = exactBigIntStat(result, "nlink");
+    this.uid = exactBigIntStat(result, "uid");
+    this.gid = exactBigIntStat(result, "gid");
+    this.rdev = exactBigIntStat(result, "rdev");
+    this.size = exactBigIntStat(result, "size");
+    this.blksize = exactBigIntStat(result, "blksize");
+    this.blocks = exactBigIntStat(result, "blocks");
+    this.atimeNs = exactStatTimeNs(result, "atime");
+    this.mtimeNs = exactStatTimeNs(result, "mtime");
+    this.ctimeNs = exactStatTimeNs(result, "ctime");
+    this.birthtimeNs = exactStatTimeNs(result, "birthtime");
+    this.atimeMs = this.atimeNs / 1000000n;
+    this.mtimeMs = this.mtimeNs / 1000000n;
+    this.ctimeMs = this.ctimeNs / 1000000n;
+    this.birthtimeMs = this.birthtimeNs / 1000000n;
   }
 
   isFile() { return modeMatches(Number(this.mode), constants.S_IFREG ?? 0o100000); }
@@ -532,8 +534,20 @@ function toBigIntStat(value) {
   return BigInt(Math.trunc(Number(value) || 0));
 }
 
+function exactBigIntStat(result, field) {
+  const exact = result?.[`${field}BigInt`];
+  return exact == null ? toBigIntStat(result?.[field]) : BigInt(exact);
+}
+
 function msToNs(value) {
   return BigInt(Math.trunc((Number(value) || 0) * 1000000));
+}
+
+function exactStatTimeNs(result, field) {
+  const seconds = result?.[`${field}Sec`];
+  const nanoseconds = result?.[`${field}Nsec`];
+  if (seconds == null || nanoseconds == null) return msToNs(result?.[`${field}Ms`]);
+  return BigInt(Math.trunc(Number(seconds))) * 1000000000n + BigInt(Math.trunc(Number(nanoseconds)));
 }
 
 function wantsBigInt(options) {
@@ -1353,19 +1367,34 @@ function streamPrematureCloseError() {
   return error;
 }
 
+function isStreamFileHandle(value) {
+  return value !== null && typeof value === "object" &&
+    typeof value._acquireStreamRef === "function" &&
+    typeof value._releaseStreamRef === "function";
+}
+
+function fileHandleCustomFsError() {
+  const error = new Error("FileHandle with custom fs operations is not implemented");
+  error.code = "ERR_METHOD_NOT_IMPLEMENTED";
+  return error;
+}
+
 class ReadStreamImpl extends Readable {
   constructor(path, options = {}) {
     options = normalizeStreamOptions(options);
     // Lifecycle (open/close/destroy) is managed by this class, not the engine.
     super({ ...options, autoDestroy: false, emitClose: false });
     const hasFd = Object.prototype.hasOwnProperty.call(options, "fd") && options.fd != null;
-    const fd = hasFd ? validateFd(options.fd) : null;
+    const fdHandle = hasFd && isStreamFileHandle(options.fd) ? options.fd : null;
+    if (fdHandle && options.fs != null) throw fileHandleCustomFsError();
+    let fd = hasFd ? validateFd(fdHandle ? fdHandle.fd : options.fd) : null;
     if (!hasFd) validatePathArg(path);
     const start = options.start == null ? null : validateInteger(options.start, "start", 0, Number.MAX_SAFE_INTEGER);
     const end = options.end == null || options.end === Infinity
       ? null
       : validateInteger(options.end, "end", 0, Number.MAX_SAFE_INTEGER);
     if (start != null && end != null && start > end) throw outOfRange("start", `<= ${end}`, start);
+    if (fdHandle) fd = fdHandle._acquireStreamRef("createReadStream");
     defineOwnState(this, {
       path: hasFd ? path : normalizePath(path),
       flags: options?.flags || "r",
@@ -1389,7 +1418,15 @@ class ReadStreamImpl extends Readable {
       _opened: false,
       _reading: false,
       _abortListener: null,
+      _fdHandle: fdHandle,
+      _fdHandleReleased: false,
+      _fdHandleCloseListener: null,
     });
+
+    if (fdHandle) {
+      this._fdHandleCloseListener = () => this.close();
+      fdHandle.on("close", this._fdHandleCloseListener);
+    }
 
     if (options.signal) {
       this._abortListener = () => this.destroy(abortReasonForStream(options.signal));
@@ -1431,15 +1468,29 @@ class ReadStreamImpl extends Readable {
     this._closed = true;
     this.closed = true;
     if (this.fd != null) {
-      try { closeSync(this.fd); } catch {}
+      if (this._fdHandle) {
+        this._releaseFileHandle();
+      } else {
+        try { closeSync(this.fd); } catch {}
+      }
     }
     this.fd = null;
     this.emit("close");
   }
 
+  _releaseFileHandle() {
+    if (!this._fdHandle || this._fdHandleReleased) return;
+    this._fdHandleReleased = true;
+    this._fdHandle.removeListener("close", this._fdHandleCloseListener);
+    this._fdHandle._releaseStreamRef();
+    const closeResult = this._fdHandle.close();
+    closeResult?.catch?.(error => queueMicrotask(() => this.emit("error", error)));
+  }
+
   _pump() {
     if (this.destroyed || this.readableEnded || this._paused || this._reading) return;
     this._reading = true;
+    let asyncRead = false;
     try {
       this._open();
       if (this.destroyed || this._paused) return;
@@ -1450,6 +1501,16 @@ class ReadStreamImpl extends Readable {
         return;
       }
       const chunk = new Uint8Array(length);
+      if (this._fdHandle) {
+        asyncRead = true;
+        Promise.resolve(this._fdHandle.read(chunk, 0, length, this.pos)).then(
+          result => this._finishAsyncRead(chunk, length, Number(result?.bytesRead ?? 0)),
+        ).catch(error => {
+          this._reading = false;
+          this.destroy(error);
+        });
+        return;
+      }
       const bytesRead = readSync(this.fd, chunk, 0, length, this.pos);
       if (bytesRead <= 0) {
         this._finishRead();
@@ -1464,8 +1525,23 @@ class ReadStreamImpl extends Readable {
     } catch (error) {
       this.destroy(error);
     } finally {
-      this._reading = false;
+      if (!asyncRead) this._reading = false;
     }
+  }
+
+  _finishAsyncRead(chunk, length, bytesRead) {
+    this._reading = false;
+    if (this.destroyed || this.readableEnded) return;
+    if (bytesRead <= 0) {
+      this._finishRead();
+      return;
+    }
+    this.bytesRead += bytesRead;
+    if (this.pos != null) this.pos += bytesRead;
+    const value = chunk.subarray(0, bytesRead);
+    this.push(this.encoding ? decodeBytes(value, this.encoding) : bufferFrom(value));
+    if (bytesRead < length) this._finishRead();
+    else queueMicrotask(() => this._pump());
   }
 
   _finishRead() {
@@ -1548,10 +1624,16 @@ class WriteStreamImpl extends Writable {
     // Lifecycle (open/close/destroy) is managed by this class, not the engine.
     super({ ...options, autoDestroy: false, emitClose: false });
     const hasFd = Object.prototype.hasOwnProperty.call(options, "fd") && options.fd != null;
-    const fd = hasFd ? validateFd(options.fd) : null;
+    const fdHandle = hasFd && isStreamFileHandle(options.fd) ? options.fd : null;
+    if (fdHandle && options.fs != null) throw fileHandleCustomFsError();
+    let fd = hasFd ? validateFd(fdHandle ? fdHandle.fd : options.fd) : null;
     if (!hasFd) validatePathArg(path);
     const start = options.start == null ? null : validateInteger(options.start, "start", 0, Number.MAX_SAFE_INTEGER);
     const highWaterMark = Math.max(1, Math.min(Number(options?.highWaterMark || 16 * 1024), 1024 * 1024));
+    if (options.flush != null && typeof options.flush !== "boolean") {
+      throw invalidArgType("options.flush", "of type boolean", options.flush);
+    }
+    if (fdHandle) fd = fdHandle._acquireStreamRef("createWriteStream");
     defineOwnState(this, {
       path: hasFd ? path : normalizePath(path),
       flags: options?.flags || "w",
@@ -1575,9 +1657,14 @@ class WriteStreamImpl extends Writable {
       _abortListener: null,
       _finalizing: false,
       _finished: false,
+      _pendingWrites: 0,
+      _fdHandle: fdHandle,
+      _fdHandleReleased: false,
+      _fdHandleCloseListener: null,
     });
-    if (options.flush != null && typeof options.flush !== "boolean") {
-      throw invalidArgType("options.flush", "of type boolean", options.flush);
+    if (fdHandle) {
+      this._fdHandleCloseListener = () => this.close();
+      fdHandle.on("close", this._fdHandleCloseListener);
     }
     if (options.signal) {
       this._abortListener = () => this.destroy(abortReasonForStream(options.signal));
@@ -1613,29 +1700,50 @@ class WriteStreamImpl extends Writable {
       callback = encoding;
       encoding = undefined;
     }
+    let pendingLength = 0;
     try {
       if (this.pending) this._open();
       const bytes = bytesFromData(chunk, encoding ?? "utf8");
+      pendingLength = bytes.byteLength;
       this.writableLength += bytes.byteLength;
-      const bytesWritten = writeSync(this.fd, bytes, 0, bytes.byteLength, this.pos);
-      if (this.pos != null) this.pos += bytesWritten;
-      this.bytesWritten += bytesWritten;
+      this._pendingWrites += 1;
       const overHighWaterMark = this.writableLength >= this.highWaterMark;
       if (overHighWaterMark) this.writableNeedDrain = true;
-      queueMicrotask(() => {
-        this.writableLength = Math.max(0, this.writableLength - bytes.byteLength);
-        if (this.writableNeedDrain && this.writableLength === 0) {
-          this.writableNeedDrain = false;
-          this.emit("drain");
-        }
-        if (callback) callback(null);
-      });
+      if (this._fdHandle) {
+        this._fdHandle.write(bytes, 0, bytes.byteLength, this.pos).then(
+          result => this._settleWrite(bytes.byteLength, Number(result?.bytesWritten ?? 0), callback),
+          error => this._settleWrite(bytes.byteLength, 0, callback, error),
+        );
+      } else {
+        const bytesWritten = writeSync(this.fd, bytes, 0, bytes.byteLength, this.pos);
+        queueMicrotask(() => this._settleWrite(bytes.byteLength, bytesWritten, callback));
+      }
       return !overHighWaterMark;
     } catch (error) {
+      if (pendingLength > 0) {
+        this._pendingWrites = Math.max(0, this._pendingWrites - 1);
+        this.writableLength = Math.max(0, this.writableLength - pendingLength);
+      }
       if (callback) callback(error);
-      this.emit("error", error);
+      this.destroy(error);
       return false;
     }
+  }
+
+  _settleWrite(length, bytesWritten, callback, error = undefined) {
+    this._pendingWrites = Math.max(0, this._pendingWrites - 1);
+    this.writableLength = Math.max(0, this.writableLength - length);
+    if (!error) {
+      if (this.pos != null) this.pos += bytesWritten;
+      this.bytesWritten += bytesWritten;
+    }
+    if (this.writableNeedDrain && this.writableLength === 0) {
+      this.writableNeedDrain = false;
+      this.emit("drain");
+    }
+    if (callback) callback(error ?? null);
+    if (error) this.destroy(error);
+    else if (this._finalizing) this._finishWrite();
   }
 
   end(chunk = undefined, encoding = undefined, callback = undefined) {
@@ -1666,16 +1774,18 @@ class WriteStreamImpl extends Writable {
     if (typeof callback === "function") this.once("finish", callback);
     if (this._finalizing) return this;
     this._finalizing = true;
-    queueMicrotask(() => {
-      if (this.destroyed || this._finished) return;
-      if (this.flush && this.fd != null) {
-        try { fsyncSync(this.fd); } catch (error) { this.destroy(error); return; }
-      }
-      this._finished = true;
-      this.emit("finish");
-      if (this.autoClose) this.destroy();
-    });
+    queueMicrotask(() => this._finishWrite());
     return this;
+  }
+
+  _finishWrite() {
+    if (this.destroyed || this._finished || this._pendingWrites > 0) return;
+    if (this.flush && this.fd != null) {
+      try { fsyncSync(this.fd); } catch (error) { this.destroy(error); return; }
+    }
+    this._finished = true;
+    this.emit("finish");
+    if (this.autoClose) this.destroy();
   }
 
   close(callback = undefined) {
@@ -1690,13 +1800,26 @@ class WriteStreamImpl extends Writable {
     this.destroyed = true;
     this.writable = false;
     if (this.fd != null) {
-      try { closeSync(this.fd); } catch {}
+      if (this._fdHandle) {
+        this._releaseFileHandle();
+      } else {
+        try { closeSync(this.fd); } catch {}
+      }
     }
     this.fd = null;
     if (error) this.emit("error", error);
     this.closed = true;
     queueMicrotask(() => this.emit("close"));
     return this;
+  }
+
+  _releaseFileHandle() {
+    if (!this._fdHandle || this._fdHandleReleased) return;
+    this._fdHandleReleased = true;
+    this._fdHandle.removeListener("close", this._fdHandleCloseListener);
+    this._fdHandle._releaseStreamRef();
+    const closeResult = this._fdHandle.close();
+    closeResult?.catch?.(error => queueMicrotask(() => this.emit("error", error)));
   }
 
   destroySoon() {
@@ -2016,57 +2139,9 @@ Object.defineProperty(writev, customPromisify, {
   },
 });
 
-function snapshot(path, recursive, validateRoot = false) {
-  const root = normalizePath(path);
-  const linkStats = lstatSync(root);
-  const stats = linkStats.isSymbolicLink() ? statSync(root) : linkStats;
-  if (validateRoot && (Number(stats.mode) & 0o444) === 0) {
-    const error = new Error("Permission denied");
-    error.code = "EACCES";
-    throw makeFsError(error, root, "watch");
-  }
-  const entries = new Map();
-  const add = (relative, fullPath, entryStats = lstatSync(fullPath)) => {
-    entries.set(relative, {
-      identity: `${entryStats.dev}:${entryStats.ino}`,
-      metadata: `${entryStats.mode}:${entryStats.size}:${entryStats.mtimeMs}:${entryStats.ctimeMs}:${entryStats.birthtimeMs}`,
-    });
-  };
-  if (!stats.isDirectory()) {
-    add(String(root).split("/").pop() || "", root, stats);
-    return entries;
-  }
-  const walk = (dir, prefix = "") => {
-    let children;
-    try {
-      children = readdirSync(dir, { withFileTypes: true });
-    } catch (error) {
-      if (prefix) return;
-      throw error;
-    }
-    for (const entry of children) {
-      const name = String(entry.name);
-      const relative = prefix ? `${prefix}/${name}` : name;
-      const fullPath = join(dir, name);
-      let entryStats;
-      try {
-        entryStats = lstatSync(fullPath);
-      } catch {
-        continue;
-      }
-      add(relative, fullPath, entryStats);
-      if (recursive && entryStats.isDirectory()) {
-        walk(fullPath, relative);
-      }
-    }
-  };
-  walk(root);
-  return entries;
-}
-
-function watchFilename(name, options) {
-  const encoding = normalizeEncoding(options, "utf8");
-  const bytes = bufferFrom(encoder.encode(name));
+function watchFilename(data, encoding) {
+  if (data == null) return null;
+  const bytes = bufferFrom(data);
   return encoding === "buffer" ? bytes : bytes.toString(encoding);
 }
 
@@ -2080,133 +2155,163 @@ function watchAbortError(signal) {
   return error;
 }
 
-function diffSnapshots(previous, current) {
-  const events = [];
-  for (const [name, signature] of current) {
-    if (!previous.has(name)) events.push(["rename", name]);
-    else if (previous.get(name).identity !== signature.identity) events.push(["rename", name]);
-    else if (previous.get(name).metadata !== signature.metadata) events.push(["change", name]);
+function installFsWatchDispatcher() {
+  const listeners = globalThis.__cottontailFdWatchListeners ??= new Map();
+  if (!globalThis.__cottontailFdWatchHandlerInstalled && typeof cottontail.fdSetEventHandler === "function") {
+    globalThis.__cottontailFdWatchHandlerInstalled = true;
+    cottontail.fdSetEventHandler((event) => {
+      const connectListener = globalThis.__cottontailTcpConnectListeners?.get?.(Number(event?.id));
+      if (typeof connectListener === "function") {
+        connectListener(event);
+        return;
+      }
+      const fdListener = globalThis.__cottontailFdWatchListeners?.get?.(Number(event?.id));
+      if (typeof fdListener === "function") {
+        fdListener(event);
+        return;
+      }
+      const tlsListener = globalThis.__cottontailTlsListeners?.get?.(Number(event?.id));
+      if (typeof tlsListener === "function") tlsListener(event);
+    });
   }
-  for (const name of previous.keys()) {
-    if (!current.has(name)) events.push(["rename", name]);
-  }
-  return events;
+  return listeners;
 }
 
-export function watch(path, options = {}, listener = undefined) {
-  if (typeof options === "function") {
-    listener = options;
-    options = {};
+function normalizeWatchPath(path) {
+  validatePathArg(path);
+  if (typeof path === "string" && path.startsWith("file:")) {
+    return normalizeFileUrlPath(new URL(path));
   }
-  if (typeof options === "string") options = { encoding: options };
-  normalizeEncoding(options, "utf8");
-  validateAbortSignal(options?.signal);
-  const filename = normalizePath(path);
-  const recursive = Boolean(options?.recursive);
-  const listeners = new Map();
-  let closed = false;
-  let persistent = options?.persistent !== false;
-  let last;
-  try {
-    last = snapshot(filename, recursive, true);
-  } catch (error) {
-    if (error?.syscall === "watch") throw error;
-    throw makeFsError(error, filename, "watch");
+  return normalizePath(path);
+}
+
+function validateWatchRoot(path) {
+  const linkStats = lstatSync(path);
+  const stats = linkStats.isSymbolicLink() ? statSync(path) : linkStats;
+  if (globalThis.process?.platform !== "win32" && (Number(stats.mode) & 0o444) === 0) {
+    const error = new Error("Permission denied");
+    error.code = "EACCES";
+    throw makeFsError(error, path, "watch");
   }
-  let timer = null;
-  let abortQueued = false;
-  const watcher = {
-    close() {
-      if (closed) return;
-      closed = true;
-      if (timer != null) clearInterval(timer);
-      options?.signal?.removeEventListener?.("abort", abort);
-      emit("close");
-    },
-    addListener(name, handler) {
-      return watcher.on(name, handler);
-    },
-    on(name, handler) {
-      const handlers = listeners.get(name) ?? [];
-      handlers.push(handler);
-      listeners.set(name, handlers);
-      return watcher;
-    },
-    once(name, handler) {
-      const wrapped = (...args) => {
-        watcher.off(name, wrapped);
-        handler(...args);
-      };
-      return watcher.on(name, wrapped);
-    },
-    off(name, handler) {
-      const handlers = listeners.get(name) ?? [];
-      listeners.set(name, handlers.filter((item) => item !== handler));
-      return watcher;
-    },
-    removeListener(name, handler) {
-      return watcher.off(name, handler);
-    },
-    removeAllListeners(name = undefined) {
-      if (name == null) listeners.clear();
-      else listeners.delete(name);
-      return watcher;
-    },
-    emit(name, ...args) {
-      emit(name, ...args);
-      return true;
-    },
-    ref() {
-      if (!closed) {
-        persistent = true;
-        timer?.ref?.();
+}
+
+class FSWatcher extends EventEmitter {
+  constructor(path, options = {}, listener = undefined) {
+    super();
+    if (typeof options === "function") {
+      listener = options;
+      options = {};
+    } else if (typeof options === "string") {
+      options = { encoding: options };
+    } else if (options == null) {
+      options = {};
+    } else if (typeof options !== "object") {
+      throw invalidArgType("options", "of type string or object", options);
+    }
+
+    this._path = normalizeWatchPath(path);
+    this._encoding = normalizeEncoding(options, "utf8");
+    this._signal = validateAbortSignal(options.signal);
+    this._persistent = options.persistent !== false;
+    this._closed = false;
+    this._abortQueued = false;
+    this._id = null;
+    this._listeners = installFsWatchDispatcher();
+    this._onNativeEvent = event => this._handleNativeEvent(event);
+    this._onAbort = () => this._abort();
+    if (typeof listener === "function") this.on("change", listener);
+
+    if (this._signal?.aborted) {
+      this._abort();
+      return;
+    }
+
+    try {
+      validateWatchRoot(this._path);
+      if (typeof cottontail.fsWatchStart !== "function") {
+        const error = new Error("ENOSYS: native filesystem watching is unavailable");
+        error.code = "ENOSYS";
+        throw error;
       }
-      return watcher;
-    },
-    unref() {
-      persistent = false;
-      timer?.unref?.();
-      return watcher;
-    },
-    hasRef() { return !closed && (timer?.hasRef?.() ?? persistent); },
-  };
-  const emit = (name, ...args) => {
-    for (const handler of listeners.get(name) ?? []) handler(...args);
-  };
-  if (listener) watcher.on("change", listener);
-  function abort() {
-    if (closed || abortQueued) return;
-    abortQueued = true;
-    queueMicrotask(() => {
-      abortQueued = false;
-      if (closed) return;
+      const handle = cottontail.fsWatchStart(this._path, Boolean(options.recursive), this._persistent);
+      this._id = Number(handle?.id);
+      this._listeners.set(this._id, this._onNativeEvent);
+    } catch (error) {
+      if (error?.syscall === "watch") throw error;
+      throw makeFsError(error, this._path, "watch");
+    }
+    this._signal?.addEventListener("abort", this._onAbort, { once: true });
+  }
+
+  _handleNativeEvent(event) {
+    if (this._closed) return;
+    if (event?.type === "rename" || event?.type === "change") {
+      this.emit("change", event.type, watchFilename(event.data, this._encoding));
+      return;
+    }
+    if (event?.type === "error") {
+      const source = new Error(event.message || "Filesystem watcher failed");
+      if (event.code) source.code = event.code;
+      const error = makeFsError(source, this._path, "watch");
       try {
-        emit("error", watchAbortError(options?.signal));
+        this.emit("error", error);
       } finally {
-        watcher.close();
+        this.close();
+      }
+    }
+  }
+
+  _abort() {
+    if (this._closed || this._abortQueued) return;
+    this._abortQueued = true;
+    queueMicrotask(() => {
+      this._abortQueued = false;
+      if (this._closed) return;
+      try {
+        this.emit("error", watchAbortError(this._signal));
+      } finally {
+        this.close();
       }
     });
   }
-  if (options?.signal?.aborted) abort();
-  else options?.signal?.addEventListener?.("abort", abort, { once: true });
-  timer = setInterval(() => {
-    if (closed) return;
-    try {
-      const next = snapshot(filename, recursive);
-      for (const [eventType, filename] of diffSnapshots(last, next)) {
-        emit("change", eventType, watchFilename(filename, options));
-      }
-      last = next;
-    } catch (error) {
-      try {
-        emit("error", makeFsError(error, filename, "watch"));
-      } finally {
-        watcher.close();
-      }
+
+  close() {
+    if (this._closed) return;
+    this._closed = true;
+    this._signal?.removeEventListener("abort", this._onAbort);
+    if (this._id != null) {
+      this._listeners.delete(this._id);
+      cottontail.fsWatchStop?.(this._id);
+      this._id = null;
     }
-  }, Number(options?.interval || 500));
-  if (!persistent) timer?.unref?.();
-  return watcher;
+    queueMicrotask(() => this.emit("close"));
+  }
+
+  ref() {
+    if (!this._closed && !this._persistent) {
+      this._persistent = true;
+      if (this._id != null) cottontail.fsWatchSetRef?.(this._id, true);
+    }
+    return this;
+  }
+
+  unref() {
+    if (!this._closed && this._persistent) {
+      this._persistent = false;
+      if (this._id != null) cottontail.fsWatchSetRef?.(this._id, false);
+    }
+    return this;
+  }
+
+  hasRef() {
+    return !this._closed && this._persistent;
+  }
+
+  start() {}
+}
+
+export function watch(path, options = {}, listener = undefined) {
+  return new FSWatcher(path, options, listener);
 }
 
 function zeroStats(options = undefined) {
@@ -2296,77 +2401,45 @@ export function unwatchFile(path, listener = undefined) {
 }
 
 function normalizeGlobPattern(pattern) {
-  return String(pattern).replace(/\\/g, "/").replace(/^\.\//, "");
+  const value = globalThis.process?.platform === "win32" ? pattern.replaceAll("\\", "/") : pattern;
+  return value.replace(/^\.\//, "");
 }
 
-function globSegments(pattern) {
-  return normalizeGlobPattern(pattern).split("/").filter((segment, index) => segment !== "" || index === 0);
-}
-
-function escapeRegExp(value) {
-  return String(value).replace(/[.+^${}()|[\]\\]/g, "\\$&");
-}
-
-function segmentToRegExp(segment) {
-  let source = "";
-  for (let index = 0; index < segment.length; index += 1) {
-    const char = segment[index];
-    if (char === "*") {
-      source += "[^/]*";
-    } else if (char === "?") {
-      source += "[^/]";
-    } else if (char === "{") {
-      const end = segment.indexOf("}", index + 1);
-      if (end > index) {
-        const alternatives = segment.slice(index + 1, end).split(",").map(escapeRegExp).join("|");
-        source += `(?:${alternatives})`;
-        index = end;
-      } else {
-        source += "\\{";
-      }
-    } else {
-      source += escapeRegExp(char);
-    }
+function validateGlobPatterns(pattern) {
+  const patterns = Array.isArray(pattern) ? pattern : [pattern];
+  for (const candidate of patterns) {
+    if (typeof candidate !== "string") throw invalidArgType("pattern", "of type string", candidate);
   }
-  return new RegExp(`^${source}$`);
+  return patterns.map(normalizeGlobPattern);
 }
 
-function matchGlobSegments(patternParts, pathParts, patternIndex = 0, pathIndex = 0) {
-  if (patternIndex >= patternParts.length) return pathIndex >= pathParts.length;
-  const pattern = patternParts[patternIndex];
-  if (pattern === "**") {
-    // A trailing "/**" matches everything below the prefix but not the prefix
-    // directory itself (e.g. "a/**" matches "a/b.txt" but not "a").
-    if (patternIndex === patternParts.length - 1) {
-      return patternIndex === 0 || pathIndex < pathParts.length;
-    }
-    for (let nextIndex = pathIndex; nextIndex <= pathParts.length; nextIndex += 1) {
-      if (matchGlobSegments(patternParts, pathParts, patternIndex + 1, nextIndex)) return true;
-    }
-    return false;
-  }
-  if (pathIndex >= pathParts.length) return false;
-  return segmentToRegExp(pattern).test(pathParts[pathIndex]) &&
-    matchGlobSegments(patternParts, pathParts, patternIndex + 1, pathIndex + 1);
+function createGlobMatcher(pattern) {
+  return picomatch(pattern, {
+    dot: false,
+    noext: true,
+    nonegate: true,
+    windows: false,
+  });
 }
 
-function globMatches(pattern, relativePath) {
-  const normalized = normalizeGlobPattern(relativePath);
-  return matchGlobSegments(globSegments(pattern), normalized.split("/").filter(Boolean));
+function globPathOutput(relativePath) {
+  return globalThis.process?.platform === "win32" ? relativePath.replaceAll("/", "\\") : relativePath;
 }
 
 function makeExcludeMatcher(exclude) {
   if (exclude == null) return () => false;
-  if (typeof exclude === "function") return (entry, value) => Boolean(exclude(value));
-  const patterns = (Array.isArray(exclude) ? exclude : [exclude]).map(normalizeGlobPattern);
-  return (entry) => patterns.some((pattern) => globMatches(pattern, entry.relative));
+  if (typeof exclude === "function") return entry => Boolean(exclude(globPathOutput(entry.relative)));
+  if (!Array.isArray(exclude)) throw invalidArgType("options.exclude", "an array or function", exclude);
+  const patterns = exclude.flatMap(pattern => {
+    if (typeof pattern !== "string") throw invalidArgType("options.exclude", "an array of strings", pattern);
+    const normalized = normalizeGlobPattern(pattern).replace(/\/+$/, "");
+    return [normalized, `${normalized}/**`];
+  });
+  const matchers = patterns.map(createGlobMatcher);
+  return entry => matchers.some(matcher => matcher(entry.relative));
 }
 
-function makeGlobDirent(entry) {
-  return new Dirent(entry.name, entry.stats, entry.parentPath);
-}
-
-function walkGlobEntries(root, options = {}, prefix = "", seenDirectories = new Set(), exclude = () => false, withFileTypes = false) {
+function walkGlobEntries(root, prefix = "", seenDirectories = new Set(), exclude = () => false) {
   const out = [];
   for (const dirent of readdirSync(root, { withFileTypes: true })) {
     const name = String(dirent.name);
@@ -2380,40 +2453,52 @@ function walkGlobEntries(root, options = {}, prefix = "", seenDirectories = new 
       relative,
       stats: lstat,
     };
-    const excludeValue = withFileTypes ? makeGlobDirent(entry) : entry.relative;
-    const excluded = exclude(entry, excludeValue);
+    const excluded = exclude(entry);
     if (!excluded) out.push(entry);
 
     let descend = lstat.isDirectory();
-    if (!descend && options?.followSymlinks && lstat.isSymbolicLink()) {
+    if (!descend && lstat.isSymbolicLink()) {
       try {
         descend = statSync(fullPath).isDirectory();
       } catch {}
     }
-    if (!descend || excluded) continue;
+    if (!descend) continue;
 
     let real = fullPath;
     try { real = realpathSync(fullPath); } catch {}
     if (seenDirectories.has(real)) continue;
     seenDirectories.add(real);
-    out.push(...walkGlobEntries(fullPath, options, relative, seenDirectories, exclude, withFileTypes));
+    out.push(...walkGlobEntries(fullPath, relative, seenDirectories, exclude));
   }
   return out;
 }
 
 export function globSync(pattern, options) {
-  const patterns = (Array.isArray(pattern) ? pattern : [pattern]).map(normalizeGlobPattern);
-  const cwd = normalizePath(options?.cwd ?? globalThis.process?.cwd?.() ?? ".");
-  const withFileTypes = Boolean(options?.withFileTypes);
-  const exclude = makeExcludeMatcher(options?.exclude);
-  const matches = [];
-  for (const entry of walkGlobEntries(cwd, options ?? {}, "", new Set(), exclude, withFileTypes)) {
-    const value = withFileTypes
-      ? makeGlobDirent(entry)
-      : options?.absolute ? resolve(cwd, entry.relative) : entry.relative;
-    if (patterns.some((candidate) => globMatches(candidate, entry.relative))) matches.push(value);
+  const patterns = validateGlobPatterns(pattern);
+  if (options == null) options = {};
+  if (typeof options !== "object" || Array.isArray(options)) {
+    throw invalidArgType("options", "of type object", options);
   }
-  return withFileTypes ? matches : matches.sort();
+  if (options.withFileTypes) {
+    throw new TypeError("fs.glob does not support options.withFileTypes yet. Please open an issue on GitHub.");
+  }
+  const cwdValue = options.cwd ?? globalThis.process?.cwd?.() ?? ".";
+  if (typeof cwdValue !== "string") throw invalidArgType("options.cwd", "of type string", cwdValue);
+  const cwd = normalizePath(cwdValue);
+  const exclude = makeExcludeMatcher(options.exclude);
+  const seenDirectories = new Set();
+  try { seenDirectories.add(realpathSync(cwd)); } catch {}
+  const entries = walkGlobEntries(cwd, "", seenDirectories, exclude)
+    .sort((left, right) => left.relative < right.relative ? -1 : left.relative > right.relative ? 1 : 0);
+  const matches = [];
+  for (const pattern of patterns) {
+    const matcher = createGlobMatcher(pattern);
+    for (const entry of entries) {
+      if (!matcher(entry.relative)) continue;
+      matches.push(options.absolute ? resolve(cwd, entry.relative) : globPathOutput(entry.relative));
+    }
+  }
+  return matches;
 }
 // Keep Node-compatible function name even if a bundler renames the binding.
 Object.defineProperty(globSync, "name", { value: "globSync" });
