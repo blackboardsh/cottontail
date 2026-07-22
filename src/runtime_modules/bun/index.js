@@ -9433,8 +9433,8 @@ async function serveHtmlBuildConfig(state) {
     } catch {}
     const plugins = [];
     for (const pluginPath of Array.isArray(staticConfig.plugins) ? staticConfig.plugins : []) {
-      const absolutePath = nodePathResolve(pathDirname(bunfigPath), String(pluginPath));
-      const namespace = await import(nodePathToFileURL(absolutePath).href);
+      const resolvedPath = await resolve(String(pluginPath), pathDirname(bunfigPath));
+      const namespace = await import(nodePathToFileURL(resolvedPath).href);
       let plugin = namespace;
       while (plugin != null && typeof plugin === "object" && typeof plugin.setup !== "function" &&
         plugin.default != null && plugin.default !== plugin) {
@@ -11100,12 +11100,29 @@ export function serve(options) {
 
   let native;
   try {
-    native = cottontail.httpServerStart(
-      hostname,
-      defaultServePort(options),
-      unixPath || undefined,
-      configuredMaxRequestBodySize,
-    );
+    const preboundKey = Symbol.for("cottontail.preboundHttpServer");
+    const prebound = globalThis[preboundKey];
+    const requestedPort = defaultServePort(options);
+    if (
+      prebound?.native != null &&
+      !unixPath &&
+      hostname === "localhost" &&
+      Number(prebound.requestedPort) === requestedPort
+    ) {
+      native = prebound.native;
+      delete globalThis[preboundKey];
+    } else {
+      if (prebound?.native != null) {
+        try { cottontail.httpServerStop(prebound.native.id, true); } catch {}
+        delete globalThis[preboundKey];
+      }
+      native = cottontail.httpServerStart(
+        hostname,
+        requestedPort,
+        unixPath || undefined,
+        configuredMaxRequestBodySize,
+      );
+    }
   } catch (rawError) {
     if (rawError instanceof Error) throw rawError;
     const reason = String(rawError);

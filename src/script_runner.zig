@@ -1268,6 +1268,94 @@ pub fn runEval(
     return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null, null, null, null);
 }
 
+const HtmlDevServerRun = struct {
+    init: std.process.Init,
+    source: [:0]const u8,
+    early_source: [:0]const u8,
+    script_args: []const [:0]const u8,
+    exec_args: []const [:0]const u8,
+    exit_code: u8 = 1,
+};
+
+pub fn runHtmlDevServer(
+    init: std.process.Init,
+    source: [:0]const u8,
+    early_source: [:0]const u8,
+    script_args: []const [:0]const u8,
+    exec_args: []const [:0]const u8,
+) !u8 {
+    var server_run = HtmlDevServerRun{
+        .init = init,
+        .source = source,
+        .early_source = early_source,
+        .script_args = script_args,
+        .exec_args = exec_args,
+    };
+    if (comptime builtin.os.tag == .windows) {
+        const thread = try WindowsScriptThread.startRaw(windowsHtmlDevServerThreadEntry, &server_run);
+        defer thread.deinit();
+        thread.join();
+    } else {
+        const thread = try std.Thread.spawn(
+            .{ .stack_size = script_thread_stack_size },
+            runHtmlDevServerThread,
+            .{&server_run},
+        );
+        thread.join();
+    }
+    return server_run.exit_code;
+}
+
+fn windowsHtmlDevServerThreadEntry(raw_server_run: ?*anyopaque) callconv(.winapi) u32 {
+    const server_run: *HtmlDevServerRun = @ptrCast(@alignCast(raw_server_run.?));
+    runHtmlDevServerThread(server_run);
+    return 0;
+}
+
+fn runHtmlDevServerThread(server_run: *HtmlDevServerRun) void {
+    server_run.exit_code = runHtmlDevServerOnThread(server_run) catch |err| {
+        writeStderr(server_run.init.io, "cottontail: failed to start HTML development server: {s}\n", .{@errorName(err)});
+        return;
+    };
+}
+
+fn runHtmlDevServerOnThread(server_run: *HtmlDevServerRun) !u8 {
+    const init = server_run.init;
+    const ctx = try makeContext(init);
+    const executable_source = (try rewriteLegacyHtmlClosingComments(ctx.allocator, server_run.source)) orelse server_run.source;
+    if (!validateEvalSyntax(&ctx, executable_source)) return 1;
+
+    const process_args = try ctx.allocator.alloc([:0]const u8, server_run.script_args.len + 1);
+    process_args[0] = try ctx.allocator.dupeZ(u8, "[eval]");
+    for (server_run.script_args, 0..) |arg, index| process_args[index + 1] = arg;
+    if (!applyRuntimeEnvFlags(init.io, ctx.allocator, server_run.exec_args)) return 1;
+    const inspector = inspectorLaunchFromArgs(&ctx, server_run.exec_args) catch |err| {
+        ctx.writeStderr("cottontail: invalid inspector endpoint: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    icu_bootstrap.ensure(init) catch |err| {
+        ctx.writeStderr("cottontail: failed to initialize ICU: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+
+    var js_runtime = try runtime.Runtime.initWithStackSize(init.io, ctx.allocator, script_js_stack_size);
+    defer js_runtime.deinit();
+    try js_runtime.setProcessArgs(process_args, 1, server_run.exec_args);
+    var execution = ScriptExecution{
+        .io = init.io,
+        .allocator = ctx.allocator,
+        .runnable_path = process_args[0],
+        .process_args = process_args,
+        .process_user_arg_offset = 1,
+        .exec_args = server_run.exec_args,
+        .inspector = inspector,
+    };
+    if (!configureRuntimeInspector(&execution, &js_runtime)) return 1;
+
+    try js_runtime.evalImmediate(server_run.early_source, "cottontail:html-server-prebind");
+    return js_runtime.runSource(executable_source, process_args[0]);
+}
+
 fn validateEvalSyntax(ctx: *const Context, source: []const u8) bool {
     var error_message: ?[*:0]u8 = null;
     const imports = native_transpiler.scanImportsJsonWithError(source, "tsx", &error_message) catch {
@@ -4621,11 +4709,18 @@ fn acquireLauncherCache(
         hasher.update("\x00entry\x00");
         hasher.update(key_material);
     }
-    for ([_][]const u8{ "NODE_PATH", "NODE_ENV" }) |name| {
+    for ([_][]const u8{"NODE_PATH"}) |name| {
         hasher.update("\x00");
         hasher.update(name);
         hasher.update("=");
         if (ctx.environ_map.get(name)) |value| hasher.update(value);
+    }
+    // The reusable CommonJS launcher contains only Cottontail's runtime and
+    // reads NODE_ENV from process.env. Next sets NODE_ENV for its server
+    // worker, but that must not force an identical runtime bundle rebuild.
+    if (!hash_wrapper_source) {
+        hasher.update("\x00NODE_ENV=");
+        if (ctx.environ_map.get("NODE_ENV")) |value| hasher.update(value);
     }
     var digest: [32]u8 = undefined;
     hasher.final(&digest);

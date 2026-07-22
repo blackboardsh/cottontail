@@ -30253,6 +30253,88 @@ static bool ct_is_js_identifier_char(char ch) {
         ch == '$';
 }
 
+static bool ct_js_regex_prefix_keyword(const char *start, const char *end) {
+    static const char *keywords[] = {
+        "await", "case", "delete", "do", "else", "in", "instanceof",
+        "new", "return", "throw", "typeof", "void", "yield",
+    };
+    while (start < end && (end[-1] == ' ' || end[-1] == '\t')) end -= 1;
+    const char *word = end;
+    while (word > start && ct_is_js_identifier_char(word[-1])) word -= 1;
+    for (size_t index = 0; index < sizeof(keywords) / sizeof(keywords[0]); index += 1) {
+        size_t len = strlen(keywords[index]);
+        if ((size_t)(end - word) == len && memcmp(word, keywords[index], len) == 0) return true;
+    }
+    return false;
+}
+
+static bool ct_js_slash_starts_regex(const char *line, const char *slash) {
+    const char *previous = slash;
+    while (previous > line && (previous[-1] == ' ' || previous[-1] == '\t')) previous -= 1;
+    if (previous == line) return true;
+    switch (previous[-1]) {
+        case '(':
+        case '[':
+        case '{':
+        case '=':
+        case ',':
+        case ':':
+        case ';':
+        case '!':
+        case '&':
+        case '|':
+        case '?':
+        case '+':
+        case '-':
+        case '*':
+        case '%':
+        case '^':
+        case '~':
+        case '<':
+        case '>':
+            return true;
+        default:
+            return ct_js_regex_prefix_keyword(line, previous);
+    }
+}
+
+static const char *ct_js_regex_literal_end(const char *line, const char *slash, const char *end) {
+    if (!ct_js_slash_starts_regex(line, slash)) return slash;
+    bool escaped = false;
+    bool in_class = false;
+    for (const char *scan = slash + 1; scan < end; scan += 1) {
+        char ch = *scan;
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (ch == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (ch == '[' && !in_class) {
+            in_class = true;
+            continue;
+        }
+        if (ch == ']' && in_class) {
+            in_class = false;
+            continue;
+        }
+        if (ch != '/' || in_class) continue;
+        scan += 1;
+        while (scan < end && ct_is_js_identifier_char(*scan)) scan += 1;
+        return scan;
+    }
+    return slash;
+}
+
+static const char *ct_js_block_comment_end(const char *start, const char *end) {
+    for (const char *scan = start; scan + 1 < end; scan += 1) {
+        if (scan[0] == '*' && scan[1] == '/') return scan + 2;
+    }
+    return NULL;
+}
+
 // Tracks whether a scan position is inside a string/template literal. The
 // source is processed line by line, but template literals span lines, so the
 // state must be carried across line boundaries (otherwise `import.meta.*`
@@ -30279,6 +30361,18 @@ static void ct_js_scan_advance_line(CtJsScanState *state, const char *bytes, siz
             continue;
         }
         if (ch == '/' && i + 1 < len && bytes[i + 1] == '/') break;
+        if (ch == '/' && i + 1 < len && bytes[i + 1] == '*') {
+            const char *after_comment = ct_js_block_comment_end(bytes + i + 2, bytes + len);
+            if (after_comment == NULL) break;
+            i = (size_t)(after_comment - bytes - 1);
+            continue;
+        }
+        if (ch == '/') {
+            const char *after_regex = ct_js_regex_literal_end(bytes, bytes + i, bytes + len);
+            if (after_regex != bytes + i) {
+                i = (size_t)(after_regex - bytes - 1);
+            }
+        }
     }
     // Line boundary: an escape at end of line consumes the newline (string
     // continues); otherwise only template literals stay open across lines.
@@ -30320,6 +30414,19 @@ static bool ct_append_rewritten_dynamic_imports(
                 continue;
             }
             if (ch == '/' && scan + 1 < end && scan[1] == '/') break;
+            if (ch == '/' && scan + 1 < end && scan[1] == '*') {
+                const char *after_comment = ct_js_block_comment_end(scan + 2, end);
+                if (after_comment == NULL) break;
+                scan = after_comment - 1;
+                continue;
+            }
+            if (ch == '/') {
+                const char *after_regex = ct_js_regex_literal_end(line, scan, end);
+                if (after_regex != scan) {
+                    scan = after_regex - 1;
+                    continue;
+                }
+            }
             if (strncmp(scan, "import", 6) != 0) continue;
             if (scan > line && (ct_is_js_identifier_char(scan[-1]) || scan[-1] == '#' || scan[-1] == '.')) continue;
             if (scan + 6 < end && ct_is_js_identifier_char(scan[6])) continue;
@@ -30485,6 +30592,19 @@ static bool ct_append_rewritten_import_meta(
                 continue;
             }
             if (ch == '/' && scan + 1 < end && scan[1] == '/') break;
+            if (ch == '/' && scan + 1 < end && scan[1] == '*') {
+                const char *after_comment = ct_js_block_comment_end(scan + 2, end);
+                if (after_comment == NULL) break;
+                scan = after_comment - 1;
+                continue;
+            }
+            if (ch == '/') {
+                const char *after_regex = ct_js_regex_literal_end(line, scan, end);
+                if (after_regex != scan) {
+                    scan = after_regex - 1;
+                    continue;
+                }
+            }
             if (strncmp(scan, meta_token, meta_token_len) == 0 &&
                 (scan == line || !ct_is_js_identifier_char(scan[-1])) &&
                 (scan + meta_token_len == end || !ct_is_js_identifier_char(scan[meta_token_len]))) {

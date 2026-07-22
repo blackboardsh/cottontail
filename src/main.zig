@@ -663,7 +663,13 @@ fn runHtmlEntrypoints(init: std.process.Init, invocation: CliInvocation) !?u8 {
         \\
     );
     const source_z = try allocator.dupeZ(u8, source.items);
-    return try script_runner.runEval(init, source_z, &.{}, invocation.exec_args, false);
+    const early_source = try std.fmt.allocPrintSentinel(
+        allocator,
+        "globalThis[Symbol.for(\"cottontail.preboundHttpServer\")]={{requestedPort:{s},native:cottontail.httpServerStart(\"localhost\",{s},undefined,134217728)}};",
+        .{ port, port },
+        0,
+    );
+    return try script_runner.runHtmlDevServer(init, source_z, early_source, &.{}, invocation.exec_args);
 }
 
 const PackageScripts = struct {
@@ -787,6 +793,70 @@ fn prependAncestorBinPaths(
     try env.put("PATH", try std.mem.join(allocator, separator, parts.items));
 }
 
+fn nonEmptyEnvironment(env: *const std.process.Environ.Map, name: []const u8) ?[]const u8 {
+    const value = env.get(name) orelse return null;
+    return if (value.len > 0) value else null;
+}
+
+fn platformTempDir(env: *const std.process.Environ.Map) []const u8 {
+    return nonEmptyEnvironment(env, "BUN_TMPDIR") orelse
+        nonEmptyEnvironment(env, "TMPDIR") orelse
+        nonEmptyEnvironment(env, "TEMP") orelse
+        nonEmptyEnvironment(env, "TMP") orelse
+        if (builtin.os.tag == .windows) "." else "/tmp";
+}
+
+fn prependForcedBunRuntimePath(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+) !void {
+    const executable = try std.process.executablePathAlloc(init.io, allocator);
+    const executable_hash = std.hash.Wyhash.hash(0, executable);
+    const user_hash: u64 = if (builtin.os.tag == .windows)
+        std.hash.Wyhash.hash(0, env.get("USERPROFILE") orelse env.get("USERNAME") orelse "cottontail")
+    else
+        @intCast(std.c.getuid());
+    const launcher_dir = try std.fs.path.join(allocator, &.{
+        platformTempDir(env),
+        try std.fmt.allocPrint(allocator, "cottontail-node-{x}-{x}", .{ user_hash, executable_hash }),
+    });
+    try std.Io.Dir.cwd().createDirPath(init.io, launcher_dir);
+
+    if (builtin.os.tag == .windows) {
+        for ([_][]const u8{ "node.cmd", "bun.cmd" }) |name| {
+            const launcher = try std.fs.path.join(allocator, &.{ launcher_dir, name });
+            const command = try std.fmt.allocPrint(allocator, "@\"{s}\" %*\r\n", .{executable});
+            try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = launcher, .data = command });
+        }
+    } else {
+        for ([_][]const u8{ "node", "bun" }) |name| {
+            const launcher = try std.fs.path.join(allocator, &.{ launcher_dir, name });
+            std.Io.Dir.cwd().symLink(init.io, executable, launcher, .{}) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
+        }
+    }
+
+    const path = if (env.get("PATH")) |original|
+        try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ launcher_dir, std.fs.path.delimiter, original })
+    else
+        launcher_dir;
+    try env.put("PATH", path);
+    try env.put("BUN_BE_BUN", "1");
+    const path_z = try allocator.dupeZ(u8, path);
+    _ = setenv("PATH", path_z.ptr, 1);
+    _ = setenv("BUN_BE_BUN", "1", 1);
+}
+
+fn forcesBunRuntime(exec_args: []const [:0]const u8) bool {
+    for (exec_args) |arg| {
+        if (std.mem.eql(u8, arg, "--bun") or std.mem.eql(u8, arg, "-b")) return true;
+    }
+    return false;
+}
+
 fn findAncestorBin(io: std.Io, allocator: std.mem.Allocator, name: []const u8) !?[]const u8 {
     const cwd_abs = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch return null;
     var current: []const u8 = cwd_abs;
@@ -811,11 +881,13 @@ fn runAncestorBin(
     init: std.process.Init,
     executable: []const u8,
     args: []const [:0]const u8,
+    force_runtime: bool,
 ) !u8 {
     const allocator = init.arena.allocator();
     const cwd_abs = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
     var env = try init.environ_map.clone(allocator);
     try prependAncestorBinPaths(allocator, &env, cwd_abs);
+    if (force_runtime) try prependForcedBunRuntimePath(init, allocator, &env);
 
     const argv = try allocator.alloc([]const u8, args.len + 1);
     argv[0] = executable;
@@ -902,6 +974,7 @@ fn runPackageScripts(
     pkg: PackageScripts,
     flags: RunScriptFlags,
     extra_args: []const [:0]const u8,
+    force_runtime: bool,
 ) !u8 {
     const allocator = init.arena.allocator();
     var env = try init.environ_map.clone(allocator);
@@ -919,6 +992,7 @@ fn runPackageScripts(
     if (pkg.package_version.len > 0) try env.put("npm_package_version", pkg.package_version);
     try env.put("npm_package_json", pkg.package_json);
     try prependAncestorBinPaths(allocator, &env, pkg.dir);
+    if (force_runtime) try prependForcedBunRuntimePath(init, allocator, &env);
     for (pkg.config) |entry| try env.put(entry.name, entry.value);
 
     if (pkg.pre) |pre_command| {
@@ -2861,7 +2935,7 @@ pub fn main(init: std.process.Init) !void {
                         try stderr.flush();
                         std.process.exit(1);
                     };
-                    const exit_code = try runPackageScripts(init, pkg, .{}, &.{});
+                    const exit_code = try runPackageScripts(init, pkg, .{}, &.{}, false);
                     if (exit_code != 0) std.process.exit(exit_code);
                     return;
                 },
@@ -3054,12 +3128,23 @@ pub fn main(init: std.process.Init) !void {
             std.mem.indexOfScalar(u8, payload, '\\') != null;
         if (!path_like) {
             if (try findPackageScripts(init.io, init.arena.allocator(), payload)) |pkg| {
-                const script_exit = try runPackageScripts(init, pkg, invocation.flags, invocation.args);
+                const script_exit = try runPackageScripts(
+                    init,
+                    pkg,
+                    invocation.flags,
+                    invocation.args,
+                    forcesBunRuntime(invocation.exec_args),
+                );
                 if (script_exit != 0) std.process.exit(script_exit);
                 return;
             }
             if (try findAncestorBin(init.io, init.arena.allocator(), payload)) |executable| {
-                const binary_exit = try runAncestorBin(init, executable, invocation.args);
+                const binary_exit = try runAncestorBin(
+                    init,
+                    executable,
+                    invocation.args,
+                    forcesBunRuntime(invocation.exec_args),
+                );
                 if (binary_exit != 0) std.process.exit(binary_exit);
                 return;
             }
@@ -3072,6 +3157,10 @@ pub fn main(init: std.process.Init) !void {
         }
         try stderr.flush();
         std.process.exit(1);
+    }
+
+    if (forcesBunRuntime(invocation.exec_args)) {
+        try prependForcedBunRuntimePath(init, init.arena.allocator(), init.environ_map);
     }
 
     const exit_code = switch (invocation.mode) {

@@ -282,6 +282,21 @@ pub const Runtime = struct {
         return self.runSource(source, script_path);
     }
 
+    pub fn evalImmediate(self: *Runtime, source: []const u8, filename: [:0]const u8) !void {
+        var eval_error: [*c]u8 = null;
+        if (c.ct_jsc_runtime_eval_immediate(
+            self.handle,
+            source.ptr,
+            source.len,
+            filename.ptr,
+            &eval_error,
+        ) != 0) {
+            defer if (eval_error != null) c.ct_jsc_string_free(eval_error);
+            if (eval_error != null) self.writeStderrLine(std.mem.span(eval_error));
+            return error.ImmediateEvalFailed;
+        }
+    }
+
     pub fn runSource(self: *Runtime, source: []const u8, filename: [:0]const u8) u8 {
         return self.runSourceInternal(source, filename, null);
     }
