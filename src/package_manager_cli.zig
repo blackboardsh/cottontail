@@ -2129,6 +2129,11 @@ const security_scanner_runtime: [:0]const u8 =
     \\}
 ;
 
+const SuppressedBinEdge = struct {
+    alias: []const u8,
+    parent_dir: []const u8,
+};
+
 const Manager = struct {
     init_data: std.process.Init,
     allocator: std.mem.Allocator,
@@ -2194,6 +2199,7 @@ const Manager = struct {
     network_task_count: usize = 0,
     changed: bool = false,
     deferred_install_error: ?anyerror = null,
+    suppressed_registry_bin_edge: ?SuppressedBinEdge = null,
     update_package_json_changed: bool = false,
     interactive_update_prepared: bool = false,
     interactive_changed_manifests: std.ArrayList(InteractiveChangedManifest) = .empty,
@@ -6353,6 +6359,16 @@ const Manager = struct {
             if (optional_peer) continue;
             const edge_optional = optional;
             const edge_peer = std.mem.eql(u8, key, "peerDependencies");
+            const previous_suppressed_bin_edge = manager.suppressed_registry_bin_edge;
+            defer manager.suppressed_registry_bin_edge = previous_suppressed_bin_edge;
+            // COTTONTAIL-COMPAT: Bun replaces a required registry edge with its
+            // optional duplicate before that required edge can enqueue its bin.
+            if (std.mem.eql(u8, key, "optionalDependencies") and
+                objectSectionContains(package_json, "dependencies", alias) and
+                isRegistryUpdateSpecifier(spec_value.string))
+            {
+                manager.suppressed_registry_bin_edge = .{ .alias = alias, .parent_dir = parent_dir };
+            }
             const resolved_version = manager.installDependency(alias, spec_value.string, parent_dir, direct, edge_optional, edge_peer) catch |err| {
                 if (manager.options.command == .link and !direct and err == error.MissingPackageJSON) continue;
                 // COTTONTAIL-COMPAT: Bun resolves peer edges after required
@@ -8609,8 +8625,24 @@ const Manager = struct {
                         spec,
                         checkout_path,
                     ) catch |err| {
-                        try manager.stderr.print("error: git dependency {s} failed to resolve\n", .{requested});
-                        return err;
+                        if (err == error.OutOfMemory or optional) return err;
+                        const alias = alias_hint orelse gitRepositoryName(spec) orelse requested;
+                        switch (err) {
+                            error.InstallFailed => try manager.stderr.print(
+                                "error: InstallFailed cloning repository for {s}\n",
+                                .{alias},
+                            ),
+                            error.GitCloneFailed, error.RepositoryNotFound => try manager.stderr.print(
+                                "error: \"git clone\" for \"{s}\" failed\n",
+                                .{alias},
+                            ),
+                            error.GitCommitNotFound => try manager.stderr.print(
+                                "error: no commit matching \"{s}\" found for \"{s}\" (but repository exists)\n",
+                                .{ spec.committish, alias },
+                            ),
+                            else => try manager.stderr.print("error: git dependency {s} failed to resolve\n", .{requested}),
+                        }
+                        return error.PackageManagerErrorReported;
                     },
                 };
             const checkout = checkout_result.checkout;
@@ -10149,6 +10181,10 @@ const Manager = struct {
         report_direct: bool,
         parent_dir: []const u8,
     ) !void {
+        if (manager.suppressed_registry_bin_edge) |edge| {
+            if (std.mem.eql(u8, edge.alias, alias) and
+                std.mem.eql(u8, edge.parent_dir, parent_dir)) return;
+        }
         if (metadata.* != .object) return;
         const consumer_modules = if (manager.node_linker == .isolated)
             try manager.isolatedConsumerModules(parent_dir)

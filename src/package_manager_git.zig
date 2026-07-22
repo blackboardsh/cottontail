@@ -112,6 +112,7 @@ pub fn checkout(
     destination: []const u8,
 ) !Checkout {
     deletePath(io, destination);
+    errdefer deletePath(io, destination);
     if (std.fs.path.dirname(destination)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
 
     var git_environment = try environ.clone(allocator);
@@ -121,27 +122,38 @@ pub fn checkout(
         try git_environment.put("GIT_SSH_COMMAND", "ssh -oStrictHostKeyChecking=accept-new");
     }
 
-    try runGit(allocator, io, &git_environment, &.{
-        "git",
-        "clone",
-        "-c",
-        "core.longpaths=true",
-        "--quiet",
-        "--no-checkout",
-        spec.clone_url,
-        destination,
-    });
-    errdefer deletePath(io, destination);
+    cloneRepository(allocator, io, &git_environment, spec.clone_url, destination) catch |err| switch (err) {
+        error.RepositoryNotFound => return error.GitCloneFailed,
+        error.InstallFailed => {
+            const fallback_url = try sshFallbackURL(allocator, spec);
+            if (fallback_url == null) return err;
+            defer allocator.free(fallback_url.?);
 
-    try runGit(allocator, io, &git_environment, &.{
+            deletePath(io, destination);
+            cloneRepository(allocator, io, &git_environment, fallback_url.?, destination) catch |fallback_err| switch (fallback_err) {
+                error.RepositoryNotFound, error.InstallFailed => return error.GitCloneFailed,
+                else => return fallback_err,
+            };
+        },
+        else => return err,
+    };
+    runGit(allocator, io, &git_environment, &.{
         "git",
         "-C",
         destination,
         "checkout",
         "--quiet",
         if (spec.committish.len > 0) spec.committish else "HEAD",
-    });
-    const result = try runGitCapture(allocator, io, &git_environment, &.{ "git", "-C", destination, "rev-parse", "HEAD" });
+    }) catch |err| switch (err) {
+        error.RepositoryNotFound, error.InstallFailed => return error.GitCommitNotFound,
+        else => return err,
+    };
+    const result = runGitCapture(allocator, io, &git_environment, &.{ "git", "-C", destination, "rev-parse", "HEAD" }) catch |err| switch (err) {
+        error.RepositoryNotFound, error.InstallFailed => return error.GitCommitNotFound,
+        else => return err,
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
     const commit = std.mem.trim(u8, result.stdout, " \t\r\n");
     if (commit.len == 0) return error.GitCommitNotFound;
 
@@ -151,13 +163,34 @@ pub fn checkout(
     };
 }
 
+fn cloneRepository(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    url: []const u8,
+    destination: []const u8,
+) !void {
+    try runGit(allocator, io, environ, &.{
+        "git",
+        "clone",
+        "-c",
+        "core.longpaths=true",
+        "--quiet",
+        "--no-checkout",
+        url,
+        destination,
+    });
+}
+
 fn runGit(
     allocator: std.mem.Allocator,
     io: std.Io,
     environ: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !void {
-    _ = try runGitCapture(allocator, io, environ, argv);
+    const result = try runGitCapture(allocator, io, environ, argv);
+    allocator.free(result.stdout);
+    allocator.free(result.stderr);
 }
 
 fn runGitCapture(
@@ -176,7 +209,57 @@ fn runGitCapture(
         .exited => |code| if (code == 0) return result,
         else => {},
     }
-    return error.GitCommandFailed;
+    const repository_not_found = gitStderrIsRepositoryNotFound(result.stderr);
+    allocator.free(result.stdout);
+    allocator.free(result.stderr);
+    return if (repository_not_found) error.RepositoryNotFound else error.InstallFailed;
+}
+
+fn gitStderrIsRepositoryNotFound(stderr: []const u8) bool {
+    return (std.mem.indexOf(u8, stderr, "remote:") != null and
+        std.mem.indexOf(u8, stderr, "not") != null and
+        std.mem.indexOf(u8, stderr, "found") != null) or
+        std.mem.indexOf(u8, stderr, "does not exist") != null;
+}
+
+fn sshFallbackURL(allocator: std.mem.Allocator, spec: Spec) !?[]const u8 {
+    var source = spec.lock_prefix;
+    if (std.mem.startsWith(u8, source, "git+")) source = source["git+".len..];
+    if (std.mem.startsWith(u8, source, "http://") or
+        std.mem.startsWith(u8, source, "https://") or
+        std.mem.startsWith(u8, source, "git://")) return null;
+
+    const candidate = if (std.mem.startsWith(u8, source, "ssh://")) blk: {
+        const remainder = source["ssh://".len..];
+        if (std.mem.indexOfScalar(u8, remainder, '/') != null) {
+            break :blk try allocator.dupe(u8, source);
+        }
+        const colon = std.mem.indexOfScalar(u8, remainder, ':') orelse
+            break :blk try allocator.dupe(u8, source);
+        break :blk try std.fmt.allocPrint(
+            allocator,
+            "ssh://{s}/{s}",
+            .{ remainder[0..colon], remainder[colon + 1 ..] },
+        );
+    } else if (isScpLike(source)) blk: {
+        const colon = std.mem.indexOfScalar(u8, source, ':').?;
+        const authority = source[0..colon];
+        const path = source[colon + 1 ..];
+        if (std.mem.indexOfScalar(u8, authority, '@') != null) {
+            break :blk try std.fmt.allocPrint(allocator, "ssh://{s}/{s}", .{ authority, path });
+        }
+        break :blk try std.fmt.allocPrint(
+            allocator,
+            "ssh://git@{s}/{s}",
+            .{ normalizedGitHost(authority), path },
+        );
+    } else return null;
+
+    if (std.mem.eql(u8, candidate, spec.clone_url)) {
+        allocator.free(candidate);
+        return null;
+    }
+    return candidate;
 }
 
 fn githubSpec(allocator: std.mem.Allocator, path: []const u8, committish: []const u8) !?Spec {
@@ -254,11 +337,15 @@ fn scpHttpsURL(allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
     const colon = std.mem.indexOfScalar(u8, source, ':') orelse return error.InvalidGitDependency;
     const authority = source[0..colon];
     const path = source[colon + 1 ..];
-    var host = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority[at + 1 ..] else authority;
-    if (std.mem.eql(u8, host, "bitbucket")) host = "bitbucket.org";
-    if (std.mem.eql(u8, host, "github")) host = "github.com";
-    if (std.mem.eql(u8, host, "gitlab")) host = "gitlab.com";
+    const host = normalizedGitHost(if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority[at + 1 ..] else authority);
     return std.fmt.allocPrint(allocator, "https://{s}/{s}", .{ host, path });
+}
+
+fn normalizedGitHost(host: []const u8) []const u8 {
+    if (std.mem.eql(u8, host, "bitbucket")) return "bitbucket.org";
+    if (std.mem.eql(u8, host, "github")) return "github.com";
+    if (std.mem.eql(u8, host, "gitlab")) return "gitlab.com";
+    return host;
 }
 
 fn isCommitishHash(value: []const u8) bool {
