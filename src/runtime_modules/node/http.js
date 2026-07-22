@@ -14,6 +14,9 @@ const socketAsyncResourceSymbol = Symbol("cottontail.http.socketAsyncResource");
 const freeSocketErrorSymbol = Symbol("cottontail.http.freeSocketError");
 const clientSocketCleanupSymbol = Symbol("cottontail.http.clientSocketCleanup");
 const incomingParserResumeSymbol = Symbol("cottontail.http.incomingParserResume");
+const agentSocketStateSymbol = Symbol("cottontail.http.agentSocketState");
+const agentRequestOptionsSymbol = Symbol("cottontail.http.agentRequestOptions");
+const agentRequestResourceSymbol = Symbol("cottontail.http.agentRequestResource");
 const eventLoopTaskStateSymbol = Symbol.for("cottontail.eventLoopTaskState");
 const httpResponseTaskRefSymbol = Symbol("cottontail.http.responseTaskRef");
 const eventLoopTaskState = globalThis[eventLoopTaskStateSymbol] ??= { activeTasks: 0, concurrentRef: 0 };
@@ -2048,33 +2051,50 @@ export class ServerResponse extends OutgoingMessage {
   }
 }
 
+function validateAgentSocketLimit(value) {
+  if (typeof value !== "number") {
+    const received = typeof value === "string" ? `'${value.replaceAll("'", "\\'")}'` : String(value);
+    throw nodeError(
+      TypeError,
+      "ERR_INVALID_ARG_TYPE",
+      `The "maxTotalSockets" argument must be of type number. Received type ${typeof value} (${received})`,
+    );
+  }
+  if (Number.isNaN(value) || value < 1) {
+    throw nodeError(RangeError, "ERR_OUT_OF_RANGE", `The value of "maxTotalSockets" is out of range. It must be >= 1. Received ${value}`);
+  }
+  return value;
+}
+
 class AgentImpl extends EventEmitter {
   constructor(options = {}) {
     super();
     this.options = Object.assign(Object.create(null), options);
     if (this.options.noDelay === undefined) this.options.noDelay = true;
     this.options.path = null;
-    this.defaultPort = Number(this.options.defaultPort ?? 80);
-    this.protocol = this.options.protocol ?? "http:";
-    this.requests = {};
-    this.sockets = {};
-    this.freeSockets = {};
-    this.keepAliveMsecs = Number(this.options.keepAliveMsecs ?? 1000);
-    this.keepAlive = Boolean(this.options.keepAlive);
-    this.maxSockets = this.options.maxSockets ?? Infinity;
-    this.maxFreeSockets = this.options.maxFreeSockets ?? 256;
-    this.maxTotalSockets = this.options.maxTotalSockets ?? Infinity;
+    this.defaultPort = this.options.defaultPort || 80;
+    this.protocol = this.options.protocol || "http:";
+    this.requests = Object.create(null);
+    this.sockets = Object.create(null);
+    this.freeSockets = Object.create(null);
+    this.keepAliveMsecs = this.options.keepAliveMsecs || 1000;
+    this.keepAlive = this.options.keepAlive || false;
+    this.maxSockets = this.options.maxSockets || Infinity;
+    this.maxFreeSockets = this.options.maxFreeSockets || 256;
+    this.maxTotalSockets = this.options.maxTotalSockets === undefined
+      ? Infinity
+      : validateAgentSocketLimit(this.options.maxTotalSockets);
     this.totalSocketCount = 0;
-    this.scheduling = this.options.scheduling ?? "lifo";
+    this.scheduling = this.options.scheduling || "lifo";
     if (this.scheduling !== "fifo" && this.scheduling !== "lifo") {
       throw nodeError(TypeError, "ERR_INVALID_ARG_VALUE", `The argument 'scheduling' must be one of: 'fifo', 'lifo'. Received '${this.scheduling}'`);
     }
-    if (this.maxTotalSockets !== Infinity) validateIntegerOption(this.maxTotalSockets, "maxTotalSockets", 1);
     this.agentKeepAliveTimeoutBuffer = Number.isFinite(this.options.agentKeepAliveTimeoutBuffer) && this.options.agentKeepAliveTimeoutBuffer >= 0
       ? Number(this.options.agentKeepAliveTimeoutBuffer)
       : 1000;
     this._trackedSockets = new Set();
-    this._watchedSockets = new WeakSet();
+    this._pendingSocketCount = 0;
+    this._pendingSockets = Object.create(null);
   }
 
   createConnection(options, callback = undefined) {
@@ -2091,20 +2111,28 @@ class AgentImpl extends EventEmitter {
     if (request == null || options == null) {
       throw nodeError(TypeError, "ERR_INVALID_ARG_TYPE", 'The "request" and "options" arguments are required.');
     }
-    const connectOptions = { ...options, ...this.options };
-    if (connectOptions.socketPath != null) connectOptions.path = connectOptions.socketPath;
+    const connectOptions = Object.assign(Object.create(null), options, this.options);
+    if (connectOptions.socketPath) connectOptions.path = connectOptions.socketPath;
     else delete connectOptions.path;
+    const timeout = Number(request?._timeout || request?.timeout || this.options.timeout || 0);
+    if (timeout > 0) connectOptions.timeout = timeout;
+    connectOptions.encoding = null;
+    if (this.keepAlive) {
+      connectOptions.keepAlive = true;
+      connectOptions.keepAliveInitialDelay = this.keepAliveMsecs;
+    }
+
     let called = false;
-    const done = (error, socket) => {
-      if (called) return;
-      called = true;
-      if (typeof callback === "function") callback(error ?? null, socket);
-    };
     let socket;
+    const done = (error, connectedSocket) => {
+      if (called) return;
+      const created = connectedSocket ?? socket;
+      if (error == null && created == null) return;
+      called = true;
+      if (typeof callback === "function") callback(error ?? null, created);
+    };
     try {
-      socket = this.createConnection(connectOptions, (error, connectedSocket) => {
-        done(error, connectedSocket ?? socket);
-      });
+      socket = this.createConnection(connectOptions, (error, connectedSocket) => done(error, connectedSocket));
     } catch (error) {
       done(error);
       return undefined;
@@ -2114,9 +2142,13 @@ class AgentImpl extends EventEmitter {
   }
 
   getName(options = {}) {
-    let name = `${options.host ?? options.hostname ?? "localhost"}:${options.port ?? ""}:${options.localAddress ?? ""}`;
+    let name = options.host || "localhost";
+    name += ":";
+    if (options.port) name += options.port;
+    name += ":";
+    if (options.localAddress) name += options.localAddress;
     if (options.family === 4 || options.family === 6) name += `:${options.family}`;
-    if (options.socketPath != null) name += `:${options.socketPath}`;
+    if (options.socketPath) name += `:${options.socketPath}`;
     return name;
   }
 
@@ -2124,7 +2156,19 @@ class AgentImpl extends EventEmitter {
     return (this.sockets[name] ?? []).filter((socket) => !socket.destroyed).length;
   }
 
-  _rememberSocket(name, socket) {
+  _reserveSocket(name) {
+    this._pendingSocketCount += 1;
+    this._pendingSockets[name] = (this._pendingSockets[name] ?? 0) + 1;
+  }
+
+  _releaseReservation(name) {
+    this._pendingSocketCount = Math.max(0, this._pendingSocketCount - 1);
+    const count = Math.max(0, Number(this._pendingSockets[name] ?? 0) - 1);
+    if (count === 0) delete this._pendingSockets[name];
+    else this._pendingSockets[name] = count;
+  }
+
+  _rememberSocket(name, socket, options = {}) {
     const list = this.sockets[name] ?? [];
     if (!list.includes(socket)) list.push(socket);
     this.sockets[name] = list;
@@ -2132,10 +2176,69 @@ class AgentImpl extends EventEmitter {
       this._trackedSockets.add(socket);
       this.totalSocketCount += 1;
     }
-    if (!this._watchedSockets.has(socket)) {
-      this._watchedSockets.add(socket);
-      socket.once?.("close", () => this.removeSocket(socket, { _agentName: name }));
+
+    const socketOptions = Object.assign(Object.create(null), options, { _agentName: name });
+    const existing = socket[agentSocketStateSymbol];
+    if (existing?.agent === this && !existing.detached) {
+      existing.name = name;
+      existing.options = socketOptions;
+      existing.free = false;
+      return;
     }
+
+    const state = {
+      agent: this,
+      name,
+      options: socketOptions,
+      free: false,
+      detached: false,
+      onFree: null,
+      onClose: null,
+      onTimeout: null,
+      onRemove: null,
+    };
+    const removeListeners = () => {
+      socket.off?.("free", state.onFree);
+      socket.off?.("close", state.onClose);
+      socket.off?.("timeout", state.onTimeout);
+      socket.off?.("agentRemove", state.onRemove);
+    };
+    state.onFree = () => {
+      if (!state.detached) this._releaseSocket(socket, state.options);
+    };
+    state.onClose = () => {
+      if (state.detached) return;
+      state.detached = true;
+      state.free = false;
+      removeListeners();
+      if (socket[freeSocketErrorSymbol]) {
+        socket.off?.("error", socket[freeSocketErrorSymbol]);
+        socket[freeSocketErrorSymbol] = null;
+      }
+      this.removeSocket(socket, state.options, true, true);
+    };
+    state.onTimeout = () => {
+      if (state.free && this.freeSockets[state.name]?.includes(socket)) socket.destroy?.();
+    };
+    state.onRemove = () => {
+      if (state.detached) return;
+      state.detached = true;
+      state.free = false;
+      removeListeners();
+      if (socket[freeSocketErrorSymbol]) {
+        socket.off?.("error", socket[freeSocketErrorSymbol]);
+        socket[freeSocketErrorSymbol] = null;
+      }
+      this.removeSocket(socket, state.options, true, true);
+    };
+    Object.defineProperty(socket, agentSocketStateSymbol, {
+      value: state,
+      configurable: true,
+    });
+    socket.on?.("free", state.onFree);
+    socket.on?.("close", state.onClose);
+    socket.on?.("timeout", state.onTimeout);
+    socket.on?.("agentRemove", state.onRemove);
   }
 
   _takeSocket(options = {}) {
@@ -2143,13 +2246,15 @@ class AgentImpl extends EventEmitter {
     const free = this.freeSockets[name] ?? [];
     while (free.length > 0) {
       const socket = this.scheduling === "fifo" ? free.shift() : free.pop();
-      if (!socket?.destroyed && socket.writable !== false) {
-        this.sockets[name] = this.sockets[name] ?? [];
-        if (!this.sockets[name].includes(socket)) this.sockets[name].push(socket);
+      const state = socket?.[agentSocketStateSymbol];
+      if (socket && !socket.destroyed && socket.writable !== false && !state?.detached) {
+        if (free.length === 0) delete this.freeSockets[name];
+        this._rememberSocket(name, socket, options);
         return socket;
       }
+      socket?.destroy?.();
     }
-    if (free.length === 0) delete this.freeSockets[name];
+    delete this.freeSockets[name];
     return null;
   }
 
@@ -2161,62 +2266,128 @@ class AgentImpl extends EventEmitter {
       }
     }
     for (const name of names) {
-      const queued = this.requests[name]?.shift();
-      if (!queued) continue;
-      if ((this.requests[name] ?? []).length === 0) delete this.requests[name];
-      return queued;
+      const queue = this.requests[name];
+      while (queue?.length) {
+        const request = queue.shift();
+        if (queue.length === 0) delete this.requests[name];
+        const queued = {
+          request,
+          options: request?.[agentRequestOptionsSymbol],
+          resource: request?.[agentRequestResourceSymbol],
+        };
+        if (request) {
+          request[agentRequestOptionsSymbol] = undefined;
+          request[agentRequestResourceSymbol] = undefined;
+        }
+        if (request?.destroyed || request?.aborted) {
+          queued.resource?.emitDestroy?.();
+          continue;
+        }
+        return queued;
+      }
     }
     return null;
   }
 
-  addRequest(request, options = {}) {
-    if (request == null || typeof request.emit !== "function" || typeof request.onSocket !== "function") {
-      throw nodeError(TypeError, "ERR_INVALID_ARG_TYPE", 'The "request" argument must be an instance of ClientRequest.');
+  _runQueued(queued, callback) {
+    const run = () => callback(queued.request, queued.options);
+    try {
+      if (queued.resource) queued.resource.runInAsyncScope(run, queued.request);
+      else run();
+    } finally {
+      queued.resource?.emitDestroy?.();
     }
-    options = { ...options, ...this.options };
-    const name = options._agentName ?? this.getName(options);
-    options._agentName = name;
-    const socket = this._takeSocket(options);
-    if (socket) {
+  }
+
+  _queueRequest(name, request, options) {
+    const queue = this.requests[name] ?? [];
+    request[agentRequestOptionsSymbol] = Object.assign(Object.create(null), options);
+    request[agentRequestResourceSymbol] = new AsyncResource("QueuedRequest");
+    queue.push(request);
+    this.requests[name] = queue;
+  }
+
+  _scheduleQueued(preferredName, allowOtherNames) {
+    const queued = this._takeQueuedRequest(preferredName, allowOtherNames);
+    if (!queued) return false;
+    queueMicrotask(() => this._runQueued(queued, (request, options) => this.addRequest(request, options)));
+    return true;
+  }
+
+  _assignQueuedSocket(queued, socket, name) {
+    this._runQueued(queued, (request, options) => {
+      this._rememberSocket(name, socket, options);
       this.reuseSocket(socket, request);
-      queueMicrotask(() => request.onSocket(socket, true));
-      return;
-    }
-    if (this._activeCount(name) >= Number(this.maxSockets) || this.totalSocketCount >= Number(this.maxTotalSockets)) {
-      const queue = this.requests[name] ?? [];
-      queue.push({ request, options: { ...options } });
-      this.requests[name] = queue;
-      return;
-    }
-    this.createSocket(request, options, (error, created) => {
-      if (error || created == null) {
-        const failure = error instanceof Error ? error : new Error("Agent failed to create a socket");
-        queueMicrotask(() => request.emit("error", failure));
-        request.destroy?.();
-        return;
-      }
-      assignSocketAsyncId(created);
-      this._rememberSocket(name, created);
-      request.onSocket(created, false);
+      request._agentOptions = options;
+      request.onSocket(socket, true);
     });
   }
 
-  removeSocket(socket, options = {}) {
-    const name = options._agentName ?? this.getName(options);
+  addRequest(request, options = {}, port = undefined, localAddress = undefined) {
+    if (request == null || typeof request.emit !== "function" || typeof request.onSocket !== "function") {
+      throw nodeError(TypeError, "ERR_INVALID_ARG_TYPE", 'The "request" argument must be an instance of ClientRequest.');
+    }
+    if (typeof options === "string") {
+      options = { host: options, port, localAddress };
+    }
+    options = Object.assign(Object.create(null), options, this.options);
+    if (options.socketPath) options.path = options.socketPath;
+    const name = this.getName(options);
+    options._agentName = name;
+    request._agentOptions = options;
+
+    const socket = this._takeSocket(options);
+    if (socket) {
+      this.reuseSocket(socket, request);
+      request.onSocket(socket, true);
+      return;
+    }
+
+    const originCount = this._activeCount(name) + Number(this._pendingSockets[name] ?? 0);
+    const totalCount = this.totalSocketCount + this._pendingSocketCount;
+    if (originCount >= Number(this.maxSockets) || totalCount >= Number(this.maxTotalSockets)) {
+      this._queueRequest(name, request, options);
+      return;
+    }
+
+    this._reserveSocket(name);
+    let settled = false;
+    const onSocket = (error, created) => {
+      if (settled) return;
+      settled = true;
+      this._releaseReservation(name);
+      if (error || created == null) {
+        const failure = error instanceof Error ? error : new Error("Agent failed to create a socket");
+        queueMicrotask(() => request.destroy?.(failure));
+        this._scheduleQueued(name, true);
+        return;
+      }
+      assignSocketAsyncId(created);
+      this._rememberSocket(name, created, options);
+      request.onSocket(created, false);
+    };
+    try {
+      this.createSocket(request, options, onSocket);
+    } catch (error) {
+      onSocket(error);
+    }
+  }
+
+  removeSocket(socket, options = {}, removeTracking = socket?.destroyed === true, schedule = true) {
+    const state = socket?.[agentSocketStateSymbol];
+    const name = options._agentName ?? state?.name ?? this.getName(options);
     const active = this.sockets[name] ?? [];
     const nextActive = active.filter((item) => item !== socket);
-    this.sockets[name] = nextActive;
-    if (this.sockets[name].length === 0) delete this.sockets[name];
+    if (nextActive.length > 0) this.sockets[name] = nextActive;
+    else delete this.sockets[name];
     const free = this.freeSockets[name] ?? [];
-    this.freeSockets[name] = free.filter((item) => item !== socket);
-    if (this.freeSockets[name].length === 0) delete this.freeSockets[name];
-    if (socket?.destroyed && this._trackedSockets.delete(socket)) {
+    const nextFree = free.filter((item) => item !== socket);
+    if (nextFree.length > 0) this.freeSockets[name] = nextFree;
+    else delete this.freeSockets[name];
+    if (removeTracking && this._trackedSockets.delete(socket)) {
       this.totalSocketCount = Math.max(0, this.totalSocketCount - 1);
-      const queued = this._takeQueuedRequest(name, true);
-      if (queued) {
-        queueMicrotask(() => this.addRequest(queued.request, queued.options));
-      }
     }
+    if (schedule) this._scheduleQueued(name, true);
   }
 
   keepSocketAlive(socket) {
@@ -2224,17 +2395,19 @@ class AgentImpl extends EventEmitter {
     socket.unref?.();
     let timeout = Number(this.options.timeout) || 0;
     const keepAlive = String(socket?._httpMessage?.res?.headers?.["keep-alive"] ?? "");
-    const hint = /^timeout=(\d+)/i.exec(keepAlive)?.[1];
+    const hint = /^timeout=(\d+)/.exec(keepAlive)?.[1];
     if (hint != null) {
-      const hintedTimeout = Math.max(0, Number(hint) * 1000 - this.agentKeepAliveTimeoutBuffer);
+      const hintedTimeout = Math.max(0, Number.parseInt(hint, 10) * 1000 - this.agentKeepAliveTimeoutBuffer);
       if (hintedTimeout === 0) return false;
-      if (timeout === 0 || hintedTimeout < timeout) timeout = hintedTimeout;
+      if (hintedTimeout < timeout) timeout = hintedTimeout;
     }
-    socket.setTimeout?.(timeout);
+    if (socket.timeout !== timeout) socket.setTimeout?.(timeout);
     return true;
   }
 
   reuseSocket(socket, request) {
+    const state = socket[agentSocketStateSymbol];
+    if (state?.agent === this) state.free = false;
     if (socket[freeSocketErrorSymbol]) {
       socket.off?.("error", socket[freeSocketErrorSymbol]);
       socket[freeSocketErrorSymbol] = null;
@@ -2245,46 +2418,66 @@ class AgentImpl extends EventEmitter {
   }
 
   _releaseSocket(socket, options = {}) {
-    const name = options._agentName ?? this.getName(options);
-    this.removeSocket(socket, { ...options, _agentName: name });
-    // Response backpressure may leave the transport watcher paused after the
-    // body has completed. A pooled socket must remain readable for reuse and
-    // for a peer FIN while it is idle.
+    const state = socket?.[agentSocketStateSymbol];
+    if (state?.detached || state?.free) return;
+    const name = options._agentName ?? state?.name ?? this.getName(options);
+    const socketOptions = Object.assign(Object.create(null), state?.options, options, { _agentName: name });
+    if (socket.destroyed || socket.writable === false) {
+      socket.destroy?.();
+      return;
+    }
+
+    this.removeSocket(socket, socketOptions, false, false);
     socket.resume?.();
     markSocketAsyncFree(socket);
-    const queued = this._takeQueuedRequest(name);
+
+    const queued = this._takeQueuedRequest(name, false);
     if (queued) {
-      this._rememberSocket(name, socket);
-      this.reuseSocket(socket, queued.request);
-      queueMicrotask(() => queued.request.onSocket(socket, true));
+      this._assignQueuedSocket(queued, socket, name);
       return;
     }
-    if (!this.keepAlive || socket.destroyed || socket.writable === false || this.keepSocketAlive(socket) === false) {
+
+    if (Number.isFinite(this.maxTotalSockets) &&
+        this.totalSocketCount >= Number(this.maxTotalSockets) &&
+        Object.keys(this.requests).length > 0) {
       socket.destroy?.();
       return;
     }
+    if (!this.keepAlive || this.keepSocketAlive(socket) === false) {
+      socket.destroy?.();
+      return;
+    }
+
     const free = this.freeSockets[name] ?? [];
-    if (free.length >= Number(this.maxFreeSockets)) {
+    const activeCount = this._activeCount(name);
+    if (this.totalSocketCount > Number(this.maxTotalSockets) ||
+        activeCount + free.length >= Number(this.maxSockets) ||
+        free.length >= Number(this.maxFreeSockets)) {
       socket.destroy?.();
       return;
     }
+
+    socket._httpMessage = null;
     free.push(socket);
     this.freeSockets[name] = free;
+    if (state?.agent === this) {
+      state.name = name;
+      state.options = socketOptions;
+      state.free = true;
+    }
     const onFreeError = () => {
       socket[freeSocketErrorSymbol] = null;
       socket.destroy?.();
+      socket.emit?.("agentRemove");
     };
     socket[freeSocketErrorSymbol] = onFreeError;
     socket.once?.("error", onFreeError);
-    this.emit("free", socket, options);
+    this.emit("free", socket, socketOptions);
   }
 
   destroy() {
-    for (const socket of Object.values(this.sockets).flat()) socket.destroy?.();
     for (const socket of Object.values(this.freeSockets).flat()) socket.destroy?.();
-    this.requests = {};
-    this.sockets = {};
-    this.freeSockets = {};
+    for (const socket of Object.values(this.sockets).flat()) socket.destroy?.();
   }
 }
 
@@ -2667,7 +2860,14 @@ export class ClientRequest extends OutgoingMessage {
     socket._httpMessage = this;
     socket.setNoDelay?.(this._setNoDelay);
     if (this._keepAliveSetting) socket.setKeepAlive?.(...this._keepAliveSetting);
-    const onDrain = () => this.emit("drain");
+    const runInSocketScope = (callback, ...args) => {
+      const resource = socket[socketAsyncResourceSymbol];
+      if (resource && typeof resource.runInAsyncScope === "function") {
+        return resource.runInAsyncScope(callback, this, ...args);
+      }
+      return callback(...args);
+    };
+    const onDrain = () => runInSocketScope(() => this.emit("drain"));
     socket.on?.("drain", onDrain);
     queueMicrotask(() => this.emit("socket", socket));
     let completed = false;
@@ -2692,10 +2892,10 @@ export class ClientRequest extends OutgoingMessage {
         clearTimeout(this._continueTimer);
         this._continueTimer = null;
       }
-      socket.off?.("connect", onConnect);
-      socket.off?.("data", onData);
-      socket.off?.("end", onEnd);
-      socket.off?.("error", onError);
+      socket.off?.("connect", onSocketConnect);
+      socket.off?.("data", onSocketData);
+      socket.off?.("end", onSocketEnd);
+      socket.off?.("error", onSocketError);
       socket.off?.("drain", onDrain);
       if (responseMessage) responseMessage[incomingParserResumeSymbol] = null;
       wireParser?.close();
@@ -2836,7 +3036,7 @@ export class ClientRequest extends OutgoingMessage {
         responseShouldKeepAlive = info.shouldKeepAlive;
         message[incomingParserResumeSymbol] = () => {
           try {
-            return wireParser.resume();
+            return runInSocketScope(() => wireParser.resume());
           } catch (error) {
             queueMicrotask(() => failResponse(error));
             return false;
@@ -2871,6 +3071,7 @@ export class ClientRequest extends OutgoingMessage {
       onUpgrade: (state, head) => {
         if (!state?.message) return;
         state.message[incomingParserResumeSymbol] = null;
+        socket.emit?.("agentRemove");
         this._emitParsedResponse({ message: state.message, head, consumed: 0 });
         releaseOrClose(state.message, true);
       },
@@ -2917,11 +3118,15 @@ export class ClientRequest extends OutgoingMessage {
     const onError = (error) => {
       failResponse(error, true);
     };
-    socket.once("connect", onConnect);
-    socket.on("data", onData);
-    socket.on("end", onEnd);
-    socket.on("error", onError);
-    if (reused || socket.readyState === "open") queueMicrotask(onConnect);
+    const onSocketConnect = () => runInSocketScope(onConnect);
+    const onSocketData = (chunk) => runInSocketScope(onData, chunk);
+    const onSocketEnd = () => runInSocketScope(onEnd);
+    const onSocketError = (error) => runInSocketScope(onError, error);
+    socket.once("connect", onSocketConnect);
+    socket.on("data", onSocketData);
+    socket.on("end", onSocketEnd);
+    socket.on("error", onSocketError);
+    if (reused || socket.readyState === "open") queueMicrotask(onSocketConnect);
   }
 }
 
