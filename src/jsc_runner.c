@@ -12320,7 +12320,7 @@ static JSValueRef ct_unix_server_listen(JSContextRef ctx, JSObjectRef function, 
     unlink(path);
 
     int backlog = 128;
-    if (argc >= 2 && !ct_value_to_int_checked(ctx, argv[1], 1, INT_MAX, &backlog, exception, "Invalid socket backlog")) {
+    if (argc >= 2 && !ct_value_to_int_checked(ctx, argv[1], 0, INT_MAX, &backlog, exception, "Invalid socket backlog")) {
         close(fd);
         unlink(path);
         free(path);
