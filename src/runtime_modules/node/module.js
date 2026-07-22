@@ -2419,6 +2419,11 @@ function executeCommonJsSource(module, filename, source) {
     } catch (error) {
       throw remapThrownModuleError(error, filename, FUNCTION_WRAPPER_LINE_OFFSET);
     }
+    if (module.exports != null &&
+        (typeof module.exports === "object" || typeof module.exports === "function") &&
+        Object.hasOwn(module.exports, "module.exports")) {
+      module.exports = module.exports["module.exports"];
+    }
     module.loaded = true;
     return module.exports;
   }
