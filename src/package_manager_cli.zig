@@ -12,6 +12,7 @@ const PmPkg = @import("package_manager_pm_pkg.zig");
 const PmInfo = @import("package_manager_pm_info.zig");
 const PmVersion = @import("package_manager_pm_version.zig");
 const PmWhy = @import("package_manager_pm_why.zig");
+const PmTrusted = @import("package_manager_pm_trusted.zig");
 const Isolated = @import("package_manager_isolated.zig");
 const Workspaces = @import("package_manager_workspaces.zig");
 const Analyzer = @import("package_manager_analyzer.zig");
@@ -76,6 +77,7 @@ const Options = struct {
     registry: ?[]const u8 = null,
     production: bool = false,
     ignore_scripts: bool = false,
+    trust: bool = false,
     lockfile_only: bool = false,
     frozen_lockfile: bool = false,
     no_save: bool = false,
@@ -402,7 +404,15 @@ pub fn run(
     }
     const allocator = init.arena.allocator();
     const options = parseOptions(allocator, args) catch |err| {
-        try stderr.print("error: {s}\n", .{@errorName(err)});
+        switch (err) {
+            error.TrustWithProductionUnsupported => try stderr.writeAll(
+                "error: The '--production' and '--trust' flags together are not supported because the --trust flag potentially modifies the lockfile after installing packages\n",
+            ),
+            error.TrustWithFrozenLockfileUnsupported => try stderr.writeAll(
+                "error: The '--frozen-lockfile' and '--trust' flags together are not supported because the --trust flag potentially modifies the lockfile after installing packages\n",
+            ),
+            else => try stderr.print("error: {s}\n", .{@errorName(err)}),
+        }
         try stderr.flush();
         return 1;
     };
@@ -567,6 +577,8 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
             options.production = true;
         } else if (std.mem.eql(u8, arg, "--ignore-scripts")) {
             options.ignore_scripts = true;
+        } else if (std.mem.eql(u8, arg, "--trust")) {
+            options.trust = true;
         } else if (std.mem.eql(u8, arg, "--lockfile-only")) {
             options.lockfile_only = true;
         } else if (std.mem.eql(u8, arg, "--frozen-lockfile")) {
@@ -708,6 +720,11 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
     if ((options.command == .patch or options.command == .patch_commit) and options.positionals.len == 0) {
         return error.MissingPatchTarget;
     }
+    if (options.trust and options.command != .install and options.command != .add) {
+        return error.InvalidPackageManagerOption;
+    }
+    if (options.trust and options.production) return error.TrustWithProductionUnsupported;
+    if (options.trust and options.frozen_lockfile) return error.TrustWithFrozenLockfileUnsupported;
     return options;
 }
 
@@ -759,6 +776,7 @@ fn printPackageManagerHelp(command: Command, writer: *std.Io.Writer) !void {
         \\  -p, --production         Omit devDependencies
         \\  --omit <kind>            Omit dev, optional, or peer dependencies
         \\  --ignore-scripts         Skip project lifecycle scripts
+        \\  --trust                  Trust added packages and run lifecycle scripts
         \\  --lockfile-only          Resolve without writing node_modules
         \\  --linker <strategy>      Use the isolated or hoisted install layout
         \\  --no-save                Do not update package.json or bun.lock
@@ -783,6 +801,24 @@ fn runPm(
         .pm_why => "why",
         else => if (options.positionals.len > 0) options.positionals[0] else "",
     };
+    if (std.mem.eql(u8, subcommand, "default-trusted")) {
+        return PmTrusted.runDefaultTrusted(stdout);
+    }
+    if (std.mem.eql(u8, subcommand, "untrusted")) {
+        const cwd = try absolutePath(init.io, init.arena.allocator(), ".");
+        return PmTrusted.runUntrusted(init, cwd, stdout, stderr);
+    }
+    if (std.mem.eql(u8, subcommand, "trust")) {
+        const cwd = try absolutePath(init.io, init.arena.allocator(), ".");
+        return PmTrusted.runTrust(
+            init,
+            cwd,
+            options.positionals[1..],
+            options.all,
+            stdout,
+            stderr,
+        );
+    }
     if (std.mem.eql(u8, subcommand, "ls") or std.mem.eql(u8, subcommand, "list")) {
         return runPmList(init, options, stdout, stderr);
     }
@@ -1577,6 +1613,7 @@ const Manager = struct {
     registry_manifests: std.StringHashMap(*Value),
     direct_bins: std.array_list.Managed([]const u8),
     explicit_adds: std.StringHashMap(void),
+    trusted_additions: std.StringHashMap(void),
     direct_install_reports: std.array_list.Managed(DirectInstallReport),
     removed_materialized_names: std.array_list.Managed([]const u8),
     latest_versions: std.StringHashMap([]const u8),
@@ -1612,6 +1649,7 @@ const Manager = struct {
     security_scanner: ?[]const u8 = null,
     minimum_release_age_excludes: []const []const u8 = &.{},
     script_queue: Scripts.Queue,
+    blocked_scripts: usize = 0,
     started_wall_ms: f64,
 
     fn init(
@@ -1636,6 +1674,7 @@ const Manager = struct {
             .registry_scopes = std.StringHashMap(RegistryConfig).init(allocator),
             .direct_bins = std.array_list.Managed([]const u8).init(allocator),
             .explicit_adds = std.StringHashMap(void).init(allocator),
+            .trusted_additions = std.StringHashMap(void).init(allocator),
             .direct_install_reports = std.array_list.Managed(DirectInstallReport).init(allocator),
             .removed_materialized_names = std.array_list.Managed([]const u8).init(allocator),
             .latest_versions = std.StringHashMap([]const u8).init(allocator),
@@ -1669,6 +1708,7 @@ const Manager = struct {
         manager.latest_versions.deinit();
         manager.removed_materialized_names.deinit();
         manager.direct_install_reports.deinit();
+        manager.trusted_additions.deinit();
         manager.explicit_adds.deinit();
         manager.peer_conflict_warnings.deinit();
         manager.script_queue.deinit();
@@ -1862,6 +1902,10 @@ const Manager = struct {
             .audit, .pm, .pm_list, .pm_info, .pm_whoami, .pm_why => unreachable,
         }
 
+        if (manager.trusted_additions.count() > 0 and !manager.options.no_save) {
+            try manager.persistTrustedAdditions(&root);
+        }
+
         if (security_resolution_output) |output_path| {
             try manager.writeSecurityResolution(output_path, null);
             return 0;
@@ -1882,6 +1926,15 @@ const Manager = struct {
                 command_package_json.*,
                 command_package_json_had_trailing_newline,
             );
+            if (manager.options.trust and command_package_json != &root) {
+                try writePackageJSON(
+                    manager.init_data.io,
+                    manager.allocator,
+                    package_json_path,
+                    root,
+                    had_trailing_newline,
+                );
+            }
         }
 
         if (!manager.options.dry_run and !manager.options.no_save) {
@@ -1970,6 +2023,12 @@ const Manager = struct {
                     elapsed_ms,
                 });
             }
+        }
+        if (!manager.options.silent and manager.blocked_scripts > 0) {
+            try manager.stdout.print("\nBlocked {d} postinstall{s}. Run `bun pm untrusted` for details.\n\n", .{
+                manager.blocked_scripts,
+                if (manager.blocked_scripts == 1) "" else "s",
+            });
         }
         try manager.stdout.flush();
         try manager.stderr.flush();
@@ -3874,13 +3933,20 @@ const Manager = struct {
             !isTarballSpec(resolution_spec) and
             !isLocalSpec(resolution_spec);
 
-        if (direct and !refresh_direct_registry) {
+        const inspect_direct_trust = manager.options.trust and manager.options.command == .add and direct;
+        if (direct and !refresh_direct_registry and !inspect_direct_trust) {
             const direct_key = if (explicit_global_link and !std.mem.eql(u8, parent_dir, manager.root_dir)) blk: {
                 const destination = try packageDestination(manager.allocator, parent_dir, alias);
                 break :blk try manager.lockKeyForDestination(destination);
             } else alias;
             for (manager.records.items) |record| {
-                if (std.mem.eql(u8, record.alias, alias) and std.mem.eql(u8, recordLogicalKey(record), direct_key)) return record.version;
+                if (std.mem.eql(u8, record.alias, alias) and std.mem.eql(u8, recordLogicalKey(record), direct_key)) {
+                    const newly_trusted = manager.manifest_policy.?.trusted_dependencies != null and
+                        manager.manifest_policy.?.isTrusted(alias, record.kind == .npm) and
+                        (manager.lock_graph == null or
+                            !Manifest.Policy.wasTrustedInLock(&manager.lock_graph.?.document, alias));
+                    if (!newly_trusted) return record.version;
+                }
             }
         }
 
@@ -4001,7 +4067,7 @@ const Manager = struct {
                 }
             }
             if (placement_kind != .root) {
-                try manager.queuePackageScripts(alias, local.version, destination, .local, optional, newly_installed);
+                try manager.queuePackageScripts(alias, local.name, local.version, destination, .local, direct, optional, newly_installed);
             }
             return local.version;
         }
@@ -4167,7 +4233,7 @@ const Manager = struct {
             try manager.installDependencyObject(@constCast(package_metadata), "optionalDependencies", destination, false, true);
         }
         try manager.installOrLinkPeerDependencies(package_metadata, destination, destination, parent_dir);
-        try manager.queuePackageScripts(resolved.name, resolved.version, destination, .npm, optional, !installed);
+        try manager.queuePackageScripts(alias, resolved.name, resolved.version, destination, .npm, direct, optional, !installed);
         return resolved.version;
     }
 
@@ -4387,7 +4453,7 @@ const Manager = struct {
                     }
                     try manager.installOrLinkPeerDependencies(info, selection.destination, selection.destination, parent_dir);
                 }
-                try manager.queuePackageScripts(package.name, package.version, selection.destination, .npm, optional, !installed);
+                try manager.queuePackageScripts(alias, package.name, package.version, selection.destination, .npm, direct, optional, !installed);
                 return package.version;
             },
             .workspace => {
@@ -4467,7 +4533,7 @@ const Manager = struct {
                 const source_context = try manager.pushIsolatedSourceContext(local.path, selection.destination);
                 defer manager.popIsolatedSourceContext(source_context) catch {};
                 try manager.installLockedDependencies(package, local.path, selection.destination, parent_dir);
-                try manager.queuePackageScripts(package.name, local.version, selection.destination, .local, optional, newly_installed);
+                try manager.queuePackageScripts(alias, local.name, local.version, selection.destination, .local, direct, optional, newly_installed);
                 return local.version;
             },
             .local_tarball, .remote_tarball => {
@@ -4525,7 +4591,7 @@ const Manager = struct {
                 });
                 try manager.rememberPackageMetadata(selection.destination, package.info orelse metadata);
                 try manager.installLockedDependencies(package, selection.destination, selection.destination, parent_dir);
-                try manager.queuePackageScripts(name, version_value, selection.destination, .local, optional, !installed);
+                try manager.queuePackageScripts(alias, name, version_value, selection.destination, .local, direct, optional, !installed);
                 return version_value;
             },
             .git, .github => {
@@ -5918,7 +5984,7 @@ const Manager = struct {
         if (manager.node_linker == .isolated) {
             try manager.linkPeerDependencies(metadata, final_destination, parent_dir);
         }
-        try manager.queuePackageScripts(alias, package_version, final_destination, .git, optional, !installed);
+        try manager.queuePackageScripts(alias, package_name, package_version, final_destination, .git, direct, optional, !installed);
         return .{
             .alias = alias,
             .name = package_name,
@@ -6183,7 +6249,7 @@ const Manager = struct {
             try manager.installDependencyObject(metadata, "optionalDependencies", destination, false, true);
         }
         try manager.installOrLinkPeerDependencies(metadata, destination, destination, parent_dir);
-        try manager.queuePackageScripts(package_name, package_version, destination, .local, optional, true);
+        try manager.queuePackageScripts(alias, package_name, package_version, destination, .local, direct, optional, true);
         return .{
             .alias = alias,
             .name = package_name,
@@ -7508,7 +7574,7 @@ const Manager = struct {
             }
             try manager.installOrLinkPeerDependencies(workspace.package_json, workspace.path, workspace.path, workspace.path);
             if (!manager.options.production) try manager.installDependencyObject(workspace.package_json, "devDependencies", workspace.path, false, false);
-            try manager.queuePackageScripts(workspace.name, workspace.version, workspace.path, .workspace, false, true);
+            try manager.queuePackageScripts(workspace.name, workspace.name, workspace.version, workspace.path, .workspace, true, false, true);
         }
     }
 
@@ -7535,32 +7601,78 @@ const Manager = struct {
 
     fn queuePackageScripts(
         manager: *Manager,
-        name: []const u8,
+        alias: []const u8,
+        package_name: []const u8,
         version_value: []const u8,
         package_dir: []const u8,
         kind: Scripts.PackageKind,
+        direct: bool,
         optional: bool,
         newly_installed: bool,
     ) !void {
         if (manager.options.ignore_scripts or manager.options.lockfile_only or manager.options.dry_run) return;
         const npm_package = kind == .npm;
-        if (!manager.manifest_policy.?.isTrusted(name, npm_package)) return;
+        const explicitly_trusted = manager.options.trust and
+            manager.options.command == .add and
+            (direct or manager.explicit_adds.contains(alias));
+        const trusted = kind == .workspace or
+            explicitly_trusted or
+            manager.manifest_policy.?.isTrusted(alias, npm_package);
+        if (!trusted) {
+            if (newly_installed) {
+                const manifest = manager.readInstalledPackageJSON(package_dir) catch return;
+                const scripts = Scripts.inspectLifecycleScripts(
+                    manager.init_data.io,
+                    manager.allocator,
+                    package_dir,
+                    manifest,
+                    kind,
+                ) catch return;
+                manager.blocked_scripts += scripts.total;
+            }
+            return;
+        }
 
-        if (!newly_installed) {
+        if (explicitly_trusted) {
+            const manifest = manager.readInstalledPackageJSON(package_dir) catch return;
+            const scripts = Scripts.inspectLifecycleScripts(
+                manager.init_data.io,
+                manager.allocator,
+                package_dir,
+                manifest,
+                kind,
+            ) catch return;
+            if (scripts.total == 0) return;
+            try manager.trusted_additions.put(try manager.allocator.dupe(u8, alias), {});
+        }
+
+        if (!newly_installed and !explicitly_trusted) {
             if (manager.manifest_policy.?.trusted_dependencies == null) return;
             const graph = if (manager.lock_graph) |*value| value else null;
             if (graph) |locked| {
-                if (Manifest.Policy.wasTrustedInLock(&locked.document, name)) return;
+                if (Manifest.Policy.wasTrustedInLock(&locked.document, alias)) return;
             }
         }
 
         try manager.script_queue.add(.{
-            .name = name,
+            .name = package_name,
             .version = version_value,
             .cwd = package_dir,
             .kind = kind,
             .optional = optional,
         });
+    }
+
+    fn persistTrustedAdditions(manager: *Manager, root: *Value) !void {
+        const additions = try manager.allocator.alloc([]const u8, manager.trusted_additions.count());
+        var iterator = manager.trusted_additions.keyIterator();
+        var index: usize = 0;
+        while (iterator.next()) |name| : (index += 1) additions[index] = name.*;
+        _ = try Manifest.mergeTrustedDependencies(manager.allocator, root, additions);
+
+        if (manager.manifest_policy) |*policy| policy.deinit();
+        manager.manifest_policy = try Manifest.Policy.init(manager.allocator, root);
+        manager.changed = true;
     }
 
     fn pathExists(manager: *Manager, path: []const u8) bool {

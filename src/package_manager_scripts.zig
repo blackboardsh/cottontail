@@ -10,6 +10,55 @@ pub const PackageKind = enum {
     git,
 };
 
+pub const lifecycle_stage_names = [_][]const u8{
+    "preinstall",
+    "install",
+    "postinstall",
+    "preprepare",
+    "prepare",
+    "postprepare",
+};
+
+pub const LifecycleScripts = struct {
+    commands: [lifecycle_stage_names.len]?[]const u8 = .{null} ** lifecycle_stage_names.len,
+    total: usize = 0,
+};
+
+pub fn inspectLifecycleScripts(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    package_dir: []const u8,
+    manifest: *const Value,
+    kind: PackageKind,
+) !LifecycleScripts {
+    var result: LifecycleScripts = .{};
+    const scripts = if (manifest.* == .object) manifest.object.get("scripts") else null;
+    if (scripts != null and scripts.? == .object) {
+        for (lifecycle_stage_names, 0..) |stage, index| {
+            const include = switch (index) {
+                0...2 => true,
+                3, 5 => kind == .git,
+                4 => kind == .git or kind == .workspace,
+                else => unreachable,
+            };
+            if (!include) continue;
+            const command = scripts.?.object.get(stage) orelse continue;
+            if (command != .string or command.string.len == 0) continue;
+            result.commands[index] = command.string;
+            result.total += 1;
+        }
+    }
+
+    if (result.commands[0] == null and result.commands[1] == null) {
+        const binding_gyp = try std.fs.path.join(allocator, &.{ package_dir, "binding.gyp" });
+        if (std.Io.Dir.cwd().access(io, binding_gyp, .{})) |_| {
+            result.commands[1] = "node-gyp rebuild";
+            result.total += 1;
+        } else |_| {}
+    }
+    return result;
+}
+
 pub const Task = struct {
     name: []const u8,
     version: []const u8,
@@ -222,19 +271,10 @@ fn runManifestScripts(
     manifest: *const Value,
     stderr: *std.Io.Writer,
 ) !void {
-    const scripts = if (manifest.* == .object) manifest.object.get("scripts") orelse return else return;
-    if (scripts != .object) return;
-
-    const install_stages = [_][]const u8{ "preinstall", "install", "postinstall" };
-    for (install_stages) |stage| try runStage(init, root_dir, task, &scripts, stage, stderr, .install);
-
-    switch (task.kind) {
-        .npm, .local => {},
-        .workspace => try runStage(init, root_dir, task, &scripts, "prepare", stderr, .install),
-        .git => {
-            const prepare_stages = [_][]const u8{ "preprepare", "prepare", "postprepare" };
-            for (prepare_stages) |stage| try runStage(init, root_dir, task, &scripts, stage, stderr, .install);
-        },
+    const scripts = try inspectLifecycleScripts(init.io, init.arena.allocator(), task.cwd, manifest, task.kind);
+    for (lifecycle_stage_names, scripts.commands) |stage, maybe_command| {
+        const command = maybe_command orelse continue;
+        try runStageCommand(init, root_dir, task, stage, command, stderr, .install);
     }
 }
 
@@ -252,12 +292,24 @@ fn runStage(
     const value = scripts.object.get(stage) orelse return;
     if (value != .string or value.string.len == 0) return;
 
+    try runStageCommand(init, root_dir, task, stage, value.string, stderr, diagnostic);
+}
+
+fn runStageCommand(
+    init: std.process.Init,
+    root_dir: []const u8,
+    task: Task,
+    stage: []const u8,
+    script: []const u8,
+    stderr: *std.Io.Writer,
+    diagnostic: StageDiagnostic,
+) !void {
     const allocator = init.arena.allocator();
     var environment = try init.environ_map.clone(allocator);
     defer environment.deinit();
-    try configureEnvironment(&environment, allocator, init.io, root_dir, task, stage, value.string);
+    try configureEnvironment(&environment, allocator, init.io, root_dir, task, stage, script);
 
-    const command = try replaceBunCommand(allocator, init.io, value.string);
+    const command = try replaceBunCommand(allocator, init.io, script);
     const shell_args: []const []const u8 = if (builtin.os.tag == .windows)
         &.{ "cmd.exe", "/d", "/s", "/c", command }
     else
@@ -361,4 +413,25 @@ test "lifecycle command replacement only changes the bun executable token" {
     const replaced = try replaceBunCommand(arena.allocator(), std.testing.io, "bun script.js");
     try std.testing.expect(std.mem.endsWith(u8, replaced, " script.js"));
     try std.testing.expect(!std.mem.eql(u8, replaced, "bun script.js"));
+}
+
+test "lifecycle inspection applies Bun's binding.gyp fallback" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "binding.gyp", .data = "{}" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const manifest = try std.json.parseFromSliceLeaky(Value, allocator,
+        \\{"scripts":{"postinstall":"node post.js","prepare":"node prepare.js"}}
+    , .{});
+    const package_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    const scripts = try inspectLifecycleScripts(io, allocator, package_dir, &manifest, .npm);
+
+    try std.testing.expectEqual(@as(usize, 2), scripts.total);
+    try std.testing.expectEqualStrings("node-gyp rebuild", scripts.commands[1].?);
+    try std.testing.expectEqualStrings("node post.js", scripts.commands[2].?);
+    try std.testing.expect(scripts.commands[4] == null);
 }

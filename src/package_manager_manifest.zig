@@ -70,7 +70,7 @@ pub const Policy = struct {
 
     pub fn isTrusted(policy: *const Policy, package_name: []const u8, npm_package: bool) bool {
         if (policy.trusted_dependencies) |trusted| return trusted.contains(package_name);
-        return !npm_package or isDefaultTrustedDependency(package_name);
+        return npm_package and isDefaultTrustedDependency(package_name);
     }
 
     pub fn patchPath(policy: *const Policy, package_name: []const u8, version: []const u8) ?[]const u8 {
@@ -302,11 +302,45 @@ fn isValidDependencyValue(value: []const u8) bool {
     return true;
 }
 
-fn isDefaultTrustedDependency(name: []const u8) bool {
-    const source = @embedFile("compiler/src/install/default-trusted-dependencies.txt");
-    var names = std.mem.tokenizeAny(u8, source, " \r\n\t");
+pub const default_trusted_dependencies_source = @embedFile("compiler/src/install/default-trusted-dependencies.txt");
+
+pub fn isDefaultTrustedDependency(name: []const u8) bool {
+    var names = std.mem.tokenizeAny(u8, default_trusted_dependencies_source, " \r\n\t");
     while (names.next()) |trusted| if (std.mem.eql(u8, trusted, name)) return true;
     return false;
+}
+
+pub fn mergeTrustedDependencies(
+    allocator: std.mem.Allocator,
+    document: *Value,
+    additions: []const []const u8,
+) ![][]const u8 {
+    if (document.* != .object) return error.InvalidPackageJSON;
+    var names = std.StringHashMap(void).init(allocator);
+    defer names.deinit();
+    if (document.object.get("trustedDependencies")) |trusted| {
+        if (trusted != .array) return error.InvalidTrustedDependencies;
+        for (trusted.array.items) |entry| {
+            if (entry != .string) return error.InvalidTrustedDependencies;
+            try names.put(entry.string, {});
+        }
+    }
+    for (additions) |name| try names.put(name, {});
+
+    const sorted = try allocator.alloc([]const u8, names.count());
+    var iterator = names.keyIterator();
+    var index: usize = 0;
+    while (iterator.next()) |name| : (index += 1) sorted[index] = name.*;
+    std.mem.sort([]const u8, sorted, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.order(u8, left, right) == .lt;
+        }
+    }.lessThan);
+
+    var array = std.json.Array.init(allocator);
+    for (sorted) |name| try array.append(.{ .string = name });
+    try document.object.put(allocator, "trustedDependencies", .{ .array = array });
+    return sorted;
 }
 
 fn sortedKeys(comptime V: type, allocator: std.mem.Allocator, map: *const std.StringHashMap(V)) ![][]const u8 {
@@ -373,4 +407,34 @@ test "manifest policy resolves catalogs and overrides" {
     try std.testing.expect(policy.isTrusted("foo", true));
     try std.testing.expect(!policy.isTrusted("bar", true));
     try std.testing.expectEqualStrings("patches/bar.patch", policy.patchPath("bar", "2.0.0").?);
+}
+
+test "default trust applies only to npm packages" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try std.json.parseFromSliceLeaky(Value, allocator, "{}", .{});
+    var policy = try Policy.init(allocator, &root);
+    defer policy.deinit();
+
+    try std.testing.expect(policy.isTrusted("esbuild", true));
+    try std.testing.expect(!policy.isTrusted("esbuild", false));
+    try std.testing.expect(!policy.isTrusted("not-default-trusted", true));
+}
+
+test "trusted dependency updates are a sorted union" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var root = try std.json.parseFromSliceLeaky(
+        Value,
+        allocator,
+        "{\"trustedDependencies\":[\"z-package\",\"a-package\"]}",
+        .{},
+    );
+    const names = try mergeTrustedDependencies(allocator, &root, &.{ "m-package", "a-package" });
+    try std.testing.expectEqual(@as(usize, 3), names.len);
+    try std.testing.expectEqualStrings("a-package", names[0]);
+    try std.testing.expectEqualStrings("m-package", names[1]);
+    try std.testing.expectEqualStrings("z-package", names[2]);
 }
