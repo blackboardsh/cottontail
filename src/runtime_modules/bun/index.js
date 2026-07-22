@@ -15882,7 +15882,10 @@ export function connect(options) {
         state.opened = true;
         resolve(socket);
       };
+      let transportOpened = false;
       const onTransportOpen = () => {
+        if (transportOpened) return;
+        transportOpened = true;
         settle();
         if (typeof attached.handlers.handshake === "function") callBunSocketOpen(attached);
         if (!normalized.unix) {
@@ -15896,6 +15899,7 @@ export function connect(options) {
           }
         }
       };
+      socket.once("connect", onTransportOpen);
       if (transport.connecting) transport.once("connect", onTransportOpen);
       else queueMicrotask(onTransportOpen);
       socket.once("secureConnect", () => {

@@ -722,6 +722,7 @@ export class TLSSocket extends Socket {
     this.ciphers = options.ciphers;
     this._tlsId = null;
     this._tlsInfo = null;
+    this._tlsTransportConnected = false;
     this._encoding = null;
     this._tlsListenerInstalled = false;
     this._tlsReadEndTimer = null;
@@ -770,6 +771,18 @@ export class TLSSocket extends Socket {
     this.connecting = true;
   }
 
+  _markTlsTransportConnected() {
+    if (this._tlsTransportConnected) return;
+    this._tlsTransportConnected = true;
+    this.connecting = false;
+    if (this.isServer) return;
+    this.emit("connect");
+    if (!this._readyEmitted) {
+      this._readyEmitted = true;
+      this.emit("ready");
+    }
+  }
+
   _attachNative(native, connectedEvent = "secureConnect") {
     this._tlsId = Number(native.id);
     this.fd = Number(native.fd ?? -1);
@@ -783,8 +796,8 @@ export class TLSSocket extends Socket {
     if (this._maxSendFragment != null) {
       try { cottontail.tlsConnectionSetMaxSendFragment?.(this._tlsId, this._maxSendFragment); } catch {}
     }
+    this._markTlsTransportConnected();
     if (native.pending === true) {
-      this.connecting = true;
       this.authorized = false;
       this._continueTlsHandshake(connectedEvent);
       return this;
@@ -809,7 +822,7 @@ export class TLSSocket extends Socket {
         this._refreshTimeout?.();
         this._tlsNativeWriteBlocked = false;
         this._tlsWriteBlocked = this._tlsTransportWriteBlocked;
-        if (this.connecting) this._driveMemoryHandshake(connectedEvent);
+        if (this.secureConnecting) this._driveMemoryHandshake(connectedEvent);
         else if (this._secureEventsEmitted) {
           this._drainMemoryPlaintext();
           this._flushMemoryCiphertext();
@@ -839,18 +852,19 @@ export class TLSSocket extends Socket {
     transport.on("drain", onDrain);
     if (this._handshakeTimeout > 0) {
       this._tlsHandshakeTimer = setTimeout(() => {
-        if (!this.connecting || this.destroyed) return;
+        if (!this.secureConnecting || this.destroyed) return;
         const error = tlsError("TLS handshake timed out", "ETIMEDOUT");
         this.destroy(error);
       }, this._handshakeTimeout);
       if (!this._refed) this._tlsHandshakeTimer.unref?.();
     }
+    this._markTlsTransportConnected();
     this._driveMemoryHandshake(connectedEvent);
     return this;
   }
 
   _driveMemoryHandshake(connectedEvent) {
-    if (this.destroyed || this._tlsId == null || !this.connecting) return;
+    if (this.destroyed || this._tlsId == null || !this.secureConnecting) return;
     try {
       const complete = cottontail.tlsClientHandshake(this._tlsId) === true;
       this._flushMemoryCiphertext();
@@ -908,7 +922,7 @@ export class TLSSocket extends Socket {
   }
 
   _drainMemoryPlaintext() {
-    if (this._tlsId == null || this._memoryTransport == null || this.connecting) return;
+    if (this._tlsId == null || this._memoryTransport == null || this.secureConnecting) return;
     const result = cottontail.tlsConnectionReadMemory(this._tlsId);
     if (result?.secure) this._handleRenegotiationSecure();
     if (this.destroyed) return;
@@ -933,12 +947,12 @@ export class TLSSocket extends Socket {
 
   _endMemoryTransport(receivedCloseNotify = false) {
     if (this._memoryTransportEnded || this.destroyed) return;
-    if (!this.connecting && !this._secureEventsEmitted) {
+    if (!this.secureConnecting && !this._secureEventsEmitted) {
       this._memoryTransportEndPending = Boolean(receivedCloseNotify || this._memoryTransportEndPending);
       return;
     }
     this._memoryTransportEnded = true;
-    if (this.connecting) {
+    if (this.secureConnecting) {
       this.destroy(tlsError("Client network socket disconnected before secure TLS connection was established", "ECONNRESET"));
       return;
     }
@@ -1001,11 +1015,7 @@ export class TLSSocket extends Socket {
         this._ocspResponseEmitted = true;
         this.emit("OCSPResponse", bufferFromNativeBytes(info.ocspResponse) ?? null);
       }
-      if (!this.isServer) {
-        this.emit("connect");
-        this._readyEmitted = true;
-        this.emit("ready");
-      }
+      this._markTlsTransportConnected();
       if (this.isServer) this.server?._onTlsSecure?.(this);
       this.emit("secure", this);
       if (!this.isServer) this.emit(connectedEvent);
@@ -1247,7 +1257,7 @@ export class TLSSocket extends Socket {
   }
 
   _flushTlsPendingWrites() {
-    if (this.destroyed || this.connecting || this._tlsId == null) return false;
+    if (this.destroyed || this.secureConnecting || this._tlsId == null) return false;
     while (this._pendingWrites.length > 0) {
       const entry = this._pendingWrites[0];
       const offset = entry.offset ?? 0;
@@ -1337,7 +1347,7 @@ export class TLSSocket extends Socket {
   }
 
   _finishTlsWritable() {
-    if (!this._ending || this.connecting || this._pendingWrites.length > 0 || this._finishEmitted) return;
+    if (!this._ending || this.secureConnecting || this._pendingWrites.length > 0 || this._finishEmitted) return;
     if (this._tlsId != null && !this._tlsShutdownSent) {
       this._tlsShutdownSent = true;
       try {
@@ -1371,7 +1381,7 @@ export class TLSSocket extends Socket {
       });
       return false;
     }
-    if (this.destroyed || (!this.connecting && this._tlsId == null)) {
+    if (this.destroyed || (!this.secureConnecting && this._tlsId == null)) {
       const error = tlsError("TLS socket is closed", "ERR_SOCKET_CLOSED");
       queueMicrotask(() => callback?.(error));
       return false;
@@ -1381,7 +1391,7 @@ export class TLSSocket extends Socket {
     this._pendingWrites.push({ bytes, callback, offset: 0 });
     const overHighWaterMark = this.writableLength >= this.writableHighWaterMark;
     if (overHighWaterMark) this.writableNeedDrain = true;
-    const flushed = this.connecting ? true : this._flushTlsPendingWrites();
+    const flushed = this.secureConnecting ? true : this._flushTlsPendingWrites();
     return flushed && !overHighWaterMark;
   }
 
@@ -2018,7 +2028,7 @@ export function connect(...args) {
     socket._parent = parentSocket;
   }
   const onParentClose = () => {
-    if (socket.connecting && !socket.destroyed) fail(tlsError("Client network socket disconnected before secure TLS connection was established", "ECONNRESET"));
+    if (socket.secureConnecting && !socket.destroyed) fail(tlsError("Client network socket disconnected before secure TLS connection was established", "ECONNRESET"));
   };
   parentSocket.once("error", fail);
   parentSocket.once("close", onParentClose);
