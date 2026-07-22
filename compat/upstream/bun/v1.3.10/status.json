@@ -2840,6 +2840,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (20 bun:test cases, 55 assertions)."
     },
+    "test/js/node/fs/fs-oom.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream OOM coverage passes directly under Cottontail on macOS (7 bun:test cases, 7 assertions); Linux additionally exercises native memfd-backed large regular files."
+    },
     "test/js/node/fs/fs-promises-writeFile-async-iterator.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 6 assertions)."
@@ -2853,9 +2857,9 @@
       "reason": "Copied upstream file passes directly under Cottontail (26 bun:test cases, 41 assertions)."
     },
     "test/js/node/fs/fs.test.ts": {
-      "status": "expected-failure",
+      "status": "enabled",
       "timeoutMs": 120000,
-      "reason": "Cottontail passes 224 of 235 active cases (plus 5 upstream skips). The remaining 11 are cross-subsystem blockers: six FileHandle cases receive the test loader's deleted .cottontail-compat __filename instead of the source path, four child eval cases require Node/Bun's implicit fs and assert globals, and one encoding case is blocked by Buffer.from(string, 'hex') accepting invalid pairs. Focused stable-path FileHandle, recursive promise readdir, platform errno, and strict fs hex-write behavior pass."
+      "reason": "Copied upstream filesystem corpus passes all 235 active cases with 5 upstream skips and 5,341 harness assertions, including FileHandle lifecycle, recursive readdir stress, streams, validation, and child-process path behavior."
     },
     "test/js/node/harness.test.js": {
       "status": "enabled",
