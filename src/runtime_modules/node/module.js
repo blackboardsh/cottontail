@@ -233,6 +233,26 @@ const runtimePluginResolvedModules = new Map();
 const runtimePluginPendingLoads = new Map();
 const runtimePluginNamespacePattern = /^[/@A-Za-z0-9_-]+$/;
 
+const hotReloadHooks = globalThis.__cottontailHotReloadHooks ?? new Set();
+if (globalThis.__cottontailHotReloadHooks == null) {
+  Object.defineProperty(globalThis, "__cottontailHotReloadHooks", { value: hotReloadHooks, configurable: true });
+}
+hotReloadHooks.add(() => {
+  commonJsCache.clear();
+  builtinModuleMap.clear();
+  builtinNamespaceEntries.clear();
+  for (const key of Object.keys(modulePathCache)) delete modulePathCache[key];
+  moduleHooks.length = 0;
+  hookResolvedFormats.clear();
+  sourceMapCache.clear();
+  runtimePluginOnResolve.length = 0;
+  runtimePluginOnLoad.length = 0;
+  runtimePluginVirtualModules.clear();
+  runtimePluginResolvedModules.clear();
+  runtimePluginPendingLoads.clear();
+  mainModule = null;
+});
+
 function runtimePluginFilterMatches(filter, path) {
   filter.lastIndex = 0;
   const matched = filter.test(path);

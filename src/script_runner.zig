@@ -52,6 +52,19 @@ const WindowsMemoryBasicInformation = extern struct {
     kind: u32,
 };
 
+const ReloadMode = enum {
+    none,
+    hot,
+    watch,
+};
+
+const ReloadExecution = struct {
+    ctx: Context,
+    entrypoint_path: []const u8,
+    mode: ReloadMode,
+    clear_screen: bool,
+};
+
 const ScriptExecution = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -64,6 +77,7 @@ const ScriptExecution = struct {
     embedded_source_map: ?[]const u8 = null,
     embedded_files: ?[]const u8 = null,
     exit_cleanup_path: ?[:0]const u8 = null,
+    reload: ?ReloadExecution = null,
     exit_code: u8 = 1,
 };
 
@@ -217,6 +231,24 @@ pub fn runWithExecArgv(
     return runWithExecArgvDisplay(init, script_path, null, script_args, exec_args);
 }
 
+fn reloadMode(exec_args: []const [:0]const u8) ReloadMode {
+    var mode: ReloadMode = .none;
+    for (exec_args) |arg_z| {
+        const arg: []const u8 = arg_z;
+        if (std.mem.eql(u8, arg, "--hot")) return .hot;
+        if (std.mem.eql(u8, arg, "--watch")) mode = .watch;
+    }
+    return mode;
+}
+
+fn reloadShouldClearScreen(exec_args: []const [:0]const u8) bool {
+    for (exec_args) |arg_z| {
+        const arg: []const u8 = arg_z;
+        if (std.mem.eql(u8, arg, "--no-clear-screen")) return false;
+    }
+    return true;
+}
+
 pub fn bunEntrypointFallbackExtensions(path: []const u8) []const []const u8 {
     const extension = std.fs.path.extension(path);
     if (std.mem.eql(u8, extension, ".mjs")) return &.{".mts"};
@@ -255,7 +287,28 @@ pub fn runWithExecArgvDisplay(
 
     if (try rejectInvalidBunCjsPragma(&ctx, entrypoint_path)) return 1;
 
-    var runnable = bundleScriptNative(&ctx, entrypoint_path, exec_args, script_args, null, null, null, false) catch |err| {
+    const process_args = try allocator.alloc([:0]const u8, script_args.len + 1);
+    const canonical_script_path = resolvePathForCwd(ctx.io, allocator, script_path) catch
+        try absolutePathForCwd(ctx.io, allocator, script_path);
+    process_args[0] = display_path orelse try allocator.dupeZ(u8, canonical_script_path);
+    for (script_args, 0..) |arg, index| {
+        process_args[index + 1] = arg;
+    }
+
+    const reload_mode = reloadMode(exec_args);
+    if (reload_mode != .none) {
+        return try runReloadPrepared(
+            init,
+            &ctx,
+            entrypoint_path,
+            process_args,
+            exec_args,
+            reload_mode,
+            reloadShouldClearScreen(exec_args),
+        );
+    }
+
+    var runnable = bundleScriptNative(&ctx, entrypoint_path, exec_args, script_args, null, null, null, false, null) catch |err| {
         if (err == error.TestBundleFailed) return 1;
         if (err == error.SyntaxError) {
             ctx.writeStderr("error: Syntax Error\n", .{});
@@ -266,13 +319,6 @@ pub fn runWithExecArgvDisplay(
     defer runnable.deinit(&ctx);
 
     const runnable_path_z = try allocator.dupeZ(u8, runnable.path);
-    const process_args = try allocator.alloc([:0]const u8, script_args.len + 1);
-    const canonical_script_path = resolvePathForCwd(ctx.io, allocator, script_path) catch
-        try absolutePathForCwd(ctx.io, allocator, script_path);
-    process_args[0] = display_path orelse try allocator.dupeZ(u8, canonical_script_path);
-    for (script_args, 0..) |arg, index| {
-        process_args[index + 1] = arg;
-    }
 
     return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null, null);
 }
@@ -1095,7 +1141,7 @@ pub fn runEval(
     const eval_entry = try writeEvalEntrypoint(&ctx, ctx.project_root, executable_source, print_result, module_input, "[eval]", true, .omit_entrypoint);
     defer std.Io.Dir.cwd().deleteFile(ctx.io, eval_entry.entry_path) catch {};
     defer if (eval_entry.source_path) |path| std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
-    var runnable = try bundleScriptNative(&ctx, eval_entry.entry_path, exec_args, script_args, ctx.project_root, null, null, false);
+    var runnable = try bundleScriptNative(&ctx, eval_entry.entry_path, exec_args, script_args, ctx.project_root, null, null, false, null);
     defer runnable.deinit(&ctx);
     canonicalizeEvalSourceMap(&ctx, runnable.path, eval_entry.source_path orelse eval_entry.entry_path) catch |err| switch (err) {
         error.EvalSourceMissingFromSourceMap => {},
@@ -1520,6 +1566,7 @@ pub fn compileStandaloneSource(
         standalone_options,
         &graph,
         true,
+        null,
     );
     defer runnable.deinit(&ctx);
     defer graph.deinit();
@@ -1732,7 +1779,7 @@ pub fn runStdin(
     const stdin_entry = try writeEvalEntrypoint(&ctx, ctx.project_root, source_z, false, module_input, "[stdin]", true, .stdin);
     defer std.Io.Dir.cwd().deleteFile(ctx.io, stdin_entry.entry_path) catch {};
     defer if (stdin_entry.source_path) |path| std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
-    var runnable = try bundleScriptNative(&ctx, stdin_entry.entry_path, exec_args, script_args, ctx.project_root, null, null, false);
+    var runnable = try bundleScriptNative(&ctx, stdin_entry.entry_path, exec_args, script_args, ctx.project_root, null, null, false, null);
     defer runnable.deinit(&ctx);
     canonicalizeVirtualSourceMap(&ctx, runnable.path, stdin_entry.source_path orelse stdin_entry.entry_path, "[stdin]") catch |err| switch (err) {
         error.EvalSourceMissingFromSourceMap => {},
@@ -1993,12 +2040,81 @@ fn runPrepared(
         else
             null,
     };
+    return try runExecutionThread(ctx, &execution);
+}
+
+fn configureRuntimeInspector(execution: *const ScriptExecution, js_runtime: *runtime.Runtime) bool {
+    const inspector = execution.inspector orelse return true;
+    const inspector_url = js_runtime.startInspector(inspector.options) catch {
+        writeStderr(execution.io, "cottontail: failed to start inspector\n", .{});
+        return false;
+    };
+    defer js_runtime.allocator.free(inspector_url);
+
+    if (!inspector.automatic) {
+        const browser_target = if (std.mem.startsWith(u8, inspector_url, "ws://"))
+            inspector_url["ws://".len..]
+        else
+            inspector_url;
+        writeStderr(
+            execution.io,
+            "--------------------- Bun Inspector ---------------------\nListening:\n  {s}\nInspect in browser:\n  https://debug.bun.sh/#{s}\n--------------------- Bun Inspector ---------------------\n",
+            .{ inspector_url, browser_target },
+        );
+    }
+    if (inspector.wait_for_connection) {
+        js_runtime.waitForInspector() catch {
+            writeStderr(execution.io, "cottontail: inspector stopped before a debugger connected\n", .{});
+            return false;
+        };
+    }
+    return true;
+}
+
+fn runReloadPrepared(
+    init: std.process.Init,
+    ctx: *const Context,
+    entrypoint_path: []const u8,
+    process_args: []const [:0]const u8,
+    exec_args: []const [:0]const u8,
+    mode: ReloadMode,
+    clear_screen: bool,
+) !u8 {
+    const allocator = init.arena.allocator();
+    if (!applyRuntimeEnvFlags(init.io, allocator, exec_args)) return 1;
+    const inspector = inspectorLaunchFromArgs(ctx, exec_args) catch |err| {
+        ctx.writeStderr("cottontail: invalid inspector endpoint: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    icu_bootstrap.ensure(init) catch |err| {
+        ctx.writeStderr("cottontail: failed to initialize ICU: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    var execution = ScriptExecution{
+        .io = init.io,
+        .allocator = allocator,
+        .runnable_path = "",
+        .process_args = process_args,
+        .process_user_arg_offset = 1,
+        .exec_args = exec_args,
+        .inspector = inspector,
+        .reload = .{
+            .ctx = ctx.*,
+            .entrypoint_path = entrypoint_path,
+            .mode = mode,
+            .clear_screen = clear_screen,
+        },
+    };
+    return try runExecutionThread(ctx, &execution);
+}
+
+fn runExecutionThread(ctx: *const Context, execution: *ScriptExecution) !u8 {
     const main_thread_status: ?u8 = if (builtin.os.tag == .windows) blk: {
         // Zig's Windows Thread.spawn passes stack_size to NtCreateThreadEx as
         // committed memory. A fully committed 128 MiB stack has no reserved
         // region or guard page for WebKit's Windows StackBounds discovery.
         // Reserve the large limit while retaining normal incremental commits.
-        const thread = try WindowsScriptThread.start(&execution);
+        const thread = try WindowsScriptThread.start(execution);
         defer thread.deinit();
         const status = if (shouldRunElectrobunMainThread(ctx))
             runElectrobunMainThread(ctx) catch |err| status: {
@@ -2013,7 +2129,7 @@ fn runPrepared(
         const thread = try std.Thread.spawn(
             .{ .stack_size = script_thread_stack_size },
             runScriptExecution,
-            .{&execution},
+            .{execution},
         );
         const status = if (shouldRunElectrobunMainThread(ctx))
             runElectrobunMainThread(ctx) catch |err| status: {
@@ -2115,7 +2231,203 @@ fn runElectrobunMainThread(ctx: *const Context) !u8 {
     return 0;
 }
 
+const ReloadDependencies = struct {
+    paths: []const [:0]const u8 = &.{},
+
+    fn init(entrypoint_path: []const u8) !ReloadDependencies {
+        var result: ReloadDependencies = .{};
+        const initial = [_][]const u8{entrypoint_path};
+        try result.replace(initial[0..]);
+        return result;
+    }
+
+    fn replace(self: *ReloadDependencies, paths: anytype) !void {
+        const next = try std.heap.c_allocator.alloc([:0]const u8, paths.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (next[0..initialized]) |path| std.heap.c_allocator.free(path);
+            if (next.len > 0) std.heap.c_allocator.free(next);
+        }
+        for (paths, 0..) |path, index| {
+            next[index] = try std.heap.c_allocator.dupeZ(u8, path);
+            initialized += 1;
+        }
+        self.deinit();
+        self.paths = next;
+    }
+
+    fn deinit(self: *ReloadDependencies) void {
+        for (self.paths) |path| std.heap.c_allocator.free(path);
+        if (self.paths.len > 0) std.heap.c_allocator.free(self.paths);
+        self.paths = &.{};
+    }
+};
+
+const ReloadGenerationResult = union(enum) {
+    reload,
+    exit: u8,
+};
+
+fn initReloadRuntime(execution: *ScriptExecution) !runtime.Runtime {
+    var js_runtime = try runtime.Runtime.initWithStackSize(
+        execution.io,
+        std.heap.c_allocator,
+        script_js_stack_size,
+    );
+    errdefer js_runtime.deinit();
+    try js_runtime.setProcessArgs(
+        execution.process_args,
+        execution.process_user_arg_offset,
+        execution.exec_args,
+    );
+    if (!configureRuntimeInspector(execution, &js_runtime)) return error.InspectorSetupFailed;
+    return js_runtime;
+}
+
+fn ensureHotRuntime(
+    execution: *ScriptExecution,
+    hot_runtime: *?runtime.Runtime,
+) !*runtime.Runtime {
+    if (hot_runtime.* == null) hot_runtime.* = try initReloadRuntime(execution);
+    return if (hot_runtime.*) |*js_runtime| js_runtime else unreachable;
+}
+
+fn waitForReloadAfterBuildFailure(
+    js_runtime: *runtime.Runtime,
+    dependencies: *const ReloadDependencies,
+) !ReloadGenerationResult {
+    try js_runtime.setWatchPaths(dependencies.paths);
+    try js_runtime.waitForReload();
+    return .reload;
+}
+
+fn runReloadGeneration(
+    execution: *ScriptExecution,
+    reload: *ReloadExecution,
+    generation_ctx: *const Context,
+    dependencies: *ReloadDependencies,
+    hot_runtime: *?runtime.Runtime,
+) !ReloadGenerationResult {
+    var watch_runtime: ?runtime.Runtime = null;
+    defer if (watch_runtime) |*js_runtime| js_runtime.deinit();
+
+    const js_runtime: *runtime.Runtime = if (reload.mode == .hot)
+        try ensureHotRuntime(execution, hot_runtime)
+    else blk: {
+        watch_runtime = try initReloadRuntime(execution);
+        break :blk if (watch_runtime) |*value| value else unreachable;
+    };
+
+    const empty_paths: [0][:0]const u8 = .{};
+    try js_runtime.setWatchPaths(empty_paths[0..]);
+
+    var generated_dependencies: []const [:0]const u8 = &.{};
+    var runnable = bundleScriptNative(
+        generation_ctx,
+        reload.entrypoint_path,
+        execution.exec_args,
+        execution.process_args[execution.process_user_arg_offset..],
+        null,
+        null,
+        null,
+        false,
+        &generated_dependencies,
+    ) catch |err| {
+        if (err != error.ReloadBundleFailed and err != error.TestBundleFailed) {
+            generation_ctx.writeStderr("cottontail: reload build failed: {s}\n", .{@errorName(err)});
+        }
+        return try waitForReloadAfterBuildFailure(js_runtime, dependencies);
+    };
+    defer runnable.deinit(generation_ctx);
+    const runnable_path_z = try generation_ctx.allocator.dupeZ(u8, runnable.path);
+
+    const source_map_path = try std.mem.concat(
+        generation_ctx.allocator,
+        u8,
+        &.{ runnable.path, ".map" },
+    );
+    if (std.Io.Dir.cwd().access(execution.io, source_map_path, .{})) {
+        try js_runtime.setExternalSourceMap(source_map_path, runnable.path);
+    } else |_| {}
+
+    if (runnableDirectoryForCleanup(generation_ctx, runnable.path)) |directory| {
+        try js_runtime.setExitCleanupPath(try generation_ctx.allocator.dupeZ(u8, directory));
+    }
+    try dependencies.replace(generated_dependencies);
+    try js_runtime.setWatchPaths(dependencies.paths);
+
+    return switch (js_runtime.runReloadableFile(runnable_path_z)) {
+        .reload => result: {
+            if (reload.mode == .hot) try js_runtime.prepareHotReload();
+            break :result .reload;
+        },
+        .failed => result: {
+            try js_runtime.prepareHotReload();
+            try js_runtime.waitForReload();
+            break :result .reload;
+        },
+        .exited => |code| .{ .exit = code },
+    };
+}
+
+fn clearReloadScreen(execution: *const ScriptExecution, reload: *const ReloadExecution) void {
+    if (!reload.clear_screen or !(std.Io.File.stdout().isTty(execution.io) catch false)) return;
+    var buffer: [64]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(execution.io, &buffer);
+    writer.interface.writeAll("\x1b[2J\x1b[H") catch {};
+    writer.interface.flush() catch {};
+}
+
+fn runReloadExecution(execution: *ScriptExecution, reload: *ReloadExecution) void {
+    var dependencies = ReloadDependencies.init(reload.entrypoint_path) catch {
+        writeStderr(execution.io, "cottontail: failed to initialize reload dependencies\n", .{});
+        execution.exit_code = 1;
+        return;
+    };
+    defer dependencies.deinit();
+
+    var hot_runtime: ?runtime.Runtime = null;
+    defer if (hot_runtime) |*js_runtime| js_runtime.deinit();
+
+    var generation: usize = 0;
+    while (true) : (generation += 1) {
+        if (generation > 0) {
+            std.Io.sleep(execution.io, .fromMilliseconds(25), .awake) catch {};
+            clearReloadScreen(execution, reload);
+        }
+
+        const result: ReloadGenerationResult = generation_result: {
+            var generation_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer generation_arena.deinit();
+            var generation_ctx = reload.ctx;
+            generation_ctx.allocator = generation_arena.allocator();
+            break :generation_result runReloadGeneration(
+                execution,
+                reload,
+                &generation_ctx,
+                &dependencies,
+                &hot_runtime,
+            ) catch |err| {
+                writeStderr(execution.io, "cottontail: reload failed: {s}\n", .{@errorName(err)});
+                execution.exit_code = 1;
+                return;
+            };
+        };
+        switch (result) {
+            .reload => continue,
+            .exit => |code| {
+                execution.exit_code = code;
+                return;
+            },
+        }
+    }
+}
+
 fn runScriptExecution(execution: *ScriptExecution) void {
+    if (execution.reload) |*reload| {
+        runReloadExecution(execution, reload);
+        return;
+    }
     const profiler_options = parseCpuProfileOptions(execution.exec_args);
     const heap_profile_options = parseHeapProfileOptions(execution.exec_args);
     writeHeapProfileWarnings(execution.io, heap_profile_options);
@@ -2148,30 +2460,9 @@ fn runScriptExecution(execution: *ScriptExecution) void {
         return;
     };
 
-    if (execution.inspector) |inspector| {
-        const inspector_url = js_runtime.startInspector(inspector.options) catch {
-            writeStderr(execution.io, "cottontail: failed to start inspector\n", .{});
-            execution.exit_code = 1;
-            return;
-        };
-        if (!inspector.automatic) {
-            const browser_target = if (std.mem.startsWith(u8, inspector_url, "ws://"))
-                inspector_url["ws://".len..]
-            else
-                inspector_url;
-            writeStderr(
-                execution.io,
-                "--------------------- Bun Inspector ---------------------\nListening:\n  {s}\nInspect in browser:\n  https://debug.bun.sh/#{s}\n--------------------- Bun Inspector ---------------------\n",
-                .{ inspector_url, browser_target },
-            );
-        }
-        if (inspector.wait_for_connection) {
-            js_runtime.waitForInspector() catch {
-                writeStderr(execution.io, "cottontail: inspector stopped before a debugger connected\n", .{});
-                execution.exit_code = 1;
-                return;
-            };
-        }
+    if (!configureRuntimeInspector(execution, &js_runtime)) {
+        execution.exit_code = 1;
+        return;
     }
 
     // Cached runtime artifacts keep their external map beside the immutable
@@ -3063,6 +3354,7 @@ fn nativeBundleFailure(
     script_entry_abs: []const u8,
     tmp_dir: []const u8,
     runtime_execution: bool,
+    recoverable: bool,
     error_message: ?[*:0]u8,
     err: anyerror,
 ) anyerror {
@@ -3094,6 +3386,7 @@ fn nativeBundleFailure(
         // adding a Zig error-return trace to an ordinary JavaScript failure.
         cleanupGeneratedSource(ctx, script_entry_abs, script_abs);
         std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
+        if (recoverable) return error.ReloadBundleFailed;
         std.process.exit(1);
     }
     ctx.writeStderr("cottontail: native bundle failed: {s}\n", .{@errorName(err)});
@@ -3186,7 +3479,9 @@ fn bundleScriptNative(
     build_options: ?native_bundler.BundleOptions,
     graph_out: ?*native_bundler.BundleGraphOutput,
     standalone_compile: bool,
+    reload_dependencies_out: ?*[]const [:0]const u8,
 ) !RuntimeArtifact {
+    if (reload_dependencies_out) |dependencies| dependencies.* = &.{};
     const tmp_dir = try ensureTempDir(ctx);
     errdefer std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
 
@@ -3222,7 +3517,8 @@ fn bundleScriptNative(
     const preload_imports = try std.mem.concat(ctx.allocator, u8, &.{ bunfig_preload_imports, cli_preload_imports, test_preload_imports });
     const is_common_js_entrypoint = !is_wasm_entrypoint and try shouldBundleCommonJsEntrypoint(ctx, script_abs);
     if (is_common_js_entrypoint) try validateCommonJsTestSyntax(ctx, script_abs);
-    const runtime_bootstrap_mode: RuntimeBootstrapMode = if ((build_options == null or standalone_compile) and
+    const runtime_bootstrap_mode: RuntimeBootstrapMode = if (reload_dependencies_out == null and
+        (build_options == null or standalone_compile) and
         preload_imports.len == 0 and
         !is_wasm_entrypoint)
         try entrypointRuntimeBootstrapMode(ctx, script_entry_abs)
@@ -3239,6 +3535,7 @@ fn bundleScriptNative(
     const plain_launcher_cacheable = preload_imports.len == 0 and
         build_options == null and
         !has_custom_conditions and
+        reload_dependencies_out == null and
         features.items.len == 0 and
         tsconfig_override == null and
         !package_json_patch.active and
@@ -3250,7 +3547,7 @@ fn bundleScriptNative(
     // graph edge whenever build options are present so its source and
     // transitive dependencies are embedded in the generated bundle.
     const bundle_common_js_entrypoint = is_common_js_entrypoint and
-        (has_custom_conditions or build_options != null or use_selective_runtime);
+        (has_custom_conditions or build_options != null or use_selective_runtime or reload_dependencies_out != null);
     const use_esm_bundle_cache = !is_wasm_entrypoint and
         !is_common_js_entrypoint and
         plain_launcher_cacheable;
@@ -3380,6 +3677,7 @@ fn bundleScriptNative(
             script_entry_abs,
             tmp_dir,
             build_options == null,
+            reload_dependencies_out != null,
             error_message,
             err,
         );
@@ -3404,10 +3702,20 @@ fn bundleScriptNative(
         script_entry_abs,
         tmp_dir,
         build_options == null,
+        reload_dependencies_out != null,
         error_message,
         err,
     );
     defer output.deinit();
+    if (reload_dependencies_out) |dependencies| {
+        dependencies.* = try collectReloadDependencyPaths(
+            ctx,
+            wrapped_entry,
+            script_entry_abs,
+            script_abs,
+            output.input_files,
+        );
+    }
     const entry = output.entryPoint() orelse return error.MissingRuntimeEntryPoint;
     const output_source_map: ?[]const u8 = if (entry.source_map) |source_map| source_map.contents else null;
     const native_addons: RuntimeNativeAddons = if (build_options == null)
@@ -3952,6 +4260,40 @@ fn collectLauncherCacheDependencies(
         }
     }
     return try dependencies.toOwnedSlice(ctx.allocator);
+}
+
+fn pathHasNodeModulesComponent(path: []const u8) bool {
+    var components = std.mem.tokenizeAny(u8, path, "/\\");
+    while (components.next()) |component| {
+        if (builtin.os.tag == .windows) {
+            if (std.ascii.eqlIgnoreCase(component, "node_modules")) return true;
+        } else if (std.mem.eql(u8, component, "node_modules")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn collectReloadDependencyPaths(
+    ctx: *const Context,
+    wrapped_entry: []const u8,
+    generated_entry: []const u8,
+    original_entry: []const u8,
+    input_files: []const native_bundler.GraphInputFile,
+) ![]const [:0]const u8 {
+    const dependencies = try collectLauncherCacheDependencies(
+        ctx,
+        wrapped_entry,
+        generated_entry,
+        original_entry,
+        input_files,
+    );
+    var paths: std.ArrayList([:0]const u8) = .empty;
+    for (dependencies) |dependency| {
+        if (dependency.kind == .directory or pathHasNodeModulesComponent(dependency.path)) continue;
+        try paths.append(ctx.allocator, try ctx.allocator.dupeZ(u8, dependency.path));
+    }
+    return try paths.toOwnedSlice(ctx.allocator);
 }
 
 fn launcherCacheDependencyLessThan(

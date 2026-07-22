@@ -9,6 +9,22 @@ import {
 
 const g = globalThis;
 const processStartMs = Date.now();
+const hotReloadHooks = g.__cottontailHotReloadHooks ?? new Set();
+if (g.__cottontailHotReloadHooks == null) {
+  Object.defineProperty(g, "__cottontailHotReloadHooks", { value: hotReloadHooks, configurable: true });
+}
+Object.defineProperty(g, "__cottontailPrepareHotReload", { configurable: true, value: () => {
+  const hooks = [...hotReloadHooks];
+  hotReloadHooks.clear();
+  for (const hook of hooks) {
+    try { hook(); } catch (error) { console.error(error); }
+  }
+  g.process?.__cottontailListeners?.clear?.();
+  if (g.process) g.process.exitCode = 0;
+  g.__ctUnhandledRejection = undefined;
+  g.__ctError = undefined;
+  g.__ctErrorSet = false;
+} });
 
 // Install disposal symbols before ANY other module evaluates: several modules
 // (events.js, the vendored readable-stream primordials, node/http.js) capture
@@ -2269,6 +2285,21 @@ g.__cottontailRunLoopTick = () => {
   cottontail.drainJobs?.();
   return nextRunLoopDelay(timerNow());
 };
+
+hotReloadHooks.add(() => {
+  for (const timer of timers.values()) {
+    timer.destroyed = true;
+    if (timer.handle) timer.handle._entry = timer;
+  }
+  timers.clear();
+  cancelledTimers.clear();
+  spawnEventListeners.clear();
+  workerMessageListeners.clear();
+  for (const worker of [...workerInstances.values()]) {
+    try { worker.terminate(); } catch {}
+  }
+  workerInstances.clear();
+});
 
 function normalizeWorkerScriptPath(scriptPath) {
   const text = String(scriptPath);

@@ -1954,18 +1954,31 @@ export const _events = processObject._events;
 export const _eventsCount = processObject._eventsCount;
 export const _maxListeners = processObject._maxListeners;
 export let _exiting = processObject._exiting;
-export let exitCode = normalizeExitCode(processObject.exitCode);
+const exitCodeStateKey = Symbol.for("cottontail.process.exitCodeState");
+const exitCodeState = processObject[exitCodeStateKey] ?? {
+  value: normalizeExitCode(processObject.exitCode),
+  updateBinding: null,
+};
+if (processObject[exitCodeStateKey] == null) {
+  Object.defineProperty(processObject, exitCodeStateKey, { value: exitCodeState });
+}
+export let exitCode = exitCodeState.value;
+exitCodeState.updateBinding = value => { exitCode = value; };
 export let sourceMapsEnabled = sourceMapsState;
 export const allowedNodeEnvironmentFlags = new ImmutableSet([]);
 processObject.allowedNodeEnvironmentFlags = allowedNodeEnvironmentFlags;
-Object.defineProperty(processObject, "exitCode", {
-  get() { return exitCode; },
-  set(value) {
-    exitCode = normalizeExitCode(value);
-  },
-  enumerable: true,
-  configurable: false,
-});
+const exitCodeDescriptor = Object.getOwnPropertyDescriptor(processObject, "exitCode");
+if (exitCodeDescriptor == null || exitCodeDescriptor.configurable) {
+  Object.defineProperty(processObject, "exitCode", {
+    get() { return exitCodeState.value; },
+    set(value) {
+      exitCodeState.value = normalizeExitCode(value);
+      exitCodeState.updateBinding?.(exitCodeState.value);
+    },
+    enumerable: true,
+    configurable: false,
+  });
+}
 Object.defineProperty(processObject, "sourceMapsEnabled", {
   get() { return sourceMapsState; },
   enumerable: true,

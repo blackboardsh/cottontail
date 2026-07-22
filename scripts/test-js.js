@@ -747,6 +747,27 @@ try {
     runCase(testCase);
   }
 
+  const hotWatchResult = spawnSync(process.execPath, [join(rootDir, 'tests', 'js', 'hot-watch-runtime.integration.js')], {
+    cwd: rootDir,
+    env: process.env,
+    encoding: 'utf8',
+  });
+  if (hotWatchResult.error) {
+    fail(`Failed to execute hot/watch integration test: ${hotWatchResult.error.message}`);
+  }
+  if (hotWatchResult.status !== 0) {
+    fail(
+      [
+        `Hot/watch integration test exited with ${hotWatchResult.status ?? 1}.`,
+        hotWatchResult.stdout ? `stdout:\n${hotWatchResult.stdout}` : '',
+        hotWatchResult.stderr ? `stderr:\n${hotWatchResult.stderr}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n')
+    );
+  }
+  process.stdout.write(hotWatchResult.stdout);
+
   if (readdirSync(tempDir).some(name => name.startsWith('.cottontail-eval-'))) {
     fail('Eval entrypoint was not cleaned up.');
   }

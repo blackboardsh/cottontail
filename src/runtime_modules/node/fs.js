@@ -2339,6 +2339,17 @@ function statsEqual(a, b) {
 }
 
 const fileWatchers = globalThis.__cottontailFileWatchers ??= new Map();
+const hotReloadHooks = globalThis.__cottontailHotReloadHooks ?? new Set();
+if (globalThis.__cottontailHotReloadHooks == null) {
+  Object.defineProperty(globalThis, "__cottontailHotReloadHooks", { value: hotReloadHooks, configurable: true });
+}
+hotReloadHooks.add(() => {
+  for (const entry of fileWatchers.values()) {
+    clearInterval(entry.timer);
+    entry.listeners.clear();
+  }
+  fileWatchers.clear();
+});
 
 export function watchFile(path, options = {}, listener = undefined) {
   if (typeof options === "function") {

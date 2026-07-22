@@ -7,6 +7,10 @@
 
 typedef struct CtJscRuntime CtJscRuntime;
 
+enum {
+    CT_JSC_EVAL_RELOAD = 2,
+};
+
 CtJscRuntime *ct_jsc_runtime_create(void);
 CtJscRuntime *ct_jsc_runtime_create_with_stack_size(size_t stack_size);
 void ct_jsc_runtime_destroy(CtJscRuntime *runtime);
@@ -33,6 +37,15 @@ int ct_jsc_runtime_eval(
     const char *filename,
     char **error_out
 );
+int ct_jsc_runtime_set_watch_paths(
+    CtJscRuntime *runtime,
+    size_t path_count,
+    const char *const *paths,
+    char **error_out
+);
+bool ct_jsc_runtime_take_reload_request(CtJscRuntime *runtime);
+int ct_jsc_runtime_wait_for_reload(CtJscRuntime *runtime, char **error_out);
+int ct_jsc_runtime_prepare_hot_reload(CtJscRuntime *runtime, char **error_out);
 int ct_jsc_runtime_exit_code(CtJscRuntime *runtime);
 int ct_jsc_runtime_tick(CtJscRuntime *runtime, char **error_out);
 int ct_jsc_runtime_start_inspector(

@@ -1501,6 +1501,7 @@ typedef struct CtHttpServer {
     pthread_cond_t clients_cond;
     size_t active_clients;
     CtHttpRequest *requests;
+    struct CtJscRuntime *runtime;
     struct CtHttpServer *next;
 } CtHttpServer;
 
@@ -1751,6 +1752,19 @@ typedef struct CtSignalWatcher {
 } CtSignalWatcher;
 #endif
 
+typedef struct CtReloadWatchPath {
+    char *name;
+    struct CtReloadWatchPath *next;
+} CtReloadWatchPath;
+
+typedef struct CtReloadWatcher {
+    struct CtJscRuntime *runtime;
+    uv_fs_event_t handle;
+    char *directory;
+    CtReloadWatchPath *paths;
+    struct CtReloadWatcher *next;
+} CtReloadWatcher;
+
 struct CtJscRuntime {
     JSGlobalContextRef context;
     JSObjectRef host_object;
@@ -1807,6 +1821,8 @@ struct CtJscRuntime {
     bool next_tick_pending;
     bool next_tick_priority_armed;
     bool fatal_exception_routed;
+    bool reload_requested;
+    CtReloadWatcher *reload_watchers;
     bool sampling_profiler_enabled;
     bool execution_time_limit_installed;
     CtJscShouldTerminateCallback should_terminate_callback;
@@ -3151,6 +3167,202 @@ static void ct_set_error_out(char **error_out, char *message) {
     } else {
         free(message);
     }
+}
+
+static bool ct_reload_path_equal(const char *left, const char *right) {
+#if defined(_WIN32)
+    return _stricmp(left, right) == 0;
+#else
+    return strcmp(left, right) == 0;
+#endif
+}
+
+static void ct_reload_watcher_free(CtReloadWatcher *watcher) {
+    if (watcher == NULL) return;
+    CtReloadWatchPath *path = watcher->paths;
+    while (path != NULL) {
+        CtReloadWatchPath *next = path->next;
+        free(path->name);
+        free(path);
+        path = next;
+    }
+    free(watcher->directory);
+    free(watcher);
+}
+
+static void ct_reload_watcher_close_callback(uv_handle_t *handle) {
+    CtReloadWatcher *watcher = handle != NULL ? (CtReloadWatcher *)handle->data : NULL;
+    ct_reload_watcher_free(watcher);
+}
+
+static void ct_reload_watchers_close(CtJscRuntime *runtime, CtReloadWatcher *watchers) {
+    CtReloadWatcher *watcher = watchers;
+    while (watcher != NULL) {
+        CtReloadWatcher *next = watcher->next;
+        watcher->next = NULL;
+        (void)uv_fs_event_stop(&watcher->handle);
+        if (!uv_is_closing((uv_handle_t *)&watcher->handle)) {
+            uv_close((uv_handle_t *)&watcher->handle, ct_reload_watcher_close_callback);
+        }
+        watcher = next;
+    }
+    if (runtime != NULL && runtime->uv_loop_initialized) {
+        (void)uv_run(&runtime->uv_loop, UV_RUN_NOWAIT);
+    }
+}
+
+static bool ct_reload_split_path(const char *path, char **directory_out, char **name_out) {
+    *directory_out = NULL;
+    *name_out = NULL;
+    if (path == NULL || path[0] == '\0') return false;
+
+    const char *separator = NULL;
+    for (const char *cursor = path; *cursor != '\0'; cursor += 1) {
+        if (*cursor == '/' || *cursor == '\\') separator = cursor;
+    }
+    if (separator == NULL) {
+        *directory_out = ct_duplicate_string(".");
+        *name_out = ct_duplicate_string(path);
+    } else {
+        size_t directory_len = (size_t)(separator - path);
+        if (directory_len == 0) directory_len = 1;
+#if defined(_WIN32)
+        if (directory_len == 2 && path[1] == ':') directory_len = 3;
+#endif
+        *directory_out = ct_duplicate_bytes(path, directory_len);
+        *name_out = ct_duplicate_string(separator + 1);
+    }
+    if (*directory_out == NULL || *name_out == NULL || (*name_out)[0] == '\0') {
+        free(*directory_out);
+        free(*name_out);
+        *directory_out = NULL;
+        *name_out = NULL;
+        return false;
+    }
+    return true;
+}
+
+static void ct_reload_fs_event_callback(
+    uv_fs_event_t *handle,
+    const char *filename,
+    int events,
+    int status
+) {
+    (void)events;
+    CtReloadWatcher *watcher = handle != NULL ? (CtReloadWatcher *)handle->data : NULL;
+    if (watcher == NULL || watcher->runtime == NULL) return;
+
+    if (status >= 0 && filename != NULL) {
+        const char *basename = filename;
+        for (const char *cursor = filename; *cursor != '\0'; cursor += 1) {
+            if (*cursor == '/' || *cursor == '\\') basename = cursor + 1;
+        }
+        CtReloadWatchPath *path = watcher->paths;
+        while (path != NULL && !ct_reload_path_equal(path->name, basename)) path = path->next;
+        if (path == NULL) return;
+    }
+
+    watcher->runtime->reload_requested = true;
+    ct_runtime_wake(watcher->runtime);
+}
+
+int ct_jsc_runtime_set_watch_paths(
+    CtJscRuntime *runtime,
+    size_t path_count,
+    const char *const *paths,
+    char **error_out
+) {
+    if (error_out != NULL) *error_out = NULL;
+    if (runtime == NULL || !runtime->uv_loop_initialized) {
+        ct_set_error_out(error_out, ct_duplicate_string("JavaScript runtime is not initialized"));
+        return -1;
+    }
+
+    CtReloadWatcher *watchers = NULL;
+    for (size_t index = 0; index < path_count; index += 1) {
+        char *directory = NULL;
+        char *name = NULL;
+        if (!ct_reload_split_path(paths[index], &directory, &name)) {
+            ct_reload_watchers_close(runtime, watchers);
+            ct_set_error_out(error_out, ct_duplicate_string("Invalid dependency watch path"));
+            return -1;
+        }
+
+        CtReloadWatcher *watcher = watchers;
+        while (watcher != NULL && !ct_reload_path_equal(watcher->directory, directory)) {
+            watcher = watcher->next;
+        }
+        if (watcher == NULL) {
+            watcher = (CtReloadWatcher *)calloc(1, sizeof(*watcher));
+            if (watcher == NULL) {
+                free(directory);
+                free(name);
+                ct_reload_watchers_close(runtime, watchers);
+                ct_set_error_out(error_out, ct_duplicate_string("Out of memory"));
+                return -1;
+            }
+            watcher->runtime = runtime;
+            watcher->directory = directory;
+            watcher->next = watchers;
+            watchers = watcher;
+            if (uv_fs_event_init(&runtime->uv_loop, &watcher->handle) != 0) {
+                watchers = watcher->next;
+                free(name);
+                ct_reload_watcher_free(watcher);
+                ct_reload_watchers_close(runtime, watchers);
+                ct_set_error_out(error_out, ct_duplicate_string("Failed to initialize dependency watcher"));
+                return -1;
+            }
+            watcher->handle.data = watcher;
+            int start_status = uv_fs_event_start(
+                &watcher->handle,
+                ct_reload_fs_event_callback,
+                watcher->directory,
+                0
+            );
+            if (start_status != 0) {
+                watchers = watcher->next;
+                free(name);
+                uv_close((uv_handle_t *)&watcher->handle, ct_reload_watcher_close_callback);
+                ct_reload_watchers_close(runtime, watchers);
+                (void)uv_run(&runtime->uv_loop, UV_RUN_NOWAIT);
+                ct_set_error_out(error_out, ct_duplicate_string(uv_strerror(start_status)));
+                return -1;
+            }
+        } else {
+            free(directory);
+        }
+
+        CtReloadWatchPath *existing = watcher->paths;
+        while (existing != NULL && !ct_reload_path_equal(existing->name, name)) existing = existing->next;
+        if (existing != NULL) {
+            free(name);
+            continue;
+        }
+        CtReloadWatchPath *watch_path = (CtReloadWatchPath *)calloc(1, sizeof(*watch_path));
+        if (watch_path == NULL) {
+            free(name);
+            ct_reload_watchers_close(runtime, watchers);
+            ct_set_error_out(error_out, ct_duplicate_string("Out of memory"));
+            return -1;
+        }
+        watch_path->name = name;
+        watch_path->next = watcher->paths;
+        watcher->paths = watch_path;
+    }
+
+    CtReloadWatcher *previous = runtime->reload_watchers;
+    runtime->reload_watchers = watchers;
+    runtime->reload_requested = false;
+    ct_reload_watchers_close(runtime, previous);
+    return 0;
+}
+
+bool ct_jsc_runtime_take_reload_request(CtJscRuntime *runtime) {
+    if (runtime == NULL) return false;
+    bool requested = runtime->reload_requested;
+    runtime->reload_requested = false;
+    return requested;
 }
 
 static void ct_throw_message(JSContextRef ctx, JSValueRef *exception, const char *message) {
@@ -24673,7 +24885,6 @@ static JSValueRef ct_fd_set_event_handler(JSContextRef ctx, JSObjectRef function
 }
 
 static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
     (void)thisObject;
     const char *hostname = "127.0.0.1";
     char *hostname_arg = NULL;
@@ -24782,6 +24993,7 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
     server->port = bound_port;
     server->hostname = unix_path == NULL ? ct_duplicate_string(hostname) : NULL;
     server->unix_path = unix_path;
+    server->runtime = ct_callback_runtime(function);
     pthread_mutex_init(&server->mutex, NULL);
     pthread_cond_init(&server->clients_cond, NULL);
 
@@ -25170,6 +25382,22 @@ static void ct_http_stop_server(CtHttpServer *server, bool remove_from_global_li
     pthread_cond_destroy(&server->clients_cond);
     pthread_mutex_destroy(&server->mutex);
     free(server);
+}
+
+static void ct_http_servers_stop_runtime(CtJscRuntime *runtime) {
+    for (;;) {
+        CtHttpServer *server = NULL;
+        pthread_mutex_lock(&ct_http_servers_mutex);
+        for (CtHttpServer *candidate = ct_http_servers; candidate != NULL; candidate = candidate->next) {
+            if (candidate->runtime == runtime) {
+                server = candidate;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&ct_http_servers_mutex);
+        if (server == NULL) break;
+        ct_http_stop_server(server, true, true);
+    }
 }
 
 static JSValueRef ct_http_server_stop(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -26553,8 +26781,23 @@ static CtJscRuntime *ct_jsc_runtime_create_internal(
     return runtime;
 }
 
-void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
-    if (runtime == NULL) return;
+int ct_jsc_runtime_prepare_hot_reload(CtJscRuntime *runtime, char **error_out) {
+    if (error_out != NULL) *error_out = NULL;
+    if (runtime == NULL || runtime->context == NULL) return -1;
+
+    JSContextRef ctx = runtime->context;
+    JSValueRef hook_exception = NULL;
+    JSValueRef hook = ct_get_property(
+        ctx,
+        JSContextGetGlobalObject(ctx),
+        "__cottontailPrepareHotReload",
+        &hook_exception
+    );
+    if (hook_exception == NULL && hook != NULL && JSValueIsObject(ctx, hook) &&
+        JSObjectIsFunction(ctx, (JSObjectRef)hook)) {
+        (void)JSObjectCallAsFunction(ctx, (JSObjectRef)hook, NULL, 0, NULL, &hook_exception);
+    }
+
     ct_workers_detach_runtime(runtime);
     ct_async_processes_wait_for_runtime(runtime);
     ct_tcp_connects_stop_runtime(runtime);
@@ -26564,15 +26807,35 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
     ct_tls_servers_stop_runtime(runtime);
     ct_tls_connections_stop_runtime(runtime);
 #endif
-    pthread_mutex_lock(&ct_http_servers_mutex);
-    CtHttpServer *servers = ct_http_servers;
-    ct_http_servers = NULL;
-    pthread_mutex_unlock(&ct_http_servers_mutex);
-    while (servers != NULL) {
-        CtHttpServer *next = servers->next;
-        ct_http_stop_server(servers, false, true);
-        servers = next;
+    ct_dns_requests_cancel_runtime(runtime);
+    ct_http_servers_stop_runtime(runtime);
+    ct_timer_destroy_all(runtime);
+    ct_brotli_encoder_destroy_all(runtime);
+    ct_vm_context_destroy_all(runtime);
+    runtime->fatal_exception_routed = false;
+    ct_process_set_exit_code(ctx, 0);
+
+    if (hook_exception != NULL) {
+        ct_set_error_out(error_out, ct_copy_exception(ctx, hook_exception));
+        return -1;
     }
+    return 0;
+}
+
+void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
+    if (runtime == NULL) return;
+    CtReloadWatcher *reload_watchers = runtime->reload_watchers;
+    runtime->reload_watchers = NULL;
+    ct_reload_watchers_close(runtime, reload_watchers);
+    ct_workers_detach_runtime(runtime);
+    ct_async_processes_wait_for_runtime(runtime);
+    ct_tcp_connects_stop_runtime(runtime);
+    ct_fd_watchers_wait_for_runtime(runtime);
+#if CT_HAS_OPENSSL
+    ct_tls_servers_stop_runtime(runtime);
+    ct_tls_connections_stop_runtime(runtime);
+#endif
+    ct_http_servers_stop_runtime(runtime);
 
     JSContextRef ctx = runtime->context;
     if (ctx != NULL) {
@@ -27517,6 +27780,7 @@ static int ct_jsc_runtime_eval_internal(
     char **error_out
 ) {
     if (error_out != NULL) *error_out = NULL;
+    if (runtime->reload_requested) return CT_JSC_EVAL_RELOAD;
     JSContextRef ctx = runtime->context;
     char *wrapped = ct_prepare_wrapped_source(source, source_len, filename);
     if (wrapped == NULL) {
@@ -27540,7 +27804,9 @@ static int ct_jsc_runtime_eval_internal(
      * event-loop pacing. */
     bool spin_top_level_await = ct_debug_flag("COTTONTAIL_TEST_SPIN_TOP_LEVEL_AWAIT");
     while (!ct_global_bool(ctx, "__ctDone")) {
+        if (runtime->reload_requested) return CT_JSC_EVAL_RELOAD;
         if (ct_jsc_runtime_tick(runtime, error_out) != 0) return -1;
+        if (runtime->reload_requested) return CT_JSC_EVAL_RELOAD;
         if (wait_for_active_handles && !ct_global_bool(ctx, "__ctDone")) {
             bool has_active_handles = false;
             if (ct_jsc_runtime_has_active_handles(runtime, &has_active_handles, error_out) != 0) return -1;
@@ -27556,6 +27822,7 @@ static int ct_jsc_runtime_eval_internal(
     }
     if (ct_route_global_uncaught_exception(runtime, "__ctError", error_out) != 0) return -1;
     for (int index = 0; index < 16; index += 1) {
+        if (runtime->reload_requested) return CT_JSC_EVAL_RELOAD;
         if (ct_jsc_runtime_tick(runtime, error_out) != 0) return -1;
     }
 
@@ -27571,11 +27838,13 @@ static int ct_jsc_runtime_eval_internal(
     if (!wait_for_active_handles) return 0;
 
     for (;;) {
+        if (runtime->reload_requested) return CT_JSC_EVAL_RELOAD;
         bool has_active_handles = false;
         int delay_ms = 16;
         if (ct_jsc_runtime_has_active_handles(runtime, &has_active_handles, error_out) != 0) return -1;
         if (!has_active_handles) break;
         if (ct_jsc_runtime_tick_with_delay(runtime, &delay_ms, error_out) != 0) return -1;
+        if (runtime->reload_requested) return CT_JSC_EVAL_RELOAD;
         ct_runtime_wait(runtime, delay_ms);
     }
 
@@ -27592,6 +27861,16 @@ static int ct_jsc_runtime_eval_internal(
 
 int ct_jsc_runtime_eval(CtJscRuntime *runtime, const uint8_t *source, size_t source_len, const char *filename, char **error_out) {
     return ct_jsc_runtime_eval_internal(runtime, source, source_len, filename, true, error_out);
+}
+
+int ct_jsc_runtime_wait_for_reload(CtJscRuntime *runtime, char **error_out) {
+    if (error_out != NULL) *error_out = NULL;
+    if (runtime == NULL) return -1;
+    while (!runtime->reload_requested) {
+        if (ct_jsc_runtime_tick(runtime, error_out) != 0) return -1;
+        ct_runtime_wait(runtime, 16);
+    }
+    return 0;
 }
 
 int ct_jsc_runtime_exit_code(CtJscRuntime *runtime) {

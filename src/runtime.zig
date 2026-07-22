@@ -19,6 +19,12 @@ extern fn ct_jsc_runtime_emit_process_shutdown(
 ) c_int;
 extern fn ct_jsc_runtime_had_fatal_exception(runtime: *c.CtJscRuntime) c_int;
 
+pub const ReloadResult = union(enum) {
+    reload,
+    failed: u8,
+    exited: u8,
+};
+
 pub const Runtime = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -206,6 +212,7 @@ pub const Runtime = struct {
             self.writeLoadError(script_path, err);
             return 1;
         };
+        defer self.allocator.free(source);
 
         return self.runSource(source, script_path);
     }
@@ -215,6 +222,7 @@ pub const Runtime = struct {
             self.writeStderrLine("cottontail: out of memory preparing script source");
             return 1;
         };
+        defer self.allocator.free(source_z);
         @memcpy(source_z[0..source.len], source);
         source_z[source.len] = 0;
 
@@ -243,6 +251,93 @@ pub const Runtime = struct {
         const shutdown_status = self.emitProcessShutdown(true);
         if (shutdown_status != 0) return shutdown_status;
         return @intCast(c.ct_jsc_runtime_exit_code(self.handle));
+    }
+
+    pub fn setWatchPaths(self: *Runtime, paths: []const [:0]const u8) !void {
+        const path_ptrs = try self.allocator.alloc([*c]const u8, paths.len);
+        defer self.allocator.free(path_ptrs);
+        for (paths, 0..) |path, index| path_ptrs[index] = path.ptr;
+        const paths_ptr = if (path_ptrs.len == 0)
+            @as([*c]const [*c]const u8, null)
+        else
+            @as([*c]const [*c]const u8, @ptrCast(path_ptrs.ptr));
+
+        var watch_error: [*c]u8 = null;
+        if (c.ct_jsc_runtime_set_watch_paths(
+            self.handle,
+            paths.len,
+            paths_ptr,
+            &watch_error,
+        ) != 0) {
+            defer if (watch_error != null) c.ct_jsc_string_free(watch_error);
+            if (watch_error != null) self.writeStderrLine(std.mem.span(watch_error));
+            return error.WatchSetupFailed;
+        }
+    }
+
+    pub fn waitForReload(self: *Runtime) !void {
+        var wait_error: [*c]u8 = null;
+        if (c.ct_jsc_runtime_wait_for_reload(self.handle, &wait_error) != 0) {
+            defer if (wait_error != null) c.ct_jsc_string_free(wait_error);
+            if (wait_error != null) self.writeStderrLine(std.mem.span(wait_error));
+            return error.ReloadWaitFailed;
+        }
+        _ = c.ct_jsc_runtime_take_reload_request(self.handle);
+    }
+
+    pub fn prepareHotReload(self: *Runtime) !void {
+        var cleanup_error: [*c]u8 = null;
+        if (c.ct_jsc_runtime_prepare_hot_reload(self.handle, &cleanup_error) != 0) {
+            defer if (cleanup_error != null) c.ct_jsc_string_free(cleanup_error);
+            if (cleanup_error != null) self.writeStderrLine(std.mem.span(cleanup_error));
+            return error.HotReloadCleanupFailed;
+        }
+    }
+
+    pub fn runReloadableFile(self: *Runtime, script_path: [:0]const u8) ReloadResult {
+        const source = std.Io.Dir.cwd().readFileAlloc(
+            self.io,
+            script_path,
+            self.allocator,
+            .limited(self.max_script_size),
+        ) catch |err| {
+            self.writeLoadError(script_path, err);
+            return .{ .failed = 1 };
+        };
+        defer self.allocator.free(source);
+        return self.runReloadableSource(source, script_path);
+    }
+
+    pub fn runReloadableSource(
+        self: *Runtime,
+        source: []const u8,
+        filename: [:0]const u8,
+    ) ReloadResult {
+        const source_z = self.allocator.alloc(u8, source.len + 1) catch {
+            self.writeStderrLine("cottontail: out of memory preparing script source");
+            return .{ .failed = 1 };
+        };
+        defer self.allocator.free(source_z);
+        @memcpy(source_z[0..source.len], source);
+        source_z[source.len] = 0;
+
+        var eval_error: [*c]u8 = null;
+        const status = c.ct_jsc_runtime_eval(self.handle, source_z.ptr, source.len, filename.ptr, &eval_error);
+        defer if (eval_error != null) c.ct_jsc_string_free(eval_error);
+        if (status == c.CT_JSC_EVAL_RELOAD) {
+            _ = c.ct_jsc_runtime_take_reload_request(self.handle);
+            return .reload;
+        }
+        if (status != 0) {
+            if (eval_error != null) {
+                self.writeStderrLine(std.mem.span(eval_error));
+            } else if (status != -13) {
+                self.writeStderrLine("Unknown JavaScript exception");
+            }
+            const exit_code: u8 = @intCast(c.ct_jsc_runtime_exit_code(self.handle));
+            return .{ .failed = if (exit_code != 0) exit_code else 1 };
+        }
+        return .{ .exited = @intCast(c.ct_jsc_runtime_exit_code(self.handle)) };
     }
 
     fn emitProcessShutdown(self: *Runtime, include_before_exit: bool) u8 {
