@@ -335,6 +335,7 @@ enum class NapiEventLoopLifecycle : uint8_t {
 struct napi_threadsafe_function__ {
     NapiEnv* env { nullptr };
     JSValueRef callback { nullptr };
+    napi_async_context async_context { nullptr };
     void* context { nullptr };
     void* finalize_data { nullptr };
     napi_finalize finalize_callback { nullptr };
@@ -1842,8 +1843,14 @@ static void teardown_threadsafe_function(NapiEnv* env, napi_threadsafe_function_
         }
     }
 
-    if (!function->finalized && function->finalize_callback)
+    if (!function->finalized && function->finalize_callback) {
+        AutomaticScope scope(env);
         function->finalize_callback(reinterpret_cast<napi_env>(env), function->finalize_data, function->context);
+    }
+    if (function->async_context) {
+        napi_async_context context = std::exchange(function->async_context, nullptr);
+        (void)napi_async_destroy(reinterpret_cast<napi_env>(env), context);
+    }
     if (function->callback)
         JSValueUnprotect(env->context, function->callback);
 
@@ -5596,7 +5603,7 @@ extern "C" napi_status napi_is_detached_arraybuffer(napi_env opaque_env, napi_va
 extern "C" napi_status napi_create_threadsafe_function(
     napi_env opaque_env,
     napi_value function,
-    napi_value,
+    napi_value resource,
     napi_value resource_name,
     size_t max_queue_size,
     size_t initial_thread_count,
@@ -5626,11 +5633,27 @@ extern "C" napi_status napi_create_threadsafe_function(
     threadsafe->call_js = call_js;
     threadsafe->max_queue_size = max_queue_size;
     threadsafe->thread_count = initial_thread_count;
+    napi_status context_status = napi_async_init(
+        opaque_env,
+        resource,
+        resource_name,
+        &threadsafe->async_context);
+    if (context_status != napi_ok) {
+        delete threadsafe;
+        return context_status;
+    }
     if (threadsafe->callback)
         JSValueProtect(env->context, threadsafe->callback);
-    {
+    try {
         std::lock_guard lock(env->async_mutex);
         env->thread_safe_functions.insert(threadsafe);
+    } catch (...) {
+        if (threadsafe->callback)
+            JSValueUnprotect(env->context, threadsafe->callback);
+        napi_async_context async_context = std::exchange(threadsafe->async_context, nullptr);
+        (void)napi_async_destroy(opaque_env, async_context);
+        delete threadsafe;
+        return finish(env, napi_generic_failure);
     }
     *result = reinterpret_cast<napi_threadsafe_function>(threadsafe);
     wake(env);
@@ -5941,12 +5964,35 @@ static bool drain_threadsafe_functions(NapiEnv* env, JSValueRef* exception)
                         function->call_js(nullptr, nullptr, function->context, call.data);
                 } else {
                     AutomaticScope scope(env);
-                    if (function->call_js) {
-                        function->call_js(reinterpret_cast<napi_env>(env), to_napi(function->callback), function->context, call.data);
-                    } else if (function->callback) {
-                        napi_value global = nullptr;
-                        napi_get_global(reinterpret_cast<napi_env>(env), &global);
-                        napi_call_function(reinterpret_cast<napi_env>(env), global, to_napi(function->callback), 0, nullptr, nullptr);
+                    napi_callback_scope callback_scope = nullptr;
+                    napi_status scope_status = function->async_context
+                        ? napi_open_callback_scope(
+                            reinterpret_cast<napi_env>(env),
+                            nullptr,
+                            function->async_context,
+                            &callback_scope)
+                        : napi_ok;
+                    if (scope_status == napi_ok) {
+                        if (function->call_js) {
+                            function->call_js(reinterpret_cast<napi_env>(env), to_napi(function->callback), function->context, call.data);
+                        } else if (function->callback) {
+                            napi_value global = nullptr;
+                            napi_get_global(reinterpret_cast<napi_env>(env), &global);
+                            napi_call_function(reinterpret_cast<napi_env>(env), global, to_napi(function->callback), 0, nullptr, nullptr);
+                        }
+                    }
+                    if (callback_scope) {
+                        napi_status close_status = napi_close_callback_scope(
+                            reinterpret_cast<napi_env>(env),
+                            callback_scope);
+                        if (scope_status == napi_ok)
+                            scope_status = close_status;
+                    }
+                    if (scope_status != napi_ok && !env->pending_exception) {
+                        (void)napi_throw_error(
+                            reinterpret_cast<napi_env>(env),
+                            nullptr,
+                            "failed to enter the thread-safe function async context");
                     }
                 }
                 if (take_pending_exception(env, exception))
@@ -5958,8 +6004,15 @@ static bool drain_threadsafe_functions(NapiEnv* env, JSValueRef* exception)
                     std::lock_guard lock(function->mutex);
                     function->finalized = true;
                 }
-                if (function->finalize_callback)
+                if (function->finalize_callback) {
+                    AutomaticScope scope(env);
                     function->finalize_callback(reinterpret_cast<napi_env>(env), function->finalize_data, function->context);
+                }
+                napi_status context_status = napi_ok;
+                if (function->async_context) {
+                    napi_async_context context = std::exchange(function->async_context, nullptr);
+                    context_status = napi_async_destroy(reinterpret_cast<napi_env>(env), context);
+                }
                 if (function->callback)
                     JSValueUnprotect(env->context, function->callback);
                 {
@@ -5967,6 +6020,12 @@ static bool drain_threadsafe_functions(NapiEnv* env, JSValueRef* exception)
                     env->thread_safe_functions.erase(function);
                 }
                 delete function;
+                if (context_status != napi_ok && !env->pending_exception) {
+                    (void)napi_throw_error(
+                        reinterpret_cast<napi_env>(env),
+                        nullptr,
+                        "failed to destroy the thread-safe function async context");
+                }
                 if (take_pending_exception(env, exception))
                     return false;
                 break;
