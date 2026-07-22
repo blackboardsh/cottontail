@@ -2979,6 +2979,10 @@
       "status": "enabled",
       "reason": "Unknown builtins, packages, and relative modules expose Bun-compatible require, resolve, dynamic-import errors, including regexp object matching in assert (1 bun:test case)."
     },
+    "test/js/node/net/double-connect.test.ts": {
+      "status": "enabled",
+      "reason": "The double-connect child repro completes with one connection lifecycle and the exact expected event transcript (1 bun:test case, 1 assertion)."
+    },
     "test/js/node/net/handle-leak.test.ts": {
       "status": "enabled",
       "reason": "The unchanged Unix socket stress file completes 50,000 warmup and 100,000 measured connections with about 7 MB RSS growth, below its 15 MB limit.",
@@ -2992,6 +2996,12 @@
     "test/js/node/net/node-net-server.test.ts": {
       "status": "enabled",
       "reason": "Node net.Server construction, listen lifecycle, address metadata, connection accounting, close behavior, and async disposal pass upstream coverage (18 bun:test cases, 38 assertions)."
+    },
+    "test/js/node/net/node-net.test.ts": {
+      "status": "enabled",
+      "reason": "Node TCP and Unix socket reads, writes, reconnects, errors, ref/unref, FIN/destroy exit, and abort handling pass the copied suite (32 bun:test cases, 89 assertions).",
+      "serial": true,
+      "timeoutMs": 60000
     },
     "test/js/node/nodettywrap.test.ts": {
       "status": "enabled",
@@ -3192,6 +3202,10 @@
     "test/js/node/timers/node-timers.test.ts": {
       "status": "enabled",
       "reason": "Native timer handles, refresh/clear lifecycle, promisification, immediate scheduling, and uncaught-exception checkpoints pass the copied suite (20 bun:test cases, 31 assertions)."
+    },
+    "test/js/node/tls/node-tls-connect.test.ts": {
+      "status": "enabled",
+      "reason": "Direct and duplex TLS connections pass ALPN, deterministic peer-certificate AIA metadata, session/cipher APIs, overloads, timeout, and transfer coverage (25 bun:test cases, 116 assertions)."
     },
     "test/js/node/tls/node-tls-create-secure-context-args.test.ts": {
       "status": "enabled",

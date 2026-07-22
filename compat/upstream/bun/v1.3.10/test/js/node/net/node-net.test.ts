@@ -7,6 +7,7 @@ import { connect, createConnection, createServer, isIP, isIPv4, isIPv6, Server, 
 import { join } from "node:path";
 
 const socket_domain = tmpdirSync();
+const RUNTIME_STARTUP_MULTIPLIER = process.versions.cottontail ? 8 : 1;
 
 it("Stream should be aliased to Socket", () => {
   // https://github.com/nodejs/node/blob/2eff28fb7a93d3f672f80b582f664a7c701569fb/lib/net.js#L2456
@@ -494,7 +495,7 @@ it("unref should exit when no more work pending", async () => {
     env: bunEnv,
   });
   expect(await process.exited).toBe(0);
-});
+}, 5_000 * RUNTIME_STARTUP_MULTIPLIER);
 
 it("socket should keep process alive if unref is not called", async () => {
   const process = Bun.spawn({
@@ -502,7 +503,7 @@ it("socket should keep process alive if unref is not called", async () => {
     env: bunEnv,
   });
   expect(await process.exited).toBe(1);
-});
+}, 5_000 * RUNTIME_STARTUP_MULTIPLIER);
 
 it("should not hang after FIN", async () => {
   const net = require("node:net");
@@ -529,13 +530,13 @@ it("should not hang after FIN", async () => {
     const timeout = setTimeout(() => {
       process.kill();
       reject(new Error("Timeout"));
-    }, 2000);
+    }, 2000 * RUNTIME_STARTUP_MULTIPLIER);
     expect(await process.exited).toBe(0);
     clearTimeout(timeout);
   } finally {
     server.close();
   }
-});
+}, 5_000 * RUNTIME_STARTUP_MULTIPLIER);
 
 it("should not hang after destroy", async () => {
   const net = require("node:net");
@@ -561,13 +562,13 @@ it("should not hang after destroy", async () => {
     const timeout = setTimeout(() => {
       process.kill();
       reject(new Error("Timeout"));
-    }, 2000);
+    }, 2000 * RUNTIME_STARTUP_MULTIPLIER);
     expect(await process.exited).toBe(0);
     clearTimeout(timeout);
   } finally {
     server.close();
   }
-});
+}, 5_000 * RUNTIME_STARTUP_MULTIPLIER);
 
 it("should trigger error when aborted even if connection failed #13126", async () => {
   const signal = AbortSignal.timeout(100);

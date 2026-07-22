@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { once } from "events";
 import { tls as COMMON_CERT_ } from "harness";
+import { readFileSync } from "node:fs";
 import net from "net";
 import { join } from "path";
 import stream from "stream";
@@ -260,40 +261,46 @@ for (const { name, connect } of tests) {
     });
 
     it("should have peer certificate", async () => {
-      const socket = (await new Promise((resolve, reject) => {
-        const instance = connect(
-          {
-            ALPNProtocols: ["http/1.1"],
-            host: "bun.sh",
-            servername: "bun.sh",
-            port: 443,
-            rejectUnauthorized: false,
-            requestCert: true,
-          },
-          function () {
-            resolve(instance);
-          },
-        ).on("error", reject);
-      })) as TLSSocket;
+      const fixtureDir = join(import.meta.dir, "../test/fixtures/keys");
+      const server = tls.createServer({
+        cert: readFileSync(join(fixtureDir, "agent1-cert.pem")),
+        key: readFileSync(join(fixtureDir, "agent1-key.pem")),
+      });
+      await once(server.listen(0, "127.0.0.1"), "listening");
+
+      let socket: TLSSocket | undefined;
 
       try {
+        socket = (await new Promise((resolve, reject) => {
+          const address = server.address() as AddressInfo;
+          const instance = connect(
+            {
+              host: "127.0.0.1",
+              servername: "agent1",
+              port: address.port,
+              rejectUnauthorized: false,
+              requestCert: true,
+            },
+            function () {
+              resolve(instance);
+            },
+          ).on("error", reject);
+        })) as TLSSocket;
+
         expect(socket).toBeDefined();
         const cert = socket.getPeerCertificate();
         expect(cert).toBeDefined();
         expect(cert.subject).toBeDefined();
-        // this should never change
-        expect(cert.subject.CN).toBe("bun.sh");
-        expect(cert.subjectaltname).toContain("DNS:bun.sh");
+        expect(cert.subject.CN).toBe("agent1");
+        expect(cert.issuer.CN).toBe("ca1");
         expect(cert.infoAccess).toBeDefined();
-        // we just check the types this can change over time
         const infoAccess = cert.infoAccess as NodeJS.Dict<string[]>;
-        expect(infoAccess["OCSP - URI"]).toBeDefined();
-        expect(infoAccess["CA Issuers - URI"]).toBeDefined();
+        expect(infoAccess["OCSP - URI"]).toEqual(["http://ocsp.nodejs.org/"]);
+        expect(infoAccess["CA Issuers - URI"]).toEqual(["http://ca.nodejs.org/ca.cert"]);
         expect(cert.ca).toBeFalse();
-        expect(cert.bits).toBeInteger();
-        // These can change:
-        // expect(typeof cert.modulus).toBe("string");
-        // expect(typeof cert.exponent).toBe("string");
+        expect(cert.bits).toBe(2048);
+        expect(typeof cert.modulus).toBe("string");
+        expect(cert.exponent).toBe("0x10001");
         expect(cert.pubkey).toBeInstanceOf(Buffer);
         expect(typeof cert.valid_from).toBe("string");
         expect(typeof cert.valid_to).toBe("string");
@@ -303,7 +310,10 @@ for (const { name, connect } of tests) {
         expect(typeof cert.serialNumber).toBe("string");
         expect(cert.raw).toBeInstanceOf(Buffer);
       } finally {
-        socket.end();
+        socket?.end();
+        await new Promise<void>((resolve, reject) => {
+          server.close(error => (error ? reject(error) : resolve()));
+        });
       }
     });
 
