@@ -171,6 +171,7 @@ async function loadProductionConfig(projectRoot, entrypoint) {
     inlineImportMetaProperties: true,
     includeRuntimeModules: true,
     minify: false,
+    production: true,
   });
   const artifact = result.outputs.find(output => output.kind === "entry-point") ?? result.outputs[0];
   if (!artifact) throw new Error(`Bake production build did not emit ${configPath}`);
@@ -290,6 +291,7 @@ async function writeClientGraph(context, route) {
     define: productionDefines(clientOptions, "client"),
     jsx: { ...(clientOptions.jsx ?? {}), development: false },
     minify: clientOptions.minify ?? true,
+    production: true,
     publicPath: "/",
     serverComponents: false,
     external: clientOptions.external ?? [],
@@ -366,6 +368,7 @@ async function buildSsrFrameworkAliases(context) {
       define: productionDefines(ssrOptions, "server"),
       jsx: { ...(ssrOptions.jsx ?? {}), development: false },
       minify: false,
+      production: true,
       serverComponents: false,
       external: [...new Set([...(ssrOptions.external ?? []), "bake/server", "bun:bake/server"])],
       write: false,
@@ -393,6 +396,7 @@ async function buildSsrComponents(context, route) {
       define: productionDefines(context.ssrOptions, "server"),
       jsx: { ...(context.ssrOptions.jsx ?? {}), development: false },
       minify: false,
+      production: true,
       serverComponents: false,
       external: [...new Set([...(context.ssrOptions.external ?? []), "bake/server", "bun:bake/server"])],
       write: false,
@@ -443,6 +447,7 @@ async function loadServerRoute(context, route) {
     define: productionDefines(context.serverOptions, "server"),
     jsx: { ...(context.serverOptions.jsx ?? {}), development: false },
     minify: false,
+    production: true,
     serverComponents: context.serverComponents !== null,
     external: [...new Set([...(context.serverOptions.external ?? []), "bake/server", "bun:bake/server"])],
     metafile: true,
