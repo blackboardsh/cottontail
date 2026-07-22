@@ -4034,6 +4034,11 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
     },
+    "test/js/third_party/svelte/svelte.test.ts": {
+      "status": "enabled",
+      "reason": "The unchanged Svelte runtime-plugin file passes SSR plus 1,000 distinct require and dynamic-import module identities (4 cases, 2,002 assertions); the bounded file budget accommodates stock-JSC launcher compilation.",
+      "timeoutMs": 840000
+    },
     "test/js/third_party/webpack/webpack.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
