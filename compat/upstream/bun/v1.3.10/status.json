@@ -958,6 +958,10 @@
       "status": "enabled",
       "reason": "Invalid workspace globs, ./ paths, and Windows-style .\\ paths fail cleanly without crashing across all three copied cases (8 assertions)."
     },
+    "test/cli/install/bun-create.test.ts": {
+      "status": "enabled",
+      "reason": "Bun create template resolution, scoped initializer naming, GitHub shorthand handling, argument forwarding, and destination validation pass all 13 copied cases (24 assertions)."
+    },
     "test/cli/install/bun-info.test.ts": {
       "status": "enabled",
       "reason": "Bun info and pm view package selection, rendering, property access, JSON output, diagnostics, and concurrent inline snapshots pass all 19 copied cases (60 assertions)."

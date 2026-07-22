@@ -341,6 +341,36 @@ fn runManifestScripts(
 
 const StageDiagnostic = enum { install, version };
 
+const CapturedOutput = struct {
+    io: std.Io,
+    file: std.Io.File,
+    bytes: std.ArrayList(u8) = .empty,
+    failure: ?anyerror = null,
+
+    fn deinit(output: *CapturedOutput) void {
+        output.bytes.deinit(std.heap.c_allocator);
+    }
+
+    fn read(output: *CapturedOutput) void {
+        defer output.file.close(output.io);
+        var buffer: [16 * 1024]u8 = undefined;
+        while (true) {
+            const count = output.file.readStreaming(output.io, &.{buffer[0..]}) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => {
+                    output.failure = err;
+                    break;
+                },
+            };
+            if (count == 0) continue;
+            output.bytes.appendSlice(std.heap.c_allocator, buffer[0..count]) catch |err| {
+                output.failure = err;
+                break;
+            };
+        }
+    }
+};
+
 fn runStage(
     init: std.process.Init,
     root_dir: []const u8,
@@ -380,22 +410,69 @@ fn runCommandStage(
         &.{ "cmd.exe", "/d", "/s", "/c", command }
     else
         &.{ "/bin/sh", "-c", command };
+    const foreground = std.mem.eql(u8, task.cwd, root_dir);
     var child = try std.process.spawn(init.io, .{
         .argv = shell_args,
         .cwd = .{ .path = task.cwd },
         .environ_map = &environment,
-        .stdin = .inherit,
-        .stdout = .inherit,
-        .stderr = .inherit,
+        .stdin = if (foreground) .inherit else .ignore,
+        .stdout = if (foreground) .inherit else .pipe,
+        .stderr = if (foreground) .inherit else .pipe,
         .create_no_window = true,
     });
     defer child.kill(init.io);
-    const result = try child.wait(init.io);
+    const result = if (foreground)
+        try child.wait(init.io)
+    else result: {
+        var captured_stdout: CapturedOutput = .{ .io = init.io, .file = child.stdout.? };
+        defer captured_stdout.deinit();
+        child.stdout = null;
+        var captured_stderr: CapturedOutput = .{ .io = init.io, .file = child.stderr.? };
+        defer captured_stderr.deinit();
+        child.stderr = null;
+
+        const stdout_thread = std.Thread.spawn(.{}, CapturedOutput.read, .{&captured_stdout}) catch |err| {
+            captured_stdout.file.close(init.io);
+            captured_stderr.file.close(init.io);
+            child.kill(init.io);
+            return err;
+        };
+        const stderr_thread = std.Thread.spawn(.{}, CapturedOutput.read, .{&captured_stderr}) catch |err| {
+            captured_stderr.file.close(init.io);
+            child.kill(init.io);
+            stdout_thread.join();
+            return err;
+        };
+        const term = child.wait(init.io) catch |err| {
+            child.kill(init.io);
+            stdout_thread.join();
+            stderr_thread.join();
+            return err;
+        };
+        stdout_thread.join();
+        stderr_thread.join();
+        if (captured_stdout.failure) |err| return err;
+        if (captured_stderr.failure) |err| return err;
+
+        const succeeded = switch (term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+        if (!succeeded) {
+            if (!task.optional) {
+                if (captured_stdout.bytes.items.len > 0) try stderr.print("{s}\n", .{captured_stdout.bytes.items});
+                if (captured_stderr.bytes.items.len > 0) try stderr.print("{s}\n", .{captured_stderr.bytes.items});
+            }
+        }
+        break :result term;
+    };
     const exit_code: u8 = switch (result) {
         .exited => |code| @intCast(@min(code, 255)),
         else => 1,
     };
     if (exit_code == 0) return;
+
+    if (task.optional) return error.LifecycleScriptFailed;
 
     switch (diagnostic) {
         .install => try stderr.print("error: {s} script from \"{s}\" exited with {d}\n", .{ stage, task.name, exit_code }),

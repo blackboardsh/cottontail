@@ -121,12 +121,12 @@ pub fn run(
     const parsed = parseOptions(args, invocation);
     const options = switch (parsed) {
         .version => {
-            try stdout.print("{s}\n", .{version});
+            try stdout.print("{s}\n", .{displayVersion(init)});
             try stdout.flush();
             return 0;
         },
         .revision => {
-            try stdout.print("{s}+cottontail\n", .{version});
+            try stdout.print("{s}+cottontail\n", .{displayVersion(init)});
             try stdout.flush();
             return 0;
         },
@@ -274,6 +274,10 @@ pub fn run(
     }
     try stderr.flush();
     return 1;
+}
+
+fn displayVersion(init: std.process.Init) []const u8 {
+    return init.environ_map.get("COTTONTAIL_UPSTREAM_VERSION") orelse version;
 }
 
 fn parseOptions(args: []const [:0]const u8, invocation: Invocation) ParseResult {

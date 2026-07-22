@@ -139,6 +139,8 @@ const Options = struct {
     minimum_release_age_cli: bool = false,
     concurrent_scripts: ?usize = null,
     concurrent_scripts_cli: bool = false,
+    network_concurrency: ?usize = null,
+    invalid_network_concurrency: ?[]const u8 = null,
     pack_destination: ?[]const u8 = null,
     pack_filename: ?[]const u8 = null,
     pack_gzip_level: ?[]const u8 = null,
@@ -517,6 +519,15 @@ pub fn run(
         return 1;
     };
 
+    if (options.invalid_network_concurrency) |value| {
+        try stderr.print(
+            "error: Expected --network-concurrency to be a number between 0 and 65535: {s}\n",
+            .{value},
+        );
+        try stderr.flush();
+        return 1;
+    }
+
     if (options.invalid_cpu) |value| {
         try stderr.print("error: Invalid CPU architecture: '{s}'. Valid values are: *, any, arm, arm64, ia32, mips, mipsel, ppc, ppc64, s390, s390x, x32, x64. Use !name to negate.\n", .{value});
         try stderr.flush();
@@ -797,6 +808,19 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
             if (value.len == 0) return error.MissingOptionValue;
             options.minimum_release_age_ms = try parseMinimumReleaseAge(value);
             options.minimum_release_age_cli = true;
+        } else if (std.mem.eql(u8, arg, "--network-concurrency")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            options.network_concurrency = parseNetworkConcurrency(args[index]) catch invalid: {
+                options.invalid_network_concurrency = args[index];
+                break :invalid null;
+            };
+        } else if (std.mem.startsWith(u8, arg, "--network-concurrency=")) {
+            const value = arg["--network-concurrency=".len..];
+            options.network_concurrency = parseNetworkConcurrency(value) catch invalid: {
+                options.invalid_network_concurrency = value;
+                break :invalid null;
+            };
         } else if (std.mem.eql(u8, arg, "--no-summary")) {
             options.no_summary = true;
         } else if (std.mem.eql(u8, arg, "--dev") or std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "-D") or std.mem.eql(u8, arg, "--development")) {
@@ -942,6 +966,11 @@ fn parseMinimumReleaseAge(value: []const u8) !f64 {
     const milliseconds = seconds * std.time.ms_per_s;
     if (!std.math.isFinite(milliseconds)) return error.InvalidMinimumReleaseAge;
     return milliseconds;
+}
+
+fn parseNetworkConcurrency(value: []const u8) !usize {
+    const parsed = std.fmt.parseInt(u16, value, 10) catch return error.InvalidNetworkConcurrency;
+    return @max(1, parsed);
 }
 
 fn parseConcurrentScripts(value: []const u8) !?usize {
@@ -1968,6 +1997,7 @@ const Manager = struct {
     resolving: std.StringHashMap(void),
     expanded_lock_packages: std.StringHashMap(void),
     registry_manifests: std.StringHashMap(*Value),
+    registry_manifest_failures: std.StringHashMap(void),
     refreshed_update_manifests: std.StringHashMap(void),
     direct_bins: std.array_list.Managed([]const u8),
     explicit_adds: std.StringHashMap(void),
@@ -2033,6 +2063,7 @@ const Manager = struct {
             .resolving = std.StringHashMap(void).init(allocator),
             .expanded_lock_packages = std.StringHashMap(void).init(allocator),
             .registry_manifests = std.StringHashMap(*Value).init(allocator),
+            .registry_manifest_failures = std.StringHashMap(void).init(allocator),
             .refreshed_update_manifests = std.StringHashMap(void).init(allocator),
             .registry_scopes = std.StringHashMap(RegistryConfig).init(allocator),
             .direct_bins = std.array_list.Managed([]const u8).init(allocator),
@@ -2065,6 +2096,7 @@ const Manager = struct {
     fn deinit(manager: *Manager) void {
         manager.registry_scopes.deinit();
         manager.refreshed_update_manifests.deinit();
+        manager.registry_manifest_failures.deinit();
         manager.registry_manifests.deinit();
         manager.resolution_only_records.deinit();
         manager.filtered_workspaces.deinit();
@@ -2319,6 +2351,8 @@ const Manager = struct {
                 manager.deleteLockfiles();
                 if (manager.options.command == .remove and manager.changed and had_lockfile and !manager.options.silent) {
                     try manager.stderr.writeAll("\npackage.json has no dependencies! Deleted empty lockfile\n");
+                } else if (manager.options.command == .install and !manager.options.silent) {
+                    try manager.stderr.writeAll("No packages! Deleted empty lockfile\n");
                 }
             } else {
                 const save_bun_lockfile = manager.changed or !manager.hasExistingLockfile() or manager.lockfileNeedsRewrite();
@@ -2345,10 +2379,11 @@ const Manager = struct {
         {
             const finished_ns = std.Io.Clock.awake.now(manager.init_data.io).nanoseconds;
             const elapsed_ms = @as(f64, @floatFromInt(finished_ns - manager.started_ns)) / std.time.ns_per_ms;
-            const reported_installed_count = if (manager.options.command == .link)
+            const physical_installed_count = if (manager.options.command == .link)
                 manager.options.positionals.len
             else
                 manager.installed_count;
+            const reported_installed_count = physical_installed_count -| manager.duplicateDirectInstallCount();
             if (manager.options.command == .install and manager.options.dry_run) {
                 try manager.stdout.print("[{d:.2}ms] done\n", .{elapsed_ms});
             } else if (manager.options.command == .remove) {
@@ -2413,7 +2448,7 @@ const Manager = struct {
             }
         }
         if (!manager.options.silent and manager.blocked_scripts > 0) {
-            try manager.stdout.print("\nBlocked {d} postinstall{s}. Run `bun pm untrusted` for details.\n\n", .{
+            try manager.stdout.print("\nBlocked {d} postinstall{s}. Run `bun pm untrusted` for details.\n", .{
                 manager.blocked_scripts,
                 if (manager.blocked_scripts == 1) "" else "s",
             });
@@ -3521,11 +3556,12 @@ const Manager = struct {
             try std.Io.Dir.cwd().createDirPath(manager.init_data.io, install_cache);
         }
         const node_modules = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules" });
+        const uses_explicit_install_cache = manager.init_data.environ_map.get("BUN_INSTALL_CACHE_DIR") != null;
         if (manager.node_linker == .isolated) {
             // Bun establishes the project cache before converting an add to
             // isolated layout. Preserve that ordering so the migration leaves
             // the same .old_modules-* holding directory on a first add.
-            if (manager.options.command == .add and !manager.pathExists(node_modules)) {
+            if (!uses_explicit_install_cache and manager.options.command == .add and !manager.pathExists(node_modules)) {
                 const initial_cache = try std.fs.path.join(manager.allocator, &.{ node_modules, ".cache" });
                 try std.Io.Dir.cwd().createDirPath(manager.init_data.io, initial_cache);
             }
@@ -3542,7 +3578,7 @@ const Manager = struct {
             manager.workspaces.count() == 0 and
                 (manager.options.command == .add or manager.options.command == .install or
                     manager.options.cpu_overridden or manager.options.os_overridden);
-        if (create_project_cache) {
+        if (!uses_explicit_install_cache and create_project_cache) {
             const cache = try std.fs.path.join(manager.allocator, &.{ node_modules, ".cache" });
             try std.Io.Dir.cwd().createDirPath(manager.init_data.io, cache);
         }
@@ -5196,8 +5232,10 @@ const Manager = struct {
             {
                 const display = if (isTarballSpec(spec_value.string))
                     spec_value.string
+                else if (isGitSpec(spec_value.string))
+                    try manager.directGitDisplay(alias, spec_value.string)
                 else if (isLocalSpec(spec_value.string))
-                    if (isGlobalLinkSpec(spec_value.string)) spec_value.string else localSpecPath(spec_value.string)
+                    if (isGlobalLinkSpec(spec_value.string)) spec_value.string else directLocalDisplay(spec_value.string)
                 else
                     workspace_display orelse resolved_version;
                 try manager.direct_install_reports.append(.{
@@ -5216,6 +5254,8 @@ const Manager = struct {
         std.sort.pdq(DirectInstallReport, manager.direct_install_reports.items, {}, struct {
             fn lessThan(_: void, left: DirectInstallReport, right: DirectInstallReport) bool {
                 if (left.section_priority != right.section_priority) return left.section_priority < right.section_priority;
+                const alias_order = std.mem.order(u8, left.alias, right.alias);
+                if (alias_order != .eq) return alias_order == .lt;
                 return left.sequence < right.sequence;
             }
         }.lessThan);
@@ -5249,6 +5289,44 @@ const Manager = struct {
             manager.direct_install_reports.items.len == 0 and
             !manager.rootLifecycleScriptsWillRun()) return "";
         return "\n";
+    }
+
+    fn directGitDisplay(manager: *Manager, alias: []const u8, fallback: []const u8) ![]const u8 {
+        var index = manager.records.items.len;
+        while (index > 0) {
+            index -= 1;
+            const record = manager.records.items[index];
+            if (!std.mem.eql(u8, record.alias, alias) or
+                (record.kind != .git and record.kind != .github)) continue;
+            return displayGitResolution(manager.allocator, record.resolution);
+        }
+        return displayGitResolution(manager.allocator, fallback);
+    }
+
+    fn duplicateDirectInstallCount(manager: *const Manager) usize {
+        var duplicates: usize = 0;
+        for (manager.direct_install_reports.items, 0..) |report, index| {
+            const record = manager.directRecord(report.alias) orelse continue;
+            for (manager.direct_install_reports.items[0..index]) |previous_report| {
+                const previous = manager.directRecord(previous_report.alias) orelse continue;
+                if (packageRecordsHaveSameIdentity(record, previous)) {
+                    duplicates += 1;
+                    break;
+                }
+            }
+        }
+        return duplicates;
+    }
+
+    fn directRecord(manager: *const Manager, alias: []const u8) ?PackageRecord {
+        for (manager.records.items) |record| {
+            if (std.mem.eql(u8, record.alias, alias) and
+                (std.mem.eql(u8, record.key, alias) or isTopLevelDestination(manager.root_dir, record.install_dir, alias)))
+            {
+                return record;
+            }
+        }
+        return null;
     }
 
     fn installDependency(
@@ -5460,7 +5538,7 @@ const Manager = struct {
                 const minimum_age_seconds = (manager.options.minimum_release_age_ms orelse 0) / std.time.ms_per_s;
                 try manager.stderr.print(
                     "error: No version matching \"{s}\" found for specifier \"{s}\" (blocked by minimum-release-age: {d} seconds)\n",
-                    .{ registry_name, registry_spec, minimum_age_seconds },
+                    .{ registry_spec, registry_name, minimum_age_seconds },
                 );
                 return error.PackageManagerErrorReported;
             }
@@ -5474,9 +5552,10 @@ const Manager = struct {
                 return manager.installResolvedWorkspace(alias, workspace, parent_dir, direct, protocol_patch_paths);
             }
             if (err == error.NoMatchingVersion) {
+                const package_exists = manager.registry_manifests.contains(registry_name);
                 try manager.stderr.print(
-                    "error: No version matching \"{s}\" found for specifier \"{s}\"\n",
-                    .{ registry_name, registry_spec },
+                    "error: No version matching \"{s}\" found for specifier \"{s}\"{s}\n",
+                    .{ registry_spec, registry_name, if (package_exists) " (but package exists)" else "" },
                 );
                 return error.PackageManagerErrorReported;
             }
@@ -7877,6 +7956,9 @@ const Manager = struct {
             !manager.refreshed_update_manifests.contains(name);
         const cached_manifest: ?*Value = if (refresh_manifest) null else manager.registry_manifests.get(name);
         const manifest = cached_manifest orelse blk: {
+            if (!refresh_manifest and manager.registry_manifest_failures.contains(name)) {
+                return error.RegistryManifestRequestFailed;
+            }
             const encoded_name = try encodePackageName(manager.allocator, name);
             const configured_registry = manager.registryConfigForPackage(name);
             const cache_path = try manager.registryManifestCachePath(configured_registry.url, encoded_name);
@@ -7911,7 +7993,9 @@ const Manager = struct {
         if (manifest.object.get("dist-tags")) |dist_tags| {
             if (dist_tags == .object) {
                 if (dist_tags.object.get("latest")) |latest| {
-                    if (latest == .string) latest_version = latest.string;
+                    if (latest == .string and versions_value.object.get(latest.string) != null) {
+                        latest_version = latest.string;
+                    }
                 }
             }
         }
@@ -8197,7 +8281,7 @@ const Manager = struct {
             });
         }
 
-        const concurrency = packageFetchConcurrency();
+        const concurrency = manager.options.network_concurrency orelse packageFetchConcurrency();
         var offset: usize = 0;
         while (offset < fetches.items.len) {
             const end = @min(offset + concurrency, fetches.items.len);
@@ -8208,9 +8292,18 @@ const Manager = struct {
             try group.await(manager.init_data.io);
 
             for (batch) |*fetch| {
+                if (fetch.failure) |failure| {
+                    if (failure == error.RegistryManifestRequestFailed) {
+                        try manager.registry_manifest_failures.put(
+                            try manager.allocator.dupe(u8, fetch.name),
+                            {},
+                        );
+                    }
+                }
                 const bytes = fetch.bytes orelse continue;
                 defer std.heap.smp_allocator.free(bytes);
                 const parsed = (try manager.parseRegistryManifest(bytes)) orelse continue;
+                _ = manager.registry_manifest_failures.remove(fetch.name);
                 try manager.registry_manifests.put(try manager.allocator.dupe(u8, fetch.name), parsed);
                 if (fetch.cache_path) |path| {
                     std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = path, .data = bytes }) catch {};
@@ -8242,7 +8335,7 @@ const Manager = struct {
             });
         }
 
-        const concurrency = packageFetchConcurrency();
+        const concurrency = manager.options.network_concurrency orelse packageFetchConcurrency();
         var offset: usize = 0;
         while (offset < fetches.items.len) {
             const end = @min(offset + concurrency, fetches.items.len);
@@ -9782,6 +9875,11 @@ fn localSpecPath(spec: []const u8) []const u8 {
     }
     if (std.mem.startsWith(u8, spec, "link:")) return spec["link:".len..];
     return spec;
+}
+
+fn directLocalDisplay(spec: []const u8) []const u8 {
+    const path = localSpecPath(spec);
+    return if (std.mem.startsWith(u8, path, "./")) path[2..] else path;
 }
 
 fn isTarballSpec(spec: []const u8) bool {
