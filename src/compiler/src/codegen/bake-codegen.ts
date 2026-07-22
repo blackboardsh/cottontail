@@ -30,19 +30,21 @@ function convertZigEnum(zig: string, names: string[]) {
   return output;
 }
 
-function css(file: string, is_development: boolean): string {
-  const { success, stdout, stderr } = Bun.spawnSync({
-    cmd: [process.execPath, "build", file, "--minify"],
-    cwd: import.meta.dir,
-    stdio: ["ignore", "pipe", "pipe"],
+async function css(file: string): Promise<string> {
+  const result = await Bun.build({
+    entrypoints: [join(import.meta.dir, file)],
+    minify: true,
+    target: "browser",
   });
-  if (!success) throw new Error(stderr.toString("utf-8"));
-  return stdout.toString("utf-8");
+  if (!result.success) throw new AggregateError(result.logs);
+  assert(result.outputs.length === 1, "CSS must bundle to a single file");
+  return result.outputs[0].text();
 }
 
 async function run() {
   const devServerZig = readFileSync(join(base_dir, "DevServer.zig"), "utf-8");
   writeIfNotChanged(join(base_dir, "generated.ts"), convertZigEnum(devServerZig, ["IncomingMessageId", "MessageId"]));
+  const overlayCss = await css("../bake/client/overlay.css");
 
   const results = await Promise.allSettled(
     ["client", "server", "error"].map(async file => {
@@ -53,7 +55,7 @@ async function run() {
           side: JSON.stringify(side),
           IS_ERROR_RUNTIME: String(file === "error"),
           IS_BUN_DEVELOPMENT: String(!!debug),
-          OVERLAY_CSS: css("../bake/client/overlay.css", !!debug),
+          OVERLAY_CSS: overlayCss,
         },
         minify: {
           syntax: !debug,

@@ -2,7 +2,7 @@ import path from "../node/path.js";
 import { readFileSync, readdirSync, statSync, writeFileSync } from "../node/fs.js";
 import { pathToFileURL } from "../node/url.js";
 import { __setBuiltinModules } from "../node/module.js";
-import { Bun, serve } from "./index.js";
+import { Bun, HTMLRewriter, serve } from "./index.js";
 import {
   bakeGraphAttributeFiles,
   contentTypeForStaticFile,
@@ -20,6 +20,7 @@ import {
   staticRouterFile,
 } from "./bake-framework.js";
 import { FrameworkRouter } from "./bake-framework-router.js";
+import { handleBakeErrorReport } from "./bake-error-report.js";
 import { buildBakeProduction } from "./bake-production.js";
 
 let responseOptionsAsyncLocalStorage = null;
@@ -281,6 +282,49 @@ function bakeBuildErrors(logs, fallbackPath) {
     level: String(log.level || "error"),
     message: String(log.message || log),
   }));
+}
+
+function canDeferBakeHmrBuildErrors(logs) {
+  let foundTopLevelAwait = false;
+  for (const log of logs) {
+    const message = String(log?.message ?? log);
+    if (/^This require call is not allowed because .+ contains a top-level await$/.test(message)) {
+      foundTopLevelAwait = true;
+      continue;
+    }
+    if (/^No matching export in .+ for import .+$/.test(message)) continue;
+    return false;
+  }
+  return foundTopLevelAwait;
+}
+
+function localHtmlModuleScripts(source, htmlPath) {
+  const scripts = [];
+  new HTMLRewriter().on("script", {
+    element(element) {
+      const type = element.getAttribute("type");
+      const sourceUrl = element.getAttribute("src");
+      if (type?.toLowerCase() !== "module" || !sourceUrl || sourceUrl.startsWith("//")) return;
+
+      let parsed;
+      try {
+        parsed = new URL(sourceUrl, "http://cottontail.invalid/");
+      } catch {
+        return;
+      }
+      if (parsed.origin !== "http://cottontail.invalid") return;
+
+      const sourcePath = sourceUrl.split(/[?#]/, 1)[0];
+      const entryPath = sourcePath.startsWith("/")
+        ? path.resolve(globalThis.process?.cwd?.() ?? ".", `.${sourcePath}`)
+        : path.resolve(path.dirname(htmlPath), sourcePath);
+      scripts.push({
+        assetPath: parsed.pathname,
+        entryPath,
+      });
+    },
+  }).transform(source);
+  return scripts;
 }
 
 const bakeSetErrorsClientSource = `(errors => {
@@ -590,6 +634,7 @@ function createHtmlDispatcher(config, development) {
   const bundles = new Map();
   const successfulBundles = new Map();
   const assets = new Map();
+  const sourceMaps = new Map();
   const retiredAssets = new Set();
   const staticConfig = loadBakeStaticConfig(projectRoot);
   let buildId = 0;
@@ -598,6 +643,46 @@ function createHtmlDispatcher(config, development) {
   function nextHotUpdateId() {
     hotUpdateId = (hotUpdateId + 1) >>> 0;
     return hotUpdateId.toString(16).padStart(16, "0");
+  }
+
+  async function buildDeferredHtmlHmr(sourceText, htmlPath, outdir, buildConfig) {
+    const scripts = localHtmlModuleScripts(sourceText, htmlPath);
+    if (scripts.length === 0) return null;
+
+    const hmrEntries = [];
+    for (const { assetPath, entryPath } of scripts) {
+      let artifact;
+      try {
+        artifact = await buildInternalBakeEntry(entryPath, outdir, buildConfig);
+      } catch {
+        return null;
+      }
+
+      let source = await artifact.text();
+      if (artifact.sourcemap) {
+        const sourceMapPath = `${assetPath}.map`;
+        source += `\n//# sourceMappingURL=${sourceMapPath}\n`;
+        assets.set(sourceMapPath, artifact.sourcemap);
+        sourceMaps.set(assetPath, {
+          body: artifact.sourcemap,
+          bundlePath: assetPath,
+          mapPath: path.join(outdir, sourceMapPath.replace(/^\//, "")),
+          sourceRoot: outdir,
+        });
+      }
+      assets.set(assetPath, new Blob([source], { type: artifact.type || "text/javascript; charset=utf-8" }));
+      hmrEntries.push({
+        entryPath,
+        assetPath,
+        source,
+        modules: bakeRegistryModules(source),
+      });
+    }
+
+    // COTTONTAIL-COMPAT: Bake's HMR linker defers require/TLA failures until
+    // module evaluation. Keep the original HTML while serving its scripts from
+    // the internal HMR graph so the runtime reports Bun's exact diagnostic.
+    return { body: sourceText, sourceText, hmrEntries, buildError: false, errors: [] };
   }
 
   async function buildHtml(htmlPath) {
@@ -624,6 +709,10 @@ function createHtmlDispatcher(config, development) {
       });
       if (!result.success) {
         if (development) {
+          if (buildConfig.hmr !== false && canDeferBakeHmrBuildErrors(result.logs ?? [])) {
+            const deferred = await buildDeferredHtmlHmr(sourceText, htmlPath, outdir, buildConfig);
+            if (deferred !== null) return deferred;
+          }
           const errors = bakeBuildErrors(result.logs ?? [], htmlPath);
           return {
             body: bakeBuildErrorPage(errors),
@@ -677,6 +766,12 @@ function createHtmlDispatcher(config, development) {
               const sourceMapPath = `${assetPath}.map`;
               source += `\n//# sourceMappingURL=${sourceMapPath}\n`;
               assets.set(sourceMapPath, internalArtifact.sourcemap);
+              sourceMaps.set(assetPath, {
+                body: internalArtifact.sourcemap,
+                bundlePath: assetPath,
+                mapPath: path.join(outdir, sourceMapPath.replace(/^\//, "")),
+                sourceRoot: outdir,
+              });
               servedArtifact = new Blob([source], { type: internalArtifact.type });
             } else {
               servedArtifact = internalArtifact;
@@ -729,11 +824,13 @@ function createHtmlDispatcher(config, development) {
     return new Response("Not Found", { status: 404 });
   };
   dispatchHtmlRequest.projectRoot = projectRoot;
+  dispatchHtmlRequest.sourceMapForPath = pathname => sourceMaps.get(pathname) ?? null;
   dispatchHtmlRequest.serveConfig = { ...config, routes, static: staticRoutes };
   dispatchHtmlRequest.invalidate = () => {
     bundles.clear();
     for (const assetPath of assets.keys()) retiredAssets.add(assetPath);
     assets.clear();
+    sourceMaps.clear();
   };
   dispatchHtmlRequest.update = async (changedPaths = []) => {
     const activePaths = [...bundles.keys()];
@@ -1158,6 +1255,7 @@ function createFrameworkDispatcher(config) {
   const routeRecords = [];
   const routeRecordByPage = new Map();
   const assets = new Map();
+  const sourceMaps = new Map();
   const retiredClientEntries = new Set();
   let hmrRuntime = null;
   let wrapperId = 0;
@@ -1372,6 +1470,12 @@ function createFrameworkDispatcher(config) {
       assets.set(`${url}.map`, {
         body: sourceMap,
         type: "application/json; charset=utf-8",
+      });
+      sourceMaps.set(url, {
+        body: sourceMap,
+        bundlePath: url,
+        mapPath: path.join(projectRoot, `${url.replace(/^\//, "")}.map`),
+        sourceRoot: projectRoot,
       });
     }
     retiredClientEntries.delete(url);
@@ -1663,6 +1767,7 @@ function createFrameworkDispatcher(config) {
     });
   };
   dispatchFrameworkRequest.projectRoot = projectRoot;
+  dispatchFrameworkRequest.sourceMapForPath = pathname => sourceMaps.get(pathname) ?? null;
   dispatchFrameworkRequest.routeIdForPath = pathname => {
     const found = matchFrameworkRoute(pathname, "http://localhost/");
     if (found === null) return null;
@@ -1679,6 +1784,7 @@ function createFrameworkDispatcher(config) {
         const url = record.route.hmrArgs.clientEntryUrl;
         assets.delete(url);
         assets.delete(`${url}.map`);
+        sourceMaps.delete(url);
         retiredClientEntries.add(url);
       }
     }
@@ -1922,6 +2028,9 @@ function installDevelopmentSocket(config, bakeRuntime) {
     automaticTimer.unref?.();
   }
 
+  routes["/_bun/report_error"] = {
+    POST: request => handleBakeErrorReport(request, bakeRuntime),
+  };
   routes["/_bun/hmr"] = (request, server) => {
     if (server.upgrade(request)) return;
     return new Response("WebSocket upgrade required", { status: 426 });
@@ -2090,6 +2199,9 @@ export function startDefaultApp(entryNamespace) {
         projectRoot: htmlFetch?.projectRoot ?? frameworkFetch?.projectRoot,
         routeIdForPath(pathname) {
           return frameworkFetch?.routeIdForPath?.(pathname) ?? null;
+        },
+        sourceMapForPath(pathname) {
+          return htmlFetch?.sourceMapForPath?.(pathname) ?? frameworkFetch?.sourceMapForPath?.(pathname) ?? null;
         },
         invalidate() {
           htmlFetch?.invalidate?.();

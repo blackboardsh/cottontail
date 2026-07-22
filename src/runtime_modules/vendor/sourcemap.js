@@ -121,7 +121,7 @@ function readMapText(mapPath) {
   return null;
 }
 
-function buildState(mapPath, mapData, configuredBundlePath) {
+function buildState(mapPath, mapData, configuredBundlePath, configuredSourceRoot = undefined) {
   try {
     const text = typeof mapData === "string" ? mapData : readMapText(mapPath);
     if (typeof text !== "string" || text === "") return null;
@@ -132,7 +132,9 @@ function buildState(mapPath, mapData, configuredBundlePath) {
       : `${configuredBundlePath || "/$bunfs/root/index.js"}.map`;
     const slash = effectiveMapPath.lastIndexOf("/");
     const mapDir = slash > 0 ? effectiveMapPath.slice(0, slash) : "/";
-    const configuredRoot = globalThis.__cottontailBundleSourceRoot;
+    const configuredRoot = configuredSourceRoot === undefined
+      ? globalThis.__cottontailBundleSourceRoot
+      : configuredSourceRoot;
     const sourceBase = typeof configuredRoot === "string" && configuredRoot !== "" ? configuredRoot : mapDir;
     const sources = map.sources.map((source) => resolveSource(sourceBase, map.sourceRoot, source));
     const generatedSources = map.sources.map((source) => resolveSource(mapDir, map.sourceRoot, source));
@@ -199,7 +201,7 @@ function getState() {
   cachedMapData = mapData;
   cachedBundlePath = bundlePath;
   cachedSourceRoot = sourceRoot;
-  cachedState = buildState(hasMapPath ? mapPath : "", hasMapData ? mapData : null, bundlePath);
+  cachedState = buildState(hasMapPath ? mapPath : "", hasMapData ? mapData : null, bundlePath, sourceRoot);
   return cachedState;
 }
 
@@ -365,6 +367,31 @@ function lookup(state, line, column) {
   const source = state.sources[sourceIndex];
   if (source == null) return null;
   return { source, line: sourceLine + 1, column: sourceColumn + 1, sourceIndex, generatedLine: line };
+}
+
+export function createSourceMapConsumer(mapData, options = {}) {
+  const mapPath = typeof options.mapPath === "string" ? options.mapPath : "";
+  const bundlePath = typeof options.bundlePath === "string" ? options.bundlePath : "";
+  const sourceRoot = typeof options.sourceRoot === "string" ? options.sourceRoot : undefined;
+  const state = buildState(mapPath, mapData, bundlePath, sourceRoot);
+  if (!state) return null;
+
+  return Object.freeze({
+    originalPositionFor(line, column) {
+      const mapped = lookup(state, Number(line), Number(column));
+      if (!mapped) return null;
+      const display = finalizeMappedPosition(state, mapped);
+      if (!display) return null;
+      const virtual = virtualSourceMapping(state, mapped.sourceIndex);
+      const lines = virtual?.originalLines ?? state.sourceLines[mapped.sourceIndex];
+      return {
+        source: display.source,
+        line: display.line,
+        column: display.column,
+        lines: Array.isArray(lines) ? lines : null,
+      };
+    },
+  });
 }
 
 export function remapPosition(line, column) {
@@ -547,4 +574,10 @@ function remapAdjacentBundleFrames(stack) {
   });
 }
 
-export default { remapErrorPosition, remapPosition, remapStackString, sourceContextForLocation };
+export default {
+  createSourceMapConsumer,
+  remapErrorPosition,
+  remapPosition,
+  remapStackString,
+  sourceContextForLocation,
+};
