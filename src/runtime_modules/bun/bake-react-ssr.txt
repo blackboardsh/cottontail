@@ -19,6 +19,11 @@ const createFromNodeStreamOptions: Manifest = {
   moduleLoading: { prefix: "/" },
 };
 
+// COTTONTAIL-COMPAT: Stock-JSC direct streams ignore a rejected pull after close; error explicitly.
+function errorDirectStream(controller: ReadableStreamDirectController, error: any) {
+  controller.error(error);
+}
+
 // The `renderToHtml` function not only implements converting the RSC payload
 // into HTML via react-dom, but also streaming the RSC payload via injected
 // script tags.  While the page is streaming, the client is loading the RSC
@@ -58,7 +63,7 @@ export function renderToHtml(
 
       // If the signal is already aborted, we should not proceed
       if (signal.aborted) {
-        controller.close(signal.aborted);
+        errorDirectStream(controller, signal.aborted);
         return Promise.reject(signal.aborted);
       }
 
@@ -74,7 +79,8 @@ export function renderToHtml(
             abort();
             if (signal.abort) signal.abort();
             if (stream) {
-              stream.controller.close();
+              errorDirectStream(stream.controller, error);
+              stream.reject(error);
             }
           }
         },
@@ -163,8 +169,7 @@ class RscInjectionStream extends EventEmitter {
     });
     rscPayload.on("error", err => {
       this.rscHasEnded = true;
-      // Close the controller
-      controller.close();
+      errorDirectStream(controller, err);
       // Reject the promise instead of resolving it
       this.reject(err);
     });
