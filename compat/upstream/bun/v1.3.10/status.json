@@ -2269,7 +2269,7 @@
     },
     "test/js/bun/spawn/spawn-pipe-leak.test.ts": {
       "status": "expected-failure",
-      "reason": "The 3 active cases each launch 750 nested Cottontail processes (2,250 total), so none finishes within the 30-second harness file budget; reduced read-before-exit, read-after-exit, and unread external-child probes pass with stable forced-GC RSS."
+      "reason": "Performance-only expected failure: the exact unchanged aggregate launches 2,250 nested Cottontail processes and was stopped after 32 minutes while bounded batches continued making progress; reduced read-after-exit, unread, and read-before-exit probes pass with stable forced-GC RSS."
     },
     "test/js/bun/spawn/spawn-signal.test.ts": {
       "status": "enabled",
@@ -2330,8 +2330,14 @@
       "reason": "Bun.spawn send/receive IPC lifecycle passes all 4 JSON and advanced-mode upstream cases with 6 assertions."
     },
     "test/js/bun/spawn/spawn.test.ts": {
-      "status": "expected-failure",
-      "reason": "107 of 108 active macOS cases pass in focused groups (5 additional cases are skipped upstream); the remaining onExit case launches 2,000 nested Cottontail processes and cannot finish within the 30-second harness file budget."
+      "status": "enabled",
+      "reason": "The exact unchanged aggregate passes all 108 active macOS cases (5 upstream skips; 113 registered tests, 5,456 assertions), including the 1,000-iteration/2,000-child onExit workload, in 550.33 seconds with serial scaled deadlines.",
+      "serial": true,
+      "args": ["--max-concurrency=1"],
+      "env": {
+        "COTTONTAIL_TEST_TIMEOUT_SCALE": "60"
+      },
+      "timeoutMs": 1200000
     },
     "test/js/bun/spawn/spawnSync.test.ts": {
       "status": "enabled",
