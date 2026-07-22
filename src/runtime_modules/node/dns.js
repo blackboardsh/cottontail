@@ -702,6 +702,30 @@ function pruneNetworkCache(now) {
   }
 }
 
+function insertNetworkCacheEntry(host, port, now) {
+  while (dnsCacheState.entries.size >= DNS_CACHE_MAX_ENTRIES) {
+    const oldest = dnsCacheState.entries.keys().next().value;
+    if (oldest === undefined) break;
+    dnsCacheState.entries.delete(oldest);
+  }
+  const entry = {
+    createdAt: now,
+    port: Number(port) || 0,
+    records: null,
+    pending: false,
+  };
+  dnsCacheState.entries.set(host, entry);
+  return entry;
+}
+
+function failNetworkCacheEntry(host, entry, error) {
+  if (dnsCacheState.entries.get(host) !== entry) return;
+  entry.pending = false;
+  entry.error = error;
+  dnsCacheState.errors += 1;
+  dnsCacheState.entries.delete(host);
+}
+
 function resolveForNetwork(hostname, port = 0, preload = false) {
   const host = String(hostname);
   const now = Date.now();
@@ -711,32 +735,54 @@ function resolveForNetwork(hostname, port = 0, preload = false) {
   const existing = dnsCacheState.entries.get(host);
   if (existing) {
     // Bun preloads an existing entry without counting it as a consumer hit.
-    if (!preload) {
-      if (existing.records) dnsCacheState.cacheHitsCompleted += 1;
-      else dnsCacheState.cacheHitsInflight += 1;
-    }
+    if (preload) return [];
+    if (existing.records) dnsCacheState.cacheHitsCompleted += 1;
+    else dnsCacheState.cacheHitsInflight += 1;
     if (existing.records) return existing.records.map((record) => ({ ...record }));
     if (existing.error) throw existing.error;
-    return [];
+
+    // Cottontail's socket layer currently consumes DNS synchronously. When it
+    // joins a prefetch that is still in flight, finish through libc while the
+    // original asynchronous request remains responsible for cache warming.
+    try {
+      existing.records = lookupRecords(host, 0, defaultResultOrder(), null);
+      existing.pending = false;
+      return existing.records.map((record) => ({ ...record }));
+    } catch (error) {
+      failNetworkCacheEntry(host, existing, error);
+      throw error;
+    }
   }
 
   dnsCacheState.cacheMisses += 1;
-  while (dnsCacheState.entries.size >= DNS_CACHE_MAX_ENTRIES) {
-    const oldest = dnsCacheState.entries.keys().next().value;
-    if (oldest === undefined) break;
-    dnsCacheState.entries.delete(oldest);
-  }
-  const entry = { createdAt: now, port: Number(port) || 0, records: null, error: null };
-  dnsCacheState.entries.set(host, entry);
+  const entry = insertNetworkCacheEntry(host, port, now);
   try {
     entry.records = lookupRecords(host, 0, defaultResultOrder(), null);
     return entry.records.map((record) => ({ ...record }));
   } catch (error) {
-    entry.error = error;
-    dnsCacheState.errors += 1;
-    dnsCacheState.entries.delete(host);
+    failNetworkCacheEntry(host, entry, error);
     throw error;
   }
+}
+
+function prefetchForNetwork(hostname, port) {
+  const host = String(hostname);
+  const now = Date.now();
+  dnsCacheState.totalCount += 1;
+  pruneNetworkCache(now);
+  if (dnsCacheState.entries.has(host)) return;
+
+  dnsCacheState.cacheMisses += 1;
+  const entry = insertNetworkCacheEntry(host, port, now);
+  entry.pending = true;
+  lookupRecordsAsync(host, 0, defaultResultOrder(), 0).then(
+    (records) => {
+      if (dnsCacheState.entries.get(host) !== entry) return;
+      entry.records = records;
+      entry.pending = false;
+    },
+    (error) => failNetworkCacheEntry(host, entry, error),
+  );
 }
 
 dnsCacheState.resolveForNetwork = resolveForNetwork;
@@ -945,9 +991,7 @@ function prefetch(hostname, port = 443) {
     error.code = "ERR_INVALID_ARG_TYPE";
     throw error;
   }
-  try {
-    resolveForNetwork(hostname, port, true);
-  } catch {}
+  prefetchForNetwork(hostname, port);
 }
 
 function getCacheStats() {
