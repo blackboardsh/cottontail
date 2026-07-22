@@ -798,6 +798,37 @@ function changedPathMatchesModule(projectRoot, changedPaths, moduleId) {
   return false;
 }
 
+async function buildChangedHtmlHmrModules(projectRoot, changedPaths, previousBundle, outdir, buildConfig) {
+  const loadedModuleIds = new Set(
+    previousBundle.hmrEntries.flatMap(entry => Object.keys(entry.modules)),
+  );
+  const modules = {};
+  const sourceMapRecords = new Map();
+
+  for (const changedPath of changedPaths) {
+    const entryPath = path.resolve(projectRoot, changedPath);
+    if (!isJavaScriptArtifact({ loader: loaderForPath(entryPath) })) continue;
+    if (![...loadedModuleIds].some(id => changedPathMatchesModule(projectRoot, [changedPath], id))) continue;
+
+    let artifact;
+    try {
+      artifact = await buildInternalBakeEntry(entryPath, outdir, buildConfig);
+    } catch {
+      return null;
+    }
+
+    const source = await artifact.text();
+    const sourceMapRecord = await sourceMapRecordForArtifact(artifact, [artifact], source, projectRoot);
+    for (const [id, definition] of Object.entries(bakeRegistryModules(source))) {
+      if (!loadedModuleIds.has(id) || !changedPathMatchesModule(projectRoot, [changedPath], id)) continue;
+      modules[id] = definition;
+      if (sourceMapRecord !== null) sourceMapRecords.set(id, sourceMapRecord);
+    }
+  }
+
+  return Object.keys(modules).length === 0 ? null : { modules, sourceMapRecords };
+}
+
 function createHtmlDispatcher(config, development) {
   const projectRoot = globalThis.process?.cwd?.() ?? ".";
   const routes = { ...(config.routes ?? {}) };
@@ -1040,6 +1071,9 @@ function createHtmlDispatcher(config, development) {
             });
           }
         }
+        // The JavaScript artifact above owns this URL after replacing the
+        // generic HTML build with its internal Bake graph and normalized map.
+        if (artifact.kind === "sourcemap" && assets.has(assetPath)) continue;
         retiredAssets.delete(assetPath);
         assets.set(assetPath, servedArtifact);
       }
@@ -1114,6 +1148,23 @@ function createHtmlDispatcher(config, development) {
       const previousSuccessful = successfulBundles.get(htmlPath);
       const next = await buildHtml(htmlPath);
       if (next.buildError) {
+        const changed = previousSuccessful && changedPaths.length > 0
+          ? await buildChangedHtmlHmrModules(
+              projectRoot,
+              changedPaths,
+              previousSuccessful,
+              path.join(projectRoot, ".cottontail-tmp", "bake-html", String(buildId++)),
+              await staticConfig,
+            )
+          : null;
+        if (changed !== null) {
+          retainHotUpdate(packets, createBakeHotUpdatePacket(
+            changed.modules,
+            changed.sourceMapRecords,
+            nextHotUpdateId(),
+          ));
+          continue;
+        }
         if (!previous?.buildError || JSON.stringify(previous.errors) !== JSON.stringify(next.errors)) {
           retainHotUpdate(packets, createBakeErrorUpdatePacket(next.errors, nextHotUpdateId()));
         }
