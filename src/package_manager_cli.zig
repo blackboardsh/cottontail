@@ -8962,9 +8962,8 @@ const Manager = struct {
         try std.Io.Dir.cwd().createDirPath(manager.init_data.io, bin_dir);
         const destination = try std.fs.path.join(manager.allocator, &.{ bin_dir, name });
         deletePath(manager.init_data.io, destination);
-        if (std.fs.path.dirname(destination)) |destination_parent| {
-            try std.Io.Dir.cwd().createDirPath(manager.init_data.io, destination_parent);
-        }
+        const destination_parent = std.fs.path.dirname(destination) orelse bin_dir;
+        try std.Io.Dir.cwd().createDirPath(manager.init_data.io, destination_parent);
         if (builtin.os.tag == .windows) {
             const command_path = try std.fmt.allocPrint(manager.allocator, "{s}.cmd", .{destination});
             const executable = try std.process.executablePathAlloc(manager.init_data.io, manager.allocator);
@@ -8978,7 +8977,7 @@ const Manager = struct {
                 manager.allocator,
                 manager.root_dir,
                 manager.init_data.environ_map,
-                bin_dir,
+                destination_parent,
                 target,
             );
             try std.Io.Dir.cwd().symLink(manager.init_data.io, bin_target, destination, .{});
