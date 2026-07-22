@@ -28,7 +28,9 @@ extern uint32_t ct_jsc_weak_collection_size(JSValueRef value);
 extern bool ct_jsc_array_buffer_view_has_buffer(JSValueRef value);
 extern JSObjectRef ct_jsc_create_buffer_is_ascii(JSContextRef context);
 extern JSObjectRef ct_jsc_create_buffer_transcode(JSContextRef context);
+extern uint32_t ct_jsc_cached_data_version_tag(void);
 extern char *ct_jsc_heap_snapshot(JSContextRef context, int gc_debugging);
+extern size_t ct_jsc_query_objects_count(JSContextRef context, JSObjectRef prototype);
 extern size_t ct_jsc_heap_footprint(JSContextRef context);
 extern bool ct_jsc_value_is_rope(JSContextRef context, JSValueRef value);
 extern bool ct_jsc_set_time_zone(JSContextRef context, const char *time_zone);
@@ -22891,6 +22893,15 @@ static JSValueRef ct_jsc_memory_usage(JSContextRef ctx, JSObjectRef function, JS
     return statistics;
 }
 
+static JSValueRef ct_jsc_cached_data_version_tag_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    (void)exception;
+    return JSValueMakeNumber(ctx, (double)ct_jsc_cached_data_version_tag());
+}
+
 static JSValueRef ct_jsc_heap_snapshot_host_impl(JSContextRef ctx, JSValueRef *exception, bool gc_debugging) {
     char *snapshot = ct_jsc_heap_snapshot(ctx, gc_debugging ? 1 : 0);
     if (snapshot == NULL) {
@@ -22926,6 +22937,21 @@ static JSValueRef ct_jsc_heap_snapshot_for_debugging_host(JSContextRef ctx, JSOb
     JSGarbageCollect(ctx);
 #endif
     return ct_jsc_heap_snapshot_host_impl(ctx, exception, true);
+}
+
+static JSValueRef ct_jsc_query_objects_count_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1 || !JSValueIsObject(ctx, argv[0])) {
+        ct_throw_type_error(ctx, exception, "cottontail.jscQueryObjectsCount(prototype) requires an object prototype");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t count = ct_jsc_query_objects_count(ctx, (JSObjectRef)argv[0]);
+    if (count == SIZE_MAX) {
+        ct_throw_message(ctx, exception, "stock JSC heap analyzer ABI is unavailable");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeNumber(ctx, (double)count);
 }
 
 static JSValueRef ct_jsc_string_is_8_bit_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {

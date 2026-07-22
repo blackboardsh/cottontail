@@ -184,7 +184,10 @@ export function isStringOneByteRepresentation(value) {
 }
 
 export function cachedDataVersionTag() {
-  throw unsupported("cachedDataVersionTag()", "stock JSC has no cached-bytecode embedding API");
+  if (typeof cottontail.jscCachedDataVersionTag !== "function") {
+    throw unsupported("cachedDataVersionTag()", "the JSC cached-bytecode version bridge is unavailable");
+  }
+  return cottontail.jscCachedDataVersionTag();
 }
 
 function exposeGc() {
@@ -223,7 +226,7 @@ export function setHeapSnapshotNearHeapLimit(limit) {
   if (limit < 1 || limit > maxUint32) throw outOfRange("limit", limit, ">= 1 && <= 4294967295");
   throw unsupported(
     "setHeapSnapshotNearHeapLimit()",
-    "stock JSC does not expose a near-heap-limit callback",
+    "JSC's max-heap option has no embeddable near-limit callback or rearm contract",
   );
 }
 
@@ -308,7 +311,10 @@ export const promiseHooks = {
 
 export class GCProfiler {
   start() {
-    throw unsupported("GCProfiler.start()", "stock JSC exposes no garbage-collection event observer");
+    throw unsupported(
+      "GCProfiler.start()",
+      "JSC's HeapObserver registration is a private inline API absent from the stock JSCOnly SDK",
+    );
   }
 
   stop() {
@@ -332,10 +338,20 @@ export function queryObjects(constructor, options = undefined) {
   if (format !== undefined && format !== "count" && format !== "summary") {
     throw invalidArgValue("property 'options.format'", format);
   }
-  throw unsupported(
-    "queryObjects()",
-    "stock JSC can snapshot heap identities but cannot return live cells through its embedding API",
-  );
+  const prototype = constructor.prototype;
+  if ((typeof prototype !== "object" && typeof prototype !== "function") || prototype === null) {
+    return format === "summary" ? [] : 0;
+  }
+  if (format === "summary") {
+    throw unsupported(
+      "queryObjects(..., { format: 'summary' })",
+      "stock JSC exposes live cells but no side-effect-free object preview formatter",
+    );
+  }
+  if (typeof cottontail.jscQueryObjectsCount !== "function") {
+    throw unsupported("queryObjects()", "the JSC live-cell enumeration bridge is unavailable");
+  }
+  return cottontail.jscQueryObjectsCount(prototype);
 }
 
 export const startupSnapshot = {

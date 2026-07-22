@@ -196,7 +196,10 @@ const defaultDeserializer = new DefaultDeserializer(defaultSerializer.releaseBuf
 defaultDeserializer.readHeader();
 assert(defaultDeserializer.readValue().ok === true, "DefaultSerializer/DefaultDeserializer mismatch");
 
-expectThrows(() => cachedDataVersionTag(), "ERR_NOT_SUPPORTED", "cachedDataVersionTag");
+const cachedDataTag = cachedDataVersionTag();
+assert(Number.isInteger(cachedDataTag) && cachedDataTag >= 0 && cachedDataTag <= 0xffffffff,
+  "cachedDataVersionTag mismatch");
+assert(cachedDataVersionTag() === cachedDataTag, "cachedDataVersionTag stability mismatch");
 const heapStats = getHeapStatistics();
 assert(typeof heapStats.total_heap_size === "number" && heapStats.total_heap_size >= heapStats.used_heap_size,
   "getHeapStatistics mismatch");
@@ -265,8 +268,32 @@ expectThrows(() => setFlagsFromString("--trace-gc"), "ERR_NOT_SUPPORTED", "setFl
 expectThrows(() => setFlagsFromString(1 as never), "ERR_INVALID_ARG_TYPE", "setFlagsFromString validation");
 expectThrows(() => setHeapSnapshotNearHeapLimit(2), "ERR_NOT_SUPPORTED", "setHeapSnapshotNearHeapLimit");
 expectThrows(() => setHeapSnapshotNearHeapLimit(0), "ERR_OUT_OF_RANGE", "setHeapSnapshotNearHeapLimit validation");
-expectThrows(() => queryObjects(Object), "ERR_NOT_SUPPORTED", "queryObjects");
+
+let prototypeTrapCalls = 0;
+const queryPrototype = new Proxy({}, {
+  getPrototypeOf() {
+    prototypeTrapCalls += 1;
+    return Object.prototype;
+  },
+});
+function QueryObjectTarget() {}
+QueryObjectTarget.prototype = queryPrototype;
+const queryObjectRoots = [Object.create(queryPrototype), Object.create(Object.create(queryPrototype))];
+const queryObjectGlobal = globalThis as typeof globalThis & { __cottontailV8QueryObjectRoots?: object[] };
+queryObjectGlobal.__cottontailV8QueryObjectRoots = queryObjectRoots;
+const queryObjectCount = queryObjects(QueryObjectTarget, { format: "count" });
+assert(Number.isInteger(queryObjectCount) && queryObjectCount >= queryObjectRoots.length,
+  "queryObjects count mismatch");
+assert(prototypeTrapCalls === 0, "queryObjects invoked a prototype trap");
+delete queryObjectGlobal.__cottontailV8QueryObjectRoots;
+
+assert(queryObjects(() => {}) === 0, "queryObjects prototype-less constructor mismatch");
+assert((queryObjects(() => {}, { format: "summary" }) as unknown[]).length === 0,
+  "queryObjects prototype-less summary mismatch");
+expectThrows(() => queryObjects(QueryObjectTarget, { format: "summary" }), "ERR_NOT_SUPPORTED", "queryObjects summary");
 expectThrows(() => queryObjects(null as never), "ERR_INVALID_ARG_TYPE", "queryObjects validation");
+expectThrows(() => queryObjects(QueryObjectTarget, null as never), "ERR_INVALID_ARG_TYPE", "queryObjects options validation");
+expectThrows(() => queryObjects(QueryObjectTarget, { format: "invalid" as never }), "ERR_INVALID_ARG_VALUE", "queryObjects format validation");
 expectThrows(() => takeCoverage(), "ERR_NOT_SUPPORTED", "takeCoverage");
 expectThrows(() => stopCoverage(), "ERR_NOT_SUPPORTED", "stopCoverage");
 assert(startupSnapshot.isBuildingSnapshot() === false, "startupSnapshot mismatch");

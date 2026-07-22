@@ -11,12 +11,14 @@
 #include <JavaScriptCore/JSTypedArray.h>
 #include <JavaScriptCore/JSValueRef.h>
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <cstdlib>
 #include <cstdio>
 #include <cstdint>
 #include <cstddef>
+#include <mutex>
 #include <span>
 #include <utility>
 #include <vector>
@@ -26,8 +28,10 @@
 #include <wtf/MainThread.h>
 #endif
 #include <wtf/PtrTag.h>
+#include <wtf/text/ASCIILiteral.h>
 #include <wtf/text/ExternalStringImpl.h>
 #include <wtf/text/StringImpl.h>
+#include <wtf/text/UniquedStringImpl.h>
 
 namespace WTF {
 
@@ -251,10 +255,25 @@ using EncodedJSValue = int64_t;
 
 class CallFrame;
 class Exception;
-class HeapAnalyzer;
+class JSCell;
 class JSGlobalObject;
 class JSObject;
 class VM;
+
+enum class RootMarkReason : uint8_t;
+
+class HeapAnalyzer {
+public:
+    virtual ~HeapAnalyzer() = default;
+    virtual void analyzeNode(JSCell*) = 0;
+    virtual void analyzeEdge(JSCell*, JSCell*, RootMarkReason) = 0;
+    virtual void analyzePropertyNameEdge(JSCell*, JSCell*, UniquedStringImpl*) = 0;
+    virtual void analyzeVariableNameEdge(JSCell*, JSCell*, UniquedStringImpl*) = 0;
+    virtual void analyzeIndexEdge(JSCell*, JSCell*, uint32_t) = 0;
+    virtual void setOpaqueRootReachabilityReasonForCell(JSCell*, ASCIILiteral) = 0;
+    virtual void setWrappedObjectForCell(JSCell*, void*) = 0;
+    virtual void setLabelForCell(JSCell*, const String&) = 0;
+};
 
 namespace DOMJIT {
 class Signature;
@@ -366,6 +385,7 @@ private:
 
 JSObject* createError(JSGlobalObject*, const WTF::String&);
 JSObject* createTypeError(JSGlobalObject*, const WTF::String&);
+uint32_t computeJSCBytecodeCacheVersion();
 }
 
 static_assert(sizeof(JSValueRef) == sizeof(JSC::EncodedJSValue));
@@ -420,13 +440,8 @@ static char* ct_jsc_copy_utf8(const WTF::String& value)
     return result;
 }
 
-extern "C" char* ct_jsc_heap_snapshot(JSContextRef context, int gc_debugging)
+static JSC::HeapProfiler* ct_jsc_heap_profiler(JSC::VM* vm)
 {
-    if (context == nullptr)
-        return nullptr;
-    auto* vm = ct_jsc_vm(context);
-    JSC::JSLockHolder lock(*vm);
-
     // VM::ensureHeapProfiler() is inline in a private header omitted by the
     // JSCOnly artifact. Locate m_activeHeapAnalyzer with a temporary sentinel,
     // then use the pinned field delta to reach the adjacent LazyUniqueRef. The
@@ -485,6 +500,116 @@ extern "C" char* ct_jsc_heap_snapshot(JSContextRef context, int gc_debugging)
             reinterpret_cast<void*>(*lazy_slot));
     }
     if (profiler == nullptr || *reinterpret_cast<JSC::VM**>(profiler) != vm)
+        return nullptr;
+    return profiler;
+}
+
+extern "C" uint32_t ct_jsc_cached_data_version_tag()
+{
+    // Expose JSC's compatibility key without defining a cache payload format.
+    return JSC::computeJSCBytecodeCacheVersion();
+}
+
+class CtQueryObjectsAnalyzer final : public JSC::HeapAnalyzer {
+public:
+    void analyzeNode(JSC::JSCell* cell) final
+    {
+        std::lock_guard lock(m_mutex);
+        m_cells.push_back(cell);
+    }
+
+    void analyzeEdge(JSC::JSCell*, JSC::JSCell*, JSC::RootMarkReason) final { }
+    void analyzePropertyNameEdge(JSC::JSCell*, JSC::JSCell*, UniquedStringImpl*) final { }
+    void analyzeVariableNameEdge(JSC::JSCell*, JSC::JSCell*, UniquedStringImpl*) final { }
+    void analyzeIndexEdge(JSC::JSCell*, JSC::JSCell*, uint32_t) final { }
+    void setOpaqueRootReachabilityReasonForCell(JSC::JSCell*, ASCIILiteral) final { }
+    void setWrappedObjectForCell(JSC::JSCell*, void*) final { }
+    void setLabelForCell(JSC::JSCell*, const WTF::String&) final { }
+
+    std::vector<JSC::JSCell*> takeCells()
+    {
+        std::lock_guard lock(m_mutex);
+        return std::move(m_cells);
+    }
+
+private:
+    std::mutex m_mutex;
+    std::vector<JSC::JSCell*> m_cells;
+};
+
+class CtActiveHeapAnalyzerScope {
+public:
+    CtActiveHeapAnalyzerScope(JSC::HeapProfiler& profiler, JSC::HeapAnalyzer& analyzer)
+        : m_profiler(profiler)
+    {
+        m_profiler.setActiveHeapAnalyzer(&analyzer);
+    }
+
+    ~CtActiveHeapAnalyzerScope()
+    {
+        m_profiler.setActiveHeapAnalyzer(nullptr);
+    }
+
+private:
+    JSC::HeapProfiler& m_profiler;
+};
+
+extern "C" size_t ct_jsc_query_objects_count(JSContextRef context, JSObjectRef prototype)
+{
+    if (context == nullptr || prototype == nullptr)
+        return SIZE_MAX;
+    auto* vm = ct_jsc_vm(context);
+    JSC::JSLockHolder lock(*vm);
+    auto* profiler = ct_jsc_heap_profiler(vm);
+    if (profiler == nullptr)
+        return SIZE_MAX;
+
+    JSValueProtect(context, prototype);
+    CtQueryObjectsAnalyzer analyzer;
+    {
+        CtActiveHeapAnalyzerScope active_analyzer(*profiler, analyzer);
+        // The public operation is a synchronous full collection in the pinned
+        // JSC release, matching HeapSnapshotBuilder::buildSnapshot().
+        JSGarbageCollect(context);
+    }
+
+    auto cells = analyzer.takeCells();
+    std::sort(cells.begin(), cells.end(), [](auto* left, auto* right) {
+        return reinterpret_cast<uintptr_t>(left) < reinterpret_cast<uintptr_t>(right);
+    });
+    cells.erase(std::unique(cells.begin(), cells.end()), cells.end());
+
+    size_t count = 0;
+    for (auto* cell : cells) {
+        auto value = reinterpret_cast<JSValueRef>(cell);
+        if (!JSValueIsObject(context, value))
+            continue;
+
+        auto object = reinterpret_cast<JSObjectRef>(cell);
+        size_t remaining_prototypes = cells.size();
+        while (remaining_prototypes-- > 0) {
+            auto next = JSObjectGetPrototype(context, object);
+            if (next == prototype) {
+                ++count;
+                break;
+            }
+            if (!JSValueIsObject(context, next))
+                break;
+            object = reinterpret_cast<JSObjectRef>(const_cast<OpaqueJSValue*>(next));
+        }
+    }
+    JSValueUnprotect(context, prototype);
+    return count;
+}
+
+extern "C" char* ct_jsc_heap_snapshot(JSContextRef context, int gc_debugging)
+{
+    if (context == nullptr)
+        return nullptr;
+    auto* vm = ct_jsc_vm(context);
+    JSC::JSLockHolder lock(*vm);
+    auto* profiler = ct_jsc_heap_profiler(vm);
+    if (profiler == nullptr)
         return nullptr;
 
     profiler->clearSnapshots();

@@ -599,6 +599,12 @@ function makeAbortControllerModule() {
   };
 }
 
+function throwNotBuildingSnapshot() {
+  const error = new Error("Operation cannot be invoked when not building startup snapshot");
+  error.code = "ERR_NOT_BUILDING_SNAPSHOT";
+  throw error;
+}
+
 const stubFactories = {
   "internal/bootstrap/realm": () => ({
     BuiltinModule: {
@@ -613,9 +619,9 @@ const stubFactories = {
   "internal/v8/startup_snapshot": () => ({
     namespace: {
       isBuildingSnapshot: () => false,
-      addSerializeCallback() {},
-      addDeserializeCallback() {},
-      setDeserializeMainFunction() {},
+      addSerializeCallback: throwNotBuildingSnapshot,
+      addDeserializeCallback: throwNotBuildingSnapshot,
+      setDeserializeMainFunction: throwNotBuildingSnapshot,
     },
   }),
   "internal/options": () => ({
