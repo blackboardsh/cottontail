@@ -22,7 +22,7 @@ const javascriptExtensions = new Set([
   ".cts",
 ]);
 
-const scannedExtensions = new Set([".tsx", ".ts", ".jsx", ".js"]);
+const defaultScannedExtensions = [".tsx", ".ts", ".jsx", ".js"];
 
 function routeError(message, start, length) {
   throw new Error(`${message} (${start}:${length})`);
@@ -169,12 +169,12 @@ function parseNextLikeSegment(rawInput, routeSegment, convention) {
   return parts;
 }
 
-function parsePages(filePath, extension) {
+function parsePages(filePath, extension, allowLayouts) {
   let route = filePath.slice(0, filePath.length - extension.length);
   let kind = "page";
   if (route.endsWith("/index")) {
     route = route.slice(0, -"/index".length);
-  } else if (route.endsWith("/_layout")) {
+  } else if (allowLayouts && route.endsWith("/_layout")) {
     route = route.slice(0, -"/_layout".length);
     kind = "layout";
   }
@@ -184,7 +184,7 @@ function parsePages(filePath, extension) {
   };
 }
 
-function parseApp(filePath, extension, style) {
+function parseApp(filePath, extension, style, allowLayouts) {
   if (!javascriptExtensions.has(extension)) return null;
   const withoutExtension = filePath.slice(0, filePath.length - extension.length);
   const basename = path.posix.basename(withoutExtension);
@@ -201,6 +201,7 @@ function parseApp(filePath, extension, style) {
     : { route: "page" };
   const kind = kinds[basename];
   if (kind === undefined) return null;
+  if (kind === "layout" && !allowLayouts) return null;
 
   const dirname = path.posix.dirname(withoutExtension);
   return {
@@ -209,7 +210,7 @@ function parseApp(filePath, extension, style) {
   };
 }
 
-function parsePattern(style, filePath) {
+function parsePattern(style, filePath, allowLayouts = true) {
   const extension = path.posix.extname(filePath);
   if (typeof style === "function") {
     const result = style(filePath);
@@ -219,8 +220,8 @@ function parsePattern(style, filePath) {
     }
     return result;
   }
-  if (style === "nextjs-pages") return parsePages(filePath, extension);
-  return parseApp(filePath, extension, style);
+  if (style === "nextjs-pages") return parsePages(filePath, extension, allowLayouts);
+  return parseApp(filePath, extension, style, allowLayouts);
 }
 
 export function parseRoutePattern(style, filePath) {
@@ -301,6 +302,47 @@ function trimTrailingSeparator(value) {
   return value;
 }
 
+function normalizeExtensions(value) {
+  if (value === undefined) return new Set(defaultScannedExtensions);
+  if (value === "*") return null;
+  if (!Array.isArray(value)) {
+    throw new TypeError("'extensions' must be an array of strings or \"*\" for all extensions");
+  }
+
+  const extensions = new Set();
+  for (const item of value) {
+    if (typeof item !== "string") throw new TypeError("'extensions' must be an array of strings");
+    if (item === "*") {
+      throw new TypeError("'extensions' cannot include \"*\" as an extension. Pass \"*\" instead of the array.");
+    }
+    if (item.length === 0) throw new TypeError("'extensions' cannot include \"\" as an extension.");
+    extensions.add(item.startsWith(".") ? item : `.${item}`);
+  }
+  return extensions.size === 0 ? null : extensions;
+}
+
+function normalizeIgnoreDirs(value) {
+  if (value === undefined) return new Set([".git", "node_modules"]);
+  if (!Array.isArray(value) || value.some(item => typeof item !== "string")) {
+    throw new TypeError("'ignoreDirs' must be an array of strings");
+  }
+  return new Set(value);
+}
+
+function effectiveRouteKey(parts) {
+  let key = "";
+  for (const part of parts) {
+    switch (part.type) {
+      case "text": key += `/${part.value}`; break;
+      case "param": key += ":"; break;
+      case "catch_all": key += ":."; break;
+      case "catch_all_optional": key += ":?"; break;
+      case "group": break;
+    }
+  }
+  return key || "/";
+}
+
 export class FrameworkRouter {
   constructor(options) {
     if (options === null || typeof options !== "object") {
@@ -310,9 +352,14 @@ export class FrameworkRouter {
 
     this.root = trimTrailingSeparator(path.resolve(String(options.root)));
     this.style = normalizeStyle(options.style);
+    this.allowLayouts = options.layouts === undefined ? true : Boolean(options.layouts);
+    this.ignoreUnderscores = options.ignoreUnderscores === true;
+    this.ignoreDirs = normalizeIgnoreDirs(options.ignoreDirs);
+    this.extensions = normalizeExtensions(options.extensions);
     this.tree = routeNode();
     this.staticRoutes = new Map();
     this.dynamicRoutes = [];
+    this.effectiveRoutes = new Map();
     const errors = [];
     this.scanDirectory(this.root, errors);
     if (errors.length > 0) throw new AggregateError(errors, "Errors scanning routes");
@@ -331,23 +378,24 @@ export class FrameworkRouter {
     for (let index = entries.length - 1; index >= 0; index -= 1) {
       const entry = entries[index];
       if (entry.isDirectory()) {
-        if (entry.name === ".git" || entry.name === "node_modules") continue;
+        if ((this.ignoreUnderscores && entry.name.startsWith("_")) || this.ignoreDirs.has(entry.name)) continue;
         this.scanDirectory(path.join(directory, entry.name), errors);
         continue;
       }
       if (!entry.isFile()) continue;
       const extension = path.extname(entry.name);
-      if (!scannedExtensions.has(extension)) continue;
+      if (this.extensions !== null && !this.extensions.has(extension)) continue;
       const absolutePath = path.join(directory, entry.name);
       const relativePath = `/${path.relative(this.root, absolutePath).split(path.sep).join("/")}`;
       let parsed;
       try {
-        parsed = parsePattern(this.style, relativePath);
+        parsed = parsePattern(this.style, relativePath, this.allowLayouts);
       } catch (error) {
         errors.push(new Error(`Invalid route ${JSON.stringify(relativePath)}: ${error.message}`));
         continue;
       }
       if (parsed === null || parsed.kind === "extra") continue;
+      if (parsed.kind === "page" && this.ignoreUnderscores && entry.name.startsWith("_")) continue;
       if (parsed.parts.filter(part => part.type !== "text" && part.type !== "group").length > 64) {
         errors.push(new Error(`Invalid route ${JSON.stringify(relativePath)}: Pattern cannot have more than 64 param`));
         continue;
@@ -378,6 +426,13 @@ export class FrameworkRouter {
     node[field] = absolutePath;
 
     if (field !== "page") return;
+    const routeKey = effectiveRouteKey(parsed.parts);
+    const effectiveRoute = this.effectiveRoutes.get(routeKey);
+    if (effectiveRoute && effectiveRoute !== absolutePath) {
+      node[field] = null;
+      throw new Error(`Route collision between ${JSON.stringify(effectiveRoute)} and ${JSON.stringify(absolutePath)}`);
+    }
+    this.effectiveRoutes.set(routeKey, absolutePath);
     const dynamic = parsed.parts.some(part => part.type === "param" || part.type.startsWith("catch_all"));
     if (dynamic) {
       this.dynamicRoutes.push({ parts: parsed.parts, node });
@@ -409,7 +464,12 @@ export class FrameworkRouter {
     let params = null;
     if (matchedParams.length > 0) {
       params = {};
-      for (const [key, value] of matchedParams) params[key] = value;
+      for (const [key, value] of matchedParams) {
+        const existing = params[key];
+        if (existing === undefined) params[key] = value;
+        else if (Array.isArray(existing)) existing.push(value);
+        else params[key] = [existing, value];
+      }
     }
     return { params, route: routeToInverseJSON(node) };
   }

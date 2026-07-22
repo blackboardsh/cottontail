@@ -1,8 +1,137 @@
 import path from "../node/path.js";
 import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "../node/fs.js";
 import { pathToFileURL } from "../node/url.js";
+import { __setBuiltinModules } from "../node/module.js";
 import { Bun, serve } from "./index.js";
 import { FrameworkRouter } from "./bake-framework-router.js";
+
+let responseOptionsAsyncLocalStorage = null;
+let BakeResponse = null;
+
+function currentBakeRequestStore(required) {
+  if (responseOptionsAsyncLocalStorage === null) {
+    if (required) throw new TypeError("Response.render() is only available in the Bun dev server");
+    return null;
+  }
+
+  const store = responseOptionsAsyncLocalStorage.getStore();
+  if (store === null || typeof store !== "object") {
+    throw new TypeError("store value must be an object");
+  }
+  return store;
+}
+
+function assertBakeStreamingDisabled(displayFunction, required = false) {
+  const store = currentBakeRequestStore(required);
+  if (store === null) return null;
+  if (typeof store.streaming !== "boolean") {
+    throw new TypeError('"streaming" field must be a boolean');
+  }
+  if (store.streaming) {
+    throw new TypeError(`"${displayFunction}" is not available when \`export const streaming = true\``);
+  }
+  return store;
+}
+
+function isJSXElement(value) {
+  if (value === null || typeof value !== "object") return false;
+  const marker = value.$$typeof;
+  return marker === Symbol.for("react.element") || marker === Symbol.for("react.transitional.element");
+}
+
+function defineReactElementFields(response, type) {
+  const fields = {
+    $$typeof: Symbol.for("react.transitional.element"),
+    type,
+    key: null,
+    props: {},
+    _store: { validated: 0 },
+    _owner: null,
+    _debugInfo: null,
+    _debugStack: null,
+    _debugTask: null,
+  };
+  for (const [name, value] of Object.entries(fields)) {
+    Object.defineProperty(response, name, {
+      configurable: true,
+      enumerable: true,
+      value,
+      writable: true,
+    });
+  }
+  return response;
+}
+
+function decorateComponentResponse(response, component, responseOptions) {
+  return defineReactElementFields(response, function BakeResponseComponent() {
+    const store = responseOptionsAsyncLocalStorage?.getStore?.();
+    if (store && typeof store === "object") store.responseOptions = responseOptions;
+    return component;
+  });
+}
+
+function decorateControlResponse(response) {
+  return defineReactElementFields(response, function BakeResponseControl() {
+    throw response;
+  });
+}
+
+function ensureBakeResponseInstalled() {
+  if (BakeResponse !== null) return BakeResponse;
+  const WebResponse = globalThis.Response;
+  if (typeof WebResponse !== "function") {
+    throw new TypeError("The Web Response constructor is not installed");
+  }
+
+  BakeResponse = class BakeResponse extends WebResponse {
+    constructor(body = null, init = undefined) {
+      const jsx = isJSXElement(body);
+      if (jsx) assertBakeStreamingDisabled("new Response(<jsx />, { ... })");
+      super(body, init);
+      if (jsx) decorateComponentResponse(this, body, init);
+      else defineReactElementFields(this, null);
+    }
+
+    static redirect(url, status = 302) {
+      if (responseOptionsAsyncLocalStorage === null) return WebResponse.redirect(url, status);
+      assertBakeStreamingDisabled("Response.redirect");
+      const response = WebResponse.redirect(url, status);
+      Object.setPrototypeOf(response, BakeResponse.prototype);
+      return decorateControlResponse(response);
+    }
+
+    static render(path) {
+      assertBakeStreamingDisabled("Response.render", true);
+      if (arguments.length < 1) {
+        throw new TypeError("Response.render() requires at least a path argument");
+      }
+      if (typeof path !== "string") {
+        throw new TypeError("Response.render() path must be a string");
+      }
+      return decorateControlResponse(new BakeResponse(null, {
+        headers: { location: path },
+        status: 200,
+      }));
+    }
+  };
+
+  __setBuiltinModules({ "bun:app": Object.freeze({ Response: BakeResponse }) });
+  return BakeResponse;
+}
+
+function setBakeResponseAsyncLocalStorage(storage) {
+  if (storage === null || typeof storage !== "object" || typeof storage.getStore !== "function") {
+    throw new TypeError("bakeEnsureAsyncLocalStorage requires an AsyncLocalStorage instance");
+  }
+  responseOptionsAsyncLocalStorage = storage;
+  ensureBakeResponseInstalled();
+}
+
+// Bun exposes bun:app natively. Install its stock-JSC equivalent after the
+// cyclic runtime bootstrap has initialized the Web Response constructor.
+queueMicrotask(() => {
+  if (typeof globalThis.Response === "function") ensureBakeResponseInstalled();
+});
 
 const bakeStateSymbol = Symbol.for("cottontail.bake.dev-server-state");
 
@@ -324,6 +453,54 @@ function createBakeJavaScriptPacket(code) {
   return packet;
 }
 
+function createBakeFrameworkUpdatePacket(serverRouteIds, routeStyles, cssMutations) {
+  const encoder = new TextEncoder();
+  const encodedCss = cssMutations.map(({ id, source }) => {
+    if (!/^[a-f0-9]{16}$/.test(id)) throw new TypeError(`Invalid Bake CSS id: ${id}`);
+    return { id, source: encoder.encode(source) };
+  });
+  let size = 1 + (serverRouteIds.length + 1) * 4 + 4 + 4;
+  for (const styles of routeStyles.values()) size += 8 + (styles === null ? 0 : styles.length * 16);
+  for (const item of encodedCss) size += 20 + item.source.length;
+
+  const packet = new Uint8Array(size);
+  const view = new DataView(packet.buffer);
+  let offset = 0;
+  packet[offset++] = "u".charCodeAt(0);
+  for (const routeId of serverRouteIds) {
+    view.setInt32(offset, routeId, true);
+    offset += 4;
+  }
+  view.setInt32(offset, -1, true);
+  offset += 4;
+  for (const [routeId, styles] of routeStyles) {
+    view.setInt32(offset, routeId, true);
+    offset += 4;
+    view.setInt32(offset, styles === null ? -1 : styles.length, true);
+    offset += 4;
+    if (styles !== null) {
+      for (const id of styles) {
+        if (!/^[a-f0-9]{16}$/.test(id)) throw new TypeError(`Invalid Bake CSS id: ${id}`);
+        packet.set(encoder.encode(id), offset);
+        offset += 16;
+      }
+    }
+  }
+  view.setInt32(offset, -1, true);
+  offset += 4;
+  view.setUint32(offset, encodedCss.length, true);
+  offset += 4;
+  for (const item of encodedCss) {
+    packet.set(encoder.encode(item.id), offset);
+    offset += 16;
+    view.setUint32(offset, item.source.length, true);
+    offset += 4;
+    packet.set(item.source, offset);
+    offset += item.source.length;
+  }
+  return packet;
+}
+
 function createBakeHotUpdatePacket(modules, scriptId) {
   const registry = Object.entries(modules)
     .map(([id, definition]) => `${JSON.stringify(id)}:${bakeModuleDefinitionSource(definition)}`)
@@ -513,7 +690,7 @@ function createHtmlDispatcher(config, development) {
     for (const htmlPath of activePaths) previousBundles.set(htmlPath, await bundles.get(htmlPath));
 
     dispatchHtmlRequest.invalidate();
-    let hardReload = activePaths.length === 0;
+    let hardReload = false;
     const packets = [];
     for (const htmlPath of activePaths) {
       const previous = previousBundles.get(htmlPath);
@@ -592,6 +769,21 @@ function serverBuildOptions(framework, app) {
   return options;
 }
 
+function clientBuildOptions(framework, app) {
+  const frameworkOptions = framework.bundlerOptions ?? {};
+  const appOptions = app.bundlerOptions ?? {};
+  const options = {
+    ...frameworkOptions,
+    ...(frameworkOptions.client ?? {}),
+    ...appOptions,
+    ...(appOptions.client ?? {}),
+  };
+  delete options.client;
+  delete options.server;
+  delete options.ssr;
+  return options;
+}
+
 function loaderForPath(value) {
   const match = /\.([a-zA-Z0-9]+)(?:[?#].*)?$/.exec(String(value));
   switch ((match?.[1] ?? "").toLowerCase()) {
@@ -614,7 +806,7 @@ function loaderForPath(value) {
   }
 }
 
-function adaptServerPlugins(plugins) {
+function adaptFrameworkPlugins(plugins, side) {
   return plugins.map(plugin => ({
     ...plugin,
     setup(build) {
@@ -626,7 +818,7 @@ function adaptServerPlugins(plugins) {
               target.onLoad(constraints, args => callback({
                 ...args,
                 loader: args.loader ?? loaderForPath(args.path),
-                side: "server",
+                side,
               }));
               return adapted;
             };
@@ -638,6 +830,51 @@ function adaptServerPlugins(plugins) {
       return plugin.setup(adapted);
     },
   }));
+}
+
+function isCssArtifact(artifact) {
+  return artifact.loader === "css" || path.extname(String(artifact.path)).toLowerCase() === ".css";
+}
+
+function frameworkArtifactContentType(artifact) {
+  if (isCssArtifact(artifact)) return "text/css; charset=utf-8";
+  if (artifact.kind === "sourcemap") return "application/json; charset=utf-8";
+  if (isJavaScriptArtifact(artifact)) return "text/javascript; charset=utf-8";
+  return artifact.type || "application/octet-stream";
+}
+
+function metafileOutputForArtifact(metafile, artifact, projectRoot) {
+  const artifactPath = path.resolve(projectRoot, String(artifact.path));
+  const basename = path.basename(artifactPath);
+  let basenameMatch = null;
+  for (const [outputPath, output] of Object.entries(metafile?.outputs ?? {})) {
+    const candidates = [
+      path.resolve(projectRoot, outputPath),
+      path.resolve(path.dirname(artifactPath), path.basename(outputPath)),
+    ];
+    if (candidates.some(candidate => path.normalize(candidate) === path.normalize(artifactPath))) return output;
+    if (path.basename(outputPath) === basename) {
+      if (basenameMatch !== null) return null;
+      basenameMatch = output;
+    }
+  }
+  return basenameMatch;
+}
+
+function bakeCssId(metafile, artifact, projectRoot) {
+  const output = metafileOutputForArtifact(metafile, artifact, projectRoot);
+  const inputs = Object.keys(output?.inputs ?? {})
+    .filter(input => loaderForPath(input) === "css")
+    .map(input => metafileInputPath(projectRoot, input))
+    .sort();
+  const key = inputs.length > 0 ? inputs.join("\0") : path.resolve(projectRoot, String(artifact.path));
+  return BigInt.asUintN(64, Bun.hash(key)).toString(16).padStart(16, "0");
+}
+
+function bakeRouteClientUrl(routeId, generation) {
+  const id = (routeId >>> 0).toString(16).padStart(8, "0");
+  const version = (generation >>> 0).toString(16).padStart(8, "0");
+  return `/_bun/client/route-${id}${version}.js`;
 }
 
 function routeFiles(route) {
@@ -743,62 +980,207 @@ function createFrameworkDispatcher(config) {
   const app = config.app;
   const framework = app?.framework;
   if (!app || !framework || typeof framework !== "object") return null;
+  ensureBakeResponseInstalled();
 
   const projectRoot = globalThis.process?.cwd?.() ?? ".";
-  const plugins = adaptServerPlugins([...(framework.plugins ?? []), ...(app.plugins ?? [])]);
-  const buildOptions = serverBuildOptions(framework, app);
+  const configuredPlugins = [...(framework.plugins ?? []), ...(app.plugins ?? [])];
+  const serverPlugins = adaptFrameworkPlugins(configuredPlugins, "server");
+  const clientPlugins = adaptFrameworkPlugins(configuredPlugins, "client");
+  const serverOptions = serverBuildOptions(framework, app);
+  const clientOptions = clientBuildOptions(framework, app);
+  const serverComponents = framework.serverComponents && typeof framework.serverComponents === "object"
+    ? framework.serverComponents
+    : null;
+  const reactFastRefresh = framework.reactFastRefresh === true ||
+    (framework.reactFastRefresh !== null && typeof framework.reactFastRefresh === "object");
   const development = globalThis.process?.env?.NODE_ENV !== "production";
   const bundles = new Map();
   const wrapperPaths = new Map();
+  const clientWrapperPaths = new Map();
   const hmrDefinitions = new Map();
+  const routeRecords = [];
+  const routeRecordByPage = new Map();
+  const assets = new Map();
+  const retiredClientEntries = new Set();
   let hmrRuntime = null;
   let wrapperId = 0;
+  let hotUpdateId = 0;
+  let hadBuildErrors = false;
   const routerTypes = framework.fileSystemRouterTypes ?? [];
   const createRouters = () => routerTypes.map(type => {
     const root = path.resolve(projectRoot, String(type.root));
     return {
       type,
       prefix: normalizePrefix(type.prefix),
-      router: new FrameworkRouter({ root, style: type.style }),
+      router: new FrameworkRouter({
+        root,
+        style: type.style,
+        layouts: type.layouts ?? false,
+        ignoreUnderscores: type.ignoreUnderscores,
+        ignoreDirs: type.ignoreDirs,
+        extensions: type.extensions ?? [".jsx", ".tsx", ".js", ".ts", ".cjs", ".cts", ".mjs", ".mts"],
+      }),
       serverEntryPoint: resolveImportSource(projectRoot, type.serverEntryPoint),
+      clientEntryPoint: type.clientEntryPoint == null
+        ? null
+        : resolveImportSource(projectRoot, type.clientEntryPoint),
     };
   });
   let routers = createRouters();
 
-  async function bundleRoute(router, matched) {
+  function nextHotUpdateId() {
+    hotUpdateId = (hotUpdateId + 1) >>> 0;
+    return hotUpdateId.toString(16).padStart(16, "0");
+  }
+
+  function randomGeneration() {
+    if (typeof globalThis.crypto?.getRandomValues === "function") {
+      return globalThis.crypto.getRandomValues(new Uint32Array(1))[0];
+    }
+    return Math.floor(Math.random() * 0x100000000) >>> 0;
+  }
+
+  function getRouteRecord(page) {
+    let record = routeRecordByPage.get(page);
+    if (record) return record;
+    record = {
+      id: routeRecords.length,
+      page,
+      pathname: null,
+      generation: randomGeneration(),
+      route: null,
+      promise: null,
+    };
+    routeRecords.push(record);
+    routeRecordByPage.set(page, record);
+    return record;
+  }
+
+  async function collectBuildAssets(result) {
+    const css = new Map();
+    for (const artifact of result.outputs) {
+      if (artifact.kind === "entry-point" || artifact.kind === "sourcemap") continue;
+      if (isCssArtifact(artifact)) {
+        const id = bakeCssId(result.metafile, artifact, projectRoot);
+        const url = `/_bun/asset/${id}.css`;
+        const source = await artifact.text();
+        assets.set(url, { body: source, type: "text/css; charset=utf-8" });
+        css.set(id, { id, source, url });
+        continue;
+      }
+      const url = `/_bun/asset/${path.basename(String(artifact.path))}`;
+      assets.set(url, { body: artifact, type: frameworkArtifactContentType(artifact) });
+    }
+    return css;
+  }
+
+  async function buildClientRoute(record, router) {
+    let wrapperPath = clientWrapperPaths.get(record.page);
+    if (!wrapperPath) {
+      wrapperPath = path.join(projectRoot, `.cottontail-bake-client-${record.id}.js`);
+      clientWrapperPaths.set(record.page, wrapperPath);
+    }
+    const source = router.clientEntryPoint === null
+      ? "export {};"
+      : `import ${JSON.stringify(router.clientEntryPoint)};`;
+    const result = await Bun.build({
+      ...clientOptions,
+      entrypoints: [wrapperPath],
+      files: {
+        ...(clientOptions.files ?? {}),
+        [wrapperPath]: source,
+      },
+      format: development ? "internal_bake_dev" : "esm",
+      minify: development ? false : clientOptions.minify,
+      target: "browser",
+      publicPath: "/_bun/asset",
+      sourcemap: development ? "external" : "none",
+      reactFastRefresh: development && reactFastRefresh,
+      serverComponents: false,
+      external: [...new Set([...(clientOptions.external ?? []), "bun:bake/client"])],
+      metafile: true,
+      write: false,
+      throw: false,
+      plugins: clientPlugins,
+    });
+    if (!result.success || result.outputs.length === 0) {
+      throw new AggregateError(result.logs ?? [], `Failed to bundle Bake client entry ${router.clientEntryPoint ?? wrapperPath}`);
+    }
+    const artifact = result.outputs.find(isJavaScriptEntry);
+    if (!artifact) throw new Error(`Bake's client build did not emit ${router.clientEntryPoint ?? wrapperPath}`);
+
+    const originalSource = await artifact.text();
+    const url = bakeRouteClientUrl(record.id, record.generation);
+    let servedSource = originalSource;
+    const sourceMap = artifact.sourcemap ?? result.outputs.find(output => output.kind === "sourcemap");
+    if (sourceMap) {
+      const sourceMapComment = `//# sourceMappingURL=${url}.map`;
+      servedSource = /\/\/# sourceMappingURL=[^\r\n]*/.test(servedSource)
+        ? servedSource.replace(/\/\/# sourceMappingURL=[^\r\n]*/g, sourceMapComment)
+        : `${servedSource}\n${sourceMapComment}\n`;
+      assets.set(`${url}.map`, {
+        body: sourceMap,
+        type: "application/json; charset=utf-8",
+      });
+    }
+    retiredClientEntries.delete(url);
+    assets.set(url, { body: servedSource, type: "text/javascript; charset=utf-8" });
+    return {
+      modules: development ? bakeRegistryModules(originalSource) : null,
+      styles: await collectBuildAssets(result),
+      url,
+    };
+  }
+
+  async function bundleRoute(router, matched, force = false) {
     const { page, layouts } = routeFiles(matched.route);
     if (!page) return null;
-    let pending = bundles.get(page);
-    if (pending) return pending;
+    const record = getRouteRecord(page);
+    if (!force && record.route !== null) return record.route;
+    if (!force && record.promise !== null) return record.promise;
 
-    pending = (async () => {
+    const pending = (async () => {
       let wrapperPath = wrapperPaths.get(page);
       if (!wrapperPath) {
         wrapperPath = path.join(projectRoot, `.cottontail-bake-route-${wrapperId++}.ts`);
         wrapperPaths.set(page, wrapperPath);
       }
+      const configuredConditions = Array.isArray(serverOptions.conditions) ? serverOptions.conditions : [];
+      const conditions = serverComponents === null
+        ? configuredConditions
+        : [...new Set([...configuredConditions, "react-server"])];
       const result = await Bun.build({
-        ...buildOptions,
+        ...serverOptions,
         entrypoints: [wrapperPath],
         files: {
-          ...(buildOptions.files ?? {}),
+          ...(serverOptions.files ?? {}),
           [wrapperPath]: development
             ? hmrRouteWrapperSource(router.serverEntryPoint, page, layouts)
             : commonJSRouteWrapperSource(router.serverEntryPoint, page, layouts),
         },
         format: development ? "internal_bake_dev" : "cjs",
-        minify: development ? false : buildOptions.minify,
+        minify: development ? false : serverOptions.minify,
         target: "bun",
-        plugins,
+        publicPath: "/_bun/asset",
+        sourcemap: development ? "external" : serverOptions.sourcemap,
+        serverComponents: serverComponents !== null,
+        conditions,
+        metafile: true,
+        write: false,
+        throw: false,
+        plugins: serverPlugins,
       });
       if (!result.success || result.outputs.length === 0) {
         throw new AggregateError(result.logs ?? [], `Failed to bundle Bake route ${page}`);
       }
       const artifact = result.outputs.find(output => output.kind === "entry-point") ?? result.outputs[0];
+      const serverStyles = await collectBuildAssets(result);
+      const client = await buildClientRoute(record, router);
+      const styles = new Map([...serverStyles, ...client.styles]);
       if (development) {
         const parsed = parseHmrArtifact(await artifact.text());
         if (hmrRuntime === null) {
-          hmrRuntime = parsed.factory(framework.serverComponents?.separateSSRGraph === true, {
+          hmrRuntime = parsed.factory(serverComponents?.separateSSRGraph === true, {
             require: globalThis.require,
             resolve: specifier => specifier,
             bakeBuiltin: bakeBuiltinNamespace,
@@ -821,60 +1203,262 @@ function createFrameworkDispatcher(config) {
         const entryDefinition = parsed.modules[parsed.bundleConfig.main];
         const [serverId, pageId, ...layoutIds] = moduleDependencyIds(entryDefinition);
         if (!serverId || !pageId) throw new TypeError("Bake's HMR route bundle is missing framework modules");
-        return {
+        const route = {
+          clientModules: client.modules,
+          css: styles,
+          matched,
+          router,
+          serverModules: parsed.modules,
+          hmrArgs: {
+            routerTypeMain: serverId,
+            routeModules: [pageId, ...layoutIds],
+            clientEntryUrl: client.url,
+            styles: [...styles.values()].map(item => item.url),
+          },
           render(request, metadata) {
             return hmrRuntime.handleRequest(
               request,
               serverId,
               [pageId, ...layoutIds],
-              metadata.modules[0] ?? "",
-              metadata.styles,
+              client.url,
+              [...styles.values()].map(item => item.url),
               metadata.params,
-              () => {},
-              () => { throw new Error("Bake Response.render() route transitions are not connected yet"); },
-              () => { throw new Error("Bake Response.render() route transitions are not connected yet"); },
+              setBakeResponseAsyncLocalStorage,
+              bundleNewRoute,
+              newRouteParams,
             );
           },
         };
+        return route;
       }
 
       const exports = executeCommonJSArtifact(await artifact.text(), artifact.path || wrapperPath);
       if (typeof exports.render !== "function") {
         throw new TypeError(`Bake route bundle for ${page} did not export render()`);
       }
-      return exports;
+      return {
+        clientModules: null,
+        css: styles,
+        matched,
+        router,
+        serverModules: null,
+        hmrArgs: {
+          clientEntryUrl: client.url,
+          styles: [...styles.values()].map(item => item.url),
+        },
+        render: exports.render,
+      };
     })();
+    record.promise = pending;
     bundles.set(page, pending);
     try {
-      return await pending;
+      const route = await pending;
+      record.route = route;
+      return route;
     } catch (error) {
-      bundles.delete(page);
+      if (record.route === null) bundles.delete(page);
       throw error;
+    } finally {
+      if (record.promise === pending) record.promise = null;
     }
   }
 
-  const dispatchFrameworkRequest = async function dispatchFrameworkRequest(request) {
-    const pathname = new URL(request.url).pathname;
+  function matchFrameworkRoute(url, requestUrl) {
+    const pathname = new URL(String(url), requestUrl).pathname;
     for (const router of routers) {
       const relativePathname = pathnameForRouter(pathname, router.prefix);
       if (relativePathname === null) continue;
       const matched = router.router.match(relativePathname);
-      if (matched === null) continue;
-      const route = await bundleRoute(router, matched);
-      if (route === null) continue;
-      return route.render(request, {
-        params: matched.params,
-        modules: [],
-        modulepreload: [],
-        styles: [],
+      if (matched !== null) return { matched, router };
+    }
+    return null;
+  }
+
+  function bundleNewRoute(request, url) {
+    const found = matchFrameworkRoute(url, request.url);
+    if (found === null) throw new Error(`No route found for path: ${new URL(String(url), request.url).pathname}`);
+    const { page } = routeFiles(found.matched.route);
+    if (!page) throw new Error(`No page found for path: ${new URL(String(url), request.url).pathname}`);
+
+    const record = getRouteRecord(page);
+    record.pathname = new URL(String(url), request.url).pathname;
+    const promise = record.route === null
+      ? bundleRoute(found.router, found.matched).then(route => {
+          if (route === null) throw new Error(`No route bundle produced for path: ${String(url)}`);
+        })
+      : undefined;
+    return [record.id, promise];
+  }
+
+  function newRouteParams(request, routeBundleIndex, url) {
+    if (!Number.isInteger(routeBundleIndex) || routeBundleIndex < 0 || routeBundleIndex >= routeRecords.length) {
+      throw new TypeError("Route bundle index must be an integer");
+    }
+    const record = routeRecords[routeBundleIndex];
+    if (record.route === null) throw new Error(`Route bundle ${routeBundleIndex} has not finished loading`);
+
+    const found = matchFrameworkRoute(url, request.url);
+    if (found === null) throw new Error(`No route found for path: ${new URL(String(url), request.url).pathname}`);
+    const { page } = routeFiles(found.matched.route);
+    if (page !== record.page) {
+      throw new Error(`Route index mismatch for path: ${new URL(String(url), request.url).pathname}`);
+    }
+    return {
+      ...record.route.hmrArgs,
+      params: found.matched.params,
+    };
+  }
+
+  const dispatchFrameworkRequest = async function dispatchFrameworkRequest(request) {
+    const pathname = new URL(request.url).pathname;
+    const asset = assets.get(pathname);
+    if (asset) {
+      return new Response(asset.body, {
+        headers: {
+          "cache-control": "no-cache",
+          "content-type": asset.type,
+        },
       });
     }
-    return new Response("Not Found", { status: 404 });
+    if (retiredClientEntries.has(pathname)) {
+      return new Response(
+        "try{location.reload()}catch(_){}\naddEventListener(\"DOMContentLoaded\",()=>location.reload())",
+        { headers: { "content-type": "text/javascript; charset=utf-8" } },
+      );
+    }
+    const found = matchFrameworkRoute(request.url, request.url);
+    if (found === null) return new Response("Not Found", { status: 404 });
+    const { page } = routeFiles(found.matched.route);
+    if (!page) return new Response("Not Found", { status: 404 });
+    const record = getRouteRecord(page);
+    record.pathname = pathname;
+    const route = await bundleRoute(found.router, found.matched);
+    if (route === null) return new Response("Not Found", { status: 404 });
+    return route.render(request, {
+      params: found.matched.params,
+      modules: [route.hmrArgs?.clientEntryUrl ?? ""],
+      modulepreload: [],
+      styles: route.hmrArgs?.styles ?? [],
+    });
   };
   dispatchFrameworkRequest.projectRoot = projectRoot;
+  dispatchFrameworkRequest.routeIdForPath = pathname => {
+    const found = matchFrameworkRoute(pathname, "http://localhost/");
+    if (found === null) return null;
+    const { page } = routeFiles(found.matched.route);
+    if (!page) return null;
+    const record = getRouteRecord(page);
+    record.pathname = new URL(String(pathname), "http://localhost/").pathname;
+    return record.id;
+  };
   dispatchFrameworkRequest.invalidate = () => {
     bundles.clear();
+    for (const record of routeRecords) {
+      if (record.route?.hmrArgs?.clientEntryUrl) {
+        const url = record.route.hmrArgs.clientEntryUrl;
+        assets.delete(url);
+        assets.delete(`${url}.map`);
+        retiredClientEntries.add(url);
+      }
+    }
+    routeRecords.length = 0;
+    routeRecordByPage.clear();
+    wrapperPaths.clear();
+    clientWrapperPaths.clear();
     routers = createRouters();
+  };
+  dispatchFrameworkRequest.update = async (changedPaths = []) => {
+    const activeRecords = routeRecords.filter(record => record.route !== null);
+    const previousRouters = routers;
+    const packets = [];
+    const serverRouteIds = [];
+    const routeStyles = new Map();
+    const cssMutations = new Map();
+    const changedClientModules = {};
+    let hardReload = false;
+    let buildFailed = false;
+
+    try {
+      routers = createRouters();
+    } catch (error) {
+      routers = previousRouters;
+      const errors = bakeBuildErrors(error?.errors ?? [error], projectRoot);
+      packets.push(createBakeErrorUpdatePacket(errors, nextHotUpdateId()));
+      hadBuildErrors = true;
+      return { hardReload: false, packets };
+    }
+
+    for (const record of activeRecords) {
+      const previous = record.route;
+      const found = matchFrameworkRoute(record.pathname ?? "/", "http://localhost/");
+      const nextPage = found === null ? null : routeFiles(found.matched.route).page;
+      if (found === null || nextPage !== record.page) {
+        hardReload = true;
+        continue;
+      }
+
+      let next;
+      try {
+        next = await bundleRoute(found.router, found.matched, true);
+      } catch (error) {
+        const errors = bakeBuildErrors(error?.errors ?? [error], record.page);
+        packets.push(createBakeErrorUpdatePacket(errors, nextHotUpdateId()));
+        buildFailed = true;
+        continue;
+      }
+
+      if (development) {
+        let serverChanged = false;
+        const previousServerModules = previous.serverModules ?? {};
+        const nextServerModules = next.serverModules ?? {};
+        const serverModuleIds = new Set([...Object.keys(previousServerModules), ...Object.keys(nextServerModules)]);
+        for (const id of serverModuleIds) {
+          if (moduleDefinitionSignature(previousServerModules[id]) !== moduleDefinitionSignature(nextServerModules[id])) {
+            serverChanged = true;
+            break;
+          }
+        }
+        if (serverChanged) serverRouteIds.push(record.id);
+
+        const previousClientModules = previous.clientModules ?? {};
+        for (const [id, definition] of Object.entries(next.clientModules ?? {})) {
+          if (changedPathMatchesModule(projectRoot, changedPaths, id) ||
+              moduleDefinitionSignature(previousClientModules[id]) !== moduleDefinitionSignature(definition)) {
+            changedClientModules[id] = definition;
+          }
+        }
+
+        const previousCssIds = [...previous.css.keys()];
+        const nextCssIds = [...next.css.keys()];
+        const stylesChanged = previousCssIds.length !== nextCssIds.length ||
+          previousCssIds.some((id, index) => id !== nextCssIds[index]);
+        if (serverChanged || stylesChanged) {
+          routeStyles.set(record.id, stylesChanged ? nextCssIds : null);
+        }
+        for (const [id, item] of next.css) {
+          if (previous.css.get(id)?.source !== item.source) cssMutations.set(id, item);
+        }
+      }
+    }
+
+    if (buildFailed) {
+      routers = previousRouters;
+      hadBuildErrors = true;
+    } else if (hadBuildErrors) {
+      packets.push(createBakeErrorUpdatePacket([], nextHotUpdateId()));
+      hadBuildErrors = false;
+    }
+    if (serverRouteIds.length > 0 || routeStyles.size > 0 || cssMutations.size > 0) {
+      packets.push(createBakeFrameworkUpdatePacket(
+        serverRouteIds,
+        routeStyles,
+        [...cssMutations.values()],
+      ));
+    }
+    if (Object.keys(changedClientModules).length > 0) {
+      packets.push(createBakeHotUpdatePacket(changedClientModules, nextHotUpdateId()));
+    }
+    return { hardReload, packets };
   };
   return dispatchFrameworkRequest;
 }
@@ -959,6 +1543,7 @@ function installDevelopmentSocket(config, bakeRuntime) {
   const queuedChangedPaths = new Set();
 
   function broadcastUpdate(update) {
+    if (!update.hardReload && update.packets.length === 0) return;
     for (const browserSocket of browserSockets) {
       const browserSession = watchSessions.get(browserSocket);
       if (!update.hardReload && update.packets.length > 0 && browserSession?.kind === "hmr-browser") {
@@ -1056,6 +1641,13 @@ function installDevelopmentSocket(config, bakeRuntime) {
           if (existing) existing.kind = "hmr-browser";
           browserSockets.add(socket);
           startAutomaticWatcher();
+          const routeId = bakeRuntime?.routeIdForPath?.(text.slice(1) || "/");
+          if (Number.isInteger(routeId) && routeId >= 0) {
+            const response = new Uint8Array(5);
+            response[0] = "n".charCodeAt(0);
+            new DataView(response.buffer).setUint32(1, routeId, true);
+            socket.sendBinary(response);
+          }
         } else if (text.startsWith("s")) {
           if (existing && existing.kind !== "hmr-browser") existing.kind = "browser";
           browserSockets.add(socket);
@@ -1319,14 +1911,21 @@ export function startDefaultApp(entryNamespace) {
   const bakeRuntime = htmlFetch || frameworkFetch
     ? {
         projectRoot: htmlFetch?.projectRoot ?? frameworkFetch?.projectRoot,
+        routeIdForPath(pathname) {
+          return frameworkFetch?.routeIdForPath?.(pathname) ?? null;
+        },
         invalidate() {
           htmlFetch?.invalidate?.();
           frameworkFetch?.invalidate?.();
         },
         async update(changedPaths) {
           const htmlUpdate = htmlFetch ? await htmlFetch.update(changedPaths) : null;
-          frameworkFetch?.invalidate?.();
-          return htmlUpdate ?? { hardReload: true, packets: [] };
+          const frameworkUpdate = frameworkFetch ? await frameworkFetch.update(changedPaths) : null;
+          if (!htmlUpdate && !frameworkUpdate) return { hardReload: true, packets: [] };
+          return {
+            hardReload: Boolean(htmlUpdate?.hardReload || frameworkUpdate?.hardReload),
+            packets: [...(htmlUpdate?.packets ?? []), ...(frameworkUpdate?.packets ?? [])],
+          };
         },
       }
     : null;
@@ -1339,6 +1938,11 @@ export function startDefaultApp(entryNamespace) {
     serveConfig = {
       ...serveConfig,
       async fetch(request, server) {
+        const pathname = new URL(request.url).pathname;
+        if (frameworkFetch && (pathname.startsWith("/_bun/client/") || pathname.startsWith("/_bun/asset/"))) {
+          const response = await frameworkFetch(request);
+          if (response.status !== 404) return response;
+        }
         if (htmlFetch) {
           const response = await htmlFetch(request);
           if (response.status !== 404) return response;
