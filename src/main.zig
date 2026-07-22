@@ -900,21 +900,6 @@ fn platformTempDir(env: *const std.process.Environ.Map) []const u8 {
         if (builtin.os.tag == .windows) "." else "/tmp";
 }
 
-const package_bin_runtime_env = "COTTONTAIL_PACKAGE_BIN_RUNTIME";
-
-fn isPackageBinEntrypoint(path: []const u8) bool {
-    var components = std.mem.tokenizeAny(u8, path, "/\\");
-    var previous_was_node_modules = false;
-    while (components.next()) |component| {
-        if (previous_was_node_modules and std.mem.eql(u8, component, ".bin")) return true;
-        previous_was_node_modules = if (builtin.os.tag == .windows)
-            std.ascii.eqlIgnoreCase(component, "node_modules")
-        else
-            std.mem.eql(u8, component, "node_modules");
-    }
-    return false;
-}
-
 fn prependForcedBunRuntimePath(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -954,11 +939,9 @@ fn prependForcedBunRuntimePath(
         launcher_dir;
     try env.put("PATH", path);
     try env.put("BUN_BE_BUN", "1");
-    try env.put(package_bin_runtime_env, "1");
     const path_z = try allocator.dupeZ(u8, path);
     _ = setenv("PATH", path_z.ptr, 1);
     _ = setenv("BUN_BE_BUN", "1", 1);
-    _ = setenv(package_bin_runtime_env, "1", 1);
 }
 
 fn forcesBunRuntime(exec_args: []const [:0]const u8) bool {
@@ -3548,8 +3531,6 @@ pub fn main(init: std.process.Init) !void {
 
     if (forcesBunRuntime(invocation.exec_args)) {
         try prependForcedBunRuntimePath(init, init.arena.allocator(), init.environ_map);
-    } else if (invocation.mode == .script and isPackageBinEntrypoint(invocation.payload)) {
-        try init.environ_map.put(package_bin_runtime_env, "1");
     }
 
     const exit_code = switch (invocation.mode) {
@@ -3584,14 +3565,6 @@ test "runtime flags can precede the test command" {
     try std.testing.expectEqualStrings("--conditions", normalized[3]);
     try std.testing.expectEqualStrings("shell", normalized[4]);
     try std.testing.expectEqualStrings("suite.test.ts", normalized[5]);
-}
-
-test "package bin entrypoints select the reusable runtime launcher" {
-    try std.testing.expect(isPackageBinEntrypoint("./node_modules/.bin/vite"));
-    try std.testing.expect(isPackageBinEntrypoint("/work/app/node_modules/.bin/vite"));
-    try std.testing.expect(isPackageBinEntrypoint("C:\\work\\app\\node_modules\\.bin\\vite.cmd"));
-    try std.testing.expect(!isPackageBinEntrypoint("/work/app/node_modules/vite/bin/vite.js"));
-    try std.testing.expect(!isPackageBinEntrypoint("./vite"));
 }
 
 test "test execution preserves inspector runtime flags" {

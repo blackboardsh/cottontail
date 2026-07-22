@@ -5382,6 +5382,15 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 300 assertions)."
     },
+    "test/regression/issue/ctrl-c.test.ts": {
+      "status": "enabled",
+      "reason": "All eight copied signal regressions pass across queued self-signals, package-script forwarding, direct package bins, and forced Cottontail runtime execution (22 assertions).",
+      "env": {
+        "COTTONTAIL_TEST_TIMEOUT_SCALE": "6"
+      },
+      "timeoutMs": 180000,
+      "serial": true
+    },
     "test/regression/issue/css-system-color-contexts.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
