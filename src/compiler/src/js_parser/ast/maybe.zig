@@ -412,7 +412,9 @@ pub fn AstMaybe(
 
                     // Inline import.meta properties for Bake, CommonJS, or a
                     // host that evaluates bundled ESM through a script API.
-                    if (p.options.inline_import_meta_properties or p.options.framework != null or (p.options.bundle and p.options.output_format == .cjs)) {
+                    if (p.options.inline_import_meta_properties or p.options.framework != null or
+                        (p.options.bundle and p.options.output_format == .cjs) or p.hasOriginalPathMarker())
+                    {
                         const import_meta_path = p.pathForImportMeta();
                         if (strings.eqlComptime(name, "dir") or strings.eqlComptime(name, "dirname")) {
                             // Inline import.meta.dir
