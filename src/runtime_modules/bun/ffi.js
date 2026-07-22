@@ -2547,7 +2547,9 @@ function prepareWorkerScriptPath(scriptPath, options = undefined) {
   const bundledPath = `${tempDir}/bun-worker-${nonce}.js`;
   const slashCwd = String(cottontail.cwd()).replace(/\\/g, "/");
   const slashTarget = String(target).replace(/\\/g, "/");
-  const runtimeEntry = `${slashCwd}/.cottontail-embedded-runtime/bun/index.js`;
+  // The FFI runtime owns process, timers, and the native worker transport.
+  // Worker entry dependencies are linked into the bundle below as usual.
+  const runtimeEntry = `${slashCwd}/.cottontail-embedded-runtime/bun/ffi.js`;
   if (options?.[preparedWorkerScript] === true) {
     const runtimePrelude = loadWorkerRuntimePrelude(tempDir, slashCwd, runtimeEntry, nonce);
     const source = cottontail.readFile(target);

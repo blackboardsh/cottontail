@@ -167,6 +167,11 @@
       "reason": "The copied Rollup v4 fixture loads the native parseAst package entry and matches Bun's AST snapshot (one case, one assertion)."
     },
     {
+      "pattern": "^test/js/third_party/comlink/comlink\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "The copied Comlink fixture starts a real Web Worker through the native transport and resolves its first remote property within Bun's 100ms bound (one case, one assertion)."
+    },
+    {
       "pattern": "^test/js/bun/.*\\.test\\.(?:js|mjs|cjs|ts|tsx|mts|cts)$",
       "status": "enabled",
       "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
