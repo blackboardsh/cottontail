@@ -15192,6 +15192,7 @@ function normalizeBunSocketHandlers(value, isServer = false) {
   }
 
   const handlers = { binaryType: "buffer", isServer };
+  let callbackCount = 0;
   for (const [name, callbackName] of Object.entries(bunSocketCallbackNames)) {
     const callback = value[name];
     if (callback == null) continue;
@@ -15199,6 +15200,7 @@ function normalizeBunSocketHandlers(value, isServer = false) {
       throw bunSocketInvalidArgument(`Expected "${callbackName}" callback to be a function`);
     }
     handlers[name] = _wrapAsyncCallback(callback);
+    callbackCount += 1;
   }
 
   if (value.binaryType !== undefined) {
@@ -15211,7 +15213,7 @@ function normalizeBunSocketHandlers(value, isServer = false) {
     handlers.binaryType = value.binaryType;
   }
 
-  if (handlers.data == null && handlers.drain == null) {
+  if (handlers.data == null && handlers.drain == null && callbackCount === 0) {
     throw bunSocketInvalidArgument('Expected at least "data" or "drain" callback');
   }
   return handlers;

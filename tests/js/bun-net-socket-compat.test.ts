@@ -152,6 +152,13 @@ test.skipIf(process.platform === "win32")("Bun.listen and Bun.connect exchange U
 });
 
 test("Bun sockets validate handlers and binaryType", () => {
+  const lifecycleOnly = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: { close() {} },
+  });
+  lifecycleOnly.stop(true);
+
   expect(() => Bun.listen({
     hostname: "127.0.0.1",
     port: 0,
