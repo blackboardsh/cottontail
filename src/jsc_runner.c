@@ -25299,10 +25299,28 @@ static JSValueRef ct_open_fd(JSContextRef ctx, JSObjectRef function, JSObjectRef
         }
     } else if (flags != NULL) {
         if (strcmp(flags, "r") == 0) open_flags = O_RDONLY;
+        else if (strcmp(flags, "rn") == 0) {
+            open_flags = O_RDONLY;
+#if !defined(_WIN32)
+            open_flags |= O_NONBLOCK;
+#endif
+        }
         else if (strcmp(flags, "r+") == 0) open_flags = O_RDWR;
         else if (strcmp(flags, "rs") == 0 || strcmp(flags, "sr") == 0) open_flags = O_RDONLY | O_SYNC;
         else if (strcmp(flags, "rs+") == 0 || strcmp(flags, "sr+") == 0) open_flags = O_RDWR | O_SYNC;
         else if (strcmp(flags, "w") == 0) open_flags = O_WRONLY | O_CREAT | O_TRUNC;
+        else if (strcmp(flags, "wn") == 0) {
+            open_flags = O_WRONLY | O_CREAT;
+#if !defined(_WIN32)
+            open_flags |= O_NONBLOCK;
+#endif
+        }
+        else if (strcmp(flags, "wnt") == 0) {
+            open_flags = O_WRONLY | O_CREAT | O_TRUNC;
+#if !defined(_WIN32)
+            open_flags |= O_NONBLOCK;
+#endif
+        }
         else if (strcmp(flags, "wx") == 0 || strcmp(flags, "xw") == 0) open_flags = O_WRONLY | O_CREAT | O_TRUNC | O_EXCL;
         else if (strcmp(flags, "w+") == 0) open_flags = O_RDWR | O_CREAT | O_TRUNC;
         else if (strcmp(flags, "wx+") == 0 || strcmp(flags, "xw+") == 0) open_flags = O_RDWR | O_CREAT | O_TRUNC | O_EXCL;
