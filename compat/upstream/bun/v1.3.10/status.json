@@ -735,6 +735,10 @@
       "status": "enabled",
       "reason": "Bake React HTML routes, refresh registration, hook-state preservation, custom hooks, and mutually recursive components pass all 6 copied cases (13 assertions)."
     },
+    "test/bake/dev/server-sourcemap.test.ts": {
+      "status": "enabled",
+      "reason": "Bake server errors map generated frames back to original route, dependency, and plugin sources across all 3 copied cases (11 assertions)."
+    },
     "test/bake/dev/sourcemap.test.ts": {
       "status": "enabled",
       "reason": "Bake client source maps preserve original sources across primary and hot-reload chunks (2 cases, 6 assertions)."
@@ -1742,6 +1746,10 @@
     "test/integration/sharp/sharp.test.ts": {
       "status": "enabled",
       "reason": "Cottontail installs and loads sharp through its native package-manager path, and all five copied resize, conversion, quality, crop, and rotation cases pass within the upstream timeout."
+    },
+    "test/integration/svelte/client-side.test.ts": {
+      "status": "enabled",
+      "reason": "The unchanged Svelte client integration builds and serves development HTML through configured plugins and the Node-backed HMR server (2 cases, 5 assertions)."
     },
     "test/integration/svelte/server-side.test.ts": {
       "status": "enabled",
