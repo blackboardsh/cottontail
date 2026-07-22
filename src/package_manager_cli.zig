@@ -9812,17 +9812,14 @@ const Manager = struct {
             return;
         }
 
-        const directories = metadata.object.get("directories") orelse return;
-        if (directories != .object) return;
-        const directory_value = directories.object.get("bin") orelse return;
-        if (directory_value != .string) return;
-        const directory_path = try std.fs.path.join(manager.allocator, &.{ package_dir, directory_value.string });
+        const bin_directory = packageBinDirectory(metadata) orelse return;
+        const directory_path = try std.fs.path.join(manager.allocator, &.{ package_dir, bin_directory });
         var directory = std.Io.Dir.cwd().openDir(manager.init_data.io, directory_path, .{ .iterate = true }) catch return;
         defer directory.close(manager.init_data.io);
         var iterator = directory.iterate();
         while (try iterator.next(manager.init_data.io)) |entry| {
             if (entry.kind != .file) continue;
-            const relative_target = try std.fs.path.join(manager.allocator, &.{ directory_value.string, entry.name });
+            const relative_target = try std.fs.path.join(manager.allocator, &.{ bin_directory, entry.name });
             if (try manager.linkBin(bin_dir, normalizedBinName(entry.name), package_dir, relative_target)) {
                 if (report_direct) try manager.direct_bins.append(normalizedBinName(entry.name));
             }
@@ -9845,11 +9842,8 @@ const Manager = struct {
             return;
         }
 
-        const directories = metadata.object.get("directories") orelse return;
-        if (directories != .object) return;
-        const directory_value = directories.object.get("bin") orelse return;
-        if (directory_value != .string) return;
-        const directory_path = try std.fs.path.join(manager.allocator, &.{ manager.invocation_package_dir, directory_value.string });
+        const bin_directory = packageBinDirectory(metadata) orelse return;
+        const directory_path = try std.fs.path.join(manager.allocator, &.{ manager.invocation_package_dir, bin_directory });
         var directory = std.Io.Dir.cwd().openDir(manager.init_data.io, directory_path, .{ .iterate = true }) catch return;
         defer directory.close(manager.init_data.io);
         var iterator = directory.iterate();
@@ -10715,7 +10709,17 @@ const Manager = struct {
         var first = true;
         for (fields) |field| {
             if (std.mem.eql(u8, field, "devDependencies") and !include_dev_dependencies) continue;
-            const field_value = value.object.get(field) orelse continue;
+            const field_value = value.object.get(field) orelse {
+                if (std.mem.eql(u8, field, "binDir")) {
+                    const bin_directory = packageBinDirectory(value) orelse continue;
+                    if (!first) try writer.writeAll(", ");
+                    first = false;
+                    try writeJSONString(writer, field);
+                    try writer.writeAll(": ");
+                    try writeJSONString(writer, bin_directory);
+                }
+                continue;
+            };
             if (!first) try writer.writeAll(", ");
             first = false;
             try writeJSONString(writer, field);
@@ -11448,6 +11452,17 @@ fn pathsEquivalent(io: std.Io, allocator: std.mem.Allocator, left: []const u8, r
     const real_left = std.Io.Dir.cwd().realPathFileAlloc(io, left, allocator) catch return false;
     const real_right = std.Io.Dir.cwd().realPathFileAlloc(io, right, allocator) catch return false;
     return std.mem.eql(u8, real_left, real_right);
+}
+
+fn packageBinDirectory(metadata: *const Value) ?[]const u8 {
+    if (metadata.* != .object) return null;
+    if (metadata.object.get("binDir")) |bin_dir| {
+        if (bin_dir == .string) return bin_dir.string;
+    }
+    const directories = metadata.object.get("directories") orelse return null;
+    if (directories != .object) return null;
+    const bin_dir = directories.object.get("bin") orelse return null;
+    return if (bin_dir == .string) bin_dir.string else null;
 }
 
 fn normalizedBinName(name: []const u8) []const u8 {
