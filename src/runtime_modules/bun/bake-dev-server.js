@@ -869,11 +869,14 @@ function createBakeErrorUpdatePacket(errors, scriptId) {
 }
 
 function changedPathMatchesModule(projectRoot, changedPaths, moduleId) {
-  const cleanId = String(moduleId).split(/[?#]/, 1)[0];
+  let cleanId = String(moduleId).split(/[?#]/, 1)[0];
+  if (cleanId.startsWith("ssr:")) cleanId = cleanId.slice("ssr:".length);
   if (!cleanId || cleanId.startsWith("bun:")) return false;
   const modulePath = path.isAbsolute(cleanId) ? path.normalize(cleanId) : path.resolve(projectRoot, cleanId);
+  const transformedSourcePath = cleanId.endsWith(".js") ? modulePath.slice(0, -3) : null;
   for (const changedPath of changedPaths) {
-    if (modulePath === path.resolve(projectRoot, changedPath)) return true;
+    const absoluteChangedPath = path.resolve(projectRoot, changedPath);
+    if (modulePath === absoluteChangedPath || transformedSourcePath === absoluteChangedPath) return true;
   }
   return false;
 }
@@ -1628,13 +1631,103 @@ function moduleDependencyIds(definition) {
   return ids;
 }
 
+function changedModuleSelection(projectRoot, changedPaths, previousModules, nextModules) {
+  const changedIds = [];
+  const moduleIds = new Set([...Object.keys(previousModules), ...Object.keys(nextModules)]);
+  for (const id of moduleIds) {
+    if (moduleDefinitionSignature(previousModules[id]) !== moduleDefinitionSignature(nextModules[id])) {
+      changedIds.push(id);
+    }
+  }
+
+  const matchedIds = changedIds.filter(id => changedPathMatchesModule(projectRoot, changedPaths, id));
+  const allPathsMatched = changedPaths.length > 0 && changedPaths.every(changedPath =>
+    changedIds.some(id => changedPathMatchesModule(projectRoot, [changedPath], id))
+  );
+  const triggerIds = allPathsMatched ? matchedIds : changedIds;
+  const includedIds = new Set(triggerIds.filter(id => Object.prototype.hasOwnProperty.call(nextModules, id)));
+
+  // An invalidated module can introduce a dependency that the loaded graph has
+  // never seen. Bun's incremental linker includes those new definitions in the
+  // same HMR chunk, so include their transitive closure here as well.
+  const queue = [...includedIds];
+  while (queue.length > 0) {
+    const id = queue.shift();
+    const definition = nextModules[id];
+    if (!Array.isArray(definition?.[0])) continue;
+    for (const dependency of moduleDependencyIds(definition)) {
+      if (Object.prototype.hasOwnProperty.call(previousModules, dependency) || includedIds.has(dependency)) continue;
+      if (!Object.prototype.hasOwnProperty.call(nextModules, dependency)) continue;
+      includedIds.add(dependency);
+      queue.push(dependency);
+    }
+  }
+
+  const modules = {};
+  for (const id of includedIds) modules[id] = nextModules[id];
+  return { modules, triggerIds };
+}
+
+function moduleChangesReachRoots(previousModules, nextModules, triggerIds, rootIds, boundaryIds) {
+  if (triggerIds.length === 0 || rootIds.size === 0) return false;
+
+  const importers = new Map();
+  for (const modules of [previousModules, nextModules]) {
+    for (const [importerId, definition] of Object.entries(modules)) {
+      if (!Array.isArray(definition?.[0])) continue;
+      for (const dependencyId of moduleDependencyIds(definition)) {
+        let entries = importers.get(dependencyId);
+        if (!entries) importers.set(dependencyId, entries = new Set());
+        entries.add(importerId);
+      }
+    }
+  }
+
+  const queue = [...triggerIds];
+  const visited = new Set(queue);
+  while (queue.length > 0) {
+    const id = queue.shift();
+    if (rootIds.has(id)) return true;
+    if (boundaryIds.has(id)) continue;
+    for (const importerId of importers.get(id) ?? []) {
+      if (visited.has(importerId)) continue;
+      visited.add(importerId);
+      queue.push(importerId);
+    }
+  }
+  return false;
+}
+
+function boundaryModuleIds(projectRoot, modules, boundaries) {
+  const ids = new Set();
+  const boundaryPaths = [];
+  for (const boundary of boundaries) {
+    ids.add(boundary.id);
+    ids.add(`ssr:${boundary.id}`);
+    if (boundary.__pluginModuleId) {
+      ids.add(boundary.__pluginModuleId);
+      ids.add(`ssr:${boundary.__pluginModuleId}`);
+    }
+    const sourcePath = boundary.__pluginTarget?.path ?? boundary.path;
+    if (sourcePath && !String(sourcePath).startsWith("cottontail-bake-client-boundary:")) {
+      boundaryPaths.push(sourcePath);
+    }
+  }
+  for (const id of Object.keys(modules)) {
+    if (changedPathMatchesModule(projectRoot, boundaryPaths, id)) ids.add(id);
+  }
+  return ids;
+}
+
 function hmrImportWrapperSource(imports) {
   if (imports.length === 0) return "export {};";
   const declarations = imports
     .map((specifier, index) => `import * as __ctGraph${index} from ${JSON.stringify(specifier)};`)
     .join("\n");
   const names = imports.map((_, index) => `__ctGraph${index}`).join(", ");
-  return `${declarations}\nexport const __cottontailBakeGraph = [${names}];`;
+  return `${declarations}
+export const __cottontailBakeGraph = [${names}];
+globalThis[Symbol.for("cottontail.bake.hmr-roots")]?.(__cottontailBakeGraph);`;
 }
 
 function rewriteHmrLoader(loader, mapId) {
@@ -1748,6 +1841,7 @@ function createFrameworkDispatcher(config) {
   const clientWrapperPaths = new Map();
   const ssrWrapperPaths = new Map();
   const hmrDefinitions = new Map();
+  const hmrBoundaryDefinitions = new Map();
   const routeRecords = [];
   const routeRecordByPage = new Map();
   const assets = new Map();
@@ -2059,7 +2153,7 @@ function createFrameworkDispatcher(config) {
     };
   }
 
-  async function bundleRoute(router, matched, force = false) {
+  async function bundleRoute(router, matched, force = false, changedPaths = null) {
     const { page, layouts } = routeFiles(matched.route);
     if (!page) return null;
     const record = getRouteRecord(page);
@@ -2173,8 +2267,16 @@ function createFrameworkDispatcher(config) {
         ]);
         const serverModules = rewriteHmrDependencies(parsed.modules, replacements);
         const allModules = { ...serverModules, ...(ssr?.modules ?? {}) };
+        const selectedServerModules = changedPaths === null
+          ? allModules
+          : changedModuleSelection(
+              projectRoot,
+              changedPaths,
+              record.route?.serverModules ?? {},
+              allModules,
+            ).modules;
         const changedModules = {};
-        for (const [id, definition] of Object.entries(allModules)) {
+        for (const [id, definition] of Object.entries(selectedServerModules)) {
           const signature = moduleDefinitionSignature(definition);
           if (hmrDefinitions.get(id) === signature) continue;
           hmrDefinitions.set(id, signature);
@@ -2183,12 +2285,16 @@ function createFrameworkDispatcher(config) {
         const previousBoundaries = new Map((record.route?.boundaries ?? []).map(item => [item.id, item]));
         const nextBoundaries = new Map(graph.boundaries.map(item => [item.id, item]));
         const changedBoundaryIds = graph.boundaries
-          .filter(item => JSON.stringify(previousBoundaries.get(item.id)?.exports) !== JSON.stringify(item.exports))
+          .filter(item => hmrBoundaryDefinitions.get(item.id) !== JSON.stringify(item.exports))
           .map(item => item.id);
+        for (const item of graph.boundaries) {
+          hmrBoundaryDefinitions.set(item.id, JSON.stringify(item.exports));
+        }
         const removedBoundaryIds = [...previousBoundaries.keys()].filter(id => {
           if (nextBoundaries.has(id)) return false;
           return !routeRecords.some(other => other !== record && other.route?.boundaries?.some(item => item.id === id));
         });
+        for (const id of removedBoundaryIds) hmrBoundaryDefinitions.delete(id);
         const manifestDeletes = [...new Set([...changedBoundaryIds.filter(id => previousBoundaries.has(id)), ...removedBoundaryIds])];
         if (manifestDeletes.length > 0) {
           deleteComponentManifests(manifestDeletes);
@@ -2399,7 +2505,9 @@ function createFrameworkDispatcher(config) {
     routers = createRouters();
   };
   dispatchFrameworkRequest.update = async (changedPaths = []) => {
-    const activeRecords = routeRecords.filter(record => record.route !== null);
+    const activeRecords = routeRecords.filter(
+      record => record.route !== null && record.pathname !== null,
+    );
     const previousRouters = routers;
     const packets = [];
     const serverRouteIds = [];
@@ -2431,7 +2539,7 @@ function createFrameworkDispatcher(config) {
 
       let next;
       try {
-        next = await bundleRoute(found.router, found.matched, true);
+        next = await bundleRoute(found.router, found.matched, true, changedPaths);
       } catch (error) {
         const errors = bakeBuildErrors(error?.errors ?? [error], record.page);
         retainHotUpdate(packets, createBakeErrorUpdatePacket(errors, nextHotUpdateId()));
@@ -2440,32 +2548,48 @@ function createFrameworkDispatcher(config) {
       }
 
       if (development) {
-        let serverChanged = false;
         const previousServerModules = previous.serverModules ?? {};
         const nextServerModules = next.serverModules ?? {};
-        const serverModuleIds = new Set([...Object.keys(previousServerModules), ...Object.keys(nextServerModules)]);
-        for (const id of serverModuleIds) {
-          if (moduleDefinitionSignature(previousServerModules[id]) !== moduleDefinitionSignature(nextServerModules[id])) {
-            serverChanged = true;
-            break;
-          }
-        }
+        const serverSelection = changedModuleSelection(
+          projectRoot,
+          changedPaths,
+          previousServerModules,
+          nextServerModules,
+        );
+        const routeRootIds = new Set([
+          previous.hmrArgs?.routerTypeMain,
+          ...(previous.hmrArgs?.routeModules ?? []),
+          next.hmrArgs?.routerTypeMain,
+          ...(next.hmrArgs?.routeModules ?? []),
+        ].filter(Boolean));
+        const serverBoundaryIds = boundaryModuleIds(projectRoot, nextServerModules, next.boundaries ?? []);
+        const serverChanged = moduleChangesReachRoots(
+          previousServerModules,
+          nextServerModules,
+          serverSelection.triggerIds,
+          routeRootIds,
+          serverBoundaryIds,
+        );
         if (serverChanged) serverRouteIds.push(record.id);
 
         const previousClientModules = previous.clientModules ?? {};
-        for (const [id, definition] of Object.entries(next.clientModules ?? {})) {
-          if (changedPathMatchesModule(projectRoot, changedPaths, id) ||
-              moduleDefinitionSignature(previousClientModules[id]) !== moduleDefinitionSignature(definition)) {
-            changedClientModules[id] = definition;
-            if (next.clientSourceMapRecord) changedClientSourceMapRecords.set(id, next.clientSourceMapRecord);
-          }
+        const clientSelection = changedModuleSelection(
+          projectRoot,
+          changedPaths,
+          previousClientModules,
+          next.clientModules ?? {},
+        );
+        for (const [id, definition] of Object.entries(clientSelection.modules)) {
+          changedClientModules[id] = definition;
+          if (next.clientSourceMapRecord) changedClientSourceMapRecords.set(id, next.clientSourceMapRecord);
         }
+        const clientChanged = clientSelection.triggerIds.length > 0;
 
         const previousCssIds = [...previous.css.keys()];
         const nextCssIds = [...next.css.keys()];
         const stylesChanged = previousCssIds.length !== nextCssIds.length ||
           previousCssIds.some((id, index) => id !== nextCssIds[index]);
-        if (serverChanged || stylesChanged) {
+        if (serverChanged || clientChanged || stylesChanged) {
           routeStyles.set(record.id, stylesChanged ? nextCssIds : null);
         }
         for (const [id, item] of next.css) {
