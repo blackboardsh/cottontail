@@ -53,12 +53,29 @@ function resolveSource(mapDir, sourceRoot, source) {
   return normalizePath(`${mapDir}/${text}`);
 }
 
-// Decodes the `mappings` string into one array per generated line; each entry
-// is [generatedColumn, sourceIndex, sourceLine, sourceColumn] (all 0-based),
-// sorted by generatedColumn. Segments without source info are dropped.
-function decodeMappings(mappings) {
-  const lines = [];
-  let line = [];
+// Index cumulative VLQ state at each generated line. Materializing every
+// segment as nested JavaScript arrays amplifies large bundle maps by orders of
+// magnitude, while stack remapping usually reads only a handful of lines.
+function indexMappings(mappings, sourceCount) {
+  let lineCount = 1;
+  for (let index = 0; index < mappings.length; index += 1) {
+    if (mappings.charCodeAt(index) === 59) lineCount += 1;
+  }
+
+  const lineOffsets = new Uint32Array(lineCount + 1);
+  const lineSourceIndices = new Int32Array(lineCount);
+  const lineSourceLines = new Int32Array(lineCount);
+  const lineSourceColumns = new Int32Array(lineCount);
+  const firstGeneratedLines = new Int32Array(sourceCount);
+  const firstExecutableGeneratedLines = new Int32Array(sourceCount);
+  const seenGeneratedLines = new Int32Array(sourceCount);
+  const seenSourceLines = new Int32Array(sourceCount);
+  const seenSourceColumns = new Int32Array(sourceCount);
+  firstGeneratedLines.fill(-1);
+  firstExecutableGeneratedLines.fill(-1);
+  seenGeneratedLines.fill(-1);
+
+  let lineIndex = 0;
   let genColumn = 0;
   let sourceIndex = 0;
   let sourceLine = 0;
@@ -75,7 +92,19 @@ function decodeMappings(mappings) {
       sourceIndex += fields[1];
       sourceLine += fields[2];
       sourceColumn += fields[3];
-      line.push([genColumn, sourceIndex, sourceLine, sourceColumn]);
+      if (sourceIndex >= 0 && sourceIndex < sourceCount) {
+        if (firstGeneratedLines[sourceIndex] === -1) firstGeneratedLines[sourceIndex] = lineIndex;
+        if (seenGeneratedLines[sourceIndex] !== lineIndex) {
+          seenGeneratedLines[sourceIndex] = lineIndex;
+          seenSourceLines[sourceIndex] = sourceLine;
+          seenSourceColumns[sourceIndex] = sourceColumn;
+        } else if (firstExecutableGeneratedLines[sourceIndex] === -1 &&
+            (seenSourceLines[sourceIndex] !== sourceLine || seenSourceColumns[sourceIndex] !== sourceColumn)) {
+          // Bundler declarations and module wrappers usually carry one coarse
+          // mapping. Multiple source positions mark the first emitted statement.
+          firstExecutableGeneratedLines[sourceIndex] = lineIndex;
+        }
+      }
     }
     fieldCount = 0;
   };
@@ -84,9 +113,14 @@ function decodeMappings(mappings) {
     const code = mappings.charCodeAt(i);
     if (code === 59) { // ';'
       flushSegment();
-      lines.push(line);
-      line = [];
       genColumn = 0;
+      lineIndex += 1;
+      lineOffsets[lineIndex] = i + 1;
+      if (lineIndex < lineCount) {
+        lineSourceIndices[lineIndex] = sourceIndex;
+        lineSourceLines[lineIndex] = sourceLine;
+        lineSourceColumns[lineIndex] = sourceColumn;
+      }
     } else if (code === 44) { // ','
       flushSegment();
     } else {
@@ -106,8 +140,69 @@ function decodeMappings(mappings) {
     }
   }
   flushSegment();
-  lines.push(line);
-  return lines;
+  lineOffsets[lineCount] = mappings.length;
+  return {
+    lineOffsets,
+    lineSourceIndices,
+    lineSourceLines,
+    lineSourceColumns,
+    firstGeneratedLines,
+    firstExecutableGeneratedLines,
+  };
+}
+
+function decodeLineSegments(state, lineIndex) {
+  if (lineIndex < 0 || lineIndex >= state.mappingIndex.lineSourceIndices.length) return [];
+  const start = state.mappingIndex.lineOffsets[lineIndex];
+  const end = state.mappingIndex.lineOffsets[lineIndex + 1];
+  let genColumn = 0;
+  let sourceIndex = state.mappingIndex.lineSourceIndices[lineIndex];
+  let sourceLine = state.mappingIndex.lineSourceLines[lineIndex];
+  let sourceColumn = state.mappingIndex.lineSourceColumns[lineIndex];
+  const fields = [0, 0, 0, 0, 0];
+  const segments = [];
+  let fieldCount = 0;
+  let value = 0;
+  let shift = 0;
+
+  const flushSegment = () => {
+    if (fieldCount === 0) return;
+    genColumn += fields[0];
+    if (fieldCount >= 4) {
+      sourceIndex += fields[1];
+      sourceLine += fields[2];
+      sourceColumn += fields[3];
+      segments.push([genColumn, sourceIndex, sourceLine, sourceColumn]);
+    }
+    fieldCount = 0;
+  };
+
+  for (let index = start; index < end; index += 1) {
+    const code = state.mappings.charCodeAt(index);
+    if (code === 59) {
+      flushSegment();
+      break;
+    }
+    if (code === 44) {
+      flushSegment();
+      continue;
+    }
+    const digit = code < 128 ? BASE64_VALUES[code] : -1;
+    if (digit === -1) throw new Error(`Invalid VLQ character at index ${index}`);
+    value += (digit & 31) << shift;
+    if (digit & 32) {
+      shift += 5;
+    } else {
+      const negative = value & 1;
+      value >>>= 1;
+      if (fieldCount < 5) fields[fieldCount] = negative ? -value : value;
+      fieldCount += 1;
+      value = 0;
+      shift = 0;
+    }
+  }
+  flushSegment();
+  return segments;
 }
 
 function escapeRegExp(text) {
@@ -121,11 +216,157 @@ function readMapText(mapPath) {
   return null;
 }
 
+function skipJsonWhitespace(text, index) {
+  while (index < text.length) {
+    const code = text.charCodeAt(index);
+    if (code !== 9 && code !== 10 && code !== 13 && code !== 32) break;
+    index += 1;
+  }
+  return index;
+}
+
+function scanJsonStringEnd(text, start) {
+  if (text.charCodeAt(start) !== 34) throw new Error("Expected JSON string");
+  for (let index = start + 1; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code === 34) return index + 1;
+    if (code === 92) index += 1;
+  }
+  throw new Error("Unterminated JSON string");
+}
+
+function scanJsonValueEnd(text, start) {
+  const first = text.charCodeAt(start);
+  if (first === 34) return scanJsonStringEnd(text, start);
+  if (first !== 91 && first !== 123) {
+    let index = start;
+    while (index < text.length && text.charCodeAt(index) !== 44 && text.charCodeAt(index) !== 93 &&
+        text.charCodeAt(index) !== 125) index += 1;
+    return index;
+  }
+
+  const nesting = [first];
+  for (let index = start + 1; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code === 34) {
+      index = scanJsonStringEnd(text, index) - 1;
+      continue;
+    }
+    if (code === 91 || code === 123) {
+      nesting.push(code);
+      continue;
+    }
+    if (code !== 93 && code !== 125) continue;
+    const opening = nesting.pop();
+    if ((opening === 91 && code !== 93) || (opening === 123 && code !== 125)) {
+      throw new Error("Mismatched JSON container");
+    }
+    if (nesting.length === 0) return index + 1;
+  }
+  throw new Error("Unterminated JSON container");
+}
+
+function decodeJsonString(text, start, end) {
+  if (text.charCodeAt(start) !== 34 || text.charCodeAt(end - 1) !== 34) {
+    throw new Error("Expected JSON string");
+  }
+  const firstEscape = text.indexOf("\\", start + 1);
+  if (firstEscape < 0 || firstEscape >= end - 1) return text.slice(start + 1, end - 1);
+
+  const parts = [];
+  let chunkStart = start + 1;
+  for (let index = firstEscape; index < end - 1; index += 1) {
+    if (text.charCodeAt(index) !== 92) continue;
+    parts.push(text.slice(chunkStart, index));
+    index += 1;
+    const escaped = text[index];
+    switch (escaped) {
+      case '"': parts.push('"'); break;
+      case "\\": parts.push("\\"); break;
+      case "/": parts.push("/"); break;
+      case "b": parts.push("\b"); break;
+      case "f": parts.push("\f"); break;
+      case "n": parts.push("\n"); break;
+      case "r": parts.push("\r"); break;
+      case "t": parts.push("\t"); break;
+      case "u": {
+        const hex = text.slice(index + 1, index + 5);
+        if (!/^[0-9A-Fa-f]{4}$/.test(hex)) throw new Error("Invalid JSON Unicode escape");
+        parts.push(String.fromCharCode(Number.parseInt(hex, 16)));
+        index += 4;
+        break;
+      }
+      default: throw new Error("Invalid JSON escape");
+    }
+    chunkStart = index + 1;
+  }
+  parts.push(text.slice(chunkStart, end - 1));
+  return parts.join("");
+}
+
+function indexJsonArray(text, start, end) {
+  let index = skipJsonWhitespace(text, start);
+  if (text.startsWith("null", index)) return null;
+  if (text.charCodeAt(index) !== 91) throw new Error("Expected JSON array");
+  index = skipJsonWhitespace(text, index + 1);
+  const spans = [];
+  while (index < end && text.charCodeAt(index) !== 93) {
+    const valueStart = index;
+    const valueEnd = scanJsonValueEnd(text, valueStart);
+    spans.push([valueStart, valueEnd]);
+    index = skipJsonWhitespace(text, valueEnd);
+    if (text.charCodeAt(index) === 44) index = skipJsonWhitespace(text, index + 1);
+    else if (text.charCodeAt(index) !== 93) throw new Error("Expected JSON array separator");
+  }
+  return spans;
+}
+
+function decodeJsonStringValue(text, span) {
+  if (!span) return null;
+  const start = skipJsonWhitespace(text, span[0]);
+  let end = span[1];
+  while (end > start && /\s/.test(text[end - 1])) end -= 1;
+  if (text.slice(start, end) === "null") return null;
+  return decodeJsonString(text, start, end);
+}
+
+function parseSourceMap(text) {
+  let index = skipJsonWhitespace(text, 0);
+  if (text.charCodeAt(index) !== 123) throw new Error("Expected source map object");
+  index = skipJsonWhitespace(text, index + 1);
+  let mappings;
+  let sourceRoot;
+  let sources;
+  let sourceContentSpans = null;
+
+  while (index < text.length && text.charCodeAt(index) !== 125) {
+    const keyStart = index;
+    const keyEnd = scanJsonStringEnd(text, keyStart);
+    const key = decodeJsonString(text, keyStart, keyEnd);
+    index = skipJsonWhitespace(text, keyEnd);
+    if (text.charCodeAt(index) !== 58) throw new Error("Expected JSON property separator");
+    const valueStart = skipJsonWhitespace(text, index + 1);
+    const valueEnd = scanJsonValueEnd(text, valueStart);
+    const span = [valueStart, valueEnd];
+    if (key === "mappings") mappings = decodeJsonStringValue(text, span);
+    else if (key === "sourceRoot") sourceRoot = decodeJsonStringValue(text, span);
+    else if (key === "sources") {
+      sources = indexJsonArray(text, valueStart, valueEnd)?.map(item => decodeJsonStringValue(text, item));
+    } else if (key === "sourcesContent") {
+      sourceContentSpans = indexJsonArray(text, valueStart, valueEnd);
+    }
+    index = skipJsonWhitespace(text, valueEnd);
+    if (text.charCodeAt(index) === 44) index = skipJsonWhitespace(text, index + 1);
+    else if (text.charCodeAt(index) !== 125) throw new Error("Expected JSON object separator");
+  }
+  return { mappings, sourceRoot, sources, sourceContentSpans };
+}
+
 function buildState(mapPath, mapData, configuredBundlePath, configuredSourceRoot = undefined) {
   try {
     const text = typeof mapData === "string" ? mapData : readMapText(mapPath);
     if (typeof text !== "string" || text === "") return null;
-    const map = JSON.parse(text);
+    const map = parseSourceMap(text);
     if (!map || typeof map !== "object" || typeof map.mappings !== "string" || !Array.isArray(map.sources)) return null;
     const effectiveMapPath = typeof mapPath === "string" && mapPath !== ""
       ? mapPath
@@ -138,47 +379,25 @@ function buildState(mapPath, mapData, configuredBundlePath, configuredSourceRoot
     const sourceBase = typeof configuredRoot === "string" && configuredRoot !== "" ? configuredRoot : mapDir;
     const sources = map.sources.map((source) => resolveSource(sourceBase, map.sourceRoot, source));
     const generatedSources = map.sources.map((source) => resolveSource(mapDir, map.sourceRoot, source));
-    const sourceLines = map.sources.map((_, index) => {
-      const contents = Array.isArray(map.sourcesContent) ? map.sourcesContent[index] : null;
-      return typeof contents === "string" ? contents.split(/\r?\n/) : null;
-    });
+    const sourceLines = new Array(map.sources.length);
     const bundlePath = typeof configuredBundlePath === "string" && configuredBundlePath !== ""
       ? configuredBundlePath
       : effectiveMapPath.endsWith(".map")
         ? effectiveMapPath.slice(0, -".map".length)
         : null;
-    const lines = decodeMappings(map.mappings);
-    const firstGeneratedLines = new Int32Array(sources.length);
-    const firstExecutableGeneratedLines = new Int32Array(sources.length);
-    firstGeneratedLines.fill(-1);
-    firstExecutableGeneratedLines.fill(-1);
-    for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
-      const positionsBySource = new Map();
-      for (const segment of lines[lineIndex]) {
-        const sourceIndex = segment[1];
-        if (firstGeneratedLines[sourceIndex] === -1) firstGeneratedLines[sourceIndex] = lineIndex;
-        let positions = positionsBySource.get(sourceIndex);
-        if (!positions) positionsBySource.set(sourceIndex, positions = new Set());
-        positions.add(`${segment[2]}:${segment[3]}`);
-      }
-      for (const [sourceIndex, positions] of positionsBySource) {
-        // Bundler declarations and module wrappers usually carry one coarse
-        // mapping. A line with multiple source positions is the first emitted
-        // user statement and is the origin for Bun's originalLine metadata.
-        if (positions.size > 1 && firstExecutableGeneratedLines[sourceIndex] === -1) {
-          firstExecutableGeneratedLines[sourceIndex] = lineIndex;
-        }
-      }
-    }
+    const mappingIndex = indexMappings(map.mappings, sources.length);
     return {
       sources,
       generatedSources,
+      sourceContentText: map.sourceContentSpans ? text : null,
+      sourceContentSpans: map.sourceContentSpans,
       sourceLines,
       sourceLineAttempts: new Set(),
       nestedStates: new Map(),
-      lines,
-      firstGeneratedLines,
-      firstExecutableGeneratedLines,
+      mappings: map.mappings,
+      mappingIndex,
+      firstGeneratedLines: mappingIndex.firstGeneratedLines,
+      firstExecutableGeneratedLines: mappingIndex.firstExecutableGeneratedLines,
       bundlePath,
       bundleRegExp: bundlePath ? new RegExp(`${escapeRegExp(bundlePath)}:(\\d+):(\\d+)`, "g") : null,
     };
@@ -233,6 +452,14 @@ function sourceLinesForIndex(state, sourceIndex) {
   if (Array.isArray(cached)) return cached;
   if (state.sourceLineAttempts.has(sourceIndex)) return null;
   state.sourceLineAttempts.add(sourceIndex);
+  const embeddedSpan = state.sourceContentSpans?.[sourceIndex];
+  const embedded = decodeJsonStringValue(state.sourceContentText, embeddedSpan);
+  if (typeof embedded === "string") {
+    const lines = embedded.split(/\r?\n/);
+    state.sourceLines[sourceIndex] = lines;
+    state.sourceContentSpans[sourceIndex] = null;
+    return lines;
+  }
   const source = state.sources[sourceIndex];
   if (typeof source !== "string" || source === "") return null;
   try {
@@ -425,7 +652,7 @@ function remapVirtualSourceFrame(state, file, line, column) {
 
 function lookup(state, line, column) {
   if (!Number.isFinite(line) || !Number.isFinite(column) || line < 1 || column < 1) return null;
-  const segments = state.lines[line - 1];
+  const segments = decodeLineSegments(state, line - 1);
   if (!segments || segments.length === 0) return null;
   const target = column - 1;
   let low = 0;
@@ -461,7 +688,7 @@ export function createSourceMapConsumer(mapData, options = {}) {
       const display = finalizeMappedPosition(state, mapped);
       if (!display) return null;
       const virtual = virtualSourceMapping(state, mapped.sourceIndex);
-      const lines = virtual?.originalLines ?? state.sourceLines[mapped.sourceIndex];
+      const lines = virtual?.originalLines ?? sourceLinesForIndex(state, mapped.sourceIndex);
       return {
         source: display.source,
         line: display.line,
@@ -557,7 +784,7 @@ function preferConstructedErrorCallSite(state, generatedLine, generatedColumn, m
       /\bnew\s*$/.test(previousSource)) {
     const target = generatedColumn - 1;
     for (let candidateLine = generatedLine; candidateLine >= Math.max(1, generatedLine - 1); candidateLine -= 1) {
-      const segments = state.lines[candidateLine - 1] ?? [];
+      const segments = decodeLineSegments(state, candidateLine - 1);
       for (let index = segments.length - 1; index >= 0; index -= 1) {
         const [generatedSegmentColumn, sourceIndex, sourceLine, sourceColumn] = segments[index];
         if (candidateLine === generatedLine && generatedSegmentColumn > target) continue;
@@ -575,7 +802,7 @@ function preferConstructedErrorCallSite(state, generatedLine, generatedColumn, m
   }
   if (/\.stack\b/.test(currentSource)) {
     for (let line = generatedLine - 1; line >= Math.max(1, generatedLine - 8); line -= 1) {
-      const segments = state.lines[line - 1] ?? [];
+      const segments = decodeLineSegments(state, line - 1);
       for (const segment of segments) {
         const [, sourceIndex, sourceLine, sourceColumn] = segment;
         if (sourceIndex !== mapped.sourceIndex) continue;

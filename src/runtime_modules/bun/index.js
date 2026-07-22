@@ -180,6 +180,7 @@ if (inheritedFileBackedStdin) {
 let ctEvalOffsetMap;
 let ctEvalLineOffset;
 const ctDynamicFunctionNames = [];
+const ctPendingDynamicFunctionNames = new Map();
 
 function evalBootstrapLineOffset() {
   const map = globalThis.__cottontailBundleSourceMap ?? globalThis.__cottontailBundleSourceMapData;
@@ -210,11 +211,15 @@ function remapEvalStackLines(stack) {
   });
 }
 
-function ctRemapStackString(stack) {
+function remapStackLocations(stack) {
   let remapped = remapBundleStack(stack);
   const moduleRemapper = globalThis.__cottontailRemapModuleStackString;
   if (typeof moduleRemapper === "function") remapped = moduleRemapper(remapped);
-  return remapDynamicFunctionNames(normalizeCottontailStackFrames(remapEvalStackLines(remapped)));
+  return normalizeCottontailStackFrames(remapEvalStackLines(remapped));
+}
+
+function ctRemapStackString(stack) {
+  return remapDynamicFunctionNames(remapStackLocations(stack));
 }
 
 function normalizeCottontailStackFrames(stack) {
@@ -257,7 +262,16 @@ function dynamicFunctionNameAtLocation(name, file, line, column) {
 }
 
 function remapDynamicFunctionNames(stack) {
-  if (typeof stack !== "string" || ctDynamicFunctionNames.length === 0) return stack;
+  if (typeof stack !== "string") return stack;
+  const names = new Set();
+  for (const line of stack.split("\n")) {
+    const jscFrame = /^([^@]*)@.+:[0-9]+:[0-9]+$/.exec(line);
+    const v8Frame = /^\s*at\s+(.*?)\s+\(.+:[0-9]+:[0-9]+\)$/.exec(line);
+    const name = String(jscFrame?.[1] ?? v8Frame?.[1] ?? "").replace(/^async\s+/, "");
+    if (name) names.add(name);
+  }
+  for (const name of names) resolvePendingDynamicFunctionNames(name);
+  if (ctDynamicFunctionNames.length === 0) return stack;
   return stack.split("\n").map((line) => {
     const jscFrame = /^([^@]*)@(.+):([0-9]+):([0-9]+)$/.exec(line);
     if (jscFrame) {
@@ -271,15 +285,8 @@ function remapDynamicFunctionNames(stack) {
   }).join("\n");
 }
 
-function captureDynamicFunctionRename(originalName, replacement) {
-  if (typeof nativeCaptureStackTrace !== "function") return;
-  const holder = {};
-  try {
-    nativeCaptureStackTrace(holder, Object.defineProperty);
-  } catch {
-    return;
-  }
-  const stack = ctRemapStackString(holder.stack);
+function registerDynamicFunctionRename(originalName, replacement, callSite) {
+  const stack = remapStackLocations(`@${callSite.file}:${callSite.line}:${callSite.column}`);
   for (const line of String(stack ?? "").split("\n")) {
     const jscFrame = /^([^@]*)@(.+):([0-9]+):([0-9]+)$/.exec(line);
     const v8Frame = /^\s*at(?:\s+.*?)?\s*\(?(.+):([0-9]+):([0-9]+)\)?$/.exec(line);
@@ -304,6 +311,46 @@ function captureDynamicFunctionRename(originalName, replacement) {
       return;
     }
   }
+}
+
+function dynamicFunctionRenameCallSite(stack) {
+  for (const line of String(stack ?? "").split("\n")) {
+    const jscFrame = /^([^@]*)@(.+):([0-9]+):([0-9]+)$/.exec(line);
+    const v8Frame = /^\s*at\s+(?:(.*?)\s+\()?(.+):([0-9]+):([0-9]+)\)?$/.exec(line);
+    const name = jscFrame?.[1] ?? v8Frame?.[1] ?? "";
+    if (name === "__name") continue;
+    const file = jscFrame?.[2] ?? v8Frame?.[2];
+    const frameLine = Number(jscFrame?.[3] ?? v8Frame?.[3]);
+    const column = Number(jscFrame?.[4] ?? v8Frame?.[4]);
+    if (file && Number.isFinite(frameLine) && Number.isFinite(column)) {
+      return { file, line: frameLine, column };
+    }
+  }
+  return null;
+}
+
+function resolvePendingDynamicFunctionNames(originalName) {
+  const pending = ctPendingDynamicFunctionNames.get(originalName);
+  if (!pending) return;
+  ctPendingDynamicFunctionNames.delete(originalName);
+  for (const entry of pending) {
+    registerDynamicFunctionRename(originalName, entry.replacement, entry.callSite);
+  }
+}
+
+function captureDynamicFunctionRename(originalName, replacement) {
+  if (typeof nativeCaptureStackTrace !== "function") return;
+  const holder = {};
+  try {
+    nativeCaptureStackTrace(holder, Object.defineProperty);
+  } catch {
+    return;
+  }
+  const callSite = dynamicFunctionRenameCallSite(holder.stack);
+  if (!callSite) return;
+  const pending = ctPendingDynamicFunctionNames.get(originalName) ?? [];
+  pending.push({ replacement, callSite });
+  ctPendingDynamicFunctionNames.set(originalName, pending);
 }
 
 // The generated __toESM helper strictly honors the __esModule marker:
