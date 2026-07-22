@@ -2906,6 +2906,8 @@ function isAsyncModuleRequireError(error) {
 }
 
 const asyncEsmModuleCache = new Map();
+const dynamicEsmFactoryCache = new Map();
+const asyncDynamicEsmFactoryCache = new Map();
 
 function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, originalSource, ancestors = undefined) {
   const cacheKey = String(resolved);
@@ -2918,20 +2920,26 @@ function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, origina
   asyncEsmModuleCache.set(cacheKey, record);
   const moduleAncestors = new Set(ancestors ?? []);
   moduleAncestors.add(cacheKey);
-  const transformed = transformEsmSourceForDynamicImport(
-    maybeStripTypeScript(resolvedPath, originalSource),
-    true,
-  );
-  maybeRegisterSourceMap(resolvedPath, transformed);
-  recordCompileCache(resolvedPath, transformed);
-  const body = `${transformed}\n//# sourceURL=${resolvedPath}${suffix}`;
-  const AsyncFunction = (async () => {}).constructor;
   let run;
-  try {
-    run = new AsyncFunction(ESM_EXPORTS_BINDING, "__ctImportMeta", "__ctModuleAncestors", "Error", body);
-  } catch (error) {
-    asyncEsmModuleCache.delete(cacheKey);
-    throw markModuleCompileError(error, resolvedPath, originalSource);
+  const cachedFactory = asyncDynamicEsmFactoryCache.get(cacheKey);
+  if (cachedFactory?.source === originalSource) {
+    run = cachedFactory.run;
+  } else {
+    const transformed = transformEsmSourceForDynamicImport(
+      maybeStripTypeScript(resolvedPath, originalSource),
+      true,
+    );
+    maybeRegisterSourceMap(resolvedPath, transformed);
+    recordCompileCache(resolvedPath, transformed);
+    const body = `${transformed}\n//# sourceURL=${resolvedPath}${suffix}`;
+    const AsyncFunction = (async () => {}).constructor;
+    try {
+      run = new AsyncFunction(ESM_EXPORTS_BINDING, "__ctImportMeta", "__ctModuleAncestors", "Error", body);
+    } catch (error) {
+      asyncEsmModuleCache.delete(cacheKey);
+      throw markModuleCompileError(error, resolvedPath, originalSource);
+    }
+    asyncDynamicEsmFactoryCache.set(cacheKey, { source: originalSource, run });
   }
   record.promise = run(
     namespace,
@@ -2976,19 +2984,26 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
   }
   const namespace = createModuleNamespace();
   const originalSource = sourceText;
-  const transformed = transformEsmSourceForDynamicImport(maybeStripTypeScript(resolvedPath, originalSource));
-  maybeRegisterSourceMap(resolvedPath, transformed);
-  recordCompileCache(resolvedPath, transformed);
-  const body = `${transformed}\n//# sourceURL=${resolvedPath}${suffix}`;
   let run;
-  try {
-    run = new Function(ESM_EXPORTS_BINDING, "require", "__ctModuleRecord", "__ctImportMeta", "Error", body);
-  } catch (error) {
-    // Dynamically imported ES modules may use top-level await (e.g. Bun.build
-    // outputs re-imported via blob: URLs). Preserve synchronous evaluation for
-    // ordinary modules and only retry syntax containing await asynchronously.
-    if (!(error instanceof SyntaxError) || !/(?<![.\w$])await\b/.test(transformed)) throw error;
-    return executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, originalSource);
+  const factoryCacheKey = String(resolved);
+  const cachedFactory = dynamicEsmFactoryCache.get(factoryCacheKey);
+  if (cachedFactory?.source === originalSource) {
+    run = cachedFactory.run;
+  } else {
+    const transformed = transformEsmSourceForDynamicImport(maybeStripTypeScript(resolvedPath, originalSource));
+    maybeRegisterSourceMap(resolvedPath, transformed);
+    recordCompileCache(resolvedPath, transformed);
+    const body = `${transformed}\n//# sourceURL=${resolvedPath}${suffix}`;
+    try {
+      run = new Function(ESM_EXPORTS_BINDING, "require", "__ctModuleRecord", "__ctImportMeta", "Error", body);
+    } catch (error) {
+      // Dynamically imported ES modules may use top-level await (e.g. Bun.build
+      // outputs re-imported via blob: URLs). Preserve synchronous evaluation for
+      // ordinary modules and only retry syntax containing await asynchronously.
+      if (!(error instanceof SyntaxError) || !/(?<![.\w$])await\b/.test(transformed)) throw error;
+      return executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, originalSource);
+    }
+    dynamicEsmFactoryCache.set(factoryCacheKey, { source: originalSource, run });
   }
   try {
     run(
@@ -3123,7 +3138,19 @@ export function __importModule(
     throw dynamicResolveMessage(`Cannot find module '${specifierText}' from '${parent}'`);
   }
   const resolved = pluginAttempt?.resolved ?? resolveRequest(String(specifier), parent, true, "import");
-  return importResolvedRuntimeModule(resolved, options, forceAsync, asyncAncestors);
+  if (forceAsync) return importResolvedRuntimeModule(resolved, options, true, asyncAncestors);
+
+  const loader = options?.with?.type ?? options?.assert?.type ?? options?.type;
+  const cacheKey = loader == null ? String(resolved) : `${resolved}\0${loader}`;
+  const registry = globalThis.Loader?.registry;
+  if (registry?.has?.(cacheKey)) return registry.get(cacheKey);
+
+  const promise = Promise.resolve(importResolvedRuntimeModule(resolved, options, false, asyncAncestors));
+  registry?.set?.(cacheKey, promise);
+  promise.catch(() => {
+    if (registry?.get?.(cacheKey) === promise) registry.delete(cacheKey);
+  });
+  return promise;
 }
 
 // The native dynamic-import shim (cottontail.importModule) stringifies any
@@ -3171,6 +3198,12 @@ function attachModuleChild(parent, child) {
   if (!parent || !child || !Array.isArray(parent.children)) return;
   if (!parent.children.includes(child)) parent.children.push(child);
   if (child[moduleParentKey] == null) child[moduleParentKey] = parent;
+}
+
+function detachModuleChild(parent, child) {
+  if (!parent || !child || !Array.isArray(parent.children)) return;
+  const index = parent.children.indexOf(child);
+  if (index !== -1) parent.children.splice(index, 1);
 }
 
 function circularRequireExports(module) {
@@ -3410,7 +3443,11 @@ const commonJsCacheObject = new Proxy(commonJsCacheTarget, {
   },
   deleteProperty(target, property) {
     if (typeof property !== "string") return Reflect.deleteProperty(target, property);
-    if (typeof property === "string") commonJsCache.delete(property);
+    const cached = commonJsCache.get(property);
+    if (cached) detachModuleChild(cached[moduleParentKey], cached);
+    commonJsCache.delete(property);
+    asyncEsmModuleCache.delete(property);
+    globalThis.Loader?.registry?.delete?.(property);
     return true;
   },
   ownKeys(target) {
@@ -3526,6 +3563,11 @@ export class Module {
       },
       set(value) {
         maybeWarnModuleParent();
+        const previous = this[moduleParentKey];
+        if (previous !== value) {
+          detachModuleChild(previous, this);
+          attachModuleChild(value, this);
+        }
         this[moduleParentKey] = value;
       },
     });

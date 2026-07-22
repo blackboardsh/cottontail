@@ -1450,6 +1450,14 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
     },
+    "test/cli/run/multi-run.test.ts": {
+      "status": "enabled",
+      "reason": "Parallel and sequential multi-run execution, failure handling, output routing and formatting, lifecycle hooks, shell commands, globs, and workspace selection pass all 118 copied cases (527 assertions). The unchanged subprocess-heavy workload needs scaled stock-JSC startup deadlines.",
+      "env": {
+        "COTTONTAIL_TEST_TIMEOUT_SCALE": "6"
+      },
+      "timeoutMs": 240000
+    },
     "test/cli/run/no-envfile.test.ts": {
       "status": "enabled",
       "reason": "Runtime bundles defer dotenv reads until CLI and bunfig policy are available, covering --no-env-file, explicit env files, eval mode, NODE_ENV variants, and bunfig configuration (9 bun:test cases, 36 assertions)."
@@ -1465,6 +1473,14 @@
     "test/cli/run/run-cjs.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/cli/run/run-crash-handler.test.ts": {
+      "status": "enabled",
+      "reason": "Crash-handler bypass, panic, segmentation fault, and out-of-memory diagnostics deliver or suppress self-hosted crash reports as expected across all 5 copied cases (19 assertions). Fresh stock-JSC subprocesses need scaled startup deadlines.",
+      "env": {
+        "COTTONTAIL_TEST_TIMEOUT_SCALE": "4"
+      },
+      "timeoutMs": 120000
     },
     "test/cli/run/run-extensionless.test.ts": {
       "status": "enabled",
