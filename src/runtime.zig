@@ -137,7 +137,7 @@ pub const Runtime = struct {
 
         var eval_error: [*c]u8 = null;
         const filename = "cottontail:standalone-source-map";
-        if (c.ct_jsc_runtime_eval(
+        if (c.ct_jsc_runtime_eval_immediate(
             self.handle,
             setup_source.ptr,
             setup_source.len,
@@ -176,7 +176,7 @@ pub const Runtime = struct {
 
         var eval_error: [*c]u8 = null;
         const filename = "cottontail:external-source-map";
-        if (c.ct_jsc_runtime_eval(
+        if (c.ct_jsc_runtime_eval_immediate(
             self.handle,
             setup_source.ptr,
             setup_source.len,

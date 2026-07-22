@@ -37,6 +37,13 @@ int ct_jsc_runtime_eval(
     const char *filename,
     char **error_out
 );
+int ct_jsc_runtime_eval_immediate(
+    CtJscRuntime *runtime,
+    const uint8_t *source,
+    size_t source_len,
+    const char *filename,
+    char **error_out
+);
 int ct_jsc_runtime_set_watch_paths(
     CtJscRuntime *runtime,
     size_t path_count,

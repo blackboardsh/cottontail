@@ -1838,6 +1838,7 @@ typedef struct CtReloadWatcher {
     uv_fs_event_t handle;
     char *directory;
     CtReloadWatchPath *paths;
+    bool watch_all;
     struct CtReloadWatcher *next;
 } CtReloadWatcher;
 
@@ -1903,6 +1904,7 @@ struct CtJscRuntime {
     bool fatal_exception_routed;
     bool reload_requested;
     CtReloadWatcher *reload_watchers;
+    FILE *reload_trace_file;
     bool sampling_profiler_enabled;
     bool execution_time_limit_installed;
     CtJscShouldTerminateCallback should_terminate_callback;
@@ -3584,6 +3586,20 @@ static bool ct_reload_split_path(const char *path, char **directory_out, char **
     *name_out = NULL;
     if (path == NULL || path[0] == '\0') return false;
 
+    size_t path_len = strlen(path);
+    size_t directory_len = path_len;
+    while (directory_len > 1 &&
+           (path[directory_len - 1] == '/' || path[directory_len - 1] == '\\')) {
+#if defined(_WIN32)
+        if (directory_len == 3 && path[1] == ':') break;
+#endif
+        directory_len -= 1;
+    }
+    if (directory_len < path_len) {
+        *directory_out = ct_duplicate_bytes(path, directory_len);
+        return *directory_out != NULL;
+    }
+
     const char *separator = NULL;
     for (const char *cursor = path; *cursor != '\0'; cursor += 1) {
         if (*cursor == '/' || *cursor == '\\') separator = cursor;
@@ -3610,6 +3626,87 @@ static bool ct_reload_split_path(const char *path, char **directory_out, char **
     return true;
 }
 
+static void ct_reload_trace_write_json_string(FILE *file, const char *value) {
+    fputc('"', file);
+    const unsigned char *cursor = (const unsigned char *)(value != NULL ? value : "");
+    while (*cursor != '\0') {
+        unsigned char byte = *cursor++;
+        switch (byte) {
+            case '"': fputs("\\\"", file); break;
+            case '\\': fputs("\\\\", file); break;
+            case '\b': fputs("\\b", file); break;
+            case '\f': fputs("\\f", file); break;
+            case '\n': fputs("\\n", file); break;
+            case '\r': fputs("\\r", file); break;
+            case '\t': fputs("\\t", file); break;
+            default:
+                if (byte < 0x20) {
+                    fprintf(file, "\\u%04x", (unsigned int)byte);
+                } else {
+                    fputc((int)byte, file);
+                }
+                break;
+        }
+    }
+    fputc('"', file);
+}
+
+static void ct_reload_trace_init(CtJscRuntime *runtime) {
+    if (runtime == NULL || runtime->reload_trace_file != NULL) return;
+    const char *path = getenv("BUN_WATCHER_TRACE");
+    if (path == NULL || path[0] == '\0') return;
+    runtime->reload_trace_file = fopen(path, "ab");
+}
+
+static void ct_reload_trace_event(
+    CtReloadWatcher *watcher,
+    const char *filename,
+    int events,
+    int status
+) {
+    if (watcher == NULL || watcher->runtime == NULL) return;
+    FILE *file = watcher->runtime->reload_trace_file;
+    if (file == NULL) return;
+
+    size_t directory_len = strlen(watcher->directory);
+    size_t filename_len = filename != NULL ? strlen(filename) : 0;
+    bool needs_separator = filename_len > 0 && directory_len > 0 &&
+        watcher->directory[directory_len - 1] != '/' &&
+        watcher->directory[directory_len - 1] != '\\';
+    size_t full_len = directory_len + (needs_separator ? 1 : 0) + filename_len;
+    char *full_path = (char *)malloc(full_len + 1);
+    if (full_path == NULL) return;
+    memcpy(full_path, watcher->directory, directory_len);
+    size_t offset = directory_len;
+    if (needs_separator) full_path[offset++] = '/';
+    if (filename_len > 0) memcpy(full_path + offset, filename, filename_len);
+    full_path[full_len] = '\0';
+
+    uv_timeval64_t now;
+    int time_status = uv_gettimeofday(&now);
+    long long timestamp = time_status == 0
+        ? (long long)now.tv_sec * 1000LL + (long long)(now.tv_usec / 1000)
+        : (long long)time(NULL) * 1000LL;
+
+    fprintf(file, "{\"timestamp\":%lld,\"files\":{", timestamp);
+    ct_reload_trace_write_json_string(file, full_path);
+    fputs(":{\"events\":[", file);
+    bool wrote_event = false;
+    if ((events & UV_CHANGE) != 0) {
+        fputs("\"write\"", file);
+        wrote_event = true;
+    }
+    if ((events & UV_RENAME) != 0) {
+        if (wrote_event) fputc(',', file);
+        fputs("\"rename\"", file);
+        wrote_event = true;
+    }
+    if (!wrote_event && status < 0) fputs("\"error\"", file);
+    fputs("]}}}\n", file);
+    fflush(file);
+    free(full_path);
+}
+
 static void ct_reload_fs_event_callback(
     uv_fs_event_t *handle,
     const char *filename,
@@ -3620,7 +3717,7 @@ static void ct_reload_fs_event_callback(
     CtReloadWatcher *watcher = handle != NULL ? (CtReloadWatcher *)handle->data : NULL;
     if (watcher == NULL || watcher->runtime == NULL) return;
 
-    if (status >= 0 && filename != NULL) {
+    if (status >= 0 && filename != NULL && !watcher->watch_all) {
         const char *basename = filename;
         for (const char *cursor = filename; *cursor != '\0'; cursor += 1) {
             if (*cursor == '/' || *cursor == '\\') basename = cursor + 1;
@@ -3630,6 +3727,7 @@ static void ct_reload_fs_event_callback(
         if (path == NULL) return;
     }
 
+    ct_reload_trace_event(watcher, filename, events, status);
     watcher->runtime->reload_requested = true;
     ct_runtime_wake(watcher->runtime);
 }
@@ -3645,6 +3743,8 @@ int ct_jsc_runtime_set_watch_paths(
         ct_set_error_out(error_out, ct_duplicate_string("JavaScript runtime is not initialized"));
         return -1;
     }
+
+    if (path_count > 0) ct_reload_trace_init(runtime);
 
     CtReloadWatcher *watchers = NULL;
     for (size_t index = 0; index < path_count; index += 1) {
@@ -3701,6 +3801,11 @@ int ct_jsc_runtime_set_watch_paths(
             free(directory);
         }
 
+        if (name == NULL) {
+            watcher->watch_all = true;
+            continue;
+        }
+
         CtReloadWatchPath *existing = watcher->paths;
         while (existing != NULL && !ct_reload_path_equal(existing->name, name)) existing = existing->next;
         if (existing != NULL) {
@@ -3721,7 +3826,6 @@ int ct_jsc_runtime_set_watch_paths(
 
     CtReloadWatcher *previous = runtime->reload_watchers;
     runtime->reload_watchers = watchers;
-    runtime->reload_requested = false;
     ct_reload_watchers_close(runtime, previous);
     return 0;
 }
@@ -28540,6 +28644,10 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
     CtReloadWatcher *reload_watchers = runtime->reload_watchers;
     runtime->reload_watchers = NULL;
     ct_reload_watchers_close(runtime, reload_watchers);
+    if (runtime->reload_trace_file != NULL) {
+        fclose(runtime->reload_trace_file);
+        runtime->reload_trace_file = NULL;
+    }
     ct_workers_detach_runtime(runtime);
     ct_async_processes_wait_for_runtime(runtime);
     ct_tcp_connects_stop_runtime(runtime);
@@ -29575,6 +29683,36 @@ static int ct_jsc_runtime_eval_internal(
 
 int ct_jsc_runtime_eval(CtJscRuntime *runtime, const uint8_t *source, size_t source_len, const char *filename, char **error_out) {
     return ct_jsc_runtime_eval_internal(runtime, source, source_len, filename, true, error_out);
+}
+
+int ct_jsc_runtime_eval_immediate(
+    CtJscRuntime *runtime,
+    const uint8_t *source,
+    size_t source_len,
+    const char *filename,
+    char **error_out
+) {
+    if (error_out != NULL) *error_out = NULL;
+    if (runtime == NULL || runtime->context == NULL) return -1;
+
+    char *wrapped = ct_prepare_sync_source(source, source_len, filename);
+    if (wrapped == NULL) {
+        ct_set_error_out(error_out, ct_duplicate_string("Out of memory"));
+        return -1;
+    }
+
+    JSStringRef script = ct_js_string(wrapped);
+    JSStringRef source_url = ct_js_string(filename != NULL ? filename : "<script>");
+    JSValueRef exception = NULL;
+    JSEvaluateScript(runtime->context, script, NULL, source_url, 1, &exception);
+    JSStringRelease(script);
+    JSStringRelease(source_url);
+    free(wrapped);
+    if (exception != NULL) {
+        ct_set_error_out(error_out, ct_copy_exception(runtime->context, exception));
+        return -1;
+    }
+    return 0;
 }
 
 int ct_jsc_runtime_wait_for_reload(CtJscRuntime *runtime, char **error_out) {

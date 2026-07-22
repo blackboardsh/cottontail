@@ -43,6 +43,11 @@ extern "kernel32" fn VirtualQuery(
     information: *WindowsMemoryBasicInformation,
     information_size: usize,
 ) callconv(.winapi) usize;
+extern "kernel32" fn GetCurrentProcess() callconv(.winapi) std.os.windows.HANDLE;
+extern "kernel32" fn TerminateProcess(
+    process: std.os.windows.HANDLE,
+    exit_code: u32,
+) callconv(.winapi) i32;
 
 const stack_size_param_is_a_reservation = 0x00010000;
 const mem_reserve = 0x00002000;
@@ -68,6 +73,7 @@ const ReloadMode = enum {
 const ReloadExecution = struct {
     ctx: Context,
     entrypoint_path: []const u8,
+    process_argv: []const [:0]const u8,
     mode: ReloadMode,
     clear_screen: bool,
 };
@@ -252,6 +258,59 @@ fn reloadShouldClearScreen(exec_args: []const [:0]const u8) bool {
         if (std.mem.eql(u8, arg, "--no-clear-screen")) return false;
     }
     return true;
+}
+
+fn preloadPathExists(ctx: *const Context, path: []const u8) bool {
+    if (pathExists(ctx.io, path)) return true;
+    const extension = std.fs.path.extension(path);
+    const suffixes: []const []const u8 = if (extension.len == 0)
+        &.{ ".js", ".jsx", ".ts", ".tsx", ".mjs", ".mts", ".cjs", ".cts", ".json" }
+    else if (std.mem.eql(u8, extension, ".js") or std.mem.eql(u8, extension, ".jsx"))
+        &.{ ".ts", ".tsx", ".mts" }
+    else if (std.mem.eql(u8, extension, ".mjs"))
+        &.{".mts"}
+    else
+        &.{};
+    const stem = path[0 .. path.len - extension.len];
+    for (suffixes) |suffix| {
+        const candidate = std.mem.concat(ctx.allocator, u8, &.{ stem, suffix }) catch return false;
+        if (pathExists(ctx.io, candidate)) return true;
+    }
+    for ([_][]const u8{ "index.js", "index.jsx", "index.ts", "index.tsx", "index.mjs", "index.cjs", "package.json" }) |name| {
+        const candidate = std.fs.path.join(ctx.allocator, &.{ path, name }) catch return false;
+        if (pathExists(ctx.io, candidate)) return true;
+    }
+    return false;
+}
+
+fn missingExplicitPreload(ctx: *const Context, exec_args: []const [:0]const u8) ?[]const u8 {
+    var index: usize = 0;
+    while (index < exec_args.len) : (index += 1) {
+        const arg = exec_args[index];
+        var specifier: ?[]const u8 = null;
+        if ((std.mem.eql(u8, arg, "--preload") or
+            std.mem.eql(u8, arg, "--require") or
+            std.mem.eql(u8, arg, "--import") or
+            std.mem.eql(u8, arg, "-r")) and index + 1 < exec_args.len)
+        {
+            index += 1;
+            specifier = exec_args[index];
+        } else if (std.mem.startsWith(u8, arg, "--preload=")) {
+            specifier = arg["--preload=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--require=")) {
+            specifier = arg["--require=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--import=")) {
+            specifier = arg["--import=".len..];
+        }
+        const raw = specifier orelse continue;
+        if (!std.fs.path.isAbsolute(raw) and !std.mem.startsWith(u8, raw, ".")) continue;
+        const resolved = if (std.fs.path.isAbsolute(raw))
+            raw
+        else
+            std.fs.path.join(ctx.allocator, &.{ ctx.project_root, raw }) catch return raw;
+        if (!preloadPathExists(ctx, resolved)) return raw;
+    }
+    return null;
 }
 
 pub fn bunEntrypointFallbackExtensions(path: []const u8) []const []const u8 {
@@ -2310,6 +2369,15 @@ fn runReloadPrepared(
     clear_screen: bool,
 ) !u8 {
     const allocator = init.arena.allocator();
+    if (comptime builtin.os.tag == .windows) {
+        if (mode == .watch and !compiler.windows.isWatcherChild()) {
+            compiler.windows.becomeWatcherManager(allocator);
+        }
+    }
+    if (missingExplicitPreload(ctx, exec_args)) |specifier| {
+        ctx.writeStderr("error: preload not found {s}\n", .{specifier});
+        return 1;
+    }
     if (!applyRuntimeEnvFlags(init.io, allocator, exec_args)) return 1;
     const inspector = inspectorLaunchFromArgs(ctx, exec_args) catch |err| {
         ctx.writeStderr("cottontail: invalid inspector endpoint: {s}\n", .{@errorName(err)});
@@ -2330,6 +2398,7 @@ fn runReloadPrepared(
         .reload = .{
             .ctx = ctx.*,
             .entrypoint_path = entrypoint_path,
+            .process_argv = try init.minimal.args.toSlice(allocator),
             .mode = mode,
             .clear_screen = clear_screen,
         },
@@ -2470,6 +2539,40 @@ const ReloadDependencies = struct {
         return result;
     }
 
+    fn replaceAfterBuildFailure(
+        self: *ReloadDependencies,
+        ctx: *const Context,
+        entrypoint_path: []const u8,
+    ) !void {
+        var paths: std.ArrayList([]const u8) = .empty;
+        try paths.append(ctx.allocator, entrypoint_path);
+
+        const entrypoint_dir = std.fs.path.dirname(entrypoint_path) orelse ctx.project_root;
+        const root = if (std.mem.startsWith(u8, entrypoint_path, ctx.project_root))
+            ctx.project_root
+        else
+            entrypoint_dir;
+        try appendReloadWatchDirectory(ctx.allocator, &paths, root);
+
+        var directory = std.Io.Dir.cwd().openDir(ctx.io, root, .{ .iterate = true }) catch {
+            try self.replace(paths.items);
+            return;
+        };
+        defer directory.close(ctx.io);
+        var walker = try directory.walk(ctx.allocator);
+        defer walker.deinit();
+        while (try walker.next(ctx.io)) |entry| {
+            if (entry.kind != .directory) continue;
+            if (reloadWatchDirectoryExcluded(entry.basename)) {
+                walker.leave(ctx.io);
+                continue;
+            }
+            const absolute = try std.fs.path.join(ctx.allocator, &.{ root, entry.path });
+            try appendReloadWatchDirectory(ctx.allocator, &paths, absolute);
+        }
+        try self.replace(paths.items);
+    }
+
     fn replace(self: *ReloadDependencies, paths: anytype) !void {
         const next = try std.heap.c_allocator.alloc([:0]const u8, paths.len);
         var initialized: usize = 0;
@@ -2491,6 +2594,23 @@ const ReloadDependencies = struct {
         self.paths = &.{};
     }
 };
+
+fn reloadWatchDirectoryExcluded(name: []const u8) bool {
+    return std.mem.eql(u8, name, ".git") or
+        std.mem.eql(u8, name, "node_modules") or
+        std.mem.eql(u8, name, ".cottontail-tmp") or
+        std.mem.eql(u8, name, ".zig-cache") or
+        std.mem.eql(u8, name, "zig-cache");
+}
+
+fn appendReloadWatchDirectory(
+    allocator: std.mem.Allocator,
+    paths: *std.ArrayList([]const u8),
+    directory: []const u8,
+) !void {
+    const marker = try std.fmt.allocPrint(allocator, "{s}{c}", .{ directory, std.fs.path.sep });
+    try paths.append(allocator, marker);
+}
 
 const ReloadGenerationResult = union(enum) {
     reload,
@@ -2547,9 +2667,6 @@ fn runReloadGeneration(
         break :blk if (watch_runtime) |*value| value else unreachable;
     };
 
-    const empty_paths: [0][:0]const u8 = .{};
-    try js_runtime.setWatchPaths(empty_paths[0..]);
-
     var generated_dependencies: []const [:0]const u8 = &.{};
     var runnable = bundleScriptNative(
         generation_ctx,
@@ -2565,6 +2682,7 @@ fn runReloadGeneration(
         if (err != error.ReloadBundleFailed and err != error.TestBundleFailed) {
             generation_ctx.writeStderr("cottontail: reload build failed: {s}\n", .{@errorName(err)});
         }
+        try dependencies.replaceAfterBuildFailure(generation_ctx, reload.entrypoint_path);
         return try waitForReloadAfterBuildFailure(js_runtime, dependencies);
     };
     defer runnable.deinit(generation_ctx);
@@ -2607,6 +2725,57 @@ fn clearReloadScreen(execution: *const ScriptExecution, reload: *const ReloadExe
     writer.interface.flush() catch {};
 }
 
+fn replaceWatchProcess(execution: *const ScriptExecution, reload: *const ReloadExecution) !void {
+    if (comptime builtin.os.tag == .windows) {
+        if (TerminateProcess(
+            GetCurrentProcess(),
+            @intCast(compiler.windows.watcher_reload_exit),
+        ) == 0) return error.WatchProcessReplacementFailed;
+        while (true) std.atomic.spinLoopHint();
+    }
+
+    if (comptime builtin.os.tag == .macos or builtin.os.tag == .linux) {
+        const allocator = std.heap.c_allocator;
+        const executable = try std.process.executablePathAlloc(execution.io, allocator);
+        defer allocator.free(executable);
+
+        const argv = try allocator.allocSentinel(?[*:0]const u8, reload.process_argv.len, null);
+        var argv_initialized: usize = 0;
+        defer {
+            for (argv[0..argv_initialized]) |arg| allocator.free(std.mem.span(arg.?));
+            allocator.free(argv);
+        }
+        for (reload.process_argv, 0..) |arg, index| {
+            argv[index] = (try allocator.dupeZ(u8, arg)).ptr;
+            argv_initialized += 1;
+        }
+
+        const current_environment = std.mem.span(std.c.environ);
+        const environment = try allocator.allocSentinel(?[*:0]const u8, current_environment.len, null);
+        var environment_initialized: usize = 0;
+        defer {
+            for (environment[0..environment_initialized]) |entry| allocator.free(std.mem.span(entry.?));
+            allocator.free(environment);
+        }
+        for (current_environment, 0..) |entry, index| {
+            environment[index] = if (entry) |value|
+                (try allocator.dupeZ(u8, std.mem.span(value))).ptr
+            else
+                null;
+            environment_initialized += 1;
+        }
+
+        if (std.c.execve(
+            executable.ptr,
+            @ptrCast(argv.ptr),
+            @ptrCast(environment.ptr),
+        ) != 0) return error.WatchProcessReplacementFailed;
+        unreachable;
+    }
+
+    return error.WatchProcessReplacementUnsupported;
+}
+
 fn runReloadExecution(execution: *ScriptExecution, reload: *ReloadExecution) void {
     var dependencies = ReloadDependencies.init(reload.entrypoint_path) catch {
         writeStderr(execution.io, "cottontail: failed to initialize reload dependencies\n", .{});
@@ -2643,7 +2812,18 @@ fn runReloadExecution(execution: *ScriptExecution, reload: *ReloadExecution) voi
             };
         };
         switch (result) {
-            .reload => continue,
+            .reload => {
+                if (reload.mode == .watch) {
+                    clearReloadScreen(execution, reload);
+                    replaceWatchProcess(execution, reload) catch |err| {
+                        writeStderr(execution.io, "cottontail: failed to replace watch process: {s}\n", .{@errorName(err)});
+                        execution.exit_code = 1;
+                        return;
+                    };
+                    unreachable;
+                }
+                continue;
+            },
             .exit => |code| {
                 execution.exit_code = code;
                 return;
