@@ -419,9 +419,11 @@ constexpr const char* error_messages[] = {
     "JavaScript execution is not allowed",
 };
 
+struct RegisteredModule;
+struct ModuleRegistrationSession;
+
 static thread_local NapiEnv* loading_env;
-static thread_local napi_module* loading_module;
-static thread_local node::node_module* loading_legacy_module;
+static thread_local ModuleRegistrationSession* module_registration_session;
 static thread_local NapiEnv* active_env;
 static unsigned char empty_external_buffer_sentinel;
 
@@ -469,14 +471,68 @@ private:
     NapiEnv* previous;
 };
 
+enum class RegisteredModuleKind {
+    napi,
+    legacy,
+};
+
 struct RegisteredModule {
-    napi_addon_register_func callback { nullptr };
-    int version { NAPI_VERSION };
+    RegisteredModuleKind kind { RegisteredModuleKind::napi };
+    napi_module napi_module_data {};
+    node::node_module* legacy_module { nullptr };
+
+    static RegisteredModule from_napi(const napi_module& module)
+    {
+        RegisteredModule registration;
+        registration.kind = RegisteredModuleKind::napi;
+        registration.napi_module_data = module;
+        return registration;
+    }
+
+    static RegisteredModule from_legacy(node::node_module* module)
+    {
+        RegisteredModule registration;
+        registration.kind = RegisteredModuleKind::legacy;
+        registration.legacy_module = module;
+        return registration;
+    }
+};
+
+struct ModuleRegistrationSession {
+    std::vector<RegisteredModule> registrations;
+    bool attempted { false };
+    bool invalid { false };
+    bool allocation_failed { false };
+};
+
+class ModuleRegistrationScope {
+public:
+    ModuleRegistrationScope(NapiEnv* env, ModuleRegistrationSession* session)
+        : previous_env(loading_env)
+        , previous_session(module_registration_session)
+    {
+        loading_env = env;
+        module_registration_session = session;
+    }
+
+    void did_finish_loading()
+    {
+        loading_env = previous_env;
+    }
+
+    ~ModuleRegistrationScope()
+    {
+        loading_env = previous_env;
+        module_registration_session = previous_session;
+    }
+
+private:
+    NapiEnv* previous_env { nullptr };
+    ModuleRegistrationSession* previous_session { nullptr };
 };
 
 static std::mutex registered_modules_mutex;
-static std::unordered_map<std::string, RegisteredModule> registered_modules;
-static std::unordered_map<std::string, node::node_module*> registered_legacy_modules;
+static std::unordered_map<void*, std::vector<RegisteredModule>> registered_modules;
 
 static JSClassRef function_class;
 static JSClassRef external_class;
@@ -1949,24 +2005,65 @@ extern "C" void ct_napi_env_destroy(CtNapiEnv* opaque_env)
 
 extern "C" void napi_module_register(napi_module* module)
 {
-    if (!module)
+    auto* session = module_registration_session;
+    if (!session)
         return;
-    loading_module = module;
-    if (loading_env && !loading_env->module_filename.empty() && module->nm_register_func) {
-        std::lock_guard lock(registered_modules_mutex);
-        registered_modules[loading_env->module_filename] = { module->nm_register_func, module->nm_version };
+    session->attempted = true;
+    if (!module || !module->nm_register_func) {
+        session->invalid = true;
+        return;
+    }
+    try {
+        session->registrations.push_back(RegisteredModule::from_napi(*module));
+    } catch (...) {
+        session->allocation_failed = true;
     }
 }
 
 extern "C" void node_module_register(void* opaque_module)
 {
-    auto* module = static_cast<node::node_module*>(opaque_module);
-    if (!module)
+    auto* session = module_registration_session;
+    if (!session)
         return;
-    loading_legacy_module = module;
-    if (loading_env && !loading_env->module_filename.empty()) {
+    session->attempted = true;
+    auto* module = static_cast<node::node_module*>(opaque_module);
+    if (!module || (!module->nm_register_func && !module->nm_context_register_func)) {
+        session->invalid = true;
+        return;
+    }
+    try {
+        session->registrations.push_back(RegisteredModule::from_legacy(module));
+    } catch (...) {
+        session->allocation_failed = true;
+    }
+}
+
+static bool cache_registered_modules(void* handle, const std::vector<RegisteredModule>& registrations)
+{
+    try {
         std::lock_guard lock(registered_modules_mutex);
-        registered_legacy_modules[loading_env->module_filename] = module;
+        registered_modules[handle] = registrations;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool find_registered_modules(
+    void* handle,
+    std::vector<RegisteredModule>* registrations,
+    bool* found
+)
+{
+    try {
+        std::lock_guard lock(registered_modules_mutex);
+        auto iterator = registered_modules.find(handle);
+        *found = iterator != registered_modules.end();
+        if (*found)
+            *registrations = iterator->second;
+        return true;
+    } catch (...) {
+        return false;
     }
 }
 
@@ -1978,6 +2075,38 @@ static JSValueRef make_loader_error(NapiEnv* env, const std::string& message)
     JSValueRef exception = nullptr;
     JSObjectRef error = JSObjectMakeError(env->context, 1, &argument, &exception);
     return exception ? exception : error;
+}
+
+static bool retain_addon_env(NapiEnv* root, NapiEnv* env, JSValueRef* exception)
+{
+    try {
+        root->addon_envs.push_back(env);
+        return true;
+    } catch (...) {
+        *exception = make_loader_error(root, "failed to retain a Node-API environment");
+        return false;
+    }
+}
+
+static JSValueRef invoke_napi_module(
+    NapiEnv* env,
+    napi_addon_register_func callback,
+    JSObjectRef exports,
+    JSValueRef* exception
+)
+{
+    if (!callback)
+        return nullptr;
+    ActiveEnvScope active_scope(env);
+    AutomaticScope automatic_scope(env);
+    napi_value result = callback(reinterpret_cast<napi_env>(env), to_napi(exports));
+    if (env->pending_exception) {
+        *exception = env->pending_exception;
+        JSValueUnprotect(env->context, env->pending_exception);
+        env->pending_exception = nullptr;
+        return nullptr;
+    }
+    return result ? to_js(result) : nullptr;
 }
 
 static JSValueRef invoke_legacy_module(NapiEnv* env, node::node_module* module, JSObjectRef exports, JSValueRef* exception)
@@ -2046,20 +2175,133 @@ extern "C" JSValueRef ct_napi_load_addon(
         *exception = make_loader_error(root, "failed to allocate a Node-API environment");
         return nullptr;
     }
-    env->module_filename = path_to_file_uri(path);
-    loading_env = env;
-    loading_module = nullptr;
-    loading_legacy_module = nullptr;
+    try {
+        env->module_filename = path_to_file_uri(path);
+    } catch (...) {
+        *exception = make_loader_error(root, "failed to record the native addon filename");
+        destroy_single_env(env);
+        return nullptr;
+    }
+
+    ModuleRegistrationSession registration_session;
+    ModuleRegistrationScope registration_scope(env, &registration_session);
     dlerror();
     void* handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
     const char* open_error = handle ? nullptr : dlerror();
-    node::node_module* legacy_module = loading_legacy_module;
-    loading_legacy_module = nullptr;
-    loading_env = nullptr;
+    registration_scope.did_finish_loading();
     if (!handle) {
         *exception = make_loader_error(env, std::string("dlopen(") + path + ") failed: " + (open_error ? open_error : "unknown error"));
         destroy_single_env(env);
         return nullptr;
+    }
+
+    if (registration_session.allocation_failed) {
+        *exception = make_loader_error(env, "failed to record a native addon registration");
+        destroy_single_env(env);
+        dlclose(handle);
+        return nullptr;
+    }
+
+    const bool registered_during_load = registration_session.attempted;
+    bool found_cached_registrations = false;
+    if (!registered_during_load
+        && !find_registered_modules(handle, &registration_session.registrations, &found_cached_registrations)) {
+        *exception = make_loader_error(env, "failed to retrieve cached native addon registrations");
+        destroy_single_env(env);
+        dlclose(handle);
+        return nullptr;
+    }
+
+    if (registered_during_load && registration_session.invalid) {
+        *exception = make_loader_error(env, "Module has no declared entry point.");
+        destroy_single_env(env);
+        dlclose(handle);
+        return nullptr;
+    }
+
+    if (!registration_session.registrations.empty()) {
+        if (registered_during_load && !cache_registered_modules(handle, registration_session.registrations)) {
+            *exception = make_loader_error(env, "failed to cache native addon registrations");
+            destroy_single_env(env);
+            dlclose(handle);
+            return nullptr;
+        }
+
+        JSValueRef current_exports = exports ? static_cast<JSValueRef>(exports) : JSObjectMake(env->context, nullptr, nullptr);
+        const size_t cached_registration_count = registration_session.registrations.size();
+        size_t index = 0;
+        while (index < registration_session.registrations.size()) {
+            RegisteredModule registration = registration_session.registrations[index++];
+            NapiEnv* module_env = env;
+            if (index > 1) {
+                module_env = allocate_env(root->context, root->event_loop, root->wake_opaque, root->wake_callback, root);
+                if (!module_env) {
+                    *exception = make_loader_error(root, "failed to allocate a Node-API environment");
+                    return nullptr;
+                }
+                try {
+                    module_env->module_filename = env->module_filename;
+                } catch (...) {
+                    *exception = make_loader_error(root, "failed to record the native addon filename");
+                    destroy_single_env(module_env);
+                    return nullptr;
+                }
+            }
+
+            if (registration.kind == RegisteredModuleKind::napi)
+                module_env->module_api_version = registration.napi_module_data.nm_version;
+            if (!retain_addon_env(root, module_env, exception)) {
+                destroy_single_env(module_env);
+                return nullptr;
+            }
+
+            if (registration.kind == RegisteredModuleKind::legacy) {
+                if (!JSValueIsObject(module_env->context, current_exports)) {
+                    *exception = make_loader_error(module_env, "Expected a native addon registration to receive an exports object");
+                    return nullptr;
+                }
+                current_exports = invoke_legacy_module(
+                    module_env,
+                    registration.legacy_module,
+                    const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(current_exports)),
+                    exception);
+            } else {
+                auto& module = registration.napi_module_data;
+                if (!JSValueIsObject(module_env->context, current_exports)) {
+                    *exception = make_loader_error(module_env, "Expected a Node-API module registration to receive an exports object");
+                    return nullptr;
+                }
+                current_exports = invoke_napi_module(
+                    module_env,
+                    module.nm_register_func,
+                    const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(current_exports)),
+                    exception);
+                if (!*exception && !current_exports) {
+                    const char* module_name = module.nm_modname ? module.nm_modname : "unknown";
+                    *exception = make_loader_error(module_env, std::string("Node-API module \"") + module_name + "\" returned an error");
+                } else if (!*exception && !JSValueIsObject(module_env->context, current_exports)) {
+                    const char* module_name = module.nm_modname ? module.nm_modname : "unknown";
+                    *exception = make_loader_error(module_env, std::string("Expected Node-API module \"") + module_name + "\" to return an exports object");
+                }
+            }
+            if (*exception)
+                return nullptr;
+            if (registration_session.allocation_failed) {
+                *exception = make_loader_error(module_env, "failed to record a native addon registration");
+                return nullptr;
+            }
+            if (registration_session.invalid) {
+                *exception = make_loader_error(module_env, "Module has no declared entry point.");
+                return nullptr;
+            }
+        }
+
+        if ((registered_during_load || registration_session.registrations.size() != cached_registration_count)
+            && !cache_registered_modules(handle, registration_session.registrations)) {
+            *exception = make_loader_error(env, "failed to cache native addon registrations");
+            return nullptr;
+        }
+        return current_exports;
     }
 
     using RegisterFunction = napi_value (*)(napi_env, napi_value);
@@ -2067,43 +2309,24 @@ extern "C" JSValueRef ct_napi_load_addon(
     auto* direct_register = reinterpret_cast<RegisterFunction>(dlsym(handle, "napi_register_module_v1"));
     auto* get_api_version = reinterpret_cast<ApiVersionFunction>(dlsym(handle, "node_api_module_get_api_version_v1"));
     env->module_api_version = get_api_version ? get_api_version() : 8;
-    napi_addon_register_func register_callback = direct_register;
-    if (!register_callback && loading_module)
-        register_callback = loading_module->nm_register_func;
-    if (!register_callback && !legacy_module) {
-        std::lock_guard lock(registered_modules_mutex);
-        auto iterator = registered_modules.find(env->module_filename);
-        if (iterator != registered_modules.end())
-            register_callback = iterator->second.callback;
-        auto legacy_iterator = registered_legacy_modules.find(env->module_filename);
-        if (!register_callback && legacy_iterator != registered_legacy_modules.end())
-            legacy_module = legacy_iterator->second;
-    }
-    if (!register_callback && !legacy_module) {
-        if (loading_module && !loading_module->nm_register_func)
-            *exception = make_loader_error(env, "Module has no declared entry point.");
-        else
-            *exception = make_loader_error(env, std::string("Native addon ") + path + " does not export a Node-API or V8 module initializer");
+    if (!direct_register) {
+        *exception = make_loader_error(env, std::string("Native addon ") + path + " does not export a Node-API or V8 module initializer");
         destroy_single_env(env);
         dlclose(handle);
         return nullptr;
     }
 
-    root->addon_envs.push_back(env);
-    if (legacy_module)
-        return invoke_legacy_module(env, legacy_module, exports, exception);
     if (!exports)
         exports = JSObjectMake(env->context, nullptr, nullptr);
-    AutomaticScope scope(env);
-    ActiveEnvScope active_scope(env);
-    napi_value result = register_callback(reinterpret_cast<napi_env>(env), to_napi(exports));
-    if (env->pending_exception) {
-        *exception = env->pending_exception;
-        JSValueUnprotect(env->context, env->pending_exception);
-        env->pending_exception = nullptr;
+    if (!retain_addon_env(root, env, exception)) {
+        destroy_single_env(env);
+        dlclose(handle);
         return nullptr;
     }
-    return result ? to_js(result) : exports;
+    JSValueRef result = invoke_napi_module(env, direct_register, exports, exception);
+    if (*exception)
+        return nullptr;
+    return result ? result : exports;
 }
 
 extern "C" napi_status napi_get_last_error_info(napi_env opaque_env, const napi_extended_error_info** result)
