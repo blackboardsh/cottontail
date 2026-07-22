@@ -16,6 +16,19 @@ const StandaloneOptions = struct {
 };
 const binary_header = "#!/usr/bin/env bun\nbun-lockfile-format-v0\n";
 
+pub const lifecycle_script_names = BunLockfile.Scripts.names;
+
+pub const WorkspaceLifecycleScripts = struct {
+    path: []u8,
+    commands: [lifecycle_script_names.len][]u8,
+
+    fn deinit(scripts: *WorkspaceLifecycleScripts, allocator: std.mem.Allocator) void {
+        allocator.free(scripts.path);
+        for (scripts.commands) |command| allocator.free(command);
+        scripts.* = undefined;
+    }
+};
+
 pub fn isBinaryLockfile(bytes: []const u8) bool {
     return std.mem.startsWith(u8, bytes, binary_header);
 }
@@ -183,6 +196,8 @@ pub fn textToBinaryAtRoot(
     );
     defer lockfile.deinit();
 
+    try populateWorkspaceLifecycleScripts(&lockfile, lockfile_allocator, json);
+
     if (lockfile.patched_dependencies.entries.len > 0) {
         const patch_io = io orelse return error.PatchRootRequired;
         const patch_root = root_dir orelse return error.PatchRootRequired;
@@ -220,10 +235,12 @@ pub const BinaryText = struct {
     text: []u8,
     migrated_from_v2: bool,
     trusted_dependency_hashes: ?[]compiler.install.TruncatedPackageNameHash,
+    lifecycle_scripts: []WorkspaceLifecycleScripts,
 
     pub fn deinit(converted: *BinaryText, allocator: std.mem.Allocator) void {
         allocator.free(converted.text);
         if (converted.trusted_dependency_hashes) |hashes| allocator.free(hashes);
+        deinitWorkspaceLifecycleScripts(allocator, converted.lifecycle_scripts);
         converted.* = undefined;
     }
 };
@@ -231,6 +248,7 @@ pub const BinaryText = struct {
 pub fn binaryToText(allocator: std.mem.Allocator, binary: []const u8) ![]u8 {
     const converted = try binaryToTextWithMetadata(allocator, binary);
     if (converted.trusted_dependency_hashes) |hashes| allocator.free(hashes);
+    deinitWorkspaceLifecycleScripts(allocator, converted.lifecycle_scripts);
     return converted.text;
 }
 
@@ -256,6 +274,8 @@ pub fn binaryToTextWithMetadata(allocator: std.mem.Allocator, binary: []const u8
     else
         null;
     errdefer if (trusted_dependency_hashes) |hashes| allocator.free(hashes);
+    const lifecycle_scripts = try collectWorkspaceLifecycleScripts(allocator, &lockfile);
+    errdefer deinitWorkspaceLifecycleScripts(allocator, lifecycle_scripts);
 
     const options: StandaloneOptions = .{ .config_version = lockfile.saved_config_version };
 
@@ -273,7 +293,90 @@ pub fn binaryToTextWithMetadata(allocator: std.mem.Allocator, binary: []const u8
         .text = try output.toOwnedSlice(),
         .migrated_from_v2 = migrated_from_v2,
         .trusted_dependency_hashes = trusted_dependency_hashes,
+        .lifecycle_scripts = lifecycle_scripts,
     };
+}
+
+fn populateWorkspaceLifecycleScripts(lockfile: *BunLockfile, allocator: std.mem.Allocator, root: anytype) !void {
+    const workspaces = root.getObject("workspaces") orelse return;
+    for (workspaces.data.e_object.properties.slice()) |property| {
+        const key = property.key orelse continue;
+        const value = property.value orelse continue;
+        const path = key.asString(allocator) orelse continue;
+        const package_id = findWorkspacePackage(lockfile, path) orelse continue;
+
+        var builder = lockfile.stringBuilder();
+        BunLockfile.Package.Scripts.parseCount(allocator, &builder, value);
+        try builder.allocate();
+        const scripts = &lockfile.packages.items(.scripts)[package_id];
+        scripts.parseAlloc(allocator, &builder, value);
+        scripts.filled = true;
+        lockfile.packages.items(.meta)[package_id].setHasInstallScript(scripts.hasAny());
+        builder.clamp();
+    }
+}
+
+fn findWorkspacePackage(lockfile: *const BunLockfile, path: []const u8) ?usize {
+    if (path.len == 0) return if (lockfile.packages.len > 0) 0 else null;
+
+    const resolutions = lockfile.packages.items(.resolution);
+    const string_bytes = lockfile.buffers.string_bytes.items;
+    for (resolutions, 0..) |resolution, package_id| {
+        if (resolution.tag == .workspace and
+            std.mem.eql(u8, path, resolution.value.workspace.slice(string_bytes)))
+        {
+            return package_id;
+        }
+    }
+    return null;
+}
+
+fn collectWorkspaceLifecycleScripts(
+    allocator: std.mem.Allocator,
+    lockfile: *const BunLockfile,
+) ![]WorkspaceLifecycleScripts {
+    var collected = std.array_list.Managed(WorkspaceLifecycleScripts).init(allocator);
+    errdefer {
+        for (collected.items) |*scripts| scripts.deinit(allocator);
+        collected.deinit();
+    }
+
+    const packages = lockfile.packages.slice();
+    const resolutions = packages.items(.resolution);
+    const package_scripts = packages.items(.scripts);
+    const string_bytes = lockfile.buffers.string_bytes.items;
+    for (package_scripts, 0..) |scripts, package_id| {
+        const path = if (package_id == 0)
+            ""
+        else if (resolutions[package_id].tag == .workspace)
+            resolutions[package_id].value.workspace.slice(string_bytes)
+        else
+            continue;
+
+        var cloned = WorkspaceLifecycleScripts{
+            .path = try allocator.dupe(u8, path),
+            .commands = undefined,
+        };
+        var command_count: usize = 0;
+        errdefer {
+            allocator.free(cloned.path);
+            for (cloned.commands[0..command_count]) |command| allocator.free(command);
+        }
+        inline for (lifecycle_script_names, 0..) |name, index| {
+            cloned.commands[index] = try allocator.dupe(u8, @field(scripts, name).slice(string_bytes));
+            command_count += 1;
+        }
+        try collected.append(cloned);
+    }
+    return collected.toOwnedSlice();
+}
+
+fn deinitWorkspaceLifecycleScripts(
+    allocator: std.mem.Allocator,
+    lifecycle_scripts: []WorkspaceLifecycleScripts,
+) void {
+    for (lifecycle_scripts) |*scripts| scripts.deinit(allocator);
+    allocator.free(lifecycle_scripts);
 }
 
 pub fn upgradeBinaryFormat(allocator: std.mem.Allocator, binary: []const u8) ![]u8 {

@@ -2163,6 +2163,7 @@ const Manager = struct {
     loaded_binary_lockfile: bool = false,
     binary_lockfile_needs_migration: bool = false,
     binary_lockfile_trusted_dependency_hashes: ?[]const compiler.install.TruncatedPackageNameHash = null,
+    binary_lockfile_lifecycle_scripts: []const BunLockfile.WorkspaceLifecycleScripts = &.{},
     lockfile_config_version: Lockfile.ConfigVersion = .current,
     linker_configured: bool = false,
     max_retry_count: u16 = 5,
@@ -2688,7 +2689,10 @@ const Manager = struct {
             } else if (manager.options.command == .install and reported_installed_count == 0) {
                 const checked_installs = manager.checkedInstallCount();
                 if (checked_installs == 0) {
-                    try manager.stdout.print("Done! Checked {d} packages (no changes) [{d:.2}ms]\n", .{ manager.lockfilePackageCount(), elapsed_ms });
+                    try manager.stdout.print("{s}[{d:.2}ms] done\n", .{
+                        manager.installSummarySeparator(),
+                        elapsed_ms,
+                    });
                 } else {
                     try manager.stdout.print("Checked {d} install{s} across {d} packages (no changes) [{d:.2}ms]\n", .{
                         checked_installs,
@@ -4758,11 +4762,13 @@ const Manager = struct {
             manager.loaded_binary_lockfile = true;
             manager.binary_lockfile_needs_migration = converted.migrated_from_v2;
             manager.binary_lockfile_trusted_dependency_hashes = converted.trusted_dependency_hashes;
+            manager.binary_lockfile_lifecycle_scripts = converted.lifecycle_scripts;
             manager.lock_graph = try Lockfile.parseText(manager.allocator, converted.text);
             manager.lockfile_config_version = manager.lock_graph.?.config_version orelse .v0;
             if (manager.lock_graph.?.config_version == null) manager.changed = true;
             manager.patch_policy_changed = !manager.manifest_policy.?.patchesMatchLockDocument(&manager.lock_graph.?.document);
             if (!manager.lock_graph.?.rootMatchesPackageJSON(root) or
+                !manager.binaryLockfileLifecycleScriptsMatch("", root) or
                 !manager.manifest_policy.?.matchesLockDocumentWithoutTrustedDependencies(&manager.lock_graph.?.document) or
                 !manager.manifest_policy.?.matchesTrustedDependencyHashes(converted.trusted_dependency_hashes))
             {
@@ -4830,7 +4836,9 @@ const Manager = struct {
         while (iterator.next()) |entry| {
             const workspace = entry.value_ptr.*;
             const path = try manager.relativeLockPath(workspace.path);
-            if (!graph.workspaceMatchesPackageJSON(path, workspace.package_json)) {
+            if (!graph.workspaceMatchesPackageJSON(path, workspace.package_json) or
+                !manager.binaryLockfileLifecycleScriptsMatch(path, workspace.package_json))
+            {
                 if (manager.options.frozen_lockfile) return error.FrozenLockfileChanged;
                 manager.changed = true;
             } else {
@@ -4841,6 +4849,36 @@ const Manager = struct {
             if (manager.options.frozen_lockfile) return error.FrozenLockfileChanged;
             manager.changed = true;
         }
+    }
+
+    fn binaryLockfileLifecycleScriptsMatch(
+        manager: *const Manager,
+        path: []const u8,
+        package_json: *const Value,
+    ) bool {
+        if (!manager.loaded_binary_lockfile) return true;
+        for (manager.binary_lockfile_lifecycle_scripts) |*expected| {
+            if (!std.mem.eql(u8, expected.path, path)) continue;
+            const scripts = if (package_json.* == .object)
+                package_json.object.get("scripts")
+            else
+                null;
+            inline for (BunLockfile.lifecycle_script_names, 0..) |name, index| {
+                const command = if (scripts) |value|
+                    if (value == .object)
+                        if (value.object.get(name)) |script|
+                            if (script == .string) script.string else ""
+                        else
+                            ""
+                    else
+                        ""
+                else
+                    "";
+                if (!std.mem.eql(u8, expected.commands[index], command)) return false;
+            }
+            return true;
+        }
+        return false;
     }
 
     fn filterPatternMatches(
@@ -10886,7 +10924,11 @@ const Manager = struct {
             // each package, plus one entry per distinct explicit workspace target.
             return manager.lockfilePackageCount() + manager.installed_workspaces.count();
         }
-        return manager.records.items.len;
+        var count: usize = 0;
+        for (manager.records.items) |record| {
+            if (!manager.recordResolutionOnly(record)) count += 1;
+        }
+        return count;
     }
 
     fn installWorkspaceDependencies(manager: *Manager) !void {
@@ -11479,6 +11521,30 @@ const Manager = struct {
                                     wrote_field = true;
                                 }
                             }
+                        }
+                    }
+                }
+            }
+            if (package_json.* == .object) {
+                if (package_json.object.get("scripts")) |scripts| {
+                    if (scripts == .object) {
+                        var wrote_script = false;
+                        inline for (BunLockfile.lifecycle_script_names) |script_name| {
+                            const command = scripts.object.get(script_name) orelse continue;
+                            if (command != .string) continue;
+                            if (!wrote_script) {
+                                try writer.writeAll("\n      \"scripts\": {");
+                                wrote_script = true;
+                            }
+                            try writer.writeAll("\n        ");
+                            try writeJSONString(writer, script_name);
+                            try writer.writeAll(": ");
+                            try writeJSONString(writer, command.string);
+                            try writer.writeByte(',');
+                        }
+                        if (wrote_script) {
+                            try writer.writeAll("\n      },");
+                            wrote_field = true;
                         }
                     }
                 }
