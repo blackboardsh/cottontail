@@ -112,29 +112,45 @@ const help_text =
 fn parseOptions(args: []const [:0]const u8) Options {
     var options: Options = .{};
     var parse_flags = true;
+    var previous_was_react = false;
     for (args) |arg_z| {
         const arg: []const u8 = arg_z;
         if (parse_flags and std.mem.eql(u8, arg, "--")) {
             parse_flags = false;
+            previous_was_react = false;
         } else if (parse_flags and (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help"))) {
             options.help = true;
+            previous_was_react = false;
         } else if (parse_flags and (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--minimal"))) {
             options.minimal = true;
+            previous_was_react = false;
         } else if (parse_flags and (std.mem.eql(u8, arg, "-y") or std.mem.eql(u8, arg, "--yes"))) {
             options.auto_yes = true;
+            previous_was_react = false;
         } else if (parse_flags and (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--react"))) {
             options.template = .react;
             options.auto_yes = true;
+            previous_was_react = true;
+        } else if (parse_flags and previous_was_react and std.mem.eql(u8, arg, "tailwind")) {
+            options.template = .react_tailwind;
+            previous_was_react = false;
+        } else if (parse_flags and previous_was_react and std.mem.eql(u8, arg, "shadcn")) {
+            options.template = .react_shadcn;
+            previous_was_react = false;
         } else if (parse_flags and (std.mem.eql(u8, arg, "--react=tailwind") or std.mem.eql(u8, arg, "-r=tailwind"))) {
             options.template = .react_tailwind;
             options.auto_yes = true;
+            previous_was_react = false;
         } else if (parse_flags and (std.mem.eql(u8, arg, "--react=shadcn") or std.mem.eql(u8, arg, "-r=shadcn"))) {
             options.template = .react_shadcn;
             options.auto_yes = true;
+            previous_was_react = false;
         } else if (parse_flags and std.mem.startsWith(u8, arg, "-")) {
+            previous_was_react = false;
             continue;
         } else if (options.destination == null) {
             options.destination = arg;
+            previous_was_react = false;
         }
     }
     return options;
@@ -430,7 +446,7 @@ fn initializeBlank(
     }
 
     try writePackageJson(init, root);
-    try stderr.writeAll(" + package.json\n");
+    if (!did_load) try stderr.writeAll(" + package.json\n");
 
     if (!options.minimal and !pathExists(init.io, ".gitignore")) {
         _ = try writeExclusive(init, stderr, ".gitignore", gitignore_default);

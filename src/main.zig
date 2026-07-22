@@ -16,6 +16,7 @@ const repl = @import("repl.zig");
 const cottontail_transpiler = @import("cottontail_transpiler.zig");
 const completions = @import("completions.zig");
 const native_bindings = @import("native_bindings.zig");
+const cli_create_source = @import("cli_create_source.zig");
 const cli_init = @import("cli_init.zig");
 const cli_run = @import("cli_run.zig");
 const script_runner = @import("script_runner.zig");
@@ -2713,6 +2714,24 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, arg, "create") or std.mem.eql(u8, arg, "c")) {
+        if (try cli_create_source.tryRun(init, args, stdout, stderr)) |result| {
+            switch (result) {
+                .exit_code => |exit_code| {
+                    if (exit_code != 0) std.process.exit(exit_code);
+                    return;
+                },
+                .start_dev => {
+                    const pkg = (try findPackageScripts(init.io, allocator, "dev")) orelse {
+                        try stderr.writeAll("error: Script not found \"dev\"\n");
+                        try stderr.flush();
+                        std.process.exit(1);
+                    };
+                    const exit_code = try runPackageScripts(init, pkg, .{}, &.{});
+                    if (exit_code != 0) std.process.exit(exit_code);
+                    return;
+                },
+            }
+        }
         const exit_code = try package_manager_create.run(init, args, stdout, stderr);
         if (exit_code != 0) std.process.exit(exit_code);
         return;
