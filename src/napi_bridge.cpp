@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -47,6 +48,10 @@ extern "C" void JSWeakRelease(JSContextGroupRef, CtJSWeakRef);
 extern "C" JSObjectRef JSWeakGetObject(CtJSWeakRef);
 
 namespace v8 {
+namespace internal {
+class Isolate;
+}
+
 template<typename T>
 class Local {
 public:
@@ -74,6 +79,11 @@ public:
         : value(value)
     {
     }
+    template<typename U>
+    MaybeLocal(Local<U> value)
+        : value(value)
+    {
+    }
 
     Local<T> value;
 };
@@ -92,12 +102,31 @@ public:
     T value {};
 };
 
+template<>
+class Maybe<void> {
+public:
+    Maybe() = default;
+    explicit Maybe(bool value)
+        : has_value(value)
+    {
+    }
+
+    bool has_value { false };
+};
+
+class Data;
 class Context;
 class Value;
+class Primitive;
+class Boolean;
+class Number;
+class External;
 class Object;
+class Array;
 class String;
 class Function;
 class FunctionTemplate;
+class ObjectTemplate;
 class Signature;
 class CFunction;
 
@@ -106,7 +135,7 @@ class FunctionCallbackInfo {
 public:
     void* implicit_args { nullptr };
     uintptr_t* values { nullptr };
-    int length { 0 };
+    uintptr_t length { 0 };
 };
 
 using FunctionCallback = void (*)(const FunctionCallbackInfo<Value>&);
@@ -137,27 +166,114 @@ class HandleScope {
 public:
     explicit HandleScope(Isolate*);
     ~HandleScope();
+    static uintptr_t* CreateHandle(internal::Isolate*, uintptr_t);
 
-private:
+protected:
     void* storage[3] {};
 };
 
-class Value { };
-class Context : public Value { };
+class EscapableHandleScopeBase : public HandleScope {
+public:
+    explicit EscapableHandleScopeBase(Isolate*);
+
+protected:
+    uintptr_t* EscapeSlot(uintptr_t*);
+
+private:
+    uintptr_t* escape_slot { nullptr };
+};
+
+class Data { };
+
+class Value : public Data {
+public:
+    bool FullIsFalse() const;
+    bool FullIsTrue() const;
+    bool IsArray() const;
+    bool IsBigInt() const;
+    bool IsBoolean() const;
+    bool IsFunction() const;
+    bool IsInt32() const;
+    bool IsMap() const;
+    bool IsNumber() const;
+    bool IsObject() const;
+    bool IsUint32() const;
+    bool StrictEquals(Local<Value>) const;
+};
+
+class Primitive : public Value { };
+class Boolean : public Primitive { };
+
+class Number : public Primitive {
+public:
+    static Local<Number> New(Isolate*, double);
+    double Value() const;
+};
+
+class External : public Value {
+public:
+    static Local<External> New(Isolate*, void*);
+    void* Value() const;
+};
+
+class Context : public Value {
+public:
+    Isolate* GetIsolate();
+};
 
 class String : public Value {
 public:
     static MaybeLocal<String> NewFromUtf8(Isolate*, const char*, NewStringType, int length = -1);
+    static MaybeLocal<String> NewFromOneByte(Isolate*, const uint8_t*, NewStringType, int length = -1);
+    bool ContainsOnlyOneByte() const;
+    bool IsExternal() const;
+    bool IsExternalOneByte() const;
+    bool IsExternalTwoByte() const;
+    bool IsOneByte() const;
+    int Length() const;
+    int Utf8Length(Isolate*) const;
+    int WriteUtf8(Isolate*, char*, int length = -1, int* nchars = nullptr, int options = 0) const;
 };
 
 class Object : public Value {
 public:
+    static Local<Object> New(Isolate*);
+    MaybeLocal<Value> Get(Local<Context>, uint32_t);
+    MaybeLocal<Value> Get(Local<Context>, Local<Value>);
+    void SetInternalField(int, Local<Data>);
+    Local<Data> SlowGetInternalField(int);
+    Maybe<bool> Set(Local<Context>, uint32_t, Local<Value>);
     Maybe<bool> Set(Local<Context>, Local<Value>, Local<Value>);
+};
+
+class Array : public Object {
+public:
+    enum class CallbackResult {
+        kException,
+        kBreak,
+        kContinue,
+    };
+    using IterationCallback = CallbackResult (*)(uint32_t, Local<Value>, void*);
+
+    static Local<Array> New(Isolate*, int length = 0);
+    static Local<Array> New(Isolate*, Local<Value>*, size_t);
+    static MaybeLocal<Array> New(Local<Context>, size_t, std::function<MaybeLocal<Value>()>);
+    Maybe<void> Iterate(Local<Context>, IterationCallback, void*);
+    uint32_t Length() const;
 };
 
 class Function : public Object {
 public:
+    Local<Value> GetName() const;
     void SetName(Local<String>);
+};
+
+class ObjectTemplate : public Data {
+public:
+    static Local<ObjectTemplate> New(Isolate*, Local<FunctionTemplate> = Local<FunctionTemplate>());
+    int InternalFieldCount() const;
+    MaybeLocal<Object> NewInstance(Local<Context>);
+    void SetInternalFieldCount(int);
 };
 
 class FunctionTemplate : public Value {
@@ -180,6 +296,13 @@ public:
 namespace api_internal {
 void ToLocalEmpty();
 void FromJustIsNothing();
+uintptr_t* GlobalizeReference(internal::Isolate*, uintptr_t);
+void DisposeGlobal(uintptr_t*);
+Local<Value> GetFunctionTemplateData(Isolate*, Local<Data>);
+}
+
+namespace internal {
+Isolate* IsolateFromNeverReadOnlySpaceObject(uintptr_t);
 }
 }
 
@@ -389,6 +512,7 @@ struct NapiEnv {
     std::string module_filename;
     void* addon_handle { nullptr };
     JSValueRef addon_exports { nullptr };
+    void* legacy_v8_state { nullptr };
     std::string wrap_key;
     uint64_t finalizer_key { 1 };
     JSObjectRef wrap_map { nullptr };
@@ -436,6 +560,151 @@ static thread_local ModuleRegistrationSession* module_registration_session;
 static thread_local NapiEnv* active_env;
 static unsigned char empty_external_buffer_sentinel;
 
+static constexpr uintptr_t legacy_v8_pointer_tag = 1;
+static constexpr uintptr_t legacy_v8_tag_mask = 3;
+
+static uintptr_t legacy_v8_tag_pointer(const void* pointer)
+{
+    return reinterpret_cast<uintptr_t>(pointer) | legacy_v8_pointer_tag;
+}
+
+static uintptr_t legacy_v8_tag_smi(int32_t value)
+{
+    return static_cast<uintptr_t>(static_cast<uint32_t>(value)) << 32;
+}
+
+enum class LegacyV8InstanceType : uint16_t {
+    string = 0x7f,
+    object = 0x80,
+    heap_number = 0x82,
+    oddball = 0x83,
+};
+
+struct alignas(8) LegacyV8Map {
+    uintptr_t meta_map { 0 };
+    uint32_t unused { 0xaaaaaaaa };
+    LegacyV8InstanceType instance_type { LegacyV8InstanceType::object };
+
+    enum class MetaTag { meta };
+
+    explicit LegacyV8Map(MetaTag)
+        : meta_map(legacy_v8_tag_pointer(this))
+    {
+    }
+
+    explicit LegacyV8Map(LegacyV8InstanceType type)
+        : meta_map(legacy_v8_tag_pointer(&map_map()))
+        , instance_type(type)
+    {
+    }
+
+    static const LegacyV8Map& map_map()
+    {
+        static const LegacyV8Map map(MetaTag::meta);
+        return map;
+    }
+
+    static const LegacyV8Map& object_map()
+    {
+        static const LegacyV8Map map(LegacyV8InstanceType::object);
+        return map;
+    }
+
+    static const LegacyV8Map& string_map()
+    {
+        static const LegacyV8Map map(LegacyV8InstanceType::string);
+        return map;
+    }
+
+    static const LegacyV8Map& heap_number_map()
+    {
+        static const LegacyV8Map map(LegacyV8InstanceType::heap_number);
+        return map;
+    }
+
+    static const LegacyV8Map& oddball_map()
+    {
+        static const LegacyV8Map map(LegacyV8InstanceType::oddball);
+        return map;
+    }
+};
+
+static_assert(sizeof(LegacyV8Map) == 16);
+static_assert(offsetof(LegacyV8Map, instance_type) == 12);
+
+enum class LegacyV8OddballKind : int32_t {
+    undefined = 4,
+    null = 3,
+    true_value = 99,
+    false_value = 98,
+};
+
+struct alignas(8) LegacyV8Oddball {
+    uintptr_t map { legacy_v8_tag_pointer(&LegacyV8Map::oddball_map()) };
+    uintptr_t unused[4] {};
+    uintptr_t kind { 0 };
+
+    explicit LegacyV8Oddball(LegacyV8OddballKind value)
+        : kind(legacy_v8_tag_smi(static_cast<int32_t>(value)))
+    {
+    }
+};
+
+static_assert(offsetof(LegacyV8Oddball, kind) == 40);
+
+static const LegacyV8Oddball& legacy_v8_undefined()
+{
+    static const LegacyV8Oddball value(LegacyV8OddballKind::undefined);
+    return value;
+}
+
+static const LegacyV8Oddball& legacy_v8_null()
+{
+    static const LegacyV8Oddball value(LegacyV8OddballKind::null);
+    return value;
+}
+
+static const LegacyV8Oddball& legacy_v8_true()
+{
+    static const LegacyV8Oddball value(LegacyV8OddballKind::true_value);
+    return value;
+}
+
+static const LegacyV8Oddball& legacy_v8_false()
+{
+    static const LegacyV8Oddball value(LegacyV8OddballKind::false_value);
+    return value;
+}
+
+enum class LegacyV8HeapKind : uint8_t {
+    js_value,
+    number,
+    external,
+    function_template,
+    function_target,
+    object_template,
+};
+
+struct alignas(8) LegacyV8HeapObject {
+    uintptr_t map { 0 };
+    union {
+        JSValueRef js_value;
+        double number;
+        void* pointer;
+    } payload {};
+    LegacyV8HeapKind kind { LegacyV8HeapKind::js_value };
+    void (*destroy_payload)(void*) { nullptr };
+
+    ~LegacyV8HeapObject()
+    {
+        if (destroy_payload)
+            destroy_payload(payload.pointer);
+    }
+};
+
+static_assert(offsetof(LegacyV8HeapObject, map) == 0);
+static_assert(offsetof(LegacyV8HeapObject, payload) == 8);
+
 struct LegacyV8Handle {
     uintptr_t raw { 0 };
     JSValueRef protected_value { nullptr };
@@ -449,6 +718,38 @@ struct LegacyV8ScopeData {
     std::deque<LegacyV8Handle> handles;
 };
 
+struct LegacyV8IsolateData {
+    void* state { nullptr };
+    NapiEnv* env { nullptr };
+    uintptr_t padding[78] {};
+    uintptr_t roots[9] {};
+};
+
+static_assert(offsetof(LegacyV8IsolateData, roots) == 640);
+
+struct LegacyV8InternalFields {
+    std::vector<JSValueRef> values;
+    std::vector<bool> initialized;
+};
+
+struct LegacyV8State {
+    explicit LegacyV8State(NapiEnv* owner)
+        : env(owner)
+    {
+        isolate.state = this;
+        isolate.env = owner;
+        isolate.roots[4] = legacy_v8_tag_pointer(&legacy_v8_undefined());
+        isolate.roots[5] = isolate.roots[4];
+        isolate.roots[6] = legacy_v8_tag_pointer(&legacy_v8_null());
+        isolate.roots[7] = legacy_v8_tag_pointer(&legacy_v8_true());
+        isolate.roots[8] = legacy_v8_tag_pointer(&legacy_v8_false());
+    }
+
+    NapiEnv* env { nullptr };
+    LegacyV8IsolateData isolate;
+    std::unordered_map<JSObjectRef, LegacyV8InternalFields> internal_fields;
+};
+
 struct LegacyV8FunctionTemplateData {
     v8::FunctionCallback callback { nullptr };
     JSValueRef data { nullptr };
@@ -459,6 +760,10 @@ struct LegacyV8FunctionData {
     JSGlobalContextRef context { nullptr };
     v8::FunctionCallback callback { nullptr };
     JSValueRef data { nullptr };
+};
+
+struct LegacyV8ObjectTemplateData {
+    int internal_field_count { 0 };
 };
 
 static thread_local LegacyV8ScopeData* legacy_v8_scope;
@@ -1510,25 +1815,205 @@ static std::string path_to_file_uri(const char* path)
     return result;
 }
 
-static uintptr_t* legacy_v8_add_handle(uintptr_t raw, JSValueRef protected_value = nullptr, void* owned_value = nullptr, void (*destroy_owned)(void*) = nullptr)
+static LegacyV8State* legacy_v8_state_for(NapiEnv* env)
 {
-    if (!legacy_v8_scope)
+    if (!env)
+        return nullptr;
+    if (!env->legacy_v8_state)
+        env->legacy_v8_state = new (std::nothrow) LegacyV8State(env);
+    return static_cast<LegacyV8State*>(env->legacy_v8_state);
+}
+
+static NapiEnv* legacy_v8_env(v8::Isolate* isolate)
+{
+    auto* data = reinterpret_cast<LegacyV8IsolateData*>(isolate);
+    return data ? data->env : nullptr;
+}
+
+static v8::Isolate* legacy_v8_isolate(NapiEnv* env)
+{
+    auto* state = legacy_v8_state_for(env);
+    return state ? reinterpret_cast<v8::Isolate*>(&state->isolate) : nullptr;
+}
+
+static void legacy_v8_destroy_state(NapiEnv* env)
+{
+    auto* state = env ? static_cast<LegacyV8State*>(env->legacy_v8_state) : nullptr;
+    if (!state)
+        return;
+    for (auto& entry : state->internal_fields) {
+        auto& fields = entry.second;
+        for (size_t index = 0; index < fields.values.size(); ++index) {
+            if (index < fields.initialized.size() && fields.initialized[index] && fields.values[index])
+                JSValueUnprotect(env->context, fields.values[index]);
+        }
+    }
+    delete state;
+    env->legacy_v8_state = nullptr;
+}
+
+static const LegacyV8Oddball* legacy_v8_as_oddball(uintptr_t raw)
+{
+    if ((raw & legacy_v8_tag_mask) != legacy_v8_pointer_tag)
+        return nullptr;
+    auto* pointer = reinterpret_cast<const LegacyV8Oddball*>(raw & ~legacy_v8_tag_mask);
+    if (pointer == &legacy_v8_undefined() || pointer == &legacy_v8_null()
+        || pointer == &legacy_v8_true() || pointer == &legacy_v8_false())
+        return pointer;
+    return nullptr;
+}
+
+static LegacyV8HeapObject* legacy_v8_heap_object(uintptr_t raw)
+{
+    if ((raw & legacy_v8_tag_mask) != legacy_v8_pointer_tag || legacy_v8_as_oddball(raw))
+        return nullptr;
+    return reinterpret_cast<LegacyV8HeapObject*>(raw & ~legacy_v8_tag_mask);
+}
+
+static LegacyV8HeapObject* legacy_v8_new_heap(const LegacyV8Map& map, LegacyV8HeapKind kind)
+{
+    auto* object = new (std::nothrow) LegacyV8HeapObject;
+    if (!object)
+        return nullptr;
+    object->map = legacy_v8_tag_pointer(&map);
+    object->kind = kind;
+    return object;
+}
+
+static uintptr_t* legacy_v8_add_handle_to(
+    LegacyV8ScopeData* scope,
+    uintptr_t raw,
+    JSValueRef protected_value = nullptr,
+    void* owned_value = nullptr,
+    void (*destroy_owned)(void*) = nullptr)
+{
+    if (!scope)
         return nullptr;
     if (protected_value)
-        JSValueProtect(legacy_v8_scope->env->context, protected_value);
-    legacy_v8_scope->handles.push_back({ raw, protected_value, owned_value, destroy_owned });
-    return &legacy_v8_scope->handles.back().raw;
+        JSValueProtect(scope->env->context, protected_value);
+    scope->handles.push_back({ raw, protected_value, owned_value, destroy_owned });
+    return &scope->handles.back().raw;
+}
+
+static uintptr_t* legacy_v8_add_handle(uintptr_t raw, JSValueRef protected_value = nullptr, void* owned_value = nullptr, void (*destroy_owned)(void*) = nullptr)
+{
+    return legacy_v8_add_handle_to(legacy_v8_scope, raw, protected_value, owned_value, destroy_owned);
+}
+
+static uintptr_t legacy_v8_encode_js_value(NapiEnv* env, JSValueRef value, LegacyV8ScopeData* scope)
+{
+    if (!env || !value || !scope)
+        return 0;
+    if (JSValueIsUndefined(env->context, value))
+        return legacy_v8_tag_pointer(&legacy_v8_undefined());
+    if (JSValueIsNull(env->context, value))
+        return legacy_v8_tag_pointer(&legacy_v8_null());
+    if (JSValueIsBoolean(env->context, value))
+        return legacy_v8_tag_pointer(JSValueToBoolean(env->context, value) ? &legacy_v8_true() : &legacy_v8_false());
+    if (JSValueIsNumber(env->context, value)) {
+        JSValueRef exception = nullptr;
+        double number = JSValueToNumber(env->context, value, &exception);
+        if (!exception && std::isfinite(number) && !(number == 0 && std::signbit(number))
+            && std::trunc(number) == number
+            && number >= std::numeric_limits<int32_t>::min()
+            && number <= std::numeric_limits<int32_t>::max())
+            return legacy_v8_tag_smi(static_cast<int32_t>(number));
+        auto* object = legacy_v8_new_heap(LegacyV8Map::heap_number_map(), LegacyV8HeapKind::number);
+        if (!object)
+            return 0;
+        object->payload.number = number;
+        legacy_v8_add_handle_to(scope, legacy_v8_tag_pointer(object), nullptr, object, [](void* value) { delete static_cast<LegacyV8HeapObject*>(value); });
+        return legacy_v8_tag_pointer(object);
+    }
+
+    auto* object = legacy_v8_new_heap(
+        JSValueIsString(env->context, value) ? LegacyV8Map::string_map() : LegacyV8Map::object_map(),
+        LegacyV8HeapKind::js_value);
+    if (!object)
+        return 0;
+    object->payload.js_value = value;
+    legacy_v8_add_handle_to(scope, legacy_v8_tag_pointer(object), value, object, [](void* owned) { delete static_cast<LegacyV8HeapObject*>(owned); });
+    return legacy_v8_tag_pointer(object);
+}
+
+static uintptr_t* legacy_v8_add_js_handle_to(LegacyV8ScopeData* scope, JSValueRef value)
+{
+    if (!scope || !value)
+        return nullptr;
+    const size_t old_size = scope->handles.size();
+    uintptr_t raw = legacy_v8_encode_js_value(scope->env, value, scope);
+    if (!raw && !(JSValueIsNumber(scope->env->context, value) && JSValueToNumber(scope->env->context, value, nullptr) == 0))
+        return nullptr;
+    if (scope->handles.size() != old_size)
+        return &scope->handles.back().raw;
+    return legacy_v8_add_handle_to(scope, raw);
 }
 
 static uintptr_t* legacy_v8_add_js_handle(JSValueRef value)
 {
-    return value ? legacy_v8_add_handle(reinterpret_cast<uintptr_t>(value), value) : nullptr;
+    return legacy_v8_add_js_handle_to(legacy_v8_scope, value);
+}
+
+static JSValueRef legacy_v8_decode_raw(NapiEnv* env, uintptr_t raw)
+{
+    if (!env)
+        return nullptr;
+    if ((raw & legacy_v8_tag_mask) == 0)
+        return JSValueMakeNumber(env->context, static_cast<int32_t>(raw >> 32));
+    if (const auto* oddball = legacy_v8_as_oddball(raw)) {
+        const int32_t kind = static_cast<int32_t>(oddball->kind >> 32);
+        if (kind == static_cast<int32_t>(LegacyV8OddballKind::undefined))
+            return JSValueMakeUndefined(env->context);
+        if (kind == static_cast<int32_t>(LegacyV8OddballKind::null))
+            return JSValueMakeNull(env->context);
+        if (kind == static_cast<int32_t>(LegacyV8OddballKind::true_value))
+            return JSValueMakeBoolean(env->context, true);
+        return JSValueMakeBoolean(env->context, false);
+    }
+    auto* object = legacy_v8_heap_object(raw);
+    if (!object)
+        return nullptr;
+    if (object->kind == LegacyV8HeapKind::number)
+        return JSValueMakeNumber(env->context, object->payload.number);
+    if (object->kind == LegacyV8HeapKind::js_value)
+        return object->payload.js_value;
+    return nullptr;
 }
 
 template<typename T>
 static JSValueRef legacy_v8_js_value(v8::Local<T> value)
 {
-    return value.location ? reinterpret_cast<JSValueRef>(*value.location) : nullptr;
+    auto* env = active_env ? active_env : loading_env;
+    return value.location ? legacy_v8_decode_raw(env, *value.location) : nullptr;
+}
+
+static uintptr_t* legacy_v8_clone_handle_to(LegacyV8ScopeData* scope, uintptr_t raw)
+{
+    if (!scope)
+        return nullptr;
+    if ((raw & legacy_v8_tag_mask) == 0 || legacy_v8_as_oddball(raw))
+        return legacy_v8_add_handle_to(scope, raw);
+    auto* object = legacy_v8_heap_object(raw);
+    if (!object)
+        return nullptr;
+    if (object->kind == LegacyV8HeapKind::js_value)
+        return legacy_v8_add_js_handle_to(scope, object->payload.js_value);
+    auto* clone = legacy_v8_new_heap(
+        object->kind == LegacyV8HeapKind::number ? LegacyV8Map::heap_number_map() : LegacyV8Map::object_map(),
+        object->kind);
+    if (!clone)
+        return nullptr;
+    clone->payload = object->payload;
+    return legacy_v8_add_handle_to(scope, legacy_v8_tag_pointer(clone), nullptr, clone, [](void* value) { delete static_cast<LegacyV8HeapObject*>(value); });
+}
+
+static LegacyV8HeapObject* legacy_v8_owned_object(const void* handle, LegacyV8HeapKind kind)
+{
+    if (!handle)
+        return nullptr;
+    auto raw = *reinterpret_cast<const uintptr_t*>(handle);
+    auto* object = legacy_v8_heap_object(raw);
+    return object && object->kind == kind ? object : nullptr;
 }
 
 static void legacy_v8_function_finalize(JSObjectRef function)
@@ -1562,17 +2047,26 @@ static JSValueRef legacy_v8_function_call(
     if (!data || !data->env || !data->callback)
         return JSValueMakeUndefined(context);
     ActiveEnvScope active_scope(data->env);
-    v8::HandleScope handle_scope(reinterpret_cast<v8::Isolate*>(data->env));
+    v8::Isolate* isolate = legacy_v8_isolate(data->env);
+    v8::HandleScope handle_scope(isolate);
     std::vector<uintptr_t> arguments(argc + 1);
-    arguments[0] = reinterpret_cast<uintptr_t>(this_object ? static_cast<JSValueRef>(this_object) : JSContextGetGlobalObject(context));
+    arguments[0] = legacy_v8_encode_js_value(
+        data->env,
+        this_object ? static_cast<JSValueRef>(this_object) : JSContextGetGlobalObject(context),
+        legacy_v8_scope);
     for (size_t index = 0; index < argc; ++index)
-        arguments[index + 1] = reinterpret_cast<uintptr_t>(argv[index]);
+        arguments[index + 1] = legacy_v8_encode_js_value(data->env, argv[index], legacy_v8_scope);
+    auto* target = legacy_v8_new_heap(LegacyV8Map::object_map(), LegacyV8HeapKind::function_target);
+    if (!target)
+        return JSValueMakeUndefined(context);
+    target->payload.pointer = data;
+    legacy_v8_add_handle(legacy_v8_tag_pointer(target), nullptr, target, [](void* value) { delete static_cast<LegacyV8HeapObject*>(value); });
     LegacyV8ImplicitArgs implicit_args {
         nullptr,
-        reinterpret_cast<v8::Isolate*>(data->env),
+        isolate,
         data->env->context,
-        0,
-        reinterpret_cast<uintptr_t>(function),
+        legacy_v8_tag_pointer(&legacy_v8_undefined()),
+        legacy_v8_tag_pointer(target),
         nullptr,
     };
     v8::FunctionCallbackInfo<v8::Value> info;
@@ -1586,9 +2080,8 @@ static JSValueRef legacy_v8_function_call(
         data->env->pending_exception = nullptr;
         return JSValueMakeUndefined(context);
     }
-    return implicit_args.return_value
-        ? reinterpret_cast<JSValueRef>(implicit_args.return_value)
-        : JSValueMakeUndefined(context);
+    JSValueRef returned = legacy_v8_decode_raw(data->env, implicit_args.return_value);
+    return returned ? returned : JSValueMakeUndefined(context);
 }
 
 static void initialize_legacy_v8_classes()
@@ -1605,26 +2098,32 @@ static void initialize_legacy_v8_classes()
 v8::Isolate* v8::Isolate::GetCurrent()
 {
     NapiEnv* env = active_env ? active_env : loading_env;
-    return reinterpret_cast<v8::Isolate*>(env);
+    return legacy_v8_isolate(env);
 }
 
 v8::Local<v8::Context> v8::Isolate::GetCurrentContext()
 {
-    auto* env = reinterpret_cast<NapiEnv*>(this);
+    auto* env = legacy_v8_env(this);
     return env ? v8::Local<v8::Context>(legacy_v8_add_js_handle(JSContextGetGlobalObject(env->context))) : v8::Local<v8::Context>();
+}
+
+v8::Isolate* v8::Context::GetIsolate()
+{
+    return v8::Isolate::GetCurrent();
 }
 
 v8::HandleScope::HandleScope(v8::Isolate* isolate)
 {
-    auto* env = reinterpret_cast<NapiEnv*>(isolate);
+    auto* env = legacy_v8_env(isolate);
     auto* scope = new LegacyV8ScopeData { env, legacy_v8_scope, {} };
-    storage[0] = scope;
+    storage[0] = isolate;
+    storage[1] = scope;
     legacy_v8_scope = scope;
 }
 
 v8::HandleScope::~HandleScope()
 {
-    auto* scope = static_cast<LegacyV8ScopeData*>(storage[0]);
+    auto* scope = static_cast<LegacyV8ScopeData*>(storage[1]);
     if (!scope)
         return;
     legacy_v8_scope = scope->previous;
@@ -1635,12 +2134,226 @@ v8::HandleScope::~HandleScope()
             handle.destroy_owned(handle.owned_value);
     }
     delete scope;
-    storage[0] = nullptr;
+    storage[1] = nullptr;
+}
+
+uintptr_t* v8::HandleScope::CreateHandle(v8::internal::Isolate*, uintptr_t raw)
+{
+    return legacy_v8_clone_handle_to(legacy_v8_scope, raw);
+}
+
+v8::EscapableHandleScopeBase::EscapableHandleScopeBase(v8::Isolate* isolate)
+    : HandleScope(isolate)
+{
+    auto* scope = static_cast<LegacyV8ScopeData*>(storage[1]);
+    escape_slot = scope && scope->previous
+        ? legacy_v8_add_handle_to(scope->previous, legacy_v8_tag_pointer(&legacy_v8_undefined()))
+        : nullptr;
+}
+
+uintptr_t* v8::EscapableHandleScopeBase::EscapeSlot(uintptr_t* value)
+{
+    if (!escape_slot || !value)
+        std::abort();
+    auto* scope = static_cast<LegacyV8ScopeData*>(storage[1]);
+    uintptr_t* result = legacy_v8_clone_handle_to(scope ? scope->previous : nullptr, *value);
+    escape_slot = nullptr;
+    return result;
+}
+
+static NapiEnv* legacy_v8_current_env()
+{
+    return active_env ? active_env : loading_env;
+}
+
+static uintptr_t legacy_v8_raw(const void* value)
+{
+    return value ? *reinterpret_cast<const uintptr_t*>(value) : 0;
+}
+
+static bool legacy_v8_raw_is_smi(uintptr_t raw)
+{
+    return (raw & legacy_v8_tag_mask) == 0;
+}
+
+static double legacy_v8_number_value(NapiEnv* env, uintptr_t raw, bool* valid = nullptr)
+{
+    if (legacy_v8_raw_is_smi(raw)) {
+        if (valid)
+            *valid = true;
+        return static_cast<int32_t>(raw >> 32);
+    }
+    auto* object = legacy_v8_heap_object(raw);
+    if (object && object->kind == LegacyV8HeapKind::number) {
+        if (valid)
+            *valid = true;
+        return object->payload.number;
+    }
+    JSValueRef value = legacy_v8_decode_raw(env, raw);
+    if (value && JSValueIsNumber(env->context, value)) {
+        JSValueRef exception = nullptr;
+        double number = JSValueToNumber(env->context, value, &exception);
+        if (!exception) {
+            if (valid)
+                *valid = true;
+            return number;
+        }
+    }
+    if (valid)
+        *valid = false;
+    return 0;
+}
+
+bool v8::Value::FullIsFalse() const
+{
+    auto* env = legacy_v8_current_env();
+    JSValueRef value = legacy_v8_decode_raw(env, legacy_v8_raw(this));
+    return value && JSValueIsBoolean(env->context, value) && !JSValueToBoolean(env->context, value);
+}
+
+bool v8::Value::FullIsTrue() const
+{
+    auto* env = legacy_v8_current_env();
+    JSValueRef value = legacy_v8_decode_raw(env, legacy_v8_raw(this));
+    return value && JSValueIsBoolean(env->context, value) && JSValueToBoolean(env->context, value);
+}
+
+bool v8::Value::IsArray() const
+{
+    auto* env = legacy_v8_current_env();
+    JSValueRef value = legacy_v8_decode_raw(env, legacy_v8_raw(this));
+    return value && JSValueIsArray(env->context, value);
+}
+
+bool v8::Value::IsBigInt() const
+{
+    auto* env = legacy_v8_current_env();
+    JSValueRef value = legacy_v8_decode_raw(env, legacy_v8_raw(this));
+    return value && JSValueIsBigInt(env->context, value);
+}
+
+bool v8::Value::IsBoolean() const
+{
+    auto* env = legacy_v8_current_env();
+    JSValueRef value = legacy_v8_decode_raw(env, legacy_v8_raw(this));
+    return value && JSValueIsBoolean(env->context, value);
+}
+
+bool v8::Value::IsFunction() const
+{
+    auto* env = legacy_v8_current_env();
+    JSValueRef value = legacy_v8_decode_raw(env, legacy_v8_raw(this));
+    if (!value || !JSValueIsObject(env->context, value))
+        return false;
+    return JSObjectIsFunction(env->context, const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(value)));
+}
+
+bool v8::Value::IsInt32() const
+{
+    auto* env = legacy_v8_current_env();
+    bool valid = false;
+    double number = legacy_v8_number_value(env, legacy_v8_raw(this), &valid);
+    return valid && std::isfinite(number) && std::trunc(number) == number
+        && number >= std::numeric_limits<int32_t>::min()
+        && number <= std::numeric_limits<int32_t>::max();
+}
+
+bool v8::Value::IsMap() const
+{
+    auto* env = legacy_v8_current_env();
+    JSValueRef value = legacy_v8_decode_raw(env, legacy_v8_raw(this));
+    if (!value)
+        return false;
+    JSValueRef exception = nullptr;
+    bool result = is_instance_of_global(env, to_napi(value), "Map", &exception);
+    if (exception)
+        caught(env, exception);
+    return result && !exception;
+}
+
+bool v8::Value::IsNumber() const
+{
+    bool valid = false;
+    (void)legacy_v8_number_value(legacy_v8_current_env(), legacy_v8_raw(this), &valid);
+    return valid;
+}
+
+bool v8::Value::IsObject() const
+{
+    auto* env = legacy_v8_current_env();
+    JSValueRef value = legacy_v8_decode_raw(env, legacy_v8_raw(this));
+    return value && JSValueIsObject(env->context, value);
+}
+
+bool v8::Value::IsUint32() const
+{
+    auto* env = legacy_v8_current_env();
+    bool valid = false;
+    double number = legacy_v8_number_value(env, legacy_v8_raw(this), &valid);
+    return valid && std::isfinite(number) && std::trunc(number) == number
+        && number >= 0 && number <= std::numeric_limits<uint32_t>::max();
+}
+
+bool v8::Value::StrictEquals(v8::Local<v8::Value> other) const
+{
+    auto* env = legacy_v8_current_env();
+    uintptr_t left_raw = legacy_v8_raw(this);
+    uintptr_t right_raw = other.location ? *other.location : 0;
+    JSValueRef left = legacy_v8_decode_raw(env, left_raw);
+    JSValueRef right = legacy_v8_decode_raw(env, right_raw);
+    if (left && right)
+        return JSValueIsStrictEqual(env->context, left, right);
+    return left_raw == right_raw;
+}
+
+v8::Local<v8::Number> v8::Number::New(v8::Isolate* isolate, double number)
+{
+    auto* env = legacy_v8_env(isolate);
+    uintptr_t* handle = env ? legacy_v8_add_js_handle(JSValueMakeNumber(env->context, number)) : nullptr;
+    return v8::Local<v8::Number>(handle);
+}
+
+double v8::Number::Value() const
+{
+    return legacy_v8_number_value(legacy_v8_current_env(), legacy_v8_raw(this));
+}
+
+v8::Local<v8::External> v8::External::New(v8::Isolate*, void* pointer)
+{
+    auto* object = legacy_v8_new_heap(LegacyV8Map::object_map(), LegacyV8HeapKind::external);
+    if (!object)
+        return v8::Local<v8::External>();
+    object->payload.pointer = pointer;
+    uintptr_t* handle = legacy_v8_add_handle(
+        legacy_v8_tag_pointer(object), nullptr, object,
+        [](void* value) { delete static_cast<LegacyV8HeapObject*>(value); });
+    return v8::Local<v8::External>(handle);
+}
+
+void* v8::External::Value() const
+{
+    auto* object = legacy_v8_owned_object(this, LegacyV8HeapKind::external);
+    return object ? object->payload.pointer : nullptr;
+}
+
+static JSStringRef legacy_v8_string_copy(const void* value)
+{
+    auto* env = legacy_v8_current_env();
+    JSValueRef js_value = legacy_v8_decode_raw(env, legacy_v8_raw(value));
+    if (!env || !js_value || !JSValueIsString(env->context, js_value))
+        return nullptr;
+    JSValueRef exception = nullptr;
+    JSStringRef string = JSValueToStringCopy(env->context, js_value, &exception);
+    if (exception) {
+        caught(env, exception);
+        return nullptr;
+    }
+    return string;
 }
 
 v8::MaybeLocal<v8::String> v8::String::NewFromUtf8(v8::Isolate* isolate, const char* data, v8::NewStringType, int signed_length)
 {
-    auto* env = reinterpret_cast<NapiEnv*>(isolate);
+    auto* env = legacy_v8_env(isolate);
     if (!env || !data || signed_length < -1)
         return v8::MaybeLocal<v8::String>();
     size_t length = signed_length < 0 ? NAPI_AUTO_LENGTH : static_cast<size_t>(signed_length);
@@ -1651,6 +2364,443 @@ v8::MaybeLocal<v8::String> v8::String::NewFromUtf8(v8::Isolate* isolate, const c
     JSStringRelease(string);
     uintptr_t* handle = legacy_v8_add_js_handle(value);
     return handle ? v8::MaybeLocal<v8::String>(v8::Local<v8::String>(handle)) : v8::MaybeLocal<v8::String>();
+}
+
+v8::MaybeLocal<v8::String> v8::String::NewFromOneByte(v8::Isolate* isolate, const uint8_t* data, v8::NewStringType, int signed_length)
+{
+    auto* env = legacy_v8_env(isolate);
+    if (!env || !data || signed_length < -1)
+        return v8::MaybeLocal<v8::String>();
+    size_t length = signed_length < 0 ? NAPI_AUTO_LENGTH : static_cast<size_t>(signed_length);
+    JSStringRef string = make_latin1_string(reinterpret_cast<const char*>(data), length);
+    if (!string)
+        return v8::MaybeLocal<v8::String>();
+    JSValueRef value = JSValueMakeString(env->context, string);
+    JSStringRelease(string);
+    uintptr_t* handle = legacy_v8_add_js_handle(value);
+    return handle ? v8::MaybeLocal<v8::String>(v8::Local<v8::String>(handle)) : v8::MaybeLocal<v8::String>();
+}
+
+bool v8::String::ContainsOnlyOneByte() const
+{
+    JSStringRef string = legacy_v8_string_copy(this);
+    if (!string)
+        return false;
+    const JSChar* characters = JSStringGetCharactersPtr(string);
+    size_t length = JSStringGetLength(string);
+    bool result = true;
+    for (size_t index = 0; index < length; ++index) {
+        if (characters[index] > 0xff) {
+            result = false;
+            break;
+        }
+    }
+    JSStringRelease(string);
+    return result;
+}
+
+bool v8::String::IsOneByte() const
+{
+    return ContainsOnlyOneByte();
+}
+
+bool v8::String::IsExternal() const
+{
+    return false;
+}
+
+bool v8::String::IsExternalOneByte() const
+{
+    return false;
+}
+
+bool v8::String::IsExternalTwoByte() const
+{
+    return false;
+}
+
+int v8::String::Length() const
+{
+    JSStringRef string = legacy_v8_string_copy(this);
+    if (!string)
+        return 0;
+    size_t length = JSStringGetLength(string);
+    JSStringRelease(string);
+    return length > static_cast<size_t>(std::numeric_limits<int>::max())
+        ? std::numeric_limits<int>::max()
+        : static_cast<int>(length);
+}
+
+static size_t legacy_v8_utf8_width(uint32_t code_point)
+{
+    if (code_point <= 0x7f)
+        return 1;
+    if (code_point <= 0x7ff)
+        return 2;
+    if (code_point <= 0xffff)
+        return 3;
+    return 4;
+}
+
+static size_t legacy_v8_encode_utf8(uint32_t code_point, char* output)
+{
+    const size_t width = legacy_v8_utf8_width(code_point);
+    if (width == 1) {
+        output[0] = static_cast<char>(code_point);
+    } else if (width == 2) {
+        output[0] = static_cast<char>(0xc0 | (code_point >> 6));
+        output[1] = static_cast<char>(0x80 | (code_point & 0x3f));
+    } else if (width == 3) {
+        output[0] = static_cast<char>(0xe0 | (code_point >> 12));
+        output[1] = static_cast<char>(0x80 | ((code_point >> 6) & 0x3f));
+        output[2] = static_cast<char>(0x80 | (code_point & 0x3f));
+    } else {
+        output[0] = static_cast<char>(0xf0 | (code_point >> 18));
+        output[1] = static_cast<char>(0x80 | ((code_point >> 12) & 0x3f));
+        output[2] = static_cast<char>(0x80 | ((code_point >> 6) & 0x3f));
+        output[3] = static_cast<char>(0x80 | (code_point & 0x3f));
+    }
+    return width;
+}
+
+int v8::String::Utf8Length(v8::Isolate*) const
+{
+    JSStringRef string = legacy_v8_string_copy(this);
+    if (!string)
+        return 0;
+    const JSChar* characters = JSStringGetCharactersPtr(string);
+    size_t length = JSStringGetLength(string);
+    size_t bytes = 0;
+    for (size_t index = 0; index < length; ++index) {
+        uint32_t code_point = characters[index];
+        if (code_point >= 0xd800 && code_point <= 0xdbff && index + 1 < length
+            && characters[index + 1] >= 0xdc00 && characters[index + 1] <= 0xdfff) {
+            code_point = 0x10000 + ((code_point - 0xd800) << 10) + (characters[++index] - 0xdc00);
+        }
+        bytes += legacy_v8_utf8_width(code_point);
+    }
+    JSStringRelease(string);
+    return bytes > static_cast<size_t>(std::numeric_limits<int>::max())
+        ? std::numeric_limits<int>::max()
+        : static_cast<int>(bytes);
+}
+
+int v8::String::WriteUtf8(v8::Isolate*, char* buffer, int signed_length, int* nchars, int) const
+{
+    JSStringRef string = legacy_v8_string_copy(this);
+    if (!string || !buffer) {
+        if (nchars)
+            *nchars = 0;
+        if (string)
+            JSStringRelease(string);
+        return 0;
+    }
+    const JSChar* characters = JSStringGetCharactersPtr(string);
+    const size_t string_length = JSStringGetLength(string);
+    const size_t capacity = signed_length < 0 ? std::numeric_limits<size_t>::max() : static_cast<size_t>(signed_length);
+    size_t read = 0;
+    size_t written = 0;
+    while (read < string_length) {
+        uint32_t code_point = characters[read];
+        size_t consumed = 1;
+        const bool is_surrogate_pair = code_point >= 0xd800 && code_point <= 0xdbff
+            && read + 1 < string_length
+            && characters[read + 1] >= 0xdc00 && characters[read + 1] <= 0xdfff;
+        if (is_surrogate_pair) {
+            code_point = 0x10000 + ((code_point - 0xd800) << 10) + (characters[read + 1] - 0xdc00);
+            consumed = 2;
+        }
+        size_t width = legacy_v8_utf8_width(code_point);
+        const size_t remaining = capacity - std::min(capacity, written);
+        if (is_surrogate_pair && width > remaining && remaining >= 3) {
+            // V8 writes the leading surrogate as WTF-8 when a buffer ends
+            // between the two UTF-16 code units of a surrogate pair.
+            code_point = characters[read];
+            consumed = 1;
+            width = 3;
+        }
+        if (width > remaining)
+            break;
+        legacy_v8_encode_utf8(code_point, buffer + written);
+        written += width;
+        read += consumed;
+    }
+    if (read == string_length && written < capacity)
+        buffer[written++] = '\0';
+    if (nchars)
+        *nchars = static_cast<int>(read);
+    JSStringRelease(string);
+    return static_cast<int>(written);
+}
+
+static JSObjectRef legacy_v8_object_ref(NapiEnv* env, const void* value)
+{
+    JSValueRef js_value = legacy_v8_decode_raw(env, legacy_v8_raw(value));
+    if (!js_value || !JSValueIsObject(env->context, js_value))
+        return nullptr;
+    return const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(js_value));
+}
+
+v8::Local<v8::Object> v8::Object::New(v8::Isolate* isolate)
+{
+    auto* env = legacy_v8_env(isolate);
+    JSObjectRef object = env ? JSObjectMake(env->context, nullptr, nullptr) : nullptr;
+    return v8::Local<v8::Object>(object ? legacy_v8_add_js_handle(object) : nullptr);
+}
+
+v8::MaybeLocal<v8::Value> v8::Object::Get(v8::Local<v8::Context>, uint32_t index)
+{
+    auto* env = legacy_v8_current_env();
+    JSObjectRef object = legacy_v8_object_ref(env, this);
+    if (!object)
+        return v8::MaybeLocal<v8::Value>();
+    JSValueRef exception = nullptr;
+    JSValueRef value = JSObjectGetPropertyAtIndex(env->context, object, index, &exception);
+    if (exception) {
+        caught(env, exception);
+        return v8::MaybeLocal<v8::Value>();
+    }
+    return v8::MaybeLocal<v8::Value>(v8::Local<v8::Value>(legacy_v8_add_js_handle(value)));
+}
+
+v8::MaybeLocal<v8::Value> v8::Object::Get(v8::Local<v8::Context>, v8::Local<v8::Value> key)
+{
+    auto* env = legacy_v8_current_env();
+    JSObjectRef object = legacy_v8_object_ref(env, this);
+    JSValueRef key_value = legacy_v8_js_value(key);
+    if (!object || !key_value)
+        return v8::MaybeLocal<v8::Value>();
+    JSValueRef exception = nullptr;
+    JSValueRef value = JSObjectGetPropertyForKey(env->context, object, key_value, &exception);
+    if (exception) {
+        caught(env, exception);
+        return v8::MaybeLocal<v8::Value>();
+    }
+    return v8::MaybeLocal<v8::Value>(v8::Local<v8::Value>(legacy_v8_add_js_handle(value)));
+}
+
+v8::Maybe<bool> v8::Object::Set(v8::Local<v8::Context>, uint32_t index, v8::Local<v8::Value> value)
+{
+    auto* env = legacy_v8_current_env();
+    JSObjectRef object = legacy_v8_object_ref(env, this);
+    JSValueRef assigned = legacy_v8_js_value(value);
+    if (!object || !assigned)
+        return v8::Maybe<bool>();
+    JSValueRef exception = nullptr;
+    JSObjectSetPropertyAtIndex(env->context, object, index, assigned, &exception);
+    if (exception) {
+        caught(env, exception);
+        return v8::Maybe<bool>();
+    }
+    return v8::Maybe<bool>(true);
+}
+
+v8::Maybe<bool> v8::Object::Set(v8::Local<v8::Context>, v8::Local<v8::Value> key, v8::Local<v8::Value> value)
+{
+    auto* env = legacy_v8_current_env();
+    JSObjectRef object = legacy_v8_object_ref(env, this);
+    JSValueRef key_value = legacy_v8_js_value(key);
+    JSValueRef assigned = legacy_v8_js_value(value);
+    if (!object || !key_value || !assigned)
+        return v8::Maybe<bool>();
+    JSValueRef exception = nullptr;
+    JSObjectSetPropertyForKey(env->context, object, key_value, assigned, kJSPropertyAttributeNone, &exception);
+    if (exception) {
+        caught(env, exception);
+        return v8::Maybe<bool>();
+    }
+    return v8::Maybe<bool>(true);
+}
+
+void v8::Object::SetInternalField(int index, v8::Local<v8::Data> value)
+{
+    auto* env = legacy_v8_current_env();
+    auto* state = legacy_v8_state_for(env);
+    JSObjectRef object = legacy_v8_object_ref(env, this);
+    JSValueRef js_value = legacy_v8_js_value(value);
+    if (!state || !object || !js_value || index < 0)
+        return;
+    auto& fields = state->internal_fields[object];
+    const size_t required = static_cast<size_t>(index) + 1;
+    if (fields.values.size() < required) {
+        fields.values.resize(required, nullptr);
+        fields.initialized.resize(required, false);
+    }
+    if (fields.initialized[index] && fields.values[index])
+        JSValueUnprotect(env->context, fields.values[index]);
+    fields.values[index] = js_value;
+    fields.initialized[index] = true;
+    JSValueProtect(env->context, js_value);
+}
+
+v8::Local<v8::Data> v8::Object::SlowGetInternalField(int index)
+{
+    auto* env = legacy_v8_current_env();
+    auto* state = legacy_v8_state_for(env);
+    JSObjectRef object = legacy_v8_object_ref(env, this);
+    JSValueRef value = JSValueMakeUndefined(env->context);
+    if (state && object && index >= 0) {
+        auto iterator = state->internal_fields.find(object);
+        if (iterator != state->internal_fields.end()) {
+            auto& fields = iterator->second;
+            if (static_cast<size_t>(index) < fields.values.size() && fields.initialized[index])
+                value = fields.values[index];
+        }
+    }
+    return v8::Local<v8::Data>(legacy_v8_add_js_handle(value));
+}
+
+v8::Local<v8::Array> v8::Array::New(v8::Isolate* isolate, int length)
+{
+    auto* env = legacy_v8_env(isolate);
+    if (!env)
+        return v8::Local<v8::Array>();
+    JSValueRef exception = nullptr;
+    JSObjectRef array = JSObjectMakeArray(env->context, 0, nullptr, &exception);
+    if (exception || !array) {
+        if (exception)
+            caught(env, exception);
+        return v8::Local<v8::Array>();
+    }
+    if (length > 0)
+        set_property(env, array, "length", JSValueMakeNumber(env->context, length), kJSPropertyAttributeNone, &exception);
+    if (exception) {
+        caught(env, exception);
+        return v8::Local<v8::Array>();
+    }
+    return v8::Local<v8::Array>(legacy_v8_add_js_handle(array));
+}
+
+v8::Local<v8::Array> v8::Array::New(v8::Isolate* isolate, v8::Local<v8::Value>* elements, size_t length)
+{
+    auto* env = legacy_v8_env(isolate);
+    if (!env)
+        return v8::Local<v8::Array>();
+    std::vector<JSValueRef> values(length);
+    for (size_t index = 0; index < length; ++index) {
+        values[index] = legacy_v8_js_value(elements[index]);
+        if (!values[index])
+            values[index] = JSValueMakeUndefined(env->context);
+    }
+    JSValueRef exception = nullptr;
+    JSObjectRef array = JSObjectMakeArray(env->context, length, values.data(), &exception);
+    if (exception || !array) {
+        if (exception)
+            caught(env, exception);
+        return v8::Local<v8::Array>();
+    }
+    return v8::Local<v8::Array>(legacy_v8_add_js_handle(array));
+}
+
+v8::MaybeLocal<v8::Array> v8::Array::New(
+    v8::Local<v8::Context> context,
+    size_t length,
+    std::function<v8::MaybeLocal<v8::Value>()> next)
+{
+    auto* env = legacy_v8_current_env();
+    std::vector<JSValueRef> values;
+    values.reserve(length);
+    for (size_t index = 0; index < length; ++index) {
+        v8::MaybeLocal<v8::Value> maybe = next();
+        if (maybe.value.IsEmpty())
+            return v8::MaybeLocal<v8::Array>();
+        JSValueRef value = legacy_v8_js_value(maybe.value);
+        if (!value)
+            return v8::MaybeLocal<v8::Array>();
+        values.push_back(value);
+    }
+    JSValueRef exception = nullptr;
+    JSObjectRef array = JSObjectMakeArray(env->context, length, values.data(), &exception);
+    if (exception || !array) {
+        if (exception)
+            caught(env, exception);
+        return v8::MaybeLocal<v8::Array>();
+    }
+    return v8::MaybeLocal<v8::Array>(v8::Local<v8::Array>(legacy_v8_add_js_handle(array)));
+}
+
+uint32_t v8::Array::Length() const
+{
+    auto* env = legacy_v8_current_env();
+    JSObjectRef array = legacy_v8_object_ref(env, this);
+    if (!array)
+        return 0;
+    JSValueRef exception = nullptr;
+    JSValueRef value = get_property(env, array, "length", &exception);
+    double length = exception ? 0 : JSValueToNumber(env->context, value, &exception);
+    if (exception) {
+        caught(env, exception);
+        return 0;
+    }
+    return static_cast<uint32_t>(length);
+}
+
+v8::Maybe<void> v8::Array::Iterate(v8::Local<v8::Context> context, v8::Array::IterationCallback callback, void* data)
+{
+    if (!callback)
+        return v8::Maybe<void>();
+    const uint32_t length = Length();
+    for (uint32_t index = 0; index < length; ++index) {
+        v8::MaybeLocal<v8::Value> maybe = Get(context, index);
+        if (maybe.value.IsEmpty())
+            return v8::Maybe<void>();
+        switch (callback(index, maybe.value, data)) {
+        case v8::Array::CallbackResult::kException:
+            return v8::Maybe<void>();
+        case v8::Array::CallbackResult::kBreak:
+            return v8::Maybe<void>(true);
+        case v8::Array::CallbackResult::kContinue:
+            break;
+        }
+    }
+    return v8::Maybe<void>(true);
+}
+
+v8::Local<v8::ObjectTemplate> v8::ObjectTemplate::New(v8::Isolate*, v8::Local<v8::FunctionTemplate>)
+{
+    auto* metadata = new (std::nothrow) LegacyV8ObjectTemplateData;
+    auto* object = legacy_v8_new_heap(LegacyV8Map::object_map(), LegacyV8HeapKind::object_template);
+    if (!metadata || !object) {
+        delete metadata;
+        delete object;
+        return v8::Local<v8::ObjectTemplate>();
+    }
+    object->payload.pointer = metadata;
+    object->destroy_payload = [](void* value) { delete static_cast<LegacyV8ObjectTemplateData*>(value); };
+    uintptr_t* handle = legacy_v8_add_handle(
+        legacy_v8_tag_pointer(object), nullptr, object,
+        [](void* value) { delete static_cast<LegacyV8HeapObject*>(value); });
+    return v8::Local<v8::ObjectTemplate>(handle);
+}
+
+int v8::ObjectTemplate::InternalFieldCount() const
+{
+    auto* object = legacy_v8_owned_object(this, LegacyV8HeapKind::object_template);
+    auto* metadata = object ? static_cast<LegacyV8ObjectTemplateData*>(object->payload.pointer) : nullptr;
+    return metadata ? metadata->internal_field_count : 0;
+}
+
+void v8::ObjectTemplate::SetInternalFieldCount(int count)
+{
+    auto* object = legacy_v8_owned_object(this, LegacyV8HeapKind::object_template);
+    auto* metadata = object ? static_cast<LegacyV8ObjectTemplateData*>(object->payload.pointer) : nullptr;
+    if (metadata)
+        metadata->internal_field_count = std::max(0, count);
+}
+
+v8::MaybeLocal<v8::Object> v8::ObjectTemplate::NewInstance(v8::Local<v8::Context>)
+{
+    auto* env = legacy_v8_current_env();
+    auto* state = legacy_v8_state_for(env);
+    auto* template_object = legacy_v8_owned_object(this, LegacyV8HeapKind::object_template);
+    auto* metadata = template_object ? static_cast<LegacyV8ObjectTemplateData*>(template_object->payload.pointer) : nullptr;
+    if (!env || !state || !metadata)
+        return v8::MaybeLocal<v8::Object>();
+    JSObjectRef object = JSObjectMake(env->context, nullptr, nullptr);
+    auto& fields = state->internal_fields[object];
+    fields.values.resize(metadata->internal_field_count, nullptr);
+    fields.initialized.resize(metadata->internal_field_count, false);
+    return v8::MaybeLocal<v8::Object>(v8::Local<v8::Object>(legacy_v8_add_js_handle(object)));
 }
 
 v8::Local<v8::FunctionTemplate> v8::FunctionTemplate::New(
@@ -1667,15 +2817,19 @@ v8::Local<v8::FunctionTemplate> v8::FunctionTemplate::New(
     uint16_t)
 {
     auto* function_template = new (std::nothrow) LegacyV8FunctionTemplateData { callback, legacy_v8_js_value(data) };
-    if (!function_template)
-        return v8::Local<v8::FunctionTemplate>();
-    uintptr_t* handle = legacy_v8_add_handle(
-        reinterpret_cast<uintptr_t>(function_template),
-        nullptr,
-        function_template,
-        [](void* value) { delete static_cast<LegacyV8FunctionTemplateData*>(value); });
-    if (!handle) {
+    auto* object = legacy_v8_new_heap(LegacyV8Map::object_map(), LegacyV8HeapKind::function_template);
+    if (!function_template || !object) {
         delete function_template;
+        delete object;
+        return v8::Local<v8::FunctionTemplate>();
+    }
+    object->payload.pointer = function_template;
+    object->destroy_payload = [](void* value) { delete static_cast<LegacyV8FunctionTemplateData*>(value); };
+    uintptr_t* handle = legacy_v8_add_handle(
+        legacy_v8_tag_pointer(object), nullptr, object,
+        [](void* value) { delete static_cast<LegacyV8HeapObject*>(value); });
+    if (!handle) {
+        delete object;
         return v8::Local<v8::FunctionTemplate>();
     }
     return v8::Local<v8::FunctionTemplate>(handle);
@@ -1683,8 +2837,11 @@ v8::Local<v8::FunctionTemplate> v8::FunctionTemplate::New(
 
 v8::MaybeLocal<v8::Function> v8::FunctionTemplate::GetFunction(v8::Local<v8::Context>)
 {
-    auto* env = active_env ? active_env : loading_env;
-    auto* function_template = reinterpret_cast<LegacyV8FunctionTemplateData*>(*reinterpret_cast<uintptr_t*>(this));
+    auto* env = legacy_v8_current_env();
+    auto* template_object = legacy_v8_owned_object(this, LegacyV8HeapKind::function_template);
+    auto* function_template = template_object
+        ? static_cast<LegacyV8FunctionTemplateData*>(template_object->payload.pointer)
+        : nullptr;
     if (!env || !function_template || !function_template->callback)
         return v8::MaybeLocal<v8::Function>();
     std::call_once(legacy_v8_classes_once, initialize_legacy_v8_classes);
@@ -1699,50 +2856,47 @@ v8::MaybeLocal<v8::Function> v8::FunctionTemplate::GetFunction(v8::Local<v8::Con
     if (data->data)
         JSValueProtect(data->context, data->data);
     JSObjectRef function = JSObjectMake(env->context, legacy_v8_function_class, data);
+    JSValueRef exception = nullptr;
+    JSObjectRef function_constructor = global_constructor(env, "Function", &exception);
+    if (!exception && function_constructor) {
+        JSValueRef prototype = get_property(env, function_constructor, "prototype", &exception);
+        if (!exception && prototype)
+            JSObjectSetPrototype(env->context, function, prototype);
+    }
+    if (exception) {
+        caught(env, exception);
+        return v8::MaybeLocal<v8::Function>();
+    }
     uintptr_t* handle = legacy_v8_add_js_handle(function);
     if (!handle)
         return v8::MaybeLocal<v8::Function>();
     return v8::MaybeLocal<v8::Function>(v8::Local<v8::Function>(handle));
 }
 
-v8::Maybe<bool> v8::Object::Set(v8::Local<v8::Context>, v8::Local<v8::Value> key, v8::Local<v8::Value> value)
+v8::Local<v8::Value> v8::Function::GetName() const
 {
-    auto* env = active_env ? active_env : loading_env;
-    JSValueRef object_value = reinterpret_cast<JSValueRef>(*reinterpret_cast<uintptr_t*>(this));
-    JSValueRef key_value = legacy_v8_js_value(key);
-    JSValueRef assigned_value = legacy_v8_js_value(value);
-    if (!env || !object_value || !key_value || !assigned_value || !JSValueIsObject(env->context, object_value))
-        return v8::Maybe<bool>();
+    auto* env = legacy_v8_current_env();
+    JSObjectRef function = legacy_v8_object_ref(env, this);
+    if (!function)
+        return v8::Local<v8::Value>();
     JSValueRef exception = nullptr;
-    JSObjectSetPropertyForKey(
-        env->context,
-        const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(object_value)),
-        key_value,
-        assigned_value,
-        kJSPropertyAttributeNone,
-        &exception);
+    JSValueRef name = get_property(env, function, "name", &exception);
     if (exception) {
         caught(env, exception);
-        return v8::Maybe<bool>();
+        return v8::Local<v8::Value>();
     }
-    return v8::Maybe<bool>(true);
+    return v8::Local<v8::Value>(legacy_v8_add_js_handle(name));
 }
 
 void v8::Function::SetName(v8::Local<v8::String> name)
 {
-    auto* env = active_env ? active_env : loading_env;
-    JSValueRef function_value = reinterpret_cast<JSValueRef>(*reinterpret_cast<uintptr_t*>(this));
+    auto* env = legacy_v8_current_env();
+    JSObjectRef function = legacy_v8_object_ref(env, this);
     JSValueRef name_value = legacy_v8_js_value(name);
-    if (!env || !function_value || !name_value || !JSValueIsObject(env->context, function_value))
+    if (!env || !function || !name_value)
         return;
     JSValueRef exception = nullptr;
-    set_property(
-        env,
-        const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(function_value)),
-        "name",
-        name_value,
-        kJSPropertyAttributeDontEnum,
-        &exception);
+    set_property(env, function, "name", name_value, kJSPropertyAttributeDontEnum, &exception);
     if (exception)
         caught(env, exception);
 }
@@ -1757,16 +2911,79 @@ void v8::api_internal::FromJustIsNothing()
     std::abort();
 }
 
+uintptr_t* v8::api_internal::GlobalizeReference(v8::internal::Isolate*, uintptr_t raw)
+{
+    auto* env = legacy_v8_current_env();
+    if (!env)
+        return nullptr;
+    auto* persistent = new (std::nothrow) LegacyV8Handle;
+    if (!persistent)
+        return nullptr;
+    persistent->raw = raw;
+    if (!legacy_v8_raw_is_smi(raw) && !legacy_v8_as_oddball(raw)) {
+        auto* object = legacy_v8_heap_object(raw);
+        if (!object) {
+            delete persistent;
+            return nullptr;
+        }
+        auto* clone = legacy_v8_new_heap(
+            object->kind == LegacyV8HeapKind::number ? LegacyV8Map::heap_number_map() : LegacyV8Map::object_map(),
+            object->kind);
+        if (!clone) {
+            delete persistent;
+            return nullptr;
+        }
+        clone->payload = object->payload;
+        persistent->raw = legacy_v8_tag_pointer(clone);
+        persistent->owned_value = clone;
+        persistent->destroy_owned = [](void* value) { delete static_cast<LegacyV8HeapObject*>(value); };
+        if (object->kind == LegacyV8HeapKind::js_value) {
+            persistent->protected_value = object->payload.js_value;
+            JSValueProtect(env->context, persistent->protected_value);
+        }
+    }
+    return &persistent->raw;
+}
+
+void v8::api_internal::DisposeGlobal(uintptr_t* location)
+{
+    if (!location)
+        return;
+    auto* env = legacy_v8_current_env();
+    auto* persistent = reinterpret_cast<LegacyV8Handle*>(location);
+    if (env && persistent->protected_value)
+        JSValueUnprotect(env->context, persistent->protected_value);
+    if (persistent->destroy_owned)
+        persistent->destroy_owned(persistent->owned_value);
+    delete persistent;
+}
+
+v8::Local<v8::Value> v8::api_internal::GetFunctionTemplateData(v8::Isolate*, v8::Local<v8::Data> target)
+{
+    auto* object = target.location ? legacy_v8_heap_object(*target.location) : nullptr;
+    auto* function = object && object->kind == LegacyV8HeapKind::function_target
+        ? static_cast<LegacyV8FunctionData*>(object->payload.pointer)
+        : nullptr;
+    auto* env = legacy_v8_current_env();
+    JSValueRef data = function && function->data ? function->data : JSValueMakeUndefined(env->context);
+    return v8::Local<v8::Value>(legacy_v8_add_js_handle(data));
+}
+
+v8::internal::Isolate* v8::internal::IsolateFromNeverReadOnlySpaceObject(uintptr_t)
+{
+    return reinterpret_cast<v8::internal::Isolate*>(v8::Isolate::GetCurrent());
+}
+
 void node::AddEnvironmentCleanupHook(v8::Isolate* isolate, void (*callback)(void*), void* data)
 {
-    auto* env = reinterpret_cast<NapiEnv*>(isolate);
+    auto* env = legacy_v8_env(isolate);
     if (env && callback)
         (void)napi_add_env_cleanup_hook(reinterpret_cast<napi_env>(env), callback, data);
 }
 
 void node::RemoveEnvironmentCleanupHook(v8::Isolate* isolate, void (*callback)(void*), void* data)
 {
-    auto* env = reinterpret_cast<NapiEnv*>(isolate);
+    auto* env = legacy_v8_env(isolate);
     if (env && callback)
         (void)napi_remove_env_cleanup_hook(reinterpret_cast<napi_env>(env), callback, data);
 }
@@ -2029,6 +3246,7 @@ static void destroy_single_env(NapiEnv* env)
         JSValueUnprotect(env->context, env->logically_detached_buffers);
     if (env->addon_exports)
         JSValueUnprotect(env->context, env->addon_exports);
+    legacy_v8_destroy_state(env);
     if (env == env->runtime_root) {
         env->event_loop_lifecycle = NapiEventLoopLifecycle::unavailable;
         env->event_loop = nullptr;
@@ -2242,10 +3460,11 @@ static JSValueRef invoke_legacy_module(NapiEnv* env, node::node_module* module, 
 
     ActiveEnvScope active_scope(env);
     AutomaticScope automatic_scope(env);
-    v8::HandleScope handle_scope(reinterpret_cast<v8::Isolate*>(env));
+    v8::Isolate* isolate = legacy_v8_isolate(env);
+    v8::HandleScope handle_scope(isolate);
     v8::Local<v8::Object> local_exports(legacy_v8_add_js_handle(exports));
     v8::Local<v8::Value> local_module(legacy_v8_add_js_handle(module_object));
-    v8::Local<v8::Context> context = reinterpret_cast<v8::Isolate*>(env)->GetCurrentContext();
+    v8::Local<v8::Context> context = isolate->GetCurrentContext();
     if (module->nm_context_register_func)
         module->nm_context_register_func(local_exports, local_module, context, module->nm_priv);
     else
