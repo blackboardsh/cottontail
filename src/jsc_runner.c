@@ -230,12 +230,18 @@ typedef unsigned int gid_t;
 #include <sys/sysctl.h>
 #elif defined(__linux__)
 #include <linux/fs.h>
+#if __has_include(<linux/memfd.h>)
+#include <linux/memfd.h>
+#endif
 #include <linux/stat.h>
 #include <netpacket/packet.h>
 #include <sys/syscall.h>
 #include <sys/statvfs.h>
 #ifndef AT_EMPTY_PATH
 #define AT_EMPTY_PATH 0x1000
+#endif
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
 #endif
 #elif !defined(_WIN32)
 #include <sys/statvfs.h>
@@ -11808,6 +11814,9 @@ static const char *ct_socket_error_code(int error_code) {
         case ENOBUFS: return "ENOBUFS";
         case ENOENT: return "ENOENT";
         case ENOMEM: return "ENOMEM";
+#ifdef ENOSYS
+        case ENOSYS: return "ENOSYS";
+#endif
         case ENOSPC: return "ENOSPC";
         case ENOTDIR: return "ENOTDIR";
         case ENOTCONN: return "ENOTCONN";
@@ -26293,6 +26302,41 @@ static JSValueRef ct_fs_async_cancel(JSContextRef ctx, JSObjectRef function, JSO
         return JSValueMakeBoolean(ctx, true);
     }
     return JSValueMakeBoolean(ctx, false);
+}
+
+static JSValueRef ct_memfd_create_for_testing(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1 || !JSValueIsNumber(ctx, argv[0])) {
+        ct_throw_message(ctx, exception, "memfd_create(size) requires a numeric size");
+        return JSValueMakeUndefined(ctx);
+    }
+    double size_number = ct_value_to_number(ctx, argv[0]);
+    if (!isfinite(size_number) || size_number < 0 || floor(size_number) != size_number || size_number > (double)INT64_MAX) {
+        ct_throw_message(ctx, exception, "memfd_create(size) requires a non-negative integer size");
+        return JSValueMakeUndefined(ctx);
+    }
+
+#ifdef ENOSYS
+    int error_code = ENOSYS;
+#else
+    int error_code = EINVAL;
+#endif
+#if defined(__linux__) && defined(SYS_memfd_create)
+    int fd = (int)syscall(SYS_memfd_create, "my_memfd", MFD_CLOEXEC);
+    if (fd >= 0) {
+        if (ftruncate(fd, (off_t)size_number) == 0) return JSValueMakeNumber(ctx, fd);
+        error_code = errno;
+        close(fd);
+    } else {
+        error_code = errno;
+    }
+#endif
+
+    char message[256];
+    snprintf(message, sizeof(message), "%s: %s", ct_socket_error_code(error_code), strerror(error_code));
+    ct_throw_message(ctx, exception, message);
+    return JSValueMakeUndefined(ctx);
 }
 
 static void ct_fs_async_cancel_runtime(CtJscRuntime *runtime) {

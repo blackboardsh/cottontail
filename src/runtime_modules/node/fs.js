@@ -5,6 +5,7 @@ import { EventEmitter } from "./events.js";
 import { dirname, isAbsolute, join, relative, resolve } from "./path.js";
 import { Readable, Writable } from "./stream.js";
 import {
+  allocationLimitForEncoding,
   encodingFromOptions,
   invalidArgType,
   invalidArgValue,
@@ -107,30 +108,33 @@ function normalizePath(path) {
     if (decoded.includes("\0")) throw invalidArgValue("path", decoded, "must be a string without null bytes");
     return decoded;
   }
-  if (path && typeof path === "object" && typeof path.href === "string" && path.protocol === "file:") {
+  validatePathArg(path);
+  if (typeof URL === "function" && path instanceof URL) {
     path = normalizeFileUrlPath(path);
     if (path.includes("\0")) throw invalidArgValue("path", path, "must be a string without null bytes");
     return path;
   }
-  if (typeof path === "string" && path.startsWith("file:")) {
-    let url;
-    try {
-      url = new URL(path);
-    } catch {
-      // Let the filesystem report malformed file: strings as ordinary paths.
-    }
-    if (url?.protocol === "file:") {
-      path = normalizeFileUrlPath(url);
-      if (path.includes("\0")) throw invalidArgValue("path", path, "must be a string without null bytes");
-      return path;
-    }
-  }
-  const normalized = String(path);
+  const normalized = path;
   if (normalized.includes("\0")) throw invalidArgValue("path", normalized, "must be a string without null bytes");
   return normalized;
 }
 
 function normalizeFileUrlPath(url) {
+  if (url.protocol !== "file:") {
+    const error = new TypeError("The URL must be of scheme file");
+    error.code = "ERR_INVALID_URL_SCHEME";
+    throw error;
+  }
+  if (globalThis.process?.platform !== "win32" && url.hostname && url.hostname !== "localhost") {
+    const error = new TypeError(`File URL host must be "localhost" or empty on ${globalThis.process?.platform ?? "this platform"}`);
+    error.code = "ERR_INVALID_FILE_URL_HOST";
+    throw error;
+  }
+  if (/%2f|%5c/i.test(url.pathname)) {
+    const error = new TypeError("File URL path must not include encoded / or \\ characters");
+    error.code = "ERR_INVALID_FILE_URL_PATH";
+    throw error;
+  }
   let pathname = decodeURIComponent(url.pathname);
   if (globalThis.process?.platform === "win32" && /^\/[A-Za-z]:/.test(pathname)) {
     pathname = pathname.slice(1).replaceAll("/", "\\");
@@ -222,7 +226,7 @@ function makeInvalidArgTypeError(name, expected, value) {
 function validatePathArg(path, name = "path") {
   if (typeof path === "string") return;
   if (path instanceof Uint8Array) return;
-  if (path && typeof path === "object" && typeof path.href === "string" && typeof path.protocol === "string") return;
+  if (typeof URL === "function" && path instanceof URL) return;
   throw makeInvalidArgTypeError(name, "of type string or an instance of Buffer or URL", path);
 }
 
@@ -288,18 +292,6 @@ function decodeBytes(bytes, encoding = "utf8") {
   if (encoding === "buffer" || encoding == null) return bufferFrom(bytes);
   if (globalThis.Buffer?.from) return globalThis.Buffer.from(bytes).toString(encoding);
   return decoder.decode(bytes);
-}
-
-function allocationLimitForEncoding(encoding) {
-  const configured = Number(globalThis.__cottontailSyntheticAllocationLimit);
-  if (!Number.isFinite(configured) || configured <= 0) return Number.MAX_SAFE_INTEGER;
-  const normalized = String(encoding ?? "buffer").toLowerCase();
-  if (normalized === "hex") return configured * 2;
-  if (normalized === "base64" || normalized === "base64url") return configured * 3;
-  if (normalized === "utf8" || normalized === "utf-8" || normalized === "ucs2" || normalized === "ucs-2" || normalized === "utf16le" || normalized === "utf-16le") {
-    return configured * 4;
-  }
-  return configured;
 }
 
 function makeOutOfMemoryError(path = undefined) {
@@ -723,8 +715,9 @@ export function existsSync(path) {
 
 export function accessSync(path, mode = F_OK) {
   const normalizedPath = normalizePath(path);
+  mode = validateInteger(mode ?? F_OK, "mode", 0, 7);
   try {
-    cottontail.accessSync(normalizedPath, Number(mode ?? F_OK));
+    cottontail.accessSync(normalizedPath, mode);
   } catch (error) {
     throw makeFsError(error, normalizedPath, "access");
   }
@@ -829,7 +822,7 @@ export function readSync(fd, buffer, offset = 0, length = undefined, position = 
     offset = offset.offset ?? 0;
   }
   const view = buffer instanceof ArrayBuffer ? new Uint8Array(buffer) : buffer;
-  const range = validateBufferRange(view, Number(offset ?? 0), length == null ? undefined : Number(length));
+  const range = validateBufferRange(view, offset ?? 0, length);
   position = validatePosition(position);
   if (range.length === 0) return 0;
   try {
@@ -862,7 +855,7 @@ export function writeSync(fd, data, offset = undefined, length = undefined, posi
     offset = offset.offset ?? 0;
   }
   const view = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
-  const range = validateBufferRange(view, Number(offset ?? 0), length == null ? undefined : Number(length));
+  const range = validateBufferRange(view, offset ?? 0, length);
   position = validatePosition(position);
   if (range.length === 0) return 0;
   try {
@@ -1043,19 +1036,23 @@ export function lchmodSync(path, mode) {
 }
 
 export function fchmodSync(fd, mode) {
-  cottontail.fchmodSync(Number(fd), parseMode(mode));
+  cottontail.fchmodSync(validateFd(fd), parseMode(mode));
 }
 
 export function chownSync(path, uid, gid) {
-  cottontail.chownSync(normalizePath(path), Number(uid), Number(gid), true);
+  cottontail.chownSync(normalizePath(path), validateId(uid, "uid"), validateId(gid, "gid"), true);
 }
 
 export function lchownSync(path, uid, gid) {
-  cottontail.chownSync(normalizePath(path), Number(uid), Number(gid), false);
+  cottontail.chownSync(normalizePath(path), validateId(uid, "uid"), validateId(gid, "gid"), false);
 }
 
 export function fchownSync(fd, uid, gid) {
-  cottontail.fchownSync(Number(fd), Number(uid), Number(gid));
+  cottontail.fchownSync(validateFd(fd), validateId(uid, "uid"), validateId(gid, "gid"));
+}
+
+function validateId(value, name) {
+  return validateInteger(value, name, -1, 0xffffffff);
 }
 
 function parseMkdirOptions(options) {
@@ -1218,7 +1215,7 @@ export function linkSync(existingPath, newPath) {
 
 export function symlinkSync(target, path, type = undefined) {
   void type;
-  cottontail.symlinkSync(String(target), normalizePath(path));
+  cottontail.symlinkSync(normalizePath(target), normalizePath(path));
 }
 
 export function readlinkSync(path, options = undefined) {
@@ -1353,7 +1350,7 @@ export function truncateSync(path, len = 0) {
 }
 
 export function futimesSync(fd, atime, mtime) {
-  cottontail.futimesSync(Number(fd), _toUnixTimestamp(atime), _toUnixTimestamp(mtime));
+  cottontail.futimesSync(validateFd(fd), _toUnixTimestamp(atime), _toUnixTimestamp(mtime));
 }
 
 export function utimesSync(path, atime, mtime) {
@@ -1459,6 +1456,7 @@ class ReadStreamImpl extends Readable {
       _opened: false,
       _reading: false,
       _abortListener: null,
+      _abortSignal: null,
       _fdHandle: fdHandle,
       _fdHandleReleased: false,
       _fdHandleCloseListener: null,
@@ -1470,10 +1468,10 @@ class ReadStreamImpl extends Readable {
     }
 
     if (options.signal) {
+      this._abortSignal = options.signal;
       this._abortListener = () => this.destroy(abortReasonForStream(options.signal));
       if (options.signal.aborted) queueMicrotask(this._abortListener);
       else options.signal.addEventListener("abort", this._abortListener, { once: true });
-      this.once("close", () => options.signal.removeEventListener("abort", this._abortListener));
     }
 
     queueMicrotask(() => {
@@ -1507,6 +1505,7 @@ class ReadStreamImpl extends Readable {
   _close() {
     if (this._closed) return;
     this._closed = true;
+    this._clearAbortListener();
     this.closed = true;
     if (this.fd != null) {
       if (this._fdHandle) {
@@ -1526,6 +1525,14 @@ class ReadStreamImpl extends Readable {
     this._fdHandle._releaseStreamRef();
     const closeResult = this._fdHandle.close();
     closeResult?.catch?.(error => queueMicrotask(() => this.emit("error", error)));
+  }
+
+  _clearAbortListener() {
+    if (this._abortSignal && this._abortListener) {
+      this._abortSignal.removeEventListener("abort", this._abortListener);
+    }
+    this._abortSignal = null;
+    this._abortListener = null;
   }
 
   _pump() {
@@ -1589,6 +1596,7 @@ class ReadStreamImpl extends Readable {
     if (this.readableEnded) return;
     this.readableEnded = true;
     this.readable = false;
+    this._clearAbortListener();
     this.push(null);
     if (this.autoClose) {
       this.destroyed = true;
@@ -1697,6 +1705,7 @@ class WriteStreamImpl extends Writable {
       _ownsFd: fd == null || Number.isNaN(fd),
       flush: options.flush === true,
       _abortListener: null,
+      _abortSignal: null,
       _finalizing: false,
       _finished: false,
       _pendingWrites: 0,
@@ -1709,10 +1718,10 @@ class WriteStreamImpl extends Writable {
       fdHandle.on("close", this._fdHandleCloseListener);
     }
     if (options.signal) {
+      this._abortSignal = options.signal;
       this._abortListener = () => this.destroy(abortReasonForStream(options.signal));
       if (options.signal.aborted) queueMicrotask(this._abortListener);
       else options.signal.addEventListener("abort", this._abortListener, { once: true });
-      this.once("close", () => options.signal.removeEventListener("abort", this._abortListener));
     }
     queueMicrotask(() => {
       try { this._open(); } catch (error) { this.destroy(error); }
@@ -1826,6 +1835,7 @@ class WriteStreamImpl extends Writable {
       try { fsyncSync(this.fd); } catch (error) { this.destroy(error); return; }
     }
     this._finished = true;
+    this._clearAbortListener();
     this.emit("finish");
     if (this.autoClose) this.destroy();
   }
@@ -1841,6 +1851,7 @@ class WriteStreamImpl extends Writable {
     if (this.destroyed) return this;
     this.destroyed = true;
     this.writable = false;
+    this._clearAbortListener();
     if (this.fd != null) {
       if (this._fdHandle) {
         this._releaseFileHandle();
@@ -1853,6 +1864,14 @@ class WriteStreamImpl extends Writable {
     this.closed = true;
     queueMicrotask(() => this.emit("close"));
     return this;
+  }
+
+  _clearAbortListener() {
+    if (this._abortSignal && this._abortListener) {
+      this._abortSignal.removeEventListener("abort", this._abortListener);
+    }
+    this._abortSignal = null;
+    this._abortListener = null;
   }
 
   _releaseFileHandle() {
@@ -1908,14 +1927,62 @@ function callbackify(action, callbackName = "callback", validate = undefined) {
   };
 }
 
-export const access = callbackify(accessSync);
+function validateNormalizedPath(path, name = "path") {
+  validatePathArg(path, name);
+  normalizePath(path);
+}
+
+function validateAccess(path, mode = F_OK) {
+  validateNormalizedPath(path);
+  validateInteger(mode ?? F_OK, "mode", 0, 7);
+}
+
+function validateChmod(path, mode) {
+  validateNormalizedPath(path);
+  parseMode(mode);
+}
+
+function validateChown(path, uid, gid) {
+  validateNormalizedPath(path);
+  validateId(uid, "uid");
+  validateId(gid, "gid");
+}
+
+function validateFdChmod(fd, mode) {
+  validateFd(fd);
+  parseMode(mode);
+}
+
+function validateFdChown(fd, uid, gid) {
+  validateFd(fd);
+  validateId(uid, "uid");
+  validateId(gid, "gid");
+}
+
+function validateFdAndLength(fd, len = 0) {
+  validateFd(fd);
+  validateInteger(len ?? 0, "len", 0, Number.MAX_SAFE_INTEGER);
+}
+
+function validateTwoPaths(first, second, firstName = "path", secondName = "path") {
+  validateNormalizedPath(first, firstName);
+  validateNormalizedPath(second, secondName);
+}
+
+function validateTimes(path, atime, mtime) {
+  validateNormalizedPath(path);
+  _toUnixTimestamp(atime);
+  _toUnixTimestamp(mtime);
+}
+
+export const access = callbackify(accessSync, "callback", validateAccess);
 export function appendFile(path, data, options, callback) {
   if (typeof options === "function") {
     callback = options;
     options = undefined;
   }
   if (typeof callback !== "function") throw makeInvalidCallbackError("callback", callback);
-  if (typeof path !== "number") validatePathArg(path);
+  if (typeof path !== "number") validateNormalizedPath(path);
   validateWriteData(data);
   normalizeEncoding(options, "utf8");
   const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
@@ -1924,8 +1991,8 @@ export function appendFile(path, data, options, callback) {
     error => callback(error),
   );
 }
-export const chmod = callbackify(chmodSync);
-export const chown = callbackify(chownSync);
+export const chmod = callbackify(chmodSync, "callback", validateChmod);
+export const chown = callbackify(chownSync, "callback", validateChown);
 export function close(fd, callback = undefined) {
   fd = validateFd(fd);
   if (callback !== undefined && typeof callback !== "function") {
@@ -1940,7 +2007,10 @@ export function close(fd, callback = undefined) {
     }
   });
 }
-export const copyFile = callbackify(copyFileSync);
+export const copyFile = callbackify(copyFileSync, "callback", (source, destination, mode = 0) => {
+  validateTwoPaths(source, destination, "src", "dest");
+  normalizeCopyMode(mode);
+});
 export function cp(source, destination, options, callback) {
   if (typeof options === "function") {
     callback = options;
@@ -1952,18 +2022,24 @@ export function cp(source, destination, options, callback) {
     callback,
   );
 }
-export const fchmod = callbackify(fchmodSync);
-export const fchown = callbackify(fchownSync);
-export const fdatasync = callbackify(fdatasyncSync);
-export const fstat = callbackify(fstatSync);
-export const fsync = callbackify(fsyncSync);
-export const ftruncate = callbackify(ftruncateSync);
-export const futimes = callbackify(futimesSync);
-export const lchmod = callbackify(lchmodSync);
-export const lchown = callbackify(lchownSync);
-export const link = callbackify(linkSync);
-export const lstat = callbackify(lstatSync);
-export const lutimes = callbackify(lutimesSync);
+export const fchmod = callbackify(fchmodSync, "callback", validateFdChmod);
+export const fchown = callbackify(fchownSync, "callback", validateFdChown);
+export const fdatasync = callbackify(fdatasyncSync, "callback", validateFd);
+export const fstat = callbackify(fstatSync, "callback", validateFd);
+export const fsync = callbackify(fsyncSync, "callback", validateFd);
+export const ftruncate = callbackify(ftruncateSync, "callback", validateFdAndLength);
+export const futimes = callbackify(futimesSync, "callback", (fd, atime, mtime) => {
+  validateFd(fd);
+  _toUnixTimestamp(atime);
+  _toUnixTimestamp(mtime);
+});
+export const lchmod = callbackify(lchmodSync, "callback", validateChmod);
+export const lchown = callbackify(lchownSync, "callback", validateChown);
+export const link = callbackify(linkSync, "callback", (existingPath, newPath) => {
+  validateTwoPaths(existingPath, newPath, "existingPath", "newPath");
+});
+export const lstat = callbackify(lstatSync, "callback", path => validateNormalizedPath(path));
+export const lutimes = callbackify(lutimesSync, "callback", validateTimes);
 export function mkdir(path, options, callback) {
   if (typeof options === "function") {
     callback = options;
@@ -1971,14 +2047,14 @@ export function mkdir(path, options, callback) {
   }
   if (typeof callback !== "function") throw makeInvalidCallbackError("callback", callback);
   // Node validates the path and options synchronously.
-  validatePathArg(path);
+  validateNormalizedPath(path);
   parseMkdirOptions(options ?? {});
   queueFsRequest(() => {
     try { callback(null, mkdirSync(path, options ?? {})); } catch (error) { callback(error); }
   });
 }
 export const mkdtemp = callbackify(mkdtempSync, "callback", (prefix, options) => {
-  validatePathArg(prefix, "prefix");
+  validateNormalizedPath(prefix, "prefix");
   normalizeEncoding(options);
 });
 export function open(path, flags, mode, callback) {
@@ -1987,21 +2063,21 @@ export function open(path, flags, mode, callback) {
     mode = 0o666;
   }
   if (typeof callback !== "function") throw makeInvalidCallbackError("callback", callback);
-  validatePathArg(path);
+  validateNormalizedPath(path);
   normalizeOpenFlags(flags);
   normalizeOpenMode(mode ?? 0o666);
   queueFsRequest(() => {
     try { callback(null, openSync(path, flags, mode ?? 0o666)); } catch (error) { callback(error); }
   });
 }
-export const opendir = callbackify(opendirSync);
+export const opendir = callbackify(opendirSync, "callback", path => validateNormalizedPath(path));
 export function readFile(path, options, callback) {
   if (typeof options === "function") {
     callback = options;
     options = undefined;
   }
   if (typeof callback !== "function") throw makeInvalidCallbackError("callback", callback);
-  if (typeof path !== "number") validatePathArg(path);
+  if (typeof path !== "number") validateNormalizedPath(path);
   normalizeEncoding(options);
   const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
   runAbortable(() => readFileSync(path, options), signal, new FSReqCallback()).then(
@@ -2010,33 +2086,40 @@ export function readFile(path, options, callback) {
   );
 }
 export const readdir = callbackify(readdirSync, "callback", (path, options) => {
-  validatePathArg(path);
+  validateNormalizedPath(path);
   normalizeEncoding(options);
 });
 export const readlink = callbackify(readlinkSync, "callback", (path, options) => {
-  validatePathArg(path);
+  validateNormalizedPath(path);
   normalizeEncoding(options);
 });
 export const realpath = callbackify(realpathSync, "callback", (path, options) => {
-  validatePathArg(path);
+  validateNormalizedPath(path);
   normalizeEncoding(options);
 });
-export const rename = callbackify(renameSync);
-export const rm = callbackify(rmSync);
-export const rmdir = callbackify(rmdirSync);
-export const stat = callbackify(statSync);
-export const statfs = callbackify(statfsSync);
-export const symlink = callbackify(symlinkSync);
-export const truncate = callbackify(truncateSync);
-export const unlink = callbackify(unlinkSync);
-export const utimes = callbackify(utimesSync);
+export const rename = callbackify(renameSync, "callback", (oldPath, newPath) => {
+  validateTwoPaths(oldPath, newPath, "oldPath", "newPath");
+});
+export const rm = callbackify(rmSync, "callback", path => validateNormalizedPath(path));
+export const rmdir = callbackify(rmdirSync, "callback", path => validateNormalizedPath(path));
+export const stat = callbackify(statSync, "callback", path => validateNormalizedPath(path));
+export const statfs = callbackify(statfsSync, "callback", path => validateNormalizedPath(path));
+export const symlink = callbackify(symlinkSync, "callback", (target, path) => {
+  validateTwoPaths(target, path, "target", "path");
+});
+export const truncate = callbackify(truncateSync, "callback", (path, len = 0) => {
+  validateNormalizedPath(path);
+  validateInteger(len ?? 0, "len", 0, Number.MAX_SAFE_INTEGER);
+});
+export const unlink = callbackify(unlinkSync, "callback", validateNormalizedPath);
+export const utimes = callbackify(utimesSync, "callback", validateTimes);
 export function writeFile(path, data, options, callback) {
   if (typeof options === "function") {
     callback = options;
     options = undefined;
   }
   if (typeof callback !== "function") throw makeInvalidCallbackError("callback", callback);
-  if (typeof path !== "number") validatePathArg(path);
+  if (typeof path !== "number") validateNormalizedPath(path);
   validateWriteData(data);
   normalizeEncoding(options, "utf8");
   const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);

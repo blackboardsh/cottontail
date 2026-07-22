@@ -60,6 +60,22 @@ export function encodingFromOptions(options, fallback = undefined) {
   return normalized;
 }
 
+export function allocationLimitForEncoding(encoding) {
+  const configured = Number(globalThis.__cottontailSyntheticAllocationLimit);
+  if (!Number.isFinite(configured) || configured <= 0) return Number.MAX_SAFE_INTEGER;
+  const normalized = String(encoding ?? "buffer").toLowerCase();
+  if (normalized === "hex") return configured * 2;
+  if (normalized === "base64" || normalized === "base64url") return configured * 3;
+  if (
+    normalized === "utf8" || normalized === "utf-8" ||
+    normalized === "ucs2" || normalized === "ucs-2" ||
+    normalized === "utf16le" || normalized === "utf-16le"
+  ) {
+    return configured * 4;
+  }
+  return configured;
+}
+
 export function validateAbortSignal(signal, name = "options.signal") {
   if (signal == null) return null;
   if (

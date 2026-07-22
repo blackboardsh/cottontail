@@ -871,10 +871,24 @@ export function getDevServerDeinitCount() {
   return getBakeDevServerDeinitCount();
 }
 
-export function memfd_create() {
-  const error = new Error("memfd_create is only available on Linux");
-  error.code = "ENOSYS";
-  throw error;
+export function memfd_create(size) {
+  if (globalThis.process?.platform !== "linux" || typeof globalThis.cottontail?.memfdCreateForTesting !== "function") {
+    const error = new Error("memfd_create is only available on Linux");
+    error.code = "ENOSYS";
+    throw error;
+  }
+  if (typeof size !== "number" || !Number.isInteger(size) || size < 0 || !Number.isSafeInteger(size)) {
+    const error = new RangeError("memfd_create size must be a non-negative safe integer");
+    error.code = "ERR_OUT_OF_RANGE";
+    throw error;
+  }
+  try {
+    return globalThis.cottontail.memfdCreateForTesting(size);
+  } catch (error) {
+    const code = /^([A-Z][A-Z0-9]+):/.exec(String(error?.message ?? error))?.[1];
+    if (code && error && typeof error === "object") error.code = code;
+    throw error;
+  }
 }
 
 export function setSyntheticAllocationLimitForTesting(limit) {

@@ -47,6 +47,7 @@ import {
 } from "../fs.js";
 import { ReadableStream as WebReadableStream } from "../stream/web.js";
 import {
+  allocationLimitForEncoding,
   abortReason,
   encodingFromOptions,
   invalidArgType,
@@ -165,6 +166,16 @@ function nativeFsError(event, fd, syscall) {
   return error;
 }
 
+class FSReqPromise {}
+
+function makeOutOfMemoryError() {
+  const error = new Error("ENOMEM: not enough memory");
+  error.errno = -(Number(constantsObject.ENOMEM) || 12);
+  error.code = "ENOMEM";
+  error.syscall = "read";
+  return error;
+}
+
 function nativeFdRequest(kind, fd, buffer, offset, length, position, signal = null) {
   fd = validateFd(fd);
   position = validatePosition(position);
@@ -180,6 +191,8 @@ function nativeFdRequest(kind, fd, buffer, offset, length, position, signal = nu
   }
 
   return new Promise((resolve, reject) => {
+    const activeRequest = new FSReqPromise();
+    globalThis.cottontail?.activeRequestRegister?.(activeRequest);
     let id;
     let settled = false;
     let aborted = false;
@@ -188,6 +201,7 @@ function nativeFdRequest(kind, fd, buffer, offset, length, position, signal = nu
     const cleanup = () => {
       if (id !== undefined) listeners.delete(id);
       signal?.removeEventListener("abort", onAbort);
+      globalThis.cottontail?.activeRequestUnregister?.(activeRequest);
     };
     const finish = (callback, value) => {
       if (settled) return;
@@ -242,16 +256,29 @@ async function readFileFdNative(fd, options = undefined) {
   const encoding = encodingFromOptions(options);
   const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
   if (signal?.aborted) throw abortReason(signal);
+  const allocationLimit = allocationLimitForEncoding(encoding);
+  try {
+    const stats = fstatSync(fd);
+    if (stats.isFile() && stats.size > allocationLimit) throw makeOutOfMemoryError();
+  } catch (error) {
+    if (error?.code === "ENOMEM") throw error;
+  }
   const chunks = [];
   let total = 0;
   for (;;) {
     const chunk = globalThis.Buffer?.allocUnsafe?.(64 * 1024) ?? new Uint8Array(64 * 1024);
     const bytesRead = await nativeFdRequest("read", fd, chunk, 0, chunk.byteLength, null, signal);
     if (bytesRead === 0) break;
+    if (total + bytesRead > allocationLimit) throw makeOutOfMemoryError();
     chunks.push(chunk.subarray(0, bytesRead));
     total += bytesRead;
   }
-  const output = globalThis.Buffer?.allocUnsafe?.(total) ?? new Uint8Array(total);
+  let output;
+  try {
+    output = globalThis.Buffer?.allocUnsafe?.(total) ?? new Uint8Array(total);
+  } catch {
+    throw makeOutOfMemoryError();
+  }
   let offset = 0;
   for (const chunk of chunks) {
     output.set(chunk, offset);
@@ -547,12 +574,14 @@ class FileHandle extends EventEmitter {
 
   _withRef(syscall, operation) {
     let result;
+    let acquired = false;
     try {
       this._assertOpen(syscall);
       this._refs += 1;
+      acquired = true;
       result = operation();
     } catch (error) {
-      if (this._refs > 0 && !this._closing) this._unref();
+      if (acquired) this._unref();
       return Promise.reject(error);
     }
     return Promise.resolve(result).finally(() => this._unref());
@@ -572,9 +601,20 @@ class FileHandle extends EventEmitter {
       this._closeResolve = resolve;
       this._closeReject = reject;
     });
+    const closePromise = this._closePromise;
+    closePromise.then(
+      () => this._clearClosePromise(closePromise),
+      () => this._clearClosePromise(closePromise),
+    );
     this._emitClose();
     this._finishClose();
-    return this._closePromise;
+    return closePromise;
+  }
+  _clearClosePromise(closePromise) {
+    if (this._closePromise !== closePromise) return;
+    this._closePromise = null;
+    this._closeResolve = null;
+    this._closeReject = null;
   }
   createReadStream(options = {}) {
     this._assertOpen("createReadStream");

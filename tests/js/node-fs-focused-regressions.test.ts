@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
+import { memfd_create, setSyntheticAllocationLimitForTesting } from "bun:internal-for-testing";
 import { getEventListeners } from "node:events";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -8,6 +9,15 @@ import path from "node:path";
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "cottontail-fs-focused-"));
 
 afterAll(() => fs.rmSync(root, { recursive: true, force: true }));
+
+function rejectionOf(promise: Promise<unknown>) {
+  return promise.then(
+    () => {
+      throw new Error("expected promise to reject");
+    },
+    error => error,
+  );
+}
 
 test("string writes stop hex decoding at the first invalid pair", async () => {
   const target = path.join(root, "hex.bin");
@@ -268,6 +278,177 @@ test("fs flags, modes, and encoding aliases follow Bun validation", () => {
   expect(() => fs.readFileSync(target, { encoding: "utf-16le" as any })).toThrow(
     expect.objectContaining({ code: "ERR_INVALID_ARG_VALUE" }),
   );
+});
+
+test("fs path and numeric validation is eager and non-coercing", () => {
+  const target = path.join(root, "edge-validation.txt");
+  fs.writeFileSync(target, "data");
+
+  for (const operation of [
+    () => fs.accessSync({} as any),
+    () => fs.chmodSync({} as any, 0o600),
+    () => fs.readdirSync({} as any),
+    () => fs.realpathSync({} as any),
+  ]) {
+    expect(operation).toThrow(expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }));
+  }
+
+  let callbackCalled = false;
+  const callback = () => { callbackCalled = true; };
+  expect(() => fs.access({} as any, callback)).toThrow(expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }));
+  expect(() => fs.chown(target, "1" as any, 0, callback)).toThrow(
+    expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }),
+  );
+  expect(() => fs.rename({} as any, target, callback)).toThrow(
+    expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }),
+  );
+  expect(callbackCalled).toBe(false);
+
+  const fd = fs.openSync(target, "r+");
+  try {
+    expect(() => fs.readSync(fd, Buffer.alloc(1), "0" as any, 1, 0)).toThrow(
+      expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }),
+    );
+    expect(() => fs.writeSync(fd, Buffer.from("x"), "0" as any, 1, 0)).toThrow(
+      expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }),
+    );
+  } finally {
+    fs.closeSync(fd);
+  }
+
+  expect(fs.readFileSync(new URL(`file://${target}`), "utf8")).toBe("data");
+  expect(() => fs.readFileSync(`file://${target}`)).toThrow(expect.objectContaining({ code: "ENOENT" }));
+  expect(() => fs.statSync({ href: `file://${target}`, protocol: "file:" } as any)).toThrow(
+    expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }),
+  );
+});
+
+test("autoClose false streams release abort listeners and preserve descriptors", async () => {
+  const target = path.join(root, "stream-abort-cleanup.txt");
+  fs.writeFileSync(target, "read-data");
+
+  const readFd = fs.openSync(target, "r");
+  const readController = new AbortController();
+  const readStream = fs.createReadStream(null as any, {
+    fd: readFd,
+    autoClose: false,
+    signal: readController.signal,
+  });
+  await new Promise<void>((resolve, reject) => {
+    readStream.once("error", reject);
+    readStream.once("end", resolve);
+    readStream.resume();
+  });
+  expect(getEventListeners(readController.signal, "abort")).toHaveLength(0);
+  expect(fs.fstatSync(readFd).isFile()).toBe(true);
+  fs.closeSync(readFd);
+
+  const writeFd = fs.openSync(target, "w+");
+  const writeController = new AbortController();
+  const writeStream = fs.createWriteStream(null as any, {
+    fd: writeFd,
+    autoClose: false,
+    signal: writeController.signal,
+  });
+  writeStream.end("written");
+  await new Promise<void>((resolve, reject) => {
+    writeStream.once("error", reject);
+    writeStream.once("finish", resolve);
+  });
+  expect(getEventListeners(writeController.signal, "abort")).toHaveLength(0);
+  expect(fs.fstatSync(writeFd).isFile()).toBe(true);
+  fs.closeSync(writeFd);
+  expect(fs.readFileSync(target, "utf8")).toBe("written");
+});
+
+test("native FileHandle requests register once and clean up after abort", async () => {
+  const target = path.join(root, "native-request-cleanup.bin");
+  const handle = await fsp.open(target, "w+");
+  try {
+    const beforeWrite = new Set(process._getActiveRequests());
+    const write = handle.write(Buffer.alloc(256 * 1024, 0x61));
+    const request = process._getActiveRequests().find(
+      item => item?.constructor?.name === "FSReqPromise" && !beforeWrite.has(item),
+    );
+    expect(request).toBeDefined();
+    await write;
+    expect(process._getActiveRequests().some(item => item === request)).toBe(false);
+
+    const controller = new AbortController();
+    const reason = new Error("cancel bounded native write");
+    const beforeAbort = new Set(process._getActiveRequests());
+    const aborted = handle.writeFile(Buffer.alloc(256 * 1024, 0x62), { signal: controller.signal });
+    const abortedRequest = process._getActiveRequests().find(
+      item => item?.constructor?.name === "FSReqPromise" && !beforeAbort.has(item),
+    );
+    expect(abortedRequest).toBeDefined();
+    controller.abort(reason);
+    expect(await rejectionOf(aborted)).toBe(reason);
+    expect(process._getActiveRequests().some(item => item === abortedRequest)).toBe(false);
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+  } finally {
+    await handle.close();
+  }
+});
+
+test("synthetic allocation limits cover sync and descriptor reads", async () => {
+  const target = path.join(root, "bounded-oom.bin");
+  fs.writeFileSync(target, Buffer.alloc(384 * 1024, 0x63));
+  const previousLimit = setSyntheticAllocationLimitForTesting(64 * 1024);
+  try {
+    expect(() => fs.readFileSync(target)).toThrow(expect.objectContaining({
+      code: "ENOMEM",
+      syscall: "read",
+      path: target,
+    }));
+    expect(() => fs.readFileSync(target, "utf8")).toThrow(expect.objectContaining({ code: "ENOMEM" }));
+
+    const handle = await fsp.open(target, "r");
+    try {
+      expect(await rejectionOf(handle.readFile())).toMatchObject({ code: "ENOMEM", syscall: "read" });
+      expect(fs.fstatSync(handle.fd).isFile()).toBe(true);
+    } finally {
+      await handle.close();
+    }
+
+    const fd = fs.openSync(target, "r");
+    try {
+      expect(await rejectionOf(fsp.readFile(fd))).toMatchObject({ code: "ENOMEM", syscall: "read" });
+      expect(fs.fstatSync(fd).isFile()).toBe(true);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } finally {
+    setSyntheticAllocationLimitForTesting(previousLimit);
+  }
+});
+
+test("FileHandle reports one close failure then remains idempotent", async () => {
+  const target = path.join(root, "close-failure.txt");
+  fs.writeFileSync(target, "close");
+  const handle = await fsp.open(target, "r");
+  fs.closeSync(handle.fd);
+  expect(await rejectionOf(handle.close())).toMatchObject({ code: "EBADF", syscall: "close" });
+  await handle.close();
+  expect(handle.fd).toBe(-1);
+});
+
+test("memfd_create is native on Linux and guarded elsewhere", () => {
+  if (process.platform !== "linux") {
+    expect(() => memfd_create(4097)).toThrow(expect.objectContaining({ code: "ENOSYS" }));
+    return;
+  }
+
+  const fd = memfd_create(4097);
+  try {
+    expect(fs.fstatSync(fd).size).toBe(4097);
+    expect(fs.writeSync(fd, Buffer.from("memfd"), 0, 5, 0)).toBe(5);
+    const output = Buffer.alloc(5);
+    expect(fs.readSync(fd, output, 0, output.length, 0)).toBe(5);
+    expect(output.toString()).toBe("memfd");
+  } finally {
+    fs.closeSync(fd);
+  }
 });
 
 test("BigIntStats preserves exact integer fields and nanosecond components", () => {
