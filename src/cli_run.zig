@@ -400,7 +400,14 @@ fn runStage(
         }
     };
 
-    return termResult(term, was_aborted);
+    const result = termResult(term, was_aborted);
+    if ((result.code != 0 or result.signaled) and !coordinator.no_exit_on_error) {
+        // Publish failure before the deferred pipe-reader joins. A descendant
+        // can keep a copied pipe descriptor open after the shell exits; sibling
+        // groups must still be cancelled while this worker drains its streams.
+        coordinator.abort_requested.store(true, .release);
+    }
+    return result;
 }
 
 const WorkerContext = struct {
