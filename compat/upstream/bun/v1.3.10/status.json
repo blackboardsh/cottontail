@@ -1364,6 +1364,11 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
     },
+    "test/cli/test/bun-test.test.ts": {
+      "status": "enabled",
+      "reason": "The copied Bun test CLI corpus passes all 76 cases covering discovery, path selection, output, filtering, failures, bail, timeouts, hooks, and nested subprocess behavior (143 assertions).",
+      "timeoutMs": 600000
+    },
     "test/cli/test/claudecode-flag.test.ts": {
       "status": "enabled",
       "reason": "Bun test's --claude-code flag behavior passes the copied CLI corpus (3 bun:test cases, 17 assertions)."
