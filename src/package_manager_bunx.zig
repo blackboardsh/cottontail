@@ -92,9 +92,11 @@ pub fn addCreatePrefix(allocator: std.mem.Allocator, input: []const u8) ![:0]con
     return output;
 }
 
-pub fn detectInvocation(args: []const [:0]const u8) ?Invocation {
+pub fn detectInvocation(args: []const [:0]const u8, internal_install: bool) ?Invocation {
     if (args.len == 0) return null;
     if (isBunxArgv0(args[0])) {
+        if (internal_install and args.len > 1 and
+            (std.mem.eql(u8, args[1], "add") or std.mem.eql(u8, args[1], "exec"))) return null;
         return .{ .args_start = 1, .argv0_alias = true };
     }
 
@@ -851,7 +853,7 @@ fn runBinary(
     const extra = if (use_runtime or use_node) @as(usize, 1) else 0;
     var argv = try allocator.alloc([]const u8, passthrough.len + 1 + extra);
     argv[0] = executable;
-    if (use_runtime or use_node) argv[1] = resolved;
+    if (use_runtime or use_node) argv[1] = path;
     for (passthrough, 0..) |arg, index| argv[index + 1 + extra] = arg;
 
     if (builtin.os.tag == .windows and !use_runtime and !use_node and
@@ -944,11 +946,13 @@ fn printUsage(writer: *std.Io.Writer) !void {
 
 test "bunx invocation recognizes x, global --bun, and argv0 aliases" {
     const direct = [_][:0]const u8{ "cottontail", "x", "tool" };
-    try std.testing.expectEqual(@as(usize, 2), detectInvocation(&direct).?.args_start);
+    try std.testing.expectEqual(@as(usize, 2), detectInvocation(&direct, false).?.args_start);
     const forced = [_][:0]const u8{ "cottontail", "--bun", "x", "tool" };
-    try std.testing.expect(detectInvocation(&forced).?.force_runtime);
+    try std.testing.expect(detectInvocation(&forced, false).?.force_runtime);
     const alias = [_][:0]const u8{ "/tmp/bunx", "tool" };
-    try std.testing.expect(detectInvocation(&alias).?.argv0_alias);
+    try std.testing.expect(detectInvocation(&alias, false).?.argv0_alias);
+    const internal_add = [_][:0]const u8{ "/tmp/bunx", "add", "tool" };
+    try std.testing.expect(detectInvocation(&internal_add, true) == null);
 }
 
 test "bunx package parsing preserves versions, scopes, and aliases" {

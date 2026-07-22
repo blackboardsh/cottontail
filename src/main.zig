@@ -3081,7 +3081,7 @@ pub fn main(init: std.process.Init) !void {
     var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
-    if (package_manager_bunx.detectInvocation(args)) |invocation| {
+    if (package_manager_bunx.detectInvocation(args, init.environ_map.get("BUN_INTERNAL_BUNX_INSTALL") != null)) |invocation| {
         const exit_code = try package_manager_bunx.run(init, args, invocation, stdout, stderr);
         if (exit_code != 0) std.process.exit(exit_code);
         return;
