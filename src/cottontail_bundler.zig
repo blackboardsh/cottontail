@@ -12,6 +12,7 @@ pub const RuntimeAlias = compiler.resolver.Resolver.RuntimeAlias;
 pub const BundleOptions = struct {
     aliases: []const RuntimeAlias = &.{},
     conditions: []const []const u8 = &.{},
+    node_path: ?[]const u8 = null,
     tsconfig_override: ?[]const u8 = null,
     source_map: compiler.schema.api.SourceMapMode = .none,
     output_format: compiler.options.Format = .esm,
@@ -845,6 +846,7 @@ pub fn bundleEntryPointGraphWithOptions(
     // resolution. The resolver consumes NODE_PATH and condition-related env
     // values even when runtime process.env reads are intentionally not inlined.
     try transpiler.env.loadProcess();
+    if (options.node_path) |node_path| try transpiler.env.map.put("NODE_PATH", node_path);
     try transpiler.fs.setTopLevelDir(working_dir_z);
     transpiler.resolver.runtime_aliases = options.aliases;
 
@@ -2036,6 +2038,7 @@ pub fn buildEntryPointsJson(
     // Match Bun's compiler lifecycle so package resolution sees NODE_PATH and
     // the rest of the inherited process environment.
     try transpiler.env.loadProcess();
+    if (options.node_path) |node_path| try transpiler.env.map.put("NODE_PATH", node_path);
     try transpiler.fs.setTopLevelDir(working_dir_z);
     transpiler.resolver.runtime_aliases = options.aliases;
 

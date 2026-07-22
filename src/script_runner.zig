@@ -427,7 +427,13 @@ fn autoInstallMode(exec_args: []const [:0]const u8) AutoInstallMode {
     return mode;
 }
 
-fn packageNameFromSpecifier(specifier: []const u8) ?[]const u8 {
+const AutoInstallRequest = struct {
+    install_specifier: []const u8,
+    package_name: []const u8,
+    requested_version: ?[]const u8,
+};
+
+fn autoInstallRequestFromSpecifier(specifier: []const u8) ?AutoInstallRequest {
     if (specifier.len == 0 or
         std.fs.path.isAbsolute(specifier) or
         std.mem.startsWith(u8, specifier, "./") or
@@ -438,13 +444,26 @@ fn packageNameFromSpecifier(specifier: []const u8) ?[]const u8 {
         std.mem.startsWith(u8, specifier, "file:")) return null;
     if (isMinimalRuntimeAliasSpecifier(specifier)) return null;
 
-    if (specifier[0] == '@') {
+    const package_end = if (specifier[0] == '@') blk: {
         const slash = std.mem.indexOfScalarPos(u8, specifier, 1, '/') orelse return null;
-        const end = std.mem.indexOfScalarPos(u8, specifier, slash + 1, '/') orelse specifier.len;
-        return specifier[0..end];
-    }
-    const end = std.mem.indexOfScalar(u8, specifier, '/') orelse specifier.len;
-    return specifier[0..end];
+        break :blk std.mem.indexOfScalarPos(u8, specifier, slash + 1, '/') orelse specifier.len;
+    } else std.mem.indexOfScalar(u8, specifier, '/') orelse specifier.len;
+    const install_specifier = specifier[0..package_end];
+    const version_separator = std.mem.lastIndexOfScalar(u8, install_specifier, '@');
+    const has_version = if (version_separator) |separator|
+        separator > 0 and (specifier[0] != '@' or std.mem.indexOfScalarPos(u8, install_specifier, 1, '/').? < separator)
+    else
+        false;
+    const package_name = if (has_version) install_specifier[0..version_separator.?] else install_specifier;
+    const requested_version = if (has_version and version_separator.? + 1 < install_specifier.len)
+        install_specifier[version_separator.? + 1 ..]
+    else
+        null;
+    return .{
+        .install_specifier = install_specifier,
+        .package_name = package_name,
+        .requested_version = requested_version,
+    };
 }
 
 fn directoryHasNodeModules(ctx: *const Context, start_dir: []const u8) bool {
@@ -617,10 +636,85 @@ fn sourceMayLoadModules(source: []const u8) bool {
     return false;
 }
 
+fn autoInstallPathIsDirectory(ctx: *const Context, path: []const u8) bool {
+    const stat = std.Io.Dir.cwd().statFile(ctx.io, path, .{}) catch return false;
+    return stat.kind == .directory;
+}
+
+fn prependAutoInstallNodePath(ctx: *const Context, node_modules: []const u8) !void {
+    const existing = ctx.environ_map.get("NODE_PATH") orelse "";
+    if (std.mem.indexOf(u8, existing, node_modules) != null) return;
+    const value = if (existing.len == 0)
+        node_modules
+    else
+        try std.fmt.allocPrint(ctx.allocator, "{s}{c}{s}", .{ node_modules, std.fs.path.delimiter, existing });
+    try ctx.environ_map.put("NODE_PATH", value);
+}
+
+fn installedAutoPackageVersion(ctx: *const Context, package_dir: []const u8) ?[]const u8 {
+    const package_json = std.fs.path.join(ctx.allocator, &.{ package_dir, "package.json" }) catch return null;
+    const contents = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        package_json,
+        ctx.allocator,
+        .limited(16 * 1024 * 1024),
+    ) catch return null;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, ctx.allocator, contents, .{}) catch return null;
+    if (parsed != .object) return null;
+    const version = parsed.object.get("version") orelse return null;
+    return if (version == .string) version.string else null;
+}
+
+fn createAutoInstallSymlink(ctx: *const Context, target: []const u8, link_path: []const u8) !void {
+    if (autoInstallPathIsDirectory(ctx, link_path)) return;
+    if (std.fs.path.dirname(link_path)) |parent| try std.Io.Dir.cwd().createDirPath(ctx.io, parent);
+    std.Io.Dir.symLinkAbsolute(ctx.io, target, link_path, .{ .is_directory = true }) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+}
+
+fn exposeAutoInstalledPackage(
+    ctx: *const Context,
+    cache_root: []const u8,
+    staging_node_modules: []const u8,
+    request: AutoInstallRequest,
+) !void {
+    const installed_dir = try std.fs.path.join(ctx.allocator, &.{ staging_node_modules, request.package_name });
+    if (!autoInstallPathIsDirectory(ctx, installed_dir)) return error.AutoInstallFailed;
+    const version = installedAutoPackageVersion(ctx, installed_dir) orelse request.requested_version orelse "latest";
+    const cache_package_dir = try std.fs.path.join(ctx.allocator, &.{ cache_root, request.package_name });
+    try std.Io.Dir.cwd().createDirPath(ctx.io, cache_package_dir);
+    const cache_entry_name = try std.fmt.allocPrint(ctx.allocator, "{s}@@@1", .{version});
+    const cache_entry = try std.fs.path.join(ctx.allocator, &.{ cache_package_dir, cache_entry_name });
+    try createAutoInstallSymlink(ctx, installed_dir, cache_entry);
+
+    if (!std.mem.eql(u8, request.install_specifier, request.package_name)) {
+        const alias = try std.fs.path.join(ctx.allocator, &.{ staging_node_modules, request.install_specifier });
+        try createAutoInstallSymlink(ctx, installed_dir, alias);
+    }
+}
+
 fn maybeAutoInstall(ctx: *const Context, entrypoint_path: []const u8, exec_args: []const [:0]const u8) !void {
     const mode = autoInstallMode(exec_args);
     if (mode == .disable) return;
     const entry_dir = std.fs.path.dirname(entrypoint_path) orelse ctx.project_root;
+    const configured_cache = ctx.environ_map.get("BUN_INSTALL_CACHE_DIR");
+    const cache_root = if (configured_cache) |path|
+        if (std.fs.path.isAbsolute(path)) path else try absolutePathForCwd(ctx.io, ctx.allocator, path)
+    else
+        null;
+    const staging_root = if (cache_root) |root|
+        try std.fs.path.join(ctx.allocator, &.{ root, ".cottontail-auto-install" })
+    else
+        null;
+    const staging_node_modules = if (staging_root) |root|
+        try std.fs.path.join(ctx.allocator, &.{ root, "node_modules" })
+    else
+        null;
+    if (staging_node_modules) |node_modules| {
+        if (autoInstallPathIsDirectory(ctx, node_modules)) try prependAutoInstallNodePath(ctx, node_modules);
+    }
     if (mode == .auto and directoryHasNodeModules(ctx, entry_dir)) return;
 
     const loader = transpilerLoaderForPath(entrypoint_path) orelse return;
@@ -640,18 +734,25 @@ fn maybeAutoInstall(ctx: *const Context, entrypoint_path: []const u8, exec_args:
     const parsed = std.json.parseFromSlice([]const ScannedImport, ctx.allocator, imports_json, .{}) catch return;
     defer parsed.deinit();
 
-    var packages: std.ArrayList([]const u8) = .empty;
+    var packages: std.ArrayList(AutoInstallRequest) = .empty;
     for (parsed.value) |item| {
-        const package_name = packageNameFromSpecifier(item.path) orelse continue;
-        if (packageIsInstalled(ctx, entry_dir, package_name)) continue;
+        const request = autoInstallRequestFromSpecifier(item.path) orelse continue;
+        if (request.requested_version == null and packageIsInstalled(ctx, entry_dir, request.package_name)) continue;
+        if (staging_node_modules) |node_modules| {
+            const installed_alias = try std.fs.path.join(ctx.allocator, &.{ node_modules, request.install_specifier });
+            if (autoInstallPathIsDirectory(ctx, installed_alias)) {
+                try exposeAutoInstalledPackage(ctx, cache_root.?, node_modules, request);
+                continue;
+            }
+        }
         var duplicate = false;
         for (packages.items) |existing| {
-            if (std.mem.eql(u8, existing, package_name)) {
+            if (std.mem.eql(u8, existing.install_specifier, request.install_specifier)) {
                 duplicate = true;
                 break;
             }
         }
-        if (!duplicate) try packages.append(ctx.allocator, package_name);
+        if (!duplicate) try packages.append(ctx.allocator, request);
     }
     if (packages.items.len == 0) return;
 
@@ -659,17 +760,30 @@ fn maybeAutoInstall(ctx: *const Context, entrypoint_path: []const u8, exec_args:
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(ctx.allocator, &.{ executable, "add", "--no-save", "--silent" });
     if (mode == .force) try argv.append(ctx.allocator, "--force");
-    try argv.appendSlice(ctx.allocator, packages.items);
+    for (packages.items) |request| try argv.append(ctx.allocator, request.install_specifier);
+    const install_cwd = staging_root orelse entry_dir;
+    if (staging_root) |root| try std.Io.Dir.cwd().createDirPath(ctx.io, root);
+    var child_env = try ctx.environ_map.clone(ctx.allocator);
+    defer child_env.deinit();
+    if (cache_root) |root| {
+        const download_cache = try std.fs.path.join(ctx.allocator, &.{ root, ".cottontail-download-cache" });
+        try std.Io.Dir.cwd().createDirPath(ctx.io, download_cache);
+        try child_env.put("BUN_INSTALL_CACHE_DIR", download_cache);
+    }
     const result = try std.process.run(ctx.allocator, ctx.io, .{
         .argv = argv.items,
-        .cwd = .{ .path = entry_dir },
-        .environ_map = ctx.environ_map,
+        .cwd = .{ .path = install_cwd },
+        .environ_map = &child_env,
         .stdout_limit = .limited(64 * 1024 * 1024),
         .stderr_limit = .limited(64 * 1024 * 1024),
     });
     switch (result.term) {
         .exited => |code| if (code != 0) return error.AutoInstallFailed,
         else => return error.AutoInstallFailed,
+    }
+    if (staging_node_modules) |node_modules| {
+        try prependAutoInstallNodePath(ctx, node_modules);
+        for (packages.items) |request| try exposeAutoInstalledPackage(ctx, cache_root.?, node_modules, request);
     }
 }
 
@@ -4582,6 +4696,7 @@ fn bundleScriptNative(
     }
     options.aliases = aliases;
     options.conditions = conditions.items;
+    options.node_path = ctx.environ_map.get("NODE_PATH");
     options.features = features.items;
     options.tsconfig_override = tsconfig_override;
     options.include_runtime_modules = true;

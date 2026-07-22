@@ -82,9 +82,14 @@ fn printHelp(writer: anytype) !void {
 
 const CliMode = enum { script, eval, print, stdin };
 
+const RunShell = enum { bun, system };
+
 const RunScriptFlags = struct {
     if_present: bool = false,
     silent: bool = false,
+    bun: bool = false,
+    shell: ?RunShell = null,
+    config_path: ?[]const u8 = null,
 };
 
 const CliInvocation = struct {
@@ -809,6 +814,55 @@ fn findPackageScripts(
     return null;
 }
 
+const RunBunfig = struct {
+    silent: bool = false,
+    bun: bool = false,
+    shell: ?RunShell = null,
+};
+
+fn parseRunBunfig(allocator: std.mem.Allocator, path: []const u8, contents: []const u8) RunBunfig {
+    var ast_memory_allocator: cottontail_compiler.ast.ASTMemoryAllocator = undefined;
+    var ast_scope = ast_memory_allocator.enter(allocator);
+    defer ast_scope.exit();
+
+    var log = cottontail_compiler.logger.Log.init(allocator);
+    defer log.deinit();
+    const source = cottontail_compiler.logger.Source.initPathString(path, contents);
+    const root = cottontail_compiler.interchange.toml.TOML.parse(&source, &log, allocator, true) catch return .{};
+    if (log.hasErrors()) return .{};
+    const run = root.get("run") orelse return .{};
+
+    var config: RunBunfig = .{};
+    if (run.get("silent")) |value| config.silent = value.asBool() orelse false;
+    if (run.get("bun")) |value| config.bun = value.asBool() orelse false;
+    if (run.get("shell")) |value| {
+        if (value.asString(allocator)) |shell| {
+            if (std.mem.eql(u8, shell, "bun")) {
+                config.shell = .bun;
+            } else if (std.mem.eql(u8, shell, "system")) {
+                config.shell = .system;
+            }
+        }
+    }
+    return config;
+}
+
+fn configuredRunScriptFlags(init: std.process.Init, flags: RunScriptFlags) !RunScriptFlags {
+    var configured = flags;
+    const path = if (flags.config_path) |value| if (value.len > 0) value else "bunfig.toml" else "bunfig.toml";
+    const contents = std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        path,
+        init.arena.allocator(),
+        .limited(16 * 1024 * 1024),
+    ) catch return configured;
+    const bunfig = parseRunBunfig(init.arena.allocator(), path, contents);
+    configured.silent = configured.silent or bunfig.silent;
+    configured.bun = configured.bun or bunfig.bun;
+    if (configured.shell == null) configured.shell = bunfig.shell;
+    return configured;
+}
+
 fn prependAncestorBinPaths(
     allocator: std.mem.Allocator,
     env: *std.process.Environ.Map,
@@ -972,11 +1026,11 @@ fn runOnePackageScript(
     dir: []const u8,
     stage_name: []const u8,
     command: []const u8,
-    silent: bool,
+    flags: RunScriptFlags,
 ) !u8 {
     try env.put("npm_lifecycle_event", stage_name);
     try env.put("npm_lifecycle_script", command);
-    if (!silent) {
+    if (!flags.silent) {
         var stderr_buffer: [4096]u8 = undefined;
         var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
         const stderr = &stderr_writer.interface;
@@ -984,10 +1038,27 @@ fn runOnePackageScript(
         try stderr.flush();
     }
     const rewritten_command = try cli_script_command.replacePackageManagerRun(init.arena.allocator(), init.io, command);
-    const shell_args: []const []const u8 = if (builtin.os.tag == .windows)
-        &.{ "cmd.exe", "/d", "/s", "/c", rewritten_command }
-    else
-        &.{ "/bin/sh", "-c", rewritten_command };
+    var bun_shell_args: [3][]const u8 = undefined;
+    var system_shell_args: [5][]const u8 = undefined;
+    const use_bun_shell = flags.shell == .bun or (flags.shell == null and builtin.os.tag == .windows);
+    const shell_args: []const []const u8 = if (use_bun_shell) blk: {
+        var source: std.ArrayList(u8) = .empty;
+        try source.appendSlice(init.arena.allocator(), "const { $ } = await import(\"bun\"); const __s = [");
+        try appendJavaScriptStringLiteral(init.arena.allocator(), &source, rewritten_command);
+        try source.appendSlice(init.arena.allocator(), "]; __s.raw = __s; const __result = await $(__s).nothrow(); process.exitCode = __result.exitCode;\n");
+        bun_shell_args = .{
+            try std.process.executablePathAlloc(init.io, init.arena.allocator()),
+            "-e",
+            try init.arena.allocator().dupeZ(u8, source.items),
+        };
+        break :blk &bun_shell_args;
+    } else if (builtin.os.tag == .windows) blk: {
+        system_shell_args = .{ "cmd.exe", "/d", "/s", "/c", rewritten_command };
+        break :blk &system_shell_args;
+    } else blk: {
+        system_shell_args = .{ "/bin/sh", "-c", rewritten_command, "", "" };
+        break :blk system_shell_args[0..3];
+    };
     var signal_scope = signal_forwarding.Scope.begin();
     defer signal_scope.deinit();
     var child = try std.process.spawn(init.io, .{
@@ -1026,11 +1097,11 @@ fn runPackageScripts(
     if (pkg.package_version.len > 0) try env.put("npm_package_version", pkg.package_version);
     try env.put("npm_package_json", pkg.package_json);
     try prependAncestorBinPaths(allocator, &env, pkg.dir);
-    if (force_runtime) try prependForcedBunRuntimePath(init, allocator, &env);
+    if (force_runtime or flags.bun) try prependForcedBunRuntimePath(init, allocator, &env);
     for (pkg.config) |entry| try env.put(entry.name, entry.value);
 
     if (pkg.pre) |pre_command| {
-        const code = try runOnePackageScript(init, &env, pkg.dir, try std.mem.concat(allocator, u8, &.{ "pre", pkg.script_name }), pre_command, flags.silent);
+        const code = try runOnePackageScript(init, &env, pkg.dir, try std.mem.concat(allocator, u8, &.{ "pre", pkg.script_name }), pre_command, flags);
         if (code != 0) return code;
     }
 
@@ -1044,11 +1115,11 @@ fn runPackageScripts(
         }
         main_command = buffer.items;
     }
-    const main_code = try runOnePackageScript(init, &env, pkg.dir, pkg.script_name, main_command, flags.silent);
+    const main_code = try runOnePackageScript(init, &env, pkg.dir, pkg.script_name, main_command, flags);
     if (main_code != 0) return main_code;
 
     if (pkg.post) |post_command| {
-        const code = try runOnePackageScript(init, &env, pkg.dir, try std.mem.concat(allocator, u8, &.{ "post", pkg.script_name }), post_command, flags.silent);
+        const code = try runOnePackageScript(init, &env, pkg.dir, try std.mem.concat(allocator, u8, &.{ "post", pkg.script_name }), post_command, flags);
         if (code != 0) return code;
     }
     return 0;
@@ -2576,6 +2647,25 @@ fn parseRunInvocation(
             break;
         }
         if (!std.mem.startsWith(u8, arg, "-")) break;
+        if (std.mem.startsWith(u8, arg, "-c=")) {
+            flags.config_path = arg["-c=".len..];
+            appendExecArg(exec_args_storage, exec_len, arg);
+            index += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--config=")) {
+            flags.config_path = arg["--config=".len..];
+            appendExecArg(exec_args_storage, exec_len, arg);
+            index += 1;
+            continue;
+        }
+        if ((std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) and index + 1 < args.len) {
+            flags.config_path = args[index + 1];
+            appendExecArg(exec_args_storage, exec_len, arg);
+            appendExecArg(exec_args_storage, exec_len, args[index + 1]);
+            index += 2;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--if-present")) {
             flags.if_present = true;
             index += 1;
@@ -2587,7 +2677,29 @@ fn parseRunInvocation(
             continue;
         }
         if (std.mem.eql(u8, arg, "--bun") or std.mem.eql(u8, arg, "-b")) {
+            flags.bun = true;
             appendExecArg(exec_args_storage, exec_len, arg);
+            index += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--shell") and index + 1 < args.len) {
+            flags.shell = if (std.mem.eql(u8, args[index + 1], "bun"))
+                .bun
+            else if (std.mem.eql(u8, args[index + 1], "system"))
+                .system
+            else
+                null;
+            index += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--shell=")) {
+            const shell = arg["--shell=".len..];
+            flags.shell = if (std.mem.eql(u8, shell, "bun"))
+                .bun
+            else if (std.mem.eql(u8, shell, "system"))
+                .system
+            else
+                null;
             index += 1;
             continue;
         }
@@ -2641,6 +2753,7 @@ fn parseInvocation(io: std.Io, allocator: std.mem.Allocator, args: []const [:0]c
                 .exec_args = inspector_exec_args,
             };
         }
+
         return .{
             .mode = .script,
             .payload = try defaultTestEntrypoint(io, allocator),
@@ -2663,6 +2776,28 @@ fn parseInvocation(io: std.Io, allocator: std.mem.Allocator, args: []const [:0]c
                 .exec_args = exec_args_storage[0..exec_len],
                 .flags = flags,
             };
+        }
+
+        if (std.mem.startsWith(u8, arg, "-c=")) {
+            flags.config_path = arg["-c=".len..];
+            appendExecArg(exec_args_storage, &exec_len, arg);
+            index += 1;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, arg, "--config=")) {
+            flags.config_path = arg["--config=".len..];
+            appendExecArg(exec_args_storage, &exec_len, arg);
+            index += 1;
+            continue;
+        }
+
+        if ((std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) and index + 1 < args.len) {
+            flags.config_path = args[index + 1];
+            appendExecArg(exec_args_storage, &exec_len, arg);
+            appendExecArg(exec_args_storage, &exec_len, args[index + 1]);
+            index += 2;
+            continue;
         }
 
         if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--eval")) {
@@ -2722,7 +2857,31 @@ fn parseInvocation(io: std.Io, allocator: std.mem.Allocator, args: []const [:0]c
         }
 
         if (std.mem.eql(u8, arg, "--bun") or std.mem.eql(u8, arg, "-b")) {
+            flags.bun = true;
             appendExecArg(exec_args_storage, &exec_len, arg);
+            index += 1;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--shell") and index + 1 < args.len) {
+            flags.shell = if (std.mem.eql(u8, args[index + 1], "bun"))
+                .bun
+            else if (std.mem.eql(u8, args[index + 1], "system"))
+                .system
+            else
+                null;
+            index += 2;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, arg, "--shell=")) {
+            const shell = arg["--shell=".len..];
+            flags.shell = if (std.mem.eql(u8, shell, "bun"))
+                .bun
+            else if (std.mem.eql(u8, shell, "system"))
+                .system
+            else
+                null;
             index += 1;
             continue;
         }
@@ -3162,10 +3321,11 @@ pub fn main(init: std.process.Init) !void {
             std.mem.indexOfScalar(u8, payload, '\\') != null;
         if (!path_like) {
             if (try findPackageScripts(init.io, init.arena.allocator(), payload)) |pkg| {
+                const flags = try configuredRunScriptFlags(init, invocation.flags);
                 const script_exit = try runPackageScripts(
                     init,
                     pkg,
-                    invocation.flags,
+                    flags,
                     invocation.args,
                     forcesBunRuntime(invocation.exec_args),
                 );
