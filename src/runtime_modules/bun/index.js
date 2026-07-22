@@ -7078,6 +7078,7 @@ export class Request {
       credentials: "include",
       keepalive,
       keepaliveExplicit,
+      serveIdleTimeout: undefined,
     });
     this._body = bodyOwner instanceof Request && bodyOwner === input && bodySet && !bodyFromInit
       ? bodyForRequestCopy(bodyOwner)
@@ -7498,7 +7499,6 @@ const activeServeDispatches = globalThis.__cottontailActiveServeDispatches ??= n
 const activeServeAbortControllers = globalThis.__cottontailActiveServeAbortControllers ??= new WeakMap();
 const activeServeLifecycles = globalThis.__cottontailActiveServeLifecycles ??= new WeakMap();
 const activeServeRequestBodyStateSymbol = Symbol("cottontail.activeServeRequestBodyState");
-const serveRequestIdleTimeouts = new WeakMap();
 
 function setServeRequestIdleTimeout(request, seconds, isUnix, argumentCount) {
   if (argumentCount < 2 || request == null) {
@@ -7509,7 +7509,9 @@ function setServeRequestIdleTimeout(request, seconds, isUnix, argumentCount) {
   const integer = Number.isFinite(seconds) ? Math.trunc(seconds) : 0;
   const value = Math.min(255, integer >>> 0);
   if (request instanceof Request) {
-    serveRequestIdleTimeouts.set(request, value);
+    const state = requestState.get(request);
+    if (state == null) throw new TypeError("timeout() requires a Request object");
+    state.serveIdleTimeout = value;
   } else if (request instanceof nodeHttp.ServerResponse) {
     request.setTimeout(value * 1000);
   } else {
@@ -7519,7 +7521,7 @@ function setServeRequestIdleTimeout(request, seconds, isUnix, argumentCount) {
 }
 
 function requestIdleTimeout(request, fallback) {
-  return serveRequestIdleTimeouts.has(request) ? serveRequestIdleTimeouts.get(request) : fallback;
+  return requestState.get(request)?.serveIdleTimeout ?? fallback;
 }
 
 function createServeLifecycle(getPendingWebSockets) {
@@ -10707,7 +10709,7 @@ function serveHandlerErrorDiagnostic(error) {
 function reportServeHandlerError(error) {
   const diagnostic = serveHandlerErrorDiagnostic(error);
   if (diagnostic != null) console.error(diagnostic);
-  setTimeout(() => { throw error; }, 0);
+  process.nextTick(() => { throw error; });
 }
 
 function invokeWebSocketHandler(state, name, ...args) {
