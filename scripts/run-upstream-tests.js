@@ -36,6 +36,7 @@ const bunSnapshotSourceNames = new Set([
   'src',
   'status.json',
   'test',
+  'tsconfig.base.json',
 ]);
 
 function removeTemp(path) {

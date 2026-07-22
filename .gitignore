@@ -19,8 +19,8 @@ vm-*-test.log
 vm-*-release.log
 
 # test-run artifacts inside the upstream snapshot
-# The copied Bun snapshot owns only these five entries at its root. Upstream
-# tests frequently write arbitrary filenames beside them.
+# The copied Bun snapshot owns only the explicitly unignored entries at its
+# root. Upstream tests frequently write arbitrary filenames beside them.
 compat/upstream/bun/*/*
 !compat/upstream/bun/*/LICENSE.md
 !compat/upstream/bun/*/manifest.json
@@ -28,6 +28,7 @@ compat/upstream/bun/*/*
 !compat/upstream/bun/*/status.json
 !compat/upstream/bun/*/test/
 !compat/upstream/bun/*/packages/
+!compat/upstream/bun/*/tsconfig.base.json
 compat/upstream/bun/*/packages/*
 !compat/upstream/bun/*/packages/bun-native-bundler-plugin-api/
 compat/upstream/bun/*/packages/bun-native-bundler-plugin-api/*

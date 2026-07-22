@@ -15,8 +15,8 @@ const copySpecs = {
     paths: ['test', 'tools', 'LICENSE'],
   },
   bun: {
-    sparse: ['test/**', 'LICENSE.md'],
-    paths: ['test', 'LICENSE.md'],
+    sparse: ['test/**', 'tsconfig.base.json', 'LICENSE.md'],
+    paths: ['test', 'tsconfig.base.json', 'LICENSE.md'],
   },
 };
 
