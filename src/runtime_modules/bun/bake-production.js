@@ -281,9 +281,9 @@ async function writeClientGraph(context, route) {
     ])],
     splitting: true,
     naming: {
-      entry: "_bun/[name]-[hash].[ext]",
-      chunk: "_bun/[name]-[hash].[ext]",
-      asset: "_bun/[name]-[hash].[ext]",
+      entry: "_bun/[hash].[ext]",
+      chunk: "_bun/[hash].[ext]",
+      asset: "_bun/[hash].[ext]",
       ...(typeof clientOptions.naming === "object" ? clientOptions.naming : {}),
     },
     define: productionDefines(clientOptions, "client"),
