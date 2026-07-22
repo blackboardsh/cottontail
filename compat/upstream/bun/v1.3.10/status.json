@@ -4042,6 +4042,11 @@
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (1 bun:test cases, 0 assertions)."
     },
+    "test/js/third_party/next-auth/next-auth.test.ts": {
+      "status": "enabled",
+      "reason": "The unchanged NextAuth edge-runtime fixture passes its keep-alive POST request under Cottontail after WebCrypto constructor identity and HTTP status-message parity fixes (1 bun:test case, 9 assertions).",
+      "timeoutMs": 120000
+    },
     "test/js/third_party/nodemailer/nodemailer.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
