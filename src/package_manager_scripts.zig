@@ -513,7 +513,6 @@ fn configureEnvironment(
         if (!first) try path.writer.writeByte(pathDelimiter());
         try path.writer.writeAll(bin);
         first = false;
-        if (std.mem.eql(u8, current, root_dir)) break;
         const parent = std.fs.path.dirname(current) orelse break;
         if (std.mem.eql(u8, parent, current)) break;
         directory = parent;
