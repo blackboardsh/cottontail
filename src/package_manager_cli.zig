@@ -8134,7 +8134,8 @@ const Manager = struct {
             }
 
             if (manager.isSecurityResolution()) {
-                const destination = try packageDestination(manager.allocator, parent_dir, alias);
+                const consumer_modules = try manager.isolatedConsumerModules(parent_dir);
+                const destination = try std.fs.path.join(manager.allocator, &.{ consumer_modules, alias });
                 if (!manager.pathIsWorkspace(destination)) {
                     const metadata = manager.readInstalledPackageJSON(destination) catch return null;
                     const installed_name = jsonString(metadata, "name") orelse alias;
@@ -8142,17 +8143,22 @@ const Manager = struct {
                     if (std.mem.eql(u8, installed_name, registry_name) and
                         (tagged_version or semverSatisfies(manager.allocator, registry_spec, installed_version)))
                     {
+                        const installed_path = std.Io.Dir.cwd().realPathFileAlloc(
+                            manager.init_data.io,
+                            destination,
+                            manager.allocator,
+                        ) catch destination;
                         const patch_paths = try manager.packagePatchPaths(installed_name, installed_version, protocol_patch_paths);
-                        if (!try manager.packagePatchStateMatches(destination, patch_paths)) return null;
+                        if (!try manager.packagePatchStateMatches(installed_path, patch_paths)) return null;
 
                         const logical_key = try manager.dependencyLockKey(parent_dir, alias);
-                        const modules_dir = try std.fs.path.join(manager.allocator, &.{ destination, "node_modules" });
+                        const modules_dir = std.fs.path.dirname(installed_path) orelse return null;
                         try manager.isolated_parent_modules.put(
-                            try manager.allocator.dupe(u8, destination),
+                            try manager.allocator.dupe(u8, installed_path),
                             try manager.allocator.dupe(u8, modules_dir),
                         );
                         try manager.isolated_parent_keys.put(
-                            try manager.allocator.dupe(u8, destination),
+                            try manager.allocator.dupe(u8, installed_path),
                             try manager.allocator.dupe(u8, logical_key),
                         );
                         try manager.root_versions.put(try manager.allocator.dupe(u8, alias), installed_version);
@@ -8163,14 +8169,14 @@ const Manager = struct {
                             .version = installed_version,
                             .resolution = registry_spec,
                             .metadata = metadata,
-                            .install_dir = destination,
+                            .install_dir = installed_path,
                         });
-                        try manager.rememberPackageMetadata(destination, metadata);
-                        try manager.installDependencyObject(metadata, "dependencies", destination, false, false);
+                        try manager.rememberPackageMetadata(installed_path, metadata);
+                        try manager.installDependencyObject(metadata, "dependencies", installed_path, false, false);
                         if (!manager.options.omit_optional) {
-                            try manager.installDependencyObject(metadata, "optionalDependencies", destination, false, true);
+                            try manager.installDependencyObject(metadata, "optionalDependencies", installed_path, false, true);
                         }
-                        try manager.installOrLinkPeerDependencies(metadata, destination, destination, parent_dir);
+                        try manager.installOrLinkPeerDependencies(metadata, installed_path, installed_path, parent_dir);
                         return installed_version;
                     }
                 }
