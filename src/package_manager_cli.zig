@@ -6953,14 +6953,14 @@ const Manager = struct {
                 try manager.installedPackageMatches(destination, resolved.name, resolved.version) and
                 try manager.packagePatchStateMatches(destination, protocol_patch_paths);
             if (!installed) {
-                const archive = prefetched_archive orelse
-                    try manager.fetchRegistryArchive(resolved.archive(), fetch_log_level);
-                deletePath(manager.init_data.io, destination);
-                try std.Io.Dir.cwd().createDirPath(manager.init_data.io, destination);
-                var destination_dir = try std.Io.Dir.cwd().openDir(manager.init_data.io, destination, .{});
-                defer destination_dir.close(manager.init_data.io);
-                try extractTarballArchive(manager.init_data.io, manager.allocator, destination_dir, archive);
-                try manager.applyPackagePatch(resolved.name, resolved.version, destination, protocol_patch_paths);
+                const patch_paths = try manager.packagePatchPaths(resolved.name, resolved.version, protocol_patch_paths);
+                try manager.materializeRegistryArchive(
+                    resolved.archive(),
+                    destination,
+                    patch_paths,
+                    fetch_log_level,
+                    prefetched_archive,
+                );
             }
             try manager.ensureIsolatedLinks(alias, parent_dir, destination);
             try manager.linkBins(alias, destination, package_metadata, direct, parent_dir);
@@ -7222,19 +7222,20 @@ const Manager = struct {
                             try resolveRegistryTarballURL(manager.allocator, registry.url, package.source)
                         else
                             try manager.defaultTarballURL(package.name, package.version);
-                        const archive = try manager.fetchRegistryArchive(.{
+                        const archive_request: RegistryArchive = .{
                             .name = package.name,
                             .version = package.version,
                             .tarball = tarball_url,
                             .integrity = if (package.integrity.len > 0) package.integrity else null,
                             .authorization = manager.authorizationForPackageURL(package.name, tarball_url),
-                        }, if (optional) .warn else .err);
-                        deletePath(manager.init_data.io, selection.destination);
-                        try std.Io.Dir.cwd().createDirPath(manager.init_data.io, selection.destination);
-                        var destination_dir = try std.Io.Dir.cwd().openDir(manager.init_data.io, selection.destination, .{});
-                        defer destination_dir.close(manager.init_data.io);
-                        try extractTarballArchive(manager.init_data.io, manager.allocator, destination_dir, archive);
-                        try manager.applyPatchPaths(selection.destination, patch_paths);
+                        };
+                        try manager.materializeRegistryArchive(
+                            archive_request,
+                            selection.destination,
+                            patch_paths,
+                            if (optional) .warn else .err,
+                            null,
+                        );
                         try manager.countRegistryInstall(package.name, package.version, tarball_url);
                     }
                     try manager.ensureIsolatedLinks(alias, parent_dir, selection.destination);
@@ -9555,6 +9556,75 @@ const Manager = struct {
         const source_hash = std.hash.Wyhash.hash(0, tarball_url);
         const filename = try std.fmt.allocPrint(manager.allocator, "{s}-{x}.tgz", .{ version_value, source_hash });
         return try std.fs.path.join(manager.allocator, &.{ package_cache, filename });
+    }
+
+    fn registryURLHostname(manager: *Manager, registry_url: []const u8) ?[]const u8 {
+        _ = manager;
+        const scheme_end = std.mem.indexOf(u8, registry_url, "://") orelse return null;
+        const authority_start = scheme_end + 3;
+        const authority_end = std.mem.indexOfAnyPos(u8, registry_url, authority_start, "/?#") orelse registry_url.len;
+        var authority = registry_url[authority_start..authority_end];
+        if (std.mem.lastIndexOfScalar(u8, authority, '@')) |index| authority = authority[index + 1 ..];
+        if (authority.len == 0) return null;
+        if (authority[0] == '[') {
+            const end = std.mem.indexOfScalar(u8, authority, ']') orelse return null;
+            return authority[1..end];
+        }
+        const port = std.mem.indexOfScalar(u8, authority, ':') orelse authority.len;
+        return if (port > 0) authority[0..port] else null;
+    }
+
+    fn registryExtractedCachePath(manager: *Manager, name: []const u8, version_value: []const u8) !?[]const u8 {
+        const cache_dir = manager.cache_directory orelse return null;
+        const parsed = Semver.Version.parseUTF8(version_value);
+        if (!parsed.valid) return null;
+
+        const registry = manager.registryConfigForPackage(name);
+        const custom_registry = !std.mem.eql(u8, registry.url, default_registry);
+        var basename_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const basename = compiler.install.PackageManager.cachedNPMPackageFolderPrintBasename(
+            &basename_buffer,
+            name,
+            parsed.version.min(),
+            null,
+            !custom_registry,
+        );
+        if (!custom_registry) return try std.fs.path.join(manager.allocator, &.{ cache_dir, basename });
+
+        const hostname = manager.registryURLHostname(registry.url) orelse return null;
+        const custom_basename = try std.fmt.allocPrint(manager.allocator, "{s}@@{s}@@@1", .{ basename, hostname });
+        return try std.fs.path.join(manager.allocator, &.{ cache_dir, custom_basename });
+    }
+
+    fn materializeRegistryArchive(
+        manager: *Manager,
+        package: RegistryArchive,
+        destination: []const u8,
+        patch_paths: []const []const u8,
+        log_level: FetchLogLevel,
+        prefetched_archive: ?[]const u8,
+    ) !void {
+        const cache_path = try manager.registryExtractedCachePath(package.name, package.version);
+        const cache_is_valid = if (cache_path) |path|
+            try manager.installedPackageMatches(path, package.name, package.version)
+        else
+            false;
+
+        if (!cache_is_valid) {
+            const archive = prefetched_archive orelse try manager.fetchRegistryArchive(package, log_level);
+            const extraction_path = cache_path orelse destination;
+            deletePath(manager.init_data.io, extraction_path);
+            try std.Io.Dir.cwd().createDirPath(manager.init_data.io, extraction_path);
+            var extraction_dir = try std.Io.Dir.cwd().openDir(manager.init_data.io, extraction_path, .{});
+            defer extraction_dir.close(manager.init_data.io);
+            try extractTarballArchive(manager.init_data.io, manager.allocator, extraction_dir, archive);
+        }
+
+        if (cache_path) |path| {
+            deletePath(manager.init_data.io, destination);
+            try copyDirectoryTree(manager.init_data.io, manager.allocator, path, destination);
+        }
+        try manager.applyPatchPaths(destination, patch_paths);
     }
 
     fn parseRegistryManifest(manager: *Manager, bytes: []const u8) !?*Value {
