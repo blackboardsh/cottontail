@@ -1,5 +1,11 @@
 import "./encoding.js";
 import { createReadableStdio, createWritableStdio } from "../node/stdio.js";
+import {
+  decodeBunSpawnIpc,
+  encodeBunSpawnIpc,
+  installInheritedBunIpcCodec,
+  installInheritedNodeIpc,
+} from "../internal/bun-spawn-ipc.js";
 
 const g = globalThis;
 const processStartMs = Date.now();
@@ -237,7 +243,7 @@ if (Number.isInteger(nativeIpcFd) && nativeIpcFd > 2 &&
   g.process.connected = true;
   g.process.send = (message) => {
     if (!g.process.connected) return false;
-    return cottontail.ipcSend(nativeIpcFd, `${ipcPrefix}${JSON.stringify(message)}\n`) === true;
+    return cottontail.ipcSend(nativeIpcFd, encodeBunSpawnIpc(message)) === true;
   };
   g.process.disconnect = () => {
     if (!g.process.connected) return;
@@ -267,7 +273,7 @@ if (Number.isInteger(nativeIpcFd) && nativeIpcFd > 2 &&
               ipcBuffer = ipcBuffer.slice(newlineIndex + 1);
               if (!line.startsWith(ipcPrefix)) continue;
               messageCount += 1;
-              g.process.emit("message", JSON.parse(line.slice(ipcPrefix.length)));
+              g.process.emit("message", decodeBunSpawnIpc(line));
             }
           }
         } catch (error) {
@@ -286,7 +292,7 @@ if (Number.isInteger(nativeIpcFd) && nativeIpcFd > 2 &&
   g.process.connected = true;
   g.process.send = (message) => {
     if (!g.process.connected) return false;
-    return g.process.stdout.write(`${ipcPrefix}${JSON.stringify(message)}\n`);
+    return g.process.stdout.write(encodeBunSpawnIpc(message));
   };
   g.process.disconnect = () => {
     g.process.connected = false;
@@ -304,7 +310,7 @@ if (Number.isInteger(nativeIpcFd) && nativeIpcFd > 2 &&
       ipcBuffer = ipcBuffer.slice(newlineIndex + 1);
       if (!line.startsWith(ipcPrefix)) continue;
       try {
-        g.process.emit("message", JSON.parse(line.slice(ipcPrefix.length)));
+        g.process.emit("message", decodeBunSpawnIpc(line));
       } catch (error) {
         g.process.emit("error", error);
       }
@@ -1961,6 +1967,8 @@ function installTimers() {
 }
 
 installTimers();
+installInheritedBunIpcCodec(cottontail, g.process);
+installInheritedNodeIpc(cottontail, g.process);
 installNativeProcessIpcReader?.();
 
 const spawnEventListeners = new Map();

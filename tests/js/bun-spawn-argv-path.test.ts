@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-test("Bun.spawn preserves a relative child script path in process.argv", async () => {
+test("Bun.spawn and Bun.spawnSync preserve large argv and relative script paths", async () => {
   const args = Array.from({ length: 129 }, (_, index) => `arg${index}`);
   const cwd = mkdtempSync(join(tmpdir(), "cottontail-spawn-argv-"));
   const scriptName = "bun-spawn-argv-child.js";
@@ -32,6 +32,19 @@ test("Bun.spawn preserves a relative child script path in process.argv", async (
   expect(argv[0]).toBe(execPath);
   expect(argv[1]).toEndWith(scriptName);
   expect(argv.slice(2)).toEqual(args);
+
+  const syncChild = Bun.spawnSync([process.execPath, scriptName, ...args], {
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(syncChild.exitCode).toBe(0);
+  expect(syncChild.stderr.toString()).toBe("");
+  const syncResult = JSON.parse(syncChild.stdout.toString());
+  expect(syncResult.argv).toHaveLength(131);
+  expect(syncResult.argv[0]).toBe(syncResult.execPath);
+  expect(syncResult.argv[1]).toEndWith(scriptName);
+  expect(syncResult.argv.slice(2)).toEqual(args);
 });
 
 test("Bun.spawnSync reports child resource usage", () => {

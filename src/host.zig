@@ -532,6 +532,26 @@ fn createPosixSpawnPipe() std.process.SpawnError![2]c_int {
     return fds;
 }
 
+fn addPosixSpawnInheritAction(
+    actions: *c.posix_spawn_file_actions_t,
+    fd: c_int,
+) std.process.SpawnError!void {
+    if (comptime builtin.os.tag == .macos) {
+        try checkPosixSpawnResult(c.posix_spawn_file_actions_addinherit_np(actions, fd));
+    } else {
+        try checkPosixSpawnResult(c.posix_spawn_file_actions_adddup2(actions, fd, fd));
+    }
+}
+
+fn addPosixSpawnDup2Action(
+    actions: *c.posix_spawn_file_actions_t,
+    source_fd: c_int,
+    target_fd: c_int,
+) std.process.SpawnError!void {
+    if (source_fd == target_fd) return addPosixSpawnInheritAction(actions, target_fd);
+    try checkPosixSpawnResult(c.posix_spawn_file_actions_adddup2(actions, source_fd, target_fd));
+}
+
 fn addPosixSpawnStdioAction(
     actions: *c.posix_spawn_file_actions_t,
     option: std.process.SpawnOptions.StdIo,
@@ -541,10 +561,10 @@ fn addPosixSpawnStdioAction(
     input: bool,
 ) std.process.SpawnError!void {
     switch (option) {
-        .inherit => {},
+        .inherit => try addPosixSpawnInheritAction(actions, target_fd),
         .file => |file| {
             const source_fd: c_int = if (action_fd >= 0) action_fd else @intCast(file.handle);
-            if (source_fd != target_fd) try checkPosixSpawnResult(c.posix_spawn_file_actions_adddup2(actions, source_fd, target_fd));
+            try addPosixSpawnDup2Action(actions, source_fd, target_fd);
         },
         .ignore => try checkPosixSpawnResult(c.posix_spawn_file_actions_addopen(
             actions,
@@ -553,7 +573,7 @@ fn addPosixSpawnStdioAction(
             if (input) c.O_RDONLY else c.O_WRONLY,
             0,
         )),
-        .pipe => try checkPosixSpawnResult(c.posix_spawn_file_actions_adddup2(actions, pipe_fd, target_fd)),
+        .pipe => try addPosixSpawnDup2Action(actions, pipe_fd, target_fd),
         .close => try checkPosixSpawnResult(c.posix_spawn_file_actions_addclose(actions, target_fd)),
     }
 }

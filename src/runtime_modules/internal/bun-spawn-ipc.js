@@ -1,9 +1,10 @@
-import { deserialize, serialize } from "../node/v8.js";
+import { deserializeJscValue, serializeJscValue } from "./jsc-value-serialization.js";
 
 const ipcPrefix = "__COTTONTAIL_IPC__";
 const advancedPrefix = "A:";
 const jsonPrefix = "J:";
 const advancedEnvelopeKey = "__cottontailBunSpawnIpcAdvanced";
+const inheritedNodeIpcSymbol = Symbol.for("cottontail.inheritedNodeIpc");
 
 function invalidIpcMessage(message) {
   if (message === undefined) {
@@ -31,7 +32,7 @@ function validateBunIpcMessage(message) {
 
 function encodeAdvancedMessage(message) {
   try {
-    return serialize(message).toString("base64");
+    return Buffer.from(serializeJscValue(message)).toString("base64");
   } catch (error) {
     if (!String(error?.message ?? error).includes("Unserializable value")) throw error;
     const cloneError = new Error("The object can not be cloned.");
@@ -40,19 +41,12 @@ function encodeAdvancedMessage(message) {
   }
 }
 
-function advancedEnvelope(message) {
-  return {
-    [advancedEnvelopeKey]: 1,
-    data: encodeAdvancedMessage(message),
-  };
-}
-
 function decodeAdvancedEnvelope(message) {
   if (message == null || typeof message !== "object" || message[advancedEnvelopeKey] !== 1 ||
       typeof message.data !== "string") {
     return message;
   }
-  return deserialize(Buffer.from(message.data, "base64"));
+  return deserializeJscValue(Buffer.from(message.data, "base64"));
 }
 
 export function encodeBunSpawnIpc(message, nodeProtocol = false, serialization = undefined) {
@@ -67,9 +61,7 @@ export function encodeBunSpawnIpc(message, nodeProtocol = false, serialization =
     return `${JSON.stringify(message)}\n`;
   }
   if (mode === "advanced") {
-    // Keep the outer frame valid JSON because Cottontail's earliest process
-    // bootstrap owns the inherited fd before Bun's full IPC codec is loaded.
-    return `${ipcPrefix}${JSON.stringify(advancedEnvelope(message))}\n`;
+    return `${ipcPrefix}${advancedPrefix}${encodeAdvancedMessage(message)}\n`;
   }
   return `${ipcPrefix}${jsonPrefix}${JSON.stringify(message)}\n`;
 }
@@ -78,7 +70,7 @@ export function decodeBunSpawnIpc(line) {
   let text = String(line);
   if (text.startsWith(ipcPrefix)) text = text.slice(ipcPrefix.length);
   if (text.startsWith(advancedPrefix)) {
-    return deserialize(Buffer.from(text.slice(advancedPrefix.length), "base64"));
+    return deserializeJscValue(Buffer.from(text.slice(advancedPrefix.length), "base64"));
   }
   if (text.startsWith(jsonPrefix)) text = text.slice(jsonPrefix.length);
   return decodeAdvancedEnvelope(JSON.parse(text));
@@ -88,10 +80,10 @@ export function isCottontailIpcFrame(line) {
   return String(line).startsWith(ipcPrefix);
 }
 
-// bun/ffi.js installs a minimal JSON process channel before bun/index.js and
-// this module are evaluated. Upgrade that channel in place: the original fd
-// reader remains the sole reader, while advanced envelopes are decoded before
-// user message listeners run and process.send emits matching envelopes.
+// bun/ffi.js installs a process channel before user code runs, then invokes
+// this codec once Buffer and the process bootstrap are ready. Keep the original
+// fd reader as the sole reader while upgrading process.send and retaining
+// legacy JSON-envelope decoding for children from older Cottontail builds.
 export function installInheritedBunIpcCodec(host, processObject = globalThis.process) {
   if (processObject == null || processObject.env?.COTTONTAIL_IPC_BOOTSTRAP === "node") return false;
   const fd = Number(processObject.env?.COTTONTAIL_IPC_FD);
@@ -160,13 +152,16 @@ function validateNodeIpcMessage(message, argumentCount) {
   throw error;
 }
 
-// A Cottontail process launched by node:child_process receives an inherited
-// NODE_CHANNEL_FD instead of COTTONTAIL_IPC_FD. Install the JSON channel during
-// Bun runtime initialization so process.send works without requiring
-// node:child_process from the child entrypoint.
+// Install child_process IPC during runtime initialization so process.send works
+// without requiring node:child_process from the child entrypoint. Cottontail
+// children use native framed IPC; external Node children use its JSON channel.
 export function installInheritedNodeIpc(host, processObject = globalThis.process) {
   if (processObject == null || typeof processObject.send === "function") return false;
-  const fd = Number(processObject.env?.NODE_CHANNEL_FD);
+  const nativeFd = Number(processObject.env?.COTTONTAIL_IPC_FD);
+  const nodeFd = Number(processObject.env?.NODE_CHANNEL_FD);
+  const nativeProtocol = processObject.env?.COTTONTAIL_IPC_BOOTSTRAP === "node" &&
+    Number.isInteger(nativeFd) && nativeFd > 2;
+  const fd = nativeProtocol ? nativeFd : nodeFd;
   if (!Number.isInteger(fd) || fd <= 2 || typeof host?.ipcSend !== "function" || typeof host?.ipcRecv !== "function") {
     return false;
   }
@@ -174,10 +169,14 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
   // COTTONTAIL-COMPAT: Node advanced IPC uses V8's binary ValueSerializer
   // framing. The inherited bridge remains JSON-compatible; the native process
   // hook must expose Node's binary framing for cross-runtime advanced mode.
-  const serialization = processObject.env?.NODE_CHANNEL_SERIALIZATION_MODE === "advanced" ? "advanced" : "json";
+  const serializationMode = nativeProtocol
+    ? processObject.env?.COTTONTAIL_IPC_SERIALIZATION
+    : processObject.env?.NODE_CHANNEL_SERIALIZATION_MODE;
+  const serialization = serializationMode === "advanced" ? "advanced" : "json";
   let connected = true;
   let buffer = "";
   let timer = null;
+  const wrappedMethods = [];
   const decoder = new TextDecoder();
   const channelEvents = new Set(["message", "disconnect", "internalMessage"]);
 
@@ -192,7 +191,14 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
     },
   };
 
-  const close = (emitDisconnect = true) => {
+  const restoreProcessMethods = () => {
+    for (const [name, original, wrapper] of wrappedMethods) {
+      if (processObject[name] === wrapper) processObject[name] = original;
+    }
+    wrappedMethods.length = 0;
+  };
+
+  const close = (emitDisconnect = true, closeFd = true) => {
     if (!connected) return;
     connected = false;
     processObject.connected = false;
@@ -202,7 +208,13 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
     }
     processObject.channel = null;
     processObject._channel = null;
-    try { host.closeFd?.(fd); } catch {}
+    restoreProcessMethods();
+    if (nativeProtocol) {
+      try { delete processObject[inheritedNodeIpcSymbol]; } catch {}
+    }
+    if (closeFd) {
+      try { host.closeFd?.(fd); } catch {}
+    }
     if (emitDisconnect) processObject.emit?.("disconnect");
   };
 
@@ -252,9 +264,9 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
     }
     let ok = false;
     try {
-      // JSON is also the intentional fallback for advanced mode until the
-      // native serializer hook described above exists.
-      ok = host.ipcSend(fd, encodeBunSpawnIpc(message, true)) === true;
+      // External Node advanced IPC requires V8's binary wire format. Native
+      // Cottontail children use the stock-JSC structured value codec instead.
+      ok = host.ipcSend(fd, encodeBunSpawnIpc(message, !nativeProtocol, serialization)) === true;
     } catch (error) {
       if (typeof callback === "function") queueMicrotask(() => callback(error));
       else queueMicrotask(() => processObject.emit?.("error", error));
@@ -276,20 +288,38 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
   for (const methodName of ["on", "addListener", "once", "prependListener", "prependOnceListener"]) {
     const original = processObject[methodName];
     if (typeof original !== "function") continue;
-    processObject[methodName] = function (name, ...args) {
+    const wrapper = function (name, ...args) {
       const result = original.call(this, name, ...args);
       if (channelEvents.has(name)) channel.ref();
       return result;
     };
+    processObject[methodName] = wrapper;
+    wrappedMethods.push([methodName, original, wrapper]);
   }
   for (const methodName of ["off", "removeListener", "removeAllListeners"]) {
     const original = processObject[methodName];
     if (typeof original !== "function") continue;
-    processObject[methodName] = function (name, ...args) {
+    const wrapper = function (name, ...args) {
       const result = original.call(this, name, ...args);
       if (name === undefined || channelEvents.has(name)) updateChannelRef();
       return result;
     };
+    processObject[methodName] = wrapper;
+    wrappedMethods.push([methodName, original, wrapper]);
+  }
+
+  if (nativeProtocol) {
+    Object.defineProperty(processObject, inheritedNodeIpcSymbol, {
+      value: {
+        detach() {
+          const pending = buffer;
+          buffer = "";
+          close(false, false);
+          return { buffer: pending };
+        },
+      },
+      configurable: true,
+    });
   }
 
   // Match Node: these variables configure bootstrap and are not left in the
@@ -299,5 +329,3 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
   processObject.channel.serializationMode = serialization;
   return true;
 }
-
-installInheritedBunIpcCodec(globalThis.cottontail, globalThis.process);

@@ -860,6 +860,8 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
         stderr: stderrSourceFd ?? stderrMode,
         ipc: ipcRequested,
         argv0: options.argv0 != null ? String(options.argv0) : undefined,
+        windowsHide: options.windowsHide === true,
+        windowsVerbatimArguments: options.windowsVerbatimArguments === true,
         deferStart,
       });
       child.pid = native.pid ?? 0;
@@ -1128,6 +1130,7 @@ execFile[kChildProcessPromisify] = (file, args = undefined, options = undefined)
 
 const ipcPrefix = "__COTTONTAIL_IPC__";
 const ipcEnvelopeKey = "__cottontailIpcEnvelope";
+const inheritedNodeIpcSymbol = Symbol.for("cottontail.inheritedNodeIpc");
 
 function encodeIpcMessage(message, mode = "json") {
   if (mode === "advanced") return `A:${serialize(message).toString("base64")}`;
@@ -1293,9 +1296,9 @@ function writeNativeIpc(fd, message, mode, sendHandle = undefined, finish = unde
   return ok;
 }
 
-function installNativeIpcReader(fd, onFrame, onDisconnect, onError, closeFd = true) {
+function installNativeIpcReader(fd, onFrame, onDisconnect, onError, closeFd = true, initialBuffer = "") {
   if (!Number.isInteger(fd) || fd < 0 || typeof cottontail.ipcRecv !== "function") return null;
-  let buffer = "";
+  let buffer = String(initialBuffer ?? "");
   let closed = false;
   let timer = null;
   const poll = () => {
@@ -1625,7 +1628,9 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
     throw new TypeError(`Unknown child_process serialization mode: ${serializationMode}`);
   }
   const processObject = globalThis.process;
-  if (!processObject || typeof processObject.send === "function") return;
+  const inheritedIpc = processObject?.[inheritedNodeIpcSymbol];
+  if (!processObject || (typeof processObject.send === "function" && inheritedIpc == null)) return;
+  const inheritedState = inheritedIpc?.detach?.();
   const nativeFd = Number(processObject.env?.COTTONTAIL_IPC_FD ?? fd);
   const hasNativeIpc = Number.isInteger(nativeFd) && nativeFd > 2 && typeof cottontail.ipcSend === "function" && typeof cottontail.ipcRecv === "function";
 
@@ -1679,6 +1684,8 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
         if (processObject.connected) processObject.disconnect();
       },
       (error) => processObject.emit?.("error", error),
+      true,
+      inheritedState?.buffer,
     );
     stopNativeIpc = reader == null ? null : () => reader.close();
     if (reader != null) {

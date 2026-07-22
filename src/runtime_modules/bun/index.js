@@ -67,6 +67,7 @@ import {
 import {
   decodeBunSpawnIpc,
   encodeBunSpawnIpc,
+  installInheritedBunIpcCodec,
   installInheritedNodeIpc,
   isCottontailIpcFrame,
 } from "../internal/bun-spawn-ipc.js";
@@ -84,6 +85,7 @@ if (globalThis.process && Object.prototype.toString.call(globalThis.process) !==
   });
 }
 
+installInheritedBunIpcCodec(cottontail);
 installInheritedNodeIpc(cottontail);
 
 const inheritedSpawnArgv0 = globalThis.process?.env?.COTTONTAIL_SPAWN_ARGV0;

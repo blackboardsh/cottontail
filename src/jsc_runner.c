@@ -17404,6 +17404,19 @@ static void ct_process_close_stdio_action_fds(const int source_fds[3], int actio
     }
 }
 
+static int ct_process_add_inherit_action(posix_spawn_file_actions_t *actions, int fd) {
+#if defined(__APPLE__)
+    return posix_spawn_file_actions_addinherit_np(actions, fd);
+#else
+    return posix_spawn_file_actions_adddup2(actions, fd, fd);
+#endif
+}
+
+static int ct_process_add_dup2_action(posix_spawn_file_actions_t *actions, int source_fd, int target_fd) {
+    if (source_fd == target_fd) return ct_process_add_inherit_action(actions, target_fd);
+    return posix_spawn_file_actions_adddup2(actions, source_fd, target_fd);
+}
+
 static void ct_process_close_extra_stdio(CtProcessExtraStdio *entries, size_t count, bool close_parent) {
     for (size_t index = 0; index < count; index += 1) {
         if (entries[index].action_source_fd >= 0 && entries[index].action_source_fd != entries[index].source_fd) {
@@ -18443,9 +18456,10 @@ static bool ct_windows_command_append_char(CtWindowsCommandLine *command, char v
     return ct_windows_command_append(command, &value, 1);
 }
 
-static bool ct_windows_command_append_arg(CtWindowsCommandLine *command, const char *arg) {
+static bool ct_windows_command_append_arg(CtWindowsCommandLine *command, const char *arg, bool verbatim) {
     if (command->len > 0 && !ct_windows_command_append_char(command, ' ')) return false;
     size_t len = strlen(arg);
+    if (verbatim) return ct_windows_command_append(command, arg, len);
     bool quote = len == 0 || strpbrk(arg, " \t\n\v\"") != NULL;
     if (!quote) return ct_windows_command_append(command, arg, len);
     if (!ct_windows_command_append_char(command, '\"')) return false;
@@ -18553,6 +18567,19 @@ static int ct_windows_handle_to_fd(HANDLE handle, int flags) {
     return fd;
 }
 
+static HANDLE ct_windows_duplicate_inheritable_handle(int source_fd, DWORD standard_handle) {
+    HANDLE source = source_fd >= 0
+        ? (HANDLE)_get_osfhandle(source_fd)
+        : GetStdHandle(standard_handle);
+    if (source == NULL || source == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
+    HANDLE duplicate = NULL;
+    HANDLE process = GetCurrentProcess();
+    if (!DuplicateHandle(process, source, process, &duplicate, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
+        return INVALID_HANDLE_VALUE;
+    }
+    return duplicate;
+}
+
 static bool ct_windows_spawn_process(
     const char *file,
     char *const *args,
@@ -18569,6 +18596,8 @@ static bool ct_windows_spawn_process(
     int stdout_source_fd,
     int stderr_source_fd,
     bool detached,
+    bool windows_hide,
+    bool windows_verbatim_arguments,
     bool suspended,
     HANDLE *process_out,
     HANDLE *thread_out,
@@ -18585,9 +18614,12 @@ static bool ct_windows_spawn_process(
     *stderr_fd_out = -1;
 
     CtWindowsCommandLine command = { 0 };
-    if (!ct_windows_command_append_arg(&command, argv0 != NULL && argv0[0] != '\0' ? argv0 : file)) goto fail;
+    if (!ct_windows_command_append_arg(
+            &command,
+            argv0 != NULL && argv0[0] != '\0' ? argv0 : file,
+            windows_verbatim_arguments)) goto fail;
     for (size_t index = 0; index < arg_count; index += 1) {
-        if (!ct_windows_command_append_arg(&command, args[index])) goto fail;
+        if (!ct_windows_command_append_arg(&command, args[index], windows_verbatim_arguments)) goto fail;
     }
     WCHAR *file_wide = ct_windows_utf8_to_wide(file);
     WCHAR *command_wide = ct_windows_utf8_to_wide(command.data);
@@ -18604,19 +18636,18 @@ static bool ct_windows_spawn_process(
     if (stdin_mode == CT_PROCESS_STDIO_PIPE && !ct_windows_create_pipe(&parent_stdin, &child_stdin, true)) goto handles_fail;
     if (stdout_mode == CT_PROCESS_STDIO_PIPE && !ct_windows_create_pipe(&parent_stdout, &child_stdout, false)) goto handles_fail;
     if (stderr_mode == CT_PROCESS_STDIO_PIPE && !ct_windows_create_pipe(&parent_stderr, &child_stderr, false)) goto handles_fail;
-    if (stdin_mode == CT_PROCESS_STDIO_INHERIT) child_stdin = stdin_source_fd >= 0
-        ? (HANDLE)_get_osfhandle(stdin_source_fd)
-        : GetStdHandle(STD_INPUT_HANDLE);
-    else if (stdin_mode == CT_PROCESS_STDIO_IGNORE) child_stdin = ct_windows_null_handle(GENERIC_READ);
-    if (stdout_mode == CT_PROCESS_STDIO_INHERIT) child_stdout = stdout_source_fd >= 0
-        ? (HANDLE)_get_osfhandle(stdout_source_fd)
-        : GetStdHandle(STD_OUTPUT_HANDLE);
-    else if (stdout_mode == CT_PROCESS_STDIO_IGNORE) child_stdout = ct_windows_null_handle(GENERIC_WRITE);
-    if (stderr_mode == CT_PROCESS_STDIO_INHERIT) child_stderr = stderr_source_fd >= 0
-        ? (HANDLE)_get_osfhandle(stderr_source_fd)
-        : GetStdHandle(STD_ERROR_HANDLE);
-    else if (stderr_mode == CT_PROCESS_STDIO_IGNORE) child_stderr = ct_windows_null_handle(GENERIC_WRITE);
-    if (child_stdin == INVALID_HANDLE_VALUE || child_stdout == INVALID_HANDLE_VALUE || child_stderr == INVALID_HANDLE_VALUE) goto handles_fail;
+    if (stdin_mode == CT_PROCESS_STDIO_INHERIT) {
+        child_stdin = ct_windows_duplicate_inheritable_handle(stdin_source_fd, STD_INPUT_HANDLE);
+    } else if (stdin_mode == CT_PROCESS_STDIO_IGNORE) child_stdin = ct_windows_null_handle(GENERIC_READ);
+    if (stdout_mode == CT_PROCESS_STDIO_INHERIT) {
+        child_stdout = ct_windows_duplicate_inheritable_handle(stdout_source_fd, STD_OUTPUT_HANDLE);
+    } else if (stdout_mode == CT_PROCESS_STDIO_IGNORE) child_stdout = ct_windows_null_handle(GENERIC_WRITE);
+    if (stderr_mode == CT_PROCESS_STDIO_INHERIT) {
+        child_stderr = ct_windows_duplicate_inheritable_handle(stderr_source_fd, STD_ERROR_HANDLE);
+    } else if (stderr_mode == CT_PROCESS_STDIO_IGNORE) child_stderr = ct_windows_null_handle(GENERIC_WRITE);
+    if (child_stdin == NULL || child_stdin == INVALID_HANDLE_VALUE ||
+        child_stdout == NULL || child_stdout == INVALID_HANDLE_VALUE ||
+        child_stderr == NULL || child_stderr == INVALID_HANDLE_VALUE) goto handles_fail;
 
     STARTUPINFOW startup;
     PROCESS_INFORMATION process_info;
@@ -18628,13 +18659,13 @@ static bool ct_windows_spawn_process(
     startup.hStdOutput = child_stdout;
     startup.hStdError = child_stderr;
     DWORD flags = CREATE_UNICODE_ENVIRONMENT |
-        (detached ? CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS : CREATE_NO_WINDOW) |
+        (detached ? CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS : (windows_hide ? CREATE_NO_WINDOW : 0)) |
         (suspended ? CREATE_SUSPENDED : 0);
     BOOL created = CreateProcessW(file_wide, command_wide, NULL, NULL, TRUE, flags, environment, cwd_wide, &startup, &process_info);
 
-    if (stdin_mode != CT_PROCESS_STDIO_INHERIT && child_stdin != NULL) CloseHandle(child_stdin);
-    if (stdout_mode != CT_PROCESS_STDIO_INHERIT && child_stdout != NULL) CloseHandle(child_stdout);
-    if (stderr_mode != CT_PROCESS_STDIO_INHERIT && child_stderr != NULL) CloseHandle(child_stderr);
+    CloseHandle(child_stdin);
+    CloseHandle(child_stdout);
+    CloseHandle(child_stderr);
     free(file_wide); free(command_wide); free(cwd_wide); free(environment); free(command.data);
     if (!created) {
         if (parent_stdin != NULL) CloseHandle(parent_stdin);
@@ -18655,9 +18686,9 @@ handles_fail:
     if (parent_stdin != NULL) CloseHandle(parent_stdin);
     if (parent_stdout != NULL) CloseHandle(parent_stdout);
     if (parent_stderr != NULL) CloseHandle(parent_stderr);
-    if (stdin_mode != CT_PROCESS_STDIO_INHERIT && child_stdin != NULL && child_stdin != INVALID_HANDLE_VALUE) CloseHandle(child_stdin);
-    if (stdout_mode != CT_PROCESS_STDIO_INHERIT && child_stdout != NULL && child_stdout != INVALID_HANDLE_VALUE) CloseHandle(child_stdout);
-    if (stderr_mode != CT_PROCESS_STDIO_INHERIT && child_stderr != NULL && child_stderr != INVALID_HANDLE_VALUE) CloseHandle(child_stderr);
+    if (child_stdin != NULL && child_stdin != INVALID_HANDLE_VALUE) CloseHandle(child_stdin);
+    if (child_stdout != NULL && child_stdout != INVALID_HANDLE_VALUE) CloseHandle(child_stdout);
+    if (child_stderr != NULL && child_stderr != INVALID_HANDLE_VALUE) CloseHandle(child_stderr);
     free(file_wide); free(command_wide); free(cwd_wide); free(environment);
 fail:
     free(command.data);
@@ -19145,6 +19176,8 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     bool ipc_enabled = false;
     bool node_ipc_protocol = false;
     bool defer_start = false;
+    bool windows_hide = false;
+    bool windows_verbatim_arguments = false;
     int terminal_fd = -1;
     CtProcessStdioMode stdin_mode = CT_PROCESS_STDIO_IGNORE;
     CtProcessStdioMode stdout_mode = CT_PROCESS_STDIO_PIPE;
@@ -19171,6 +19204,8 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         JSValueRef node_ipc_value = ct_get_property(ctx, options, "nodeIpc", exception);
         JSValueRef argv0_value = ct_get_property(ctx, options, "argv0", exception);
         JSValueRef defer_start_value = ct_get_property(ctx, options, "deferStart", exception);
+        JSValueRef windows_hide_value = ct_get_property(ctx, options, "windowsHide", exception);
+        JSValueRef windows_verbatim_value = ct_get_property(ctx, options, "windowsVerbatimArguments", exception);
         JSValueRef terminal_fd_value = ct_get_property(ctx, options, "terminalFd", exception);
         JSValueRef extra_stdio_value = ct_get_property(ctx, options, "extraStdio", exception);
         if (exception != NULL && *exception != NULL) {
@@ -19183,6 +19218,8 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         ipc_enabled = JSValueToBoolean(ctx, ipc_value);
         node_ipc_protocol = JSValueToBoolean(ctx, node_ipc_value);
         defer_start = JSValueToBoolean(ctx, defer_start_value);
+        windows_hide = JSValueToBoolean(ctx, windows_hide_value);
+        windows_verbatim_arguments = JSValueToBoolean(ctx, windows_verbatim_value);
         argv0 = ct_value_to_optional_string(ctx, argv0_value);
         if (!JSValueIsUndefined(ctx, terminal_fd_value) && !JSValueIsNull(ctx, terminal_fd_value) &&
             !ct_value_to_int_checked(ctx, terminal_fd_value, 0, INT_MAX, &terminal_fd, exception, "invalid terminal file descriptor")) {
@@ -19275,7 +19312,8 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     if (!ct_windows_spawn_process(file, args, arg_count, argv0, cwd, env_entries, env_count, clear_env,
                                   stdin_mode, stdout_mode, stderr_mode,
                                   stdin_source_fd, stdout_source_fd, stderr_source_fd,
-                                  false, defer_start, &process_handle, &start_thread, &pid,
+                                  false, windows_hide, windows_verbatim_arguments, defer_start,
+                                  &process_handle, &start_thread, &pid,
                                   &stdin_fd, &stdout_fd, &stderr_fd)) {
         ct_throw_message(ctx, exception, "CreateProcessW failed");
         free(file);
@@ -19554,28 +19592,31 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
 
         if (cwd != NULL) posix_spawn_file_actions_addchdir_np(&spawn_actions, cwd);
         if (terminal_fd >= 0) {
-            posix_spawn_file_actions_adddup2(&spawn_actions, terminal_fd, STDIN_FILENO);
-            posix_spawn_file_actions_adddup2(&spawn_actions, terminal_fd, STDOUT_FILENO);
-            posix_spawn_file_actions_adddup2(&spawn_actions, terminal_fd, STDERR_FILENO);
+            ct_process_add_dup2_action(&spawn_actions, terminal_fd, STDIN_FILENO);
+            ct_process_add_dup2_action(&spawn_actions, terminal_fd, STDOUT_FILENO);
+            ct_process_add_dup2_action(&spawn_actions, terminal_fd, STDERR_FILENO);
         } else {
             if (stdin_mode == CT_PROCESS_STDIO_PIPE && stdin_pipe[0] >= 0) {
-                posix_spawn_file_actions_adddup2(&spawn_actions, stdin_pipe[0], STDIN_FILENO);
-            } else if (stdin_mode == CT_PROCESS_STDIO_INHERIT && stdin_source_fd >= 0 && stdin_source_fd != STDIN_FILENO) {
-                posix_spawn_file_actions_adddup2(&spawn_actions, stdio_action_fds[0], STDIN_FILENO);
+                ct_process_add_dup2_action(&spawn_actions, stdin_pipe[0], STDIN_FILENO);
+            } else if (stdin_mode == CT_PROCESS_STDIO_INHERIT) {
+                int source_fd = stdin_source_fd >= 0 ? stdio_action_fds[0] : STDIN_FILENO;
+                ct_process_add_dup2_action(&spawn_actions, source_fd, STDIN_FILENO);
             } else if (stdin_mode != CT_PROCESS_STDIO_INHERIT) {
                 posix_spawn_file_actions_addopen(&spawn_actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
             }
             if (stdout_mode == CT_PROCESS_STDIO_PIPE && stdout_pipe[1] >= 0) {
-                posix_spawn_file_actions_adddup2(&spawn_actions, stdout_pipe[1], STDOUT_FILENO);
-            } else if (stdout_mode == CT_PROCESS_STDIO_INHERIT && stdout_source_fd >= 0 && stdout_source_fd != STDOUT_FILENO) {
-                posix_spawn_file_actions_adddup2(&spawn_actions, stdio_action_fds[1], STDOUT_FILENO);
+                ct_process_add_dup2_action(&spawn_actions, stdout_pipe[1], STDOUT_FILENO);
+            } else if (stdout_mode == CT_PROCESS_STDIO_INHERIT) {
+                int source_fd = stdout_source_fd >= 0 ? stdio_action_fds[1] : STDOUT_FILENO;
+                ct_process_add_dup2_action(&spawn_actions, source_fd, STDOUT_FILENO);
             } else if (stdout_mode != CT_PROCESS_STDIO_INHERIT) {
                 posix_spawn_file_actions_addopen(&spawn_actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
             }
             if (stderr_mode == CT_PROCESS_STDIO_PIPE && stderr_pipe[1] >= 0) {
-                posix_spawn_file_actions_adddup2(&spawn_actions, stderr_pipe[1], STDERR_FILENO);
-            } else if (stderr_mode == CT_PROCESS_STDIO_INHERIT && stderr_source_fd >= 0 && stderr_source_fd != STDERR_FILENO) {
-                posix_spawn_file_actions_adddup2(&spawn_actions, stdio_action_fds[2], STDERR_FILENO);
+                ct_process_add_dup2_action(&spawn_actions, stderr_pipe[1], STDERR_FILENO);
+            } else if (stderr_mode == CT_PROCESS_STDIO_INHERIT) {
+                int source_fd = stderr_source_fd >= 0 ? stdio_action_fds[2] : STDERR_FILENO;
+                ct_process_add_dup2_action(&spawn_actions, source_fd, STDERR_FILENO);
             } else if (stderr_mode != CT_PROCESS_STDIO_INHERIT) {
                 posix_spawn_file_actions_addopen(&spawn_actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
             }
@@ -19583,10 +19624,10 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         for (size_t index = 0; index < extra_stdio_count; index += 1) {
             CtProcessExtraStdio *entry = &extra_stdio[index];
             if (entry->mode == CT_PROCESS_STDIO_PIPE) {
-                posix_spawn_file_actions_adddup2(&spawn_actions, entry->child_fd, entry->target_fd);
-            } else if (entry->mode == CT_PROCESS_STDIO_INHERIT &&
-                       entry->source_fd >= 0 && entry->source_fd != entry->target_fd) {
-                posix_spawn_file_actions_adddup2(&spawn_actions, entry->action_source_fd, entry->target_fd);
+                ct_process_add_dup2_action(&spawn_actions, entry->child_fd, entry->target_fd);
+            } else if (entry->mode == CT_PROCESS_STDIO_INHERIT) {
+                int source_fd = entry->source_fd >= 0 ? entry->action_source_fd : entry->target_fd;
+                ct_process_add_dup2_action(&spawn_actions, source_fd, entry->target_fd);
             } else if (entry->mode == CT_PROCESS_STDIO_IGNORE) {
                 posix_spawn_file_actions_addopen(&spawn_actions, entry->target_fd, "/dev/null", O_RDWR, 0);
             }
@@ -19621,7 +19662,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
                 posix_spawn_file_actions_addclose(&spawn_actions, ipc_socket[0]);
             }
             if (ipc_socket[1] >= 0 && ipc_socket[1] != ipc_target_fd) {
-                posix_spawn_file_actions_adddup2(&spawn_actions, ipc_socket[1], ipc_target_fd);
+                ct_process_add_dup2_action(&spawn_actions, ipc_socket[1], ipc_target_fd);
                 if (ipc_socket[1] >= safe_fd_minimum) posix_spawn_file_actions_addclose(&spawn_actions, ipc_socket[1]);
             }
         }
@@ -19987,7 +20028,8 @@ static JSValueRef ct_spawn_detached(JSContextRef ctx, JSObjectRef function, JSOb
     if (!ct_windows_spawn_process(file, args, arg_count, NULL, cwd, env_entries, env_count, clear_env,
                                   CT_PROCESS_STDIO_IGNORE, CT_PROCESS_STDIO_IGNORE, CT_PROCESS_STDIO_IGNORE,
                                   -1, -1, -1,
-                                  true, false, &process_handle, &start_thread, &pid, &stdin_fd, &stdout_fd, &stderr_fd)) {
+                                  true, false, false, false,
+                                  &process_handle, &start_thread, &pid, &stdin_fd, &stdout_fd, &stderr_fd)) {
         ct_throw_message(ctx, exception, "CreateProcessW failed");
         pid = 0;
     }

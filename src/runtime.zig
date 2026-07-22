@@ -54,10 +54,12 @@ pub const Runtime = struct {
         exec_args: []const [:0]const u8,
     ) !void {
         const arg_ptrs = try self.allocator.alloc([*c]const u8, args.len);
+        defer self.allocator.free(arg_ptrs);
         for (args, 0..) |arg, index| {
             arg_ptrs[index] = arg.ptr;
         }
         const exec_arg_ptrs = try self.allocator.alloc([*c]const u8, exec_args.len);
+        defer self.allocator.free(exec_arg_ptrs);
         for (exec_args, 0..) |arg, index| {
             exec_arg_ptrs[index] = arg.ptr;
         }

@@ -77,6 +77,20 @@ test.skipIf(process.platform === "win32")("extra pipe descriptors are exposed an
   closeSync(fd);
 });
 
+test.skipIf(process.platform === "win32")("same-slot numeric descriptors clear close-on-exec", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "cottontail-spawn-same-fd-"));
+  using cleanup = { [Symbol.dispose]: () => rmSync(directory, { recursive: true, force: true }) };
+  const outputPath = join(directory, "same-slot.txt");
+  const fd = openSync(outputPath, "w+");
+  const stdio = Array.from({ length: fd + 1 }, () => "ignore" as const);
+  stdio[fd] = fd as any;
+
+  const child = Bun.spawn(["/bin/sh", "-c", `printf same-slot >&${fd}`], { stdio });
+  expect(await child.exited).toBe(0);
+  closeSync(fd);
+  expect(readFileSync(outputPath, "utf8")).toBe("same-slot");
+});
+
 test.skipIf(process.platform === "win32")("Bun.spawn IPC launches Node directly with its requested argv0", async () => {
   let resolveMessage!: (value: { argv0: string; pid: number }) => void;
   const messagePromise = new Promise<{ argv0: string; pid: number }>((resolve) => {
