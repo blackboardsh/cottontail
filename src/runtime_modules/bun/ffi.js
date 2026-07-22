@@ -1,6 +1,7 @@
 import "./encoding.js";
 import { createReadableStdio, createWritableStdio } from "../node/stdio.js";
 import {
+  adoptBunSpawnIpcHandle,
   decodeBunSpawnIpc,
   encodeBunSpawnIpc,
   installInheritedBunIpcCodec,
@@ -288,7 +289,7 @@ g.process.stderr ??= createWritableStdio(2);
 const ipcPrefix = "__COTTONTAIL_IPC__";
 const nativeIpcFd = Number(g.process.env?.COTTONTAIL_IPC_FD);
 let installNativeProcessIpcReader = null;
-if (Number.isInteger(nativeIpcFd) && nativeIpcFd > 2 &&
+if (Number.isInteger(nativeIpcFd) && nativeIpcFd >= 0 &&
     g.process.env?.COTTONTAIL_IPC_BOOTSTRAP !== "node" &&
     typeof cottontail.ipcSend === "function" &&
     typeof g.process.send !== "function") {
@@ -298,14 +299,21 @@ if (Number.isInteger(nativeIpcFd) && nativeIpcFd > 2 &&
     return cottontail.ipcSend(nativeIpcFd, encodeBunSpawnIpc(message)) === true;
   };
   g.process.disconnect = () => {
-    if (!g.process.connected) return;
+    if (!g.process.connected) {
+      const error = new Error("IPC channel is already disconnected");
+      error.code = "ERR_IPC_DISCONNECTED";
+      throw error;
+    }
     g.process.connected = false;
-    g.process.emit("disconnect");
+    try { cottontail.closeFd?.(nativeIpcFd); } catch {}
+    queueMicrotask(() => g.process.emit("disconnect"));
   };
 
   if (typeof cottontail.ipcRecv === "function") {
     installNativeProcessIpcReader = () => {
       let ipcBuffer = "";
+      let ipcPendingFd;
+      const ipcDecoder = new TextDecoder();
       const pollIpc = () => {
         if (!g.process.connected) return 0;
         let messageCount = 0;
@@ -314,18 +322,38 @@ if (Number.isInteger(nativeIpcFd) && nativeIpcFd > 2 &&
             const event = cottontail.ipcRecv(nativeIpcFd, 64 * 1024);
             if (!event) break;
             if (event.end) {
+              if (Number.isInteger(event.fd) && event.fd >= 0) {
+                try { cottontail.closeFd?.(event.fd); } catch {}
+              }
+              if (Number.isInteger(ipcPendingFd) && ipcPendingFd >= 0) {
+                try { cottontail.closeFd?.(ipcPendingFd); } catch {}
+                ipcPendingFd = undefined;
+              }
               g.process.disconnect();
               return;
             }
-            ipcBuffer += new TextDecoder().decode(event.data ?? new ArrayBuffer(0));
+            if (Number.isInteger(event.fd) && event.fd >= 0) {
+              if (Number.isInteger(ipcPendingFd) && ipcPendingFd >= 0) {
+                try { cottontail.closeFd?.(ipcPendingFd); } catch {}
+              }
+              ipcPendingFd = Number(event.fd);
+            }
+            ipcBuffer += ipcDecoder.decode(event.data ?? new ArrayBuffer(0), { stream: true });
             for (;;) {
               const newlineIndex = ipcBuffer.indexOf("\n");
               if (newlineIndex < 0) break;
               const line = ipcBuffer.slice(0, newlineIndex).replace(/\r$/, "");
               ipcBuffer = ipcBuffer.slice(newlineIndex + 1);
-              if (!line.startsWith(ipcPrefix)) continue;
+              const frameFd = ipcPendingFd;
+              ipcPendingFd = undefined;
+              if (!line.startsWith(ipcPrefix)) {
+                if (Number.isInteger(frameFd) && frameFd >= 0) {
+                  try { cottontail.closeFd?.(frameFd); } catch {}
+                }
+                continue;
+              }
               messageCount += 1;
-              g.process.emit("message", decodeBunSpawnIpc(line));
+              g.process.emit("message", decodeBunSpawnIpc(line), adoptBunSpawnIpcHandle(cottontail, frameFd));
             }
           }
         } catch (error) {
@@ -2032,7 +2060,13 @@ function installSpawnEventHandler() {
   spawnEventHandlerInstalled = true;
   cottontail.spawnSetEventHandler?.((event) => {
     const entry = spawnEventListeners.get(Number(event?.id));
-    if (typeof entry?.listener === "function") entry.listener(event);
+    if (typeof entry?.listener === "function") {
+      entry.listener(event);
+    } else if (Number.isInteger(event?.fd) && event.fd >= 0) {
+      // Native IPC descriptor ownership transfers with the event. If its
+      // process listener has already gone away, close it here.
+      try { cottontail.closeFd?.(event.fd); } catch {}
+    }
   });
 }
 
@@ -2049,9 +2083,11 @@ g.__cottontailRegisterSpawnListener = (id, listener) => {
   };
   unregister.ref = () => {
     entry.ref = true;
+    cottontail.spawnSetReferenced?.(key, true);
   };
   unregister.unref = () => {
     entry.ref = false;
+    cottontail.spawnSetReferenced?.(key, false);
   };
   return unregister;
 };

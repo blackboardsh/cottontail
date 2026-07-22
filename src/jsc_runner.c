@@ -1398,7 +1398,11 @@ typedef struct CtAsyncProcess {
     int ipc_fd;
     bool close_stdout_requested;
     bool close_stderr_requested;
+    bool close_ipc_requested;
+    bool killed;
+    bool referenced;
     CtJscRuntime *runtime;
+    pthread_mutex_t event_mutex;
     pthread_t thread;
     bool thread_started;
 #if defined(_WIN32)
@@ -1533,6 +1537,7 @@ typedef enum {
     CT_PROCESS_STDIO_PIPE,
     CT_PROCESS_STDIO_INHERIT,
     CT_PROCESS_STDIO_IGNORE,
+    CT_PROCESS_STDIO_IPC,
 } CtProcessStdioMode;
 
 typedef struct {
@@ -20274,9 +20279,12 @@ static int ct_process_parse_stdio_value(
     } else if (strcmp(mode, "ignore") == 0) {
         *out = CT_PROCESS_STDIO_IGNORE;
         *source_fd = -1;
+    } else if (strcmp(mode, "ipc") == 0) {
+        *out = CT_PROCESS_STDIO_IPC;
+        *source_fd = -1;
     } else {
         free(mode);
-        ct_throw_message(ctx, exception, "spawn stdio must be 'pipe', 'inherit', or 'ignore'");
+        ct_throw_message(ctx, exception, "spawn stdio must be 'pipe', 'inherit', 'ignore', or 'ipc'");
         return -1;
     }
 
@@ -20523,7 +20531,20 @@ static JSValueRef ct_process_execve(JSContextRef ctx, JSObjectRef function, JSOb
     return JSValueMakeUndefined(ctx);
 }
 
+static void ct_spawn_event_destroy(CtSpawnEvent *event, bool close_received_fd) {
+    if (event == NULL) return;
+    if (close_received_fd && event->has_fd && event->received_fd >= 0) close(event->received_fd);
+    free(event->type);
+    free(event->data);
+    free(event);
+}
+
 static void ct_queue_spawn_event(CtJscRuntime *runtime, CtSpawnEvent *event) {
+    if (event == NULL) return;
+    if (runtime == NULL) {
+        ct_spawn_event_destroy(event, true);
+        return;
+    }
     pthread_mutex_lock(&runtime->spawn_event_mutex);
     if (runtime->spawn_events_tail != NULL) {
         runtime->spawn_events_tail->next = event;
@@ -20543,6 +20564,10 @@ static void ct_queue_spawn_text(CtJscRuntime *runtime, uint32_t id, const char *
     event->type = ct_duplicate_bytes(type, strlen(type));
     event->data = ct_duplicate_bytes(data, data_len);
     event->data_len = data_len;
+    if (event->type == NULL || event->data == NULL) {
+        ct_spawn_event_destroy(event, false);
+        return;
+    }
     ct_queue_spawn_event(runtime, event);
 }
 
@@ -20561,7 +20586,10 @@ static void ct_queue_spawn_simple(CtJscRuntime *runtime, uint32_t id, const char
 static void ct_queue_spawn_ipc(CtJscRuntime *runtime, uint32_t id, const char *data, size_t data_len, int received_fd) {
     if (data == NULL && received_fd < 0) return;
     CtSpawnEvent *event = (CtSpawnEvent *)calloc(1, sizeof(CtSpawnEvent));
-    if (event == NULL) return;
+    if (event == NULL) {
+        if (received_fd >= 0) close(received_fd);
+        return;
+    }
     event->process_id = id;
     event->type = ct_duplicate_bytes("ipc", 3);
     event->data = data_len > 0 ? ct_duplicate_bytes(data, data_len) : NULL;
@@ -20571,13 +20599,55 @@ static void ct_queue_spawn_ipc(CtJscRuntime *runtime, uint32_t id, const char *d
         event->has_fd = true;
     }
     if (event->type == NULL || (data_len > 0 && event->data == NULL)) {
-        free(event->type);
-        free(event->data);
-        if (received_fd >= 0) close(received_fd);
-        free(event);
+        ct_spawn_event_destroy(event, true);
         return;
     }
     ct_queue_spawn_event(runtime, event);
+}
+
+static void ct_async_process_queue_text(CtAsyncProcess *process, const char *type, const char *data, size_t data_len) {
+    pthread_mutex_lock(&process->event_mutex);
+    ct_queue_spawn_text(process->runtime, process->id, type, data, data_len);
+    pthread_mutex_unlock(&process->event_mutex);
+}
+
+static void ct_async_process_queue_simple(CtAsyncProcess *process, const char *type) {
+    pthread_mutex_lock(&process->event_mutex);
+    ct_queue_spawn_simple(process->runtime, process->id, type);
+    pthread_mutex_unlock(&process->event_mutex);
+}
+
+static void ct_async_process_queue_ipc(CtAsyncProcess *process, const char *data, size_t data_len, int received_fd) {
+    pthread_mutex_lock(&process->event_mutex);
+    ct_queue_spawn_ipc(process->runtime, process->id, data, data_len, received_fd);
+    pthread_mutex_unlock(&process->event_mutex);
+}
+
+static void ct_queue_spawn_exit(
+    CtAsyncProcess *process,
+    int exit_code,
+    int signal_code,
+    const struct rusage *resource_usage,
+    bool has_resource_usage
+) {
+    CtSpawnEvent *event = (CtSpawnEvent *)calloc(1, sizeof(CtSpawnEvent));
+    if (event == NULL) return;
+    event->process_id = process->id;
+    event->type = ct_duplicate_bytes("exit", 4);
+    event->exit_code = exit_code;
+    event->signal_code = signal_code;
+    pthread_mutex_lock(&ct_async_processes_mutex);
+    event->killed = process->killed;
+    pthread_mutex_unlock(&ct_async_processes_mutex);
+    if (resource_usage != NULL) event->resource_usage = *resource_usage;
+    event->has_resource_usage = has_resource_usage;
+    if (event->type == NULL) {
+        ct_spawn_event_destroy(event, false);
+        return;
+    }
+    pthread_mutex_lock(&process->event_mutex);
+    ct_queue_spawn_event(process->runtime, event);
+    pthread_mutex_unlock(&process->event_mutex);
 }
 
 static void ct_queue_fd_event(CtJscRuntime *runtime, CtFdEvent *event) {
@@ -21528,15 +21598,27 @@ static void ct_async_processes_stop_runtime(CtJscRuntime *runtime) {
     CtAsyncProcess *cursor = ct_async_processes;
     while (cursor != NULL) {
         if (cursor->runtime == runtime) {
-            kill(cursor->pid, SIGTERM);
+            if (!cursor->referenced) {
+                // No event may retain the runtime after this handoff: every
+                // worker queue operation holds event_mutex while reading it.
+                pthread_mutex_lock(&cursor->event_mutex);
+                cursor->runtime = NULL;
+                pthread_mutex_unlock(&cursor->event_mutex);
+                cursor->close_stdout_requested = true;
+                cursor->close_stderr_requested = true;
+                cursor->close_ipc_requested = true;
+            } else {
+                kill(cursor->pid, SIGTERM);
+            }
             if (cursor->stdin_fd >= 0) {
                 close(cursor->stdin_fd);
                 cursor->stdin_fd = -1;
             }
-            if (cursor->ipc_fd >= 0) {
-                close(cursor->ipc_fd);
-                cursor->ipc_fd = -1;
-            }
+#if defined(_WIN32)
+            if (cursor->wake_event != NULL) SetEvent(cursor->wake_event);
+#else
+            if (cursor->wake_write_fd >= 0) (void)write(cursor->wake_write_fd, "x", 1);
+#endif
         }
         cursor = cursor->next;
     }
@@ -21549,6 +21631,31 @@ static void ct_async_processes_wait_for_runtime(CtJscRuntime *runtime) {
         if (attempt == 250) ct_async_processes_stop_runtime(runtime);
         usleep(1000);
     }
+    // A child may ignore SIGTERM. Never leave its detached waiter with a
+    // pointer to a runtime that is about to be destroyed.
+    pthread_mutex_lock(&ct_async_processes_mutex);
+    CtAsyncProcess *cursor = ct_async_processes;
+    while (cursor != NULL) {
+        if (cursor->runtime == runtime) {
+            pthread_mutex_lock(&cursor->event_mutex);
+            cursor->runtime = NULL;
+            pthread_mutex_unlock(&cursor->event_mutex);
+            cursor->close_stdout_requested = true;
+            cursor->close_stderr_requested = true;
+            cursor->close_ipc_requested = true;
+            if (cursor->stdin_fd >= 0) {
+                close(cursor->stdin_fd);
+                cursor->stdin_fd = -1;
+            }
+#if defined(_WIN32)
+            if (cursor->wake_event != NULL) SetEvent(cursor->wake_event);
+#else
+            if (cursor->wake_write_fd >= 0) (void)write(cursor->wake_write_fd, "x", 1);
+#endif
+        }
+        cursor = cursor->next;
+    }
+    pthread_mutex_unlock(&ct_async_processes_mutex);
 }
 
 #if defined(_WIN32)
@@ -21828,7 +21935,7 @@ static bool ct_windows_drain_process_pipe(CtAsyncProcess *process, int *fd, cons
     if (!PeekNamedPipe((HANDLE)raw_handle, NULL, 0, NULL, &available, NULL)) {
         DWORD error = GetLastError();
         if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED) {
-            ct_queue_spawn_simple(process->runtime, process->id, strcmp(type, "stdout") == 0 ? "stdout_end" : "stderr_end");
+            ct_async_process_queue_simple(process, strcmp(type, "stdout") == 0 ? "stdout_end" : "stderr_end");
             close(*fd);
             *fd = -1;
         }
@@ -21839,7 +21946,7 @@ static bool ct_windows_drain_process_pipe(CtAsyncProcess *process, int *fd, cons
     unsigned int amount = available < sizeof(buffer) ? (unsigned int)available : (unsigned int)sizeof(buffer);
     int count = read(*fd, buffer, amount);
     if (count > 0) {
-        ct_queue_spawn_text(process->runtime, process->id, type, buffer, (size_t)count);
+        ct_async_process_queue_text(process, type, buffer, (size_t)count);
         return true;
     }
     return false;
@@ -21862,6 +21969,13 @@ static void ct_windows_rusage_for_process(HANDLE process, struct rusage *usage) 
 }
 #endif
 
+static void ct_async_process_finish_ipc(CtAsyncProcess *process) {
+    if (process->ipc_fd < 0) return;
+    close(process->ipc_fd);
+    process->ipc_fd = -1;
+    ct_async_process_queue_simple(process, "ipc_end");
+}
+
 static void ct_async_process_apply_output_close_requests(CtAsyncProcess *process) {
     pthread_mutex_lock(&ct_async_processes_mutex);
     if (process->close_stdout_requested) {
@@ -21874,6 +21988,10 @@ static void ct_async_process_apply_output_close_requests(CtAsyncProcess *process
         process->stderr_fd = -1;
         process->close_stderr_requested = false;
     }
+    if (process->close_ipc_requested) {
+        ct_async_process_finish_ipc(process);
+        process->close_ipc_requested = false;
+    }
     pthread_mutex_unlock(&ct_async_processes_mutex);
 }
 
@@ -21881,7 +21999,10 @@ static void *ct_async_process_thread(void *opaque) {
     CtAsyncProcess *process = (CtAsyncProcess *)opaque;
 #if defined(_WIN32)
     bool exited = false;
+    bool exit_queued = false;
     DWORD exit_code = 1;
+    struct rusage resource_usage;
+    memset(&resource_usage, 0, sizeof(resource_usage));
     while (!exited || process->stdout_fd >= 0 || process->stderr_fd >= 0) {
         ct_async_process_apply_output_close_requests(process);
         bool read_data = false;
@@ -21890,17 +22011,20 @@ static void *ct_async_process_thread(void *opaque) {
         if (!exited && WaitForSingleObject(process->process_handle, 0) == WAIT_OBJECT_0) {
             exited = true;
             GetExitCodeProcess(process->process_handle, &exit_code);
+            ct_windows_rusage_for_process(process->process_handle, &resource_usage);
+            ct_queue_spawn_exit(process, (int)exit_code, 0, &resource_usage, true);
+            exit_queued = true;
         }
         if (exited && !read_data) {
             ct_windows_drain_process_pipe(process, &process->stdout_fd, "stdout");
             ct_windows_drain_process_pipe(process, &process->stderr_fd, "stderr");
             if (process->stdout_fd >= 0) {
-                ct_queue_spawn_simple(process->runtime, process->id, "stdout_end");
+                ct_async_process_queue_simple(process, "stdout_end");
                 close(process->stdout_fd);
                 process->stdout_fd = -1;
             }
             if (process->stderr_fd >= 0) {
-                ct_queue_spawn_simple(process->runtime, process->id, "stderr_end");
+                ct_async_process_queue_simple(process, "stderr_end");
                 close(process->stderr_fd);
                 process->stderr_fd = -1;
             }
@@ -21914,27 +22038,24 @@ static void *ct_async_process_thread(void *opaque) {
             }
         }
     }
-    struct rusage resource_usage;
-    ct_windows_rusage_for_process(process->process_handle, &resource_usage);
-    CtSpawnEvent *exit_event = (CtSpawnEvent *)calloc(1, sizeof(CtSpawnEvent));
-    if (exit_event != NULL) {
-        exit_event->process_id = process->id;
-        exit_event->type = ct_duplicate_bytes("exit", 4);
-        exit_event->exit_code = (int)exit_code;
-        exit_event->resource_usage = resource_usage;
-        exit_event->has_resource_usage = true;
-        ct_queue_spawn_event(process->runtime, exit_event);
+    if (!exit_queued) {
+        ct_windows_rusage_for_process(process->process_handle, &resource_usage);
+        ct_queue_spawn_exit(process, (int)exit_code, 0, &resource_usage, true);
     }
     if (process->stdin_fd >= 0) close(process->stdin_fd);
+    ct_async_process_finish_ipc(process);
+    ct_async_process_queue_simple(process, "close");
     if (process->start_thread != NULL) CloseHandle(process->start_thread);
     if (process->wake_event != NULL) CloseHandle(process->wake_event);
     CloseHandle(process->process_handle);
     ct_async_process_remove(process);
+    pthread_mutex_destroy(&process->event_mutex);
     free(process);
     return NULL;
 #else
     int status = 0;
     bool exited = false;
+    bool exit_queued = false;
     struct rusage resource_usage;
     memset(&resource_usage, 0, sizeof(resource_usage));
     bool has_resource_usage = false;
@@ -21989,7 +22110,7 @@ static void *ct_async_process_thread(void *opaque) {
                 }
                 if (strcmp(types[index], "ipc") == 0) {
                     if ((fds[index].revents & POLLNVAL) != 0) {
-                        process->ipc_fd = -1;
+                        ct_async_process_finish_ipc(process);
                         continue;
                     }
                     for (;;) {
@@ -22015,18 +22136,16 @@ static void *ct_async_process_thread(void *opaque) {
                                     break;
                                 }
                             }
-                            ct_queue_spawn_ipc(process->runtime, process->id, buffer, (size_t)n, received_fd);
+                            ct_async_process_queue_ipc(process, buffer, (size_t)n, received_fd);
                             continue;
                         }
                         if (n == 0) {
-                            if (process->ipc_fd >= 0) close(process->ipc_fd);
-                            process->ipc_fd = -1;
+                            ct_async_process_finish_ipc(process);
                             break;
                         }
                         if (errno == EINTR) continue;
                         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                        if (process->ipc_fd >= 0) close(process->ipc_fd);
-                        process->ipc_fd = -1;
+                        ct_async_process_finish_ipc(process);
                         break;
                     }
                     continue;
@@ -22035,16 +22154,16 @@ static void *ct_async_process_thread(void *opaque) {
                 for (;;) {
                     ssize_t n = read(fds[index].fd, buffer, sizeof(buffer));
                     if (n > 0) {
-                        ct_queue_spawn_text(process->runtime, process->id, types[index], buffer, (size_t)n);
+                        ct_async_process_queue_text(process, types[index], buffer, (size_t)n);
                         continue;
                     }
                     if (n == 0) {
                         if (fds[index].fd == process->stdout_fd) {
-                            ct_queue_spawn_simple(process->runtime, process->id, "stdout_end");
+                            ct_async_process_queue_simple(process, "stdout_end");
                             close(process->stdout_fd);
                             process->stdout_fd = -1;
                         } else if (fds[index].fd == process->stderr_fd) {
-                            ct_queue_spawn_simple(process->runtime, process->id, "stderr_end");
+                            ct_async_process_queue_simple(process, "stderr_end");
                             close(process->stderr_fd);
                             process->stderr_fd = -1;
                         }
@@ -22053,11 +22172,11 @@ static void *ct_async_process_thread(void *opaque) {
                     if (errno == EINTR) continue;
                     if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                     if (fds[index].fd == process->stdout_fd) {
-                        ct_queue_spawn_simple(process->runtime, process->id, "stdout_end");
+                        ct_async_process_queue_simple(process, "stdout_end");
                         close(process->stdout_fd);
                         process->stdout_fd = -1;
                     } else if (fds[index].fd == process->stderr_fd) {
-                        ct_queue_spawn_simple(process->runtime, process->id, "stderr_end");
+                        ct_async_process_queue_simple(process, "stderr_end");
                         close(process->stderr_fd);
                         process->stderr_fd = -1;
                     }
@@ -22071,8 +22190,19 @@ static void *ct_async_process_thread(void *opaque) {
             if (wait_result == process->pid) {
                 exited = true;
                 has_resource_usage = true;
+                int exit_code = 1;
+                int signal_code = 0;
+                if (WIFEXITED(status)) exit_code = WEXITSTATUS(status);
+                else if (WIFSIGNALED(status)) {
+                    signal_code = WTERMSIG(status);
+                    exit_code = 128 + signal_code;
+                }
+                ct_queue_spawn_exit(process, exit_code, signal_code, &resource_usage, true);
+                exit_queued = true;
             } else if (wait_result < 0 && errno != EINTR) {
                 exited = true;
+                ct_queue_spawn_exit(process, 1, 0, NULL, false);
+                exit_queued = true;
             }
         }
 
@@ -22094,22 +22224,15 @@ static void *ct_async_process_thread(void *opaque) {
         exit_code = 128 + signal_code;
     }
 
-    CtSpawnEvent *exit_event = (CtSpawnEvent *)calloc(1, sizeof(CtSpawnEvent));
-    if (exit_event != NULL) {
-        exit_event->process_id = process->id;
-        exit_event->type = ct_duplicate_bytes("exit", 4);
-        exit_event->exit_code = exit_code;
-        exit_event->signal_code = signal_code;
-        exit_event->resource_usage = resource_usage;
-        exit_event->has_resource_usage = has_resource_usage;
-        ct_queue_spawn_event(process->runtime, exit_event);
-    }
+    if (!exit_queued) ct_queue_spawn_exit(process, exit_code, signal_code, &resource_usage, has_resource_usage);
     if (process->stdin_fd >= 0) close(process->stdin_fd);
-    if (process->ipc_fd >= 0) close(process->ipc_fd);
+    ct_async_process_finish_ipc(process);
+    ct_async_process_queue_simple(process, "close");
     if (process->wake_read_fd >= 0) close(process->wake_read_fd);
     if (process->wake_write_fd >= 0) close(process->wake_write_fd);
     if (process->start_gate_fd >= 0) close(process->start_gate_fd);
     ct_async_process_remove(process);
+    pthread_mutex_destroy(&process->event_mutex);
     free(process);
     return NULL;
 #endif
@@ -22297,6 +22420,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     bool ipc_enabled = false;
     bool node_ipc_protocol = false;
     bool defer_start = false;
+    bool detached = false;
     bool windows_hide = false;
     bool windows_verbatim_arguments = false;
     int terminal_fd = -1;
@@ -22325,6 +22449,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         JSValueRef node_ipc_value = ct_get_property(ctx, options, "nodeIpc", exception);
         JSValueRef argv0_value = ct_get_property(ctx, options, "argv0", exception);
         JSValueRef defer_start_value = ct_get_property(ctx, options, "deferStart", exception);
+        JSValueRef detached_value = ct_get_property(ctx, options, "detached", exception);
         JSValueRef windows_hide_value = ct_get_property(ctx, options, "windowsHide", exception);
         JSValueRef windows_verbatim_value = ct_get_property(ctx, options, "windowsVerbatimArguments", exception);
         JSValueRef terminal_fd_value = ct_get_property(ctx, options, "terminalFd", exception);
@@ -22339,6 +22464,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         ipc_enabled = JSValueToBoolean(ctx, ipc_value);
         node_ipc_protocol = JSValueToBoolean(ctx, node_ipc_value);
         defer_start = JSValueToBoolean(ctx, defer_start_value);
+        detached = JSValueToBoolean(ctx, detached_value);
         windows_hide = JSValueToBoolean(ctx, windows_hide_value);
         windows_verbatim_arguments = JSValueToBoolean(ctx, windows_verbatim_value);
         argv0 = ct_value_to_optional_string(ctx, argv0_value);
@@ -22392,6 +22518,38 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     }
 
     uint32_t id = ++runtime->next_process_id;
+    int ipc_target_fd = -1;
+    CtProcessStdioMode primary_stdio_modes[3] = { stdin_mode, stdout_mode, stderr_mode };
+    for (int target_fd = 0; target_fd < 3; target_fd += 1) {
+        if (primary_stdio_modes[target_fd] != CT_PROCESS_STDIO_IPC) continue;
+        if (ipc_target_fd >= 0) {
+            ct_throw_message(ctx, exception, "Child process can have only one IPC pipe");
+            free(file);
+            ct_free_string_array(args, arg_count);
+            free(cwd);
+            free(argv0);
+            free(extra_stdio);
+            ct_free_env_entries(env_entries, env_count);
+            return JSValueMakeUndefined(ctx);
+        }
+        ipc_target_fd = target_fd;
+    }
+    for (size_t index = 0; index < extra_stdio_count; index += 1) {
+        if (extra_stdio[index].mode != CT_PROCESS_STDIO_IPC) continue;
+        if (ipc_target_fd >= 0) {
+            ct_throw_message(ctx, exception, "Child process can have only one IPC pipe");
+            free(file);
+            ct_free_string_array(args, arg_count);
+            free(cwd);
+            free(argv0);
+            free(extra_stdio);
+            ct_free_env_entries(env_entries, env_count);
+            return JSValueMakeUndefined(ctx);
+        }
+        ipc_target_fd = extra_stdio[index].target_fd;
+    }
+    if (ipc_target_fd >= 0) ipc_enabled = true;
+    if (ipc_enabled && ipc_target_fd < 0) ipc_target_fd = (int)extra_stdio_count + 3;
 
 #if defined(_WIN32)
     if (extra_stdio_count > 0) {
@@ -22433,7 +22591,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     if (!ct_windows_spawn_process(file, args, arg_count, argv0, cwd, env_entries, env_count, clear_env,
                                   stdin_mode, stdout_mode, stderr_mode,
                                   stdin_source_fd, stdout_source_fd, stderr_source_fd,
-                                  false, windows_hide, windows_verbatim_arguments, defer_start,
+                                  detached, windows_hide, windows_verbatim_arguments, defer_start,
                                   &process_handle, &start_thread, &pid,
                                   &stdin_fd, &stdout_fd, &stderr_fd)) {
         ct_throw_message(ctx, exception, "CreateProcessW failed");
@@ -22468,7 +22626,9 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     process->stdout_fd = stdout_fd;
     process->stderr_fd = stderr_fd;
     process->ipc_fd = -1;
+    process->referenced = true;
     process->runtime = runtime;
+    pthread_mutex_init(&process->event_mutex, NULL);
     process->process_handle = process_handle;
     process->wake_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     process->start_thread = start_thread;
@@ -22492,8 +22652,8 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     ct_free_env_entries(env_entries, env_count);
     return response;
 #else
-    int ipc_target_fd = ipc_enabled ? (int)extra_stdio_count + 3 : -1;
-    int reserved_fd_max = ipc_enabled ? ipc_target_fd : (int)extra_stdio_count + 2;
+    int reserved_fd_max = (int)extra_stdio_count + 2;
+    if (ipc_enabled && ipc_target_fd > reserved_fd_max) reserved_fd_max = ipc_target_fd;
     int safe_fd_minimum = reserved_fd_max + 1;
     int stdin_pipe[2] = { -1, -1 };
     int stdout_pipe[2] = { -1, -1 };
@@ -22698,11 +22858,32 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         node_ipc_protocol
     );
     posix_spawn_file_actions_t spawn_actions;
+    posix_spawnattr_t spawn_attributes;
     bool spawn_actions_ok = posix_spawn_file_actions_init(&spawn_actions) == 0;
+    bool spawn_attributes_ok = posix_spawnattr_init(&spawn_attributes) == 0;
     pid_t pid = -1;
-    if (argv_exec == NULL || envp_exec == NULL || !spawn_actions_ok) {
+    if (argv_exec == NULL || envp_exec == NULL || !spawn_actions_ok || !spawn_attributes_ok) {
         errno = ENOMEM;
     } else {
+        short spawn_flags = POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK;
+        sigset_t default_signals;
+        sigset_t signal_mask;
+        sigemptyset(&default_signals);
+        sigemptyset(&signal_mask);
+        for (int signal_number = 1; signal_number < NSIG; signal_number += 1) {
+            if (signal_number != SIGKILL && signal_number != SIGSTOP) sigaddset(&default_signals, signal_number);
+        }
+        posix_spawnattr_setsigdefault(&spawn_attributes, &default_signals);
+        posix_spawnattr_setsigmask(&spawn_attributes, &signal_mask);
+        if (detached) {
+#if defined(POSIX_SPAWN_SETSID)
+            spawn_flags |= POSIX_SPAWN_SETSID;
+#else
+            spawn_flags |= POSIX_SPAWN_SETPGROUP;
+            posix_spawnattr_setpgroup(&spawn_attributes, 0);
+#endif
+        }
+        posix_spawnattr_setflags(&spawn_attributes, spawn_flags);
         argv_exec[0] = argv0 != NULL && argv0[0] != '\0' ? argv0 : file;
         if (defer_start) {
             snprintf(gate_arg, sizeof(gate_arg), "--cottontail-spawn-gate=%d", start_gate[0]);
@@ -22722,7 +22903,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
             } else if (stdin_mode == CT_PROCESS_STDIO_INHERIT) {
                 int source_fd = stdin_source_fd >= 0 ? stdio_action_fds[0] : STDIN_FILENO;
                 ct_process_add_dup2_action(&spawn_actions, source_fd, STDIN_FILENO);
-            } else if (stdin_mode != CT_PROCESS_STDIO_INHERIT) {
+            } else if (stdin_mode == CT_PROCESS_STDIO_IGNORE) {
                 posix_spawn_file_actions_addopen(&spawn_actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
             }
             if (stdout_mode == CT_PROCESS_STDIO_PIPE && stdout_pipe[1] >= 0) {
@@ -22730,7 +22911,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
             } else if (stdout_mode == CT_PROCESS_STDIO_INHERIT) {
                 int source_fd = stdout_source_fd >= 0 ? stdio_action_fds[1] : STDOUT_FILENO;
                 ct_process_add_dup2_action(&spawn_actions, source_fd, STDOUT_FILENO);
-            } else if (stdout_mode != CT_PROCESS_STDIO_INHERIT) {
+            } else if (stdout_mode == CT_PROCESS_STDIO_IGNORE) {
                 posix_spawn_file_actions_addopen(&spawn_actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
             }
             if (stderr_mode == CT_PROCESS_STDIO_PIPE && stderr_pipe[1] >= 0) {
@@ -22738,7 +22919,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
             } else if (stderr_mode == CT_PROCESS_STDIO_INHERIT) {
                 int source_fd = stderr_source_fd >= 0 ? stdio_action_fds[2] : STDERR_FILENO;
                 ct_process_add_dup2_action(&spawn_actions, source_fd, STDERR_FILENO);
-            } else if (stderr_mode != CT_PROCESS_STDIO_INHERIT) {
+            } else if (stderr_mode == CT_PROCESS_STDIO_IGNORE) {
                 posix_spawn_file_actions_addopen(&spawn_actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
             }
         }
@@ -22805,8 +22986,8 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         }
         const char *spawn_file = resolved_file != NULL ? resolved_file : file;
         int spawn_result = resolved_file != NULL
-            ? posix_spawn(&pid, spawn_file, &spawn_actions, NULL, argv_exec, envp_exec)
-            : posix_spawnp(&pid, spawn_file, &spawn_actions, NULL, argv_exec, envp_exec);
+            ? posix_spawn(&pid, spawn_file, &spawn_actions, &spawn_attributes, argv_exec, envp_exec)
+            : posix_spawnp(&pid, spawn_file, &spawn_actions, &spawn_attributes, argv_exec, envp_exec);
         if (spawn_result == ENOEXEC) {
             // execvp falls back to interpreting non-binaries (e.g. empty or
             // shebang-less scripts) with /bin/sh; posix_spawn does not.
@@ -22816,7 +22997,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
                 sh_argv[1] = (char *)spawn_file;
                 for (size_t index = 0; index < arg_count; index += 1) sh_argv[index + 2] = args[index];
                 sh_argv[arg_count + 2] = NULL;
-                spawn_result = posix_spawn(&pid, "/bin/sh", &spawn_actions, NULL, sh_argv, envp_exec);
+                spawn_result = posix_spawn(&pid, "/bin/sh", &spawn_actions, &spawn_attributes, sh_argv, envp_exec);
                 free(sh_argv);
             }
         }
@@ -22827,6 +23008,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         }
     }
     if (spawn_actions_ok) posix_spawn_file_actions_destroy(&spawn_actions);
+    if (spawn_attributes_ok) posix_spawnattr_destroy(&spawn_attributes);
     ct_process_close_stdio_action_fds(stdio_source_fds, stdio_action_fds, safe_fd_minimum);
     ct_process_close_extra_stdio(extra_stdio, extra_stdio_count, false);
     free(argv_exec);
@@ -22876,6 +23058,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     process->stdout_fd = stdout_mode == CT_PROCESS_STDIO_PIPE ? stdout_pipe[0] : -1;
     process->stderr_fd = stderr_mode == CT_PROCESS_STDIO_PIPE ? stderr_pipe[0] : -1;
     process->ipc_fd = ipc_enabled ? ipc_socket[0] : -1;
+    process->referenced = true;
     process->start_gate_fd = defer_start ? start_gate[1] : -1;
     ct_process_set_close_on_exec(process->stdin_fd);
     ct_process_set_close_on_exec(process->stdout_fd);
@@ -22898,6 +23081,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         }
     }
     process->runtime = runtime;
+    pthread_mutex_init(&process->event_mutex, NULL);
     pthread_mutex_lock(&ct_async_processes_mutex);
     process->next = ct_async_processes;
     ct_async_processes = process;
@@ -23025,11 +23209,6 @@ static JSValueRef ct_spawn_close_output(JSContextRef ctx, JSObjectRef function, 
 #if defined(_WIN32)
         if (process->wake_event != NULL) SetEvent(process->wake_event);
 #else
-        int *output_fd = fd == STDOUT_FILENO ? &process->stdout_fd : &process->stderr_fd;
-        if (*output_fd >= 0) close(*output_fd);
-        *output_fd = -1;
-        if (fd == STDOUT_FILENO) process->close_stdout_requested = false;
-        else process->close_stderr_requested = false;
         if (process->wake_write_fd >= 0) {
             const char wake = 1;
             (void)write(process->wake_write_fd, &wake, 1);
@@ -23061,6 +23240,10 @@ static JSValueRef ct_spawn_release(JSContextRef ctx, JSObjectRef function, JSObj
             if (process->stderr_fd >= 0) close(process->stderr_fd);
             process->stderr_fd = -1;
             process->close_stderr_requested = false;
+        }
+        if (process->close_ipc_requested) {
+            ct_async_process_finish_ipc(process);
+            process->close_ipc_requested = false;
         }
         if (!process->thread_started && pthread_create(&process->thread, NULL, ct_async_process_thread, process) == 0) {
             process->thread_started = true;
@@ -23094,11 +23277,37 @@ static JSValueRef ct_spawn_close_ipc(JSContextRef ctx, JSObjectRef function, JSO
     CtAsyncProcess *process = ct_async_processes;
     while (process != NULL && process->id != id) process = process->next;
     if (process != NULL && process->ipc_fd >= 0) {
-        close(process->ipc_fd);
-        process->ipc_fd = -1;
+        process->close_ipc_requested = true;
+#if defined(_WIN32)
+        if (process->wake_event != NULL) SetEvent(process->wake_event);
+#else
+        if (process->wake_write_fd >= 0) {
+            const char wake = 1;
+            (void)write(process->wake_write_fd, &wake, 1);
+        }
+#endif
     }
     pthread_mutex_unlock(&ct_async_processes_mutex);
     return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_spawn_set_referenced(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    if (argc < 2) return JSValueMakeBoolean(ctx, false);
+    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    bool referenced = JSValueToBoolean(ctx, argv[1]);
+    bool found = false;
+    pthread_mutex_lock(&ct_async_processes_mutex);
+    CtAsyncProcess *process = ct_async_processes;
+    while (process != NULL && process->id != id) process = process->next;
+    if (process != NULL) {
+        process->referenced = referenced;
+        found = true;
+    }
+    pthread_mutex_unlock(&ct_async_processes_mutex);
+    return JSValueMakeBoolean(ctx, found);
 }
 
 static JSValueRef ct_spawn_kill(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -23112,9 +23321,36 @@ static JSValueRef ct_spawn_kill(JSContextRef ctx, JSObjectRef function, JSObject
     pthread_mutex_lock(&ct_async_processes_mutex);
     CtAsyncProcess *process = ct_async_processes;
     while (process != NULL && process->id != id) process = process->next;
-    if (process != NULL) ok = kill(process->pid, signal_number) == 0;
+    if (process != NULL) {
+        ok = kill(process->pid, signal_number) == 0;
+        if (ok && signal_number != 0) process->killed = true;
+    }
     pthread_mutex_unlock(&ct_async_processes_mutex);
     return JSValueMakeBoolean(ctx, ok);
+}
+
+static JSValueRef ct_spawn_dispose(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)exception;
+    if (argc < 1) return JSValueMakeUndefined(ctx);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    pthread_mutex_lock(&runtime->spawn_event_mutex);
+    CtSpawnEvent **cursor = &runtime->spawn_events_head;
+    CtSpawnEvent *tail = NULL;
+    while (*cursor != NULL) {
+        CtSpawnEvent *event = *cursor;
+        if (event->process_id == id) {
+            *cursor = event->next;
+            ct_spawn_event_destroy(event, true);
+            continue;
+        }
+        tail = event;
+        cursor = &event->next;
+    }
+    runtime->spawn_events_tail = tail;
+    pthread_mutex_unlock(&runtime->spawn_event_mutex);
+    return JSValueMakeUndefined(ctx);
 }
 
 static JSValueRef ct_spawn_detached(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -23800,9 +24036,7 @@ static JSValueRef ct_dispatch_spawn_events(JSContextRef ctx, CtJscRuntime *runti
         }
         JSValueRef arg = item;
         JSObjectCallAsFunction(ctx, runtime->spawn_event_handler, NULL, 1, &arg, exception);
-        free(event->type);
-        free(event->data);
-        free(event);
+        ct_spawn_event_destroy(event, false);
         if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
     }
     return JSValueMakeUndefined(ctx);
@@ -25638,36 +25872,49 @@ static JSValueRef ct_ipc_send(JSContextRef ctx, JSObjectRef function, JSObjectRe
 
     signal(SIGPIPE, SIG_IGN);
     char empty = 0;
-    struct iovec iov;
-    iov.iov_base = len > 0 ? (void *)bytes : (void *)&empty;
-    iov.iov_len = len > 0 ? len : 1;
-    struct msghdr msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-
     char control[CMSG_SPACE(sizeof(int))];
-    if (send_fd >= 0) {
-        memset(control, 0, sizeof(control));
-        msg.msg_control = control;
-        msg.msg_controllen = sizeof(control);
-        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-        cmsg->cmsg_level = SOL_SOCKET;
-        cmsg->cmsg_type = SCM_RIGHTS;
-        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-        memcpy(CMSG_DATA(cmsg), &send_fd, sizeof(int));
-    }
-
-    bool ok = false;
-    for (;;) {
-        ssize_t sent = sendmsg(fd, &msg, 0);
-        if (sent >= 0) {
-            ok = true;
-            break;
+    size_t total = len > 0 ? len : 1;
+    size_t offset = 0;
+    bool descriptor_sent = false;
+    bool ok = true;
+    while (offset < total) {
+        struct iovec iov;
+        iov.iov_base = len > 0 ? (void *)(bytes + offset) : (void *)&empty;
+        iov.iov_len = total - offset;
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        if (send_fd >= 0 && !descriptor_sent) {
+            memset(control, 0, sizeof(control));
+            msg.msg_control = control;
+            msg.msg_controllen = sizeof(control);
+            struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+            cmsg->cmsg_level = SOL_SOCKET;
+            cmsg->cmsg_type = SCM_RIGHTS;
+            cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+            memcpy(CMSG_DATA(cmsg), &send_fd, sizeof(int));
         }
-        if (errno == EINTR) continue;
+
+        ssize_t sent = sendmsg(fd, &msg, 0);
+        if (sent > 0) {
+            descriptor_sent = descriptor_sent || send_fd >= 0;
+            offset += (size_t)sent;
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) continue;
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd writable = { .fd = fd, .events = POLLOUT | POLLHUP | POLLERR, .revents = 0 };
+            int ready;
+            do {
+                ready = poll(&writable, 1, 1000);
+            } while (ready < 0 && errno == EINTR);
+            if (ready > 0 && (writable.revents & POLLOUT) != 0) continue;
+        }
+        ok = false;
         break;
     }
+    if (!ok && offset > 0) (void)shutdown(fd, SHUT_WR);
     free(text);
     return JSValueMakeBoolean(ctx, ok);
 #endif
@@ -28897,9 +29144,7 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
     while (runtime->spawn_events_head != NULL) {
         CtSpawnEvent *event = runtime->spawn_events_head;
         runtime->spawn_events_head = event->next;
-        free(event->type);
-        free(event->data);
-        free(event);
+        ct_spawn_event_destroy(event, true);
     }
     while (runtime->fd_events_head != NULL) {
         CtFdEvent *event = runtime->fd_events_head;

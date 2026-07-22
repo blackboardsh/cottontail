@@ -1,10 +1,72 @@
 import { deserializeJscValue, serializeJscValue } from "./jsc-value-serialization.js";
+import { Server as NetServer, Socket as NetSocket } from "../node/net.js";
 
 const ipcPrefix = "__COTTONTAIL_IPC__";
 const advancedPrefix = "A:";
 const jsonPrefix = "J:";
 const advancedEnvelopeKey = "__cottontailBunSpawnIpcAdvanced";
+const nodeIpcEnvelopeKey = "__cottontailIpcEnvelope";
 const inheritedNodeIpcSymbol = Symbol.for("cottontail.inheritedNodeIpc");
+
+export function bunSpawnIpcHandleInfo(handle = undefined) {
+  if (handle == null) return null;
+  if (Number.isInteger(handle) && handle >= 0) return { fd: Number(handle), type: "net.Handle" };
+  if (Number.isInteger(handle.fd) && handle.fd >= 0) {
+    return {
+      fd: Number(handle.fd),
+      type: handle instanceof NetSocket ? "net.Socket" : "net.Handle",
+    };
+  }
+  if (Number.isInteger(handle._fd) && handle._fd >= 0) {
+    return {
+      fd: Number(handle._fd),
+      type: handle instanceof NetServer ? "net.Server" : "net.Handle",
+    };
+  }
+  if (Number.isInteger(handle._handle?.fd) && handle._handle.fd >= 0) {
+    return {
+      fd: Number(handle._handle.fd),
+      type: handle instanceof NetServer ? "net.Server" : handle instanceof NetSocket ? "net.Socket" : "net.Handle",
+    };
+  }
+  return null;
+}
+
+export function adoptBunSpawnIpcHandle(host, fd = undefined, type = "net.Socket") {
+  if (!Number.isInteger(fd) || fd < 0) return undefined;
+  try {
+    if (type === "net.Server" && typeof NetServer._fromFd === "function") return NetServer._fromFd(fd);
+    if (type === "net.Handle") {
+      let open = true;
+      return {
+        fd,
+        close(callback = undefined) {
+          if (open) {
+            open = false;
+            try { host.closeFd?.(fd); } catch {}
+          }
+          if (typeof callback === "function") queueMicrotask(callback);
+        },
+        ref() { return this; },
+        unref() { return this; },
+      };
+    }
+    let local;
+    let remote;
+    try { local = host.tcpSocketAddress?.(fd, false); } catch {}
+    try { remote = host.tcpSocketAddress?.(fd, true); } catch {}
+    return new NetSocket({
+      fd,
+      local,
+      remote,
+      pipe: local?.path != null || remote?.path != null,
+      path: local?.path ?? remote?.path,
+    });
+  } catch {
+    try { host.closeFd?.(fd); } catch {}
+    return undefined;
+  }
+}
 
 function invalidIpcMessage(message) {
   if (message === undefined) {
@@ -87,7 +149,7 @@ export function isCottontailIpcFrame(line) {
 export function installInheritedBunIpcCodec(host, processObject = globalThis.process) {
   if (processObject == null || processObject.env?.COTTONTAIL_IPC_BOOTSTRAP === "node") return false;
   const fd = Number(processObject.env?.COTTONTAIL_IPC_FD);
-  if (!Number.isInteger(fd) || fd <= 2 || typeof host?.ipcSend !== "function" ||
+  if (!Number.isInteger(fd) || fd < 0 || typeof host?.ipcSend !== "function" ||
       typeof processObject.emit !== "function") {
     return false;
   }
@@ -111,8 +173,20 @@ export function installInheritedBunIpcCodec(host, processObject = globalThis.pro
 
   const send = function send(message, sendHandleOrCallback = undefined, optionsOrCallback = undefined, callback = undefined) {
     validateNodeIpcMessage(message, arguments.length);
-    if (typeof sendHandleOrCallback === "function") callback = sendHandleOrCallback;
-    else if (typeof optionsOrCallback === "function") callback = optionsOrCallback;
+    let sendHandle = sendHandleOrCallback;
+    let options = optionsOrCallback;
+    if (typeof sendHandleOrCallback === "function") {
+      callback = sendHandleOrCallback;
+      sendHandle = undefined;
+      options = undefined;
+    } else if (typeof optionsOrCallback === "function") {
+      callback = optionsOrCallback;
+      options = undefined;
+    } else if (options !== undefined && (options === null || typeof options !== "object")) {
+      const error = new TypeError('The "options" argument must be of type object.');
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
+    }
     if (processObject.connected === false) {
       const error = new Error("Channel closed");
       error.code = "ERR_IPC_CHANNEL_CLOSED";
@@ -123,7 +197,9 @@ export function installInheritedBunIpcCodec(host, processObject = globalThis.pro
 
     let ok = false;
     try {
-      ok = host.ipcSend(fd, encodeBunSpawnIpc(message)) === true;
+      const handleInfo = bunSpawnIpcHandleInfo(sendHandle);
+      if (sendHandle != null && handleInfo == null) throw invalidIpcHandle();
+      ok = host.ipcSend(fd, encodeBunSpawnIpc(message), handleInfo?.fd ?? -1) === true;
     } catch (error) {
       if (typeof callback === "function") queueMicrotask(() => callback(error));
       else queueMicrotask(() => processObject.emit?.("error", error));
@@ -152,6 +228,96 @@ function validateNodeIpcMessage(message, argumentCount) {
   throw error;
 }
 
+function invalidIpcHandle() {
+  const error = new TypeError("This handle type cannot be sent");
+  error.code = "ERR_INVALID_HANDLE_TYPE";
+  return error;
+}
+
+function decodeInheritedNodeIpcFrame(host, message, receivedFd, adoptedHandles) {
+  if (message && typeof message === "object" && message[nodeIpcEnvelopeKey] === 1) {
+    const handle = adoptBunSpawnIpcHandle(host, receivedFd, message.handleType);
+    if (message.handleSeq != null && handle != null) {
+      adoptedHandles.set(message.handleSeq, handle);
+      if (adoptedHandles.size > 32) adoptedHandles.delete(adoptedHandles.keys().next().value);
+    }
+    return { message: message.message, handle };
+  }
+  if (message && typeof message === "object" && message[nodeIpcEnvelopeKey] === 3) {
+    if (Number.isInteger(receivedFd) && receivedFd >= 0) {
+      try { host.closeFd?.(receivedFd); } catch {}
+    }
+    const socket = adoptedHandles.get(message.handleSeq);
+    adoptedHandles.delete(message.handleSeq);
+    if (socket != null && message.data) {
+      const bytes = Buffer.from(String(message.data), "base64");
+      if (bytes.length > 0) {
+        queueMicrotask(() => {
+          try {
+            const chunk = socket._encoding ? bytes.toString(socket._encoding) : bytes;
+            if (typeof socket._emitData === "function") socket._emitData(chunk);
+            else socket.emit?.("data", chunk);
+          } catch {}
+        });
+      }
+    }
+    return null;
+  }
+  return {
+    message,
+    handle: adoptBunSpawnIpcHandle(host, receivedFd),
+  };
+}
+
+function writeInheritedNodeIpc(host, fd, message, serialization, sendHandle, options, finish) {
+  const handleInfo = bunSpawnIpcHandleInfo(sendHandle);
+  if (sendHandle != null && handleInfo == null) throw invalidIpcHandle();
+  const handleSeq = handleInfo == null
+    ? undefined
+    : (globalThis.__cottontailIpcHandleSequence = (globalThis.__cottontailIpcHandleSequence ?? 0) + 1);
+  const payload = handleInfo == null
+    ? message
+    : {
+        [nodeIpcEnvelopeKey]: 1,
+        message,
+        handleType: handleInfo.type,
+        handleSeq,
+      };
+  if (handleInfo != null) {
+    try { sendHandle?.pause?.(); } catch {}
+  }
+  const ok = host.ipcSend(
+    fd,
+    encodeBunSpawnIpc(payload, false, serialization),
+    handleInfo?.fd ?? -1,
+  ) === true;
+  const complete = () => finish?.(ok ? null : new Error("write failed"));
+  if (handleInfo == null || !ok) {
+    queueMicrotask(complete);
+    return ok;
+  }
+  setTimeout(() => {
+    try {
+      const pending = Array.isArray(sendHandle?._pendingData) ? sendHandle._pendingData.splice(0) : [];
+      try { sendHandle?._stopRead?.(); } catch {}
+      if (pending.length > 0) {
+        const data = Buffer.concat(pending.map(chunk => Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))).toString("base64");
+        host.ipcSend(
+          fd,
+          encodeBunSpawnIpc({ [nodeIpcEnvelopeKey]: 3, handleSeq, data }, false, "json"),
+          -1,
+        );
+      }
+      if (sendHandle instanceof NetSocket) {
+        if (options?.keepOpen === true) sendHandle.resume?.();
+        else sendHandle.destroy?.();
+      }
+    } catch {}
+    complete();
+  }, 5);
+  return ok;
+}
+
 // Install child_process IPC during runtime initialization so process.send works
 // without requiring node:child_process from the child entrypoint. Cottontail
 // children use native framed IPC; external Node children use its JSON channel.
@@ -160,9 +326,9 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
   const nativeFd = Number(processObject.env?.COTTONTAIL_IPC_FD);
   const nodeFd = Number(processObject.env?.NODE_CHANNEL_FD);
   const nativeProtocol = processObject.env?.COTTONTAIL_IPC_BOOTSTRAP === "node" &&
-    Number.isInteger(nativeFd) && nativeFd > 2;
+    Number.isInteger(nativeFd) && nativeFd >= 0;
   const fd = nativeProtocol ? nativeFd : nodeFd;
-  if (!Number.isInteger(fd) || fd <= 2 || typeof host?.ipcSend !== "function" || typeof host?.ipcRecv !== "function") {
+  if (!Number.isInteger(fd) || fd < 0 || typeof host?.ipcSend !== "function" || typeof host?.ipcRecv !== "function") {
     return false;
   }
 
@@ -175,9 +341,11 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
   const serialization = serializationMode === "advanced" ? "advanced" : "json";
   let connected = true;
   let buffer = "";
+  let pendingFd;
   let timer = null;
   const wrappedMethods = [];
   const decoder = new TextDecoder();
+  const adoptedHandles = new Map();
   const channelEvents = new Set(["message", "disconnect", "internalMessage"]);
 
   const channel = {
@@ -212,10 +380,14 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
     if (nativeProtocol) {
       try { delete processObject[inheritedNodeIpcSymbol]; } catch {}
     }
+    if (Number.isInteger(pendingFd) && pendingFd >= 0) {
+      try { host.closeFd?.(pendingFd); } catch {}
+      pendingFd = undefined;
+    }
     if (closeFd) {
       try { host.closeFd?.(fd); } catch {}
     }
-    if (emitDisconnect) processObject.emit?.("disconnect");
+    if (emitDisconnect) queueMicrotask(() => processObject.emit?.("disconnect"));
   };
 
   const poll = () => {
@@ -225,8 +397,17 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
         const event = host.ipcRecv(fd, 64 * 1024);
         if (event == null) break;
         if (event.end) {
+          if (Number.isInteger(event.fd) && event.fd >= 0) {
+            try { host.closeFd?.(event.fd); } catch {}
+          }
           close();
           return;
+        }
+        if (Number.isInteger(event.fd) && event.fd >= 0) {
+          if (Number.isInteger(pendingFd) && pendingFd >= 0) {
+            try { host.closeFd?.(pendingFd); } catch {}
+          }
+          pendingFd = Number(event.fd);
         }
         buffer += decoder.decode(event.data ?? new ArrayBuffer(0), { stream: true });
         for (;;) {
@@ -235,11 +416,25 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
           const line = buffer.slice(0, newline).replace(/\r$/, "");
           buffer = buffer.slice(newline + 1);
           if (line === "") continue;
+          const frameFd = pendingFd;
+          pendingFd = undefined;
           // Node reserves NODE_* command objects for its internal channel.
           // Bun's public IPC callback receives ordinary payloads only.
-          const message = decodeBunSpawnIpc(line);
-          if (message?.cmd?.startsWith?.("NODE_")) processObject.emit?.("internalMessage", message);
-          else processObject.emit?.("message", message);
+          let frame;
+          try {
+            frame = decodeInheritedNodeIpcFrame(host, decodeBunSpawnIpc(line), frameFd, adoptedHandles);
+          } catch (error) {
+            if (Number.isInteger(frameFd) && frameFd >= 0) {
+              try { host.closeFd?.(frameFd); } catch {}
+            }
+            throw error;
+          }
+          if (frame == null) continue;
+          if (frame.message?.cmd?.startsWith?.("NODE_")) {
+            processObject.emit?.("internalMessage", frame.message, frame.handle);
+          } else {
+            processObject.emit?.("message", frame.message, frame.handle);
+          }
           updateChannelRef();
         }
       }
@@ -253,8 +448,20 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
   processObject._channel = channel;
   processObject.send = function send(message, sendHandleOrCallback = undefined, optionsOrCallback = undefined, callback = undefined) {
     validateNodeIpcMessage(message, arguments.length);
-    if (typeof sendHandleOrCallback === "function") callback = sendHandleOrCallback;
-    else if (typeof optionsOrCallback === "function") callback = optionsOrCallback;
+    let sendHandle = sendHandleOrCallback;
+    let options = optionsOrCallback;
+    if (typeof sendHandleOrCallback === "function") {
+      callback = sendHandleOrCallback;
+      sendHandle = undefined;
+      options = undefined;
+    } else if (typeof optionsOrCallback === "function") {
+      callback = optionsOrCallback;
+      options = undefined;
+    } else if (options !== undefined && (options === null || typeof options !== "object")) {
+      const error = new TypeError('The "options" argument must be of type object.');
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
+    }
     if (!connected) {
       const error = new Error("Channel closed");
       error.code = "ERR_IPC_CHANNEL_CLOSED";
@@ -266,7 +473,15 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
     try {
       // External Node advanced IPC requires V8's binary wire format. Native
       // Cottontail children use the stock-JSC structured value codec instead.
-      ok = host.ipcSend(fd, encodeBunSpawnIpc(message, !nativeProtocol, serialization)) === true;
+      if (nativeProtocol) {
+        ok = writeInheritedNodeIpc(host, fd, message, serialization, sendHandle, options, error => {
+          if (typeof callback === "function") callback(error);
+          else if (error != null) processObject.emit?.("error", error);
+        });
+        return ok;
+      }
+      if (sendHandle != null) throw invalidIpcHandle();
+      ok = host.ipcSend(fd, encodeBunSpawnIpc(message, true, serialization)) === true;
     } catch (error) {
       if (typeof callback === "function") queueMicrotask(() => callback(error));
       else queueMicrotask(() => processObject.emit?.("error", error));
@@ -275,7 +490,14 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
     if (typeof callback === "function") queueMicrotask(() => callback(ok ? null : new Error("write failed")));
     return ok;
   };
-  processObject.disconnect = () => close();
+  processObject.disconnect = () => {
+    if (!connected) {
+      const error = new Error("IPC channel is already disconnected");
+      error.code = "ERR_IPC_DISCONNECTED";
+      throw error;
+    }
+    close();
+  };
 
   timer = setInterval(poll, 1);
   channel.unref();

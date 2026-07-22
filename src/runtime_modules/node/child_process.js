@@ -41,6 +41,7 @@ export class ChildProcess extends EventEmitter {
     const file = String(options.file);
     const argv = Array.isArray(options?.args) ? Array.from(options.args, String) : [];
     const spawnOptions = { ...options, args: undefined, file: undefined, envPairs: undefined };
+    if (spawnOptions.argv0 == null && argv.length > 0) spawnOptions.argv0 = argv[0];
     if (options.envPairs !== undefined) spawnOptions.env = envPairsToObject(options.envPairs);
     return spawnInternal(file, argv.length > 0 ? argv.slice(1) : [], spawnOptions, this);
   }
@@ -68,6 +69,28 @@ function invalidArgTypeError(name, expected, value) {
   const error = new TypeError(`The "${name}" argument must be of type ${expected}. Received ${receivedValueText(value)}`);
   error.code = "ERR_INVALID_ARG_TYPE";
   return error;
+}
+
+function tagNodeError(error, code) {
+  error.code = code;
+  Object.defineProperty(error, "toString", {
+    configurable: true,
+    value() {
+      return `${this.name} [${this.code}]: ${this.message}`;
+    },
+  });
+  return error;
+}
+
+function inspectOptionValue(value) {
+  if (typeof value === "string") return `'${value.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
+  if (value === null) return "null";
+  if (typeof value === "number") return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 function invalidFileArgError(file) {
@@ -152,9 +175,10 @@ const DEFAULT_SYNC_MAX_BUFFER = 1024 * 1024;
 function validateSyncTimeout(timeout) {
   if (timeout == null) return undefined;
   if (typeof timeout !== "number" || !Number.isFinite(timeout) || !Number.isInteger(timeout) || timeout < 0) {
-    const error = new RangeError(`The value of "options.timeout" is out of range. It must be an unsigned integer. Received ${timeout}`);
-    error.code = "ERR_OUT_OF_RANGE";
-    throw error;
+    throw tagNodeError(
+      new RangeError(`The value of "options.timeout" is out of range. It must be an unsigned integer. Received ${timeout}`),
+      "ERR_OUT_OF_RANGE",
+    );
   }
   return timeout;
 }
@@ -247,14 +271,21 @@ function classifySyncStdio(value, parentFd) {
   }
   if (value === "ignore") return { capture: false };
   if (value === "inherit") return { capture: false, targetFd: parentFd };
+  if (value === "ipc") {
+    const error = new Error("IPC cannot be used with synchronous forks");
+    error.code = "ERR_IPC_SYNC_FORK";
+    throw error;
+  }
   if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
     return { capture: false, targetFd: value };
   }
   if (typeof value === "object") {
-    if (typeof value.fd === "number") return { capture: false, targetFd: value.fd };
+    if (typeof value.fd === "number" && Number.isInteger(value.fd) && value.fd >= 0) {
+      return { capture: false, targetFd: value.fd };
+    }
     if (typeof value.write === "function") return { capture: false, targetStream: value };
   }
-  return { capture: true };
+  throw invalidArgTypeError(`options.stdio[${parentFd}]`, "string, number, or stream", value);
 }
 
 function nativeSyncStdioMode(target, parentFd) {
@@ -280,6 +311,7 @@ export function spawnSync(file, args = [], options = {}) {
   if (typeof file !== "string") throw invalidFileArgError(file);
   const normalized = normalizeSpawnArgs(args, options);
   validateSpawnOptions(normalized.options);
+  validateSpawnStrings(file, normalized.args, normalized.options);
   const command = normalizeSpawnCommand(file, normalized.args, normalized.options);
   const nativeOptions = prepareNativeOptions(command.file, normalized.options);
   const stdioOption = normalized.options.stdio;
@@ -309,6 +341,8 @@ export function spawnSync(file, args = [], options = {}) {
       maxBuffer,
       killSignal,
       argv0: normalized.options.argv0,
+      windowsHide: normalized.options.windowsHide === true,
+      windowsVerbatimArguments: normalized.options.windowsVerbatimArguments === true,
     });
   } catch (error) {
     return makeSpawnFailureResult(file, error, command.args);
@@ -392,6 +426,17 @@ function validateSpawnOptions(options) {
   }
   if (options.argv0 != null && typeof options.argv0 !== "string") {
     throw invalidArgTypeError("options.argv0", "string", options.argv0);
+  }
+  if (options.stdio != null && typeof options.stdio !== "string" && !Array.isArray(options.stdio)) {
+    throw invalidArgTypeError("options.stdio", "string or Array", options.stdio);
+  }
+  if (options.serialization !== undefined && options.serialization !== "json" && options.serialization !== "advanced") {
+    const error = new TypeError(
+      "The property 'options.serialization' must be one of: undefined, 'json', 'advanced'. " +
+        `Received ${inspectOptionValue(options.serialization)}`,
+    );
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
   }
   normalizeCwdOption(options.cwd);
 }
@@ -478,14 +523,67 @@ function makeAbortError(reason = undefined) {
   return error;
 }
 
-function normalizeStdio(value, fallback) {
+function normalizeStdio(value, fallback, index) {
   // Node treats both null and undefined stdio entries as the default (pipe
   // for fds 0-2).
   if (value === undefined || value === null) return fallback;
-  if (value === "pipe" || value === "inherit" || value === "ignore") return value;
-  if (value === "ipc") return "pipe";
-  if (typeof value === "number") return "inherit";
-  return fallback;
+  if (value === "pipe" || value === "overlapped") return "pipe";
+  if (value === "inherit" || value === "ignore") return value;
+  if (value === "ipc") return "ipc";
+  if (stdioSourceFd(value) != null) return "inherit";
+  throw invalidArgTypeError(`options.stdio[${index}]`, "string, number, or stream", value);
+}
+
+function normalizeExtraStdio(value, index) {
+  if (value === undefined || value === null) return "ignore";
+  if (value === "pipe" || value === "overlapped") return "pipe";
+  if (value === "inherit" || value === "ignore" || value === "ipc") return value;
+  const fd = stdioSourceFd(value);
+  if (fd != null) return fd;
+  throw invalidArgTypeError(`options.stdio[${index}]`, "string, number, or stream", value);
+}
+
+function validateAsyncTimeout(value) {
+  if (value == null) return 0;
+  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+    throw tagNodeError(
+      new RangeError(`The value of "options.timeout" is out of range. It must be an unsigned integer. Received ${value}`),
+      "ERR_OUT_OF_RANGE",
+    );
+  }
+  return value;
+}
+
+function validateAbortSignal(signal) {
+  if (signal == null) return;
+  if (typeof AbortSignal !== "function" || !(signal instanceof AbortSignal)) {
+    throw invalidArgTypeError("options.signal", "AbortSignal", signal);
+  }
+}
+
+function validateSpawnStrings(file, args, options) {
+  if (file.length === 0) {
+    const error = new TypeError('The argument \'file\' cannot be empty. Received \'\'');
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
+  }
+  const assertNoNull = (name, value) => {
+    if (!String(value).includes("\0")) return;
+    const error = new TypeError(`The argument '${name}' must be a string without null bytes. Received ${JSON.stringify(String(value))}`);
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
+  };
+  assertNoNull("file", file);
+  for (let index = 0; index < args.length; index += 1) assertNoNull(`args[${index}]`, args[index]);
+  if (options.cwd != null) assertNoNull("options.cwd", normalizeCwdOption(options.cwd));
+  if (options.argv0 != null) assertNoNull("options.argv0", options.argv0);
+  if (typeof options.shell === "string") assertNoNull("options.shell", options.shell);
+  if (options.env != null && typeof options.env === "object") {
+    for (const [key, value] of Object.entries(options.env)) {
+      assertNoNull(`options.env['${key}']`, key);
+      if (value !== undefined) assertNoNull(`options.env['${key}']`, value);
+    }
+  }
 }
 
 function stdioSourceFd(value) {
@@ -561,6 +659,11 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
   const normalized = normalizeSpawnArgs(args, options);
   args = normalized.args;
   options = normalized.options;
+  validateSpawnOptions(options);
+  validateSpawnStrings(file, args, options);
+  const timeout = validateAsyncTimeout(options.timeout);
+  validateAbortSignal(options.signal);
+  if (options.killSignal != null) normalizeSpawnKillSignal(options.killSignal);
   const command = normalizeSpawnCommand(file, args, options);
   let preflightError = options.shell ? null : spawnPreflightError(command.file, args, file);
   const stdoutListeners = new Map();
@@ -575,23 +678,46 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
   let stdinOption;
   let stdoutOption;
   let stderrOption;
+  const extraStdio = [];
+  let ipcIndex = -1;
   if (Array.isArray(options.stdio)) {
     stdinOption = options.stdio[0];
     stdoutOption = options.stdio[1];
     stderrOption = options.stdio[2];
+    for (let index = 3; index < options.stdio.length; index += 1) {
+      const entry = normalizeExtraStdio(options.stdio[index], index);
+      if (entry === "ipc") {
+        if (ipcIndex !== -1) {
+          const error = new Error("Child process can have only one IPC pipe");
+          error.code = "ERR_IPC_ONE_PIPE";
+          throw error;
+        }
+        ipcIndex = index;
+      }
+      extraStdio.push(entry);
+    }
   } else if (typeof options.stdio === "string") {
     stdinOption = stdoutOption = stderrOption = options.stdio;
   }
   if (options.stdin !== undefined) stdinOption = options.stdin;
   if (options.stdout !== undefined) stdoutOption = options.stdout;
   if (options.stderr !== undefined) stderrOption = options.stderr;
-  stdinMode = normalizeStdio(stdinOption, stdinMode);
-  stdoutMode = normalizeStdio(stdoutOption, stdoutMode);
-  stderrMode = normalizeStdio(stderrOption, stderrMode);
+  for (const [index, entry] of [stdinOption, stdoutOption, stderrOption].entries()) {
+    if (entry !== "ipc") continue;
+    if (ipcIndex !== -1) {
+      const error = new Error("Child process can have only one IPC pipe");
+      error.code = "ERR_IPC_ONE_PIPE";
+      throw error;
+    }
+    ipcIndex = index;
+  }
+  stdinMode = normalizeStdio(stdinOption, stdinMode, 0);
+  stdoutMode = normalizeStdio(stdoutOption, stdoutMode, 1);
+  stderrMode = normalizeStdio(stderrOption, stderrMode, 2);
   const stdinSourceFd = stdioSourceFd(stdinOption);
   const stdoutSourceFd = stdioSourceFd(stdoutOption);
   const stderrSourceFd = stdioSourceFd(stderrOption);
-  const ipcRequested = options.ipc === true || (Array.isArray(options.stdio) && options.stdio.some((item) => item === "ipc"));
+  const ipcRequested = options.ipc === true || ipcIndex !== -1;
   const nodeIpcProtocol = options.__nodeIpcProtocol === true;
 
   const nativeOptions = prepareNativeOptions(command.file, options);
@@ -829,10 +955,12 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
     stderr: stderrMode === "pipe" ? makeStream(stderrListeners, 2) : null,
     _nativeId: -1,
     _ipcFd: null,
+    spawnfile: command.file,
+    spawnargs: [options.argv0 != null ? String(options.argv0) : command.file, ...command.args],
     kill(signal = "SIGTERM") {
       const signalNumber = normalizeKillSignal(signal);
       const killed = cottontail.spawnKill?.(native.id, signalNumber) === true;
-      child.killed = child.killed || killed;
+      if (signalNumber !== 0) child.killed = child.killed || killed;
       return killed;
     },
     ref() {
@@ -858,28 +986,40 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
         stdin: stdinSourceFd ?? stdinMode,
         stdout: stdoutSourceFd ?? stdoutMode,
         stderr: stderrSourceFd ?? stderrMode,
+        extraStdio,
         ipc: ipcRequested,
+        nodeIpc: nodeIpcProtocol,
         argv0: options.argv0 != null ? String(options.argv0) : undefined,
         windowsHide: options.windowsHide === true,
         windowsVerbatimArguments: options.windowsVerbatimArguments === true,
+        detached: options.detached === true,
         deferStart,
       });
       child.pid = native.pid ?? 0;
       child._nativeId = native.id;
       child._ipcFd = native.ipcFd == null ? null : Number(native.ipcFd);
+      const nativeExtraFds = Array.isArray(native.extraFds) ? native.extraFds : [];
+      const extraStreams = nativeExtraFds.map((fd, index) =>
+        extraStdio[index] === "pipe" && Number.isInteger(fd) && fd >= 0
+          ? new NetSocket({ fd, pipe: true })
+          : null
+      );
+      child.stdio = [child.stdin, child.stdout, child.stderr, ...extraStreams];
+      if (ipcIndex >= 0) child.stdio[ipcIndex] = null;
     } catch (error) {
       preflightError = normalizeSpawnError(file, args, error);
     }
   }
 
-  if (options.timeout != null && Number(options.timeout) > 0) {
+  if (preflightError == null && timeout > 0) {
     child._timeoutTimer = setTimeout(() => {
       child.kill(options.killSignal ?? "SIGTERM");
-    }, Number(options.timeout));
+    }, timeout);
+    child._timeoutTimer.unref?.();
   }
 
   let abortHandler = null;
-  if (options.signal) {
+  if (preflightError == null && options.signal) {
     abortHandler = () => {
       const error = makeAbortError(options.signal?.reason);
       child.kill(options.killSignal ?? "SIGTERM");
@@ -891,7 +1031,70 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
 
   const emitChild = (name, ...values) => child.emit(name, ...values);
 
-  if (preflightError == null) unregisterSpawnListener = globalThis.__cottontailRegisterSpawnListener?.(native.id, (event) => {
+  const finishStdin = () => {
+    if (!child.stdin || child.stdin.destroyed) return;
+    child.stdin.writable = false;
+    child.stdin.writableEnded = true;
+    child.stdin.writableFinished = true;
+    child.stdin.destroyed = true;
+    emitFrom(stdinListeners, "close");
+  };
+  const finishReadable = (stream, map) => {
+    if (!stream || stream.readableEnded || stream.destroyed) return;
+    stream.readable = false;
+    stream.readableEnded = true;
+    emitFrom(map, "end");
+    stream.destroyed = true;
+    emitFrom(map, "close");
+  };
+  const finishIpc = () => {
+    const wasConnected = child.connected === true;
+    child.connected = false;
+    const onExit = child._ipcOnExit;
+    child._ipcOnExit = null;
+    onExit?.();
+    if (wasConnected) emitChild("disconnect");
+  };
+  const closePendingIpcEvents = () => {
+    if (!Array.isArray(child._pendingIpcEvents)) return;
+    for (const pendingEvent of child._pendingIpcEvents) {
+      if (Number.isInteger(pendingEvent?.fd) && pendingEvent.fd >= 0) {
+        try { cottontail.closeFd?.(pendingEvent.fd); } catch {}
+      }
+    }
+    child._pendingIpcEvents = [];
+  };
+
+  let exited = false;
+  let exitEmitted = false;
+  let closeEmitted = false;
+  let closeCodeOverride;
+  let terminalTimer = null;
+  const scheduleTerminalEvents = () => {
+    if (terminalTimer != null) return;
+    terminalTimer = setTimeout(() => {
+      terminalTimer = null;
+      if (exited && !exitEmitted) {
+        exitEmitted = true;
+        finishStdin();
+        emitChild("exit", child.exitCode, child.signalCode);
+      }
+      if (closed && !closeEmitted) {
+        closeEmitted = true;
+        finishStdin();
+        finishReadable(child.stdout, stdoutListeners);
+        finishReadable(child.stderr, stderrListeners);
+        closePendingIpcEvents();
+        finishIpc();
+        emitChild("close", closeCodeOverride ?? child.exitCode, child.signalCode);
+        if (native.id >= 0) cottontail.spawnDispose?.(native.id);
+      }
+    }, 0);
+  };
+
+  let spawnEmitted = false;
+  const pendingNativeEvents = [];
+  const handleNativeSpawnEvent = (event) => {
     if (!event) return;
     if (event.type === "stdout") {
       const bytes = new Uint8Array(event.data ?? new ArrayBuffer(0));
@@ -903,6 +1106,14 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
       if (bytes.length > 0) deliverStreamData(child.stderr, stderrListeners, streamChunk(child.stderr, bytes));
       return;
     }
+    if (event.type === "stdout_end") {
+      finishReadable(child.stdout, stdoutListeners);
+      return;
+    }
+    if (event.type === "stderr_end") {
+      finishReadable(child.stderr, stderrListeners);
+      return;
+    }
     if (event.type === "ipc") {
       if (typeof child._handleIpcEvent === "function") {
         child._handleIpcEvent(event);
@@ -912,58 +1123,40 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
       }
       return;
     }
-    if (event.type === "exit" && !closed) {
-      closed = true;
+    if (event.type === "ipc_end") {
+      finishIpc();
+      return;
+    }
+    if (event.type === "exit" && !exited) {
+      exited = true;
       if (child._timeoutTimer != null) {
         clearTimeout(child._timeoutTimer);
         child._timeoutTimer = null;
       }
       if (abortHandler != null) options.signal?.removeEventListener?.("abort", abortHandler);
-      if (unregisterSpawnListener != null) {
-        unregisterSpawnListener();
-        unregisterSpawnListener = null;
-      }
       // Node reports code null + signal name when the child died from a signal.
       const exitCode = event.exitCode == null ? (event.signalCode == null ? 0 : null) : Number(event.exitCode);
       const signalCode = signalNumberToName(event.signalCode);
       child.exitCode = exitCode;
       child.signalCode = signalCode;
-      if (Array.isArray(child._pendingIpcEvents)) {
-        for (const pendingEvent of child._pendingIpcEvents) {
-          if (Number.isInteger(pendingEvent?.fd) && pendingEvent.fd >= 0) cottontail.closeFd?.(pendingEvent.fd);
-        }
-        child._pendingIpcEvents = [];
-      }
-      // Defer terminal events by one macrotask: the exit event can be
-      // dispatched in the same pump as the JS continuation that attaches
-      // 'exit'/'close' listeners right after spawn()/kill(), and emitting
-      // synchronously here would fire before those listeners exist. The
-      // (ref'd) timer also keeps the event loop alive now that the spawn
-      // listener has been unregistered.
-      setTimeout(() => {
-        if (child.stdout) {
-          child.stdout.readableEnded = true;
-          child.stdout.destroyed = true;
-          emitFrom(stdoutListeners, "end");
-          emitFrom(stdoutListeners, "close");
-        }
-        if (child.stderr) {
-          child.stderr.readableEnded = true;
-          child.stderr.destroyed = true;
-          emitFrom(stderrListeners, "end");
-          emitFrom(stderrListeners, "close");
-        }
-        // The IPC channel dies with the child; Node marks it closed before
-        // 'exit' listeners run, then emits 'disconnect'.
-        const wasConnected = child.connected === true;
-        child.connected = false;
-        child._ipcOnExit?.();
-        emitChild("exit", exitCode, signalCode);
-        if (wasConnected) emitChild("disconnect");
-        emitChild("close", exitCode, signalCode);
-        cottontail.spawnDispose?.(native.id);
-      }, 0);
+      scheduleTerminalEvents();
+      return;
     }
+    if (event.type === "close" && !closed) {
+      closed = true;
+      if (unregisterSpawnListener != null) {
+        unregisterSpawnListener();
+        unregisterSpawnListener = null;
+      }
+      scheduleTerminalEvents();
+    }
+  };
+  if (preflightError == null) unregisterSpawnListener = globalThis.__cottontailRegisterSpawnListener?.(native.id, (event) => {
+    if (!spawnEmitted) {
+      pendingNativeEvents.push(event);
+      return;
+    }
+    handleNativeSpawnEvent(event);
   });
 
   if (ipcRequested && Number.isInteger(child._ipcFd) && child._ipcFd >= 0) {
@@ -971,8 +1164,14 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
   }
 
   if (preflightError) {
-    // Failed exec: 'error' fires asynchronously instead of 'spawn'.
-    queueMicrotask(() => emitChild("error", preflightError));
+    child.pid = undefined;
+    closeCodeOverride = preflightError.errno ?? -1;
+    // Failed exec: 'error' precedes 'close' and no 'spawn'/'exit' event fires.
+    queueMicrotask(() => {
+      emitChild("error", preflightError);
+      closed = true;
+      scheduleTerminalEvents();
+    });
     return child;
   }
 
@@ -983,7 +1182,9 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
 
   // Node emits 'spawn' asynchronously once the process started successfully.
   queueMicrotask(() => {
-    if (!closed) emitChild("spawn");
+    spawnEmitted = true;
+    emitChild("spawn");
+    for (const event of pendingNativeEvents.splice(0)) handleNativeSpawnEvent(event);
   });
 
   return child;
@@ -1082,7 +1283,7 @@ export function execFile(file, args = [], options = {}, callback = undefined) {
   const normalized = normalizeExecFileArgs(args, options, callback);
   const child = spawn(file, normalized.args, {
     ...normalized.options,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
   });
   return collectChild(child, normalized.options, normalized.callback, String(file));
 }
@@ -1098,7 +1299,7 @@ export function exec(command, options = {}, callback = undefined) {
   const child = spawn(shell, args, {
     ...options,
     shell: false, // already wrapped in a shell here; don't re-wrap in spawn()
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
   });
   return collectChild(child, options, callback, String(command));
 }
@@ -1154,6 +1355,13 @@ function normalizeSendArgs(sendHandleOrCallback = undefined, optionsOrCallback =
   } else if (typeof optionsOrCallback === "function") {
     callback = optionsOrCallback;
     options = undefined;
+  } else if (options !== undefined && (options === null || typeof options !== "object")) {
+    throw invalidArgTypeError("options", "object", options);
+  }
+  if (sendHandle != null && !isIpcSendHandle(sendHandle)) {
+    const error = new TypeError("This handle type cannot be sent");
+    error.code = "ERR_INVALID_HANDLE_TYPE";
+    throw error;
   }
   return { sendHandle, options, callback };
 }
@@ -1194,6 +1402,16 @@ function ipcHandleInfo(sendHandle = undefined) {
   // Handle without an underlying descriptor yet (e.g. a net.Server that never
   // listened): Node still delivers the message; we just cannot pass the handle.
   return null;
+}
+
+function isIpcSendHandle(handle) {
+  if (handle == null || (typeof handle !== "object" && typeof handle !== "function")) return false;
+  if (handle instanceof NetSocket || handle instanceof NetServer) return true;
+  if (Number.isInteger(handle.fd) || Number.isInteger(handle._fd) || Number.isInteger(handle._handle?.fd)) return true;
+  // Datagram sockets and not-yet-bound native handles expose `_handle` before
+  // they necessarily have an fd. They are valid handle kinds even when there
+  // is not yet a descriptor to transfer.
+  return handle._handle != null;
 }
 
 function receivedIpcHandle(fd = undefined, type = "net.Socket") {
@@ -1472,12 +1690,19 @@ function installParentIpcChannel(child, serialization = undefined, nodeProtocol 
   };
 
   child.disconnect = () => {
-    if (!child.connected) return;
+    if (!child.connected) {
+      const error = new Error("IPC channel is already disconnected");
+      error.code = "ERR_IPC_DISCONNECTED";
+      throw error;
+    }
     child.connected = false;
     cottontail.spawnCloseIpc?.(child._nativeId);
+    const onExit = child._ipcOnExit;
+    child._ipcOnExit = null;
+    onExit?.();
     child.channel = null;
     child._channel = null;
-    emitChildMessage(child, undefined, "disconnect");
+    queueMicrotask(() => emitChildMessage(child, undefined, "disconnect"));
   };
 }
 
@@ -1503,9 +1728,45 @@ export function fork(modulePath, args = [], options = {}) {
   if (options.execPath != null && typeof options.execPath !== "string") {
     throw invalidArgTypeError("options.execPath", "string", options.execPath);
   }
+  if (options.silent != null && typeof options.silent !== "boolean") {
+    throw invalidArgTypeError("options.silent", "boolean", options.silent);
+  }
+  if (options.execArgv != null && !Array.isArray(options.execArgv)) {
+    throw invalidArgTypeError("options.execArgv", "Array", options.execArgv);
+  }
+  if (options.env != null && typeof options.env !== "object") {
+    throw invalidArgTypeError("options.env", "object", options.env);
+  }
   const execPath = options.execPath ?? process.execPath;
   const nodeIpcProtocol = execPath !== process.execPath;
   const serialization = options.serialization === "advanced" ? "advanced" : "json";
+  let stdio;
+  if (options.stdio == null) {
+    stdio = options.silent
+      ? ["pipe", "pipe", "pipe", "ipc"]
+      : ["inherit", "inherit", "inherit", "ipc"];
+  } else {
+    if (typeof options.stdio === "string") {
+      if (!["pipe", "ignore", "inherit", "overlapped"].includes(options.stdio)) {
+        throw invalidArgTypeError("options.stdio", "string or Array", options.stdio);
+      }
+      stdio = [options.stdio, options.stdio, options.stdio, "ipc"];
+    } else {
+      if (!Array.isArray(options.stdio)) throw invalidArgTypeError("options.stdio", "string or Array", options.stdio);
+      stdio = Array.from(options.stdio);
+    }
+    const ipcCount = stdio.filter(entry => entry === "ipc").length;
+    if (ipcCount === 0) {
+      const error = new Error("Forked processes must have an IPC channel, missing value 'ipc' in options.stdio");
+      error.code = "ERR_CHILD_PROCESS_IPC_REQUIRED";
+      throw error;
+    }
+    if (ipcCount > 1) {
+      const error = new Error("Child process can have only one IPC pipe");
+      error.code = "ERR_IPC_ONE_PIPE";
+      throw error;
+    }
+  }
 
   const env = withoutElectrobunHostEnv({
     ...process.env,
@@ -1523,7 +1784,7 @@ export function fork(modulePath, args = [], options = {}) {
     ...options,
     env,
     ipc: true,
-    stdio: ["pipe", "pipe", options.silent ? "pipe" : "inherit"],
+    stdio,
     // The native start gate is a private Cottontail CLI argument. External
     // runtimes cannot consume it, and their fd 3 IPC channel is ready at exec.
     __deferStart: !nodeIpcProtocol,
@@ -1632,7 +1893,7 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
   if (!processObject || (typeof processObject.send === "function" && inheritedIpc == null)) return;
   const inheritedState = inheritedIpc?.detach?.();
   const nativeFd = Number(processObject.env?.COTTONTAIL_IPC_FD ?? fd);
-  const hasNativeIpc = Number.isInteger(nativeFd) && nativeFd > 2 && typeof cottontail.ipcSend === "function" && typeof cottontail.ipcRecv === "function";
+  const hasNativeIpc = Number.isInteger(nativeFd) && nativeFd >= 0 && typeof cottontail.ipcSend === "function" && typeof cottontail.ipcRecv === "function";
 
   processObject.connected = true;
   let stopNativeIpc = null;
@@ -1752,10 +2013,8 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
   }
 }
 
-// COTTONTAIL-COMPAT: forked children are marked with COTTONTAIL_IPC_BOOTSTRAP=node but no
-// startup hook calls _forkChild yet, so bootstrap process.send/disconnect when this module
-// loads in such a child. Children that never require node:child_process still miss out;
-// the process bootstrap (bun/ffi.js or node/process.js) should eventually call _forkChild.
+// The normal runtime bootstrap installs process IPC before user code. Keep a
+// module-local fallback for embedders that load child_process without ffi.js.
 if (globalThis.process?.env?.COTTONTAIL_IPC_BOOTSTRAP === "node" && typeof globalThis.process?.send !== "function") {
   try { _forkChild(); } catch {}
 }

@@ -1,5 +1,5 @@
 // Source-derived Bun.spawn/Bun.spawnSync argument contract. Process creation
-// stays in bun/index.js because it is coupled to Cottontail's host hooks.
+// is implemented by bun/spawn.js against Cottontail's native host hooks.
 
 const signalNames = [
   undefined,
@@ -139,7 +139,7 @@ export function validateBunSpawnCallbacks(options, sync = false) {
       throw new TypeError(`${name} must be a function or undefined`);
     }
   }
-  if (!sync && typeof options.ipc === "function" && !isEmptyBunSpawnOption(options.serialization)) {
+  if (!sync && !isEmptyBunSpawnOption(options.serialization)) {
     if (typeof options.serialization !== "string") {
       throw new TypeError("Expected serialization to be a string for 'spawn'.");
     }
