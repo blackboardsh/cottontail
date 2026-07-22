@@ -4269,8 +4269,7 @@ fn entrypointImportsOnlyRuntimeAliases(ctx: *const Context, path: []const u8) !b
     const parsed = std.json.parseFromSlice([]const ScannedImport, ctx.allocator, imports_json, .{}) catch return false;
     defer parsed.deinit();
     for (parsed.value) |item| {
-        if ((!std.mem.eql(u8, item.kind, "import-statement") and
-            !std.mem.eql(u8, item.kind, "require-call")) or
+        if (!std.mem.eql(u8, item.kind, "import-statement") or
             item.path.len == 0 or
             !isMinimalRuntimeAliasSpecifier(item.path)) return false;
     }
@@ -4387,14 +4386,6 @@ fn runtimeMemberProperty(tokens: []const JavaScriptModuleToken, index: usize) ?[
     return tokens[property_index].text;
 }
 
-fn isLiteralRuntimeRequire(tokens: []const JavaScriptModuleToken, index: usize) bool {
-    return index + 3 < tokens.len and
-        tokenIs(tokens[index + 1], .punct, "(") and
-        tokens[index + 2].kind == .string and
-        isMinimalRuntimeAliasSpecifier(tokens[index + 2].text) and
-        tokenIs(tokens[index + 3], .punct, ")");
-}
-
 const RuntimeBootstrapMode = enum {
     full,
     minimal,
@@ -4434,8 +4425,6 @@ fn entrypointRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !Runtim
                     std.mem.eql(u8, property, "prepareStackTrace") or
                     std.mem.eql(u8, property, "stackTraceLimit")) return .full;
             }
-        } else if (std.mem.eql(u8, token.text, "require")) {
-            if (!isLiteralRuntimeRequire(tokens, index)) return .full;
         } else if (fullRuntimeGlobal(token.text)) {
             return .full;
         }
@@ -4688,10 +4677,6 @@ fn bundleScriptNative(
         is_common_js_entrypoint and
         !bundle_common_js_entrypoint and
         plain_launcher_cacheable;
-    const use_common_js_bundle_cache = is_common_js_entrypoint and
-        bundle_common_js_entrypoint and
-        plain_launcher_cacheable;
-    const use_common_js_cache = use_common_js_launcher_cache or use_common_js_bundle_cache;
     const runtime_virtual_root = if (use_common_js_launcher_cache or use_package_bin_launcher_cache)
         reusable_runtime_bundle_root
     else
@@ -4719,7 +4704,7 @@ fn bundleScriptNative(
             bundle_common_js_entrypoint,
             preload_imports,
             is_test_cli_execution,
-            use_common_js_cache,
+            use_common_js_launcher_cache,
             runtime_virtual_root,
             runtime_bootstrap_mode,
             false,
@@ -4799,8 +4784,6 @@ fn bundleScriptNative(
         "package-bin-runtime"
     else if (use_common_js_launcher_cache)
         "commonjs-runtime"
-    else if (use_common_js_bundle_cache)
-        try std.fmt.allocPrint(ctx.allocator, "commonjs-entry-{x}", .{std.hash.Wyhash.hash(0, script_abs)})
     else if (use_esm_bundle_cache)
         try std.fmt.allocPrint(ctx.allocator, "esm-entry-{x}", .{std.hash.Wyhash.hash(0, script_abs)})
     else
@@ -4813,8 +4796,8 @@ fn bundleScriptNative(
             ctx,
             wrapped_entry,
             name,
-            use_common_js_cache or use_package_bin_launcher_cache,
-            if (use_common_js_bundle_cache or use_esm_bundle_cache) script_entry_abs else null,
+            use_common_js_launcher_cache or use_package_bin_launcher_cache,
+            if (use_esm_bundle_cache) script_entry_abs else null,
         )
     else
         null;
@@ -4906,7 +4889,7 @@ fn bundleScriptNative(
             &cache,
             wrapped_entry,
             script_entry_abs,
-            if (use_common_js_bundle_cache or use_esm_bundle_cache) script_abs else null,
+            if (use_esm_bundle_cache) script_abs else null,
             runtime_code,
             runtime_source_map,
             output.input_files,
