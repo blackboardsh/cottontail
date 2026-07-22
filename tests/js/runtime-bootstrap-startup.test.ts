@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -84,6 +84,21 @@ test("stdio-only child evals stay on the selective startup path", () => {
     expect(String(result.stderr)).toBe(`child-${index}\n`);
   }
   expect(Date.now() - startedAt).toBeLessThan(5_000);
+});
+
+test("selective bootstrap initializes process before transitive runtime modules", () => {
+  const fixture = join(temporaryDirectory, "selective-process-argv.js");
+  const userArguments = Array.from({ length: 129 }, (_, index) => `arg${index}`);
+  writeFileSync(fixture, "console.log(JSON.stringify(process.argv));\n");
+
+  const result = run([fixture, ...userArguments]);
+  expect(String(result.stderr)).toBe("");
+  expect(result.exitCode).toBe(0);
+
+  const argv = JSON.parse(String(result.stdout));
+  expect(argv[0]).toBe(process.execPath);
+  expect(argv[1]).toBe(realpathSync(fixture));
+  expect(argv.slice(2)).toEqual(userArguments);
 });
 
 test("cold readline process bootstrap completes within Bun's spawn timeout", () => {

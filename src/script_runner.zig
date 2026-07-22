@@ -5722,6 +5722,7 @@ fn writeMinimalRuntimeEntryWrapper(
     bootstrap_mode: RuntimeBootstrapMode,
 ) ![]const u8 {
     std.debug.assert(bootstrap_mode != .full);
+    const process_bootstrap_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "internal", "runtime-process-bootstrap.js" });
     const bootstrap_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "internal", "runtime-bootstrap.js" });
     const url_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "url.js" });
     const process_import = if (bootstrap_mode == .process) blk: {
@@ -5754,6 +5755,7 @@ fn writeMinimalRuntimeEntryWrapper(
     else
         "";
     const source = try std.fmt.allocPrint(ctx.allocator,
+        \\import {s};
         \\import {{ installRuntimeBootstrap as __ctInstallRuntimeBootstrap }} from {s};
         \\import {{ fileURLToPath as __ctFileURLToPath, pathToFileURL as __ctPathToFileURL }} from {s};
         \\{s}
@@ -5779,6 +5781,7 @@ fn writeMinimalRuntimeEntryWrapper(
         \\}}
         \\
     , .{
+        try jsonStringLiteral(ctx, process_bootstrap_module),
         try jsonStringLiteral(ctx, bootstrap_module),
         try jsonStringLiteral(ctx, url_module),
         process_import,
