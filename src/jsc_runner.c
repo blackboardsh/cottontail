@@ -84,7 +84,9 @@ extern void JSGlobalContextSetUnhandledRejectionCallback(
 #include <brotli/decode.h>
 #include <brotli/encode.h>
 #include <dirent.h>
+#if !defined(_WIN32)
 #include <dlfcn.h>
+#endif
 #include <errno.h>
 #if __has_include(<ffi/ffi.h>)
 #include <ffi/ffi.h>
@@ -2031,6 +2033,76 @@ static char *ct_duplicate_bytes(const char *bytes, size_t len) {
 
 static char *ct_duplicate_string(const char *value) {
     return ct_duplicate_bytes(value != NULL ? value : "", value != NULL ? strlen(value) : 0);
+}
+
+typedef struct {
+    uv_lib_t uv;
+    bool initialized;
+} CtDynamicLibrary;
+
+static bool ct_dynamic_library_is_open(const CtDynamicLibrary *library) {
+    return library != NULL && library->initialized && library->uv.handle != NULL;
+}
+
+static void ct_dynamic_library_close(CtDynamicLibrary *library) {
+    if (library == NULL || !library->initialized) return;
+    uv_dlclose(&library->uv);
+    memset(library, 0, sizeof(*library));
+}
+
+static int ct_dynamic_library_open(CtDynamicLibrary *library, const char *path, char **error_out) {
+    if (error_out != NULL) *error_out = NULL;
+    if (library == NULL) {
+        if (error_out != NULL) *error_out = ct_duplicate_string("invalid dynamic library owner");
+        return -1;
+    }
+
+    memset(library, 0, sizeof(*library));
+    library->initialized = true;
+    if (uv_dlopen(path, &library->uv) == 0) return 0;
+
+    if (error_out != NULL) {
+        const char *message = uv_dlerror(&library->uv);
+        *error_out = ct_duplicate_string(message != NULL ? message : "dynamic library load failed");
+    }
+    ct_dynamic_library_close(library);
+    return -1;
+}
+
+static int ct_dynamic_library_symbol(const CtDynamicLibrary *library, const char *name, void **symbol_out, char **error_out) {
+    uv_lib_t lookup = {0};
+    int result = -1;
+
+    if (symbol_out != NULL) *symbol_out = NULL;
+    if (error_out != NULL) *error_out = NULL;
+    if (!ct_dynamic_library_is_open(library) || symbol_out == NULL) {
+        if (error_out != NULL) *error_out = ct_duplicate_string("dynamic library is not open");
+        return -1;
+    }
+
+    lookup.handle = library->uv.handle;
+    result = uv_dlsym(&lookup, name, symbol_out);
+    if (result != 0 && error_out != NULL) {
+        const char *message = uv_dlerror(&lookup);
+        *error_out = ct_duplicate_string(message != NULL ? message : "dynamic symbol lookup failed");
+    } else if (result == 0 && *symbol_out == NULL) {
+        result = -1;
+        if (error_out != NULL) *error_out = ct_duplicate_string("dynamic symbol resolved to a null address");
+    }
+
+    /* The temporary view owns only libuv's symbol-error allocation. */
+    lookup.handle = NULL;
+    uv_dlclose(&lookup);
+    return result == 0 ? 0 : -1;
+}
+
+static void *ct_process_symbol(const char *name) {
+#if defined(_WIN32)
+    HMODULE executable = GetModuleHandleW(NULL);
+    return executable != NULL ? (void *)(uintptr_t)GetProcAddress(executable, name) : NULL;
+#else
+    return dlsym(RTLD_DEFAULT, name);
+#endif
 }
 
 static bool ct_debug_flag(const char *name) {
@@ -4229,7 +4301,7 @@ typedef const char *(*CtZstdGetErrorNameFn)(size_t code);
 
 typedef struct {
     bool attempted;
-    void *handle;
+    CtDynamicLibrary library;
     CtZstdCompressBoundFn compress_bound;
     CtZstdCompressFn compress;
     CtZstdGetFrameContentSizeFn get_frame_content_size;
@@ -4244,34 +4316,49 @@ static CtZstdApi ct_zstd_api = {0};
 #define CT_ZSTD_CONTENTSIZE_ERROR ((unsigned long long)-2)
 
 static bool ct_zstd_load(void) {
-    if (ct_zstd_api.attempted) return ct_zstd_api.handle != NULL;
+    if (ct_zstd_api.attempted) return ct_dynamic_library_is_open(&ct_zstd_api.library);
     ct_zstd_api.attempted = true;
 
     const char *candidates[] = {
+#if defined(_WIN32)
+        "libzstd.dll",
+        "zstd.dll",
+#elif defined(__APPLE__)
         "libzstd.1.dylib",
         "libzstd.dylib",
         "/opt/homebrew/lib/libzstd.dylib",
         "/usr/local/lib/libzstd.dylib",
+#else
         "libzstd.so.1",
         "libzstd.so",
+#endif
     };
     for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); index += 1) {
-        void *handle = dlopen(candidates[index], RTLD_LAZY | RTLD_LOCAL);
-        if (handle == NULL) continue;
-        ct_zstd_api.compress_bound = (CtZstdCompressBoundFn)dlsym(handle, "ZSTD_compressBound");
-        ct_zstd_api.compress = (CtZstdCompressFn)dlsym(handle, "ZSTD_compress");
-        ct_zstd_api.get_frame_content_size = (CtZstdGetFrameContentSizeFn)dlsym(handle, "ZSTD_getFrameContentSize");
-        ct_zstd_api.decompress = (CtZstdDecompressFn)dlsym(handle, "ZSTD_decompress");
-        ct_zstd_api.is_error = (CtZstdIsErrorFn)dlsym(handle, "ZSTD_isError");
-        ct_zstd_api.get_error_name = (CtZstdGetErrorNameFn)dlsym(handle, "ZSTD_getErrorName");
+        void *symbol = NULL;
+        if (ct_dynamic_library_open(&ct_zstd_api.library, candidates[index], NULL) != 0) continue;
+        if (ct_dynamic_library_symbol(&ct_zstd_api.library, "ZSTD_compressBound", &symbol, NULL) == 0)
+            ct_zstd_api.compress_bound = (CtZstdCompressBoundFn)symbol;
+        if (ct_dynamic_library_symbol(&ct_zstd_api.library, "ZSTD_compress", &symbol, NULL) == 0)
+            ct_zstd_api.compress = (CtZstdCompressFn)symbol;
+        if (ct_dynamic_library_symbol(&ct_zstd_api.library, "ZSTD_getFrameContentSize", &symbol, NULL) == 0)
+            ct_zstd_api.get_frame_content_size = (CtZstdGetFrameContentSizeFn)symbol;
+        if (ct_dynamic_library_symbol(&ct_zstd_api.library, "ZSTD_decompress", &symbol, NULL) == 0)
+            ct_zstd_api.decompress = (CtZstdDecompressFn)symbol;
+        if (ct_dynamic_library_symbol(&ct_zstd_api.library, "ZSTD_isError", &symbol, NULL) == 0)
+            ct_zstd_api.is_error = (CtZstdIsErrorFn)symbol;
+        if (ct_dynamic_library_symbol(&ct_zstd_api.library, "ZSTD_getErrorName", &symbol, NULL) == 0)
+            ct_zstd_api.get_error_name = (CtZstdGetErrorNameFn)symbol;
         if (ct_zstd_api.compress_bound != NULL && ct_zstd_api.compress != NULL && ct_zstd_api.get_frame_content_size != NULL &&
             ct_zstd_api.decompress != NULL && ct_zstd_api.is_error != NULL && ct_zstd_api.get_error_name != NULL) {
-            ct_zstd_api.handle = handle;
             return true;
         }
-        dlclose(handle);
-        memset(&ct_zstd_api, 0, sizeof(ct_zstd_api));
-        ct_zstd_api.attempted = true;
+        ct_dynamic_library_close(&ct_zstd_api.library);
+        ct_zstd_api.compress_bound = NULL;
+        ct_zstd_api.compress = NULL;
+        ct_zstd_api.get_frame_content_size = NULL;
+        ct_zstd_api.decompress = NULL;
+        ct_zstd_api.is_error = NULL;
+        ct_zstd_api.get_error_name = NULL;
     }
     return false;
 }
@@ -6531,7 +6618,7 @@ static int ct_get_bytes(JSContextRef ctx, JSValueRef value, uint8_t **out_data, 
 // WHATWG TextDecoder support: legacy multi-byte/rare single-byte encodings are
 // decoded with the ICU converters already linked into the process (system
 // libicucore on macOS, the vendored ICU bridge on Linux). Symbols are looked
-// up with dlsym so a missing ICU stays a soft failure (returns null to JS).
+// up dynamically so a missing ICU stays a soft failure (returns null to JS).
 // ---------------------------------------------------------------------------
 
 #if !defined(_WIN32)
@@ -6555,12 +6642,12 @@ typedef struct {
 } CtIcuConverterApi;
 
 static void *ct_icu_converter_symbol(const char *base) {
-    void *symbol = dlsym(RTLD_DEFAULT, base);
+    void *symbol = ct_process_symbol(base);
     if (symbol != NULL) return symbol;
     char versioned[96];
     for (int version = 60; version <= 99; version += 1) {
         snprintf(versioned, sizeof(versioned), "%s_%d", base, version);
-        symbol = dlsym(RTLD_DEFAULT, versioned);
+        symbol = ct_process_symbol(versioned);
         if (symbol != NULL) return symbol;
     }
     return NULL;
@@ -17002,48 +17089,66 @@ struct CtFfiCallback {
 
 typedef struct CtNativeLibrary {
     char *path;
-    void *handle;
+    CtDynamicLibrary library;
     struct CtNativeLibrary *next;
 } CtNativeLibrary;
 
 static pthread_mutex_t ct_native_libraries_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtNativeLibrary *ct_native_libraries = NULL;
 
-static void *ct_get_native_library_handle(const char *path, char **error_out) {
-    void *handle = NULL;
+static CtNativeLibrary *ct_find_native_library_locked(const char *path) {
+    for (CtNativeLibrary *entry = ct_native_libraries; entry != NULL; entry = entry->next) {
+        if (strcmp(entry->path, path) == 0) return entry;
+    }
+    return NULL;
+}
+
+static CtNativeLibrary *ct_get_native_library(const char *path, char **error_out) {
+    CtDynamicLibrary opened = {0};
+    CtNativeLibrary *entry = NULL;
+    CtNativeLibrary *existing = NULL;
+
+    if (error_out != NULL) *error_out = NULL;
 
     pthread_mutex_lock(&ct_native_libraries_mutex);
-    for (CtNativeLibrary *entry = ct_native_libraries; entry != NULL; entry = entry->next) {
-        if (strcmp(entry->path, path) == 0) {
-            handle = entry->handle;
-            break;
-        }
-    }
+    existing = ct_find_native_library_locked(path);
     pthread_mutex_unlock(&ct_native_libraries_mutex);
+    if (existing != NULL) return existing;
 
-    if (handle != NULL) return handle;
+    if (ct_dynamic_library_open(&opened, path, error_out) != 0) return NULL;
 
-    handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
-    if (handle == NULL) {
-        const char *message = dlerror();
-        *error_out = message != NULL ? ct_duplicate_string(message) : ct_duplicate_string("dlopen failed");
+    entry = (CtNativeLibrary *)calloc(1, sizeof(CtNativeLibrary));
+    if (entry == NULL) {
+        if (error_out != NULL) *error_out = ct_duplicate_string("out of memory");
+        ct_dynamic_library_close(&opened);
+        return NULL;
+    }
+    entry->path = ct_duplicate_string(path);
+    if (entry->path == NULL) {
+        if (error_out != NULL) *error_out = ct_duplicate_string("out of memory");
+        ct_dynamic_library_close(&opened);
+        free(entry);
         return NULL;
     }
 
-    CtNativeLibrary *entry = (CtNativeLibrary *)calloc(1, sizeof(CtNativeLibrary));
-    if (entry == NULL) {
-        *error_out = ct_duplicate_string("out of memory");
-        return handle;
-    }
-    entry->path = ct_duplicate_string(path);
-    entry->handle = handle;
-
     pthread_mutex_lock(&ct_native_libraries_mutex);
-    entry->next = ct_native_libraries;
-    ct_native_libraries = entry;
+    existing = ct_find_native_library_locked(path);
+    if (existing == NULL) {
+        /* FFI pointers can escape the runtime, so published libraries stay resident. */
+        entry->library = opened;
+        memset(&opened, 0, sizeof(opened));
+        entry->next = ct_native_libraries;
+        ct_native_libraries = entry;
+    }
     pthread_mutex_unlock(&ct_native_libraries_mutex);
 
-    return handle;
+    if (existing != NULL) {
+        ct_dynamic_library_close(&opened);
+        free(entry->path);
+        free(entry);
+        return existing;
+    }
+    return entry;
 }
 
 static ffi_type *ct_ffi_libffi_type(CtFfiType type) {
@@ -17976,9 +18081,10 @@ static JSValueRef ct_shared_atomic_notify(JSContextRef ctx, JSObjectRef function
 
 static JSValueRef ct_native_call(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     CtJscRuntime *runtime = ct_callback_runtime(function);
-    void *handle = NULL;
+    CtNativeLibrary *library = NULL;
     void *symbol = NULL;
     char *open_error = NULL;
+    char *symbol_error = NULL;
     CtFfiType return_type = CT_FFI_TYPE_VOID;
     CtFfiType arg_types[CT_FFI_MAX_ARGS];
     ffi_type *ffi_arg_types[CT_FFI_MAX_ARGS];
@@ -18077,10 +18183,10 @@ static JSValueRef ct_native_call(JSContextRef ctx, JSObjectRef function, JSObjec
         arg_value_ptrs[index] = ct_ffi_value_ptr(&arg_values[index], arg_types[index]);
     }
 
-    handle = ct_get_native_library_handle(library_path, &open_error);
-    if (handle == NULL) {
+    library = ct_get_native_library(library_path, &open_error);
+    if (library == NULL) {
         char message[1024];
-        snprintf(message, sizeof(message), "dlopen(%s) failed: %s", library_path, open_error != NULL ? open_error : "unknown error");
+        snprintf(message, sizeof(message), "uv_dlopen(%s) failed: %s", library_path, open_error != NULL ? open_error : "unknown error");
         free(open_error);
         free(library_path);
         free(symbol_name);
@@ -18088,10 +18194,10 @@ static JSValueRef ct_native_call(JSContextRef ctx, JSObjectRef function, JSObjec
         return JSValueMakeUndefined(ctx);
     }
 
-    symbol = dlsym(handle, symbol_name);
-    if (symbol == NULL) {
+    if (ct_dynamic_library_symbol(&library->library, symbol_name, &symbol, &symbol_error) != 0) {
         char message[1024];
-        snprintf(message, sizeof(message), "dlsym(%s) failed: %s", symbol_name, dlerror());
+        snprintf(message, sizeof(message), "uv_dlsym(%s) failed: %s", symbol_name, symbol_error != NULL ? symbol_error : "unknown error");
+        free(symbol_error);
         free(library_path);
         free(symbol_name);
         ct_throw_message(ctx, exception, message);
@@ -18125,9 +18231,10 @@ static JSValueRef ct_native_call(JSContextRef ctx, JSObjectRef function, JSObjec
 }
 
 static JSValueRef ct_native_symbol(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    void *handle = NULL;
+    CtNativeLibrary *library = NULL;
     void *symbol = NULL;
     char *open_error = NULL;
+    char *symbol_error = NULL;
     (void)function;
     (void)thisObject;
 
@@ -18145,10 +18252,10 @@ static JSValueRef ct_native_symbol(JSContextRef ctx, JSObjectRef function, JSObj
         return JSValueMakeUndefined(ctx);
     }
 
-    handle = ct_get_native_library_handle(library_path, &open_error);
-    if (handle == NULL) {
+    library = ct_get_native_library(library_path, &open_error);
+    if (library == NULL) {
         char message[1024];
-        snprintf(message, sizeof(message), "dlopen(%s) failed: %s", library_path, open_error != NULL ? open_error : "unknown error");
+        snprintf(message, sizeof(message), "uv_dlopen(%s) failed: %s", library_path, open_error != NULL ? open_error : "unknown error");
         free(open_error);
         free(library_path);
         free(symbol_name);
@@ -18156,10 +18263,10 @@ static JSValueRef ct_native_symbol(JSContextRef ctx, JSObjectRef function, JSObj
         return JSValueMakeUndefined(ctx);
     }
 
-    symbol = dlsym(handle, symbol_name);
-    if (symbol == NULL) {
+    if (ct_dynamic_library_symbol(&library->library, symbol_name, &symbol, &symbol_error) != 0) {
         char message[1024];
-        snprintf(message, sizeof(message), "dlsym(%s) failed: %s", symbol_name, dlerror());
+        snprintf(message, sizeof(message), "uv_dlsym(%s) failed: %s", symbol_name, symbol_error != NULL ? symbol_error : "unknown error");
+        free(symbol_error);
         free(library_path);
         free(symbol_name);
         ct_throw_message(ctx, exception, message);
