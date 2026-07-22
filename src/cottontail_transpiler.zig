@@ -182,34 +182,10 @@ fn setLogError(
     var output: std.Io.Writer.Allocating = .init(c_allocator);
     defer output.deinit();
     var count: usize = 0;
-    for (log.msgs.items) |message| {
+    for (log.msgs.items) |*message| {
         if (message.kind != .err and message.kind != .warn) continue;
         if (count > 0) output.writer.writeAll("\n\n") catch break;
-        if (message.data.location) |location| {
-            if (location.line_text) |raw_line_text| {
-                const line_text = std.mem.trimStart(
-                    u8,
-                    std.mem.trimEnd(u8, raw_line_text, " \r\n\t"),
-                    "\n\r",
-                );
-                if (location.line > 0 and location.column > 0 and line_text.len > 0) {
-                    output.writer.print("{d} | {s}\n", .{ location.line, line_text }) catch break;
-                    const caret_padding = std.fmt.count("{d} | ", .{location.line}) +
-                        @as(usize, @intCast(location.column - 1));
-                    output.writer.splatByteAll(' ', caret_padding) catch break;
-                    output.writer.writeAll("^\n") catch break;
-                }
-            }
-            output.writer.print("{s}: {s}\n    at {s}:{d}:{d}", .{
-                message.kind.string(),
-                message.data.text,
-                location.file,
-                location.line,
-                location.column,
-            }) catch break;
-        } else {
-            output.writer.print("{s}: {s}", .{ message.kind.string(), message.data.text }) catch break;
-        }
+        message.writeFormat(&output.writer, false) catch break;
         count += 1;
     }
     if (count > 0) {
@@ -219,25 +195,115 @@ fn setLogError(
     setError(error_out, "JavaScript transform failed: {s}", .{@errorName(fallback)});
 }
 
-test "transform errors retain all source diagnostics" {
+fn expectCompilerDiagnostic(
+    source: []const u8,
+    loader: []const u8,
+    expected: []const []const u8,
+) !void {
     var error_message: ?[*:0]u8 = null;
-    const source =
-        \\const object = {
-        \\  a() {}
-        \\  b: async function(first) {}
-        \\};
-    ;
-    const output = process(.scan_imports, source, "", "js", &error_message) catch null;
+    const output = process(.scan_imports, source, "", loader, &error_message) catch null;
     defer if (output) |bytes| c_allocator.free(bytes);
     defer if (error_message) |message| ct_transpiler_string_free(message);
-    const text = std.mem.span(error_message.?);
-    try std.testing.expect(std.mem.indexOf(u8, text, "2 |   a() {}") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "3 |   b: async function(first) {}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "error:") != null);
-    var separators = std.mem.splitSequence(u8, text, "\n\n");
-    var diagnostic_count: usize = 0;
-    while (separators.next()) |_| diagnostic_count += 1;
-    try std.testing.expect(diagnostic_count > 1);
+    try std.testing.expect(output == null);
+    const text = if (error_message) |message| std.mem.span(message) else return error.MissingCompilerDiagnostic;
+    for (expected) |fragment| {
+        try std.testing.expect(std.mem.indexOf(u8, text, fragment) != null);
+    }
+}
+
+test "compiler diagnostics parity retains parser recovery errors" {
+    const source =
+        \\
+        \\const object = {
+        \\  a(el) {
+        \\  }
+        \\  b: async function(first) {
+        \\
+        \\  }
+        \\}
+    ;
+    try expectCompilerDiagnostic(source, "js", &.{
+        "5 |   b: async function(first) {",
+        "error: Expected \"}\" but found \"b\"",
+        ":5:3",
+        "error: Expected \";\" but found \":\"",
+        ":5:4",
+        "error: Expected identifier but found \"(\"",
+        ":5:20",
+        "error: Expected \"(\" but found \"first\"",
+        ":5:21",
+        "8 | }",
+        "error: Unexpected }",
+        ":8:1",
+    });
+
+    try expectCompilerDiagnostic("\nb: async function(first) {\n}\n", "js", &.{
+        "2 | b: async function(first) {",
+        "error: Cannot use a declaration in a single-statement context",
+        ":2:4",
+        "error: Expected identifier but found \"(\"",
+        ":2:18",
+        "error: Expected \"(\" but found \"first\"",
+        ":2:19",
+    });
+}
+
+test "compiler diagnostics parity reports invalid identifier escapes" {
+    const cases = [_]struct {
+        source: []const u8,
+        message: []const u8,
+    }{
+        .{ .source = "const \\x41 = 1;", .message = "Unexpected escape sequence" },
+        .{ .source = "const \\\" = 1;", .message = "Unexpected escaped double quote" },
+        .{ .source = "const \\' = 1;", .message = "Unexpected escaped single quote" },
+        .{ .source = "const \\` = 1;", .message = "Unexpected escaped backtick" },
+        .{ .source = "const \\\\ = 1;", .message = "Unexpected escaped backslash" },
+        .{ .source = "const \\z = 1;", .message = "Unexpected escape sequence" },
+    };
+    for (cases) |case| {
+        try expectCompilerDiagnostic(case.source, "js", &.{ case.message, ":1:7" });
+    }
+
+    var error_message: ?[*:0]u8 = null;
+    const output = try process(
+        .transform,
+        "const \\u0041 = 1; const \\u{42} = 2; console.log(A, B);",
+        "",
+        "js",
+        &error_message,
+    );
+    defer c_allocator.free(output);
+    defer if (error_message) |message| ct_transpiler_string_free(message);
+    try std.testing.expect(error_message == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "console.log(A, B)") != null);
+}
+
+test "compiler diagnostics parity rejects malformed JSX without crashing" {
+    try expectCompilerDiagnostic(
+        "export function x(){return<div a=``/>}",
+        "tsx",
+        &.{
+            "error: Expected \"{\" but found \"`\"",
+            ":1:34",
+            "error: Unexpected >",
+            ":1:37",
+        },
+    );
+}
+
+test "compiler diagnostics parity preserves Unicode property regular expressions" {
+    var error_message: ?[*:0]u8 = null;
+    const output = try process(
+        .transform,
+        "export const hangul = /\\p{Script=Hangul}/u;",
+        "",
+        "js",
+        &error_message,
+    );
+    defer c_allocator.free(output);
+    defer if (error_message) |message| ct_transpiler_string_free(message);
+    try std.testing.expect(error_message == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\\p{Script=Hangul}") != null);
 }
 
 fn jsonBool(object: std.json.ObjectMap, name: []const u8) ?bool {

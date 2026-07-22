@@ -167,51 +167,6 @@ fn setError(error_out: *?[*:0]u8, comptime fmt: []const u8, args: anytype) void 
     error_out.* = message.ptr;
 }
 
-fn writeBuildDiagnosticData(
-    writer: *std.Io.Writer,
-    data: *const compiler.logger.Data,
-    kind: []const u8,
-) !void {
-    if (data.location) |location| {
-        if (location.line_text) |raw_line_text| {
-            const line_text = std.mem.trimStart(
-                u8,
-                std.mem.trimEnd(u8, raw_line_text, " \r\n\t"),
-                "\n\r",
-            );
-            if (location.line > 0 and location.column > 0 and line_text.len > 0) {
-                try writer.print("{d} | {s}\n", .{ location.line, line_text });
-                const caret_padding = std.fmt.count("{d} | ", .{location.line}) +
-                    @as(usize, @intCast(location.column - 1));
-                try writer.splatByteAll(' ', caret_padding);
-                try writer.writeAll("^\n");
-            }
-        }
-    }
-
-    try writer.print("{s}: {s}", .{ kind, data.text });
-    if (data.location) |location| {
-        if (location.file.len > 0) {
-            try writer.writeAll("\n");
-            try writer.splatByteAll(' ', kind.len + 2 - "at ".len);
-            try writer.print("at {s}", .{location.file});
-            if (location.line > 0 and location.column >= 0) {
-                try writer.print(":{d}:{d}", .{ location.line, location.column });
-            } else if (location.line >= 0) {
-                try writer.print(":{d}", .{location.line});
-            }
-        }
-    }
-}
-
-fn writeBuildDiagnostic(writer: *std.Io.Writer, message: *const compiler.logger.Msg) !void {
-    try writeBuildDiagnosticData(writer, &message.data, "error");
-    for (message.notes) |*note| {
-        try writer.writeAll("\n\n");
-        try writeBuildDiagnosticData(writer, note, "note");
-    }
-}
-
 fn setBuildError(error_out: *?[*:0]u8, log: *const compiler.logger.Log, fallback: anyerror) void {
     var output: std.Io.Writer.Allocating = .init(c_allocator);
     defer output.deinit();
@@ -220,7 +175,7 @@ fn setBuildError(error_out: *?[*:0]u8, log: *const compiler.logger.Log, fallback
     for (log.msgs.items) |*message| {
         if (message.kind != .err) continue;
         if (error_count > 0) output.writer.writeAll("\n\n") catch break;
-        writeBuildDiagnostic(&output.writer, message) catch break;
+        message.writeFormat(&output.writer, false) catch break;
         error_count += 1;
     }
 
@@ -232,9 +187,19 @@ fn setBuildError(error_out: *?[*:0]u8, log: *const compiler.logger.Log, fallback
     setError(error_out, "JavaScript bundle failed: {s}", .{@errorName(fallback)});
 }
 
-test "build errors retain every formatted source diagnostic" {
+test "compiler diagnostics parity uses Bun formatting for errors and notes" {
     var log = compiler.logger.Log.init(std.testing.allocator);
     defer log.msgs.deinit();
+
+    var notes = [_]compiler.logger.Data{.{
+        .text = "The declaration started here",
+        .location = .{
+            .file = "input.js",
+            .line = 1,
+            .column = 1,
+            .line_text = "const value = 1;",
+        },
+    }};
 
     try log.msgs.append(.{
         .kind = .err,
@@ -247,6 +212,7 @@ test "build errors retain every formatted source diagnostic" {
                 .line_text = "  broken syntax",
             },
         },
+        .notes = &notes,
     });
     try log.msgs.append(.{
         .kind = .err,
@@ -267,6 +233,7 @@ test "build errors retain every formatted source diagnostic" {
     const text = std.mem.span(error_message.?);
     try std.testing.expect(std.mem.indexOf(u8, text, "2 |   broken syntax") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "error: Expected identifier") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "note: The declaration started here") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "3 | }") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "error: Unexpected token") != null);
 }
@@ -1689,6 +1656,88 @@ fn runCssStylesheetInternals(
             };
         },
         .err => return cssInternalsError(allocator, &log, "CSS parsing failed"),
+    }
+}
+
+test "compiler diagnostics parity serializes CSS and recovers malformed input" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const large_number_source =
+        ".test-rounded-full {\n" ++
+        "  border-radius: 3.40282e38px;\n" ++
+        "  width: 2147483648px;\n" ++
+        "  height: -2147483649px;\n" ++
+        "}\n" ++
+        ".test-negative {\n" ++
+        "  border-radius: -3.40282e38px;\n" ++
+        "}\n" ++
+        ".test-very-large {\n" ++
+        "  border-radius: 999999999999999999999999999999999999999px;\n" ++
+        "}\n" ++
+        ".test-large-integer {\n" ++
+        "  border-radius: 340282366920938463463374607431768211456px;\n" ++
+        "}\n" ++
+        ".test-colors {\n" ++
+        "  color: rgb(300, -50, 1000);\n" ++
+        "  background: rgba(999.9, 0.1, -10.5, 1.5);\n" ++
+        "}\n" ++
+        ".test-percentages {\n" ++
+        "  width: 999999999999999999%;\n" ++
+        "  height: -999999999999999999%;\n" ++
+        "}\n" ++
+        ".test-boundaries {\n" ++
+        "  margin: 2147483647px;\n" ++
+        "  padding: -2147483648px;\n" ++
+        "  left: 4294967295px;\n" ++
+        "}\n" ++
+        ".test-normal {\n" ++
+        "  width: 10px;\n" ++
+        "  height: 20.5px;\n" ++
+        "  margin: 0px;\n" ++
+        "}\n";
+    const large_number_json = try runCssStylesheetInternals(
+        allocator,
+        large_number_source,
+        .normal,
+        null,
+        null,
+    );
+    defer c_allocator.free(large_number_json);
+    const large_number_response = try std.json.parseFromSlice(
+        CssInternalsResponse,
+        allocator,
+        large_number_json,
+        .{},
+    );
+    try std.testing.expect(large_number_response.value.success);
+    const css_output = large_number_response.value.result orelse return error.MissingCssOutput;
+    try std.testing.expect(std.mem.indexOf(u8, css_output, "border-radius: 3.40282e+38px") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css_output, "width: 2147480000px") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css_output, "height: -2147480000px") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css_output, "border-radius: -3.40282e+38px") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css_output, "color: #f0f") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css_output, "background: red") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css_output, "width: 1000000000000000000%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css_output, "height: -1000000000000000000%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css_output, "left: 4294970000px") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css_output, "height: 20.5px") != null);
+
+    const malformed_sources = [_][]const u8{
+        "}{color:red}",
+        ".test{color:}",
+        "/* unclosed comment .test{color:red}",
+        "@media screen { @media print { } ",
+        "@import url(;",
+        ".test{color:red\x00;}",
+        "\x01.test{color:red}",
+    };
+    for (malformed_sources) |source| {
+        const response_json = try runCssStylesheetInternals(allocator, source, .normal, null, null);
+        defer c_allocator.free(response_json);
+        const response = try std.json.parseFromSlice(CssInternalsResponse, allocator, response_json, .{});
+        try std.testing.expect(response.value.success or response.value.@"error" != null);
     }
 }
 
