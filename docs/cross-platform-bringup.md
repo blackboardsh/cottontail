@@ -4,6 +4,10 @@ Use this runbook to reproduce the native GitHub Actions build on persistent
 Linux and Windows machines. GitHub Actions remains the final clean-environment
 and publishing gate, but platform work should be debugged locally first.
 
+After the native build and package gate is green, continue with
+[`cross-platform-compatibility.md`](cross-platform-compatibility.md) to validate
+the complete Node and Bun behavior tiers on each operating system.
+
 ## Common rules
 
 - Work from the repository root.
