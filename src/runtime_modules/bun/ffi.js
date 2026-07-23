@@ -2451,11 +2451,60 @@ const workerNativeOptions = Symbol.for("cottontail.worker.native-options");
 
 const workerRuntimeAliasPaths = Object.freeze({
   assert: "node/assert.cjs",
+  "assert/strict": "node/assert/strict.js",
+  async_hooks: "node/async_hooks.js",
+  buffer: "node/buffer.js",
+  child_process: "node/child_process.js",
+  cluster: "node/cluster.js",
+  console: "node/console.js",
+  constants: "node/constants.js",
+  crypto: "node/crypto.js",
+  dgram: "node/dgram.js",
+  diagnostics_channel: "node/diagnostics_channel.js",
+  dns: "node/dns.js",
+  "dns/promises": "node/dns/promises.js",
+  domain: "node/domain.js",
   "path/posix": "node/path/posix.cjs",
   "path/win32": "node/path/win32.cjs",
   events: "node/events.cjs",
+  fs: "node/fs.js",
+  "fs/promises": "node/fs/promises.js",
+  http: "node/http.js",
+  http2: "node/http2.js",
+  https: "node/https.js",
+  inspector: "node/inspector.js",
+  "inspector/promises": "node/inspector/promises.js",
+  module: "node/module.js",
+  net: "node/net.js",
+  os: "node/os.js",
+  path: "node/path.js",
+  perf_hooks: "node/perf_hooks.js",
+  process: "node/process.js",
+  punycode: "node/punycode.js",
+  querystring: "node/querystring.js",
+  readline: "node/readline.js",
+  "readline/promises": "node/readline/promises.js",
+  repl: "node/repl.js",
   stream: "node/stream.cjs",
+  "stream/consumers": "node/stream/consumers.js",
+  "stream/promises": "node/stream/promises.js",
+  "stream/web": "node/stream/web.js",
+  string_decoder: "node/string_decoder.js",
+  sys: "node/sys.js",
+  timers: "node/timers.js",
+  "timers/promises": "node/timers/promises.js",
+  tls: "node/tls.js",
+  trace_events: "node/trace_events.js",
+  tty: "node/tty.js",
   undici: "node/undici-public.js",
+  url: "node/url.js",
+  util: "node/util.js",
+  "util/types": "node/util/types.js",
+  v8: "node/v8.js",
+  vm: "node/vm.js",
+  wasi: "node/wasi.js",
+  worker_threads: "node/worker_threads.js",
+  zlib: "node/zlib.js",
   bun: "bun/index.js",
   "bun:ffi": "bun/ffi.js",
   "bun:jsc": "bun/jsc.js",
@@ -2483,25 +2532,10 @@ const workerRuntimeAliasPaths = Object.freeze({
 
 function workerRuntimeAliases(runtimeRoot) {
   const aliases = {};
-  let builtinNames = [];
-  try {
-    const namespace = currentRuntimeRequire()?.("node:module");
-    builtinNames = namespace?.builtinModules ?? namespace?.default?.builtinModules ?? [];
-  } catch {}
-  for (const name of builtinNames) {
-    const specifier = String(name).replace(/^node:/, "");
-    if (!specifier || specifier === "ws" || specifier.startsWith("bun:")) continue;
-    const relativePath = workerRuntimeAliasPaths[specifier] ?? `node/${specifier}.js`;
+  for (const [specifier, relativePath] of Object.entries(workerRuntimeAliasPaths)) {
     const path = `${runtimeRoot}/${relativePath}`;
     aliases[specifier] = path;
-    aliases[`node:${specifier}`] = path;
-  }
-  for (const [specifier, relativePath] of Object.entries(workerRuntimeAliasPaths)) {
-    aliases[specifier] = `${runtimeRoot}/${relativePath}`;
-  }
-  aliases["node:undici"] = `${runtimeRoot}/node/undici-public.js`;
-  for (const specifier of ["sea", "sqlite", "test", "test/reporters"]) {
-    aliases[`node:${specifier}`] = aliases[specifier];
+    if (relativePath.startsWith("node/")) aliases[`node:${specifier}`] = path;
   }
   return aliases;
 }
@@ -2619,12 +2653,12 @@ function prepareWorkerScriptPath(scriptPath, options = undefined) {
   const bundledPath = `${tempDir}/bun-worker-${nonce}.js`;
   const slashCwd = String(cottontail.cwd()).replace(/\\/g, "/");
   const slashTarget = String(target).replace(/\\/g, "/");
-  // The FFI runtime owns process, timers, and the native worker transport.
-  // Worker entry dependencies are linked into the bundle below as usual.
-  const runtimeEntry = `${slashCwd}/.cottontail-embedded-runtime/bun/ffi.js`;
+  const runtimeRoot = `${slashCwd}/.cottontail-embedded-runtime`;
+  // Workers are independent Bun runtimes, not FFI-only isolates. Boot the full
+  // runtime so worker code sees the same Bun and Node APIs as the main thread.
+  const runtimeEntry = `${runtimeRoot}/bun/index.js`;
   if (options?.[preparedWorkerScript] === true) {
-    const moduleEntry = runtimeEntry.replace(/\/bun\/ffi\.js$/, "/node/module.js");
-    const runtimeRoot = `${slashCwd}/.cottontail-embedded-runtime`;
+    const moduleEntry = `${runtimeRoot}/node/module.js`;
     cottontail.writeFile(wrapperPath, [
       `import ${JSON.stringify(runtimeEntry)};`,
       `import ${JSON.stringify(moduleEntry)};`,
@@ -2692,6 +2726,7 @@ function prepareWorkerScriptPath(scriptPath, options = undefined) {
       target: "bun",
       includeRuntimeModules: true,
       inlineImportMetaProperties: true,
+      alias: workerRuntimeAliases(runtimeRoot),
     }));
     cottontail.writeFile(bundledPath, bundled);
     if (!hasWorkerOptions) workerBundleCache.set(cacheKey, bundledPath);

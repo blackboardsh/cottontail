@@ -4895,6 +4895,17 @@ fn canUseRuntimeModuleLauncher(requirements: RuntimeModuleLaunchRequirements) bo
         !requirements.wasm_entrypoint;
 }
 
+fn entrypointNeedsMainMetadataTransform(ctx: *const Context, script_abs: []const u8) !bool {
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        script_abs,
+        ctx.allocator,
+        .limited(4 * 1024 * 1024),
+    ) catch return false;
+    return std.mem.indexOf(u8, source, "import.meta.main") != null or
+        std.mem.indexOf(u8, source, "require.main") != null;
+}
+
 fn bundleScriptNative(
     ctx: *const Context,
     script_path: []const u8,
@@ -4937,7 +4948,11 @@ fn bundleScriptNative(
         try shouldBundleCommonJsEntrypoint(ctx, script_abs)
     else
         false;
-    const runtime_module_entrypoint = runtime_module_launcher_candidate and !runtime_candidate_is_common_js;
+    const runtime_entrypoint_needs_main_transform = runtime_module_launcher_candidate and
+        try entrypointNeedsMainMetadataTransform(ctx, script_abs);
+    const runtime_module_entrypoint = runtime_module_launcher_candidate and
+        !runtime_candidate_is_common_js and
+        !runtime_entrypoint_needs_main_transform;
     const script_entry_abs = if (is_wasm_entrypoint or runtime_module_entrypoint)
         script_abs
     else

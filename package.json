@@ -13,6 +13,7 @@
     "pin:jsc": "node scripts/pin-jsc-release.js",
     "check-zig-version": "bun run setup && node scripts/zig.js version",
     "build": "bun run setup && node scripts/zig.js build",
+    "build:local": "node scripts/build-local.js",
     "build:release": "bun run setup && node scripts/build-release.js",
     "package:release": "node scripts/package-release.js",
     "publish:preview": "node scripts/upload-release-r2.js --all",

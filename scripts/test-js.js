@@ -94,6 +94,12 @@ try {
       stdoutIncludes: ['module imports passed'],
     },
     {
+      name: 'import-meta-main-entry-identity',
+      scriptPath: join(rootDir, 'tests', 'js', 'import-meta-main-entry.mjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['import.meta.main entry identity passed'],
+    },
+    {
       name: 'bun-narrow-import-installs-web-globals',
       scriptPath: join(rootDir, 'tests', 'js', 'fixtures', 'bun-narrow-import-globals.mjs'),
       expectExitCode: 0,

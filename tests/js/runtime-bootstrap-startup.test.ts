@@ -117,6 +117,18 @@ test("wrapped node shebang entrypoints remain valid JavaScript", () => {
   });
 });
 
+test("ordinary CommonJS entrypoints retain ownership of -c arguments", () => {
+  const fixture = join(temporaryDirectory, "commonjs-cli-arguments.cjs");
+  const config = join(temporaryDirectory, "application.config.js");
+  writeFileSync(fixture, 'console.log(JSON.stringify(process.argv.slice(2)));\n');
+  writeFileSync(config, "module.exports = { nested: { value: true } };\n");
+
+  const result = run([fixture, "-c", config]);
+  expect(String(result.stderr)).toBe("");
+  expect(result.exitCode).toBe(0);
+  expect(JSON.parse(String(result.stdout))).toEqual(["-c", config]);
+});
+
 test("cold readline process bootstrap completes within Bun's spawn timeout", () => {
   const fixture = join(import.meta.dir, "fixtures", "runtime-bootstrap-readline-close.mjs");
   const coldRoot = join(temporaryDirectory, "cold-readline");
