@@ -13,17 +13,66 @@ against the macOS baseline.
 
 Cottontail owns these pinned upstream snapshots:
 
-- Node 24.11.1: 7,015 discovered runnable files, all currently enabled.
+- Node 24.11.1: on Linux, 4,969 source files recognized by Node's own
+  `tools/test.py`, mapping to 4,962 harness selectors; all are currently
+  enabled by the common Cottontail status contract.
 - Bun 1.3.10: 1,440 enabled files and five performance-only expected failures.
 
-Those classifications are global and were established from the current macOS
-working baseline. `compat:surface:all` does not record results by operating
-system. It can therefore display 100 percent while the same enabled tier fails
-on Linux or Windows.
+The Node inventory is harness-derived rather than an extension scan. Files
+under `test/fixtures` and other helpers that Node's harness cannot select are
+not counted. Seven `.js`/`.mjs` pairs share selectors, which accounts for the
+difference between recognized files and selectors.
 
-The release workflow currently proves native compilation, Zig tests, a small
-runtime smoke test, packaging, and Linux ICU fallback. It does not run the local
-JavaScript behavior suite or either copied upstream compatibility suite.
+Those status classifications are global and were established from the current
+macOS working baseline. `compat:surface:all` does not record results by
+operating system. It can therefore display 100 percent while the same enabled
+tier fails on Linux or Windows.
+
+The release workflow is configured to run native compilation, Zig tests, a
+small runtime smoke test, packaging, and the offline packaged Linux ICU
+fallback. It does not run the local JavaScript behavior suite or either copied
+upstream compatibility suite.
+
+### Current Linux ARM64 evidence
+
+The July 23, 2026 native Ubuntu 25.04 ARM64/glibc 2.41 checkpoint has verified
+a fresh-cache `ReleaseSmall` build (12/12 build steps), the native test target
+(48 passed, one intentional skip), the complete local JavaScript behavior
+suite against the embedded executable, both targeted ICU Zig tests, the
+network-isolated packaged ICU fallback, all 13 upstream-runner regression
+tests, a real 4,969-file/4,962-selector Node inventory, exact focused selection,
+focused package-manager retry behavior, and final archive packaging/smoke.
+
+The previous `spawnSync` hang was a Linux signal-handler collision: JSC used
+`SIGUSR1` for GC thread suspension while libuv installed its own `SIGUSR1`
+watcher. Cottontail now configures JSC to use `SIGRTMIN` before VM creation.
+Cottontail's lazy, unreferenced libuv watchers now deliver external `SIGALRM`,
+`SIGPROF`, `SIGVTALRM`, `SIGPWR`, and aliases while tracking the supported
+listener add/remove paths. `SIGPIPE` and `SIGXFSZ` have Node-compatible initial
+and post-listener defaults, `SIGKILL` and `SIGSTOP` registration is rejected,
+and numeric Linux real-time signals are external-target-only. All 30
+process/signal lifecycle tests (60 assertions) and 50/50 child-process stress
+iterations passed against the final executable.
+
+Focused Linux regressions also verify native filesystem magic in
+`fs.statfsSync` and `fs.promises.statfs` `type` results, including bigint sync
+results. Standalone bytecode compilation now shuts down cleanly after the
+bridge took ownership of cached bytecode and restored the vendored JSC
+archive's `HAVE_MMAP`-dependent private ABI layout; all 12
+runtime-bootstrap/startup checks passed.
+
+The inventory verifies discovery and exact selection only; it is not a
+4,969-file upstream execution pass. A focused upstream Node run still exposed
+the copied harness's global-leak check on Cottontail/Bun globals, and the
+sampled Bun run lacked its pinned test dependencies. Complete Node and Bun
+runs, real application canaries, and Linux x64 verification remain
+outstanding. Do not describe this checkpoint as complete Linux Node or Bun
+compatibility. Synchronous fatal signals remain owned by Cottontail's native
+crash handler rather than exposed as JavaScript signal events.
+
+Performance benchmarking and tuning remain deferred during this functional
+bring-up. The five existing Bun performance-only expected failures remain the
+only performance quarantines.
 
 ## Definition of done
 
@@ -54,20 +103,28 @@ An upstream-authored skip for functionality that Node or Bun does not support
 on that operating system is valid. A new skip that only avoids a Cottontail
 failure is not.
 
-## First runner improvements
+## Runner and result reporting
 
-Do these before a long repair campaign. They improve iteration and reporting
-but must not delay fixing an already understood runtime failure.
+The Node runner safeguards below are implemented. Per-platform result recording
+is still required before compatibility can be claimed.
 
-### Make Node filters effective
+### Node inventory and exact filtering
 
-`scripts/run-upstream-tests.js node --match ...` currently computes a filtered
-entry list, but `runNodeHarness()` invokes the full suite whenever Node's
-`defaultStatus` is `enabled`. Update it so `--match`, `--max-tests`,
-`--only-status`, and `--test` all pass the selected Node test selectors to
-`tools/test.py`.
+`scripts/run-upstream-tests.js` imports the pinned Node harness configuration to
+inventory only tests recognized by `tools/test.py`. `--match`, `--max-tests`,
+`--only-status`, and `--test` pass the resulting exact selectors to the Node
+harness. Selector lists are deduplicated and split into bounded command-line
+chunks; paths sharing one selector must be selected together.
 
-Until that is fixed, use `--test` for a focused Node reproduction.
+Every harness invocation uses `--report` and must report exactly the number of
+cases predicted by the inventory. A missing report or an unmatched/overmatched
+selector fails the run. Non-list runs also preflight the executable's
+Cottontail, Node, and Bun identity before starting either upstream suite.
+
+The identity preflight rejects an ordinary non-Cottontail executable, while the
+inventory and report checks reject selector-count mismatches and fixture-only
+paths. They do not prove the executable's Git or JSC revision, and they do not
+replace executing the complete suite on each target.
 
 ### Record platform results separately
 

@@ -27,6 +27,12 @@ pub fn ensure(init: std.process.Init) !void {
     }
 
     const allocator = std.heap.smp_allocator;
+    if (try loadPackagedData(init.io, allocator)) |bytes| {
+        try activateFallback(allocator, bytes);
+        initialized = true;
+        return;
+    }
+
     const root = try dataRoot(init, allocator);
     defer allocator.free(root);
     try std.Io.Dir.cwd().createDirPath(init.io, root);
@@ -45,6 +51,11 @@ pub fn ensure(init: std.process.Init) !void {
     defer lock.close(init.io);
 
     const bytes = try loadOrDownload(init, allocator, path, marker_path);
+    try activateFallback(allocator, bytes);
+    initialized = true;
+}
+
+fn activateFallback(allocator: std.mem.Allocator, bytes: []u8) !void {
     if (c.cottontail_icu_use_fallback(bytes.ptr, bytes.len) == 0) {
         allocator.free(bytes);
         const message = std.mem.span(c.cottontail_icu_last_error());
@@ -52,7 +63,36 @@ pub fn ensure(init: std.process.Init) !void {
         return error.IcuInitializationFailed;
     }
     retained_data = bytes;
-    initialized = true;
+}
+
+fn packagedDataPath(allocator: std.mem.Allocator, executable_dir: []const u8) ![]u8 {
+    const package_root = std.fs.path.dirname(executable_dir) orelse return error.InvalidExecutablePath;
+    return std.fs.path.join(allocator, &.{
+        package_root,
+        "share",
+        "cottontail",
+        "icu",
+        version,
+        data_file,
+    });
+}
+
+fn loadPackagedData(io: std.Io, allocator: std.mem.Allocator) !?[]u8 {
+    const executable_dir = std.process.executableDirPathAlloc(io, allocator) catch return null;
+    defer allocator.free(executable_dir);
+    const path = try packagedDataPath(allocator, executable_dir);
+    defer allocator.free(path);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(max_data_size),
+    ) catch return null;
+    if (bytes.len != expected_data_size or !hashMatches(bytes)) {
+        allocator.free(bytes);
+        return error.IcuChecksumMismatch;
+    }
+    return bytes;
 }
 
 fn dataRoot(init: std.process.Init, allocator: std.mem.Allocator) ![]u8 {
@@ -127,4 +167,29 @@ fn loadOrDownload(
     try std.Io.Dir.cwd().rename(temporary_path, std.Io.Dir.cwd(), path, init.io);
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = marker_path, .data = expected_sha256 ++ "\n" });
     return bytes;
+}
+
+test "packaged ICU data path is rooted beside the executable directory" {
+    const allocator = std.testing.allocator;
+    const executable_dir = try std.fs.path.join(allocator, &.{ "opt", "cottontail", "bin" });
+    defer allocator.free(executable_dir);
+    const actual = try packagedDataPath(allocator, executable_dir);
+    defer allocator.free(actual);
+    const expected = try std.fs.path.join(allocator, &.{
+        "opt",
+        "cottontail",
+        "share",
+        "cottontail",
+        "icu",
+        version,
+        data_file,
+    });
+    defer allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
+test "packaged ICU lookup tolerates an unpackaged executable" {
+    const bytes = try loadPackagedData(std.testing.io, std.testing.allocator);
+    if (bytes) |contents| std.testing.allocator.free(contents);
 }

@@ -98,6 +98,36 @@ function validFallbackDirectory(fallbackDir, platformKey) {
   });
 }
 
+function ensurePinnedIcuData(fallbackDir) {
+  const fallback = MANIFEST.icuFallback;
+  const dataPath = join(fallbackDir, fallback.dataFile);
+  if (
+    existsSync(dataPath) &&
+    statSync(dataPath).isFile() &&
+    statSync(dataPath).size === fallback.dataSize &&
+    sha256File(dataPath) === fallback.dataSha256
+  ) {
+    return;
+  }
+
+  const temporaryPath = `${dataPath}.tmp`;
+  rmSync(temporaryPath, { force: true });
+  console.log(`Downloading pinned ICU ${fallback.version} data...`);
+  downloadFile(fallback.dataUrl, temporaryPath);
+  const actualSize = statSync(temporaryPath).size;
+  const actualSha256 = sha256File(temporaryPath);
+  if (actualSize !== fallback.dataSize || actualSha256 !== fallback.dataSha256) {
+    rmSync(temporaryPath, { force: true });
+    fail(
+      `The pinned ICU data file failed verification.\n` +
+        `Expected: ${fallback.dataSize} bytes, ${fallback.dataSha256}\n` +
+        `Actual:   ${actualSize} bytes, ${actualSha256}`
+    );
+  }
+  rmSync(dataPath, { force: true });
+  renameSync(temporaryPath, dataPath);
+}
+
 function validIcuHeaders(vendorDir) {
   const unicodeDir = join(vendorDir, 'include', 'unicode');
   return ['uchar.h', 'ucol.h', 'utypes.h'].every((name) => {
@@ -225,6 +255,7 @@ function buildPinnedIcuFallback(vendorDir, platformKey) {
 
   if (validFallbackDirectory(fallbackDir, platformKey)) {
     verifyPublishedFallbackMetadata(fallbackDir, platformKey);
+    ensurePinnedIcuData(fallbackDir);
     seedGlobalIcuData(fallbackDir);
     console.log(`✓ Pinned ICU ${fallback.version} fallback already vendored`);
     return;
@@ -311,6 +342,7 @@ function buildPinnedIcuFallback(vendorDir, platformKey) {
     if (!validFallbackDirectory(fallbackDir, platformKey)) {
       fail(`Pinned ICU installation is incomplete under ${fallbackDir}`);
     }
+    ensurePinnedIcuData(fallbackDir);
     seedGlobalIcuData(fallbackDir);
     console.log(`✓ Pinned ICU ${fallback.version} fallback vendored`);
   } finally {

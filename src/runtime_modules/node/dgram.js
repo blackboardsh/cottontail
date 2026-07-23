@@ -472,22 +472,27 @@ export class Socket extends EventEmitter {
 
   setBroadcast(flag) {
     this._healthCheck();
-    return cottontail.udpSocketSetBroadcast(this.fd, Boolean(flag));
+    cottontail.udpSocketSetBroadcast(this.fd, Boolean(flag));
   }
 
   setTTL(ttl) {
     this._healthCheck();
-    return cottontail.udpSocketSetTTL(this.fd, validateTTL(ttl), this.family);
+    const normalized = validateTTL(ttl);
+    cottontail.udpSocketSetTTL(this.fd, normalized, this.family);
+    return normalized;
   }
 
   setMulticastTTL(ttl) {
     this._healthCheck();
-    return cottontail.udpSocketSetMulticastTTL(this.fd, validateTTL(ttl), this.family);
+    const normalized = validateTTL(ttl);
+    cottontail.udpSocketSetMulticastTTL(this.fd, normalized, this.family);
+    return normalized;
   }
 
   setMulticastLoopback(flag) {
     this._healthCheck();
-    return cottontail.udpSocketSetMulticastLoopback(this.fd, Boolean(flag), this.family);
+    cottontail.udpSocketSetMulticastLoopback(this.fd, Boolean(flag), this.family);
+    return flag;
   }
 
   setRecvBufferSize(size) {

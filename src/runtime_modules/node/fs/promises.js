@@ -94,6 +94,8 @@ const fsConstantNames = [
   "O_TRUNC",
   "O_APPEND",
   "O_DIRECTORY",
+  "O_DIRECT",
+  "O_NOATIME",
   "O_NOFOLLOW",
   "O_SYNC",
   "O_DSYNC",

@@ -226,12 +226,20 @@ test("glob uses Bun grammar and Node fs validation", () => {
   expect(fs.globSync("literal\\[.txt", { cwd })).toEqual(["literal[.txt"]);
   expect(fs.globSync("*", { cwd })).not.toContain(".hidden.js");
   expect(() => fs.globSync(1 as any, { cwd })).toThrow(expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }));
-  expect(() => fs.globSync("*", { cwd, withFileTypes: true } as any)).toThrow(
-    "fs.glob does not support options.withFileTypes yet",
-  );
+  const dirents = fs.globSync("*", { cwd: new URL(`file://${cwd}/`), withFileTypes: true });
+  expect(dirents.map(entry => entry.name)).toContain("a.js");
+  expect(dirents.find(entry => entry.name === "a.js")?.parentPath).toBe(cwd);
 
   fs.mkdirSync(path.join(cwd, "nested"));
   fs.writeFileSync(path.join(cwd, "nested", "deep.txt"), "deep");
+  const pruned = fs.globSync("**/*.txt", {
+    cwd,
+    withFileTypes: true,
+    exclude(entry) {
+      return entry.isDirectory() && entry.name === "nested";
+    },
+  });
+  expect(pruned.some(entry => entry.name === "deep.txt")).toBe(false);
   expect(fs.globSync(".hidden.js", { cwd })).toEqual([".hidden.js"]);
   expect(fs.globSync(".*", { cwd })).toEqual([]);
   expect(fs.globSync("!*", { cwd })).toEqual([]);

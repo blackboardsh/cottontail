@@ -87,7 +87,9 @@ test("send implicitly binds and preserves offset/length overloads", async () => 
   expect(server.setTTL(1.5)).toBe(1);
   expect(server.setMulticastTTL(2)).toBe(2);
   expect(server.setMulticastLoopback(true)).toBe(true);
-  expect(server.setBroadcast(true)).toBe(true);
+  expect(server.setMulticastLoopback(16 as never)).toBe(16);
+  expect(server.setMulticastLoopback(0 as never)).toBe(0);
+  expect(server.setBroadcast(true)).toBeUndefined();
   expect(server.setRecvBufferSize(65536)).toBeUndefined();
   expect(server.setSendBufferSize(65536)).toBeUndefined();
   await close(client);

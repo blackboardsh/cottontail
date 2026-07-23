@@ -1171,7 +1171,7 @@ export function resolveTxt(hostname, callback) {
 }
 
 export function getDefaultResultOrder() {
-  return defaultResultOrder;
+  return defaultResultOrder();
 }
 
 export function setDefaultResultOrder(order) {
@@ -1388,6 +1388,12 @@ export class PromisesResolver {
   reverse(ip) { if (typeof ip !== "string") throw invalidArgType("ip", "of type string", ip); return promiseFromCallback(Resolver.prototype.reverse.bind(this), ip); }
 }
 
+let promisesDefaultResolver;
+
+function defaultPromisesResolver() {
+  return promisesDefaultResolver ??= new PromisesResolver();
+}
+
 export const promises = {
   ADDRGETNETWORKPARAMS,
   BADFAMILY,
@@ -1435,23 +1441,25 @@ export const promises = {
       });
     });
   },
-  resolve(hostname, rrtype = "A") { validateResolveHostname(hostname, "resolve"); normalizeRrtype(rrtype); return promiseFromCallback(resolve, hostname, rrtype); },
-  resolve4(hostname, options = undefined) { validateResolveHostname(hostname, "resolve", false, true); return promiseFromCallback(resolve4, hostname, options); },
-  resolve6(hostname, options = undefined) { validateResolveHostname(hostname, "resolve", false, true); return promiseFromCallback(resolve6, hostname, options); },
-  resolveAny(hostname) { validateResolveHostname(hostname, "resolveAny", false, true); return promiseFromCallback(resolveAny, hostname); },
-  resolveCaa(hostname) { validateResolveHostname(hostname, "resolveCaa", false, true); return promiseFromCallback(resolveCaa, hostname); },
-  resolveCname(hostname) { validateResolveHostname(hostname, "resolveCname", false, true); return promiseFromCallback(resolveCname, hostname); },
-  resolveMx(hostname) { validateResolveHostname(hostname, "resolveMx", false, true); return promiseFromCallback(resolveMx, hostname); },
-  resolveNaptr(hostname) { validateResolveHostname(hostname, "resolveNaptr", false, true); return promiseFromCallback(resolveNaptr, hostname); },
-  resolveNs(hostname) { validateResolveHostname(hostname, "resolveNs", true, true); return promiseFromCallback(resolveNs, hostname); },
-  resolvePtr(hostname) { validateResolveHostname(hostname, "resolvePtr", false, true); return promiseFromCallback(resolvePtr, hostname); },
-  resolveSoa(hostname) { validateResolveHostname(hostname, "resolveSoa", true, true); return promiseFromCallback(resolveSoa, hostname); },
-  resolveSrv(hostname) { validateResolveHostname(hostname, "resolveSrv", false, true); return promiseFromCallback(resolveSrv, hostname); },
-  resolveTlsa(hostname) { validateResolveHostname(hostname, "resolveTlsa", false, true); return promiseFromCallback(resolveTlsa, hostname); },
-  resolveTxt(hostname) { validateResolveHostname(hostname, "resolveTxt", false, true); return promiseFromCallback(resolveTxt, hostname); },
-  reverse(ip) { if (typeof ip !== "string") throw invalidArgType("ip", "of type string", ip); return promiseFromCallback(reverse, ip); },
+  resolve(hostname, rrtype = "A") { return defaultPromisesResolver().resolve(hostname, rrtype); },
+  resolve4(hostname, options = undefined) { return defaultPromisesResolver().resolve4(hostname, options); },
+  resolve6(hostname, options = undefined) { return defaultPromisesResolver().resolve6(hostname, options); },
+  resolveAny(hostname) { return defaultPromisesResolver().resolveAny(hostname); },
+  resolveCaa(hostname) { return defaultPromisesResolver().resolveCaa(hostname); },
+  resolveCname(hostname) { return defaultPromisesResolver().resolveCname(hostname); },
+  resolveMx(hostname) { return defaultPromisesResolver().resolveMx(hostname); },
+  resolveNaptr(hostname) { return defaultPromisesResolver().resolveNaptr(hostname); },
+  resolveNs(hostname) { return defaultPromisesResolver().resolveNs(hostname); },
+  resolvePtr(hostname) { return defaultPromisesResolver().resolvePtr(hostname); },
+  resolveSoa(hostname) { return defaultPromisesResolver().resolveSoa(hostname); },
+  resolveSrv(hostname) { return defaultPromisesResolver().resolveSrv(hostname); },
+  resolveTlsa(hostname) { return defaultPromisesResolver().resolveTlsa(hostname); },
+  resolveTxt(hostname) { return defaultPromisesResolver().resolveTxt(hostname); },
+  reverse(ip) { return defaultPromisesResolver().reverse(ip); },
+  getDefaultResultOrder,
+  getServers() { return defaultPromisesResolver().getServers(); },
   setDefaultResultOrder,
-  setServers,
+  setServers(nextServers) { return defaultPromisesResolver().setServers(nextServers); },
 };
 
 // util.promisify(dns.fn) must return the exact dns.promises implementation (Node behavior).

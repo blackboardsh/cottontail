@@ -1,0 +1,4 @@
+{
+  // JSONC comments and trailing commas require the compatibility loader.
+  "answer": 42,
+}

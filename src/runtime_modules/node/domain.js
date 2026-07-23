@@ -55,9 +55,14 @@ export class Domain extends EventEmitter {
     const domain = this;
     return function bound(...args) {
       domain.enter();
-      const result = callback.apply(this, args);
-      domain.exit();
-      return result;
+      try {
+        return callback.apply(this, args);
+      } catch (error) {
+        if (domain._errorHandler(error)) return undefined;
+        throw error;
+      } finally {
+        if (_stack.includes(domain)) domain.exit();
+      }
     };
   }
 
@@ -74,9 +79,14 @@ export class Domain extends EventEmitter {
 
   run(callback, ...args) {
     this.enter();
-    const result = callback(...args);
-    this.exit();
-    return result;
+    try {
+      return callback(...args);
+    } catch (error) {
+      if (this._errorHandler(error)) return undefined;
+      throw error;
+    } finally {
+      if (_stack.includes(this)) this.exit();
+    }
   }
 
   _errorHandler(error) {

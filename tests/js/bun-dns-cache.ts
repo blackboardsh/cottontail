@@ -98,14 +98,20 @@ try {
     "Bun DNS cache stats should expose Bun's counter shape",
   );
 
-  bunDns.prefetch("localhost", address.port);
+  // The trailing dot is DNS-equivalent but avoids Cottontail's in-process
+  // localhost server shortcut, so this exercises the actual TCP resolver path.
+  bunDns.prefetch("localhost.", address.port);
   const prefetched = bunDns.getCacheStats();
   strictEqual(prefetched.cacheMisses, before.cacheMisses + 1, "prefetch should populate a missing cache entry");
   strictEqual(prefetched.totalCount, before.totalCount + 1, "prefetch should count one resolver request");
 
-  await fetch(`http://localhost:${address.port}`, { keepalive: false });
+  await fetch(`http://localhost.:${address.port}`, { keepalive: false });
   const fetched = bunDns.getCacheStats();
-  strictEqual(fetched.cacheHitsCompleted, prefetched.cacheHitsCompleted + 1, "fetch should consume the prefetched address");
+  strictEqual(
+    fetched.cacheHitsCompleted + fetched.cacheHitsInflight,
+    prefetched.cacheHitsCompleted + prefetched.cacheHitsInflight + 1,
+    "fetch should consume or join the prefetched address",
+  );
   strictEqual(fetched.totalCount, prefetched.totalCount + 1, "fetch should count one cache lookup");
 } finally {
   await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -204,18 +210,21 @@ try {
   });
 
   const resultOrder = dns.getDefaultResultOrder();
-  strictEqual(typeof resultOrder, "function", "Bun 1.3.10 exposes its lazy result-order getter");
-  const originalResultOrder = resultOrder();
+  strictEqual(typeof resultOrder, "string", "node:dns should expose its configured result order");
   dns.setDefaultResultOrder("ipv4first");
-  strictEqual(resultOrder(), "ipv4first");
+  strictEqual(dns.getDefaultResultOrder(), "ipv4first");
   throws(() => dns.setDefaultResultOrder(4 as never), { code: "ERR_INVALID_ARG_VALUE" });
-  dns.setDefaultResultOrder(originalResultOrder);
+  dns.setDefaultResultOrder(resultOrder);
 
   const fractionalService = await dns.promises.lookupService("127.0.0.1", 80.9);
   strictEqual(fractionalService.service, "http", "lookupService should truncate numeric ports");
   throws(() => dns.lookupService("127.0.0.1", "80" as never, () => {}), { code: "ERR_SOCKET_BAD_PORT" });
 
-  const resolver = new dns.promises.Resolver({ timeout: 1_000, tries: 1.5 });
+  throws(
+    () => new dns.promises.Resolver({ timeout: 1_000, tries: 1.5 }),
+    { code: "ERR_OUT_OF_RANGE" },
+  );
+  const resolver = new dns.promises.Resolver({ timeout: 1_000, tries: 2 });
   resolver.setServers([`127.0.0.1:${dnsPort}`]);
   resolver.setLocalAddress("::1", "127.0.0.1");
   const cancelled = resolver.resolve4("cancel.fixture.test");

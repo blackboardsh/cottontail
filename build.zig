@@ -327,6 +327,13 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
     step.root_module.addIncludePath(b.path("src/compiler/src/jsc/bindings/sqlite"));
     step.root_module.addCMacro("COTTONTAIL_VERSION", b.fmt("\"{s}\"", .{cottontail_version}));
     const resolved_target = step.root_module.resolved_target.?.result;
+    if (resolved_target.os.tag == .linux) {
+        // The POSIX libuv shims and synchronous signal forwarding use APIs
+        // hidden by glibc's strict C11 feature set unless these are defined
+        // for every C source group, not only the vendored libuv files.
+        step.root_module.addCMacro("_GNU_SOURCE", "1");
+        step.root_module.addCMacro("_POSIX_C_SOURCE", "200112");
+    }
     const platform_key = jscVendorPlatformKey(resolved_target) orelse {
         std.debug.print(
             "error: no vendored JavaScriptCore target for {s}-{s}\n",

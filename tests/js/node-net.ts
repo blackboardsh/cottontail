@@ -1,4 +1,5 @@
 import net, { Server, Socket, TCP, _createServerHandle, connect, createConnection, createServer, isIP, isIPv4, isIPv6 } from "node:net";
+import { EADDRINUSE } from "node:constants";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -52,6 +53,13 @@ await new Promise<void>((resolve, reject) => {
 const address = server.address();
 assert(address && address.port > 0, "server should report a bound port");
 assert(address.address === "127.0.0.1", "server should bind requested address");
+
+const conflictingServer = createServer();
+const addressInUseError = new Promise<any>((resolve) => conflictingServer.once("error", resolve));
+conflictingServer.listen(address.port, "127.0.0.1");
+const bindError = await addressInUseError;
+assert(bindError.code === "EADDRINUSE", "duplicate listen error code mismatch");
+assert(bindError.errno === -EADDRINUSE, "duplicate listen errno mismatch");
 
 const client = connect(address.port, "127.0.0.1");
 const received = await new Promise<string>((resolve, reject) => {

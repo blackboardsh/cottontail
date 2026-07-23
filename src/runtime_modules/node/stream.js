@@ -41,7 +41,7 @@ export const promises = Stream.promises;
 // The vendored bundle exposes `promises` as a lazy getter that builds a fresh
 // object per access; pin the captured instance so require("stream").promises
 // and node:stream/promises stay identical.
-Object.defineProperty(Stream, "promises", { value: promises, enumerable: false, configurable: true, writable: true });
+Object.defineProperty(Stream, "promises", { value: promises, enumerable: true, configurable: true, writable: true });
 export const _isUint8Array = Stream._isUint8Array;
 export const _uint8ArrayToBuffer = Stream._uint8ArrayToBuffer;
 

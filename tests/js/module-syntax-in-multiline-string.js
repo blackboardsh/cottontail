@@ -25,6 +25,18 @@ if (importedFromInterpolation !== "42") {
   throw new Error(`dynamic import inside a template interpolation was not rewritten`);
 }
 
+let importOptionSideEffects = 0;
+const importedWithOpaqueOptions = await import(
+  "./modules/dep.js?opaque-options",
+  (() => {
+    importOptionSideEffects++;
+    return undefined;
+  })()
+);
+if (importedWithOpaqueOptions.answer !== 42 || importOptionSideEffects !== 1) {
+  throw new Error("dynamic import with opaque options was not rewritten");
+}
+
 const objectWithImportMethod = { import(value) { return value; } };
 if (objectWithImportMethod.import("object") !== "object") {
   throw new Error("object method named import was rewritten");

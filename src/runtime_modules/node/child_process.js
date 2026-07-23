@@ -5,6 +5,7 @@ import { Server as NetServer, Socket as NetSocket } from "./net.js";
 import { Readable as ReadableStreamClass, Writable as WritableStreamClass } from "./stream.js";
 import { accessSync, statSync, writeSync, constants as fsConstants } from "./fs.js";
 import { isAbsolute as pathIsAbsolute, resolve as pathResolve } from "./path.js";
+import { EACCES, ENOBUFS, ENOENT, ETIMEDOUT } from "./constants.js";
 
 const Promise = globalThis.Promise;
 const queueMicrotask = globalThis.queueMicrotask.bind(globalThis);
@@ -110,7 +111,7 @@ function envPairsToObject(envPairs) {
 
 const isDarwinPlatform = typeof cottontail?.platform === "function" ? cottontail.platform() === "darwin" : true;
 
-const signalNumbersByName = {
+const fallbackSignalNumbersByName = {
   SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6, SIGIOT: 6,
   SIGFPE: 8, SIGKILL: 9, SIGSEGV: 11, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15,
   ...(isDarwinPlatform
@@ -125,6 +126,14 @@ const signalNumbersByName = {
         SIGXFSZ: 25, SIGVTALRM: 26, SIGPROF: 27, SIGWINCH: 28, SIGIO: 29, SIGPWR: 30, SIGSYS: 31,
       }),
 };
+const hostSignalNumbersByName = Object.fromEntries(
+  Object.entries(cottontail.platformConstants?.() ?? {}).filter(
+    ([name, value]) => /^SIG[A-Z0-9]+$/.test(name) && Number.isInteger(value),
+  ),
+);
+const signalNumbersByName = Object.keys(hostSignalNumbersByName).length > 0
+  ? hostSignalNumbersByName
+  : fallbackSignalNumbersByName;
 
 const signalNamesByNumber = {};
 for (const [name, number] of Object.entries(signalNumbersByName)) {
@@ -508,9 +517,9 @@ function normalizeSyncResult(result, options = {}, file = "", args = []) {
     stderr,
   };
   if (!normalized.error && result.exitedDueToTimeout === true) {
-    normalized.error = makeSpawnSyncLimitError("ETIMEDOUT", -60, file, args);
+    normalized.error = makeSpawnSyncLimitError("ETIMEDOUT", -ETIMEDOUT, file, args);
   } else if (!normalized.error && result.exitedDueToMaxBuffer === true) {
-    normalized.error = makeSpawnSyncLimitError("ENOBUFS", -55, file, args);
+    normalized.error = makeSpawnSyncLimitError("ENOBUFS", -ENOBUFS, file, args);
   }
   return normalized;
 }
@@ -618,14 +627,14 @@ function spawnPreflightError(resolvedFile, spawnargs, originalFile) {
   try {
     stats = statSync(resolvedFile);
   } catch {
-    return makeError("ENOENT", -2);
+    return makeError("ENOENT", -ENOENT);
   }
   try {
     accessSync(resolvedFile, fsConstants.X_OK);
   } catch {
-    return makeError("EACCES", -13);
+    return makeError("EACCES", -EACCES);
   }
-  if (stats.isDirectory()) return makeError("EACCES", -13);
+  if (stats.isDirectory()) return makeError("EACCES", -EACCES);
   return null;
 }
 
@@ -636,10 +645,10 @@ function normalizeSpawnError(file, spawnargs, cause) {
   let errno;
   if (causeCode === "ENOENT" || /filenotfound|enoent|no such file/i.test(message)) {
     code = "ENOENT";
-    errno = -2;
+    errno = -ENOENT;
   } else if (causeCode === "EACCES" || /eacces|permission denied/i.test(message)) {
     code = "EACCES";
-    errno = -13;
+    errno = -EACCES;
   } else {
     code = causeCode || "UNKNOWN";
     errno = cause?.errno;

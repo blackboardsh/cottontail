@@ -87,13 +87,24 @@ await new Promise<void>((resolve, reject) => {
   });
 });
 assert(Number.isFinite(stats.ino), "statSync ino missing");
-assert(statfsSync(root).bsize > 0, "statfsSync bsize missing");
+const filesystemStats = statfsSync(root);
+assert(filesystemStats.bsize > 0, "statfsSync bsize missing");
+if (process.platform === "linux") {
+  assert(
+    Number.isInteger(filesystemStats.type) && filesystemStats.type !== 0,
+    "statfsSync should expose the Linux filesystem magic",
+  );
+}
+const asyncFilesystemStats = await fsPromises.statfs(root);
+assert(asyncFilesystemStats.type === filesystemStats.type, "fs.promises.statfs type mismatch");
 const bigintStats = statSync(filePath, { bigint: true });
 assert(typeof bigintStats.size === "bigint", "statSync bigint size mismatch");
 assert(typeof bigintStats.mtimeNs === "bigint", "statSync bigint mtimeNs mismatch");
 assert(bigintStats.isFile(), "statSync bigint isFile mismatch");
 assert(statSync(`${root}/missing.txt`, { throwIfNoEntry: false }) === undefined, "statSync throwIfNoEntry mismatch");
-assert(typeof statfsSync(root, { bigint: true }).bsize === "bigint", "statfsSync bigint mismatch");
+const bigintFilesystemStats = statfsSync(root, { bigint: true });
+assert(typeof bigintFilesystemStats.bsize === "bigint", "statfsSync bigint mismatch");
+assert(bigintFilesystemStats.type === BigInt(filesystemStats.type), "statfsSync bigint type mismatch");
 
 chmodSync(filePath, 0o644);
 const fd = openSync(filePath, "r+");
@@ -189,6 +200,17 @@ assert(!globSync("**/*.txt", { cwd: root, exclude: ["nested-copy/**"] }).include
 const globDirents = globSync("nested/**/*.txt", { cwd: new URL(`file://${root}/`), withFileTypes: true });
 assert(globDirents[0]?.name === "match.txt", "globSync withFileTypes name mismatch");
 assert(String(globDirents[0]?.parentPath).endsWith("/nested/child"), "globSync withFileTypes parentPath mismatch");
+const prunedGlobDirents = globSync("**/*.txt", {
+  cwd: root,
+  withFileTypes: true,
+  exclude(entry) {
+    return entry.isDirectory() && entry.name === "nested";
+  },
+});
+assert(
+  !prunedGlobDirents.some(entry => String(entry.parentPath).includes("/nested/")),
+  "globSync withFileTypes directory exclusion should prune the subtree",
+);
 
 const disposable = mkdtempDisposableSync(`${root}/dispose-`);
 assert(statSync(disposable.path).isDirectory(), "mkdtempDisposableSync path mismatch");

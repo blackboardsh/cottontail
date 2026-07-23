@@ -83,13 +83,66 @@ written to a log.
 ```bash
 set -e -o pipefail
 node scripts/zig.js build test --verbose 2>&1 | tee vm-linux-test.log
-node scripts/zig.js build -Doptimize=ReleaseSmall --verbose 2>&1 \
+node scripts/zig.js build -Doptimize=ReleaseSmall -Dcpu=baseline --verbose 2>&1 \
   | tee vm-linux-release.log
 test "$(./zig-out/bin/cottontail -p '6 * 7')" = '42'
 node scripts/package-release.js
 ```
 
 Success produces an archive and checksum under `release/`.
+
+### Current Linux ARM64 checkpoint
+
+The July 23, 2026 working-tree checkpoint has the following local evidence on
+native Ubuntu 25.04 ARM64 with glibc 2.41:
+
+- A fresh-cache `ReleaseSmall` build completed all 12 build steps. The native
+  test target then passed 48 tests with one intentional skip.
+- The complete local JavaScript behavior suite, including its hot/watch
+  integration, passed against the final executable with its runtime modules
+  embedded.
+- Both targeted ICU Zig tests passed. The system-ICU path and the packaged ICU
+  70.1 fallback were exercised, including a network-isolated packaged run with
+  system ICU loading disabled.
+- Packaging, checksum generation, the package script's smoke test, and an
+  extracted-archive smoke outside the checkout passed.
+- The upstream-runner regression suite passed all 13 tests.
+- A real Node inventory/list smoke found 4,969 files recognized by Node's
+  `tools/test.py`, mapping to 4,962 harness selectors, and exact focused
+  selection worked.
+- The Linux child-process deadlock and signal lifecycle/default gaps were
+  fixed. JSC and libuv had both claimed `SIGUSR1`; Cottontail now moves JSC's
+  GC suspension signal to a protected `SIGRTMIN` before VM creation and then
+  allows libuv to own `SIGUSR1`. Lazy, unreferenced libuv watchers deliver
+  external `SIGALRM`, `SIGPROF`, `SIGVTALRM`, `SIGPWR`, and aliases while
+  tracking every supported listener add/remove path. `SIGPIPE` and `SIGXFSZ`
+  have Node-compatible initial and post-listener defaults, `SIGKILL` and
+  `SIGSTOP` registration is rejected, and numeric Linux real-time signals are
+  external-target-only. All 30 process/signal lifecycle tests (60 assertions)
+  and 50 consecutive child-process stress iterations passed.
+- Linux `fs.statfsSync` and `fs.promises.statfs` now report the native
+  filesystem magic in `type` instead of the previous zero placeholder,
+  including bigint sync results.
+- Standalone bytecode compilation now shuts down cleanly on Linux. The bridge
+  owns its cached bytecode and restores the vendored JSC archive's
+  `HAVE_MMAP`-dependent private ABI layout; all 12 runtime-bootstrap/startup
+  checks passed.
+- Focused constants, filesystem, networking/UDP, DNS, worker, and
+  package-manager retry checks passed.
+
+This remains an in-progress Linux ARM64 compatibility checkpoint. The Node
+inventory verifies discovery and selection, not a 4,969-file execution pass.
+One focused upstream Node execution was selected exactly but failed the copied
+harness's global-leak check on Cottontail/Bun globals; the sampled Bun run
+lacked its pinned snapshot test dependencies. The complete Node and Bun
+upstream suites, real application canaries, and Linux x64 verification remain
+outstanding. Synchronous fatal signals remain owned by Cottontail's native
+crash handler rather than exposed as JavaScript signal events.
+
+Performance tuning remains deferred while functional Linux parity is being
+established. The five existing Bun performance quarantines remain documented
+in `cross-platform-compatibility.md`; remaining functional gaps must not be
+reclassified as performance exceptions.
 
 ### Linux diagnostics
 
@@ -174,7 +227,8 @@ node scripts/zig.js build test --verbose 2>&1 |
   Tee-Object vm-windows-test.log
 if ($LASTEXITCODE -ne 0) { throw "Windows tests failed" }
 
-node scripts/zig.js build -Doptimize=ReleaseSmall --verbose 2>&1 |
+node scripts/zig.js build -Doptimize=ReleaseSmall `
+  -Dtarget=x86_64-windows-msvc -Dcpu=baseline --verbose 2>&1 |
   Tee-Object vm-windows-release.log
 if ($LASTEXITCODE -ne 0) { throw "Windows release build failed" }
 

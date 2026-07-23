@@ -174,20 +174,36 @@ jobs:
         run: |
           archive=$(find "$PWD/release" -maxdepth 1 -name 'cottontail-*-linux-*.tar.gz' -print -quit)
           test -n "$archive"
+          smoke_image="cottontail-icu-smoke:${GITHUB_RUN_ID}-${{ matrix.platform }}"
+          trap 'docker image rm --force "$smoke_image" >/dev/null 2>&1 || true' EXIT
+          docker build --tag "$smoke_image" - <<'DOCKERFILE'
+          FROM ubuntu:24.04
+          RUN apt-get update >/dev/null \
+            && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              libatomic1 libbrotli1 libffi8 libgcc-s1 libstdc++6 zlib1g >/dev/null \
+            && mkdir -p /app /work \
+            && rm -rf /var/lib/apt/lists/*
+          DOCKERFILE
           docker run --rm \
+            --network none \
+            --read-only \
+            --tmpfs /app:rw,exec \
+            --tmpfs /tmp:rw,exec \
+            --tmpfs /work:rw,exec \
+            --workdir /work \
+            --env HOME=/unwritable \
+            --env XDG_DATA_HOME=/unwritable \
             -v "$archive:/release.tar.gz:ro" \
             -v "$PWD/tests/js/icu-fallback-smoke.js:/icu-fallback-smoke.js:ro" \
-            ubuntu:24.04 \
+            "$smoke_image" \
             bash -euc '
-              apt-get update >/dev/null
-              apt-get install -y --no-install-recommends \
-                ca-certificates libatomic1 libbrotli1 libffi8 libgcc-s1 libstdc++6 zlib1g >/dev/null
               if ldconfig -p | grep -q "libicu"; then
                 echo "minimal test image unexpectedly contains system ICU" >&2
                 exit 1
               fi
-              mkdir /app
               tar -xzf /release.tar.gz --strip-components=1 -C /app
+              test -f /app/share/cottontail/icu/70.1/icudt70l.dat
+              test -f /app/share/cottontail/icu/70.1/LICENSE
               test "$(/app/bin/cottontail /icu-fallback-smoke.js)" = "icu fallback passed"
             '
 

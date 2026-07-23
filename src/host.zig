@@ -38,9 +38,14 @@ const DarwinC = struct {
 const c = if (builtin.os.tag == .windows) @cImport({
     @cInclude("stdlib.h");
 }) else if (builtin.os.tag == .macos) DarwinC else @cImport({
+    // Zig imports declarations rather than glibc's fortified inline wrappers.
+    // Newer glibc fcntl wrappers intentionally contain compile-time error calls
+    // that translate-c cannot lower as declarations.
+    @cUndef("_FORTIFY_SOURCE");
     @cDefine("_GNU_SOURCE", "1");
     @cInclude("errno.h");
     @cInclude("fcntl.h");
+    @cInclude("signal.h");
     @cInclude("spawn.h");
     @cInclude("stdlib.h");
     @cInclude("unistd.h");
@@ -623,6 +628,7 @@ fn spawnPosixWithArgv0(
     stdin_option: std.process.SpawnOptions.StdIo,
     stdout_option: std.process.SpawnOptions.StdIo,
     stderr_option: std.process.SpawnOptions.StdIo,
+    create_process_group: bool,
 ) std.process.SpawnError!std.process.Child {
     const gpa = std.heap.c_allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -704,10 +710,40 @@ fn spawnPosixWithArgv0(
     }
     const spawn_file = if (resolved_executable) |path| path.ptr else executable;
     var pid: std.posix.pid_t = -1;
-    const spawn_result = if (resolved_executable != null or std.mem.indexOfScalar(u8, std.mem.span(executable), '/') != null)
-        c.posix_spawn(&pid, spawn_file, &actions, null, @ptrCast(argv_z.ptr), @ptrCast(envp))
-    else
-        c.posix_spawnp(&pid, spawn_file, &actions, null, @ptrCast(argv_z.ptr), @ptrCast(envp));
+    const spawn_result = spawn: {
+        if (comptime builtin.os.tag == .linux) {
+            var attributes: c.posix_spawnattr_t = undefined;
+            try checkPosixSpawnResult(c.posix_spawnattr_init(&attributes));
+            defer _ = c.posix_spawnattr_destroy(&attributes);
+
+            var default_signals: c.sigset_t = undefined;
+            var signal_mask: c.sigset_t = undefined;
+            _ = c.sigemptyset(&default_signals);
+            _ = c.sigemptyset(&signal_mask);
+            var signal_number: c_int = 1;
+            while (signal_number < c.NSIG) : (signal_number += 1) {
+                if (signal_number != c.SIGKILL and signal_number != c.SIGSTOP) {
+                    _ = c.sigaddset(&default_signals, signal_number);
+                }
+            }
+            try checkPosixSpawnResult(c.posix_spawnattr_setsigdefault(&attributes, &default_signals));
+            try checkPosixSpawnResult(c.posix_spawnattr_setsigmask(&attributes, &signal_mask));
+            var flags: c_short = @intCast(c.POSIX_SPAWN_SETSIGDEF | c.POSIX_SPAWN_SETSIGMASK);
+            if (create_process_group) {
+                try checkPosixSpawnResult(c.posix_spawnattr_setpgroup(&attributes, 0));
+                flags |= @intCast(c.POSIX_SPAWN_SETPGROUP);
+            }
+            try checkPosixSpawnResult(c.posix_spawnattr_setflags(&attributes, flags));
+            break :spawn if (resolved_executable != null or std.mem.indexOfScalar(u8, std.mem.span(executable), '/') != null)
+                c.posix_spawn(&pid, spawn_file, &actions, &attributes, @ptrCast(argv_z.ptr), @ptrCast(envp))
+            else
+                c.posix_spawnp(&pid, spawn_file, &actions, &attributes, @ptrCast(argv_z.ptr), @ptrCast(envp));
+        }
+        break :spawn if (resolved_executable != null or std.mem.indexOfScalar(u8, std.mem.span(executable), '/') != null)
+            c.posix_spawn(&pid, spawn_file, &actions, null, @ptrCast(argv_z.ptr), @ptrCast(envp))
+        else
+            c.posix_spawnp(&pid, spawn_file, &actions, null, @ptrCast(argv_z.ptr), @ptrCast(envp));
+    };
     try checkPosixSpawnResult(spawn_result);
 
     closePosixSpawnFd(&stdin_pipe[0]);
@@ -724,9 +760,20 @@ fn spawnPosixWithArgv0(
     };
 }
 
-fn createSpawnMemfd(name: []const u8) ?std.Io.File {
+fn createSpawnMemfd(name: []const u8, append: bool) ?std.Io.File {
     if (comptime builtin.os.tag != .linux) return null;
     const fd = std.posix.memfd_create(name, 0) catch return null;
+    if (append) {
+        const current_flags = c.fcntl(fd, c.F_GETFL);
+        if (current_flags < 0) {
+            _ = c.close(fd);
+            return null;
+        }
+        if (c.fcntl(fd, c.F_SETFL, current_flags | c.O_APPEND) < 0) {
+            _ = c.close(fd);
+            return null;
+        }
+    }
     return .{ .handle = fd, .flags = .{ .nonblocking = false } };
 }
 
@@ -772,7 +819,7 @@ fn processId(id: std.process.Child.Id) u64 {
     return @intCast(id);
 }
 
-fn rawTerminateProcess(id: std.process.Child.Id, signal_code: c_int) void {
+fn rawTerminateProcess(id: std.process.Child.Id, signal_code: c_int, process_group: bool) void {
     if (signal_code == 0) return;
 
     if (comptime builtin.os.tag == .windows) {
@@ -785,6 +832,14 @@ fn rawTerminateProcess(id: std.process.Child.Id, signal_code: c_int) void {
     }
 
     const signal: std.posix.SIG = @enumFromInt(@as(std.meta.Tag(std.posix.SIG), @intCast(signal_code)));
+    if (comptime builtin.os.tag == .linux) {
+        if (process_group) {
+            std.posix.kill(-id, signal) catch {
+                std.posix.kill(id, signal) catch {};
+            };
+            return;
+        }
+    }
     std.posix.kill(id, signal) catch {};
 }
 
@@ -794,6 +849,7 @@ const SpawnControl = struct {
     mutex: std.Io.Mutex = .init,
     alive: bool = true,
     kill_signal: c_int,
+    process_group: bool,
     termination_reason: SpawnTerminationReason = .none,
     termination_requested_while_alive: bool = false,
     max_buffer_exceeded: bool = false,
@@ -809,7 +865,7 @@ const SpawnControl = struct {
         self.termination_requested_while_alive = true;
 
         const signal_code = if (reason == .io_error and self.kill_signal == 0) 15 else self.kill_signal;
-        rawTerminateProcess(self.id, signal_code);
+        rawTerminateProcess(self.id, signal_code, self.process_group);
     }
 
     fn markExited(self: *SpawnControl) void {
@@ -1260,7 +1316,7 @@ pub export fn ct_host_spawn_sync(
     var stderr_memfd: ?std.Io.File = null;
     if (comptime builtin.os.tag == .linux) {
         if (options.stdin_mode == @intFromEnum(SpawnStdio.pipe) and options.input_present) {
-            stdin_memfd = createSpawnMemfd("spawn_stdio_stdin");
+            stdin_memfd = createSpawnMemfd("spawn_stdio_stdin", false);
             if (stdin_memfd) |file_handle| {
                 file_handle.writePositionalAll(io, input, 0) catch {
                     file_handle.close(io);
@@ -1269,10 +1325,10 @@ pub export fn ct_host_spawn_sync(
             }
         }
         if (!options.max_buffer_enabled and options.stdout_mode == @intFromEnum(SpawnStdio.pipe)) {
-            stdout_memfd = createSpawnMemfd("spawn_stdio_stdout");
+            stdout_memfd = createSpawnMemfd("spawn_stdio_stdout", true);
         }
         if (!options.max_buffer_enabled and options.stderr_mode == @intFromEnum(SpawnStdio.pipe)) {
-            stderr_memfd = createSpawnMemfd("spawn_stdio_stderr");
+            stderr_memfd = createSpawnMemfd("spawn_stdio_stderr", true);
         }
     }
     defer if (stdin_memfd) |file_handle| file_handle.close(io);
@@ -1291,6 +1347,8 @@ pub export fn ct_host_spawn_sync(
         .{ .file = file_handle }
     else
         spawnStdioOption(options.stderr_mode, options.stderr_fd);
+    const isolate_process_group = builtin.os.tag == .linux and
+        (options.timeout_enabled or options.max_buffer_enabled or options.abort_requested);
 
     const spawn_options: std.process.SpawnOptions = .{
         .argv = argv.items,
@@ -1300,6 +1358,7 @@ pub export fn ct_host_spawn_sync(
         .stdout = stdout_option,
         .stderr = stderr_option,
         .request_resource_usage_statistics = true,
+        .pgid = if (isolate_process_group) 0 else null,
         .create_no_window = shouldCreateNoWindow(options.stdin_mode, options.stdout_mode, options.stderr_mode),
     };
     var signal_scope = signal_forwarding.Scope.begin();
@@ -1314,6 +1373,7 @@ pub export fn ct_host_spawn_sync(
                 stdin_option,
                 stdout_option,
                 stderr_option,
+                isolate_process_group,
             )
         else
             std.process.spawn(io, spawn_options)
@@ -1335,6 +1395,7 @@ pub export fn ct_host_spawn_sync(
         .io = io,
         .id = child.id.?,
         .kill_signal = options.kill_signal,
+        .process_group = isolate_process_group,
     };
 
     var stdin_context = SpawnWriteContext{

@@ -262,7 +262,7 @@ export function setTimezone(value) {
 export function callerSourceOrigin() {
   const stack = String(new Error().stack ?? "");
   for (const line of stack.split("\n").slice(1)) {
-    const match = line.match(/(?:\(|@|\s)((?:file:\/\/)?\/.*\.[cm]?[jt]sx?):\d+:\d+\)?$/);
+    const match = line.match(/(?:\(|@|\s)((?:file:\/\/)?\/.*\.[cm]?[jt]sx?(?:[?#][^\s)]*)?):\d+:\d+\)?$/);
     if (
       !match ||
       match[1].includes("runtime_modules/bun/jsc") ||

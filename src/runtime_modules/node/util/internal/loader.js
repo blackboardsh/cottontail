@@ -12,6 +12,7 @@ import buildPrimordials from "./vendor/per_context__primordials.js";
 import { vendored } from "./vendor/registry.js";
 import * as typesModule from "../types.js";
 import * as bufferModule from "../../buffer.js";
+import * as nodeConstants from "../../constants.js";
 import * as eventsModule from "../../events.js";
 import * as stringDecoderModule from "../../string_decoder.js";
 import * as pathModule from "../../path.js";
@@ -31,10 +32,10 @@ if (typeof globalThis.Float16Array === "function") {
 export const primordials = buildPrimordials(primordialsSeed);
 
 // ---------------------------------------------------------------------------
-// internalBinding('uv') data: [errno, code, message] triples matching libuv.
-// (Extracted from Node.js v24.11.1 on darwin; the negative-4xxx entries are
-// platform-independent libuv codes.)
-const uvEntries = [
+// internalBinding('uv') data: [errno, code, message] triples matching the
+// libuv linked into this executable. Keep the Darwin snapshot as a fallback
+// for older hosts which do not expose the native table.
+const fallbackUvEntries = [
   [-7, "E2BIG", "argument list too long"],
   [-13, "EACCES", "permission denied"],
   [-48, "EADDRINUSE", "address already in use"],
@@ -121,25 +122,43 @@ const uvEntries = [
   [-4023, "EUNATCH", "protocol driver not attached"],
   [-8, "ENOEXEC", "exec format error"],
 ];
+const nativeUvEntries = globalThis.cottontail?.uvErrorEntries?.();
+const uvEntries = Array.isArray(nativeUvEntries) && nativeUvEntries.length > 0
+  ? nativeUvEntries
+  : fallbackUvEntries;
 export const uvErrorMap = new Map(uvEntries.map(([errno, code, message]) => [errno, [code, message]]));
 
-const signalsDarwin = {
-  SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6,
-  SIGIOT: 6, SIGBUS: 10, SIGFPE: 8, SIGKILL: 9, SIGUSR1: 30, SIGSEGV: 11,
-  SIGUSR2: 31, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15, SIGCHLD: 20,
-  SIGCONT: 19, SIGSTOP: 17, SIGTSTP: 18, SIGTTIN: 21, SIGTTOU: 22,
-  SIGURG: 16, SIGXCPU: 24, SIGXFSZ: 25, SIGVTALRM: 26, SIGPROF: 27,
-  SIGWINCH: 28, SIGIO: 23, SIGINFO: 29, SIGSYS: 12,
-};
-const signalsLinux = {
-  SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6,
-  SIGIOT: 6, SIGBUS: 7, SIGFPE: 8, SIGKILL: 9, SIGUSR1: 10, SIGSEGV: 11,
-  SIGUSR2: 12, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15, SIGSTKFLT: 16,
-  SIGCHLD: 17, SIGCONT: 18, SIGSTOP: 19, SIGTSTP: 20, SIGTTIN: 21,
-  SIGTTOU: 22, SIGURG: 23, SIGXCPU: 24, SIGXFSZ: 25, SIGVTALRM: 26,
-  SIGPROF: 27, SIGWINCH: 28, SIGIO: 29, SIGPOLL: 29, SIGPWR: 30, SIGSYS: 31,
-};
-const osSignals = (globalThis.cottontail?.platform ?? "darwin") === "linux" ? signalsLinux : signalsDarwin;
+function selectNodeConstants(predicate) {
+  return Object.fromEntries(
+    Object.entries(nodeConstants).filter(([name, value]) => predicate(name, value)),
+  );
+}
+
+const osSignals = selectNodeConstants(
+  (name, value) => /^SIG[A-Z0-9]+$/.test(name) && Number.isInteger(value),
+);
+const osErrno = selectNodeConstants(
+  (name, value) => /^E[A-Z0-9]+$/.test(name) && !name.startsWith("ENGINE_") && Number.isInteger(value),
+);
+const osDlopen = selectNodeConstants(
+  (name, value) => name.startsWith("RTLD_") && Number.isInteger(value),
+);
+const osPriority = selectNodeConstants(
+  (name, value) => name.startsWith("PRIORITY_") && Number.isInteger(value),
+);
+const fsConstants = selectNodeConstants(
+  (name, value) => Number.isInteger(value) && (
+    name === "F_OK" ||
+    name === "R_OK" ||
+    name === "W_OK" ||
+    name === "X_OK" ||
+    name.startsWith("O_") ||
+    name.startsWith("S_") ||
+    name.startsWith("UV_DIRENT_") ||
+    name.startsWith("UV_FS_") ||
+    name.startsWith("COPYFILE_")
+  ),
+);
 
 // ---------------------------------------------------------------------------
 // internalBinding('util') implemented in JS.
@@ -431,12 +450,13 @@ const bindings = {
   },
   constants: {
     os: {
+      UV_UDP_REUSEADDR: 4,
       signals: osSignals,
-      errno: {},
-      dlopen: {},
-      priority: { PRIORITY_LOW: 19, PRIORITY_BELOW_NORMAL: 10, PRIORITY_NORMAL: 0, PRIORITY_ABOVE_NORMAL: -7, PRIORITY_HIGH: -14, PRIORITY_HIGHEST: -20 },
+      errno: osErrno,
+      dlopen: osDlopen,
+      priority: osPriority,
     },
-    fs: {},
+    fs: fsConstants,
     crypto: {},
     trace: { CHAR: "" },
   },

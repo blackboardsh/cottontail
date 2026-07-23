@@ -25,7 +25,10 @@ const libcSymbols = dlopen(libc, {
 });
 const hello = Buffer.from("hello\0");
 assert(libcSymbols.symbols.strlen(hello) === 5n, "bun:ffi dlopen strlen mismatch");
-for (const libraryInput of [Bun.pathToFileURL(libc), Bun.pathToFileURL(libc).href, Bun.file(libc)]) {
+const libcFilePath = process.platform === "linux"
+  ? process.report.getReport().sharedObjects.find((path: string) => /\/libc\.so(?:\.|$)/.test(path)) ?? libc
+  : libc;
+for (const libraryInput of [Bun.pathToFileURL(libcFilePath), Bun.pathToFileURL(libcFilePath).href, Bun.file(libcFilePath)]) {
   const library = dlopen(libraryInput, {
     strlen: { args: [FFIType.cstring], returns: "usize" },
   });

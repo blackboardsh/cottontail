@@ -714,8 +714,9 @@ pub const Libc = enum(u8) {
         return .{ .added = this, .removed = .none };
     }
 
-    // TODO:
-    pub const current: Libc = @intFromEnum(glibc);
+    // Cottontail's supported Linux release targets use glibc. Other operating
+    // systems do not have an npm `libc` target.
+    pub const current: Libc = if (Environment.isLinux) @enumFromInt(glibc) else .none;
 
     pub const jsFunctionLibcIsMatch = @import("../install_jsc/npm_jsc.zig").libcIsMatch;
 };

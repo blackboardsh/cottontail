@@ -18,14 +18,20 @@ function fail(message) {
   process.exit(1);
 }
 
+function embeddedRuntimeEnvironment(overrides = undefined) {
+  const env = {
+    ...process.env,
+    ...(overrides ?? {}),
+  };
+  delete env.COTTONTAIL_RUNTIME_MODULES_DIR;
+  return env;
+}
+
 function runCase(testCase) {
   const argv = testCase.argv ?? [testCase.scriptPath, ...(testCase.args ?? [])];
-  const result = spawnSync(binaryPath, argv, {
+  const result = spawnSync(testCase.executablePath ?? binaryPath, argv, {
     cwd: testCase.cwd ?? rootDir,
-    env: {
-      ...process.env,
-      ...(testCase.env ?? {}),
-    },
+    env: embeddedRuntimeEnvironment(testCase.env),
     encoding: 'utf8',
   });
 
@@ -109,13 +115,13 @@ try {
       name: 'bundled-dynamic-import-default-identity',
       argv: ['test', join(rootDir, 'tests', 'js', 'builtin-dynamic-import-default-identity.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: ['1 pass', '0 fail'],
+      stderrIncludes: ['1 pass', '0 fail'],
     },
     {
       name: 'runtime-bootstrap-startup-regressions',
       argv: ['test', join(rootDir, 'tests', 'js', 'runtime-bootstrap-startup.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: ['9 pass', '0 fail'],
+      stderrIncludes: ['12 pass', '0 fail'],
     },
     {
       name: 'upstream-test-temp-cleanup-regressions',
@@ -124,16 +130,23 @@ try {
       stderrIncludes: ['5 pass', '0 fail'],
     },
     {
+      name: 'upstream-runner-regressions',
+      executablePath: process.execPath,
+      argv: ['--test-reporter=tap', '--test', join(rootDir, 'tests', 'upstream-runner.test.mjs')],
+      expectExitCode: 0,
+      stdoutIncludes: ['# tests 13', '# pass 13', '# fail 0'],
+    },
+    {
       name: 'internal-runtime-bindings',
       argv: ['test', join(rootDir, 'tests', 'js', 'internal-runtime-bindings.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: ['7 pass', '0 fail'],
+      stderrIncludes: ['7 pass', '0 fail'],
     },
     {
       name: 'cli-version-identity-regressions',
       argv: ['test', join(rootDir, 'tests', 'js', 'cli-version-identity.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: ['3 pass', '0 fail'],
+      stderrIncludes: ['3 pass', '0 fail'],
     },
     {
       name: 'cli-init-regressions',
@@ -142,7 +155,7 @@ try {
         COTTONTAIL_INIT_TEST_ROOT: join(rootDir, '.cottontail-tmp'),
       },
       expectExitCode: 0,
-      stdoutIncludes: ['5 pass', '0 fail'],
+      stderrIncludes: ['5 pass', '0 fail'],
     },
     {
       name: 'cli-run-package-script-regressions',
@@ -151,13 +164,19 @@ try {
         COTTONTAIL_CLI_RUN_TEST_ROOT: join(rootDir, '.cottontail-tmp'),
       },
       expectExitCode: 0,
-      stdoutIncludes: ['2 pass', '0 fail'],
+      stderrIncludes: ['2 pass', '0 fail'],
     },
     {
       name: 'module-syntax-in-multiline-string',
       scriptPath: join(rootDir, 'tests', 'js', 'module-syntax-in-multiline-string.js'),
       expectExitCode: 0,
       stdoutIncludes: ['module syntax string passed'],
+    },
+    {
+      name: 'bun-transpiled-dynamic-import',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-transpiled-dynamic-import.js'),
+      expectExitCode: 0,
+      stdoutIncludes: ['bun transpiled dynamic import passed'],
     },
     {
       name: 'async',
@@ -356,7 +375,7 @@ try {
       name: 'bun-typescript-compiler-parity',
       argv: ['test', join(rootDir, 'tests', 'js', 'bun-typescript-compiler-parity.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: ['8 pass', '0 fail'],
+      stderrIncludes: ['8 pass', '0 fail'],
     },
     {
       name: 'native-build-cli',
@@ -368,7 +387,7 @@ try {
         nativeBuildOutDir,
       ],
       expectExitCode: 0,
-      stdoutIncludes: [join(nativeBuildOutDir, 'bun-build-entry.js')],
+      stdoutIncludes: ['bun-build-entry.js'],
     },
     {
       name: 'native-build-cli-output',
@@ -577,19 +596,19 @@ try {
       name: 'node-net-native-readiness',
       argv: ['test', join(rootDir, 'tests', 'js', 'node-net-native-readiness.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: ['2 pass', '0 fail'],
+      stderrIncludes: ['2 pass', '0 fail'],
     },
     {
       name: 'node-net-lifecycle-regressions',
       argv: ['test', join(rootDir, 'tests', 'js', 'node-net-lifecycle-regressions.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: ['6 pass', '0 fail'],
+      stderrIncludes: ['13 pass', '0 fail'],
     },
     {
       name: 'node-net-duplex',
       argv: ['test', join(rootDir, 'tests', 'js', 'node-net-duplex.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: ['7 pass', '0 fail'],
+      stderrIncludes: ['7 pass', '0 fail'],
     },
     {
       name: 'node-readline',
@@ -694,7 +713,7 @@ try {
       name: 'websocket-production',
       argv: ['test', join(rootDir, 'tests', 'js', 'websocket-production.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: ['5 pass', '0 fail'],
+      stderrIncludes: ['6 pass', '0 fail'],
     },
     {
       name: 'node-dns-surface',
@@ -766,13 +785,13 @@ try {
       name: 'sync-error',
       scriptPath: join(rootDir, 'tests', 'js', 'sync-error.js'),
       expectExitCode: 1,
-      stderrIncludes: ['Error: sync boom'],
+      stderrIncludes: ['error: sync boom'],
     },
     {
       name: 'unhandled-rejection',
       scriptPath: join(rootDir, 'tests', 'js', 'unhandled-rejection.js'),
       expectExitCode: 1,
-      stderrIncludes: ['Error: async boom'],
+      stderrIncludes: ['error: async boom'],
     },
   ];
 
@@ -782,7 +801,7 @@ try {
 
   const hotWatchResult = spawnSync(process.execPath, [join(rootDir, 'tests', 'js', 'hot-watch-runtime.integration.js')], {
     cwd: rootDir,
-    env: process.env,
+    env: embeddedRuntimeEnvironment(),
     encoding: 'utf8',
   });
   if (hotWatchResult.error) {

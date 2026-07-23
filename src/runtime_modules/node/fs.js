@@ -62,6 +62,8 @@ const fsConstantNames = [
   "O_TRUNC",
   "O_APPEND",
   "O_DIRECTORY",
+  "O_DIRECT",
+  "O_NOATIME",
   "O_NOFOLLOW",
   "O_SYNC",
   "O_DSYNC",
@@ -1845,7 +1847,10 @@ class WriteStreamImpl extends Writable {
   close(callback = undefined) {
     if (callback) this.once("close", callback);
     this.end();
-    if (!this.autoClose) this.once("finish", () => this.destroy());
+    if (!this.autoClose) {
+      if (this._finished) this.destroy();
+      else this.once("finish", () => this.destroy());
+    }
     return this;
   }
 
@@ -2615,8 +2620,8 @@ function walkGlobEntries(root, prefix = "", seenDirectories = new Set()) {
       parentPath: root,
       relative,
       stats: lstat,
+      descends: false,
     };
-    out.push(entry);
 
     let descend = lstat.isDirectory();
     if (!descend && lstat.isSymbolicLink()) {
@@ -2624,6 +2629,8 @@ function walkGlobEntries(root, prefix = "", seenDirectories = new Set()) {
         descend = statSync(fullPath).isDirectory();
       } catch {}
     }
+    entry.descends = descend;
+    out.push(entry);
     if (!descend) continue;
 
     let real = fullPath;
@@ -2670,7 +2677,7 @@ function globEntriesForPattern(pattern, cwd) {
       } else if (absolute) {
         dynamicPath = normalizeGlobPattern(relative(root, entry.fullPath));
       }
-      return { candidate, dynamicPath, traversalPath };
+      return { candidate, dynamicPath, traversalPath, entry };
     })
     .sort((left, right) => left.candidate < right.candidate ? -1 : left.candidate > right.candidate ? 1 : 0)
     .filter(entry => entry.traversalPath.split("/").length <= negatedDepth)
@@ -2683,22 +2690,39 @@ export function globSync(pattern, options) {
   if (typeof options !== "object" || Array.isArray(options)) {
     throw invalidArgType("options", "of type object", options);
   }
-  if (options.withFileTypes) {
-    throw new TypeError("fs.glob does not support options.withFileTypes yet. Please open an issue on GitHub.");
-  }
+  const withFileTypes = Boolean(options.withFileTypes);
   const cwdValue = options.cwd ?? globalThis.process?.cwd?.() ?? ".";
-  if (typeof cwdValue !== "string") throw new TypeError("scanSync: invalid `cwd`, not a string");
   const cwd = normalizePath(cwdValue);
   const cwdStats = statSync(cwd);
   if (!cwdStats.isDirectory()) readdirSync(cwd);
-  const exclude = makeExcludeMatcher(options.exclude);
+  const excludeOption = options.exclude;
+  const exclude = makeExcludeMatcher(excludeOption);
   const matches = [];
   for (const pattern of patterns) {
     const matcher = createGlobMatcher(pattern);
+    const mayTraverseDescendants = pattern.includes("/") || pattern.includes("**");
+    const excludedDirectoryPrefixes = [];
     for (const entry of globEntriesForPattern(pattern, cwd)) {
+      if (excludedDirectoryPrefixes.some(prefix => entry.candidate.startsWith(prefix))) continue;
+      const outputPath = globPathOutput(entry.candidate);
+      const output = withFileTypes
+        ? new Dirent(entry.entry.name, entry.entry.stats, entry.entry.parentPath)
+        : outputPath;
+      const excludeValue = withFileTypes && typeof excludeOption === "function" ? output : outputPath;
+      let excludeChecked = false;
+      if (typeof excludeOption === "function" && entry.entry.descends && mayTraverseDescendants) {
+        excludeChecked = true;
+        if (exclude(excludeValue)) {
+          excludedDirectoryPrefixes.push(`${entry.candidate}/`);
+          continue;
+        }
+      }
       if (!matcher(entry.candidate)) continue;
-      const output = globPathOutput(entry.candidate);
-      if (!exclude(output)) matches.push(output);
+      if (!excludeChecked && exclude(excludeValue)) {
+        if (entry.entry.descends) excludedDirectoryPrefixes.push(`${entry.candidate}/`);
+        continue;
+      }
+      matches.push(output);
     }
   }
   return matches;

@@ -240,6 +240,7 @@ typedef unsigned int gid_t;
 #include <netpacket/packet.h>
 #include <sys/syscall.h>
 #include <sys/statvfs.h>
+#include <sys/vfs.h>
 #ifndef AT_EMPTY_PATH
 #define AT_EMPTY_PATH 0x1000
 #endif
@@ -259,6 +260,47 @@ typedef unsigned int gid_t;
 #include <time.h>
 #include <uv.h>
 #include <zlib.h>
+
+#if !defined(_WIN32)
+static pthread_once_t ct_process_signal_defaults_once = PTHREAD_ONCE_INIT;
+
+static void ct_process_signal_defaults_configure_once(void) {
+    /* Node ignores broken-pipe and file-size-limit signals until JavaScript
+     * explicitly installs a listener for them. This is only the initial
+     * disposition: after the first listener is removed, libuv restores
+     * SIG_DFL, matching Node. */
+#if defined(SIGPIPE)
+    (void)signal(SIGPIPE, SIG_IGN);
+#endif
+#if defined(SIGXFSZ)
+    (void)signal(SIGXFSZ, SIG_IGN);
+#endif
+}
+
+static void ct_process_signal_defaults_configure(void) {
+    (void)pthread_once(&ct_process_signal_defaults_once, ct_process_signal_defaults_configure_once);
+}
+#endif
+
+#if defined(__linux__)
+/* JSCOnly exports this embedding API from JSBasePrivate.h, which is not part
+ * of the installed public header set. */
+extern bool JSConfigureSignalForGC(int signal);
+
+static pthread_once_t ct_jsc_gc_signal_once = PTHREAD_ONCE_INIT;
+static bool ct_jsc_gc_signal_moved_from_sigusr1 = false;
+
+static void ct_jsc_configure_gc_signal_once(void) {
+    const int signal_number = SIGRTMIN;
+    if (signal_number <= SIGRTMAX) {
+        ct_jsc_gc_signal_moved_from_sigusr1 = JSConfigureSignalForGC(signal_number);
+    }
+}
+
+static void ct_jsc_configure_gc_signal(void) {
+    (void)pthread_once(&ct_jsc_gc_signal_once, ct_jsc_configure_gc_signal_once);
+}
+#endif
 
 #if defined(_WIN32)
 #define environ _environ
@@ -1921,11 +1963,12 @@ typedef struct CtVmContext {
 } CtVmContext;
 
 #if !defined(_WIN32)
-#define CT_SIGNAL_WATCHER_CAPACITY 8
+#define CT_SIGNAL_WATCHER_CAPACITY 64
+#define CT_SIGNAL_NAME_CAPACITY 24
 typedef struct CtSignalWatcher {
     struct CtJscRuntime *runtime;
     uv_signal_t handle;
-    const char *name;
+    char name[CT_SIGNAL_NAME_CAPACITY];
     int number;
     unsigned int pending;
     bool active;
@@ -1968,6 +2011,7 @@ struct CtJscRuntime {
     pthread_mutex_t spawn_event_mutex;
     CtSpawnEvent *spawn_events_head;
     CtSpawnEvent *spawn_events_tail;
+    bool dispatching_spawn_events;
     pthread_mutex_t fd_event_mutex;
     CtFdEvent *fd_events_head;
     CtFdEvent *fd_events_tail;
@@ -2096,37 +2140,103 @@ static void ct_signal_callback(uv_signal_t *handle, int signum) {
 }
 
 static void ct_signal_watchers_init(CtJscRuntime *runtime) {
-    static const struct {
-        const char *name;
-        int number;
-    } signals[] = {
-        { "SIGHUP", SIGHUP },
-        { "SIGINT", SIGINT },
-        { "SIGQUIT", SIGQUIT },
-        { "SIGTERM", SIGTERM },
-        { "SIGUSR1", SIGUSR1 },
-        { "SIGUSR2", SIGUSR2 },
-#if defined(SIGWINCH)
-        { "SIGWINCH", SIGWINCH },
-#endif
-    };
+    (void)runtime;
+}
 
-    for (size_t index = 0; index < sizeof(signals) / sizeof(signals[0]); index += 1) {
-        if (runtime->signal_watcher_count >= CT_SIGNAL_WATCHER_CAPACITY) break;
-        CtSignalWatcher *watcher = &runtime->signal_watchers[runtime->signal_watcher_count];
+static bool ct_signal_watcher_is_crash_signal(int number) {
+#if defined(SIGABRT)
+    if (number == SIGABRT) return true;
+#endif
+#if defined(SIGBUS)
+    if (number == SIGBUS) return true;
+#endif
+#if defined(SIGFPE)
+    if (number == SIGFPE) return true;
+#endif
+#if defined(SIGILL)
+    if (number == SIGILL) return true;
+#endif
+#if defined(SIGSEGV)
+    if (number == SIGSEGV) return true;
+#endif
+    return false;
+}
+
+static int ct_signal_watcher_validate(const char *name, int number) {
+    if (name == NULL || name[0] == '\0' || strnlen(name, CT_SIGNAL_NAME_CAPACITY) >= CT_SIGNAL_NAME_CAPACITY) {
+        return UV_EINVAL;
+    }
+    if (number <= 0) return UV_EINVAL;
+#if defined(NSIG)
+    if (number >= NSIG) return UV_EINVAL;
+#endif
+#if defined(SIGKILL)
+    if (number == SIGKILL) return UV_EINVAL;
+#endif
+#if defined(SIGSTOP)
+    if (number == SIGSTOP) return UV_EINVAL;
+#endif
+    /* Cottontail's synchronous crash handlers own these dispositions until
+     * their interaction with libuv can be made explicitly reversible. */
+    if (ct_signal_watcher_is_crash_signal(number)) return UV_EINVAL;
+#if defined(__linux__)
+    /* JSC uses the first application real-time signal for stop-the-world
+     * suspension. It must never become a JavaScript process event. */
+    if (number == SIGRTMIN) return UV_EINVAL;
+    if (number == SIGUSR1 && !ct_jsc_gc_signal_moved_from_sigusr1) return UV_EINVAL;
+#endif
+    return 0;
+}
+
+static CtSignalWatcher *ct_signal_watcher_find(CtJscRuntime *runtime, const char *name, int number) {
+    for (size_t index = 0; index < runtime->signal_watcher_count; index += 1) {
+        CtSignalWatcher *watcher = &runtime->signal_watchers[index];
+        if (watcher->number == number && strcmp(watcher->name, name) == 0) return watcher;
+    }
+    return NULL;
+}
+
+static int ct_signal_watcher_start(CtJscRuntime *runtime, const char *name, int number) {
+    int validation_status = ct_signal_watcher_validate(name, number);
+    if (validation_status != 0) return validation_status;
+    if (runtime == NULL || !runtime->uv_loop_initialized) return UV_EINVAL;
+    if (runtime->worker != NULL) return 0;
+
+    CtSignalWatcher *watcher = ct_signal_watcher_find(runtime, name, number);
+    if (watcher == NULL) {
+        if (runtime->signal_watcher_count >= CT_SIGNAL_WATCHER_CAPACITY) return UV_ENOSPC;
+        watcher = &runtime->signal_watchers[runtime->signal_watcher_count];
         watcher->runtime = runtime;
-        watcher->name = signals[index].name;
-        watcher->number = signals[index].number;
-        if (uv_signal_init(&runtime->uv_loop, &watcher->handle) != 0) continue;
+        watcher->number = number;
+        memcpy(watcher->name, name, strlen(name) + 1);
+        int init_status = uv_signal_init(&runtime->uv_loop, &watcher->handle);
+        if (init_status != 0) {
+            memset(watcher, 0, sizeof(*watcher));
+            return init_status;
+        }
         runtime->signal_watcher_count += 1;
         watcher->handle.data = watcher;
-        if (uv_signal_start(&watcher->handle, ct_signal_callback, watcher->number) != 0) {
-            uv_close((uv_handle_t *)&watcher->handle, NULL);
-            continue;
-        }
-        watcher->active = true;
         uv_unref((uv_handle_t *)&watcher->handle);
     }
+    if (watcher->active) return 0;
+
+    watcher->pending = 0;
+    int start_status = uv_signal_start(&watcher->handle, ct_signal_callback, watcher->number);
+    if (start_status != 0) return start_status;
+    watcher->active = true;
+    return 0;
+}
+
+static int ct_signal_watcher_stop(CtJscRuntime *runtime, const char *name, int number) {
+    int validation_status = ct_signal_watcher_validate(name, number);
+    if (validation_status != 0) return validation_status;
+    if (runtime == NULL || runtime->worker != NULL) return 0;
+
+    CtSignalWatcher *watcher = ct_signal_watcher_find(runtime, name, number);
+    if (watcher == NULL || !watcher->active) return 0;
+    watcher->pending = 0;
+    watcher->active = false;
+    return uv_signal_stop(&watcher->handle);
 }
 
 static void ct_signal_watchers_stop(CtJscRuntime *runtime) {
@@ -2145,6 +2255,20 @@ static void ct_signal_watchers_init(CtJscRuntime *runtime) {
 
 static void ct_signal_watchers_stop(CtJscRuntime *runtime) {
     (void)runtime;
+}
+
+static int ct_signal_watcher_start(CtJscRuntime *runtime, const char *name, int number) {
+    (void)runtime;
+    (void)name;
+    (void)number;
+    return 0;
+}
+
+static int ct_signal_watcher_stop(CtJscRuntime *runtime, const char *name, int number) {
+    (void)runtime;
+    (void)name;
+    (void)number;
+    return 0;
 }
 #endif
 
@@ -9887,47 +10011,20 @@ static int ct_dispatch_signals(CtJscRuntime *runtime, char **error_out) {
                 ct_set_error_out(error_out, ct_copy_exception(ctx, exception != NULL ? exception : thrown));
                 return -1;
             }
-            if (emitted != NULL && JSValueToBoolean(ctx, emitted)) continue;
-
-            watcher->active = false;
-            watcher->pending = 0;
-            (void)uv_signal_stop(&watcher->handle);
-            (void)signal(watcher->number, SIG_DFL);
-            (void)raise(watcher->number);
+            /* SignalWrap ignores EventEmitter's boolean return. Normally the
+             * removeListener hook has already stopped a watcher with no
+             * listeners; if user code bypassed that lifecycle, just drop this
+             * delivery instead of re-raising from inside the runtime. */
+            (void)emitted;
         }
     }
     return 0;
-}
-
-static bool ct_runtime_has_signal_listeners(CtJscRuntime *runtime) {
-    if (runtime->worker != NULL) return false;
-    JSContextRef ctx = runtime->context;
-    JSObjectRef process = ct_process_object(ctx);
-    if (process == NULL) return false;
-    JSValueRef exception = NULL;
-    JSValueRef events_value = ct_get_property(ctx, process, "_events", &exception);
-    if (exception != NULL || events_value == NULL || !JSValueIsObject(ctx, events_value)) return false;
-    JSObjectRef events = (JSObjectRef)events_value;
-
-    for (size_t index = 0; index < runtime->signal_watcher_count; index += 1) {
-        CtSignalWatcher *watcher = &runtime->signal_watchers[index];
-        if (!watcher->active) continue;
-        JSValueRef listener = ct_get_property(ctx, events, watcher->name, &exception);
-        if (exception != NULL) return false;
-        if (listener != NULL && !JSValueIsUndefined(ctx, listener) && !JSValueIsNull(ctx, listener)) return true;
-    }
-    return false;
 }
 #else
 static int ct_dispatch_signals(CtJscRuntime *runtime, char **error_out) {
     (void)runtime;
     (void)error_out;
     return 0;
-}
-
-static bool ct_runtime_has_signal_listeners(CtJscRuntime *runtime) {
-    (void)runtime;
-    return false;
 }
 #endif
 
@@ -10190,6 +10287,38 @@ static JSValueRef ct_pid(JSContextRef ctx, JSObjectRef function, JSObjectRef thi
     return JSValueMakeNumber(ctx, (double)getpid());
 }
 
+static JSValueRef ct_signal_watcher_start_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)exception;
+    int status = UV_EINVAL;
+    if (argc >= 2) {
+        char *name = ct_value_to_string_copy(ctx, argv[0]);
+        double number_value = ct_value_to_number(ctx, argv[1]);
+        if (name != NULL && isfinite(number_value) && trunc(number_value) == number_value &&
+            number_value >= INT_MIN && number_value <= INT_MAX) {
+            status = ct_signal_watcher_start(ct_callback_runtime(function), name, (int)number_value);
+        }
+        free(name);
+    }
+    return JSValueMakeNumber(ctx, (double)status);
+}
+
+static JSValueRef ct_signal_watcher_stop_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)exception;
+    int status = UV_EINVAL;
+    if (argc >= 2) {
+        char *name = ct_value_to_string_copy(ctx, argv[0]);
+        double number_value = ct_value_to_number(ctx, argv[1]);
+        if (name != NULL && isfinite(number_value) && trunc(number_value) == number_value &&
+            number_value >= INT_MIN && number_value <= INT_MAX) {
+            status = ct_signal_watcher_stop(ct_callback_runtime(function), name, (int)number_value);
+        }
+        free(name);
+    }
+    return JSValueMakeNumber(ctx, (double)status);
+}
+
 static JSValueRef ct_kill_process(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -10209,6 +10338,14 @@ static JSValueRef ct_kill_process(JSContextRef ctx, JSObjectRef function, JSObje
     }
     pid_t pid = (pid_t)pid_number;
     int signal_number = (int)signal_value;
+#if defined(__linux__)
+    if (signal_number == SIGRTMIN) {
+        pid_t process_group = getpgrp();
+        if (pid == getpid() || pid == 0 || pid == -1 || (process_group > 0 && pid == -process_group)) {
+            return JSValueMakeNumber(ctx, (double)-EINVAL);
+        }
+    }
+#endif
     if (kill(pid, signal_number) != 0) {
         ct_throw_message(ctx, exception, strerror(errno));
         return JSValueMakeBoolean(ctx, false);
@@ -10235,6 +10372,235 @@ static JSValueRef ct_platform(JSContextRef ctx, JSObjectRef function, JSObjectRe
     (void)argv;
     (void)exception;
     return ct_make_string(ctx, CT_PLATFORM_STRING);
+}
+
+static JSValueRef ct_platform_constants(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    JSObjectRef result = ct_make_object(ctx);
+
+#define CT_SET_PLATFORM_CONSTANT(name) \
+    do { \
+        if (!ct_set_property(ctx, result, #name, JSValueMakeNumber(ctx, (double)(name)), exception)) { \
+            return JSValueMakeUndefined(ctx); \
+        } \
+    } while (0)
+
+#if !defined(_WIN32)
+    CT_SET_PLATFORM_CONSTANT(E2BIG);
+    CT_SET_PLATFORM_CONSTANT(EACCES);
+    CT_SET_PLATFORM_CONSTANT(EADDRINUSE);
+    CT_SET_PLATFORM_CONSTANT(EADDRNOTAVAIL);
+    CT_SET_PLATFORM_CONSTANT(EAFNOSUPPORT);
+    CT_SET_PLATFORM_CONSTANT(EAGAIN);
+    CT_SET_PLATFORM_CONSTANT(EALREADY);
+    CT_SET_PLATFORM_CONSTANT(EBADF);
+    CT_SET_PLATFORM_CONSTANT(EBADMSG);
+    CT_SET_PLATFORM_CONSTANT(EBUSY);
+    CT_SET_PLATFORM_CONSTANT(ECANCELED);
+    CT_SET_PLATFORM_CONSTANT(ECHILD);
+    CT_SET_PLATFORM_CONSTANT(ECONNABORTED);
+    CT_SET_PLATFORM_CONSTANT(ECONNREFUSED);
+    CT_SET_PLATFORM_CONSTANT(ECONNRESET);
+    CT_SET_PLATFORM_CONSTANT(EDEADLK);
+    CT_SET_PLATFORM_CONSTANT(EDESTADDRREQ);
+    CT_SET_PLATFORM_CONSTANT(EDOM);
+    CT_SET_PLATFORM_CONSTANT(EDQUOT);
+    CT_SET_PLATFORM_CONSTANT(EEXIST);
+    CT_SET_PLATFORM_CONSTANT(EFAULT);
+    CT_SET_PLATFORM_CONSTANT(EFBIG);
+    CT_SET_PLATFORM_CONSTANT(EHOSTUNREACH);
+    CT_SET_PLATFORM_CONSTANT(EIDRM);
+    CT_SET_PLATFORM_CONSTANT(EILSEQ);
+    CT_SET_PLATFORM_CONSTANT(EINPROGRESS);
+    CT_SET_PLATFORM_CONSTANT(EINTR);
+    CT_SET_PLATFORM_CONSTANT(EINVAL);
+    CT_SET_PLATFORM_CONSTANT(EIO);
+    CT_SET_PLATFORM_CONSTANT(EISCONN);
+    CT_SET_PLATFORM_CONSTANT(EISDIR);
+    CT_SET_PLATFORM_CONSTANT(ELOOP);
+    CT_SET_PLATFORM_CONSTANT(EMFILE);
+    CT_SET_PLATFORM_CONSTANT(EMLINK);
+    CT_SET_PLATFORM_CONSTANT(EMSGSIZE);
+    CT_SET_PLATFORM_CONSTANT(EMULTIHOP);
+    CT_SET_PLATFORM_CONSTANT(ENAMETOOLONG);
+    CT_SET_PLATFORM_CONSTANT(ENETDOWN);
+    CT_SET_PLATFORM_CONSTANT(ENETRESET);
+    CT_SET_PLATFORM_CONSTANT(ENETUNREACH);
+    CT_SET_PLATFORM_CONSTANT(ENFILE);
+    CT_SET_PLATFORM_CONSTANT(ENOBUFS);
+    CT_SET_PLATFORM_CONSTANT(ENODATA);
+    CT_SET_PLATFORM_CONSTANT(ENODEV);
+    CT_SET_PLATFORM_CONSTANT(ENOENT);
+    CT_SET_PLATFORM_CONSTANT(ENOEXEC);
+    CT_SET_PLATFORM_CONSTANT(ENOLCK);
+    CT_SET_PLATFORM_CONSTANT(ENOLINK);
+    CT_SET_PLATFORM_CONSTANT(ENOMEM);
+    CT_SET_PLATFORM_CONSTANT(ENOMSG);
+    CT_SET_PLATFORM_CONSTANT(ENOPROTOOPT);
+    CT_SET_PLATFORM_CONSTANT(ENOSPC);
+    CT_SET_PLATFORM_CONSTANT(ENOSR);
+    CT_SET_PLATFORM_CONSTANT(ENOSTR);
+    CT_SET_PLATFORM_CONSTANT(ENOSYS);
+    CT_SET_PLATFORM_CONSTANT(ENOTCONN);
+    CT_SET_PLATFORM_CONSTANT(ENOTDIR);
+    CT_SET_PLATFORM_CONSTANT(ENOTEMPTY);
+    CT_SET_PLATFORM_CONSTANT(ENOTSOCK);
+    CT_SET_PLATFORM_CONSTANT(ENOTSUP);
+    CT_SET_PLATFORM_CONSTANT(ENOTTY);
+    CT_SET_PLATFORM_CONSTANT(ENXIO);
+    CT_SET_PLATFORM_CONSTANT(EOPNOTSUPP);
+    CT_SET_PLATFORM_CONSTANT(EOVERFLOW);
+    CT_SET_PLATFORM_CONSTANT(EPERM);
+    CT_SET_PLATFORM_CONSTANT(EPIPE);
+    CT_SET_PLATFORM_CONSTANT(EPROTO);
+    CT_SET_PLATFORM_CONSTANT(EPROTONOSUPPORT);
+    CT_SET_PLATFORM_CONSTANT(EPROTOTYPE);
+    CT_SET_PLATFORM_CONSTANT(ERANGE);
+    CT_SET_PLATFORM_CONSTANT(EROFS);
+    CT_SET_PLATFORM_CONSTANT(ESPIPE);
+    CT_SET_PLATFORM_CONSTANT(ESRCH);
+    CT_SET_PLATFORM_CONSTANT(ESTALE);
+    CT_SET_PLATFORM_CONSTANT(ETIME);
+    CT_SET_PLATFORM_CONSTANT(ETIMEDOUT);
+    CT_SET_PLATFORM_CONSTANT(ETXTBSY);
+    CT_SET_PLATFORM_CONSTANT(EWOULDBLOCK);
+    CT_SET_PLATFORM_CONSTANT(EXDEV);
+
+    CT_SET_PLATFORM_CONSTANT(F_OK);
+    CT_SET_PLATFORM_CONSTANT(R_OK);
+    CT_SET_PLATFORM_CONSTANT(W_OK);
+    CT_SET_PLATFORM_CONSTANT(X_OK);
+    CT_SET_PLATFORM_CONSTANT(O_APPEND);
+    CT_SET_PLATFORM_CONSTANT(O_CREAT);
+    CT_SET_PLATFORM_CONSTANT(O_DIRECTORY);
+    CT_SET_PLATFORM_CONSTANT(O_DSYNC);
+    CT_SET_PLATFORM_CONSTANT(O_EXCL);
+    CT_SET_PLATFORM_CONSTANT(O_NOCTTY);
+    CT_SET_PLATFORM_CONSTANT(O_NOFOLLOW);
+    CT_SET_PLATFORM_CONSTANT(O_NONBLOCK);
+    CT_SET_PLATFORM_CONSTANT(O_RDONLY);
+    CT_SET_PLATFORM_CONSTANT(O_RDWR);
+    CT_SET_PLATFORM_CONSTANT(O_SYNC);
+    CT_SET_PLATFORM_CONSTANT(O_TRUNC);
+    CT_SET_PLATFORM_CONSTANT(O_WRONLY);
+#ifdef O_DIRECT
+    CT_SET_PLATFORM_CONSTANT(O_DIRECT);
+#endif
+#ifdef O_NOATIME
+    CT_SET_PLATFORM_CONSTANT(O_NOATIME);
+#endif
+#ifdef O_SYMLINK
+    CT_SET_PLATFORM_CONSTANT(O_SYMLINK);
+#endif
+
+    CT_SET_PLATFORM_CONSTANT(S_IFBLK);
+    CT_SET_PLATFORM_CONSTANT(S_IFCHR);
+    CT_SET_PLATFORM_CONSTANT(S_IFDIR);
+    CT_SET_PLATFORM_CONSTANT(S_IFIFO);
+    CT_SET_PLATFORM_CONSTANT(S_IFLNK);
+    CT_SET_PLATFORM_CONSTANT(S_IFMT);
+    CT_SET_PLATFORM_CONSTANT(S_IFREG);
+    CT_SET_PLATFORM_CONSTANT(S_IFSOCK);
+    CT_SET_PLATFORM_CONSTANT(S_IRGRP);
+    CT_SET_PLATFORM_CONSTANT(S_IROTH);
+    CT_SET_PLATFORM_CONSTANT(S_IRUSR);
+    CT_SET_PLATFORM_CONSTANT(S_IRWXG);
+    CT_SET_PLATFORM_CONSTANT(S_IRWXO);
+    CT_SET_PLATFORM_CONSTANT(S_IRWXU);
+    CT_SET_PLATFORM_CONSTANT(S_IWGRP);
+    CT_SET_PLATFORM_CONSTANT(S_IWOTH);
+    CT_SET_PLATFORM_CONSTANT(S_IWUSR);
+    CT_SET_PLATFORM_CONSTANT(S_IXGRP);
+    CT_SET_PLATFORM_CONSTANT(S_IXOTH);
+    CT_SET_PLATFORM_CONSTANT(S_IXUSR);
+
+    CT_SET_PLATFORM_CONSTANT(RTLD_GLOBAL);
+    CT_SET_PLATFORM_CONSTANT(RTLD_LAZY);
+    CT_SET_PLATFORM_CONSTANT(RTLD_LOCAL);
+    CT_SET_PLATFORM_CONSTANT(RTLD_NOW);
+#ifdef RTLD_DEEPBIND
+    CT_SET_PLATFORM_CONSTANT(RTLD_DEEPBIND);
+#endif
+
+    CT_SET_PLATFORM_CONSTANT(SIGABRT);
+    CT_SET_PLATFORM_CONSTANT(SIGALRM);
+    CT_SET_PLATFORM_CONSTANT(SIGBUS);
+    CT_SET_PLATFORM_CONSTANT(SIGCHLD);
+    CT_SET_PLATFORM_CONSTANT(SIGCONT);
+    CT_SET_PLATFORM_CONSTANT(SIGFPE);
+    CT_SET_PLATFORM_CONSTANT(SIGHUP);
+    CT_SET_PLATFORM_CONSTANT(SIGILL);
+    CT_SET_PLATFORM_CONSTANT(SIGINT);
+    CT_SET_PLATFORM_CONSTANT(SIGIO);
+    CT_SET_PLATFORM_CONSTANT(SIGIOT);
+    CT_SET_PLATFORM_CONSTANT(SIGKILL);
+    CT_SET_PLATFORM_CONSTANT(SIGPIPE);
+    CT_SET_PLATFORM_CONSTANT(SIGPROF);
+    CT_SET_PLATFORM_CONSTANT(SIGQUIT);
+    CT_SET_PLATFORM_CONSTANT(SIGSEGV);
+    CT_SET_PLATFORM_CONSTANT(SIGSTOP);
+    CT_SET_PLATFORM_CONSTANT(SIGSYS);
+    CT_SET_PLATFORM_CONSTANT(SIGTERM);
+    CT_SET_PLATFORM_CONSTANT(SIGTRAP);
+    CT_SET_PLATFORM_CONSTANT(SIGTSTP);
+    CT_SET_PLATFORM_CONSTANT(SIGTTIN);
+    CT_SET_PLATFORM_CONSTANT(SIGTTOU);
+    CT_SET_PLATFORM_CONSTANT(SIGURG);
+    CT_SET_PLATFORM_CONSTANT(SIGUSR1);
+    CT_SET_PLATFORM_CONSTANT(SIGUSR2);
+    CT_SET_PLATFORM_CONSTANT(SIGVTALRM);
+    CT_SET_PLATFORM_CONSTANT(SIGWINCH);
+    CT_SET_PLATFORM_CONSTANT(SIGXCPU);
+    CT_SET_PLATFORM_CONSTANT(SIGXFSZ);
+#ifdef SIGINFO
+    CT_SET_PLATFORM_CONSTANT(SIGINFO);
+#endif
+#ifdef SIGEMT
+    CT_SET_PLATFORM_CONSTANT(SIGEMT);
+#endif
+#ifdef SIGPOLL
+    CT_SET_PLATFORM_CONSTANT(SIGPOLL);
+#endif
+#ifdef SIGPWR
+    CT_SET_PLATFORM_CONSTANT(SIGPWR);
+#endif
+#ifdef SIGSTKFLT
+    CT_SET_PLATFORM_CONSTANT(SIGSTKFLT);
+#endif
+#endif
+
+#undef CT_SET_PLATFORM_CONSTANT
+    return result;
+}
+
+static JSValueRef ct_uv_error_entries(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    JSObjectRef result = ct_make_array(ctx, 0, NULL, exception);
+    if (result == NULL || (exception != NULL && *exception != NULL)) return JSValueMakeUndefined(ctx);
+    unsigned index = 0;
+
+#define CT_SET_UV_ERROR(code, description) \
+    do { \
+        JSValueRef fields[] = { \
+            JSValueMakeNumber(ctx, (double)UV_##code), \
+            ct_make_string(ctx, #code), \
+            ct_make_string(ctx, description), \
+        }; \
+        JSObjectRef entry = ct_make_array(ctx, sizeof(fields) / sizeof(fields[0]), fields, exception); \
+        if (entry == NULL || (exception != NULL && *exception != NULL)) return JSValueMakeUndefined(ctx); \
+        JSObjectSetPropertyAtIndex(ctx, result, index++, entry, exception); \
+        if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx); \
+    } while (0);
+
+    UV_ERRNO_MAP(CT_SET_UV_ERROR)
+#undef CT_SET_UV_ERROR
+    return result;
 }
 
 static JSValueRef ct_arch(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -10291,7 +10657,10 @@ static JSObjectRef ct_dns_addrinfo_to_js(JSContextRef ctx, struct addrinfo *resu
 static const char *ct_dns_uv_error_code(int status) {
     if (status == UV_ECANCELED || status == UV_EAI_CANCELED) return "ECANCELLED";
     if (status == UV_EAI_NONAME) return "ENOTFOUND";
-    if (status == UV_EAI_NODATA) return "ENODATA";
+    /* Node normalizes both getaddrinfo/getnameinfo "name not found" variants
+     * to ENOTFOUND. ENODATA remains meaningful for record-query APIs, which
+     * use their own resolver path rather than this libuv lookup mapper. */
+    if (status == UV_EAI_NODATA) return "ENOTFOUND";
     if (status == UV_EAI_AGAIN) return "EAI_AGAIN";
     if (status == UV_EAI_BADFLAGS) return "EAI_BADFLAGS";
     if (status == UV_EAI_BADHINTS) return "EAI_BADHINTS";
@@ -17462,6 +17831,68 @@ static JSObjectRef ct_runtime_cpu_info(JSContextRef ctx, JSValueRef *exception) 
     }
     uv_free_cpu_info(cpu_info, cpu_count);
     return result;
+}
+
+static JSValueRef ct_os_cpu_info(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    return ct_runtime_cpu_info(ctx, exception);
+}
+
+static JSValueRef ct_os_loadavg(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    double averages[3] = {0, 0, 0};
+    uv_loadavg(averages);
+    JSValueRef values[3] = {
+        JSValueMakeNumber(ctx, averages[0]),
+        JSValueMakeNumber(ctx, averages[1]),
+        JSValueMakeNumber(ctx, averages[2]),
+    };
+    return ct_make_array(ctx, 3, values, exception);
+}
+
+static JSValueRef ct_os_uptime(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    (void)exception;
+    double uptime = 0;
+    if (uv_uptime(&uptime) != 0 || !isfinite(uptime) || uptime < 0) uptime = 0;
+    return JSValueMakeNumber(ctx, uptime);
+}
+
+static JSValueRef ct_os_available_parallelism(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    (void)exception;
+    unsigned int count = uv_available_parallelism();
+    return JSValueMakeNumber(ctx, (double)(count > 0 ? count : 1));
+}
+
+static JSValueRef ct_os_total_memory(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    (void)exception;
+    return JSValueMakeNumber(ctx, ct_total_memory_bytes());
+}
+
+static JSValueRef ct_os_free_memory(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    (void)exception;
+    return JSValueMakeNumber(ctx, ct_free_memory_bytes());
 }
 
 static JSObjectRef ct_runtime_native_stack(JSContextRef ctx, JSValueRef *exception) {
@@ -24859,7 +25290,8 @@ static JSValueRef ct_create_buffer_transcode(JSContextRef ctx, JSObjectRef funct
 }
 
 static JSValueRef ct_dispatch_spawn_events(JSContextRef ctx, CtJscRuntime *runtime, JSValueRef *exception) {
-    if (runtime->spawn_event_handler == NULL) return JSValueMakeUndefined(ctx);
+    if (runtime->spawn_event_handler == NULL || runtime->dispatching_spawn_events) return JSValueMakeUndefined(ctx);
+    runtime->dispatching_spawn_events = true;
     for (;;) {
         pthread_mutex_lock(&runtime->spawn_event_mutex);
         CtSpawnEvent *event = runtime->spawn_events_head;
@@ -24869,7 +25301,6 @@ static JSValueRef ct_dispatch_spawn_events(JSContextRef ctx, CtJscRuntime *runti
         }
         pthread_mutex_unlock(&runtime->spawn_event_mutex);
         if (event == NULL) break;
-
         JSObjectRef item = ct_make_object(ctx);
         ct_set_property(ctx, item, "id", JSValueMakeNumber(ctx, event->process_id), exception);
         ct_set_property(ctx, item, "type", ct_make_string(ctx, event->type != NULL ? event->type : ""), exception);
@@ -24905,8 +25336,12 @@ static JSValueRef ct_dispatch_spawn_events(JSContextRef ctx, CtJscRuntime *runti
         JSValueRef arg = item;
         JSObjectCallAsFunction(ctx, runtime->spawn_event_handler, NULL, 1, &arg, exception);
         ct_spawn_event_destroy(event, false);
-        if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
+        if (exception != NULL && *exception != NULL) {
+            runtime->dispatching_spawn_events = false;
+            return JSValueMakeUndefined(ctx);
+        }
     }
+    runtime->dispatching_spawn_events = false;
     return JSValueMakeUndefined(ctx);
 }
 
@@ -27529,13 +27964,13 @@ static JSValueRef ct_statfs_sync_native(JSContextRef ctx, JSObjectRef function, 
     ct_set_property(ctx, result, "files", JSValueMakeNumber(ctx, (double)value.f_files), exception);
     ct_set_property(ctx, result, "ffree", JSValueMakeNumber(ctx, (double)value.f_ffree), exception);
 #elif defined(__linux__)
-    struct statvfs value;
-    if (path == NULL || statvfs(path, &value) != 0) {
+    struct statfs value;
+    if (path == NULL || statfs(path, &value) != 0) {
         ct_throw_message(ctx, exception, strerror(errno));
         free(path);
         return JSValueMakeUndefined(ctx);
     }
-    ct_set_property(ctx, result, "type", JSValueMakeNumber(ctx, 0), exception);
+    ct_set_property(ctx, result, "type", JSValueMakeNumber(ctx, (double)value.f_type), exception);
     ct_set_property(ctx, result, "bsize", JSValueMakeNumber(ctx, (double)value.f_bsize), exception);
     ct_set_property(ctx, result, "blocks", JSValueMakeNumber(ctx, (double)value.f_blocks), exception);
     ct_set_property(ctx, result, "bfree", JSValueMakeNumber(ctx, (double)value.f_bfree), exception);
@@ -29505,6 +29940,39 @@ static JSValueRef ct_vm_context_run(
     return result != NULL ? result : JSValueMakeUndefined(ctx);
 }
 
+static JSValueRef ct_vm_context_export(
+    JSContextRef ctx,
+    JSObjectRef function,
+    JSObjectRef this_object,
+    size_t argc,
+    const JSValueRef argv[],
+    JSValueRef *exception
+) {
+    (void)this_object;
+    CtJscRuntime *runtime = (CtJscRuntime *)JSObjectGetPrivate(function);
+    if (runtime == NULL || argc < 2 || !JSValueIsObject(ctx, argv[1])) {
+        ct_throw_type_error(ctx, exception, "vmExportContext(handle, sandbox) requires a context and sandbox");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSValueRef id_exception = NULL;
+    double id_number = JSValueToNumber(ctx, argv[0], &id_exception);
+    if (id_exception != NULL) {
+        if (exception != NULL) *exception = id_exception;
+        return JSValueMakeUndefined(ctx);
+    }
+    CtVmContext *entry = ct_vm_context_find(runtime, (uint64_t)id_number);
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "Invalid or released JavaScript VM context");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSValueRef export_exception = NULL;
+    ct_vm_bridge_call(entry, "exportSandbox", argv[1], &export_exception);
+    if (export_exception != NULL && exception != NULL) *exception = export_exception;
+    return JSValueMakeUndefined(ctx);
+}
+
 static JSValueRef ct_vm_context_release(
     JSContextRef ctx,
     JSObjectRef function,
@@ -29550,22 +30018,6 @@ static JSValueRef ct_exit(JSContextRef ctx, JSObjectRef function, JSObjectRef th
         if (cleanup_error != NULL) ct_host_string_free(cleanup_error);
     }
     exit(code);
-}
-
-static JSValueRef ct_host_namespace_call(
-    JSContextRef ctx,
-    JSObjectRef function,
-    JSObjectRef this_object,
-    size_t argc,
-    const JSValueRef argv[],
-    JSValueRef *exception
-) {
-    (void)function;
-    (void)this_object;
-    (void)argc;
-    (void)argv;
-    (void)exception;
-    return JSValueMakeUndefined(ctx);
 }
 
 static JSValueRef ct_unhandled_rejection(
@@ -29619,7 +30071,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_set_property(ctx, console, "warn", ct_make_plain_function(ctx, "warn", ct_console_error), &exception);
     ct_set_property(ctx, global, "console", console, &exception);
 
-    JSObjectRef host = (JSObjectRef)ct_make_function(ctx, "cottontail", ct_host_namespace_call, runtime);
+    JSObjectRef host = ct_make_object(ctx);
     runtime->host_object = host;
     JSValueProtect(ctx, host);
 
@@ -29893,6 +30345,12 @@ static CtJscRuntime *ct_jsc_runtime_create_internal(
     void *terminate_context
 ) {
     (void)stack_size;
+#if !defined(_WIN32)
+    ct_process_signal_defaults_configure();
+#endif
+#if defined(__linux__)
+    ct_jsc_configure_gc_signal();
+#endif
     ct_install_crash_handlers();
 #if defined(_WIN32)
     if (ct_windows_ensure_winsock() != 0) return NULL;
@@ -31261,11 +31719,6 @@ static int ct_jsc_runtime_has_active_handles(CtJscRuntime *runtime, bool *has_ac
         *has_active_handles_out = true;
         return 0;
     }
-    if (ct_runtime_has_signal_listeners(runtime)) {
-        *has_active_handles_out = true;
-        return 0;
-    }
-
     JSContextRef ctx = runtime->context;
     JSStringRef source = ct_js_string(
         "globalThis.__cottontailHasActiveHandles ? globalThis.__cottontailHasActiveHandles() : false"
@@ -31482,6 +31935,9 @@ int ct_jsc_generate_bytecode(
         return -1;
     }
 
+#if defined(__linux__)
+    ct_jsc_configure_gc_signal();
+#endif
 #if defined(_WIN32) || defined(__linux__)
     ct_jsc_initialize_main_thread();
 #endif

@@ -10,7 +10,7 @@ const server = Bun.serve({
   },
 });
 
-Bun.spawn(["curl", "-s", "--max-time", "2", "-o", outputPath, `${server.url}/hello`], {
+Bun.spawn(["curl", "-s", "--max-time", "2", "-o", outputPath, new URL("hello", server.url).href], {
   detached: true,
 });
 

@@ -1,8 +1,13 @@
-import { Database, SQLiteError, constants } from "bun:sqlite";
+import SQLiteDefault, { Database, SQLiteError, constants } from "bun:sqlite";
+import { createRequire } from "node:module";
 
 function assert(value: unknown, message: string): asserts value {
   if (!value) throw new Error(message);
 }
+
+assert(SQLiteDefault === Database, "bun:sqlite default export mismatch");
+const require = createRequire(import.meta.url);
+assert(require("bun:sqlite").default === Database, "bun:sqlite require default mismatch");
 
 const db = new Database(":memory:");
 assert(db.filename === ":memory:", "bun:sqlite filename mismatch");

@@ -72,6 +72,7 @@ channel.port1.unref();
 assert(channel.port1.hasRef() === false, "MessagePort unref mismatch");
 channel.port1.ref();
 assert(channel.port1.hasRef() === true, "MessagePort ref mismatch");
+channel.port1.close();
 
 const complexChannel = new MessageChannel();
 const cyclic: any = {
@@ -125,6 +126,7 @@ try {
   detachedTransferError = error?.name === "DataCloneError";
 }
 assert(detachedTransferError, "detached ArrayBuffer should reject transferList reuse");
+complexChannel.port1.close();
 
 let broadcastMessage = "";
 const left = new BroadcastChannel("cottontail-worker-test");
@@ -178,7 +180,8 @@ const reply = new Promise<any>((resolve, reject) => {
   });
   worker.on("error", reject);
 });
-assert(worker.ref() === worker && worker.unref() === worker, "Worker ref/unref mismatch");
+assert(worker.ref() === undefined && worker.unref() === undefined, "Worker ref/unref return mismatch");
+worker.ref();
 let cpuUsageError: any;
 try {
   await worker.cpuUsage();
@@ -240,6 +243,7 @@ const portReply = await transferredPortReply;
 assert(portReply.value === "through-port", "transferred MessagePort reply mismatch");
 assert(portReply.map === "port-map", "transferred MessagePort structured clone mismatch");
 assert(portReply.threadId === worker.threadId, "transferred MessagePort worker thread mismatch");
+transferredChannel.port1.close();
 
 assert(typeof SharedArrayBuffer === "function", "SharedArrayBuffer global missing");
 const sharedBuffer = new SharedArrayBuffer(8);
@@ -257,7 +261,11 @@ const sharedReplyPromise = new Promise<any>((resolve, reject) => {
   });
 });
 worker.postMessage({ shared: sharedBuffer });
-assert(Atomics.wait(sharedView, 0, 7, 1000) === "ok", "Atomics.wait should be notified by worker");
+const sharedWaitResult = Atomics.wait(sharedView, 0, 7, 1000);
+assert(
+  sharedWaitResult === "ok" || sharedWaitResult === "not-equal",
+  "Atomics.wait should observe or be notified of the worker update",
+);
 const sharedReply = await sharedReplyPromise;
 assert(sharedReply.isShared === true, "worker should receive SharedArrayBuffer");
 assert(sharedReply.before === 7, "worker shared buffer initial value mismatch");

@@ -310,25 +310,53 @@ function installResolverCache() {
 
   const state = {
     nativeLookup: cottontail.dnsLookup,
+    nativeLookupAsync: cottontail.dnsLookupAsync,
     resolving: 0,
   };
   globalThis[resolverHookKey] = state;
 
   cottontail.dnsLookup = function bunCachedDnsLookup(hostname, family = 0, nativeOptions = undefined) {
     const normalizedFamily = Number(family) || 0;
-    if (state.resolving > 0 || nativeOptions !== undefined) {
+    if (state.resolving > 0 || nativeOptions !== undefined || normalizedFamily !== 0) {
       return state.nativeLookup(hostname, normalizedFamily, nativeOptions);
     }
 
     state.resolving += 1;
     try {
       const records = cacheState.resolveForNetwork(String(hostname), 0, false);
-      if (normalizedFamily !== 4 && normalizedFamily !== 6) return records;
-      return records.filter((record) => Number(record.family) === normalizedFamily);
+      return records;
     } finally {
       state.resolving -= 1;
     }
   };
+
+  if (typeof state.nativeLookupAsync === "function") {
+    cottontail.dnsLookupAsync = function bunCachedDnsLookupAsync(hostname, family = 0, hints = 0, callback) {
+      const normalizedFamily = Number(family) || 0;
+      if (state.resolving > 0 || Number(hints) !== 0 || normalizedFamily !== 0) {
+        return state.nativeLookupAsync(hostname, normalizedFamily, hints, callback);
+      }
+
+      state.resolving += 1;
+      let records;
+      let failure;
+      try {
+        records = cacheState.resolveForNetwork(String(hostname), 0, false);
+      } catch (error) {
+        failure = error;
+      } finally {
+        state.resolving -= 1;
+      }
+      queueMicrotask(() => {
+        if (failure) {
+          callback(failure.code ?? "ENOTFOUND", undefined, failure.message ?? String(failure));
+        } else {
+          callback(null, records, undefined);
+        }
+      });
+      return undefined;
+    };
+  }
 }
 
 installResolverCache();

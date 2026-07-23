@@ -439,6 +439,7 @@ fn autoInstallRequestFromSpecifier(specifier: []const u8) ?AutoInstallRequest {
         std.fs.path.isAbsolute(specifier) or
         std.mem.startsWith(u8, specifier, "./") or
         std.mem.startsWith(u8, specifier, "../") or
+        std.mem.eql(u8, specifier, "bun") or
         std.mem.startsWith(u8, specifier, "node:") or
         std.mem.startsWith(u8, specifier, "bun:") or
         std.mem.startsWith(u8, specifier, "data:") or
@@ -897,6 +898,14 @@ test "auto-install preflight cannot skip module-loading syntax" {
     try std.testing.expect(sourceMayLoadModules("requ\\u0069re('pkg');"));
     try std.testing.expect(!sourceMayLoadModules("const __require = require.apply.bind(require);"));
     try std.testing.expect(!sourceMayLoadModules("const answer = 42;"));
+}
+
+test "auto-install excludes runtime builtin specifiers" {
+    try std.testing.expect(autoInstallRequestFromSpecifier("bun") == null);
+    try std.testing.expect(autoInstallRequestFromSpecifier("bun:sqlite") == null);
+    try std.testing.expect(autoInstallRequestFromSpecifier("node:fs") == null);
+    try std.testing.expect(autoInstallRequestFromSpecifier("fs") == null);
+    try std.testing.expect(autoInstallRequestFromSpecifier("left-pad") != null);
 }
 
 const BundleDiagnostic = struct {
@@ -4917,10 +4926,16 @@ fn bundleScriptNative(
     const is_test_runtime_execution = is_test_cli_execution or
         ctx.environ_map.get("COTTONTAIL_TEST_FILE_COUNT") != null or
         isTestEntrypointPath(script_abs);
+    const is_wasm_entrypoint = std.mem.eql(u8, std.fs.path.extension(script_abs), ".wasm");
     var package_json_patch = try maybePatchEmptyPackageJsonForBundle(ctx, script_dir);
     defer restoreEmptyMetadataPatch(ctx, &package_json_patch);
+    const bun_compat_entry_abs = if (is_wasm_entrypoint)
+        script_abs
+    else
+        try writeBunCompatTransformedSource(ctx, script_abs, source_base_dir, standalone_compile);
+    const has_bun_compat_transform = !std.mem.eql(u8, bun_compat_entry_abs, script_abs);
+    defer cleanupGeneratedSource(ctx, bun_compat_entry_abs, script_abs);
 
-    const is_wasm_entrypoint = std.mem.eql(u8, std.fs.path.extension(script_abs), ".wasm");
     const runtime_module_launcher_candidate = canUseRuntimeModuleLauncher(.{
         .has_source_base_dir = source_base_dir != null,
         .has_build_options = build_options != null,
@@ -4929,7 +4944,7 @@ fn bundleScriptNative(
         .tracks_reload_dependencies = reload_dependencies_out != null,
         .test_cli_execution = is_test_runtime_execution,
         .wasm_entrypoint = is_wasm_entrypoint,
-    });
+    }) and !has_bun_compat_transform;
     // CommonJS already has a runtime-only Module.runMain() launcher. Route
     // ordinary ESM through the same on-demand module system without changing
     // the compatibility transforms used by CommonJS and test entry points.
@@ -4941,8 +4956,7 @@ fn bundleScriptNative(
     const script_entry_abs = if (is_wasm_entrypoint or runtime_module_entrypoint)
         script_abs
     else
-        try writeBunCompatTransformedSource(ctx, script_abs, source_base_dir, standalone_compile);
-    defer cleanupGeneratedSource(ctx, script_entry_abs, script_abs);
+        bun_compat_entry_abs;
     const script_identity_abs = if (is_wasm_entrypoint)
         script_abs
     else
@@ -8061,30 +8075,27 @@ fn scanDynamicImports(
     var has_custom_signal = false;
     const uses_module_mock = std.mem.indexOf(u8, source, "mock.module(") != null or
         std.mem.indexOf(u8, source, "mock.module (") != null;
-    const source_is_typescript = if (source_loader) |loader|
-        std.mem.eql(u8, loader, "ts") or std.mem.eql(u8, loader, "tsx")
-    else
-        false;
+    const is_bun_transpiled_artifact = hasBunTranspiledPragma(source);
     var runtime_dynamic_import_starts: std.ArrayList(usize) = .empty;
     defer runtime_dynamic_import_starts.deinit(ctx.allocator);
-    if (source_is_typescript) {
-        if (source_loader) |loader| {
-            const ranges_json = native_transpiler.scanImportRangesJson(source, loader) catch null;
-            if (ranges_json) |json| {
-                defer std.heap.c_allocator.free(json);
-                const ScannedImportRange = struct {
-                    path: []const u8,
-                    kind: []const u8,
-                    start: i32,
-                    end: i32,
-                };
-                const parsed = std.json.parseFromSlice([]const ScannedImportRange, ctx.allocator, json, .{}) catch null;
-                if (parsed) |document| {
-                    defer document.deinit();
-                    for (document.value) |record| {
-                        if (record.start >= 0 and std.mem.eql(u8, record.kind, "dynamic-import")) {
-                            try runtime_dynamic_import_starts.append(ctx.allocator, @intCast(record.start));
-                        }
+    var has_runtime_import_ranges = false;
+    if (source_loader) |loader| {
+        const ranges_json = native_transpiler.scanImportRangesJson(source, loader) catch null;
+        if (ranges_json) |json| {
+            defer std.heap.c_allocator.free(json);
+            const ScannedImportRange = struct {
+                path: []const u8,
+                kind: []const u8,
+                start: i32,
+                end: i32,
+            };
+            const parsed = std.json.parseFromSlice([]const ScannedImportRange, ctx.allocator, json, .{}) catch null;
+            if (parsed) |document| {
+                defer document.deinit();
+                has_runtime_import_ranges = true;
+                for (document.value) |record| {
+                    if (record.start >= 0 and std.mem.eql(u8, record.kind, "dynamic-import")) {
+                        try runtime_dynamic_import_starts.append(ctx.allocator, @intCast(record.start));
                     }
                 }
             }
@@ -8364,7 +8375,7 @@ fn scanDynamicImports(
         }
         const comma = findTopLevelComma(arguments);
         const expression = std.mem.trim(u8, if (comma) |index| arguments[0..index] else arguments, " \t\r\n");
-        if (source_is_typescript and isExactJavaScriptStringLiteral(expression)) {
+        if (has_runtime_import_ranges and isExactJavaScriptStringLiteral(expression)) {
             const expression_start = @intFromPtr(expression.ptr) - @intFromPtr(source.ptr);
             var is_runtime_import = false;
             for (runtime_dynamic_import_starts.items) |start| {
@@ -8378,7 +8389,15 @@ fn scanDynamicImports(
                 if (inferredLoaderForTarget(specifier)) |loader| std.mem.eql(u8, loader, "file") else false
             else
                 false;
-            if (!is_runtime_import and !may_use_runtime_plugin) {
+            // The compiler omits ranges for import options it cannot prove
+            // side-effect-free and for already-bundled `// @bun` artifacts.
+            // Those are still live syntax; ranges only reject no-options
+            // string/template text that fooled the compatibility scanner.
+            if (!is_runtime_import and
+                comma == null and
+                !is_bun_transpiled_artifact and
+                !may_use_runtime_plugin)
+            {
                 cursor = close + 1;
                 continue;
             }

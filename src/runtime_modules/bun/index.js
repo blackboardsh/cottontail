@@ -30,6 +30,7 @@ import * as streamWeb from "../node/stream/web.js";
 import { fileURLToPath as nodeFileURLToPath, pathToFileURL as nodePathToFileURL } from "../node/url.js";
 import { inspect as nodeInspect, isDeepStrictEqual, stripVTControlCharacters } from "../node/util.js";
 import { _patchAsyncContextGlobals, _wrapAsyncCallback } from "../node/async_hooks.js";
+import * as bunSqliteModule from "./sqlite.js";
 import { Database as SQLiteDatabase } from "./sqlite.js";
 import { parse as parseJSON5, stringify as stringifyJSON5 } from "./json5.js";
 import { parse as parseTOML, stringify as stringifyTOML } from "./toml.js";
@@ -5868,7 +5869,9 @@ async function parseMultipartFormData(body, contentType) {
   if (!boundary || /[\r\n]/.test(boundary)) {
     throw new TypeError("Missing multipart boundary");
   }
-  const source = new TextDecoder("latin1").decode(await bytesFromBody(body));
+  // WHATWG aliases "latin1" to windows-1252, so TextDecoder remaps bytes in
+  // the 0x80-0x9f range. Multipart parsing needs a lossless byte string.
+  const source = stringLatin1FromBytes(await bytesFromBody(body));
   return parseMultipartFormDataText(source, boundary);
 }
 
@@ -12280,8 +12283,11 @@ export class Archive {
       const mtime = tarOctal(bytes, offset + 136, 12);
       const typeflag = String.fromCharCode(bytes[offset + 156] || 0);
       if (!name && size === 0) break;
+      // POSIX writes "ustar\0"; GNU tar writes "ustar " in the same field.
       const magic = tarString(bytes, offset + 257, 6);
-      if (magic && magic !== "ustar") throw new Error("Invalid tar archive");
+      if (magic && magic !== "ustar" && magic !== "ustar ") {
+        throw new Error("Invalid tar archive");
+      }
       let path;
       try {
         path = safeArchivePath(prefix ? `${prefix}/${name}` : name);
@@ -20094,7 +20100,7 @@ nodeSetBuiltinModules({
   "bun:test": bunTestModule.default ?? bunTestModule,
   "bun:jsc": bunJscModule.default ?? bunJscModule,
   "bun:ffi": FFI.default ?? FFI,
-  "bun:sqlite": { Database: SQLiteDatabase, default: SQLiteDatabase },
+  "bun:sqlite": bunSqliteModule,
   "bun:internal-for-testing": bunInternalForTestingModule,
   ws: wsBuiltin,
   "ws/lib/websocket": wsBuiltin,

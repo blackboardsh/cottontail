@@ -43,7 +43,7 @@ if (cottontail.platform() !== "win32" && cottontail.spawnSync("curl", ["--versio
   assert(server.url instanceof URL, "Bun.serve url should be a URL");
   assert(String(server.url).startsWith("http://127.0.0.1:"), "Bun.serve url string mismatch");
 
-  const route = Bun.spawn(["curl", "-s", `${server.url}/hello/cottontail`], { stdout: "pipe", stderr: "pipe" });
+  const route = Bun.spawn(["curl", "-s", new URL("hello/cottontail", server.url).href], { stdout: "pipe", stderr: "pipe" });
   assert(route.stdout, "route stdout pipe missing");
   const routeText = await route.stdout.text();
   await route.exited;
@@ -51,7 +51,7 @@ if (cottontail.platform() !== "win32" && cottontail.spawnSync("curl", ["--versio
   assert(parsed.name === "cottontail", `Bun.serve route params mismatch: ${routeText}`);
   assert(parsed.path === "/hello/cottontail", `Bun.serve route URL mismatch: ${routeText}`);
 
-  const echo = Bun.spawn(["curl", "-s", "-X", "POST", "--data", "posted", `${server.url}/echo`], {
+  const echo = Bun.spawn(["curl", "-s", "-X", "POST", "--data", "posted", new URL("echo", server.url).href], {
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -59,7 +59,7 @@ if (cottontail.platform() !== "win32" && cottontail.spawnSync("curl", ["--versio
   assert(await echo.stdout.text() === "posted", "Bun.serve method route mismatch");
   await echo.exited;
 
-  const fallback = await server.fetch(`${server.url}/fallback`);
+  const fallback = await server.fetch(new URL("fallback", server.url));
   assert(await fallback.text() === "/fallback", "Bun.serve server.fetch fallback mismatch");
 
   await server.stop();

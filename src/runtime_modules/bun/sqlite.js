@@ -617,13 +617,4 @@ export class Database {
 
 export const __esModule = true;
 
-const defaultExport = {
-  __esModule,
-  Database,
-  SQLiteError,
-  Statement,
-  constants,
-  default: Database,
-};
-
-export default defaultExport;
+export default Database;

@@ -1,6 +1,7 @@
 import { EventEmitter } from "./events.js";
 import { _wrapAsyncCallback } from "./async_hooks.js";
 import { Duplex } from "./stream.js";
+import * as nodeConstants from "./constants.js";
 
 const kConnectionCount = Symbol("connectionCount");
 // Allow a stock-JSC host-loop turn for bytes racing a graceful destroy to
@@ -254,12 +255,12 @@ function normalizeFamily(family = "ipv4") {
 }
 
 const connectErrnos = {
-  ECONNREFUSED: -61,
-  ECONNRESET: -54,
-  EHOSTUNREACH: -65,
-  ENETUNREACH: -51,
-  ENOENT: -2,
-  ETIMEDOUT: -60,
+  ECONNREFUSED: -nodeConstants.ECONNREFUSED,
+  ECONNRESET: -nodeConstants.ECONNRESET,
+  EHOSTUNREACH: -nodeConstants.EHOSTUNREACH,
+  ENETUNREACH: -nodeConstants.ENETUNREACH,
+  ENOENT: -nodeConstants.ENOENT,
+  ETIMEDOUT: -nodeConstants.ETIMEDOUT,
 };
 
 function connectionException(rawError, options, host, port) {
@@ -1935,13 +1936,13 @@ class ServerImpl extends EventEmitter {
       this.listening = false;
       this._fd = null;
       const error = rawError instanceof Error ? rawError : new Error(String(rawError));
-      if (error.code == null && /(in use|EADDRINUSE)/i.test(String(error.message))) {
-        error.code = "EADDRINUSE";
-        error.errno = -48;
-        error.syscall = "listen";
+      if (/(in use|EADDRINUSE)/i.test(String(error.message))) {
+        if (error.code == null) error.code = "EADDRINUSE";
+        if (error.code === "EADDRINUSE" && error.errno == null) error.errno = -nodeConstants.EADDRINUSE;
+        if (error.syscall == null) error.syscall = "listen";
         if (!this._isPipe) {
-          error.address = options.host ?? "::";
-          error.port = Number(options.port ?? 0);
+          if (error.address == null) error.address = options.host ?? "::";
+          if (error.port == null) error.port = Number(options.port ?? 0);
         }
       }
       queueMicrotask(() => this.emit("error", error));

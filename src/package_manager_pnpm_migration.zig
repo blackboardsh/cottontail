@@ -456,7 +456,7 @@ fn buildMetadata(allocator: std.mem.Allocator, package: *const Value, snapshot: 
             if (normalized.object.count() > 0) try metadata.object.put(allocator, field, normalized);
         }
     }
-    for ([_][]const u8{ "os", "cpu", "bin" }) |field| {
+    for ([_][]const u8{ "os", "cpu", "libc", "bin" }) |field| {
         if (package.object.get(field)) |contents| try metadata.object.put(allocator, field, contents);
     }
     if (peers.count() > 0) {
@@ -763,4 +763,22 @@ fn jsonString(value: *const Value, key: []const u8) ?[]const u8 {
     if (value.* != .object) return null;
     const field = value.object.get(key) orelse return null;
     return if (field == .string) field.string else null;
+}
+
+test "pnpm package metadata preserves libc constraints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const package = try std.json.parseFromSliceLeaky(
+        Value,
+        allocator,
+        "{\"name\":\"native-addon\",\"version\":\"1.0.0\",\"os\":[\"linux\"],\"cpu\":[\"x64\"],\"libc\":[\"musl\"]}",
+        .{},
+    );
+    const metadata = try buildMetadata(allocator, &package, null);
+    const libc = metadata.object.get("libc").?;
+
+    try std.testing.expect(libc == .array);
+    try std.testing.expectEqual(@as(usize, 1), libc.array.items.len);
+    try std.testing.expectEqualStrings("musl", libc.array.items[0].string);
 }

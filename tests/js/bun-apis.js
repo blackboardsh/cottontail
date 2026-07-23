@@ -9,7 +9,7 @@ const tmpDir = cottontail.env("COTTONTAIL_TMP_DIR");
 assert(tmpDir, "COTTONTAIL_TMP_DIR missing");
 cottontail.mkdirSync(tmpDir, true);
 
-assert(FFIType.int === "int", "FFIType.int should match Bun's int type name");
+assert(FFIType.int === 5 && FFIType.int === FFIType.i32, "FFIType.int should match Bun's i32 type id");
 assert(JSON.stringify(Bun.$.braces("echo {one,{two,three}}")) === JSON.stringify(["echo one", "echo two", "echo three"]), "Bun.$.braces nested expansion mismatch");
 assert(JSON.stringify(Bun.$.braces("echo plain")) === JSON.stringify(["echo plain"]), "Bun.$.braces no-op mismatch");
 assert(new TextDecoder().decode(await Bun.$`printf shell-bytes`.bytes()) === "shell-bytes", "Bun shell bytes mismatch");
@@ -196,7 +196,7 @@ if (cottontail.platform() !== "win32") {
       },
     });
 
-    Bun.spawn(["sh", "-c", `curl -s ${server.url}/hello > ${serveOut}`], {
+    Bun.spawn(["sh", "-c", `curl -s ${server.url}hello > ${serveOut}`], {
       detached: true,
     });
 

@@ -3,7 +3,9 @@
 // context retains its own ECMAScript intrinsics.
 const contexts = new WeakSet();
 const contextHandles = new WeakMap();
+const contextVmSnapshots = new WeakMap();
 const vmHost = globalThis.cottontail;
+const intrinsicPromiseThen = Promise.prototype.then;
 const contextFinalizer = typeof FinalizationRegistry === "function" &&
   typeof vmHost?.vmReleaseContext === "function"
   ? new FinalizationRegistry(handle => {
@@ -282,6 +284,40 @@ function withSourceURL(code, filename) {
   return `${text}\n//# sourceURL=${safeName}`;
 }
 
+function descriptorSnapshot(value) {
+  const snapshot = new Map();
+  for (const key of Reflect.ownKeys(value)) {
+    snapshot.set(key, Reflect.getOwnPropertyDescriptor(value, key));
+  }
+  return snapshot;
+}
+
+function sameDescriptor(left, right) {
+  if (left === undefined || right === undefined) return left === right;
+  return left.configurable === right.configurable &&
+    left.enumerable === right.enumerable &&
+    left.writable === right.writable &&
+    left.value === right.value &&
+    left.get === right.get &&
+    left.set === right.set;
+}
+
+function exportContextDelta(handle, context) {
+  const baseline = contextVmSnapshots.get(context) ?? descriptorSnapshot(context);
+  const exported = Object.create(null);
+  vmHost.vmExportContext(handle, exported);
+  const nextSnapshot = descriptorSnapshot(exported);
+  const keys = new Set([...baseline.keys(), ...Reflect.ownKeys(exported)]);
+  for (const key of keys) {
+    const before = baseline.get(key);
+    const after = Reflect.getOwnPropertyDescriptor(exported, key);
+    if (sameDescriptor(before, after)) continue;
+    if (after === undefined) Reflect.deleteProperty(context, key);
+    else Reflect.defineProperty(context, key, after);
+  }
+  contextVmSnapshots.set(context, nextSnapshot);
+}
+
 function runCodeInContextFallback(code, context, options = undefined) {
   const { filename } = normalizeRunOptions(options);
   const scope = makeScopeProxy(context, { filename });
@@ -316,7 +352,33 @@ function runCodeInContext(code, context, options = undefined) {
     const { filename } = normalizeRunOptions(options);
     const source = String(code);
     const sourceName = sourceURLFromCode(source) ?? filename ?? "evalmachine.<anonymous>";
-    return vmHost.vmRunInContext(handle, context, source, sourceName);
+    let result;
+    try {
+      result = vmHost.vmRunInContext(handle, context, source, sourceName);
+    } finally {
+      // vmRunInContext imports the host sandbox and immediately exports the
+      // resulting VM state. Keep that VM-side snapshot separate from later
+      // host changes so concurrent async evaluations only export their delta.
+      try {
+        contextVmSnapshots.set(context, descriptorSnapshot(context));
+      } catch {}
+    }
+    if (
+      result !== null &&
+      (typeof result === "object" || typeof result === "function") &&
+      typeof vmHost.vmExportContext === "function"
+    ) {
+      try {
+        // Brand-check through the host intrinsic instead of inspecting or
+        // assimilating `result.then`. This accepts a Promise from the sibling
+        // JSC realm, rejects ordinary thenables, and preserves the exact value
+        // and realm identity returned by vm.runInContext().
+        const exportContext = () => exportContextDelta(handle, context);
+        const observer = intrinsicPromiseThen.call(result, exportContext, exportContext);
+        intrinsicPromiseThen.call(observer, undefined, () => {});
+      } catch {}
+    }
+    return result;
   }
   return runCodeInContextFallback(code, context, options);
 }

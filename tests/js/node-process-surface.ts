@@ -190,8 +190,46 @@ assert(bufferBinding.indexOfNumber(Buffer.from([1, 2, 3]), 2, 0) === 1, "process
 const osBinding = (process as any).binding("os");
 assert(typeof osBinding.getHostname() === "string", "process.binding os hostname mismatch");
 const loadAverage = new Float64Array(3);
-osBinding.getLoadAvg(loadAverage);
-assert(loadAverage.length === 3, "process.binding os loadavg mismatch");
+assert(osBinding.getLoadAvg(loadAverage) === undefined, "process.binding os getLoadAvg return mismatch");
+assert(loadAverage.every(Number.isFinite), "process.binding os loadavg mismatch");
+assert(Number.isFinite(osBinding.getUptime()) && osBinding.getUptime() >= 0, "process.binding os uptime mismatch");
+assert(Number.isFinite(osBinding.getTotalMem()) && osBinding.getTotalMem() > 0, "process.binding os total memory mismatch");
+assert(Number.isFinite(osBinding.getFreeMem()) && osBinding.getFreeMem() >= 0, "process.binding os free memory mismatch");
+assert(
+  Number.isInteger(osBinding.getAvailableParallelism()) && osBinding.getAvailableParallelism() >= 1,
+  "process.binding os available parallelism mismatch",
+);
+assert(
+  osBinding.getAvailableParallelism() === cottontail.osAvailableParallelism(),
+  "process.binding os should use native available parallelism",
+);
+const bindingCpus = osBinding.getCPUs();
+assert(Array.isArray(bindingCpus) && bindingCpus.length > 0 && bindingCpus.length % 7 === 0, "process.binding os CPU tuple shape mismatch");
+assert(bindingCpus.length === cottontail.osCpuInfo().length * 7, "process.binding os CPU count mismatch");
+for (let index = 0; index < bindingCpus.length; index += 7) {
+  assert(typeof bindingCpus[index] === "string", "process.binding os CPU model mismatch");
+  for (let field = 1; field < 7; field += 1) {
+    assert(Number.isFinite(bindingCpus[index + field]), "process.binding os CPU numeric field mismatch");
+  }
+}
+const bindingOsInformation = osBinding.getOSInformation();
+const diagnosticOsInformation = cottontail.runtimeDiagnostics().os;
+assert(
+  JSON.stringify(bindingOsInformation) === JSON.stringify([
+    diagnosticOsInformation.name,
+    diagnosticOsInformation.version,
+    diagnosticOsInformation.release,
+    diagnosticOsInformation.machine,
+  ]),
+  "process.binding os information ordering mismatch",
+);
+assert(
+  osBinding.isBigEndian === (new Uint8Array(new Uint16Array([0x0102]).buffer)[0] === 0x01),
+  "process.binding os endianness mismatch",
+);
+if (process.platform === "linux") {
+  assert(osBinding.getUptime() > 1, "process.binding os should report Linux system uptime");
+}
 
 const spawnSyncBinding = (process as any).binding("spawn_sync");
 const privateSpawn = spawnSyncBinding.spawn({

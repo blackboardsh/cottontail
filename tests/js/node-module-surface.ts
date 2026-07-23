@@ -170,6 +170,11 @@ assert(stripped.length === stripSource.length, "stripTypeScriptTypes strip mode 
 assert(!stripped.includes(": number"), "stripTypeScriptTypes should remove annotations");
 assert(!stripped.includes("export type"), "stripTypeScriptTypes should remove type-only exports");
 assert(stripTypeScriptTypes("import { type Foo, Bar } from \"x\";\n") === "import {           Bar } from \"x\";\n", "stripTypeScriptTypes should erase named type imports");
+assert(
+  stripTypeScriptTypes("import Default, { value as alias } from \"x\";\nexport { alias as renamed };\n") ===
+    "import Default, { value as alias } from \"x\";\nexport { alias as renamed };\n",
+  "stripTypeScriptTypes should preserve module binding aliases",
+);
 const genericStripSource = "function f<T extends string>(x: T): T { return x }\n";
 const genericStripped = stripTypeScriptTypes(genericStripSource);
 assert(genericStripped.length === genericStripSource.length, "stripTypeScriptTypes generic strip length mismatch");
@@ -225,7 +230,10 @@ const dynamicHook = registerHooks({
     return nextLoad(url, context);
   },
 });
-const dynamicImported = (globalThis as any).cottontail.importModule("dynamic-hook", `file://${join(root, "entry.js")}`);
+const dynamicImported = await (globalThis as any).cottontail.importModule(
+  "dynamic-hook",
+  `file://${join(root, "entry.js")}`,
+);
 assert(dynamicImported.value === "dynamic-hooked", "dynamic import hook named export mismatch");
 assert(dynamicImported.default.value === "dynamic-hooked", "dynamic import hook default export mismatch");
 dynamicHook.deregister();

@@ -96,6 +96,10 @@ function linuxCpuTimes() {
 }
 
 export function cpus() {
+  try {
+    const native = cottontail.osCpuInfo?.();
+    if (Array.isArray(native) && native.length > 0) return native;
+  } catch {}
   const count = Number(cottontail.cpuCount?.() || 1);
   const model = cpuModel();
   const speed = cpuSpeed();
@@ -118,19 +122,37 @@ export function endianness() {
 }
 
 export function availableParallelism() {
-  return Math.max(1, Number(cottontail.cpuCount?.() || 1));
+  try {
+    const native = Number(cottontail.osAvailableParallelism?.());
+    if (Number.isInteger(native) && native > 0) return native;
+  } catch {}
+  return Math.max(1, cpus().length);
 }
 
 export function freemem() {
+  try {
+    const native = Number(cottontail.osFreeMemory?.());
+    if (Number.isFinite(native) && native >= 0) return native;
+  } catch {}
   return Number(globalThis.process?.availableMemory?.() ?? 0);
 }
 
 export function totalmem() {
-  return Number(globalThis.process?.constrainedMemory?.() || freemem() || 0);
+  try {
+    const native = Number(cottontail.osTotalMemory?.());
+    if (Number.isFinite(native) && native > 0) return native;
+  } catch {}
+  return Number(freemem() || 0);
 }
 
 export function loadavg() {
   if (platform() === "win32") return [0, 0, 0];
+  try {
+    const native = cottontail.osLoadavg?.();
+    if (Array.isArray(native) && native.length === 3 && native.every(Number.isFinite)) {
+      return native.map(Number);
+    }
+  } catch {}
   const linux = cottontail.existsSync?.("/proc/loadavg") ? cottontail.readFile("/proc/loadavg") : "";
   const source = linux || shell("sysctl -n vm.loadavg");
   const matches = String(source).match(/[-+]?\d+(?:\.\d+)?/g) ?? [];
@@ -140,10 +162,15 @@ export function loadavg() {
 export function machine() {
   if (arch() === "x64") return "x86_64";
   if (arch() === "ia32" || arch() === "x86") return "i386";
+  if (platform() === "linux" && arch() === "arm64") return "aarch64";
   return arch();
 }
 
 export function uptime() {
+  try {
+    const native = Number(cottontail.osUptime?.());
+    if (Number.isFinite(native) && native >= 0) return native;
+  } catch {}
   if (cottontail.existsSync?.("/proc/uptime")) {
     const value = Number(String(cottontail.readFile("/proc/uptime")).split(/\s+/)[0]);
     if (Number.isFinite(value)) return value;
@@ -301,12 +328,17 @@ export const devNull = platform() === "win32" ? "\\\\.\\nul" : "/dev/null";
 export const constants = {
   UV_UDP_REUSEADDR: 4,
   dlopen: {
+    ...(typeof nodeConstants.RTLD_DEEPBIND === "number"
+      ? { RTLD_DEEPBIND: nodeConstants.RTLD_DEEPBIND }
+      : {}),
     RTLD_LAZY: nodeConstants.RTLD_LAZY,
     RTLD_NOW: nodeConstants.RTLD_NOW,
     RTLD_GLOBAL: nodeConstants.RTLD_GLOBAL,
     RTLD_LOCAL: nodeConstants.RTLD_LOCAL,
   },
-  errno: Object.fromEntries(Object.entries(nodeConstants).filter(([name, value]) => /^E[A-Z0-9]+$/.test(name) && typeof value === "number")),
+  errno: Object.fromEntries(Object.entries(nodeConstants).filter(
+    ([name, value]) => /^E[A-Z0-9]+$/.test(name) && !name.startsWith("ENGINE_") && typeof value === "number",
+  )),
   signals: Object.fromEntries(Object.entries(nodeConstants).filter(([name, value]) => /^SIG[A-Z0-9]+$/.test(name) && typeof value === "number")),
   priority: {
     PRIORITY_LOW: nodeConstants.PRIORITY_LOW,

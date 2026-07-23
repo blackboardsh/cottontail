@@ -55,7 +55,21 @@ const utf16String = new TextDecoder("utf-16le").decode(utf16Data);
 assert(describeJscValue("123").includes("8Bit:(1)"), "bun:jsc 8-bit string description mismatch");
 assert(describeJscValue(utf16String).includes("8Bit:(0)"), "bun:jsc 16-bit string description mismatch");
 assert(describeArray([1, "a"]).length === 2, "bun:jsc describeArray mismatch");
-assert(callerSourceOrigin() === import.meta.url, "bun:jsc callerSourceOrigin mismatch");
+const sourceOrigin = callerSourceOrigin();
+assert(
+  sourceOrigin === import.meta.url,
+  `bun:jsc callerSourceOrigin mismatch: expected ${import.meta.url}, received ${sourceOrigin}`,
+);
+const syncOriginModule = await import(new URL("./modules/jsc-caller-origin-sync.js?origin=sync", import.meta.url).href);
+assert(
+  syncOriginModule.sourceOrigin === syncOriginModule.metaUrl,
+  `bun:jsc sync child callerSourceOrigin mismatch: expected ${syncOriginModule.metaUrl}, received ${syncOriginModule.sourceOrigin}`,
+);
+const asyncOriginModule = await import(new URL("./modules/jsc-caller-origin-async.js#origin=async", import.meta.url).href);
+assert(
+  asyncOriginModule.sourceOrigin === asyncOriginModule.metaUrl,
+  `bun:jsc async child callerSourceOrigin mismatch: expected ${asyncOriginModule.metaUrl}, received ${asyncOriginModule.sourceOrigin}`,
+);
 let ropeValuePart: number | undefined = 123;
 assert(isRope("a" + ropeValuePart + "b"), "bun:jsc isRope should detect a deferred string");
 assert(!isRope("abcdefgh"), "bun:jsc isRope should reject a flat string");
@@ -144,7 +158,9 @@ assert(glob.scanSync({ cwd: "tests/js" }).includes("bun-sqlite.ts"), "Bun.Glob s
 const router = new Bun.FileSystemRouter({ style: "nextjs", dir: "tests/js" });
 assert(router.routes["/bun-sqlite"]?.endsWith("bun-sqlite.ts"), "Bun.FileSystemRouter routes mismatch");
 assert(router.match("/bun-sqlite").pathname === "/bun-sqlite", "Bun.FileSystemRouter match mismatch");
-const routerDir = `${cottontail.env("COTTONTAIL_TMP_DIR")}/filesystem-router`;
+const routerTmpDir = cottontail.env("COTTONTAIL_TMP_DIR");
+assert(routerTmpDir, "COTTONTAIL_TMP_DIR missing");
+const routerDir = `${routerTmpDir}/filesystem-router`;
 cottontail.mkdirSync(`${routerDir}/posts`, true);
 cottontail.writeFile(`${routerDir}/posts/[id].tsx`, "export default null;");
 const dynamicRouter = new Bun.FileSystemRouter({ style: "nextjs", dir: routerDir, origin: "https://example.test", assetPrefix: "/assets" });
@@ -197,10 +213,21 @@ await vm.runInContext(replTranspiler.transformSync("const replValue = await Prom
 const replResult = await vm.runInContext(replTranspiler.transformSync("replValue * 2"), replContext);
 assert(replContext.replValue === 21 && replResult.value === 42, "Bun.Transpiler replMode persistence mismatch");
 
-// Cottontail always links the vendored JSCOnly static build. That build cannot
-// construct ShadowRealms from C-API-created contexts (it segfaults), so
-// cottontail keeps the option off and the constructor absent.
+// Cottontail keeps JSC's unsafe C-API ShadowRealm constructor disabled and
+// installs a sibling-context implementation through the node:vm bridge.
 assert((globalThis as any).cottontail.jscVendored === true, "cottontail should run on the vendored JSC build");
-assert(typeof (globalThis as any).ShadowRealm === "undefined", "ShadowRealm should stay disabled on the vendored JSC build");
+const ShadowRealmConstructor = (globalThis as any).ShadowRealm;
+assert(typeof ShadowRealmConstructor === "function", "ShadowRealm compatibility constructor mismatch");
+const shadowRealm = new ShadowRealmConstructor();
+assert(shadowRealm.evaluate("21 * 2") === 42, "ShadowRealm primitive evaluation mismatch");
+const shadowRealmFunction = shadowRealm.evaluate("(value) => value + 1");
+assert(shadowRealmFunction(41) === 42, "ShadowRealm callable transfer mismatch");
+let shadowRealmObjectError: unknown;
+try {
+  shadowRealm.evaluate("({ value: 42 })");
+} catch (error) {
+  shadowRealmObjectError = error;
+}
+assert(shadowRealmObjectError instanceof TypeError, "ShadowRealm should reject object transfer");
 
 console.log("bun jsc and global passed");

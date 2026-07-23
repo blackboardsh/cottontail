@@ -1,22 +1,25 @@
 .DS_Store
 .zig-cache/
+.zig-cache-*/
 zig-out/
 node_modules/
+__pycache__/
+*.py[cod]
 vendors/zig/
 vendors/zig.zip
 vendors/zig-temp/
 vendors/esbuild/
 vendors/zig-html-rewriter/
 vendors/.zig-html-rewriter-*/
-.cottontail-tmp/
+.cottontail-tmp*/
+.cottontail-local-tools/
 .cottontail-eval-*
 fixtures/electrobun-cli/build/
 fixtures/electrobun-cli/.cottontail-tmp/
 vendors/jsc/
 vendors/windows-deps/
 release/
-vm-*-test.log
-vm-*-release.log
+/vm-*.log
 
 # test-run artifacts inside the upstream snapshot
 # The copied Bun snapshot owns only the explicitly unignored entries at its

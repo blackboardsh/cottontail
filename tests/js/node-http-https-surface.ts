@@ -460,6 +460,12 @@ const websocketServer = createNetServer((socket) => {
     const frame = readMaskedClientTextFrame(buffer);
     if (!frame) return;
     buffer = buffer.subarray(frame.consumed);
+    if (frame.opcode === 0x8) {
+      // Complete the closing handshake so the client and raw server do not
+      // wait on their 30-second forced-close timers.
+      socket.end(Buffer.from([0x88, 0x00]));
+      return;
+    }
     if (frame.opcode !== 0x1) return;
     strictEqual(frame.text, "ws-ping", "websocket server payload mismatch");
     socket.write(unmaskedWebSocketTextFrame("ws-pong"));

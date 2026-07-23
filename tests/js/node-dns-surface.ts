@@ -1,7 +1,8 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import * as dns from "node:dns";
-import * as dnsPromises from "node:dns/promises";
+import dnsPromisesDefault, * as dnsPromises from "node:dns/promises";
 
 const require = createRequire(import.meta.url);
 const requiredDns = require("dns");
@@ -9,6 +10,12 @@ const requiredDnsPromises = require("node:dns/promises");
 
 strictEqual(requiredDns.lookup, dns.lookup, "require dns lookup mismatch");
 strictEqual(requiredDnsPromises.lookup, dnsPromises.lookup, "require dns/promises lookup mismatch");
+strictEqual(requiredDnsPromises, dnsPromisesDefault, "require dns/promises default identity mismatch");
+strictEqual(requiredDnsPromises, dns.promises, "require dns/promises should equal dns.promises");
+strictEqual(dnsPromises.getDefaultResultOrder, dns.getDefaultResultOrder, "dns default order getter identity mismatch");
+strictEqual(dnsPromises.setDefaultResultOrder, dns.setDefaultResultOrder, "dns default order setter identity mismatch");
+ok(dnsPromises.getServers !== dns.getServers, "dns server getter should use the promises default resolver");
+ok(dnsPromises.setServers !== dns.setServers, "dns server setter should use the promises default resolver");
 strictEqual(dns.NOTFOUND, "ENOTFOUND", "dns NOTFOUND constant mismatch");
 strictEqual(dns.ADDRCONFIG, 1024, "dns ADDRCONFIG constant mismatch");
 strictEqual(dns.promises.lookup, dnsPromises.lookup, "dns.promises lookup mismatch");
@@ -45,13 +52,19 @@ for (const name of expectedDnsFunctions) {
 strictEqual(typeof dns.Resolver, "function", "dns Resolver should be exported");
 strictEqual(typeof dnsPromises.Resolver, "function", "dns/promises Resolver should be exported");
 
-const previousOrder = dns.getDefaultResultOrder();
-dns.setDefaultResultOrder("ipv4first");
-strictEqual(dns.getDefaultResultOrder(), "ipv4first", "dns default order setter mismatch");
+const previousOrder = dnsPromises.getDefaultResultOrder();
+strictEqual(dns.getDefaultResultOrder(), previousOrder, "dns default order getter state mismatch");
+dnsPromises.setDefaultResultOrder("ipv4first");
+strictEqual(dns.getDefaultResultOrder(), "ipv4first", "dns promises default order setter mismatch");
+dns.setDefaultResultOrder("ipv6first");
+strictEqual(dnsPromises.getDefaultResultOrder(), "ipv6first", "dns default order should be shared with promises");
 dns.setDefaultResultOrder(previousOrder);
 
+const previousCallbackServers = dns.getServers();
+const previousPromisesServers = dnsPromises.getServers();
 dns.setServers(["127.0.0.1", "127.0.0.1:53", "[::1]:53"]);
 deepStrictEqual(dns.getServers(), ["127.0.0.1", "127.0.0.1", "::1"], "dns getServers mismatch");
+deepStrictEqual(dnsPromises.getServers(), previousPromisesServers, "dns callback servers should not mutate promises servers");
 try {
   dns.setServers(["not-an-ip"]);
   throw new Error("dns.setServers invalid server should throw");
@@ -59,11 +72,15 @@ try {
   strictEqual((error as Error & { code?: string }).code, "ERR_INVALID_IP_ADDRESS", "dns.setServers invalid server code mismatch");
 }
 dns.setServers(["127.0.0.1"]);
+dnsPromises.setServers(["8.8.8.8"]);
+deepStrictEqual(dnsPromises.getServers(), ["8.8.8.8"], "dns promises getServers mismatch");
+deepStrictEqual(dns.getServers(), ["127.0.0.1"], "dns promises servers should not mutate callback servers");
 const isolatedResolver = new dns.Resolver();
 isolatedResolver.setServers(["8.8.8.8"]);
 deepStrictEqual(isolatedResolver.getServers(), ["8.8.8.8"], "dns Resolver local servers mismatch");
 deepStrictEqual(dns.getServers(), ["127.0.0.1"], "dns Resolver setServers should not mutate global servers");
 dns.setServers([]);
+dnsPromises.setServers(previousPromisesServers);
 
 const lookupAll = await new Promise<Array<{ address: string; family: number }>>((resolve, reject) => {
   dns.lookup("localhost", { all: true, order: "ipv4first" }, (error, addresses) => {
@@ -76,6 +93,45 @@ ok(lookupAll.some((record) => record.address === "127.0.0.1" && record.family ==
 const lookupOne = await dnsPromises.lookup("localhost", { family: 4 });
 strictEqual(lookupOne.address, "127.0.0.1", "dns promises lookup IPv4 mismatch");
 strictEqual(lookupOne.family, 4, "dns promises lookup family mismatch");
+
+if (process.platform === "linux") {
+  // glibc reports EAI_NODATA when an /etc/hosts name exists only for the
+  // opposite address family. Node normalizes that getaddrinfo result to
+  // ENOTFOUND, while DNS record-query APIs retain their ENODATA distinction.
+  const hostFamilies = new Map<string, Set<number>>();
+  let normalizedOppositeFamilyFailure = false;
+  try {
+    for (const line of readFileSync("/etc/hosts", "utf8").split(/\r?\n/)) {
+      const fields = line.replace(/#.*/, "").trim().split(/\s+/);
+      if (fields.length < 2) continue;
+      const family = fields[0].includes(":") ? 6 : fields[0].includes(".") ? 4 : 0;
+      if (family === 0) continue;
+      for (const hostname of fields.slice(1)) {
+        const families = hostFamilies.get(hostname) ?? new Set<number>();
+        families.add(family);
+        hostFamilies.set(hostname, families);
+      }
+    }
+  } catch {}
+  for (const [hostname, families] of hostFamilies) {
+    if (!families.has(4) || families.has(6)) continue;
+    try {
+      await dnsPromises.lookup(hostname, { family: 6 });
+    } catch (error) {
+      strictEqual(
+        (error as Error & { code?: string }).code,
+        "ENOTFOUND",
+        "dns lookup should normalize Linux EAI_NODATA to ENOTFOUND",
+      );
+      normalizedOppositeFamilyFailure = true;
+      break;
+    }
+  }
+  ok(
+    normalizedOppositeFamilyFailure,
+    "Linux DNS fixture should exercise an IPv4-only /etc/hosts lookup as IPv6",
+  );
+}
 
 const service = await dnsPromises.lookupService("127.0.0.1", 80);
 ok(service.hostname.length > 0, "dns lookupService should return hostname");

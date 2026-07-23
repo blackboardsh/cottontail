@@ -25,6 +25,13 @@ function close(socket: dgram.Socket): Promise<void> {
   return new Promise((resolve) => socket.close(() => resolve()));
 }
 
+function connect(socket: dgram.Socket, port: number, address: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    socket.once("error", reject);
+    socket.connect(port, address, () => resolve());
+  });
+}
+
 const server = dgram.createSocket("udp4");
 const client = dgram.createSocket({ type: "udp4" });
 
@@ -33,12 +40,12 @@ const address = server.address();
 strictEqual(address.address, "127.0.0.1", "dgram server address mismatch");
 strictEqual(address.family, "IPv4", "dgram server family mismatch");
 ok(address.port > 0, "dgram server should bind to an ephemeral port");
-strictEqual(server.setBroadcast(true), server, "dgram setBroadcast should be chainable");
-strictEqual(server.setTTL(64), server, "dgram setTTL should be chainable");
-strictEqual(server.setMulticastTTL(32), server, "dgram setMulticastTTL should be chainable");
-strictEqual(server.setMulticastLoopback(true), server, "dgram setMulticastLoopback should be chainable");
-strictEqual(server.setRecvBufferSize(65536), server, "dgram setRecvBufferSize should be chainable");
-strictEqual(server.setSendBufferSize(65536), server, "dgram setSendBufferSize should be chainable");
+strictEqual(server.setBroadcast(true), undefined, "dgram setBroadcast return mismatch");
+strictEqual(server.setTTL(64), 64, "dgram setTTL return mismatch");
+strictEqual(server.setMulticastTTL(32), 32, "dgram setMulticastTTL return mismatch");
+strictEqual(server.setMulticastLoopback(true), true, "dgram setMulticastLoopback return mismatch");
+strictEqual(server.setRecvBufferSize(65536), undefined, "dgram setRecvBufferSize return mismatch");
+strictEqual(server.setSendBufferSize(65536), undefined, "dgram setSendBufferSize return mismatch");
 ok(server.getRecvBufferSize() > 0, "dgram getRecvBufferSize mismatch");
 ok(server.getSendBufferSize() > 0, "dgram getSendBufferSize mismatch");
 server.addMembership("224.0.0.114");
@@ -69,7 +76,7 @@ strictEqual(packet.rinfo.family, "IPv4", "dgram rinfo family mismatch");
 strictEqual(packet.rinfo.size, "cottontail udp".length, "dgram rinfo size mismatch");
 ok(packet.rinfo.port > 0, "dgram rinfo port mismatch");
 
-client.connect(address.port, "127.0.0.1");
+await connect(client, address.port, "127.0.0.1");
 strictEqual(client.remoteAddress().address, "127.0.0.1", "dgram remoteAddress mismatch");
 client.disconnect();
 

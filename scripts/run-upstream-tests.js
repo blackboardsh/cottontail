@@ -22,12 +22,17 @@ const disabledStatuses = new Set(['disabled', 'skip']);
 const directTestTimeoutMs = Number(process.env.COTTONTAIL_UPSTREAM_TEST_TIMEOUT_MS ?? 30000);
 const directTestMaxBuffer = Number(process.env.COTTONTAIL_UPSTREAM_TEST_MAX_BUFFER ?? 64 * 1024 * 1024);
 const defaultBunJobs = Math.max(1, Math.min(4, os.availableParallelism?.() ?? os.cpus().length));
+const binaryPreflightPrefix = 'COTTONTAIL_UPSTREAM_BINARY_PREFLIGHT:';
+const binaryPreflightTimeoutMs = 15000;
+const defaultNodeSelectorChunkChars = 16 * 1024;
+const nodeHarnessInventoryPrefix = 'COTTONTAIL_NODE_HARNESS_INVENTORY:';
 const bundlerTestDiscoveryPrefix = 'COTTONTAIL_BUNDLER_TEST_ID:';
 const duckDBUpstreamTest = 'test/js/third_party/duckdb/duckdb-basic-usage.test.ts';
 const svelteUpstreamTest = 'test/integration/svelte/client-side.test.ts';
 const activeChildren = new Set();
 const snapshotArtifactRoots = new Map();
-const readOnlySnapshotRoots = new Set();
+const externallyManagedSnapshotRoots = new Set();
+const nodeHarnessInventoryCache = new Map();
 const bunSnapshotSourceNames = new Set([
   'LICENSE.md',
   'manifest.json',
@@ -51,7 +56,7 @@ function removeTemp(path) {
 }
 
 function removeSnapshotArtifacts(snapshotRoot, runtime) {
-  if (readOnlySnapshotRoots.has(snapshotRoot)) return;
+  if (externallyManagedSnapshotRoots.has(snapshotRoot)) return;
   const installedDependencies = join(snapshotRoot, 'test', 'node_modules');
   const stack = [snapshotRoot];
   while (stack.length > 0) {
@@ -114,10 +119,124 @@ function readJson(path) {
   return JSON.parse(readFileSync(path, 'utf8'));
 }
 
+function binaryPreflightDetails(result) {
+  return [result.stdout, result.stderr]
+    .map((value) => String(value ?? '').trim())
+    .filter(Boolean)
+    .join('\n');
+}
+
+function immutableBinaryEnvironment(overrides = undefined, allowTestPreflightShim = false) {
+  const env = { ...process.env };
+  // Authoritative upstream runs validate the executable selected by --binary,
+  // never preloads, module paths, or a development-only source overlay from
+  // the invoking shell.
+  delete env.COTTONTAIL_RUNTIME_MODULES_DIR;
+  delete env.NODE_OPTIONS;
+  delete env.BUN_OPTIONS;
+  delete env.NODE_PATH;
+  const testPreflightShim = env.COTTONTAIL_UPSTREAM_RUNNER_TEST_NODE_OPTIONS;
+  delete env.COTTONTAIL_UPSTREAM_RUNNER_TEST_NODE_OPTIONS;
+  if (
+    allowTestPreflightShim &&
+    env.COTTONTAIL_RUNNER_TEST_CAPTURE &&
+    testPreflightShim
+  ) {
+    env.NODE_OPTIONS = testPreflightShim;
+  }
+  return { ...env, ...(overrides ?? {}) };
+}
+
+function preflightBinary() {
+  const source = `
+const record = {
+  answer: 6 * 7,
+  releaseName: globalThis.process?.release?.name,
+  cottontailVersion: globalThis.process?.versions?.cottontail,
+  productVersion: typeof globalThis.cottontail?.processInfo === "function"
+    ? String(globalThis.cottontail.processInfo("version"))
+    : null,
+  bunVersion: globalThis.Bun?.version,
+  processBunVersion: globalThis.process?.versions?.bun,
+  bunType: typeof globalThis.Bun,
+  cottontailType: typeof globalThis.cottontail,
+  revision: globalThis.process?.revision,
+  isBun: globalThis.process?.isBun,
+  platform: globalThis.process?.platform,
+  arch: globalThis.process?.arch,
+  runtimeModulesOverride: globalThis.process?.env?.COTTONTAIL_RUNTIME_MODULES_DIR ?? null,
+};
+console.log(${JSON.stringify(binaryPreflightPrefix)} + JSON.stringify(record));
+`;
+  const result = spawnSync(binaryPath, ['--eval', source], {
+    cwd: rootDir,
+    env: {
+      ...immutableBinaryEnvironment(undefined, true),
+      COTTONTAIL_UPSTREAM_PREFLIGHT: '1',
+    },
+    encoding: 'utf8',
+    timeout: binaryPreflightTimeoutMs,
+    maxBuffer: 1024 * 1024,
+  });
+  const details = binaryPreflightDetails(result);
+  if (result.error?.code === 'ETIMEDOUT') {
+    fail(`Cottontail binary preflight timed out after ${binaryPreflightTimeoutMs}ms: ${binaryPath}`);
+  }
+  if (result.error) {
+    fail(`Cottontail binary preflight failed to start ${binaryPath}: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    fail([
+      `Cottontail binary preflight exited ${result.status ?? 1}: ${binaryPath}`,
+      details,
+    ].filter(Boolean).join('\n'));
+  }
+
+  const line = String(result.stdout ?? '')
+    .split(/\r?\n/)
+    .find((candidate) => candidate.startsWith(binaryPreflightPrefix));
+  if (!line) {
+    fail([
+      `Binary is not a working Cottontail runtime (missing identity record): ${binaryPath}`,
+      details,
+    ].filter(Boolean).join('\n'));
+  }
+
+  let record;
+  try {
+    record = JSON.parse(line.slice(binaryPreflightPrefix.length));
+  } catch (error) {
+    fail(`Cottontail binary preflight emitted invalid identity JSON: ${error.message}`);
+  }
+  const valid = record?.answer === 42 &&
+    record.releaseName === 'node' &&
+    typeof record.cottontailVersion === 'string' &&
+    record.cottontailVersion.length > 0 &&
+    record.cottontailVersion === record.productVersion &&
+    typeof record.bunVersion === 'string' &&
+    record.bunVersion.length > 0 &&
+    record.bunVersion === record.processBunVersion &&
+    record.bunType === 'object' &&
+    record.cottontailType === 'object' &&
+    record.revision === 'cottontail' &&
+    record.isBun === true &&
+    typeof record.platform === 'string' &&
+    record.platform.length > 0 &&
+    typeof record.arch === 'string' &&
+    record.arch.length > 0 &&
+    record.runtimeModulesOverride === null;
+  if (!valid) {
+    fail(
+      `Binary is not a working Cottontail runtime (identity mismatch): ${binaryPath}\n` +
+      `received: ${JSON.stringify(record)}`
+    );
+  }
+}
+
 function targetSnapshotRoot(runtime, target) {
   const override = process.env[`COTTONTAIL_UPSTREAM_${runtime.toUpperCase()}_SNAPSHOT`];
   const snapshotRoot = resolve(rootDir, override ?? target.snapshot);
-  if (override != null) readOnlySnapshotRoots.add(snapshotRoot);
+  if (override != null) externallyManagedSnapshotRoots.add(snapshotRoot);
   return snapshotRoot;
 }
 
@@ -141,8 +260,8 @@ function usage() {
     '',
     'Snapshot overrides:',
     '  COTTONTAIL_UPSTREAM_TARGETS_PATH   Read target metadata from this JSON file.',
-    '  COTTONTAIL_UPSTREAM_BUN_SNAPSHOT   Run against this read-only Bun snapshot.',
-    '  COTTONTAIL_UPSTREAM_NODE_SNAPSHOT  Run against this read-only Node snapshot.',
+    '  COTTONTAIL_UPSTREAM_BUN_SNAPSHOT   Run against an externally managed Bun snapshot.',
+    '  COTTONTAIL_UPSTREAM_NODE_SNAPSHOT  Run against an externally managed Node snapshot.',
   ].join('\n'));
 }
 
@@ -256,15 +375,154 @@ function countFiles(dir) {
   return count;
 }
 
+function nodeHarnessInventory(snapshotRoot) {
+  const cached = nodeHarnessInventoryCache.get(snapshotRoot);
+  if (cached) return cached;
+
+  const source = `
+import importlib.util
+import json
+import os
+import sys
+
+snapshot_root = os.path.abspath(sys.argv[1])
+tools_root = os.path.join(snapshot_root, "tools")
+test_root = os.path.join(snapshot_root, "test")
+sys.path.insert(0, tools_root)
+
+spec = importlib.util.spec_from_file_location(
+    "cottontail_node_test_tool",
+    os.path.join(tools_root, "test.py"),
+)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+suites = sorted(module.GetSuites(test_root))
+repositories = [
+    module.TestRepository(os.path.join(test_root, suite))
+    for suite in suites
+]
+root = module.LiteralTestSuite(repositories, test_root)
+context = module.Context(
+    snapshot_root,
+    False,
+    sys.executable,
+    [],
+    False,
+    120,
+    lambda args: args,
+    True,
+    False,
+    1,
+    False,
+)
+
+records = []
+seen = set()
+for suite in suites:
+    path = module.SplitPath(suite)
+    for case in root.ListTests([], path, context, "none", "release"):
+        file_path = os.path.abspath(case.file)
+        relative_path = os.path.relpath(file_path, snapshot_root).replace(os.sep, "/")
+        selector = "/".join(str(part) for part in case.path)
+        key = (relative_path, selector)
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append({"path": relative_path, "selector": selector})
+
+records.sort(key=lambda record: (record["path"], record["selector"]))
+print(${JSON.stringify(nodeHarnessInventoryPrefix)} + json.dumps(records, separators=(",", ":")))
+`;
+  const result = spawnSync(pythonPath, ['-c', source, snapshotRoot], {
+    cwd: snapshotRoot,
+    env: {
+      ...process.env,
+      PYTHONDONTWRITEBYTECODE: '1',
+    },
+    encoding: 'utf8',
+    timeout: 30000,
+    maxBuffer: directTestMaxBuffer,
+  });
+  const details = binaryPreflightDetails(result);
+  if (result.error?.code === 'ETIMEDOUT') {
+    fail(`Node harness inventory timed out after 30000ms: ${snapshotRoot}`);
+  }
+  if (result.error) {
+    fail(`Node harness inventory failed to start ${pythonPath}: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    fail([
+      `Node harness inventory exited ${result.status ?? 1}: ${snapshotRoot}`,
+      details,
+    ].filter(Boolean).join('\n'));
+  }
+  const line = String(result.stdout ?? '')
+    .split(/\r?\n/)
+    .find((candidate) => candidate.startsWith(nodeHarnessInventoryPrefix));
+  if (!line) {
+    fail([
+      `Node harness inventory did not emit a machine-readable record: ${snapshotRoot}`,
+      details,
+    ].filter(Boolean).join('\n'));
+  }
+
+  let rawRecords;
+  try {
+    rawRecords = JSON.parse(line.slice(nodeHarnessInventoryPrefix.length));
+  } catch (error) {
+    fail(`Node harness inventory emitted invalid JSON: ${error.message}`);
+  }
+  if (!Array.isArray(rawRecords)) {
+    fail('Node harness inventory record must be an array.');
+  }
+
+  const records = [];
+  const selectorByPath = new Map();
+  const pathsBySelector = new Map();
+  for (const rawRecord of rawRecords) {
+    const path = String(rawRecord?.path ?? '').replace(/\\/g, '/');
+    const selector = String(rawRecord?.selector ?? '').replace(/\\/g, '/');
+    const absolutePath = resolve(snapshotRoot, path);
+    const relativePath = relative(snapshotRoot, absolutePath);
+    if (!path.startsWith('test/') ||
+        relativePath === '..' ||
+        relativePath.startsWith(`..${sep}`) ||
+        !existsSync(absolutePath) ||
+        !statSync(absolutePath).isFile() ||
+        selector.length === 0) {
+      fail(`Node harness inventory emitted an invalid test record: ${JSON.stringify(rawRecord)}`);
+    }
+    const previousSelector = selectorByPath.get(path);
+    if (previousSelector != null && previousSelector !== selector) {
+      fail(`Node harness maps ${path} to multiple selectors: ${previousSelector}, ${selector}`);
+    }
+    if (previousSelector != null) continue;
+    selectorByPath.set(path, selector);
+    const selectorPaths = pathsBySelector.get(selector) ?? [];
+    selectorPaths.push(path);
+    pathsBySelector.set(selector, selectorPaths);
+    records.push({ path, selector });
+  }
+  if (records.length === 0) {
+    fail(`Node harness inventory is empty: ${snapshotRoot}`);
+  }
+
+  const inventory = { records, selectorByPath, pathsBySelector };
+  nodeHarnessInventoryCache.set(snapshotRoot, inventory);
+  return inventory;
+}
+
 function discoverRunnableFiles(snapshotRoot, runtime = 'node') {
+  if (runtime === 'node') {
+    return nodeHarnessInventory(snapshotRoot).records.map((record) => record.path);
+  }
   const testRoot = join(snapshotRoot, 'test');
   const installedDependencies = join(testRoot, 'node_modules');
   if (!existsSync(testRoot)) return [];
   const result = [];
   const stack = [testRoot];
-  const runnablePattern = runtime === 'bun'
-    ? /\.test\.(?:js|mjs|cjs|ts|tsx|mts|cts)$/i
-    : /\.(?:js|mjs|cjs)$/i;
+  const runnablePattern = /\.test\.(?:js|mjs|cjs|ts|tsx|mts|cts)$/i;
   while (stack.length > 0) {
     const current = stack.pop();
     for (const name of readdirSync(current)) {
@@ -402,10 +660,10 @@ function makeEnv(runtime, target, runTemp = tempRoot, overrides = undefined) {
     ? join(targetSnapshotRoot(runtime, target), 'test', 'node_modules')
     : null;
   return {
-    ...process.env,
+    ...immutableBinaryEnvironment(),
     ...(runtime === 'bun' ? { TZ: process.env.COTTONTAIL_UPSTREAM_TZ ?? 'Etc/UTC' } : {}),
     ...(upstreamNodeModules ? {
-      NODE_PATH: [upstreamNodeModules, process.env.NODE_PATH].filter(Boolean).join(delimiter),
+      NODE_PATH: upstreamNodeModules,
     } : {}),
     COTTONTAIL_TMP_DIR: runTemp,
     COTTONTAIL_UPSTREAM_TEMP_OWNER: 'launcher',
@@ -429,6 +687,13 @@ function prepareBunTestDependencies(entries, snapshotRoot) {
   ];
   for (const [testPath, name, scriptName] of fixtures) {
     if (!selected.has(testPath)) continue;
+    if (externallyManagedSnapshotRoots.has(snapshotRoot)) {
+      fail(
+        `${name} fixture preparation mutates its Bun snapshot. ` +
+        `Copy the snapshot to a writable location and use the configured target instead of ` +
+        `COTTONTAIL_UPSTREAM_BUN_SNAPSHOT for ${testPath}.`
+      );
+    }
     const setupScript = join(rootDir, 'scripts', scriptName);
     const result = spawnSync(process.execPath, [setupScript, '--snapshot', snapshotRoot], {
       cwd: rootDir,
@@ -552,38 +817,98 @@ function expandBunEntries(entries, snapshotRoot, target, options) {
   return expanded;
 }
 
-function nodeTestSelector(entryPath) {
-  let selector = entryPath.replace(/\\/g, '/');
-  if (selector.startsWith('test/')) selector = selector.slice('test/'.length);
-  selector = selector.replace(/\.(?:mjs|cjs|js)$/i, '');
+function normalizeNodeEntryPath(entryPath) {
+  return String(entryPath).replace(/\\/g, '/').replace(/^\.\/+/, '');
+}
+
+function nodeTestSelector(entryPath, snapshotRoot) {
+  const path = normalizeNodeEntryPath(entryPath);
+  const selector = nodeHarnessInventory(snapshotRoot).selectorByPath.get(path);
+  if (selector == null) {
+    fail(`Node upstream path is not recognized by tools/test.py: ${entryPath}`);
+  }
   return selector;
 }
 
-function nodeSkipSelectors(status) {
-  return Object.entries(status.tests ?? {})
-    .filter(([, entry]) => disabledStatuses.has(entry.status))
-    .map(([path]) => nodeTestSelector(path));
+function nodeSelectorsForEntries(entries, snapshotRoot) {
+  const inventory = nodeHarnessInventory(snapshotRoot);
+  const selectedPaths = new Set(entries.map((entry) => normalizeNodeEntryPath(entry.path)));
+  const selectors = [];
+  const seenSelectors = new Set();
+  for (const entry of entries) {
+    const selector = nodeTestSelector(entry.path, snapshotRoot);
+    if (seenSelectors.has(selector)) continue;
+    seenSelectors.add(selector);
+    const missingPaths = inventory.pathsBySelector.get(selector)
+      .filter((path) => !selectedPaths.has(path));
+    if (missingPaths.length > 0) {
+      fail(
+        `Node harness selector ${selector} also selects: ${missingPaths.join(', ')}. ` +
+        'Select every colliding path together.'
+      );
+    }
+    selectors.push(selector);
+  }
+  return selectors;
 }
 
-function runNodeHarness(target, entries, snapshotRoot, status, options) {
-  const selectors = options.test || status.defaultStatus !== 'enabled'
-    ? entries.map((entry) => nodeTestSelector(entry.path))
-    : [];
-  const skipSelectors = options.test ? [] : nodeSkipSelectors(status);
-  const args = ['tools/test.py', '--shell', binaryPath, '-j4'];
-  if (skipSelectors.length > 0) args.push('--skip-tests', skipSelectors.join(','));
-  args.push(...selectors);
-  const result = spawnSync(
-    pythonPath,
-    args,
-    {
+function nodeSelectorChunkChars() {
+  const value = Number(
+    process.env.COTTONTAIL_UPSTREAM_NODE_SELECTOR_CHUNK_CHARS ??
+      defaultNodeSelectorChunkChars
+  );
+  if (!Number.isFinite(value) || value < 1) {
+    fail('COTTONTAIL_UPSTREAM_NODE_SELECTOR_CHUNK_CHARS must be a positive number');
+  }
+  return Math.trunc(value);
+}
+
+function chunkNodeSelectors(selectors) {
+  const maxChars = nodeSelectorChunkChars();
+  const chunks = [];
+  let chunk = [];
+  let chars = 0;
+  for (const selector of selectors) {
+    // The payload limit deliberately leaves ample room below Windows'
+    // CreateProcess command-line limit for Python, fixed harness arguments,
+    // quoting, and absolute executable paths.
+    const selectorChars = selector.length + 1;
+    if (selectorChars > maxChars) {
+      fail(`Node upstream test selector exceeds the safe command-line chunk size: ${selector}`);
+    }
+    if (chunk.length > 0 && chars + selectorChars > maxChars) {
+      chunks.push(chunk);
+      chunk = [];
+      chars = 0;
+    }
+    chunk.push(selector);
+    chars += selectorChars;
+  }
+  if (chunk.length > 0) chunks.push(chunk);
+  return chunks;
+}
+
+function runNodeHarness(target, entries, snapshotRoot, expectedFailure = false) {
+  const inventory = nodeHarnessInventory(snapshotRoot);
+  const selectors = nodeSelectorsForEntries(entries, snapshotRoot);
+  const chunks = chunkNodeSelectors(selectors);
+  return chunks.map((chunk, index) => {
+    const expectedTests = chunk.reduce(
+      (total, selector) => total + inventory.pathsBySelector.get(selector).length,
+      0,
+    );
+    const args = ['tools/test.py', '--shell', binaryPath, '-j4', '--report', ...chunk];
+    const result = spawnSync(pythonPath, args, {
       cwd: snapshotRoot,
-      env: makeEnv('node', target),
+      env: {
+        ...makeEnv('node', target),
+        PYTHONDONTWRITEBYTECODE: '1',
+      },
       encoding: 'utf8',
       maxBuffer: directTestMaxBuffer,
-    }
-  );
-  return result;
+    });
+    return { index, selectors: chunk, expectedTests, result, expectedFailure };
+  });
 }
 
 function runDirect(runtime, target, entry, snapshotRoot) {
@@ -802,27 +1127,98 @@ function parseBunTestExecution(stderr) {
   return execution;
 }
 
-function runNode(runtime, target, status, entries, snapshotRoot, options) {
-  const result = runNodeHarness(target, entries, snapshotRoot, status, options);
-  const spawnError = formatSpawnError(runtime, { path: 'tools/test.py' }, result);
-  if (spawnError) {
-    return [{ runtime, ok: false, unexpected: true, message: spawnError }];
-  }
+function parseNodeHarnessReport(stdout) {
+  const text = String(stdout ?? '');
+  const totalMatches = [...text.matchAll(/^Total:\s+(\d+)\s+tests\s*$/gm)];
+  const skippedMatches = [...text.matchAll(/^\s*\*\s+(\d+)\s+tests will be skipped\s*$/gm)];
+  if (totalMatches.length !== 1 || skippedMatches.length !== 1) return null;
+  return {
+    total: Number(totalMatches[0][1]),
+    skipped: Number(skippedMatches[0][1]),
+  };
+}
 
-  const exitCode = result.status ?? 1;
-  const shouldFail = entries.length > 0 && entries.every((entry) => entry.status === 'expected-failure');
-  const ok = shouldFail ? exitCode !== 0 : exitCode === 0;
+function runNode(runtime, target, entries, snapshotRoot, options) {
+  const enabledEntries = entries.filter((entry) => entry.status !== 'expected-failure');
+  const expectedFailureEntries = entries.filter((entry) => entry.status === 'expected-failure');
+  const chunks = [
+    ...runNodeHarness(target, enabledEntries, snapshotRoot),
+    ...expectedFailureEntries.flatMap((entry) =>
+      runNodeHarness(target, [entry], snapshotRoot, true)
+    ),
+  ].map((chunk, index) => ({ ...chunk, index }));
+  const unexpectedChunks = [];
+  for (const chunk of chunks) {
+    const spawnError = formatSpawnError(runtime, { path: 'tools/test.py' }, chunk.result);
+    if (spawnError) {
+      unexpectedChunks.push({ ...chunk, spawnError });
+      continue;
+    }
+    const report = parseNodeHarnessReport(chunk.result.stdout);
+    if (!report) {
+      unexpectedChunks.push({
+        ...chunk,
+        reportError: 'tools/test.py did not emit exactly one parseable --report summary',
+      });
+      continue;
+    }
+    if (report.total !== chunk.expectedTests) {
+      unexpectedChunks.push({
+        ...chunk,
+        reportError:
+          `tools/test.py matched ${report.total} test(s), expected ${chunk.expectedTests}`,
+      });
+      continue;
+    }
+    const exitCode = chunk.result.status ?? 1;
+    const allSkipped = report.total > 0 &&
+      report.skipped === report.total &&
+      /(?:^|\n)No tests to run\.\s*(?:\n|$)/.test(String(chunk.result.stdout ?? ''));
+    if (allSkipped && chunk.expectedFailure) {
+      unexpectedChunks.push({
+        ...chunk,
+        reportError: 'expected-failure selector was skipped by tools/test.py',
+      });
+      continue;
+    }
+    const chunkOk = allSkipped ||
+      (chunk.expectedFailure ? exitCode !== 0 : exitCode === 0);
+    if (!chunkOk) unexpectedChunks.push(chunk);
+  }
+  const ok = unexpectedChunks.length === 0;
+  const focused = options.test ||
+    options.match ||
+    options.onlyStatus ||
+    Number.isFinite(options.maxTests);
   const label = options.test
     ? entries[0]?.path ?? 'selected tests'
-    : status.defaultStatus === 'enabled'
-      ? 'all enabled harness tests'
-      : `${entries.length} enabled harness test(s)`;
+    : focused
+      ? `${entries.length} selected harness path(s) in ${chunks.length} chunk(s)`
+      : `${entries.length} enabled harness path(s) in ${chunks.length} chunk(s)`;
+  const allExpectedFailure = expectedFailureEntries.length === entries.length;
+  const expectationLabel = expectedFailureEntries.length > 0 && !allExpectedFailure
+    ? ` (${expectedFailureEntries.length} expected failure(s))`
+    : '';
+  const failureDetails = unexpectedChunks.map((chunk) => {
+    const result = chunk.result;
+    const heading =
+      `Node harness chunk ${chunk.index + 1}/${chunks.length} ` +
+      `(${chunk.selectors.length} selector(s)` +
+      `${chunk.expectedFailure ? ', expected failure' : ''})`;
+    return [
+      heading,
+      chunk.spawnError ??
+        chunk.reportError ??
+        `exited ${result.status ?? 1}${result.signal ? ` (${result.signal})` : ''}`,
+      result.stdout ? `stdout:\n${result.stdout}` : '',
+      result.stderr ? `stderr:\n${result.stderr}` : '',
+    ].filter(Boolean).join('\n');
+  });
   const message = ok
-    ? `${shouldFail ? 'xfail' : 'ok'} ${runtime} ${label}`
+    ? `${allExpectedFailure ? 'xfail' : 'ok'} ${runtime} ${label}${expectationLabel}`
     : [
-        `${shouldFail ? 'XPASS' : 'FAIL'} ${runtime} ${label} exited ${exitCode}`,
-        result.stdout ? `stdout:\n${result.stdout}` : '',
-        result.stderr ? `stderr:\n${result.stderr}` : '',
+        `${allExpectedFailure ? 'XPASS' : 'FAIL'} ${runtime} ${label}${expectationLabel}`,
+        ...failureDetails,
       ].filter(Boolean).join('\n');
   return [{ runtime, ok, unexpected: !ok, message }];
 }
@@ -880,6 +1276,7 @@ if (!existsSync(targetsPath)) fail(`Missing ${targetsPath}`);
 if (!options.list) {
   if (!existsSync(binaryPath)) fail(`Built cottontail binary not found at ${binaryPath}. Run "bun run build" first.`);
   if (statSync(binaryPath).size === 0) fail(`Built cottontail binary is empty at ${binaryPath}. Rebuild after clearing the Zig cache.`);
+  preflightBinary();
 }
 
 const targets = readJson(targetsPath);
@@ -904,6 +1301,9 @@ for (const name of runtimeTargets(runtime, targets)) {
   if (options.list) {
     if (options.test || options.match || options.onlyStatus) {
       const entries = selectedTests(status, options, snapshotRoot, name).slice(0, options.maxTests);
+      if (name === 'node' && entries.length > 0) {
+        nodeSelectorsForEntries(entries, snapshotRoot);
+      }
       console.log(`  selected: ${entries.length}`);
       for (const entry of entries) console.log(`    ${entry.status}\t${entry.path}`);
     }
@@ -911,9 +1311,12 @@ for (const name of runtimeTargets(runtime, targets)) {
   }
 
   const entries = selectedTests(status, options, snapshotRoot, name).slice(0, options.maxTests);
+  if (entries.length === 0) {
+    fail(`No ${name} upstream tests matched the requested selection.`);
+  }
   if (name === 'bun') prepareBunTestDependencies(entries, snapshotRoot);
   const results = name === 'node'
-    ? runNode(name, target, status, entries, snapshotRoot, options)
+    ? runNode(name, target, entries, snapshotRoot, options)
     : await runBunEntries(name, target, entries, options);
   const executionTotals = { tests: 0, assertions: 0, files: 0, filesWithoutSummary: 0 };
   for (const result of results) {

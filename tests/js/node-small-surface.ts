@@ -101,16 +101,30 @@ assert(resolveObjectURL(objectUrl) === objectUrlBlob, "resolveObjectURL should r
 URL.revokeObjectURL(objectUrl);
 assert(resolveObjectURL(objectUrl) === undefined, "resolveObjectURL should return undefined after revoke");
 
-assert(availableParallelism() >= 1, "availableParallelism mismatch");
+assert(
+  Number.isInteger(availableParallelism()) &&
+    availableParallelism() === Math.max(1, Number(cottontail.osAvailableParallelism?.() ?? availableParallelism())),
+  "availableParallelism mismatch",
+);
 const cpuList = cpus();
 assert(cpuList.length >= 1, "cpus length mismatch");
 assert(typeof cpuList[0].model === "string" && cpuList[0].model.length > 0, "cpus model mismatch");
 assert(Number.isFinite(cpuList[0].speed), "cpus speed mismatch");
 assert(Number.isFinite(cpuList[0].times.user) && Number.isFinite(cpuList[0].times.idle), "cpus times mismatch");
-assert(typeof freemem() === "number", "freemem mismatch");
-assert(typeof totalmem() === "number", "totalmem mismatch");
-assert(loadavg().length === 3, "loadavg length mismatch");
+assert(Number.isFinite(freemem()) && freemem() >= 0, "freemem mismatch");
+assert(Number.isFinite(totalmem()) && totalmem() > 0 && totalmem() < Number.MAX_SAFE_INTEGER, "totalmem mismatch");
+assert(loadavg().length === 3 && loadavg().every(Number.isFinite), "loadavg mismatch");
 assert(typeof machine() === "string" && machine().length > 0, "machine mismatch");
+if (process.platform === "linux" && process.arch === "arm64") {
+  assert(machine() === "aarch64", "machine should use Linux's aarch64 uname name");
+}
+if (process.platform === "linux") {
+  assert(
+    cpuList.some(cpu => Object.values(cpu.times).some(value => Number(value) > 0)),
+    "cpus should expose Linux host accounting",
+  );
+  assert(uptime() > 1, "uptime should report Linux system uptime");
+}
 assert(typeof release() === "string", "release mismatch");
 assert(typeof version() === "string", "version mismatch");
 assert(typeof uptime() === "number" && uptime() >= 0, "uptime mismatch");

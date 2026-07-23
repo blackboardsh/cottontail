@@ -14,6 +14,14 @@
 #endif
 #endif
 
+// The Linux archive is produced by CMake with HAVE_MMAP enabled. The installed
+// WTF headers do not carry that generated definition, but MappedFileData is
+// part of CachePayload's private ABI, so the bridge must restore it before
+// including those headers.
+#if defined(__linux__) && !defined(HAVE_MMAP)
+#define HAVE_MMAP 1
+#endif
+
 #include <JavaScriptCore/JSContextRef.h>
 #include <JavaScriptCore/JSStringRef.h>
 #include <JavaScriptCore/JSValueRef.h>
@@ -284,19 +292,10 @@ private:
     WTF::Vector<CacheUpdate> m_updates;
 };
 
-#if OS(LINUX)
-// COTTONTAIL-COMPAT: The pinned Linux JSC SDK has a smaller release-mode
-// WTF::Variant layout than Darwin and Windows.
-constexpr size_t expected_cache_payload_size = 0x18;
-constexpr size_t expected_function_update_size = 0x28;
-constexpr size_t expected_cache_update_size = 0x30;
-constexpr size_t expected_cached_bytecode_size = 0x40;
-#else
 constexpr size_t expected_cache_payload_size = 0x20;
 constexpr size_t expected_function_update_size = 0x30;
 constexpr size_t expected_cache_update_size = 0x38;
 constexpr size_t expected_cached_bytecode_size = 0x48;
-#endif
 
 static_assert(sizeof(CachePayload) == expected_cache_payload_size,
     "pinned CachePayload layout changed; update the stock-JSC bytecode bridge");
@@ -461,7 +460,7 @@ public:
     WTF::StringView source() const final { return m_source.get(); }
     WTF::RefPtr<CachedBytecode> cachedBytecode() const final
     {
-        return WTF::RefPtr<CachedBytecode>(m_cachedBytecode);
+        return m_cachedBytecode;
     }
 
     VM& vm() const { return m_vm; }
@@ -493,7 +492,7 @@ private:
     // opaque, so the adapter supplies the same pinned provider shape.
     VM& m_vm;
     const WTF::Ref<WTF::StringImpl> m_source;
-    CachedBytecode* m_cachedBytecode;
+    WTF::RefPtr<CachedBytecode> m_cachedBytecode;
 };
 
 } // namespace JSC

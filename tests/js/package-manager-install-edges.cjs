@@ -193,12 +193,24 @@ function testRegistryAndMinimumAge() {
     "age-package": ["1.0.0", "2.0.0"],
     "excluded-package": ["1.0.0", "2.0.0"],
     "invalid-time-package": ["1.0.0"],
+    "direct-musl-package": ["1.0.0"],
+    "glibc-package": ["1.0.0"],
+    "musl-package": ["1.0.0"],
   };
   for (const [name, packageVersions] of Object.entries(versions)) {
     for (const version of packageVersions) {
+      const libc = name === "glibc-package"
+        ? ["glibc"]
+        : name === "musl-package" || name === "direct-musl-package"
+          ? ["musl"]
+          : undefined;
       fs.writeFileSync(
         path.join(registryRoot, `${name}-${version}.tgz`),
-        packageArchive({ name, version }),
+        packageArchive({
+          name,
+          version,
+          ...(libc ? { os: ["linux"], cpu: [process.arch], libc } : {}),
+        }),
       );
     }
   }
@@ -289,6 +301,11 @@ server.listen(0, () => fs.writeFileSync(portFile, String(server.address().port))
         "age-package": "*",
         "excluded-package": "*",
         "invalid-time-package": "*",
+        "direct-musl-package": "*",
+      },
+      optionalDependencies: {
+        "glibc-package": "*",
+        "musl-package": "*",
       },
     });
     fs.writeFileSync(
@@ -312,6 +329,22 @@ server.listen(0, () => fs.writeFileSync(portFile, String(server.address().port))
       JSON.parse(fs.readFileSync(path.join(root, "node_modules", "invalid-time-package", "package.json"))).version,
       "1.0.0",
     );
+    if (process.platform === "linux") {
+      assert.ok(fs.existsSync(path.join(root, "node_modules", "glibc-package", "package.json")));
+      assert.ok(!fs.existsSync(path.join(root, "node_modules", "musl-package")));
+      assert.ok(!fs.existsSync(path.join(root, "node_modules", "direct-musl-package")));
+
+      // Bun's current lock format does not persist libc metadata, so a
+      // lockfile reinstall must rehydrate it from the package archives.
+      fs.rmSync(path.join(root, "node_modules"), { recursive: true, force: true });
+      const lockedResult = runInstall(root, home, ["--no-verify"], {
+        BUN_CONFIG_TOKEN: "edge-token",
+      });
+      expectSuccess("registry libc install from legacy lock metadata", lockedResult);
+      assert.ok(fs.existsSync(path.join(root, "node_modules", "glibc-package", "package.json")));
+      assert.ok(!fs.existsSync(path.join(root, "node_modules", "musl-package")));
+      assert.ok(!fs.existsSync(path.join(root, "node_modules", "direct-musl-package")));
+    }
 
     const stats = JSON.parse(fs.readFileSync(statsFile, "utf8"));
     assert.ok(stats.retryManifestRequests >= 3, "429 manifest response was not retried");
@@ -332,6 +365,38 @@ server.listen(0, () => fs.writeFileSync(portFile, String(server.address().port))
     );
     assert.ok(crossOriginTarball, "cross-origin tarball was not requested");
     assert.equal(crossOriginTarball.authorization, null);
+
+    if (process.platform === "linux") {
+      const offlineRoot = path.join(scratch, "registry-offline-project");
+      const offlineHome = path.join(scratch, "registry-offline-home");
+      writeJson(path.join(offlineRoot, "package.json"), {
+        name: "registry-offline-project",
+        version: "1.0.0",
+        dependencies: { "edge-package": "*" },
+      });
+      fs.writeFileSync(
+        path.join(offlineRoot, "bunfig.toml"),
+        `[install]\nregistry = "http://127.0.0.1:${port}/"\n`,
+      );
+      expectSuccess(
+        "registry offline fixture initial install",
+        runInstall(offlineRoot, offlineHome, ["--no-verify"]),
+      );
+
+      const lockPath = path.join(offlineRoot, "bun.lock");
+      const lockSource = fs.readFileSync(lockPath, "utf8");
+      const unreachableLockSource = lockSource.replaceAll(`:${port}`, ":1");
+      assert.notEqual(unreachableLockSource, lockSource, "offline fixture lock should contain registry URLs");
+      fs.writeFileSync(lockPath, unreachableLockSource);
+      fs.rmSync(path.join(offlineHome, ".bun", "install", "cache"), {
+        recursive: true,
+        force: true,
+      });
+      expectSuccess(
+        "intact legacy lock reinstall without registry or tarball cache",
+        runInstall(offlineRoot, offlineHome, ["--no-verify"]),
+      );
+    }
   } finally {
     server.kill();
   }

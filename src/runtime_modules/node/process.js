@@ -276,6 +276,113 @@ function createEventApi(processObject) {
     });
   }
 
+  if (
+    processObject.platform !== "win32" &&
+    cottontail.isWorker?.() !== true &&
+    typeof cottontail.signalStart === "function" &&
+    typeof cottontail.signalStop === "function"
+  ) {
+    // libuv cannot coexist safely with Cottontail's synchronous crash
+    // handlers yet. Those event names remain valid EventEmitter events, but
+    // do not take ownership of the native signal disposition in this pass.
+    const crashSignalNames = new Set([
+      "SIGABRT", "SIGIOT", "SIGBUS", "SIGFPE", "SIGILL", "SIGSEGV",
+    ]);
+    const nativeSignalNumber = type => {
+      if (
+        typeof type !== "string" ||
+        crashSignalNames.has(type) ||
+        !Object.prototype.hasOwnProperty.call(signalConstants, type)
+      ) {
+        return undefined;
+      }
+      return signalConstants[type];
+    };
+    const startListeningIfSignal = type => {
+      const number = nativeSignalNumber(type);
+      if (number === undefined) return false;
+      const status = Number(cottontail.signalStart(type, number));
+      if (status === 0) return true;
+      const code = uvErrorMap.get(status)?.[0] ?? "UNKNOWN";
+      const error = nodeError(Error, code, `uv_signal_start ${code}`);
+      error.errno = status;
+      error.syscall = "uv_signal_start";
+      throw error;
+    };
+    const stopListeningIfSignal = type => {
+      const number = nativeSignalNumber(type);
+      if (number === undefined || processObject.listenerCount(type) !== 0) return;
+      cottontail.signalStop(type, number);
+    };
+
+    const addListener = function addListener(type, listener) {
+      if (
+        this !== processObject ||
+        typeof listener !== "function" ||
+        nativeSignalNumber(type) === undefined
+      ) {
+        return EventEmitter.prototype.addListener.call(this, type, listener);
+      }
+      const started = processObject.listenerCount(type) === 0 && startListeningIfSignal(type);
+      try {
+        return EventEmitter.prototype.addListener.call(this, type, listener);
+      } catch (error) {
+        if (started && processObject.listenerCount(type) === 0) stopListeningIfSignal(type);
+        throw error;
+      }
+    };
+    const prependListener = function prependListener(type, listener) {
+      if (
+        this !== processObject ||
+        typeof listener !== "function" ||
+        nativeSignalNumber(type) === undefined
+      ) {
+        return EventEmitter.prototype.prependListener.call(this, type, listener);
+      }
+      const started = processObject.listenerCount(type) === 0 && startListeningIfSignal(type);
+      try {
+        return EventEmitter.prototype.prependListener.call(this, type, listener);
+      } catch (error) {
+        if (started && processObject.listenerCount(type) === 0) stopListeningIfSignal(type);
+        throw error;
+      }
+    };
+    const removeListener = function removeListener(type, listener) {
+      try {
+        return EventEmitter.prototype.removeListener.call(this, type, listener);
+      } finally {
+        if (this === processObject) stopListeningIfSignal(type);
+      }
+    };
+    const removeAllListeners = function removeAllListeners(type) {
+      const removeEveryEvent = arguments.length === 0;
+      try {
+        return removeEveryEvent
+          ? EventEmitter.prototype.removeAllListeners.call(this)
+          : EventEmitter.prototype.removeAllListeners.call(this, type);
+      } finally {
+        if (this === processObject) {
+          if (removeEveryEvent) {
+            for (const name of Object.keys(signalConstants)) stopListeningIfSignal(name);
+          } else {
+            stopListeningIfSignal(type);
+          }
+        }
+      }
+    };
+
+    processObject.addListener = processObject.on = addListener;
+    processObject.prependListener = prependListener;
+    processObject.once = function once(type, listener) {
+      return EventEmitter.prototype.once.call(this, type, listener);
+    };
+    processObject.prependOnceListener = function prependOnceListener(type, listener) {
+      return EventEmitter.prototype.prependOnceListener.call(this, type, listener);
+    };
+    processObject.removeListener = processObject.off = removeListener;
+    processObject.removeAllListeners = removeAllListeners;
+  }
+
   for (const [name, handlers] of legacyListeners) {
     for (const handler of handlers) processObject.on(name, handler);
   }
@@ -347,7 +454,9 @@ function pickConstants(predicate) {
   return Object.freeze(out);
 }
 
-const errnoConstants = pickConstants((name, value) => /^E[A-Z0-9]+$/.test(name) && Number.isInteger(value));
+const errnoConstants = pickConstants(
+  (name, value) => /^E[A-Z0-9]+$/.test(name) && !name.startsWith("ENGINE_") && Number.isInteger(value),
+);
 const signalConstants = pickConstants((name, value) => /^SIG[A-Z0-9]+$/.test(name) && Number.isInteger(value));
 const signalNamesByNumber = new Map();
 for (const signals of [signalConstants, fallbackSignalNumbers]) {
@@ -650,6 +759,12 @@ function makeOsBinding() {
   const loadavgValues = () => {
     if (processObject.platform === "win32") return [0, 0, 0];
     try {
+      const values = cottontail.osLoadavg?.();
+      if (Array.isArray(values) && values.length === 3 && values.every(Number.isFinite)) {
+        return values.map(Number);
+      }
+    } catch {}
+    try {
       const source = cottontail.existsSync?.("/proc/loadavg") ? cottontail.readFile("/proc/loadavg") : "";
       const matches = String(source).match(/[-+]?\d+(?:\.\d+)?/g) ?? [];
       return [0, 1, 2].map((index) => Number(matches[index] ?? 0));
@@ -657,6 +772,49 @@ function makeOsBinding() {
       return [0, 0, 0];
     }
   };
+  const systemUptime = () => {
+    try {
+      const value = Number(cottontail.osUptime?.());
+      if (Number.isFinite(value) && value >= 0) return value;
+    } catch {}
+    return Math.max(0, Number(processInfo("uptime")) || 0);
+  };
+  const availableParallelism = () => {
+    try {
+      const value = Number(cottontail.osAvailableParallelism?.());
+      if (Number.isInteger(value) && value > 0) return value;
+    } catch {}
+    return Math.max(1, Number(cottontail.cpuCount?.() || 1));
+  };
+  const memoryValue = (nativeName, fallbackKind) => {
+    try {
+      const value = Number(cottontail[nativeName]?.());
+      if (Number.isFinite(value) && value >= 0) return value;
+    } catch {}
+    return Number(processInfo(fallbackKind)) || 0;
+  };
+  const flattenedCpuInfo = () => {
+    let records;
+    try {
+      records = cottontail.osCpuInfo?.();
+    } catch {}
+    if (!Array.isArray(records)) records = runtimeDiagnostics().cpus;
+    const output = [];
+    for (const record of records ?? []) {
+      const times = record?.times ?? {};
+      output.push(
+        String(record?.model ?? ""),
+        Number(record?.speed) || 0,
+        Number(times.user) || 0,
+        Number(times.nice) || 0,
+        Number(times.sys) || 0,
+        Number(times.idle) || 0,
+        Number(times.irq) || 0,
+      );
+    }
+    return output;
+  };
+  const isBigEndian = new Uint8Array(new Uint16Array([0x0102]).buffer)[0] === 0x01;
   return Object.freeze({
     getHostname: () => cottontail.hostname(),
     getLoadAvg(target = undefined) {
@@ -664,12 +822,11 @@ function makeOsBinding() {
       if (target && typeof target.length === "number") {
         for (let index = 0; index < 3; index += 1) target[index] = values[index];
       }
-      return values;
     },
-    getUptime: () => Math.max(0, Number(processInfo("uptime")) || 0),
-    getTotalMem: () => Number(processInfo("totalMemory")) || 0,
-    getFreeMem: () => Number(processInfo("freeMemory")) || 0,
-    getCPUs: () => runtimeDiagnostics().cpus,
+    getUptime: systemUptime,
+    getTotalMem: () => memoryValue("osTotalMemory", "totalMemory"),
+    getFreeMem: () => memoryValue("osFreeMemory", "freeMemory"),
+    getCPUs: flattenedCpuInfo,
     getInterfaceAddresses: () => typeof cottontail.osNetworkInterfaces === "function" ? cottontail.osNetworkInterfaces() : [],
     getHomeDirectory: () => cottontail.env("HOME") || cottontail.env("USERPROFILE") || "/",
     getUserInfo: () => ({
@@ -681,12 +838,12 @@ function makeOsBinding() {
     }),
     setPriority: (pid, priority) => cottontail.osSetPriority?.(Number(pid || processObject.pid), Number(priority)),
     getPriority: (pid = 0) => typeof cottontail.osGetPriority === "function" ? Number(cottontail.osGetPriority(Number(pid || processObject.pid))) : 0,
-    getAvailableParallelism: () => Math.max(1, Number(cottontail.cpuCount?.() || 1)),
+    getAvailableParallelism: availableParallelism,
     getOSInformation: () => {
       const os = runtimeDiagnostics().os;
-      return [os.name, os.release, os.version, os.machine];
+      return [os.name, os.version, os.release, os.machine];
     },
-    isBigEndian: () => false,
+    isBigEndian,
   });
 }
 
@@ -879,6 +1036,12 @@ function makeProcessBinding(name) {
       return makeFsBinding();
     case "buffer":
       return makeBufferBinding();
+    case "os":
+      return makeOsBinding();
+    case "spawn_sync":
+      return makeSpawnSyncBinding();
+    case "zlib":
+      return makeZlibBinding();
     case "uv":
       return uvBinding;
     case "util":
@@ -1985,7 +2148,276 @@ if (processObject[exitCodeStateKey] == null) {
 export let exitCode = exitCodeState.value;
 exitCodeState.updateBinding = value => { exitCode = value; };
 export let sourceMapsEnabled = sourceMapsState;
-export const allowedNodeEnvironmentFlags = new ImmutableSet([]);
+// Canonical NODE_OPTIONS spellings exposed by Node 24. ImmutableSet.has()
+// accepts Node's underscore, omitted-prefix, and `--flag=value` variants.
+const allowedNodeEnvironmentFlagValues = `
+--abort-on-uncaught-exception
+--addons
+--allow-addons
+--allow-child-process
+--allow-fs-read
+--allow-fs-write
+--allow-wasi
+--allow-worker
+--async-context-frame
+--conditions
+--cpu-prof
+--cpu-prof-dir
+--cpu-prof-interval
+--cpu-prof-name
+--debug-arraybuffer-allocations
+--debug-port
+--deprecation
+--diagnostic-dir
+--disable-proto
+--disable-sigusr1
+--disable-warning
+--disable-wasm-trap-handler
+--disallow-code-generation-from-strings
+--dns-result-order
+--enable-etw-stack-walking
+--enable-fips
+--enable-network-family-autoselection
+--enable-source-maps
+--entry-url
+--es-module-specifier-resolution
+--experimental-abortcontroller
+--experimental-addon-modules
+--experimental-detect-module
+--experimental-eventsource
+--experimental-fetch
+--experimental-global-customevent
+--experimental-global-navigator
+--experimental-global-webcrypto
+--experimental-import-meta-resolve
+--experimental-json-modules
+--experimental-loader
+--experimental-modules
+--experimental-print-required-tla
+--experimental-quic
+--experimental-repl-await
+--experimental-report
+--experimental-require-module
+--experimental-shadow-realm
+--experimental-specifier-resolution
+--experimental-sqlite
+--experimental-strip-types
+--experimental-test-isolation
+--experimental-top-level-await
+--experimental-transform-types
+--experimental-vm-modules
+--experimental-wasi-unstable-preview1
+--experimental-wasm-modules
+--experimental-websocket
+--experimental-webstorage
+--experimental-worker
+--expose-gc
+--extra-info-on-fatal-exception
+--force-async-hooks-checks
+--force-context-aware
+--force-fips
+--force-node-api-uncaught-exceptions-policy
+--frozen-intrinsics
+--global-search-paths
+--heap-prof
+--heap-prof-dir
+--heap-prof-interval
+--heap-prof-name
+--heapsnapshot-near-heap-limit
+--heapsnapshot-signal
+--http-parser
+--icu-data-dir
+--import
+--input-type
+--insecure-http-parser
+--inspect
+--inspect-brk
+--inspect-port
+--inspect-publish-uid
+--inspect-wait
+--interpreted-frames-native-stack
+--jitless
+--loader
+--localstorage-file
+--max-http-header-size
+--max-old-space-size
+--max-old-space-size-percentage
+--max-semi-space-size
+--napi-modules
+--network-family-autoselection
+--network-family-autoselection-attempt-timeout
+--no-addons
+--no-allow-addons
+--no-allow-child-process
+--no-allow-wasi
+--no-allow-worker
+--no-async-context-frame
+--no-cpu-prof
+--no-debug-arraybuffer-allocations
+--no-deprecation
+--no-disable-sigusr1
+--no-disable-wasm-trap-handler
+--no-enable-fips
+--no-enable-source-maps
+--no-entry-url
+--no-experimental-addon-modules
+--no-experimental-detect-module
+--no-experimental-eventsource
+--no-experimental-global-navigator
+--no-experimental-import-meta-resolve
+--no-experimental-print-required-tla
+--no-experimental-repl-await
+--no-experimental-require-module
+--no-experimental-shadow-realm
+--no-experimental-sqlite
+--no-experimental-strip-types
+--no-experimental-transform-types
+--no-experimental-vm-modules
+--no-experimental-websocket
+--no-experimental-webstorage
+--no-extra-info-on-fatal-exception
+--no-force-async-hooks-checks
+--no-force-context-aware
+--no-force-fips
+--no-force-node-api-uncaught-exceptions-policy
+--no-frozen-intrinsics
+--no-global-search-paths
+--no-heap-prof
+--no-insecure-http-parser
+--no-inspect
+--no-inspect-brk
+--no-inspect-wait
+--no-network-family-autoselection
+--no-node-snapshot
+--no-openssl-legacy-provider
+--no-openssl-shared-config
+--no-pending-deprecation
+--no-permission
+--no-preserve-symlinks
+--no-preserve-symlinks-main
+--no-report-compact
+--no-report-exclude-env
+--no-report-exclude-network
+--no-report-on-fatalerror
+--no-report-on-signal
+--no-report-uncaught-exception
+--no-test-only
+--no-throw-deprecation
+--no-tls-max-v1.2
+--no-tls-max-v1.3
+--no-tls-min-v1.0
+--no-tls-min-v1.1
+--no-tls-min-v1.2
+--no-tls-min-v1.3
+--no-trace-deprecation
+--no-trace-env
+--no-trace-env-js-stack
+--no-trace-env-native-stack
+--no-trace-exit
+--no-trace-promises
+--no-trace-sigint
+--no-trace-sync-io
+--no-trace-tls
+--no-trace-uncaught
+--no-trace-warnings
+--no-track-heap-objects
+--no-use-bundled-ca
+--no-use-env-proxy
+--no-use-openssl-ca
+--no-use-system-ca
+--no-verify-base-objects
+--no-warnings
+--no-watch
+--no-watch-preserve-output
+--no-zero-fill-buffers
+--node-memory-debug
+--node-snapshot
+--openssl-config
+--openssl-legacy-provider
+--openssl-shared-config
+--pending-deprecation
+--perf-basic-prof
+--perf-basic-prof-only-functions
+--perf-prof
+--perf-prof-unwinding-info
+--permission
+--preserve-symlinks
+--preserve-symlinks-main
+--prof-process
+--redirect-warnings
+--report-compact
+--report-dir
+--report-directory
+--report-exclude-env
+--report-exclude-network
+--report-filename
+--report-on-fatalerror
+--report-on-signal
+--report-signal
+--report-uncaught-exception
+--require
+--secure-heap
+--secure-heap-min
+--snapshot-blob
+--stack-trace-limit
+--test-coverage-branches
+--test-coverage-exclude
+--test-coverage-functions
+--test-coverage-include
+--test-coverage-lines
+--test-global-setup
+--test-isolation
+--test-name-pattern
+--test-only
+--test-reporter
+--test-reporter-destination
+--test-rerun-failures
+--test-shard
+--test-skip-pattern
+--throw-deprecation
+--title
+--tls-cipher-list
+--tls-keylog
+--tls-max-v1.2
+--tls-max-v1.3
+--tls-min-v1.0
+--tls-min-v1.1
+--tls-min-v1.2
+--tls-min-v1.3
+--trace-deprecation
+--trace-env
+--trace-env-js-stack
+--trace-env-native-stack
+--trace-event-categories
+--trace-event-file-pattern
+--trace-events-enabled
+--trace-exit
+--trace-promises
+--trace-require-module
+--trace-sigint
+--trace-sync-io
+--trace-tls
+--trace-uncaught
+--trace-warnings
+--track-heap-objects
+--unhandled-rejections
+--use-bundled-ca
+--use-env-proxy
+--use-largepages
+--use-openssl-ca
+--use-system-ca
+--v8-pool-size
+--verify-base-objects
+--warnings
+--watch
+--watch-kill-signal
+--watch-path
+--watch-preserve-output
+--zero-fill-buffers
+-C
+-r
+`.trim().split(/\s+/);
+export const allowedNodeEnvironmentFlags = new ImmutableSet(allowedNodeEnvironmentFlagValues);
 processObject.allowedNodeEnvironmentFlags = allowedNodeEnvironmentFlags;
 const exitCodeDescriptor = Object.getOwnPropertyDescriptor(processObject, "exitCode");
 if (exitCodeDescriptor == null || exitCodeDescriptor.configurable) {
@@ -2084,9 +2516,18 @@ export const kill = processObject.kill = (targetPid, signal = "SIGTERM") => {
       `The "signal" argument must be one of type string or number. Received type ${typeof signal}`);
   }
   const signalValue = signalNumber(signal ?? "SIGTERM");
+  const isKnownSignal = signalValue === 0 ||
+    Object.values(signalConstants).includes(signalValue) ||
+    Object.values(fallbackSignalNumbers).includes(signalValue);
+  const isExternalLinuxRealtimeSignal =
+    processObject.platform === "linux" &&
+    typeof signal === "number" &&
+    pidNumber > 0 &&
+    pidNumber !== processObject.pid &&
+    signalValue >= 32 &&
+    signalValue <= 64;
   if (!Number.isInteger(signalValue) || signalValue < 0 || signalValue > 64 ||
-      (signalValue !== 0 && !Object.values(signalConstants).includes(signalValue) &&
-        !Object.values(fallbackSignalNumbers).includes(signalValue))) {
+      (!isKnownSignal && !isExternalLinuxRealtimeSignal)) {
     const error = nodeError(Error, "EINVAL", `kill EINVAL`);
     error.errno = -(errnoConstants.EINVAL ?? 22);
     error.syscall = "kill";
@@ -2111,14 +2552,26 @@ export const kill = processObject.kill = (targetPid, signal = "SIGTERM") => {
   } catch (cause) {
     if (cause instanceof Error) throw cause;
     const text = String(cause);
-    const code = /no such process/i.test(text) ? "ESRCH" : /permission/i.test(text) ? "EPERM" : "UNKNOWN";
+    const code = /no such process/i.test(text)
+      ? "ESRCH"
+      : /permission/i.test(text)
+        ? "EPERM"
+        : /invalid argument/i.test(text)
+          ? "EINVAL"
+          : "UNKNOWN";
     const error = nodeError(Error, code, `kill ${code}`);
     error.errno = -(errnoConstants[code] ?? 1);
     error.syscall = "kill";
     throw error;
   }
   if (typeof result === "number" && result < 0) {
-    const code = result === -(errnoConstants.ESRCH ?? 3) ? "ESRCH" : result === -(errnoConstants.EPERM ?? 1) ? "EPERM" : "UNKNOWN";
+    const code = result === -(errnoConstants.ESRCH ?? 3)
+      ? "ESRCH"
+      : result === -(errnoConstants.EPERM ?? 1)
+        ? "EPERM"
+        : result === -(errnoConstants.EINVAL ?? 22)
+          ? "EINVAL"
+          : "UNKNOWN";
     const error = nodeError(Error, code, `kill ${code}`);
     error.errno = result;
     error.syscall = "kill";

@@ -341,6 +341,7 @@ const RegistryManifestFetch = struct {
     authorization: ?[]const u8,
     cache_path: ?[]const u8,
     accept: []const u8,
+    max_retry_count: u16,
     bytes: ?[]u8 = null,
     failure: ?anyerror = null,
 
@@ -367,17 +368,28 @@ const RegistryManifestFetch = struct {
             header_count += 1;
         }
 
-        var output: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
-        defer output.deinit();
-        const result = try client.fetch(.{
-            .location = .{ .url = fetch_state.url },
-            .response_writer = &output.writer,
-            .extra_headers = headers[0..header_count],
-        });
-        const status: u16 = @intFromEnum(result.status);
-        if (status < 200 or status >= 300) return error.RegistryManifestRequestFailed;
-        if (output.written().len > max_manifest_bytes) return error.ResponseTooLarge;
-        fetch_state.bytes = try output.toOwnedSlice();
+        var attempt: usize = 0;
+        while (attempt <= fetch_state.max_retry_count) : (attempt += 1) {
+            var output: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
+            defer output.deinit();
+            const result = client.fetch(.{
+                .location = .{ .url = fetch_state.url },
+                .response_writer = &output.writer,
+                .extra_headers = headers[0..header_count],
+            }) catch |err| {
+                if (attempt == fetch_state.max_retry_count) return err;
+                continue;
+            };
+            const status: u16 = @intFromEnum(result.status);
+            if (status >= 200 and status < 300) {
+                if (output.written().len > max_manifest_bytes) return error.ResponseTooLarge;
+                fetch_state.bytes = try output.toOwnedSlice();
+                return;
+            }
+            if ((status >= 500 or status == 429) and attempt < fetch_state.max_retry_count) continue;
+            return error.RegistryManifestRequestFailed;
+        }
+        unreachable;
     }
 };
 
@@ -6995,8 +7007,11 @@ const Manager = struct {
             manager.options.cpu,
             manager.options.os,
         );
+        // npm's compact install manifest omits `libc`. Hydrate the selected
+        // package from the archive Linux installs already need so glibc and
+        // musl variants with the same OS/CPU metadata are not both selected.
         if (platform_matches and
-            (optional or manager.options.cpu_overridden or manager.options.os_overridden) and
+            (builtin.os.tag == .linux or optional or manager.options.cpu_overridden or manager.options.os_overridden) and
             !manager.options.lockfile_only and !manager.options.dry_run)
         {
             const archive = try manager.fetchRegistryArchive(resolved.archive(), fetch_log_level);
@@ -7251,6 +7266,34 @@ const Manager = struct {
         }
     }
 
+    fn archiveForLockedRegistryPackage(
+        manager: *Manager,
+        package: *const Lockfile.Package,
+    ) !RegistryArchive {
+        if (package.source.len > 0 and
+            !std.mem.startsWith(u8, package.source, "https://") and
+            !std.mem.startsWith(u8, package.source, "http://"))
+        {
+            try manager.stderr.print(
+                "error: Expected tarball URL to start with https:// or http://, got \"{s}\" while fetching package \"{s}\"\n",
+                .{ package.source, package.name },
+            );
+            return error.PackageManagerErrorReported;
+        }
+        const registry = manager.registryConfigForPackage(package.name);
+        const tarball_url = if (package.source.len > 0)
+            try resolveRegistryTarballURL(manager.allocator, registry.url, package.source)
+        else
+            try manager.defaultTarballURL(package.name, package.version);
+        return .{
+            .name = package.name,
+            .version = package.version,
+            .tarball = tarball_url,
+            .integrity = if (package.integrity.len > 0) package.integrity else null,
+            .authorization = manager.authorizationForPackageURL(package.name, tarball_url),
+        };
+    }
+
     fn installLockedPackage(
         manager: *Manager,
         selection: LockedSelection,
@@ -7269,9 +7312,40 @@ const Manager = struct {
             try manager.trackIsolatedPlacement(try manager.packagePlacementFromLock(package, selection.peer_context));
             _ = try manager.peerContextForPackage(package.info, parent_dir, true);
         }
+        var package_metadata = package.info;
+        var prefetched_archive: ?[]const u8 = null;
+        var locked_archive_request: ?RegistryArchive = null;
+        const needs_libc_probe = package_metadata == null or
+            package_metadata.?.* != .object or
+            package_metadata.?.object.get("libc") == null;
+        // Bun text/binary locks created by older clients can omit `libc`.
+        // Rehydrate Linux package metadata before applying a shared lock.
+        if (builtin.os.tag == .linux and
+            package.kind == .npm and
+            needs_libc_probe and
+            !manager.options.lockfile_only and !manager.options.dry_run)
+        {
+            // An intact install contains the package.json from the selected
+            // archive and is authoritative for this exact name/version. Read
+            // it before consulting the cache or registry so a legacy lock does
+            // not turn a no-op reinstall into a network operation.
+            const installed_matches = !manager.options.force and
+                try manager.installedPackageMatches(selection.destination, package.name, package.version);
+            package_metadata = if (installed_matches)
+                try manager.metadataForInstalledPackage(selection.destination, null)
+            else
+                null;
+            if (package_metadata == null) {
+                const archive_request = try manager.archiveForLockedRegistryPackage(package);
+                locked_archive_request = archive_request;
+                const archive = try manager.fetchRegistryArchive(archive_request, if (optional) .warn else .err);
+                prefetched_archive = archive;
+                package_metadata = try manager.readTarballPackageJSON(archive);
+            }
+        }
         const skip_for_platform = package.kind == .npm and
-            package.info != null and
-            !packageSupportsPlatform(package.info.?, manager.options.cpu, manager.options.os);
+            package_metadata != null and
+            !packageSupportsPlatform(package_metadata.?, manager.options.cpu, manager.options.os);
         if (skip_for_platform) {
             const previous_resolution_only = manager.setResolutionOnly(true);
             defer manager.restoreResolutionOnly(previous_resolution_only);
@@ -7286,11 +7360,11 @@ const Manager = struct {
                 .tarball = package.source,
                 .git_resolved = package.git_resolved,
                 .integrity = package.integrity,
-                .metadata = package.info,
+                .metadata = package_metadata,
                 .peer_hash = selection.peer_context.hash,
                 .install_dir = selection.destination,
             });
-            try manager.rememberPackageMetadata(selection.destination, package.info);
+            try manager.rememberPackageMetadata(selection.destination, package_metadata);
             return package.version;
         }
         switch (package.kind) {
@@ -7298,45 +7372,24 @@ const Manager = struct {
                 try manager.ensureProjectInstallCache();
                 const patch_paths = try manager.packagePatchPaths(package.name, package.version, protocol_patch_paths);
                 var installed = false;
-                const package_metadata = package.info;
                 if (!manager.options.lockfile_only and !manager.options.dry_run) {
                     installed = !manager.options.force and
                         try manager.installedPackageMatches(selection.destination, package.name, package.version) and
                         try manager.packagePatchStateMatches(selection.destination, patch_paths);
                     if (!installed) {
-                        if (package.source.len > 0 and
-                            !std.mem.startsWith(u8, package.source, "https://") and
-                            !std.mem.startsWith(u8, package.source, "http://"))
-                        {
-                            try manager.stderr.print(
-                                "error: Expected tarball URL to start with https:// or http://, got \"{s}\" while fetching package \"{s}\"\n",
-                                .{ package.source, package.name },
-                            );
-                            return error.PackageManagerErrorReported;
-                        }
-                        const registry = manager.registryConfigForPackage(package.name);
-                        const tarball_url = if (package.source.len > 0)
-                            try resolveRegistryTarballURL(manager.allocator, registry.url, package.source)
-                        else
-                            try manager.defaultTarballURL(package.name, package.version);
-                        const archive_request: RegistryArchive = .{
-                            .name = package.name,
-                            .version = package.version,
-                            .tarball = tarball_url,
-                            .integrity = if (package.integrity.len > 0) package.integrity else null,
-                            .authorization = manager.authorizationForPackageURL(package.name, tarball_url),
-                        };
+                        const archive_request = locked_archive_request orelse
+                            try manager.archiveForLockedRegistryPackage(package);
                         try manager.materializeRegistryArchive(
                             archive_request,
                             selection.destination,
                             patch_paths,
                             if (optional) .warn else .err,
-                            null,
+                            prefetched_archive,
                         );
-                        try manager.countRegistryInstall(package.name, package.version, tarball_url);
+                        try manager.countRegistryInstall(package.name, package.version, archive_request.tarball);
                     }
                     try manager.ensureIsolatedLinks(alias, parent_dir, selection.destination);
-                    if (package.info) |info| {
+                    if (package_metadata) |info| {
                         try manager.linkBins(alias, selection.destination, info, direct, parent_dir);
                     } else if (try manager.metadataForInstalledPackage(selection.destination, null)) |info| {
                         try manager.linkBins(alias, selection.destination, info, direct, parent_dir);
@@ -7353,7 +7406,7 @@ const Manager = struct {
                     .version = package.version,
                     .tarball = package.source,
                     .integrity = package.integrity,
-                    .metadata = package.info,
+                    .metadata = package_metadata,
                     .peer_hash = selection.peer_context.hash,
                     .install_dir = selection.destination,
                 });
@@ -10161,6 +10214,7 @@ const Manager = struct {
                 .authorization = configured_registry.authorization,
                 .cache_path = cache_path,
                 .accept = manager.registryManifestAccept(),
+                .max_retry_count = manager.max_retry_count,
             });
         }
 
@@ -12586,6 +12640,9 @@ fn packageSupportsPlatform(
     if (metadata.object.get("cpu")) |cpu| {
         if (!platformSetFromJson(Npm.Architecture, cpu).isMatch(cpu_target)) return false;
     }
+    if (builtin.os.tag == .linux) if (metadata.object.get("libc")) |libc| {
+        if (!platformSetFromJson(Npm.Libc, libc).isMatch(Npm.Libc.current)) return false;
+    };
     return true;
 }
 
@@ -13636,6 +13693,39 @@ test "package specs preserve scoped names and ranges" {
     const raw_git = splitPackageSpec("git@github.com:owner/repository.git");
     try std.testing.expect(raw_git.name == null);
     try std.testing.expectEqualStrings("git@github.com:owner/repository.git", raw_git.spec);
+}
+
+test "package platform metadata includes libc" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const glibc = try std.json.parseFromSliceLeaky(
+        Value,
+        allocator,
+        "{\"libc\":[\"glibc\"]}",
+        .{},
+    );
+    const musl = try std.json.parseFromSliceLeaky(
+        Value,
+        allocator,
+        "{\"libc\":[\"musl\"]}",
+        .{},
+    );
+    const excluded_glibc = try std.json.parseFromSliceLeaky(
+        Value,
+        allocator,
+        "{\"libc\":[\"!glibc\"]}",
+        .{},
+    );
+
+    try std.testing.expect(packageSupportsPlatform(&glibc, .current, .current));
+    if (builtin.os.tag == .linux) {
+        try std.testing.expect(!packageSupportsPlatform(&musl, .current, .current));
+        try std.testing.expect(!packageSupportsPlatform(&excluded_glibc, .current, .current));
+    } else {
+        try std.testing.expect(packageSupportsPlatform(&musl, .current, .current));
+        try std.testing.expect(packageSupportsPlatform(&excluded_glibc, .current, .current));
+    }
 }
 
 test "security scanner package metadata uses declared ranges" {

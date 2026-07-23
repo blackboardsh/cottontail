@@ -1,4 +1,5 @@
-import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
+import { ChildProcess, execFile, execFileSync, spawn, spawnSync } from "node:child_process";
+import { ETIMEDOUT } from "node:constants";
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -89,6 +90,19 @@ assert(syncResult.stdout.toString() === "sync-out", "spawnSync stdout Buffer mis
 assert(syncResult.stderr.toString() === "sync-err", "spawnSync stderr Buffer mismatch");
 assert(syncResult.output[1].toString() === "sync-out", "spawnSync output stdout mismatch");
 
+const timeoutStartedAt = Date.now();
+const timeoutResult = spawnSync("sh", ["-c", "sleep 5"], { timeout: 10 });
+assert(timeoutResult.error?.code === "ETIMEDOUT", "spawnSync timeout code mismatch");
+assert(timeoutResult.error?.errno === -ETIMEDOUT, "spawnSync timeout errno mismatch");
+assert(Date.now() - timeoutStartedAt < 1_000, "spawnSync timeout waited for a descendant-held pipe");
+
+const platformSignalAlias = process.platform === "linux"
+  ? "SIGPOLL"
+  : process.platform === "darwin"
+    ? "SIGINFO"
+    : "SIGTERM";
+assert(new ChildProcess().kill(platformSignalAlias) === false, "child_process platform signal alias mismatch");
+
 const mixedStdioResult = spawnSync(process.execPath, ["-e", "process.stdout.write('mixed-stdio')"], {
   stdio: [process.stdin, "pipe", process.stderr],
 });
@@ -107,27 +121,13 @@ const maxBufferError = await new Promise<any>((resolve) => {
 });
 assert(maxBufferError?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", "execFile maxBuffer error mismatch");
 
-const controller = {
-  signal: {
-    aborted: false,
-    listener: undefined as undefined | (() => void),
-    addEventListener(name: string, listener: () => void) {
-      if (name === "abort") this.listener = listener;
-    },
-    removeEventListener(name: string, listener: () => void) {
-      if (name === "abort" && this.listener === listener) this.listener = undefined;
-    },
-  },
-  abort() {
-    this.signal.aborted = true;
-    this.signal.listener?.();
-  },
-};
-const abortChild = spawn("sh", ["-c", "sleep 5"], { signal: controller.signal, stdio: ["ignore", "pipe", "pipe"] });
+const controller = new AbortController();
+const abortChild = spawn("sh", ["-c", "exec sleep 5"], { signal: controller.signal, stdio: ["ignore", "pipe", "pipe"] });
 const abortError = new Promise<any>((resolve) => abortChild.on("error", resolve));
+const abortClose = new Promise<void>((resolve) => abortChild.on("close", () => resolve()));
 controller.abort();
 const aborted = await abortError;
 assert(aborted?.name === "AbortError", "spawn AbortSignal error mismatch");
-await new Promise<void>((resolve) => abortChild.on("close", () => resolve()));
+await abortClose;
 
 console.log("node child_process spawn passed");

@@ -926,12 +926,22 @@ function bunModuleMockFor(...keys) {
 
 // Builtins whose require() result must be the module's default-export object
 // rather than the namespace wrapper. Node guarantees identities like
-// require("fs/promises") === require("fs").promises, and fs.js exports its
-// `promises` property as the fs/promises default object; storing the raw
-// namespace here would break that identity (upstream fs tests assert it).
+// require("fs/promises") === require("fs").promises and
+// require("dns/promises") === require("dns").promises; storing the raw
+// namespace here would break those identities.
 const kUnwrapDefaultBuiltins = new Set([
+  // constants.js declares the union of platform-specific ESM names, while
+  // CommonJS exposes only the host-filtered default object.
+  "constants",
+  "node:constants",
+  // Buffer's CommonJS export is mutable; zlib and other Node APIs observe
+  // changes to that shared object.
+  "buffer",
+  "node:buffer",
   "fs/promises",
   "node:fs/promises",
+  "dns/promises",
+  "node:dns/promises",
   // Node's HTTP interceptors replace methods on the mutable CommonJS export.
   // Keep require(), ESM default imports, and named wrappers on that one object.
   "http",
@@ -2358,6 +2368,25 @@ function hasRuntimeDecoratorSyntax(source) {
   return false;
 }
 
+const explicitResourceManagementPattern = /\b(?:await\s+)?using\s+[$A-Z_a-z][$\w]*\s*=/g;
+
+function hasExplicitResourceManagementSyntax(source) {
+  const text = String(source);
+  if (!/\busing\b/.test(text)) return false;
+  const mask = codePositionMask(text);
+  explicitResourceManagementPattern.lastIndex = 0;
+  let match;
+  while ((match = explicitResourceManagementPattern.exec(text)) != null) {
+    const usingIndex = match.index + match[0].indexOf("using");
+    if (mask[usingIndex] === 1) return true;
+  }
+  return false;
+}
+
+function hasRuntimeTransformSyntax(source) {
+  return hasRuntimeDecoratorSyntax(source) || hasExplicitResourceManagementSyntax(source);
+}
+
 function formatForHookSource(resolved, source) {
   if (hasEsmSyntax(source)) return "module";
   if (hasCommonJsSyntax(source)) return "commonjs";
@@ -2388,7 +2417,7 @@ function maybeStripTypeScript(filename, source) {
 
 function maybeTransformRuntimeSyntax(filename, source) {
   const path = String(filename);
-  const needsTransform = hasRuntimeDecoratorSyntax(source);
+  const needsTransform = hasRuntimeTransformSyntax(source);
   if (!needsTransform || typeof cottontail.transpilerTransform !== "function") return source;
   const extension = path.toLowerCase().match(/\.([^.]+)$/)?.[1];
   const loader = extension === "tsx" ? "tsx"
@@ -2425,7 +2454,7 @@ function markModuleCompileError(error, filename, source, lineOffset = FUNCTION_W
   return error;
 }
 
-function compileModuleWrapper(args, source, filename) {
+function compileModuleWrapper(args, source, filename, diagnosticSource = source) {
   const useNativeCompiler = typeof cottontail.compileFunction === "function";
   try {
     if (useNativeCompiler) {
@@ -2433,7 +2462,20 @@ function compileModuleWrapper(args, source, filename) {
     }
     return new Function(...args, `${source}\n//# sourceURL=${filename}`);
   } catch (error) {
-    throw markModuleCompileError(error, filename, source, useNativeCompiler ? 1 : FUNCTION_WRAPPER_LINE_OFFSET);
+    throw markModuleCompileError(error, filename, diagnosticSource, useNativeCompiler ? 1 : FUNCTION_WRAPPER_LINE_OFFSET);
+  }
+}
+
+function compileAsyncModuleWrapper(args, source, filename, diagnosticSource = source) {
+  const useNativeCompiler = typeof cottontail.compileFunction === "function";
+  try {
+    if (useNativeCompiler) {
+      return cottontail.compileFunction(`(async function(${args.join(",")}) {\n${source}\n})`, filename);
+    }
+    const AsyncFunction = (async () => {}).constructor;
+    return new AsyncFunction(...args, `${source}\n//# sourceURL=${filename}`);
+  } catch (error) {
+    throw markModuleCompileError(error, filename, diagnosticSource, useNativeCompiler ? 1 : FUNCTION_WRAPPER_LINE_OFFSET);
   }
 }
 
@@ -2536,7 +2578,7 @@ function transpileExtensionSource(filename, loader, forceTransform = false, inpu
   };
   if (loader === "ts" && hasBunTranspiledPragma(source)) return finish(source);
   const extension = String(filename).toLowerCase().match(/\.[^.]+$/)?.[0];
-  const needsRuntimeTransform = hasRuntimeDecoratorSyntax(source);
+  const needsRuntimeTransform = hasRuntimeTransformSyntax(source);
   // Plain CommonJS JavaScript is already valid input for JSC. Keeping its
   // source layout intact preserves Node-compatible stack and source-map
   // coordinates instead of rewriting every require() through the transpiler.
@@ -3050,7 +3092,19 @@ function namespaceFromBuiltin(name, value) {
   // live value here would misclassify CommonJS-style builtins after user code
   // assigns an ordinary `.default` property to them.
   if (builtinNamespaceEntries.has(String(name))) return unwrapped;
-  return namespaceFromCommonJs(unwrapped);
+  const namespace = namespaceFromCommonJs(unwrapped);
+  // bun/index.js exports the global Bun object both as its default and as the
+  // named `Bun` binding. The builtin registry intentionally stores the plain
+  // object so require("bun") retains Bun's identity; restore the ESM-only
+  // alias on the synthetic namespace without adding a Bun.Bun property.
+  if (String(name) === "bun") {
+    Object.defineProperty(namespace, "Bun", {
+      configurable: true,
+      enumerable: true,
+      get: () => unwrapped,
+    });
+  }
+  return namespace;
 }
 
 function importedBindingEntries(names) {
@@ -3142,6 +3196,15 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
   // destructuring snapshots an incompletely initialized namespace; Svelte's
   // compiler graph, for example, intentionally closes a cycle between its
   // node constructors and map_children module.
+  output = replaceCodePattern(output,
+    /\bimport\s+([A-Za-z_$][\w$]*)\s*,\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s+from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
+    (_all, def, name, spec, attributeKeyword, attributes) => {
+      const namespace = importNamespace(spec, attributeKeyword, attributes);
+      importedBindings[def] = liveImportedBinding(namespace, "default");
+      importedBindings[name] = namespace;
+      return ";";
+    },
+  );
   output = replaceCodePattern(output,
     /\bimport\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s+from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
     (_all, name, spec, attributeKeyword, attributes) => {
@@ -3329,6 +3392,7 @@ const asyncDynamicEsmFactoryCache = new Map();
 
 function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, originalSource, ancestors = undefined) {
   const cacheKey = String(resolved);
+  const sourceName = `${resolvedPath}${suffix}`;
   const cached = asyncEsmModuleCache.get(cacheKey);
   if (cached !== undefined) {
     return ancestors?.has(cacheKey) ? cached.namespace : cached.promise;
@@ -3349,13 +3413,16 @@ function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, origina
     );
     maybeRegisterSourceMap(resolvedPath, transformed);
     recordCompileCache(resolvedPath, transformed);
-    const body = `${transformed}\n//# sourceURL=${resolvedPath}${suffix}`;
-    const AsyncFunction = (async () => {}).constructor;
     try {
-      run = new AsyncFunction(ESM_EXPORTS_BINDING, "__ctImportMeta", "__ctModuleAncestors", "Error", body);
+      run = compileAsyncModuleWrapper(
+        [ESM_EXPORTS_BINDING, "__ctImportMeta", "__ctModuleAncestors", "Error"],
+        transformed,
+        sourceName,
+        originalSource,
+      );
     } catch (error) {
       asyncEsmModuleCache.delete(cacheKey);
-      throw markModuleCompileError(error, resolvedPath, originalSource);
+      throw error;
     }
     asyncDynamicEsmFactoryCache.set(cacheKey, { source: originalSource, run });
   }
@@ -3363,7 +3430,7 @@ function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, origina
     namespace,
     importMetaForHookModule(resolvedPath, suffix),
     moduleAncestors,
-    dynamicModuleErrorConstructor(resolvedPath, originalSource),
+    dynamicModuleErrorConstructor(sourceName, originalSource),
   ).then(
     () => namespace,
     error => {
@@ -3376,6 +3443,7 @@ function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, origina
 
 function executeDynamicImportSource(resolved, source, format, forceAsync = false, asyncAncestors = undefined) {
   const { bare: resolvedPath, suffix } = splitSpecifierSuffix(resolved);
+  const sourceName = `${resolvedPath}${suffix}`;
   const sourceText = String(source ?? "").replace(/^#!/, "//");
   const effectiveFormat = format ?? formatForHookSource(resolvedPath, sourceText);
   if (effectiveFormat === "builtin") {
@@ -3438,9 +3506,13 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
     const transformed = transformEsmSourceForDynamicImport(maybeStripTypeScript(resolvedPath, originalSource));
     maybeRegisterSourceMap(resolvedPath, transformed);
     recordCompileCache(resolvedPath, transformed);
-    const body = `${transformed}\n//# sourceURL=${resolvedPath}${suffix}`;
     try {
-      run = new Function(ESM_EXPORTS_BINDING, "require", "__ctModuleRecord", "__ctImportMeta", "Error", body);
+      run = compileModuleWrapper(
+        [ESM_EXPORTS_BINDING, "require", "__ctModuleRecord", "__ctImportMeta", "Error"],
+        transformed,
+        sourceName,
+        originalSource,
+      );
     } catch (error) {
       // Dynamically imported ES modules may use top-level await (e.g. Bun.build
       // outputs re-imported via blob: URLs). Preserve synchronous evaluation for
@@ -3457,7 +3529,7 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
       createEsmRequire(hookRequireBase(resolvedPath), moduleRecord),
       moduleRecord,
       importMetaForHookModule(resolvedPath, suffix),
-      dynamicModuleErrorConstructor(resolvedPath, originalSource),
+      dynamicModuleErrorConstructor(sourceName, originalSource),
     );
   } catch (error) {
     if (!isAsyncModuleRequireError(error)) throw error;
@@ -5097,8 +5169,29 @@ function applyMaskRanges(source, ranges) {
   return chars.join("");
 }
 
+function moduleBindingAliasPositions(source) {
+  const positions = new Set();
+  const code = codeOnlyText(source);
+  const declarations = [
+    /\b(?:import|export)\s+(?:type\s+)?(?:[A-Za-z_$][\w$]*\s*,\s*)?\{[^{}]*\}/g,
+    /\b(?:import|export)\s+(?:type\s+)?(?:[A-Za-z_$][\w$]*\s*,\s*)?\*\s+as\s+[A-Za-z_$][\w$]*/g,
+  ];
+  for (const declaration of declarations) {
+    let match;
+    while ((match = declaration.exec(code)) != null) {
+      const aliasPattern = /\bas\b/g;
+      let alias;
+      while ((alias = aliasPattern.exec(match[0])) != null) {
+        positions.add(match.index + alias.index);
+      }
+    }
+  }
+  return positions;
+}
+
 function stripTypeScriptTypesPreserveWhitespace(source) {
   const ranges = [];
+  const moduleBindingAliases = moduleBindingAliasPositions(source);
   for (let cursor = 0; cursor < source.length; cursor += 1) {
     const char = source[cursor];
     if (char === "\"" || char === "'" || char === "`" || (char === "/" && (source[cursor + 1] === "/" || source[cursor + 1] === "*"))) {
@@ -5125,6 +5218,7 @@ function stripTypeScriptTypesPreserveWhitespace(source) {
       continue;
     }
     if (wordAt(source, cursor, "as")) {
+      if (moduleBindingAliases.has(cursor)) continue;
       addMaskRange(ranges, cursor, findTypeEnd(source, cursor + 2, new Set([";", ",", ")", "]", "}", "\n"])));
       continue;
     }
@@ -5328,6 +5422,7 @@ const pathWin32Builtin = pathBuiltin.win32 ?? (pathWin32.default ?? pathWin32);
 // (Node exposes fs.promises as the exact fs/promises module object).
 const fsBuiltin = fs.default ?? fs;
 const fsPromisesBuiltin = fsBuiltin.promises ?? (fsPromises.default ?? fsPromises);
+const constantsBuiltin = nodeConstants.default ?? nodeConstants;
 // CommonJS exposes a mutable object for node:buffer. Some Node APIs, including
 // zlib's global output limit, intentionally observe mutations to that object.
 const bufferBuiltin = buffer.default ?? buffer;
@@ -5427,8 +5522,8 @@ __setBuiltinModules({
   "node:cluster": cluster,
   console: consoleBuiltin,
   "node:console": consoleBuiltin,
-  constants: nodeConstants,
-  "node:constants": nodeConstants,
+  constants: constantsBuiltin,
+  "node:constants": constantsBuiltin,
   crypto,
   "node:crypto": crypto,
   diagnostics_channel: diagnosticsChannel,

@@ -50,6 +50,82 @@ describe("node:vm native context realms", () => {
       .toBe(symbol);
   });
 
+  test("context globals synchronize after asynchronous evaluation", async () => {
+    const context = vm.createContext({});
+    const result = await vm.runInContext(
+      "(async () => { await Promise.resolve(); globalThis.asyncValue = 42; return asyncValue; })()",
+      context,
+    );
+
+    expect(result).toBe(42);
+    expect(context.asyncValue).toBe(42);
+    expect(vm.runInContext("asyncValue * 2", context)).toBe(84);
+  });
+
+  test("asynchronous exports preserve intervening host sandbox changes", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const context = vm.createContext({ gate, deletedByHost: 1, changedByHost: 1 });
+    const result = vm.runInContext(
+      "(async () => { await gate; globalThis.changedInVm = 42; })()",
+      context,
+    );
+
+    delete context.deletedByHost;
+    context.changedByHost = 9;
+    release();
+    await result;
+
+    expect(context.deletedByHost).toBe(undefined);
+    expect(context.changedByHost).toBe(9);
+    expect(context.changedInVm).toBe(42);
+  });
+
+  test("concurrent asynchronous exports compare against the latest VM state", async () => {
+    let releaseFirst!: () => void;
+    let releaseSecond!: () => void;
+    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
+    const secondGate = new Promise<void>(resolve => { releaseSecond = resolve; });
+    const context = vm.createContext({ firstGate, secondGate, x: 0, y: 0 });
+    const first = vm.runInContext(
+      "(async () => { await firstGate; globalThis.x = 1; })()",
+      context,
+    );
+    const second = vm.runInContext(
+      "(async () => { await secondGate; globalThis.y = 2; })()",
+      context,
+    );
+
+    releaseFirst();
+    await first;
+    context.x = 9;
+    releaseSecond();
+    await second;
+
+    expect(context.x).toBe(9);
+    expect(context.y).toBe(2);
+  });
+
+  test("foreign promises and ordinary thenables preserve their identity", async () => {
+    const context = vm.createContext({});
+    const promise = vm.runInContext(
+      "globalThis.promise ??= Promise.resolve(42); promise",
+      context,
+    );
+
+    expect(promise instanceof Promise).toBe(false);
+    expect(vm.runInContext("promise", context)).toBe(promise);
+    expect(await promise).toBe(42);
+
+    const thenable = vm.runInContext(
+      "globalThis.thenable ??= ({ then() { globalThis.thenCalls = (globalThis.thenCalls ?? 0) + 1; } }); thenable",
+      context,
+    );
+    expect(vm.runInContext("thenable", context)).toBe(thenable);
+    await Promise.resolve();
+    expect(vm.runInContext("globalThis.thenCalls ?? 0", context)).toBe(0);
+  });
+
   test("intrinsic mutations stay inside their context", () => {
     const first = vm.createContext({});
     const second = vm.createContext({});

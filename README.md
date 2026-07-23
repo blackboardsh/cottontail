@@ -2,11 +2,16 @@
 
 `cottontail` is a tiny Zig-based JavaScript runtime for Electrobun workloads.
 
-After a fresh clone, Bun is still the bootstrap path until `cottontail` is published or otherwise available on the machine. Once you have built the local binary once, you can use `cottontail` itself to drive the repo workflow.
+After a fresh clone, Node.js 24 can bootstrap the vendored toolchains and build
+Cottontail. Bun remains a supported convenience for the package scripts, but it
+is not required by the native cross-platform bring-up path. Once you have built
+the local binary, you can also use `cottontail` itself to drive the repo
+workflow.
 
 This repo currently focuses on developer experience:
 
-- Bun drives the local workflow.
+- Node.js drives the cross-platform setup and build scripts; Bun package scripts
+  remain available for local convenience.
 - Zig is vendored locally into `vendors/zig`.
 - The pinned Zig version is `0.16.0`.
 - JavaScriptCore is the only JavaScript engine backend.
@@ -35,13 +40,16 @@ Cottontail-specific engine contract is that JSC uses the unversioned ICU 70 C
 ABI. On every supported platform, Cottontail's runtime bridge first uses a
 system ICU with ABI 70 or newer. If none is usable, the executable switches to
 its statically linked ICU 70.1 fallback implementation and a checksum-pinned
-external data file. JSC SDK artifacts publish the fallback code and canonical
-data; setup can also reproduce the Unix fallback from its checksum-pinned ICU
-source when consuming an older artifact.
+data file. Release archives carry that data file under `share/cottontail/icu`;
+legacy or otherwise unpackaged executables can instead use the verified
+per-user cache and download path. JSC SDK artifacts publish the fallback code
+and metadata; setup ensures the canonical data file is present, downloading
+and verifying the checksum-pinned ICU data when an artifact does not carry it.
 
-Known engine difference: ShadowRealm stays disabled because the JSCOnly port
-cannot construct ShadowRealms from C-API-created contexts (the constructor
-segfaults), so Cottontail keeps the option off and the constructor absent.
+Known engine difference: JSC's native ShadowRealm option stays disabled because
+the JSCOnly port cannot safely construct ShadowRealms from C-API-created
+contexts. Cottontail instead exposes a compatibility constructor backed by an
+isolated sibling VM context.
 
 Bun-specific JSC patches, including test clocks and private runtime hooks, are
 not compatibility dependencies. Tests that rely on them should be adapted to
@@ -82,16 +90,22 @@ The schema 2 archive layout contains a standalone executable for Dash CLI consum
 
 - `bin/cottontail` (`bin/cottontail.exe` on Windows)
 - `runtime_modules/` for downstream bundlers that need physical module paths
+- `share/cottontail/icu/70.1/icudt70l.dat`, the checksum-pinned fallback data
+- `share/cottontail/icu/70.1/LICENSE`, the ICU license accompanying that data
 - `cottontail-release.json`
 
-Cottontail does not put downloaded files beside its executable. When no
-compatible system ICU exists, it downloads and verifies `icudt70l.dat` into a
-shared per-user location: `~/Library/Application Support/Cottontail/icu/70.1`
-on macOS, `%LOCALAPPDATA%\Cottontail\icu\70.1` on Windows, and
-`${XDG_DATA_HOME:-~/.local/share}/cottontail/icu/70.1` on Linux. A small verified
-marker avoids hashing the 28 MB database on every launch. GitHub Actions runs the
-packaged Linux binary in a minimal image with no system ICU to exercise this
-production download path without a CI-only switch.
+The release manifest records the ICU policy, packaged data path, size, SHA-256,
+and system/fallback ABI requirements. At runtime Cottontail tries a compatible
+system ICU first, then the packaged pinned data. Only legacy or unpackaged
+installs without that file fall back to downloading and verifying
+`icudt70l.dat` in a shared per-user location:
+`~/Library/Application Support/Cottontail/icu/70.1` on macOS,
+`%LOCALAPPDATA%\Cottontail\icu\70.1` on Windows, and
+`${XDG_DATA_HOME:-~/.local/share}/cottontail/icu/70.1` on Linux. A small
+verified marker avoids hashing the 28 MB per-user database on every launch.
+The release workflow is configured to exercise the packaged Linux fallback in
+a minimal image with no system ICU, with networking disabled and the container
+filesystem read-only.
 
 The native matrix exercises the platform host bridge on each supported target.
 
@@ -139,9 +153,17 @@ all four archives and the `--all` option.
 
 ## Bootstrap
 
-After a fresh clone:
+After a fresh clone, the Node-only bootstrap path is:
 
-- `bun run build`
+```sh
+node scripts/setup.js
+node scripts/setup-zig-html-rewriter.js
+node scripts/setup-jsc.js
+node scripts/zig.js build
+```
+
+When Bun is installed, `bun run build` remains a convenience wrapper for the
+same setup and build path.
 
 After the first local build, you can drive the repo with `cottontail` itself:
 
@@ -199,4 +221,11 @@ Current limitations:
 
 ## Current status
 
-The runtime is intentionally minimal right now. It embeds JavaScriptCore, supports relative ESM imports and async jobs, exposes `cottontail.args`, `cwd()`, `readFile()`, `writeFile()`, `env()`, `nanotime()`, basic fs mutation, platform/process info, and synchronous child process execution, and now has an early Electrobun bridge plus the first cottontail-owned Electrobun CLI path. It still does not expose a broad compatibility surface or a full Electrobun main-process API.
+Cottontail now has a substantial local Node and Bun compatibility layer covering
+module loading, filesystem and process APIs, child processes, workers, streams,
+networking, SQLite, FFI, testing, building, and package installation. It is not
+yet a complete cross-platform replacement: the copied Node 24.11.1 and Bun
+1.3.10 suites and real application canaries are not green on every target, and
+the full Electrobun main-process API remains incomplete. See
+[`docs/cross-platform-compatibility.md`](docs/cross-platform-compatibility.md)
+for exact platform evidence and remaining gates.
