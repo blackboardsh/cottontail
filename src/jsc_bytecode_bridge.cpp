@@ -284,20 +284,34 @@ private:
     WTF::Vector<CacheUpdate> m_updates;
 };
 
-static_assert(sizeof(CachePayload) == 0x20,
+#if OS(LINUX)
+// COTTONTAIL-COMPAT: The pinned Linux JSC SDK has a smaller release-mode
+// WTF::Variant layout than Darwin and Windows.
+constexpr size_t expected_cache_payload_size = 0x18;
+constexpr size_t expected_function_update_size = 0x28;
+constexpr size_t expected_cache_update_size = 0x30;
+constexpr size_t expected_cached_bytecode_size = 0x40;
+#else
+constexpr size_t expected_cache_payload_size = 0x20;
+constexpr size_t expected_function_update_size = 0x30;
+constexpr size_t expected_cache_update_size = 0x38;
+constexpr size_t expected_cached_bytecode_size = 0x48;
+#endif
+
+static_assert(sizeof(CachePayload) == expected_cache_payload_size,
     "pinned CachePayload layout changed; update the stock-JSC bytecode bridge");
 static_assert(sizeof(CachedFunctionExecutableMetadata) == 0x4,
     "pinned function metadata layout changed; update the stock-JSC bytecode bridge");
-static_assert(sizeof(CacheUpdate::GlobalUpdate) == 0x20,
+static_assert(sizeof(CacheUpdate::GlobalUpdate) == expected_cache_payload_size,
     "pinned global cache update layout changed; update the stock-JSC bytecode bridge");
 static_assert(offsetof(CacheUpdate::FunctionUpdate, m_payload) == 0x10
-        && sizeof(CacheUpdate::FunctionUpdate) == 0x30,
+        && sizeof(CacheUpdate::FunctionUpdate) == expected_function_update_size,
     "pinned function cache update layout changed; update the stock-JSC bytecode bridge");
-static_assert(sizeof(CacheUpdate) == 0x38,
+static_assert(sizeof(CacheUpdate) == expected_cache_update_size,
     "pinned CacheUpdate layout changed; update the stock-JSC bytecode bridge");
 static_assert(sizeof(LeafExecutableMap) == 0x8,
     "pinned LeafExecutableMap layout changed; update the stock-JSC bytecode bridge");
-static_assert(sizeof(CachedBytecode) == 0x48,
+static_assert(sizeof(CachedBytecode) == expected_cached_bytecode_size,
     "pinned CachedBytecode layout changed; update the stock-JSC bytecode bridge");
 
 } // namespace JSC

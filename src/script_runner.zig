@@ -6636,8 +6636,8 @@ fn isTestAggregateEntrypointPath(path: []const u8) bool {
 }
 
 fn shouldLoadBunfigTestPreloads(path: []const u8, test_cli_execution: bool) bool {
-    _ = path;
-    return test_cli_execution;
+    return test_cli_execution and
+        (isTestEntrypointPath(path) or isTestAggregateEntrypointPath(path));
 }
 
 /// Append every quoted ("..." or '...') segment in `text` to `list`,

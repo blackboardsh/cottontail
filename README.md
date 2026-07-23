@@ -104,7 +104,8 @@ release to Cloudflare R2. Configure these GitHub repository secrets:
 - `COTTONTAIL_R2_ACCESS_KEY_ID`: access key from an R2 Object Read & Write token scoped to the release bucket.
 - `COTTONTAIL_R2_SECRET_ACCESS_KEY`: secret for that access key.
 
-Configure this GitHub repository variable:
+Configure this value as either a GitHub repository secret or variable. The
+secret takes precedence when both exist:
 
 - `COTTONTAIL_R2_PUBLIC_BASE_URL`: public custom-domain or `r2.dev` origin for the bucket, without a trailing slash.
 

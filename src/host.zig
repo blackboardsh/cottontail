@@ -2,9 +2,42 @@ const std = @import("std");
 const builtin = @import("builtin");
 const compiler = @import("cottontail_compiler");
 const signal_forwarding = @import("signal_forwarding.zig");
+// COTTONTAIL-COMPAT: SDK 26.4 asserts the size of Mach bitfield records that
+// Zig's C importer leaves opaque. Use Zig's Darwin libc ABI instead.
+const DarwinC = struct {
+    pub const EACCES: c_int = @intFromEnum(std.c.E.ACCES);
+    pub const EPERM: c_int = @intFromEnum(std.c.E.PERM);
+    pub const ENOENT: c_int = @intFromEnum(std.c.E.NOENT);
+    pub const ENOTDIR: c_int = @intFromEnum(std.c.E.NOTDIR);
+    pub const ENOEXEC: c_int = @intFromEnum(std.c.E.NOEXEC);
+    pub const ENOMEM: c_int = @intFromEnum(std.c.E.NOMEM);
+    pub const EMFILE: c_int = @intFromEnum(std.c.E.MFILE);
+    pub const ENFILE: c_int = @intFromEnum(std.c.E.NFILE);
+    pub const F_DUPFD_CLOEXEC: c_int = std.c.F.DUPFD_CLOEXEC;
+    pub const F_GETFD: c_int = std.c.F.GETFD;
+    pub const F_SETFD: c_int = std.c.F.SETFD;
+    pub const FD_CLOEXEC: c_int = std.c.FD_CLOEXEC;
+    pub const O_RDONLY: c_int = @bitCast(std.c.O{});
+    pub const O_WRONLY: c_int = @bitCast(std.c.O{ .ACCMODE = .WRONLY });
+    pub const posix_spawn_file_actions_t = std.c.posix_spawn_file_actions_t;
+    pub const malloc = std.c.malloc;
+    pub const free = std.c.free;
+    pub const close = std.c.close;
+    pub const pipe = std.c.pipe;
+    pub const fcntl = std.c.fcntl;
+    pub const posix_spawn_file_actions_init = std.c.posix_spawn_file_actions_init;
+    pub const posix_spawn_file_actions_destroy = std.c.posix_spawn_file_actions_destroy;
+    pub const posix_spawn_file_actions_addclose = std.c.posix_spawn_file_actions_addclose;
+    pub const posix_spawn_file_actions_addopen = std.c.posix_spawn_file_actions_addopen;
+    pub const posix_spawn_file_actions_adddup2 = std.c.posix_spawn_file_actions_adddup2;
+    pub const posix_spawn_file_actions_addinherit_np = std.c.posix_spawn_file_actions_addinherit_np;
+    pub const posix_spawn_file_actions_addchdir_np = std.c.posix_spawn_file_actions_addchdir_np;
+    pub const posix_spawn = std.c.posix_spawn;
+    pub const posix_spawnp = std.c.posix_spawnp;
+};
 const c = if (builtin.os.tag == .windows) @cImport({
     @cInclude("stdlib.h");
-}) else @cImport({
+}) else if (builtin.os.tag == .macos) DarwinC else @cImport({
     @cDefine("_GNU_SOURCE", "1");
     @cInclude("errno.h");
     @cInclude("fcntl.h");
