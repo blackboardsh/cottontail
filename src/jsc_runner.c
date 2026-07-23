@@ -9530,11 +9530,14 @@ static bool ct_timer_heap_reserve(CtJscRuntime *runtime, size_t required) {
     return true;
 }
 
-static void ct_timer_heap_push(CtJscRuntime *runtime, CtTimer *timer) {
+static bool ct_timer_heap_push(CtJscRuntime *runtime, CtTimer *timer) {
+    if (runtime->timer_heap_len == SIZE_MAX) return false;
+    if (!ct_timer_heap_reserve(runtime, runtime->timer_heap_len + 1)) return false;
     size_t index = runtime->timer_heap_len++;
     runtime->timer_heap[index] = timer;
     timer->heap_index = index;
     ct_timer_heap_sift_up(runtime, index);
+    return true;
 }
 
 static CtTimer *ct_timer_heap_remove_at(CtJscRuntime *runtime, size_t index) {
@@ -9550,6 +9553,7 @@ static CtTimer *ct_timer_heap_remove_at(CtJscRuntime *runtime, size_t index) {
             ct_timer_heap_sift_down(runtime, index);
         }
     }
+    runtime->timer_heap[last] = NULL;
     removed->heap_index = SIZE_MAX;
     return removed;
 }
@@ -9652,7 +9656,7 @@ static JSValueRef ct_timer_schedule(JSContextRef ctx, JSObjectRef function, JSOb
         if (timer->firing) timer->refreshed_while_firing = true;
         ct_timer_heap_update(runtime, timer);
     } else {
-        if (!ct_timer_id_reserve(runtime, id) || !ct_timer_heap_reserve(runtime, runtime->timer_heap_len + 1)) {
+        if (!ct_timer_id_reserve(runtime, id)) {
             ct_throw_message(ctx, exception, "Out of memory");
             return JSValueMakeUndefined(ctx);
         }
@@ -9674,7 +9678,15 @@ static JSValueRef ct_timer_schedule(JSContextRef ctx, JSObjectRef function, JSOb
         if (referenced) runtime->referenced_timer_count += 1;
         runtime->protected_timer_count += 1;
         JSValueProtect(ctx, handle);
-        ct_timer_heap_push(runtime, timer);
+        if (!ct_timer_heap_push(runtime, timer)) {
+            runtime->timers_by_id[id] = NULL;
+            if (referenced && runtime->referenced_timer_count > 0) runtime->referenced_timer_count -= 1;
+            if (runtime->protected_timer_count > 0) runtime->protected_timer_count -= 1;
+            JSValueUnprotect(ctx, handle);
+            free(timer);
+            ct_throw_message(ctx, exception, "Out of memory");
+            return JSValueMakeUndefined(ctx);
+        }
     }
 
     ct_timer_set_number(ctx, handle, "_id", (double)id);
@@ -9736,6 +9748,16 @@ static JSValueRef ct_timer_has_active(JSContextRef ctx, JSObjectRef function, JS
     (void)exception;
     CtJscRuntime *runtime = ct_callback_runtime(function);
     return JSValueMakeBoolean(ctx, runtime != NULL && runtime->referenced_timer_count > 0);
+}
+
+static void ct_timer_dispose_due_tail(CtTimer **due, size_t begin, size_t end) {
+    for (size_t index = begin; index < end; index += 1) {
+        CtTimer *timer = due[index];
+        if (timer == NULL) continue;
+        if (timer->active) ct_timer_deactivate(timer, false);
+        timer->firing = false;
+        free(timer);
+    }
 }
 
 static JSObjectRef ct_process_object(JSContextRef ctx) {
@@ -10032,7 +10054,17 @@ static int ct_dispatch_timers(CtJscRuntime *runtime, char **error_out) {
                 timer->deadline_ns = next_deadline;
                 ct_timer_set_number(ctx, handle, "_idleStart", (double)callback_started_at / 1000000.0);
             }
-            ct_timer_heap_push(runtime, timer);
+            if (!ct_timer_heap_push(runtime, timer)) {
+                ct_timer_deactivate(timer, false);
+                timer->firing = false;
+                free(timer);
+                JSValueUnprotect(ctx, handle);
+                ct_timer_dispose_due_tail(due, index + 1, due_count);
+                if (microtask_delay_scope != NULL) ct_jsc_microtask_delay_end(microtask_delay_scope);
+                free(due);
+                ct_set_error_out(error_out, ct_duplicate_string("Out of memory"));
+                return -1;
+            }
         } else {
             if (timer->active) ct_timer_deactivate(timer, false);
             timer->firing = false;
@@ -10048,6 +10080,7 @@ static int ct_dispatch_timers(CtJscRuntime *runtime, char **error_out) {
                 ct_jsc_microtask_delay_end(microtask_delay_scope);
                 microtask_delay_scope = NULL;
             }
+            ct_timer_dispose_due_tail(due, index + 1, due_count);
             free(due);
             ct_set_error_out(error_out, message);
             return -1;
@@ -10057,6 +10090,7 @@ static int ct_dispatch_timers(CtJscRuntime *runtime, char **error_out) {
                 ct_jsc_microtask_delay_end(microtask_delay_scope);
                 microtask_delay_scope = NULL;
             }
+            ct_timer_dispose_due_tail(due, index + 1, due_count);
             free(due);
             return -1;
         }
