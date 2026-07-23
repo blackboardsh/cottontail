@@ -251,7 +251,7 @@
     {
       "pattern": "^test/cli/install/",
       "status": "expected-failure",
-      "reason": "Cottontail's package manager is implemented; the remaining files cover unresolved command breadth, binary bun.lockb compatibility, security scanning, publishing, and deeper install edge cases."
+      "reason": "Strict fallback for newly copied package-manager files; every currently vendored install file has a measured exact enabled override."
     },
     {
       "pattern": "^test/bake/",
@@ -1237,6 +1237,13 @@
       "serial": true,
       "args": ["--max-concurrency=1", "--timeout=300000"],
       "timeoutMs": 300000
+    },
+    "test/cli/install/bun-install-registry.test.ts": {
+      "status": "enabled",
+      "reason": "All 220 active copied registry-install cases pass across resolution, hoisting, transitive folder dependencies, updates, prereleases, peer graphs, lockfiles, and reinstall behavior (18 snapshots, 5,404 assertions); five upstream todos remain.",
+      "serial": true,
+      "args": ["--max-concurrency=1", "--timeout=30000"],
+      "timeoutMs": 120000
     },
     "test/cli/install/bun-pm-scan.test.ts": {
       "status": "enabled",

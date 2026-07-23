@@ -474,6 +474,13 @@ const PackageRecord = struct {
     install_dir: []const u8 = "",
 };
 
+const PendingRegistryExpansion = struct {
+    metadata: *const Value,
+    dependency_parent_dir: []const u8,
+    package_dir: []const u8,
+    peer_parent_dir: []const u8,
+};
+
 const InstalledIsolatedDependency = struct {
     alias: []const u8,
     spec: []const u8,
@@ -2174,10 +2181,13 @@ const Manager = struct {
     initial_root_versions: std.StringHashMap([]const u8),
     resolving: std.StringHashMap(void),
     expanded_lock_packages: std.StringHashMap(void),
+    pending_registry_expansions: std.array_list.Managed(PendingRegistryExpansion),
+    defer_registry_expansions: bool = false,
     registry_manifests: std.StringHashMap(*Value),
     registry_manifest_failures: std.StringHashMap(void),
     registry_archives: std.StringHashMap([]const u8),
     installed_registry_packages: std.StringHashMap(void),
+    installed_folder_packages: std.StringHashMap(void),
     linked_bins: std.StringHashMap(void),
     refreshed_update_manifests: std.StringHashMap(void),
     update_selections: std.StringHashMap([]const u8),
@@ -2253,10 +2263,12 @@ const Manager = struct {
             .initial_root_versions = std.StringHashMap([]const u8).init(allocator),
             .resolving = std.StringHashMap(void).init(allocator),
             .expanded_lock_packages = std.StringHashMap(void).init(allocator),
+            .pending_registry_expansions = std.array_list.Managed(PendingRegistryExpansion).init(allocator),
             .registry_manifests = std.StringHashMap(*Value).init(allocator),
             .registry_manifest_failures = std.StringHashMap(void).init(allocator),
             .registry_archives = std.StringHashMap([]const u8).init(allocator),
             .installed_registry_packages = std.StringHashMap(void).init(allocator),
+            .installed_folder_packages = std.StringHashMap(void).init(allocator),
             .linked_bins = std.StringHashMap(void).init(allocator),
             .refreshed_update_manifests = std.StringHashMap(void).init(allocator),
             .update_selections = std.StringHashMap([]const u8).init(allocator),
@@ -2290,10 +2302,12 @@ const Manager = struct {
 
     fn deinit(manager: *Manager) void {
         manager.registry_scopes.deinit();
+        manager.pending_registry_expansions.deinit();
         manager.initial_root_versions.deinit();
         manager.refreshed_update_manifests.deinit();
         manager.update_selections.deinit();
         manager.linked_bins.deinit();
+        manager.installed_folder_packages.deinit();
         manager.installed_registry_packages.deinit();
         manager.registry_archives.deinit();
         manager.registry_manifest_failures.deinit();
@@ -5127,11 +5141,18 @@ const Manager = struct {
 
     fn installRoot(manager: *Manager, root: *Value, report_direct: bool) !void {
         const previous_report_direct = manager.report_direct_installs;
+        const previous_defer_registry_expansions = manager.defer_registry_expansions;
+        const collect_registry_expansions = manager.node_linker == .hoisted and
+            !previous_defer_registry_expansions;
+        if (collect_registry_expansions) manager.defer_registry_expansions = true;
         manager.report_direct_installs = report_direct and
             manager.root_selected and
             (manager.options.command == .install or manager.options.command == .add or manager.options.command == .remove) and
             !manager.options.lockfile_only;
-        defer manager.report_direct_installs = previous_report_direct;
+        defer {
+            manager.report_direct_installs = previous_report_direct;
+            manager.defer_registry_expansions = previous_defer_registry_expansions;
+        }
         if (manager.root_selected) {
             try manager.installImporterDependencies(root, manager.root_dir, true);
         } else {
@@ -5140,7 +5161,56 @@ const Manager = struct {
             try manager.installImporterDependencies(root, manager.root_dir, true);
         }
         try manager.installWorkspaceDependencies();
+        if (collect_registry_expansions) try manager.drainPendingRegistryExpansions();
         try manager.emitDirectInstallReports();
+    }
+
+    fn installOrQueueRegistryDependencies(
+        manager: *Manager,
+        expansion_key: []const u8,
+        metadata: *const Value,
+        dependency_parent_dir: []const u8,
+        package_dir: []const u8,
+        peer_parent_dir: []const u8,
+    ) !void {
+        const expansion = try manager.expanded_lock_packages.getOrPut(expansion_key);
+        if (expansion.found_existing) return;
+        if (manager.defer_registry_expansions and manager.node_linker == .hoisted) {
+            try manager.pending_registry_expansions.append(.{
+                .metadata = metadata,
+                .dependency_parent_dir = dependency_parent_dir,
+                .package_dir = package_dir,
+                .peer_parent_dir = peer_parent_dir,
+            });
+            return;
+        }
+        try manager.installRegistryDependencies(metadata, dependency_parent_dir, package_dir, peer_parent_dir);
+    }
+
+    fn installRegistryDependencies(
+        manager: *Manager,
+        metadata: *const Value,
+        dependency_parent_dir: []const u8,
+        package_dir: []const u8,
+        peer_parent_dir: []const u8,
+    ) !void {
+        try manager.installDependencyObject(@constCast(metadata), "dependencies", dependency_parent_dir, false, false);
+        try manager.installOptionalDependencies(@constCast(metadata), dependency_parent_dir, false);
+        try manager.installOrLinkPeerDependencies(metadata, dependency_parent_dir, package_dir, peer_parent_dir);
+    }
+
+    fn drainPendingRegistryExpansions(manager: *Manager) !void {
+        var cursor: usize = 0;
+        defer manager.pending_registry_expansions.clearRetainingCapacity();
+        while (cursor < manager.pending_registry_expansions.items.len) : (cursor += 1) {
+            const expansion = manager.pending_registry_expansions.items[cursor];
+            try manager.installRegistryDependencies(
+                expansion.metadata,
+                expansion.dependency_parent_dir,
+                expansion.package_dir,
+                expansion.peer_parent_dir,
+            );
+        }
     }
 
     fn addPackages(manager: *Manager, package_json: *Value, parent_dir: []const u8) !void {
@@ -6710,6 +6780,12 @@ const Manager = struct {
         if (isLocalSpec(resolution_spec)) {
             if (protocol_patch_paths.len > 0) return error.UnsupportedPatchResolution;
             const local = manager.resolveLocalPackage(resolution_spec, parent_dir) catch |err| {
+                const transitive_folder = !std.mem.startsWith(u8, resolution_spec, "link:") and
+                    !std.mem.eql(u8, parent_dir, manager.root_dir) and
+                    !manager.pathIsWorkspace(parent_dir);
+                if (err == error.MissingPackageJSON and transitive_folder) {
+                    return manager.installMissingTransitiveFolder(alias, alias, resolution_spec, parent_dir);
+                }
                 if (err == error.MissingPackageJSON and !direct) return resolution_spec;
                 if (err == error.MissingPackageJSON and !optional and !peer) {
                     try manager.stderr.print(
@@ -6725,6 +6801,9 @@ const Manager = struct {
             }
             const kind: Lockfile.Kind = if (std.mem.startsWith(u8, resolution_spec, "link:")) .symlink else .folder;
             const placement_kind: Lockfile.Kind = if (std.mem.eql(u8, local.path, manager.root_dir)) .root else kind;
+            const transitive_folder = kind == .folder and
+                !std.mem.eql(u8, parent_dir, manager.root_dir) and
+                !manager.pathIsWorkspace(parent_dir);
             const normalized_source = try manager.normalizeLocalSpec(resolution_spec, local.path);
             const peer_context = try manager.peerContextForPackage(local.package_json, parent_dir, true);
             const destination = if (manager.node_linker == .isolated)
@@ -6740,6 +6819,8 @@ const Manager = struct {
                 )
             else if (explicit_global_link and !std.mem.eql(u8, parent_dir, manager.root_dir))
                 try packageDestination(manager.allocator, parent_dir, alias)
+            else if (transitive_folder)
+                try packageDestination(manager.allocator, parent_dir, alias)
             else if (!std.mem.eql(u8, parent_dir, manager.root_dir) and manager.root_versions.contains(alias))
                 try packageDestination(manager.allocator, parent_dir, alias)
             else
@@ -6754,6 +6835,8 @@ const Manager = struct {
                         try copyDirectoryTree(manager.init_data.io, manager.allocator, local.path, destination);
                     }
                     try manager.ensureIsolatedLinks(alias, parent_dir, destination);
+                } else if (transitive_folder) {
+                    try manager.linkDirectoryFilesAt(destination, local.path);
                 } else {
                     try manager.linkDirectoryAt(destination, local.path);
                 }
@@ -6770,14 +6853,18 @@ const Manager = struct {
                 .local_path = local.path,
                 .resolution = localSpecPath(normalized_source),
                 .kind = placement_kind,
-                .metadata = local.package_json,
+                .metadata = if (transitive_folder) null else local.package_json,
                 .peer_hash = peer_context.hash,
                 .install_dir = destination,
             });
             try manager.rememberPackageMetadata(destination, local.package_json);
             try manager.rememberPackageMetadata(local.path, local.package_json);
-            if (!manager.options.lockfile_only and !manager.options.dry_run) manager.installed_count += 1;
-            if (placement_kind != .root) {
+            if (transitive_folder) {
+                try manager.countFolderInstall(alias, local.name, resolution_spec, parent_dir, newly_installed);
+            } else if (!manager.options.lockfile_only and !manager.options.dry_run) {
+                manager.installed_count += 1;
+            }
+            if (placement_kind != .root and !transitive_folder) {
                 const source_context = try manager.pushIsolatedSourceContext(local.path, destination);
                 defer manager.popIsolatedSourceContext(source_context) catch {};
                 const cycle_key = try std.fmt.allocPrint(manager.allocator, "local:{s}", .{local.path});
@@ -6997,9 +7084,13 @@ const Manager = struct {
         if (!installed) try manager.countRegistryInstall(resolved.name, resolved.version, resolved.tarball);
         manager.changed = true;
 
-        try manager.installDependencyObject(@constCast(package_metadata), "dependencies", destination, false, false);
-        try manager.installOptionalDependencies(@constCast(package_metadata), destination, false);
-        try manager.installOrLinkPeerDependencies(package_metadata, destination, destination, parent_dir);
+        try manager.installOrQueueRegistryDependencies(
+            record_key,
+            package_metadata,
+            destination,
+            destination,
+            parent_dir,
+        );
         try manager.queuePackageScripts(alias, resolved.name, resolved.version, destination, .npm, direct, optional, !installed);
         return resolved.version;
     }
@@ -7269,12 +7360,13 @@ const Manager = struct {
                 try manager.rememberPackageMetadata(selection.destination, package_metadata);
                 if (package_metadata) |info| {
                     try manager.registerBundledPackages(record_key, info, selection.destination);
-                    const expansion = try manager.expanded_lock_packages.getOrPut(package.key);
-                    if (!expansion.found_existing) {
-                        try manager.installDependencyObject(@constCast(info), "dependencies", selection.destination, false, false);
-                        try manager.installOptionalDependencies(@constCast(info), selection.destination, false);
-                        try manager.installOrLinkPeerDependencies(info, selection.destination, selection.destination, parent_dir);
-                    }
+                    try manager.installOrQueueRegistryDependencies(
+                        package.key,
+                        info,
+                        selection.destination,
+                        selection.destination,
+                        parent_dir,
+                    );
                 }
                 try manager.queuePackageScripts(alias, package.name, package.version, selection.destination, .npm, direct, optional, !installed);
                 return package.version;
@@ -7318,6 +7410,9 @@ const Manager = struct {
             },
             .folder, .symlink => {
                 if (protocol_patch_paths.len > 0) return error.UnsupportedPatchResolution;
+                const transitive_folder = package.kind == .folder and
+                    !std.mem.eql(u8, parent_dir, manager.root_dir) and
+                    !manager.pathIsWorkspace(parent_dir);
                 const spec = spec: {
                     if (package.kind == .symlink) {
                         if (manager.rootDependencySpec(alias)) |root_spec| {
@@ -7329,7 +7424,14 @@ const Manager = struct {
                         package.source,
                     });
                 };
-                const local = try manager.resolveLocalPackage(spec, manager.root_dir);
+                const local = manager.resolveLocalPackage(spec, manager.root_dir) catch |err| {
+                    if (err == error.MissingPackageJSON and transitive_folder) {
+                        return manager.installMissingTransitiveFolder(alias, package.name, spec, parent_dir);
+                    }
+                    return err;
+                };
+                const lock_metadata = package.info;
+                const install_metadata = lock_metadata orelse local.package_json;
                 const newly_installed = !manager.pathExists(selection.destination);
                 if (!manager.options.lockfile_only and !manager.options.dry_run) {
                     if (manager.node_linker == .isolated) {
@@ -7340,10 +7442,12 @@ const Manager = struct {
                             try copyDirectoryTree(manager.init_data.io, manager.allocator, local.path, selection.destination);
                         }
                         try manager.ensureIsolatedLinks(alias, parent_dir, selection.destination);
+                    } else if (transitive_folder) {
+                        try manager.linkDirectoryFilesAt(selection.destination, local.path);
                     } else {
                         try manager.linkDirectoryAt(selection.destination, local.path);
                     }
-                    try manager.linkBins(alias, selection.destination, package.info orelse local.package_json, direct, parent_dir);
+                    try manager.linkBins(alias, selection.destination, install_metadata, direct, parent_dir);
                 }
                 try manager.addRecord(.{
                     .key = record_key,
@@ -7353,15 +7457,20 @@ const Manager = struct {
                     .local_path = local.path,
                     .resolution = package.source,
                     .kind = package.kind,
-                    .metadata = package.info orelse local.package_json,
+                    .metadata = lock_metadata,
                     .peer_hash = selection.peer_context.hash,
                     .install_dir = selection.destination,
                 });
-                try manager.rememberPackageMetadata(selection.destination, package.info orelse local.package_json);
-                try manager.rememberPackageMetadata(local.path, package.info orelse local.package_json);
-                const source_context = try manager.pushIsolatedSourceContext(local.path, selection.destination);
-                defer manager.popIsolatedSourceContext(source_context) catch {};
-                try manager.installFolderPackageDependencies(local.package_json, local.path, selection.destination, parent_dir);
+                try manager.rememberPackageMetadata(selection.destination, install_metadata);
+                try manager.rememberPackageMetadata(local.path, install_metadata);
+                if (transitive_folder) {
+                    try manager.countFolderInstall(alias, local.name, spec, parent_dir, newly_installed);
+                }
+                if (lock_metadata) |metadata| {
+                    const source_context = try manager.pushIsolatedSourceContext(local.path, selection.destination);
+                    defer manager.popIsolatedSourceContext(source_context) catch {};
+                    try manager.installFolderPackageDependencies(@constCast(metadata), local.path, selection.destination, parent_dir);
+                }
                 try manager.queuePackageScripts(alias, local.name, local.version, selection.destination, .local, direct, optional, newly_installed);
                 return local.version;
             },
@@ -7483,6 +7592,41 @@ const Manager = struct {
             try manager.installDependencyObject(package_json, "devDependencies", dependency_parent_dir, false, false);
         }
         try manager.installOrLinkPeerDependencies(package_json, dependency_parent_dir, package_dir, peer_parent_dir);
+    }
+
+    fn installMissingTransitiveFolder(
+        manager: *Manager,
+        alias: []const u8,
+        package_name: []const u8,
+        spec: []const u8,
+        parent_dir: []const u8,
+    ) ![]const u8 {
+        const path = try manager.localPackagePath(spec, parent_dir);
+        const normalized_source = try manager.normalizeLocalSpec(spec, path);
+        const destination = if (manager.node_linker == .isolated)
+            try std.fs.path.join(manager.allocator, &.{ try manager.isolatedConsumerModules(parent_dir), alias })
+        else
+            try packageDestination(manager.allocator, parent_dir, alias);
+        if (!manager.options.lockfile_only and !manager.options.dry_run) {
+            if (std.fs.path.dirname(destination)) |modules_dir| {
+                try std.Io.Dir.cwd().createDirPath(manager.init_data.io, modules_dir);
+            }
+        }
+        try manager.countFolderInstall(alias, package_name, spec, parent_dir, true);
+        try manager.addRecord(.{
+            .key = if (manager.node_linker == .isolated)
+                try manager.dependencyLockKey(parent_dir, alias)
+            else
+                try manager.lockKeyForDestination(destination),
+            .alias = alias,
+            .name = package_name,
+            .version = "0.0.0",
+            .local_path = path,
+            .resolution = localSpecPath(normalized_source),
+            .kind = .folder,
+            .install_dir = destination,
+        });
+        return "0.0.0";
     }
 
     fn installedPackageMatches(manager: *Manager, destination: []const u8, name: []const u8, version_value: []const u8) !bool {
@@ -10355,6 +10499,12 @@ const Manager = struct {
         };
     }
 
+    fn linkDirectoryFilesAt(manager: *Manager, destination: []const u8, target: []const u8) !void {
+        if (manager.options.dry_run) return;
+        deletePath(manager.init_data.io, destination);
+        try symlinkDirectoryFiles(manager.init_data.io, manager.allocator, target, destination);
+    }
+
     fn linkBins(
         manager: *Manager,
         alias: []const u8,
@@ -11002,8 +11152,48 @@ const Manager = struct {
         if (!entry.found_existing) manager.installed_count += 1;
     }
 
+    fn countFolderInstall(
+        manager: *Manager,
+        alias: []const u8,
+        package_name: []const u8,
+        spec: []const u8,
+        parent_dir: []const u8,
+        newly_installed: bool,
+    ) !void {
+        if (!newly_installed or manager.options.lockfile_only or manager.options.dry_run) return;
+
+        var parent_kind: []const u8 = "path";
+        var parent_name = parent_dir;
+        var parent_version: []const u8 = "";
+        var parent_source = spec;
+        for (manager.records.items) |record| {
+            if (!std.mem.eql(u8, record.install_dir, parent_dir)) continue;
+            if (record.kind == .npm) {
+                parent_kind = "npm";
+                parent_name = record.name;
+                parent_version = record.version;
+                parent_source = record.tarball;
+            } else {
+                parent_kind = @tagName(record.kind);
+                parent_name = record.key;
+                parent_version = record.version;
+            }
+        }
+
+        const key = try std.fmt.allocPrint(manager.allocator, "{s}\x00{s}\x00{s}\x00{s}\x00{s}\x00{s}", .{
+            parent_kind,
+            parent_name,
+            parent_version,
+            parent_source,
+            alias,
+            package_name,
+        });
+        const entry = try manager.installed_folder_packages.getOrPut(key);
+        if (!entry.found_existing) manager.installed_count += 1;
+    }
+
     fn countWorkspaceInstall(manager: *Manager, workspace: Workspace, destination: []const u8) !void {
-        if (manager.options.lockfile_only or manager.options.dry_run or manager.options.command == .update) return;
+        if (manager.options.lockfile_only or manager.options.dry_run) return;
         const entry = try manager.installed_workspaces.getOrPut(workspace.name);
         const manifest_changed = manager.options.command == .install and if (manager.lock_graph) |*graph|
             !graph.workspaceMatchesPackageJSON(workspace.relative_path, workspace.package_json)
@@ -11083,15 +11273,15 @@ const Manager = struct {
             defer manager.restoreResolutionOnly(previous);
             try manager.installDependencyObject(workspace.package_json, "dependencies", workspace.path, false, false);
             try manager.installOptionalDependencies(workspace.package_json, workspace.path, false);
-            if (manager.options.omit_peer) {
-                try manager.resolveOmittedDependencyObject(workspace.package_json, "peerDependencies", workspace.path, false, false);
-            } else {
-                try manager.installOrLinkPeerDependencies(workspace.package_json, workspace.path, workspace.path, workspace.path);
-            }
             if (manager.options.production or manager.options.omit_dev) {
                 try manager.resolveOmittedDependencyObject(workspace.package_json, "devDependencies", workspace.path, false, false);
             } else {
                 try manager.installDependencyObject(workspace.package_json, "devDependencies", workspace.path, false, false);
+            }
+            if (manager.options.omit_peer) {
+                try manager.resolveOmittedDependencyObject(workspace.package_json, "peerDependencies", workspace.path, false, false);
+            } else {
+                try manager.installOrLinkPeerDependencies(workspace.package_json, workspace.path, workspace.path, workspace.path);
             }
             try manager.queuePackageScripts(workspace.name, workspace.name, workspace.version, workspace.path, .workspace, true, false, true);
         }
@@ -13400,6 +13590,28 @@ fn copyDirectoryTree(io: std.Io, allocator: std.mem.Allocator, source: []const u
             .directory => try copyDirectoryTree(io, allocator, source_path, destination_path),
             .file => try std.Io.Dir.copyFileAbsolute(source_path, destination_path, io, .{ .replace = true, .make_path = true }),
             .sym_link => try clonePackagePath(io, allocator, source_path, destination_path),
+            else => {},
+        }
+    }
+}
+
+fn symlinkDirectoryFiles(io: std.Io, allocator: std.mem.Allocator, source: []const u8, destination: []const u8) anyerror!void {
+    try std.Io.Dir.cwd().createDirPath(io, destination);
+    var source_dir = try std.Io.Dir.cwd().openDir(io, source, .{ .iterate = true });
+    defer source_dir.close(io);
+    var iterator = source_dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind == .directory and std.mem.eql(u8, entry.name, "node_modules")) continue;
+        const source_path = try std.fs.path.join(allocator, &.{ source, entry.name });
+        const destination_path = try std.fs.path.join(allocator, &.{ destination, entry.name });
+        switch (entry.kind) {
+            .directory => try symlinkDirectoryFiles(io, allocator, source_path, destination_path),
+            .file, .sym_link => {
+                const target_stat = std.Io.Dir.cwd().statFile(io, source_path, .{}) catch null;
+                try std.Io.Dir.symLinkAbsolute(io, source_path, destination_path, .{
+                    .is_directory = target_stat != null and target_stat.?.kind == .directory,
+                });
+            },
             else => {},
         }
     }
