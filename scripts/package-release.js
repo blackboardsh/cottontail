@@ -29,6 +29,7 @@ function sha256(path) {
 }
 
 function gitRevision() {
+  if (process.env.GITHUB_SHA) return process.env.GITHUB_SHA;
   if (process.env.CIRCLE_SHA1) return process.env.CIRCLE_SHA1;
   try {
     return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: rootDir, encoding: 'utf8' }).trim();

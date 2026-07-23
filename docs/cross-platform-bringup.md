@@ -1,8 +1,8 @@
 # Cross-platform bring-up
 
-Use this runbook to reproduce the native CircleCI build on persistent Linux and
-Windows machines. CircleCI remains the final clean-environment and publishing
-gate, but platform work should be debugged locally first.
+Use this runbook to reproduce the native GitHub Actions build on persistent
+Linux and Windows machines. GitHub Actions remains the final clean-environment
+and publishing gate, but platform work should be debugged locally first.
 
 ## Common rules
 
@@ -11,9 +11,9 @@ gate, but platform work should be debugged locally first.
 - Do not install Zig separately. `scripts/setup.js` downloads the pinned Zig
   toolchain into `vendors/zig`.
 - Do not use Bun for this bring-up loop. The commands below use Node directly
-  and match the CircleCI jobs.
-- Do not upload to R2 from a VM. Let the complete CircleCI matrix publish after
-  all four targets pass.
+  and match the GitHub Actions jobs.
+- Do not upload to R2 from a VM. Let the complete GitHub Actions matrix publish
+  after all four targets pass.
 
 After pulling a new revision, leave `vendors/zig`, `vendors/jsc`, and
 `vendors/zig-html-rewriter` in place unless diagnosing setup itself. Their
@@ -30,7 +30,7 @@ node -p 'process.platform + " " + process.arch'
 ```
 
 Expected values are `x86_64` plus `linux x64`, or `aarch64` plus `linux arm64`.
-Emulation is acceptable for debugging, but the final CircleCI jobs run natively.
+Emulation is acceptable for debugging, but the final GitHub Actions jobs run natively.
 
 ### Install prerequisites
 
@@ -71,7 +71,7 @@ Confirm that setup selected the expected JSC directory:
 find vendors/jsc -maxdepth 3 -type f -name '.jsc-vendored' -print
 ```
 
-### Run the CircleCI sequence
+### Run the GitHub Actions sequence
 
 `pipefail` ensures a failed build remains a failed command when output is also
 written to a log.
@@ -163,7 +163,7 @@ Get-ChildItem vendors\jsc -Recurse -Filter SYSTEM_ICU_USAGE
 Get-ChildItem "$env:WindowsSdkDir\Lib" -Recurse -Filter icu.lib
 ```
 
-### Run the CircleCI sequence
+### Run the GitHub Actions sequence
 
 ```powershell
 node scripts/zig.js build test --verbose 2>&1 |
@@ -203,7 +203,7 @@ On either VM:
 3. Rerun the test build until it passes.
 4. Run `ReleaseSmall`, the smoke test, and packaging.
 5. Commit the platform fix and pull that same commit on the other machines.
-6. Run CircleCI only after the affected native VM is green.
+6. Run GitHub Actions only after the affected native VM is green.
 
 Do not add stubs, expected failures, or platform skips to make the release
 matrix green. A target is complete only when its native test, release, smoke,
@@ -214,7 +214,7 @@ and package sequence all pass.
 Start a coding session from the repository root on the failing VM and use:
 
 > Continue Cottontail's cross-platform release bring-up on this native machine.
-> Read `docs/cross-platform-bringup.md` and `.circleci/config.yml`. Reproduce the
+> Read `docs/cross-platform-bringup.md` and `.github/workflows/build-release.yml`. Reproduce the
 > failure locally with the documented verbose command, fix actual behavior or
 > linkage without stubs or skips, and continue until tests, ReleaseSmall, the
 > `6 * 7` smoke test, and packaging all pass. Preserve unrelated worktree

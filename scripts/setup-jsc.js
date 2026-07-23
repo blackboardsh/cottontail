@@ -233,7 +233,7 @@ function buildPinnedIcuFallback(vendorDir, platformKey) {
   if (platformKey.startsWith('windows-')) {
     fail(
       'The pinned Windows JSC artifact has no static ICU fallback. ' +
-        'Publish and pin a current blackboardsh/jsc CircleCI artifact.'
+        'Publish and pin a current blackboardsh/jsc GitHub Actions artifact.'
     );
   }
 

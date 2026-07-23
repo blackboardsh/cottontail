@@ -31,6 +31,7 @@ function platformKey() {
 }
 
 function gitRevision() {
+  if (process.env.GITHUB_SHA) return process.env.GITHUB_SHA;
   if (process.env.CIRCLE_SHA1) return process.env.CIRCLE_SHA1;
   try {
     return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: rootDir, encoding: 'utf8' }).trim();
@@ -40,6 +41,9 @@ function gitRevision() {
 }
 
 function isVersionTag(version) {
+  if (process.env.GITHUB_ACTIONS === 'true') {
+    return process.env.GITHUB_REF === `refs/tags/v${version}`;
+  }
   try {
     const tags = execFileSync('git', ['tag', '--points-at', 'HEAD'], {
       cwd: rootDir,
@@ -127,6 +131,14 @@ async function putObject(config, object) {
 
 if (process.env.CIRCLECI === 'true' && process.env.CIRCLE_BRANCH !== 'main') {
   console.log(`Skipping R2 preview upload from branch ${process.env.CIRCLE_BRANCH ?? '(unknown)'}`);
+  process.exit(0);
+}
+if (
+  process.env.GITHUB_ACTIONS === 'true'
+  && process.env.GITHUB_REF !== 'refs/heads/main'
+  && !process.env.GITHUB_REF?.startsWith('refs/tags/v')
+) {
+  console.log(`Skipping R2 upload from ref ${process.env.GITHUB_REF ?? '(unknown)'}`);
   process.exit(0);
 }
 

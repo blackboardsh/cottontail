@@ -132,4 +132,4 @@ git(["commit", "-m", tag], { inherit: true });
 git(["tag", "--annotate", tag, "--message", tag], { inherit: true });
 git(["push", "--atomic", "origin", "HEAD:main", `refs/tags/${tag}`], { inherit: true });
 
-console.log(`Published ${tag}. CircleCI will build and publish its platform matrix.`);
+console.log(`Published ${tag}. GitHub Actions will build and publish its platform matrix.`);

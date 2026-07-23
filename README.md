@@ -69,14 +69,13 @@ exposed by Cottontail itself.
 
 ## Release builds
 
-CircleCI defines native release jobs for macOS arm64, Linux x64, Linux arm64,
-and Windows x64 in `.circleci/config.yml`. Every job is configured to run Zig
-tests, build with `ReleaseSmall`, smoke-test the binary, package the runtime
-and store the archive plus its SHA-256 file. The JavaScript runtime modules are
-embedded in the executable at build time. The Windows job remains a bring-up
-gate until its native host implementation and release sequence are complete.
+GitHub Actions defines native release jobs for macOS arm64, Linux x64, Linux
+arm64, and Windows x64 in `.github/workflows/build-release.yml`. Every job runs Zig
+tests, builds with `ReleaseSmall`, smoke-tests the binary, packages the runtime,
+and stores the archive plus its SHA-256 file. The JavaScript runtime modules are
+embedded in the executable at build time.
 
-For native VM setup, exact Circle-equivalent commands, diagnostics, and the
+For native VM setup, exact workflow-equivalent commands, diagnostics, and the
 cross-platform working loop, see [`docs/cross-platform-bringup.md`](docs/cross-platform-bringup.md).
 
 The schema 2 archive layout contains a standalone executable for Dash CLI consumption:
@@ -90,22 +89,23 @@ compatible system ICU exists, it downloads and verifies `icudt70l.dat` into a
 shared per-user location: `~/Library/Application Support/Cottontail/icu/70.1`
 on macOS, `%LOCALAPPDATA%\Cottontail\icu\70.1` on Windows, and
 `${XDG_DATA_HOME:-~/.local/share}/cottontail/icu/70.1` on Linux. A small verified
-marker avoids hashing the 28 MB database on every launch. CircleCI runs the
+marker avoids hashing the 28 MB database on every launch. GitHub Actions runs the
 packaged Linux binary in a minimal image with no system ICU to exercise this
 production download path without a CI-only switch.
 
-The current C host bridge uses POSIX APIs directly for process, socket, DNS,
-polling, mmap, user/group, and filesystem behavior; those paths still need
-native Win32 implementations before the Windows job can pass.
+The native matrix exercises the platform host bridge on each supported target.
 
 ### Preview publishing
 
 After every `main` branch matrix job succeeds, a fan-in job uploads the complete
-release to Cloudflare R2. Configure these CircleCI project environment variables:
+release to Cloudflare R2. Configure these GitHub repository secrets:
 
 - `COTTONTAIL_R2_ACCOUNT_ID`: Cloudflare account ID used to derive the R2 S3 endpoint.
 - `COTTONTAIL_R2_ACCESS_KEY_ID`: access key from an R2 Object Read & Write token scoped to the release bucket.
 - `COTTONTAIL_R2_SECRET_ACCESS_KEY`: secret for that access key.
+
+Configure this GitHub repository variable:
+
 - `COTTONTAIL_R2_PUBLIC_BASE_URL`: public custom-domain or `r2.dev` origin for the bucket, without a trailing slash.
 
 The target bucket is `electrobun-artifacts`. Continuous preview archives use
@@ -130,8 +130,8 @@ channel pointers are:
 - `cottontail/preview/versions/<version>.json`
 
 The publisher uploads every archive before replacing `latest.json`, so a failed
-build or upload cannot advertise a partial matrix. Non-`main` CircleCI builds
-run tests and packaging but skip R2 publishing. Run
+build or upload cannot advertise a partial matrix. Pull requests run tests and
+packaging but skip R2 publishing. Run
 `node scripts/upload-release-r2.js --dry-run` after local packaging to inspect a
 single-platform dry run without requiring credentials. Real publication requires
 all four archives and the `--all` option.
