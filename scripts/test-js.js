@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { spawnSync } from 'child_process';
 import os from 'os';
 import { join } from 'path';
@@ -11,6 +11,17 @@ const binaryPath = join(
   'zig-out',
   'bin',
   process.platform === 'win32' ? 'cottontail.exe' : 'cottontail'
+);
+const repositoryMetadataPaths = [
+  'package.json',
+  'bun.lock',
+  'bun.lockb',
+  'package-lock.json',
+  'pnpm-lock.yaml',
+  'yarn.lock',
+].map(path => join(rootDir, path));
+const repositoryMetadataBaseline = new Map(
+  repositoryMetadataPaths.map(path => [path, existsSync(path) ? readFileSync(path) : null])
 );
 
 function fail(message) {
@@ -67,6 +78,16 @@ function runCase(testCase) {
   console.log(`ok ${testCase.name}`);
 }
 
+function assertRepositoryMetadataUnchanged(testName) {
+  for (const path of repositoryMetadataPaths) {
+    const baseline = repositoryMetadataBaseline.get(path);
+    const current = existsSync(path) ? readFileSync(path) : null;
+    if (baseline === null ? current !== null : current === null || !baseline.equals(current)) {
+      fail(`Test "${testName}" modified repository package metadata: ${path}`);
+    }
+  }
+}
+
 if (!existsSync(binaryPath)) {
   fail(`Built cottontail binary not found at ${binaryPath}. Run "bun run build" first.`);
 }
@@ -100,6 +121,12 @@ try {
       stdoutIncludes: ['module imports passed'],
     },
     {
+      name: 'import-meta-main-entry-identity',
+      scriptPath: join(rootDir, 'tests', 'js', 'import-meta-main-entry.mjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['import.meta.main entry identity passed'],
+    },
+    {
       name: 'bun-narrow-import-installs-web-globals',
       scriptPath: join(rootDir, 'tests', 'js', 'fixtures', 'bun-narrow-import-globals.mjs'),
       expectExitCode: 0,
@@ -121,7 +148,13 @@ try {
       name: 'runtime-bootstrap-startup-regressions',
       argv: ['test', join(rootDir, 'tests', 'js', 'runtime-bootstrap-startup.test.ts')],
       expectExitCode: 0,
-      stderrIncludes: ['12 pass', '0 fail'],
+      stderrIncludes: ['13 pass', '0 fail'],
+    },
+    {
+      name: 'web-worker-module-loading',
+      argv: ['test', join(rootDir, 'tests', 'js', 'web-worker-module-loading.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['1 pass', '0 fail'],
     },
     {
       name: 'upstream-test-temp-cleanup-regressions',
@@ -797,6 +830,7 @@ try {
 
   for (const testCase of tests) {
     runCase(testCase);
+    assertRepositoryMetadataUnchanged(testCase.name);
   }
 
   const hotWatchResult = spawnSync(process.execPath, [join(rootDir, 'tests', 'js', 'hot-watch-runtime.integration.js')], {
@@ -819,6 +853,7 @@ try {
     );
   }
   process.stdout.write(hotWatchResult.stdout);
+  assertRepositoryMetadataUnchanged('hot/watch runtime integration');
 
   if (readdirSync(tempDir).some(name => name.startsWith('.cottontail-eval-'))) {
     fail('Eval entrypoint was not cleaned up.');

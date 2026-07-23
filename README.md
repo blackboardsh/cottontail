@@ -62,6 +62,7 @@ exposed by Cottontail itself.
 - `bun run setup:jsc` vendors only the pinned JavaScriptCore build (see `scripts/jsc-manifest.json`).
 - `bun run pin:jsc -- [WebKit-tag]` pins a completed R2 JSC matrix (or `jsc/latest.json` when omitted) and updates the matching build path.
 - `bun run build` builds the debug executable.
+- `bun run build:local` incrementally builds against a sibling `../jsc` checkout and reuses unchanged local JSC/Cottontail outputs.
 - `bun run build:release` builds with `ReleaseSmall`.
 - `bun run package:release` creates a platform archive and SHA-256 file under `release/`.
 - `bun run run -- test.js` builds and runs a JavaScript file through `cottontail`.

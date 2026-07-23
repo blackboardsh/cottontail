@@ -3,8 +3,14 @@ import { resolve } from "../node/path.js";
 import { parse as parseTOML } from "../bun/toml.js";
 
 const argv = Array.from(globalThis.process?.argv ?? []).slice(2).map(String);
+const emptyConfig = Object.create(null);
 let cachedConfig;
 let cachedRuntimeOptions;
+
+function testCliModeEnabled() {
+  return globalThis.__cottontailBunTestHeaderPrinted === true ||
+    globalThis.process?.env?.COTTONTAIL_TEST_CLI_HEADER_PRINTED === "1";
+}
 
 function option(args, name) {
   const inline = args.find((argument) => argument.startsWith(`${name}=`));
@@ -202,6 +208,7 @@ function validateConfig(config, source, path) {
 }
 
 export function bunTestConfig() {
+  if (!testCliModeEnabled()) return emptyConfig;
   if (cachedConfig !== undefined) return cachedConfig;
   const cwd = String(globalThis.process?.cwd?.() ?? ".");
   const path = resolve(cwd, configuredPath());
@@ -220,6 +227,7 @@ export function bunTestConfig() {
 }
 
 export function bunTestRuntimeOptions(args = argv) {
+  if (!testCliModeEnabled()) args = [];
   if (args === argv && cachedRuntimeOptions !== undefined) return cachedRuntimeOptions;
   const config = bunTestConfig();
 

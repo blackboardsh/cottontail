@@ -434,6 +434,18 @@ const AutoInstallRequest = struct {
     requested_version: ?[]const u8,
 };
 
+fn isInternalRuntimeSpecifier(specifier: []const u8) bool {
+    inline for (&.{
+        "internal/assert/myers_diff",
+        "internal/async_hooks",
+        "internal/event_target",
+        "internal/test/binding",
+    }) |runtime_specifier| {
+        if (std.mem.eql(u8, specifier, runtime_specifier)) return true;
+    }
+    return false;
+}
+
 fn autoInstallRequestFromSpecifier(specifier: []const u8) ?AutoInstallRequest {
     if (specifier.len == 0 or
         std.fs.path.isAbsolute(specifier) or
@@ -443,7 +455,8 @@ fn autoInstallRequestFromSpecifier(specifier: []const u8) ?AutoInstallRequest {
         std.mem.startsWith(u8, specifier, "node:") or
         std.mem.startsWith(u8, specifier, "bun:") or
         std.mem.startsWith(u8, specifier, "data:") or
-        std.mem.startsWith(u8, specifier, "file:")) return null;
+        std.mem.startsWith(u8, specifier, "file:") or
+        isInternalRuntimeSpecifier(specifier)) return null;
     if (isMinimalRuntimeAliasSpecifier(specifier)) return null;
 
     const package_end = if (specifier[0] == '@') blk: {
@@ -905,6 +918,11 @@ test "auto-install excludes runtime builtin specifiers" {
     try std.testing.expect(autoInstallRequestFromSpecifier("bun:sqlite") == null);
     try std.testing.expect(autoInstallRequestFromSpecifier("node:fs") == null);
     try std.testing.expect(autoInstallRequestFromSpecifier("fs") == null);
+    try std.testing.expect(autoInstallRequestFromSpecifier("internal/assert/myers_diff") == null);
+    try std.testing.expect(autoInstallRequestFromSpecifier("internal/async_hooks") == null);
+    try std.testing.expect(autoInstallRequestFromSpecifier("internal/event_target") == null);
+    try std.testing.expect(autoInstallRequestFromSpecifier("internal/test/binding") == null);
+    try std.testing.expect(autoInstallRequestFromSpecifier("internal/not-a-runtime-module") != null);
     try std.testing.expect(autoInstallRequestFromSpecifier("left-pad") != null);
 }
 
@@ -4904,6 +4922,17 @@ fn canUseRuntimeModuleLauncher(requirements: RuntimeModuleLaunchRequirements) bo
         !requirements.wasm_entrypoint;
 }
 
+fn entrypointNeedsMainMetadataTransform(ctx: *const Context, script_abs: []const u8) !bool {
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        script_abs,
+        ctx.allocator,
+        .limited(4 * 1024 * 1024),
+    ) catch return false;
+    return std.mem.indexOf(u8, source, "import.meta.main") != null or
+        std.mem.indexOf(u8, source, "require.main") != null;
+}
+
 fn bundleScriptNative(
     ctx: *const Context,
     script_path: []const u8,
@@ -4952,7 +4981,11 @@ fn bundleScriptNative(
         try shouldBundleCommonJsEntrypoint(ctx, script_abs)
     else
         false;
-    const runtime_module_entrypoint = runtime_module_launcher_candidate and !runtime_candidate_is_common_js;
+    const runtime_entrypoint_needs_main_transform = runtime_module_launcher_candidate and
+        try entrypointNeedsMainMetadataTransform(ctx, script_abs);
+    const runtime_module_entrypoint = runtime_module_launcher_candidate and
+        !runtime_candidate_is_common_js and
+        !runtime_entrypoint_needs_main_transform;
     const script_entry_abs = if (is_wasm_entrypoint or runtime_module_entrypoint)
         script_abs
     else

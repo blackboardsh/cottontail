@@ -14,7 +14,7 @@ import {
   writeFileSync,
 } from 'fs';
 import { cpus } from 'os';
-import { join, dirname } from 'path';
+import { join, dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
 const ROOT = process.cwd();
@@ -355,6 +355,74 @@ function ensureIcuFallback(vendorDir, platformKey) {
   buildPinnedIcuFallback(vendorDir, platformKey);
 }
 
+function vendorLocalJsc(platformKey, archiveValue) {
+  const archivePath = resolve(archiveValue);
+  if (!existsSync(archivePath) || !statSync(archivePath).isFile()) {
+    fail(`COTTONTAIL_JSC_ARCHIVE points to a missing file: ${archivePath}`);
+  }
+
+  const archiveSha256 = sha256File(archivePath);
+  const localIcuDataValue = process.env.COTTONTAIL_JSC_ICU_DATA;
+  const localIcuData = localIcuDataValue ? resolve(localIcuDataValue) : null;
+  let localIcuDataSha256 = null;
+  if (localIcuData) {
+    if (!existsSync(localIcuData) || !statSync(localIcuData).isFile()) {
+      fail(`COTTONTAIL_JSC_ICU_DATA points to a missing file: ${localIcuData}`);
+    }
+    localIcuDataSha256 = sha256File(localIcuData);
+    if (localIcuDataSha256 !== MANIFEST.icuFallback.dataSha256) {
+      fail(
+        `Local JSC ICU data checksum mismatch.\n` +
+          `Expected: ${MANIFEST.icuFallback.dataSha256}\n` +
+          `Actual:   ${localIcuDataSha256}`
+      );
+    }
+  }
+  const vendorDir = join(JSC_ROOT, MANIFEST.tag, platformKey);
+  const stampPath = join(vendorDir, '.jsc-vendored');
+  const expectedStamp =
+    `local ${archiveSha256} icu-${MANIFEST.icuFallback.version} ${MANIFEST.icuFallback.sha256}` +
+    ` data-${localIcuDataSha256 ?? 'external'}`;
+
+  if (isCurrentJscVendored(vendorDir, stampPath, expectedStamp)) {
+    ensureIcuHeaders(vendorDir);
+    ensureIcuFallback(vendorDir, platformKey);
+    console.log(`✓ Local JavaScriptCore SDK already vendored from ${archivePath}`);
+    return;
+  }
+
+  const stagingDir = `${vendorDir}.local-staging`;
+  console.log(`Vendoring local JavaScriptCore SDK (${platformKey})...`);
+  rmSync(stagingDir, { recursive: true, force: true });
+  mkdirSync(stagingDir, { recursive: true });
+
+  try {
+    exec('tar', ['-xzf', archivePath, '--strip-components=1', '-C', stagingDir]);
+
+    const libDir = join(stagingDir, 'lib');
+    const includeDir = join(stagingDir, 'include', 'JavaScriptCore');
+    if (!existsSync(libDir) || !existsSync(includeDir)) {
+      fail(`Local JavaScriptCore SDK layout is incomplete in ${archivePath}`);
+    }
+
+    if (localIcuData) {
+      const fallbackDir = join(stagingDir, 'lib', 'cottontail-icu');
+      mkdirSync(fallbackDir, { recursive: true });
+      copyFileSync(localIcuData, join(fallbackDir, MANIFEST.icuFallback.dataFile));
+    }
+
+    ensureIcuHeaders(stagingDir);
+    ensureIcuFallback(stagingDir, platformKey);
+    writeFileSync(join(stagingDir, '.jsc-vendored'), `${expectedStamp}\n`);
+    rmSync(vendorDir, { recursive: true, force: true });
+    renameSync(stagingDir, vendorDir);
+    console.log(`✓ Local JavaScriptCore SDK vendored at vendors/jsc/${MANIFEST.tag}/${platformKey}`);
+  } catch (error) {
+    rmSync(stagingDir, { recursive: true, force: true });
+    fail('Failed to vendor local JavaScriptCore SDK.', error);
+  }
+}
+
 function vendorJsc() {
   const platformKey = getPlatformKey();
 
@@ -362,6 +430,11 @@ function vendorJsc() {
     console.log(
       `- Skipping JavaScriptCore vendoring: no prebuilt asset for ${process.platform}/${process.arch}`
     );
+    return;
+  }
+
+  if (process.env.COTTONTAIL_JSC_ARCHIVE) {
+    vendorLocalJsc(platformKey, process.env.COTTONTAIL_JSC_ARCHIVE);
     return;
   }
 
