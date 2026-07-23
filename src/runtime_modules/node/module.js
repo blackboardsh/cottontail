@@ -227,6 +227,7 @@ export const builtinModules = [
 const commonJsCache = new Map();
 const commonJsWrapperFactoryCache = new Map();
 const bundledAsyncEsmGraphCache = new Map();
+const nativeObjectDefineProperty = Object.defineProperty;
 const builtinModuleMap = new Map();
 const builtinNamespaceEntries = new Set();
 let modulePathCache = Object.create(null);
@@ -2092,18 +2093,20 @@ function resolveRequest(request, basePath, useHooks = true, kind = "require") {
 }
 
 function makeModule(filename, parent = null, isMain = false) {
-  const module = new Module(isMain ? "." : filename, parent);
+  const module = new Module(filename, parent);
+  if (isMain) module.id = ".";
   module.filename = filename;
-  module.path = dirname(filename);
-  module.paths = _nodeModulePaths(module.path);
   if (isMain) refreshModuleRequire(module);
   return module;
 }
 
+function invokeModuleRequire(module, request) {
+  return Module.prototype.require.call(module, request);
+}
+
 function refreshModuleRequire(module) {
-  const require = function require(request) {
-    return Module.prototype.require.call(module, request);
-  };
+  const require = invokeModuleRequire.bind(undefined, module);
+  nativeObjectDefineProperty(require, "name", { value: "require", configurable: true });
   const moduleBase = module.filename || (isAbsolute(module.id) ? module.id : cottontail.cwd());
   configureRequireProperties(require, moduleBase, () => module, true);
   module.require = require;
@@ -2319,6 +2322,7 @@ function codeOnlyText(source) {
 
 function hasEsmSyntax(source) {
   const text = String(source);
+  if (!esmSyntaxPattern.test(text)) return false;
   const mask = codePositionMask(text);
   const matcher = new RegExp(esmSyntaxPattern.source, "gm");
   let match;
@@ -2339,10 +2343,13 @@ function hasCommonJsSyntax(source) {
   return false;
 }
 
+const runtimeDecoratorSyntaxPattern = /(?:^|[\n;{}])\s*@[A-Za-z_$(\[]/;
+
 function hasRuntimeDecoratorSyntax(source) {
   const text = String(source);
+  if (!runtimeDecoratorSyntaxPattern.test(text)) return false;
   const mask = codePositionMask(text);
-  const matcher = /(?:^|[\n;{}])\s*@[A-Za-z_$(\[]/g;
+  const matcher = new RegExp(runtimeDecoratorSyntaxPattern.source, "g");
   let match;
   while ((match = matcher.exec(text)) != null) {
     const decorator = match.index + match[0].lastIndexOf("@");
@@ -2467,8 +2474,8 @@ function compilePublicCommonJsWrapper(source, filename) {
   return compiledWrapper;
 }
 
-function executeCommonJsSource(module, filename, source, requireOverride = undefined) {
-  if (hasEsmSyntax(source)) {
+function executeCommonJsSource(module, filename, source, requireOverride = undefined, sourceIsEsm = undefined) {
+  if (sourceIsEsm ?? hasEsmSyntax(source)) {
     const transformed = transformEsmSourceForDynamicImport(source);
     maybeRegisterSourceMap(filename, transformed);
     recordCompileCache(filename, transformed);
@@ -2799,15 +2806,16 @@ function executeRuntimeEsmSourceModule(module, filename, originalSource, loader)
   const source = transpileExtensionSource(filename, loader, true, originalSource);
   module.exports = createModuleNamespace();
   module[runtimeEsmSourceModuleKey] = true;
-  return executeCommonJsSource(module, filename, source, createEsmRequire(filename, module));
+  return executeCommonJsSource(module, filename, source, createEsmRequire(filename, module), true);
 }
 
 function executeDefaultExtension(module, filename, loader) {
   const originalSource = readModuleFile(filename).replace(/^#![^\n]*(\n|$)/, "");
-  if (runtimeEsmSourceExecutionDepth > 0 && hasEsmSyntax(originalSource)) {
+  const originalIsEsm = hasEsmSyntax(originalSource);
+  if (runtimeEsmSourceExecutionDepth > 0 && originalIsEsm) {
     return executeRuntimeEsmSourceModule(module, filename, originalSource, loader);
   }
-  if (hasEsmSyntax(originalSource) &&
+  if (originalIsEsm &&
       !standaloneFileEntry(filename).found &&
       typeof cottontail.bundleNative === "function") {
     return executeBundledCommonJsModule(module, filename, originalSource, loader);
@@ -2815,10 +2823,11 @@ function executeDefaultExtension(module, filename, loader) {
   const compileOverridden = module._compile !== defaultModuleCompile;
   const source = transpileExtensionSource(filename, loader, compileOverridden, originalSource);
   // Bun's synchronous ESM path does not call an overridden module._compile.
-  if (hasEsmSyntax(source)) return executeCommonJsSource(module, filename, source);
+  const sourceIsEsm = source === originalSource ? originalIsEsm : hasEsmSyntax(source);
+  if (sourceIsEsm) return executeCommonJsSource(module, filename, source, undefined, true);
   const compileSource = formatExtensionCompileSource(source, compileOverridden);
   if (compileOverridden) return module._compile(compileSource, filename);
-  return executeCommonJsSource(module, filename, compileSource);
+  return executeCommonJsSource(module, filename, compileSource, undefined, false);
 }
 
 function loaderExtensionFor(filename) {
@@ -4017,35 +4026,39 @@ export function __runMain(filename) {
   }
 }
 
+function getModuleParent() {
+  maybeWarnModuleParent();
+  return this[moduleParentKey];
+}
+
+function setModuleParent(value) {
+  maybeWarnModuleParent();
+  const previous = this[moduleParentKey];
+  if (previous !== value) {
+    detachModuleChild(previous, this);
+    attachModuleChild(value, this);
+  }
+  this[moduleParentKey] = value;
+}
+
+const moduleParentDescriptor = {
+  configurable: true,
+  enumerable: true,
+  get: getModuleParent,
+  set: setModuleParent,
+};
+
 export class Module {
   constructor(id = "", parent = null) {
-    Object.defineProperties(this, {
-      id: { configurable: true, enumerable: true, writable: true, value: id },
-      path: { configurable: true, enumerable: true, writable: true, value: id ? dirname(id) : "" },
-      exports: { configurable: true, enumerable: true, writable: true, value: {} },
-      filename: { configurable: true, enumerable: true, writable: true, value: null },
-      loaded: { configurable: true, enumerable: true, writable: true, value: false },
-      children: { configurable: true, enumerable: true, writable: true, value: [] },
-      paths: { configurable: true, enumerable: true, writable: true, value: id ? _nodeModulePaths(dirname(id)) : [] },
-    });
+    this.id = id;
+    this.path = id ? dirname(id) : "";
+    this.exports = {};
+    this.filename = null;
+    this.loaded = false;
+    this.children = [];
+    this.paths = id ? _nodeModulePaths(this.path) : [];
     this[moduleParentKey] = parent;
-    Object.defineProperty(this, "parent", {
-      configurable: true,
-      enumerable: true,
-      get() {
-        maybeWarnModuleParent();
-        return this[moduleParentKey];
-      },
-      set(value) {
-        maybeWarnModuleParent();
-        const previous = this[moduleParentKey];
-        if (previous !== value) {
-          detachModuleChild(previous, this);
-          attachModuleChild(value, this);
-        }
-        this[moduleParentKey] = value;
-      },
-    });
+    nativeObjectDefineProperty(this, "parent", moduleParentDescriptor);
     refreshModuleRequire(this);
   }
 

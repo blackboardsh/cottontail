@@ -22,6 +22,7 @@ extern void ct_jsc_run_loop_cycle(void);
 extern void *ct_jsc_run_loop_current(void);
 extern void ct_jsc_run_loop_dispatch(void *run_loop, void (*callback)(void *), void *context);
 extern void ct_jsc_drain_microtasks(JSContextRef context);
+extern void ct_jsc_collect_full(JSContextRef context);
 extern void *ct_jsc_microtask_delay_begin(JSContextGroupRef group);
 extern void ct_jsc_microtask_delay_end(void *opaque_scope);
 extern int ct_jsc_promise_status(JSValueRef value);
@@ -24271,13 +24272,17 @@ static JSValueRef ct_gc(JSContextRef ctx, JSObjectRef function, JSObjectRef this
     bool force = argc > 0 && ct_value_to_bool(ctx, argv[0]);
 #if defined(__APPLE__)
     if (force) {
-        JSSynchronousGarbageCollectForDebugging(ctx);
+        ct_jsc_collect_full(ctx);
         malloc_zone_pressure_relief(NULL, 0);
     } else {
         JSGarbageCollect(ctx);
     }
 #else
-    JSGarbageCollect(ctx);
+    if (force) {
+        ct_jsc_collect_full(ctx);
+    } else {
+        JSGarbageCollect(ctx);
+    }
 #endif
     if (runtime != NULL && runtime->napi_env != NULL) {
         JSValueRef napi_exception = NULL;

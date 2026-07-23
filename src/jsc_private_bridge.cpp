@@ -364,6 +364,7 @@ public:
 
     void drainMicrotasks();
     bool enableControlFlowProfiler();
+    void clearSourceProviderCaches();
     Exception* cottontailThrowException(JSGlobalObject* global_object, JSObject* exception)
     {
         return throwException(global_object, exception);
@@ -390,6 +391,11 @@ enum Synchronousness {
     Sync,
 };
 
+enum DeleteAllCodeEffort {
+    PreventCollectionAndDeleteAllCode,
+    DeleteAllCodeIfNotCollecting,
+};
+
 struct GCRequest {
     explicit GCRequest(CollectionScope requested_scope)
         : scope(requested_scope)
@@ -411,6 +417,7 @@ class Heap {
 public:
     void allowCollection();
     void collectNow(Synchronousness, GCRequest);
+    void deleteAllUnlinkedCodeBlocks(DeleteAllCodeEffort);
     void preventCollection();
 };
 
@@ -461,6 +468,29 @@ static JSC::VM* ct_jsc_vm(JSContextRef context)
 {
     return reinterpret_cast<JSC::VM*>(
         const_cast<OpaqueJSContextGroup*>(JSContextGetGroup(context)));
+}
+
+static JSC::Heap* ct_jsc_heap(JSC::VM* vm)
+{
+    constexpr ptrdiff_t vm_heap_offset = 0xf8;
+    return reinterpret_cast<JSC::Heap*>(
+        reinterpret_cast<unsigned char*>(vm) + vm_heap_offset);
+}
+
+extern "C" void ct_jsc_collect_full(JSContextRef context)
+{
+    if (context == nullptr)
+        return;
+
+    auto* vm = ct_jsc_vm(context);
+    JSC::JSLockHolder lock(*vm);
+    auto* heap = ct_jsc_heap(vm);
+
+    // Match Bun's synchronous GC path: source-provider and unlinked-code
+    // caches otherwise keep evicted modules' source and filenames alive.
+    vm->clearSourceProviderCaches();
+    heap->deleteAllUnlinkedCodeBlocks(JSC::PreventCollectionAndDeleteAllCode);
+    heap->collectNow(JSC::Sync, JSC::GCRequest(JSC::CollectionScope::Full));
 }
 
 static std::atomic<ptrdiff_t> ct_jsc_control_flow_profiler_offset { -1 };
