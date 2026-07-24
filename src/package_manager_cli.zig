@@ -527,9 +527,11 @@ const PeerCandidate = struct {
 
 const IsolatedSourceContext = struct {
     source_dir: []const u8,
+    previous_install_dir: ?[]const u8,
     previous_modules: ?[]const u8,
     previous_key: ?[]const u8,
     active: bool,
+    isolated_active: bool,
 };
 
 const ReconciledRecord = struct {
@@ -2238,6 +2240,7 @@ const Manager = struct {
     hidden_hoist_pattern: ?Isolated.HoistPattern = null,
     isolated_parent_modules: std.StringHashMap([]const u8),
     isolated_parent_keys: std.StringHashMap([]const u8),
+    local_source_install_dirs: std.StringHashMap([]const u8),
     isolated_package_metadata: std.StringHashMap(*const Value),
     isolated_live_store_keys: std.StringHashMap(void),
     isolated_live_links: std.StringHashMap(void),
@@ -2296,6 +2299,7 @@ const Manager = struct {
             .resolution_only_records = std.StringHashMap(void).init(allocator),
             .isolated_parent_modules = std.StringHashMap([]const u8).init(allocator),
             .isolated_parent_keys = std.StringHashMap([]const u8).init(allocator),
+            .local_source_install_dirs = std.StringHashMap([]const u8).init(allocator),
             .isolated_package_metadata = std.StringHashMap(*const Value).init(allocator),
             .isolated_live_store_keys = std.StringHashMap(void).init(allocator),
             .isolated_live_links = std.StringHashMap(void).init(allocator),
@@ -2340,6 +2344,7 @@ const Manager = struct {
         manager.isolated_live_links.deinit();
         manager.isolated_live_store_keys.deinit();
         manager.isolated_package_metadata.deinit();
+        manager.local_source_install_dirs.deinit();
         manager.isolated_parent_modules.deinit();
         manager.isolated_parent_keys.deinit();
         if (manager.manifest_policy) |*policy| policy.deinit();
@@ -6733,7 +6738,7 @@ const Manager = struct {
         const inspect_direct_trust = manager.options.trust and manager.options.command == .add and direct;
         if (direct and !refresh_direct_registry and !refresh_direct_source and !inspect_direct_trust) {
             const direct_key = if (explicit_global_link and !std.mem.eql(u8, parent_dir, manager.root_dir)) blk: {
-                const destination = try packageDestination(manager.allocator, parent_dir, alias);
+                const destination = try packageDestination(manager.allocator, manager.installParentDir(parent_dir), alias);
                 break :blk try manager.lockKeyForDestination(destination);
             } else alias;
             for (manager.records.items) |record| {
@@ -6817,6 +6822,7 @@ const Manager = struct {
                 !std.mem.eql(u8, parent_dir, manager.root_dir) and
                 !manager.pathIsWorkspace(parent_dir);
             const normalized_source = try manager.normalizeLocalSpec(resolution_spec, local.path);
+            const install_parent_dir = manager.installParentDir(parent_dir);
             const peer_context = try manager.peerContextForPackage(local.package_json, parent_dir, true);
             const destination = if (manager.node_linker == .isolated)
                 try manager.packageInstallDestinationWithPeerContext(
@@ -6830,11 +6836,11 @@ const Manager = struct {
                     peer_context,
                 )
             else if (explicit_global_link and !std.mem.eql(u8, parent_dir, manager.root_dir))
-                try packageDestination(manager.allocator, parent_dir, alias)
+                try packageDestination(manager.allocator, install_parent_dir, alias)
             else if (transitive_folder)
-                try packageDestination(manager.allocator, parent_dir, alias)
+                try packageDestination(manager.allocator, install_parent_dir, alias)
             else if (!std.mem.eql(u8, parent_dir, manager.root_dir) and manager.root_versions.contains(alias))
-                try packageDestination(manager.allocator, parent_dir, alias)
+                try packageDestination(manager.allocator, install_parent_dir, alias)
             else
                 try packageDestination(manager.allocator, manager.root_dir, alias);
             const newly_installed = !manager.pathExists(destination);
@@ -6847,7 +6853,7 @@ const Manager = struct {
                         try copyDirectoryTree(manager.init_data.io, manager.allocator, local.path, destination);
                     }
                     try manager.ensureIsolatedLinks(alias, parent_dir, destination);
-                } else if (transitive_folder) {
+                } else if (kind == .folder and placement_kind != .root) {
                     try manager.linkDirectoryFilesAt(destination, local.path);
                 } else {
                     try manager.linkDirectoryAt(destination, local.path);
@@ -7141,7 +7147,8 @@ const Manager = struct {
                 .peer_context = peer_context,
             };
         }
-        var base = parent_dir;
+        const install_parent_dir = manager.installParentDir(parent_dir);
+        var base = install_parent_dir;
         while (true) {
             const destination = try packageDestination(manager.allocator, base, alias);
             if (try manager.workspaceLockKeyForDestination(destination)) |workspace_key| {
@@ -7161,7 +7168,7 @@ const Manager = struct {
                     {
                         return .{
                             .package = package,
-                            .destination = try packageDestination(manager.allocator, parent_dir, alias),
+                            .destination = try packageDestination(manager.allocator, install_parent_dir, alias),
                         };
                     }
                 }
@@ -7495,7 +7502,7 @@ const Manager = struct {
                             try copyDirectoryTree(manager.init_data.io, manager.allocator, local.path, selection.destination);
                         }
                         try manager.ensureIsolatedLinks(alias, parent_dir, selection.destination);
-                    } else if (transitive_folder) {
+                    } else if (package.kind == .folder) {
                         try manager.linkDirectoryFilesAt(selection.destination, local.path);
                     } else {
                         try manager.linkDirectoryAt(selection.destination, local.path);
@@ -7659,7 +7666,7 @@ const Manager = struct {
         const destination = if (manager.node_linker == .isolated)
             try std.fs.path.join(manager.allocator, &.{ try manager.isolatedConsumerModules(parent_dir), alias })
         else
-            try packageDestination(manager.allocator, parent_dir, alias);
+            try packageDestination(manager.allocator, manager.installParentDir(parent_dir), alias);
         if (!manager.options.lockfile_only and !manager.options.dry_run) {
             if (std.fs.path.dirname(destination)) |modules_dir| {
                 try std.Io.Dir.cwd().createDirPath(manager.init_data.io, modules_dir);
@@ -7842,7 +7849,7 @@ const Manager = struct {
 
     fn dependencyLockKey(manager: *Manager, parent_dir: []const u8, alias: []const u8) ![]const u8 {
         if (manager.node_linker != .isolated) {
-            const destination = try packageDestination(manager.allocator, parent_dir, alias);
+            const destination = try packageDestination(manager.allocator, manager.installParentDir(parent_dir), alias);
             return manager.lockKeyForDestination(destination);
         }
         if (std.mem.eql(u8, parent_dir, manager.root_dir)) return manager.allocator.dupe(u8, alias);
@@ -7855,7 +7862,7 @@ const Manager = struct {
             if (!std.mem.eql(u8, parent_dir, workspace.path)) continue;
             return std.fmt.allocPrint(manager.allocator, "{s}/{s}", .{ workspace.name, alias });
         }
-        const destination = try packageDestination(manager.allocator, parent_dir, alias);
+        const destination = try packageDestination(manager.allocator, manager.installParentDir(parent_dir), alias);
         return manager.lockKeyForDestination(destination);
     }
 
@@ -8673,11 +8680,19 @@ const Manager = struct {
     fn pushIsolatedSourceContext(manager: *Manager, source_dir: []const u8, package_dir: []const u8) !IsolatedSourceContext {
         const context = IsolatedSourceContext{
             .source_dir = source_dir,
+            .previous_install_dir = manager.local_source_install_dirs.get(source_dir),
             .previous_modules = manager.isolated_parent_modules.get(source_dir),
             .previous_key = manager.isolated_parent_keys.get(source_dir),
-            .active = manager.node_linker == .isolated and !std.mem.eql(u8, source_dir, package_dir),
+            .active = !std.mem.eql(u8, source_dir, package_dir),
+            .isolated_active = manager.node_linker == .isolated and !std.mem.eql(u8, source_dir, package_dir),
         };
         if (!context.active) return context;
+
+        try manager.local_source_install_dirs.put(
+            try manager.allocator.dupe(u8, source_dir),
+            try manager.allocator.dupe(u8, package_dir),
+        );
+        if (!context.isolated_active) return context;
 
         if (manager.isolated_parent_modules.get(package_dir)) |modules| {
             try manager.isolated_parent_modules.put(
@@ -8696,6 +8711,13 @@ const Manager = struct {
 
     fn popIsolatedSourceContext(manager: *Manager, context: IsolatedSourceContext) !void {
         if (!context.active) return;
+        if (context.previous_install_dir) |install_dir| {
+            try manager.local_source_install_dirs.put(context.source_dir, install_dir);
+        } else {
+            _ = manager.local_source_install_dirs.remove(context.source_dir);
+        }
+        if (!context.isolated_active) return;
+
         if (context.previous_modules) |modules| {
             try manager.isolated_parent_modules.put(context.source_dir, modules);
         } else {
@@ -8706,6 +8728,10 @@ const Manager = struct {
         } else {
             _ = manager.isolated_parent_keys.remove(context.source_dir);
         }
+    }
+
+    fn installParentDir(manager: *Manager, source_parent_dir: []const u8) []const u8 {
+        return manager.local_source_install_dirs.get(source_parent_dir) orelse source_parent_dir;
     }
 
     fn isolatedConsumerModules(manager: *Manager, parent_dir: []const u8) ![]const u8 {
@@ -9513,6 +9539,7 @@ const Manager = struct {
         parent_dir: []const u8,
         direct: bool,
     ) ![]const u8 {
+        const install_parent_dir = manager.installParentDir(parent_dir);
         if (!direct) {
             if (manager.rootDependencySpec(alias)) |root_spec| {
                 const effective = manager.manifest_policy.?.resolveDependency(alias, root_spec, false) catch root_spec;
@@ -9525,7 +9552,7 @@ const Manager = struct {
                 {
                     const root_npm = parseNpmAlias(alias, unwrapped);
                     if (!semverSatisfies(manager.allocator, root_npm[1], version_value)) {
-                        return packageDestination(manager.allocator, parent_dir, alias);
+                        return packageDestination(manager.allocator, install_parent_dir, alias);
                     }
                 }
             }
@@ -9536,7 +9563,7 @@ const Manager = struct {
         if (manager.root_versions.get(alias)) |existing| {
             if (std.mem.eql(u8, existing, version_value)) return packageDestination(manager.allocator, manager.root_dir, alias);
         }
-        return packageDestination(manager.allocator, parent_dir, alias);
+        return packageDestination(manager.allocator, install_parent_dir, alias);
     }
 
     fn rootDependencySpec(manager: *Manager, alias: []const u8) ?[]const u8 {
@@ -9679,7 +9706,7 @@ const Manager = struct {
             }
             return null;
         }
-        const candidates = [_][]const u8{ parent_dir, manager.root_dir };
+        const candidates = [_][]const u8{ manager.installParentDir(parent_dir), manager.root_dir };
         for (candidates) |base| {
             const destination = try packageDestination(manager.allocator, base, alias);
             const destination_key = try manager.lockKeyForDestination(destination);
@@ -13665,9 +13692,20 @@ fn symlinkDirectoryFiles(io: std.Io, allocator: std.mem.Allocator, source: []con
             .directory => try symlinkDirectoryFiles(io, allocator, source_path, destination_path),
             .file, .sym_link => {
                 const target_stat = std.Io.Dir.cwd().statFile(io, source_path, .{}) catch null;
-                try std.Io.Dir.symLinkAbsolute(io, source_path, destination_path, .{
-                    .is_directory = target_stat != null and target_stat.?.kind == .directory,
-                });
+                if (builtin.os.tag == .windows) {
+                    if (target_stat != null and target_stat.?.kind == .directory) {
+                        try symlinkDirectoryFiles(io, allocator, source_path, destination_path);
+                    } else {
+                        try std.Io.Dir.copyFileAbsolute(source_path, destination_path, io, .{
+                            .replace = true,
+                            .make_path = true,
+                        });
+                    }
+                } else {
+                    try std.Io.Dir.symLinkAbsolute(io, source_path, destination_path, .{
+                        .is_directory = target_stat != null and target_stat.?.kind == .directory,
+                    });
+                }
             },
             else => {},
         }

@@ -372,6 +372,15 @@ try {
       stdoutIncludes: ['bun package manager link passed'],
     },
     {
+      name: 'package-manager-external-file-dependencies',
+      scriptPath: join(rootDir, 'tests', 'js', 'package-manager-external-file-dependencies.ts'),
+      env: {
+        COTTONTAIL_TMP_DIR: tempDir,
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['package manager external file dependencies passed'],
+    },
+    {
       name: 'bun-sqlite',
       scriptPath: join(rootDir, 'tests', 'js', 'bun-sqlite.ts'),
       env: {

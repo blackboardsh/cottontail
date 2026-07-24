@@ -188,6 +188,7 @@ function testRegistryAndMinimumAge() {
 
   const versions = {
     "edge-package": ["1.0.0"],
+    "external-child": ["1.0.0"],
     "cross-package": ["1.0.0"],
     "retry-package": ["1.0.0"],
     "age-package": ["1.0.0", "2.0.0"],
@@ -291,11 +292,20 @@ server.listen(0, () => fs.writeFileSync(portFile, String(server.address().port))
     const port = Number(fs.readFileSync(portFile, "utf8"));
     const root = path.join(scratch, "registry-project");
     const home = path.join(scratch, "registry-project-home");
+    const externalPackage = path.join(scratch, "external-registry-package");
+    writeJson(path.join(externalPackage, "package.json"), {
+      name: "external-registry-package",
+      version: "1.0.0",
+      dependencies: {
+        "external-child": "*",
+      },
+    });
     writeJson(path.join(root, "package.json"), {
       name: "registry-project",
       version: "1.0.0",
       dependencies: {
         "edge-package": "*",
+        "external-registry-package": "file:../external-registry-package",
         "cross-package": "*",
         "retry-package": "*",
         "age-package": "*",
@@ -317,6 +327,14 @@ server.listen(0, () => fs.writeFileSync(portFile, String(server.address().port))
       BUN_CONFIG_TOKEN: "edge-token",
     });
     expectSuccess("registry edge and minimum release age install", result);
+    assert.ok(
+      fs.lstatSync(path.join(root, "node_modules", "external-registry-package")).isDirectory(),
+      "external file package should be materialized as a directory",
+    );
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(root, "node_modules", "external-child", "package.json"))).version,
+      "1.0.0",
+    );
     assert.equal(
       JSON.parse(fs.readFileSync(path.join(root, "node_modules", "age-package", "package.json"))).version,
       "1.0.0",
