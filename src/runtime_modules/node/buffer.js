@@ -1083,13 +1083,13 @@ export function SlowBuffer(size) {
   return Buffer.allocUnsafe(Number(size) || 0);
 }
 
-const nativeIsAscii = globalThis.cottontail.createBufferIsAscii();
-export const isAscii = new Proxy(nativeIsAscii, {
-  apply(target, thisArgument, [input]) {
-    bufferSourceBytes(input);
-    return Reflect.apply(target, thisArgument, [input]);
-  },
-});
+export function isAscii(input) {
+  const bytes = bufferSourceBytes(input);
+  for (let index = 0; index < bytes.length; index += 1) {
+    if ((bytes[index] & 0x80) !== 0) return false;
+  }
+  return true;
+}
 
 export function isUtf8(input) {
   const bytes = bufferSourceBytes(input);
@@ -1134,7 +1134,9 @@ Object.defineProperty(globalThis, "__cottontailBufferTranscodeImplementation", {
   configurable: true,
 });
 
-export const transcode = globalThis.cottontail.createBufferTranscode();
+export function transcode(source, fromEncoding, toEncoding) {
+  return transcodeImplementation(source, fromEncoding, toEncoding);
+}
 
 export function resolveObjectURL(id) {
   if (typeof globalThis.resolveObjectURL === "function") return globalThis.resolveObjectURL(id);

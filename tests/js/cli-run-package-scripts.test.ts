@@ -1,5 +1,13 @@
 import { afterAll, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 
 const scratchRoot = process.env.COTTONTAIL_CLI_RUN_TEST_ROOT ?? join(process.cwd(), ".cottontail-tmp");
@@ -33,18 +41,19 @@ function run(cwd: string, args: string[]) {
 test("multi-run rewrites nested package-manager commands and exposes lifecycle metadata", () => {
   const directory = join(scratch, "nested-run");
   mkdirSync(directory, { recursive: true });
-  writeFileSync(
-    join(directory, "package.json"),
-    `{
+  const packageJson = `{
       // Package scripts are loaded with Bun's JSONC rules.
       "name": "run-fixture",
       "version": "1.2.3",
       "config": { "flavor": "stock-jsc" },
       "scripts": {
-        "inner": "bun probe.js",
+        "inner": "bun probe.js \\"two words\\" 'quoted value'",
         "outer": "npm run inner",
       },
-    }`,
+    }`;
+  writeFileSync(
+    join(directory, "package.json"),
+    packageJson,
   );
   writeFileSync(
     join(directory, "probe.js"),
@@ -60,6 +69,7 @@ test("multi-run rewrites nested package-manager commands and exposes lifecycle m
       configFlavor: process.env.npm_package_config_flavor,
       bun: process.env.BUN,
       execPath: process.execPath,
+      args: process.argv.slice(2),
     }));\n`,
   );
 
@@ -74,14 +84,17 @@ test("multi-run rewrites nested package-manager commands and exposes lifecycle m
     packageVersion: "1.2.3",
     packageJson: join(realDirectory, "package.json"),
     lifecycleEvent: "inner",
-    lifecycleScript: "bun probe.js",
+    lifecycleScript: `bun probe.js "two words" 'quoted value'`,
     initCwd: realDirectory,
     localPrefix: realDirectory,
     configFlavor: "stock-jsc",
+    args: ["two words", "quoted value"],
   });
   expect(metadata.userAgent).toStartWith("bun/1.3.10 ");
   expect(metadata.bun).toBe(metadata.execPath);
   expect(result.stderr).toMatch(/^outer\s+\| Done/m);
+  expect(readFileSync(join(directory, "package.json"), "utf8")).toBe(packageJson);
+  expect(existsSync(join(directory, "node_modules", "bun"))).toBe(false);
 });
 
 test("workspace multi-run honors JSONC patterns and sorts packages by name", () => {
@@ -120,4 +133,23 @@ test("workspace multi-run honors JSONC patterns and sorts packages by name", () 
   expect(alpha).toBeGreaterThanOrEqual(0);
   expect(omega).toBeGreaterThan(alpha);
   expect(result.stdout).not.toContain("ignored");
+});
+
+test("single package scripts do not install the public bun package", () => {
+  const directory = join(scratch, "single-run");
+  mkdirSync(directory, { recursive: true });
+  const packageJson = JSON.stringify({
+    name: "single-run",
+    version: "1.0.0",
+    scripts: {
+      probe: "printf 'single-run\\n'",
+    },
+  }, null, 2);
+  writeFileSync(join(directory, "package.json"), packageJson);
+
+  const result = run(directory, ["run", "probe"]);
+  expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
+  expect(result.stdout).toContain("single-run\n");
+  expect(readFileSync(join(directory, "package.json"), "utf8")).toBe(packageJson);
+  expect(existsSync(join(directory, "node_modules", "bun"))).toBe(false);
 });

@@ -1,4 +1,5 @@
 import { deepStrictEqual, ok, strictEqual } from "node:assert/strict";
+import { X509Certificate } from "node:crypto";
 import { createRequire } from "node:module";
 import * as tls from "node:tls";
 import * as http2 from "node:http2";
@@ -83,6 +84,28 @@ ok(context.context && typeof context.context === "object", "tls SecureContext na
 ok(Array.isArray(tls.rootCertificates), "tls rootCertificates should be an array");
 ok(tls.rootCertificates.length > 0, "tls rootCertificates should load system roots");
 ok(tls.getCACertificates().length > 0, "tls getCACertificates should return default roots");
+if (process.platform === "win32") {
+  const nativeRoots = cottontail.systemRootCertificates();
+  ok(typeof nativeRoots === "string" && nativeRoots.length > 0, "Windows certificate store should return PEM roots");
+  const pemRoots = nativeRoots.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) ?? [];
+  strictEqual(pemRoots.length, tls.rootCertificates.length, "Windows native and node:tls root counts should match");
+  for (const pem of pemRoots) {
+    ok(new X509Certificate(pem).raw.byteLength > 0, "Windows root should be a valid X.509 PEM certificate");
+  }
+
+  const validateSecureContext = cottontail.tlsValidateSecureContext;
+  let defaultClientCA;
+  try {
+    cottontail.tlsValidateSecureContext = (_cert, _key, _passphrase, ca) => {
+      defaultClientCA = ca;
+      return {};
+    };
+    tls.createSecureContext();
+  } finally {
+    cottontail.tlsValidateSecureContext = validateSecureContext;
+  }
+  strictEqual(defaultClientCA, nativeRoots, "Windows default TLS credentials should use system roots");
+}
 tls.setDefaultCACertificates([tls.rootCertificates[0]]);
 strictEqual(tls.getCACertificates("default").length, 1, "tls setDefaultCACertificates mismatch");
 

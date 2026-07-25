@@ -72,6 +72,17 @@ const require = createRequire(import.meta.url);
 const requiredStream = require("node:stream");
 assert(requiredStream === StreamDefault, "require node:stream default mismatch");
 assert(requiredStream.Readable === Readable, "require node:stream Readable mismatch");
+assert(
+  Object.getOwnPropertyDescriptor(requiredStream, "promises")?.enumerable === false,
+  "require node:stream promises enumerability mismatch",
+);
+const bareStreamNamespace = await import("stream");
+const nodeStreamNamespace = await import("node:stream");
+assert(bareStreamNamespace === nodeStreamNamespace, "stream builtin namespace alias mismatch");
+assert(
+  Object.getOwnPropertyDescriptor(nodeStreamNamespace, "promises")?.enumerable === true,
+  "import node:stream promises enumerability mismatch",
+);
 assert(require("stream/consumers").text === text, "require stream/consumers mismatch");
 assert(require("node:stream/promises").pipeline === pipelinePromise, "require stream/promises mismatch");
 assert(require("stream/web").ReadableStream === ReadableStream, "require stream/web mismatch");

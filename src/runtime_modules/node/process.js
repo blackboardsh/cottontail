@@ -15,23 +15,44 @@ import { internalRequire, uvErrorMap } from "./util/internal/loader.js";
 import { fileURLToPath } from "./url.js";
 import { makeHttpParserBinding } from "../internal/node-http-parser.js";
 import EventEmitter from "./events.js";
+import {
+  assertPermission,
+  assertFsRead,
+  assertFsWrite,
+  permission as permissionObject,
+  permissionsEnabled,
+} from "./internal/permissions.js";
 
-const nodeCompatVersion = "24.3.0";
+const nodeCompatVersion = "24.11.1";
 let sourceMapsState = false;
 let uncaughtExceptionCaptureCallback = null;
 let lastClockNs = 0n;
 
-const fallbackSignalNumbers = {
-  SIGHUP: 1,
-  SIGINT: 2,
-  SIGQUIT: 3,
-  SIGABRT: 6,
-  SIGKILL: 9,
-  SIGUSR1: cottontail.platform?.() === "linux" ? 10 : 30,
-  SIGUSR2: cottontail.platform?.() === "linux" ? 12 : 31,
-  SIGALRM: 14,
-  SIGTERM: 15,
-};
+const fallbackSignalNumbers = cottontail.platform?.() === "win32"
+  ? {
+      SIGHUP: 1,
+      SIGINT: 2,
+      SIGQUIT: 3,
+      SIGILL: 4,
+      SIGFPE: 8,
+      SIGKILL: 9,
+      SIGSEGV: 11,
+      SIGTERM: 15,
+      SIGBREAK: 21,
+      SIGABRT: 22,
+      SIGWINCH: 28,
+    }
+  : {
+      SIGHUP: 1,
+      SIGINT: 2,
+      SIGQUIT: 3,
+      SIGABRT: 6,
+      SIGKILL: 9,
+      SIGUSR1: cottontail.platform?.() === "linux" ? 10 : 30,
+      SIGUSR2: cottontail.platform?.() === "linux" ? 12 : 31,
+      SIGALRM: 14,
+      SIGTERM: 15,
+    };
 
 function nodeError(ErrorCtor, code, message) {
   const error = new ErrorCtor(message);
@@ -454,9 +475,10 @@ function pickConstants(predicate) {
   return Object.freeze(out);
 }
 
-const errnoConstants = pickConstants(
-  (name, value) => /^E[A-Z0-9]+$/.test(name) && !name.startsWith("ENGINE_") && Number.isInteger(value),
-);
+const errnoConstants = pickConstants((name, value) =>
+  !name.startsWith("ENGINE_") &&
+  (/^E[A-Z0-9]+$/.test(name) || /^WSA[A-Z0-9_]+$/.test(name)) &&
+  Number.isInteger(value));
 const signalConstants = pickConstants((name, value) => /^SIG[A-Z0-9]+$/.test(name) && Number.isInteger(value));
 const signalNamesByNumber = new Map();
 for (const signals of [signalConstants, fallbackSignalNumbers]) {
@@ -828,13 +850,23 @@ function makeOsBinding() {
     getFreeMem: () => memoryValue("osFreeMemory", "freeMemory"),
     getCPUs: flattenedCpuInfo,
     getInterfaceAddresses: () => typeof cottontail.osNetworkInterfaces === "function" ? cottontail.osNetworkInterfaces() : [],
-    getHomeDirectory: () => cottontail.env("HOME") || cottontail.env("USERPROFILE") || "/",
+    getHomeDirectory: () => processObject.platform === "win32"
+      ? cottontail.env("USERPROFILE") ||
+        `${cottontail.env("HOMEDRIVE") || ""}${cottontail.env("HOMEPATH") || ""}` ||
+        cottontail.env("HOME") ||
+        "/"
+      : cottontail.env("HOME") || "/",
     getUserInfo: () => ({
       uid: Number(processObject.getuid?.() ?? -1),
       gid: Number(processObject.getgid?.() ?? -1),
       username: cottontail.env("USER") || cottontail.env("USERNAME") || "",
-      homedir: cottontail.env("HOME") || cottontail.env("USERPROFILE") || "/",
-      shell: cottontail.env("SHELL") || (processObject.platform === "win32" ? cottontail.env("ComSpec") || "cmd.exe" : "/bin/sh"),
+      homedir: processObject.platform === "win32"
+        ? cottontail.env("USERPROFILE") ||
+          `${cottontail.env("HOMEDRIVE") || ""}${cottontail.env("HOMEPATH") || ""}` ||
+          cottontail.env("HOME") ||
+          "/"
+        : cottontail.env("HOME") || "/",
+      shell: processObject.platform === "win32" ? null : cottontail.env("SHELL") || "/bin/sh",
     }),
     setPriority: (pid, priority) => cottontail.osSetPriority?.(Number(pid || processObject.pid), Number(priority)),
     getPriority: (pid = 0) => typeof cottontail.osGetPriority === "function" ? Number(cottontail.osGetPriority(Number(pid || processObject.pid))) : 0,
@@ -1014,6 +1046,44 @@ const ttyWrapBinding = Object.freeze({
   isTTY: ttyIsatty,
 });
 
+const signalWrapInstances = new WeakSet();
+
+// Cottontail's process signal delivery is owned by the runtime-level libuv
+// watchers. This internal test binding mirrors Signal's construction,
+// receiver validation, and start/stop return contract without installing a
+// second Windows console-control watcher.
+class SignalWrap {
+  constructor() {
+    signalWrapInstances.add(this);
+  }
+
+  start(signum) {
+    if (!signalWrapInstances.has(this)) throw new TypeError("Illegal invocation");
+    const normalized = Number(signum) | 0;
+    return signalNamesByNumber.has(normalized) ? 0 : uvBinding.UV_EINVAL;
+  }
+
+  stop() {
+    if (!signalWrapInstances.has(this)) throw new TypeError("Illegal invocation");
+    return 0;
+  }
+}
+
+Object.defineProperty(SignalWrap, "name", {
+  value: "Signal",
+  configurable: true,
+});
+for (const name of ["start", "stop"]) {
+  Object.defineProperty(SignalWrap.prototype, name, {
+    ...Object.getOwnPropertyDescriptor(SignalWrap.prototype, name),
+    enumerable: true,
+  });
+}
+
+const signalWrapBinding = Object.freeze({
+  Signal: SignalWrap,
+});
+
 function makeProcessBinding(name) {
   switch (name) {
     case "natives":
@@ -1048,6 +1118,8 @@ function makeProcessBinding(name) {
       return utilBinding;
     case "tty_wrap":
       return ttyWrapBinding;
+    case "signal_wrap":
+      return signalWrapBinding;
     case "http_parser":
       return makeHttpParserBinding();
     case "timers":
@@ -1255,6 +1327,7 @@ function makeReport() {
         const separator = platform === "win32" ? "\\" : "/";
         output = `${String(this.directory).replace(/[\\/]$/, "")}${separator}${output}`;
       }
+      assertFsWrite(output);
       const data = JSON.stringify(createReport(this, error, output), null, this.compact ? 0 : 2);
       cottontail.writeFile(output, `${data}\n`);
       return output;
@@ -1428,14 +1501,17 @@ processObject.env ??= cottontail.env();
       return result;
     },
     get(target, key, receiver) {
-      if (typeof key === "symbol") return undefined;
+      // Internal runtime markers may be non-configurable properties on an
+      // environment proxy. Forward symbol reads so nested hot-reload proxies
+      // preserve the target's invariants.
+      if (typeof key === "symbol") return Reflect.get(target, key, receiver);
       return Reflect.get(target, key, receiver);
     },
     has(target, key) {
-      return typeof key === "symbol" ? false : Reflect.has(target, key);
+      return Reflect.has(target, key);
     },
     deleteProperty(target, key) {
-      if (typeof key === "symbol") return true;
+      if (typeof key === "symbol") return Reflect.deleteProperty(target, key);
       const result = Reflect.deleteProperty(target, key);
       updateTimeZone(key);
       return result;
@@ -1502,6 +1578,8 @@ for (let index = 0; index < processObject.execArgv.length; index += 1) {
     processObject.title = String(processObject.execArgv[++index]);
   }
 }
+if (permissionsEnabled()) processObject.permission = permissionObject;
+else if (processObject.permission !== undefined) delete processObject.permission;
 // Bun reports "bun" as the default process title (upstream regression 23183).
 // COTTONTAIL-COMPAT: Assignments update the JS value; changing the operating-system process title needs a native host API.
 processObject.title ??= "bun";
@@ -2097,7 +2175,8 @@ class ImmutableSet extends Set {
   [Symbol.iterator]() { return this.values(); }
 
   has(value) {
-    const text = String(value);
+    if (typeof value !== "string") return false;
+    const text = value;
     const values = immutableSetValues.get(this);
     if (values.has(text)) return true;
     const option = text.split("=", 1)[0];
@@ -2441,6 +2520,7 @@ export const cwd = processObject.cwd = () => cottontail.cwd();
 
 export const chdir = processObject.chdir = (directory) => {
   if (typeof directory !== "string") throw invalidArgType("directory", "string", directory);
+  assertFsRead(directory);
   const source = processObject.cwd();
   try {
     processInfo("chdir", directory);
@@ -2481,7 +2561,9 @@ export const reallyExit = processObject.reallyExit = (code = undefined) => {
 };
 
 export const abort = processObject.abort = () => {
-  cottontail.kill(processObject.pid, signalNumber("SIGABRT"));
+  // Windows Node terminates immediately with the conventional abort status
+  // 3 << 6 (134), even though its exported SIGABRT constant is 22.
+  cottontail.kill(processObject.pid, cottontail.platform?.() === "win32" ? 134 : signalNumber("SIGABRT"));
 };
 
 export const nextTick = processObject.nextTick = function nextTick(callback, ...args) {
@@ -2490,7 +2572,11 @@ export const nextTick = processObject.nextTick = function nextTick(callback, ...
       `The "callback" argument must be of type function. Received ${callback === null ? "null" : `type ${typeof callback}`}`);
   }
   const wrapped = _wrapAsyncCallback(callback);
-  _enqueueNextTick(args.length === 0 ? wrapped : () => wrapped(...args));
+  const activeDomain = processObject.domain;
+  const invoke = activeDomain && typeof activeDomain.run === "function"
+    ? (...tickArgs) => activeDomain.run(wrapped, ...tickArgs)
+    : wrapped;
+  _enqueueNextTick(args.length === 0 ? invoke : () => invoke(...args));
 };
 // The bundler suffixes identifiers when deduplicating; pin the public name.
 Object.defineProperty(nextTick, "name", { value: "nextTick", configurable: true });
@@ -2540,7 +2626,7 @@ export const kill = processObject.kill = (targetPid, signal = "SIGTERM") => {
       : signalNamesByNumber.get(signalValue);
   if (pidNumber === processObject.pid && signalName && processObject.listenerCount(signalName) > 0) {
     _enqueueNextTick(() => {
-      if (!processObject.emit(signalName, signalName, signalValue)) {
+      if (!processObject.emit(signalName, signalName)) {
         processObject._kill(pidNumber, signalValue);
       }
     });
@@ -2865,8 +2951,28 @@ export const _fatalException = processObject._fatalException = function _fatalEx
 };
 
 globalThis.__cottontailHandleUncaughtException = error => {
-  const handled = processObject._fatalException(error, false);
-  if (!handled) globalThis.__cottontailFormatUncaughtModuleError?.(error);
+  const monitorActive = processObject.listenerCount("uncaughtExceptionMonitor") > 0;
+  let handled;
+  try {
+    handled = processObject._fatalException(error, false);
+  } catch (handlerError) {
+    if (monitorActive && handlerError !== null &&
+        (typeof handlerError === "object" || typeof handlerError === "function")) {
+      try {
+        Object.defineProperty(handlerError, "__cottontailSkipUncaughtModuleFormatting", {
+          value: true,
+          configurable: true,
+        });
+        const header = Error.prototype.toString.call(handlerError);
+        if (typeof handlerError.stack === "string" &&
+            !handlerError.stack.split(/\r?\n/).includes(header)) {
+          handlerError.stack = `${header}\n${handlerError.stack}`;
+        }
+      } catch {}
+    }
+    throw handlerError;
+  }
+  if (!handled && !monitorActive) globalThis.__cottontailFormatUncaughtModuleError?.(error);
   return handled;
 };
 
@@ -2994,6 +3100,7 @@ export const execve = processObject.execve = (file, args = [], execEnv = process
       "process.execve is not supported in workers",
     );
   }
+  assertPermission("child", file);
   if (processObject.platform === "win32") {
     throw nodeError(
       TypeError,
@@ -3001,7 +3108,6 @@ export const execve = processObject.execve = (file, args = [], execEnv = process
       "process.execve is not available on this platform",
     );
   }
-  // COTTONTAIL-COMPAT: The native execve host must enforce Cottontail's process permission policy.
   return cottontail.processExecve(file, args, execEnv);
 };
 
@@ -3020,9 +3126,9 @@ export const getBuiltinModule = processObject.getBuiltinModule = (specifier) => 
 
 export const loadEnvFile = processObject.loadEnvFile = (path = ".env") => {
   if (typeof path !== "string") throw invalidArgType("path", "string", path);
+  assertFsRead(path);
   let source;
   try {
-    // COTTONTAIL-COMPAT: Filesystem permission enforcement requires a shared native permission service.
     source = cottontail.readFile(path);
   } catch (cause) {
     const error = nodeError(Error, "ENOENT", `ENOENT: no such file or directory, open '${path}'`);
@@ -3093,6 +3199,7 @@ export const finalization = processObject.finalization = (() => {
 })();
 
 export const report = processObject.report = makeReport();
+export const permission = processObject.permission;
 
 // COTTONTAIL-COMPAT: node:process addon ABI - process metadata, credentials, signals, reports, env loading, execve, and common internal bindings use native host APIs; N-API module initialization still needs a Node-compatible ABI entrypoint.
 

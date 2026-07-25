@@ -54,8 +54,16 @@ public:
 namespace {
 
 constexpr std::size_t invalid_count = std::numeric_limits<std::size_t>::max();
+#if defined(_WIN32)
+// The same pinned VM constructor initializes Heap at VM + 0xf0.
+constexpr std::size_t vm_heap_offset = 0xf0;
+// The pinned Windows JavaScriptCore.lib VM constructor initializes DateCache
+// at VM + 0x1e630 (UnifiedSource-f2e18ffc-47.cpp.obj, lea rcx,[rsi+1E630h]).
+constexpr std::size_t vm_date_cache_offset = 0x1e630;
+#else
 constexpr std::size_t vm_heap_offset = 0xf8;
 constexpr std::size_t vm_date_cache_offset = 0x1e638;
+#endif
 constexpr std::size_t heap_protected_values_offset = 0x198;
 constexpr std::size_t heap_strong_list_offset = 0x228;
 constexpr uintptr_t deleted_hash_key = std::numeric_limits<uintptr_t>::max();

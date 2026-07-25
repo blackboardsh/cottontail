@@ -1,10 +1,12 @@
-import { afterAll, expect, test } from "bun:test";
+import { afterAll, expect, setDefaultTimeout, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
 const fixtureDirectory = mkdtempSync(join(tmpdir(), "cottontail-process-lifecycle-"));
 let fixtureId = 0;
+
+setDefaultTimeout(15_000);
 
 afterAll(() => {
   rmSync(fixtureDirectory, { recursive: true, force: true });
@@ -110,6 +112,32 @@ test("an exception from an uncaughtException listener uses fatal exit code 7", a
   expect(result.stderr).toContain("handler-failed");
 });
 
+test("uncaught ReferenceError messages use Node wording", async () => {
+  const result = await runSource("missingLifecycleBinding();");
+
+  expect(result.exitCode).toBe(1);
+  expect(result.stderr).toContain("ReferenceError: missingLifecycleBinding is not defined");
+  expect(result.stderr).not.toContain("Can't find variable:");
+});
+
+test("a monitor-only nextTick exception is routed once", async () => {
+  const result = await runSource(`
+    let monitored = 0;
+    process.on("uncaughtExceptionMonitor", (error, origin) => {
+      monitored++;
+      console.log("monitor", error.message, origin);
+    });
+    process.on("exit", () => console.log("monitored", monitored));
+    process.nextTick(() => { throw new Error("nextTick-fatal"); });
+  `);
+
+  expect(result.exitCode).toBe(1);
+  expect(result.stdout).toBe(
+    "monitor nextTick-fatal uncaughtException\nmonitored 1\n",
+  );
+  expect(result.stderr).toContain("Error: nextTick-fatal");
+});
+
 test("exit listeners can replace a fatal exit code with zero", async () => {
   const result = await runSource(`
     process.on("exit", code => {
@@ -123,17 +151,17 @@ test("exit listeners can replace a fatal exit code with zero", async () => {
   expect(result.stdout).toBe("1 1\n");
 });
 
-test.skipIf(process.platform === "win32")("OS signals emit their name and number", async () => {
+test.skipIf(process.platform === "win32")("OS signals emit their name", async () => {
   const result = await runSource(`
-    process.once("SIGUSR1", (name, number) => {
-      console.log(name, number);
+    process.once("SIGUSR1", (...arguments_) => {
+      console.log(JSON.stringify(arguments_));
       process.exit(0);
     });
     process.kill(process.pid, "SIGUSR1");
   `);
 
   expect(result.exitCode).toBe(0);
-  expect(result.stdout).toBe(`SIGUSR1 ${process.binding("constants").os.signals.SIGUSR1}\n`);
+  expect(result.stdout).toBe('["SIGUSR1"]\n');
 });
 
 for (const signal of ["SIGALRM", "SIGPROF", "SIGVTALRM", "SIGPWR"] as const) {

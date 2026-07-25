@@ -6,6 +6,7 @@
 #endif
 
 #include "jsc_runner.h"
+#include "icu_bridge/icu-bridge.h"
 #include "napi_bridge.h"
 
 #include <JavaScriptCore/JavaScript.h>
@@ -15,6 +16,7 @@
 #endif
 
 extern bool ct_jsc_string_is_8_bit(JSStringRef string);
+extern bool ct_jsc_value_is_out_of_memory_error(JSContextRef context, JSValueRef value);
 #if defined(_WIN32) || defined(__linux__)
 extern void ct_jsc_initialize_main_thread(void);
 #endif
@@ -134,6 +136,7 @@ extern void JSGlobalContextSetUnhandledRejectionCallback(
 #include <windows.h>
 #include <windns.h>
 #include <winioctl.h>
+#include <winternl.h>
 #else
 #include <arpa/inet.h>
 #endif
@@ -179,6 +182,7 @@ extern void JSGlobalContextSetUnhandledRejectionCallback(
 #include <spawn.h>
 #endif
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -191,10 +195,12 @@ extern void JSGlobalContextSetUnhandledRejectionCallback(
 #include <process.h>
 #include <psapi.h>
 #include <iphlpapi.h>
+#include <bcrypt.h>
 #include <tlhelp32.h>
-#define chdir _chdir
+#include <wincred.h>
+#define chdir ct_windows_chdir
 #define dup2 _dup2
-#define getcwd _getcwd
+#define getcwd ct_windows_getcwd
 #define open _open
 #define O_SYNC 0
 #define F_OK 0
@@ -203,6 +209,7 @@ extern void JSGlobalContextSetUnhandledRejectionCallback(
 #define STDERR_FILENO 2
 #define strcasecmp _stricmp
 #define strncasecmp _strnicmp
+#define SHUT_RD SD_RECEIVE
 #define SHUT_WR SD_SEND
 #define SHUT_RDWR SD_BOTH
 #define umask _umask
@@ -258,6 +265,7 @@ typedef unsigned int gid_t;
 #include <unistd.h>
 #endif
 #include <time.h>
+#include <wchar.h>
 #include <uv.h>
 #include <zlib.h>
 
@@ -363,6 +371,10 @@ static int ct_windows_mutex_destroy(pthread_mutex_t *mutex) {
     return 0;
 }
 
+static int ct_windows_mutex_trylock(pthread_mutex_t *mutex) {
+    return TryAcquireSRWLockExclusive(mutex) ? 0 : EBUSY;
+}
+
 static int ct_windows_cond_destroy(pthread_cond_t *cond) {
     (void)cond;
     return 0;
@@ -379,6 +391,7 @@ static int ct_windows_cond_signal(pthread_cond_t *cond) {
 #define pthread_join ct_windows_thread_join
 #define pthread_equal(left, right) ((left) == (right))
 #define pthread_mutex_destroy ct_windows_mutex_destroy
+#define pthread_mutex_trylock ct_windows_mutex_trylock
 #define pthread_cond_destroy ct_windows_cond_destroy
 #define pthread_cond_signal ct_windows_cond_signal
 
@@ -431,12 +444,359 @@ int setenv(const char *name, const char *value, int overwrite) {
     return _putenv_s(name, value);
 }
 
-static int ct_lstat(const char *path, struct stat *stat_value) {
-    if (stat(path, stat_value) != 0) return -1;
-    DWORD attributes = GetFileAttributesA(path);
-    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-        stat_value->st_mode = (stat_value->st_mode & ~S_IFMT) | S_IFLNK;
+static int ct_windows_set_errno(DWORD error) {
+    switch (error) {
+        case ERROR_SUCCESS:
+            errno = 0;
+            break;
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND:
+        case ERROR_INVALID_DRIVE:
+        case ERROR_ENVVAR_NOT_FOUND:
+            errno = ENOENT;
+            break;
+        case ERROR_ACCESS_DENIED:
+        case ERROR_SHARING_VIOLATION:
+        case ERROR_LOCK_VIOLATION:
+        case ERROR_PRIVILEGE_NOT_HELD:
+            errno = EACCES;
+            break;
+        case ERROR_FILE_EXISTS:
+        case ERROR_ALREADY_EXISTS:
+            errno = EEXIST;
+            break;
+        case ERROR_DIR_NOT_EMPTY:
+            errno = ENOTEMPTY;
+            break;
+        case ERROR_NOT_SAME_DEVICE:
+            errno = EXDEV;
+            break;
+        case ERROR_FILENAME_EXCED_RANGE:
+            errno = ENAMETOOLONG;
+            break;
+        case ERROR_DIRECTORY:
+            errno = ENOTDIR;
+            break;
+        case ERROR_NOT_ENOUGH_MEMORY:
+        case ERROR_OUTOFMEMORY:
+            errno = ENOMEM;
+            break;
+        case ERROR_INVALID_NAME:
+        case ERROR_INVALID_PARAMETER:
+        case ERROR_NOT_A_REPARSE_POINT:
+        case ERROR_SYMLINK_NOT_SUPPORTED:
+            errno = EINVAL;
+            break;
+        default:
+            errno = EIO;
+            break;
     }
+    return -1;
+}
+
+static int ct_windows_set_errno_from_uv(int error) {
+    switch (error) {
+        case UV_EPERM: errno = EPERM; break;
+        case UV_ENOENT: errno = ENOENT; break;
+        case UV_EIO: errno = EIO; break;
+        case UV_EBADF: errno = EBADF; break;
+        case UV_EACCES: errno = EACCES; break;
+        case UV_EEXIST: errno = EEXIST; break;
+        case UV_EXDEV: errno = EXDEV; break;
+        case UV_ENOTDIR: errno = ENOTDIR; break;
+        case UV_EISDIR: errno = EISDIR; break;
+        case UV_EINVAL: errno = EINVAL; break;
+        case UV_ENFILE: errno = ENFILE; break;
+        case UV_EMFILE: errno = EMFILE; break;
+        case UV_EROFS: errno = EROFS; break;
+        case UV_EPIPE: errno = EPIPE; break;
+        case UV_ENOTEMPTY: errno = ENOTEMPTY; break;
+        case UV_ELOOP: errno = ELOOP; break;
+        case UV_ENAMETOOLONG: errno = ENAMETOOLONG; break;
+        case UV_ENOSPC: errno = ENOSPC; break;
+        case UV_EFBIG: errno = EFBIG; break;
+        case UV_EAGAIN: errno = EAGAIN; break;
+        case UV_EBUSY: errno = EBUSY; break;
+        case UV_EMLINK: errno = EMLINK; break;
+        case UV_ENODEV: errno = ENODEV; break;
+        case UV_ENXIO: errno = ENXIO; break;
+        case UV_ENOSYS: errno = ENOSYS; break;
+        case UV_ENOTSUP: errno = ENOTSUP; break;
+        case UV_ENOMEM: errno = ENOMEM; break;
+        default: errno = EIO; break;
+    }
+    return -1;
+}
+
+static WCHAR *ct_windows_utf8_to_wide(const char *value) {
+    if (value == NULL) {
+        errno = EINVAL;
+        return NULL;
+    }
+    size_t value_len = strlen(value);
+    if (value_len > INT_MAX) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    if (value_len == 0) {
+        WCHAR *empty = (WCHAR *)calloc(1, sizeof(WCHAR));
+        if (empty == NULL) errno = ENOMEM;
+        return empty;
+    }
+    int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, (int)value_len, NULL, 0);
+    if (required <= 0) {
+        ct_windows_set_errno(GetLastError());
+        if (errno == EIO) errno = EILSEQ;
+        return NULL;
+    }
+    WCHAR *wide = (WCHAR *)malloc(sizeof(WCHAR) * ((size_t)required + 1));
+    if (wide == NULL) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    int written = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, (int)value_len, wide, required);
+    if (written != required) {
+        DWORD error = GetLastError();
+        free(wide);
+        ct_windows_set_errno(error);
+        if (errno == EIO) errno = EILSEQ;
+        return NULL;
+    }
+    wide[written] = L'\0';
+    return wide;
+}
+
+static char *ct_windows_wide_to_utf8(const WCHAR *value, size_t value_len, size_t *length_out) {
+    if (length_out != NULL) *length_out = 0;
+    if (value == NULL || value_len > INT_MAX) {
+        errno = value_len > INT_MAX ? ENAMETOOLONG : EINVAL;
+        return NULL;
+    }
+    if (value_len == 0) {
+        char *empty = (char *)calloc(1, 1);
+        if (empty == NULL) errno = ENOMEM;
+        return empty;
+    }
+    int required = WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        value,
+        (int)value_len,
+        NULL,
+        0,
+        NULL,
+        NULL
+    );
+    if (required <= 0) {
+        ct_windows_set_errno(GetLastError());
+        if (errno == EIO) errno = EILSEQ;
+        return NULL;
+    }
+    char *utf8 = (char *)malloc((size_t)required + 1);
+    if (utf8 == NULL) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    int written = WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        value,
+        (int)value_len,
+        utf8,
+        required,
+        NULL,
+        NULL
+    );
+    if (written != required) {
+        DWORD error = GetLastError();
+        free(utf8);
+        ct_windows_set_errno(error);
+        if (errno == EIO) errno = EILSEQ;
+        return NULL;
+    }
+    utf8[written] = '\0';
+    if (length_out != NULL) *length_out = (size_t)written;
+    return utf8;
+}
+
+static WCHAR *ct_windows_path_from_utf8(const char *path) {
+    if (path == NULL || path[0] == '\0') {
+        errno = ENOENT;
+        return NULL;
+    }
+    const char *source = strcmp(path, "/dev/null") == 0 ? "\\\\.\\NUL" : path;
+    WCHAR *wide = ct_windows_utf8_to_wide(source);
+    if (wide == NULL) return NULL;
+    for (WCHAR *cursor = wide; *cursor != L'\0'; cursor += 1) {
+        if (*cursor == L'/') *cursor = L'\\';
+    }
+    if (wcsncmp(wide, L"\\\\?\\", 4) == 0 || wcsncmp(wide, L"\\\\.\\", 4) == 0) return wide;
+
+    DWORD required = GetFullPathNameW(wide, 0, NULL, NULL);
+    if (required == 0) {
+        DWORD error = GetLastError();
+        free(wide);
+        if (error == ERROR_INVALID_NAME) {
+            errno = ENOENT;
+            return NULL;
+        }
+        ct_windows_set_errno(error);
+        return NULL;
+    }
+    size_t input_len = wcslen(wide);
+    if (required <= MAX_PATH && input_len < MAX_PATH) return wide;
+
+    WCHAR *full = (WCHAR *)malloc(sizeof(WCHAR) * (size_t)required);
+    if (full == NULL) {
+        free(wide);
+        errno = ENOMEM;
+        return NULL;
+    }
+    DWORD written = GetFullPathNameW(wide, required, full, NULL);
+    free(wide);
+    if (written == 0 || written >= required) {
+        DWORD error = GetLastError();
+        free(full);
+        ct_windows_set_errno(error);
+        return NULL;
+    }
+
+    size_t full_len = (size_t)written;
+    if (full_len < MAX_PATH) return full;
+    bool unc = full_len >= 2 && full[0] == L'\\' && full[1] == L'\\';
+    const WCHAR *prefix = unc ? L"\\\\?\\UNC\\" : L"\\\\?\\";
+    size_t prefix_len = unc ? 8 : 4;
+    size_t source_offset = unc ? 2 : 0;
+    size_t extended_len = prefix_len + full_len - source_offset;
+    WCHAR *extended = (WCHAR *)malloc(sizeof(WCHAR) * (extended_len + 1));
+    if (extended == NULL) {
+        free(full);
+        errno = ENOMEM;
+        return NULL;
+    }
+    memcpy(extended, prefix, prefix_len * sizeof(WCHAR));
+    memcpy(extended + prefix_len, full + source_offset, (full_len - source_offset + 1) * sizeof(WCHAR));
+    free(full);
+    return extended;
+}
+
+static char *ct_windows_getcwd(char *buffer, size_t size) {
+    DWORD required = GetCurrentDirectoryW(0, NULL);
+    if (required == 0) {
+        ct_windows_set_errno(GetLastError());
+        return NULL;
+    }
+    WCHAR *wide = (WCHAR *)malloc(sizeof(WCHAR) * (size_t)required);
+    if (wide == NULL) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    DWORD written = GetCurrentDirectoryW(required, wide);
+    if (written == 0 || written >= required) {
+        DWORD error = GetLastError();
+        free(wide);
+        ct_windows_set_errno(error);
+        return NULL;
+    }
+    size_t utf8_len = 0;
+    char *utf8 = ct_windows_wide_to_utf8(wide, (size_t)written, &utf8_len);
+    free(wide);
+    if (utf8 == NULL) return NULL;
+
+    size_t capacity = size;
+    char *result = buffer;
+    if (result == NULL) {
+        capacity = capacity > 0 ? capacity : utf8_len + 1;
+        result = (char *)malloc(capacity);
+        if (result == NULL) {
+            free(utf8);
+            errno = ENOMEM;
+            return NULL;
+        }
+    }
+    if (capacity <= utf8_len) {
+        if (buffer == NULL) free(result);
+        free(utf8);
+        errno = ERANGE;
+        return NULL;
+    }
+    memcpy(result, utf8, utf8_len + 1);
+    free(utf8);
+    return result;
+}
+
+static int ct_windows_chdir(const char *path) {
+    WCHAR *wide = ct_windows_path_from_utf8(path);
+    if (wide == NULL) return -1;
+    BOOL changed = SetCurrentDirectoryW(wide);
+    DWORD error = changed ? ERROR_SUCCESS : GetLastError();
+    free(wide);
+    if (changed) return 0;
+    return ct_windows_set_errno(error);
+}
+
+static FILE *ct_windows_fopen(const char *path, const char *mode) {
+    WCHAR *wide_path = ct_windows_path_from_utf8(path);
+    WCHAR *wide_mode = ct_windows_utf8_to_wide(mode);
+    if (wide_path == NULL || wide_mode == NULL) {
+        free(wide_path);
+        free(wide_mode);
+        return NULL;
+    }
+    FILE *file = _wfopen(wide_path, wide_mode);
+    free(wide_path);
+    free(wide_mode);
+    return file;
+}
+
+static int ct_windows_open(const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if ((flags & _O_CREAT) != 0) {
+        va_list arguments;
+        va_start(arguments, flags);
+        mode = (mode_t)va_arg(arguments, int);
+        va_end(arguments);
+    }
+    WCHAR *wide = ct_windows_path_from_utf8(path);
+    if (wide == NULL) return -1;
+    int fd = (flags & _O_CREAT) != 0 ? _wopen(wide, flags, mode) : _wopen(wide, flags);
+    free(wide);
+    if (fd < 0 && errno == EINVAL) errno = ENOENT;
+    return fd;
+}
+
+static int ct_windows_stat(const char *path, bool follow, struct stat *stat_value, uv_stat_t *uv_stat_out) {
+    WCHAR *wide_path = ct_windows_path_from_utf8(path);
+    if (wide_path == NULL) return -1;
+    char *uv_path = ct_windows_wide_to_utf8(wide_path, wcslen(wide_path), NULL);
+    free(wide_path);
+    if (uv_path == NULL) return -1;
+
+    uv_fs_t request;
+    int status = follow
+        ? uv_fs_stat(NULL, &request, uv_path, NULL)
+        : uv_fs_lstat(NULL, &request, uv_path, NULL);
+    free(uv_path);
+    if (status < 0) {
+        uv_fs_req_cleanup(&request);
+        return ct_windows_set_errno_from_uv(status);
+    }
+
+    const uv_stat_t *uv_stat = uv_fs_get_statbuf(&request);
+    memset(stat_value, 0, sizeof(*stat_value));
+    stat_value->st_dev = uv_stat->st_dev;
+    stat_value->st_ino = uv_stat->st_ino;
+    stat_value->st_mode = (unsigned short)uv_stat->st_mode;
+    stat_value->st_nlink = (short)uv_stat->st_nlink;
+    stat_value->st_uid = (short)uv_stat->st_uid;
+    stat_value->st_gid = (short)uv_stat->st_gid;
+    stat_value->st_rdev = uv_stat->st_rdev;
+    stat_value->st_size = uv_stat->st_size;
+    stat_value->st_atime = (time_t)uv_stat->st_atim.tv_sec;
+    stat_value->st_mtime = (time_t)uv_stat->st_mtim.tv_sec;
+    stat_value->st_ctime = (time_t)uv_stat->st_ctim.tv_sec;
+    if (uv_stat_out != NULL) *uv_stat_out = *uv_stat;
+    uv_fs_req_cleanup(&request);
     return 0;
 }
 
@@ -479,6 +839,14 @@ static ssize_t ct_pwrite(int fd, const void *buffer, size_t length, off_t offset
     return (ssize_t)transferred;
 }
 
+static int ct_windows_chmod(const char *path, mode_t mode) {
+    WCHAR *wide = ct_windows_path_from_utf8(path);
+    if (wide == NULL) return -1;
+    int status = _wchmod(wide, mode);
+    free(wide);
+    return status;
+}
+
 static int ct_fchmod(int fd, mode_t mode) {
     HANDLE handle = (HANDLE)_get_osfhandle(fd);
     if (handle == INVALID_HANDLE_VALUE) {
@@ -491,8 +859,7 @@ static int ct_fchmod(int fd, mode_t mode) {
         errno = EIO;
         return -1;
     }
-    const WCHAR *normalized = wcsncmp(path, L"\\\\?\\", 4) == 0 ? path + 4 : path;
-    return _wchmod(normalized, mode);
+    return _wchmod(path, mode);
 }
 
 static void ct_windows_filetime_from_timeval(const struct timeval *value, FILETIME *filetime) {
@@ -519,11 +886,16 @@ static int ct_futimes(int fd, const struct timeval times[2]) {
     return 0;
 }
 
-static int ct_utimes(const char *path, const struct timeval times[2]) {
-    HANDLE handle = CreateFileA(path, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+static int ct_windows_utimes(const char *path, const struct timeval times[2], bool follow) {
+    WCHAR *wide = ct_windows_path_from_utf8(path);
+    if (wide == NULL) return -1;
+    DWORD flags = FILE_FLAG_BACKUP_SEMANTICS;
+    if (!follow) flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+    HANDLE handle = CreateFileW(wide, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                NULL, OPEN_EXISTING, flags, NULL);
+    free(wide);
     if (handle == INVALID_HANDLE_VALUE) {
-        errno = ENOENT;
+        ct_windows_set_errno(GetLastError());
         return -1;
     }
     FILETIME access_time;
@@ -539,105 +911,213 @@ static int ct_utimes(const char *path, const struct timeval times[2]) {
     return 0;
 }
 
+static int ct_utimes(const char *path, const struct timeval times[2]) {
+    return ct_windows_utimes(path, times, true);
+}
+
 static int ct_truncate(const char *path, off_t length) {
-    int fd = _open(path, _O_WRONLY | _O_BINARY);
+    int fd = ct_windows_open(path, _O_WRONLY | _O_BINARY);
     if (fd < 0) return -1;
     int status = _chsize_s(fd, length) == 0 ? 0 : -1;
     _close(fd);
     return status;
 }
 
-static int ct_unsupported_ownership(void) {
-    errno = ENOSYS;
-    return -1;
+static int ct_windows_access(const char *path, int mode) {
+    WCHAR *wide = ct_windows_path_from_utf8(path);
+    if (wide == NULL) return -1;
+    int status = _waccess(wide, mode);
+    free(wide);
+    return status;
+}
+
+static int ct_windows_rename(const char *old_path, const char *new_path) {
+    WCHAR *wide_old = ct_windows_path_from_utf8(old_path);
+    WCHAR *wide_new = ct_windows_path_from_utf8(new_path);
+    if (wide_old == NULL || wide_new == NULL) {
+        free(wide_old);
+        free(wide_new);
+        return -1;
+    }
+    BOOL moved = MoveFileExW(wide_old, wide_new, MOVEFILE_REPLACE_EXISTING);
+    DWORD error = moved ? ERROR_SUCCESS : GetLastError();
+    free(wide_old);
+    free(wide_new);
+    if (moved) return 0;
+    return ct_windows_set_errno_from_uv(uv_translate_sys_error((int)error));
+}
+
+static int ct_windows_noop_ownership(void) {
+    return 0;
 }
 
 static int ct_link(const char *existing_path, const char *new_path) {
-    if (CreateHardLinkA(new_path, existing_path, NULL)) return 0;
-    errno = EIO;
+    WCHAR *wide_existing = ct_windows_path_from_utf8(existing_path);
+    WCHAR *wide_new = ct_windows_path_from_utf8(new_path);
+    if (wide_existing == NULL || wide_new == NULL) {
+        free(wide_existing);
+        free(wide_new);
+        return -1;
+    }
+    BOOL linked = CreateHardLinkW(wide_new, wide_existing, NULL);
+    DWORD error = linked ? ERROR_SUCCESS : GetLastError();
+    free(wide_existing);
+    free(wide_new);
+    if (linked) return 0;
+    ct_windows_set_errno(error);
     return -1;
+}
+
+static int ct_windows_symlink_with_flags(const char *target, const char *path, int flags) {
+    WCHAR *wide_path = ct_windows_path_from_utf8(path);
+    if (wide_path == NULL) return -1;
+    char *uv_path = ct_windows_wide_to_utf8(wide_path, wcslen(wide_path), NULL);
+    free(wide_path);
+    if (uv_path == NULL) return -1;
+
+    uv_fs_t request;
+    int status = uv_fs_symlink(NULL, &request, target, uv_path, flags, NULL);
+    free(uv_path);
+    if (status < 0) {
+        uv_fs_req_cleanup(&request);
+        return ct_windows_set_errno_from_uv(status);
+    }
+    uv_fs_req_cleanup(&request);
+    return 0;
 }
 
 static int ct_symlink(const char *target, const char *path) {
-    DWORD attributes = GetFileAttributesA(target);
+    WCHAR *wide_target = ct_windows_utf8_to_wide(target);
+    if (wide_target == NULL) {
+        free(wide_target);
+        return -1;
+    }
+    for (WCHAR *cursor = wide_target; *cursor != L'\0'; cursor += 1) {
+        if (*cursor == L'/') *cursor = L'\\';
+    }
+    DWORD attributes = GetFileAttributesW(wide_target);
     DWORD flags = (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
-        ? SYMBOLIC_LINK_FLAG_DIRECTORY
+        ? UV_FS_SYMLINK_DIR
         : 0;
-#if defined(SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)
-    if (CreateSymbolicLinkA(path, target, flags | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) return 0;
-#endif
-    if (CreateSymbolicLinkA(path, target, flags)) return 0;
-    errno = GetLastError() == ERROR_PRIVILEGE_NOT_HELD ? EPERM : EIO;
-    return -1;
+    free(wide_target);
+    return ct_windows_symlink_with_flags(target, path, flags);
 }
 
-typedef struct {
-    DWORD tag;
-    WORD data_length;
-    WORD reserved;
-    union {
-        struct {
-            WORD substitute_name_offset;
-            WORD substitute_name_length;
-            WORD print_name_offset;
-            WORD print_name_length;
-            ULONG flags;
-            WCHAR path_buffer[1];
-        } symbolic_link;
-        struct {
-            WORD substitute_name_offset;
-            WORD substitute_name_length;
-            WORD print_name_offset;
-            WORD print_name_length;
-            WCHAR path_buffer[1];
-        } mount_point;
-    } data;
-} CtReparseDataBuffer;
-
 static ssize_t ct_readlink(const char *path, char *buffer, size_t capacity) {
-    HANDLE handle = CreateFileA(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
-                                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-    if (handle == INVALID_HANDLE_VALUE) {
-        errno = ENOENT;
+    WCHAR *wide_path = ct_windows_path_from_utf8(path);
+    if (wide_path == NULL) return -1;
+    char *uv_path = ct_windows_wide_to_utf8(wide_path, wcslen(wide_path), NULL);
+    free(wide_path);
+    if (uv_path == NULL) return -1;
+
+    uv_fs_t request;
+    int status = uv_fs_readlink(NULL, &request, uv_path, NULL);
+    free(uv_path);
+    if (status < 0) {
+        uv_fs_req_cleanup(&request);
+        return ct_windows_set_errno_from_uv(status);
+    }
+
+    const char *target = (const char *)request.ptr;
+    if (target == NULL) {
+        uv_fs_req_cleanup(&request);
+        errno = EIO;
         return -1;
     }
-    unsigned char storage[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
-    DWORD bytes = 0;
-    BOOL ok = DeviceIoControl(handle, FSCTL_GET_REPARSE_POINT, NULL, 0, storage, sizeof(storage), &bytes, NULL);
-    CloseHandle(handle);
-    if (!ok) {
-        errno = EINVAL;
+    size_t required = strlen(target);
+    if (required > SSIZE_MAX) {
+        uv_fs_req_cleanup(&request);
+        errno = EOVERFLOW;
         return -1;
     }
-    CtReparseDataBuffer *reparse = (CtReparseDataBuffer *)storage;
-    const WCHAR *wide = NULL;
-    int wide_len = 0;
-    if (reparse->tag == IO_REPARSE_TAG_SYMLINK) {
-        wide = reparse->data.symbolic_link.path_buffer + reparse->data.symbolic_link.print_name_offset / sizeof(WCHAR);
-        wide_len = reparse->data.symbolic_link.print_name_length / sizeof(WCHAR);
-    } else if (reparse->tag == IO_REPARSE_TAG_MOUNT_POINT) {
-        wide = reparse->data.mount_point.path_buffer + reparse->data.mount_point.print_name_offset / sizeof(WCHAR);
-        wide_len = reparse->data.mount_point.print_name_length / sizeof(WCHAR);
-    } else {
-        errno = EINVAL;
-        return -1;
+    if (required > capacity) {
+        uv_fs_req_cleanup(&request);
+        return capacity > SSIZE_MAX ? SSIZE_MAX : (ssize_t)capacity;
     }
-    int required = WideCharToMultiByte(CP_UTF8, 0, wide, wide_len, NULL, 0, NULL, NULL);
-    if (required < 0) {
-        errno = EILSEQ;
-        return -1;
-    }
-    if ((size_t)required > capacity) return (ssize_t)capacity;
-    int written = WideCharToMultiByte(CP_UTF8, 0, wide, wide_len, buffer, (int)capacity, NULL, NULL);
-    if (written <= 0 && wide_len > 0) {
-        errno = EILSEQ;
-        return -1;
-    }
-    return written;
+    if (required > 0) memcpy(buffer, target, required);
+    uv_fs_req_cleanup(&request);
+    return (ssize_t)required;
 }
 
 static char *ct_realpath(const char *path, char *resolved) {
-    return _fullpath(resolved, path, resolved != NULL ? PATH_MAX : 0);
+    WCHAR *wide_path = ct_windows_path_from_utf8(path);
+    if (wide_path == NULL) return NULL;
+    HANDLE handle = CreateFileW(
+        wide_path,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        NULL
+    );
+    free(wide_path);
+    if (handle == INVALID_HANDLE_VALUE) {
+        ct_windows_set_errno(GetLastError());
+        return NULL;
+    }
+    DWORD required = GetFinalPathNameByHandleW(handle, NULL, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (required == 0) {
+        DWORD error = GetLastError();
+        CloseHandle(handle);
+        ct_windows_set_errno(error);
+        return NULL;
+    }
+    WCHAR *wide_resolved = (WCHAR *)malloc(sizeof(WCHAR) * ((size_t)required + 1));
+    if (wide_resolved == NULL) {
+        CloseHandle(handle);
+        errno = ENOMEM;
+        return NULL;
+    }
+    DWORD written = GetFinalPathNameByHandleW(
+        handle,
+        wide_resolved,
+        required + 1,
+        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS
+    );
+    DWORD final_error = written == 0 || written > required ? GetLastError() : ERROR_SUCCESS;
+    CloseHandle(handle);
+    if (final_error != ERROR_SUCCESS) {
+        free(wide_resolved);
+        ct_windows_set_errno(final_error);
+        return NULL;
+    }
+
+    const WCHAR *display = wide_resolved;
+    size_t display_len = (size_t)written;
+    WCHAR *unc_display = NULL;
+    if (display_len >= 8 && wcsncmp(display, L"\\\\?\\UNC\\", 8) == 0) {
+        display_len -= 6;
+        unc_display = (WCHAR *)malloc(sizeof(WCHAR) * (display_len + 1));
+        if (unc_display == NULL) {
+            free(wide_resolved);
+            errno = ENOMEM;
+            return NULL;
+        }
+        unc_display[0] = L'\\';
+        unc_display[1] = L'\\';
+        memcpy(unc_display + 2, display + 8, (display_len - 1) * sizeof(WCHAR));
+        unc_display[display_len] = L'\0';
+        display = unc_display;
+    } else if (display_len >= 4 && wcsncmp(display, L"\\\\?\\", 4) == 0) {
+        display += 4;
+        display_len -= 4;
+    }
+
+    size_t utf8_len = 0;
+    char *utf8 = ct_windows_wide_to_utf8(display, display_len, &utf8_len);
+    free(unc_display);
+    free(wide_resolved);
+    if (utf8 == NULL) return NULL;
+    if (resolved == NULL) return utf8;
+    if (utf8_len >= PATH_MAX) {
+        free(utf8);
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    memcpy(resolved, utf8, utf8_len + 1);
+    free(utf8);
+    return resolved;
 }
 
 static void ct_usleep(unsigned long usec) {
@@ -665,6 +1145,42 @@ static int ct_clock_gettime(int clock_id, struct timespec *value) {
     value->tv_sec = (time_t)(counter.QuadPart / frequency.QuadPart);
     value->tv_nsec = (long)(((counter.QuadPart % frequency.QuadPart) * 1000000000LL) / frequency.QuadPart);
     return 0;
+}
+
+/*
+ * WebKit's Windows pthread shim compares deadlines to QPC time and returns a
+ * Win32 BOOL. Keep POSIX absolute-realtime and error semantics in this file.
+ */
+static int ct_windows_pthread_cond_timedwait(
+    pthread_cond_t *condition,
+    pthread_mutex_t *mutex,
+    const struct timespec *deadline
+) {
+    struct timespec now;
+    if (ct_clock_gettime(0, &now) != 0) return EINVAL;
+
+    int64_t seconds = (int64_t)deadline->tv_sec - (int64_t)now.tv_sec;
+    int64_t nanos = (int64_t)deadline->tv_nsec - (int64_t)now.tv_nsec;
+    if (nanos < 0) {
+        seconds -= 1;
+        nanos += 1000000000LL;
+    }
+
+    DWORD timeout_ms = 0;
+    if (seconds > 0 || (seconds == 0 && nanos > 0)) {
+        uint64_t remaining_ms;
+        if ((uint64_t)seconds > ((uint64_t)INFINITE - 1ULL) / 1000ULL) {
+            remaining_ms = (uint64_t)INFINITE - 1ULL;
+        } else {
+            remaining_ms = (uint64_t)seconds * 1000ULL +
+                ((uint64_t)nanos + 999999ULL) / 1000000ULL;
+            if (remaining_ms >= (uint64_t)INFINITE) remaining_ms = (uint64_t)INFINITE - 1ULL;
+        }
+        timeout_ms = (DWORD)remaining_ms;
+    }
+
+    if (SleepConditionVariableSRW(condition, mutex, timeout_ms, 0)) return 0;
+    return GetLastError() == ERROR_TIMEOUT ? ETIMEDOUT : EINVAL;
 }
 
 static int ct_windows_socket_errno(void);
@@ -721,6 +1237,28 @@ static SOCKET ct_windows_socket_from_fd(int fd) {
 
 static INIT_ONCE ct_winsock_once = INIT_ONCE_STATIC_INIT;
 static int ct_winsock_status = WSANOTINITIALISED;
+static INIT_ONCE ct_standard_streams_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK ct_windows_initialize_standard_streams(PINIT_ONCE once, PVOID parameter, PVOID *context) {
+    (void)once;
+    (void)parameter;
+    (void)context;
+    int saved_errno = errno;
+    (void)_setmode(STDIN_FILENO, _O_BINARY);
+    (void)_setmode(STDOUT_FILENO, _O_BINARY);
+    (void)_setmode(STDERR_FILENO, _O_BINARY);
+    errno = saved_errno;
+    return TRUE;
+}
+
+static void ct_windows_ensure_standard_streams_binary(void) {
+    (void)InitOnceExecuteOnce(
+        &ct_standard_streams_once,
+        ct_windows_initialize_standard_streams,
+        NULL,
+        NULL
+    );
+}
 
 static BOOL CALLBACK ct_windows_initialize_winsock(PINIT_ONCE once, PVOID parameter, PVOID *context) {
     (void)once;
@@ -790,6 +1328,14 @@ static int ct_windows_listen(int fd, int backlog) {
 }
 
 static int ct_windows_poll(WSAPOLLFD *fds, ULONG count, int timeout) {
+    /*
+     * POSIX poll tolerates POLLERR/POLLHUP/POLLNVAL in events even though
+     * they are output-only. WSAPoll rejects that mask with WSAEINVAL, so
+     * normalize every caller at the compatibility boundary.
+     */
+    for (ULONG index = 0; index < count; index += 1) {
+        fds[index].events &= (SHORT)~(POLLERR | POLLHUP | POLLNVAL);
+    }
     int result = WSAPoll(fds, count, timeout);
     if (result == SOCKET_ERROR) errno = ct_windows_socket_errno();
     return result;
@@ -835,6 +1381,119 @@ static bool ct_windows_is_socket(int fd) {
     return is_socket;
 }
 
+static int ct_windows_named_pipe_set_errno(DWORD error);
+
+typedef NTSTATUS (NTAPI *CtNtQueryInformationFileFn)(
+    HANDLE,
+    PIO_STATUS_BLOCK,
+    PVOID,
+    ULONG,
+    int
+);
+
+typedef struct {
+    ULONG Mode;
+} CtWindowsFileModeInformation;
+
+#define CT_WINDOWS_FILE_MODE_INFORMATION_CLASS 16
+
+static INIT_ONCE ct_windows_nt_query_information_file_once = INIT_ONCE_STATIC_INIT;
+static CtNtQueryInformationFileFn ct_windows_nt_query_information_file = NULL;
+
+static BOOL CALLBACK ct_windows_initialize_nt_query_information_file(
+    PINIT_ONCE once,
+    PVOID parameter,
+    PVOID *context
+) {
+    (void)once;
+    (void)parameter;
+    (void)context;
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll != NULL) {
+        ct_windows_nt_query_information_file =
+            (CtNtQueryInformationFileFn)(void *)GetProcAddress(
+                ntdll,
+                "NtQueryInformationFile");
+    }
+    return TRUE;
+}
+
+static bool ct_windows_pipe_is_overlapped(HANDLE pipe) {
+    if (!InitOnceExecuteOnce(
+            &ct_windows_nt_query_information_file_once,
+            ct_windows_initialize_nt_query_information_file,
+            NULL,
+            NULL) ||
+        ct_windows_nt_query_information_file == NULL) {
+        return false;
+    }
+
+    IO_STATUS_BLOCK io_status;
+    CtWindowsFileModeInformation mode;
+    memset(&io_status, 0, sizeof(io_status));
+    memset(&mode, 0, sizeof(mode));
+    NTSTATUS status = ct_windows_nt_query_information_file(
+        pipe,
+        &io_status,
+        &mode,
+        sizeof(mode),
+        CT_WINDOWS_FILE_MODE_INFORMATION_CLASS);
+    if (!NT_SUCCESS(status)) return false;
+    return (mode.Mode &
+            (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)) == 0;
+}
+
+static bool ct_windows_pipe_transfer(
+    HANDLE pipe,
+    bool write_operation,
+    void *buffer,
+    DWORD length,
+    DWORD *transferred_out,
+    DWORD *error_out
+) {
+    *transferred_out = 0;
+    *error_out = ERROR_SUCCESS;
+
+    HANDLE event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (event == NULL) {
+        *error_out = GetLastError();
+        return false;
+    }
+
+    OVERLAPPED overlapped;
+    memset(&overlapped, 0, sizeof(overlapped));
+    overlapped.hEvent = event;
+    BOOL completed = write_operation
+        ? WriteFile(pipe, buffer, length, transferred_out, &overlapped)
+        : ReadFile(pipe, buffer, length, transferred_out, &overlapped);
+    if (!completed) {
+        DWORD error = GetLastError();
+        if (error == ERROR_IO_PENDING) {
+            DWORD wait_status = WaitForSingleObject(event, INFINITE);
+            if (wait_status == WAIT_OBJECT_0) {
+                completed = GetOverlappedResult(pipe, &overlapped, transferred_out, FALSE);
+                if (!completed) error = GetLastError();
+            } else {
+                DWORD wait_error =
+                    wait_status == WAIT_FAILED ? GetLastError() : ERROR_OPERATION_ABORTED;
+                /*
+                 * The OVERLAPPED and its event are stack-owned. A failed wait
+                 * cannot return while the kernel may still reference either;
+                 * cancel this request and synchronously drain its completion.
+                 */
+                (void)CancelIoEx(pipe, &overlapped);
+                DWORD canceled_bytes = 0;
+                (void)GetOverlappedResult(pipe, &overlapped, &canceled_bytes, TRUE);
+                error = wait_error;
+            }
+        }
+        if (!completed) *error_out = error;
+    }
+
+    CloseHandle(event);
+    return completed;
+}
+
 static int ct_windows_close(int fd) {
     if (ct_windows_is_socket(fd)) {
         int result = closesocket(ct_windows_socket_from_fd(fd));
@@ -845,7 +1504,27 @@ static int ct_windows_close(int fd) {
 }
 
 static ssize_t ct_windows_read(int fd, void *buffer, size_t length) {
-    if (!ct_windows_is_socket(fd)) return _read(fd, buffer, length > UINT_MAX ? UINT_MAX : (unsigned int)length);
+    if (!ct_windows_is_socket(fd)) {
+        intptr_t raw_handle = _get_osfhandle(fd);
+        if (raw_handle == -1) {
+            errno = EBADF;
+            return -1;
+        }
+        HANDLE handle = (HANDLE)raw_handle;
+        if (GetFileType(handle) != FILE_TYPE_PIPE ||
+            !ct_windows_pipe_is_overlapped(handle)) {
+            return _read(fd, buffer, length > UINT_MAX ? UINT_MAX : (unsigned int)length);
+        }
+        DWORD transferred = 0;
+        DWORD error = ERROR_SUCCESS;
+        DWORD amount = length > UINT32_MAX ? UINT32_MAX : (DWORD)length;
+        if (ct_windows_pipe_transfer(handle, false, buffer, amount, &transferred, &error)) {
+            return (ssize_t)transferred;
+        }
+        if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED) return 0;
+        ct_windows_named_pipe_set_errno(error);
+        return -1;
+    }
     int result = recv(ct_windows_socket_from_fd(fd), (char *)buffer, length > INT_MAX ? INT_MAX : (int)length, 0);
     if (result == SOCKET_ERROR) {
         errno = ct_windows_socket_errno();
@@ -855,7 +1534,26 @@ static ssize_t ct_windows_read(int fd, void *buffer, size_t length) {
 }
 
 static ssize_t ct_windows_write(int fd, const void *buffer, size_t length) {
-    if (!ct_windows_is_socket(fd)) return _write(fd, buffer, length > UINT_MAX ? UINT_MAX : (unsigned int)length);
+    if (!ct_windows_is_socket(fd)) {
+        intptr_t raw_handle = _get_osfhandle(fd);
+        if (raw_handle == -1) {
+            errno = EBADF;
+            return -1;
+        }
+        HANDLE handle = (HANDLE)raw_handle;
+        if (GetFileType(handle) != FILE_TYPE_PIPE ||
+            !ct_windows_pipe_is_overlapped(handle)) {
+            return _write(fd, buffer, length > UINT_MAX ? UINT_MAX : (unsigned int)length);
+        }
+        DWORD transferred = 0;
+        DWORD error = ERROR_SUCCESS;
+        DWORD amount = length > UINT32_MAX ? UINT32_MAX : (DWORD)length;
+        if (ct_windows_pipe_transfer(handle, true, (void *)buffer, amount, &transferred, &error)) {
+            return (ssize_t)transferred;
+        }
+        ct_windows_named_pipe_set_errno(error);
+        return -1;
+    }
     int result = send(ct_windows_socket_from_fd(fd), (const char *)buffer, length > INT_MAX ? INT_MAX : (int)length, 0);
     if (result == SOCKET_ERROR) {
         errno = ct_windows_socket_errno();
@@ -982,9 +1680,9 @@ static int ct_getrusage(int who, struct rusage *usage) {
 #define fdatasync _commit
 #define ftruncate(fd, length) (_chsize_s((fd), (length)) == 0 ? 0 : -1)
 #define fchmod ct_fchmod
-#define fchown(fd, uid, gid) ct_unsupported_ownership()
-#define chown(path, uid, gid) ct_unsupported_ownership()
-#define lchown(path, uid, gid) ct_unsupported_ownership()
+#define fchown(fd, uid, gid) ct_windows_noop_ownership()
+#define chown(path, uid, gid) ct_windows_noop_ownership()
+#define lchown(path, uid, gid) ct_windows_noop_ownership()
 #define futimes ct_futimes
 #define truncate ct_truncate
 #define utimes ct_utimes
@@ -1006,6 +1704,7 @@ static int ct_getrusage(int who, struct rusage *usage) {
 #define CLOCK_REALTIME 0
 #define CLOCK_MONOTONIC 1
 #define clock_gettime ct_clock_gettime
+#define pthread_cond_timedwait ct_windows_pthread_cond_timedwait
 #else
 extern char **environ;
 #endif
@@ -1135,6 +1834,8 @@ typedef struct {
     uint64_t max_buffer;
     int kill_signal;
     bool abort_requested;
+    bool windows_hide;
+    bool windows_verbatim_arguments;
 } CtHostSpawnOptions;
 
 typedef struct {
@@ -1565,6 +2266,25 @@ typedef struct CtFsAsyncRequest {
     struct CtFsAsyncRequest *next;
 } CtFsAsyncRequest;
 
+#if defined(_WIN32)
+typedef struct CtWindowsPipeWrite {
+    uint32_t id;
+    CtJscRuntime *runtime;
+    HANDLE pipe;
+    HANDLE thread;
+    uint8_t *bytes;
+    size_t length;
+    size_t written;
+    DWORD error;
+    bool canceled;
+    bool completed;
+    bool suppress_event;
+    bool referenced;
+    bool overlapped;
+    struct CtWindowsPipeWrite *next;
+} CtWindowsPipeWrite;
+#endif
+
 typedef struct CtTcpConnect {
     uint32_t id;
     int fd;
@@ -1585,6 +2305,18 @@ typedef struct CtTcpConnect {
     int error_code;
     struct CtTcpConnect *next;
 } CtTcpConnect;
+
+#if defined(_WIN32)
+typedef struct CtWindowsNamedPipeListener {
+    uint32_t id;
+    HANDLE pending;
+    WCHAR *path;
+    char *utf8_path;
+    DWORD max_instances;
+    CtJscRuntime *runtime;
+    struct CtWindowsNamedPipeListener *next;
+} CtWindowsNamedPipeListener;
+#endif
 
 typedef struct CtActiveRequest {
     JSObjectRef value;
@@ -1626,6 +2358,7 @@ typedef struct {
     int parent_fd;
     int child_fd;
     CtProcessStdioMode mode;
+    bool child_overlapped;
 } CtProcessExtraStdio;
 
 static pthread_mutex_t ct_async_processes_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -1633,6 +2366,10 @@ static CtAsyncProcess *ct_async_processes = NULL;
 static pthread_mutex_t ct_fd_watchers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtFdWatcher *ct_fd_watchers = NULL;
 static uint32_t ct_next_fd_watch_id = 1;
+#if defined(_WIN32)
+static pthread_mutex_t ct_windows_pipe_writes_mutex = PTHREAD_MUTEX_INITIALIZER;
+static CtWindowsPipeWrite *ct_windows_pipe_writes = NULL;
+#endif
 
 static uint32_t ct_next_fd_event_id(void) {
     pthread_mutex_lock(&ct_fd_watchers_mutex);
@@ -1644,6 +2381,11 @@ static uint32_t ct_next_fd_event_id(void) {
 static pthread_mutex_t ct_tcp_connects_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtTcpConnect *ct_tcp_connects = NULL;
 static uint32_t ct_next_tcp_connect_id = 0x40000000u;
+#if defined(_WIN32)
+static pthread_mutex_t ct_windows_named_pipe_listeners_mutex = PTHREAD_MUTEX_INITIALIZER;
+static CtWindowsNamedPipeListener *ct_windows_named_pipe_listeners = NULL;
+static uint32_t ct_next_windows_named_pipe_listener_id = 0x70000000u;
+#endif
 static pthread_mutex_t ct_workers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t ct_bundler_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtWorker *ct_workers = NULL;
@@ -1962,8 +2704,11 @@ typedef struct CtVmContext {
     struct CtVmContext *next;
 } CtVmContext;
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#define CT_SIGNAL_WATCHER_CAPACITY 8
+#else
 #define CT_SIGNAL_WATCHER_CAPACITY 64
+#endif
 #define CT_SIGNAL_NAME_CAPACITY 24
 typedef struct CtSignalWatcher {
     struct CtJscRuntime *runtime;
@@ -1973,7 +2718,6 @@ typedef struct CtSignalWatcher {
     unsigned int pending;
     bool active;
 } CtSignalWatcher;
-#endif
 
 typedef struct CtReloadWatchPath {
     char *name;
@@ -2055,6 +2799,7 @@ struct CtJscRuntime {
     bool next_tick_priority_armed;
     bool control_flow_profiler_enabled;
     bool fatal_exception_routed;
+    bool fatal_out_of_memory;
     bool reload_requested;
     uint32_t standalone_bytecode_module_count;
     CtReloadWatcher *reload_watchers;
@@ -2063,10 +2808,8 @@ struct CtJscRuntime {
     bool execution_time_limit_installed;
     CtJscShouldTerminateCallback should_terminate_callback;
     void *should_terminate_context;
-#if !defined(_WIN32)
     CtSignalWatcher signal_watchers[CT_SIGNAL_WATCHER_CAPACITY];
     size_t signal_watcher_count;
-#endif
 };
 
 static bool ct_jsc_runtime_should_terminate(CtJscRuntime *runtime) {
@@ -2132,7 +2875,6 @@ fail:
     return -1;
 }
 
-#if !defined(_WIN32)
 static void ct_signal_callback(uv_signal_t *handle, int signum) {
     CtSignalWatcher *watcher = handle != NULL ? (CtSignalWatcher *)handle->data : NULL;
     if (watcher == NULL || !watcher->active || watcher->number != signum) return;
@@ -2140,7 +2882,41 @@ static void ct_signal_callback(uv_signal_t *handle, int signum) {
 }
 
 static void ct_signal_watchers_init(CtJscRuntime *runtime) {
+#if defined(_WIN32)
+    static const struct {
+        const char *name;
+        int number;
+    } signals[] = {
+        /*
+         * These are the console control events dispatched by libuv on
+         * Windows. Signal handles stay unref'd, matching Node: installing a
+         * process signal listener alone does not keep an otherwise-idle
+         * process alive.
+         */
+        { "SIGHUP", SIGHUP },
+        { "SIGINT", SIGINT },
+        { "SIGBREAK", SIGBREAK },
+    };
+
+    for (size_t index = 0; index < sizeof(signals) / sizeof(signals[0]); index += 1) {
+        if (runtime->signal_watcher_count >= CT_SIGNAL_WATCHER_CAPACITY) break;
+        CtSignalWatcher *watcher = &runtime->signal_watchers[runtime->signal_watcher_count];
+        watcher->runtime = runtime;
+        watcher->number = signals[index].number;
+        memcpy(watcher->name, signals[index].name, strlen(signals[index].name) + 1);
+        if (uv_signal_init(&runtime->uv_loop, &watcher->handle) != 0) continue;
+        runtime->signal_watcher_count += 1;
+        watcher->handle.data = watcher;
+        if (uv_signal_start(&watcher->handle, ct_signal_callback, watcher->number) != 0) {
+            uv_close((uv_handle_t *)&watcher->handle, NULL);
+            continue;
+        }
+        watcher->active = true;
+        uv_unref((uv_handle_t *)&watcher->handle);
+    }
+#else
     (void)runtime;
+#endif
 }
 
 static bool ct_signal_watcher_is_crash_signal(int number) {
@@ -2163,7 +2939,7 @@ static bool ct_signal_watcher_is_crash_signal(int number) {
 }
 
 static int ct_signal_watcher_validate(const char *name, int number) {
-    if (name == NULL || name[0] == '\0' || strnlen(name, CT_SIGNAL_NAME_CAPACITY) >= CT_SIGNAL_NAME_CAPACITY) {
+    if (name == NULL || name[0] == '\0' || strlen(name) >= CT_SIGNAL_NAME_CAPACITY) {
         return UV_EINVAL;
     }
     if (number <= 0) return UV_EINVAL;
@@ -2248,29 +3024,6 @@ static void ct_signal_watchers_stop(CtJscRuntime *runtime) {
         (void)uv_signal_stop(&watcher->handle);
     }
 }
-#else
-static void ct_signal_watchers_init(CtJscRuntime *runtime) {
-    (void)runtime;
-}
-
-static void ct_signal_watchers_stop(CtJscRuntime *runtime) {
-    (void)runtime;
-}
-
-static int ct_signal_watcher_start(CtJscRuntime *runtime, const char *name, int number) {
-    (void)runtime;
-    (void)name;
-    (void)number;
-    return 0;
-}
-
-static int ct_signal_watcher_stop(CtJscRuntime *runtime, const char *name, int number) {
-    (void)runtime;
-    (void)name;
-    (void)number;
-    return 0;
-}
-#endif
 
 static void ct_uv_close_walk(uv_handle_t *handle, void *opaque) {
     (void)opaque;
@@ -2414,7 +3167,11 @@ static bool ct_debug_flag(const char *name) {
 }
 
 static int ct_read_file_bytes(const char *path, char **out_buf, size_t *out_len) {
+#if defined(_WIN32)
+    FILE *file = ct_windows_fopen(path, "rb");
+#else
     FILE *file = fopen(path, "rb");
+#endif
     long len = 0;
     char *buffer = NULL;
     size_t read_len = 0;
@@ -3907,7 +4664,11 @@ static void ct_reload_trace_init(CtJscRuntime *runtime) {
     if (runtime == NULL || runtime->reload_trace_file != NULL) return;
     const char *path = getenv("BUN_WATCHER_TRACE");
     if (path == NULL || path[0] == '\0') return;
+#if defined(_WIN32)
+    runtime->reload_trace_file = ct_windows_fopen(path, "ab");
+#else
     runtime->reload_trace_file = fopen(path, "ab");
+#endif
 }
 
 static void ct_reload_trace_event(
@@ -4179,6 +4940,27 @@ static bool ct_value_to_uint32_checked(
     return true;
 }
 
+static bool ct_value_to_ownership_id_checked(
+    JSContextRef ctx,
+    JSValueRef value,
+    uint32_t *result,
+    JSValueRef *exception,
+    const char *message
+) {
+    JSValueRef conversion_exception = NULL;
+    double number = JSValueToNumber(ctx, value, &conversion_exception);
+    if (conversion_exception != NULL) {
+        if (exception != NULL) *exception = conversion_exception;
+        return false;
+    }
+    if (!isfinite(number) || number < -1 || number > UINT32_MAX) {
+        ct_throw_message(ctx, exception, message);
+        return false;
+    }
+    *result = number == -1 ? UINT32_MAX : (uint32_t)number;
+    return true;
+}
+
 static char *ct_value_to_optional_string(JSContextRef ctx, JSValueRef value) {
     if (value == NULL || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value)) return NULL;
     return ct_value_to_string_copy(ctx, value);
@@ -4261,7 +5043,14 @@ static JSValueRef ct_uint8_array_from_owned_bytes(JSContextRef ctx, uint8_t *byt
 
 static int ct_fill_random_bytes(uint8_t *buffer, size_t len) {
     if (len == 0) return 0;
-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#if defined(_WIN32)
+    if (len > ULONG_MAX ||
+        BCryptGenRandom(NULL, buffer, (ULONG)len, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
     arc4random_buf(buffer, len);
     return 0;
 #else
@@ -4751,15 +5540,36 @@ static CtZstdApi ct_zstd_api = {0};
 #define CT_ZSTD_CONTENTSIZE_UNKNOWN ((unsigned long long)-1)
 #define CT_ZSTD_CONTENTSIZE_ERROR ((unsigned long long)-2)
 
+#if defined(_WIN32)
+extern size_t ZSTD_compressBound(size_t src_size);
+extern size_t ZSTD_compress(void *dst, size_t dst_capacity, const void *src, size_t src_size, int compression_level);
+extern unsigned long long ZSTD_getFrameContentSize(const void *src, size_t src_size);
+extern size_t ZSTD_decompress(void *dst, size_t dst_capacity, const void *src, size_t src_size);
+extern unsigned int ZSTD_isError(size_t code);
+extern const char *ZSTD_getErrorName(size_t code);
+#endif
+
+static bool ct_zstd_is_available(void) {
+    return ct_zstd_api.compress_bound != NULL && ct_zstd_api.compress != NULL &&
+        ct_zstd_api.get_frame_content_size != NULL && ct_zstd_api.decompress != NULL &&
+        ct_zstd_api.is_error != NULL && ct_zstd_api.get_error_name != NULL;
+}
+
 static bool ct_zstd_load(void) {
-    if (ct_zstd_api.attempted) return ct_dynamic_library_is_open(&ct_zstd_api.library);
+    if (ct_zstd_api.attempted) return ct_zstd_is_available();
     ct_zstd_api.attempted = true;
 
-    const char *candidates[] = {
 #if defined(_WIN32)
-        "libzstd.dll",
-        "zstd.dll",
-#elif defined(__APPLE__)
+    ct_zstd_api.compress_bound = ZSTD_compressBound;
+    ct_zstd_api.compress = ZSTD_compress;
+    ct_zstd_api.get_frame_content_size = ZSTD_getFrameContentSize;
+    ct_zstd_api.decompress = ZSTD_decompress;
+    ct_zstd_api.is_error = ZSTD_isError;
+    ct_zstd_api.get_error_name = ZSTD_getErrorName;
+    return ct_zstd_is_available();
+#else
+    const char *candidates[] = {
+#if defined(__APPLE__)
         "libzstd.1.dylib",
         "libzstd.dylib",
         "/opt/homebrew/lib/libzstd.dylib",
@@ -4797,6 +5607,7 @@ static bool ct_zstd_load(void) {
         ct_zstd_api.get_error_name = NULL;
     }
     return false;
+#endif
 }
 
 static JSValueRef ct_zstd_transform_sync(JSContextRef ctx, CtZlibMode mode, const uint8_t *input, size_t input_len, int level, JSValueRef *exception) {
@@ -7053,11 +7864,10 @@ static int ct_get_bytes(JSContextRef ctx, JSValueRef value, uint8_t **out_data, 
 // ---------------------------------------------------------------------------
 // WHATWG TextDecoder support: legacy multi-byte/rare single-byte encodings are
 // decoded with the ICU converters already linked into the process (system
-// libicucore on macOS, the vendored ICU bridge on Linux). Symbols are looked
-// up dynamically so a missing ICU stays a soft failure (returns null to JS).
+// libicucore on macOS, the system ICU where compatible, or the vendored ICU
+// fallback). Converter symbols are resolved through the same dispatch bridge
+// as JSC's ICU calls so static Windows builds do not depend on PE exports.
 // ---------------------------------------------------------------------------
-
-#if !defined(_WIN32)
 
 typedef struct CtUConverter CtUConverter;
 typedef CtUConverter *(*CtUcnvOpenFn)(const char *name, int32_t *status);
@@ -7078,7 +7888,10 @@ typedef struct {
 } CtIcuConverterApi;
 
 static void *ct_icu_converter_symbol(const char *base) {
-    void *symbol = ct_process_symbol(base);
+    void *symbol = cottontail_icu_resolve_symbol(base);
+    if (symbol != NULL) return symbol;
+#if !defined(_WIN32)
+    symbol = ct_process_symbol(base);
     if (symbol != NULL) return symbol;
     char versioned[96];
     for (int version = 60; version <= 99; version += 1) {
@@ -7086,6 +7899,7 @@ static void *ct_icu_converter_symbol(const char *base) {
         symbol = ct_process_symbol(versioned);
         if (symbol != NULL) return symbol;
     }
+#endif
     return NULL;
 }
 
@@ -7139,8 +7953,6 @@ static CtUConverter *ct_icu_cached_converter(const CtIcuConverterApi *api, const
     return converter;
 }
 
-#endif // !defined(_WIN32)
-
 #define CT_ICU_STATUS_BUFFER_OVERFLOW 15
 
 // cottontail.icuDecode(converterName, bytes, fatal) -> string | null
@@ -7148,12 +7960,6 @@ static CtUConverter *ct_icu_cached_converter(const CtIcuConverterApi *api, const
 static JSValueRef ct_icu_decode(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
-#if defined(_WIN32)
-    (void)argc;
-    (void)argv;
-    (void)exception;
-    return JSValueMakeNull(ctx);
-#else
     if (argc < 2) {
         ct_throw_message(ctx, exception, "cottontail.icuDecode(name, bytes[, fatal]) requires a converter name and bytes");
         return JSValueMakeUndefined(ctx);
@@ -7206,7 +8012,6 @@ static JSValueRef ct_icu_decode(JSContextRef ctx, JSObjectRef function, JSObject
     JSValueRef result = JSValueMakeString(ctx, text);
     JSStringRelease(text);
     return result;
-#endif
 }
 
 // Preserve UTF-16 storage even when every code unit fits in Latin-1. Bun's
@@ -9915,7 +10720,17 @@ static bool ct_process_has_uncaught_capture_callback(JSContextRef ctx) {
     return exception == NULL && result != NULL && JSValueToBoolean(ctx, result);
 }
 
+static void ct_normalize_uncaught_exception(JSContextRef ctx, JSValueRef thrown) {
+    JSObjectRef global = JSContextGetGlobalObject(ctx);
+    JSValueRef exception = NULL;
+    JSValueRef normalizer = ct_get_property(ctx, global, "__cottontailNormalizeUncaughtException", &exception);
+    if (exception != NULL || normalizer == NULL || !JSValueIsObject(ctx, normalizer) ||
+        !JSObjectIsFunction(ctx, (JSObjectRef)normalizer)) return;
+    JSObjectCallAsFunction(ctx, (JSObjectRef)normalizer, global, 1, &thrown, &exception);
+}
+
 static void ct_format_uncaught_exception(JSContextRef ctx, JSValueRef thrown) {
+    ct_normalize_uncaught_exception(ctx, thrown);
     JSObjectRef global = JSContextGetGlobalObject(ctx);
     JSValueRef exception = NULL;
     JSValueRef formatter = ct_get_property(ctx, global, "__cottontailFormatUncaughtModuleError", &exception);
@@ -9924,8 +10739,33 @@ static void ct_format_uncaught_exception(JSContextRef ctx, JSValueRef thrown) {
     JSObjectCallAsFunction(ctx, (JSObjectRef)formatter, global, 1, &thrown, &exception);
 }
 
+static bool ct_mark_out_of_memory_exception(CtJscRuntime *runtime, JSValueRef thrown) {
+    if (
+        runtime == NULL ||
+        thrown == NULL ||
+        !ct_jsc_value_is_out_of_memory_error(runtime->context, thrown)
+    ) {
+        return false;
+    }
+    /*
+     * V8 terminates Windows processes with the conventional abort status when
+     * its heap ceiling is reached. Preserve that observable Node contract for
+     * genuine JSC OOM errors, while user-thrown errors with the same text keep
+     * normal uncaught-exception handling.
+     */
+    runtime->fatal_exception_routed = true;
+    runtime->fatal_out_of_memory = true;
+    ct_process_set_exit_code(runtime->context, 134);
+    return true;
+}
+
 static bool ct_handle_uncaught_exception(CtJscRuntime *runtime, JSValueRef thrown, JSValueRef *exception_out) {
     JSContextRef ctx = runtime->context;
+    if (ct_mark_out_of_memory_exception(runtime, thrown)) {
+        *exception_out = thrown;
+        return false;
+    }
+    ct_normalize_uncaught_exception(ctx, thrown);
     JSObjectRef global = JSContextGetGlobalObject(ctx);
     bool capture_callback_active = ct_process_has_uncaught_capture_callback(ctx);
     JSValueRef lookup_exception = NULL;
@@ -9992,41 +10832,50 @@ static JSValueRef ct_process_emit_event(
     );
 }
 
-#if !defined(_WIN32)
 static int ct_dispatch_signals(CtJscRuntime *runtime, char **error_out) {
     JSContextRef ctx = runtime->context;
     for (size_t index = 0; index < runtime->signal_watcher_count; index += 1) {
         CtSignalWatcher *watcher = &runtime->signal_watchers[index];
         while (watcher->active && watcher->pending > 0) {
             watcher->pending -= 1;
-            JSValueRef arguments[2] = {
+            JSValueRef arguments[1] = {
                 ct_make_string(ctx, watcher->name),
-                JSValueMakeNumber(ctx, watcher->number),
             };
             JSValueRef exception = NULL;
-            JSValueRef emitted = ct_process_emit_event(ctx, watcher->name, 2, arguments, &exception);
+            JSValueRef emitted = ct_process_emit_event(ctx, watcher->name, 1, arguments, &exception);
             if (exception != NULL) {
                 JSValueRef thrown = exception;
                 if (ct_handle_uncaught_exception(runtime, thrown, &exception)) continue;
                 ct_set_error_out(error_out, ct_copy_exception(ctx, exception != NULL ? exception : thrown));
                 return -1;
             }
+#if defined(_WIN32)
+            if (emitted != NULL && JSValueToBoolean(ctx, emitted)) continue;
+
+            watcher->active = false;
+            watcher->pending = 0;
+            (void)uv_signal_stop(&watcher->handle);
+            /*
+             * The CRT can restore the default action for SIGINT/SIGBREAK.
+             * SIGHUP is a libuv-only Windows constant, so _exit() is also the
+             * fallback if raise() cannot perform the default action.
+             */
+            if (watcher->number != SIGHUP) {
+                (void)signal(watcher->number, SIG_DFL);
+                (void)raise(watcher->number);
+            }
+            _exit(128 + watcher->number);
+#else
             /* SignalWrap ignores EventEmitter's boolean return. Normally the
              * removeListener hook has already stopped a watcher with no
              * listeners; if user code bypassed that lifecycle, just drop this
              * delivery instead of re-raising from inside the runtime. */
             (void)emitted;
+#endif
         }
     }
     return 0;
 }
-#else
-static int ct_dispatch_signals(CtJscRuntime *runtime, char **error_out) {
-    (void)runtime;
-    (void)error_out;
-    return 0;
-}
-#endif
 
 static int ct_drain_next_ticks(CtJscRuntime *runtime, bool begin_turn, char **error_out) {
     if (!runtime->next_tick_pending && (!begin_turn || runtime->next_tick_priority_armed)) return 0;
@@ -10059,6 +10908,35 @@ static JSValueRef ct_next_tick_state(JSContextRef ctx, JSObjectRef function, JSO
         runtime->next_tick_priority_armed = argc > 1 && JSValueToBoolean(ctx, argv[1]);
     }
     return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_route_uncaught_exception_host(
+    JSContextRef ctx,
+    JSObjectRef function,
+    JSObjectRef thisObject,
+    size_t argc,
+    const JSValueRef argv[],
+    JSValueRef *exception
+) {
+    (void)thisObject;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 1) return JSValueMakeBoolean(ctx, false);
+
+    JSValueRef handler_exception = NULL;
+    bool handled = ct_handle_uncaught_exception(runtime, argv[0], &handler_exception);
+    if (!handled) {
+        JSValueRef fatal = handler_exception != NULL ? handler_exception : argv[0];
+        JSValueRef store_exception = NULL;
+        ct_set_property(
+            ctx,
+            JSContextGetGlobalObject(ctx),
+            "__cottontailRoutedFatalException",
+            fatal,
+            &store_exception
+        );
+        if (store_exception != NULL && exception != NULL) *exception = store_exception;
+    }
+    return JSValueMakeBoolean(ctx, handled);
 }
 
 static int ct_dispatch_timers(CtJscRuntime *runtime, char **error_out) {
@@ -10270,12 +11148,23 @@ static JSValueRef ct_cwd(JSContextRef ctx, JSObjectRef function, JSObjectRef thi
     (void)thisObject;
     (void)argc;
     (void)argv;
+#if defined(_WIN32)
+    char *buffer = getcwd(NULL, 0);
+    if (buffer == NULL) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    JSValueRef result = ct_make_string(ctx, buffer);
+    free(buffer);
+    return result;
+#else
     char buffer[4096];
     if (getcwd(buffer, sizeof(buffer)) == NULL) {
         ct_throw_message(ctx, exception, strerror(errno));
         return JSValueMakeUndefined(ctx);
     }
     return ct_make_string(ctx, buffer);
+#endif
 }
 
 static JSValueRef ct_pid(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -10358,6 +11247,46 @@ static JSValueRef ct_exec_path(JSContextRef ctx, JSObjectRef function, JSObjectR
     (void)thisObject;
     (void)argc;
     (void)argv;
+#if defined(_WIN32)
+    DWORD wide_capacity = 32768;
+    WCHAR *wide = (WCHAR *)malloc(sizeof(WCHAR) * (size_t)wide_capacity);
+    if (wide != NULL) {
+        DWORD wide_length = GetModuleFileNameW(NULL, wide, wide_capacity);
+        if (wide_length > 0 && wide_length < wide_capacity) {
+            int utf8_length = WideCharToMultiByte(
+                CP_UTF8,
+                WC_ERR_INVALID_CHARS,
+                wide,
+                (int)wide_length,
+                NULL,
+                0,
+                NULL,
+                NULL
+            );
+            if (utf8_length > 0) {
+                char *utf8 = (char *)malloc((size_t)utf8_length);
+                if (utf8 != NULL &&
+                    WideCharToMultiByte(
+                        CP_UTF8,
+                        WC_ERR_INVALID_CHARS,
+                        wide,
+                        (int)wide_length,
+                        utf8,
+                        utf8_length,
+                        NULL,
+                        NULL
+                    ) == utf8_length) {
+                    JSValueRef result = ct_make_string_len(ctx, utf8, (size_t)utf8_length);
+                    free(utf8);
+                    free(wide);
+                    return result;
+                }
+                free(utf8);
+            }
+        }
+        free(wide);
+    }
+#endif
     char buffer[32768];
     size_t size = sizeof(buffer);
     if (uv_exepath(buffer, &size) == 0 && size > 0) return ct_make_string_len(ctx, buffer, size);
@@ -10610,6 +11539,568 @@ static JSValueRef ct_arch(JSContextRef ctx, JSObjectRef function, JSObjectRef th
     (void)argv;
     (void)exception;
     return ct_make_string(ctx, CT_ARCH_STRING);
+}
+
+#if defined(_WIN32)
+static WCHAR ct_windows_secret_username[] = L"Cottontail";
+
+static bool ct_windows_secret_legacy_string_eligible(const JSChar *characters, size_t length) {
+    for (size_t index = 0; index < length; index += 1) {
+        unsigned int code_unit = (unsigned int)characters[index];
+        if (code_unit == 0) return false;
+        if (code_unit >= 0xd800 && code_unit <= 0xdbff) {
+            if (index + 1 >= length) return false;
+            unsigned int trailing = (unsigned int)characters[index + 1];
+            if (trailing < 0xdc00 || trailing > 0xdfff) return false;
+            index += 1;
+        } else if (code_unit >= 0xdc00 && code_unit <= 0xdfff) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static WCHAR *ct_windows_secret_target(
+    JSContextRef ctx,
+    JSValueRef service_value,
+    JSValueRef name_value,
+    bool *legacy_eligible_out,
+    DWORD *error_out,
+    JSValueRef *exception
+) {
+    /* TargetName lookup is case-insensitive. Canonical hex of the UTF-16 code
+       units preserves exact JavaScript string identity, including lone
+       surrogates and embedded NULs, without relying on target-name casing. */
+    static const WCHAR prefix[] = L"CottontailSecrets-v1-";
+    static const WCHAR hex[] = L"0123456789ABCDEF";
+    *legacy_eligible_out = false;
+    *error_out = ERROR_NOT_ENOUGH_MEMORY;
+
+    JSStringRef service = JSValueToStringCopy(ctx, service_value, exception);
+    if (service == NULL) return NULL;
+    if (exception != NULL && *exception != NULL) {
+        JSStringRelease(service);
+        return NULL;
+    }
+    JSStringRef name = JSValueToStringCopy(ctx, name_value, exception);
+    if (name == NULL || (exception != NULL && *exception != NULL)) {
+        if (name != NULL) JSStringRelease(name);
+        JSStringRelease(service);
+        return NULL;
+    }
+
+    size_t service_len = JSStringGetLength(service);
+    size_t name_len = JSStringGetLength(name);
+    const JSChar *service_characters = JSStringGetCharactersPtr(service);
+    const JSChar *name_characters = JSStringGetCharactersPtr(name);
+    *legacy_eligible_out =
+        ct_windows_secret_legacy_string_eligible(service_characters, service_len) &&
+        ct_windows_secret_legacy_string_eligible(name_characters, name_len);
+
+    size_t prefix_len = sizeof(prefix) / sizeof(prefix[0]) - 1;
+    if (service_len > SIZE_MAX / 4 || name_len > SIZE_MAX / 4) {
+        JSStringRelease(service);
+        JSStringRelease(name);
+        return NULL;
+    }
+    size_t service_hex_len = service_len * 4;
+    size_t name_hex_len = name_len * 4;
+    if (service_hex_len > SIZE_MAX - prefix_len - 2 ||
+        name_hex_len > SIZE_MAX - prefix_len - service_hex_len - 2) {
+        JSStringRelease(service);
+        JSStringRelease(name);
+        return NULL;
+    }
+    size_t target_len = prefix_len + service_hex_len + 1 + name_hex_len;
+    if (target_len > CRED_MAX_GENERIC_TARGET_NAME_LENGTH) {
+        JSStringRelease(service);
+        JSStringRelease(name);
+        *error_out = ERROR_BAD_LENGTH;
+        return NULL;
+    }
+    WCHAR *target = (WCHAR *)malloc((target_len + 1) * sizeof(WCHAR));
+    if (target == NULL) {
+        JSStringRelease(service);
+        JSStringRelease(name);
+        return NULL;
+    }
+    WCHAR *cursor = target;
+    memcpy(cursor, prefix, prefix_len * sizeof(WCHAR));
+    cursor += prefix_len;
+    for (size_t index = 0; index < service_len; index += 1) {
+        unsigned int code_unit = (unsigned int)service_characters[index];
+        *cursor++ = hex[(code_unit >> 12) & 0x0f];
+        *cursor++ = hex[(code_unit >> 8) & 0x0f];
+        *cursor++ = hex[(code_unit >> 4) & 0x0f];
+        *cursor++ = hex[code_unit & 0x0f];
+    }
+    *cursor++ = L'-';
+    for (size_t index = 0; index < name_len; index += 1) {
+        unsigned int code_unit = (unsigned int)name_characters[index];
+        *cursor++ = hex[(code_unit >> 12) & 0x0f];
+        *cursor++ = hex[(code_unit >> 8) & 0x0f];
+        *cursor++ = hex[(code_unit >> 4) & 0x0f];
+        *cursor++ = hex[code_unit & 0x0f];
+    }
+    *cursor = L'\0';
+    JSStringRelease(service);
+    JSStringRelease(name);
+    *error_out = ERROR_SUCCESS;
+    return target;
+}
+
+static WCHAR *ct_windows_secret_legacy_target(const char *service, const char *name) {
+    size_t service_len = strlen(service);
+    size_t name_len = strlen(name);
+    if (service_len > SIZE_MAX - name_len - 2) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    size_t target_len = service_len + 1 + name_len;
+    char *target = (char *)malloc(target_len + 1);
+    if (target == NULL) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    memcpy(target, service, service_len);
+    target[service_len] = '/';
+    memcpy(target + service_len + 1, name, name_len);
+    target[target_len] = '\0';
+    WCHAR *wide = ct_windows_utf8_to_wide(target);
+    free(target);
+    return wide;
+}
+
+static bool ct_windows_secret_legacy_matches(
+    PCREDENTIALW credential,
+    const WCHAR *target,
+    const WCHAR *username
+) {
+    /* The old service/name target was ambiguous at slashes. Old entries also
+       stored name as UserName, which conservatively attributes uncorrupted
+       entries. Case-insensitive overwrite history cannot be recovered. */
+    return credential != NULL &&
+        credential->TargetName != NULL &&
+        credential->UserName != NULL &&
+        wcscmp(credential->TargetName, target) == 0 &&
+        wcscmp(credential->UserName, username) == 0;
+}
+
+static bool ct_windows_secret_delete_matching_legacy(
+    const WCHAR *target,
+    const WCHAR *username,
+    bool *deleted_out,
+    DWORD *error_out
+) {
+    *deleted_out = false;
+    *error_out = ERROR_SUCCESS;
+    PCREDENTIALW credential = NULL;
+    if (!CredReadW(target, CRED_TYPE_GENERIC, 0, &credential)) {
+        DWORD error_code = GetLastError();
+        if (error_code == ERROR_NOT_FOUND) return true;
+        *error_out = error_code;
+        return false;
+    }
+    bool matches = ct_windows_secret_legacy_matches(credential, target, username);
+    CredFree(credential);
+    if (!matches) return true;
+
+    /* CredDeleteW has no conditional form, so keep this best-effort migration
+       path limited to an explicit delete (including public set-to-empty). */
+    if (CredDeleteW(target, CRED_TYPE_GENERIC, 0)) {
+        *deleted_out = true;
+        return true;
+    }
+    DWORD error_code = GetLastError();
+    if (error_code == ERROR_NOT_FOUND) return true;
+    *error_out = error_code;
+    return false;
+}
+
+static void ct_windows_secret_throw_error(JSContextRef ctx, JSValueRef *exception, DWORD error_code) {
+    if (exception == NULL) return;
+
+    WCHAR *wide_message = NULL;
+    DWORD wide_length = FormatMessageW(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL,
+        error_code,
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        (LPWSTR)&wide_message,
+        0,
+        NULL
+    );
+    size_t message_len = 0;
+    char *message = wide_length > 0
+        ? ct_windows_wide_to_utf8(wide_message, (size_t)wide_length, &message_len)
+        : NULL;
+    if (wide_message != NULL) LocalFree(wide_message);
+
+    const char *fallback = "Windows Credential Manager error";
+    if (message == NULL) {
+        message_len = strlen(fallback);
+        message = ct_duplicate_bytes(fallback, message_len);
+    }
+
+    char suffix[64];
+    int suffix_length = snprintf(suffix, sizeof(suffix), " (code: %lu)", (unsigned long)error_code);
+    if (suffix_length < 0) suffix_length = 0;
+    size_t suffix_len = (size_t)suffix_length;
+    char *message_with_code = NULL;
+    if (message != NULL && message_len <= SIZE_MAX - suffix_len - 1) {
+        message_with_code = (char *)malloc(message_len + suffix_len + 1);
+        if (message_with_code != NULL) {
+            memcpy(message_with_code, message, message_len);
+            memcpy(message_with_code + message_len, suffix, suffix_len);
+            message_with_code[message_len + suffix_len] = '\0';
+        }
+    }
+
+    const char *final_message = message_with_code != NULL
+        ? message_with_code
+        : (message != NULL ? message : fallback);
+    size_t final_message_len = message_with_code != NULL
+        ? message_len + suffix_len
+        : strlen(final_message);
+    JSValueRef argument = ct_make_string_len(ctx, final_message, final_message_len);
+    JSObjectRef error = JSObjectMakeError(ctx, 1, &argument, NULL);
+    ct_set_property(
+        ctx,
+        error,
+        "code",
+        ct_make_string(
+            ctx,
+            error_code == ERROR_ACCESS_DENIED
+                ? "ERR_SECRETS_ACCESS_DENIED"
+                : "ERR_SECRETS_PLATFORM_ERROR"
+        ),
+        NULL
+    );
+    *exception = error;
+    free(message_with_code);
+    free(message);
+}
+
+static bool ct_windows_secret_copy_key(
+    JSContextRef ctx,
+    size_t argc,
+    const JSValueRef argv[],
+    char **service_out,
+    char **name_out,
+    JSValueRef *exception
+) {
+    *service_out = NULL;
+    *name_out = NULL;
+    if (argc < 2) {
+        ct_throw_type_error(ctx, exception, "Windows Credential Manager requires service and name");
+        return false;
+    }
+    *service_out = ct_value_to_string_copy(ctx, argv[0]);
+    *name_out = ct_value_to_string_copy(ctx, argv[1]);
+    if (*service_out != NULL && *name_out != NULL) return true;
+    free(*service_out);
+    free(*name_out);
+    *service_out = NULL;
+    *name_out = NULL;
+    ct_throw_message(ctx, exception, "Out of memory");
+    return false;
+}
+#endif
+
+static JSValueRef ct_secret_get(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+#if defined(_WIN32)
+    char *service = NULL;
+    char *name = NULL;
+    if (!ct_windows_secret_copy_key(
+            ctx,
+            argc,
+            argv,
+            &service,
+            &name,
+            exception)) {
+        return JSValueMakeUndefined(ctx);
+    }
+    bool legacy_eligible = false;
+    DWORD target_error = ERROR_SUCCESS;
+    WCHAR *target = ct_windows_secret_target(
+        ctx,
+        argv[0],
+        argv[1],
+        &legacy_eligible,
+        &target_error,
+        exception
+    );
+    WCHAR *legacy_target = legacy_eligible
+        ? ct_windows_secret_legacy_target(service, name)
+        : NULL;
+    WCHAR *legacy_username = legacy_eligible
+        ? ct_windows_utf8_to_wide(name)
+        : NULL;
+    free(service);
+    free(name);
+    bool target_too_long = target == NULL && target_error == ERROR_BAD_LENGTH;
+    bool legacy_setup_failed =
+        legacy_eligible && (legacy_target == NULL || legacy_username == NULL);
+    if ((target == NULL && !target_too_long) || legacy_setup_failed) {
+        DWORD setup_error = legacy_setup_failed
+            ? ERROR_NOT_ENOUGH_MEMORY
+            : target_error;
+        free(target);
+        free(legacy_target);
+        free(legacy_username);
+        if (exception == NULL || *exception == NULL) {
+            ct_windows_secret_throw_error(ctx, exception, setup_error);
+        }
+        return JSValueMakeUndefined(ctx);
+    }
+
+    PCREDENTIALW credential = NULL;
+    BOOL read = target != NULL
+        ? CredReadW(target, CRED_TYPE_GENERIC, 0, &credential)
+        : FALSE;
+    DWORD error_code = target == NULL
+        ? ERROR_NOT_FOUND
+        : (read ? ERROR_SUCCESS : GetLastError());
+    if (!read && error_code == ERROR_NOT_FOUND && legacy_eligible) {
+        read = CredReadW(legacy_target, CRED_TYPE_GENERIC, 0, &credential);
+        error_code = read ? ERROR_SUCCESS : GetLastError();
+        if (read && !ct_windows_secret_legacy_matches(credential, legacy_target, legacy_username)) {
+            CredFree(credential);
+            credential = NULL;
+            read = FALSE;
+            error_code = ERROR_NOT_FOUND;
+        }
+    }
+    free(target);
+    free(legacy_target);
+    free(legacy_username);
+    if (!read) {
+        if (error_code == ERROR_NOT_FOUND) return JSValueMakeNull(ctx);
+        ct_windows_secret_throw_error(ctx, exception, error_code);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSValueRef result = JSValueMakeNull(ctx);
+    if (credential->CredentialBlob != NULL && credential->CredentialBlobSize > 0) {
+        result = ct_make_string_len(
+            ctx,
+            (const char *)credential->CredentialBlob,
+            (size_t)credential->CredentialBlobSize
+        );
+    }
+    CredFree(credential);
+    return result;
+#else
+    (void)argc;
+    (void)argv;
+    ct_throw_message(ctx, exception, "Windows Credential Manager is unavailable on this platform");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_secret_set(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+#if defined(_WIN32)
+    char *service = NULL;
+    char *name = NULL;
+    if (argc < 3 ||
+        !ct_windows_secret_copy_key(
+            ctx,
+            argc,
+            argv,
+            &service,
+            &name,
+            exception)) {
+        if (argc < 3 && (exception == NULL || *exception == NULL)) {
+            ct_throw_type_error(ctx, exception, "Windows Credential Manager requires service, name, and value");
+        }
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t value_len = 0;
+    char *value = ct_value_to_utf8_copy_checked(ctx, argv[2], &value_len, exception);
+    if (value == NULL) {
+        free(service);
+        free(name);
+        if (exception == NULL || *exception == NULL) ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    bool legacy_eligible = false;
+    DWORD target_error = ERROR_SUCCESS;
+    WCHAR *target = ct_windows_secret_target(
+        ctx,
+        argv[0],
+        argv[1],
+        &legacy_eligible,
+        &target_error,
+        exception
+    );
+    bool needs_legacy_delete = value_len == 0 && legacy_eligible;
+    WCHAR *legacy_target = needs_legacy_delete
+        ? ct_windows_secret_legacy_target(service, name)
+        : NULL;
+    WCHAR *legacy_username = needs_legacy_delete
+        ? ct_windows_utf8_to_wide(name)
+        : NULL;
+    free(service);
+    free(name);
+    bool target_too_long = target == NULL && target_error == ERROR_BAD_LENGTH;
+    bool legacy_setup_failed =
+        needs_legacy_delete && (legacy_target == NULL || legacy_username == NULL);
+    if ((target == NULL && !(value_len == 0 && target_too_long)) ||
+        legacy_setup_failed) {
+        DWORD setup_error = legacy_setup_failed
+            ? ERROR_NOT_ENOUGH_MEMORY
+            : target_error;
+        free(target);
+        free(legacy_target);
+        free(legacy_username);
+        SecureZeroMemory(value, value_len);
+        free(value);
+        if (exception == NULL || *exception == NULL) {
+            ct_windows_secret_throw_error(ctx, exception, setup_error);
+        }
+        return JSValueMakeUndefined(ctx);
+    }
+
+    BOOL written = FALSE;
+    DWORD error_code = ERROR_SUCCESS;
+    if (value_len == 0) {
+        written = target != NULL
+            ? CredDeleteW(target, CRED_TYPE_GENERIC, 0)
+            : TRUE;
+        error_code = target == NULL || written ? ERROR_SUCCESS : GetLastError();
+        if (!written && error_code == ERROR_NOT_FOUND) {
+            written = TRUE;
+            error_code = ERROR_SUCCESS;
+        }
+        if (written && needs_legacy_delete) {
+            bool legacy_deleted = false;
+            if (!ct_windows_secret_delete_matching_legacy(
+                    legacy_target,
+                    legacy_username,
+                    &legacy_deleted,
+                    &error_code)) {
+                written = FALSE;
+            }
+        }
+    } else {
+        CREDENTIALW credential;
+        memset(&credential, 0, sizeof(credential));
+        credential.Type = CRED_TYPE_GENERIC;
+        credential.TargetName = target;
+        credential.UserName = ct_windows_secret_username;
+        credential.CredentialBlobSize = (DWORD)value_len;
+        credential.CredentialBlob = (LPBYTE)value;
+        credential.Persist = CRED_PERSIST_ENTERPRISE;
+        written = CredWriteW(&credential, 0);
+        error_code = written ? ERROR_SUCCESS : GetLastError();
+    }
+
+    free(target);
+    free(legacy_target);
+    free(legacy_username);
+    SecureZeroMemory(value, value_len);
+    free(value);
+    if (!written) {
+        ct_windows_secret_throw_error(ctx, exception, error_code);
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeUndefined(ctx);
+#else
+    (void)argc;
+    (void)argv;
+    ct_throw_message(ctx, exception, "Windows Credential Manager is unavailable on this platform");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_secret_delete(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+#if defined(_WIN32)
+    char *service = NULL;
+    char *name = NULL;
+    if (!ct_windows_secret_copy_key(
+            ctx,
+            argc,
+            argv,
+            &service,
+            &name,
+            exception)) {
+        return JSValueMakeUndefined(ctx);
+    }
+    bool legacy_eligible = false;
+    DWORD target_error = ERROR_SUCCESS;
+    WCHAR *target = ct_windows_secret_target(
+        ctx,
+        argv[0],
+        argv[1],
+        &legacy_eligible,
+        &target_error,
+        exception
+    );
+    WCHAR *legacy_target = legacy_eligible
+        ? ct_windows_secret_legacy_target(service, name)
+        : NULL;
+    WCHAR *legacy_username = legacy_eligible
+        ? ct_windows_utf8_to_wide(name)
+        : NULL;
+    free(service);
+    free(name);
+    bool target_too_long = target == NULL && target_error == ERROR_BAD_LENGTH;
+    bool legacy_setup_failed =
+        legacy_eligible && (legacy_target == NULL || legacy_username == NULL);
+    if ((target == NULL && !target_too_long) || legacy_setup_failed) {
+        DWORD setup_error = legacy_setup_failed
+            ? ERROR_NOT_ENOUGH_MEMORY
+            : target_error;
+        free(target);
+        free(legacy_target);
+        free(legacy_username);
+        if (exception == NULL || *exception == NULL) {
+            ct_windows_secret_throw_error(ctx, exception, setup_error);
+        }
+        return JSValueMakeUndefined(ctx);
+    }
+
+    BOOL deleted = target != NULL
+        ? CredDeleteW(target, CRED_TYPE_GENERIC, 0)
+        : FALSE;
+    DWORD error_code = target == NULL
+        ? ERROR_NOT_FOUND
+        : (deleted ? ERROR_SUCCESS : GetLastError());
+    if (!deleted && error_code != ERROR_NOT_FOUND) {
+        free(target);
+        free(legacy_target);
+        free(legacy_username);
+        ct_windows_secret_throw_error(ctx, exception, error_code);
+        return JSValueMakeUndefined(ctx);
+    }
+    bool legacy_deleted = false;
+    bool legacy_ok = !legacy_eligible ||
+        ct_windows_secret_delete_matching_legacy(
+            legacy_target,
+            legacy_username,
+            &legacy_deleted,
+            &error_code
+        );
+    free(target);
+    free(legacy_target);
+    free(legacy_username);
+    if (!legacy_ok) {
+        ct_windows_secret_throw_error(ctx, exception, error_code);
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeBoolean(ctx, deleted || legacy_deleted);
+#else
+    (void)argc;
+    (void)argv;
+    ct_throw_message(ctx, exception, "Windows Credential Manager is unavailable on this platform");
+    return JSValueMakeUndefined(ctx);
+#endif
 }
 
 static JSValueRef ct_hostname(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -12449,7 +13940,7 @@ static bool ct_tcp_connect_prepare(CtTcpConnect *operation) {
         if (connect_status != 0) {
             struct pollfd poll_fd;
             poll_fd.fd = fd;
-            poll_fd.events = POLLOUT | POLLERR | POLLHUP;
+            poll_fd.events = POLLOUT;
             poll_fd.revents = 0;
             int ready = poll(&poll_fd, 1, 0);
             if (ready < 0) {
@@ -12502,7 +13993,7 @@ static void *ct_tcp_connect_thread(void *opaque) {
     while (!ct_tcp_connect_is_canceled(operation)) {
         struct pollfd poll_fd;
         poll_fd.fd = fd;
-        poll_fd.events = POLLOUT | POLLERR | POLLHUP;
+        poll_fd.events = POLLOUT;
         poll_fd.revents = 0;
         int ready = poll(&poll_fd, 1, 25);
         if (ready == 0) continue;
@@ -12755,15 +14246,204 @@ static JSObjectRef ct_unix_address_from_fd(JSContextRef ctx, int fd, bool peer, 
 #endif
 }
 
+#if defined(_WIN32)
+static int ct_windows_named_pipe_set_errno(DWORD error) {
+    switch (error) {
+        case ERROR_ACCESS_DENIED:
+            errno = EACCES;
+            break;
+        case ERROR_PIPE_BUSY:
+            errno = EBUSY;
+            break;
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND:
+        case ERROR_BAD_NETPATH:
+            errno = ENOENT;
+            break;
+        case ERROR_BROKEN_PIPE:
+        case ERROR_NO_DATA:
+            errno = EPIPE;
+            break;
+        case ERROR_PIPE_NOT_CONNECTED:
+            errno = ENOTCONN;
+            break;
+        case ERROR_SEM_TIMEOUT:
+            errno = ETIMEDOUT;
+            break;
+        default:
+            ct_windows_set_errno(error);
+            break;
+    }
+    return errno;
+}
+
+static HANDLE ct_windows_named_pipe_create_instance(
+    const WCHAR *path,
+    DWORD max_instances,
+    bool first
+) {
+    DWORD open_mode = PIPE_ACCESS_DUPLEX;
+#ifdef FILE_FLAG_FIRST_PIPE_INSTANCE
+    if (first) open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+#else
+    (void)first;
+#endif
+    return CreateNamedPipeW(
+        path,
+        open_mode,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
+        max_instances,
+        64 * 1024,
+        64 * 1024,
+        0,
+        NULL
+    );
+}
+
+static CtWindowsNamedPipeListener *ct_windows_named_pipe_listener_find_locked(
+    uint32_t id,
+    CtJscRuntime *runtime
+) {
+    for (
+        CtWindowsNamedPipeListener *listener = ct_windows_named_pipe_listeners;
+        listener != NULL;
+        listener = listener->next
+    ) {
+        if (listener->id == id && listener->runtime == runtime) return listener;
+    }
+    return NULL;
+}
+
+static void ct_windows_named_pipe_listener_free(CtWindowsNamedPipeListener *listener) {
+    if (listener == NULL) return;
+    if (listener->pending != NULL && listener->pending != INVALID_HANDLE_VALUE) {
+        CloseHandle(listener->pending);
+    }
+    free(listener->path);
+    free(listener->utf8_path);
+    free(listener);
+}
+
+static bool ct_windows_named_pipe_listener_remove(uint32_t id, CtJscRuntime *runtime) {
+    CtWindowsNamedPipeListener *removed = NULL;
+    pthread_mutex_lock(&ct_windows_named_pipe_listeners_mutex);
+    CtWindowsNamedPipeListener **cursor = &ct_windows_named_pipe_listeners;
+    while (*cursor != NULL) {
+        CtWindowsNamedPipeListener *listener = *cursor;
+        if (listener->id == id && listener->runtime == runtime) {
+            *cursor = listener->next;
+            listener->next = NULL;
+            removed = listener;
+            break;
+        }
+        cursor = &listener->next;
+    }
+    pthread_mutex_unlock(&ct_windows_named_pipe_listeners_mutex);
+    ct_windows_named_pipe_listener_free(removed);
+    return removed != NULL;
+}
+
+static void ct_unix_servers_stop_runtime(CtJscRuntime *runtime) {
+    for (;;) {
+        CtWindowsNamedPipeListener *removed = NULL;
+        pthread_mutex_lock(&ct_windows_named_pipe_listeners_mutex);
+        CtWindowsNamedPipeListener **cursor = &ct_windows_named_pipe_listeners;
+        while (*cursor != NULL) {
+            CtWindowsNamedPipeListener *listener = *cursor;
+            if (listener->runtime == runtime) {
+                *cursor = listener->next;
+                listener->next = NULL;
+                removed = listener;
+                break;
+            }
+            cursor = &listener->next;
+        }
+        pthread_mutex_unlock(&ct_windows_named_pipe_listeners_mutex);
+        if (removed == NULL) break;
+        ct_windows_named_pipe_listener_free(removed);
+    }
+}
+#else
+static void ct_unix_servers_stop_runtime(CtJscRuntime *runtime) {
+    (void)runtime;
+}
+#endif
+
 static JSValueRef ct_unix_server_listen(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
     (void)thisObject;
 #if defined(_WIN32)
-    (void)argc;
-    (void)argv;
-    ct_throw_message(ctx, exception, "Unix domain sockets are not available on this platform");
-    return JSValueMakeUndefined(ctx);
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "unixServerListen(path[, backlog]) requires a named pipe path");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    if (path == NULL) return JSValueMakeUndefined(ctx);
+    WCHAR *wide_path = ct_windows_utf8_to_wide(path);
+    if (wide_path == NULL) {
+        free(path);
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    int backlog = 128;
+    if (argc >= 2 && !ct_value_to_int_checked(ctx, argv[1], 0, INT_MAX, &backlog, exception, "Invalid socket backlog")) {
+        free(wide_path);
+        free(path);
+        return JSValueMakeUndefined(ctx);
+    }
+    DWORD max_instances = backlog <= 0
+        ? 1
+        : (backlog >= (int)PIPE_UNLIMITED_INSTANCES ? PIPE_UNLIMITED_INSTANCES : (DWORD)backlog);
+    HANDLE pending = ct_windows_named_pipe_create_instance(wide_path, max_instances, true);
+    if (pending == INVALID_HANDLE_VALUE) {
+        DWORD create_error = GetLastError();
+        int error_code = (
+            create_error == ERROR_ACCESS_DENIED ||
+            create_error == ERROR_PIPE_BUSY
+        ) ? (errno = EADDRINUSE) : ct_windows_named_pipe_set_errno(create_error);
+        free(wide_path);
+        free(path);
+        ct_throw_message(
+            ctx,
+            exception,
+            error_code == EADDRINUSE ? "EADDRINUSE: named pipe is already in use" : strerror(error_code)
+        );
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtWindowsNamedPipeListener *listener = (CtWindowsNamedPipeListener *)calloc(1, sizeof(*listener));
+    if (listener == NULL) {
+        CloseHandle(pending);
+        free(wide_path);
+        free(path);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    listener->pending = pending;
+    listener->path = wide_path;
+    listener->utf8_path = path;
+    listener->max_instances = max_instances;
+    listener->runtime = ct_callback_runtime(function);
+
+    pthread_mutex_lock(&ct_windows_named_pipe_listeners_mutex);
+    if (
+        ct_next_windows_named_pipe_listener_id < 0x70000000u ||
+        ct_next_windows_named_pipe_listener_id >= 0x7fffffffu
+    ) {
+        ct_next_windows_named_pipe_listener_id = 0x70000000u;
+    }
+    listener->id = ct_next_windows_named_pipe_listener_id++;
+    listener->next = ct_windows_named_pipe_listeners;
+    ct_windows_named_pipe_listeners = listener;
+    pthread_mutex_unlock(&ct_windows_named_pipe_listeners_mutex);
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, listener->id), exception);
+    ct_set_property(ctx, result, "path", ct_make_string(ctx, path), exception);
+    JSObjectRef local = ct_unix_address_from_path(ctx, path, exception);
+    ct_set_property(ctx, result, "address", local, exception);
+    return result;
 #else
+    (void)function;
     if (argc < 1) {
         ct_throw_message(ctx, exception, "unixServerListen(path[, backlog]) requires a socket path");
         return JSValueMakeUndefined(ctx);
@@ -12819,13 +14499,103 @@ static JSValueRef ct_unix_server_listen(JSContextRef ctx, JSObjectRef function, 
 }
 
 static JSValueRef ct_unix_server_accept(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
     (void)thisObject;
 #if defined(_WIN32)
-    (void)argc;
-    (void)argv;
-    return JSValueMakeNull(ctx);
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "unixServerAccept(id) requires a named pipe server id");
+        return JSValueMakeUndefined(ctx);
+    }
+    int listener_id;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &listener_id, exception, "Invalid named pipe server")) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    HANDLE connected_handle = INVALID_HANDLE_VALUE;
+    char *path = NULL;
+    int error_code = 0;
+    pthread_mutex_lock(&ct_windows_named_pipe_listeners_mutex);
+    CtWindowsNamedPipeListener *listener = ct_windows_named_pipe_listener_find_locked((uint32_t)listener_id, runtime);
+    if (listener == NULL) {
+        error_code = EBADF;
+    } else {
+        if (listener->pending == NULL || listener->pending == INVALID_HANDLE_VALUE) {
+            listener->pending = ct_windows_named_pipe_create_instance(
+                listener->path,
+                listener->max_instances,
+                false
+            );
+            if (listener->pending == INVALID_HANDLE_VALUE) {
+                DWORD create_error = GetLastError();
+                if (create_error != ERROR_PIPE_BUSY) error_code = ct_windows_named_pipe_set_errno(create_error);
+            }
+        }
+        if (error_code == 0 && listener->pending != INVALID_HANDLE_VALUE) {
+            BOOL connected = ConnectNamedPipe(listener->pending, NULL);
+            DWORD connect_error = connected ? ERROR_SUCCESS : GetLastError();
+            if (connected || connect_error == ERROR_PIPE_CONNECTED) {
+                connected_handle = listener->pending;
+                listener->pending = ct_windows_named_pipe_create_instance(
+                    listener->path,
+                    listener->max_instances,
+                    false
+                );
+                path = ct_duplicate_string(listener->utf8_path);
+                if (path == NULL) error_code = ENOMEM;
+            } else if (connect_error == ERROR_NO_DATA) {
+                DisconnectNamedPipe(listener->pending);
+                CloseHandle(listener->pending);
+                listener->pending = ct_windows_named_pipe_create_instance(
+                    listener->path,
+                    listener->max_instances,
+                    false
+                );
+            } else if (connect_error != ERROR_PIPE_LISTENING) {
+                error_code = ct_windows_named_pipe_set_errno(connect_error);
+            }
+        }
+    }
+    pthread_mutex_unlock(&ct_windows_named_pipe_listeners_mutex);
+
+    if (connected_handle == INVALID_HANDLE_VALUE) {
+        if (error_code != 0) {
+            ct_throw_message(ctx, exception, strerror(error_code));
+            return JSValueMakeUndefined(ctx);
+        }
+        return JSValueMakeNull(ctx);
+    }
+    if (error_code != 0) {
+        CloseHandle(connected_handle);
+        ct_throw_message(ctx, exception, strerror(error_code));
+        return JSValueMakeUndefined(ctx);
+    }
+
+    DWORD blocking_mode = PIPE_READMODE_BYTE | PIPE_WAIT;
+    if (!SetNamedPipeHandleState(connected_handle, &blocking_mode, NULL, NULL)) {
+        error_code = ct_windows_named_pipe_set_errno(GetLastError());
+        CloseHandle(connected_handle);
+        free(path);
+        ct_throw_message(ctx, exception, strerror(error_code));
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = _open_osfhandle((intptr_t)connected_handle, _O_RDWR | _O_BINARY | _O_NOINHERIT);
+    if (fd < 0) {
+        CloseHandle(connected_handle);
+        free(path);
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, fd), exception);
+    JSObjectRef local = ct_unix_address_from_path(ctx, path, exception);
+    ct_set_property(ctx, result, "local", local, exception);
+    JSObjectRef remote = ct_unix_address_from_path(ctx, "", exception);
+    ct_set_property(ctx, result, "remote", remote, exception);
+    free(path);
+    return result;
 #else
+    (void)function;
     if (argc < 1) {
         ct_throw_message(ctx, exception, "unixServerAccept(fd) requires a server file descriptor");
         return JSValueMakeUndefined(ctx);
@@ -12853,14 +14623,97 @@ static JSValueRef ct_unix_server_accept(JSContextRef ctx, JSObjectRef function, 
 #endif
 }
 
+static JSValueRef ct_unix_server_close(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    if (argc < 1) return JSValueMakeBoolean(ctx, false);
+    int listener_id;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &listener_id, exception, "Invalid Unix server")) {
+        return JSValueMakeUndefined(ctx);
+    }
+#if defined(_WIN32)
+    bool removed = ct_windows_named_pipe_listener_remove(
+        (uint32_t)listener_id,
+        ct_callback_runtime(function)
+    );
+    return JSValueMakeBoolean(ctx, removed);
+#else
+    (void)function;
+    return JSValueMakeBoolean(ctx, close(listener_id) == 0);
+#endif
+}
+
 static JSValueRef ct_unix_socket_connect(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
 #if defined(_WIN32)
-    (void)argc;
-    (void)argv;
-    ct_throw_message(ctx, exception, "Unix domain sockets are not available on this platform");
-    return JSValueMakeUndefined(ctx);
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "unixSocketConnect(path) requires a named pipe path");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    if (path == NULL) return JSValueMakeUndefined(ctx);
+    WCHAR *wide_path = ct_windows_utf8_to_wide(path);
+    if (wide_path == NULL) {
+        free(path);
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+
+    HANDLE handle = CreateFileW(
+        wide_path,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (handle == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PIPE_BUSY) {
+        if (WaitNamedPipeW(wide_path, 50)) {
+            handle = CreateFileW(
+                wide_path,
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                NULL,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                NULL
+            );
+        }
+    }
+    if (handle == INVALID_HANDLE_VALUE) {
+        int error_code = ct_windows_named_pipe_set_errno(GetLastError());
+        free(wide_path);
+        free(path);
+        ct_throw_message(ctx, exception, strerror(error_code));
+        return JSValueMakeUndefined(ctx);
+    }
+    free(wide_path);
+
+    DWORD blocking_mode = PIPE_READMODE_BYTE | PIPE_WAIT;
+    if (!SetNamedPipeHandleState(handle, &blocking_mode, NULL, NULL)) {
+        int error_code = ct_windows_named_pipe_set_errno(GetLastError());
+        CloseHandle(handle);
+        free(path);
+        ct_throw_message(ctx, exception, strerror(error_code));
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = _open_osfhandle((intptr_t)handle, _O_RDWR | _O_BINARY | _O_NOINHERIT);
+    if (fd < 0) {
+        CloseHandle(handle);
+        free(path);
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, fd), exception);
+    JSObjectRef local = ct_unix_address_from_path(ctx, "", exception);
+    ct_set_property(ctx, result, "local", local, exception);
+    JSObjectRef remote = ct_unix_address_from_path(ctx, path, exception);
+    ct_set_property(ctx, result, "remote", remote, exception);
+    free(path);
+    return result;
 #else
     if (argc < 1) {
         ct_throw_message(ctx, exception, "unixSocketConnect(path) requires a socket path");
@@ -12927,8 +14780,39 @@ static JSValueRef ct_socket_pair(JSContextRef ctx, JSObjectRef function, JSObjec
     (void)argc;
     (void)argv;
 #if defined(_WIN32)
-    ct_throw_message(ctx, exception, "socketpair is unavailable on Windows");
-    return JSValueMakeUndefined(ctx);
+    int listener = -1;
+    int client = -1;
+    int server = -1;
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener >= 0 &&
+        bind(listener, (struct sockaddr *)&address, sizeof(address)) == 0 &&
+        listen(listener, 1) == 0) {
+        socklen_t address_len = sizeof(address);
+        if (getsockname(listener, (struct sockaddr *)&address, &address_len) == 0) {
+            client = socket(AF_INET, SOCK_STREAM, 0);
+            if (client >= 0 &&
+                connect(client, (struct sockaddr *)&address, address_len) == 0) {
+                server = accept(listener, NULL, NULL);
+            }
+        }
+    }
+    int pair_error = errno;
+    if (listener >= 0) close(listener);
+    if (client < 0 || server < 0) {
+        if (client >= 0) close(client);
+        if (server >= 0) close(server);
+        errno = pair_error;
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    ct_set_nonblocking_fd(client);
+    ct_set_nonblocking_fd(server);
+    int descriptors[2] = { client, server };
 #else
     int descriptors[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, descriptors) != 0) {
@@ -12937,11 +14821,141 @@ static JSValueRef ct_socket_pair(JSContextRef ctx, JSObjectRef function, JSObjec
     }
     ct_set_nonblocking_fd(descriptors[0]);
     ct_set_nonblocking_fd(descriptors[1]);
+#endif
     JSValueRef values[2] = {
         JSValueMakeNumber(ctx, descriptors[0]),
         JSValueMakeNumber(ctx, descriptors[1]),
     };
     return ct_make_array(ctx, 2, values, exception);
+}
+
+static JSValueRef ct_socket_duplicate_for_process(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+#if defined(_WIN32)
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "socketDuplicateForProcess(fd, pid) requires a socket and target process id");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd;
+    int pid;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid socket descriptor") ||
+        !ct_value_to_int_checked(ctx, argv[1], 1, INT_MAX, &pid, exception, "Invalid target process id")) {
+        return JSValueMakeUndefined(ctx);
+    }
+    int startup_error = ct_windows_ensure_winsock();
+    if (startup_error != 0) {
+        ct_throw_message(ctx, exception, "Winsock initialization failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    WSAPROTOCOL_INFOW protocol_info;
+    memset(&protocol_info, 0, sizeof(protocol_info));
+    if (WSADuplicateSocketW(
+            ct_windows_socket_from_fd(fd),
+            (DWORD)pid,
+            &protocol_info
+        ) == SOCKET_ERROR) {
+        int error = WSAGetLastError();
+        char message[128];
+        snprintf(message, sizeof(message), "WSADuplicateSocketW failed with Winsock error %d", error);
+        ct_throw_message(ctx, exception, message);
+        return JSValueMakeUndefined(ctx);
+    }
+    return ct_array_buffer_from_copy(
+        ctx,
+        (const char *)&protocol_info,
+        sizeof(protocol_info),
+        exception
+    );
+#else
+    (void)argc;
+    (void)argv;
+    ct_throw_message(ctx, exception, "socket duplication is unavailable on this platform");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_socket_adopt_duplicate(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+#if defined(_WIN32)
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "socketAdoptDuplicate(bytes) requires a protocol-info buffer");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *bytes = NULL;
+    size_t byte_len = 0;
+    if (ct_get_bytes(ctx, argv[0], &bytes, &byte_len) != 0) {
+        ct_throw_message(ctx, exception, "socketAdoptDuplicate expects an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (byte_len != sizeof(WSAPROTOCOL_INFOW)) {
+        char message[160];
+        snprintf(
+            message,
+            sizeof(message),
+            "socketAdoptDuplicate expected %zu protocol-info bytes, received %zu",
+            sizeof(WSAPROTOCOL_INFOW),
+            byte_len
+        );
+        ct_throw_message(ctx, exception, message);
+        return JSValueMakeUndefined(ctx);
+    }
+    int startup_error = ct_windows_ensure_winsock();
+    if (startup_error != 0) {
+        ct_throw_message(ctx, exception, "Winsock initialization failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    WSAPROTOCOL_INFOW protocol_info;
+    memcpy(&protocol_info, bytes, sizeof(protocol_info));
+    DWORD flags = WSA_FLAG_OVERLAPPED;
+#ifdef WSA_FLAG_NO_HANDLE_INHERIT
+    flags |= WSA_FLAG_NO_HANDLE_INHERIT;
+#endif
+    SOCKET socket_value = WSASocketW(
+        FROM_PROTOCOL_INFO,
+        FROM_PROTOCOL_INFO,
+        FROM_PROTOCOL_INFO,
+        &protocol_info,
+        0,
+        flags
+    );
+    if (socket_value == INVALID_SOCKET) {
+        int error = WSAGetLastError();
+        char message[128];
+        snprintf(message, sizeof(message), "WSASocketW failed with Winsock error %d", error);
+        ct_throw_message(ctx, exception, message);
+        return JSValueMakeUndefined(ctx);
+    }
+    u_long nonblocking = 1;
+    if (ioctlsocket(socket_value, FIONBIO, &nonblocking) == SOCKET_ERROR) {
+        int error = WSAGetLastError();
+        closesocket(socket_value);
+        char message[128];
+        snprintf(message, sizeof(message), "Unable to make duplicated socket nonblocking (Winsock error %d)", error);
+        ct_throw_message(ctx, exception, message);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (!SetHandleInformation((HANDLE)socket_value, HANDLE_FLAG_INHERIT, 0)) {
+        DWORD error = GetLastError();
+        closesocket(socket_value);
+        char message[128];
+        snprintf(message, sizeof(message), "Unable to disable duplicated-socket inheritance (Windows error %lu)", (unsigned long)error);
+        ct_throw_message(ctx, exception, message);
+        return JSValueMakeUndefined(ctx);
+    }
+    uintptr_t raw_socket = (uintptr_t)socket_value;
+    if (raw_socket > INT_MAX) {
+        closesocket(socket_value);
+        ct_throw_message(ctx, exception, "Duplicated socket descriptor is out of range");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeNumber(ctx, (double)(int)raw_socket);
+#else
+    (void)argc;
+    (void)argv;
+    ct_throw_message(ctx, exception, "socket adoption is unavailable on this platform");
+    return JSValueMakeUndefined(ctx);
 #endif
 }
 
@@ -13005,6 +15019,22 @@ static JSValueRef ct_tcp_socket_shutdown(JSContextRef ctx, JSObjectRef function,
     int fd;
     if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid TCP socket")) return JSValueMakeUndefined(ctx);
     int how = argc >= 2 && ct_value_to_bool(ctx, argv[1]) ? SHUT_RD : SHUT_WR;
+#if defined(_WIN32)
+    if (!ct_windows_is_socket(fd)) {
+        intptr_t raw_handle = _get_osfhandle(fd);
+        if (raw_handle != -1 && GetFileType((HANDLE)raw_handle) == FILE_TYPE_PIPE) {
+            /*
+             * Windows named pipes have no half-close. Do not call
+             * FlushFileBuffers here: it waits for the peer to consume every
+             * byte and would block the JavaScript thread. The net.Socket
+             * layer queues pipe writes off-thread and closes the handle after
+             * its final write completes, which supplies the peer EOF.
+             */
+            (void)how;
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+#endif
     if (shutdown(fd, how) != 0 && errno != ENOTCONN) {
         ct_throw_message(ctx, exception, strerror(errno));
         return JSValueMakeUndefined(ctx);
@@ -13021,6 +15051,15 @@ static JSValueRef ct_tcp_socket_reset(JSContextRef ctx, JSObjectRef function, JS
     }
     int fd;
     if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid TCP socket")) return JSValueMakeUndefined(ctx);
+#if defined(_WIN32)
+    if (!ct_windows_is_socket(fd)) {
+        intptr_t raw_handle = _get_osfhandle(fd);
+        if (raw_handle != -1 && GetFileType((HANDLE)raw_handle) == FILE_TYPE_PIPE) {
+            close(fd);
+            return JSValueMakeBoolean(ctx, true);
+        }
+    }
+#endif
     struct linger linger_option;
     memset(&linger_option, 0, sizeof(linger_option));
     linger_option.l_onoff = 1;
@@ -13039,13 +15078,37 @@ static JSValueRef ct_tcp_socket_reset(JSContextRef ctx, JSObjectRef function, JS
 }
 
 #if CT_HAS_OPENSSL
-static pthread_once_t ct_tls_init_once_control = PTHREAD_ONCE_INIT;
-
-static void ct_tls_init_once(void) {
+static void ct_tls_initialize(void) {
     SSL_library_init();
     SSL_load_error_strings();
     OpenSSL_add_ssl_algorithms();
 }
+
+#if defined(_WIN32)
+static INIT_ONCE ct_tls_init_once_control = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK ct_tls_init_once(PINIT_ONCE once, PVOID parameter, PVOID *context) {
+    (void)once;
+    (void)parameter;
+    (void)context;
+    ct_tls_initialize();
+    return TRUE;
+}
+
+static void ct_tls_ensure_initialized(void) {
+    (void)InitOnceExecuteOnce(&ct_tls_init_once_control, ct_tls_init_once, NULL, NULL);
+}
+#else
+static pthread_once_t ct_tls_init_once_control = PTHREAD_ONCE_INIT;
+
+static void ct_tls_init_once(void) {
+    ct_tls_initialize();
+}
+
+static void ct_tls_ensure_initialized(void) {
+    (void)pthread_once(&ct_tls_init_once_control, ct_tls_init_once);
+}
+#endif
 
 static void ct_tls_enable_partial_writes(SSL *ssl) {
     if (ssl != NULL) {
@@ -14689,7 +16752,7 @@ static void *ct_tls_server_thread(void *opaque) {
     while (!ct_tls_server_is_stopped(server)) {
         struct pollfd poll_fd;
         poll_fd.fd = server->listen_fd;
-        poll_fd.events = POLLIN | POLLERR | POLLHUP;
+        poll_fd.events = POLLIN;
         poll_fd.revents = 0;
         int ready = poll(&poll_fd, 1, 50);
         if (ct_tls_server_is_stopped(server)) break;
@@ -14762,7 +16825,7 @@ static void *ct_tls_read_thread(void *opaque) {
         }
         struct pollfd poll_fd;
         poll_fd.fd = connection->fd;
-        poll_fd.events = POLLIN | POLLHUP | POLLERR;
+        poll_fd.events = POLLIN;
         if (write_wanted && !write_wants_read) poll_fd.events |= POLLOUT;
         if (renegotiating && renegotiation_wants_write) poll_fd.events |= POLLOUT;
         poll_fd.revents = 0;
@@ -15115,7 +17178,7 @@ static JSValueRef ct_tls_client_connect(JSContextRef ctx, JSObjectRef function, 
         ct_throw_message(ctx, exception, "tlsClientConnect(port, host, servername, rejectUnauthorized[, ca, cert, key, passphrase]) requires port, host, servername, and rejectUnauthorized");
         return JSValueMakeUndefined(ctx);
     }
-    pthread_once(&ct_tls_init_once_control, ct_tls_init_once);
+    ct_tls_ensure_initialized();
     int port = (int)ct_value_to_number(ctx, argv[0]);
     char *host = ct_value_to_optional_string(ctx, argv[1]);
     char *servername = ct_value_to_optional_string(ctx, argv[2]);
@@ -15224,7 +17287,7 @@ static JSValueRef ct_tls_client_connect_fd(JSContextRef ctx, JSObjectRef functio
     }
     int fd;
     if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid TLS socket")) return JSValueMakeUndefined(ctx);
-    pthread_once(&ct_tls_init_once_control, ct_tls_init_once);
+    ct_tls_ensure_initialized();
     char *servername = ct_value_to_optional_string(ctx, argv[1]);
     bool reject_unauthorized = ct_value_to_bool(ctx, argv[2]);
     char *ca = argc >= 4 ? ct_value_to_optional_string(ctx, argv[3]) : NULL;
@@ -15324,7 +17387,7 @@ static JSValueRef ct_tls_client_connect_memory(JSContextRef ctx, JSObjectRef fun
         ct_throw_message(ctx, exception, "tlsClientConnectMemory(servername, rejectUnauthorized[, ca, cert, key, passphrase, ALPNProtocols, ciphers]) requires servername and rejectUnauthorized");
         return JSValueMakeUndefined(ctx);
     }
-    pthread_once(&ct_tls_init_once_control, ct_tls_init_once);
+    ct_tls_ensure_initialized();
     char *servername = ct_value_to_optional_string(ctx, argv[0]);
     bool reject_unauthorized = ct_value_to_bool(ctx, argv[1]);
     char *ca = argc >= 3 ? ct_value_to_optional_string(ctx, argv[2]) : NULL;
@@ -15515,7 +17578,7 @@ static JSValueRef ct_tls_server_upgrade_fd(JSContextRef ctx, JSObjectRef functio
     }
     int fd;
     if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid TLS socket")) return JSValueMakeUndefined(ctx);
-    pthread_once(&ct_tls_init_once_control, ct_tls_init_once);
+    ct_tls_ensure_initialized();
     char *cert = ct_value_to_string_copy(ctx, argv[1]);
     char *key = ct_value_to_string_copy(ctx, argv[2]);
     char *passphrase = argc >= 4 ? ct_value_to_optional_string(ctx, argv[3]) : NULL;
@@ -15938,7 +18001,7 @@ static JSValueRef ct_tls_connection_add_server_context(JSContextRef ctx, JSObjec
 static JSValueRef ct_tls_validate_server_context(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
-    pthread_once(&ct_tls_init_once_control, ct_tls_init_once);
+    ct_tls_ensure_initialized();
     char *cert = argc >= 1 ? ct_value_to_optional_string(ctx, argv[0]) : NULL;
     char *key = argc >= 2 ? ct_value_to_optional_string(ctx, argv[1]) : NULL;
     char *passphrase = argc >= 3 ? ct_value_to_optional_string(ctx, argv[2]) : NULL;
@@ -16004,7 +18067,7 @@ static JSValueRef ct_tls_validate_server_context(JSContextRef ctx, JSObjectRef f
 static JSValueRef ct_tls_validate_secure_context(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
-    pthread_once(&ct_tls_init_once_control, ct_tls_init_once);
+    ct_tls_ensure_initialized();
     char *cert = argc >= 1 ? ct_value_to_optional_string(ctx, argv[0]) : NULL;
     char *key = argc >= 2 ? ct_value_to_optional_string(ctx, argv[1]) : NULL;
     char *passphrase = argc >= 3 ? ct_value_to_optional_string(ctx, argv[2]) : NULL;
@@ -16369,7 +18432,7 @@ static JSValueRef ct_tls_server_listen(JSContextRef ctx, JSObjectRef function, J
         ct_throw_message(ctx, exception, "tlsServerListen(port, host, cert, key[, passphrase]) requires port, host, cert, and key");
         return JSValueMakeUndefined(ctx);
     }
-    pthread_once(&ct_tls_init_once_control, ct_tls_init_once);
+    ct_tls_ensure_initialized();
     int port = (int)ct_value_to_number(ctx, argv[0]);
     char *host = ct_value_to_optional_string(ctx, argv[1]);
     char *cert = ct_value_to_string_copy(ctx, argv[2]);
@@ -17395,7 +19458,7 @@ static JSValueRef ct_tls_unavailable(JSContextRef ctx, JSObjectRef function, JSO
 #endif
 
 static double ct_rusage_maxrss_bytes(const struct rusage *usage) {
-#if defined(__APPLE__) || defined(__MACH__)
+#if defined(_WIN32) || defined(__APPLE__) || defined(__MACH__)
     return (double)usage->ru_maxrss;
 #else
     return (double)usage->ru_maxrss * 1024.0;
@@ -18219,6 +20282,16 @@ static JSValueRef ct_process_info(JSContextRef ctx, JSObjectRef function, JSObje
             ? (double)(now_ns - runtime->start_time_ns) / 1000000000.0
             : 0;
         free(kind);
+        return JSValueMakeNumber(ctx, uptime);
+    }
+    if (strcmp(kind, "systemUptime") == 0) {
+        double uptime = 0;
+        int status = uv_uptime(&uptime);
+        free(kind);
+        if (status != 0) {
+            ct_throw_message(ctx, exception, uv_strerror(status));
+            return JSValueMakeUndefined(ctx);
+        }
         return JSValueMakeNumber(ctx, uptime);
     }
     if (strcmp(kind, "diagnostics") == 0) {
@@ -19641,7 +21714,7 @@ static JSValueRef ct_shared_atomic_wait(JSContextRef ctx, JSObjectRef function, 
             int status = timeout_ms == INFINITY
                 ? pthread_cond_wait(&ct_shared_buffers_cond, &ct_shared_buffers_mutex)
                 : pthread_cond_timedwait(&ct_shared_buffers_cond, &ct_shared_buffers_mutex, &deadline);
-            if (status == ETIMEDOUT && !waiter.notified) {
+            if (timeout_ms != INFINITY && status != 0 && !waiter.notified) {
                 result = "timed-out";
                 break;
             }
@@ -20538,7 +22611,11 @@ static JSValueRef ct_read_file_common(JSContextRef ctx, size_t argc, const JSVal
         ct_throw_message(ctx, exception, "Invalid path");
         return JSValueMakeUndefined(ctx);
     }
+#if defined(_WIN32)
+    FILE *file = ct_windows_fopen(path, "rb");
+#else
     FILE *file = fopen(path, "rb");
+#endif
     if (file == NULL) {
         ct_throw_message(ctx, exception, strerror(errno));
         free(path);
@@ -20643,7 +22720,11 @@ static JSValueRef ct_write_file(JSContextRef ctx, JSObjectRef function, JSObject
         ct_throw_message(ctx, exception, "Invalid path");
         return JSValueMakeUndefined(ctx);
     }
+#if defined(_WIN32)
+    FILE *file = ct_windows_fopen(path, "wb");
+#else
     FILE *file = fopen(path, "wb");
+#endif
     if (file == NULL) {
         ct_throw_message(ctx, exception, strerror(errno));
         free(path);
@@ -20701,17 +22782,104 @@ static bool ct_env_is_synthesized_cf_user_text_encoding(const char *name, const 
 #endif
 }
 
+static const char *ct_platform_file_path(const char *path) {
+#if defined(_WIN32)
+    if (path != NULL && strcmp(path, "/dev/null") == 0) return "\\\\.\\NUL";
+#endif
+    return path;
+}
+
+#if defined(_WIN32)
+static char *ct_windows_environment_value(const char *name, bool *found) {
+    if (found != NULL) *found = false;
+    WCHAR *wide_name = ct_windows_utf8_to_wide(name);
+    if (wide_name == NULL) return NULL;
+
+    SetLastError(ERROR_SUCCESS);
+    DWORD capacity = GetEnvironmentVariableW(wide_name, NULL, 0);
+    DWORD error = capacity == 0 ? GetLastError() : ERROR_SUCCESS;
+    if (capacity == 0) {
+        free(wide_name);
+        if (error == ERROR_ENVVAR_NOT_FOUND) return NULL;
+        if (error != ERROR_SUCCESS) {
+            ct_windows_set_errno(error);
+            return NULL;
+        }
+        if (found != NULL) *found = true;
+        return ct_duplicate_string("");
+    }
+
+    WCHAR *wide_value = NULL;
+    DWORD copied = 0;
+    for (;;) {
+        WCHAR *next = (WCHAR *)realloc(wide_value, sizeof(WCHAR) * (size_t)capacity);
+        if (next == NULL) {
+            free(wide_name);
+            free(wide_value);
+            errno = ENOMEM;
+            return NULL;
+        }
+        wide_value = next;
+        SetLastError(ERROR_SUCCESS);
+        copied = GetEnvironmentVariableW(wide_name, wide_value, capacity);
+        if (copied < capacity) break;
+        capacity = copied;
+    }
+    error = copied == 0 ? GetLastError() : ERROR_SUCCESS;
+    free(wide_name);
+    if (copied == 0 && error != ERROR_SUCCESS) {
+        free(wide_value);
+        if (error != ERROR_ENVVAR_NOT_FOUND) ct_windows_set_errno(error);
+        return NULL;
+    }
+    char *value = ct_windows_wide_to_utf8(wide_value, (size_t)copied, NULL);
+    free(wide_value);
+    if (value != NULL && found != NULL) *found = true;
+    return value;
+}
+#endif
+
 static JSValueRef ct_env(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
     if (argc >= 1 && !JSValueIsUndefined(ctx, argv[0]) && !JSValueIsNull(ctx, argv[0])) {
         char *name = ct_value_to_string_copy(ctx, argv[0]);
+#if defined(_WIN32)
+        bool found = false;
+        char *value = name != NULL ? ct_windows_environment_value(name, &found) : NULL;
+        free(name);
+        JSValueRef result = found && value != NULL ? ct_make_string(ctx, value) : JSValueMakeUndefined(ctx);
+        free(value);
+        return result;
+#else
         const char *value = name != NULL ? getenv(name) : NULL;
         if (ct_env_is_synthesized_cf_user_text_encoding(name, value)) value = NULL;
         free(name);
         return value != NULL ? ct_make_string(ctx, value) : JSValueMakeUndefined(ctx);
+#endif
     }
     JSObjectRef env = ct_make_object(ctx);
+#if defined(_WIN32)
+    LPWCH environment = GetEnvironmentStringsW();
+    if (environment == NULL) {
+        ct_throw_message(ctx, exception, "GetEnvironmentStringsW failed");
+        return env;
+    }
+    for (const WCHAR *entry = environment; *entry != L'\0'; entry += wcslen(entry) + 1) {
+        if (entry[0] == L'=') continue;
+        const WCHAR *equals = wcschr(entry, L'=');
+        if (equals == NULL) continue;
+        char *name = ct_windows_wide_to_utf8(entry, (size_t)(equals - entry), NULL);
+        char *value = ct_windows_wide_to_utf8(equals + 1, wcslen(equals + 1), NULL);
+        if (name != NULL && value != NULL) {
+            ct_set_property(ctx, env, name, ct_make_string(ctx, value), exception);
+        }
+        free(name);
+        free(value);
+        if (exception != NULL && *exception != NULL) break;
+    }
+    FreeEnvironmentStringsW(environment);
+#else
     for (char **entry = environ; entry != NULL && *entry != NULL; entry += 1) {
         const char *equals = strchr(*entry, '=');
         if (equals == NULL) continue;
@@ -20738,6 +22906,7 @@ static JSValueRef ct_env(JSContextRef ctx, JSObjectRef function, JSObjectRef thi
         free(name);
         if (exception != NULL && *exception != NULL) return env;
     }
+#endif
     return env;
 }
 
@@ -20749,7 +22918,7 @@ static JSValueRef ct_exists_sync(JSContextRef ctx, JSObjectRef function, JSObjec
         return JSValueMakeBoolean(ctx, false);
     }
     char *path = ct_value_to_string_copy(ctx, argv[0]);
-    bool exists = path != NULL && ct_host_exists(path);
+    bool exists = path != NULL && ct_host_exists(ct_platform_file_path(path));
     free(path);
     return JSValueMakeBoolean(ctx, exists);
 }
@@ -20852,28 +23021,48 @@ static void ct_define_stat_fields(
     JSContextRef ctx,
     JSObjectRef object,
     const struct stat *stat_value,
+    const uv_stat_t *uv_stat_override,
     const CtStatTimestamp *birthtime_override,
     JSValueRef *exception
 ) {
-    CtStatTimestamp atime = ct_stat_atime(stat_value);
-    CtStatTimestamp mtime = ct_stat_mtime(stat_value);
-    CtStatTimestamp ctime = ct_stat_ctime(stat_value);
-    CtStatTimestamp birthtime = birthtime_override != NULL ? *birthtime_override : ct_stat_birthtime(stat_value);
-    ct_set_property(ctx, object, "dev", JSValueMakeNumber(ctx, (double)stat_value->st_dev), exception);
-    ct_set_property(ctx, object, "ino", JSValueMakeNumber(ctx, (double)stat_value->st_ino), exception);
-    ct_set_property(ctx, object, "size", JSValueMakeNumber(ctx, (double)stat_value->st_size), exception);
-    ct_set_property(ctx, object, "mode", JSValueMakeNumber(ctx, (double)stat_value->st_mode), exception);
-    ct_set_property(ctx, object, "nlink", JSValueMakeNumber(ctx, (double)stat_value->st_nlink), exception);
-    ct_set_property(ctx, object, "uid", JSValueMakeNumber(ctx, (double)stat_value->st_uid), exception);
-    ct_set_property(ctx, object, "gid", JSValueMakeNumber(ctx, (double)stat_value->st_gid), exception);
-    ct_set_property(ctx, object, "rdev", JSValueMakeNumber(ctx, (double)stat_value->st_rdev), exception);
+    CtStatTimestamp atime = uv_stat_override != NULL
+        ? (CtStatTimestamp){ (int64_t)uv_stat_override->st_atim.tv_sec, uv_stat_override->st_atim.tv_nsec }
+        : ct_stat_atime(stat_value);
+    CtStatTimestamp mtime = uv_stat_override != NULL
+        ? (CtStatTimestamp){ (int64_t)uv_stat_override->st_mtim.tv_sec, uv_stat_override->st_mtim.tv_nsec }
+        : ct_stat_mtime(stat_value);
+    CtStatTimestamp ctime = uv_stat_override != NULL
+        ? (CtStatTimestamp){ (int64_t)uv_stat_override->st_ctim.tv_sec, uv_stat_override->st_ctim.tv_nsec }
+        : ct_stat_ctime(stat_value);
+    CtStatTimestamp birthtime = uv_stat_override != NULL
+        ? (CtStatTimestamp){ (int64_t)uv_stat_override->st_birthtim.tv_sec, uv_stat_override->st_birthtim.tv_nsec }
+        : birthtime_override != NULL ? *birthtime_override : ct_stat_birthtime(stat_value);
+    uint64_t dev = uv_stat_override != NULL ? uv_stat_override->st_dev : (uint64_t)stat_value->st_dev;
+    uint64_t ino = uv_stat_override != NULL ? uv_stat_override->st_ino : (uint64_t)stat_value->st_ino;
+    uint64_t mode = uv_stat_override != NULL ? uv_stat_override->st_mode : (uint64_t)stat_value->st_mode;
+    uint64_t nlink = uv_stat_override != NULL ? uv_stat_override->st_nlink : (uint64_t)stat_value->st_nlink;
+    uint64_t uid = uv_stat_override != NULL ? uv_stat_override->st_uid : (uint64_t)stat_value->st_uid;
+    uint64_t gid = uv_stat_override != NULL ? uv_stat_override->st_gid : (uint64_t)stat_value->st_gid;
+    uint64_t rdev = uv_stat_override != NULL ? uv_stat_override->st_rdev : (uint64_t)stat_value->st_rdev;
+    int64_t size = uv_stat_override != NULL ? uv_stat_override->st_size : (int64_t)stat_value->st_size;
+    int64_t blksize = uv_stat_override != NULL ? uv_stat_override->st_blksize : 0;
+    int64_t blocks = uv_stat_override != NULL ? uv_stat_override->st_blocks : 0;
 #if defined(__APPLE__) || defined(__linux__)
-    ct_set_property(ctx, object, "blksize", JSValueMakeNumber(ctx, (double)stat_value->st_blksize), exception);
-    ct_set_property(ctx, object, "blocks", JSValueMakeNumber(ctx, (double)stat_value->st_blocks), exception);
-#else
-    ct_set_property(ctx, object, "blksize", JSValueMakeNumber(ctx, 0), exception);
-    ct_set_property(ctx, object, "blocks", JSValueMakeNumber(ctx, 0), exception);
+    if (uv_stat_override == NULL) {
+        blksize = (int64_t)stat_value->st_blksize;
+        blocks = (int64_t)stat_value->st_blocks;
+    }
 #endif
+    ct_set_property(ctx, object, "dev", JSValueMakeNumber(ctx, (double)dev), exception);
+    ct_set_property(ctx, object, "ino", JSValueMakeNumber(ctx, (double)ino), exception);
+    ct_set_property(ctx, object, "size", JSValueMakeNumber(ctx, (double)size), exception);
+    ct_set_property(ctx, object, "mode", JSValueMakeNumber(ctx, (double)mode), exception);
+    ct_set_property(ctx, object, "nlink", JSValueMakeNumber(ctx, (double)nlink), exception);
+    ct_set_property(ctx, object, "uid", JSValueMakeNumber(ctx, (double)uid), exception);
+    ct_set_property(ctx, object, "gid", JSValueMakeNumber(ctx, (double)gid), exception);
+    ct_set_property(ctx, object, "rdev", JSValueMakeNumber(ctx, (double)rdev), exception);
+    ct_set_property(ctx, object, "blksize", JSValueMakeNumber(ctx, (double)blksize), exception);
+    ct_set_property(ctx, object, "blocks", JSValueMakeNumber(ctx, (double)blocks), exception);
     ct_set_property(ctx, object, "atimeMs", JSValueMakeNumber(ctx, ct_stat_time_ms(atime)), exception);
     ct_set_property(ctx, object, "mtimeMs", JSValueMakeNumber(ctx, ct_stat_time_ms(mtime)), exception);
     ct_set_property(ctx, object, "ctimeMs", JSValueMakeNumber(ctx, ct_stat_time_ms(ctime)), exception);
@@ -20886,24 +23075,19 @@ static void ct_define_stat_fields(
     ct_set_property(ctx, object, "ctimeNsec", JSValueMakeNumber(ctx, (double)ctime.nanoseconds), exception);
     ct_set_property(ctx, object, "birthtimeSec", JSValueMakeNumber(ctx, (double)birthtime.seconds), exception);
     ct_set_property(ctx, object, "birthtimeNsec", JSValueMakeNumber(ctx, (double)birthtime.nanoseconds), exception);
-    ct_set_stat_unsigned_string(ctx, object, "devBigInt", (unsigned long long)stat_value->st_dev, exception);
-    ct_set_stat_unsigned_string(ctx, object, "inoBigInt", (unsigned long long)stat_value->st_ino, exception);
-    ct_set_stat_unsigned_string(ctx, object, "modeBigInt", (unsigned long long)stat_value->st_mode, exception);
-    ct_set_stat_unsigned_string(ctx, object, "nlinkBigInt", (unsigned long long)stat_value->st_nlink, exception);
-    ct_set_stat_unsigned_string(ctx, object, "uidBigInt", (unsigned long long)stat_value->st_uid, exception);
-    ct_set_stat_unsigned_string(ctx, object, "gidBigInt", (unsigned long long)stat_value->st_gid, exception);
-    ct_set_stat_unsigned_string(ctx, object, "rdevBigInt", (unsigned long long)stat_value->st_rdev, exception);
-    ct_set_stat_signed_string(ctx, object, "sizeBigInt", (long long)stat_value->st_size, exception);
-#if defined(__APPLE__) || defined(__linux__)
-    ct_set_stat_signed_string(ctx, object, "blksizeBigInt", (long long)stat_value->st_blksize, exception);
-    ct_set_stat_signed_string(ctx, object, "blocksBigInt", (long long)stat_value->st_blocks, exception);
-#else
-    ct_set_stat_signed_string(ctx, object, "blksizeBigInt", 0, exception);
-    ct_set_stat_signed_string(ctx, object, "blocksBigInt", 0, exception);
-#endif
-    ct_set_property(ctx, object, "isFile", JSValueMakeBoolean(ctx, S_ISREG(stat_value->st_mode)), exception);
-    ct_set_property(ctx, object, "isDirectory", JSValueMakeBoolean(ctx, S_ISDIR(stat_value->st_mode)), exception);
-    ct_set_property(ctx, object, "isSymbolicLink", JSValueMakeBoolean(ctx, S_ISLNK(stat_value->st_mode)), exception);
+    ct_set_stat_unsigned_string(ctx, object, "devBigInt", (unsigned long long)dev, exception);
+    ct_set_stat_unsigned_string(ctx, object, "inoBigInt", (unsigned long long)ino, exception);
+    ct_set_stat_unsigned_string(ctx, object, "modeBigInt", (unsigned long long)mode, exception);
+    ct_set_stat_unsigned_string(ctx, object, "nlinkBigInt", (unsigned long long)nlink, exception);
+    ct_set_stat_unsigned_string(ctx, object, "uidBigInt", (unsigned long long)uid, exception);
+    ct_set_stat_unsigned_string(ctx, object, "gidBigInt", (unsigned long long)gid, exception);
+    ct_set_stat_unsigned_string(ctx, object, "rdevBigInt", (unsigned long long)rdev, exception);
+    ct_set_stat_signed_string(ctx, object, "sizeBigInt", (long long)size, exception);
+    ct_set_stat_signed_string(ctx, object, "blksizeBigInt", (long long)blksize, exception);
+    ct_set_stat_signed_string(ctx, object, "blocksBigInt", (long long)blocks, exception);
+    ct_set_property(ctx, object, "isFile", JSValueMakeBoolean(ctx, S_ISREG(mode)), exception);
+    ct_set_property(ctx, object, "isDirectory", JSValueMakeBoolean(ctx, S_ISDIR(mode)), exception);
+    ct_set_property(ctx, object, "isSymbolicLink", JSValueMakeBoolean(ctx, S_ISLNK(mode)), exception);
 }
 
 static JSValueRef ct_stat_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -20916,20 +23100,29 @@ static JSValueRef ct_stat_sync(JSContextRef ctx, JSObjectRef function, JSObjectR
     char *path = ct_value_to_string_copy(ctx, argv[0]);
     bool follow = argc < 2 || ct_value_to_bool(ctx, argv[1]);
     struct stat stat_value;
-    int status = follow ? stat(path, &stat_value) : lstat(path, &stat_value);
+#if defined(_WIN32)
+    uv_stat_t windows_stat;
+    int status = ct_windows_stat(ct_platform_file_path(path), follow, &stat_value, &windows_stat);
+#else
+    const char *native_path = ct_platform_file_path(path);
+    int status = follow ? stat(native_path, &stat_value) : lstat(native_path, &stat_value);
+#endif
     if (status != 0) {
         ct_throw_message(ctx, exception, strerror(errno));
         free(path);
         return JSValueMakeUndefined(ctx);
     }
+    const uv_stat_t *uv_stat_override = NULL;
     const CtStatTimestamp *birthtime_override = NULL;
-#if defined(__linux__) && defined(SYS_statx)
+#if defined(_WIN32)
+    uv_stat_override = &windows_stat;
+#elif defined(__linux__) && defined(SYS_statx)
     CtStatTimestamp birthtime;
     if (ct_statx_birthtime_for_path(path, follow, &birthtime)) birthtime_override = &birthtime;
 #endif
     free(path);
     JSObjectRef result = ct_make_object(ctx);
-    ct_define_stat_fields(ctx, result, &stat_value, birthtime_override, exception);
+    ct_define_stat_fields(ctx, result, &stat_value, uv_stat_override, birthtime_override, exception);
     return result;
 }
 
@@ -20959,6 +23152,14 @@ static mode_t ct_mode_from_dirent_type(const struct dirent *entry) {
     return 0;
 }
 
+#if defined(_WIN32)
+static mode_t ct_windows_mode_from_attributes(DWORD attributes) {
+    if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return S_IFLNK;
+    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) return S_IFDIR;
+    return S_IFREG;
+}
+#endif
+
 static JSValueRef ct_read_dir_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -20967,6 +23168,78 @@ static JSValueRef ct_read_dir_sync(JSContextRef ctx, JSObjectRef function, JSObj
         return JSValueMakeUndefined(ctx);
     }
     char *path = ct_value_to_string_copy(ctx, argv[0]);
+#if defined(_WIN32)
+    WCHAR *wide_path = ct_windows_path_from_utf8(path);
+    if (wide_path == NULL) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        free(path);
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t wide_len = wcslen(wide_path);
+    bool needs_separator = wide_len > 0 && wide_path[wide_len - 1] != L'\\' && wide_path[wide_len - 1] != L'/';
+    WCHAR *search = (WCHAR *)malloc(sizeof(WCHAR) * (wide_len + (needs_separator ? 3 : 2)));
+    if (search == NULL) {
+        free(wide_path);
+        free(path);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    memcpy(search, wide_path, wide_len * sizeof(WCHAR));
+    size_t search_len = wide_len;
+    if (needs_separator) search[search_len++] = L'\\';
+    search[search_len++] = L'*';
+    search[search_len] = L'\0';
+    free(wide_path);
+
+    WIN32_FIND_DATAW data;
+    HANDLE find = FindFirstFileW(search, &data);
+    DWORD find_error = find == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    free(search);
+    if (find == INVALID_HANDLE_VALUE) {
+        ct_windows_set_errno(find_error);
+        ct_throw_message(ctx, exception, strerror(errno));
+        free(path);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef result = ct_make_array(ctx, 0, NULL, exception);
+    unsigned index = 0;
+    for (;;) {
+        if (wcscmp(data.cFileName, L".") != 0 && wcscmp(data.cFileName, L"..") != 0) {
+            char *name = ct_windows_wide_to_utf8(data.cFileName, wcslen(data.cFileName), NULL);
+            if (name == NULL) {
+                find_error = errno == ENOMEM ? ERROR_OUTOFMEMORY : ERROR_NO_UNICODE_TRANSLATION;
+                break;
+            }
+            JSObjectRef item = ct_make_object(ctx);
+            ct_set_property(ctx, item, "name", ct_make_string(ctx, name), exception);
+            ct_set_property(
+                ctx,
+                item,
+                "mode",
+                JSValueMakeNumber(ctx, (double)ct_windows_mode_from_attributes(data.dwFileAttributes)),
+                exception
+            );
+            ct_set_property(ctx, item, "ino", JSValueMakeNumber(ctx, 0), exception);
+            JSObjectSetPropertyAtIndex(ctx, result, index++, item, exception);
+            free(name);
+            if (exception != NULL && *exception != NULL) break;
+        }
+        if (!FindNextFileW(find, &data)) {
+            find_error = GetLastError();
+            if (find_error == ERROR_NO_MORE_FILES) find_error = ERROR_SUCCESS;
+            break;
+        }
+    }
+    FindClose(find);
+    free(path);
+    if (find_error != ERROR_SUCCESS) {
+        ct_windows_set_errno(find_error);
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    return result;
+#else
     DIR *dir = path != NULL ? opendir(path) : NULL;
     if (dir == NULL) {
         ct_throw_message(ctx, exception, strerror(errno));
@@ -21005,6 +23278,7 @@ static JSValueRef ct_read_dir_sync(JSContextRef ctx, JSObjectRef function, JSObj
     closedir(dir);
     free(path);
     return result;
+#endif
 }
 
 static JSValueRef ct_mkdir_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -21083,9 +23357,15 @@ static JSValueRef ct_chmod_sync(JSContextRef ctx, JSObjectRef function, JSObject
         free(path);
         return JSValueMakeUndefined(ctx);
     }
+#if defined(_WIN32)
+    if (path == NULL || ct_windows_chmod(path, (mode_t)mode) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+    }
+#else
     char *error = NULL;
     if (ct_host_chmod(path, mode, &error) != 0) ct_throw_message(ctx, exception, error != NULL ? error : "chmod failed");
     if (error != NULL) ct_host_string_free(error);
+#endif
     free(path);
     return JSValueMakeUndefined(ctx);
 }
@@ -21275,6 +23555,8 @@ static int ct_parse_spawn_sync_native_options(
     options->max_buffer = 0;
     options->kill_signal = SIGTERM;
     options->abort_requested = false;
+    options->windows_hide = false;
+    options->windows_verbatim_arguments = false;
 
     if (value != NULL && !JSValueIsUndefined(ctx, value) && !JSValueIsNull(ctx, value) && JSValueIsObject(ctx, value)) {
         JSObjectRef object = (JSObjectRef)value;
@@ -21320,6 +23602,8 @@ static int ct_parse_spawn_sync_native_options(
         JSValueRef max_buffer_value = ct_get_property(ctx, object, "maxBuffer", exception);
         JSValueRef kill_signal_value = ct_get_property(ctx, object, "killSignal", exception);
         JSValueRef abort_signal_value = ct_get_property(ctx, object, "signal", exception);
+        JSValueRef windows_hide_value = ct_get_property(ctx, object, "windowsHide", exception);
+        JSValueRef windows_verbatim_value = ct_get_property(ctx, object, "windowsVerbatimArguments", exception);
         if (exception != NULL && *exception != NULL) return -1;
 
         if (!JSValueIsUndefined(ctx, timeout_value) && !JSValueIsNull(ctx, timeout_value)) {
@@ -21351,6 +23635,8 @@ static int ct_parse_spawn_sync_native_options(
             if (exception != NULL && *exception != NULL) return -1;
             options->abort_requested = JSValueToBoolean(ctx, aborted_value);
         }
+        options->windows_hide = JSValueToBoolean(ctx, windows_hide_value);
+        options->windows_verbatim_arguments = JSValueToBoolean(ctx, windows_verbatim_value);
     }
 
     if (input_present) {
@@ -21538,6 +23824,7 @@ static int ct_process_parse_extra_stdio(
         entries[index].parent_fd = -1;
         entries[index].child_fd = -1;
         entries[index].mode = CT_PROCESS_STDIO_IGNORE;
+        entries[index].child_overlapped = false;
         JSValueRef entry = JSObjectGetPropertyAtIndex(ctx, array, (unsigned)index, exception);
         if ((exception != NULL && *exception != NULL) ||
             ct_process_parse_stdio_value(ctx, entry, &entries[index].mode, &entries[index].source_fd, exception) != 0) {
@@ -22583,8 +24870,13 @@ static void *ct_fd_watcher_thread(void *opaque) {
         struct pollfd poll_fd;
         poll_fd.fd = watcher->fd;
         poll_fd.events = 0;
-        if (poll_readable) poll_fd.events |= POLLIN | POLLHUP | POLLERR;
-        if (writable) poll_fd.events |= POLLOUT | POLLHUP | POLLERR;
+        /*
+         * POLLERR/POLLHUP are output-only WSAPoll flags. Including either in
+         * the requested event mask makes Winsock reject the poll with
+         * WSAEINVAL instead of watching the socket.
+         */
+        if (poll_readable) poll_fd.events |= POLLIN;
+        if (writable) poll_fd.events |= POLLOUT;
         poll_fd.revents = 0;
 #if defined(_WIN32)
         if (is_crt_handle) {
@@ -22642,6 +24934,14 @@ static void *ct_fd_watcher_thread(void *opaque) {
             if (n > 0) {
                 ct_queue_fd_data(watcher->runtime, watcher->id, buffer, (size_t)n);
                 free(buffer);
+#if defined(_WIN32)
+                /*
+                 * A synchronous named-pipe read blocks once the currently
+                 * available bytes are drained. Return to PeekNamedPipe before
+                 * reading again so duplex peers can write on the same handle.
+                 */
+                if (is_crt_pipe) break;
+#endif
                 continue;
             }
             free(buffer);
@@ -22909,37 +25209,75 @@ static bool ct_windows_command_append_arg(CtWindowsCommandLine *command, const c
     return ct_windows_command_append_char(command, '\"');
 }
 
-static WCHAR *ct_windows_utf8_to_wide(const char *value) {
-    if (value == NULL) return NULL;
-    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, NULL, 0);
-    if (length <= 0) return NULL;
-    WCHAR *wide = (WCHAR *)malloc(sizeof(WCHAR) * (size_t)length);
-    if (wide == NULL) return NULL;
-    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, wide, length) <= 0) {
-        free(wide);
-        return NULL;
-    }
-    return wide;
-}
-
 static int ct_windows_env_entry_compare(const void *left, const void *right) {
     const CtHostEnvEntry *const *left_entry = (const CtHostEnvEntry *const *)left;
     const CtHostEnvEntry *const *right_entry = (const CtHostEnvEntry *const *)right;
     return _stricmp((*left_entry)->name, (*right_entry)->name);
 }
 
-static WCHAR *ct_windows_environment_block(const CtHostEnvEntry *entries, size_t count) {
-    const CtHostEnvEntry **sorted = count > 0 ? (const CtHostEnvEntry **)malloc(sizeof(*sorted) * count) : NULL;
-    if (count > 0 && sorted == NULL) return NULL;
-    for (size_t index = 0; index < count; index += 1) sorted[index] = &entries[index];
-    qsort(sorted, count, sizeof(*sorted), ct_windows_env_entry_compare);
+static bool ct_windows_parent_system_root(char **value_out) {
+    *value_out = NULL;
+    SetLastError(ERROR_SUCCESS);
+    DWORD capacity = GetEnvironmentVariableW(L"SystemRoot", NULL, 0);
+    if (capacity == 0) {
+        DWORD error = GetLastError();
+        if (error == ERROR_SUCCESS || error == ERROR_ENVVAR_NOT_FOUND) return true;
+        ct_windows_set_errno(error);
+        return false;
+    }
+    WCHAR *wide = (WCHAR *)malloc(sizeof(WCHAR) * (size_t)capacity);
+    if (wide == NULL) {
+        errno = ENOMEM;
+        return false;
+    }
+    DWORD length = GetEnvironmentVariableW(L"SystemRoot", wide, capacity);
+    if (length == 0 || length >= capacity) {
+        DWORD error = GetLastError();
+        free(wide);
+        if (length == 0 && error == ERROR_ENVVAR_NOT_FOUND) return true;
+        ct_windows_set_errno(error);
+        return false;
+    }
+    char *utf8 = ct_windows_wide_to_utf8(wide, (size_t)length, NULL);
+    free(wide);
+    if (utf8 == NULL) return false;
+    *value_out = utf8;
+    return true;
+}
 
-    size_t capacity = 1;
+static WCHAR *ct_windows_environment_block(const CtHostEnvEntry *entries, size_t count) {
+    bool has_system_root = false;
     for (size_t index = 0; index < count; index += 1) {
+        if (_stricmp(entries[index].name, "SystemRoot") == 0) {
+            has_system_root = true;
+            break;
+        }
+    }
+
+    char *parent_system_root = NULL;
+    if (!has_system_root && !ct_windows_parent_system_root(&parent_system_root)) return NULL;
+    CtHostEnvEntry inherited_system_root = { "SystemRoot", parent_system_root };
+    size_t sorted_count = count + (parent_system_root != NULL ? 1 : 0);
+    const CtHostEnvEntry **sorted = sorted_count > 0
+        ? (const CtHostEnvEntry **)malloc(sizeof(*sorted) * sorted_count)
+        : NULL;
+    if (sorted_count > 0 && sorted == NULL) {
+        free(parent_system_root);
+        errno = ENOMEM;
+        return NULL;
+    }
+    for (size_t index = 0; index < count; index += 1) sorted[index] = &entries[index];
+    if (parent_system_root != NULL) sorted[count] = &inherited_system_root;
+    qsort(sorted, sorted_count, sizeof(*sorted), ct_windows_env_entry_compare);
+
+    /* Even an empty environment is terminated by two consecutive NULs. */
+    size_t capacity = 2;
+    for (size_t index = 0; index < sorted_count; index += 1) {
         int name_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, sorted[index]->name, -1, NULL, 0);
         int value_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, sorted[index]->value, -1, NULL, 0);
         if (name_len <= 0 || value_len <= 0) {
             free(sorted);
+            free(parent_system_root);
             return NULL;
         }
         capacity += (size_t)name_len + (size_t)value_len;
@@ -22947,10 +25285,11 @@ static WCHAR *ct_windows_environment_block(const CtHostEnvEntry *entries, size_t
     WCHAR *block = (WCHAR *)calloc(capacity, sizeof(WCHAR));
     if (block == NULL) {
         free(sorted);
+        free(parent_system_root);
         return NULL;
     }
     size_t cursor = 0;
-    for (size_t index = 0; index < count; index += 1) {
+    for (size_t index = 0; index < sorted_count; index += 1) {
         int name_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, sorted[index]->name, -1, block + cursor, (int)(capacity - cursor));
         cursor += (size_t)name_len - 1;
         block[cursor++] = L'=';
@@ -22959,7 +25298,458 @@ static WCHAR *ct_windows_environment_block(const CtHostEnvEntry *entries, size_t
     }
     block[cursor] = L'\0';
     free(sorted);
+    free(parent_system_root);
     return block;
+}
+
+static const char *ct_windows_spawn_env_entry(
+    const CtHostEnvEntry *entries,
+    size_t count,
+    const char *name,
+    bool *found
+) {
+    if (found != NULL) *found = false;
+    for (size_t index = 0; index < count; index += 1) {
+        if (_stricmp(entries[index].name, name) != 0) continue;
+        if (found != NULL) *found = true;
+        return entries[index].value;
+    }
+    return NULL;
+}
+
+/*
+ * Executable lookup happens in the parent, before CreateProcessW installs the
+ * child's environment block. Prefer a case-insensitive child override, then
+ * fall back to the parent value when the child did not specify the variable.
+ * The fallback matches posix_spawnp/libuv behavior: an env without PATH still
+ * uses the parent's PATH to locate the image, while an explicitly empty PATH
+ * disables PATH lookup.
+ */
+static WCHAR *ct_windows_spawn_environment_value(
+    const CtHostEnvEntry *entries,
+    size_t count,
+    const char *name,
+    bool *found
+) {
+    bool entry_found = false;
+    const char *entry = ct_windows_spawn_env_entry(entries, count, name, &entry_found);
+    if (entry_found) {
+        if (found != NULL) *found = true;
+        return ct_windows_utf8_to_wide(entry != NULL ? entry : "");
+    }
+
+    WCHAR *wide_name = ct_windows_utf8_to_wide(name);
+    if (wide_name == NULL) return NULL;
+    SetLastError(ERROR_SUCCESS);
+    DWORD required = GetEnvironmentVariableW(wide_name, NULL, 0);
+    DWORD error = required == 0 ? GetLastError() : ERROR_SUCCESS;
+    free(wide_name);
+    if (required == 0) {
+        if (found != NULL) *found = false;
+        if (error == ERROR_SUCCESS || error == ERROR_ENVVAR_NOT_FOUND) return NULL;
+        ct_windows_set_errno(error);
+        return NULL;
+    }
+
+    WCHAR *value = (WCHAR *)malloc(sizeof(WCHAR) * (size_t)required);
+    if (value == NULL) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    wide_name = ct_windows_utf8_to_wide(name);
+    if (wide_name == NULL) {
+        free(value);
+        return NULL;
+    }
+    DWORD written = GetEnvironmentVariableW(wide_name, value, required);
+    error = written == 0 || written >= required ? GetLastError() : ERROR_SUCCESS;
+    free(wide_name);
+    if (written == 0 || written >= required) {
+        free(value);
+        ct_windows_set_errno(error);
+        return NULL;
+    }
+    if (found != NULL) *found = true;
+    return value;
+}
+
+static WCHAR *ct_windows_spawn_effective_cwd(const char *cwd) {
+    WCHAR *input = NULL;
+    if (cwd != NULL) {
+        input = ct_windows_utf8_to_wide(cwd);
+        if (input == NULL) return NULL;
+    } else {
+        DWORD required = GetCurrentDirectoryW(0, NULL);
+        if (required == 0) {
+            ct_windows_set_errno(GetLastError());
+            return NULL;
+        }
+        input = (WCHAR *)malloc(sizeof(WCHAR) * (size_t)required);
+        if (input == NULL) {
+            errno = ENOMEM;
+            return NULL;
+        }
+        DWORD written = GetCurrentDirectoryW(required, input);
+        if (written == 0 || written >= required) {
+            DWORD error = GetLastError();
+            free(input);
+            ct_windows_set_errno(error);
+            return NULL;
+        }
+    }
+
+    DWORD required = GetFullPathNameW(input, 0, NULL, NULL);
+    if (required == 0) {
+        DWORD error = GetLastError();
+        free(input);
+        ct_windows_set_errno(error);
+        return NULL;
+    }
+    WCHAR *full = (WCHAR *)malloc(sizeof(WCHAR) * (size_t)required);
+    if (full == NULL) {
+        free(input);
+        errno = ENOMEM;
+        return NULL;
+    }
+    DWORD written = GetFullPathNameW(input, required, full, NULL);
+    free(input);
+    if (written == 0 || written >= required) {
+        DWORD error = GetLastError();
+        free(full);
+        ct_windows_set_errno(error);
+        return NULL;
+    }
+    return full;
+}
+
+static WCHAR *ct_windows_spawn_path_join_test(
+    const WCHAR *dir,
+    size_t dir_len,
+    const WCHAR *name,
+    size_t name_len,
+    const WCHAR *extension,
+    size_t extension_len,
+    const WCHAR *cwd,
+    size_t cwd_len,
+    DWORD *candidate_error
+) {
+    if (dir_len > 1 &&
+        (dir[0] == L'\\' || dir[0] == L'/') &&
+        (dir[1] == L'\\' || dir[1] == L'/')) {
+        /* UNC and extended-length paths are already rooted. */
+        cwd_len = 0;
+    } else if (dir_len >= 1 && (dir[0] == L'\\' || dir[0] == L'/')) {
+        /* A root-relative path inherits only the cwd's drive designator. */
+        cwd_len = cwd_len >= 2 && cwd[1] == L':' ? 2 : 0;
+    } else if (dir_len >= 2 && dir[1] == L':' &&
+               (dir_len < 3 || (dir[2] != L'\\' && dir[2] != L'/'))) {
+        /*
+         * Drive-relative paths use the child's cwd when it is on that drive.
+         * Otherwise leave the drive-relative form intact for Windows to
+         * interpret using its per-drive working-directory state.
+         */
+        if (cwd_len >= 2 && _wcsnicmp(cwd, dir, 2) == 0) {
+            dir += 2;
+            dir_len -= 2;
+        } else {
+            cwd_len = 0;
+        }
+    } else if (dir_len >= 3 && dir[1] == L':') {
+        cwd_len = 0;
+    }
+
+    bool cwd_separator = cwd_len > 0 && wcschr(L"\\/:", cwd[cwd_len - 1]) == NULL;
+    bool dir_separator = dir_len > 0 && wcschr(L"\\/:", dir[dir_len - 1]) == NULL;
+    bool extension_dot = extension_len > 0 && extension[0] != L'.' &&
+        (name_len == 0 || name[name_len - 1] != L'.');
+    if (cwd_len > SIZE_MAX - dir_len ||
+        cwd_len + dir_len > SIZE_MAX - name_len ||
+        cwd_len + dir_len + name_len > SIZE_MAX - extension_len - 4) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    size_t result_len = cwd_len + (cwd_separator ? 1 : 0) +
+        dir_len + (dir_separator ? 1 : 0) +
+        name_len + (extension_dot ? 1 : 0) + extension_len;
+    WCHAR *result = (WCHAR *)malloc(sizeof(WCHAR) * (result_len + 1));
+    if (result == NULL) {
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    WCHAR *out = result;
+    if (cwd_len > 0) {
+        memcpy(out, cwd, cwd_len * sizeof(WCHAR));
+        out += cwd_len;
+        if (cwd_separator) *out++ = L'\\';
+    }
+    if (dir_len > 0) {
+        memcpy(out, dir, dir_len * sizeof(WCHAR));
+        out += dir_len;
+        if (dir_separator) *out++ = L'\\';
+    }
+    if (name_len > 0) {
+        memcpy(out, name, name_len * sizeof(WCHAR));
+        out += name_len;
+    }
+    if (extension_dot) *out++ = L'.';
+    if (extension_len > 0) {
+        memcpy(out, extension, extension_len * sizeof(WCHAR));
+        out += extension_len;
+    }
+    *out = L'\0';
+    for (WCHAR *cursor = result; *cursor != L'\0'; cursor += 1) {
+        if (*cursor == L'/') *cursor = L'\\';
+    }
+
+    if (result_len >= MAX_PATH &&
+        wcsncmp(result, L"\\\\?\\", 4) != 0 &&
+        wcsncmp(result, L"\\\\.\\", 4) != 0) {
+        bool unc = result_len >= 2 && result[0] == L'\\' && result[1] == L'\\';
+        bool drive_absolute = result_len >= 3 && result[1] == L':' &&
+            (result[2] == L'\\' || result[2] == L'/');
+        if (unc || drive_absolute) {
+            const WCHAR *prefix = unc ? L"\\\\?\\UNC\\" : L"\\\\?\\";
+            size_t prefix_len = unc ? 8 : 4;
+            size_t source_offset = unc ? 2 : 0;
+            size_t extended_len = prefix_len + result_len - source_offset;
+            if (extended_len >= 32767) {
+                free(result);
+                errno = ENAMETOOLONG;
+                return NULL;
+            }
+            WCHAR *extended = (WCHAR *)malloc(sizeof(WCHAR) * (extended_len + 1));
+            if (extended == NULL) {
+                free(result);
+                errno = ENOMEM;
+                return NULL;
+            }
+            memcpy(extended, prefix, prefix_len * sizeof(WCHAR));
+            memcpy(
+                extended + prefix_len,
+                result + source_offset,
+                (result_len - source_offset + 1) * sizeof(WCHAR)
+            );
+            free(result);
+            result = extended;
+        }
+    }
+
+    SetLastError(ERROR_SUCCESS);
+    DWORD attributes = GetFileAttributesW(result);
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        return result;
+    }
+    if (candidate_error != NULL) {
+        if (attributes != INVALID_FILE_ATTRIBUTES) {
+            *candidate_error = ERROR_ACCESS_DENIED;
+        } else {
+            DWORD error = GetLastError();
+            if (error == ERROR_ACCESS_DENIED || error == ERROR_SHARING_VIOLATION) {
+                *candidate_error = error;
+            }
+        }
+    }
+    free(result);
+    return NULL;
+}
+
+static WCHAR *ct_windows_spawn_walk_extensions(
+    const WCHAR *dir,
+    size_t dir_len,
+    const WCHAR *name,
+    size_t name_len,
+    const WCHAR *pathext,
+    const WCHAR *cwd,
+    size_t cwd_len,
+    DWORD *candidate_error
+) {
+    const WCHAR *dot = wcsrchr(name, L'.');
+    bool name_has_extension = dot != NULL && dot < name + name_len && dot[1] != L'\0';
+    WCHAR *result = NULL;
+    if (name_has_extension) {
+        result = ct_windows_spawn_path_join_test(
+            dir, dir_len, name, name_len, L"", 0, cwd, cwd_len, candidate_error);
+        if (result != NULL || errno == ENOMEM || errno == ENAMETOOLONG) return result;
+    }
+
+    static const WCHAR *native_extensions[] = { L".COM", L".EXE" };
+    for (size_t index = 0; index < sizeof(native_extensions) / sizeof(native_extensions[0]); index += 1) {
+        result = ct_windows_spawn_path_join_test(
+            dir,
+            dir_len,
+            name,
+            name_len,
+            native_extensions[index],
+            4,
+            cwd,
+            cwd_len,
+            candidate_error
+        );
+        if (result != NULL || errno == ENOMEM || errno == ENAMETOOLONG) return result;
+    }
+    if (pathext == NULL || pathext[0] == L'\0') return NULL;
+
+    const WCHAR *cursor = pathext;
+    while (*cursor != L'\0') {
+        const WCHAR *end = wcschr(cursor, L';');
+        if (end == NULL) end = cursor + wcslen(cursor);
+        const WCHAR *extension = cursor;
+        size_t extension_len = (size_t)(end - cursor);
+        if (extension_len >= 2 &&
+            ((extension[0] == L'"' && extension[extension_len - 1] == L'"') ||
+             (extension[0] == L'\'' && extension[extension_len - 1] == L'\''))) {
+            extension += 1;
+            extension_len -= 2;
+        }
+        const WCHAR *extension_name = extension_len > 0 && extension[0] == L'.'
+            ? extension + 1
+            : extension;
+        size_t extension_name_len = extension_len - (size_t)(extension_name - extension);
+        bool is_native_extension =
+            (extension_name_len == 3 && _wcsnicmp(extension_name, L"COM", 3) == 0) ||
+            (extension_name_len == 3 && _wcsnicmp(extension_name, L"EXE", 3) == 0);
+        if (extension_len > 0 && !is_native_extension) {
+            result = ct_windows_spawn_path_join_test(
+                dir,
+                dir_len,
+                name,
+                name_len,
+                extension,
+                extension_len,
+                cwd,
+                cwd_len,
+                candidate_error
+            );
+            if (result != NULL || errno == ENOMEM || errno == ENAMETOOLONG) return result;
+        }
+        if (*end == L'\0') break;
+        cursor = end + 1;
+    }
+    return NULL;
+}
+
+/*
+ * Resolve against the spawned process's PATH/PATHEXT before CreateProcessW.
+ * CreateProcessW otherwise searches using the parent's environment, so child
+ * overrides such as { Path: customDirectory } would be ignored.
+ */
+static WCHAR *ct_windows_resolve_spawn_executable(
+    const char *file,
+    const WCHAR *cwd,
+    const CtHostEnvEntry *env_entries,
+    size_t env_count
+) {
+    if (file == NULL || file[0] == '\0' || strcmp(file, ".") == 0) {
+        errno = ENOENT;
+        return NULL;
+    }
+    WCHAR *wide_file = ct_windows_utf8_to_wide(file);
+    if (wide_file == NULL) return NULL;
+
+    bool path_found = false;
+    bool pathext_found = false;
+    errno = 0;
+    WCHAR *path = ct_windows_spawn_environment_value(
+        env_entries, env_count, "PATH", &path_found);
+    if (!path_found && path == NULL && errno != 0) {
+        free(wide_file);
+        return NULL;
+    }
+    errno = 0;
+    WCHAR *pathext = ct_windows_spawn_environment_value(
+        env_entries, env_count, "PATHEXT", &pathext_found);
+    if (!pathext_found && pathext == NULL && errno != 0) {
+        free(wide_file);
+        free(path);
+        return NULL;
+    }
+    if (!pathext_found) {
+        free(pathext);
+        pathext = ct_windows_utf8_to_wide("");
+        if (pathext == NULL) {
+            free(wide_file);
+            free(path);
+            return NULL;
+        }
+    }
+
+    size_t file_len = wcslen(wide_file);
+    size_t cwd_len = wcslen(cwd);
+    WCHAR *file_name = wide_file + file_len;
+    while (file_name > wide_file &&
+           file_name[-1] != L'\\' &&
+           file_name[-1] != L'/' &&
+           file_name[-1] != L':') {
+        file_name -= 1;
+    }
+    bool has_directory = file_name != wide_file;
+    DWORD candidate_error = ERROR_FILE_NOT_FOUND;
+    WCHAR *result = NULL;
+    errno = 0;
+
+    if (has_directory) {
+        result = ct_windows_spawn_walk_extensions(
+            wide_file,
+            (size_t)(file_name - wide_file),
+            file_name,
+            file_len - (size_t)(file_name - wide_file),
+            pathext,
+            cwd,
+            cwd_len,
+            &candidate_error
+        );
+    } else {
+        result = ct_windows_spawn_walk_extensions(
+            L"", 0, wide_file, file_len, pathext, cwd, cwd_len, &candidate_error);
+        const WCHAR *cursor = path;
+        while (result == NULL && errno != ENOMEM && errno != ENAMETOOLONG &&
+               cursor != NULL && *cursor != L'\0') {
+            const WCHAR *entry = cursor;
+            WCHAR quote = L'\0';
+            if (*entry == L'"' || *entry == L'\'') quote = *entry;
+            const WCHAR *end = entry;
+            while (*end != L'\0') {
+                if (quote != L'\0') {
+                    if (end > entry && *end == quote) quote = L'\0';
+                } else if (*end == L';') {
+                    break;
+                } else if (end == entry && (*end == L'"' || *end == L'\'')) {
+                    quote = *end;
+                }
+                end += 1;
+            }
+            size_t entry_len = (size_t)(end - entry);
+            if (entry_len >= 2 &&
+                ((entry[0] == L'"' && entry[entry_len - 1] == L'"') ||
+                 (entry[0] == L'\'' && entry[entry_len - 1] == L'\''))) {
+                entry += 1;
+                entry_len -= 2;
+            }
+            if (entry_len > 0) {
+                result = ct_windows_spawn_walk_extensions(
+                    entry,
+                    entry_len,
+                    wide_file,
+                    file_len,
+                    pathext,
+                    cwd,
+                    cwd_len,
+                    &candidate_error
+                );
+            }
+            if (*end == L'\0') break;
+            cursor = end + 1;
+        }
+    }
+
+    free(wide_file);
+    free(path);
+    free(pathext);
+    if (result != NULL) return result;
+    if (errno == ENOMEM || errno == ENAMETOOLONG) return NULL;
+    ct_windows_set_errno(has_directory ? candidate_error : ERROR_FILE_NOT_FOUND);
+    return NULL;
 }
 
 static HANDLE ct_windows_null_handle(DWORD access) {
@@ -22993,13 +25783,248 @@ static HANDLE ct_windows_duplicate_inheritable_handle(int source_fd, DWORD stand
     HANDLE source = source_fd >= 0
         ? (HANDLE)_get_osfhandle(source_fd)
         : GetStdHandle(standard_handle);
-    if (source == NULL || source == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
+    if (source == NULL || source == INVALID_HANDLE_VALUE || source == (HANDLE)-2) return INVALID_HANDLE_VALUE;
     HANDLE duplicate = NULL;
     HANDLE process = GetCurrentProcess();
     if (!DuplicateHandle(process, source, process, &duplicate, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
         return INVALID_HANDLE_VALUE;
     }
     return duplicate;
+}
+
+#define CT_WINDOWS_CHILD_STDIO_SIZE(count) \
+    (sizeof(int) + sizeof(unsigned char) * (count) + sizeof(uintptr_t) * (count))
+#define CT_WINDOWS_CHILD_STDIO_MAX_COUNT 255
+#define CT_WINDOWS_CHILD_STDIO_FOPEN 0x01
+#define CT_WINDOWS_CHILD_STDIO_FPIPE 0x08
+#define CT_WINDOWS_CHILD_STDIO_FDEV 0x40
+
+static volatile LONG ct_windows_child_pipe_sequence = 0;
+
+static bool ct_windows_create_duplex_pipe(
+    HANDLE *parent_end,
+    HANDLE *child_end,
+    bool child_overlapped
+) {
+    *parent_end = INVALID_HANDLE_VALUE;
+    *child_end = INVALID_HANDLE_VALUE;
+    SECURITY_ATTRIBUTES child_security = { sizeof(child_security), NULL, TRUE };
+    for (int attempt = 0; attempt < 100; attempt += 1) {
+        LONG sequence = InterlockedIncrement(&ct_windows_child_pipe_sequence);
+        WCHAR name[128];
+        int name_length = swprintf(
+            name,
+            sizeof(name) / sizeof(name[0]),
+            L"\\\\.\\pipe\\cottontail-stdio-%lu-%ld",
+            (unsigned long)GetCurrentProcessId(),
+            (long)sequence
+        );
+        if (name_length <= 0 || (size_t)name_length >= sizeof(name) / sizeof(name[0])) return false;
+
+        HANDLE server = CreateNamedPipeW(
+            name,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1,
+            64 * 1024,
+            64 * 1024,
+            0,
+            NULL
+        );
+        if (server == INVALID_HANDLE_VALUE) {
+            DWORD error = GetLastError();
+            if (error == ERROR_PIPE_BUSY || error == ERROR_ACCESS_DENIED) continue;
+            return false;
+        }
+        HANDLE client = CreateFileW(
+            name,
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            &child_security,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | (child_overlapped ? FILE_FLAG_OVERLAPPED : 0),
+            NULL
+        );
+        if (client == INVALID_HANDLE_VALUE) {
+            CloseHandle(server);
+            return false;
+        }
+        if (!ConnectNamedPipe(server, NULL) && GetLastError() != ERROR_PIPE_CONNECTED) {
+            CloseHandle(server);
+            CloseHandle(client);
+            return false;
+        }
+        if (!SetHandleInformation(server, HANDLE_FLAG_INHERIT, 0) ||
+            !SetHandleInformation(client, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) {
+            CloseHandle(server);
+            CloseHandle(client);
+            return false;
+        }
+        *parent_end = server;
+        *child_end = client;
+        return true;
+    }
+    return false;
+}
+
+static void *ct_windows_child_stdio_handle_slot(BYTE *buffer, unsigned int count, unsigned int fd) {
+    return buffer + sizeof(int) + sizeof(unsigned char) * count + sizeof(HANDLE) * fd;
+}
+
+static HANDLE ct_windows_child_stdio_handle(BYTE *buffer, unsigned int count, unsigned int fd) {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    memcpy(&handle, ct_windows_child_stdio_handle_slot(buffer, count, fd), sizeof(handle));
+    return handle;
+}
+
+static bool ct_windows_child_stdio_flags(HANDLE handle, unsigned char *flags_out) {
+    SetLastError(ERROR_SUCCESS);
+    switch (GetFileType(handle)) {
+        case FILE_TYPE_DISK:
+            *flags_out = CT_WINDOWS_CHILD_STDIO_FOPEN;
+            return true;
+        case FILE_TYPE_PIPE:
+            *flags_out = CT_WINDOWS_CHILD_STDIO_FOPEN | CT_WINDOWS_CHILD_STDIO_FPIPE;
+            return true;
+        case FILE_TYPE_CHAR:
+        case FILE_TYPE_REMOTE:
+            *flags_out = CT_WINDOWS_CHILD_STDIO_FOPEN | CT_WINDOWS_CHILD_STDIO_FDEV;
+            return true;
+        case FILE_TYPE_UNKNOWN:
+            if (GetLastError() != ERROR_SUCCESS) return false;
+            *flags_out = CT_WINDOWS_CHILD_STDIO_FOPEN | CT_WINDOWS_CHILD_STDIO_FDEV;
+            return true;
+        default:
+            return false;
+    }
+}
+
+/*
+ * Microsoft's CRT reconstructs inherited file descriptors from the reserved
+ * STARTUPINFO bytes. This is the same layout used by libuv's
+ * win/process-stdio.c:
+ *
+ *   int descriptor_count
+ *   unsigned char crt_flags[descriptor_count]
+ *   HANDLE handles[descriptor_count]
+ *
+ * The first three handles are already child-only duplicates owned by the
+ * caller. Descriptors above stderr get their own inheritable duplicates here,
+ * which are closed in the parent immediately after CreateProcessW returns.
+ */
+static BYTE *ct_windows_create_child_stdio(
+    HANDLE child_stdin,
+    HANDLE child_stdout,
+    HANDLE child_stderr,
+    CtProcessExtraStdio *extra_stdio,
+    size_t extra_stdio_count
+) {
+    if (extra_stdio_count == 0) return NULL;
+    size_t descriptor_count_size = extra_stdio_count + 3;
+    if (descriptor_count_size > CT_WINDOWS_CHILD_STDIO_MAX_COUNT) return NULL;
+    unsigned int descriptor_count = (unsigned int)descriptor_count_size;
+    size_t buffer_size = CT_WINDOWS_CHILD_STDIO_SIZE(descriptor_count);
+    if (buffer_size > USHRT_MAX) return NULL;
+    BYTE *buffer = (BYTE *)malloc(buffer_size);
+    if (buffer == NULL) return NULL;
+    HANDLE *parent_handles = (HANDLE *)malloc(sizeof(*parent_handles) * extra_stdio_count);
+    if (parent_handles == NULL) {
+        free(buffer);
+        return NULL;
+    }
+    for (size_t index = 0; index < extra_stdio_count; index += 1) {
+        parent_handles[index] = INVALID_HANDLE_VALUE;
+    }
+
+    memcpy(buffer, &descriptor_count, sizeof(descriptor_count));
+    unsigned char *flags = buffer + sizeof(int);
+    memset(flags, 0, descriptor_count);
+    for (unsigned int fd = 0; fd < descriptor_count; fd += 1) {
+        HANDLE invalid = INVALID_HANDLE_VALUE;
+        memcpy(ct_windows_child_stdio_handle_slot(buffer, descriptor_count, fd), &invalid, sizeof(invalid));
+    }
+
+    HANDLE primary_handles[3] = { child_stdin, child_stdout, child_stderr };
+    for (unsigned int fd = 0; fd < 3; fd += 1) {
+        if (!ct_windows_child_stdio_flags(primary_handles[fd], &flags[fd])) goto fail;
+        memcpy(
+            ct_windows_child_stdio_handle_slot(buffer, descriptor_count, fd),
+            &primary_handles[fd],
+            sizeof(primary_handles[fd])
+        );
+    }
+
+    for (size_t index = 0; index < extra_stdio_count; index += 1) {
+        CtProcessExtraStdio *entry = &extra_stdio[index];
+        if (entry->mode == CT_PROCESS_STDIO_IGNORE) continue;
+        HANDLE child_handle = INVALID_HANDLE_VALUE;
+        if (entry->mode == CT_PROCESS_STDIO_PIPE) {
+            if (!ct_windows_create_duplex_pipe(
+                    &parent_handles[index],
+                    &child_handle,
+                    entry->child_overlapped)) {
+                goto fail;
+            }
+        } else if (entry->mode == CT_PROCESS_STDIO_INHERIT) {
+            int source_fd = entry->source_fd >= 0 ? entry->source_fd : entry->target_fd;
+            child_handle = ct_windows_duplicate_inheritable_handle(source_fd, STD_INPUT_HANDLE);
+            if (child_handle == INVALID_HANDLE_VALUE) goto fail;
+        } else {
+            goto fail;
+        }
+        unsigned int target_fd = (unsigned int)entry->target_fd;
+        if (!ct_windows_child_stdio_flags(child_handle, &flags[target_fd])) {
+            CloseHandle(child_handle);
+            goto fail;
+        }
+        memcpy(
+            ct_windows_child_stdio_handle_slot(buffer, descriptor_count, target_fd),
+            &child_handle,
+            sizeof(child_handle)
+        );
+    }
+    for (size_t index = 0; index < extra_stdio_count; index += 1) {
+        if (parent_handles[index] == INVALID_HANDLE_VALUE) continue;
+        extra_stdio[index].parent_fd = ct_windows_handle_to_fd(parent_handles[index], _O_RDWR);
+        parent_handles[index] = INVALID_HANDLE_VALUE;
+        if (extra_stdio[index].parent_fd < 0) goto fail;
+    }
+    free(parent_handles);
+    return buffer;
+
+fail:
+    for (unsigned int fd = 3; fd < descriptor_count; fd += 1) {
+        HANDLE handle = ct_windows_child_stdio_handle(buffer, descriptor_count, fd);
+        if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+    }
+    for (size_t index = 0; index < extra_stdio_count; index += 1) {
+        if (parent_handles[index] != INVALID_HANDLE_VALUE) CloseHandle(parent_handles[index]);
+    }
+    for (size_t index = 0; index < extra_stdio_count; index += 1) {
+        if (extra_stdio[index].parent_fd >= 0) close(extra_stdio[index].parent_fd);
+        extra_stdio[index].parent_fd = -1;
+    }
+    free(parent_handles);
+    free(buffer);
+    return NULL;
+}
+
+static void ct_windows_close_extra_parent_fds(CtProcessExtraStdio *extra_stdio, size_t extra_stdio_count) {
+    for (size_t index = 0; index < extra_stdio_count; index += 1) {
+        if (extra_stdio[index].parent_fd >= 0) close(extra_stdio[index].parent_fd);
+        extra_stdio[index].parent_fd = -1;
+    }
+}
+
+static void ct_windows_destroy_child_stdio(BYTE *buffer) {
+    if (buffer == NULL) return;
+    unsigned int descriptor_count = 0;
+    memcpy(&descriptor_count, buffer, sizeof(descriptor_count));
+    for (unsigned int fd = 3; fd < descriptor_count; fd += 1) {
+        HANDLE handle = ct_windows_child_stdio_handle(buffer, descriptor_count, fd);
+        if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+    }
+    free(buffer);
 }
 
 static bool ct_windows_spawn_process(
@@ -23017,6 +26042,8 @@ static bool ct_windows_spawn_process(
     int stdin_source_fd,
     int stdout_source_fd,
     int stderr_source_fd,
+    CtProcessExtraStdio *extra_stdio,
+    size_t extra_stdio_count,
     bool detached,
     bool windows_hide,
     bool windows_verbatim_arguments,
@@ -23026,7 +26053,10 @@ static bool ct_windows_spawn_process(
     DWORD *pid_out,
     int *stdin_fd_out,
     int *stdout_fd_out,
-    int *stderr_fd_out
+    int *stderr_fd_out,
+    HANDLE *stdin_handle_out,
+    HANDLE *stdout_handle_out,
+    HANDLE *stderr_handle_out
 ) {
     *process_out = NULL;
     *thread_out = NULL;
@@ -23034,27 +26064,42 @@ static bool ct_windows_spawn_process(
     *stdin_fd_out = -1;
     *stdout_fd_out = -1;
     *stderr_fd_out = -1;
+    if (stdin_handle_out != NULL) *stdin_handle_out = NULL;
+    if (stdout_handle_out != NULL) *stdout_handle_out = NULL;
+    if (stderr_handle_out != NULL) *stderr_handle_out = NULL;
 
     CtWindowsCommandLine command = { 0 };
     if (!ct_windows_command_append_arg(
             &command,
             argv0 != NULL && argv0[0] != '\0' ? argv0 : file,
-            windows_verbatim_arguments)) goto fail;
-    for (size_t index = 0; index < arg_count; index += 1) {
-        if (!ct_windows_command_append_arg(&command, args[index], windows_verbatim_arguments)) goto fail;
+            windows_verbatim_arguments)) {
+        errno = ENOMEM;
+        goto fail;
     }
-    WCHAR *file_wide = ct_windows_utf8_to_wide(file);
+    for (size_t index = 0; index < arg_count; index += 1) {
+        if (!ct_windows_command_append_arg(&command, args[index], windows_verbatim_arguments)) {
+            errno = ENOMEM;
+            goto fail;
+        }
+    }
+    WCHAR *effective_cwd = ct_windows_spawn_effective_cwd(cwd);
+    WCHAR *file_wide = effective_cwd != NULL
+        ? ct_windows_resolve_spawn_executable(file, effective_cwd, env_entries, env_count)
+        : NULL;
     WCHAR *command_wide = ct_windows_utf8_to_wide(command.data);
-    WCHAR *cwd_wide = cwd != NULL ? ct_windows_utf8_to_wide(cwd) : NULL;
+    WCHAR *cwd_wide = cwd != NULL ? effective_cwd : NULL;
     WCHAR *environment = (clear_env || env_count > 0) ? ct_windows_environment_block(env_entries, env_count) : NULL;
-    if (file_wide == NULL || command_wide == NULL || (cwd != NULL && cwd_wide == NULL) || ((clear_env || env_count > 0) && environment == NULL)) {
-        free(file_wide); free(command_wide); free(cwd_wide); free(environment);
+    if (file_wide == NULL || command_wide == NULL || effective_cwd == NULL || ((clear_env || env_count > 0) && environment == NULL)) {
+        free(file_wide); free(command_wide); free(effective_cwd); free(environment);
         goto fail;
     }
 
     HANDLE parent_stdin = NULL, child_stdin = NULL;
     HANDLE parent_stdout = NULL, child_stdout = NULL;
     HANDLE parent_stderr = NULL, child_stderr = NULL;
+    BYTE *child_stdio = NULL;
+    LPPROC_THREAD_ATTRIBUTE_LIST attribute_list = NULL;
+    bool attribute_list_initialized = false;
     if (stdin_mode == CT_PROCESS_STDIO_PIPE && !ct_windows_create_pipe(&parent_stdin, &child_stdin, true)) goto handles_fail;
     if (stdout_mode == CT_PROCESS_STDIO_PIPE && !ct_windows_create_pipe(&parent_stdout, &child_stdout, false)) goto handles_fail;
     if (stderr_mode == CT_PROCESS_STDIO_PIPE && !ct_windows_create_pipe(&parent_stderr, &child_stderr, false)) goto handles_fail;
@@ -23070,38 +26115,127 @@ static bool ct_windows_spawn_process(
     if (child_stdin == NULL || child_stdin == INVALID_HANDLE_VALUE ||
         child_stdout == NULL || child_stdout == INVALID_HANDLE_VALUE ||
         child_stderr == NULL || child_stderr == INVALID_HANDLE_VALUE) goto handles_fail;
+    child_stdio = ct_windows_create_child_stdio(
+        child_stdin,
+        child_stdout,
+        child_stderr,
+        extra_stdio,
+        extra_stdio_count
+    );
+    if (extra_stdio_count > 0 && child_stdio == NULL) goto handles_fail;
 
-    STARTUPINFOW startup;
+    /*
+     * bInheritHandles=TRUE normally copies every inheritable handle in the
+     * process. Worker runtimes can spawn concurrently, so restrict each child
+     * to the stdio handles prepared for this CreateProcessW call.
+     */
+    HANDLE inherited_handles[CT_WINDOWS_CHILD_STDIO_MAX_COUNT];
+    size_t inherited_handle_count = 0;
+    inherited_handles[inherited_handle_count++] = child_stdin;
+    inherited_handles[inherited_handle_count++] = child_stdout;
+    inherited_handles[inherited_handle_count++] = child_stderr;
+    if (child_stdio != NULL) {
+        unsigned int descriptor_count = 0;
+        memcpy(&descriptor_count, child_stdio, sizeof(descriptor_count));
+        if (descriptor_count > CT_WINDOWS_CHILD_STDIO_MAX_COUNT) {
+            errno = EINVAL;
+            goto handles_fail;
+        }
+        for (unsigned int fd = 3; fd < descriptor_count; fd += 1) {
+            HANDLE handle = ct_windows_child_stdio_handle(child_stdio, descriptor_count, fd);
+            if (handle != INVALID_HANDLE_VALUE) inherited_handles[inherited_handle_count++] = handle;
+        }
+    }
+
+    SIZE_T attribute_list_size = 0;
+    SetLastError(ERROR_SUCCESS);
+    (void)InitializeProcThreadAttributeList(NULL, 1, 0, &attribute_list_size);
+    if (attribute_list_size == 0) {
+        DWORD attribute_error = GetLastError();
+        ct_windows_set_errno(attribute_error != ERROR_SUCCESS ? attribute_error : ERROR_INVALID_PARAMETER);
+        goto handles_fail;
+    }
+    attribute_list = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attribute_list_size);
+    if (attribute_list == NULL) {
+        errno = ENOMEM;
+        goto handles_fail;
+    }
+    if (!InitializeProcThreadAttributeList(attribute_list, 1, 0, &attribute_list_size)) {
+        ct_windows_set_errno(GetLastError());
+        goto handles_fail;
+    }
+    attribute_list_initialized = true;
+    if (!UpdateProcThreadAttribute(
+            attribute_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            inherited_handles,
+            inherited_handle_count * sizeof(inherited_handles[0]),
+            NULL,
+            NULL)) {
+        ct_windows_set_errno(GetLastError());
+        goto handles_fail;
+    }
+
+    STARTUPINFOEXW startup;
     PROCESS_INFORMATION process_info;
     memset(&startup, 0, sizeof(startup));
     memset(&process_info, 0, sizeof(process_info));
-    startup.cb = sizeof(startup);
-    startup.dwFlags = STARTF_USESTDHANDLES;
-    startup.hStdInput = child_stdin;
-    startup.hStdOutput = child_stdout;
-    startup.hStdError = child_stderr;
-    DWORD flags = CREATE_UNICODE_ENVIRONMENT |
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = child_stdin;
+    startup.StartupInfo.hStdOutput = child_stdout;
+    startup.StartupInfo.hStdError = child_stderr;
+    if (child_stdio != NULL) {
+        startup.StartupInfo.cbReserved2 = (WORD)CT_WINDOWS_CHILD_STDIO_SIZE((unsigned int)(extra_stdio_count + 3));
+        startup.StartupInfo.lpReserved2 = child_stdio;
+    }
+    startup.lpAttributeList = attribute_list;
+    DWORD flags = CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT |
         (detached ? CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS : (windows_hide ? CREATE_NO_WINDOW : 0)) |
         (suspended ? CREATE_SUSPENDED : 0);
-    BOOL created = CreateProcessW(file_wide, command_wide, NULL, NULL, TRUE, flags, environment, cwd_wide, &startup, &process_info);
+    BOOL created = CreateProcessW(
+        file_wide,
+        command_wide,
+        NULL,
+        NULL,
+        TRUE,
+        flags,
+        environment,
+        cwd_wide,
+        &startup.StartupInfo,
+        &process_info
+    );
+    DWORD create_error = created ? ERROR_SUCCESS : GetLastError();
 
+    DeleteProcThreadAttributeList(attribute_list);
+    free(attribute_list);
+    attribute_list = NULL;
+    attribute_list_initialized = false;
     CloseHandle(child_stdin);
     CloseHandle(child_stdout);
     CloseHandle(child_stderr);
-    free(file_wide); free(command_wide); free(cwd_wide); free(environment); free(command.data);
+    ct_windows_destroy_child_stdio(child_stdio);
+    free(file_wide); free(command_wide); free(effective_cwd); free(environment); free(command.data);
     if (!created) {
         if (parent_stdin != NULL) CloseHandle(parent_stdin);
         if (parent_stdout != NULL) CloseHandle(parent_stdout);
         if (parent_stderr != NULL) CloseHandle(parent_stderr);
+        ct_windows_close_extra_parent_fds(extra_stdio, extra_stdio_count);
+        if (create_error == ERROR_BAD_EXE_FORMAT) errno = ENOEXEC;
+        else ct_windows_set_errno(create_error);
         return false;
     }
     if (suspended) *thread_out = process_info.hThread;
     else CloseHandle(process_info.hThread);
     *process_out = process_info.hProcess;
     *pid_out = process_info.dwProcessId;
-    *stdin_fd_out = ct_windows_handle_to_fd(parent_stdin, _O_WRONLY);
-    *stdout_fd_out = ct_windows_handle_to_fd(parent_stdout, _O_RDONLY);
-    *stderr_fd_out = ct_windows_handle_to_fd(parent_stderr, _O_RDONLY);
+    if (stdin_handle_out != NULL) *stdin_handle_out = parent_stdin;
+    else *stdin_fd_out = ct_windows_handle_to_fd(parent_stdin, _O_WRONLY);
+    if (stdout_handle_out != NULL) *stdout_handle_out = parent_stdout;
+    else *stdout_fd_out = ct_windows_handle_to_fd(parent_stdout, _O_RDONLY);
+    if (stderr_handle_out != NULL) *stderr_handle_out = parent_stderr;
+    else *stderr_fd_out = ct_windows_handle_to_fd(parent_stderr, _O_RDONLY);
     return true;
 
 handles_fail:
@@ -23111,10 +26245,95 @@ handles_fail:
     if (child_stdin != NULL && child_stdin != INVALID_HANDLE_VALUE) CloseHandle(child_stdin);
     if (child_stdout != NULL && child_stdout != INVALID_HANDLE_VALUE) CloseHandle(child_stdout);
     if (child_stderr != NULL && child_stderr != INVALID_HANDLE_VALUE) CloseHandle(child_stderr);
-    free(file_wide); free(command_wide); free(cwd_wide); free(environment);
+    ct_windows_destroy_child_stdio(child_stdio);
+    ct_windows_close_extra_parent_fds(extra_stdio, extra_stdio_count);
+    if (attribute_list_initialized) DeleteProcThreadAttributeList(attribute_list);
+    free(attribute_list);
+    free(file_wide); free(command_wide); free(effective_cwd); free(environment);
 fail:
     free(command.data);
     return false;
+}
+
+int ct_windows_spawn_host_process(
+    const char *file,
+    const char *const *args,
+    size_t arg_count,
+    CtHostSpawnOptions options,
+    uintptr_t *process_out,
+    uintptr_t *thread_out,
+    uintptr_t *stdin_handle_out,
+    uintptr_t *stdout_handle_out,
+    uintptr_t *stderr_handle_out
+) {
+    *process_out = 0;
+    *thread_out = 0;
+    *stdin_handle_out = 0;
+    *stdout_handle_out = 0;
+    *stderr_handle_out = 0;
+
+    HANDLE process_handle = NULL;
+    HANDLE thread_handle = NULL;
+    HANDLE stdin_handle = NULL;
+    HANDLE stdout_handle = NULL;
+    HANDLE stderr_handle = NULL;
+    DWORD pid = 0;
+    int stdin_fd = -1;
+    int stdout_fd = -1;
+    int stderr_fd = -1;
+    errno = 0;
+    if (!ct_windows_spawn_process(
+            file,
+            (char *const *)args,
+            arg_count,
+            options.argv0,
+            options.cwd,
+            options.env_entries,
+            options.env_count,
+            options.clear_env,
+            (CtProcessStdioMode)options.stdin_mode,
+            (CtProcessStdioMode)options.stdout_mode,
+            (CtProcessStdioMode)options.stderr_mode,
+            options.stdin_fd,
+            options.stdout_fd,
+            options.stderr_fd,
+            NULL,
+            0,
+            false,
+            options.windows_hide,
+            options.windows_verbatim_arguments,
+            true,
+            &process_handle,
+            &thread_handle,
+            &pid,
+            &stdin_fd,
+            &stdout_fd,
+            &stderr_fd,
+            &stdin_handle,
+            &stdout_handle,
+            &stderr_handle)) {
+        return errno != 0 ? errno : EIO;
+    }
+
+    if (ResumeThread(thread_handle) == (DWORD)-1) {
+        DWORD resume_error = GetLastError();
+        if (stdin_handle != NULL) CloseHandle(stdin_handle);
+        if (stdout_handle != NULL) CloseHandle(stdout_handle);
+        if (stderr_handle != NULL) CloseHandle(stderr_handle);
+        (void)TerminateProcess(process_handle, 1);
+        (void)WaitForSingleObject(process_handle, INFINITE);
+        CloseHandle(thread_handle);
+        CloseHandle(process_handle);
+        ct_windows_set_errno(resume_error);
+        return errno != 0 ? errno : EIO;
+    }
+
+    *process_out = (uintptr_t)process_handle;
+    *thread_out = (uintptr_t)thread_handle;
+    *stdin_handle_out = (uintptr_t)stdin_handle;
+    *stdout_handle_out = (uintptr_t)stdout_handle;
+    *stderr_handle_out = (uintptr_t)stderr_handle;
+    return 0;
 }
 
 static bool ct_windows_drain_process_pipe(
@@ -23664,6 +26883,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     bool windows_hide = false;
     bool windows_verbatim_arguments = false;
     int terminal_fd = -1;
+    int windows_overlapped_stdio_fd = -1;
     CtProcessStdioMode stdin_mode = CT_PROCESS_STDIO_IGNORE;
     CtProcessStdioMode stdout_mode = CT_PROCESS_STDIO_PIPE;
     CtProcessStdioMode stderr_mode = CT_PROCESS_STDIO_INHERIT;
@@ -23694,6 +26914,8 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         JSValueRef windows_verbatim_value = ct_get_property(ctx, options, "windowsVerbatimArguments", exception);
         JSValueRef terminal_fd_value = ct_get_property(ctx, options, "terminalFd", exception);
         JSValueRef extra_stdio_value = ct_get_property(ctx, options, "extraStdio", exception);
+        JSValueRef windows_overlapped_stdio_fd_value =
+            ct_get_property(ctx, options, "windowsOverlappedStdioFd", exception);
         if (exception != NULL && *exception != NULL) {
             free(file);
             ct_free_string_array(args, arg_count);
@@ -23710,6 +26932,23 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         argv0 = ct_value_to_optional_string(ctx, argv0_value);
         if (!JSValueIsUndefined(ctx, terminal_fd_value) && !JSValueIsNull(ctx, terminal_fd_value) &&
             !ct_value_to_int_checked(ctx, terminal_fd_value, 0, INT_MAX, &terminal_fd, exception, "invalid terminal file descriptor")) {
+            free(file);
+            ct_free_string_array(args, arg_count);
+            free(cwd);
+            free(argv0);
+            ct_free_env_entries(env_entries, env_count);
+            return JSValueMakeUndefined(ctx);
+        }
+        if (!JSValueIsUndefined(ctx, windows_overlapped_stdio_fd_value) &&
+            !JSValueIsNull(ctx, windows_overlapped_stdio_fd_value) &&
+            !ct_value_to_int_checked(
+                ctx,
+                windows_overlapped_stdio_fd_value,
+                3,
+                254,
+                &windows_overlapped_stdio_fd,
+                exception,
+                "invalid Windows overlapped stdio file descriptor")) {
             free(file);
             ct_free_string_array(args, arg_count);
             free(cwd);
@@ -23792,8 +27031,8 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     if (ipc_enabled && ipc_target_fd < 0) ipc_target_fd = (int)extra_stdio_count + 3;
 
 #if defined(_WIN32)
-    if (extra_stdio_count > 0) {
-        ct_throw_message(ctx, exception, "extra stdio descriptors are unavailable on this platform");
+    if (extra_stdio_count > 252) {
+        ct_throw_message(ctx, exception, "Windows child processes support file descriptors 0 through 254");
         free(file);
         ct_free_string_array(args, arg_count);
         free(cwd);
@@ -23801,6 +27040,24 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         free(extra_stdio);
         ct_free_env_entries(env_entries, env_count);
         return JSValueMakeUndefined(ctx);
+    }
+    if (windows_overlapped_stdio_fd >= 0) {
+        size_t extra_index = (size_t)(windows_overlapped_stdio_fd - 3);
+        if (extra_index >= extra_stdio_count ||
+            extra_stdio[extra_index].mode != CT_PROCESS_STDIO_PIPE) {
+            ct_throw_message(
+                ctx,
+                exception,
+                "Windows overlapped stdio must identify an extra 'pipe' descriptor");
+            free(file);
+            ct_free_string_array(args, arg_count);
+            free(cwd);
+            free(argv0);
+            free(extra_stdio);
+            ct_free_env_entries(env_entries, env_count);
+            return JSValueMakeUndefined(ctx);
+        }
+        extra_stdio[extra_index].child_overlapped = true;
     }
     if (terminal_fd >= 0) {
         ct_throw_message(ctx, exception, "PTY not supported on this platform");
@@ -23831,10 +27088,12 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     if (!ct_windows_spawn_process(file, args, arg_count, argv0, cwd, env_entries, env_count, clear_env,
                                   stdin_mode, stdout_mode, stderr_mode,
                                   stdin_source_fd, stdout_source_fd, stderr_source_fd,
+                                  extra_stdio, extra_stdio_count,
                                   detached, windows_hide, windows_verbatim_arguments, defer_start,
                                   &process_handle, &start_thread, &pid,
-                                  &stdin_fd, &stdout_fd, &stderr_fd)) {
-        ct_throw_message(ctx, exception, "CreateProcessW failed");
+                                  &stdin_fd, &stdout_fd, &stderr_fd,
+                                  NULL, NULL, NULL)) {
+        ct_throw_message(ctx, exception, strerror(errno != 0 ? errno : EIO));
         free(file);
         ct_free_string_array(args, arg_count);
         free(cwd);
@@ -23851,6 +27110,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         if (stdin_fd >= 0) close(stdin_fd);
         if (stdout_fd >= 0) close(stdout_fd);
         if (stderr_fd >= 0) close(stderr_fd);
+        ct_windows_close_extra_parent_fds(extra_stdio, extra_stdio_count);
         ct_throw_message(ctx, exception, "Out of memory");
         free(file);
         ct_free_string_array(args, arg_count);
@@ -23862,7 +27122,8 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     }
     process->id = id;
     process->pid = (pid_t)pid;
-    process->stdin_fd = stdin_fd;
+    bool expose_stdin_fd = stdin_mode == CT_PROCESS_STDIO_PIPE && stdin_fd >= 0;
+    process->stdin_fd = expose_stdin_fd ? -1 : stdin_fd;
     process->stdout_fd = stdout_fd;
     process->stderr_fd = stderr_fd;
     process->ipc_fd = -1;
@@ -23884,6 +27145,27 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     JSObjectRef response = ct_make_object(ctx);
     ct_set_property(ctx, response, "id", JSValueMakeNumber(ctx, id), exception);
     ct_set_property(ctx, response, "pid", JSValueMakeNumber(ctx, (double)pid), exception);
+    if (expose_stdin_fd) {
+        ct_set_property(ctx, response, "stdinFd", JSValueMakeNumber(ctx, stdin_fd), exception);
+    }
+    if (extra_stdio_count > 0) {
+        JSValueRef *extra_values = (JSValueRef *)calloc(extra_stdio_count, sizeof(*extra_values));
+        if (extra_values != NULL) {
+            for (size_t index = 0; index < extra_stdio_count; index += 1) {
+                CtProcessExtraStdio *entry = &extra_stdio[index];
+                int exposed_fd = entry->mode == CT_PROCESS_STDIO_PIPE
+                    ? entry->parent_fd
+                    : entry->mode == CT_PROCESS_STDIO_INHERIT
+                        ? (entry->source_fd >= 0 ? entry->source_fd : entry->target_fd)
+                        : -1;
+                extra_values[index] = exposed_fd >= 0
+                    ? JSValueMakeNumber(ctx, exposed_fd)
+                    : JSValueMakeNull(ctx);
+            }
+            ct_set_property(ctx, response, "extraFds", ct_make_array(ctx, extra_stdio_count, extra_values, exception), exception);
+            free(extra_values);
+        }
+    }
     free(file);
     ct_free_string_array(args, arg_count);
     free(cwd);
@@ -24368,7 +27650,10 @@ static JSValueRef ct_spawn_write(JSContextRef ctx, JSObjectRef function, JSObjec
     (void)exception;
     if (argc < 2) return JSValueMakeBoolean(ctx, false);
     CtJscRuntime *runtime = ct_callback_runtime(function);
-    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    uint32_t id;
+    if (!ct_value_to_uint32_checked(ctx, argv[0], &id, NULL, "invalid process id")) {
+        return JSValueMakeBoolean(ctx, false);
+    }
     uint8_t *bytes = NULL;
     size_t len = 0;
     char *text = NULL;
@@ -24419,7 +27704,10 @@ static JSValueRef ct_spawn_close_stdin(JSContextRef ctx, JSObjectRef function, J
     (void)exception;
     if (argc < 1) return JSValueMakeUndefined(ctx);
     CtJscRuntime *runtime = ct_callback_runtime(function);
-    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    uint32_t id;
+    if (!ct_value_to_uint32_checked(ctx, argv[0], &id, NULL, "invalid process id")) {
+        return JSValueMakeUndefined(ctx);
+    }
     pthread_mutex_lock(&ct_async_processes_mutex);
     CtAsyncProcess *process = ct_async_process_find_locked(runtime, id);
     if (process != NULL && process->stdin_fd >= 0) {
@@ -24435,7 +27723,10 @@ static JSValueRef ct_spawn_close_output(JSContextRef ctx, JSObjectRef function, 
     (void)exception;
     if (argc < 2) return JSValueMakeBoolean(ctx, false);
     CtJscRuntime *runtime = ct_callback_runtime(function);
-    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    uint32_t id;
+    if (!ct_value_to_uint32_checked(ctx, argv[0], &id, NULL, "invalid process id")) {
+        return JSValueMakeBoolean(ctx, false);
+    }
     int fd = (int)ct_value_to_number(ctx, argv[1]);
     bool found = false;
     pthread_mutex_lock(&ct_async_processes_mutex);
@@ -24462,7 +27753,10 @@ static JSValueRef ct_spawn_release(JSContextRef ctx, JSObjectRef function, JSObj
     (void)exception;
     if (argc < 1) return JSValueMakeBoolean(ctx, false);
     CtJscRuntime *runtime = ct_callback_runtime(function);
-    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    uint32_t id;
+    if (!ct_value_to_uint32_checked(ctx, argv[0], &id, NULL, "invalid process id")) {
+        return JSValueMakeBoolean(ctx, false);
+    }
     bool found = false;
     pthread_mutex_lock(&ct_async_processes_mutex);
     CtAsyncProcess *process = ct_async_process_find_locked(runtime, id);
@@ -24508,7 +27802,10 @@ static JSValueRef ct_spawn_close_ipc(JSContextRef ctx, JSObjectRef function, JSO
     (void)exception;
     if (argc < 1) return JSValueMakeUndefined(ctx);
     CtJscRuntime *runtime = ct_callback_runtime(function);
-    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    uint32_t id;
+    if (!ct_value_to_uint32_checked(ctx, argv[0], &id, NULL, "invalid process id")) {
+        return JSValueMakeUndefined(ctx);
+    }
     pthread_mutex_lock(&ct_async_processes_mutex);
     CtAsyncProcess *process = ct_async_process_find_locked(runtime, id);
     if (process != NULL && process->ipc_fd >= 0) {
@@ -24531,7 +27828,10 @@ static JSValueRef ct_spawn_set_referenced(JSContextRef ctx, JSObjectRef function
     (void)exception;
     if (argc < 2) return JSValueMakeBoolean(ctx, false);
     CtJscRuntime *runtime = ct_callback_runtime(function);
-    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    uint32_t id;
+    if (!ct_value_to_uint32_checked(ctx, argv[0], &id, NULL, "invalid process id")) {
+        return JSValueMakeBoolean(ctx, false);
+    }
     bool referenced = JSValueToBoolean(ctx, argv[1]);
     bool found = false;
     pthread_mutex_lock(&ct_async_processes_mutex);
@@ -24549,7 +27849,10 @@ static JSValueRef ct_spawn_kill(JSContextRef ctx, JSObjectRef function, JSObject
     (void)exception;
     if (argc < 1) return JSValueMakeBoolean(ctx, false);
     CtJscRuntime *runtime = ct_callback_runtime(function);
-    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    uint32_t id;
+    if (!ct_value_to_uint32_checked(ctx, argv[0], &id, NULL, "invalid process id")) {
+        return JSValueMakeBoolean(ctx, false);
+    }
     int signal_number = argc >= 2 ? (int)ct_value_to_number(ctx, argv[1]) : SIGTERM;
     bool ok = false;
     pthread_mutex_lock(&ct_async_processes_mutex);
@@ -24567,7 +27870,10 @@ static JSValueRef ct_spawn_dispose(JSContextRef ctx, JSObjectRef function, JSObj
     (void)exception;
     if (argc < 1) return JSValueMakeUndefined(ctx);
     CtJscRuntime *runtime = ct_callback_runtime(function);
-    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    uint32_t id;
+    if (!ct_value_to_uint32_checked(ctx, argv[0], &id, NULL, "invalid process id")) {
+        return JSValueMakeUndefined(ctx);
+    }
     pthread_mutex_lock(&runtime->spawn_event_mutex);
     CtSpawnEvent **cursor = &runtime->spawn_events_head;
     CtSpawnEvent *tail = NULL;
@@ -24618,9 +27924,11 @@ static JSValueRef ct_spawn_detached(JSContextRef ctx, JSObjectRef function, JSOb
     if (!ct_windows_spawn_process(file, args, arg_count, NULL, cwd, env_entries, env_count, clear_env,
                                   CT_PROCESS_STDIO_IGNORE, CT_PROCESS_STDIO_IGNORE, CT_PROCESS_STDIO_IGNORE,
                                   -1, -1, -1,
+                                  NULL, 0,
                                   true, false, false, false,
-                                  &process_handle, &start_thread, &pid, &stdin_fd, &stdout_fd, &stderr_fd)) {
-        ct_throw_message(ctx, exception, "CreateProcessW failed");
+                                  &process_handle, &start_thread, &pid, &stdin_fd, &stdout_fd, &stderr_fd,
+                                  NULL, NULL, NULL)) {
+        ct_throw_message(ctx, exception, strerror(errno != 0 ? errno : EIO));
         pid = 0;
     }
     if (process_handle != NULL) CloseHandle(process_handle);
@@ -26642,8 +29950,10 @@ static JSValueRef ct_open_fd(JSContextRef ctx, JSObjectRef function, JSObjectRef
     }
 #if defined(_WIN32)
     open_flags |= _O_BINARY;
+    int fd = ct_windows_open(ct_platform_file_path(path), open_flags, (mode_t)mode);
+#else
+    int fd = open(ct_platform_file_path(path), open_flags, (mode_t)mode);
 #endif
-    int fd = open(path, open_flags, (mode_t)mode);
     if (fd < 0) ct_throw_message(ctx, exception, strerror(errno));
     free(path);
     free(flags);
@@ -26794,7 +30104,7 @@ static JSValueRef ct_close_fd(JSContextRef ctx, JSObjectRef function, JSObjectRe
     if (argc >= 1) {
         int fd;
         if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "invalid file descriptor")) return JSValueMakeUndefined(ctx);
-        close(fd);
+        if (close(fd) != 0) ct_throw_message(ctx, exception, strerror(errno));
     }
     return JSValueMakeUndefined(ctx);
 }
@@ -27041,9 +30351,47 @@ static JSValueRef ct_terminal_set_raw_mode(JSContextRef ctx, JSObjectRef functio
     (void)function;
     (void)thisObject;
 #if defined(_WIN32)
-    (void)argc;
-    (void)argv;
-    ct_throw_message(ctx, exception, "PTY not supported on this platform");
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "terminalSetRawMode(fd, enabled) requires a file descriptor and mode");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "invalid terminal file descriptor")) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    intptr_t raw_handle = _get_osfhandle(fd);
+    HANDLE handle = raw_handle == -1 ? INVALID_HANDLE_VALUE : (HANDLE)raw_handle;
+    DWORD current_mode = 0;
+    DWORD pending_events = 0;
+    if (handle == INVALID_HANDLE_VALUE ||
+        !GetConsoleMode(handle, &current_mode) ||
+        !GetNumberOfConsoleInputEvents(handle, &pending_events)) {
+        ct_throw_message(ctx, exception, "PTY not supported on this platform");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    DWORD requested_mode;
+    if (ct_value_to_bool(ctx, argv[1])) {
+        requested_mode = ENABLE_WINDOW_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT;
+        if (current_mode == requested_mode) return JSValueMakeUndefined(ctx);
+        if (SetConsoleMode(handle, requested_mode)) return JSValueMakeUndefined(ctx);
+
+        /* Older Windows consoles do not support virtual-terminal input.
+         * Match libuv's UV_TTY_MODE_RAW_VT behavior by retrying the raw mode
+         * without ENABLE_VIRTUAL_TERMINAL_INPUT. */
+        requested_mode = ENABLE_WINDOW_INPUT;
+        if (SetConsoleMode(handle, requested_mode)) return JSValueMakeUndefined(ctx);
+    } else {
+        requested_mode = ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT;
+        if (current_mode == requested_mode || SetConsoleMode(handle, requested_mode)) {
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+
+    DWORD set_error = GetLastError();
+    ct_windows_set_errno(set_error);
+    ct_throw_message(ctx, exception, strerror(errno));
     return JSValueMakeUndefined(ctx);
 #else
     if (argc < 2) {
@@ -27340,7 +30688,11 @@ static JSValueRef ct_access_sync_native(JSContextRef ctx, JSObjectRef function, 
         free(path);
         return JSValueMakeUndefined(ctx);
     }
-    if (path == NULL || access(path, mode) != 0) ct_throw_message(ctx, exception, strerror(errno));
+#if defined(_WIN32)
+    if (path == NULL || ct_windows_access(ct_platform_file_path(path), mode) != 0) ct_throw_message(ctx, exception, strerror(errno));
+#else
+    if (path == NULL || access(ct_platform_file_path(path), mode) != 0) ct_throw_message(ctx, exception, strerror(errno));
+#endif
     free(path);
     return JSValueMakeUndefined(ctx);
 }
@@ -27575,6 +30927,269 @@ static JSValueRef ct_fs_async_cancel(JSContextRef ctx, JSObjectRef function, JSO
     return JSValueMakeBoolean(ctx, false);
 }
 
+#if defined(_WIN32)
+static CtWindowsPipeWrite *ct_windows_pipe_write_find(uint32_t id) {
+    for (CtWindowsPipeWrite *operation = ct_windows_pipe_writes; operation != NULL; operation = operation->next) {
+        if (operation->id == id) return operation;
+    }
+    return NULL;
+}
+
+static void ct_windows_pipe_write_remove(CtWindowsPipeWrite *operation) {
+    CtWindowsPipeWrite **cursor = &ct_windows_pipe_writes;
+    while (*cursor != NULL) {
+        if (*cursor == operation) {
+            *cursor = operation->next;
+            operation->next = NULL;
+            return;
+        }
+        cursor = &(*cursor)->next;
+    }
+}
+
+static void ct_windows_pipe_write_destroy(CtWindowsPipeWrite *operation) {
+    if (operation == NULL) return;
+    if (operation->thread != NULL) CloseHandle(operation->thread);
+    if (operation->pipe != NULL && operation->pipe != INVALID_HANDLE_VALUE) CloseHandle(operation->pipe);
+    free(operation->bytes);
+    free(operation);
+}
+
+static bool ct_windows_pipe_write_cancel_thread(
+    HANDLE thread,
+    HANDLE pipe,
+    bool overlapped
+) {
+    if (thread == NULL) return false;
+    bool requested = false;
+    while (WaitForSingleObject(thread, 0) == WAIT_TIMEOUT) {
+        if (overlapped && pipe != NULL && pipe != INVALID_HANDLE_VALUE) {
+            if (CancelIoEx(pipe, NULL)) requested = true;
+        }
+        if (CancelSynchronousIo(thread)) requested = true;
+        DWORD wait_status = WaitForSingleObject(thread, 1);
+        if (wait_status == WAIT_OBJECT_0) break;
+        if (wait_status == WAIT_FAILED) return false;
+    }
+    return requested || WaitForSingleObject(thread, 0) == WAIT_OBJECT_0;
+}
+
+static unsigned __stdcall ct_windows_pipe_write_thread(void *opaque) {
+    CtWindowsPipeWrite *operation = (CtWindowsPipeWrite *)opaque;
+    DWORD error = ERROR_SUCCESS;
+    size_t written_total = 0;
+    while (written_total < operation->length) {
+        pthread_mutex_lock(&ct_windows_pipe_writes_mutex);
+        bool canceled = operation->canceled;
+        pthread_mutex_unlock(&ct_windows_pipe_writes_mutex);
+        if (canceled) {
+            error = ERROR_OPERATION_ABORTED;
+            break;
+        }
+        size_t remaining = operation->length - written_total;
+        DWORD requested = remaining > (size_t)UINT32_MAX ? UINT32_MAX : (DWORD)remaining;
+        DWORD written = 0;
+        if (operation->overlapped) {
+            if (!ct_windows_pipe_transfer(
+                    operation->pipe,
+                    true,
+                    operation->bytes + written_total,
+                    requested,
+                    &written,
+                    &error)) {
+                break;
+            }
+        } else if (!WriteFile(
+                       operation->pipe,
+                       operation->bytes + written_total,
+                       requested,
+                       &written,
+                       NULL)) {
+            error = GetLastError();
+            break;
+        }
+        if (written == 0) {
+            error = ERROR_WRITE_FAULT;
+            break;
+        }
+        written_total += (size_t)written;
+    }
+
+    pthread_mutex_lock(&ct_windows_pipe_writes_mutex);
+    operation->written = written_total;
+    operation->error = error;
+    operation->completed = true;
+    if (!operation->suppress_event) {
+        if (operation->canceled || error == ERROR_OPERATION_ABORTED) {
+            ct_queue_fd_result(operation->runtime, operation->id, "pipe-write-cancel", 0);
+        } else if (error != ERROR_SUCCESS) {
+            int error_code = ct_windows_named_pipe_set_errno(error);
+            ct_queue_fd_error(operation->runtime, operation->id, error_code, NULL);
+        } else {
+            ct_queue_fd_result(operation->runtime, operation->id, "pipe-write", (int64_t)written_total);
+        }
+    }
+    pthread_mutex_unlock(&ct_windows_pipe_writes_mutex);
+    return 0;
+}
+#endif
+
+static JSValueRef ct_windows_pipe_write_start(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+#if !defined(_WIN32)
+    (void)function;
+    (void)argc;
+    (void)argv;
+    ct_throw_message(ctx, exception, "Windows pipe writes are unavailable on this platform");
+    return JSValueMakeUndefined(ctx);
+#else
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 2) {
+        ct_throw_message(ctx, exception, "windowsPipeWriteStart(fd, data) requires a pipe file descriptor and data");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "invalid pipe file descriptor")) {
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *bytes = NULL;
+    size_t length = 0;
+    if (ct_get_bytes(ctx, argv[1], &bytes, &length) != 0 || length == 0 || length > 0x40000000u) {
+        ct_throw_message(ctx, exception, "invalid Windows pipe write buffer");
+        return JSValueMakeUndefined(ctx);
+    }
+    intptr_t raw_handle = _get_osfhandle(fd);
+    if (raw_handle == -1 || GetFileType((HANDLE)raw_handle) != FILE_TYPE_PIPE) {
+        ct_throw_message(ctx, exception, "file descriptor is not a Windows pipe");
+        return JSValueMakeUndefined(ctx);
+    }
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    if (!DuplicateHandle(
+            GetCurrentProcess(),
+            (HANDLE)raw_handle,
+            GetCurrentProcess(),
+            &pipe,
+            0,
+            FALSE,
+            DUPLICATE_SAME_ACCESS)) {
+        ct_windows_set_errno(GetLastError());
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtWindowsPipeWrite *operation = (CtWindowsPipeWrite *)calloc(1, sizeof(*operation));
+    if (operation == NULL) {
+        CloseHandle(pipe);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    operation->bytes = (uint8_t *)malloc(length);
+    if (operation->bytes == NULL) {
+        CloseHandle(pipe);
+        free(operation);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    memcpy(operation->bytes, bytes, length);
+    operation->id = ct_next_fd_event_id();
+    operation->runtime = runtime;
+    operation->pipe = pipe;
+    operation->length = length;
+    operation->referenced = argc < 3 || ct_value_to_bool(ctx, argv[2]);
+    operation->overlapped = ct_windows_pipe_is_overlapped(pipe);
+
+    pthread_mutex_lock(&ct_windows_pipe_writes_mutex);
+    operation->next = ct_windows_pipe_writes;
+    ct_windows_pipe_writes = operation;
+    pthread_mutex_unlock(&ct_windows_pipe_writes_mutex);
+
+    uintptr_t thread = _beginthreadex(NULL, 0, ct_windows_pipe_write_thread, operation, 0, NULL);
+    if (thread == 0) {
+        pthread_mutex_lock(&ct_windows_pipe_writes_mutex);
+        ct_windows_pipe_write_remove(operation);
+        pthread_mutex_unlock(&ct_windows_pipe_writes_mutex);
+        ct_windows_pipe_write_destroy(operation);
+        ct_throw_message(ctx, exception, "failed to create Windows pipe writer thread");
+        return JSValueMakeUndefined(ctx);
+    }
+    operation->thread = (HANDLE)thread;
+    return JSValueMakeNumber(ctx, operation->id);
+#endif
+}
+
+static JSValueRef ct_windows_pipe_write_cancel(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+#if !defined(_WIN32)
+    (void)ctx;
+    (void)argc;
+    (void)argv;
+    return JSValueMakeBoolean(ctx, false);
+#else
+    uint32_t id = argc >= 1 ? (uint32_t)ct_value_to_number(ctx, argv[0]) : 0;
+    HANDLE thread = NULL;
+    HANDLE pipe = NULL;
+    bool overlapped = false;
+    pthread_mutex_lock(&ct_windows_pipe_writes_mutex);
+    CtWindowsPipeWrite *operation = ct_windows_pipe_write_find(id);
+    if (operation != NULL && !operation->completed) {
+        operation->canceled = true;
+        thread = operation->thread;
+        pipe = operation->pipe;
+        overlapped = operation->overlapped;
+    }
+    pthread_mutex_unlock(&ct_windows_pipe_writes_mutex);
+    if (thread == NULL) return JSValueMakeBoolean(ctx, operation != NULL);
+    return JSValueMakeBoolean(
+        ctx,
+        ct_windows_pipe_write_cancel_thread(thread, pipe, overlapped));
+#endif
+}
+
+static JSValueRef ct_windows_pipe_write_set_ref(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+#if !defined(_WIN32)
+    (void)argc;
+    (void)argv;
+    return JSValueMakeBoolean(ctx, false);
+#else
+    uint32_t id = argc >= 1 ? (uint32_t)ct_value_to_number(ctx, argv[0]) : 0;
+    bool referenced = argc < 2 || ct_value_to_bool(ctx, argv[1]);
+    pthread_mutex_lock(&ct_windows_pipe_writes_mutex);
+    CtWindowsPipeWrite *operation = ct_windows_pipe_write_find(id);
+    if (operation != NULL) operation->referenced = referenced;
+    pthread_mutex_unlock(&ct_windows_pipe_writes_mutex);
+    return JSValueMakeBoolean(ctx, operation != NULL);
+#endif
+}
+
+static JSValueRef ct_windows_pipe_write_release(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+#if !defined(_WIN32)
+    (void)argc;
+    (void)argv;
+    return JSValueMakeBoolean(ctx, false);
+#else
+    uint32_t id = argc >= 1 ? (uint32_t)ct_value_to_number(ctx, argv[0]) : 0;
+    pthread_mutex_lock(&ct_windows_pipe_writes_mutex);
+    CtWindowsPipeWrite *operation = ct_windows_pipe_write_find(id);
+    if (operation == NULL || !operation->completed) {
+        pthread_mutex_unlock(&ct_windows_pipe_writes_mutex);
+        return JSValueMakeBoolean(ctx, false);
+    }
+    ct_windows_pipe_write_remove(operation);
+    pthread_mutex_unlock(&ct_windows_pipe_writes_mutex);
+    WaitForSingleObject(operation->thread, INFINITE);
+    ct_windows_pipe_write_destroy(operation);
+    return JSValueMakeBoolean(ctx, true);
+#endif
+}
+
 static JSValueRef ct_memfd_create_for_testing(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -27618,6 +31233,59 @@ static void ct_fs_async_cancel_runtime(CtJscRuntime *runtime) {
     }
 }
 
+#if defined(_WIN32)
+static bool ct_windows_pipe_writes_has_runtime(CtJscRuntime *runtime) {
+    bool found = false;
+    pthread_mutex_lock(&ct_windows_pipe_writes_mutex);
+    for (CtWindowsPipeWrite *operation = ct_windows_pipe_writes; operation != NULL; operation = operation->next) {
+        if (operation->runtime == runtime && operation->referenced) {
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ct_windows_pipe_writes_mutex);
+    return found;
+}
+
+static void ct_windows_pipe_writes_cancel_runtime(CtJscRuntime *runtime) {
+    for (;;) {
+        CtWindowsPipeWrite *operation = NULL;
+        HANDLE thread = NULL;
+        HANDLE pipe = NULL;
+        bool overlapped = false;
+        pthread_mutex_lock(&ct_windows_pipe_writes_mutex);
+        for (CtWindowsPipeWrite *cursor = ct_windows_pipe_writes; cursor != NULL; cursor = cursor->next) {
+            if (cursor->runtime != runtime) continue;
+            operation = cursor;
+            operation->canceled = true;
+            operation->suppress_event = true;
+            thread = operation->thread;
+            pipe = operation->pipe;
+            overlapped = operation->overlapped;
+            ct_windows_pipe_write_remove(operation);
+            break;
+        }
+        pthread_mutex_unlock(&ct_windows_pipe_writes_mutex);
+        if (operation == NULL) return;
+
+        if (thread != NULL) {
+            (void)ct_windows_pipe_write_cancel_thread(thread, pipe, overlapped);
+            WaitForSingleObject(thread, INFINITE);
+        }
+        ct_windows_pipe_write_destroy(operation);
+    }
+}
+#else
+static bool ct_windows_pipe_writes_has_runtime(CtJscRuntime *runtime) {
+    (void)runtime;
+    return false;
+}
+
+static void ct_windows_pipe_writes_cancel_runtime(CtJscRuntime *runtime) {
+    (void)runtime;
+}
+#endif
+
 static JSValueRef ct_fstat_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -27637,7 +31305,7 @@ static JSValueRef ct_fstat_sync(JSContextRef ctx, JSObjectRef function, JSObject
     if (ct_statx_birthtime_for_fd(fd, &birthtime)) birthtime_override = &birthtime;
 #endif
     JSObjectRef result = ct_make_object(ctx);
-    ct_define_stat_fields(ctx, result, &stat_value, birthtime_override, exception);
+    ct_define_stat_fields(ctx, result, &stat_value, NULL, birthtime_override, exception);
     return result;
 }
 
@@ -27715,8 +31383,8 @@ static JSValueRef ct_fchown_sync(JSContextRef ctx, JSObjectRef function, JSObjec
     uint32_t uid;
     uint32_t gid;
     if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "invalid file descriptor")) return JSValueMakeUndefined(ctx);
-    if (!ct_value_to_uint32_checked(ctx, argv[1], &uid, exception, "invalid user id")) return JSValueMakeUndefined(ctx);
-    if (!ct_value_to_uint32_checked(ctx, argv[2], &gid, exception, "invalid group id")) return JSValueMakeUndefined(ctx);
+    if (!ct_value_to_ownership_id_checked(ctx, argv[1], &uid, exception, "invalid user id")) return JSValueMakeUndefined(ctx);
+    if (!ct_value_to_ownership_id_checked(ctx, argv[2], &gid, exception, "invalid group id")) return JSValueMakeUndefined(ctx);
     if (fchown(fd, (uid_t)uid, (gid_t)gid) != 0) ct_throw_message(ctx, exception, strerror(errno));
     return JSValueMakeUndefined(ctx);
 }
@@ -27770,6 +31438,9 @@ static JSValueRef ct_utimes_sync(JSContextRef ctx, JSObjectRef function, JSObjec
     ct_timeval_from_seconds(ct_value_to_number(ctx, argv[2]), &times[1]);
     bool follow = argc < 4 || ct_value_to_bool(ctx, argv[3]);
     int status;
+#if defined(_WIN32)
+    status = ct_windows_utimes(path, times, follow);
+#else
     if (follow) {
         status = utimes(path, times);
     } else {
@@ -27787,6 +31458,7 @@ static JSValueRef ct_utimes_sync(JSContextRef ctx, JSObjectRef function, JSObjec
         status = -1;
 #endif
     }
+#endif
     if (path == NULL || status != 0) ct_throw_message(ctx, exception, strerror(errno));
     free(path);
     return JSValueMakeUndefined(ctx);
@@ -27802,8 +31474,8 @@ static JSValueRef ct_chown_native_sync(JSContextRef ctx, JSObjectRef function, J
     char *path = ct_value_to_string_copy(ctx, argv[0]);
     uint32_t uid;
     uint32_t gid;
-    if (!ct_value_to_uint32_checked(ctx, argv[1], &uid, exception, "invalid user id") ||
-        !ct_value_to_uint32_checked(ctx, argv[2], &gid, exception, "invalid group id")) {
+    if (!ct_value_to_ownership_id_checked(ctx, argv[1], &uid, exception, "invalid user id") ||
+        !ct_value_to_ownership_id_checked(ctx, argv[2], &gid, exception, "invalid group id")) {
         free(path);
         return JSValueMakeUndefined(ctx);
     }
@@ -27862,7 +31534,38 @@ static JSValueRef ct_symlink_sync_native(JSContextRef ctx, JSObjectRef function,
     }
     char *target = ct_value_to_string_copy(ctx, argv[0]);
     char *path = ct_value_to_string_copy(ctx, argv[1]);
-    if (target == NULL || path == NULL || symlink(target, path) != 0) ct_throw_message(ctx, exception, strerror(errno));
+    int status = -1;
+#if defined(_WIN32)
+    int flags = -1;
+    bool valid_type = true;
+    if (argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2])) {
+        if (JSValueIsNumber(ctx, argv[2])) {
+            double numeric_type = JSValueToNumber(ctx, argv[2], NULL);
+            if (numeric_type == 0) flags = 0;
+            else if (numeric_type == UV_FS_SYMLINK_DIR) flags = UV_FS_SYMLINK_DIR;
+            else if (numeric_type == UV_FS_SYMLINK_JUNCTION) flags = UV_FS_SYMLINK_JUNCTION;
+            else valid_type = false;
+        } else {
+            char *type = ct_value_to_string_copy(ctx, argv[2]);
+            if (type != NULL) {
+                if (strcmp(type, "file") == 0) flags = 0;
+                else if (strcmp(type, "dir") == 0) flags = UV_FS_SYMLINK_DIR;
+                else if (strcmp(type, "junction") == 0) flags = UV_FS_SYMLINK_JUNCTION;
+                else valid_type = false;
+            } else {
+                valid_type = false;
+            }
+            free(type);
+        }
+    }
+    if (!valid_type) errno = EINVAL;
+    if (valid_type && target != NULL && path != NULL) {
+        status = flags < 0 ? symlink(target, path) : ct_windows_symlink_with_flags(target, path, flags);
+    }
+#else
+    if (target != NULL && path != NULL) status = symlink(target, path);
+#endif
+    if (status != 0) ct_throw_message(ctx, exception, strerror(errno));
     free(target);
     free(path);
     return JSValueMakeUndefined(ctx);
@@ -27877,7 +31580,11 @@ static JSValueRef ct_rename_sync_native(JSContextRef ctx, JSObjectRef function, 
     }
     char *old_path = ct_value_to_string_copy(ctx, argv[0]);
     char *new_path = ct_value_to_string_copy(ctx, argv[1]);
+#if defined(_WIN32)
+    if (old_path == NULL || new_path == NULL || ct_windows_rename(old_path, new_path) != 0) ct_throw_message(ctx, exception, strerror(errno));
+#else
     if (old_path == NULL || new_path == NULL || rename(old_path, new_path) != 0) ct_throw_message(ctx, exception, strerror(errno));
+#endif
     free(old_path);
     free(new_path);
     return JSValueMakeUndefined(ctx);
@@ -27981,8 +31688,17 @@ static JSValueRef ct_statfs_sync_native(JSContextRef ctx, JSObjectRef function, 
     ULARGE_INTEGER available;
     ULARGE_INTEGER total;
     ULARGE_INTEGER free_bytes;
-    if (path == NULL || !GetDiskFreeSpaceExA(path, &available, &total, &free_bytes)) {
-        ct_throw_message(ctx, exception, "GetDiskFreeSpaceEx failed");
+    WCHAR *wide_path = ct_windows_path_from_utf8(path);
+    BOOL disk_status = FALSE;
+    DWORD disk_error = ERROR_SUCCESS;
+    if (wide_path != NULL) {
+        disk_status = GetDiskFreeSpaceExW(wide_path, &available, &total, &free_bytes);
+        if (!disk_status) disk_error = GetLastError();
+    }
+    free(wide_path);
+    if (!disk_status) {
+        if (disk_error != ERROR_SUCCESS) ct_windows_set_errno(disk_error);
+        ct_throw_message(ctx, exception, strerror(errno));
         free(path);
         return JSValueMakeUndefined(ctx);
     }
@@ -28228,7 +31944,12 @@ static JSValueRef ct_fs_watch_start(JSContextRef ctx, JSObjectRef function, JSOb
         return JSValueMakeUndefined(ctx);
     }
     struct stat root_stat;
-    if (stat(path, &root_stat) != 0) {
+#if defined(_WIN32)
+    int root_stat_status = ct_windows_stat(path, true, &root_stat, NULL);
+#else
+    int root_stat_status = stat(path, &root_stat);
+#endif
+    if (root_stat_status != 0) {
         int status = uv_translate_sys_error(errno);
         free(path);
         ct_throw_uv_error(ctx, exception, status);
@@ -29674,10 +33395,11 @@ static void ct_vm_context_destroy_all(CtJscRuntime *runtime) {
     }
 }
 
-static JSValueRef ct_vm_bridge_call(
+static JSValueRef ct_vm_bridge_call_args(
     CtVmContext *entry,
     const char *method,
-    JSValueRef sandbox,
+    size_t argc,
+    const JSValueRef argv[],
     JSValueRef *exception
 ) {
     JSContextRef vm_ctx = entry->context;
@@ -29687,7 +33409,16 @@ static JSValueRef ct_vm_bridge_call(
         ct_throw_message(vm_ctx, exception, "Invalid native VM context bridge");
         return JSValueMakeUndefined(vm_ctx);
     }
-    return JSObjectCallAsFunction(vm_ctx, (JSObjectRef)function_value, entry->bridge, 1, &sandbox, exception);
+    return JSObjectCallAsFunction(vm_ctx, (JSObjectRef)function_value, entry->bridge, argc, argv, exception);
+}
+
+static JSValueRef ct_vm_bridge_call(
+    CtVmContext *entry,
+    const char *method,
+    JSValueRef sandbox,
+    JSValueRef *exception
+) {
+    return ct_vm_bridge_call_args(entry, method, 1, &sandbox, exception);
 }
 
 static JSValueRef ct_vm_context_create(
@@ -29847,7 +33578,17 @@ static JSValueRef ct_vm_context_create(
             "for(const key of mirrored){if(!next.has(key))delete sandbox[key]}"
             "mirrored=next;"
         "}"
-        "return{importSandbox,exportSandbox};"
+        "const NativePromise=Promise;"
+        "function settleResult(result,sandbox){"
+            "if(result===null||(typeof result!=='object'&&typeof result!=='function'))return result;"
+            "let then;try{then=result.then}catch(error){exportSandbox(sandbox);throw error}"
+            "if(typeof then!=='function')return result;"
+            "return NativePromise.resolve(result).then("
+                "value=>{exportSandbox(sandbox);return value},"
+                "error=>{exportSandbox(sandbox);throw error}"
+            ");"
+        "}"
+        "return{importSandbox,exportSandbox,settleResult};"
         "})()";
     JSStringRef bridge_script = JSStringCreateWithUTF8CString(bridge_source);
     JSStringRef bridge_url = JSStringCreateWithUTF8CString("cottontail:vm-context-bootstrap");
@@ -29932,12 +33673,35 @@ static JSValueRef ct_vm_context_run(
     JSValueRef export_exception = NULL;
     ct_vm_bridge_call(entry, "exportSandbox", argv[1], &export_exception);
     JSValueRef thrown = run_exception != NULL ? run_exception : export_exception;
+    JSValueRef settled_result = result;
+    bool settled_result_protected = false;
+    if (thrown == NULL && result != NULL) {
+        JSValueRef settle_args[2] = { result, argv[1] };
+        JSValueRef settle_exception = NULL;
+        JSValueRef candidate = ct_vm_bridge_call_args(
+            entry,
+            "settleResult",
+            2,
+            settle_args,
+            &settle_exception
+        );
+        if (settle_exception != NULL) {
+            thrown = settle_exception;
+        } else if (candidate != NULL) {
+            settled_result = candidate;
+            if (settled_result != result) {
+                JSValueProtect(entry->context, settled_result);
+                settled_result_protected = true;
+            }
+        }
+    }
     if (thrown != NULL && exception != NULL) *exception = thrown;
 
     if (run_exception != NULL) JSValueUnprotect(entry->context, run_exception);
     if (result != NULL) JSValueUnprotect(entry->context, result);
+    if (settled_result_protected) JSValueUnprotect(entry->context, settled_result);
     if (thrown != NULL) return JSValueMakeUndefined(ctx);
-    return result != NULL ? result : JSValueMakeUndefined(ctx);
+    return settled_result != NULL ? settled_result : JSValueMakeUndefined(ctx);
 }
 
 static JSValueRef ct_vm_context_export(
@@ -30092,6 +33856,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     JSStringRef bootstrap = ct_js_string(
         "globalThis.global = globalThis;"
         "globalThis.__ctUnhandledRejection = undefined;"
+        "globalThis.__cottontailRoutedFatalException = undefined;"
         "if (typeof globalThis.queueMicrotask !== 'function') {"
         "  globalThis.queueMicrotask = function(callback){"
         "    if (typeof callback !== 'function') throw new TypeError('queueMicrotask callback must be a function');"
@@ -30353,6 +34118,10 @@ static CtJscRuntime *ct_jsc_runtime_create_internal(
 #endif
     ct_install_crash_handlers();
 #if defined(_WIN32)
+    /* The MSVCRT creates inherited descriptors 0/1/2 in text mode. Its
+     * _read/_write wrappers would otherwise translate CRLF and Ctrl-Z, while
+     * Node and Bun expose standard streams as byte-preserving pipes. */
+    ct_windows_ensure_standard_streams_binary();
     if (ct_windows_ensure_winsock() != 0) return NULL;
 #endif
 #if defined(_WIN32) || defined(__linux__)
@@ -30484,8 +34253,10 @@ int ct_jsc_runtime_prepare_hot_reload(CtJscRuntime *runtime, char **error_out) {
     ct_workers_detach_runtime(runtime);
     ct_async_processes_wait_for_runtime(runtime);
     ct_tcp_connects_stop_runtime(runtime);
+    ct_unix_servers_stop_runtime(runtime);
     ct_fs_watchers_stop_runtime(runtime);
     ct_fd_watchers_wait_for_runtime(runtime);
+    ct_windows_pipe_writes_cancel_runtime(runtime);
     ct_fs_async_cancel_runtime(runtime);
 #if CT_HAS_OPENSSL
     ct_tls_servers_stop_runtime(runtime);
@@ -30525,7 +34296,9 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
     ct_workers_detach_runtime(runtime);
     ct_async_processes_wait_for_runtime(runtime);
     ct_tcp_connects_stop_runtime(runtime);
+    ct_unix_servers_stop_runtime(runtime);
     ct_fd_watchers_wait_for_runtime(runtime);
+    ct_windows_pipe_writes_cancel_runtime(runtime);
 #if CT_HAS_OPENSSL
     ct_tls_servers_stop_runtime(runtime);
     ct_tls_connections_stop_runtime(runtime);
@@ -31634,6 +35407,29 @@ static JSValueRef ct_global_value(JSContextRef ctx, const char *name) {
     return ct_get_property(ctx, JSContextGetGlobalObject(ctx), name, &exception);
 }
 
+static int ct_take_routed_fatal_exception(CtJscRuntime *runtime, char **error_out) {
+    JSContextRef ctx = runtime->context;
+    JSObjectRef global = JSContextGetGlobalObject(ctx);
+    JSValueRef fatal = ct_global_value(ctx, "__cottontailRoutedFatalException");
+    if (fatal == NULL || JSValueIsUndefined(ctx, fatal) || JSValueIsNull(ctx, fatal)) return 0;
+
+    char *message = ct_copy_exception(ctx, fatal);
+    JSValueRef clear_exception = NULL;
+    ct_set_property(
+        ctx,
+        global,
+        "__cottontailRoutedFatalException",
+        JSValueMakeUndefined(ctx),
+        &clear_exception
+    );
+    if (clear_exception != NULL) {
+        free(message);
+        message = ct_copy_exception(ctx, clear_exception);
+    }
+    ct_set_error_out(error_out, message);
+    return -1;
+}
+
 static int ct_route_global_uncaught_exception(CtJscRuntime *runtime, const char *name, char **error_out) {
     JSContextRef ctx = runtime->context;
     JSObjectRef global = JSContextGetGlobalObject(ctx);
@@ -31667,11 +35463,9 @@ static bool ct_runtime_has_pending_native_events(CtJscRuntime *runtime) {
     if (runtime->inspector != NULL && ct_jsc_inspector_keeps_event_loop_alive(runtime->inspector)) return true;
     if (runtime->napi_env != NULL && ct_napi_env_has_pending_work(runtime->napi_env)) return true;
     if (runtime->uv_loop_initialized && uv_loop_alive(&runtime->uv_loop)) return true;
-#if !defined(_WIN32)
     for (size_t index = 0; index < runtime->signal_watcher_count; index += 1) {
         if (runtime->signal_watchers[index].pending > 0) return true;
     }
-#endif
 
 #if CT_HAS_OPENSSL
     pthread_mutex_lock(&ct_tls_mutex);
@@ -31710,6 +35504,7 @@ static bool ct_runtime_has_pending_native_events(CtJscRuntime *runtime) {
     if (ct_workers_has_referenced_runtime(runtime)) return true;
 
     if (ct_tcp_connects_has_referenced_runtime(runtime)) return true;
+    if (ct_windows_pipe_writes_has_runtime(runtime)) return true;
     return ct_fd_watchers_has_referenced_runtime(runtime);
 }
 
@@ -31816,6 +35611,7 @@ static int ct_jsc_runtime_eval_internal(
     JSStringRelease(source_url);
     free(wrapped);
     if (exception != NULL) {
+        (void)ct_mark_out_of_memory_exception(runtime, exception);
         ct_set_error_out(error_out, ct_copy_exception(ctx, exception));
         return -1;
     }
@@ -31849,8 +35645,10 @@ static int ct_jsc_runtime_eval_internal(
     if (ct_route_global_uncaught_exception(runtime, "__ctError", error_out) != 0) return -1;
     JSValueRef unhandled = ct_global_value(ctx, "__ctUnhandledRejection");
     if (unhandled != NULL && !JSValueIsUndefined(ctx, unhandled) && !JSValueIsNull(ctx, unhandled)) {
-        runtime->fatal_exception_routed = true;
-        ct_process_set_exit_code(ctx, 1);
+        if (!ct_mark_out_of_memory_exception(runtime, unhandled)) {
+            runtime->fatal_exception_routed = true;
+            ct_process_set_exit_code(ctx, 1);
+        }
         ct_set_error_out(error_out, ct_copy_exception(ctx, unhandled));
         return -1;
     }
@@ -31871,8 +35669,10 @@ static int ct_jsc_runtime_eval_internal(
     if (ct_route_global_uncaught_exception(runtime, "__ctError", error_out) != 0) return -1;
     unhandled = ct_global_value(ctx, "__ctUnhandledRejection");
     if (unhandled != NULL && !JSValueIsUndefined(ctx, unhandled) && !JSValueIsNull(ctx, unhandled)) {
-        runtime->fatal_exception_routed = true;
-        ct_process_set_exit_code(ctx, 1);
+        if (!ct_mark_out_of_memory_exception(runtime, unhandled)) {
+            runtime->fatal_exception_routed = true;
+            ct_process_set_exit_code(ctx, 1);
+        }
         ct_set_error_out(error_out, ct_copy_exception(ctx, unhandled));
         return -1;
     }
@@ -32022,6 +35822,7 @@ int ct_jsc_runtime_eval_immediate(
     JSStringRelease(source_url);
     free(wrapped);
     if (exception != NULL) {
+        (void)ct_mark_out_of_memory_exception(runtime, exception);
         ct_set_error_out(error_out, ct_copy_exception(runtime->context, exception));
         return -1;
     }
@@ -32039,6 +35840,7 @@ int ct_jsc_runtime_wait_for_reload(CtJscRuntime *runtime, char **error_out) {
 }
 
 int ct_jsc_runtime_exit_code(CtJscRuntime *runtime) {
+    if (runtime != NULL && runtime->fatal_out_of_memory) return 134;
     if (runtime == NULL || runtime->context == NULL) return 0;
 
     JSContextRef ctx = runtime->context;
@@ -32112,6 +35914,10 @@ int ct_jsc_runtime_emit_process_shutdown(
             }
 
             ct_jsc_drain_microtasks(ctx);
+            if (ct_take_routed_fatal_exception(runtime, error_out) != 0) {
+                status = -1;
+                break;
+            }
             if (ct_drain_next_ticks(runtime, true, error_out) != 0) {
                 status = -1;
                 break;
@@ -32217,6 +36023,7 @@ static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_o
         return -1;
     }
     ct_jsc_drain_microtasks(ctx);
+    if (ct_take_routed_fatal_exception(runtime, error_out) != 0) return -1;
     int js_delay_ms = 16;
     if (value != NULL && !JSValueIsUndefined(ctx, value) && !JSValueIsNull(ctx, value)) {
         JSValueRef number_exception = NULL;

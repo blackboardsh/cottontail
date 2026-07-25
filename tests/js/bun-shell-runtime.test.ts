@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { $ } from "bun";
 
 const root = mkdtempSync(join(tmpdir(), "cottontail-shell-"));
+const portableChild = join(import.meta.dir, "fixtures", "shell-portable-child.js");
 
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
@@ -14,29 +15,62 @@ test("ports Bun shell escaping", () => {
   expect($.escape("lol $NICE")).toBe('"lol \\$NICE"');
 });
 
-test.skipIf(process.platform === "win32")("preserves interpolation quote context and typed-array redirects", async () => {
+test("preserves interpolation quote context", async () => {
   const value = "http://www.example.com?candy_name=M&M";
   expect(await $`echo url="${value}"`.text()).toBe(`url=${value}\n`);
   expect(await $`echo url='${value}'`.text()).toBe(`url=${value}\n`);
   expect(await $`FOO=expanded; echo "${"$FOO"}"`.text()).toBe("$FOO\n");
+});
 
+test("matches platform object-redirection parsing and typed-array output", async () => {
   const stderr = Buffer.alloc(16);
-  const redirected = await $`echo problem >&2 2> ${stderr}`.quiet();
-  expect(redirected.stderr.byteLength).toBe(0);
-  expect(stderr.subarray(0, 8).toString()).toBe("problem\n");
+  if (process.platform === "win32") {
+    let duplicateError: any;
+    try {
+      $`echo problem >&2 2> ${stderr}`;
+    } catch (error) {
+      duplicateError = error;
+    }
+    expect(duplicateError).toBeInstanceOf(Error);
+    expect(duplicateError.name).toBe("Error");
+    expect(duplicateError.message).toBe("Redirection with no file");
+    expect(duplicateError.exitCode).toBeUndefined();
+    expect(stderr.every(byte => byte === 0)).toBe(true);
+  } else {
+    const redirected = await $`echo problem >&2 2> ${stderr}`.quiet();
+    expect(redirected.stderr.byteLength).toBe(0);
+    expect(stderr.subarray(0, 8).toString()).toBe("problem\n");
+  }
 
   const stdout = Buffer.alloc(16);
   const builtinRedirect = await $`echo answer > ${stdout}`.quiet();
+  expect(builtinRedirect.exitCode).toBe(0);
   expect(builtinRedirect.stdout.byteLength).toBe(0);
   expect(stdout.subarray(0, 7).toString()).toBe("answer\n");
 
   const subshellStdout = Buffer.alloc(16);
-  const subshellRedirect = await $`(echo nested) > ${subshellStdout}`.quiet();
-  expect(subshellRedirect.stdout.byteLength).toBe(0);
-  expect(subshellStdout.subarray(0, 7).toString()).toBe("nested\n");
+  if (process.platform === "win32") {
+    let subshellError: any;
+    try {
+      $`(echo nested) > ${subshellStdout}`;
+    } catch (error) {
+      subshellError = error;
+    }
+    expect(subshellError).toBeInstanceOf(Error);
+    expect(subshellError.name).toBe("Error");
+    expect(subshellError.message).toBe(
+      "Subshells with redirections are currently not supported. Please open a GitHub issue.",
+    );
+    expect(subshellError.exitCode).toBeUndefined();
+    expect(subshellStdout.every(byte => byte === 0)).toBe(true);
+  } else {
+    const subshellRedirect = await $`(echo nested) > ${subshellStdout}`.quiet();
+    expect(subshellRedirect.stdout.byteLength).toBe(0);
+    expect(subshellStdout.subarray(0, 7).toString()).toBe("nested\n");
+  }
 });
 
-test.skipIf(process.platform === "win32")("preserves Blob and typed-array stdin as binary data", async () => {
+test("preserves Blob and typed-array stdin as binary data", async () => {
   expect(await $`cat < ${new Blob(["blob-input"])}`.text()).toBe("blob-input");
   expect(await $`cat < ${new TextEncoder().encode("typed-input")}`.text()).toBe("typed-input");
 });
@@ -88,14 +122,14 @@ test("large raw interpolation diagnostics are cached by value", () => {
   expect(changed.position).not.toBe(first.position);
 });
 
-test.skipIf(process.platform === "win32")("shell execution does not block the JavaScript event loop", async () => {
+test("shell execution does not block the JavaScript event loop", async () => {
   let timerRan = false;
-  const pending = $`sleep 0.05; echo complete`.text();
+  const pending = $`${process.execPath} ${portableChild} delay`.text();
   setTimeout(() => { timerRan = true; }, 0);
   await new Promise((resolve) => setTimeout(resolve, 10));
   expect(timerRan).toBe(true);
-  expect(await pending).toBe("complete\n");
-});
+  expect(await pending).toBe("complete");
+}, { timeout: process.platform === "win32" ? 30_000 : 5_000 });
 
 test("ShellError preserves the original eval callsite", () => {
   const code = `import { $ } from "bun";
@@ -118,7 +152,7 @@ await fail();`;
   expect(child.stderr.toString()).toContain(`[eval]:${line}`);
 });
 
-test.skipIf(process.platform === "win32")("ported cp builtin participates in command lists", async () => {
+test("ported cp builtin participates in command lists", async () => {
   const result = await $`echo payload > source.txt; cp -v source.txt destination.txt`
     .cwd(root)
     .quiet();
@@ -128,7 +162,7 @@ test.skipIf(process.platform === "win32")("ported cp builtin participates in com
   expect(readFileSync(join(root, "destination.txt"), "utf8")).toBe("payload\n");
 });
 
-test.skipIf(process.platform === "win32")("Shell instances keep defaults isolated", async () => {
+test("Shell instances keep defaults isolated", async () => {
   const first = new $.Shell().env({ VALUE: "first" });
   const second = new $.Shell().env({ VALUE: "second" });
 

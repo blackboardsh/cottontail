@@ -23,33 +23,54 @@ let cachedState; // undefined = never attempted for cachedMapPath, null = load f
 const adjacentBundleStates = new Map();
 const virtualSourceMappings = new WeakMap();
 
+function isWindowsAbsolutePath(path) {
+  return /^[A-Za-z]:[\\/]/.test(String(path)) || /^[\\/]{2}[^\\/]/.test(String(path));
+}
+
+function isAbsolutePath(path) {
+  const text = String(path);
+  return text.startsWith("/") || isWindowsAbsolutePath(text);
+}
+
 function normalizePath(path) {
-  const isAbsolute = path.startsWith("/");
-  const parts = String(path).split("/");
+  let text = String(path).replace(/\\/g, "/");
+  let root = "";
+  const drive = /^([A-Za-z]:)\//.exec(text);
+  if (drive) {
+    root = `${drive[1]}/`;
+    text = text.slice(drive[0].length);
+  } else if (text.startsWith("//")) {
+    root = "//";
+    text = text.slice(2);
+  } else if (text.startsWith("/")) {
+    root = "/";
+    text = text.slice(1);
+  }
+  const parts = text.split("/");
   const out = [];
   for (const part of parts) {
     if (part === "" || part === ".") continue;
     if (part === "..") {
       if (out.length > 0 && out[out.length - 1] !== "..") out.pop();
-      else if (!isAbsolute) out.push("..");
+      else if (root === "") out.push("..");
     } else {
       out.push(part);
     }
   }
-  return (isAbsolute ? "/" : "") + out.join("/");
+  return root + out.join("/");
 }
 
 function resolveSource(mapDir, sourceRoot, source) {
   let text = String(source);
-  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(text)) {
+  if (!isWindowsAbsolutePath(text) && /^[A-Za-z][A-Za-z0-9+.-]*:/.test(text)) {
     if (text.startsWith("file://")) text = text.slice("file://".length);
     else return text;
   }
-  if (sourceRoot) {
+  if (sourceRoot && !isAbsolutePath(text)) {
     const root = String(sourceRoot);
-    text = root.endsWith("/") ? root + text : `${root}/${text}`;
+    text = /[\\/]$/.test(root) ? root + text : `${root}/${text}`;
   }
-  if (text.startsWith("/")) return normalizePath(text);
+  if (isAbsolutePath(text)) return normalizePath(text);
   return normalizePath(`${mapDir}/${text}`);
 }
 
@@ -207,6 +228,18 @@ function decodeLineSegments(state, lineIndex) {
 
 function escapeRegExp(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function pathRegExpSource(path) {
+  return String(path)
+    .split(/[\\/]/)
+    .map(part => escapeRegExp(part))
+    .join("[\\\\/]");
+}
+
+function bundleFrameRegExp(bundlePath) {
+  const flags = isWindowsAbsolutePath(bundlePath) ? "gi" : "g";
+  return new RegExp(`${pathRegExpSource(bundlePath)}:(\\d+):(\\d+)`, flags);
 }
 
 function readMapText(mapPath) {
@@ -371,8 +404,9 @@ function buildState(mapPath, mapData, configuredBundlePath, configuredSourceRoot
     const effectiveMapPath = typeof mapPath === "string" && mapPath !== ""
       ? mapPath
       : `${configuredBundlePath || "/$bunfs/root/index.js"}.map`;
-    const slash = effectiveMapPath.lastIndexOf("/");
-    const mapDir = slash > 0 ? effectiveMapPath.slice(0, slash) : "/";
+    const normalizedMapPath = normalizePath(effectiveMapPath);
+    const slash = normalizedMapPath.lastIndexOf("/");
+    const mapDir = slash > 0 ? normalizedMapPath.slice(0, slash) : "/";
     const configuredRoot = configuredSourceRoot === undefined
       ? globalThis.__cottontailBundleSourceRoot
       : configuredSourceRoot;
@@ -399,7 +433,7 @@ function buildState(mapPath, mapData, configuredBundlePath, configuredSourceRoot
       firstGeneratedLines: mappingIndex.firstGeneratedLines,
       firstExecutableGeneratedLines: mappingIndex.firstExecutableGeneratedLines,
       bundlePath,
-      bundleRegExp: bundlePath ? new RegExp(`${escapeRegExp(bundlePath)}:(\\d+):(\\d+)`, "g") : null,
+      bundleRegExp: bundlePath ? bundleFrameRegExp(bundlePath) : null,
     };
   } catch {
     return null;
@@ -838,7 +872,7 @@ export function remapStackString(stack) {
   const state = getState();
   if (!state) return remapAdjacentBundleFrames(stack);
   let remapped = stack;
-  if (state?.bundleRegExp && stack.includes(state.bundlePath)) {
+  if (state?.bundleRegExp) {
     state.bundleRegExp.lastIndex = 0;
     remapped = remapped.replace(state.bundleRegExp, (match, lineText, columnText) => {
       const line = Number(lineText);
@@ -889,7 +923,7 @@ export function remapStackString(stack) {
 }
 
 function remapAdjacentBundleFrames(stack) {
-  return String(stack).replace(/((?:file:\/\/)?(?:[A-Za-z]:)?\/[^@\s()]*\/script\.bundle\.mjs):(\d+):(\d+)/g, (match, file, lineText, columnText) => {
+  return String(stack).replace(/((?:file:\/\/)?(?:[A-Za-z]:)?[\\/][^@\s()]*[\\/]script\.bundle\.mjs):(\d+):(\d+)/gi, (match, file, lineText, columnText) => {
     const state = getAdjacentBundleState(file);
     if (!state) return match;
     const line = Number(lineText);

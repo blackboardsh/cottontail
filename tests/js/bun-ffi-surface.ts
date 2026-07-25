@@ -25,10 +25,16 @@ const libcSymbols = dlopen(libc, {
 });
 const hello = Buffer.from("hello\0");
 assert(libcSymbols.symbols.strlen(hello) === 5n, "bun:ffi dlopen strlen mismatch");
-const libcFilePath = process.platform === "linux"
-  ? process.report.getReport().sharedObjects.find((path: string) => /\/libc\.so(?:\.|$)/.test(path)) ?? libc
-  : libc;
-for (const libraryInput of [Bun.pathToFileURL(libcFilePath), Bun.pathToFileURL(libcFilePath).href, Bun.file(libcFilePath)]) {
+const libcFilePath = process.platform === "win32"
+  ? `${process.env.SystemRoot || "C:\\Windows"}\\System32\\msvcrt.dll`
+  : process.platform === "linux"
+    ? process.report.getReport().sharedObjects.find((path: string) => /\/libc\.so(?:\.|$)/.test(path)) ?? libc
+    : libc;
+for (const libraryInput of [
+  Bun.pathToFileURL(libcFilePath),
+  Bun.pathToFileURL(libcFilePath).href,
+  Bun.file(libcFilePath),
+]) {
   const library = dlopen(libraryInput, {
     strlen: { args: [FFIType.cstring], returns: "usize" },
   });
@@ -87,18 +93,26 @@ napi_value make_napi_string(napi_env env) {
   return result;
 }
 `);
-const compiled = cc({
-  source: sourcePath,
-  define: { COTTONTAIL_DEFINED_VALUE: 17 },
-  flags: `-I${tmp}`,
-  symbols: {
-    add: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
-    add_u64: { args: [FFIType.u64, FFIType.u64], returns: FFIType.u64 },
-    defined_value: { args: [], returns: FFIType.i32 },
-    header_value: { args: [], returns: FFIType.i32 },
-    make_napi_string: { args: ["napi_env"], returns: "napi_value" },
-  },
-});
+let compiled: ReturnType<typeof cc>;
+const originalCwd = process.cwd();
+try {
+  // Compiler discovery must not depend on running from the source checkout.
+  process.chdir(tmp);
+  compiled = cc({
+    source: sourcePath,
+    define: { COTTONTAIL_DEFINED_VALUE: 17 },
+    flags: `-I${tmp}`,
+    symbols: {
+      add: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+      add_u64: { args: [FFIType.u64, FFIType.u64], returns: FFIType.u64 },
+      defined_value: { args: [], returns: FFIType.i32 },
+      header_value: { args: [], returns: FFIType.i32 },
+      make_napi_string: { args: ["napi_env"], returns: "napi_value" },
+    },
+  });
+} finally {
+  process.chdir(originalCwd);
+}
 assert(compiled.symbols.add(2, 3) === 5, "bun:ffi cc mismatch");
 const maxU64 = (1n << 64n) - 1n;
 assert(compiled.symbols.add_u64(-maxU64, maxU64) === 0n, "bun:ffi exact uint64 argument mismatch");

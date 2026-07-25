@@ -19,21 +19,31 @@ const internal = new ChildProcess();
 internal.spawn({
   file: process.execPath,
   args: [process.execPath, "-e", "process.stdout.write(process.env.COTTONTAIL_CHILD_PROCESS_ENV_PAIR || '')"],
-  envPairs: ["COTTONTAIL_CHILD_PROCESS_ENV_PAIR=from-env-pairs"],
-  stdio: ["ignore", "pipe", "ignore"],
+  envPairs: [
+    "COTTONTAIL_CHILD_PROCESS_ENV_PAIR=from-env-pairs",
+    ...(process.platform === "win32" && process.env.LOCALAPPDATA
+      ? [`LOCALAPPDATA=${process.env.LOCALAPPDATA}`]
+      : []),
+  ],
+  stdio: ["ignore", "pipe", "pipe"],
 });
 let envOutput = "";
+let envStderr = "";
 internal.stdout.on("data", chunk => {
   envOutput += chunk.toString();
+});
+internal.stderr.on("data", chunk => {
+  envStderr += chunk.toString();
 });
 await new Promise<void>((resolve, reject) => {
   internal.once("error", reject);
   internal.once("close", code => {
     if (code === 0) resolve();
-    else reject(new Error(`internal ChildProcess.spawn exited with ${code}`));
+    else reject(new Error(`internal ChildProcess.spawn exited with ${code}: ${envStderr}`));
   });
 });
 assert(envOutput === "from-env-pairs", `envPairs mismatch: ${JSON.stringify(envOutput)}`);
+assert(envStderr === "", `envPairs child wrote stderr: ${JSON.stringify(envStderr)}`);
 
 const originalSpawn = ChildProcess.prototype.spawn;
 let prototypeSpawnCalled = false;
@@ -64,6 +74,9 @@ for (const invalid of [0, true, () => {}, Symbol("invalid")]) {
 }
 
 const child = fork(`${import.meta.dirname}/fixtures/fork-child.js`);
+if (process.platform === "win32") {
+  assert((child as any)._ipcFd == null, "Windows fork should use the framed stdio IPC fallback");
+}
 assert(child.channel === child._channel, "fork channel and _channel must alias the same control object");
 assert(typeof child.channel?.ref === "function", "fork channel.ref is missing");
 assert(typeof child.channel?.unref === "function", "fork channel.unref is missing");

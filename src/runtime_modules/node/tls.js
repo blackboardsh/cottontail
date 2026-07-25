@@ -166,6 +166,12 @@ function uniqueCertificates(certificates) {
 }
 
 function systemRootCertificates() {
+  if (process.platform === "win32") {
+    try {
+      const certs = parsePemCertificates(cottontail.systemRootCertificates?.());
+      if (certs.length > 0) return uniqueCertificates(certs);
+    } catch {}
+  }
   for (const path of certificatePaths) {
     try {
       const certs = parsePemCertificates(cottontail.readFile(path));
@@ -326,7 +332,7 @@ function tlsCredentialOptions(options) {
       : String(passphraseOption);
   const caOption = options?.ca ?? context.ca;
   let ca = caOption == null ? undefined : flattenPem(caOption);
-  if (caOption == null && (defaultCACertificatesWasSet || extraCACertificates.length > 0)) {
+  if (caOption == null && (process.platform === "win32" || defaultCACertificatesWasSet || extraCACertificates.length > 0)) {
     ca = flattenPem(defaultCACertificates);
   }
   return {

@@ -207,7 +207,43 @@ test("server address delegates listener handle errors", async () => {
   const handle = (server as any)._handle;
   expect(handle.fd).toBeNumber();
   expect(handle.hasRef()).toBe(true);
-  handle.getsockname = () => -1;
+  handle.getsockname = () => (process as any).binding("uv").UV_EPERM;
   expect(() => server.address()).toThrow("address EPERM");
   await closeServer(server);
 });
+
+test.skipIf(process.platform !== "win32")(
+  "Windows named-pipe writable shutdown preserves readable EOF ordering",
+  async () => {
+    const pipeName = `\\\\.\\pipe\\cottontail-net-half-close-${process.pid}-${Date.now()}`;
+    const events: string[] = [];
+    const acceptedClosed = Promise.withResolvers<void>();
+    const server = net.createServer(socket => {
+      socket.on("finish", () => events.push("finish"));
+      socket.on("end", () => events.push("end"));
+      socket.on("error", acceptedClosed.reject);
+      socket.on("close", () => {
+        events.push("close");
+        acceptedClosed.resolve();
+      });
+      socket.end("hello");
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(pipeName, resolve);
+    });
+
+    let output = "";
+    const client = net.connect(pipeName);
+    client.setEncoding("utf8");
+    client.on("data", chunk => {
+      output += chunk;
+    });
+    await Promise.all([once(client, "close"), acceptedClosed.promise]);
+
+    expect(output).toBe("hello");
+    expect(events).toEqual(["finish", "end", "close"]);
+    await closeServer(server);
+  },
+  10_000,
+);

@@ -30,7 +30,8 @@ import ModuleDefault, {
 } from "node:module";
 import { Buffer } from "node:buffer";
 import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 
 function assert(value: unknown, message: string): asserts value {
   if (!value) throw new Error(message);
@@ -39,7 +40,8 @@ function assert(value: unknown, message: string): asserts value {
 const tmpDir = process.env.COTTONTAIL_TMP_DIR;
 assert(tmpDir, "COTTONTAIL_TMP_DIR missing");
 
-const root = `${tmpDir}/node-module-surface`;
+const root = join(tmpDir, "node-module-surface");
+const entryUrl = pathToFileURL(join(root, "entry.js")).href;
 rmSync(root, { recursive: true, force: true });
 mkdirSync(root, { recursive: true });
 
@@ -83,7 +85,7 @@ assert(localRequire("./data.toml").owner.name === "cottontail", "createRequire T
 assert(localRequire("./data.txt").default === "plain text\n", "createRequire text loader mismatch");
 
 const paths = _nodeModulePaths(root);
-assert(paths[0].endsWith("/node_modules"), "_nodeModulePaths first entry mismatch");
+assert(paths[0] === join(root, "node_modules"), "_nodeModulePaths first entry mismatch");
 assert(Array.isArray(_resolveLookupPaths("left-pad", { filename: `${root}/entry.js` })), "_resolveLookupPaths package mismatch");
 assert(_findPath("sample.cjs", [root]) === modulePath, "_findPath mismatch");
 assert(_stat(modulePath) === 0, "_stat file mismatch");
@@ -113,7 +115,7 @@ mkdirSync(packageDir, { recursive: true });
 writeFileSync(join(packageDir, "package.json"), JSON.stringify({ name: "package-a", main: "index.js", type: "module" }));
 const packageInfo = _readPackage(packageDir);
 assert(packageInfo.exists === true && packageInfo.name === "package-a", "_readPackage mismatch");
-assert(findPackageJSON("package-a", root)?.endsWith("/package-a/package.json"), "findPackageJSON mismatch");
+assert(findPackageJSON("package-a", root)?.endsWith(join("package-a", "package.json")), "findPackageJSON mismatch");
 
 const exportsPackageDir = join(root, "exports-pkg");
 mkdirSync(join(exportsPackageDir, "features"), { recursive: true });
@@ -149,7 +151,7 @@ assert(
     cacheResult.status === constants.compileCacheStatus.ALREADY_ENABLED,
   "enableCompileCache status mismatch",
 );
-assert(getCompileCacheDir()?.endsWith("/compile-cache"), "getCompileCacheDir mismatch");
+assert(getCompileCacheDir()?.endsWith(`${sep}compile-cache`), "getCompileCacheDir mismatch");
 assert(statSync(getCompileCacheDir()).isDirectory(), "compile cache directory missing");
 const cachedModulePath = join(root, "cached.cjs");
 writeFileSync(cachedModulePath, "module.exports = { cached: true };\n");
@@ -189,7 +191,7 @@ const hookTarget = join(root, "hooked.cjs");
 writeFileSync(hookTarget, "module.exports = { value: 'hooked-resolve' };\n");
 const resolveHook = registerHooks({
   resolve(specifier: string, context: unknown, nextResolve: (specifier: string, context: unknown) => { url: string }) {
-    if (specifier === "hook-target") return { url: `file://${hookTarget}`, shortCircuit: true };
+    if (specifier === "hook-target") return { url: pathToFileURL(hookTarget).href, shortCircuit: true };
     return nextResolve(specifier, context);
   },
 });
@@ -199,7 +201,7 @@ resolveHook.deregister();
 
 const loadHook = registerHooks({
   resolve(specifier: string, context: unknown, nextResolve: (specifier: string, context: unknown) => { url: string }) {
-    if (specifier === "virtual-hook") return { url: `file://${join(root, "virtual-hook.cjs")}`, shortCircuit: true };
+    if (specifier === "virtual-hook") return { url: pathToFileURL(join(root, "virtual-hook.cjs")).href, shortCircuit: true };
     return nextResolve(specifier, context);
   },
   load(url: string, context: unknown, nextLoad: (url: string, context: unknown) => { format?: string; source?: string | null }) {
@@ -215,7 +217,7 @@ loadHook.deregister();
 const dynamicHook = registerHooks({
   resolve(specifier: string, context: unknown, nextResolve: (specifier: string, context: unknown) => { url: string }) {
     if (specifier === "dynamic-hook") {
-      return { url: `file://${join(root, "dynamic-hook.mjs")}`, format: "module", shortCircuit: true };
+      return { url: pathToFileURL(join(root, "dynamic-hook.mjs")).href, format: "module", shortCircuit: true };
     }
     return nextResolve(specifier, context);
   },
@@ -230,11 +232,11 @@ const dynamicHook = registerHooks({
     return nextLoad(url, context);
   },
 });
-const dynamicImported = await (globalThis as any).cottontail.importModule(
-  "dynamic-hook",
-  `file://${join(root, "entry.js")}`,
+const dynamicImported = await (globalThis as any).cottontail.importModule("dynamic-hook", entryUrl);
+assert(
+  dynamicImported.value === "dynamic-hooked",
+  `dynamic import hook named export mismatch: ${Reflect.ownKeys(dynamicImported).map(String).join(",")}`,
 );
-assert(dynamicImported.value === "dynamic-hooked", "dynamic import hook named export mismatch");
 assert(dynamicImported.default.value === "dynamic-hooked", "dynamic import hook default export mismatch");
 dynamicHook.deregister();
 
@@ -242,10 +244,10 @@ const registeredTarget = join(root, "registered-hook.cjs");
 const registeredHooks = join(root, "registered-hooks.cjs");
 writeFileSync(registeredTarget, "module.exports = { value: 'registered' };\n");
 writeFileSync(registeredHooks, `exports.resolve = (specifier, context, nextResolve) => {
-  if (specifier === "registered-hook") return { url: "file://${registeredTarget}", shortCircuit: true };
+  if (specifier === "registered-hook") return { url: ${JSON.stringify(pathToFileURL(registeredTarget).href)}, shortCircuit: true };
   return nextResolve(specifier, context);
 };\n`);
-assert(register(`./${registeredHooks.slice(root.length + 1)}`, `file://${join(root, "entry.js")}`) === undefined, "register should return undefined");
+assert(register(`./${registeredHooks.slice(root.length + 1)}`, entryUrl) === undefined, "register should return undefined");
 assert(localRequire("registered-hook").value === "registered", "register hook module mismatch");
 
 for (const badHooks of [{ resolve: 1 }, { load: 1 }] as never[]) {

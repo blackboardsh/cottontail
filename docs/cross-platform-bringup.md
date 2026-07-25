@@ -165,10 +165,10 @@ or Cottontail behavior failure.
 
 ## Windows x64
 
-Use Windows 11 or Windows Server x64 when possible. On a Windows ARM VM, install
-and run the x64 editions of Node and the shell so the built-in x64 emulation
-exercises the artifact Cottontail will distribute. This command must
-report `win32 x64`:
+Use Windows 11 or Windows Server x64 when possible. On a Windows ARM VM, use
+x64 Node and an x64 MSVC developer environment so the built-in x64 emulation
+exercises the artifact Cottontail will distribute. The PowerShell process
+itself does not need to be x64. This command must report `win32 x64`:
 
 ```powershell
 node -p "process.platform + ' ' + process.arch"
@@ -183,9 +183,11 @@ artifact.
 Install:
 
 1. Git for Windows.
-2. Node.js 24 LTS, x64.
+2. Node.js 24.18.0, x64 (the version pinned by the release workflow).
 3. Visual Studio 2022 Build Tools with the **Desktop development with C++**
    workload and a current Windows SDK.
+4. The Visual Studio vcpkg component, or another `vcpkg.exe` discoverable
+   through `VCPKG_ROOT` or `PATH`.
 
 The full Visual Studio IDE is not required. After installation, open **x64
 Native Tools PowerShell for VS 2022**. Do not use WSL for the Windows build.
@@ -198,7 +200,19 @@ node -p "process.platform + ' ' + process.arch"
 Get-Command node, cl, link | Format-Table Name, Source
 ```
 
-`cl.exe` and `link.exe` must resolve from the Visual Studio tools.
+The first command must report `v24.18.0`. `cl.exe` and `link.exe` must resolve
+from the Visual Studio tools.
+
+The copied Node test harness also requires Python. On Windows ARM, use an x64
+Python executable so Python extensions and child tools stay in the same
+emulated architecture:
+
+```powershell
+$env:PYTHON = (Resolve-Path C:\path\to\x64-python\python.exe).Path
+& $env:PYTHON -c "import platform; print(platform.machine())"
+```
+
+The architecture check must print `AMD64`.
 
 ### Pull and set up
 
@@ -218,18 +232,24 @@ Get-ChildItem vendors\jsc -Recurse -Filter .jsc-vendored
 Get-ChildItem vendors\jsc -Recurse -Filter JavaScriptCore.lib
 Get-ChildItem vendors\jsc -Recurse -Filter SYSTEM_ICU_USAGE
 Get-ChildItem "$env:WindowsSdkDir\Lib" -Recurse -Filter icu.lib
+Get-Item vendors\windows-deps\x64-windows-static\lib\zstd.lib
 ```
+
+On Windows, `scripts/setup.js` installs the dependencies in `vcpkg.json` with
+the `x64-windows-static` triplet into `vendors/windows-deps`. That manifest
+includes Zstandard, and the release links `zstd.lib` statically. Rerun setup
+after changing `vcpkg.json`, or whenever a required library is absent. An
+ambient `zstd.dll` on `PATH` is not a substitute for the vendored static
+library.
 
 ### Run the GitHub Actions sequence
 
 ```powershell
-node scripts/zig.js build test --verbose 2>&1 |
-  Tee-Object vm-windows-test.log
+node scripts/zig.js build test --verbose -j1
 if ($LASTEXITCODE -ne 0) { throw "Windows tests failed" }
 
 node scripts/zig.js build -Doptimize=ReleaseSmall `
-  -Dtarget=x86_64-windows-msvc -Dcpu=baseline --verbose 2>&1 |
-  Tee-Object vm-windows-release.log
+  -Dtarget=x86_64-windows-msvc -Dcpu=baseline --verbose -j1
 if ($LASTEXITCODE -ne 0) { throw "Windows release build failed" }
 
 $output = & .\zig-out\bin\cottontail.exe -p '6 * 7'
@@ -240,6 +260,14 @@ if ($LASTEXITCODE -ne 0 -or $output.Trim() -ne '42') {
 node scripts/package-release.js
 if ($LASTEXITCODE -ne 0) { throw "Windows packaging failed" }
 ```
+
+Run the Zig build commands directly. Do not merge and pipe their output through
+`Tee-Object`: Zig uses its stdout listener protocol internally on Windows, and
+putting that process behind a PowerShell pipeline can deadlock the build.
+On Windows ARM under x64 emulation, keep Zig at `-j1` and run the build, local
+suite, upstream Node suite, upstream Bun suite, and packaging as separate
+phases. Parallelize only lightweight source inspection on a memory-constrained
+VM.
 
 ### Windows diagnostics
 

@@ -7,6 +7,9 @@ const kConnectionCount = Symbol("connectionCount");
 // Allow a stock-JSC host-loop turn for bytes racing a graceful destroy to
 // be consumed before close(2), which otherwise converts the FIN into a reset.
 const gracefulDestroyDrainMilliseconds = 16;
+// Windows named pipes cannot half-close. libuv keeps the readable side alive
+// briefly after writable shutdown, then closes the pipe and reports EOF.
+const windowsPipeEofTimeoutMilliseconds = 50;
 const kSocketAddressState = new WeakMap();
 const kSocketAddressReadonlyProperties = new Set(["address", "port", "family", "flowlabel"]);
 const kBlockListState = new WeakMap();
@@ -114,6 +117,75 @@ function normalizeHighWaterMark(value, fallback = process.platform === "win32" ?
   const number = Number(value);
   if (!Number.isFinite(number) || number < 0) throw outOfRange("options.highWaterMark", ">= 0", value);
   return Math.min(Math.trunc(number), 1024 * 1024 * 1024);
+}
+
+function resolveUnixSocketAlias(path) {
+  const value = String(path);
+  if (process.platform !== "win32") return value;
+  const resolveAlias = globalThis.__cottontailResolveWindowsUnixSocketAlias;
+  return typeof resolveAlias === "function" ? String(resolveAlias(value)) : value;
+}
+
+const windowsPipeConnectQueues = globalThis.__cottontailWindowsPipeConnectQueues ??= new Map();
+
+function windowsPipeConnectKey(path) {
+  return String(path).replaceAll("/", "\\").toLowerCase();
+}
+
+function flushWindowsPipeConnectQueue(state) {
+  if (!state.ready || state.running) return;
+  while (state.entries[0]?.cancelled()) state.entries.shift();
+  const entry = state.entries.shift();
+  if (entry == null) {
+    windowsPipeConnectQueues.delete(state.key);
+    return;
+  }
+
+  state.ready = false;
+  state.running = true;
+  try {
+    entry.connected(cottontail.unixSocketConnect(state.path));
+  } catch (error) {
+    state.ready = true;
+    entry.failed(error);
+  } finally {
+    state.running = false;
+  }
+  if (state.ready) {
+    queueMicrotask(() => flushWindowsPipeConnectQueue(state));
+    return;
+  }
+
+  // A listener in another process cannot notify this queue. Give it time to
+  // create its next named-pipe instance before attempting another connection.
+  state.timer = setTimeout(() => {
+    state.timer = null;
+    state.ready = true;
+    flushWindowsPipeConnectQueue(state);
+  }, 10);
+}
+
+function queueWindowsPipeConnect(path, connected, failed, cancelled) {
+  const key = windowsPipeConnectKey(path);
+  let state = windowsPipeConnectQueues.get(key);
+  if (state == null) {
+    state = { key, path: String(path), entries: [], ready: true, running: false, timer: null };
+    windowsPipeConnectQueues.set(key, state);
+  }
+  state.entries.push({ connected, failed, cancelled });
+  flushWindowsPipeConnectQueue(state);
+}
+
+function advanceWindowsPipeConnectQueue(path) {
+  if (process.platform !== "win32" || path == null) return;
+  const state = windowsPipeConnectQueues.get(windowsPipeConnectKey(path));
+  if (state == null) return;
+  if (state.timer != null) {
+    clearTimeout(state.timer);
+    state.timer = null;
+  }
+  state.ready = true;
+  flushWindowsPipeConnectQueue(state);
 }
 
 // Module evaluation order can reach this file before bun/index.js installs the
@@ -383,6 +455,10 @@ class SocketImpl extends Duplex {
     this._pendingEnd = false;
     this._pendingWrites = [];
     this._outboundWrites = [];
+    this._asyncPipeWriteId = 0;
+    this._asyncPipeWriteEntry = null;
+    this._asyncPipeWriteClose = null;
+    this._asyncPipeWriteNative = false;
     this._writeRetryTimer = null;
     this._watchWriteOnly = false;
     this._nativeReadPaused = false;
@@ -395,6 +471,7 @@ class SocketImpl extends Duplex {
     this._pendingFinalCleanup = null;
     this._destroyCloseTimer = null;
     this._destroyFinalize = null;
+    this._windowsPipeEofTimer = null;
     this._ending = false;
     this._endEmitted = false;
     this._finishEmitted = false;
@@ -545,6 +622,48 @@ class SocketImpl extends Duplex {
     }
   }
 
+  _clearWindowsPipeEofTimer() {
+    if (this._windowsPipeEofTimer != null) {
+      globalThis.clearTimeout(this._windowsPipeEofTimer);
+      this._windowsPipeEofTimer = null;
+    }
+  }
+
+  _armWindowsPipeEofTimer() {
+    this._clearWindowsPipeEofTimer();
+    if (
+      this.destroyed ||
+      this.fd == null ||
+      this._readEndSignaled ||
+      this.readableEnded
+    ) return;
+    this._windowsPipeEofTimer = globalThis.setTimeout(() => {
+      this._windowsPipeEofTimer = null;
+      if (
+        this.destroyed ||
+        this.fd == null ||
+        this._readEndSignaled ||
+        this.readableEnded
+      ) return;
+
+      // Match libuv's close_pipe(); uv__pipe_read_eof() sequence. Detaching
+      // before close prevents a later stream auto-destroy from closing a
+      // descriptor that the OS has already recycled.
+      const fd = this.fd;
+      this._stopRead();
+      this.fd = null;
+      if (this._adoptedRawHandle && "fd" in this._adoptedRawHandle) {
+        try { this._adoptedRawHandle.fd = null; } catch {}
+      }
+      if (!this._nativeHandleTransferred) {
+        try { cottontail.closeFd?.(fd); } catch {}
+      }
+      this._nativeHandleTransferred = false;
+      this._emitEnd();
+    }, windowsPipeEofTimeoutMilliseconds);
+    if (!this._refed) this._windowsPipeEofTimer.unref?.();
+  }
+
   _refreshTimeout() {
     this._clearTimeoutTimer();
     const timeout = Number(this._timeoutValue);
@@ -646,12 +765,28 @@ class SocketImpl extends Duplex {
 
   _flushOutboundWrites() {
     if (this.destroyed || this.fd == null) return;
+    if (
+      process.platform === "win32" &&
+      this._isPipe &&
+      (
+        typeof cottontail.windowsPipeWriteStart === "function" ||
+        typeof cottontail.fsAsyncWriteStart === "function"
+      )
+    ) {
+      this._flushWindowsPipeWrite();
+      return;
+    }
+    // Keep a single readiness callback from monopolizing the JavaScript
+    // thread when Windows accepts a very large write into its TCP buffers.
+    // Node submits socket writes asynchronously, so continue a large logical
+    // write from the native writable watcher after a bounded synchronous
+    // quantum.
+    let flushBudget = 1024 * 1024;
     try {
       while (this._outboundWrites.length > 0) {
         const entry = this._outboundWrites[0];
         let remaining = entry.bytes.subarray(entry.offset);
-        // Native write bindings reject buffers >= 2 GiB; write in bounded slices.
-        if (remaining.byteLength > 0x40000000) remaining = remaining.subarray(0, 0x40000000);
+        if (remaining.byteLength > flushBudget) remaining = remaining.subarray(0, flushBudget);
         if (remaining.byteLength === 0) {
           this._outboundWrites.shift();
           if (typeof entry.callback === "function") queueMicrotask(() => entry.callback());
@@ -667,11 +802,22 @@ class SocketImpl extends Duplex {
         }
         const count = Math.min(remaining.byteLength, Math.trunc(written));
         entry.offset += count;
+        flushBudget -= count;
         this._bytesDispatchedValue += count;
         this._refreshTimeout();
-        if (entry.offset < entry.bytes.byteLength) continue;
+        if (entry.offset < entry.bytes.byteLength) {
+          if (flushBudget <= 0) {
+            this._scheduleOutboundFlush();
+            return;
+          }
+          continue;
+        }
         this._outboundWrites.shift();
         if (typeof entry.callback === "function") queueMicrotask(() => entry.callback());
+        if (flushBudget <= 0 && this._outboundWrites.length > 0) {
+          this._scheduleOutboundFlush();
+          return;
+        }
       }
     } catch (error) {
       this._failOutboundWrites(error);
@@ -683,6 +829,85 @@ class SocketImpl extends Duplex {
     } else if (this._watchId) {
       cottontail.fdWatchSetWritable?.(this._watchId, false);
     }
+  }
+
+  _flushWindowsPipeWrite() {
+    if (this.destroyed || this.fd == null || this._asyncPipeWriteId) return;
+    const entry = this._outboundWrites[0];
+    if (entry == null) return;
+    let remaining = entry.bytes.subarray(entry.offset);
+    if (remaining.byteLength > 0x40000000) remaining = remaining.subarray(0, 0x40000000);
+    if (remaining.byteLength === 0) {
+      this._outboundWrites.shift();
+      if (typeof entry.callback === "function") queueMicrotask(() => entry.callback());
+      this._flushWindowsPipeWrite();
+      return;
+    }
+
+    const listeners = installFdWatchDispatcher();
+    let requestId;
+    const nativePipeWrite = typeof cottontail.windowsPipeWriteStart === "function";
+    try {
+      requestId = Number(nativePipeWrite
+        ? cottontail.windowsPipeWriteStart(this.fd, remaining, this._refed)
+        : cottontail.fsAsyncWriteStart(
+            this.fd,
+            remaining,
+            0,
+            remaining.byteLength,
+            null,
+          ));
+      if (!Number.isInteger(requestId) || requestId <= 0) {
+        throw new Error("failed to queue Windows pipe write");
+      }
+    } catch (error) {
+      this._failOutboundWrites(error);
+      return;
+    }
+
+    this._asyncPipeWriteId = requestId;
+    this._asyncPipeWriteEntry = entry;
+    this._asyncPipeWriteNative = nativePipeWrite;
+    listeners.set(requestId, _wrapAsyncCallback((event) => {
+      if (this._asyncPipeWriteId !== requestId) return;
+      listeners.delete(requestId);
+      if (nativePipeWrite) {
+        try { cottontail.windowsPipeWriteRelease?.(requestId); } catch {}
+      }
+      this._asyncPipeWriteId = 0;
+      this._asyncPipeWriteEntry = null;
+      this._asyncPipeWriteNative = false;
+
+      const closeAfterWrite = this._asyncPipeWriteClose;
+      if (closeAfterWrite != null) {
+        this._asyncPipeWriteClose = null;
+        closeAfterWrite();
+        return;
+      }
+      if (this.destroyed || this.fd == null) return;
+      if (event?.type === "error" || event?.type === "fs-cancel" || event?.type === "pipe-write-cancel") {
+        const error = new Error(event?.message || "Windows pipe write failed");
+        if (event?.code != null) error.code = String(event.code);
+        if (event?.errno != null) error.errno = Number(event.errno);
+        this._failOutboundWrites(error);
+        return;
+      }
+
+      const written = Number(event?.result ?? 0);
+      if (!Number.isFinite(written) || written <= 0) {
+        this._failOutboundWrites(new Error("Windows pipe write failed"));
+        return;
+      }
+      const count = Math.min(remaining.byteLength, Math.trunc(written));
+      entry.offset += count;
+      this._bytesDispatchedValue += count;
+      this._refreshTimeout();
+      if (entry.offset >= entry.bytes.byteLength) {
+        if (this._outboundWrites[0] === entry) this._outboundWrites.shift();
+        if (typeof entry.callback === "function") queueMicrotask(() => entry.callback());
+      }
+      this._flushWindowsPipeWrite();
+    }));
   }
 
   _failOutboundWrites(error) {
@@ -887,6 +1112,7 @@ class SocketImpl extends Duplex {
       if (event.type === "data") {
         if (this._onread) {
           this._deliverOnread(event.data ?? new ArrayBuffer(0));
+          if (this._windowsPipeEofTimer != null) this._armWindowsPipeEofTimer();
           return;
         }
         const chunk = chunkFromBytes(event.data ?? new ArrayBuffer(0), this.encrypted ? this._encoding : null);
@@ -895,10 +1121,12 @@ class SocketImpl extends Duplex {
           this.bytesRead += length;
           this._emitData(chunk);
           this._refreshTimeout();
+          if (this._windowsPipeEofTimer != null) this._armWindowsPipeEofTimer();
         }
         return;
       }
       if (event.type === "end") {
+        this._clearWindowsPipeEofTimer();
         this._stopRead();
         this._emitEnd();
         if (this._outboundWrites.length > 0) this._scheduleOutboundFlush();
@@ -944,6 +1172,9 @@ class SocketImpl extends Duplex {
   _resetCompletedConnection() {
     const completed = this.destroyed || this.writableEnded || this.readableEnded || this._closeEmitted;
     if (!completed) return;
+    if (this._asyncPipeWriteId) {
+      throw makeNodeError(Error, "Socket is still closing", "ERR_SOCKET_CLOSED");
+    }
 
     // A finish callback can run before the peer FIN has driven the socket
     // through destroy(). Reconnecting at that point must not orphan the old fd.
@@ -965,6 +1196,11 @@ class SocketImpl extends Duplex {
     this._pendingEnd = false;
     this._pendingWrites = [];
     this._outboundWrites = [];
+    this._asyncPipeWriteId = 0;
+    this._asyncPipeWriteEntry = null;
+    this._asyncPipeWriteClose = null;
+    this._asyncPipeWriteNative = false;
+    this._clearWindowsPipeEofTimer();
     this._ending = false;
     this._endEmitted = false;
     this._finishEmitted = false;
@@ -1385,8 +1621,17 @@ class SocketImpl extends Duplex {
         return this;
       }
       if (options.path != null) {
-        const result = cottontail.unixSocketConnect(String(options.path));
-        attachConnected(result);
+        const path = resolveUnixSocketAlias(options.path);
+        if (process.platform === "win32") {
+          queueWindowsPipeConnect(
+            path,
+            attachConnected,
+            failConnect,
+            () => this.destroyed || !this.connecting,
+          );
+        } else {
+          attachConnected(cottontail.unixSocketConnect(path));
+        }
         return this;
       }
       // Connecting to a wildcard address targets the corresponding loopback.
@@ -1484,6 +1729,13 @@ class SocketImpl extends Duplex {
     this._pendingFinalCallback = null;
     if (!this._nativeShutdownSent && this.fd != null) {
       this._nativeShutdownSent = true;
+      if (process.platform === "win32" && this._isPipe) {
+        queueMicrotask(() => {
+          callback();
+          if (!this.destroyed && this.fd != null) this._armWindowsPipeEofTimer();
+        });
+        return;
+      }
       try {
         cottontail.tcpSocketShutdown?.(this.fd);
       } catch (error) {
@@ -1521,6 +1773,7 @@ class SocketImpl extends Duplex {
     this.connecting = false;
     this._hadError = Boolean(error);
     this._clearTimeoutTimer();
+    this._clearWindowsPipeEofTimer();
     if (this._writeRetryTimer != null) {
       clearTimeout(this._writeRetryTimer);
       this._writeRetryTimer = null;
@@ -1554,6 +1807,14 @@ class SocketImpl extends Duplex {
       }
     };
     callback(error);
+    if (this._asyncPipeWriteId) {
+      this._asyncPipeWriteClose = closeHandle;
+      try {
+        if (this._asyncPipeWriteNative) cottontail.windowsPipeWriteCancel?.(this._asyncPipeWriteId);
+        else cottontail.fsAsyncCancel?.(this._asyncPipeWriteId);
+      } catch {}
+      return;
+    }
     if (!error && !immediate && fd != null && this._watchId && !this.readableEnded) {
       // Match Bun's deferred handle close: let one poll turn drain bytes that
       // raced with destroy(), then close even if the peer stays open.
@@ -1660,8 +1921,12 @@ class SocketImpl extends Duplex {
     this._refed = true;
     this._writeRetryTimer?.ref?.();
     this._destroyCloseTimer?.ref?.();
+    this._windowsPipeEofTimer?.ref?.();
     for (const timer of this._connectAttemptTimers) timer.ref?.();
     if (this._watchId) cottontail.fdWatchSetRef?.(this._watchId, true);
+    if (this._asyncPipeWriteId && this._asyncPipeWriteNative) {
+      cottontail.windowsPipeWriteSetRef?.(this._asyncPipeWriteId, true);
+    }
     for (const id of this._connectAttemptIds) cottontail.tcpSocketConnectSetRef?.(id, true);
     return this;
   }
@@ -1670,8 +1935,12 @@ class SocketImpl extends Duplex {
     this._timeoutTimer?.unref?.();
     this._writeRetryTimer?.unref?.();
     this._destroyCloseTimer?.unref?.();
+    this._windowsPipeEofTimer?.unref?.();
     for (const timer of this._connectAttemptTimers) timer.unref?.();
     if (this._watchId) cottontail.fdWatchSetRef?.(this._watchId, false);
+    if (this._asyncPipeWriteId && this._asyncPipeWriteNative) {
+      cottontail.windowsPipeWriteSetRef?.(this._asyncPipeWriteId, false);
+    }
     for (const id of this._connectAttemptIds) cottontail.tcpSocketConnectSetRef?.(id, false);
     return this;
   }
@@ -1836,8 +2105,8 @@ class ServerImpl extends EventEmitter {
           continue;
         }
         const socket = event.value;
+        if (!this.pauseOnConnect) socket.resume();
         this.emit("connection", socket);
-        if (!this.pauseOnConnect && !socket.isPaused()) socket.resume();
       }
       this._emitCloseIfDrained();
     };
@@ -1925,7 +2194,8 @@ class ServerImpl extends EventEmitter {
         this._address = this._isPipe ? this._path : result.address ?? null;
       }
       this.listening = true;
-      if (!startAcceptWatch(this, this._fd, !this._unref, () => this._acceptPending())) {
+      const pollNamedPipe = this._isPipe && process.platform === "win32";
+      if (pollNamedPipe || !startAcceptWatch(this, this._fd, !this._unref, () => this._acceptPending())) {
         this._acceptTimer = setInterval(() => this._acceptPending(), 1);
         if (this._unref) this._acceptTimer?.unref?.();
       }
@@ -1962,7 +2232,8 @@ class ServerImpl extends EventEmitter {
       server._address = server._isPipe ? server._path : null;
     }
     server.listening = true;
-    if (!startAcceptWatch(server, server._fd, true, () => server._acceptPending())) {
+    const pollNamedPipe = server._isPipe && process.platform === "win32";
+    if (pollNamedPipe || !startAcceptWatch(server, server._fd, true, () => server._acceptPending())) {
       server._acceptTimer = setInterval(() => server._acceptPending(), 1);
     }
     queueMicrotask(() => server.emit("listening"));
@@ -1981,6 +2252,7 @@ class ServerImpl extends EventEmitter {
         return;
       }
       if (accepted == null) return;
+      if (this._isPipe) advanceWindowsPipeConnectQueue(this._path);
       const remoteAddress = accepted.remote?.address;
       const remoteFamilyNumber = isIP(remoteAddress);
       const blocked = remoteFamilyNumber !== 0 && this.blockList?.check(remoteAddress, `ipv${remoteFamilyNumber}`);
@@ -2024,6 +2296,10 @@ class ServerImpl extends EventEmitter {
       if (socket == null) continue;
       socket.server = this;
       socket.isServer = true;
+      // Hold plain accepted sockets at the native read boundary until their
+      // connection callback is dispatched. This keeps bytes in the kernel
+      // when a callback transfers the handle to a replacement Socket.
+      if (!socket.encrypted && !this.pauseOnConnect) socket.pause();
       this._incrementConnections();
       this._activeSockets.add(socket);
       socket.once("close", () => {
@@ -2041,8 +2317,8 @@ class ServerImpl extends EventEmitter {
         if (connectAttemptId != null || this._pendingAcceptEvents.length > 0) {
           this._queueAcceptEvent("connection", socket, connectAttemptId);
         } else {
+          if (!this.pauseOnConnect) socket.resume();
           this.emit("connection", socket);
-          if (!this.pauseOnConnect && !socket.isPaused()) socket.resume();
         }
       }
     }
@@ -2060,10 +2336,16 @@ class ServerImpl extends EventEmitter {
     this._closePending = true;
     stopAcceptWatch(this);
     if (this._fd != null) {
-      try { cottontail.closeFd?.(this._fd); } catch {}
+      try {
+        if (this._isPipe && typeof cottontail.unixServerClose === "function") {
+          if (cottontail.unixServerClose(this._fd) !== true) cottontail.closeFd?.(this._fd);
+        } else {
+          cottontail.closeFd?.(this._fd);
+        }
+      } catch {}
       this._fd = null;
     }
-    if (ownedPipePath != null) {
+    if (ownedPipePath != null && process.platform !== "win32") {
       try { cottontail.unlinkSync?.(ownedPipePath); } catch {}
     }
     this._ownsPipePath = false;

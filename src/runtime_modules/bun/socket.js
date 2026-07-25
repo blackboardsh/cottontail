@@ -716,6 +716,16 @@ function completeBunTlsHandshake(attached) {
   }
 }
 
+function validateConnectedSocketFd(fd) {
+  if (globalThis.process?.platform === "win32") {
+    // Winsock SOCKET values are kernel handles, not CRT descriptors, so fstat
+    // rejects them. getpeername validates both the handle and connected state.
+    cottontail.tcpSocketAddress(fd, true);
+    return;
+  }
+  cottontail.fstatSync(fd);
+}
+
 export function connect(options) {
   if (arguments.length === 0) throw bunSocketInvalidArgument("Missing argument");
   if (options === null || typeof options !== "object") throw new TypeError("Bun socket options must be an object");
@@ -731,7 +741,7 @@ export function connect(options) {
       if (normalized.fd !== undefined) {
         transport = new nodeNet.Socket({ allowHalfOpen: normalized.allowHalfOpen });
         try {
-          cottontail.fstatSync(normalized.fd);
+          validateConnectedSocketFd(normalized.fd);
           transport._attachFd(normalized.fd, undefined, undefined, true);
         } catch (error) {
           state.connecting = false;
@@ -792,7 +802,7 @@ export function connect(options) {
       attached = attachBunSocketHandlers(socket, handlerState, options.data, state);
       socket.once("connect", onConnect);
       try {
-        cottontail.fstatSync(normalized.fd);
+        validateConnectedSocketFd(normalized.fd);
         socket._attachFd(normalized.fd, undefined, undefined, true);
       } catch (error) {
         state.connecting = false;

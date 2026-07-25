@@ -57,7 +57,13 @@ const childResult = cottontail.spawnSync(childBinary, [childScript], {
 });
 
 assert(childResult.status === 0, `spawnSync status mismatch: ${childResult.status}`);
-assert(childResult.stdout.includes(`spawn cwd = ${childCwd}`), 'spawnSync cwd mismatch');
+const expectedChildCwd = cottontail.platform() === 'win32'
+  ? childCwd.replaceAll('/', '\\')
+  : childCwd;
+assert(
+  childResult.stdout.includes(`spawn cwd = ${expectedChildCwd}`),
+  `spawnSync cwd mismatch: ${JSON.stringify(childResult.stdout)}`
+);
 assert(childResult.stdout.includes('spawn token = spawned'), 'spawnSync env mismatch');
 
 console.log('host api passed');

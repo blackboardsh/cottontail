@@ -1,9 +1,19 @@
 import { ok, strictEqual, throws } from "node:assert/strict";
 import constantsDefault, { EACCES } from "node:constants";
 import * as constants from "node:constants";
+import {
+  closeSync,
+  constants as fsConstants,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { createRequire } from "node:module";
-import { constants as fsConstants } from "node:fs";
-import { constants as osConstants } from "node:os";
+import { constants as osConstants, tmpdir } from "node:os";
+import { join } from "node:path";
 import { getSystemErrorMap, getSystemErrorName } from "node:util";
 import {
   constants as zlibConstants,
@@ -134,6 +144,55 @@ if ("O_CREAT" in expectedPlatformConstants) {
     "EADDRINUSE",
     "system error map mismatch",
   );
+}
+
+if (process.platform === "win32") {
+  strictEqual(constantsDefault.EADDRINUSE, 100, "Windows EADDRINUSE mismatch");
+  strictEqual(constantsDefault.EAGAIN, 11, "Windows EAGAIN mismatch");
+  strictEqual(constantsDefault.O_CREAT, 0x100, "Windows O_CREAT mismatch");
+  strictEqual(constantsDefault.O_EXCL, 0x400, "Windows O_EXCL mismatch");
+  strictEqual(constantsDefault.O_TRUNC, 0x200, "Windows O_TRUNC mismatch");
+  strictEqual(constantsDefault.UV_FS_O_FILEMAP, 0x20000000, "Windows UV_FS_O_FILEMAP mismatch");
+  strictEqual(constantsDefault.SIGABRT, 22, "Windows SIGABRT mismatch");
+  strictEqual(constantsDefault.SIGBREAK, 21, "Windows SIGBREAK mismatch");
+  strictEqual(constantsDefault.WSAEADDRINUSE, 10048, "Windows WSAEADDRINUSE mismatch");
+  strictEqual(constants.SIGBREAK, 21, "ESM Windows SIGBREAK mismatch");
+  strictEqual(constants.WSAEADDRINUSE, 10048, "ESM Windows WSAEADDRINUSE mismatch");
+  strictEqual(requiredConstants.SIGBREAK, 21, "required Windows SIGBREAK mismatch");
+  strictEqual(requiredConstants.WSAEADDRINUSE, 10048, "required Windows WSAEADDRINUSE mismatch");
+  strictEqual(fsConstants.O_CREAT, 0x100, "fs.constants Windows O_CREAT mismatch");
+  strictEqual(fsConstants.O_EXCL, 0x400, "fs.constants Windows O_EXCL mismatch");
+  strictEqual(fsConstants.O_TRUNC, 0x200, "fs.constants Windows O_TRUNC mismatch");
+  strictEqual(Object.hasOwn(fsConstants, "O_DIRECTORY"), false, "Windows fs.constants should omit O_DIRECTORY");
+  strictEqual(osConstants.errno.WSAEADDRINUSE, 10048, "os.constants Windows Winsock errno mismatch");
+  strictEqual(osConstants.signals.SIGABRT, 22, "os.constants Windows SIGABRT mismatch");
+  strictEqual(osConstants.signals.SIGBREAK, 21, "os.constants Windows SIGBREAK mismatch");
+  strictEqual(Object.hasOwn(osConstants.signals, "SIGALRM"), false, "Windows os.constants should omit SIGALRM");
+  strictEqual(Object.keys(osConstants.dlopen).length, 0, "Windows os.constants.dlopen should be empty");
+
+  const constantsTempDir = mkdtempSync(join(tmpdir(), "cottontail-windows-constants-"));
+  try {
+    const truncatePath = join(constantsTempDir, "truncate.txt");
+    writeFileSync(truncatePath, "stale");
+    const truncateFd = openSync(truncatePath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC);
+    try {
+      writeSync(truncateFd, "fresh");
+    } finally {
+      closeSync(truncateFd);
+    }
+    strictEqual(readFileSync(truncatePath, "utf8"), "fresh", "numeric Windows O_TRUNC should reach the CRT");
+
+    const exclusivePath = join(constantsTempDir, "exclusive.txt");
+    const exclusiveFd = openSync(exclusivePath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL);
+    closeSync(exclusiveFd);
+    throws(
+      () => openSync(exclusivePath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL),
+      (error: NodeJS.ErrnoException) => error?.code === "EEXIST",
+      "numeric Windows O_EXCL should reach the CRT",
+    );
+  } finally {
+    rmSync(constantsTempDir, { recursive: true, force: true });
+  }
 }
 
 const payload = "cottontail zlib payload";

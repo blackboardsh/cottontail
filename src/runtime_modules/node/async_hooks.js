@@ -14,6 +14,7 @@ let nextTickJobHead = 0;
 let drainingNextTickJobs = false;
 let nextTickDrainScheduled = false;
 let nextTickPriorityArmed = true;
+let nextTickFatalExceptionPending = false;
 const promiseAsyncIds = new WeakMap();
 const gcTrackedAsyncResourceIds = new Set();
 const asyncResourceFinalizer = typeof FinalizationRegistry === "function"
@@ -665,7 +666,7 @@ Object.defineProperty(globalThis, "__cottontailWrapAsyncCallback", {
 
 let nativeQueueMicrotaskRef = null;
 
-function drainNextTickJobs() {
+function drainNextTickJobs(routeExceptions = false) {
   if (drainingNextTickJobs || nextTickJobHead >= nextTickJobs.length) return 0;
   drainingNextTickJobs = true;
   nextTickDrainScheduled = false;
@@ -673,7 +674,24 @@ function drainNextTickJobs() {
   const start = nextTickJobHead;
   try {
     while (nextTickJobHead < nextTickJobs.length) {
-      nextTickJobs[nextTickJobHead++]();
+      const job = nextTickJobs[nextTickJobHead++];
+      try {
+        job();
+      } catch (error) {
+        if (!routeExceptions) throw error;
+        if (typeof globalThis.cottontail?.routeUncaughtException === "function") {
+          if (!globalThis.cottontail.routeUncaughtException(error)) {
+            nextTickFatalExceptionPending = true;
+            return nextTickJobHead - start;
+          }
+          continue;
+        }
+        const fatalException = globalThis.process?._fatalException;
+        if (typeof fatalException !== "function" ||
+            !fatalException.call(globalThis.process, error, false)) {
+          throw error;
+        }
+      }
     }
     return nextTickJobHead - start;
   } finally {
@@ -685,7 +703,9 @@ function drainNextTickJobs() {
 }
 
 function drainNextTicksBeforeMicrotask() {
-  if (nextTickPriorityArmed && nextTickJobHead < nextTickJobs.length) drainNextTickJobs();
+  if (nextTickFatalExceptionPending) return false;
+  if (nextTickPriorityArmed && nextTickJobHead < nextTickJobs.length) drainNextTickJobs(true);
+  return !nextTickFatalExceptionPending;
 }
 
 function nextTickMicrotaskCheckpoint() {
@@ -721,7 +741,8 @@ Object.defineProperty(globalThis, "__cottontailBeforeMicrotask", {
 
 Object.defineProperty(globalThis, "__cottontailBeginNextTickTurn", {
   value() {
-    drainNextTickJobs();
+    drainNextTickJobs(true);
+    if (nextTickFatalExceptionPending) return;
     nextTickPriorityArmed = true;
     syncNextTickHostState();
   },
@@ -810,7 +831,7 @@ function patchGlobalAsyncSchedulers() {
       }
       const wrapped = _wrapAsyncCallback(callback);
       nativeQueueMicrotask(function runQueuedMicrotask() {
-        drainNextTicksBeforeMicrotask();
+        if (!drainNextTicksBeforeMicrotask()) return undefined;
         return wrapped();
       });
     };
@@ -919,7 +940,7 @@ function patchGlobalAsyncSchedulers() {
       let child;
       let childAsyncId = 0;
       const runPromiseCallback = (callback, value, isReject) => {
-        drainNextTicksBeforeMicrotask();
+        if (!drainNextTicksBeforeMicrotask()) return undefined;
         const previousAsyncId = currentAsyncId;
         const previousTriggerAsyncId = currentTriggerAsyncId;
         const previousResource = currentResource;

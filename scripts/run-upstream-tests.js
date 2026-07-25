@@ -57,6 +57,7 @@ function removeTemp(path) {
 
 function removeSnapshotArtifacts(snapshotRoot, runtime) {
   if (externallyManagedSnapshotRoots.has(snapshotRoot)) return;
+  const testRoot = join(snapshotRoot, 'test');
   const installedDependencies = join(snapshotRoot, 'test', 'node_modules');
   const stack = [snapshotRoot];
   while (stack.length > 0) {
@@ -65,6 +66,10 @@ function removeSnapshotArtifacts(snapshotRoot, runtime) {
     try { names = readdirSync(current); } catch { continue; }
     for (const name of names) {
       const path = join(current, name);
+      // Node's own tests use .tmp.<thread-id> directories, and the copied
+      // snapshot contains tracked fixtures under that naming scheme. They are
+      // neither source tests nor safe cleanup targets.
+      if (runtime === 'node' && current === testRoot && /^\.tmp\.\d+$/.test(name)) continue;
       const generated = name === '.cottontail-tmp' ||
         name === '.cottontail-compile-cache' ||
         name.startsWith('.cottontail-eval-') ||
@@ -528,6 +533,7 @@ function discoverRunnableFiles(snapshotRoot, runtime = 'node') {
     for (const name of readdirSync(current)) {
       const path = join(current, name);
       if (path === installedDependencies) continue;
+      if (current === testRoot && /^\.tmp\.\d+$/.test(name)) continue;
       const stat = lstatSync(path);
       if (stat.isDirectory() && !stat.isSymbolicLink()) {
         stack.push(path);
@@ -897,7 +903,18 @@ function runNodeHarness(target, entries, snapshotRoot, expectedFailure = false) 
       (total, selector) => total + inventory.pathsBySelector.get(selector).length,
       0,
     );
-    const args = ['tools/test.py', '--shell', binaryPath, '-j4', '--report', ...chunk];
+    const pythonBootstrap = [
+      'import os,runpy,sys',
+      'root=os.getcwd()',
+      "script=os.path.join('tools','test.py')",
+      "sys.path[:0]=[os.path.join(root,'tools'),root]",
+      'sys.argv[0]=script',
+      "runpy.run_path(script,run_name='__main__')",
+    ].join(';');
+    const harnessArgs = ['--shell', binaryPath, '-j4', '--report', ...chunk];
+    const args = process.platform === 'win32'
+      ? ['-c', pythonBootstrap, ...harnessArgs]
+      : ['tools/test.py', ...harnessArgs];
     const result = spawnSync(pythonPath, args, {
       cwd: snapshotRoot,
       env: {

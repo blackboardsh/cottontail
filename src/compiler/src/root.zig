@@ -1393,6 +1393,14 @@ pub const sys = struct {
         return exists(pathname);
     }
 
+    pub fn getFdPath(fd: FD, out_buffer: *PathBuffer) SysMaybe([]u8) {
+        const length = fd.stdDir().realPath(
+            std.Io.Threaded.global_single_threaded.io(),
+            out_buffer,
+        ) catch |err| return .{ .err = .fromZigErr(err, "getFdPath", "") };
+        return .{ .result = out_buffer[0..length] };
+    }
+
     pub fn getFileAttributes(pathname: anytype) ?WindowsFileAttributes {
         const path_slice = std.mem.sliceTo(pathname, 0);
         const stat_value = std.Io.Dir.cwd().statFile(
@@ -1574,6 +1582,10 @@ pub const Global = struct {
 
     pub fn crash() noreturn {
         @panic("fatal compiler error");
+    }
+
+    pub fn exit(code: u32) noreturn {
+        std.process.exit(@truncate(code));
     }
 };
 
@@ -2616,8 +2628,15 @@ pub fn TrivialDeinit(comptime Type: type) fn (*Type) void {
     }.deinit;
 }
 
-pub fn reinterpretSlice(comptime To: type, input: anytype) []const To {
-    return std.mem.bytesAsSlice(To, std.mem.sliceAsBytes(input));
+fn ReinterpretSliceType(comptime To: type, comptime Input: type) type {
+    return if (@typeInfo(Input).pointer.is_const) []const To else []To;
+}
+
+pub fn reinterpretSlice(comptime To: type, input: anytype) ReinterpretSliceType(To, @TypeOf(input)) {
+    const is_const = @typeInfo(@TypeOf(input)).pointer.is_const;
+    const bytes = std.mem.sliceAsBytes(input);
+    const new_ptr = @as(if (is_const) [*]const To else [*]To, @ptrCast(@alignCast(bytes.ptr)));
+    return new_ptr[0..@divTrunc(bytes.len, @sizeOf(To))];
 }
 
 pub const cpp = struct {

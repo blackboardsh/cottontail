@@ -71,6 +71,17 @@ const char* cottontail_icu_last_error(void)
     return last_error[0] ? last_error : "unknown ICU initialization error";
 }
 
+void* cottontail_icu_resolve_symbol(const char* name)
+{
+    if (!initialized || !name)
+        return NULL;
+    for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); ++i) {
+        if (strcmp(entries[i].name, name) == 0)
+            return *entries[i].target;
+    }
+    return NULL;
+}
+
 static void commit(void** resolved)
 {
     for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); ++i)

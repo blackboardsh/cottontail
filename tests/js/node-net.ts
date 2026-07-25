@@ -140,15 +140,24 @@ assert(backpressureClient.writableLength === 0, "Socket writableLength should dr
 backpressureClient.end();
 await new Promise<void>((resolve) => backpressureServer.close(() => resolve()));
 
-const ipcDir = "/tmp";
-const ipcPath = `${ipcDir}/node-net-${Date.now()}.sock`;
-try { cottontail.unlinkSync?.(ipcPath); } catch {}
+const ipcPath = process.platform === "win32"
+  ? `\\\\.\\pipe\\cottontail-node-net-${process.pid}-${Date.now()}-雪`
+  : `/tmp/node-net-${process.pid}-${Date.now()}.sock`;
+if (process.platform !== "win32") {
+  try { cottontail.unlinkSync?.(ipcPath); } catch {}
+}
+let ipcConnectionNumber = 0;
 const ipcServer = createServer((serverSocket) => {
   assert(serverSocket.remoteFamily === "Unix", "IPC server socket remote family mismatch");
+  const connectionNumber = ++ipcConnectionNumber;
   serverSocket.setEncoding("utf8");
+  let payload = "";
   serverSocket.on("data", (chunk) => {
-    assert(chunk === "ipc-ping", "IPC server payload mismatch");
-    serverSocket.end("ipc-pong");
+    payload += chunk;
+    const expected = `ipc-ping-${connectionNumber}`;
+    if (payload.length < expected.length) return;
+    assert(payload === expected, "IPC server payload mismatch");
+    serverSocket.end(`ipc-pong-${connectionNumber}`);
   });
 });
 await new Promise<void>((resolve, reject) => {
@@ -156,26 +165,38 @@ await new Promise<void>((resolve, reject) => {
   ipcServer.listen(ipcPath, () => resolve());
 });
 assert(ipcServer.address() === ipcPath, "IPC server address should be socket path");
-const ipcClient = createConnection({ path: ipcPath });
-const ipcResponse = await new Promise<string>((resolve, reject) => {
-  let data = "";
-  ipcClient.setEncoding("utf8");
-  ipcClient.once("error", reject);
-  ipcClient.once("connect", () => {
-    assert(ipcClient.readyState === "open", "IPC client readyState mismatch");
-    assert(ipcClient.remoteFamily === "Unix", "IPC client remote family mismatch");
-    ipcClient.setNoDelay();
-    ipcClient.setKeepAlive();
-    ipcClient.write("ipc-ping");
+async function exchangeIpc(connectionNumber: number) {
+  const ipcClient = createConnection({ path: ipcPath });
+  return await new Promise<string>((resolve, reject) => {
+    let data = "";
+    ipcClient.setEncoding("utf8");
+    ipcClient.once("error", reject);
+    ipcClient.once("connect", () => {
+      assert(ipcClient.readyState === "open", "IPC client readyState mismatch");
+      assert(ipcClient.remoteFamily === "Unix", "IPC client remote family mismatch");
+      ipcClient.setNoDelay();
+      ipcClient.setKeepAlive();
+      ipcClient.write(`ipc-ping-${connectionNumber}`);
+    });
+    ipcClient.on("data", (chunk) => {
+      data += chunk;
+    });
+    ipcClient.on("end", () => resolve(data));
   });
-  ipcClient.on("data", (chunk) => {
-    data += chunk;
-  });
-  ipcClient.on("end", () => resolve(data));
-});
-assert(ipcResponse === "ipc-pong", "IPC client response mismatch");
+}
+assert(await exchangeIpc(1) === "ipc-pong-1", "first IPC client response mismatch");
+assert(await exchangeIpc(2) === "ipc-pong-2", "second IPC client response mismatch");
 await new Promise<void>((resolve) => ipcServer.close(() => resolve()));
-assert(!cottontail.existsSync?.(ipcPath), "IPC socket path should be removed on close");
+if (process.platform === "win32") {
+  const closedClient = createConnection({ path: ipcPath });
+  const closeError = await new Promise<any>((resolve, reject) => {
+    closedClient.once("error", resolve);
+    closedClient.once("connect", () => reject(new Error("closed IPC server accepted a new connection")));
+  });
+  assert(closeError?.code === "ENOENT" || closeError?.code === "ECONNREFUSED", `closed IPC error mismatch: ${closeError?.code}`);
+} else {
+  assert(!cottontail.existsSync?.(ipcPath), "IPC socket path should be removed on close");
+}
 
 const handle = _createServerHandle("127.0.0.1", 0, 4);
 assert(handle instanceof TCP, "_createServerHandle should return a TCP handle");

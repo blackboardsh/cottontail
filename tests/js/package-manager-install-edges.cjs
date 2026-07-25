@@ -7,8 +7,12 @@ const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 const { gzipSync } = require("node:zlib");
 
-const cottontail = path.resolve(process.argv[2] || "zig-out/bin/cottontail");
+const cottontail = path.resolve(
+  process.argv[2] ||
+    path.join("zig-out", "bin", process.platform === "win32" ? "cottontail.exe" : "cottontail"),
+);
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "cottontail-install-edges-"));
+const childTimeout = process.platform === "win32" ? 120_000 : 30_000;
 
 function writeJson(filename, value) {
   fs.mkdirSync(path.dirname(filename), { recursive: true });
@@ -71,7 +75,7 @@ function runInstall(root, home, args = [], extraEnvironment = {}) {
     cwd: root,
     env: isolatedEnvironment(home, extraEnvironment),
     encoding: "utf8",
-    timeout: 30_000,
+    timeout: childTimeout,
   });
 }
 
@@ -79,7 +83,7 @@ function expectSuccess(label, result) {
   assert.equal(
     result.status,
     0,
-    `${label} failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+    `${label} failed\nerror:\n${result.error?.stack || result.error || ""}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
   );
 }
 
@@ -93,27 +97,59 @@ function waitForFile(filename) {
 }
 
 function testNodeGypLifecycle() {
-  if (process.platform === "win32") return;
-
   const emptyPath = path.join(scratch, "empty-path");
-  const fakeNodeGyp = path.join(scratch, "fake-node-gyp");
-  fs.mkdirSync(emptyPath, { recursive: true });
-  fs.writeFileSync(
-    fakeNodeGyp,
-    "#!/bin/sh\n" +
-      "printf '%s|%s|%s\\n' \"$npm_package_name\" \"$npm_lifecycle_event\" \"$*\" >> \"$INIT_CWD/node-gyp-events\"\n" +
-      ": > \"$PWD/build.node\"\n",
-    { mode: 0o755 },
+  const fakeNodeGyp = path.join(
+    scratch,
+    process.platform === "win32" ? "fake-node-gyp.cjs" : "fake-node-gyp",
   );
-  const lifecycleEnvironment = { PATH: emptyPath, npm_config_node_gyp: fakeNodeGyp };
+  fs.mkdirSync(emptyPath, { recursive: true });
+  if (process.platform === "win32") {
+    fs.writeFileSync(
+      fakeNodeGyp,
+      [
+        '"use strict";',
+        'const fs = require("node:fs");',
+        'const path = require("node:path");',
+        "fs.appendFileSync(",
+        '  path.join(process.env.INIT_CWD, "node-gyp-events"),',
+        '  `${process.env.npm_package_name}|${process.env.npm_lifecycle_event}|${process.argv.slice(2).join(" ")}\\n`,',
+        ");",
+        'fs.writeFileSync(path.join(process.cwd(), "build.node"), "");',
+        "",
+      ].join("\n"),
+    );
+  } else {
+    fs.writeFileSync(
+      fakeNodeGyp,
+      "#!/bin/sh\n" +
+        "printf '%s|%s|%s\\n' \"$npm_package_name\" \"$npm_lifecycle_event\" \"$*\" >> \"$INIT_CWD/node-gyp-events\"\n" +
+        ": > \"$PWD/build.node\"\n",
+      { mode: 0o755 },
+    );
+  }
+  const lifecyclePath = process.platform === "win32"
+    ? [emptyPath, path.join(process.env.SystemRoot || "C:\\Windows", "System32")].join(path.delimiter)
+    : emptyPath;
+  const lifecycleEnvironment = { PATH: lifecyclePath, npm_config_node_gyp: fakeNodeGyp };
 
   const root = path.join(scratch, "root-node-gyp");
   const home = path.join(scratch, "root-node-gyp-home");
+  fs.mkdirSync(root, { recursive: true });
+  fs.writeFileSync(
+    path.join(root, "record-lifecycle.cjs"),
+    [
+      '"use strict";',
+      'const fs = require("node:fs");',
+      'const path = require("node:path");',
+      'fs.appendFileSync(path.join(process.env.INIT_CWD, "node-gyp-events"), `${process.argv.slice(2).join("|")}\\n`);',
+      "",
+    ].join("\n"),
+  );
   writeJson(path.join(root, "package.json"), {
     name: "root-node-gyp",
     version: "1.0.0",
     scripts: {
-      postinstall: "printf 'postinstall\\n' >> \"$INIT_CWD/node-gyp-events\"",
+      postinstall: `node record-lifecycle.cjs postinstall "two words" 'single value'`,
     },
   });
   fs.writeFileSync(path.join(root, "binding.gyp"), "{}\n");
@@ -122,7 +158,7 @@ function testNodeGypLifecycle() {
   expectSuccess("automatic root node-gyp", result);
   assert.equal(
     fs.readFileSync(path.join(root, "node-gyp-events"), "utf8"),
-    "root-node-gyp|install|rebuild\npostinstall\n",
+    "root-node-gyp|install|rebuild\npostinstall|two words|single value\n",
   );
   assert.ok(fs.existsSync(path.join(root, "build.node")));
 
@@ -132,21 +168,24 @@ function testNodeGypLifecycle() {
   expectSuccess("repeated automatic root node-gyp", result);
   assert.equal(
     fs.readFileSync(path.join(root, "node-gyp-events"), "utf8"),
-    "root-node-gyp|install|rebuild\npostinstall\n",
+    "root-node-gyp|install|rebuild\npostinstall|two words|single value\n",
   );
 
   writeJson(path.join(root, "package.json"), {
     name: "root-node-gyp",
     version: "1.0.0",
     scripts: {
-      preinstall: "printf 'preinstall\\n' >> \"$INIT_CWD/node-gyp-events\"",
-      postinstall: "printf 'postinstall\\n' >> \"$INIT_CWD/node-gyp-events\"",
+      preinstall: `node record-lifecycle.cjs preinstall "two words" 'single value'`,
+      postinstall: `node record-lifecycle.cjs postinstall "two words" 'single value'`,
     },
   });
   fs.rmSync(path.join(root, "node-gyp-events"));
   result = runInstall(root, home, [], lifecycleEnvironment);
   expectSuccess("preinstall suppresses automatic node-gyp", result);
-  assert.equal(fs.readFileSync(path.join(root, "node-gyp-events"), "utf8"), "preinstall\npostinstall\n");
+  assert.equal(
+    fs.readFileSync(path.join(root, "node-gyp-events"), "utf8"),
+    "preinstall|two words|single value\npostinstall|two words|single value\n",
+  );
 
   writeJson(path.join(root, "package.json"), {
     name: "root-node-gyp",
@@ -177,6 +216,59 @@ function testNodeGypLifecycle() {
   assert.equal(
     fs.readFileSync(path.join(dependencyRoot, "node-gyp-events"), "utf8"),
     "native-dependency|install|rebuild\n",
+  );
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(dependency, "package.json"), "utf8")).dependencies,
+    undefined,
+    "internal lifecycle bootstrap must not auto-install the public bun package",
+  );
+}
+
+function testPackLifecycleQuoting() {
+  const root = path.join(scratch, "pack-lifecycle");
+  const home = path.join(scratch, "pack-lifecycle-home");
+  fs.mkdirSync(root, { recursive: true });
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(
+    path.join(root, "record-pack-lifecycle.cjs"),
+    [
+      '"use strict";',
+      'const fs = require("node:fs");',
+      'fs.appendFileSync("lifecycle.log", `${process.env.npm_lifecycle_event}|${process.argv.slice(2).join("|")}\\n`);',
+      "",
+    ].join("\n"),
+  );
+  const lifecycleCommand = `node record-pack-lifecycle.cjs "two words" 'single value'`;
+  writeJson(path.join(root, "package.json"), {
+    name: "pack-lifecycle",
+    version: "1.0.0",
+    scripts: {
+      prepack: lifecycleCommand,
+      prepare: lifecycleCommand,
+      postpack: lifecycleCommand,
+    },
+  });
+
+  const result = spawnSync(cottontail, ["publish", "--dry-run", "--silent"], {
+    cwd: root,
+    env: isolatedEnvironment(home, { BUN_CONFIG_TOKEN: "pack-lifecycle-token" }),
+    encoding: "utf8",
+    timeout: childTimeout,
+  });
+  expectSuccess("publish dry-run pack lifecycle quoting", result);
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).dependencies,
+    undefined,
+    "internal lifecycle bootstrap must not auto-install the public bun package",
+  );
+  assert.equal(
+    fs.readFileSync(path.join(root, "lifecycle.log"), "utf8"),
+    [
+      "prepack|two words|single value",
+      "prepare|two words|single value",
+      "postpack|two words|single value",
+      "",
+    ].join("\n"),
   );
 }
 
@@ -326,7 +418,12 @@ server.listen(0, () => fs.writeFileSync(portFile, String(server.address().port))
     const result = runInstall(root, home, ["--no-verify"], {
       BUN_CONFIG_TOKEN: "edge-token",
     });
-    expectSuccess("registry edge and minimum release age install", result);
+    expectSuccess(
+      `registry edge and minimum release age install; registry stats: ${
+        fs.existsSync(statsFile) ? fs.readFileSync(statsFile, "utf8") : "<missing>"
+      }`,
+      result,
+    );
     assert.ok(
       fs.lstatSync(path.join(root, "node_modules", "external-registry-package")).isDirectory(),
       "external file package should be materialized as a directory",
@@ -422,8 +519,13 @@ server.listen(0, () => fs.writeFileSync(portFile, String(server.address().port))
 
 try {
   testNodeGypLifecycle();
+  testPackLifecycleQuoting();
   testRegistryAndMinimumAge();
   console.log("package-manager install edges: pass");
 } finally {
-  fs.rmSync(scratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  if (process.env.COTTONTAIL_KEEP_TEMP === "1") {
+    console.error(`preserved package-manager edge fixture: ${scratch}`);
+  } else {
+    fs.rmSync(scratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
 }

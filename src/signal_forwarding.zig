@@ -23,7 +23,9 @@ pub const Scope = struct {
 
     pub fn setChild(self: *Scope, id: std.process.Child.Id) void {
         if (!self.active) return;
-        ct_sync_signal_forwarding_set_pid(@intCast(id));
+        if (comptime builtin.os.tag != .windows) {
+            ct_sync_signal_forwarding_set_pid(@intCast(id));
+        }
     }
 
     pub fn waitAndPropagate(self: *Scope, io: std.Io, child: *std.process.Child) !u8 {

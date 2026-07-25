@@ -124,12 +124,23 @@ public:
 class JSGlobalObjectInspectorController {
 public:
     explicit JSGlobalObjectInspectorController(JSC::JSGlobalObject&);
+#if defined(_WIN32)
+    // These are final overrides in the pinned JSC class. MSVC encodes that
+    // virtual member ABI in the symbol name, unlike the Itanium ABI used by
+    // our other supported platforms.
+    virtual ~JSGlobalObjectInspectorController();
+#else
     ~JSGlobalObjectInspectorController();
+#endif
     void connectFrontend(FrontendChannel&, bool isAutomaticInspection, bool immediatelyPause);
     void disconnectFrontend(FrontendChannel&);
     void dispatchMessageFromFrontend(const WTF::String&);
     void globalObjectDestroyed();
+#if defined(_WIN32)
+    virtual void setDidBeginCheckedPtrDeletion();
+#else
     void setDidBeginCheckedPtrDeletion();
+#endif
 
 private:
     alignas(std::max_align_t) unsigned char m_storage[4096];
@@ -772,8 +783,18 @@ void CtJscInspector::destroyController()
     remoteConnectionCount.store(0, std::memory_order_release);
     releasePinnedInspectorCheckedPtrs(controller);
     controller->globalObjectDestroyed();
+#if defined(_WIN32)
+    // Suppress virtual dispatch: this SDK-private stand-in intentionally does
+    // not reproduce the controller's complete vtable layout.
+    controller->JSGlobalObjectInspectorController::setDidBeginCheckedPtrDeletion();
+#else
     controller->setDidBeginCheckedPtrDeletion();
+#endif
+#if defined(_WIN32)
+    controller->JSGlobalObjectInspectorController::~JSGlobalObjectInspectorController();
+#else
     controller->~JSGlobalObjectInspectorController();
+#endif
     std::free(controllerMemory);
     controllerMemory = nullptr;
     controller = nullptr;

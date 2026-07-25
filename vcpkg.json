@@ -9,6 +9,7 @@
     "dlfcn-win32",
     "libffi",
     "openssl",
+    "zstd",
     "zlib"
   ],
   "overrides": [

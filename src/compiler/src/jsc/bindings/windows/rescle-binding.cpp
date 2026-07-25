@@ -1,4 +1,3 @@
-#include "root.h"
 #include "rescle.h"
 
 extern "C" int rescle__setIcon(const WCHAR* exeFilename, const WCHAR* iconFilename)

@@ -262,9 +262,10 @@ const sharedReplyPromise = new Promise<any>((resolve, reject) => {
 });
 worker.postMessage({ shared: sharedBuffer });
 const sharedWaitResult = Atomics.wait(sharedView, 0, 7, 1000);
+const sharedValueAfterWait = Atomics.load(sharedView, 0);
 assert(
-  sharedWaitResult === "ok" || sharedWaitResult === "not-equal",
-  "Atomics.wait should observe or be notified of the worker update",
+  sharedWaitResult === "ok" || (sharedWaitResult === "not-equal" && sharedValueAfterWait === 8),
+  `Atomics.wait should be notified by worker (received ${sharedWaitResult}, value ${sharedValueAfterWait})`,
 );
 const sharedReply = await sharedReplyPromise;
 assert(sharedReply.isShared === true, "worker should receive SharedArrayBuffer");
@@ -275,6 +276,7 @@ assert(Atomics.load(sharedView, 0) === 8, "parent should observe shared buffer m
 assert(Atomics.load(sharedView, 1) === 3, "parent should observe shared Atomics.add mutation");
 assert(Atomics.wait(sharedView, 0, 99, 1) === "not-equal", "Atomics.wait should report not-equal");
 assert(Atomics.wait(sharedView, 0, 8, 0) === "timed-out", "Atomics.wait zero timeout should time out");
+assert(Atomics.wait(sharedView, 0, 8, 10) === "timed-out", "Atomics.wait finite timeout should time out");
 assert(Atomics.notify(sharedView, 0, 1) === 0, "Atomics.notify should report no waiters");
 
 const waitBuffer = new SharedArrayBuffer(8);
@@ -312,6 +314,11 @@ const waitResult = await waitResultPromise;
 assert(waitResult.result === "ok", "worker Atomics.wait should return ok after notify");
 assert(Atomics.notify(waitView, 0, 1) === 0, "Atomics.notify should not count completed waiters");
 
+channel.port1.close();
+channel.port2.close();
+complexChannel.port1.close();
+complexChannel.port2.close();
+transferredChannel.port1.close();
 assert(typeof worker[Symbol.asyncDispose] === "function", "Worker asyncDispose mismatch");
 assert(await worker.terminate() === 1, "Worker terminate mismatch");
 

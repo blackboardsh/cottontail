@@ -36,9 +36,10 @@ try {
   } catch (error) {
     ordinaryDirectoryError = error;
   }
+  const expectedDirectoryUnlinkCode = cottontail.platform() === "linux" ? "EISDIR" : "EPERM";
   assert(
-    (ordinaryDirectoryError as { code?: string } | undefined)?.code === "EISDIR",
-    `unlinkSync ordinary directory should fail with EISDIR, received ${String(ordinaryDirectoryError)}`,
+    (ordinaryDirectoryError as { code?: string } | undefined)?.code === expectedDirectoryUnlinkCode,
+    `unlinkSync ordinary directory should fail with ${expectedDirectoryUnlinkCode}, received ${String(ordinaryDirectoryError)}`,
   );
   assert(existsSync(ordinaryDirectory), "unlinkSync removed an ordinary directory");
 

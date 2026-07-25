@@ -1,4 +1,4 @@
-import { Bun, Archive } from "bun";
+import Bun, { Archive } from "bun";
 import { dlopen, FFIType } from "bun:ffi";
 
 function assert(condition, message) {
@@ -9,7 +9,10 @@ const tmpDir = cottontail.env("COTTONTAIL_TMP_DIR");
 assert(tmpDir, "COTTONTAIL_TMP_DIR missing");
 cottontail.mkdirSync(tmpDir, true);
 
-assert(FFIType.int === 5 && FFIType.int === FFIType.i32, "FFIType.int should match Bun's i32 type id");
+assert(
+  FFIType.int === 5 && FFIType.int === FFIType.i32 && FFIType.int === FFIType.c_int,
+  "FFIType.int should match Bun's i32 and c_int enum value",
+);
 assert(JSON.stringify(Bun.$.braces("echo {one,{two,three}}")) === JSON.stringify(["echo one", "echo two", "echo three"]), "Bun.$.braces nested expansion mismatch");
 assert(JSON.stringify(Bun.$.braces("echo plain")) === JSON.stringify(["echo plain"]), "Bun.$.braces no-op mismatch");
 assert(new TextDecoder().decode(await Bun.$`printf shell-bytes`.bytes()) === "shell-bytes", "Bun shell bytes mismatch");
@@ -20,19 +23,26 @@ const invalidSeq = await Bun.$`seq inf`.quiet();
 assert(invalidSeq.exitCode === 1 && invalidSeq.stderr.toString().includes("invalid argument"), "Bun shell non-finite seq mismatch");
 Bun.$.throws(true);
 
-if (cottontail.platform() !== "win32") {
-  const libcPath = cottontail.platform() === "darwin" ? "/usr/lib/libSystem.B.dylib" : "libc.so.6";
-  const libc = dlopen(libcPath, {
-    getpid: { args: [], returns: FFIType.int },
-  });
-  const libcString = dlopen(libcPath, {
-    getpid: { args: [], returns: "int" },
-  });
-  assert(libc.symbols.getpid() === cottontail.pid(), "FFIType.int return mismatch");
-  assert(libcString.symbols.getpid() === cottontail.pid(), "literal int FFI return mismatch");
-}
+const processLibraryPath = cottontail.platform() === "win32"
+  ? "kernel32.dll"
+  : cottontail.platform() === "darwin"
+    ? "/usr/lib/libSystem.B.dylib"
+    : "libc.so.6";
+const processIdSymbol = cottontail.platform() === "win32" ? "GetCurrentProcessId" : "getpid";
+const processLibrary = dlopen(processLibraryPath, {
+  [processIdSymbol]: { args: [], returns: FFIType.int },
+});
+const processLibraryString = dlopen(processLibraryPath, {
+  [processIdSymbol]: { args: [], returns: "int" },
+});
+assert(processLibrary.symbols[processIdSymbol]() === cottontail.pid(), "FFIType.int return mismatch");
+assert(processLibraryString.symbols[processIdSymbol]() === cottontail.pid(), "literal int FFI return mismatch");
 
-const spawnResult = Bun.spawnSync(["sh", "-c", "printf spawn-ok"]);
+const spawnResult = Bun.spawnSync([
+  process.execPath,
+  "-e",
+  'process.stdout.write("spawn-ok")',
+]);
 assert(spawnResult.success, "Bun.spawnSync success mismatch");
 assert(spawnResult.exitCode === 0, "Bun.spawnSync exitCode mismatch");
 assert(spawnResult.stdout.toString() === "spawn-ok", "Bun.spawnSync stdout mismatch");
@@ -44,7 +54,11 @@ for (const spawnFunction of [Bun.spawn, Bun.spawnSync]) {
   assert(rejected, "Bun spawn oversized command guard mismatch");
 }
 
-const streamProcess = Bun.spawn(["sh", "-c", "printf response-stream-ok"], {
+const streamProcess = Bun.spawn([
+  process.execPath,
+  "-e",
+  'process.stdout.write("response-stream-ok")',
+], {
   stdout: "pipe",
   stderr: "pipe",
 });
@@ -165,6 +179,7 @@ await archive.extract(archiveOut);
 assert(cottontail.readFile(`${archiveOut}/hello.txt`) === "archive hello", "Archive.extract mismatch");
 
 const canTestSecrets = cottontail.platform() === "darwin" ||
+  cottontail.platform() === "win32" ||
   (cottontail.platform() === "linux" && cottontail.spawnSync("sh", ["-c", "command -v secret-tool"], { stdio: "pipe" }).status === 0);
 if (canTestSecrets) {
   const service = `cottontail-local-test-${Date.now()}`;
@@ -179,40 +194,34 @@ if (canTestSecrets) {
   }
 }
 
-if (cottontail.platform() !== "win32") {
-  const curlCheck = cottontail.spawnSync("curl", ["--version"], { stdio: "pipe" });
-  if (curlCheck.status === 0) {
-    const serveOut = `${tmpDir}/serve-out.txt`;
-    if (cottontail.existsSync(serveOut)) cottontail.unlinkSync(serveOut);
-
-    const server = Bun.serve({
-      hostname: "127.0.0.1",
-      port: 0,
-      fetch(request) {
-        const pathname = request.url.replace(/^https?:\/\/[^/]+/, "");
-        return new Response(`served ${pathname}`, {
-          headers: { "content-type": "text/plain" },
-        });
-      },
+const server = Bun.serve({
+  hostname: "127.0.0.1",
+  port: 0,
+  fetch(request) {
+    const pathname = request.url.replace(/^https?:\/\/[^/]+/, "");
+    return new Response(`served ${pathname}`, {
+      headers: { "content-type": "text/plain" },
     });
-
-    Bun.spawn(["sh", "-c", `curl -s ${server.url}hello > ${serveOut}`], {
-      detached: true,
-    });
-
-    let body = "";
-    for (let i = 0; i < 2000; i += 1) {
-      globalThis.__cottontailRunLoopTick();
-      if (cottontail.existsSync(serveOut)) {
-        body = cottontail.readFile(serveOut);
-        if (body.length > 0) break;
-      }
-      cottontail.sleep(1);
-    }
-
-    server.stop();
-    assert(body === "served /hello", `Bun.serve response mismatch: ${JSON.stringify(body)}`);
-  }
-}
+  },
+});
+const serveUrl = new URL("/hello", server.url).href;
+const serveRequest = Bun.spawn([
+  process.execPath,
+  "-e",
+  "fetch(process.argv[1]).then(async response => process.stdout.write(await response.text())).catch(error => { console.error(error); process.exitCode = 1; })",
+  serveUrl,
+], {
+  stdout: "pipe",
+  stderr: "pipe",
+});
+const servedBody = await new Response(serveRequest.stdout).text();
+const serveRequestExit = await serveRequest.exited;
+const serveRequestError = await new Response(serveRequest.stderr).text();
+server.stop();
+assert(
+  serveRequestExit === 0,
+  `Bun.serve child request failed (${serveRequestExit}): ${serveRequestError}`,
+);
+assert(servedBody === "served /hello", `Bun.serve response mismatch: ${JSON.stringify(servedBody)}`);
 
 console.log("bun apis passed");

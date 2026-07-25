@@ -1496,7 +1496,7 @@ fn report(url: []const u8) void {
 
     switch (bun.Environment.os) {
         .windows => {
-            var process: std.os.windows.PROCESS_INFORMATION = undefined;
+            var process: std.os.windows.PROCESS.INFORMATION = undefined;
             var startup_info = std.os.windows.STARTUPINFOW{
                 .cb = @sizeOf(std.os.windows.STARTUPINFOW),
                 .lpReserved = null,

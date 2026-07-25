@@ -236,6 +236,66 @@ function installProcessApi(processObject) {
   };
 }
 
+function installWindowsProcessEnvironment(processObject) {
+  if (platform() !== "win32") return;
+  const marker = Symbol.for("cottontail.windowsProcessEnvironment");
+  const source = processObject.env ?? cottontail.env();
+  if (source?.[marker] === true) return;
+
+  const target = {};
+  const names = new Map();
+  for (const key of Object.keys(source ?? {})) {
+    const name = String(key);
+    target[name] = String(source[key]);
+    names.set(name.toLowerCase(), name);
+  }
+  Object.defineProperty(target, marker, {
+    value: true,
+    configurable: false,
+    enumerable: false,
+  });
+
+  const actualName = (property) => {
+    if (typeof property !== "string") return property;
+    return names.get(property.toLowerCase()) ?? property;
+  };
+  processObject.env = new Proxy(target, {
+    get(environment, property) {
+      return Reflect.get(environment, actualName(property));
+    },
+    set(environment, property, value) {
+      if (typeof property !== "string") return Reflect.set(environment, property, value);
+      const lower = property.toLowerCase();
+      const name = names.get(lower) ?? property;
+      if (!names.has(lower)) names.set(lower, name);
+      return Reflect.set(environment, name, String(value));
+    },
+    has(environment, property) {
+      return Reflect.has(environment, actualName(property));
+    },
+    deleteProperty(environment, property) {
+      if (typeof property !== "string") return Reflect.deleteProperty(environment, property);
+      const lower = property.toLowerCase();
+      const name = names.get(lower);
+      if (name === undefined) return true;
+      names.delete(lower);
+      return Reflect.deleteProperty(environment, name);
+    },
+    getOwnPropertyDescriptor(environment, property) {
+      return Reflect.getOwnPropertyDescriptor(environment, actualName(property));
+    },
+    defineProperty(environment, property, descriptor) {
+      if (typeof property !== "string") return Reflect.defineProperty(environment, property, descriptor);
+      const lower = property.toLowerCase();
+      const name = names.get(lower) ?? property;
+      if (!names.has(lower)) names.set(lower, name);
+      const normalized = { ...descriptor };
+      if (Object.prototype.hasOwnProperty.call(normalized, "value")) normalized.value = String(normalized.value);
+      return Reflect.defineProperty(environment, name, normalized);
+    },
+  });
+}
+
 const cottontailExecPath = cottontail.execPath?.() ?? "cottontail";
 const processObject = g.process ?? {
   argv: cottontail.argv || ["cottontail", ...(cottontail.args || [])],
@@ -252,6 +312,7 @@ const processObject = g.process ?? {
   emitWarning: (message, type = "Warning") => console.warn(`${type}: ${message}`),
 };
 g.process = processObject;
+installWindowsProcessEnvironment(g.process);
 installProcessApi(g.process);
 if (g.process.env?.COTTONTAIL_TEST_CLI_HEADER_PRINTED === "1") {
   globalThis.__cottontailBunTestHeaderPrinted = true;
@@ -987,6 +1048,17 @@ const nativeConsoleLog = console.log?.bind(console);
 const nativeConsoleError = console.error?.bind(console);
 const nativeConsoleWarn = console.warn?.bind(console) ?? nativeConsoleError;
 let consoleGroupIndent = "";
+const emitConsoleText = (writer, text) => {
+  const processStream = writer === nativeConsoleLog
+    ? globalThis.process?.stdout
+    : globalThis.process?.stderr;
+  if (processStream && typeof processStream.write === "function") {
+    const output = String(text);
+    processStream.write(output.endsWith("\n") ? output : `${output}\n`);
+    return;
+  }
+  writer?.(text);
+};
 const indentConsoleText = (text, indentLines = true) => {
   const rendered = String(text);
   return consoleGroupIndent + (indentLines ? rendered.replace(/\n/g, `\n${consoleGroupIndent}`) : rendered);
@@ -999,21 +1071,13 @@ const writeConsole = (writer, args, substitutions = true, options = undefined, l
   if (isError) {
     const renderedError = formatConsoleError(args[0], level, separateError);
     if (renderedError !== undefined) {
-      writer?.(renderedError);
+      emitConsoleText(writer, renderedError);
       return;
     }
   }
   const rendered = formatConsoleArguments(args, substitutions, options);
-  if (args.length === 1 && typeof args[0] === "string" && rendered.includes("\n")) {
-    const lines = rendered.split("\n");
-    const fd = writer === nativeConsoleLog ? 1 : 2;
-    for (let index = 0; index < lines.length; index += 1) {
-      cottontail.fdWrite(fd, `${index === 0 ? consoleGroupIndent : ""}${lines[index]}\n`);
-    }
-    return;
-  }
   const indentLines = typeof args[0] !== "string";
-  writer?.(indentConsoleText(rendered, indentLines));
+  emitConsoleText(writer, indentConsoleText(rendered, indentLines));
 };
 console.log = (...args) => writeConsole(nativeConsoleLog, args);
 console.error = (...args) => writeConsole(nativeConsoleError, args, true, undefined, "error");
@@ -2530,12 +2594,47 @@ const workerRuntimeAliasPaths = Object.freeze({
   "test/reporters": "node/test/reporters.js",
 });
 
+function workerRuntimeSeparator(path = cottontail.cwd()) {
+  const text = String(path);
+  return globalThis.process?.platform === "win32" ||
+    /^[A-Za-z]:[\\/]/.test(text) ||
+    text.startsWith("\\\\")
+    ? "\\"
+    : "/";
+}
+
+function workerRuntimeRoot() {
+  const cwd = String(cottontail.cwd());
+  const separator = workerRuntimeSeparator(cwd);
+  return `${cwd}${/[\\/]$/.test(cwd) ? "" : separator}.cottontail-embedded-runtime`;
+}
+
+function workerRuntimePath(runtimeRoot, relativePath) {
+  const separator = workerRuntimeSeparator(runtimeRoot);
+  return `${runtimeRoot}${separator}${String(relativePath).replace(/[\\/]/g, separator)}`;
+}
+
 function workerRuntimeAliases(runtimeRoot) {
   const aliases = {};
-  for (const [specifier, relativePath] of Object.entries(workerRuntimeAliasPaths)) {
-    const path = `${runtimeRoot}/${relativePath}`;
+  let builtinNames = [];
+  try {
+    const namespace = currentRuntimeRequire()?.("node:module");
+    builtinNames = namespace?.builtinModules ?? namespace?.default?.builtinModules ?? [];
+  } catch {}
+  for (const name of builtinNames) {
+    const specifier = String(name).replace(/^node:/, "");
+    if (!specifier || specifier === "ws" || specifier.startsWith("bun:")) continue;
+    const relativePath = workerRuntimeAliasPaths[specifier] ?? `node/${specifier}.js`;
+    const path = workerRuntimePath(runtimeRoot, relativePath);
     aliases[specifier] = path;
-    if (relativePath.startsWith("node/")) aliases[`node:${specifier}`] = path;
+    aliases[`node:${specifier}`] = path;
+  }
+  for (const [specifier, relativePath] of Object.entries(workerRuntimeAliasPaths)) {
+    aliases[specifier] = workerRuntimePath(runtimeRoot, relativePath);
+  }
+  aliases["node:undici"] = workerRuntimePath(runtimeRoot, "node/undici-public.js");
+  for (const specifier of ["sea", "sqlite", "test", "test/reporters"]) {
+    aliases[`node:${specifier}`] = aliases[specifier];
   }
   return aliases;
 }
@@ -2651,14 +2750,13 @@ function prepareWorkerScriptPath(scriptPath, options = undefined) {
   }
   const wrapperPath = `${tempDir}/bun-worker-entry-${nonce}.mjs`;
   const bundledPath = `${tempDir}/bun-worker-${nonce}.js`;
-  const slashCwd = String(cottontail.cwd()).replace(/\\/g, "/");
   const slashTarget = String(target).replace(/\\/g, "/");
-  const runtimeRoot = `${slashCwd}/.cottontail-embedded-runtime`;
+  const runtimeRoot = workerRuntimeRoot();
   // Workers are independent Bun runtimes, not FFI-only isolates. Boot the full
   // runtime so worker code sees the same Bun and Node APIs as the main thread.
-  const runtimeEntry = `${runtimeRoot}/bun/index.js`;
+  const runtimeEntry = workerRuntimePath(runtimeRoot, "bun/index.js");
   if (options?.[preparedWorkerScript] === true) {
-    const moduleEntry = `${runtimeRoot}/node/module.js`;
+    const moduleEntry = workerRuntimePath(runtimeRoot, "node/module.js");
     cottontail.writeFile(wrapperPath, [
       `import ${JSON.stringify(runtimeEntry)};`,
       `import ${JSON.stringify(moduleEntry)};`,
@@ -3598,6 +3696,14 @@ function pathJoin(...parts) {
   return parts.filter(Boolean).join("/").replace(/\/+/g, "/");
 }
 
+function pathDirname(value) {
+  const path = String(value ?? "").replaceAll("\\", "/").replace(/\/+$/, "");
+  const slash = path.lastIndexOf("/");
+  if (slash < 0) return ".";
+  if (slash === 0) return "/";
+  return path.slice(0, slash);
+}
+
 function tmpRoot() {
   const env = globalThis.process?.env ?? cottontail.env();
   const base = String(env.COTTONTAIL_TMP_DIR || env.TMPDIR || env.TEMP || env.TMP || "/tmp");
@@ -3608,10 +3714,23 @@ function tmpRoot() {
 
 function compilerCommand() {
   const env = globalThis.process?.env ?? cottontail.env();
-  if (env.CC) return { file: env.CC, prefix: [] };
-  const zig = pathJoin(cottontail.cwd(), "vendors", "zig", "zig");
-  if (cottontail.existsSync(zig)) return { file: zig, prefix: ["cc"] };
-  return { file: "cc", prefix: [] };
+  if (env.CC) return { file: env.CC, prefix: [], kind: "cc" };
+  const zigName = platform() === "win32" ? "zig.exe" : "zig";
+  const executableDir = pathDirname(globalThis.process?.execPath ?? cottontailExecPath);
+  const roots = [
+    env.COTTONTAIL_REPO_ROOT,
+    cottontail.cwd(),
+    pathDirname(pathDirname(executableDir)),
+    pathDirname(executableDir),
+  ];
+  for (const root of roots) {
+    if (!root) continue;
+    const zig = pathJoin(root, "vendors", "zig", zigName);
+    if (cottontail.existsSync(zig)) return { file: zig, prefix: ["cc"], kind: "zig" };
+  }
+  const pathZig = globalThis.Bun?.which?.(platform() === "win32" ? "zig" : zigName);
+  if (pathZig) return { file: pathZig, prefix: ["cc"], kind: "zig" };
+  return { file: "cc", prefix: [], kind: "cc" };
 }
 
 function sourcePathForCc(source) {
@@ -3630,6 +3749,39 @@ function ccArguments(value) {
   return (Array.isArray(value) ? value : [value]).map(String);
 }
 
+function windowsNapiImportLibrary(compiler, sourcePaths, dir) {
+  if (platform() !== "win32" || compiler.kind !== "zig") return null;
+  const names = new Set();
+  for (const sourcePath of sourcePaths) {
+    const source = String(cottontail.readFile(sourcePath));
+    for (const match of source.matchAll(/\b(?:napi|node_api)_[A-Za-z0-9_]+\b/g)) {
+      names.add(match[0]);
+    }
+  }
+  if (names.size === 0) return null;
+
+  const id = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+  const definitionPath = pathJoin(dir, `cottontail-napi-${id}.def`);
+  const libraryPath = pathJoin(dir, `cottontail-napi-${id}.lib`);
+  const executableName = String(globalThis.process?.execPath ?? "cottontail.exe")
+    .replaceAll("\\", "/")
+    .split("/")
+    .pop();
+  cottontail.writeFile(
+    definitionPath,
+    `LIBRARY ${JSON.stringify(executableName)}\nEXPORTS\n${[...names].sort().map(name => `  ${name}`).join("\n")}\n`,
+  );
+  const result = cottontail.spawnSync(
+    compiler.file,
+    ["dlltool", "-d", definitionPath, "-l", libraryPath, "-m", "i386:x86-64"],
+    { stdio: "pipe" },
+  );
+  if (Number(result.status ?? 0) !== 0) {
+    throw new Error(String(result.stderr || result.stdout || `Bun.cc import library failed with status ${result.status}`));
+  }
+  return libraryPath;
+}
+
 export function cc(options) {
   if (options == null || typeof options !== "object" || Array.isArray(options)) {
     throw new TypeError("Expected options to be an object");
@@ -3644,6 +3796,7 @@ export function cc(options) {
   const sourcePaths = (Array.isArray(source) ? source : [source]).map(sourcePathForCc);
   if (sourcePaths.length === 0) throw new TypeError("Expected source to be a string to a file path");
   const compiler = compilerCommand();
+  const napiImportLibrary = windowsNapiImportLibrary(compiler, sourcePaths, dir);
   const platformName = platform();
   const sharedArgs = platformName === "darwin"
     ? ["-dynamiclib", "-undefined", "dynamic_lookup"]
@@ -3654,6 +3807,7 @@ export function cc(options) {
   const args = [
     ...compiler.prefix,
     ...sourcePaths,
+    ...(napiImportLibrary ? [napiImportLibrary] : []),
     ...sharedArgs,
     ...defines,
     "-o",

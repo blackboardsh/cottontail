@@ -47,6 +47,30 @@ describe("internal runtime bindings", () => {
     expect(() => internalBinding("definitely_missing")).toThrow("No such module");
   });
 
+  test("signal_wrap preserves native receiver safety", () => {
+    const { internalBinding } = require("internal/test/binding");
+    const binding = internalBinding("signal_wrap");
+    const { Signal } = binding;
+    const signal = new Signal();
+    const detachedStart = signal.start;
+    const detachedStop = signal.stop;
+
+    expect(binding).toBe(process.binding("signal_wrap"));
+    expect(Object.keys(binding)).toEqual(["Signal"]);
+    expect(Object.keys(Signal.prototype)).toEqual(["start", "stop"]);
+    for (const invoke of [() => detachedStart(9), () => detachedStop()]) {
+      try {
+        invoke();
+        throw new Error("detached signal method did not throw");
+      } catch (error) {
+        expect(error).toBeInstanceOf(TypeError);
+        expect(String(error)).toBe("TypeError: Illegal invocation");
+      }
+    }
+    expect(signal.start(9)).toBe(0);
+    expect(signal.stop()).toBe(0);
+  });
+
   test("test-facing helpers expose production fs, SQL, and JSC behavior", () => {
     expect(internalFs).toBe(fsPromises);
     expect(SQL).toBe(Bun.SQL);

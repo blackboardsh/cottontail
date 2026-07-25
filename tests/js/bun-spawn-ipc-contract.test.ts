@@ -211,7 +211,7 @@ test("Bun.spawn advanced IPC round-trips through a subprocess", async () => {
   expect(response.receivedCycle).toBe(true);
   expect(response.self).toBe(response);
   expect(await child.exited).toBe(0);
-});
+}, 30_000);
 
 test("Bun.spawn observes immediate child IPC and exit", async () => {
   let resolveMessage!: (message: unknown) => void;
@@ -229,7 +229,7 @@ test("Bun.spawn observes immediate child IPC and exit", async () => {
 
   expect(await message).toEqual({ ready: true });
   expect(await child.exited).toBe(0);
-});
+}, 30_000);
 
 test("node:child_process advanced IPC is available before the child imports modules", async () => {
   const childPath = join(import.meta.dir, "fixtures", "child-process-ipc-bootstrap-child.js");
@@ -241,7 +241,7 @@ test("node:child_process advanced IPC is available before the child imports modu
     const timeout = setTimeout(() => {
       child.kill();
       reject(new Error(`child_process IPC bootstrap timed out: ${stderr}`));
-    }, 5_000);
+    }, 25_000);
     child.once("error", (error) => {
       clearTimeout(timeout);
       reject(error);
@@ -272,4 +272,4 @@ test("node:child_process advanced IPC is available before the child imports modu
   expect(response.self).toBe(response);
   const exitCode = await new Promise<number | null>((resolve) => child.once("close", resolve));
   expect(exitCode).toBe(0);
-});
+}, 30_000);

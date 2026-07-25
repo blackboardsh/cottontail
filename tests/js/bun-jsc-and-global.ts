@@ -229,5 +229,7 @@ try {
   shadowRealmObjectError = error;
 }
 assert(shadowRealmObjectError instanceof TypeError, "ShadowRealm should reject object transfer");
+assert(shadowRealm.evaluate("globalThis.answer = 42; answer") === 42, "ShadowRealm compatibility evaluation mismatch");
+assert((globalThis as any).answer === undefined, "ShadowRealm compatibility global should stay isolated");
 
 console.log("bun jsc and global passed");

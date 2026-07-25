@@ -234,6 +234,34 @@ function exportedEnvironment(context) {
   return env;
 }
 
+function windowsEnvironmentValue(env, name) {
+  const normalized = name.toUpperCase();
+  for (const [key, value] of Object.entries(env ?? {})) {
+    if (key.toUpperCase() === normalized && value != null && String(value) !== "") return String(value);
+  }
+  return undefined;
+}
+
+function isWindowsBatchExecutable(path) {
+  return globalThis.process?.platform === "win32" &&
+    /\.(?:cmd|bat)$/i.test(String(path).replace(/[ .]+$/g, ""));
+}
+
+function windowsCommandProcessor(env) {
+  const inherited = globalThis.process?.env ?? {};
+  const configured = windowsEnvironmentValue(env, "ComSpec") ??
+    windowsEnvironmentValue(inherited, "ComSpec");
+  if (configured) return configured;
+  const systemRoot = windowsEnvironmentValue(env, "SystemRoot") ??
+    windowsEnvironmentValue(inherited, "SystemRoot");
+  return systemRoot ? join(systemRoot, "System32", "cmd.exe") : "cmd.exe";
+}
+
+function windowsBatchCommand(executable, args) {
+  const quote = value => `"${String(value).replaceAll('"', '""')}"`;
+  return `"${[executable, ...args].map(quote).join(" ")}"`;
+}
+
 function unwrapNestedBraceChoice(value) {
   if (value[0] !== "{") return value;
   let depth = 0;
@@ -1248,14 +1276,29 @@ export function createBunShellRuntime(host) {
     }
 
     if (commandResult == null) {
-      if (name === "bun") name = host.execPath;
       try {
-        const child = host.spawn([name, ...args], {
+        const childEnv = exportedEnvironment(commandContext);
+        const executable = name === "bun"
+          ? host.execPath
+          : host.which(name, { ...childEnv, cwd: commandContext.cwd });
+        if (executable == null) throw new Error(`command not found: ${name}`);
+        const batch = isWindowsBatchExecutable(executable);
+        const command = batch
+          ? [
+              windowsCommandProcessor(childEnv),
+              "/d",
+              "/s",
+              "/c",
+              windowsBatchCommand(executable, args),
+            ]
+          : [executable, ...args];
+        const child = host.spawn(command, {
           cwd: commandContext.cwd,
-          env: exportedEnvironment(commandContext),
+          env: childEnv,
           stdin: isStreamingInput(input) ? input : input.byteLength ? input : "ignore",
           stdout: "pipe",
           stderr: "pipe",
+          windowsVerbatimArguments: batch,
         });
         const streamsToPipeline = pipelineOutput != null
           && redirects.every(redirect => INPUT_REDIRECTS.has(redirect.operator));

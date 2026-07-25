@@ -232,9 +232,8 @@ export function runAbortable(operation, signal = null, activeRequest = undefined
 
 export function validateInteger(value, name, minimum = Number.MIN_SAFE_INTEGER, maximum = Number.MAX_SAFE_INTEGER) {
   if (typeof value !== "number") throw invalidArgType(name, "of type number", value);
-  if (!Number.isInteger(value) || value < minimum || value > maximum) {
-    throw outOfRange(name, `>= ${minimum} and <= ${maximum}`, value);
-  }
+  if (!Number.isInteger(value)) throw outOfRange(name, "an integer", value);
+  if (value < minimum || value > maximum) throw outOfRange(name, `>= ${minimum} && <= ${maximum}`, value);
   return value;
 }
 

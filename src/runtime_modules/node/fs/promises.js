@@ -448,6 +448,11 @@ export async function* glob(pattern, options) {
 Object.defineProperty(glob, "name", { value: "glob" });
 
 export async function lchmod(path, mode) {
+  if (typeof lchmodSync !== "function") {
+    const error = new Error("The lchmod() method is not implemented");
+    error.code = "ERR_METHOD_NOT_IMPLEMENTED";
+    throw error;
+  }
   return lchmodSync(path, mode);
 }
 

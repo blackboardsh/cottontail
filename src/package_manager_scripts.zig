@@ -276,10 +276,18 @@ fn runLifecycleStage(
         try stderr.print("$ {s}\n", .{value.string});
         try stderr.flush();
     }
-    const shell_args: []const []const u8 = if (builtin.os.tag == .windows)
-        &.{ "cmd.exe", "/d", "/s", "/c", command }
-    else
-        &.{ "/bin/sh", "-c", command };
+    var windows_source: std.ArrayList(u8) = .empty;
+    defer windows_source.deinit(allocator);
+    var windows_argv: [3][]const u8 = undefined;
+    const shell_args: []const []const u8 = if (builtin.os.tag == .windows) shell: {
+        try appendBunShellSource(allocator, &windows_source, command);
+        windows_argv = .{
+            try std.process.executablePathAlloc(init.io, allocator),
+            "-e",
+            windows_source.items,
+        };
+        break :shell &windows_argv;
+    } else &.{ "/bin/sh", "-c", command };
     var child = try std.process.spawn(init.io, .{
         .argv = shell_args,
         .cwd = .{ .path = root_dir },
@@ -407,10 +415,18 @@ fn runCommandStage(
     try configureEnvironment(&environment, allocator, init.io, root_dir, task, stage, script, node_gyp_dir);
 
     const command = try replaceBunCommand(allocator, init.io, script);
-    const shell_args: []const []const u8 = if (builtin.os.tag == .windows)
-        &.{ "cmd.exe", "/d", "/s", "/c", command }
-    else
-        &.{ "/bin/sh", "-c", command };
+    var windows_source: std.ArrayList(u8) = .empty;
+    defer windows_source.deinit(allocator);
+    var windows_argv: [3][]const u8 = undefined;
+    const shell_args: []const []const u8 = if (builtin.os.tag == .windows) shell: {
+        try appendBunShellSource(allocator, &windows_source, command);
+        windows_argv = .{
+            try std.process.executablePathAlloc(init.io, allocator),
+            "-e",
+            windows_source.items,
+        };
+        break :shell &windows_argv;
+    } else &.{ "/bin/sh", "-c", command };
     const foreground = std.mem.eql(u8, task.cwd, root_dir);
     var child = try std.process.spawn(init.io, .{
         .argv = shell_args,
@@ -637,6 +653,40 @@ fn replaceBunCommand(allocator: std.mem.Allocator, io: std.Io, script: []const u
         return std.fmt.allocPrint(allocator, "{s}\"{s}\"{s}", .{ script[0..prefix_len], executable, trimmed["bun".len..] });
     }
     return std.fmt.allocPrint(allocator, "{s}'{s}'{s}", .{ script[0..prefix_len], executable, trimmed["bun".len..] });
+}
+
+fn appendJavaScriptStringLiteral(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    value: []const u8,
+) !void {
+    try output.append(allocator, '"');
+    for (value) |byte| switch (byte) {
+        '"' => try output.appendSlice(allocator, "\\\""),
+        '\\' => try output.appendSlice(allocator, "\\\\"),
+        '\n' => try output.appendSlice(allocator, "\\n"),
+        '\r' => try output.appendSlice(allocator, "\\r"),
+        '\t' => try output.appendSlice(allocator, "\\t"),
+        else => try output.append(allocator, byte),
+    };
+    try output.append(allocator, '"');
+}
+
+fn appendBunShellSource(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    command: []const u8,
+) !void {
+    // The runtime initializes global Bun before evaluating user source. Using
+    // Bun.$ directly avoids treating the bare "bun" specifier as an
+    // auto-install candidate when a dependency lifecycle runs from a package
+    // directory without its own node_modules tree.
+    try output.appendSlice(allocator, "const $ = Bun.$; const __s = [");
+    try appendJavaScriptStringLiteral(allocator, output, command);
+    try output.appendSlice(
+        allocator,
+        "]; __s.raw = __s; const __result = await $(__s).nothrow(); process.exitCode = __result.exitCode;\n",
+    );
 }
 
 fn pathDelimiter() u8 {

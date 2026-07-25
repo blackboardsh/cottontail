@@ -1,4 +1,4 @@
-import { resolve as pathResolve } from "./path.js";
+import { resolve as pathResolve, win32 as pathWin32 } from "./path.js";
 import { Buffer } from "./buffer.js";
 import { toASCII, toUnicode } from "./punycode.js";
 import { parse as querystringParse, stringify as querystringStringify } from "./querystring.js";
@@ -1042,20 +1042,48 @@ function resolvePathForFileURL(filepath) {
 export function pathToFileURL(filepath, options = undefined) {
   validateString(filepath, "path");
   const windows = options?.windows ?? globalThis.process?.platform === "win32";
-  if (windows && filepath.startsWith("\\\\")) {
+  let sourcePath = String(filepath);
+  if (windows && /^\\\\\?\\[A-Za-z]:[\\/]/.test(sourcePath)) {
+    // A namespaced local drive path is still a local file URL, not a UNC URL.
+    sourcePath = sourcePath.slice(4);
+  } else if (windows && sourcePath.toUpperCase().startsWith("\\\\?\\UNC\\")) {
+    // Normalize an extended UNC path as an ordinary UNC path. This both strips
+    // the namespace marker and preserves a trailing share-root separator after
+    // resolving `..` components.
+    sourcePath = `\\\\${sourcePath.slice(8)}`;
+  }
+  const isUNC = windows && sourcePath.startsWith("\\\\");
+  let resolved = windows
+    ? pathWin32.resolve(sourcePath)
+    : resolvePathForFileURL(sourcePath);
+  if (isUNC && /^\\\\[^\\]+\\[^\\]+$/.test(sourcePath) && resolved.endsWith("\\")) {
+    // win32.resolve adds a separator to a bare UNC share root, while
+    // pathToFileURL preserves whether that separator was present in the input.
+    resolved = resolved.slice(0, -1);
+  }
+  if (isUNC || (windows && resolved.startsWith("\\\\"))) {
     // UNC path format: \\server\share\resource
-    const hostnameEndIndex = filepath.indexOf("\\", 2);
-    if (hostnameEndIndex === -1 || hostnameEndIndex === 2) {
+    // The \\?\UNC\ long-path prefix is not part of the hostname.
+    const extended = resolved.toUpperCase().startsWith("\\\\?\\UNC\\");
+    const prefixLength = extended ? 8 : 2;
+    const hostnameEndIndex = resolved.indexOf("\\", prefixLength);
+    if (hostnameEndIndex === -1 || hostnameEndIndex === prefixLength) {
       const err = new TypeError(`The argument 'path' must be an absolute path. Received ${JSON.stringify(filepath)}`);
       err.code = "ERR_INVALID_ARG_VALUE";
       throw err;
     }
-    const hostname = toASCII(filepath.slice(2, hostnameEndIndex));
-    const pathname = encodePathChars(filepath.slice(hostnameEndIndex).replace(backslashRegEx, "/"));
+    const hostname = toASCII(resolved.slice(prefixLength, hostnameEndIndex));
+    const pathname = encodePathChars(resolved.slice(hostnameEndIndex).replace(backslashRegEx, "/"));
     return createFileURLFromPath(pathname, hostname);
   }
-  let resolved = windows ? String(filepath).replace(backslashRegEx, "/") : resolvePathForFileURL(filepath);
-  if (!windows) {
+  if (windows) {
+    resolved = resolved.replace(backslashRegEx, "/");
+    if (/^[A-Za-z]:\//.test(resolved)) resolved = `/${resolved}`;
+    const filePathLast = filepath.charCodeAt(filepath.length - 1);
+    if ((filePathLast === CHAR_FORWARD_SLASH || filePathLast === 92) && resolved[resolved.length - 1] !== "/") {
+      resolved += "/";
+    }
+  } else {
     // path.resolve strips trailing slashes so we must add them back
     const filePathLast = filepath.charCodeAt(filepath.length - 1);
     if (filePathLast === CHAR_FORWARD_SLASH && resolved[resolved.length - 1] !== "/") {

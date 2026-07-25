@@ -77,7 +77,7 @@ test("Blob and File bodies retain metadata without retaining wrapper identity", 
 test("FormData is captured when attached and reparsed per body consumer", async () => {
   const source = new FormData();
   source.append("field", "original");
-  source.append("upload", new Blob(["payload"], { type: "text/plain" }), "data.txt");
+  source.append("upload", new Blob(["payload 😋"], { type: "text/plain" }), "data.txt");
 
   const response = new Response(source);
   const clone = response.clone();
@@ -93,7 +93,7 @@ test("FormData is captured when attached and reparsed per body consumer", async 
   expect(first.get("field")).toBe("original");
   expect(second.get("field")).toBe("original");
   expect(first.has("late")).toBe(false);
-  expect(await (first.get("upload") as File).text()).toBe("payload");
+  expect(await (first.get("upload") as File).text()).toBe("payload 😋");
 });
 
 test("bodyUsed follows lock and disturbance rules for buffered and custom streams", async () => {

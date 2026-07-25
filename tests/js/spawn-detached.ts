@@ -2,12 +2,19 @@ const outputPath = cottontail.env("COTTONTAIL_DETACHED_OUTPUT");
 if (!outputPath) throw new Error("COTTONTAIL_DETACHED_OUTPUT missing");
 if (cottontail.existsSync(outputPath)) cottontail.unlinkSync(outputPath);
 
-Bun.spawn(["sh", "-c", `printf detached-ok > ${outputPath}`], {
+Bun.spawn([
+  process.execPath,
+  "-e",
+  `cottontail.writeFile(${JSON.stringify(outputPath)}, "detached-ok")`,
+], {
   detached: true,
+  stdin: "ignore",
+  stdout: "ignore",
+  stderr: "ignore",
 });
 
 let output = "";
-for (let index = 0; index < 1000; index += 1) {
+for (let index = 0; index < 10000; index += 1) {
   globalThis.__cottontailRunLoopTick();
   if (cottontail.existsSync(outputPath)) {
     output = cottontail.readFile(outputPath);

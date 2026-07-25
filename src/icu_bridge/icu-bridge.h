@@ -9,6 +9,7 @@ extern "C" {
 int cottontail_icu_try_system(void);
 int cottontail_icu_use_fallback(const void* data, size_t length);
 const char* cottontail_icu_last_error(void);
+void* cottontail_icu_resolve_symbol(const char* name);
 
 #ifdef __cplusplus
 }

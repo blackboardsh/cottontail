@@ -61,11 +61,14 @@ assert(stripVTControlCharacters("\x1B[31mred\x1B[39m") === "red", "stripVTContro
 assert(styleText("red", "x").includes("\x1B[31m"), "styleText mismatch");
 assert(toUSVString("\uD800") === "\uFFFD", "toUSVString mismatch");
 
-assert(getSystemErrorName(-EACCES) === "EACCES", "getSystemErrorName mismatch");
-assert(getSystemErrorMessage(-EACCES) === "EACCES", "getSystemErrorMessage mismatch");
-assert(getSystemErrorMap().get(-EACCES)?.[0] === "EACCES", "getSystemErrorMap mismatch");
-assert(_errnoException(-EACCES, "open").code === "EACCES", "_errnoException mismatch");
-assert(_exceptionWithHostPort(-EACCES, "connect", "127.0.0.1", 80).port === 80, "_exceptionWithHostPort mismatch");
+// node:util consumes libuv error codes here. On Windows those are not the
+// negated CRT errno values exported by node:constants.
+const uvEacces = process.platform === "win32" ? -4092 : -EACCES;
+assert(getSystemErrorName(uvEacces) === "EACCES", "getSystemErrorName mismatch");
+assert(getSystemErrorMessage(uvEacces) === "EACCES", "getSystemErrorMessage mismatch");
+assert(getSystemErrorMap().get(uvEacces)?.[0] === "EACCES", "getSystemErrorMap mismatch");
+assert(_errnoException(uvEacces, "open").code === "EACCES", "_errnoException mismatch");
+assert(_exceptionWithHostPort(uvEacces, "connect", "127.0.0.1", 80).port === 80, "_exceptionWithHostPort mismatch");
 
 function Parent() {}
 Parent.prototype.parentMethod = function parentMethod() { return true; };

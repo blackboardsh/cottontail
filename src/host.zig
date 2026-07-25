@@ -36,6 +36,7 @@ const DarwinC = struct {
     pub const posix_spawnp = std.c.posix_spawnp;
 };
 const c = if (builtin.os.tag == .windows) @cImport({
+    @cInclude("errno.h");
     @cInclude("stdlib.h");
 }) else if (builtin.os.tag == .macos) DarwinC else @cImport({
     // Zig imports declarations rather than glibc's fortified inline wrappers.
@@ -84,7 +85,21 @@ pub const CtHostSpawnOptions = extern struct {
     max_buffer: u64,
     kill_signal: c_int,
     abort_requested: bool,
+    windows_hide: bool,
+    windows_verbatim_arguments: bool,
 };
+
+extern "c" fn ct_windows_spawn_host_process(
+    file: [*:0]const u8,
+    args_ptr: ?[*]const [*:0]const u8,
+    arg_count: usize,
+    options: CtHostSpawnOptions,
+    process_out: *usize,
+    thread_out: *usize,
+    stdin_handle_out: *usize,
+    stdout_handle_out: *usize,
+    stderr_handle_out: *usize,
+) c_int;
 
 pub const CtHostSpawnResult = extern struct {
     exit_code: c_int,
@@ -509,7 +524,7 @@ fn cwdOption(path: ?[*:0]const u8) std.process.Child.Cwd {
 fn spawnFileForDescriptor(fd: c_int) std.Io.File {
     if (comptime builtin.os.tag == .windows) {
         const handle = windowsFileHandle(fd);
-        return .{ .handle = handle };
+        return .{ .handle = handle, .flags = .{ .nonblocking = false } };
     }
     return .{ .handle = @intCast(fd), .flags = .{ .nonblocking = false } };
 }
@@ -525,6 +540,65 @@ fn spawnStdioOption(mode: c_int, source_fd: c_int) std.process.SpawnOptions.StdI
         .pipe => .pipe,
         .inherit => .inherit,
         .ignore => .ignore,
+    };
+}
+
+fn inheritWindowsSystemRoot(
+    map: *std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+) !void {
+    if (comptime builtin.os.tag != .windows) return;
+    if (map.contains("SystemRoot")) return;
+
+    const parent_environ: std.process.Environ = .{ .block = .global };
+    const value = parent_environ.getAlloc(allocator, "SystemRoot") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return,
+        else => return err,
+    };
+    defer allocator.free(value);
+    try map.put("SystemRoot", value);
+}
+
+fn windowsPipeFile(raw_handle: usize) ?std.Io.File {
+    if (raw_handle == 0) return null;
+    return .{
+        .handle = @ptrFromInt(raw_handle),
+        .flags = .{ .nonblocking = false },
+    };
+}
+
+fn spawnWindowsNative(
+    file: [*:0]const u8,
+    args_ptr: ?[*]const [*:0]const u8,
+    arg_count: usize,
+    options: CtHostSpawnOptions,
+) std.process.SpawnError!std.process.Child {
+    var process_handle: usize = 0;
+    var thread_handle: usize = 0;
+    var stdin_handle: usize = 0;
+    var stdout_handle: usize = 0;
+    var stderr_handle: usize = 0;
+    const code = ct_windows_spawn_host_process(
+        file,
+        args_ptr,
+        arg_count,
+        options,
+        &process_handle,
+        &thread_handle,
+        &stdin_handle,
+        &stdout_handle,
+        &stderr_handle,
+    );
+    if (code != 0) return posixSpawnError(code);
+    if (process_handle == 0 or thread_handle == 0) return error.Unexpected;
+
+    return .{
+        .id = @ptrFromInt(process_handle),
+        .thread_handle = @ptrFromInt(thread_handle),
+        .stdin = windowsPipeFile(stdin_handle),
+        .stdout = windowsPipeFile(stdout_handle),
+        .stderr = windowsPipeFile(stderr_handle),
+        .request_resource_usage_statistics = true,
     };
 }
 
@@ -1102,6 +1176,67 @@ fn waitForConstrainedChild(
     }
 }
 
+fn appendPemCertificate(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    der_bytes: []const u8,
+) !void {
+    try output.appendSlice(allocator, "-----BEGIN CERTIFICATE-----\n");
+
+    const encoder = std.base64.standard.Encoder;
+    var offset: usize = 0;
+    while (offset < der_bytes.len) {
+        // 48 input bytes encode to one conventional 64-column PEM line.
+        const end = @min(offset + 48, der_bytes.len);
+        const chunk = der_bytes[offset..end];
+        const encoded = try output.addManyAsSlice(allocator, encoder.calcSize(chunk.len));
+        _ = encoder.encode(encoded, chunk);
+        try output.append(allocator, '\n');
+        offset = end;
+    }
+
+    try output.appendSlice(allocator, "-----END CERTIFICATE-----");
+}
+
+fn windowsSystemRootCertificates() ![:0]u8 {
+    const allocator = std.heap.c_allocator;
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(allocator);
+    try bundle.rescan(allocator, getIo(), std.Io.Clock.real.now(getIo()));
+
+    var offsets: std.ArrayList(u32) = .empty;
+    defer offsets.deinit(allocator);
+    var iterator = bundle.map.valueIterator();
+    while (iterator.next()) |offset| {
+        try offsets.append(allocator, offset.*);
+    }
+    if (offsets.items.len == 0) return error.CertificateAuthorityBundleEmpty;
+    std.mem.sort(u32, offsets.items, {}, std.sort.asc(u32));
+
+    var pem: std.ArrayList(u8) = .empty;
+    errdefer pem.deinit(allocator);
+    for (offsets.items, 0..) |start, index| {
+        const end: usize = if (index + 1 < offsets.items.len)
+            offsets.items[index + 1]
+        else
+            bundle.bytes.items.len;
+        if (index > 0) try pem.append(allocator, '\n');
+        try appendPemCertificate(&pem, allocator, bundle.bytes.items[start..end]);
+    }
+    return pem.toOwnedSliceSentinel(allocator, 0);
+}
+
+pub export fn ct_host_system_root_certificates(error_out: *?[*:0]u8) ?[*:0]u8 {
+    error_out.* = null;
+    if (comptime builtin.os.tag != .windows) return null;
+
+    const pem = windowsSystemRootCertificates() catch |err| {
+        setFormattedErrorOut(error_out, "Unable to load Windows system certificates: {s}", .{@errorName(err)});
+        return null;
+    };
+    return pem.ptr;
+}
+
 pub export fn ct_host_string_free(value: ?[*:0]u8) void {
     if (value) |ptr| {
         c.free(@ptrCast(ptr));
@@ -1303,6 +1438,10 @@ pub export fn ct_host_spawn_sync(
                 };
             }
         }
+        inheritWindowsSystemRoot(&map, gpa) catch {
+            setErrorOut(error_out, "OutOfMemory");
+            return -1;
+        };
 
         env_map = map;
     }
@@ -1349,6 +1488,8 @@ pub export fn ct_host_spawn_sync(
         spawnStdioOption(options.stderr_mode, options.stderr_fd);
     const isolate_process_group = builtin.os.tag == .linux and
         (options.timeout_enabled or options.max_buffer_enabled or options.abort_requested);
+    const hide_spawn_window = options.windows_hide or
+        shouldCreateNoWindow(options.stdin_mode, options.stdout_mode, options.stderr_mode);
 
     const spawn_options: std.process.SpawnOptions = .{
         .argv = argv.items,
@@ -1359,8 +1500,10 @@ pub export fn ct_host_spawn_sync(
         .stderr = stderr_option,
         .request_resource_usage_statistics = true,
         .pgid = if (isolate_process_group) 0 else null,
-        .create_no_window = shouldCreateNoWindow(options.stdin_mode, options.stdout_mode, options.stderr_mode),
+        .create_no_window = hide_spawn_window,
     };
+    var native_windows_options = options;
+    native_windows_options.windows_hide = hide_spawn_window;
     var signal_scope = signal_forwarding.Scope.begin();
     defer signal_scope.deinit();
     const child_result = if (comptime builtin.os.tag != .windows)
@@ -1378,7 +1521,10 @@ pub export fn ct_host_spawn_sync(
         else
             std.process.spawn(io, spawn_options)
     else
-        std.process.spawn(io, spawn_options);
+        // Keep every Windows spawn route on the native implementation that
+        // uses PROC_THREAD_ATTRIBUTE_HANDLE_LIST. std.process.spawn inherits
+        // unrelated process-wide inheritable handles under concurrent workers.
+        spawnWindowsNative(file, args_ptr, arg_count, native_windows_options);
     var child = child_result catch |err| {
         setErrorOut(error_out, @errorName(err));
         return -1;

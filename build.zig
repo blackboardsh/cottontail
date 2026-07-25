@@ -495,6 +495,17 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
                 .flags = cpp_flags,
             });
         }
+        if (resolved_target.os.tag == .windows) {
+            inline for (&.{
+                "src/compiler/src/jsc/bindings/windows/rescle.cpp",
+                "src/compiler/src/jsc/bindings/windows/rescle-binding.cpp",
+            }) |source| {
+                step.root_module.addCSourceFile(.{
+                    .file = b.path(source),
+                    .flags = cpp_flags,
+                });
+            }
+        }
     }
     step.root_module.addCSourceFile(.{
         .file = b.path("src/compiler/src/jsc/bindings/sqlite/sqlite3.c"),
@@ -581,7 +592,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             for (fallback_libraries) |library|
                 step.root_module.addObjectFile(b.path(b.fmt("{s}/{s}", .{ fallback_dir, library })));
             inline for (&.{
-                "brotlicommon.lib", "brotlidec.lib", "brotlienc.lib", "dl.lib", "ffi.lib", "libcrypto.lib", "libssl.lib", "zs.lib",
+                "brotlicommon.lib", "brotlidec.lib", "brotlienc.lib", "dl.lib", "ffi.lib", "libcrypto.lib", "libssl.lib", "zs.lib", "zstd.lib",
             }) |library| {
                 step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/{s}", .{ dependency_dir, library })));
             }

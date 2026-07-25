@@ -51,6 +51,18 @@ function isWindowsDeviceRoot(code) {
   );
 }
 
+const WINDOWS_RESERVED_NAMES = new Set([
+  "CON", "PRN", "AUX", "NUL",
+  "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+  "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+  "COM\u00b9", "COM\u00b2", "COM\u00b3",
+  "LPT\u00b9", "LPT\u00b2", "LPT\u00b3",
+]);
+
+function isWindowsReservedName(path, colonIndex) {
+  return WINDOWS_RESERVED_NAMES.has(path.slice(0, colonIndex).toUpperCase());
+}
+
 // Resolves . and .. elements in a path with directory names
 function normalizeString(path, allowAboveRoot, separator, isPathSeparatorFn) {
   let res = "";
@@ -128,8 +140,11 @@ function _format(sep, pathObject) {
 }
 
 function posixCwd() {
-  const cwd = cottontail.cwd();
-  // On non-posix hosts this could contain backslashes; keep it simple.
+  let cwd = cottontail.cwd();
+  if (cottontail.platform() === "win32") {
+    cwd = cwd.replace(/\\/g, "/");
+    if (/^[A-Za-z]:\//.test(cwd)) cwd = cwd.slice(2);
+  }
   return cwd;
 }
 
@@ -581,9 +596,15 @@ export const win32 = {
                 j++;
               }
               if (j === len || j !== last) {
-                // We matched a UNC root
-                device = `\\\\${firstPart}\\${path.slice(last, j)}`;
-                rootEnd = j;
+                if (firstPart !== "." && firstPart !== "?") {
+                  // We matched a UNC root.
+                  device = `\\\\${firstPart}\\${path.slice(last, j)}`;
+                  rootEnd = j;
+                } else {
+                  // We matched a device root such as \\.\PHYSICALDRIVE0.
+                  device = `\\\\${firstPart}`;
+                  rootEnd = 4;
+                }
               }
             }
           }
@@ -680,31 +701,47 @@ export const win32 = {
             while (j < len && !isPathSeparator(path.charCodeAt(j))) {
               j++;
             }
-            if (j === len) {
-              // We matched a UNC root only
-              // Return the normalized version of the UNC root since there
-              // is nothing left to process
-              return `\\\\${firstPart}\\${path.slice(last)}\\`;
-            }
-            if (j !== last) {
-              // We matched a UNC root with leftovers
-              device = `\\\\${firstPart}\\${path.slice(last, j)}`;
-              rootEnd = j;
+            if (j === len || j !== last) {
+              if (firstPart === "." || firstPart === "?") {
+                // We matched a device root such as \\.\PHYSICALDRIVE0.
+                device = `\\\\${firstPart}`;
+                rootEnd = 4;
+                const colonIndex = path.indexOf(":");
+                const possibleDevice = path.slice(4, colonIndex + 1);
+                if (isWindowsReservedName(possibleDevice, possibleDevice.length - 1)) {
+                  device = `\\\\?\\${possibleDevice}`;
+                  rootEnd = 4 + possibleDevice.length;
+                }
+              } else if (j === len) {
+                // We matched a UNC root only.
+                return `\\\\${firstPart}\\${path.slice(last)}\\`;
+              } else {
+                // We matched a UNC root with leftovers.
+                device = `\\\\${firstPart}\\${path.slice(last, j)}`;
+                rootEnd = j;
+              }
             }
           }
         }
       } else {
         rootEnd = 1;
       }
-    } else if (isWindowsDeviceRoot(code) && path.charCodeAt(1) === CHAR_COLON) {
-      // Possible device root
-      device = path.slice(0, 2);
-      rootEnd = 2;
-      if (len > 2 && isPathSeparator(path.charCodeAt(2))) {
-        // Treat separator following drive name as an absolute path
-        // indicator
-        isAbsolute = true;
-        rootEnd = 3;
+    } else {
+      const colonIndex = path.indexOf(":");
+      if (colonIndex > 0) {
+        if (isWindowsDeviceRoot(code) && colonIndex === 1) {
+          // Possible drive root.
+          device = path.slice(0, 2);
+          rootEnd = 2;
+          if (len > 2 && isPathSeparator(path.charCodeAt(2))) {
+            // Treat separator following drive name as an absolute path.
+            isAbsolute = true;
+            rootEnd = 3;
+          }
+        } else if (isWindowsReservedName(path, colonIndex)) {
+          device = path.slice(0, colonIndex + 1);
+          rootEnd = colonIndex + 1;
+        }
       }
     }
 
@@ -712,6 +749,28 @@ export const win32 = {
       rootEnd < len ? normalizeString(path.slice(rootEnd), !isAbsolute, "\\", isPathSeparator) : "";
     if (tail.length === 0 && !isAbsolute) tail = ".";
     if (tail.length > 0 && isPathSeparator(path.charCodeAt(len - 1))) tail += "\\";
+    if (!isAbsolute && device === undefined && path.includes(":")) {
+      // Avoid returning a relative path that Windows could reinterpret as an
+      // absolute drive path (CVE-2024-36139).
+      if (
+        tail.length >= 2 &&
+        isWindowsDeviceRoot(tail.charCodeAt(0)) &&
+        tail.charCodeAt(1) === CHAR_COLON
+      ) {
+        return `.\\${tail}`;
+      }
+      let index = path.indexOf(":");
+      do {
+        if (index === len - 1 || isPathSeparator(path.charCodeAt(index + 1))) {
+          return `.\\${tail}`;
+        }
+        index = path.indexOf(":", index + 1);
+      } while (index !== -1);
+    }
+    const colonIndex = path.indexOf(":");
+    if (isWindowsReservedName(path, colonIndex)) {
+      return `.\\${device ?? ""}${tail}`;
+    }
     if (device === undefined) {
       return isAbsolute ? `\\${tail}` : tail;
     }
@@ -787,6 +846,17 @@ export const win32 = {
 
       // Replace the slashes if needed
       if (slashCount >= 2) joined = `\\${joined.slice(slashCount)}`;
+    }
+
+    // Normalizing across a colon-bearing reserved device component can turn
+    // a relative path into a different Windows device path. Preserve the
+    // joined components in that case, matching Node's Windows behavior.
+    const parts = joined.split(/\\+/).filter(Boolean);
+    if (parts.some((part) => {
+      const colonIndex = part.indexOf(":");
+      return colonIndex !== -1 && isWindowsReservedName(part, colonIndex);
+    })) {
+      return joined.replaceAll("/", "\\");
     }
 
     return win32.normalize(joined);

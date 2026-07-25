@@ -63,8 +63,14 @@ function runCase(testCase) {
     );
   }
 
+  // Bun's test reporter writes assertion results to stderr while test-body
+  // output and the banner use stdout. Treat both reporter streams as the
+  // observable test output, but keep standalone script stdout checks strict.
+  const stdoutSearch = testCase.argv?.[0] === 'test'
+    ? `${result.stdout}\n${result.stderr}`
+    : result.stdout;
   for (const expected of testCase.stdoutIncludes ?? []) {
-    if (!result.stdout.includes(expected)) {
+    if (!stdoutSearch.includes(expected)) {
       fail(`Test "${testCase.name}" stdout did not include: ${expected}`);
     }
   }
@@ -105,7 +111,11 @@ try {
   writeFileSync(join(tempDir, 'plain.test.js'), 'console.log("plain-test-body");\n');
   writeFileSync(
     join(tempDir, 'commonjs-using.js'),
-    'let disposed = false; { using value = { [Symbol.dispose]() { disposed = true; } }; } if (!disposed) throw new Error("resource was not disposed"); console.log("commonjs using passed");\n'
+    'let disposed = false; { using value = { [Symbol.dispose]() { disposed = true; } }; } if (!disposed) throw new Error("resource was not disposed"); module.exports = disposed;\n'
+  );
+  writeFileSync(
+    join(tempDir, 'commonjs-using-entry.cjs'),
+    'if (require("./commonjs-using.js") !== true) throw new Error("CommonJS export changed while lowering using"); console.log("commonjs using passed");\n'
   );
   const tests = [
     {
@@ -157,6 +167,18 @@ try {
       stderrIncludes: ['1 pass', '0 fail'],
     },
     {
+      name: 'runtime-sourcemap-regressions',
+      argv: ['test', join(rootDir, 'tests', 'js', 'runtime-sourcemap.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['2 pass', '0 fail'],
+    },
+    {
+      name: 'node-assertion-error-display',
+      argv: ['test', join(rootDir, 'tests', 'js', 'node-assertion-error-display.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['1 pass', '0 fail'],
+    },
+    {
       name: 'upstream-test-temp-cleanup-regressions',
       argv: ['test', join(rootDir, 'tests', 'js', 'upstream-test-temp-cleanup.test.ts')],
       expectExitCode: 0,
@@ -173,7 +195,7 @@ try {
       name: 'internal-runtime-bindings',
       argv: ['test', join(rootDir, 'tests', 'js', 'internal-runtime-bindings.test.ts')],
       expectExitCode: 0,
-      stderrIncludes: ['7 pass', '0 fail'],
+      stderrIncludes: ['8 pass', '0 fail'],
     },
     {
       name: 'cli-version-identity-regressions',
@@ -197,7 +219,7 @@ try {
         COTTONTAIL_CLI_RUN_TEST_ROOT: join(rootDir, '.cottontail-tmp'),
       },
       expectExitCode: 0,
-      stderrIncludes: ['2 pass', '0 fail'],
+      stderrIncludes: ['3 pass', '0 fail'],
     },
     {
       name: 'module-syntax-in-multiline-string',
@@ -263,7 +285,7 @@ try {
     {
       name: 'commonjs-explicit-resource-management',
       cwd: tempDir,
-      scriptPath: join(tempDir, 'commonjs-using.js'),
+      scriptPath: join(tempDir, 'commonjs-using-entry.cjs'),
       expectExitCode: 0,
       stdoutIncludes: ['commonjs using passed'],
     },
@@ -325,6 +347,7 @@ try {
         COTTONTAIL_TEST_ENV: 'present',
         COTTONTAIL_EXPECT_CWD: rootDir,
         COTTONTAIL_TMP_FILE: tempFilePath,
+        COTTONTAIL_TMP_DIR: tempDir,
       },
       expectExitCode: 0,
       stdoutIncludes: ['host api passed'],
@@ -361,6 +384,13 @@ try {
       },
       expectExitCode: 0,
       stdoutIncludes: ['bun package manager internals passed'],
+    },
+    {
+      name: 'package-manager-install-edges',
+      scriptPath: join(rootDir, 'tests', 'js', 'package-manager-install-edges.cjs'),
+      args: [binaryPath],
+      expectExitCode: 0,
+      stdoutIncludes: ['package-manager install edges: pass'],
     },
     {
       name: 'bun-package-manager-link',
@@ -400,6 +430,12 @@ try {
       scriptPath: join(rootDir, 'tests', 'js', 'bun-test-module.ts'),
       expectExitCode: 0,
       stdoutIncludes: ['bun test module passed'],
+    },
+    {
+      name: 'bun-test-module-explicit-cli',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-test-module.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['bun test module passed', '1 pass', '0 fail'],
     },
     {
       name: 'bun-build-error',
@@ -450,6 +486,28 @@ try {
       stdoutIncludes: ['bun jsc and global passed'],
     },
     {
+      name: 'textdecoder-legacy-encodings',
+      argv: ['test', join(rootDir, 'tests', 'js', 'textdecoder-legacy-encodings.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['4 pass', '0 fail'],
+    },
+    ...(process.platform === 'win32'
+      ? [
+          {
+            name: 'bun-secrets-windows',
+            argv: ['test', join(rootDir, 'tests', 'js', 'bun-secrets-windows.test.ts')],
+            expectExitCode: 0,
+            stdoutIncludes: ['3 pass', '0 fail'],
+          },
+          {
+            name: 'bun-build-windows-metadata',
+            argv: ['test', join(rootDir, 'tests', 'js', 'bun-build-windows-metadata.test.ts')],
+            expectExitCode: 0,
+            stdoutIncludes: ['2 pass', '0 fail'],
+          },
+        ]
+      : []),
+    {
       name: 'bun-serve-spawn-ts',
       scriptPath: join(rootDir, 'tests', 'js', 'bun-serve-spawn.ts'),
       expectExitCode: 0,
@@ -460,6 +518,42 @@ try {
       scriptPath: join(rootDir, 'tests', 'js', 'bun-spawn-streaming.ts'),
       expectExitCode: 0,
       stdoutIncludes: ['bun spawn streaming passed'],
+    },
+    {
+      name: 'bun-spawn-readable-stream',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-spawn-readable-stream.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['4 pass', '0 fail'],
+    },
+    {
+      name: 'bun-spawn-native-routing',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-spawn-native-routing.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: [process.platform === 'win32' ? '5 pass' : '6 pass', '0 fail'],
+    },
+    {
+      name: 'bun-spawn-ipc-contract',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-spawn-ipc-contract.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['8 pass', '0 fail'],
+    },
+    {
+      name: 'bun-exec-cli',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-exec-cli.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['3 pass', '0 fail'],
+    },
+    {
+      name: 'bun-shell-runtime',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-shell-runtime.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['13 pass', '0 fail'],
+    },
+    {
+      name: 'bun-shell-source-port',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-shell-source-port.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['32 pass', '0 fail'],
     },
     {
       name: 'bun-shell-long-top-level-await',
@@ -516,6 +610,37 @@ try {
       stdoutIncludes: ['node path platform exports passed'],
     },
     {
+      name: 'windows-runtime-compat',
+      scriptPath: join(rootDir, 'tests', 'js', 'windows-runtime-compat.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['windows runtime compatibility passed'],
+    },
+    ...(process.platform === 'win32'
+      ? [
+          {
+            name: 'windows-unicode-cwd',
+            scriptPath: join(rootDir, 'tests', 'js', 'windows-unicode-cwd.ts'),
+            env: {
+              COTTONTAIL_TMP_DIR: tempDir,
+            },
+            expectExitCode: 0,
+            stdoutIncludes: ['windows unicode cwd passed'],
+          },
+          {
+            name: 'node-tty-windows-raw-mode',
+            argv: ['test', join(rootDir, 'tests', 'js', 'node-tty-windows-raw-mode.test.ts')],
+            expectExitCode: 0,
+            stdoutIncludes: ['3 pass', '0 fail'],
+          },
+          {
+            name: 'node-process-windows-console-signals',
+            argv: ['test', join(rootDir, 'tests', 'js', 'node-process-windows-console-signals.test.ts')],
+            expectExitCode: 0,
+            stdoutIncludes: ['2 pass', '0 fail'],
+          },
+        ]
+      : []),
+    {
       name: 'node-fs',
       scriptPath: join(rootDir, 'tests', 'js', 'node-fs.ts'),
       env: {
@@ -539,6 +664,31 @@ try {
       expectExitCode: 0,
       stdoutIncludes: ['node fs windows long path passed'],
     },
+    ...(process.platform === 'win32'
+      ? [
+          {
+            name: 'node-fs-windows-permissions',
+            argv: ['test', join(rootDir, 'tests', 'js', 'node-fs-windows-permissions.test.ts')],
+            expectExitCode: 0,
+            stdoutIncludes: ['4 pass', '0 fail'],
+          },
+          {
+            name: 'node-fs-windows-symlink-types',
+            scriptPath: join(rootDir, 'tests', 'js', 'node-fs-windows-symlink-types.ts'),
+            env: {
+              COTTONTAIL_TMP_DIR: tempDir,
+            },
+            expectExitCode: 0,
+            stdoutIncludes: ['node fs windows symlink types passed'],
+          },
+          {
+            name: 'node-fs-windows-errors',
+            scriptPath: join(rootDir, 'tests', 'js', 'node-fs-windows-errors.ts'),
+            expectExitCode: 0,
+            stdoutIncludes: ['node fs windows error compatibility passed'],
+          },
+        ]
+      : []),
     {
       name: 'node-fs-unlink-directory-link',
       scriptPath: join(rootDir, 'tests', 'js', 'node-fs-unlink-directory-link.ts'),
@@ -558,6 +708,12 @@ try {
       stdoutIncludes: ['node fs surface passed'],
     },
     {
+      name: 'node-fs-focused-regressions',
+      argv: ['test', join(rootDir, 'tests', 'js', 'node-fs-focused-regressions.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['26 pass', '0 fail'],
+    },
+    {
       name: 'node-child-process-inherited-sync',
       scriptPath: join(rootDir, 'tests', 'js', 'node-child-process-inherited-sync.ts'),
       expectExitCode: 0,
@@ -572,16 +728,62 @@ try {
       stderrIncludes: ['inherited-stderr', 'inherited-sync-stderr'],
     },
     {
+      name: 'node-child-process-conformance',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-child-process-conformance.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node child_process conformance passed'],
+    },
+    {
       name: 'node-child-process-fork',
       scriptPath: join(rootDir, 'tests', 'js', 'node-child-process-fork.ts'),
       expectExitCode: 0,
       stdoutIncludes: ['node child_process fork passed'],
+    },
+    ...(process.platform === 'win32'
+      ? [
+          {
+            name: 'node-child-process-windows-ipc-ack-scope',
+            scriptPath: join(rootDir, 'tests', 'js', 'node-child-process-windows-ipc-ack-scope.ts'),
+            expectExitCode: 0,
+            stdoutIncludes: ['node child_process Windows IPC ACK scoping passed'],
+          },
+          {
+            name: 'node-child-process-windows-handle-isolation',
+            scriptPath: join(rootDir, 'tests', 'js', 'node-child-process-windows-handle-isolation.ts'),
+            expectExitCode: 0,
+            stdoutIncludes: ['node child_process Windows handle isolation passed'],
+          },
+          {
+            name: 'node-child-process-windows-env-case-dedup',
+            scriptPath: join(rootDir, 'tests', 'js', 'node-child-process-windows-env-case-dedup.ts'),
+            expectExitCode: 0,
+            stdoutIncludes: ['node child_process Windows env case dedup passed'],
+          },
+        ]
+      : []),
+    {
+      name: 'node-child-process-ipc-startup-backpressure',
+      argv: ['test', join(rootDir, 'tests', 'js', 'node-child-process-ipc-startup-backpressure.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['3 pass', '0 fail'],
+    },
+    {
+      name: 'node-child-process-relative-cwd',
+      argv: ['test', join(rootDir, 'tests', 'js', 'node-child-process-relative-cwd.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: [process.platform === 'win32' ? '3 pass' : '2 pass', '0 fail'],
     },
     {
       name: 'node-child-process-external-fork',
       scriptPath: join(rootDir, 'tests', 'js', 'node-child-process-external-fork.ts'),
       expectExitCode: 0,
       stdoutIncludes: ['node child_process external fork passed'],
+    },
+    {
+      name: 'node-child-process-direct-ipc',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-child-process-direct-ipc.test.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node child_process direct IPC passed'],
     },
     {
       name: 'node-os',
@@ -594,6 +796,34 @@ try {
       scriptPath: join(rootDir, 'tests', 'js', 'node-process.ts'),
       expectExitCode: 0,
       stdoutIncludes: ['node process passed'],
+    },
+    {
+      name: 'node-process-behavior',
+      argv: ['test', join(rootDir, 'tests', 'js', 'node-process-behavior.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: process.platform === 'win32'
+        ? ['22 pass', '1 skip', '0 fail']
+        : ['23 pass', '0 fail'],
+    },
+    {
+      name: 'node-process-host-lifecycle',
+      argv: ['test', join(rootDir, 'tests', 'js', 'node-process-host-lifecycle.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: process.platform === 'win32'
+        ? ['7 pass', '2 skip', '0 fail']
+        : ['9 pass', '0 fail'],
+    },
+    {
+      name: 'node-process-nexttick-uncaught',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-process-nexttick-uncaught.js'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node process nextTick uncaughtException passed'],
+    },
+    {
+      name: 'node-permission-model',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-permission-model.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node permission model passed'],
     },
     {
       name: 'node-process-surface',
@@ -635,6 +865,18 @@ try {
       stdoutIncludes: ['node net passed'],
     },
     {
+      name: 'bun-net-socket-compat',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-net-socket-compat.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['14 pass', '0 fail'],
+    },
+    {
+      name: 'windows-http-named-pipe',
+      scriptPath: join(rootDir, 'tests', 'js', 'windows-http-named-pipe.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['windows http named pipe passed'],
+    },
+    {
       name: 'node-net-native-readiness',
       argv: ['test', join(rootDir, 'tests', 'js', 'node-net-native-readiness.test.ts')],
       expectExitCode: 0,
@@ -644,7 +886,9 @@ try {
       name: 'node-net-lifecycle-regressions',
       argv: ['test', join(rootDir, 'tests', 'js', 'node-net-lifecycle-regressions.test.ts')],
       expectExitCode: 0,
-      stderrIncludes: ['13 pass', '0 fail'],
+      stderrIncludes: process.platform === 'win32'
+        ? ['14 pass', '0 fail']
+        : ['13 pass', '1 skip', '0 fail'],
     },
     {
       name: 'node-net-duplex',
@@ -827,13 +1071,13 @@ try {
       name: 'sync-error',
       scriptPath: join(rootDir, 'tests', 'js', 'sync-error.js'),
       expectExitCode: 1,
-      stderrIncludes: ['error: sync boom'],
+      stderrIncludes: ['sync boom'],
     },
     {
       name: 'unhandled-rejection',
       scriptPath: join(rootDir, 'tests', 'js', 'unhandled-rejection.js'),
       expectExitCode: 1,
-      stderrIncludes: ['error: async boom'],
+      stderrIncludes: ['async boom'],
     },
   ];
 

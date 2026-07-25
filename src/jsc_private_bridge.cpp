@@ -49,7 +49,15 @@ class RunLoop {
 public:
     enum class CycleResult { Continue, Stop };
     static RunLoop& currentSingleton();
+#if defined(_WIN32)
+    // RunLoop::dispatch overrides FunctionDispatcher::dispatch in the
+    // vendored Windows build. MSVC encodes virtualness in the decorated
+    // member name, so this declaration must match even though the minimal
+    // ABI bridge intentionally omits RunLoop's private base-class headers.
+    virtual void dispatch(Function<void()>&&) final;
+#else
     void dispatch(Function<void()>&&);
+#endif
     static CycleResult cycle(unsigned mode);
 };
 
@@ -130,6 +138,37 @@ private:
 extern "C" bool ct_jsc_string_is_8_bit(JSStringRef string)
 {
     return string != nullptr && string->is8Bit();
+}
+
+extern "C" bool ct_jsc_value_is_out_of_memory_error(
+    JSContextRef context,
+    JSValueRef value)
+{
+#if defined(_WIN32)
+    if (context == nullptr || value == nullptr || !JSValueIsObject(context, value))
+        return false;
+
+    /*
+     * This is a read-only ABI bridge for the pinned Windows JSC artifact
+     * (WebKit c279202f1882bdbf0d7c02141a95a4d1688fdf2a). JSCell stores its
+     * one-byte JSType at offset 5, where ErrorInstanceType is 0x24. MSVC
+     * places ErrorInstance's bitfield at offset 0x3b; createOutOfMemoryError
+     * sets bit 1 there. Check the cell type before reading the ErrorInstance
+     * byte so ordinary, smaller JS cells are never accessed past their type
+     * header. Keep these offsets synchronized with the vendored JSC release.
+     */
+    constexpr size_t js_cell_type_offset = 5;
+    constexpr uint8_t error_instance_type = 0x24;
+    constexpr size_t error_instance_flags_offset = 0x3b;
+    constexpr uint8_t out_of_memory_error_mask = 0x02;
+    const auto* cell = reinterpret_cast<const uint8_t*>(value);
+    return cell[js_cell_type_offset] == error_instance_type
+        && (cell[error_instance_flags_offset] & out_of_memory_error_mask) != 0;
+#else
+    (void)context;
+    (void)value;
+    return false;
+#endif
 }
 
 using CtExternalStringFinalize = void (*)(void*, void*, size_t);
@@ -470,11 +509,16 @@ static JSC::VM* ct_jsc_vm(JSContextRef context)
         const_cast<OpaqueJSContextGroup*>(JSContextGetGroup(context)));
 }
 
+#if defined(_WIN32)
+static constexpr ptrdiff_t ct_jsc_vm_heap_offset = 0xf0;
+#else
+static constexpr ptrdiff_t ct_jsc_vm_heap_offset = 0xf8;
+#endif
+
 static JSC::Heap* ct_jsc_heap(JSC::VM* vm)
 {
-    constexpr ptrdiff_t vm_heap_offset = 0xf8;
     return reinterpret_cast<JSC::Heap*>(
-        reinterpret_cast<unsigned char*>(vm) + vm_heap_offset);
+        reinterpret_cast<unsigned char*>(vm) + ct_jsc_vm_heap_offset);
 }
 
 extern "C" void ct_jsc_collect_full(JSContextRef context)
@@ -836,9 +880,8 @@ extern "C" JSObjectRef* ct_jsc_query_objects(
 
     JSValueProtect(context, prototype);
     CtQueryObjectsAnalyzer analyzer;
-    constexpr ptrdiff_t vm_heap_offset = 0xf8;
     auto* heap = reinterpret_cast<JSC::Heap*>(
-        reinterpret_cast<unsigned char*>(vm) + vm_heap_offset);
+        reinterpret_cast<unsigned char*>(vm) + ct_jsc_vm_heap_offset);
     {
         CtPreventCollectionScope prevent_collection(*heap);
         CtActiveHeapAnalyzerScope active_analyzer(*profiler, analyzer);

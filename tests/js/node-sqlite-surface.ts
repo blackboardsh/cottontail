@@ -198,7 +198,7 @@ try {
   ok(String(error).includes("unavailable"), "SQLite enableLoadExtension(true) unavailable error mismatch");
 }
 if (nativeExtensionLoading) {
-  throws(() => extensionDb.loadExtension("/definitely/missing/cottontail-ext"), /missing|not found|cannot open|dlopen|No such file/i, "SQLite loadExtension should call native loader when enabled");
+  throws(() => extensionDb.loadExtension("/definitely/missing/cottontail-ext"), /missing|not found|could not be found|cannot open|dlopen|No such file/i, "SQLite loadExtension should call native loader when enabled");
 } else {
   throws(() => extensionDb.loadExtension("/definitely/missing/cottontail-ext"), /unavailable|not allowed/, "SQLite loadExtension unavailable build mismatch");
 }

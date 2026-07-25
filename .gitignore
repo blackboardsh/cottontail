@@ -14,6 +14,7 @@ vendors/.zig-html-rewriter-*/
 .cottontail-tmp*/
 .cottontail-local-tools/
 .cottontail-eval-*
+/.cottontail-path-probe-*/
 fixtures/electrobun-cli/build/
 fixtures/electrobun-cli/.cottontail-tmp/
 vendors/jsc/
@@ -48,6 +49,7 @@ compat/upstream/**/Heap-*.heapsnapshot
 compat/upstream/**/.cottontail-compile-cache/
 compat/upstream/**/fstest*/
 compat/upstream/**/.verdaccio-db.json
+compat/upstream/node/**/__pycache__/
 compat/upstream/bun/*/app
 compat/upstream/bun/*/app.exe
 compat/upstream/bun/*/a.txt

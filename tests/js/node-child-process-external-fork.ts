@@ -19,10 +19,13 @@ child.stderr?.on("data", chunk => {
 
 await new Promise<void>((resolve, reject) => {
   let receivedPong = false;
+  let sendCallbackCalled = false;
+  let sendCallbackError: unknown = undefined;
+  const backpressureLength = 1024 * 1024 + 4096;
   const timeout = setTimeout(() => {
     child.kill();
     reject(new Error(`external Node fork timed out: ${stderr}`));
-  }, 10_000);
+  }, 30_000);
 
   child.once("error", error => {
     clearTimeout(timeout);
@@ -31,8 +34,29 @@ await new Promise<void>((resolve, reject) => {
   child.on("message", message => {
     if (message?.ready) {
       assert(message.runtime === "node", `fork used the wrong runtime: ${message.runtime}`);
-      child.send({ ping: "round-trip" });
-    } else if (message?.pong === "round-trip") {
+      assert(
+        message.framingProbe?.startsWith("node-ipc-\ud83d\ude42-") &&
+          message.framingProbe?.endsWith("-tail") &&
+          message.framingProbe.length > 96 * 1024,
+        "external Node fork lost a split libuv IPC frame",
+      );
+      const canContinue = child.send(
+        {
+          ping: "round-trip",
+          unicode: "parent-\ud83d\ude42-child",
+          backpressureProbe: "y".repeat(backpressureLength),
+        },
+        error => {
+          sendCallbackCalled = true;
+          sendCallbackError = error;
+        },
+      );
+      assert(canContinue === false, "external Node IPC send did not expose pipe backpressure");
+    } else if (
+      message?.pong === "round-trip" &&
+      message?.unicodeEcho === "parent-\ud83d\ude42-child" &&
+      message?.backpressureLength === backpressureLength
+    ) {
       receivedPong = true;
     }
   });
@@ -40,6 +64,8 @@ await new Promise<void>((resolve, reject) => {
     clearTimeout(timeout);
     if (code !== 0) reject(new Error(`external Node fork exited with ${code}: ${stderr}`));
     else if (!receivedPong) reject(new Error("external Node fork closed before the IPC round trip completed"));
+    else if (!sendCallbackCalled) reject(new Error("external Node IPC send callback was not called"));
+    else if (sendCallbackError != null) reject(sendCallbackError);
     else resolve();
   });
 });

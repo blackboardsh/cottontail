@@ -335,6 +335,23 @@ fn configureEnvironment(
     return env;
 }
 
+fn appendJavaScriptStringLiteral(
+    allocator: Allocator,
+    output: *std.ArrayList(u8),
+    value: []const u8,
+) !void {
+    try output.append(allocator, '"');
+    for (value) |byte| switch (byte) {
+        '"' => try output.appendSlice(allocator, "\\\""),
+        '\\' => try output.appendSlice(allocator, "\\\\"),
+        '\n' => try output.appendSlice(allocator, "\\n"),
+        '\r' => try output.appendSlice(allocator, "\\r"),
+        '\t' => try output.appendSlice(allocator, "\\t"),
+        else => try output.append(allocator, byte),
+    };
+    try output.append(allocator, '"');
+}
+
 fn runStage(
     init: std.process.Init,
     coordinator: *Coordinator,
@@ -342,13 +359,30 @@ fn runStage(
     group: *Group,
     stage: Stage,
 ) !StageResult {
+    const allocator = std.heap.c_allocator;
     var env = try configureEnvironment(init, group, stage);
     defer env.deinit();
 
-    const argv: []const []const u8 = if (builtin.os.tag == .windows)
-        &.{ "cmd.exe", "/d", "/s", "/c", stage.command }
-    else
-        &.{ "/bin/sh", "-c", stage.command };
+    var windows_source: std.ArrayList(u8) = .empty;
+    defer windows_source.deinit(allocator);
+    var owned_windows_executable: ?[]u8 = null;
+    defer if (owned_windows_executable) |executable| allocator.free(executable);
+    var windows_argv: [3][]const u8 = undefined;
+    // Match the regular package runner on Windows. Passing a shell command
+    // containing quotes through Zig's argv serializer to `cmd.exe /c` leaves
+    // literal backslashes in cmd's independently parsed command line.
+    const argv: []const []const u8 = if (builtin.os.tag == .windows) shell: {
+        // Bun is initialized before this eval runs. Using the global avoids
+        // treating the bare "bun" specifier as an installable dependency when
+        // a package script runs from a fresh project directory.
+        try windows_source.appendSlice(allocator, "const $ = Bun.$; const __s = [");
+        try appendJavaScriptStringLiteral(allocator, &windows_source, stage.command);
+        try windows_source.appendSlice(allocator, "]; __s.raw = __s; const __result = await $(__s).nothrow(); process.exitCode = __result.exitCode;\n");
+        const executable = try std.process.executablePathAlloc(init.io, allocator);
+        owned_windows_executable = executable;
+        windows_argv = .{ executable, "-e", windows_source.items };
+        break :shell &windows_argv;
+    } else &.{ "/bin/sh", "-c", stage.command };
     var child = try std.process.spawn(init.io, .{
         .argv = argv,
         .cwd = .{ .path = group.cwd },

@@ -72,11 +72,17 @@ assert(process.memoryUsage.rss() >= 0, "memoryUsage.rss mismatch");
 assert(process.availableMemory() >= 0, "availableMemory mismatch");
 assert(process.constrainedMemory() >= 0, "constrainedMemory mismatch");
 
-assert(Number.isInteger(process.getuid()), "getuid mismatch");
-assert(Number.isInteger(process.geteuid()), "geteuid mismatch");
-assert(Number.isInteger(process.getgid()), "getgid mismatch");
-assert(Number.isInteger(process.getegid()), "getegid mismatch");
-assert(Array.isArray(process.getgroups()), "getgroups mismatch");
+if (process.platform === "win32") {
+  for (const name of ["getuid", "geteuid", "getgid", "getegid", "getgroups"] as const) {
+    assert(process[name] === undefined, `${name} should be unavailable on Windows`);
+  }
+} else {
+  assert(Number.isInteger(process.getuid()), "getuid mismatch");
+  assert(Number.isInteger(process.geteuid()), "geteuid mismatch");
+  assert(Number.isInteger(process.getgid()), "getgid mismatch");
+  assert(Number.isInteger(process.getegid()), "getegid mismatch");
+  assert(Array.isArray(process.getgroups()), "getgroups mismatch");
+}
 const oldMask = process.umask();
 const previousMask = process.umask(oldMask);
 assert(Number.isInteger(previousMask), "umask set should return old mask");
@@ -143,7 +149,10 @@ assert(Number.isInteger(constantsBinding.zlib.Z_OK), "process.binding constants 
 assert((process as any).binding("constants") === constantsBinding, "process.binding should cache constants binding");
 
 const uvBinding = (process as any).binding("uv");
-assert(uvBinding.UV_ENOENT === -2, "process.binding uv errno mismatch");
+assert(
+  uvBinding.UV_ENOENT === (process.platform === "win32" ? -4058 : -2),
+  "process.binding uv errno mismatch",
+);
 assert(uvBinding.errname(uvBinding.UV_ENOENT) === "ENOENT", "process.binding uv errname mismatch");
 
 const utilBinding = (process as any).binding("util");
@@ -232,13 +241,20 @@ if (process.platform === "linux") {
 }
 
 const spawnSyncBinding = (process as any).binding("spawn_sync");
+const bindingShell = process.platform === "win32" ? "cmd.exe" : "sh";
+const bindingShellArgs = process.platform === "win32"
+  ? ["cmd.exe", "/d", "/s", "/c", "echo binding-spawn"]
+  : ["sh", "-c", "printf binding-spawn"];
 const privateSpawn = spawnSyncBinding.spawn({
-  file: "sh",
-  args: ["sh", "-c", "printf binding-spawn"],
+  file: bindingShell,
+  args: bindingShellArgs,
   stdio: "pipe",
 });
 assert(privateSpawn.status === 0, `process.binding spawn_sync status mismatch: ${privateSpawn.status}`);
-assert(privateSpawn.output[1].toString() === "binding-spawn", "process.binding spawn_sync stdout mismatch");
+assert(
+  privateSpawn.output[1].toString().trim() === "binding-spawn",
+  `process.binding spawn_sync stdout mismatch: ${JSON.stringify(privateSpawn.output[1].toString())}`,
+);
 
 const zlibBinding = (process as any).binding("zlib");
 assert(zlibBinding.crc32("abc") === 0x352441c2, "process.binding zlib crc32 mismatch");

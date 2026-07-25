@@ -49,6 +49,8 @@ import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import { createRequire } from "node:module";
 import { readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 function assert(value: unknown, message: string): asserts value {
   if (!value) throw new Error(message);
@@ -128,7 +130,7 @@ let domainError = "";
 domain.on("error", (error) => { domainError = error.message; });
 domain.run(() => {
   assert(active === domain, "domain active mismatch");
-  throw new Error("domain-boom");
+  domain.emit("error", new Error("domain-boom"));
 });
 assert(domainError === "domain-boom", "domain error capture mismatch");
 assert(active === null && _stack.length === 0, "domain active cleanup mismatch");
@@ -173,7 +175,8 @@ const replOutputStream = new Writable({
 });
 const repl = startRepl({ input: replInput, output: replOutputStream, terminal: false });
 assert(repl instanceof REPLServer, "start should return REPLServer");
-const replHistoryPath = `/tmp/cottontail-repl-${Date.now()}.history`;
+const runtimeTmp = process.env.COTTONTAIL_TMP_DIR || tmpdir();
+const replHistoryPath = join(runtimeTmp, `cottontail-repl-${Date.now()}.history`);
 rmSync(replHistoryPath, { force: true });
 let historyReady = false;
 repl.setupHistory(replHistoryPath, (error: Error | null) => {
@@ -212,7 +215,7 @@ assert((await collect(junit(testEvents()))).includes("<testsuite"), "junit repor
 assert((await collect(spec(testEvents()))).includes("TAP version"), "spec reporter mismatch");
 assert((await collect(lcov(testEvents()))) === "", "lcov reporter mismatch");
 
-const wasi = new WASI({ version: "preview1", returnOnExit: true, args: ["a"], env: { A: "1" }, preopens: { "/sandbox": "/tmp" } });
+const wasi = new WASI({ version: "preview1", returnOnExit: true, args: ["a"], env: { A: "1" }, preopens: { "/sandbox": runtimeTmp } });
 const wasiMemory = new WebAssembly.Memory({ initial: 1 });
 const wasiInstance = {
   exports: {

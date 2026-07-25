@@ -168,7 +168,23 @@ node scripts/zig.js build -Doptimize=ReleaseSmall `
 ```
 
 Windows also needs Python 3 available as `python` for Node's copied
-`tools/test.py` harness.
+`tools/test.py` harness. On Windows ARM, point `PYTHON` at an x64 Python
+executable and verify that `platform.machine()` reports `AMD64`.
+
+`COTTONTAIL_RUNTIME_MODULES_DIR` is a useful diagnostic overlay while changing
+embedded JavaScript modules:
+
+```powershell
+$env:COTTONTAIL_RUNTIME_MODULES_DIR = `
+  (Resolve-Path .\src\runtime_modules).Path
+```
+
+It is not a release configuration. Rebuild after changing a runtime module,
+unset the overlay, and run every final gate against the embedded modules:
+
+```powershell
+Remove-Item Env:COTTONTAIL_RUNTIME_MODULES_DIR -ErrorAction SilentlyContinue
+```
 
 ## Use clean test dependencies
 
@@ -230,23 +246,31 @@ failure set is understood, rerun failing files or subsystems with `--jobs 1`.
 ```powershell
 $binary = (Resolve-Path .\zig-out\bin\cottontail.exe).Path
 
-node scripts/test-js.js 2>&1 |
-  Tee-Object vm-windows-local-js.log
+$localStdout = "vm-windows-local-js.stdout.log"
+$localStderr = "vm-windows-local-js.stderr.log"
+node scripts/test-js.js 1> $localStdout 2> $localStderr
 if ($LASTEXITCODE -ne 0) { throw "Local JavaScript tests failed" }
 
-node scripts/run-upstream-tests.js node --binary $binary 2>&1 |
-  Tee-Object vm-windows-node.log
+node scripts/run-upstream-tests.js node --binary $binary `
+  1> vm-windows-node.stdout.log 2> vm-windows-node.stderr.log
 if ($LASTEXITCODE -ne 0) { Write-Host "Node baseline has failures" }
 
 node scripts/run-upstream-tests.js bun --binary $binary `
-  --jobs 4 --no-serial-retry 2>&1 |
-  Tee-Object vm-windows-bun-discovery.log
+  --jobs 2 --no-serial-retry `
+  1> vm-windows-bun-discovery.stdout.log `
+  2> vm-windows-bun-discovery.stderr.log
 if ($LASTEXITCODE -ne 0) { Write-Host "Bun baseline has failures" }
 ```
 
 Keep environment setup failures separate from runtime failures. Missing Python,
 compiler tools, certificates, fixture packages, or permissions do not prove a
 Cottontail behavior gap.
+
+Run these Windows phases sequentially on an ARM VM using x64 emulation. Do not
+put native commands behind `Tee-Object`; redirect stdout and stderr to separate
+files when a durable log is needed. The Node snapshot contains tracked
+`.tmp.*` fixtures, so never wildcard-delete `compat/upstream/node/**/.tmp*`.
+Remove only exact generated paths identified by the runner or `git status`.
 
 ## Triage by root cause
 
@@ -273,8 +297,10 @@ Fix shared behavior in the lowest correct layer:
 - Portable host primitives: `src/native_bindings/`, `src/native_bindings.zig`,
   `src/jsc_runner.c`, and `src/host.zig`.
 - Workers and processes: `src/runtime_modules/node/worker_threads.js`,
-  `src/runtime_modules/node/child_process.js`, `src/native_bindings/worker.c`,
-  and `src/native_bindings/process.c`.
+  `src/runtime_modules/node/child_process.js`, `src/runtime_modules/bun/ffi.js`,
+  `src/native_bindings/worker.c`, and `src/native_bindings/process.c`.
+  `src/runtime_modules/bun/ffi.js` owns the worker's virtual embedded-runtime
+  paths and the bundle that links an entrypoint with its dependencies.
 - Compiler and module loading: `src/cottontail_transpiler.zig`,
   `src/cottontail_bundler.zig`, `src/script_runner.zig`, and
   `src/compiler/src/`.
@@ -340,6 +366,22 @@ After fixing a root cause:
 
 Run the complete native suite only after a meaningful batch or before merging.
 
+The focused Windows regression families should include UTF-16 and long paths,
+filesystem error shapes and permissions, symlink types, named pipes, console
+signals and TTY raw mode, child-process IPC and startup backpressure, concurrent
+handle inheritance, `process.nextTick()` fatal routing, package lifecycle
+scripts, native publish metadata, FFI output routing, and Windows build
+metadata. Keep each focused test registered in `scripts/test-js.js`; run any
+standalone packaging test explicitly before the full gates.
+
+Also keep focused coverage for workers whose ESM entrypoints import sibling
+dependencies, `Atomics.wait()` with zero and finite timeouts, native Zstandard
+sync and async round trips, safe global link/unlink ownership, installs from a
+local HTTP registry, and the complete `bun:sqlite` named-export set. On Windows,
+the package manager's short-lived manifest and archive clients intentionally
+set `keep_alive` to false so a completed chunked response cannot strand the
+threaded reader; the local-registry regression exercises that transport path.
+
 ## Platform-specific risk areas
 
 ### Windows
@@ -355,7 +397,11 @@ Prioritize:
 - Windows certificate stores, TLS verification, DNS, and network error codes.
 - DLL and `.node` loading, MSVC runtime compatibility, N-API, and FFI calling
   conventions.
-- Package lifecycle shell selection and atomic `node_modules` replacement.
+- Package lifecycle shell selection, local-registry HTTP completion, and atomic
+  `node_modules` replacement.
+- Global package link/unlink ownership. A Windows directory-copy fallback must
+  carry a source marker, and unlink must never remove an ordinary directory, a
+  mismatched source, or an unrelated command shim.
 
 Do not translate Windows semantics into POSIX semantics merely to satisfy a
 macOS-authored local test. Match Node or Bun on Windows.
@@ -406,22 +452,26 @@ node scripts/zig.js build test
 node scripts/zig.js build -Doptimize=ReleaseSmall -Dcpu=baseline
 node scripts/test-js.js
 node scripts/run-upstream-tests.js node
-node scripts/run-upstream-tests.js bun --jobs 4
+node scripts/run-upstream-tests.js bun --jobs 2
 node scripts/run-upstream-tests.js bun \
-  --include-expected-failures --jobs 4
+  --include-expected-failures --jobs 2
 node scripts/package-release.js
 ```
 
-Use the explicit Windows target for the Windows release build.
+Use the explicit Windows target for the Windows release build. On Windows ARM
+under x64 emulation, add `-j1` to both Zig build commands and keep all heavy
+phases sequential.
 
 Extract the packaged archive into a clean directory and repeat:
 
 - `cottontail -p "6 * 7"`
 - a TypeScript entrypoint
 - a CommonJS entrypoint
-- a worker
+- a worker whose ESM entrypoint imports a sibling dependency
 - a child process
 - a local HTTP and WebSocket server/client exchange
+- native Zstandard sync and async round trips
+- `bun:sqlite` imports for `Database`, `SQLiteError`, and `constants`
 - `cottontail test`
 - `cottontail build`
 - `cottontail install` in a clean fixture

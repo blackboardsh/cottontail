@@ -4,7 +4,10 @@ function assert(condition, message) {
   }
 }
 
-assert(typeof cottontail === "object", "cottontail host object missing");
+assert(
+  typeof cottontail === "object" || typeof cottontail === "function",
+  "cottontail host object missing",
+);
 assert(typeof cottontail.nanotime === "function", "cottontail.nanotime missing");
 
 console.log("running cottontail smoke test");

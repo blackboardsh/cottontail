@@ -3,6 +3,7 @@ import bufferModule from "./buffer.js";
 import { Transform } from "./stream.js";
 
 const arrayBufferTransfer = ArrayBuffer.prototype.transfer;
+const bufferMaxLengthStateKey = Symbol.for("cottontail.node.buffer.kMaxLength");
 
 export {
   BROTLI_DECODE,
@@ -198,18 +199,6 @@ export const codes = {
   "-5": "Z_BUF_ERROR",
   "-6": "Z_VERSION_ERROR"
 };
-
-// Node and Bun expose this CommonJS export as writable. Cottontail eagerly
-// bundles builtins, so preserve that behavior on the shared namespace object.
-const kMaxLengthDescriptor = Object.getOwnPropertyDescriptor(bufferModule, "kMaxLength");
-if (kMaxLengthDescriptor?.configurable && kMaxLengthDescriptor.writable !== true) {
-  Object.defineProperty(bufferModule, "kMaxLength", {
-    configurable: true,
-    enumerable: kMaxLengthDescriptor.enumerable,
-    value: bufferModule.kMaxLength,
-    writable: true,
-  });
-}
 
 function bytesFromData(data) {
   if (data == null) return new Uint8Array(0);
@@ -1016,7 +1005,7 @@ class Zlib extends Transform {
 }
 
 function kMaxLengthLimit() {
-  const limit = bufferModule.kMaxLength;
+  const limit = globalThis[bufferMaxLengthStateKey] ?? bufferModule.kMaxLength;
   return typeof limit === "number" && limit > 0 ? limit : Number.MAX_SAFE_INTEGER;
 }
 

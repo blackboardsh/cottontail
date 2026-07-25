@@ -16,6 +16,15 @@ void ct_native_bindings_install(
     size_t callback_count
 );
 
+JSValueRef ct_system_root_certificates(
+    JSContextRef context,
+    JSObjectRef function,
+    JSObjectRef this_object,
+    size_t argument_count,
+    const JSValueRef arguments[],
+    JSValueRef *exception
+);
+
 #define CT_DECLARE_NATIVE_BINDING_MODULE(name) \
     void ct_register_##name##_bindings( \
         JSContextRef context, \

@@ -357,6 +357,7 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
   const nativeFd = Number(processObject.env?.COTTONTAIL_IPC_FD);
   const nodeFd = Number(processObject.env?.NODE_CHANNEL_FD);
   const nativeProtocol = processObject.env?.COTTONTAIL_IPC_BOOTSTRAP === "node" &&
+    processObject.env?.COTTONTAIL_IPC_PIPE !== "1" &&
     Number.isInteger(nativeFd) && nativeFd >= 0;
   const fd = nativeProtocol ? nativeFd : nodeFd;
   if (!Number.isInteger(fd) || fd < 0 || typeof host?.ipcSend !== "function" || typeof host?.ipcRecv !== "function") {

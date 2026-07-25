@@ -164,6 +164,7 @@ try {
     });
   });
 } catch (error) {
+  if (process.platform === "win32") throw error;
   assert(String((error as Error).message).includes("native Zstd support is unavailable"), "unexpected zstd failure");
 }
 

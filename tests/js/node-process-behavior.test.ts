@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const originalExitCode = process.exitCode;
-const originalUmask = process.platform === "win32" ? 0 : process.umask();
+const originalUmask = process.umask();
 
 function expectErrorCode(callback: () => unknown, code: string) {
   try {
@@ -21,7 +21,7 @@ function expectErrorCode(callback: () => unknown, code: string) {
 
 afterEach(() => {
   process.exitCode = originalExitCode;
-  if (process.platform !== "win32") process.umask(originalUmask);
+  process.umask(originalUmask);
   process.setSourceMapsEnabled(false);
 });
 
@@ -138,9 +138,11 @@ describe("node:process behavior", () => {
     expect(Object.getOwnPropertyDescriptor(process, "exitCode")?.configurable).toBe(false);
   });
 
-  test.skipIf(process.platform === "win32")("accepts octal umasks and rejects invalid masks", () => {
+  test("accepts octal umasks and rejects invalid masks", () => {
     process.umask("10664" as never);
-    expect(process.umask()).toBe(0o664);
+    // Windows' CRT retains only its supported read/write permission bits.
+    // Node and Bun both report 0600 after applying this mask on Windows.
+    expect(process.umask()).toBe(process.platform === "win32" ? 0o600 : 0o664);
     expectErrorCode(() => process.umask("999" as never), "ERR_INVALID_ARG_VALUE");
     expectErrorCode(() => process.umask(null as never), "ERR_INVALID_ARG_TYPE");
     expectErrorCode(() => process.umask(-1), "ERR_OUT_OF_RANGE");

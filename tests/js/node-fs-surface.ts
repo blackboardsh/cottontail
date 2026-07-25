@@ -46,6 +46,8 @@ import {
   writevSync,
 } from "node:fs";
 import * as fsPromises from "node:fs/promises";
+import { join, normalize, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 
 function assert(value: unknown, message: string): asserts value {
   if (!value) throw new Error(message);
@@ -170,7 +172,7 @@ assert(readFileSync(copyPath, "utf8") === "HELL", "copyFileSync mismatch");
 
 const renamedPath = `${root}/renamed.txt`;
 renameSync(copyPath, renamedPath);
-assert(realpathSync(renamedPath).endsWith("/renamed.txt"), "realpathSync mismatch");
+assert(realpathSync(renamedPath).endsWith(`${sep}renamed.txt`), "realpathSync mismatch");
 
 const hardLinkPath = `${root}/hard-link.txt`;
 linkSync(renamedPath, hardLinkPath);
@@ -178,7 +180,7 @@ assert(statSync(hardLinkPath).size === statSync(renamedPath).size, "linkSync mis
 
 const symlinkPath = `${root}/symbolic.txt`;
 symlinkSync(renamedPath, symlinkPath);
-assert(readlinkSync(symlinkPath) === renamedPath, "readlinkSync mismatch");
+assert(readlinkSync(symlinkPath) === normalize(renamedPath), "readlinkSync mismatch");
 assert(lstatSync(symlinkPath).isSymbolicLink(), "lstatSync symbolic link mismatch");
 
 const dir = opendirSync(root);
@@ -193,13 +195,15 @@ mkdirSync(`${nested}/child`, { recursive: true });
 writeFileSync(`${nested}/child/match.txt`, "glob");
 cpSync(nested, `${root}/nested-copy`, { recursive: true });
 assert(readFileSync(`${root}/nested-copy/child/match.txt`, "utf8") === "glob", "cpSync recursive mismatch");
-assert(globSync("nested/**/*.txt", { cwd: root }).includes("nested/child/match.txt"), "globSync mismatch");
+const nestedMatch = join("nested", "child", "match.txt");
+assert(globSync("nested/**/*.txt", { cwd: root }).includes(nestedMatch), "globSync mismatch");
 const allTxt = globSync("**/*.txt", { cwd: root });
 assert(allTxt.includes("file.txt"), "globSync ** should match root-level files");
-assert(!globSync("**/*.txt", { cwd: root, exclude: ["nested-copy/**"] }).includes("nested-copy/child/match.txt"), "globSync exclude pattern mismatch");
-const globDirents = globSync("nested/**/*.txt", { cwd: new URL(`file://${root}/`), withFileTypes: true });
+const copiedNestedMatch = join("nested-copy", "child", "match.txt");
+assert(!globSync("**/*.txt", { cwd: root, exclude: ["nested-copy/**"] }).includes(copiedNestedMatch), "globSync exclude pattern mismatch");
+const globDirents = globSync("nested/**/*.txt", { cwd: pathToFileURL(`${root}${sep}`), withFileTypes: true });
 assert(globDirents[0]?.name === "match.txt", "globSync withFileTypes name mismatch");
-assert(String(globDirents[0]?.parentPath).endsWith("/nested/child"), "globSync withFileTypes parentPath mismatch");
+assert(String(globDirents[0]?.parentPath).endsWith(join("nested", "child")), "globSync withFileTypes parentPath mismatch");
 const prunedGlobDirents = globSync("**/*.txt", {
   cwd: root,
   withFileTypes: true,
@@ -208,7 +212,7 @@ const prunedGlobDirents = globSync("**/*.txt", {
   },
 });
 assert(
-  !prunedGlobDirents.some(entry => String(entry.parentPath).includes("/nested/")),
+  !prunedGlobDirents.some(entry => String(entry.parentPath).includes(`${sep}nested${sep}`)),
   "globSync withFileTypes directory exclusion should prune the subtree",
 );
 
@@ -404,7 +408,7 @@ try {
 }
 const promiseGlobMatches: string[] = [];
 for await (const item of fsPromises.glob("nested/**/*.txt", { cwd: root })) promiseGlobMatches.push(String(item));
-assert(promiseGlobMatches.includes("nested/child/match.txt"), "fs/promises glob async iterator mismatch");
+assert(promiseGlobMatches.includes(nestedMatch), "fs/promises glob async iterator mismatch");
 
 rmSync(root, { recursive: true, force: true });
 console.log("node fs surface passed");

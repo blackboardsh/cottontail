@@ -1,7 +1,25 @@
-import * as nodeConstants from "./constants.js";
+import nodeConstants from "./constants.js";
 import { Buffer } from "./buffer.js";
 
 const startMs = Date.now();
+
+function processInfo(kind) {
+  if (typeof cottontail.processInfo !== "function") return undefined;
+  try {
+    return cottontail.processInfo(kind);
+  } catch {
+    return undefined;
+  }
+}
+
+function runtimeDiagnostics() {
+  try {
+    if (typeof cottontail.runtimeDiagnostics === "function") return cottontail.runtimeDiagnostics();
+    return processInfo("diagnostics") ?? {};
+  } catch {
+    return {};
+  }
+}
 
 function shell(command) {
   try {
@@ -45,12 +63,19 @@ export function type() {
 }
 
 export function release() {
-  if (platform() === "win32") return shell("ver");
+  const value = runtimeDiagnostics().os?.release;
+  if (typeof value === "string" && value.length > 0) return value;
   return shell("uname -r");
 }
 
 export function homedir() {
-  return cottontail.env("HOME") || cottontail.env("USERPROFILE") || "/";
+  if (platform() === "win32") {
+    return cottontail.env("USERPROFILE") ||
+      `${cottontail.env("HOMEDRIVE") || ""}${cottontail.env("HOMEPATH") || ""}` ||
+      cottontail.env("HOME") ||
+      "/";
+  }
+  return cottontail.env("HOME") || "/";
 }
 
 function cpuModel() {
@@ -100,6 +125,20 @@ export function cpus() {
     const native = cottontail.osCpuInfo?.();
     if (Array.isArray(native) && native.length > 0) return native;
   } catch {}
+  const diagnostics = runtimeDiagnostics().cpus;
+  if (Array.isArray(diagnostics) && diagnostics.length > 0) {
+    return diagnostics.map((cpu) => ({
+      model: String(cpu?.model ?? ""),
+      speed: Number(cpu?.speed ?? 0),
+      times: {
+        user: Number(cpu?.times?.user ?? 0),
+        nice: Number(cpu?.times?.nice ?? 0),
+        sys: Number(cpu?.times?.sys ?? 0),
+        idle: Number(cpu?.times?.idle ?? 0),
+        irq: Number(cpu?.times?.irq ?? 0),
+      },
+    }));
+  }
   const count = Number(cottontail.cpuCount?.() || 1);
   const model = cpuModel();
   const speed = cpuSpeed();
@@ -134,7 +173,7 @@ export function freemem() {
     const native = Number(cottontail.osFreeMemory?.());
     if (Number.isFinite(native) && native >= 0) return native;
   } catch {}
-  return Number(globalThis.process?.availableMemory?.() ?? 0);
+  return Number(processInfo("freeMemory") ?? globalThis.process?.availableMemory?.() ?? 0);
 }
 
 export function totalmem() {
@@ -142,7 +181,7 @@ export function totalmem() {
     const native = Number(cottontail.osTotalMemory?.());
     if (Number.isFinite(native) && native > 0) return native;
   } catch {}
-  return Number(freemem() || 0);
+  return Number(processInfo("totalMemory") ?? globalThis.process?.constrainedMemory?.() ?? freemem() ?? 0);
 }
 
 export function loadavg() {
@@ -160,6 +199,8 @@ export function loadavg() {
 }
 
 export function machine() {
+  const native = runtimeDiagnostics().os?.machine;
+  if (typeof native === "string" && native.length > 0) return native;
   if (arch() === "x64") return "x86_64";
   if (arch() === "ia32" || arch() === "x86") return "i386";
   if (platform() === "linux" && arch() === "arm64") return "aarch64";
@@ -171,6 +212,8 @@ export function uptime() {
     const native = Number(cottontail.osUptime?.());
     if (Number.isFinite(native) && native >= 0) return native;
   } catch {}
+  const fallback = Number(processInfo("systemUptime"));
+  if (Number.isFinite(fallback) && fallback >= 0) return fallback;
   if (cottontail.existsSync?.("/proc/uptime")) {
     const value = Number(String(cottontail.readFile("/proc/uptime")).split(/\s+/)[0]);
     if (Number.isFinite(value)) return value;
@@ -184,7 +227,7 @@ export function uptime() {
 export function userInfo(options = {}) {
   const encoding = options?.encoding ?? "utf8";
   const username = cottontail.env("USER") || cottontail.env("USERNAME") || "";
-  const shellPath = cottontail.env("SHELL") || (platform() === "win32" ? cottontail.env("ComSpec") || "cmd.exe" : "/bin/sh");
+  const shellPath = platform() === "win32" ? null : cottontail.env("SHELL") || "/bin/sh";
   const info = {
     uid: typeof globalThis.process?.getuid === "function" ? globalThis.process.getuid() : -1,
     gid: typeof globalThis.process?.getgid === "function" ? globalThis.process.getgid() : -1,
@@ -198,7 +241,7 @@ export function userInfo(options = {}) {
       gid: info.gid,
       username: Buffer.from(info.username),
       homedir: Buffer.from(info.homedir),
-      shell: Buffer.from(info.shell),
+      shell: info.shell == null ? null : Buffer.from(info.shell),
     };
   }
   return info;
@@ -311,7 +354,8 @@ export function setPriority(pid, priority = undefined) {
 }
 
 export function version() {
-  if (platform() === "win32") return shell("ver");
+  const value = runtimeDiagnostics().os?.version;
+  if (typeof value === "string" && value.length > 0) return value;
   return shell("uname -v");
 }
 
@@ -325,19 +369,19 @@ for (const fn of [arch, availableParallelism, endianness, freemem, homedir, host
 
 export const EOL = platform() === "win32" ? "\r\n" : "\n";
 export const devNull = platform() === "win32" ? "\\\\.\\nul" : "/dev/null";
+const dlopenConstantNames = ["RTLD_LAZY", "RTLD_NOW", "RTLD_GLOBAL", "RTLD_LOCAL", "RTLD_DEEPBIND"];
 export const constants = {
   UV_UDP_REUSEADDR: 4,
-  dlopen: {
-    ...(typeof nodeConstants.RTLD_DEEPBIND === "number"
-      ? { RTLD_DEEPBIND: nodeConstants.RTLD_DEEPBIND }
-      : {}),
-    RTLD_LAZY: nodeConstants.RTLD_LAZY,
-    RTLD_NOW: nodeConstants.RTLD_NOW,
-    RTLD_GLOBAL: nodeConstants.RTLD_GLOBAL,
-    RTLD_LOCAL: nodeConstants.RTLD_LOCAL,
-  },
+  dlopen: Object.fromEntries(
+    dlopenConstantNames
+      .filter((name) => typeof nodeConstants[name] === "number")
+      .map((name) => [name, nodeConstants[name]]),
+  ),
   errno: Object.fromEntries(Object.entries(nodeConstants).filter(
-    ([name, value]) => /^E[A-Z0-9]+$/.test(name) && !name.startsWith("ENGINE_") && typeof value === "number",
+    ([name, value]) =>
+      !name.startsWith("ENGINE_") &&
+      (/^E[A-Z0-9]+$/.test(name) || /^WSA[A-Z0-9_]+$/.test(name)) &&
+      typeof value === "number",
   )),
   signals: Object.fromEntries(Object.entries(nodeConstants).filter(([name, value]) => /^SIG[A-Z0-9]+$/.test(name) && typeof value === "number")),
   priority: {

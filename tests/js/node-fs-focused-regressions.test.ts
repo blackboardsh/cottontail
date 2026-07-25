@@ -5,6 +5,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "cottontail-fs-focused-"));
 
@@ -226,9 +227,15 @@ test("glob uses Bun grammar and Node fs validation", () => {
   expect(fs.globSync("literal\\[.txt", { cwd })).toEqual(["literal[.txt"]);
   expect(fs.globSync("*", { cwd })).not.toContain(".hidden.js");
   expect(() => fs.globSync(1 as any, { cwd })).toThrow(expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }));
-  const dirents = fs.globSync("*", { cwd: new URL(`file://${cwd}/`), withFileTypes: true });
+  const dirents = fs.globSync("*", {
+    cwd: pathToFileURL(`${cwd}${path.sep}`),
+    withFileTypes: true,
+  });
   expect(dirents.map(entry => entry.name)).toContain("a.js");
-  expect(dirents.find(entry => entry.name === "a.js")?.parentPath).toBe(cwd);
+  const dirent = dirents.find(entry => entry.name === "a.js");
+  expect(dirent).toBeInstanceOf(fs.Dirent);
+  expect(dirent?.isFile()).toBe(true);
+  expect(dirent?.parentPath).toBe(cwd);
 
   fs.mkdirSync(path.join(cwd, "nested"));
   fs.writeFileSync(path.join(cwd, "nested", "deep.txt"), "deep");

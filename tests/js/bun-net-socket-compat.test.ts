@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createSocketPair } from "bun:internal-for-testing";
-import { closeSync, readSync, unlinkSync } from "node:fs";
+import { closeSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
 const tlsFixtures = join(
@@ -115,8 +115,10 @@ test("Bun.connect with an existing fd observes its asynchronous open event", asy
   }
 });
 
-test.skipIf(process.platform === "win32")("Bun.listen and Bun.connect exchange Unix socket data", async () => {
-  const path = `/tmp/cottontail-bun-net-${process.pid}-${Date.now()}.sock`;
+test("Bun.listen and Bun.connect exchange Unix socket data", async () => {
+  const path = process.platform === "win32"
+    ? `\\\\.\\pipe\\cottontail-bun-net-${process.pid}-${Date.now()}-雪`
+    : `/tmp/cottontail-bun-net-${process.pid}-${Date.now()}.sock`;
   const received = Promise.withResolvers<string>();
   const server = Bun.listen({
     unix: path,
@@ -147,7 +149,9 @@ test.skipIf(process.platform === "win32")("Bun.listen and Bun.connect exchange U
     client.end();
   } finally {
     server.stop(true);
-    try { unlinkSync(path); } catch {}
+    if (process.platform !== "win32") {
+      try { unlinkSync(path); } catch {}
+    }
   }
 });
 
@@ -285,16 +289,29 @@ test("Bun socket lifecycle methods and timeout follow Bun contracts", async () =
   }
 });
 
-test.skipIf(process.platform === "win32")("Bun socket drain waits for native writable readiness", async () => {
-  const [socketFd, peerFd] = createSocketPair();
+test("Bun socket drain waits for native writable readiness", async () => {
   const drained = Promise.withResolvers<void>();
+  const accepted = Promise.withResolvers<Bun.Socket>();
   let peerReadStarted = false;
   let drainBeforeRead = false;
   let socket: Bun.Socket | undefined;
+  let peer: Bun.Socket | undefined;
+  const server = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: {
+      open(socket) {
+        socket.pause();
+        accepted.resolve(socket);
+      },
+      data() {},
+    },
+  });
 
   try {
     socket = await Bun.connect({
-      fd: socketFd,
+      hostname: "127.0.0.1",
+      port: server.port,
       socket: {
         data() {},
         drain() {
@@ -303,6 +320,7 @@ test.skipIf(process.platform === "win32")("Bun socket drain waits for native wri
         },
       },
     });
+    peer = await withTimeout(accepted.promise);
     const payload = Buffer.alloc(1024 * 1024, 0x61);
     let written = payload.byteLength;
     for (let attempt = 0; attempt < 8 && written === payload.byteLength; attempt += 1) {
@@ -314,11 +332,12 @@ test.skipIf(process.platform === "win32")("Bun socket drain waits for native wri
     expect(drainBeforeRead).toBe(false);
 
     peerReadStarted = true;
-    readSync(peerFd, Buffer.alloc(1024 * 1024), 0, 1024 * 1024, null);
+    peer.resume();
     await withTimeout(drained.promise);
   } finally {
     socket?.terminate();
-    closeSync(peerFd);
+    peer?.terminate();
+    server.stop(true);
   }
 });
 

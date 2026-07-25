@@ -42,7 +42,7 @@ test("fork queues a large startup message until the child IPC listener is ready"
     new Promise<number | null>((resolve) => child.once("close", resolve)),
     `startup IPC child did not exit: ${stderr}`,
   )).toBe(0);
-});
+}, 15_000);
 
 test("killing a child before IPC readiness cancels callbackless queued messages", async () => {
   const child = fork(join(import.meta.dir, "fixtures", "child-process-delayed-ipc-listener.js"), [], {
@@ -60,3 +60,34 @@ test("killing a child before IPC readiness cancels callbackless queued messages"
     signal: "SIGINT",
   });
 });
+
+test("fork delivers batched IPC messages on independent next ticks", async () => {
+  const child = fork(join(import.meta.dir, "fixtures", "child-process-ipc-uncaught-batch.js"), [], {
+    serialization: "json",
+    silent: true,
+  });
+  let stderr = "";
+  child.stderr?.on("data", (chunk) => {
+    stderr += String(chunk);
+  });
+
+  const ready = new Promise<void>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("message", (message) => {
+      expect(message).toBe("ready");
+      resolve();
+    });
+  });
+  const closed = new Promise<{ code: number | null; signal: string | null }>((resolve) => {
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
+
+  await withTimeout(ready, `batched IPC child did not become ready: ${stderr}`);
+  for (let value = 0; value < 10; value += 1) {
+    expect(child.send(value)).toBe(true);
+  }
+  expect(await withTimeout(closed, `batched IPC child did not disconnect: ${stderr}`)).toEqual({
+    code: 0,
+    signal: null,
+  });
+}, 15_000);

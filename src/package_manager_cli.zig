@@ -38,6 +38,10 @@ const default_registry = "https://registry.npmjs.org/";
 const max_manifest_bytes = 64 * 1024 * 1024;
 const max_tarball_bytes = 512 * 1024 * 1024;
 const security_resolution_output_env = "COTTONTAIL_PM_SECURITY_RESOLUTION_OUTPUT";
+const global_link_copy_marker_name = ".cottontail-global-link-source";
+const global_link_copy_marker_prefix = "COTTONTAIL_GLOBAL_LINK_COPY_V1\n";
+const DirectoryLinkResult = enum { symbolic_link, copied };
+const PathLinkStatus = enum { missing, not_link, symbolic_link, unknown };
 const all_dependency_sections = [_][]const u8{ "dependencies", "devDependencies", "optionalDependencies", "peerDependencies" };
 const mutable_dependency_sections = [_][]const u8{ "dependencies", "devDependencies", "optionalDependencies" };
 const runtime_dependency_sections = [_][]const u8{ "dependencies", "optionalDependencies" };
@@ -376,6 +380,11 @@ const RegistryManifestFetch = struct {
                 .location = .{ .url = fetch_state.url },
                 .response_writer = &output.writer,
                 .extra_headers = headers[0..header_count],
+                // A keep-alive chunked response can occasionally leave the
+                // Windows threaded-I/O reader waiting after the terminating
+                // chunk. These short-lived per-task clients do not benefit
+                // enough from pooling to justify that correctness risk.
+                .keep_alive = builtin.os.tag != .windows,
             }) catch |err| {
                 if (attempt == fetch_state.max_retry_count) return err;
                 continue;
@@ -444,6 +453,7 @@ const RegistryArchiveFetch = struct {
             .location = .{ .url = fetch_state.url },
             .response_writer = &output.writer,
             .extra_headers = headers[0..header_count],
+            .keep_alive = builtin.os.tag != .windows,
         });
         const status: u16 = @intFromEnum(result.status);
         if (status < 200 or status >= 300) return error.RegistryArchiveRequestFailed;
@@ -3505,7 +3515,22 @@ const Manager = struct {
             const node_modules = try globalLinkNodeModulesPath(manager.init_data, manager.allocator);
             try std.Io.Dir.cwd().createDirPath(manager.init_data.io, node_modules);
             const destination = try std.fs.path.join(manager.allocator, &.{ node_modules, name });
-            try manager.linkDirectoryAt(destination, manager.invocation_package_dir);
+            const link_result = try manager.linkDirectoryAtReportingFallback(destination, manager.invocation_package_dir);
+            if (builtin.os.tag == .windows and link_result == .copied) {
+                const marker = try std.fs.path.join(manager.allocator, &.{ destination, global_link_copy_marker_name });
+                deletePath(manager.init_data.io, marker);
+                try ensurePathMissing(manager.init_data.io, marker);
+                const marker_data = try std.fmt.allocPrint(
+                    manager.allocator,
+                    "{s}{s}",
+                    .{ global_link_copy_marker_prefix, manager.invocation_package_dir },
+                );
+                try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{
+                    .sub_path = marker,
+                    .data = marker_data,
+                    .flags = .{ .exclusive = true },
+                });
+            }
 
             const bin_dir = try globalBinPath(manager.init_data, manager.allocator);
             try manager.linkBinsInDirectory(name, manager.invocation_package_dir, package_json, false, bin_dir);
@@ -3538,7 +3563,49 @@ const Manager = struct {
         const node_modules = try globalLinkNodeModulesPath(manager.init_data, manager.allocator);
         const destination = try std.fs.path.join(manager.allocator, &.{ node_modules, name });
         const linked = std.Io.Dir.cwd().statFile(manager.init_data.io, destination, .{ .follow_symlinks = false }) catch null;
-        if (linked == null or linked.?.kind != .sym_link) {
+        const windows_link_status = if (builtin.os.tag == .windows)
+            pathLinkStatus(manager.init_data.io, destination)
+        else
+            .not_link;
+        const is_symbolic_link = (linked != null and linked.?.kind == .sym_link) or
+            windows_link_status == .symbolic_link;
+        var registered_link = is_symbolic_link;
+        var registered_copy = false;
+        if (builtin.os.tag == .windows and
+            windows_link_status == .not_link and
+            linked != null and
+            linked.?.kind == .directory)
+        {
+            const marker = try std.fs.path.join(manager.allocator, &.{ destination, global_link_copy_marker_name });
+            const marker_stat = std.Io.Dir.cwd().statFile(
+                manager.init_data.io,
+                marker,
+                .{ .follow_symlinks = false },
+            ) catch null;
+            if (marker_stat != null and
+                marker_stat.?.kind == .file and
+                pathLinkStatus(manager.init_data.io, marker) == .not_link)
+            {
+                const marker_data = std.Io.Dir.cwd().readFileAlloc(
+                    manager.init_data.io,
+                    marker,
+                    manager.allocator,
+                    .limited(std.fs.max_path_bytes + global_link_copy_marker_prefix.len),
+                ) catch null;
+                if (marker_data != null and
+                    std.mem.startsWith(u8, marker_data.?, global_link_copy_marker_prefix))
+                {
+                    registered_link = pathsEquivalent(
+                        manager.init_data.io,
+                        manager.allocator,
+                        marker_data.?[global_link_copy_marker_prefix.len..],
+                        manager.invocation_package_dir,
+                    ) catch false;
+                    registered_copy = registered_link;
+                }
+            }
+        }
+        if (!registered_link) {
             if (!manager.options.silent) {
                 try manager.stdout.print("success: package \"{s}\" is not globally linked, so there's nothing to do.\n", .{name});
                 try manager.stdout.flush();
@@ -3547,7 +3614,12 @@ const Manager = struct {
         }
 
         if (!manager.options.dry_run) {
-            deletePath(manager.init_data.io, destination);
+            if (is_symbolic_link) {
+                try manager.removeManagedDirectoryLink(destination);
+            } else if (registered_copy) {
+                deletePath(manager.init_data.io, destination);
+                try ensurePathMissing(manager.init_data.io, destination);
+            }
             const bin_dir = try globalBinPath(manager.init_data, manager.allocator);
             try manager.unlinkBinsInDirectory(name, package_json, bin_dir);
         }
@@ -10571,13 +10643,25 @@ const Manager = struct {
     }
 
     fn linkDirectoryAt(manager: *Manager, destination: []const u8, target: []const u8) !void {
-        if (manager.options.dry_run) return;
+        _ = try manager.linkDirectoryAtReportingFallback(destination, target);
+    }
+
+    fn linkDirectoryAtReportingFallback(
+        manager: *Manager,
+        destination: []const u8,
+        target: []const u8,
+    ) !DirectoryLinkResult {
+        if (manager.options.dry_run) return .symbolic_link;
         deletePath(manager.init_data.io, destination);
+        try ensurePathMissing(manager.init_data.io, destination);
         if (std.fs.path.dirname(destination)) |parent| try std.Io.Dir.cwd().createDirPath(manager.init_data.io, parent);
         std.Io.Dir.symLinkAbsolute(manager.init_data.io, target, destination, .{ .is_directory = true }) catch |err| {
             if (builtin.os.tag != .windows) return err;
+            try ensurePathMissing(manager.init_data.io, destination);
             try copyDirectoryTree(manager.init_data.io, manager.allocator, target, destination);
+            return .copied;
         };
+        return .symbolic_link;
     }
 
     fn linkDirectoryFilesAt(manager: *Manager, destination: []const u8, target: []const u8) !void {
@@ -13635,7 +13719,45 @@ fn packageJSONHasWorkspaces(package_json: *const Value) bool {
     };
 }
 
+fn pathLinkStatus(io: std.Io, path: []const u8) PathLinkStatus {
+    var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const target_len = if (std.fs.path.isAbsolute(path))
+        std.Io.Dir.readLinkAbsolute(io, path, &target_buffer)
+    else
+        std.Io.Dir.cwd().readLink(io, path, &target_buffer);
+    _ = target_len catch |err| switch (err) {
+        error.FileNotFound => return .missing,
+        error.NotLink => return .not_link,
+        else => return .unknown,
+    };
+    return .symbolic_link;
+}
+
+fn ensurePathMissing(io: std.Io, path: []const u8) !void {
+    if (builtin.os.tag == .windows) {
+        return switch (pathLinkStatus(io, path)) {
+            .missing => {},
+            .not_link, .symbolic_link, .unknown => error.PathAlreadyExists,
+        };
+    }
+    _ = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    return error.PathAlreadyExists;
+}
+
 fn deletePath(io: std.Io, path: []const u8) void {
+    if (builtin.os.tag == .windows) switch (pathLinkStatus(io, path)) {
+        .symbolic_link => {
+            std.Io.Dir.cwd().deleteDir(io, path) catch {
+                std.Io.Dir.cwd().deleteFile(io, path) catch {};
+            };
+            return;
+        },
+        .missing, .unknown => return,
+        .not_link => {},
+    };
     const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return;
     if (stat.kind == .directory) {
         std.Io.Dir.cwd().deleteTree(io, path) catch {};

@@ -2,7 +2,15 @@ import "../bun/ffi.js";
 import picomatch from "../vendor/picomatch.js";
 import constantsObject from "./constants.js";
 import { EventEmitter } from "./events.js";
-import { dirname, isAbsolute, join, relative, resolve } from "./path.js";
+import { dirname, isAbsolute, join, relative, resolve, toNamespacedPath } from "./path.js";
+import { fileURLToPath } from "./url.js";
+import { assertFsRead, assertFsWrite } from "./internal/permissions.js";
+import {
+  uvCodeFromMessage,
+  uvErrnoFromCode,
+  uvErrorByCode,
+  uvMessageFromCode,
+} from "./internal/uv-errors.js";
 import { Readable, Writable } from "./stream.js";
 import {
   allocationLimitForEncoding,
@@ -27,6 +35,8 @@ import fsPromisesDefault from "./fs/promises.js";
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 const kWriteStreamFastPath = Symbol.for("cottontail.node.fs.writeStreamFastPath");
+const permissionFdPaths = globalThis.__cottontailPermissionFdPaths ??= new Map();
+const isWindowsFs = cottontail.platform() === "win32";
 
 // fs.constants must be the exact same object as fsPromises.constants. Because
 // fs.js and fs/promises.js form an import cycle whose evaluation order depends
@@ -123,34 +133,14 @@ function normalizePath(path) {
 }
 
 function normalizeFileUrlPath(url) {
-  if (url.protocol !== "file:") {
-    const error = new TypeError("The URL must be of scheme file");
-    error.code = "ERR_INVALID_URL_SCHEME";
-    throw error;
-  }
-  if (globalThis.process?.platform !== "win32" && url.hostname && url.hostname !== "localhost") {
-    const error = new TypeError(`File URL host must be "localhost" or empty on ${globalThis.process?.platform ?? "this platform"}`);
-    error.code = "ERR_INVALID_FILE_URL_HOST";
-    throw error;
-  }
-  if (/%2f|%5c/i.test(url.pathname)) {
-    const error = new TypeError("File URL path must not include encoded / or \\ characters");
-    error.code = "ERR_INVALID_FILE_URL_PATH";
-    throw error;
-  }
-  let pathname = decodeURIComponent(url.pathname);
-  if (globalThis.process?.platform === "win32" && /^\/[A-Za-z]:/.test(pathname)) {
-    pathname = pathname.slice(1).replaceAll("/", "\\");
-  }
-  return pathname;
+  return fileURLToPath(url);
 }
 
-const knownErrorCodes = [
-  "EPERM", "ENOENT", "EIO", "EBADF", "EACCES", "EEXIST", "EXDEV", "ENOTDIR",
-  "EISDIR", "EINVAL", "ENFILE", "EMFILE", "EROFS", "EPIPE", "ENOTEMPTY", "ELOOP",
-  "ENAMETOOLONG", "ENOSPC", "EFBIG", "EAGAIN", "EBUSY", "EMLINK", "ENODEV", "ENXIO",
-  "ENOSYS", "ENOTSUP", "EOPNOTSUPP",
-];
+const knownErrorCodes = new Set(
+  [...uvErrorByCode.keys()]
+    .filter(code => !code.startsWith("EAI_") && code !== "EOF" && code !== "UNKNOWN"),
+);
+knownErrorCodes.add("EOPNOTSUPP");
 
 const messageByCode = {
   EPERM: "operation not permitted",
@@ -166,34 +156,48 @@ const messageByCode = {
   EOPNOTSUPP: "operation not supported",
 };
 
-function makeFsError(error, path, syscall = "open") {
+function fsErrno(code) {
+  return uvErrnoFromCode(code, -(Number(constantsObject[code]) || 5));
+}
+
+function makeFsError(error, path, syscall = "open", destination = undefined) {
   const hasPath = path !== undefined;
+  const hasDestination = destination !== undefined;
   const normalizedPath = hasPath ? normalizePath(path) : undefined;
+  const normalizedDestination = hasDestination ? normalizePath(destination) : undefined;
   const source = String(error?.message ?? error ?? "");
   let code = String(error?.code ?? "");
-  if (!knownErrorCodes.includes(code)) {
-    code = knownErrorCodes.find((candidate) => source.includes(candidate)) ?? "";
+  if (!knownErrorCodes.has(code)) {
+    code = "";
+    for (const candidate of knownErrorCodes) {
+      if (source.includes(candidate)) {
+        code = candidate;
+        break;
+      }
+    }
   }
   if (!code) {
-    if (source.includes("No such file or directory") || source.includes("FileNotFound")) code = "ENOENT";
-    else if (source.includes("Permission denied") || source.includes("access denied") || source.includes("AccessDenied")) code = "EACCES";
-    else if (source.includes("already exists") || source.includes("File exists") || source.includes("PathAlreadyExists")) code = "EEXIST";
-    else if (source.includes("Not a directory") || source.includes("NotDir")) code = "ENOTDIR";
-    else if (source.includes("Is a directory") || source.includes("IsDir")) code = "EISDIR";
-    else if (source.includes("Directory not empty") || source.includes("DirNotEmpty")) code = "ENOTEMPTY";
-    else if (source.includes("Bad file descriptor")) code = "EBADF";
-    else if (/invalid argument/i.test(source)) code = "EINVAL";
-    else if (source.includes("Device not configured") || source.includes("No such device or address") || source.includes("NoDevice")) code = "ENXIO";
-    else if (source.includes("Operation not supported") || source.includes("Not supported")) code = "ENOTSUP";
-    else if (source.includes("Function not implemented")) code = "ENOSYS";
-    else code = "EIO";
+    const lowerSource = source.toLowerCase();
+    if (lowerSource.includes("no such file or directory") || lowerSource.includes("filenotfound")) code = "ENOENT";
+    else if (lowerSource.includes("permission denied") || lowerSource.includes("access denied") || lowerSource.includes("accessdenied")) code = "EACCES";
+    else if (lowerSource.includes("already exists") || lowerSource.includes("file exists") || lowerSource.includes("pathalreadyexists")) code = "EEXIST";
+    else if (lowerSource.includes("not a directory") || lowerSource.includes("notdir")) code = "ENOTDIR";
+    else if (lowerSource.includes("is a directory") || lowerSource.includes("isdir")) code = "EISDIR";
+    else if (lowerSource.includes("directory not empty") || lowerSource.includes("dirnotempty")) code = "ENOTEMPTY";
+    else if (lowerSource.includes("device not configured") || lowerSource.includes("no such device or address") || lowerSource.includes("nodevice")) code = "ENXIO";
+    else if (lowerSource.includes("operation not supported") || lowerSource.includes("not supported")) code = "ENOTSUP";
+    else code = uvCodeFromMessage(source) ?? "EIO";
   }
-  const reason = messageByCode[code] ?? (source || code);
-  const out = new Error(`${code}: ${reason}, ${syscall}${hasPath ? ` '${normalizedPath}'` : ""}`);
-  out.errno = -(Number(constantsObject[code]) || 5);
+  const reason = messageByCode[code] ?? uvMessageFromCode(code) ?? (source || code);
+  const out = new Error(
+    `${code}: ${reason}, ${syscall}${hasPath ? ` '${normalizedPath}'` : ""}` +
+    `${hasDestination ? ` -> '${normalizedDestination}'` : ""}`,
+  );
+  out.errno = fsErrno(code);
   out.code = code;
   out.syscall = syscall;
   if (hasPath) out.path = normalizedPath;
+  if (hasDestination) out.dest = normalizedDestination;
   return out;
 }
 
@@ -301,7 +305,7 @@ function decodeBytes(bytes, encoding = "utf8") {
 function makeOutOfMemoryError(path = undefined) {
   const suffix = path == null ? "" : `, read '${normalizePath(path)}'`;
   const error = new Error(`ENOMEM: not enough memory${suffix}`);
-  error.errno = -(Number(constantsObject.ENOMEM) || 12);
+  error.errno = fsErrno("ENOMEM");
   error.code = "ENOMEM";
   error.syscall = "read";
   if (path != null) error.path = normalizePath(path);
@@ -400,7 +404,7 @@ function validateOpenInteger(value, name) {
     throw error;
   }
   if (value < 0 || value > 0xffffffff) {
-    throw outOfRange(name, ">= 0 and <= 4294967295", value);
+    throw outOfRange(name, ">= 0 && <= 4294967295", value);
   }
   return value;
 }
@@ -709,9 +713,16 @@ export class Dir {
 }
 
 export function existsSync(path) {
+  const normalizedPath = normalizePath(path);
+  assertFsRead(normalizedPath);
   try {
-    validatePathArg(path);
-    return cottontail.existsSync(normalizePath(path));
+    // GetFileAttributesW succeeds for a dangling Windows reparse point, while
+    // Node's existsSync follows links and returns false when the target is gone.
+    if (isWindowsFs) {
+      cottontail.statSync(normalizedPath, true);
+      return true;
+    }
+    return cottontail.existsSync(normalizedPath);
   } catch {
     return false;
   }
@@ -720,6 +731,8 @@ export function existsSync(path) {
 export function accessSync(path, mode = F_OK) {
   const normalizedPath = normalizePath(path);
   mode = validateInteger(mode ?? F_OK, "mode", 0, 7);
+  if ((mode & W_OK) !== 0) assertFsWrite(normalizedPath);
+  if (mode === F_OK || (mode & (R_OK | X_OK)) !== 0) assertFsRead(normalizedPath);
   try {
     cottontail.accessSync(normalizedPath, mode);
   } catch (error) {
@@ -794,8 +807,19 @@ export function openSync(path, flags = "r", mode = 0o666) {
   const normalizedPath = normalizePath(path);
   flags = normalizeOpenFlags(flags);
   const normalizedMode = normalizeOpenMode(mode ?? 0o666);
+  const numericAccess = typeof flags === "number" ? flags & 3 : null;
+  const reads = typeof flags === "string" ? flags.startsWith("r") || flags.includes("+") : numericAccess !== 1;
+  const writes = typeof flags === "string"
+    ? !flags.startsWith("r") || flags.includes("+")
+    : numericAccess !== 0 ||
+      (flags & ((constants.O_CREAT ?? 0) | (constants.O_TRUNC ?? 0) | (constants.O_APPEND ?? 0))) !== 0 ||
+      (globalThis.process?.platform === "win32" && (flags & 0x40) !== 0);
+  if (reads) assertFsRead(normalizedPath);
+  if (writes) assertFsWrite(normalizedPath);
   try {
-    return cottontail.openFd(normalizedPath, flags ?? "r", normalizedMode);
+    const fd = cottontail.openFd(normalizedPath, flags ?? "r", normalizedMode);
+    permissionFdPaths.set(fd, normalizedPath);
+    return fd;
   } catch (error) {
     throw makeFsError(error, normalizedPath, "open");
   }
@@ -804,10 +828,11 @@ export function openSync(path, flags = "r", mode = 0o666) {
 export function closeSync(fd) {
   fd = validateFd(fd);
   try {
-    // COTTONTAIL-COMPAT: the current host close primitive has no return
-    // channel, so validate first to preserve Node's EBADF contract.
-    cottontail.fstatSync(fd);
+    // Winsock SOCKET values are not CRT descriptors, so fstat cannot validate
+    // them. The native close primitive reports EBADF directly on Windows.
+    if (globalThis.process?.platform !== "win32") cottontail.fstatSync(fd);
     cottontail.closeFd(fd);
+    permissionFdPaths.delete(fd);
   } catch (error) {
     throw makeFdError(error, fd, "close");
   }
@@ -900,7 +925,7 @@ export function writevSync(fd, buffers, position = null) {
 
 function makeCodedFsError(code, message, path, syscall) {
   const error = new Error(`${code}: ${message}, ${syscall} '${path}'`);
-  error.errno = -(Number(constantsObject[code]) || 5);
+  error.errno = fsErrno(code);
   error.code = code;
   error.syscall = syscall;
   error.path = path;
@@ -929,7 +954,7 @@ function makeCopyFileError(error, source, destination) {
     .replace(/^\w+:\s*/, "")
     .replace(/,\s*\w+.*$/, "");
   normalized.code = code;
-  normalized.errno ??= -(Number(constantsObject[code]) || 5);
+  normalized.errno ??= fsErrno(code);
   normalized.syscall = "copyfile";
   normalized.path = source;
   normalized.dest = destination;
@@ -943,6 +968,8 @@ export function copyFileSync(source, destination, mode = 0) {
   mode = normalizeCopyMode(mode);
   const sourceText = normalizePath(source);
   const destinationText = normalizePath(destination);
+  assertFsRead(sourceText);
+  assertFsWrite(destinationText);
   const exclusive = (mode & (constants.COPYFILE_EXCL ?? 1)) !== 0;
   const forceClone = (mode & (constants.COPYFILE_FICLONE_FORCE ?? 4)) !== 0;
   const preferClone = forceClone || (mode & (constants.COPYFILE_FICLONE ?? 2)) !== 0;
@@ -1010,9 +1037,13 @@ export function copyFileSync(source, destination, mode = 0) {
 }
 
 export function cpSync(source, destination, options) {
+  const sourceText = normalizeCopyPath(source, "src");
+  const destinationText = normalizeCopyPath(destination, "dest");
+  assertFsRead(sourceText);
+  assertFsWrite(destinationText);
   return cpSyncImpl(
-    normalizeCopyPath(source, "src"),
-    normalizeCopyPath(destination, "dest"),
+    sourceText,
+    destinationText,
     options,
     cpOperations,
   );
@@ -1032,27 +1063,74 @@ const cpOperations = {
 };
 
 export function chmodSync(path, mode) {
-  cottontail.chmodSync(normalizePath(path), parseMode(mode));
+  const normalizedPath = normalizePath(path);
+  assertFsWrite(normalizedPath);
+  const normalizedMode = parseMode(mode);
+  try {
+    cottontail.chmodSync(normalizedPath, normalizedMode);
+  } catch (error) {
+    throw makeFsError(error, normalizedPath, "chmod");
+  }
 }
 
-export function lchmodSync(path, mode) {
-  cottontail.lchmodSync(normalizePath(path), parseMode(mode));
-}
+export var lchmodSync = isWindowsFs ? undefined : function lchmodSync(path, mode) {
+  const normalizedPath = normalizePath(path);
+  assertFsWrite(normalizedPath);
+  const normalizedMode = parseMode(mode);
+  try {
+    cottontail.lchmodSync(normalizedPath, normalizedMode);
+  } catch (error) {
+    throw makeFsError(error, normalizedPath, "lchmod");
+  }
+};
 
 export function fchmodSync(fd, mode) {
-  cottontail.fchmodSync(validateFd(fd), parseMode(mode));
+  fd = validateFd(fd);
+  const path = permissionFdPaths.get(fd);
+  if (path !== undefined) assertFsWrite(path);
+  const normalizedMode = parseMode(mode);
+  try {
+    cottontail.fchmodSync(fd, normalizedMode);
+  } catch (error) {
+    throw makeFsError(error, undefined, "fchmod");
+  }
 }
 
 export function chownSync(path, uid, gid) {
-  cottontail.chownSync(normalizePath(path), validateId(uid, "uid"), validateId(gid, "gid"), true);
+  const normalizedPath = normalizePath(path);
+  assertFsWrite(normalizedPath);
+  const normalizedUid = validateId(uid, "uid");
+  const normalizedGid = validateId(gid, "gid");
+  try {
+    cottontail.chownSync(normalizedPath, normalizedUid, normalizedGid, true);
+  } catch (error) {
+    throw makeFsError(error, normalizedPath, "chown");
+  }
 }
 
 export function lchownSync(path, uid, gid) {
-  cottontail.chownSync(normalizePath(path), validateId(uid, "uid"), validateId(gid, "gid"), false);
+  const normalizedPath = normalizePath(path);
+  assertFsWrite(normalizedPath);
+  const normalizedUid = validateId(uid, "uid");
+  const normalizedGid = validateId(gid, "gid");
+  try {
+    cottontail.chownSync(normalizedPath, normalizedUid, normalizedGid, false);
+  } catch (error) {
+    throw makeFsError(error, normalizedPath, "lchown");
+  }
 }
 
 export function fchownSync(fd, uid, gid) {
-  cottontail.fchownSync(validateFd(fd), validateId(uid, "uid"), validateId(gid, "gid"));
+  fd = validateFd(fd);
+  const path = permissionFdPaths.get(fd);
+  if (path !== undefined) assertFsWrite(path);
+  const normalizedUid = validateId(uid, "uid");
+  const normalizedGid = validateId(gid, "gid");
+  try {
+    cottontail.fchownSync(fd, normalizedUid, normalizedGid);
+  } catch (error) {
+    throw makeFsError(error, undefined, "fchown");
+  }
 }
 
 function validateId(value, name) {
@@ -1080,6 +1158,7 @@ export function mkdirSync(path, options = {}) {
   validatePathArg(path);
   const { recursive } = parseMkdirOptions(options);
   const target = normalizePath(path);
+  assertFsWrite(target);
   if (target.length === 0) throw makeFsError({ code: "ENOENT" }, target, "mkdir");
   if (!recursive) {
     try {
@@ -1095,7 +1174,7 @@ export function mkdirSync(path, options = {}) {
   if (existing) {
     if (existing.isDirectory()) return undefined;
     const error = new Error(`EEXIST: file already exists, mkdir '${target}'`);
-    error.errno = -(Number(constantsObject.EEXIST) || 17);
+    error.errno = fsErrno("EEXIST");
     error.code = "EEXIST";
     error.syscall = "mkdir";
     error.path = target;
@@ -1114,7 +1193,7 @@ export function mkdirSync(path, options = {}) {
   const base = statSync(current, { throwIfNoEntry: false });
   if (base && !base.isDirectory()) {
     const error = new Error(`ENOTDIR: not a directory, mkdir '${target}'`);
-    error.errno = -(Number(constantsObject.ENOTDIR) || 20);
+    error.errno = fsErrno("ENOTDIR");
     error.code = "ENOTDIR";
     error.syscall = "mkdir";
     error.path = target;
@@ -1135,6 +1214,7 @@ export function mkdtempSync(prefix, options = undefined) {
   validatePathArg(prefix, "prefix");
   const encoding = normalizeEncoding(options);
   const normalizedPrefix = normalizePath(prefix);
+  assertFsWrite(`${normalizedPrefix}XXXXXX`, `${normalizedPrefix}XXXXXX`);
   const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   for (let attempt = 0; attempt < 100; attempt += 1) {
     let suffix = "";
@@ -1168,6 +1248,7 @@ export function mkdtempDisposableSync(prefix) {
 
 export function rmSync(path, options = {}) {
   const normalizedPath = normalizePath(path);
+  assertFsWrite(normalizedPath);
   try {
     cottontail.rmSync(normalizedPath, Boolean(options?.recursive), Boolean(options?.force));
   } catch (error) {
@@ -1179,6 +1260,7 @@ export function rmSync(path, options = {}) {
 export function rmdirSync(path, options = {}) {
   if (options?.recursive) return rmSync(path, { recursive: true, force: false });
   const normalizedPath = normalizePath(path);
+  assertFsWrite(normalizedPath);
   try {
     cottontail.rmdirSync(normalizedPath);
   } catch (error) {
@@ -1188,13 +1270,14 @@ export function rmdirSync(path, options = {}) {
 
 export function unlinkSync(path) {
   const normalizedPath = normalizePath(path);
+  assertFsWrite(normalizedPath);
   try {
     cottontail.unlinkSync(normalizedPath);
   } catch (error) {
     const out = makeFsError(error, normalizedPath, "unlink");
     if (out.code === "EISDIR" && globalThis.process?.platform !== "linux") {
       out.code = "EPERM";
-      out.errno = -(Number(constantsObject.EPERM) || 1);
+      out.errno = fsErrno("EPERM");
       out.message = `EPERM: operation not permitted, unlink '${normalizedPath}'`;
     }
     throw out;
@@ -1204,27 +1287,76 @@ export function unlinkSync(path) {
 export function renameSync(oldPath, newPath) {
   const oldName = normalizePath(oldPath);
   const newName = normalizePath(newPath);
+  assertFsRead(oldName);
+  assertFsWrite(oldName);
+  assertFsWrite(newName);
   try {
     cottontail.renameSync(oldName, newName);
   } catch (error) {
-    const out = makeFsError(error, oldName, "rename");
-    out.dest = newName;
-    throw out;
+    throw makeFsError(error, oldName, "rename", newName);
   }
 }
 
 export function linkSync(existingPath, newPath) {
-  cottontail.linkSync(normalizePath(existingPath), normalizePath(newPath));
+  const source = normalizePath(existingPath);
+  const destination = normalizePath(newPath);
+  assertFsRead(source);
+  assertFsWrite(source);
+  assertFsWrite(destination);
+  try {
+    cottontail.linkSync(source, destination);
+  } catch (error) {
+    throw makeFsError(error, source, "link", destination);
+  }
 }
 
 export function symlinkSync(target, path, type = undefined) {
-  void type;
-  cottontail.symlinkSync(normalizePath(target), normalizePath(path));
+  if (type !== undefined && type !== null && type !== "file" && type !== "dir" && type !== "junction") {
+    throw invalidArgValue(
+      "type",
+      type,
+      "must be one of: 'dir', 'file', 'junction', null, undefined",
+    );
+  }
+  const source = normalizePath(target);
+  const destination = normalizePath(path);
+  assertFsRead(source);
+  assertFsWrite(source);
+  assertFsWrite(destination);
+  let nativeType = type;
+  if (isWindowsFs && type == null) {
+    const targetForType = isAbsolute(source) ? source : resolve(dirname(destination), source);
+    try {
+      nativeType = cottontail.statSync(targetForType, true)?.isDirectory ? "dir" : "file";
+    } catch {
+      nativeType = "file";
+    }
+  }
+  let nativeSource = source;
+  if (isWindowsFs) {
+    if (nativeType === "junction") {
+      nativeSource = toNamespacedPath(resolve(dirname(destination), source));
+    } else if (isAbsolute(source)) {
+      // CreateSymbolicLinkW rejects long absolute targets unless they use the
+      // extended path prefix. This mirrors Node's Windows target preprocessing.
+      nativeSource = toNamespacedPath(source);
+    } else {
+      // Unlike other Windows file APIs, CreateSymbolicLinkW does not normalize
+      // forward slashes in a relative target.
+      nativeSource = source.replaceAll("/", "\\");
+    }
+  }
+  try {
+    cottontail.symlinkSync(nativeSource, destination, nativeType);
+  } catch (error) {
+    throw makeFsError(error, source, "symlink", destination);
+  }
 }
 
 export function readlinkSync(path, options = undefined) {
   const encoding = normalizeEncoding(options);
   const normalizedPath = normalizePath(path);
+  assertFsRead(normalizedPath);
   try {
     const value = cottontail.readlinkSync(normalizedPath);
     return encoding === "buffer" ? bufferFrom(encoder.encode(value)) : value;
@@ -1238,6 +1370,7 @@ export function readdirSync(path, options = undefined) {
   const recursive = Boolean(options?.recursive);
   const encoding = normalizeEncoding(options);
   const root = normalizePath(path);
+  assertFsRead(root);
   const out = [];
 
   const visit = (directory, relativePrefix = "") => {
@@ -1286,6 +1419,7 @@ export function opendirSync(path, options = {}) {
 export function statSync(path, options = undefined) {
   validatePathArg(path);
   const normalizedPath = normalizePath(path);
+  assertFsRead(normalizedPath);
   try {
     return makeStats(cottontail.statSync(normalizedPath, true), options);
   } catch (error) {
@@ -1297,6 +1431,7 @@ export function statSync(path, options = undefined) {
 export function lstatSync(path, options = undefined) {
   validatePathArg(path);
   const normalizedPath = normalizePath(path);
+  assertFsRead(normalizedPath);
   try {
     return makeStats(cottontail.statSync(normalizedPath, false), options);
   } catch (error) {
@@ -1315,21 +1450,32 @@ export function fstatSync(fd, options = undefined) {
 }
 
 export function statfsSync(path, options = undefined) {
-  return makeStatFs(cottontail.statfsSync(normalizePath(path)), options);
+  const normalizedPath = normalizePath(path);
+  assertFsRead(normalizedPath);
+  return makeStatFs(cottontail.statfsSync(normalizedPath), options);
 }
 
-export function realpathSync(path, options = undefined) {
+function realpathSyncImpl(path, options, syscall) {
   const encoding = normalizeEncoding(options);
   const normalizedPath = normalizePath(path);
+  assertFsRead(normalizedPath);
   try {
     const value = cottontail.realpathSync(normalizedPath);
     return encoding === "buffer" ? bufferFrom(encoder.encode(value)) : value;
   } catch (error) {
-    throw makeFsError(error, normalizedPath, "realpath");
+    throw makeFsError(error, normalizedPath, syscall);
   }
 }
 
-realpathSync.native = realpathSync;
+export function realpathSync(path, options = undefined) {
+  return realpathSyncImpl(path, options, "lstat");
+}
+
+function realpathNativeSync(path, options = undefined) {
+  return realpathSyncImpl(path, options, "realpath");
+}
+
+realpathSync.native = realpathNativeSync;
 
 export function fsyncSync(fd) {
   fd = validateFd(fd);
@@ -1343,6 +1489,8 @@ export function fdatasyncSync(fd) {
 
 export function ftruncateSync(fd, len = 0) {
   fd = validateFd(fd);
+  const path = permissionFdPaths.get(fd);
+  if (path !== undefined) assertFsWrite(path);
   len = validateInteger(len ?? 0, "len", 0, Number.MAX_SAFE_INTEGER);
   try { cottontail.ftruncateSync(fd, len); } catch (error) { throw makeFdError(error, fd, "ftruncate"); }
 }
@@ -1350,19 +1498,39 @@ export function ftruncateSync(fd, len = 0) {
 export function truncateSync(path, len = 0) {
   len = validateInteger(len ?? 0, "len", 0, Number.MAX_SAFE_INTEGER);
   const normalizedPath = normalizePath(path);
+  assertFsWrite(normalizedPath);
   try { cottontail.truncateSync(normalizedPath, len); } catch (error) { throw makeFsError(error, normalizedPath, "truncate"); }
 }
 
 export function futimesSync(fd, atime, mtime) {
-  cottontail.futimesSync(validateFd(fd), _toUnixTimestamp(atime), _toUnixTimestamp(mtime));
+  fd = validateFd(fd);
+  const path = permissionFdPaths.get(fd);
+  if (path !== undefined) assertFsWrite(path);
+  try {
+    cottontail.futimesSync(fd, _toUnixTimestamp(atime), _toUnixTimestamp(mtime));
+  } catch (error) {
+    throw makeFdError(error, fd, "futime");
+  }
 }
 
 export function utimesSync(path, atime, mtime) {
-  cottontail.utimesSync(normalizePath(path), _toUnixTimestamp(atime), _toUnixTimestamp(mtime), true);
+  const normalizedPath = normalizePath(path);
+  assertFsWrite(normalizedPath);
+  try {
+    cottontail.utimesSync(normalizedPath, _toUnixTimestamp(atime), _toUnixTimestamp(mtime), true);
+  } catch (error) {
+    throw makeFsError(error, normalizedPath, "utime");
+  }
 }
 
 export function lutimesSync(path, atime, mtime) {
-  cottontail.utimesSync(normalizePath(path), _toUnixTimestamp(atime), _toUnixTimestamp(mtime), false);
+  const normalizedPath = normalizePath(path);
+  assertFsWrite(normalizedPath);
+  try {
+    cottontail.utimesSync(normalizedPath, _toUnixTimestamp(atime), _toUnixTimestamp(mtime), false);
+  } catch (error) {
+    throw makeFsError(error, normalizedPath, "lutime");
+  }
 }
 
 export function _toUnixTimestamp(time) {
@@ -1848,7 +2016,7 @@ class WriteStreamImpl extends Writable {
     if (callback) this.once("close", callback);
     this.end();
     if (!this.autoClose) {
-      if (this._finished) this.destroy();
+      if (this._finished) queueMicrotask(() => this.destroy());
       else this.once("finish", () => this.destroy());
     }
     return this;
@@ -1922,12 +2090,15 @@ function queueFsRequest(operation) {
   });
 }
 
-function callbackify(action, callbackName = "callback", validate = undefined) {
+function callbackify(action, callbackName = "callback", validate = undefined, validateBeforeCallback = false) {
   return (...args) => {
     const callback = args[args.length - 1];
+    if (validateBeforeCallback) {
+      validate?.(...(typeof callback === "function" ? args.slice(0, -1) : args));
+    }
     if (typeof callback !== "function") throw makeInvalidCallbackError(callbackName, callback);
     const callArgs = args.slice(0, -1);
-    validate?.(...callArgs);
+    if (!validateBeforeCallback) validate?.(...callArgs);
     queueFsRequest(() => {
       try { callback(null, action(...callArgs)); } catch (error) { callback(error); }
     });
@@ -1998,8 +2169,14 @@ export function appendFile(path, data, options, callback) {
     error => callback(error),
   );
 }
-export const chmod = callbackify(chmodSync, "callback", validateChmod);
-export const chown = callbackify(chownSync, "callback", validateChown);
+const chmodCallback = callbackify(chmodSync, "callback", validateChmod, true);
+export function chmod(path, mode, callback) {
+  return chmodCallback(path, mode, callback);
+}
+const chownCallback = callbackify(chownSync, "callback", validateChown, true);
+export function chown(path, uid, gid, callback) {
+  return chownCallback(path, uid, gid, callback);
+}
 export function close(fd, callback = undefined) {
   fd = validateFd(fd);
   if (callback !== undefined && typeof callback !== "function") {
@@ -2029,8 +2206,14 @@ export function cp(source, destination, options, callback) {
     callback,
   );
 }
-export const fchmod = callbackify(fchmodSync, "callback", validateFdChmod);
-export const fchown = callbackify(fchownSync, "callback", validateFdChown);
+const fchmodCallback = callbackify(fchmodSync, "callback", validateFdChmod, true);
+export function fchmod(fd, mode, callback) {
+  return fchmodCallback(fd, mode, callback);
+}
+const fchownCallback = callbackify(fchownSync, "callback", validateFdChown, true);
+export function fchown(fd, uid, gid, callback) {
+  return fchownCallback(fd, uid, gid, callback);
+}
 export const fdatasync = callbackify(fdatasyncSync, "callback", validateFd);
 export const fstat = callbackify(fstatSync, "callback", validateFd);
 export const fsync = callbackify(fsyncSync, "callback", validateFd);
@@ -2040,8 +2223,14 @@ export const futimes = callbackify(futimesSync, "callback", (fd, atime, mtime) =
   _toUnixTimestamp(atime);
   _toUnixTimestamp(mtime);
 });
-export const lchmod = callbackify(lchmodSync, "callback", validateChmod);
-export const lchown = callbackify(lchownSync, "callback", validateChown);
+const lchmodCallback = isWindowsFs ? undefined : callbackify(lchmodSync, "callback", validateChmod, true);
+export var lchmod = isWindowsFs ? undefined : function lchmod(path, mode, callback) {
+  return lchmodCallback(path, mode, callback);
+};
+const lchownCallback = callbackify(lchownSync, "callback", validateChown, true);
+export function lchown(path, uid, gid, callback) {
+  return lchownCallback(path, uid, gid, callback);
+}
 export const link = callbackify(linkSync, "callback", (existingPath, newPath) => {
   validateTwoPaths(existingPath, newPath, "existingPath", "newPath");
 });
@@ -2104,6 +2293,10 @@ export const realpath = callbackify(realpathSync, "callback", (path, options) =>
   validateNormalizedPath(path);
   normalizeEncoding(options);
 });
+realpath.native = callbackify(realpathNativeSync, "callback", (path, options) => {
+  validateNormalizedPath(path);
+  normalizeEncoding(options);
+});
 export const rename = callbackify(renameSync, "callback", (oldPath, newPath) => {
   validateTwoPaths(oldPath, newPath, "oldPath", "newPath");
 });
@@ -2111,7 +2304,14 @@ export const rm = callbackify(rmSync, "callback", path => validateNormalizedPath
 export const rmdir = callbackify(rmdirSync, "callback", path => validateNormalizedPath(path));
 export const stat = callbackify(statSync, "callback", path => validateNormalizedPath(path));
 export const statfs = callbackify(statfsSync, "callback", path => validateNormalizedPath(path));
-export const symlink = callbackify(symlinkSync, "callback", (target, path) => {
+export const symlink = callbackify(symlinkSync, "callback", (target, path, type = undefined) => {
+  if (type !== undefined && type !== null && type !== "file" && type !== "dir" && type !== "junction") {
+    throw invalidArgValue(
+      "type",
+      type,
+      "must be one of: 'dir', 'file', 'junction', null, undefined",
+    );
+  }
   validateTwoPaths(target, path, "target", "path");
 });
 export const truncate = callbackify(truncateSync, "callback", (path, len = 0) => {
@@ -2138,7 +2338,14 @@ export function writeFile(path, data, options, callback) {
 
 export function exists(path, callback) {
   if (typeof callback !== "function") throw makeInvalidCallbackError("callback", callback);
-  queueFsRequest(() => callback(existsSync(path)));
+  queueFsRequest(() => {
+    try {
+      callback(existsSync(path));
+    } catch (error) {
+      if (error?.code === "ERR_ACCESS_DENIED") callback(false);
+      else throw error;
+    }
+  });
 }
 
 export function read(fd, buffer, offset, length, position, callback) {
@@ -2508,6 +2715,7 @@ export function watchFile(path, options = {}, listener = undefined) {
   }
   if (typeof listener !== "function") throw new TypeError("The \"listener\" argument must be of type function");
   const filename = normalizePath(path);
+  assertFsRead(filename);
   const statOptions = options?.bigint ? { bigint: true } : undefined;
   let entry = fileWatchers.get(filename);
   if (!entry) {
@@ -2562,7 +2770,12 @@ export function unwatchFile(path, listener = undefined) {
 }
 
 function normalizeGlobPattern(pattern) {
-  const value = globalThis.process?.platform === "win32" ? pattern.replaceAll("\\", "/") : pattern;
+  let value = pattern;
+  if (globalThis.process?.platform === "win32") {
+    // Preserve an escaped, otherwise-unclosed "[" as a literal character
+    // before treating the remaining backslashes as Windows separators.
+    value = value.replace(/\\\[(?![^\\/\]]*\])/g, "[[]").replaceAll("\\", "/");
+  }
   return value.replace(/^\.\//, "");
 }
 
@@ -2692,7 +2905,14 @@ export function globSync(pattern, options) {
   }
   const withFileTypes = Boolean(options.withFileTypes);
   const cwdValue = options.cwd ?? globalThis.process?.cwd?.() ?? ".";
-  const cwd = normalizePath(cwdValue);
+  const cwdIsFileUrl = cwdValue !== null &&
+    typeof cwdValue === "object" &&
+    cwdValue.protocol === "file:" &&
+    typeof cwdValue.href === "string";
+  if (typeof cwdValue !== "string" && !cwdIsFileUrl) {
+    throw new TypeError("scanSync: invalid `cwd`, not a string or file URL");
+  }
+  const cwd = cwdIsFileUrl ? normalizeFileUrlPath(cwdValue) : normalizePath(cwdValue);
   const cwdStats = statSync(cwd);
   if (!cwdStats.isDirectory()) readdirSync(cwd);
   const excludeOption = options.exclude;

@@ -6,6 +6,7 @@ import { $ } from "bun";
 import { parseShell } from "../../src/runtime_modules/internal/bun-shell-parser.js";
 
 const root = mkdtempSync(join(tmpdir(), "cottontail-shell-source-"));
+const portableChild = join(import.meta.dir, "fixtures", "shell-portable-child.js");
 const shell = (source: string) => $`${{ raw: source }}`.cwd(root).quiet().nothrow();
 // COTTONTAIL-COMPAT: Vendored JSC startup can exceed Bun's 5s test default
 // when one shell assertion launches multiple nested Cottontail processes.
@@ -132,7 +133,7 @@ test("background lists execute concurrently and wait joins their output", async 
   expect(output.exitCode).toBe(0);
   expect(output.stdout.toString()).toBe("foreground\nbackground\njoined\n");
   expect(output.stderr.toString()).toBe("");
-});
+}, { timeout: process.platform === "win32" ? 30_000 : 5_000 });
 
 test("production parsing materializes async redirected subshell nodes", () => {
   const parseProduction = (source: string) => parseShell(source, {
@@ -337,25 +338,20 @@ test("pipeline consumers cancel input-ignoring producers", async () => {
   expect(output.exitCode).toBe(0);
   expect(output.stdout.toString()).toBe("destination\n");
   expect(output.stderr.toString()).toBe("");
-});
+}, { timeout: process.platform === "win32" ? 30_000 : 5_000 });
 
-test.skipIf(process.platform === "win32")("external producers tolerate an input-ignoring pipeline consumer", async () => {
-  const yes = Bun.which("yes");
-  expect(yes).not.toBeNull();
-
-  const output = await $`${yes!} source | echo destination`.cwd(root).quiet().nothrow();
+test("external producers tolerate an input-ignoring pipeline consumer", async () => {
+  const output = await $`${process.execPath} ${portableChild} producer | echo destination`.cwd(root).quiet().nothrow();
 
   expect(output.exitCode).toBe(0);
   expect(output.stdout.toString()).toBe("destination\n");
   expect(output.stderr.toString()).toBe("");
 });
 
-test.skipIf(process.platform === "win32")("large builtin output streams through external pipeline stages", async () => {
+test("large builtin output streams through external pipeline stages", async () => {
   const payload = "bun!".repeat(256 * 1024);
-  const cat = Bun.which("cat");
-  expect(cat).not.toBeNull();
 
-  expect(await $`echo ${payload} | ${cat}`.text()).toBe(`${payload}\n`);
+  expect(await $`echo -n ${payload} | ${process.execPath} ${portableChild} passthrough`.text()).toBe(payload);
 });
 
 test("builtin edge cases match Bun 1.3.10", async () => {

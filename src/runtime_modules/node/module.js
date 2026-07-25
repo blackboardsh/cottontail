@@ -8,7 +8,7 @@ import * as asyncHooks from "./async_hooks.js";
 import * as buffer from "./buffer.js";
 import * as childProcess from "./child_process.js";
 import * as consoleModule from "./console.js";
-import * as nodeConstants from "./constants.js";
+import nodeConstants from "./constants.js";
 import * as crypto from "./crypto.js";
 import * as diagnosticsChannel from "./diagnostics_channel.js";
 import * as dns from "./dns.js";
@@ -23,6 +23,7 @@ import * as internalAssertMyersDiff from "./internal/assert/myers_diff.js";
 import * as internalAsyncHooks from "./internal/async_hooks.js";
 import * as internalEventTarget from "./internal/event_target.js";
 import { createHttpCommonBuiltin } from "./internal/http_common.js";
+import { assertFsRead, assertFsWrite } from "./internal/permissions.js";
 import * as internalTestBinding from "./internal/test/binding.js";
 import * as net from "./net.js";
 import * as os from "./os.js";
@@ -230,6 +231,8 @@ const bundledAsyncEsmGraphCache = new Map();
 const nativeObjectDefineProperty = Object.defineProperty;
 const builtinModuleMap = new Map();
 const builtinNamespaceEntries = new Set();
+const builtinImportNamespaces = new Map();
+const kBuiltinImportNamespaces = Symbol.for("cottontail.node.builtinImportNamespaces");
 let modulePathCache = Object.create(null);
 const moduleHooks = [];
 const moduleHookIdKey = Symbol("cottontail.moduleHooksId");
@@ -264,6 +267,7 @@ hotReloadHooks.add(() => {
   bundledAsyncEsmGraphCache.clear();
   builtinModuleMap.clear();
   builtinNamespaceEntries.clear();
+  builtinImportNamespaces.clear();
   for (const key of Object.keys(modulePathCache)) delete modulePathCache[key];
   moduleHooks.length = 0;
   hookResolvedFormats.clear();
@@ -948,18 +952,63 @@ const kUnwrapDefaultBuiltins = new Set([
   "node:http",
   "https",
   "node:https",
+  "stream",
+  "node:stream",
 ]);
+const kBuiltinNonEnumerableNamedExports = new Map([
+  // The CommonJS stream export is the Stream constructor. Its ESM namespace
+  // additionally exposes the deliberately non-enumerable `promises` property.
+  ["stream", ["promises"]],
+]);
+const bufferMaxLengthStateKey = Symbol.for("cottontail.node.buffer.kMaxLength");
+
+function installMutableBufferMaxLength(moduleExports) {
+  if (moduleExports == null ||
+      (typeof moduleExports !== "object" && typeof moduleExports !== "function")) return;
+  if (!Object.hasOwn(globalThis, bufferMaxLengthStateKey)) {
+    globalThis[bufferMaxLengthStateKey] = moduleExports.kMaxLength;
+  }
+  Object.defineProperty(moduleExports, "kMaxLength", {
+    configurable: true,
+    enumerable: true,
+    get() { return globalThis[bufferMaxLengthStateKey]; },
+    set(value) { globalThis[bufferMaxLengthStateKey] = value; },
+  });
+}
 
 export function __setBuiltinModules(modules) {
   const globalMap = globalThis.__cottontailBuiltinModules ??= new Map();
+  Object.defineProperty(globalMap, kBuiltinImportNamespaces, {
+    value: builtinImportNamespaces,
+    configurable: true,
+  });
   for (let [name, value] of Object.entries(modules || {})) {
+    if (name.replace(/^node:/, "") === "buffer") installMutableBufferMaxLength(value);
     let isNamespace = value != null &&
       (typeof value === "object" || typeof value === "function") &&
       Object.hasOwn(value, "default");
+    let importNamespace;
+    const canonicalName = name.replace(/^node:/, "");
+    const additionalNamedExports = kBuiltinNonEnumerableNamedExports.get(canonicalName);
+    if (additionalNamedExports !== undefined) {
+      if (isNamespace) {
+        importNamespace = value;
+      } else {
+        const matchingAlias = [canonicalName, `node:${canonicalName}`].find(
+          alias => builtinModuleMap.get(alias) === value && builtinImportNamespaces.has(alias),
+        );
+        importNamespace = matchingAlias === undefined
+          ? undefined
+          : builtinImportNamespaces.get(matchingAlias);
+        importNamespace ??= namespaceFromCommonJs(value, false, additionalNamedExports);
+      }
+    }
     if (kUnwrapDefaultBuiltins.has(name) && value && typeof value === "object" && value.default) {
       value = value.default;
       isNamespace = false;
     }
+    if (importNamespace === undefined) builtinImportNamespaces.delete(name);
+    else builtinImportNamespaces.set(name, importNamespace);
     if (isNamespace) builtinNamespaceEntries.add(name);
     else builtinNamespaceEntries.delete(name);
     builtinModuleMap.set(name, value);
@@ -1036,7 +1085,10 @@ function standaloneDirectoryExists(path) {
 
 function readModuleFile(path) {
   const embedded = standaloneFileEntry(path);
-  if (!embedded.found) return cottontail.readFile(path);
+  if (!embedded.found) {
+    assertFsRead(String(path));
+    return cottontail.readFile(path);
+  }
   if (typeof embedded.value === "string") return embedded.value;
   if (embedded.value instanceof ArrayBuffer) return new TextDecoder().decode(embedded.value);
   if (ArrayBuffer.isView(embedded.value)) {
@@ -1696,6 +1748,13 @@ function resolvedToUrl(resolved) {
   return pathToFileURL(text).href + suffix;
 }
 
+function sourceURLForResolved(resolved) {
+  const { bare: text, suffix } = splitSpecifierSuffix(resolved);
+  if (text.startsWith("file:")) return text + suffix;
+  if (isAbsolute(text)) return pathToFileURL(text).href + suffix;
+  return String(resolved);
+}
+
 function urlToResolved(url) {
   const text = String(url);
   if (text.startsWith("node:")) return text;
@@ -1714,6 +1773,13 @@ function formatForResolved(resolved) {
     if (packageJsonValue(scope?.packageJson, "type") === "module") return "module";
   }
   return "commonjs";
+}
+
+function packageTypeIsModule(resolved) {
+  const { bare } = splitSpecifierSuffix(resolved);
+  if (!isAbsolute(bare)) return false;
+  const scope = nearestPackageScope(bare);
+  return packageJsonValue(scope?.packageJson, "type") === "module";
 }
 
 function parentURLForBase(basePath) {
@@ -2354,6 +2420,8 @@ function hasCommonJsSyntax(source) {
 }
 
 const runtimeDecoratorSyntaxPattern = /(?:^|[\n;{}])\s*@[A-Za-z_$(\[]/;
+const runtimeUsingSyntaxPattern =
+  /\b(?:await\s+)?using\s+[$_\p{ID_Start}][$_\u200C\u200D\p{ID_Continue}]*\s*=/gu;
 
 function hasRuntimeDecoratorSyntax(source) {
   const text = String(source);
@@ -2368,23 +2436,17 @@ function hasRuntimeDecoratorSyntax(source) {
   return false;
 }
 
-const explicitResourceManagementPattern = /\b(?:await\s+)?using\s+[$A-Z_a-z][$\w]*\s*=/g;
-
-function hasExplicitResourceManagementSyntax(source) {
+function hasRuntimeUsingSyntax(source) {
   const text = String(source);
   if (!/\busing\b/.test(text)) return false;
-  const mask = codePositionMask(text);
-  explicitResourceManagementPattern.lastIndex = 0;
-  let match;
-  while ((match = explicitResourceManagementPattern.exec(text)) != null) {
-    const usingIndex = match.index + match[0].indexOf("using");
-    if (mask[usingIndex] === 1) return true;
-  }
-  return false;
+  const matcher = new RegExp(runtimeUsingSyntaxPattern.source, runtimeUsingSyntaxPattern.flags);
+  // Blanking string/regexp/template trivia prevents false positives while
+  // turning comments between declaration tokens into ordinary whitespace.
+  return matcher.test(codeOnlyText(text));
 }
 
 function hasRuntimeTransformSyntax(source) {
-  return hasRuntimeDecoratorSyntax(source) || hasExplicitResourceManagementSyntax(source);
+  return hasRuntimeDecoratorSyntax(source) || hasRuntimeUsingSyntax(source);
 }
 
 function formatForHookSource(resolved, source) {
@@ -2460,7 +2522,7 @@ function compileModuleWrapper(args, source, filename, diagnosticSource = source)
     if (useNativeCompiler) {
       return cottontail.compileFunction(`(function(${args.join(",")}) {\n${source}\n})`, filename);
     }
-    return new Function(...args, `${source}\n//# sourceURL=${filename}`);
+    return new Function(...args, `${source}\n//# sourceURL=${sourceURLForResolved(filename)}`);
   } catch (error) {
     throw markModuleCompileError(error, filename, diagnosticSource, useNativeCompiler ? 1 : FUNCTION_WRAPPER_LINE_OFFSET);
   }
@@ -2473,7 +2535,7 @@ function compileAsyncModuleWrapper(args, source, filename, diagnosticSource = so
       return cottontail.compileFunction(`(async function(${args.join(",")}) {\n${source}\n})`, filename);
     }
     const AsyncFunction = (async () => {}).constructor;
-    return new AsyncFunction(...args, `${source}\n//# sourceURL=${filename}`);
+    return new AsyncFunction(...args, `${source}\n//# sourceURL=${sourceURLForResolved(filename)}`);
   } catch (error) {
     throw markModuleCompileError(error, filename, diagnosticSource, useNativeCompiler ? 1 : FUNCTION_WRAPPER_LINE_OFFSET);
   }
@@ -2582,6 +2644,9 @@ function transpileExtensionSource(filename, loader, forceTransform = false, inpu
   // Plain CommonJS JavaScript is already valid input for JSC. Keeping its
   // source layout intact preserves Node-compatible stack and source-map
   // coordinates instead of rewriting every require() through the transpiler.
+  // The generic vendored JSC ports do not parse explicit-resource-management
+  // declarations, so `using` and `await using` take the same narrow transform
+  // path as decorators.
   if (!forceTransform && loader === "js" && (extension == null || extension === ".js" || extension === ".cjs") && !needsRuntimeTransform) {
     return finish(source);
   }
@@ -2951,7 +3016,7 @@ function executeHookSource(resolved, source, format) {
     "__filename",
     "__dirname",
     "__ctImportMeta",
-    `${executableSource}\n//# sourceURL=${resolved}`,
+    `${executableSource}\n//# sourceURL=${sourceURLForResolved(resolved)}`,
   );
   const args = [
     module.exports,
@@ -3065,16 +3130,22 @@ function requiredBundledEsmNamespace(value, source, loader) {
   return namespace;
 }
 
-function namespaceFromCommonJs(value) {
+function namespaceFromCommonJs(value, packageTypeModule = false, additionalNames = []) {
   const namespace = createModuleNamespace();
   Object.defineProperty(namespace, "default", {
     configurable: true,
     enumerable: true,
-    get: () => value,
+    get: () => (
+      !packageTypeModule &&
+      value &&
+      (typeof value === "object" || typeof value === "function") &&
+      value.__esModule === true &&
+      Object.hasOwn(value, "default")
+    ) ? value.default : value,
   });
   if (value && (typeof value === "object" || typeof value === "function")) {
-    for (const key of Object.keys(value)) {
-      if (key !== "default") {
+    for (const key of new Set([...Object.keys(value), ...additionalNames])) {
+      if (key !== "default" && (packageTypeModule || key !== "__esModule")) {
         Object.defineProperty(namespace, key, {
           configurable: true,
           enumerable: true,
@@ -3087,6 +3158,8 @@ function namespaceFromCommonJs(value) {
 }
 
 function namespaceFromBuiltin(name, value) {
+  const registeredNamespace = builtinImportNamespaces.get(String(name));
+  if (registeredNamespace !== undefined) return registeredNamespace;
   const unwrapped = unwrapBuiltin(value);
   // Namespace identity is fixed when a builtin is registered. Inspecting the
   // live value here would misclassify CommonJS-style builtins after user code
@@ -3159,7 +3232,7 @@ function staticImportCall(specifier, asyncStaticImports, attributeKeyword, attri
 
 // Single line (no trailing newline) so prepending it does not shift line
 // numbers of the transformed module source.
-const staticImportHelperSource = `const __ctStaticImport = (spec) => { const value = require(spec); if (value && (typeof value === "object" || typeof value === "function") && value[Symbol.toStringTag] === "Module") return value; const ns = { default: value }; if (value && (typeof value === "object" || typeof value === "function")) { for (const key of Object.keys(value)) { if (key !== "default") ns[key] = value[key]; } if (value.__esModule && Object.hasOwn(value, "default")) ns.default = value.default; } return ns; }; const __ctDynamicImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options); `;
+const staticImportHelperSource = `const __ctStaticImport = (spec) => { const value = require(spec); const builtinMap = globalThis.__cottontailBuiltinModules; const registeredNamespace = builtinMap?.[Symbol.for("cottontail.node.builtinImportNamespaces")]?.get(String(spec)); if (registeredNamespace !== undefined && builtinMap.get(String(spec)) === value) return registeredNamespace; if (value && (typeof value === "object" || typeof value === "function") && value[Symbol.toStringTag] === "Module") return value; const ns = { default: value }; if (value && (typeof value === "object" || typeof value === "function")) { for (const key of Object.keys(value)) { if (key !== "default") ns[key] = value[key]; } if (value.__esModule && Object.hasOwn(value, "default")) ns.default = value.default; } return ns; }; const __ctDynamicImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options); `;
 const asyncStaticImportHelperSource = `const __ctDynamicImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options, true); const __ctStaticImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options, true, __ctModuleAncestors); `;
 const esmExportDeclarationTrivia = String.raw`((?:\s|\/\*(?:[^*]|\*(?!\/))*\*\/|\/\/[^\r\n]*(?:\r?\n|$))*)`;
 
@@ -3463,7 +3536,7 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
       resolvedPath,
       replaceCodePattern(source, /\bimport\.meta\b/g, "__ctImportMeta"),
       "commonjs",
-    ));
+    ), packageTypeIsModule(resolvedPath));
   }
   if (!forceAsync &&
       isAbsolute(resolvedPath) &&
@@ -3588,7 +3661,7 @@ function importResolvedRuntimeModule(resolved, options = undefined, forceAsync =
     if (forceAsync && source !== undefined && sourceRequiresAsyncModuleExecution(resolvedPath, source)) {
       return executeDynamicImportSource(resolved, source, "module", true, asyncAncestors);
     }
-    return namespaceFromCommonJs(loadCommonJsModule(resolved));
+    return namespaceFromCommonJs(loadCommonJsModule(resolved), packageTypeIsModule(resolvedPath));
   }
   return executeDynamicImportSource(
     resolved,
@@ -3683,6 +3756,23 @@ export function __importModule(
   return promise;
 }
 
+function normalizeDynamicImportError(error) {
+  if ((typeof error !== "object" && typeof error !== "function") || error === null) return error;
+  if (error.__ctModuleCompileError) {
+    error.name = "BuildMessage";
+    error.level ??= "error";
+    return error;
+  }
+  if (error.code === "MODULE_NOT_FOUND") {
+    error.name = "ResolveMessage";
+    error.code = "ERR_MODULE_NOT_FOUND";
+    error.line = Number.isFinite(Number(error.line)) ? Number(error.line) : 0;
+    error.column = Number.isFinite(Number(error.column)) ? Number(error.column) : 0;
+    error.position ??= { line: error.line, column: error.column };
+  }
+  return error;
+}
+
 // The native dynamic-import shim (cottontail.importModule) stringifies any
 // exception thrown synchronously by this hook, losing error identity (e.g.
 // error.code). Return a rejected promise instead so the original Error object
@@ -3695,9 +3785,17 @@ globalThis.__cottontailImportModule = (
   asyncAncestors = undefined,
 ) => {
   try {
-    return __importModule(specifier, referrer, options, forceAsync, asyncAncestors);
+    const result = __importModule(specifier, referrer, options, forceAsync, asyncAncestors);
+    if (result && typeof result.then === "function") {
+      const normalized = Promise.resolve(result).catch(error => {
+        throw normalizeDynamicImportError(error);
+      });
+      normalized.catch(() => {});
+      return normalized;
+    }
+    return result;
   } catch (error) {
-    const rejected = Promise.reject(error);
+    const rejected = Promise.reject(normalizeDynamicImportError(error));
     // Pre-attach a no-op handler so the runtime's unhandled-rejection tracker
     // does not flag it before the awaiting caller attaches its own handler.
     rejected.catch(() => {});
@@ -3726,7 +3824,7 @@ function executeQueriedModule(module, filename, suffix) {
     "__filename",
     "__dirname",
     "__ctImportMeta",
-    `${transformed}\n//# sourceURL=${filename}${suffix}`,
+    `${transformed}\n//# sourceURL=${sourceURLForResolved(withSpecifierSuffix(filename, suffix))}`,
   );
   module.exports = createModuleNamespace();
   module[runtimeEsmSourceModuleKey] = true;
@@ -4537,6 +4635,7 @@ function formatUncaughtBundleError(error) {
 }
 globalThis.__cottontailFormatUncaughtModuleError = error => {
   try {
+    if (error?.__cottontailSkipUncaughtModuleFormatting === true) return false;
     const metadata = error?.__ctModuleErrorMetadata;
     if (!metadata) return formatUncaughtBundleError(error);
     const location = originalErrorLocation(error, metadata);
@@ -4590,7 +4689,9 @@ function recordCompileCache(filename, source) {
       cachedAt: Date.now(),
     };
     compileCacheEntries.set(String(filename), entry);
-    cottontail.writeFile(join(compileCacheDir, `${key}.json`), JSON.stringify(entry));
+    const cachePath = join(compileCacheDir, `${key}.json`);
+    assertFsWrite(cachePath);
+    cottontail.writeFile(cachePath, JSON.stringify(entry));
   } catch {}
 }
 
@@ -4819,19 +4920,24 @@ export function enableCompileCache(cacheDir = undefined) {
   if (compileCacheDir != null) {
     return { status: constants.compileCacheStatus.ALREADY_ENABLED, directory: compileCacheDir };
   }
-  compileCacheDir = cacheDir ?? join(cottontail.cwd(), ".cottontail-compile-cache");
+  const target = cacheDir ?? join(cottontail.cwd(), ".cottontail-compile-cache");
   try {
-    cottontail.mkdirSync(compileCacheDir, true);
-    return { status: constants.compileCacheStatus.ENABLED, directory: compileCacheDir };
+    assertFsRead(target);
+    assertFsWrite(target);
+    cottontail.mkdirSync(target, true);
+    compileCacheDir = target;
+    return { status: constants.compileCacheStatus.ENABLED, directory: target };
   } catch (error) {
-    return { status: constants.compileCacheStatus.FAILED, message: String(error?.message ?? error), directory: compileCacheDir };
+    return { status: constants.compileCacheStatus.FAILED, message: String(error?.message ?? error), directory: target };
   }
 }
 
 export function flushCompileCache() {
   if (compileCacheDir != null) {
     try {
-      cottontail.writeFile(join(compileCacheDir, "manifest.json"), JSON.stringify({
+      const manifestPath = join(compileCacheDir, "manifest.json");
+      assertFsWrite(manifestPath);
+      cottontail.writeFile(manifestPath, JSON.stringify({
         version: 1,
         entries: Array.from(compileCacheEntries.values()),
       }));
@@ -5426,6 +5532,7 @@ const constantsBuiltin = nodeConstants.default ?? nodeConstants;
 // CommonJS exposes a mutable object for node:buffer. Some Node APIs, including
 // zlib's global output limit, intentionally observe mutations to that object.
 const bufferBuiltin = buffer.default ?? buffer;
+installMutableBufferMaxLength(bufferBuiltin);
 const httpAgentBuiltin = { Agent: http.Agent, globalAgent: http.globalAgent };
 const httpClientBuiltin = { ClientRequest: http.ClientRequest };
 const httpIncomingBuiltin = {

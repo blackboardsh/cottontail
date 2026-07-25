@@ -21,6 +21,7 @@ import {
 import { cpSync as nodeCpSync } from "../node/fs.js";
 import {
   basename as nodePathBasename,
+  dirname as nodePathDirname,
   isAbsolute as nodePathIsAbsolute,
   join as nodePathJoin,
   relative as nodePathRelative,
@@ -186,9 +187,11 @@ const ctPendingDynamicFunctionNames = new Map();
 function evalBootstrapLineOffset() {
   const map = globalThis.__cottontailBundleSourceMap ?? globalThis.__cottontailBundleSourceMapData;
   if (map == null) return 0;
-  if (ctEvalOffsetMap === map) return ctEvalLineOffset ?? 0;
-  ctEvalOffsetMap = map;
-  ctEvalLineOffset = 0;
+  if (ctEvalOffsetMap === map && (ctEvalLineOffset ?? 0) > 0) return ctEvalLineOffset;
+  if (ctEvalOffsetMap !== map) {
+    ctEvalOffsetMap = map;
+    ctEvalLineOffset = 0;
+  }
   const cwd = globalThis.process?.cwd?.();
   if (typeof cwd !== "string") return 0;
   const source = nodePathResolve(cwd, "[eval]").replaceAll("\\", "/");
@@ -196,7 +199,10 @@ function evalBootstrapLineOffset() {
   const lines = context?.lines;
   if (!Array.isArray(lines)) return 0;
   const boundary = lines.findIndex((line, index) =>
-    index > 0 && line.startsWith("}") && lines[index - 1]?.trim() === "});"
+    index > 0 &&
+    line.startsWith("}") &&
+    lines.slice(Math.max(0, index - 4), index)
+      .some(previous => previous.includes("__cottontailVirtualModuleNamespaces.set("))
   );
   if (boundary >= 0) ctEvalLineOffset = boundary;
   return ctEvalLineOffset;
@@ -1244,6 +1250,41 @@ function trailingRedirect(part, operator) {
   return { fd: start < end - 1 ? Number(part[start]) : operator === "<" ? 0 : 1, start, end };
 }
 
+function validateWindowsShellObjectRedirects(node, outputTargets) {
+  if (cottontail.platform() !== "win32" || outputTargets.size === 0) return;
+  const visit = value => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    if (value == null || typeof value !== "object") return;
+
+    const redirects = Array.isArray(value.redirects) ? value.redirects : [];
+    const objectRedirects = redirects
+      .map((redirect, index) => ({ redirect, index }))
+      .filter(({ redirect }) => {
+        if (outputTargets.has(redirect.target?.raw)) return true;
+        const literalTarget = redirect.target?.parts
+          ?.map(part => typeof part?.text === "string" ? part.text : "")
+          .join("");
+        return literalTarget !== undefined && outputTargets.has(literalTarget);
+      });
+    if (value.type === "subshell" && objectRedirects.length > 0) {
+      throw new Error("Subshells with redirections are currently not supported. Please open a GitHub issue.");
+    }
+    if (objectRedirects.length > 0 && redirects.length > 1) {
+      const { index } = objectRedirects[0];
+      if (index === redirects.length - 1 && redirects[index - 1]?.operator === ">&2") {
+        throw new Error("Redirection with no file");
+      }
+      throw new Error('expected a command or assignment but got: "Redirect"');
+    }
+
+    for (const child of Object.values(value)) visit(child);
+  };
+  visit(node);
+}
+
 function interpolateShellCommand(strings, values) {
   const parts = Array.isArray(strings?.raw) ? strings.raw : strings;
   let out = "";
@@ -1261,6 +1302,9 @@ function interpolateShellCommand(strings, values) {
       const target = `__cottontail_output_${index}_${outputTargets.size}__`;
       out += part;
       scanShellQuoteState(state, part);
+      if (state.quote === '"') {
+        throw new SyntaxError("JS object reference not allowed in double quotes");
+      }
       out += quotePosixShellValue(target);
       outputTargets.set(target, values[index]);
       continue;
@@ -1285,7 +1329,8 @@ function interpolateShellCommand(strings, values) {
     }
   }
   const command = out.trimEnd();
-  parseBunShellSource(command);
+  const parsed = parseBunShellSource(command);
+  validateWindowsShellObjectRedirects(parsed, outputTargets);
   return { command, outputBuffer, outputFd, outputTargets, inputBody };
 }
 
@@ -1418,8 +1463,9 @@ export class ShellError extends Error {
       configurable: true,
     });
     if (typeof this.stack === "string") {
-      const firstFrame = this.stack.indexOf("\n");
-      this.stack = `ShellError: ${this.message}${firstFrame < 0 ? "" : this.stack.slice(firstFrame)}`;
+      const remappedStack = ctRemapStackString(this.stack);
+      const firstFrame = remappedStack.indexOf("\n");
+      this.stack = `ShellError: ${this.message}${firstFrame < 0 ? "" : remappedStack.slice(firstFrame)}`;
     }
     return this;
   }
@@ -2189,12 +2235,7 @@ async function runHostShell(command, options) {
 const runBunShellRuntime = createBunShellRuntime({
   spawn,
   which(command, options = {}) {
-    const value = String(command ?? "");
-    if ((value.includes("/") || value.includes("\\")) && !/^(?:[A-Za-z]:)?[\\/]/.test(value)) {
-      const candidate = nodePathResolve(String(options.cwd ?? cottontail.cwd()), value);
-      return isExecutableFile(candidate) ? candidate : null;
-    }
-    return which(value, options);
+    return which(String(command ?? ""), options);
   },
   execPath: String(globalThis.process?.execPath ?? cottontail.execPath?.() ?? "cottontail"),
   cwd: () => globalThis.process?.cwd?.() ?? cottontail.cwd(),
@@ -2545,36 +2586,77 @@ function isExecutableFile(path) {
   }
 }
 
+const windowsExecutableExtensions = [".exe", ".cmd", ".bat"];
+const canonicalWindowsSystemRoots = new Map();
+
+function executableCandidates(path, isWindows) {
+  const lowerPath = path.toLowerCase();
+  if (!isWindows || windowsExecutableExtensions.some(extension => lowerPath.endsWith(extension))) {
+    return [path];
+  }
+  return windowsExecutableExtensions.map(extension => `${path}${extension}`);
+}
+
+function windowsSearchDirectory(path, env) {
+  const value = String(path);
+  const systemRootValue = env.SystemRoot ?? env.SYSTEMROOT ?? env.systemroot;
+  if (systemRootValue == null) return value;
+  const systemRoot = String(systemRootValue).replace(/[\\/]+$/, "");
+  if (!systemRoot) return value;
+  const comparablePath = value.replaceAll("/", "\\").toLowerCase();
+  const comparableRoot = systemRoot.replaceAll("/", "\\").toLowerCase();
+  if (!comparablePath.startsWith(comparableRoot) ||
+      (comparablePath.length > comparableRoot.length && comparablePath[comparableRoot.length] !== "\\")) {
+    return value;
+  }
+
+  // Windows commonly exports SystemRoot as C:\WINDOWS even though the
+  // filesystem spelling is C:\Windows. Canonicalize that stable prefix while
+  // retaining the PATH entry's spelling for all remaining components.
+  let canonicalRoot = canonicalWindowsSystemRoots.get(comparableRoot);
+  if (canonicalRoot === undefined) {
+    try { canonicalRoot = cottontail.realpathSync(systemRoot); } catch { canonicalRoot = null; }
+    canonicalWindowsSystemRoots.set(comparableRoot, canonicalRoot);
+  }
+  return canonicalRoot == null ? value : `${canonicalRoot}${value.slice(systemRoot.length)}`;
+}
+
 function which(command, options = undefined) {
   const value = String(command || "");
   if (!value) return null;
   if (value.length > 4096) throw new Error("bin path is too long");
+  const isWindows = cottontail.platform() === "win32";
+  const lookupCwd = String(options?.cwd ?? cottontail.cwd());
   if (value.includes("/") || value.includes("\\")) {
-    const candidate = nodePathResolve(value);
-    return isExecutableFile(candidate) ? candidate : null;
+    const candidate = nodePathResolve(lookupCwd, value);
+    let displayedCandidate = candidate;
+    if (isWindows && nodePathIsAbsolute(value)) {
+      displayedCandidate = value;
+    } else if (isWindows && value.startsWith(".\\")) {
+      displayedCandidate = `${nodePathResolve(lookupCwd)}\\${value}`;
+    }
+    const resolvedCandidates = executableCandidates(candidate, isWindows);
+    const displayedCandidates = executableCandidates(displayedCandidate, isWindows);
+    for (let index = 0; index < resolvedCandidates.length; index += 1) {
+      if (isExecutableFile(resolvedCandidates[index])) return displayedCandidates[index];
+    }
+    return null;
   }
 
   const env = BunObject.env ?? cottontail.env();
   const pathValue = String(options?.PATH ?? options?.Path ?? options?.path ?? env.PATH ?? env.Path ?? env.path ?? "");
-  const isWindows = cottontail.platform() === "win32";
-  const extensions = [""];
-  if (isWindows) {
-    const seen = new Set(extensions);
-    for (const extension of String(env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";")) {
-      const candidateExtension = extension.trim();
-      const key = candidateExtension.toLowerCase();
-      if (!key || seen.has(key)) continue;
-      seen.add(key);
-      extensions.push(candidateExtension);
-    }
-  }
 
   for (const dir of pathValue.split(isWindows ? ";" : ":")) {
     if (!dir) continue;
-    for (const ext of extensions) {
-      const candidate = pathJoin(dir, `${value}${ext}`);
-      if (isExecutableFile(candidate)) {
-        return candidate;
+    const searchDirectory = isWindows ? windowsSearchDirectory(dir, env) : dir;
+    const displayedCandidates = executableCandidates(nodePathJoin(searchDirectory, value), isWindows);
+    const resolvedDirectory = nodePathIsAbsolute(searchDirectory)
+      ? searchDirectory
+      : nodePathResolve(lookupCwd, searchDirectory);
+    const resolvedCandidates = executableCandidates(nodePathJoin(resolvedDirectory, value), isWindows);
+    for (let index = 0; index < resolvedCandidates.length; index += 1) {
+      if (isExecutableFile(resolvedCandidates[index])) {
+        return displayedCandidates[index];
       }
     }
   }
@@ -3961,7 +4043,19 @@ function ctNormalizeCompileOptions(options) {
     throw new TypeError('Bun.build compile.executablePath must be a string');
   }
   if (compile.windows != null) {
-    throw new TypeError("Bun.build compile.windows is not supported by this Cottontail target");
+    if (typeof compile.windows !== "object" || Array.isArray(compile.windows)) {
+      throw new TypeError("Bun.build compile.windows must be an object");
+    }
+    const windows = { ...compile.windows };
+    if (Object.hasOwn(windows, "hideConsole")) {
+      windows.hideConsole = Boolean(windows.hideConsole);
+    }
+    for (const name of ["icon", "title", "publisher", "version", "description", "copyright"]) {
+      if (windows[name] != null && typeof windows[name] !== "string") {
+        throw new TypeError(`Bun.build compile.windows.${name} must be a string`);
+      }
+    }
+    compile.windows = windows;
   }
   for (const name of ["autoloadDotenv", "autoloadBunfig", "autoloadTsconfig", "autoloadPackageJson"]) {
     if (Object.hasOwn(compile, name)) compile[name] = Boolean(compile[name]);
@@ -8392,6 +8486,7 @@ function fetchImpl(request, init = {}, upgradeStreamBody = null) {
     throw new TypeError(`Unsupported URL scheme: ${parsedUrl.protocol}`);
   }
   const unixSocketPath = init?.unix != null && init.unix !== false ? String(init.unix) : null;
+  const unixTransportPath = unixSocketPath == null ? null : windowsUnixTransportPath(unixSocketPath);
   const customTlsConfig = init?.tls != null && typeof init.tls === "object" && !Array.isArray(init.tls) ? init.tls : null;
   const proxy = fetchProxyConfiguration(request.url, init);
   if (unixSocketPath && proxy.active) throw new TypeError("fetch() proxy and unix options cannot be used together");
@@ -8454,7 +8549,7 @@ function fetchImpl(request, init = {}, upgradeStreamBody = null) {
     });
   }
   return fetchFromNodeClient(request, redirectMode, 0, false, {
-    socketPath: unixSocketPath ?? undefined,
+    socketPath: unixTransportPath ?? undefined,
     tlsConfig: customTlsConfig ?? undefined,
     proxy,
     decompress,
@@ -10213,6 +10308,44 @@ function normalizeServeUnixPath(value) {
   return path;
 }
 
+function isWindowsNamedPipePath(path) {
+  return /^(?:\\\\[.?]\\pipe\\|\/\/[.?]\/pipe\/)/i.test(String(path));
+}
+
+function windowsUnixPathKey(path) {
+  const value = String(path);
+  if (isWindowsNamedPipePath(value)) {
+    return `pipe:${value.replaceAll("/", "\\").toLowerCase()}`;
+  }
+  let resolved = value;
+  try { resolved = nodePathResolve(value); } catch {}
+  return `unix:${resolved.replaceAll("/", "\\").toLowerCase()}`;
+}
+
+function windowsUnixTransportPath(path) {
+  const value = String(path);
+  if (process.platform !== "win32") return value;
+  if (isWindowsNamedPipePath(value)) return value.replaceAll("/", "\\");
+  const digest = createHash("sha256").update(windowsUnixPathKey(value)).digest("hex").slice(0, 40);
+  return `\\\\.\\pipe\\cottontail-unix-${digest}`;
+}
+
+const windowsUnixSocketAliases = globalThis.__cottontailWindowsUnixSocketAliases ??= new Map();
+globalThis.__cottontailResolveWindowsUnixSocketAlias ??= (path) => {
+  const value = String(path);
+  if (process.platform !== "win32") return value;
+  return windowsUnixSocketAliases.get(windowsUnixPathKey(value)) ?? value;
+};
+
+function registerWindowsUnixSocketAlias(publicPath, transportPath) {
+  if (process.platform !== "win32") return () => {};
+  const key = windowsUnixPathKey(publicPath);
+  windowsUnixSocketAliases.set(key, transportPath);
+  return () => {
+    if (windowsUnixSocketAliases.get(key) === transportPath) windowsUnixSocketAliases.delete(key);
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Bun.serve websocket + TLS backend (built on node/http.js + node/https.js)
 // ---------------------------------------------------------------------------
@@ -11002,6 +11135,7 @@ function validateServeTls(tls) {
 
 function serveUnixUrlText(unixPath) {
   if (unixPath.startsWith("\0")) return `abstract://${unixPath.slice(1)}/`;
+  if (process.platform === "win32") return `unix://${unixPath.replaceAll("\\", "/")}`;
   let resolved = unixPath;
   try { resolved = nodePathResolve(unixPath); } catch {}
   return `unix://${resolved.startsWith("/") ? "" : "/"}${resolved}`;
@@ -11009,6 +11143,24 @@ function serveUnixUrlText(unixPath) {
 
 function validateServeUnixPathTarget(unixPath) {
   if (!unixPath || unixPath.startsWith("\0")) return;
+  if (process.platform === "win32") {
+    const limit = isWindowsNamedPipePath(unixPath) ? 256 : 260;
+    if (unixPath.length >= limit) {
+      const error = new Error(`ENAMETOOLONG: File name too long, listen '${unixPath}'`);
+      error.code = "ENAMETOOLONG";
+      throw error;
+    }
+    if (!isWindowsNamedPipePath(unixPath)) {
+      let directory = "";
+      try { directory = nodePathDirname(nodePathResolve(unixPath)); } catch {}
+      if (directory && !cottontail.existsSync(directory)) {
+        const error = new Error(`ENOENT: no such file or directory, listen '${unixPath}'`);
+        error.code = "ENOENT";
+        throw error;
+      }
+    }
+    return;
+  }
   const limit = process.platform === "linux" ? 108 : 104;
   if (Buffer.byteLength(unixPath) >= limit) {
     const error = new Error(`ENAMETOOLONG: File name too long, listen '${unixPath}'`);
@@ -11096,6 +11248,7 @@ function installBunTlsServerEvent(serverId, callback) {
 function serveNodeBacked(options, context) {
   const { hostname, unixPath, tlsConfigs, inspectorReload } = context;
   const isUnix = unixPath.length > 0;
+  const unixTransportPath = isUnix ? windowsUnixTransportPath(unixPath) : "";
   const useTls = tlsConfigs != null;
   const protocol = useTls ? "https:" : "http:";
   let activeOptions = options;
@@ -11182,7 +11335,7 @@ function serveNodeBacked(options, context) {
         }
         if (prebound != null) delete globalThis[preboundKey];
         nodeServer.listen(isUnix
-          ? { path: unixPath }
+          ? { path: unixTransportPath }
           : { host: listenHost, port: requestedPort, family: listenHost.includes(":") ? 6 : 4 });
       }
     } catch (rawError) {
@@ -11581,7 +11734,10 @@ function serveNodeBacked(options, context) {
   });
 
   let nodeTransportClosing = false;
+  let unregisterWindowsUnixSocketAlias = () => {};
   const stopNodeTransport = (force) => {
+    unregisterWindowsUnixSocketAlias();
+    unregisterWindowsUnixSocketAlias = () => {};
     for (const origin of originKeys) activeServeOrigins.delete(origin);
     if (force) {
       abortActiveServeRequests(server);
@@ -11609,6 +11765,9 @@ function serveNodeBacked(options, context) {
     if (force) nodeServer.closeAllConnections?.();
   };
   lifecycle.configure(stopNodeTransport, () => stopNodeTransport(true));
+  if (isUnix) {
+    unregisterWindowsUnixSocketAlias = registerWindowsUnixSocketAlias(unixPath, unixTransportPath);
+  }
 
   return finalizeServeInspector(server, activeOptions, inspectorReload);
 }
@@ -11663,7 +11822,8 @@ export function serve(options) {
   const legacyTls = options.cert != null || options.key != null ? options : null;
   const tlsConfigs = validateServeTls(options.tls ?? legacyTls);
   const configuredMaxRequestBodySize = Number(options.maxRequestBodySize ?? 128 * 1024 * 1024);
-  if (websocketHandlers != null || tlsConfigs != null || hostname.includes(":")) {
+  if (websocketHandlers != null || tlsConfigs != null || hostname.includes(":") ||
+      (process.platform === "win32" && unixPath)) {
     return serveNodeBacked(options, { hostname, unixPath, tlsConfigs, inspectorReload });
   }
 
@@ -17058,6 +17218,9 @@ function secretCommandError(result, operation) {
 export const secrets = {
   async get(rawOptions) {
     const options = validateSecretOptions("get", rawOptions);
+    if (process.platform === "win32") {
+      return cottontail.secretGet(options.service, options.name);
+    }
     if (process.platform === "darwin") {
       const result = secretCommand(["security", "find-generic-password", "-s", options.service, "-a", options.name, "-g"]);
       if (result.exitCode === 44) return null;
@@ -17082,6 +17245,10 @@ export const secrets = {
       await this.delete(options);
       return;
     }
+    if (process.platform === "win32") {
+      cottontail.secretSet(options.service, options.name, options.value);
+      return;
+    }
     if (process.platform === "darwin") {
       const args = ["security", "add-generic-password", "-U", "-s", options.service, "-a", options.name, "-w", options.value];
       if (options.allowUnrestrictedAccess === true) args.push("-A");
@@ -17101,6 +17268,9 @@ export const secrets = {
   },
   async delete(rawOptions) {
     const options = validateSecretOptions("delete", rawOptions);
+    if (process.platform === "win32") {
+      return cottontail.secretDelete(options.service, options.name);
+    }
     if (process.platform === "darwin") {
       const result = secretCommand(["security", "delete-generic-password", "-s", options.service, "-a", options.name]);
       if (result.exitCode === 44) return false;

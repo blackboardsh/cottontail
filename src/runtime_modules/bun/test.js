@@ -67,6 +67,7 @@ globalThis.__cottontailFormatUncaughtException ??= (value) => {
     return value.stack;
   }
   const code = safeUncaughtDescriptorValue(value, "code");
+  const name = safeUncaughtDescriptorValue(value, "name");
   const syscall = safeUncaughtDescriptorValue(value, "syscall");
   const errno = safeUncaughtDescriptorValue(value, "errno");
   const path = safeUncaughtDescriptorValue(value, "path");
@@ -86,7 +87,10 @@ globalThis.__cottontailFormatUncaughtException ??= (value) => {
   const line = safeUncaughtDescriptorValue(value, "line") ?? safeUncaughtDescriptorValue(value, "lineNumber");
   if (typeof message === "string" && (sourceURL != null || line != null)) {
     const location = `${sourceURL == null ? "<script>" : String(sourceURL)}${line == null ? "" : `:${line}`}`;
-    return `error: ${message}\n${formatUncaughtPlainObject(value)}\n      at ${location}${uncaughtRuntimeTrailer()}`;
+    const label = name === "AssertionError" && code === "ERR_ASSERTION"
+      ? "AssertionError [ERR_ASSERTION]"
+      : "error";
+    return `${label}: ${message}\n${formatUncaughtPlainObject(value)}\n      at ${location}${uncaughtRuntimeTrailer()}`;
   }
   return null;
 };

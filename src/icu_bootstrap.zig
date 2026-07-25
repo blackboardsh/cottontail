@@ -4,6 +4,19 @@ const builtin = @import("builtin");
 const c = @cImport({
     @cInclude("icu_bridge/icu-bridge.h");
 });
+const windows_shell = if (builtin.os.tag == .windows) struct {
+    const max_path = 260;
+    const csidl_local_app_data = 0x001c;
+    const shgfp_type_current = 0;
+
+    extern "shell32" fn SHGetFolderPathW(
+        hwnd_owner: ?std.os.windows.HWND,
+        csidl: c_int,
+        token: ?std.os.windows.HANDLE,
+        flags: std.os.windows.DWORD,
+        path: [*]u16,
+    ) callconv(.winapi) c_long;
+} else struct {};
 
 const version = "70.1";
 const data_file = "icudt70l.dat";
@@ -99,6 +112,20 @@ fn dataRoot(init: std.process.Init, allocator: std.mem.Allocator) ![]u8 {
     if (builtin.os.tag == .windows) {
         if (init.environ_map.get("LOCALAPPDATA")) |root|
             return std.fs.path.join(allocator, &.{ root, "Cottontail", "icu", version });
+        var buffer: [windows_shell.max_path]u16 = undefined;
+        const status = windows_shell.SHGetFolderPathW(
+            null,
+            windows_shell.csidl_local_app_data,
+            null,
+            windows_shell.shgfp_type_current,
+            buffer[0..].ptr,
+        );
+        if (status >= 0) {
+            const length = std.mem.indexOfScalar(u16, &buffer, 0) orelse buffer.len;
+            const root = try std.unicode.utf16LeToUtf8Alloc(allocator, buffer[0..length]);
+            defer allocator.free(root);
+            return std.fs.path.join(allocator, &.{ root, "Cottontail", "icu", version });
+        }
     } else if (builtin.os.tag == .macos) {
         if (init.environ_map.get("HOME")) |home|
             return std.fs.path.join(allocator, &.{ home, "Library", "Application Support", "Cottontail", "icu", version });

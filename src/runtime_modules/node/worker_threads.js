@@ -1,5 +1,5 @@
 import { EventEmitter } from "./events.js";
-import { resolve } from "./path.js";
+import { isAbsolute, resolve } from "./path.js";
 import { Readable, Writable } from "./stream.js";
 import { jscHeapSnapshotToV8 } from "./internal/heap_snapshot.js";
 import { format as formatValue, inspect as inspectValue } from "./util.js";
@@ -571,7 +571,10 @@ function normalizeWorkerInput(filename, options) {
     throw invalidArgumentType("filename", "string or an instance of URL", filename);
   }
   let text = String(filename);
-  if (/^[a-zA-Z][a-zA-Z\d+.-]*:/.test(text) && !text.startsWith("file:") && !text.startsWith("data:")) {
+  if (!isAbsolute(text) &&
+      /^[a-zA-Z][a-zA-Z\d+.-]*:/.test(text) &&
+      !text.startsWith("file:") &&
+      !text.startsWith("data:")) {
     const url = new URL(text);
     const error = new TypeError(`The URL must be of scheme file. Received protocol '${url.protocol}'`);
     error.code = "ERR_INVALID_URL_SCHEME";

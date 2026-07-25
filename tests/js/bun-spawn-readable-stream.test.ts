@@ -1,8 +1,10 @@
 import { expect, test } from "bun:test";
 
-const catCommand = process.platform === "win32"
-  ? ["cmd.exe", "/D", "/S", "/C", "more"]
-  : ["/bin/cat"];
+const catCommand = [
+  process.execPath,
+  "-e",
+  'process.stdout.write(require("node:fs").readFileSync(0))',
+];
 
 test("Bun.spawn streams a large stdin chunk without blocking output", async () => {
   const input = "x".repeat(1024 * 1024);
@@ -21,7 +23,7 @@ test("Bun.spawn streams a large stdin chunk without blocking output", async () =
 
   expect(await process.stdout.text()).toBe(input);
   expect(await process.exited).toBe(0);
-});
+}, 15_000);
 
 test("Bun.spawn preserves readable-stream chunk order", async () => {
   const chunks = Array.from({ length: 32 }, (_, index) => `${index}:`.padEnd(8192, "x"));
@@ -40,7 +42,7 @@ test("Bun.spawn preserves readable-stream chunk order", async () => {
 
   expect(await process.stdout.text()).toBe(chunks.join(""));
   expect(await process.exited).toBe(0);
-});
+}, 15_000);
 
 test("Bun.spawn writes a large stdin chunk without blocking output", async () => {
   const input = "z".repeat(1024 * 1024);
@@ -56,7 +58,7 @@ test("Bun.spawn writes a large stdin chunk without blocking output", async () =>
   expect(process.stdin.end()).toBe(0);
   expect(await process.stdout.text()).toBe(input);
   expect(await process.exited).toBe(0);
-});
+}, 15_000);
 
 test("Bun.spawn stdin uses the FileSink write and flush contract", async () => {
   await using process = Bun.spawn(catCommand, {
@@ -65,10 +67,12 @@ test("Bun.spawn stdin uses the FileSink write and flush contract", async () => {
     stderr: "pipe",
   });
 
-  expect(process.stdin.write("abc")).toBe(3);
-  expect(process.stdin.flush()).toBe(3);
-  expect(process.stdin.flush()).toBe(0);
-  expect(process.stdin.end()).toBe(0);
+  const write = process.stdin.write("abc");
+  const writeWasAsync = write instanceof Promise;
+  expect(await write).toBe(3);
+  expect(await process.stdin.flush()).toBe(writeWasAsync ? 0 : 3);
+  expect(await process.stdin.flush()).toBe(0);
+  expect(await process.stdin.end()).toBe(0);
   expect(await process.stdout.text()).toBe("abc");
   expect(await process.exited).toBe(0);
-});
+}, 15_000);

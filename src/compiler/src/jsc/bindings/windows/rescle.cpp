@@ -33,7 +33,6 @@
 #include "rescle.h"
 
 #include <assert.h>
-#include <atlstr.h>
 #include <sstream> // wstringstream
 #include <iomanip> // setw, setfill
 #include <fstream>
@@ -965,11 +964,29 @@ BOOL CALLBACK ResourceUpdater::OnEnumResourceLanguage(HANDLE hModule, LPCWSTR lp
             // case reinterpret_cast<ptrdiff_t>(RT_STRING): {
             UINT id = reinterpret_cast<ptrdiff_t>(lpszName) - 1;
             auto& vector = instance->stringTableMap_[wIDLanguage][id];
-            for (size_t k = 0; k < 16; k++) {
-                CStringW buf;
+            HRSRC resource = FindResourceExW(instance->module_, RT_STRING, lpszName, wIDLanguage);
+            HGLOBAL resourceData = resource ? LoadResource(instance->module_, resource) : nullptr;
+            const auto* cursor = resourceData
+                ? static_cast<const WCHAR*>(LockResource(resourceData))
+                : nullptr;
+            const auto* end = cursor
+                ? reinterpret_cast<const WCHAR*>(
+                    reinterpret_cast<const BYTE*>(cursor) + SizeofResource(instance->module_, resource))
+                : nullptr;
 
-                buf.LoadStringW(instance->module_, id * 16 + k, wIDLanguage);
-                vector.push_back(buf.GetBuffer());
+            for (size_t k = 0; k < 16; k++) {
+                if (!cursor || cursor >= end) {
+                    vector.emplace_back();
+                    continue;
+                }
+                const size_t length = *cursor++;
+                if (length > static_cast<size_t>(end - cursor)) {
+                    vector.emplace_back();
+                    cursor = end;
+                    continue;
+                }
+                vector.emplace_back(cursor, length);
+                cursor += length;
             }
             break;
         }

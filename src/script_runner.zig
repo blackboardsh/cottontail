@@ -1734,8 +1734,14 @@ fn replaceVirtualSourcePath(
     const encoded_path = try allocator.alloc(u8, encoder.calcSize(physical_path.len));
     defer allocator.free(encoded_path);
     const encoded_physical_path = encoder.encode(encoded_path, physical_path);
-    const physical_dir = std.fs.path.dirname(physical_path) orelse ".";
-    const virtual_eval_path = try std.fs.path.join(allocator, &.{ physical_dir, virtual_name });
+    const physical_prefix_len = physical_path.len - physical_name.len;
+    // Source-map markers retain the compiler's path spelling, which can use
+    // forward slashes on Windows. Preserve that prefix instead of joining it
+    // with the host-native separator.
+    const virtual_eval_path = if (physical_prefix_len > 0)
+        try std.mem.concat(allocator, u8, &.{ physical_path[0..physical_prefix_len], virtual_name })
+    else
+        try std.fs.path.join(allocator, &.{ ".", virtual_name });
     defer allocator.free(virtual_eval_path);
     const encoded_virtual_path_buffer = try allocator.alloc(u8, encoder.calcSize(virtual_eval_path.len));
     defer allocator.free(encoded_virtual_path_buffer);
@@ -2279,6 +2285,78 @@ fn compileFlags(compile: ?*const std.json.ObjectMap) standalone_executable.Flags
     };
 }
 
+fn compileWindowsOptions(compile: ?*const std.json.ObjectMap) !compiler.options.WindowsOptions {
+    const object = compile orelse return .{};
+    const value = object.get("windows") orelse return .{};
+    if (value == .null) return .{};
+    if (value != .object) return error.InvalidCompileWindowsOptions;
+    const windows = &value.object;
+
+    const optionalString = struct {
+        fn get(map: *const std.json.ObjectMap, name: []const u8) !?[]const u8 {
+            const field = map.get(name) orelse return null;
+            if (field == .null) return null;
+            if (field != .string) return error.InvalidCompileWindowsOptions;
+            return field.string;
+        }
+    }.get;
+    const hide_console = if (windows.get("hideConsole")) |field|
+        if (field == .bool) field.bool else return error.InvalidCompileWindowsOptions
+    else
+        false;
+
+    return .{
+        .hide_console = hide_console,
+        .icon = try optionalString(windows, "icon"),
+        .title = try optionalString(windows, "title"),
+        .publisher = try optionalString(windows, "publisher"),
+        .version = try optionalString(windows, "version"),
+        .description = try optionalString(windows, "description"),
+        .copyright = try optionalString(windows, "copyright"),
+    };
+}
+
+fn applyCompileWindowsOptions(
+    init: std.process.Init,
+    output_path: []const u8,
+    options: compiler.options.WindowsOptions,
+) !void {
+    if (comptime builtin.os.tag != .windows) {
+        if (options.hide_console or options.icon != null or options.title != null or
+            options.publisher != null or options.version != null or
+            options.description != null or options.copyright != null)
+        {
+            return error.CompileWindowsOptionsRequireWindows;
+        }
+        return;
+    }
+
+    if (options.hide_console) {
+        const output = try std.Io.Dir.cwd().openFile(init.io, output_path, .{ .mode = .read_write });
+        defer output.close(init.io);
+        try compiler.windows.editWin32BinarySubsystem(
+            .{ .handle = compiler.FD.fromStdFile(output) },
+            .windows_gui,
+        );
+    }
+
+    if (options.icon != null or options.title != null or options.publisher != null or
+        options.version != null or options.description != null or options.copyright != null)
+    {
+        var output_path_buffer: compiler.OSPathBuffer = undefined;
+        const output_path_w = compiler.strings.toWPathNormalizeAutoExtend(&output_path_buffer, output_path);
+        try compiler.windows.rescle.setWindowsMetadata(
+            output_path_w.ptr,
+            options.icon,
+            options.title,
+            options.publisher,
+            options.version,
+            options.description,
+            options.copyright,
+        );
+    }
+}
+
 fn compileExecutablePath(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -2351,6 +2429,7 @@ fn compileBuild(
     const compile_options = compileObject(request);
     payload.compile_exec_argv = try compileExecArgv(allocator, compile_options);
     payload.flags = compileFlags(compile_options);
+    const windows_options = try compileWindowsOptions(compile_options);
     const write_external_source_map = wantsExternalCompileSourceMap(request);
     const executable_path = try compileExecutablePath(init.io, allocator, working_dir, compile_options);
     try standalone_executable.write(
@@ -2360,6 +2439,7 @@ fn compileBuild(
         payload,
         write_external_source_map,
     );
+    try applyCompileWindowsOptions(init, output_path, windows_options);
 
     var outputs: std.ArrayList(CompileBuildOutputJson) = .empty;
     try outputs.append(allocator, .{ .path = output_path, .kind = "entry-point", .loader = "file" });
@@ -2697,8 +2777,53 @@ fn makeContext(init: std.process.Init) !Context {
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
+fn maxOldSpaceSizeValue(arg: []const u8) ?[]const u8 {
+    const flags = [_][]const u8{
+        "--max-old-space-size=",
+        "--max_old_space_size=",
+    };
+    for (flags) |flag| {
+        if (std.mem.startsWith(u8, arg, flag)) return arg[flag.len..];
+    }
+    return null;
+}
+
 fn applyRuntimeEnvFlags(io: std.Io, allocator: std.mem.Allocator, exec_args: []const [:0]const u8) bool {
     for (exec_args, 0..) |arg, index| {
+        if (maxOldSpaceSizeValue(arg)) |size_text| {
+            const size_mib = std.fmt.parseUnsigned(usize, size_text, 10) catch {
+                var buffer: [512]u8 = undefined;
+                var writer = std.Io.File.stderr().writer(io, &buffer);
+                writer.interface.print(
+                    "error: Invalid value for --max-old-space-size: \"{s}\". Must be a non-negative integer\n",
+                    .{size_text},
+                ) catch {};
+                writer.interface.flush() catch {};
+                return false;
+            };
+            const size_bytes = std.math.mul(usize, size_mib, 1024 * 1024) catch {
+                var buffer: [512]u8 = undefined;
+                var writer = std.Io.File.stderr().writer(io, &buffer);
+                writer.interface.print(
+                    "error: Value for --max-old-space-size is too large: \"{s}\"\n",
+                    .{size_text},
+                ) catch {};
+                writer.interface.flush() catch {};
+                return false;
+            };
+            const size_bytes_z = std.fmt.allocPrintSentinel(
+                allocator,
+                "{d}",
+                .{size_bytes},
+                0,
+            ) catch return false;
+            // COTTONTAIL-COMPAT: Node/V8 expresses this limit in MiB. The
+            // pinned JavaScriptCore build exposes the equivalent byte-based
+            // GC ceiling as gcMaxHeapSize and reads it before the first VM is
+            // constructed.
+            if (setenv("JSC_gcMaxHeapSize", size_bytes_z.ptr, 1) != 0) return false;
+        }
+
         var value: ?[]const u8 = null;
         if (std.mem.startsWith(u8, arg, "--max-http-header-size=")) {
             value = arg["--max-http-header-size=".len..];
@@ -4910,6 +5035,7 @@ const RuntimeModuleLaunchRequirements = struct {
     tracks_reload_dependencies: bool = false,
     test_cli_execution: bool = false,
     wasm_entrypoint: bool = false,
+    uses_module_mock: bool = false,
 };
 
 fn canUseRuntimeModuleLauncher(requirements: RuntimeModuleLaunchRequirements) bool {
@@ -4919,7 +5045,8 @@ fn canUseRuntimeModuleLauncher(requirements: RuntimeModuleLaunchRequirements) bo
         !requirements.standalone_compile and
         !requirements.tracks_reload_dependencies and
         !requirements.test_cli_execution and
-        !requirements.wasm_entrypoint;
+        !requirements.wasm_entrypoint and
+        !requirements.uses_module_mock;
 }
 
 fn entrypointNeedsMainMetadataTransform(ctx: *const Context, script_abs: []const u8) !bool {
@@ -4965,6 +5092,10 @@ fn bundleScriptNative(
     const has_bun_compat_transform = !std.mem.eql(u8, bun_compat_entry_abs, script_abs);
     defer cleanupGeneratedSource(ctx, bun_compat_entry_abs, script_abs);
 
+    const entrypoint_uses_module_mock = if (is_wasm_entrypoint)
+        false
+    else
+        entrypointUsesModuleMock(ctx, script_abs);
     const runtime_module_launcher_candidate = canUseRuntimeModuleLauncher(.{
         .has_source_base_dir = source_base_dir != null,
         .has_build_options = build_options != null,
@@ -4973,6 +5104,7 @@ fn bundleScriptNative(
         .tracks_reload_dependencies = reload_dependencies_out != null,
         .test_cli_execution = is_test_runtime_execution,
         .wasm_entrypoint = is_wasm_entrypoint,
+        .uses_module_mock = entrypoint_uses_module_mock,
     }) and !has_bun_compat_transform;
     // CommonJS already has a runtime-only Module.runMain() launcher. Route
     // ordinary ESM through the same on-demand module system without changing
@@ -6682,6 +6814,15 @@ fn isTestAggregateEntrypointPath(path: []const u8) bool {
         std.mem.indexOf(u8, path, "test-aggregate-") != null;
 }
 
+fn isTestAggregateMarkerPath(path: []const u8) bool {
+    const parent = std.fs.path.dirname(path) orelse return false;
+    const parent_name = std.fs.path.basename(parent);
+    const name = std.fs.path.basename(path);
+    return std.mem.startsWith(u8, parent_name, "test-aggregate-") and
+        std.mem.startsWith(u8, name, "file-") and
+        std.mem.endsWith(u8, name, ".mjs");
+}
+
 fn shouldLoadBunfigTestPreloads(path: []const u8, test_cli_execution: bool) bool {
     return test_cli_execution and
         (isTestEntrypointPath(path) or isTestAggregateEntrypointPath(path));
@@ -7647,7 +7788,7 @@ fn rewriteTestAggregateImports(
             cursor = quote_end;
             continue;
         };
-        if (!std.fs.path.isAbsolute(specifier) or !isTestEntrypointPath(specifier)) {
+        if (!std.fs.path.isAbsolute(specifier) or isTestAggregateMarkerPath(specifier)) {
             cursor = quote_end;
             continue;
         }
@@ -8073,6 +8214,21 @@ fn isJsoncLikeSpecifier(specifier: []const u8) bool {
         std.mem.eql(u8, basename, "bun.lock");
 }
 
+fn sourceUsesModuleMock(source: []const u8) bool {
+    return std.mem.indexOf(u8, source, "mock.module(") != null or
+        std.mem.indexOf(u8, source, "mock.module (") != null;
+}
+
+fn entrypointUsesModuleMock(ctx: *const Context, path: []const u8) bool {
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        path,
+        ctx.allocator,
+        .limited(4 * 1024 * 1024),
+    ) catch return false;
+    return sourceUsesModuleMock(source);
+}
+
 fn isJson5Specifier(specifier: []const u8) bool {
     const bare = pathWithoutQueryOrFragment(specifier);
     return std.mem.eql(u8, std.fs.path.extension(bare), ".json5");
@@ -8106,8 +8262,7 @@ fn scanDynamicImports(
     preserve_static_html_imports: bool,
 ) !bool {
     var has_custom_signal = false;
-    const uses_module_mock = std.mem.indexOf(u8, source, "mock.module(") != null or
-        std.mem.indexOf(u8, source, "mock.module (") != null;
+    const uses_module_mock = sourceUsesModuleMock(source);
     const is_bun_transpiled_artifact = hasBunTranspiledPragma(source);
     var runtime_dynamic_import_starts: std.ArrayList(usize) = .empty;
     defer runtime_dynamic_import_starts.deinit(ctx.allocator);
@@ -9511,7 +9666,7 @@ fn writeRuntimeEntryWrapper(
         \\import * as moduleModule from {s};
         \\import * as net from {s};
         \\import * as url from {s};
-        \\import * as constants from {s};
+        \\import constants from {s};
         \\import * as crypto from {s};
         \\import * as buffer from {s};
         \\import * as cluster from {s};
@@ -9905,6 +10060,7 @@ test "runtime module launcher is limited to ordinary file execution" {
     try std.testing.expect(!canUseRuntimeModuleLauncher(.{ .tracks_reload_dependencies = true }));
     try std.testing.expect(!canUseRuntimeModuleLauncher(.{ .test_cli_execution = true }));
     try std.testing.expect(!canUseRuntimeModuleLauncher(.{ .wasm_entrypoint = true }));
+    try std.testing.expect(!canUseRuntimeModuleLauncher(.{ .uses_module_mock = true }));
 }
 
 test "eval source maps use Bun's virtual source identity" {
@@ -9975,6 +10131,9 @@ test "isTestEntrypointPath matches bun test naming" {
     try std.testing.expect(!isTestEntrypointPath("/a/b.test.d/example.ts"));
     try std.testing.expect(!isTestEntrypointPath("/a/b/example.test.txt"));
     try std.testing.expect(!isTestEntrypointPath("/a/b/example.ts"));
+    try std.testing.expect(isTestAggregateMarkerPath("/a/.cottontail-tmp/test-aggregate-1/file-0.mjs"));
+    try std.testing.expect(!isTestAggregateMarkerPath("/a/tests/file-0.mjs"));
+    try std.testing.expect(!isTestAggregateMarkerPath("/a/.cottontail-tmp/test-aggregate-1/example.ts"));
 
     try std.testing.expect(shouldLoadBunfigTestPreloads("/a/b/example.test.ts", true));
     try std.testing.expect(shouldLoadBunfigTestPreloads("/a/.cottontail-tmp/test-aggregate-1/entry.mjs", true));

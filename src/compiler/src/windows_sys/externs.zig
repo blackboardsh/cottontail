@@ -127,6 +127,10 @@ pub extern "kernel32" fn InitializeProcThreadAttributeList(
     size: *usize,
 ) BOOL;
 
+pub extern "kernel32" fn DeleteProcThreadAttributeList(
+    lpAttributeList: [*]u8,
+) callconv(.winapi) void;
+
 pub extern "kernel32" fn UpdateProcThreadAttribute(
     lpAttributeList: [*]u8, // [in, out]
     dwFlags: DWORD, // [in]
@@ -166,13 +170,41 @@ pub extern "kernel32" fn GetCurrentThread() callconv(.winapi) HANDLE;
 
 pub extern "kernel32" fn GetCommandLineW() callconv(.winapi) LPWSTR;
 
+pub extern "kernel32" fn GetExitCodeProcess(
+    hProcess: HANDLE,
+    lpExitCode: *DWORD,
+) callconv(.winapi) BOOL;
+
 pub extern "kernel32" fn CreateDirectoryW(lpPathName: [*:0]const u16, lpSecurityAttributes: ?*windows.SECURITY_ATTRIBUTES) callconv(.winapi) BOOL;
 
 pub extern "kernel32" fn SetEndOfFile(hFile: HANDLE) callconv(.winapi) BOOL;
 
 pub extern "kernel32" fn GetProcessTimes(in_hProcess: HANDLE, out_lpCreationTime: *FILETIME, out_lpExitTime: *FILETIME, out_lpKernelTime: *FILETIME, out_lpUserTime: *FILETIME) callconv(.winapi) BOOL;
 
-pub extern fn windows_enable_stdio_inheritance() void;
+pub extern "kernel32" fn GetStdHandle(
+    nStdHandle: DWORD,
+) callconv(.winapi) ?HANDLE;
+
+pub extern "kernel32" fn SetHandleInformation(
+    hObject: HANDLE,
+    dwMask: DWORD,
+    dwFlags: DWORD,
+) callconv(.winapi) BOOL;
+
+pub fn windows_enable_stdio_inheritance() void {
+    const handle_flag_inherit: DWORD = 1;
+    const standard_handles = [_]DWORD{
+        @bitCast(@as(i32, -10)),
+        @bitCast(@as(i32, -11)),
+        @bitCast(@as(i32, -12)),
+    };
+
+    for (standard_handles) |standard_handle| {
+        const handle = GetStdHandle(standard_handle) orelse continue;
+        if (handle == windows.INVALID_HANDLE_VALUE) continue;
+        _ = SetHandleInformation(handle, handle_flag_inherit, handle_flag_inherit);
+    }
+}
 
 const std = @import("std");
 

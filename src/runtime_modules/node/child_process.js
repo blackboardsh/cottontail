@@ -109,23 +109,30 @@ function envPairsToObject(envPairs) {
   return env;
 }
 
-const isDarwinPlatform = typeof cottontail?.platform === "function" ? cottontail.platform() === "darwin" : true;
+const runtimePlatform = typeof cottontail?.platform === "function" ? cottontail.platform() : "darwin";
+const isDarwinPlatform = runtimePlatform === "darwin";
+const isWindowsPlatform = runtimePlatform === "win32";
 
-const fallbackSignalNumbersByName = {
-  SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6, SIGIOT: 6,
-  SIGFPE: 8, SIGKILL: 9, SIGSEGV: 11, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15,
-  ...(isDarwinPlatform
-    ? {
-        SIGEMT: 7, SIGBUS: 10, SIGSYS: 12, SIGURG: 16, SIGSTOP: 17, SIGTSTP: 18, SIGCONT: 19,
-        SIGCHLD: 20, SIGTTIN: 21, SIGTTOU: 22, SIGIO: 23, SIGXCPU: 24, SIGXFSZ: 25,
-        SIGVTALRM: 26, SIGPROF: 27, SIGWINCH: 28, SIGINFO: 29, SIGUSR1: 30, SIGUSR2: 31,
-      }
-    : {
-        SIGBUS: 7, SIGUSR1: 10, SIGUSR2: 12, SIGSTKFLT: 16, SIGCHLD: 17, SIGCONT: 18,
-        SIGSTOP: 19, SIGTSTP: 20, SIGTTIN: 21, SIGTTOU: 22, SIGURG: 23, SIGXCPU: 24,
-        SIGXFSZ: 25, SIGVTALRM: 26, SIGPROF: 27, SIGWINCH: 28, SIGIO: 29, SIGPWR: 30, SIGSYS: 31,
-      }),
-};
+const fallbackSignalNumbersByName = isWindowsPlatform
+  ? {
+      SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGFPE: 8, SIGKILL: 9,
+      SIGSEGV: 11, SIGTERM: 15, SIGBREAK: 21, SIGABRT: 22, SIGWINCH: 28,
+    }
+  : {
+      SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6, SIGIOT: 6,
+      SIGFPE: 8, SIGKILL: 9, SIGSEGV: 11, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15,
+      ...(isDarwinPlatform
+        ? {
+            SIGEMT: 7, SIGBUS: 10, SIGSYS: 12, SIGURG: 16, SIGSTOP: 17, SIGTSTP: 18, SIGCONT: 19,
+            SIGCHLD: 20, SIGTTIN: 21, SIGTTOU: 22, SIGIO: 23, SIGXCPU: 24, SIGXFSZ: 25,
+            SIGVTALRM: 26, SIGPROF: 27, SIGWINCH: 28, SIGINFO: 29, SIGUSR1: 30, SIGUSR2: 31,
+          }
+        : {
+            SIGBUS: 7, SIGUSR1: 10, SIGUSR2: 12, SIGSTKFLT: 16, SIGCHLD: 17, SIGCONT: 18,
+            SIGSTOP: 19, SIGTSTP: 20, SIGTTIN: 21, SIGTTOU: 22, SIGURG: 23, SIGXCPU: 24,
+            SIGXFSZ: 25, SIGVTALRM: 26, SIGPROF: 27, SIGWINCH: 28, SIGIO: 29, SIGPWR: 30, SIGSYS: 31,
+          }),
+    };
 const hostSignalNumbersByName = Object.fromEntries(
   Object.entries(cottontail.platformConstants?.() ?? {}).filter(
     ([name, value]) => /^SIG[A-Z0-9]+$/.test(name) && Number.isInteger(value),
@@ -218,6 +225,7 @@ function makeSpawnFailureResult(file, cause, args = []) {
   const error = notFound ? new Error(`spawnSync ${file} ENOENT`) : new Error(message);
   error.code = notFound ? "ENOENT" : (cause?.code ?? "UNKNOWN");
   if (notFound) error.errno = -2;
+  else if (cause?.errno !== undefined) error.errno = cause.errno;
   error.syscall = `spawnSync ${file}`;
   error.path = String(file);
   error.spawnargs = Array.from(args, String);
@@ -230,6 +238,24 @@ function makeSpawnFailureResult(file, cause, args = []) {
     stdout: null,
     stderr: null,
   };
+}
+
+function isWindowsBatchFile(file) {
+  if (!isWindowsPlatform) return false;
+  // Win32 ignores trailing spaces and dots in path components. Node rejects
+  // direct .bat/.cmd execution before CreateProcess for both existing and
+  // missing files because shell parsing cannot safely quote arbitrary args.
+  return /\.(?:bat|cmd)$/i.test(String(file).replace(/[ .]+$/g, ""));
+}
+
+function windowsBatchSpawnError(file, synchronous = false) {
+  const syscall = synchronous ? `spawnSync ${file}` : "spawn";
+  const error = new Error(`${syscall} EINVAL`);
+  error.code = "EINVAL";
+  error.errno = -4071;
+  error.syscall = syscall;
+  if (synchronous) error.path = String(file);
+  return error;
 }
 
 export function execSync(command, options = {}) {
@@ -322,6 +348,13 @@ export function spawnSync(file, args = [], options = {}) {
   validateSpawnOptions(normalized.options);
   validateSpawnStrings(file, normalized.args, normalized.options);
   const command = normalizeSpawnCommand(file, normalized.args, normalized.options);
+  if (!normalized.options.shell && isWindowsBatchFile(command.file)) {
+    return makeSpawnFailureResult(
+      file,
+      windowsBatchSpawnError(file, true),
+      command.args,
+    );
+  }
   const nativeOptions = prepareNativeOptions(command.file, normalized.options);
   const stdioOption = normalized.options.stdio;
   const stdioArray = Array.isArray(stdioOption)
@@ -351,7 +384,9 @@ export function spawnSync(file, args = [], options = {}) {
       killSignal,
       argv0: normalized.options.argv0,
       windowsHide: normalized.options.windowsHide === true,
-      windowsVerbatimArguments: normalized.options.windowsVerbatimArguments === true,
+      windowsVerbatimArguments:
+        normalized.options.windowsVerbatimArguments === true ||
+        command.windowsVerbatimArguments === true,
     });
   } catch (error) {
     return makeSpawnFailureResult(file, error, command.args);
@@ -385,7 +420,15 @@ function withoutElectrobunHostEnv(env) {
 function sanitizeEnvObject(env) {
   if (env === undefined || env === null) return env;
   const sanitized = {};
-  for (const key of Object.keys(env)) {
+  const keys = Object.keys(env);
+  const seenWindowsKeys = isWindowsPlatform ? new Set() : null;
+  if (isWindowsPlatform) keys.sort();
+  for (const key of keys) {
+    if (seenWindowsKeys != null) {
+      const uppercaseKey = key.toUpperCase();
+      if (seenWindowsKeys.has(uppercaseKey)) continue;
+      seenWindowsKeys.add(uppercaseKey);
+    }
     const value = env[key];
     if (value === undefined) continue;
     sanitized[key] = String(value);
@@ -492,11 +535,20 @@ function normalizeSpawnCommand(file, args = [], options = {}) {
     ? String(file)
     : [String(file), ...argList].join(" ");
   if (cottontail.platform() === "win32") {
-    const shell = typeof options.shell === "string" ? options.shell : "cmd";
-    return { file: shell, args: ["/d", "/s", "/c", command] };
+    const shell = typeof options.shell === "string"
+      ? options.shell
+      : (process.env.ComSpec ?? process.env.COMSPEC ?? "cmd.exe");
+    if (/^(?:.*[\\/])?cmd(?:\.exe)?$/i.test(shell)) {
+      return {
+        file: shell,
+        args: ["/d", "/s", "/c", `"${command}"`],
+        windowsVerbatimArguments: true,
+      };
+    }
+    return { file: shell, args: ["-c", command], windowsVerbatimArguments: false };
   }
   const shell = typeof options.shell === "string" ? options.shell : "sh";
-  return { file: shell, args: ["-c", command] };
+  return { file: shell, args: ["-c", command], windowsVerbatimArguments: false };
 }
 
 function normalizeSyncResult(result, options = {}, file = "", args = []) {
@@ -630,7 +682,9 @@ function spawnPreflightError(resolvedFile, spawnargs, originalFile) {
     return makeError("ENOENT", -ENOENT);
   }
   try {
-    accessSync(resolvedFile, fsConstants.X_OK);
+    // Windows has no executable permission bit and its CRT rejects X_OK.
+    // CreateProcessW decides executability after the existence/type checks.
+    accessSync(resolvedFile, cottontail.platform() === "win32" ? fsConstants.F_OK : fsConstants.X_OK);
   } catch {
     return makeError("EACCES", -EACCES);
   }
@@ -674,6 +728,9 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
   validateAbortSignal(options.signal);
   if (options.killSignal != null) normalizeSpawnKillSignal(options.killSignal);
   const command = normalizeSpawnCommand(file, args, options);
+  if (!options.shell && isWindowsBatchFile(command.file)) {
+    throw windowsBatchSpawnError(file);
+  }
   let preflightError = options.shell ? null : spawnPreflightError(command.file, args, file);
   const stdoutListeners = new Map();
   const stderrListeners = new Map();
@@ -727,12 +784,59 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
   const stdoutSourceFd = stdioSourceFd(stdoutOption);
   const stderrSourceFd = stdioSourceFd(stderrOption);
   const ipcRequested = options.ipc === true || ipcIndex !== -1;
-  const nodeIpcProtocol = options.__nodeIpcProtocol === true;
+  const currentExecutable = command.file === globalThis.process?.execPath;
+  const nodeIpcProtocol = options.__nodeIpcProtocol === true ||
+    (options.__nodeIpcProtocol == null && ipcRequested && !currentExecutable);
+  const useWindowsPipeIpc = isWindowsPlatform && ipcRequested;
+  const publicStdioLength = Array.isArray(options.stdio) ? Math.max(3, options.stdio.length) : 3;
+  const windowsPipeIpcTransportIndex = useWindowsPipeIpc
+    ? (ipcIndex >= 3 ? ipcIndex : Math.max(3, publicStdioLength))
+    : -1;
+  const windowsPipeIpcExtraIndex = windowsPipeIpcTransportIndex >= 3
+    ? windowsPipeIpcTransportIndex - 3
+    : -1;
+  const windowsOverlappedStdioFd =
+    isWindowsPlatform && Number.isInteger(options.__windowsOverlappedStdioFd)
+      ? Number(options.__windowsOverlappedStdioFd)
+      : useWindowsPipeIpc
+        ? windowsPipeIpcTransportIndex
+        : undefined;
+  if (useWindowsPipeIpc) {
+    if (ipcIndex === 0) stdinMode = "ignore";
+    else if (ipcIndex === 1) stdoutMode = "ignore";
+    else if (ipcIndex === 2) stderrMode = "ignore";
+    while (extraStdio.length <= windowsPipeIpcExtraIndex) extraStdio.push("ignore");
+    extraStdio[windowsPipeIpcExtraIndex] = "pipe";
+  }
 
   const nativeOptions = prepareNativeOptions(command.file, options);
+  if (ipcRequested) {
+    nativeOptions.env.COTTONTAIL_IPC_BOOTSTRAP = "node";
+    nativeOptions.env.COTTONTAIL_IPC_SERIALIZATION =
+      options.serialization === "advanced" ? "advanced" : "json";
+    if (useWindowsPipeIpc) {
+      if (nodeIpcProtocol) {
+        nativeOptions.env.NODE_CHANNEL_FD = String(windowsPipeIpcTransportIndex);
+        nativeOptions.env.NODE_CHANNEL_SERIALIZATION_MODE =
+          options.serialization === "advanced" ? "advanced" : "json";
+        delete nativeOptions.env.COTTONTAIL_IPC_FD;
+        delete nativeOptions.env.COTTONTAIL_IPC_PIPE;
+        delete nativeOptions.env.COTTONTAIL_IPC_PEER_PID;
+      } else {
+        nativeOptions.env.COTTONTAIL_IPC_FD = String(windowsPipeIpcTransportIndex);
+        nativeOptions.env.COTTONTAIL_IPC_PIPE = "1";
+        nativeOptions.env.COTTONTAIL_IPC_PEER_PID = String(process.pid);
+        delete nativeOptions.env.NODE_CHANNEL_FD;
+        delete nativeOptions.env.NODE_CHANNEL_SERIALIZATION_MODE;
+      }
+      delete nativeOptions.env.COTTONTAIL_IPC_STDIO;
+    }
+  }
   const deferStart = command.file === globalThis.process?.execPath || options.__deferStart === true;
   let native = { id: -1, pid: 0, ipcFd: null };
+  let windowsPipeIpcStream = null;
   let startReleased = !deferStart;
+  let windowsKillSignal = null;
 
   const releaseStart = () => {
     if (startReleased || preflightError != null || native.id < 0) return;
@@ -969,7 +1073,10 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
     kill(signal = "SIGTERM") {
       const signalNumber = normalizeKillSignal(signal);
       const killed = cottontail.spawnKill?.(native.id, signalNumber) === true;
-      if (signalNumber !== 0) child.killed = child.killed || killed;
+      if (signalNumber !== 0) {
+        child.killed = child.killed || killed;
+        if (isWindowsPlatform && killed) windowsKillSignal = signalNumber;
+      }
       return killed;
     },
     ref() {
@@ -996,25 +1103,55 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
         stdout: stdoutSourceFd ?? stdoutMode,
         stderr: stderrSourceFd ?? stderrMode,
         extraStdio,
-        ipc: ipcRequested,
-        nodeIpc: nodeIpcProtocol,
+        windowsOverlappedStdioFd,
+        ipc: useWindowsPipeIpc ? false : ipcRequested,
+        nodeIpc: useWindowsPipeIpc ? false : nodeIpcProtocol,
         argv0: options.argv0 != null ? String(options.argv0) : undefined,
         windowsHide: options.windowsHide === true,
-        windowsVerbatimArguments: options.windowsVerbatimArguments === true,
+        windowsVerbatimArguments:
+          options.windowsVerbatimArguments === true ||
+          command.windowsVerbatimArguments === true,
         detached: options.detached === true,
         deferStart,
       });
       child.pid = native.pid ?? 0;
       child._nativeId = native.id;
       child._ipcFd = native.ipcFd == null ? null : Number(native.ipcFd);
+      if (
+        isWindowsPlatform &&
+        stdinMode === "pipe" &&
+        Number.isInteger(native.stdinFd) &&
+        native.stdinFd >= 0
+      ) {
+        child.stdin = new NetSocket({
+          fd: Number(native.stdinFd),
+          pipe: true,
+          readable: false,
+          writableHighWaterMark: Number(options.highWaterMark || 16 * 1024),
+        });
+      }
       const nativeExtraFds = Array.isArray(native.extraFds) ? native.extraFds : [];
-      const extraStreams = nativeExtraFds.map((fd, index) =>
-        extraStdio[index] === "pipe" && Number.isInteger(fd) && fd >= 0
-          ? new NetSocket({ fd, pipe: true })
-          : null
-      );
+      const extraStreams = nativeExtraFds.map((fd, index) => {
+        if (extraStdio[index] !== "pipe" || !Number.isInteger(fd) || fd < 0) return null;
+        const stream = new NetSocket({
+          fd,
+          pipe: true,
+          ...(useWindowsPipeIpc && index === windowsPipeIpcExtraIndex
+            ? {
+                readableHighWaterMark: 1024 * 1024,
+                writableHighWaterMark: 1024 * 1024,
+              }
+            : {}),
+        });
+        if (useWindowsPipeIpc && index === windowsPipeIpcExtraIndex) {
+          windowsPipeIpcStream = stream;
+          return null;
+        }
+        return stream;
+      });
       child.stdio = [child.stdin, child.stdout, child.stderr, ...extraStreams];
       if (ipcIndex >= 0) child.stdio[ipcIndex] = null;
+      if (useWindowsPipeIpc) child.stdio.length = publicStdioLength;
     } catch (error) {
       preflightError = normalizeSpawnError(file, args, error);
     }
@@ -1042,6 +1179,10 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
 
   const finishStdin = () => {
     if (!child.stdin || child.stdin.destroyed) return;
+    if (child.stdin instanceof NetSocket) {
+      child.stdin.destroy();
+      return;
+    }
     child.stdin.writable = false;
     child.stdin.writableEnded = true;
     child.stdin.writableFinished = true;
@@ -1152,8 +1293,20 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
       }
       if (abortHandler != null) options.signal?.removeEventListener?.("abort", abortHandler);
       // Node reports code null + signal name when the child died from a signal.
-      const exitCode = event.exitCode == null ? (event.signalCode == null ? 0 : null) : Number(event.exitCode);
-      const signalCode = signalNumberToName(event.signalCode);
+      let exitCode = event.exitCode == null ? (event.signalCode == null ? 0 : null) : Number(event.exitCode);
+      let signalCode = signalNumberToName(event.signalCode);
+      // Windows' TerminateProcess/NtTerminateProcess exposes the requested
+      // signal number as the process exit status. Node remembers the successful
+      // kill request and reports it through signalCode instead.
+      if (
+        isWindowsPlatform &&
+        signalCode == null &&
+        windowsKillSignal != null &&
+        exitCode === windowsKillSignal
+      ) {
+        signalCode = signalNumberToName(windowsKillSignal);
+        exitCode = null;
+      }
       child.exitCode = exitCode;
       child.signalCode = signalCode;
       scheduleTerminalEvents();
@@ -1176,7 +1329,9 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
     handleNativeSpawnEvent(event);
   });
 
-  if (ipcRequested && Number.isInteger(child._ipcFd) && child._ipcFd >= 0) {
+  if (useWindowsPipeIpc && preflightError == null) {
+    installWindowsPipeIpcChannel(child, windowsPipeIpcStream, nodeIpcProtocol, options.serialization);
+  } else if (ipcRequested && Number.isInteger(child._ipcFd) && child._ipcFd >= 0) {
     installParentIpcChannel(child, options.serialization, nodeIpcProtocol);
   }
 
@@ -1310,12 +1465,12 @@ export function exec(command, options = {}, callback = undefined) {
     callback = options;
     options = {};
   }
-  const isWin = cottontail.platform() === "win32";
-  const shell = typeof options.shell === "string" && options.shell !== "" ? options.shell : (isWin ? "cmd" : "sh");
-  const args = isWin ? ["/d", "/s", "/c", String(command)] : ["-c", String(command)];
-  const child = spawn(shell, args, {
+  const shell = typeof options.shell === "string" && options.shell !== ""
+    ? options.shell
+    : true;
+  const child = spawn(String(command), [], {
     ...options,
-    shell: false, // already wrapped in a shell here; don't re-wrap in spawn()
+    shell,
     stdio: ["pipe", "pipe", "pipe"],
   });
   return collectChild(child, options, callback, String(command));
@@ -1350,6 +1505,69 @@ const ipcPrefix = "__COTTONTAIL_IPC__";
 const ipcEnvelopeKey = "__cottontailIpcEnvelope";
 const inheritedNodeIpcSymbol = Symbol.for("cottontail.inheritedNodeIpc");
 const childProcessTraceEnabled = globalThis.process?.env?.COTTONTAIL_CHILD_PROCESS_TRACE === "1";
+// NODE_CHANNEL_FD is opened as a libuv IPC pipe. On Windows, libuv prefixes
+// every data payload with this fixed native frame header; a raw byte-stream
+// peer would otherwise feed the leading 0x01 flag byte into JSON.parse().
+const windowsNodeIpcHeaderSize = 16;
+const windowsNodeIpcSocketTransferSize = 632;
+const windowsNodeIpcHasData = 0x01;
+const windowsNodeIpcHasSocketTransfer = 0x02;
+const windowsNodeIpcSocketIsConnection = 0x04;
+const windowsNodeIpcValidFlags = 0x07;
+
+function windowsNodeIpcProtocolError(message) {
+  const error = new Error(message);
+  error.code = "ERR_IPC_CHANNEL_CLOSED";
+  return error;
+}
+
+function encodeWindowsNodeIpcFrame(message) {
+  const payload = Buffer.from(`${JSON.stringify(message)}\n`);
+  if (payload.byteLength > 0xffffffff) {
+    throw windowsNodeIpcProtocolError("Windows Node IPC message is too large");
+  }
+  const header = Buffer.alloc(windowsNodeIpcHeaderSize);
+  header.writeUInt32LE(windowsNodeIpcHasData, 0);
+  header.writeUInt32LE(payload.byteLength, 8);
+  return Buffer.concat([header, payload]);
+}
+
+function consumeWindowsNodeIpcFrames(pending, chunk, onPayload) {
+  const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+  pending = pending.byteLength === 0
+    ? incoming
+    : Buffer.concat([pending, incoming]);
+  for (;;) {
+    if (pending.byteLength < windowsNodeIpcHeaderSize) return pending;
+    const flags = pending.readUInt32LE(0);
+    const dataLength = pending.readUInt32LE(8);
+    const reserved2 = pending.readUInt32LE(12);
+    const transferFlags =
+      flags & (windowsNodeIpcHasSocketTransfer | windowsNodeIpcSocketIsConnection);
+    if (
+      (flags & ~windowsNodeIpcValidFlags) !== 0 ||
+      reserved2 !== 0 ||
+      transferFlags === windowsNodeIpcSocketIsConnection ||
+      (flags & windowsNodeIpcHasData) === 0 && dataLength !== 0
+    ) {
+      throw windowsNodeIpcProtocolError("Invalid Windows Node IPC frame");
+    }
+    const transferLength = (flags & windowsNodeIpcHasSocketTransfer) !== 0
+      ? windowsNodeIpcSocketTransferSize
+      : 0;
+    const frameLength = windowsNodeIpcHeaderSize + transferLength + dataLength;
+    if (pending.byteLength < frameLength) return pending;
+    if (transferLength !== 0) {
+      throw windowsNodeIpcProtocolError(
+        "IPC handle passing from external Node runtimes is not available",
+      );
+    }
+    if (dataLength !== 0) {
+      onPayload(pending.subarray(windowsNodeIpcHeaderSize, frameLength));
+    }
+    pending = pending.subarray(frameLength);
+  }
+}
 
 function traceChildProcess(event, details = undefined) {
   if (!childProcessTraceEnabled) return;
@@ -1446,58 +1664,122 @@ function isIpcSendHandle(handle) {
   return handle._handle != null;
 }
 
-function receivedIpcHandle(fd = undefined, type = "net.Socket") {
+function receivedIpcHandle(fd = undefined, type = "net.Socket", paused = false) {
   if (!Number.isInteger(fd) || fd < 0) return undefined;
-  if (type === "net.Server" && typeof NetServer._fromFd === "function") return NetServer._fromFd(fd);
-  let local;
-  let remote;
-  try { local = cottontail.tcpSocketAddress?.(fd, false); } catch {}
-  try { remote = cottontail.tcpSocketAddress?.(fd, true); } catch {}
-  return new NetSocket({ fd, local, remote, pipe: local?.path != null || remote?.path != null, path: local?.path ?? remote?.path });
+  try {
+    if (type === "net.Server" && typeof NetServer._fromFd === "function") return NetServer._fromFd(fd);
+    let local;
+    let remote;
+    try { local = cottontail.tcpSocketAddress?.(fd, false); } catch {}
+    try { remote = cottontail.tcpSocketAddress?.(fd, true); } catch {}
+    return new NetSocket({
+      fd,
+      local,
+      remote,
+      pauseOnConnect: paused,
+      pipe: local?.path != null || remote?.path != null,
+      path: local?.path ?? remote?.path,
+    });
+  } catch (error) {
+    try { cottontail.closeFd?.(fd); } catch {}
+    throw error;
+  }
 }
 
-function encodeNativeIpcPayload(message, mode, handleInfo, handleSeq = undefined) {
+function encodeNativeIpcPayload(message, mode, handleInfo, handleSeq = undefined, socketProtocol = undefined) {
   const payload = handleInfo == null
     ? message
-    : { [ipcEnvelopeKey]: 1, message, handleType: handleInfo.type, handleSeq };
+    : {
+        [ipcEnvelopeKey]: 1,
+        message,
+        handleType: handleInfo.type,
+        handleSeq,
+        ...(socketProtocol == null ? {} : { socketProtocol }),
+      };
   return `${ipcPrefix}${encodeIpcMessage(payload, mode)}\n`;
 }
 
 // Sockets adopted from a passed fd, keyed by the sender's handle sequence so a
 // follow-up frame can replay bytes the sender's fd watcher had already consumed.
 const adoptedIpcHandles = new Map();
+const defaultAdoptedIpcChannel = Symbol("defaultAdoptedIpcChannel");
 
-function rememberAdoptedIpcHandle(handleSeq, handle) {
+function adoptedIpcChannel(channelKey, create = false) {
+  const key = channelKey ?? defaultAdoptedIpcChannel;
+  let handles = adoptedIpcHandles.get(key);
+  if (handles == null && create) adoptedIpcHandles.set(key, handles = new Map());
+  return handles;
+}
+
+function rememberAdoptedIpcHandle(channelKey, handleSeq, state) {
+  const handle = state?.handle;
   if (handleSeq == null || handle == null) return;
-  adoptedIpcHandles.set(handleSeq, handle);
-  if (adoptedIpcHandles.size > 32) {
-    const oldest = adoptedIpcHandles.keys().next().value;
-    adoptedIpcHandles.delete(oldest);
+  const handles = adoptedIpcChannel(channelKey, true);
+  handles.set(handleSeq, state);
+  if (handles.size > 32) {
+    const oldest = handles.keys().next().value;
+    const evicted = handles.get(oldest);
+    handles.delete(oldest);
+    try { evicted?.handle?.destroy?.(); } catch {}
   }
 }
 
-function deliverAdoptedHandleData(handleSeq, base64Data) {
-  const socket = adoptedIpcHandles.get(handleSeq);
-  adoptedIpcHandles.delete(handleSeq);
-  if (socket == null || !base64Data) return;
-  const bytes = Buffer.from(String(base64Data), "base64");
-  if (bytes.length === 0) return;
+function takeAdoptedIpcHandle(channelKey, handleSeq) {
+  const key = channelKey ?? defaultAdoptedIpcChannel;
+  const handles = adoptedIpcHandles.get(key);
+  const state = handles?.get(handleSeq);
+  handles?.delete(handleSeq);
+  if (handles?.size === 0) adoptedIpcHandles.delete(key);
+  return state;
+}
+
+function failAdoptedIpcHandles(channelKey) {
+  const key = channelKey ?? defaultAdoptedIpcChannel;
+  const handles = adoptedIpcHandles.get(key);
+  adoptedIpcHandles.delete(key);
+  for (const state of handles?.values?.() ?? []) {
+    try { state?.handle?.destroy?.(); } catch {}
+  }
+}
+
+function deliverAdoptedHandleData(socket, base64Data) {
+  if (socket == null) return;
+  const bytes = base64Data ? Buffer.from(String(base64Data), "base64") : Buffer.alloc(0);
   queueMicrotask(() => {
     try {
-      const chunk = socket._encoding ? bytes.toString(socket._encoding) : bytes;
-      if (typeof socket._emitData === "function") socket._emitData(chunk);
-      else socket.emit?.("data", chunk);
+      if (bytes.length > 0) {
+        const chunk = socket._encoding ? bytes.toString(socket._encoding) : bytes;
+        if (typeof socket._emitData === "function") socket._emitData(chunk);
+        else socket.emit?.("data", chunk);
+      }
+      socket.resume?.();
     } catch {}
   });
 }
 
 // Returns null for internal frames that must not surface as 'message' events.
-function decodeNativeIpcPayload(payload, receivedFd = undefined) {
+function decodeNativeIpcPayload(payload, receivedFd = undefined, channelKey = undefined) {
   const decoded = decodeIpcMessage(payload);
   if (decoded && typeof decoded === "object" && decoded[ipcEnvelopeKey] === 1) {
-    const handle = receivedIpcHandle(receivedFd, decoded.handleType);
-    rememberAdoptedIpcHandle(decoded.handleSeq, handle);
-    return { message: decoded.message, handle };
+    let handleFd = receivedFd;
+    const windowsTransfer = typeof decoded.socketProtocol === "string";
+    if (
+      (!Number.isInteger(handleFd) || handleFd < 0) &&
+      windowsTransfer &&
+      typeof cottontail.socketAdoptDuplicate === "function"
+    ) {
+      handleFd = Number(cottontail.socketAdoptDuplicate(Buffer.from(decoded.socketProtocol, "base64")));
+    }
+    const handle = receivedIpcHandle(handleFd, decoded.handleType, windowsTransfer);
+    rememberAdoptedIpcHandle(channelKey, decoded.handleSeq, {
+      handle,
+      message: decoded.message,
+      windowsTransfer,
+    });
+    if (windowsTransfer && Number.isInteger(decoded.handleSeq)) {
+      return { control: "handle-adopted", handleSeq: decoded.handleSeq };
+    }
+    return { message: decoded.message, handle, handleSeq: decoded.handleSeq };
   }
   if (decoded && typeof decoded === "object" && decoded[ipcEnvelopeKey] === 2) {
     if (Number.isInteger(receivedFd) && receivedFd >= 0) cottontail.closeFd?.(receivedFd);
@@ -1505,8 +1787,21 @@ function decodeNativeIpcPayload(payload, receivedFd = undefined) {
   }
   if (decoded && typeof decoded === "object" && decoded[ipcEnvelopeKey] === 3) {
     if (Number.isInteger(receivedFd) && receivedFd >= 0) cottontail.closeFd?.(receivedFd);
-    deliverAdoptedHandleData(decoded.handleSeq, decoded.data);
+    const state = takeAdoptedIpcHandle(channelKey, decoded.handleSeq);
+    if (state?.windowsTransfer) {
+      return {
+        message: state.message,
+        handle: state.handle,
+        handleSeq: decoded.handleSeq,
+        bufferedData: decoded.data,
+      };
+    }
+    deliverAdoptedHandleData(state?.handle, decoded.data);
     return null;
+  }
+  if (decoded && typeof decoded === "object" && decoded[ipcEnvelopeKey] === 4) {
+    if (Number.isInteger(receivedFd) && receivedFd >= 0) cottontail.closeFd?.(receivedFd);
+    return { control: "handle-ready", handleSeq: decoded.handleSeq };
   }
   return {
     message: decoded,
@@ -1514,7 +1809,131 @@ function decodeNativeIpcPayload(payload, receivedFd = undefined) {
   };
 }
 
+function createWindowsIpcFrameOrderer(emitFrame) {
+  const pending = [];
+  const flush = () => {
+    while (pending.length > 0 && pending[0].barrier == null) {
+      emitFrame(pending.shift().frame);
+    }
+  };
+  return {
+    adopt(handleSeq, acknowledge) {
+      pending.push({ barrier: handleSeq });
+      acknowledge();
+    },
+    receive(frame) {
+      if (Number.isInteger(frame?.handleSeq) &&
+          Object.prototype.hasOwnProperty.call(frame, "bufferedData")) {
+        const barrierIndex = pending.findIndex(entry => entry.barrier === frame.handleSeq);
+        if (barrierIndex >= 0) {
+          pending[barrierIndex] = { frame };
+          flush();
+          return;
+        }
+      }
+      if (pending.length > 0) pending.push({ frame });
+      else emitFrame(frame);
+    },
+    fail() {
+      for (const entry of pending.splice(0)) {
+        try { entry.frame?.handle?.destroy?.(); } catch {}
+      }
+    },
+  };
+}
+
 let ipcHandleSeqCounter = 0;
+const pendingWindowsIpcHandleSends = new Map();
+
+function encodeWindowsIpcHandleAck(handleSeq) {
+  return `${ipcPrefix}J:${JSON.stringify({ [ipcEnvelopeKey]: 4, handleSeq })}\n`;
+}
+
+function takeBufferedIpcSocketData(socket) {
+  const chunks = Array.isArray(socket?._pendingData)
+    ? socket._pendingData.splice(0)
+    : [];
+  if (typeof socket?.read === "function") {
+    for (;;) {
+      const chunk = socket.read();
+      if (chunk == null) break;
+      chunks.push(chunk);
+    }
+  }
+  return chunks.map((chunk) => Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+}
+
+function finishWindowsIpcHandleSend(handleSeq, error = null) {
+  const pending = pendingWindowsIpcHandleSends.get(handleSeq);
+  if (pending == null) return;
+  pendingWindowsIpcHandleSends.delete(handleSeq);
+  clearTimeout(pending.timeout);
+  if (error != null) {
+    try { pending.sendHandle?.resume?.(); } catch {}
+    queueMicrotask(() => pending.finish?.(error));
+    return;
+  }
+
+  // Adoption is now complete in the target process. Give the paused source
+  // watcher one final turn to publish bytes it had already read, then forward
+  // those bytes before allowing the caller to destroy the source handle.
+  setTimeout(() => {
+    let finishError = null;
+    try {
+      try { pending.sendHandle?._stopRead?.(); } catch {}
+      const buffered = takeBufferedIpcSocketData(pending.sendHandle);
+      const data = buffered.length > 0
+        ? Buffer.concat(
+            buffered.map((chunk) => Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)),
+          ).toString("base64")
+        : "";
+      // This frame also releases the receiver's short-lived adopted-handle
+      // bookkeeping when no already-consumed bytes need forwarding.
+      let settled = false;
+      const complete = (writeError = null) => {
+        if (settled) return;
+        settled = true;
+        if (writeError == null) {
+          if (pending.closeSource) {
+            try {
+              if (typeof pending.sendHandle?._destroyImmediately === "function") {
+                pending.sendHandle._destroyImmediately();
+              } else {
+                pending.sendHandle?.destroy?.();
+              }
+            } catch {}
+          } else {
+            try { pending.sendHandle?.resume?.(); } catch {}
+          }
+        } else {
+          try { pending.sendHandle?.resume?.(); } catch {}
+        }
+        pending.finish?.(writeError);
+      };
+      pending.writeFrame(
+        `${ipcPrefix}J:${JSON.stringify({ [ipcEnvelopeKey]: 3, handleSeq, data })}\n`,
+        complete,
+      );
+      return;
+    } catch (error) {
+      finishError = error;
+    }
+    try { pending.sendHandle?.resume?.(); } catch {}
+    pending.finish?.(finishError);
+  }, 0);
+}
+
+function acknowledgeWindowsIpcHandleSend(channelKey, handleSeq) {
+  const pending = pendingWindowsIpcHandleSends.get(handleSeq);
+  if (pending?.channelKey !== channelKey) return;
+  finishWindowsIpcHandleSend(handleSeq);
+}
+
+function failWindowsIpcHandleSends(channelKey, error = makeChannelClosedError()) {
+  for (const [handleSeq, pending] of pendingWindowsIpcHandleSends) {
+    if (pending.channelKey === channelKey) finishWindowsIpcHandleSend(handleSeq, error);
+  }
+}
 
 // `finish` (when provided) is always invoked asynchronously: on the next
 // microtask for plain messages, or after the handle-data flush for handle
@@ -1543,13 +1962,11 @@ function writeNativeIpc(fd, message, mode, sendHandle = undefined, finish = unde
   if (handleInfo != null && ok) {
     setTimeout(() => {
       try {
-        const pending = Array.isArray(sendHandle?._pendingData) ? sendHandle._pendingData.splice(0) : [];
         try { sendHandle?._stopRead?.(); } catch {}
-        if (pending.length > 0) {
-          const data = Buffer.concat(pending.map((chunk) => Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))).toString("base64");
-          const payload = { [ipcEnvelopeKey]: 3, handleSeq, data };
-          cottontail.ipcSend?.(Number(fd), `${ipcPrefix}J:${JSON.stringify(payload)}\n`, -1);
-        }
+        const pending = takeBufferedIpcSocketData(sendHandle);
+        const data = pending.length > 0 ? Buffer.concat(pending).toString("base64") : "";
+        const payload = { [ipcEnvelopeKey]: 3, handleSeq, data };
+        cottontail.ipcSend?.(Number(fd), `${ipcPrefix}J:${JSON.stringify(payload)}\n`, -1);
       } catch {}
       finish?.();
     }, 5);
@@ -1559,7 +1976,100 @@ function writeNativeIpc(fd, message, mode, sendHandle = undefined, finish = unde
   return ok;
 }
 
-function installNativeIpcReader(fd, onFrame, onDisconnect, onError, closeFd = true, initialBuffer = "") {
+// Windows cannot attach a Winsock handle to a byte stream as SCM_RIGHTS does
+// on Unix. WSADuplicateSocket instead produces a target-process-specific
+// protocol record, which can travel inside the existing framed stdio channel.
+function writeWindowsStdioIpc(
+  writeFrame,
+  peerPid,
+  message,
+  mode,
+  sendHandle = undefined,
+  finish = undefined,
+  channelKey = undefined,
+  keepOpen = false,
+) {
+  const handleInfo = ipcHandleInfo(sendHandle);
+  let handleSeq;
+  let socketProtocol;
+  let paused = false;
+  if (handleInfo != null) {
+    if (!Number.isInteger(peerPid) || peerPid <= 0 || typeof cottontail.socketDuplicateForProcess !== "function") {
+      throw new Error("IPC socket handle passing is unavailable");
+    }
+    handleSeq = ++ipcHandleSeqCounter;
+    try {
+      sendHandle?.pause?.();
+      paused = true;
+      const protocol = cottontail.socketDuplicateForProcess(handleInfo.fd, peerPid);
+      socketProtocol = Buffer.from(protocol).toString("base64");
+    } catch (error) {
+      if (paused) {
+        try { sendHandle?.resume?.(); } catch {}
+      }
+      throw error;
+    }
+  }
+
+  const payload = encodeNativeIpcPayload(message, mode, handleInfo, handleSeq, socketProtocol);
+  // The dedicated IPC stream uses a 1 MiB writable high-water mark. Its write
+  // result accounts for all queued frames, so repeated small sends eventually
+  // expose backpressure without rejecting the frame that crossed the mark.
+  let canContinue = true;
+  let timeout;
+  if (handleInfo != null) {
+    timeout = setTimeout(() => {
+      const error = new Error("Timed out waiting for the IPC handle receiver");
+      error.code = "ERR_IPC_HANDLE_TRANSFER_TIMEOUT";
+      finishWindowsIpcHandleSend(handleSeq, error);
+    }, 30_000);
+    timeout.unref?.();
+    pendingWindowsIpcHandleSends.set(handleSeq, {
+      channelKey,
+      closeSource: handleInfo.type === "net.Socket" && keepOpen !== true,
+      finish,
+      sendHandle,
+      timeout,
+      writeFrame,
+    });
+  }
+  try {
+    canContinue = writeFrame(payload, (error = null) => {
+      if (error != null && handleInfo != null) {
+        finishWindowsIpcHandleSend(handleSeq, error);
+      } else if (handleInfo == null) {
+        finish?.(error);
+      }
+    }) !== false;
+  } catch (error) {
+    if (handleInfo != null) {
+      pendingWindowsIpcHandleSends.delete(handleSeq);
+      clearTimeout(timeout);
+      try { sendHandle?.resume?.(); } catch {}
+    }
+    throw error;
+  }
+  traceChildProcess("ipc-write-windows-stdio", {
+    peerPid,
+    mode,
+    bytes: Buffer.byteLength(payload),
+    ok: true,
+    backpressure: !canContinue,
+    handle: handleInfo?.type,
+    message: ipcMessageSummary(message),
+  });
+  return canContinue;
+}
+
+function installNativeIpcReader(
+  fd,
+  onFrame,
+  onDisconnect,
+  onError,
+  closeFd = true,
+  initialBuffer = "",
+  channelKey = undefined,
+) {
   if (!Number.isInteger(fd) || fd < 0 || typeof cottontail.ipcRecv !== "function") return null;
   let buffer = String(initialBuffer ?? "");
   let closed = false;
@@ -1591,7 +2101,7 @@ function installNativeIpcReader(fd, onFrame, onDisconnect, onError, closeFd = tr
             if (Number.isInteger(frameFd) && frameFd >= 0) cottontail.closeFd?.(frameFd);
             continue;
           }
-          const frame = decodeNativeIpcPayload(line.slice(ipcPrefix.length), frameFd);
+          const frame = decodeNativeIpcPayload(line.slice(ipcPrefix.length), frameFd, channelKey);
           if (frame != null) {
             traceChildProcess("child-ipc-message", { fd, message: ipcMessageSummary(frame.message) });
             onFrame(frame.message, frame.handle);
@@ -1741,7 +2251,7 @@ function installParentIpcChannel(child, serialization = undefined, nodeProtocol 
         nativeIpcPendingFd = undefined;
         let frame;
         if (line.startsWith(ipcPrefix)) {
-          frame = decodeNativeIpcPayload(line.slice(ipcPrefix.length), frameFd);
+          frame = decodeNativeIpcPayload(line.slice(ipcPrefix.length), frameFd, child);
         } else if (nodeProtocol && line.trim() !== "") {
           frame = { message: JSON.parse(line), handle: undefined };
           if (Number.isInteger(frameFd) && frameFd >= 0) cottontail.closeFd?.(frameFd);
@@ -1757,7 +2267,7 @@ function installParentIpcChannel(child, serialization = undefined, nodeProtocol 
             pid: child.pid,
             message: ipcMessageSummary(frame.message),
           });
-          emitChildMessage(child, frame.message, "message", frame.handle);
+          queueIpcMessage(() => emitChildMessage(child, frame.message, "message", frame.handle));
         }
       }
     } catch (error) {
@@ -1774,6 +2284,7 @@ function installParentIpcChannel(child, serialization = undefined, nodeProtocol 
     child.channel = null;
     child._channel = null;
     failPendingNativeIpcSends(makeChannelClosedError());
+    failAdoptedIpcHandles(child);
     if (Number.isInteger(nativeIpcPendingFd) && nativeIpcPendingFd >= 0) {
       cottontail.closeFd?.(nativeIpcPendingFd);
       nativeIpcPendingFd = undefined;
@@ -1821,6 +2332,217 @@ function installParentIpcChannel(child, serialization = undefined, nodeProtocol 
   };
 }
 
+function installWindowsPipeIpcChannel(child, ipcStream, nodeIpcProtocol = false, serialization = undefined) {
+  if (ipcStream == null) {
+    const error = new Error("Failed to create the Windows IPC pipe");
+    error.code = "ERR_CHILD_PROCESS_IPC_REQUIRED";
+    child.kill();
+    throw error;
+  }
+  if (ipcStream._writableState != null) {
+    ipcStream._writableState.highWaterMark = 1024 * 1024;
+  }
+
+  child.connected = true;
+  child.serialization = serialization === "advanced" ? "advanced" : "json";
+  const channel = {
+    ref() {
+      child.ref();
+      return channel;
+    },
+    unref() {
+      child.unref();
+      return channel;
+    },
+  };
+  child.channel = channel;
+  child._channel = channel;
+  const ipcReadable = ipcStream;
+  const ipcWritable = ipcStream;
+  let ipcBuffer = "";
+  let nodeIpcFrameBuffer = Buffer.alloc(0);
+  const nodeIpcDecoder = nodeIpcProtocol ? new TextDecoder("utf-8") : null;
+  let pipeIpcReady = nodeIpcProtocol;
+  const pendingPipeIpcSends = [];
+
+  const sendPipeIpcNow = (message, normalizedSend, sendCallback) => {
+    let ok = false;
+    try {
+      if (nodeIpcProtocol) {
+        if (normalizedSend.sendHandle != null) {
+          throw new Error("IPC handle passing to external runtimes is not available");
+        }
+        ok = ipcWritable.write(encodeWindowsNodeIpcFrame(message), sendCallback
+          ? (error) => sendCallback(error ?? null)
+          : undefined);
+        return ok;
+      }
+      return writeWindowsStdioIpc(
+        (payload, done) => ipcWritable.write(payload, done),
+        Number(child.pid),
+        message,
+        child.serialization,
+        normalizedSend.sendHandle,
+        sendCallback ? (error) => sendCallback(error) : undefined,
+        child,
+        normalizedSend.options?.keepOpen === true,
+      );
+    } catch (error) {
+      if (sendCallback) queueMicrotask(() => sendCallback(error));
+      else emitChildProcessError(child, error);
+      return false;
+    }
+  };
+
+  const markPipeIpcReady = () => {
+    if (pipeIpcReady) return;
+    pipeIpcReady = true;
+    for (const pending of pendingPipeIpcSends.splice(0)) {
+      if (!child.connected) {
+        pending.callback?.(makeChannelClosedError());
+      } else {
+        sendPipeIpcNow(pending.message, pending.normalizedSend, pending.callback);
+      }
+    }
+  };
+
+  const failPendingPipeIpcSends = (error = makeChannelClosedError()) => {
+    for (const pending of pendingPipeIpcSends.splice(0)) {
+      if (pending.callback) queueMicrotask(() => pending.callback(error));
+    }
+  };
+  const incomingFrameOrder = createWindowsIpcFrameOrderer((frame) => {
+    queueIpcMessage(() => {
+      try {
+        emitChildMessage(child, frame.message, "message", frame.handle);
+      } finally {
+        if (Object.prototype.hasOwnProperty.call(frame, "bufferedData")) {
+          deliverAdoptedHandleData(frame.handle, frame.bufferedData);
+        }
+      }
+    });
+  });
+
+  const consumeNodeIpcText = (text) => {
+    ipcBuffer += text;
+    for (;;) {
+      const newlineIndex = ipcBuffer.indexOf("\n");
+      if (newlineIndex < 0) return;
+      const line = ipcBuffer.slice(0, newlineIndex).replace(/\r$/, "");
+      ipcBuffer = ipcBuffer.slice(newlineIndex + 1);
+      if (line.trim() === "") continue;
+      const message = JSON.parse(line);
+      queueIpcMessage(() => {
+        emitChildMessage(
+          child,
+          message,
+          message?.cmd?.startsWith?.("NODE_") ? "internalMessage" : "message",
+        );
+      });
+    }
+  };
+
+  if (!nodeIpcProtocol) ipcReadable.setEncoding?.("utf8");
+  ipcReadable.on("data", (chunk) => {
+    if (nodeIpcProtocol) {
+      try {
+        nodeIpcFrameBuffer = consumeWindowsNodeIpcFrames(
+          nodeIpcFrameBuffer,
+          chunk,
+          (payload) => consumeNodeIpcText(nodeIpcDecoder.decode(payload, { stream: true })),
+        );
+      } catch (error) {
+        nodeIpcFrameBuffer = Buffer.alloc(0);
+        emitChildProcessError(child, error);
+      }
+      return;
+    }
+    ipcBuffer += String(chunk);
+    for (;;) {
+      const newlineIndex = ipcBuffer.indexOf("\n");
+      if (newlineIndex < 0) break;
+      const line = ipcBuffer.slice(0, newlineIndex).replace(/\r$/, "");
+      ipcBuffer = ipcBuffer.slice(newlineIndex + 1);
+      if (!line.startsWith(ipcPrefix)) continue;
+      try {
+        const frame = decodeNativeIpcPayload(line.slice(ipcPrefix.length), undefined, child);
+        if (frame?.control === "handle-ready") {
+          acknowledgeWindowsIpcHandleSend(child, frame.handleSeq);
+        } else if (frame?.control === "handle-adopted") {
+          incomingFrameOrder.adopt(
+            frame.handleSeq,
+            () => ipcWritable.write(encodeWindowsIpcHandleAck(frame.handleSeq)),
+          );
+        } else if (frame?.control === "ready") {
+          markPipeIpcReady();
+        } else if (frame != null) {
+          incomingFrameOrder.receive(frame);
+        }
+      } catch (error) {
+        emitChildProcessError(child, error);
+      }
+    }
+  });
+
+  child.send = function send(message, sendHandleOrCallback = undefined, optionsOrCallback = undefined, callback = undefined) {
+    validateIpcMessage(message, arguments.length);
+    const normalizedSend = normalizeSendArgs(sendHandleOrCallback, optionsOrCallback, callback);
+    const sendCallback = typeof normalizedSend.callback === "function" ? normalizedSend.callback : null;
+    if (!child.connected) {
+      const error = makeChannelClosedError();
+      if (sendCallback) queueMicrotask(() => sendCallback(error));
+      else emitChildProcessError(child, error);
+      return false;
+    }
+    if (!pipeIpcReady) {
+      pendingPipeIpcSends.push({ message, normalizedSend, callback: sendCallback });
+      return true;
+    }
+    return sendPipeIpcNow(message, normalizedSend, sendCallback);
+  };
+  child.disconnect = () => {
+    if (!child.connected) return;
+    child.connected = false;
+    failPendingPipeIpcSends();
+    failWindowsIpcHandleSends(child);
+    failAdoptedIpcHandles(child);
+    incomingFrameOrder.fail();
+    ipcWritable.end();
+    child.channel = null;
+    child._channel = null;
+    emitChildMessage(child, undefined, "disconnect");
+  };
+  ipcReadable.once("end", () => {
+    if (nodeIpcProtocol) {
+      try {
+        consumeNodeIpcText(nodeIpcDecoder.decode());
+        if (nodeIpcFrameBuffer.byteLength !== 0 || ipcBuffer.length !== 0) {
+          throw windowsNodeIpcProtocolError("Truncated Windows Node IPC frame");
+        }
+      } catch (error) {
+        emitChildProcessError(child, error);
+      }
+    }
+    if (!child.connected) return;
+    child.connected = false;
+    failPendingPipeIpcSends();
+    failWindowsIpcHandleSends(child);
+    failAdoptedIpcHandles(child);
+    incomingFrameOrder.fail();
+    child.channel = null;
+    child._channel = null;
+    emitChildMessage(child, undefined, "disconnect");
+  });
+  child.once?.("close", () => {
+    failPendingPipeIpcSends();
+    failWindowsIpcHandleSends(child);
+    failAdoptedIpcHandles(child);
+    incomingFrameOrder.fail();
+  });
+
+  return child;
+}
+
 export function fork(modulePath, args = [], options = {}) {
   if (typeof modulePath !== "string" && !Buffer.isBuffer(modulePath) &&
       !(typeof URL === "function" && modulePath instanceof URL)) {
@@ -1854,6 +2576,11 @@ export function fork(modulePath, args = [], options = {}) {
   }
   const execPath = options.execPath ?? process.execPath;
   const nodeIpcProtocol = execPath !== process.execPath;
+  // Windows uses the requested IPC descriptor as a dedicated duplex named
+  // pipe. Keeping it separate preserves the user's stdin/stdout contract.
+  // External Node runtimes speak newline-delimited JSON over the same pipe;
+  // Cottontail children use the richer native-compatible framed protocol.
+  const useWindowsPipeIpc = isWindowsPlatform;
   const serialization = options.serialization === "advanced" ? "advanced" : "json";
   let stdio;
   if (options.stdio == null) {
@@ -1883,27 +2610,52 @@ export function fork(modulePath, args = [], options = {}) {
     }
   }
 
+  const forkIpcIndex = stdio.indexOf("ipc");
+  const forkIpcTransportIndex = useWindowsPipeIpc && forkIpcIndex < 3
+    ? Math.max(3, stdio.length)
+    : forkIpcIndex;
   const env = withoutElectrobunHostEnv({
     ...process.env,
     ...(options.env ?? {}),
-    COTTONTAIL_IPC_STDIO: "1",
     COTTONTAIL_IPC_BOOTSTRAP: "node",
     COTTONTAIL_IPC_SERIALIZATION: serialization,
     ...(nodeIpcProtocol ? {
-      NODE_CHANNEL_FD: "3",
+      NODE_CHANNEL_FD: String(forkIpcTransportIndex),
       NODE_CHANNEL_SERIALIZATION_MODE: serialization,
     } : {}),
   });
+  if (useWindowsPipeIpc && !nodeIpcProtocol) {
+    env.COTTONTAIL_IPC_PIPE = "1";
+    env.COTTONTAIL_IPC_FD = String(forkIpcTransportIndex);
+    env.COTTONTAIL_IPC_PEER_PID = String(process.pid);
+    delete env.COTTONTAIL_IPC_STDIO;
+    delete env.NODE_CHANNEL_FD;
+    delete env.NODE_CHANNEL_SERIALIZATION_MODE;
+  } else {
+    delete env.COTTONTAIL_IPC_PIPE;
+    delete env.COTTONTAIL_IPC_STDIO;
+    delete env.COTTONTAIL_IPC_PEER_PID;
+  }
+  let spawnStdio = stdio;
+  if (useWindowsPipeIpc) {
+    spawnStdio = stdio.map((entry, index) =>
+      index === forkIpcIndex ? (forkIpcIndex < 3 ? "ignore" : "pipe") : entry
+    );
+    while (spawnStdio.length < forkIpcTransportIndex) spawnStdio.push("ignore");
+    if (forkIpcTransportIndex >= spawnStdio.length) spawnStdio.push("pipe");
+  }
   const execArgv = Array.from(options.execArgv ?? process.execArgv ?? [], String);
   const child = spawn(execPath, [...execArgv, String(modulePath), ...Array.from(args ?? [], String)], {
     ...options,
     env,
-    ipc: true,
-    stdio,
+    ipc: !useWindowsPipeIpc,
+    stdio: spawnStdio,
     // The native start gate is a private Cottontail CLI argument. External
     // runtimes cannot consume it, and their fd 3 IPC channel is ready at exec.
     __deferStart: !nodeIpcProtocol,
     __nodeIpcProtocol: nodeIpcProtocol,
+    __windowsOverlappedStdioFd:
+      useWindowsPipeIpc ? forkIpcTransportIndex : undefined,
   });
   traceChildProcess("fork", {
     id: child._nativeId,
@@ -1921,75 +2673,17 @@ export function fork(modulePath, args = [], options = {}) {
     return child;
   }
 
-  // Fallback: no native IPC channel; multiplex IPC frames over stdio.
-  child.connected = true;
-  child.serialization = options.serialization === "advanced" ? "advanced" : "json";
-  const channel = {
-    ref() {
-      child.ref();
-      return channel;
-    },
-    unref() {
-      child.unref();
-      return channel;
-    },
-  };
-  child.channel = channel;
-  child._channel = channel;
-  let stdoutBuffer = "";
-
-  child.stdout?.on("data", (chunk) => {
-    stdoutBuffer += String(chunk);
-    for (;;) {
-      const newlineIndex = stdoutBuffer.indexOf("\n");
-      if (newlineIndex < 0) break;
-      const line = stdoutBuffer.slice(0, newlineIndex).replace(/\r$/, "");
-      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
-      if (line.startsWith(ipcPrefix)) {
-        try {
-          emitChildMessage(child, decodeIpcMessage(line.slice(ipcPrefix.length)));
-        } catch (error) {
-          emitChildProcessError(child, error);
-        }
-      } else if (!options.silent) {
-        process.stdout.write(`${line}\n`);
-      }
+  // Fallback: no native IPC channel. Windows frames over the dedicated duplex
+  // pipe placed in the original "ipc" stdio slot.
+  const ipcStream = useWindowsPipeIpc ? child.stdio?.[forkIpcTransportIndex] : null;
+  if (useWindowsPipeIpc && Array.isArray(child.stdio)) {
+    child.stdio[forkIpcIndex] = null;
+    if (forkIpcTransportIndex !== forkIpcIndex) {
+      child.stdio[forkIpcTransportIndex] = null;
+      child.stdio.length = Math.max(3, stdio.length);
     }
-  });
-
-  child.send = function send(message, sendHandleOrCallback = undefined, optionsOrCallback = undefined, callback = undefined) {
-    validateIpcMessage(message, arguments.length);
-    const normalizedSend = normalizeSendArgs(sendHandleOrCallback, optionsOrCallback, callback);
-    const sendCallback = typeof normalizedSend.callback === "function" ? normalizedSend.callback : null;
-    if (!child.connected || !child.stdin) {
-      const error = makeChannelClosedError();
-      if (sendCallback) queueMicrotask(() => sendCallback(error));
-      else emitChildProcessError(child, error);
-      return false;
-    }
-    let ok = false;
-    try {
-      if (normalizedSend.sendHandle != null) throw new Error("IPC handle passing is only available on native IPC channels");
-      ok = child.stdin.write(`${ipcPrefix}${encodeIpcMessage(message, child.serialization)}\n`);
-    } catch (error) {
-      // Node invokes the callback asynchronously with the error instead of emitting 'error'.
-      if (sendCallback) queueMicrotask(() => sendCallback(error));
-      else emitChildProcessError(child, error);
-      return false;
-    }
-    if (sendCallback) queueMicrotask(() => sendCallback(ok ? null : new Error("write failed")));
-    return ok;
-  };
-  child.disconnect = () => {
-    if (!child.connected) return;
-    child.connected = false;
-    child.stdin?.end();
-    child.channel = null;
-    child._channel = null;
-    emitChildMessage(child, undefined, "disconnect");
-  };
-
-  return child;
+  }
+  return installWindowsPipeIpcChannel(child, ipcStream, nodeIpcProtocol, serialization);
 }
 
 function emitChildMessage(child, message, eventName = "message", handle = undefined) {
@@ -2005,6 +2699,15 @@ function emitChildMessage(child, message, eventName = "message", handle = undefi
   }
 }
 
+function queueIpcMessage(callback, processObject = globalThis.process) {
+  const nextTick = processObject?.nextTick;
+  if (typeof nextTick === "function") {
+    nextTick.call(processObject, callback);
+  } else {
+    queueMicrotask(callback);
+  }
+}
+
 export function _forkChild(fd = 0, serializationMode = undefined) {
   serializationMode ??= globalThis.process?.env?.COTTONTAIL_IPC_SERIALIZATION ?? "json";
   if (serializationMode !== "json" && serializationMode !== "advanced") {
@@ -2014,16 +2717,55 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
   const inheritedIpc = processObject?.[inheritedNodeIpcSymbol];
   if (!processObject || (typeof processObject.send === "function" && inheritedIpc == null)) return;
   const inheritedState = inheritedIpc?.detach?.();
+  const useStdioIpc = processObject.env?.COTTONTAIL_IPC_STDIO === "1";
+  const usePipeIpc = processObject.env?.COTTONTAIL_IPC_PIPE === "1";
   const nativeFd = Number(processObject.env?.COTTONTAIL_IPC_FD ?? fd);
-  const hasNativeIpc = Number.isInteger(nativeFd) && nativeFd >= 0 && typeof cottontail.ipcSend === "function" && typeof cottontail.ipcRecv === "function";
-  traceChildProcess("child-ipc-bootstrap", { fd: nativeFd, mode: serializationMode, native: hasNativeIpc });
+  const hasNativeIpc = !useStdioIpc && !usePipeIpc && Number.isInteger(nativeFd) && nativeFd >= 0 &&
+    typeof cottontail.ipcSend === "function" && typeof cottontail.ipcRecv === "function";
+  const pipeIpcStream = usePipeIpc
+    ? new NetSocket({
+        fd: nativeFd,
+        pipe: true,
+        readableHighWaterMark: 1024 * 1024,
+        writableHighWaterMark: 1024 * 1024,
+      })
+    : null;
+  const ipcReadable = pipeIpcStream ?? processObject.stdin;
+  const ipcWritable = pipeIpcStream ?? processObject.stdout;
+  traceChildProcess("child-ipc-bootstrap", {
+    fd: nativeFd,
+    mode: serializationMode,
+    native: hasNativeIpc,
+    pipe: usePipeIpc,
+  });
 
   processObject.connected = true;
   let stopNativeIpc = null;
   let readySent = false;
+  const incomingFrameOrder = createWindowsIpcFrameOrderer((frame) => {
+    queueIpcMessage(() => {
+      try {
+        processObject.emit?.("message", frame.message, frame.handle);
+      } finally {
+        if (Object.prototype.hasOwnProperty.call(frame, "bufferedData")) {
+          deliverAdoptedHandleData(frame.handle, frame.bufferedData);
+        }
+      }
+    }, processObject);
+  });
   const announceReady = () => {
-    if (!hasNativeIpc || !processObject.connected || readySent) return;
-    readySent = writeNativeIpc(nativeFd, { [ipcEnvelopeKey]: 2 }, serializationMode);
+    if (!processObject.connected || readySent) return;
+    if (hasNativeIpc) {
+      readySent = writeNativeIpc(nativeFd, { [ipcEnvelopeKey]: 2 }, serializationMode);
+    } else {
+      try {
+        const payload = encodeNativeIpcPayload({ [ipcEnvelopeKey]: 2 }, serializationMode, null);
+        if (typeof ipcWritable?.write === "function") {
+          ipcWritable.write(payload);
+          readySent = true;
+        }
+      } catch {}
+    }
     traceChildProcess("child-ipc-ready", { fd: nativeFd, mode: serializationMode, ok: readySent });
   };
 
@@ -2046,8 +2788,35 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
           sendCallback ? () => sendCallback(ok ? null : new Error("write failed")) : undefined);
         return ok;
       }
+      if (isWindowsPlatform) {
+        if (usePipeIpc && normalizedSend.sendHandle == null && typeof cottontail.fdWrite === "function") {
+          const payload = encodeNativeIpcPayload(message, serializationMode, null);
+          // Small process.send() frames must survive an immediately-following
+          // process.exit(). A synchronous pipe write matches Node's channel
+          // flush guarantee without risking a blocking large-frame write.
+          if (Buffer.byteLength(payload) <= 64 * 1024) {
+            ok = cottontail.fdWrite(nativeFd, payload) === true;
+            if (sendCallback) queueMicrotask(() => sendCallback(ok ? null : new Error("write failed")));
+            return ok;
+          }
+        }
+        ok = writeWindowsStdioIpc(
+          (payload, done) => {
+            if (typeof ipcWritable?.write !== "function") throw makeChannelClosedError();
+            return ipcWritable.write(payload, done);
+          },
+          Number(processObject.env?.COTTONTAIL_IPC_PEER_PID),
+          message,
+          serializationMode,
+          normalizedSend.sendHandle,
+          sendCallback ? (error) => sendCallback(error) : undefined,
+          processObject,
+          normalizedSend.options?.keepOpen === true,
+        );
+        return ok;
+      }
       if (normalizedSend.sendHandle != null) throw new Error("IPC handle passing is only available on native IPC channels");
-      ok = processObject.stdout?.write?.(`${ipcPrefix}${encodeIpcMessage(message, serializationMode)}\n`) === true;
+      ok = ipcWritable?.write?.(`${ipcPrefix}${encodeIpcMessage(message, serializationMode)}\n`) === true;
     } catch (error) {
       // Node invokes the callback asynchronously with the error instead of emitting 'error'.
       if (sendCallback) queueMicrotask(() => sendCallback(error));
@@ -2060,23 +2829,30 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
   processObject.disconnect = () => {
     if (!processObject.connected) return;
     processObject.connected = false;
+    failWindowsIpcHandleSends(processObject);
+    failAdoptedIpcHandles(processObject);
+    incomingFrameOrder.fail();
     if (stopNativeIpc != null) {
       stopNativeIpc();
       stopNativeIpc = null;
     }
+    if (pipeIpcStream != null && !pipeIpcStream.destroyed) pipeIpcStream.end();
     processObject.emit?.("disconnect");
   };
 
   if (hasNativeIpc) {
     const reader = installNativeIpcReader(
       nativeFd,
-      (message, handle) => processObject.emit?.("message", message, handle),
+      (message, handle) => {
+        queueIpcMessage(() => processObject.emit?.("message", message, handle), processObject);
+      },
       () => {
         if (processObject.connected) processObject.disconnect();
       },
       (error) => processObject.emit?.("error", error),
       true,
       inheritedState?.buffer,
+      processObject,
     );
     stopNativeIpc = reader == null ? null : () => reader.close();
     if (reader != null) {
@@ -2124,8 +2900,8 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
     }
   } else {
     let ipcBuffer = "";
-    processObject.stdin?.setEncoding?.("utf8");
-    processObject.stdin?.on?.("data", (chunk) => {
+    ipcReadable?.setEncoding?.("utf8");
+    ipcReadable?.on?.("data", (chunk) => {
       ipcBuffer += String(chunk);
       for (;;) {
         const newlineIndex = ipcBuffer.indexOf("\n");
@@ -2134,16 +2910,61 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
         ipcBuffer = ipcBuffer.slice(newlineIndex + 1);
         if (!line.startsWith(ipcPrefix)) continue;
         try {
-          processObject.emit?.("message", decodeIpcMessage(line.slice(ipcPrefix.length)));
+          const frame = decodeNativeIpcPayload(line.slice(ipcPrefix.length), undefined, processObject);
+          if (frame?.control === "handle-ready") {
+            acknowledgeWindowsIpcHandleSend(processObject, frame.handleSeq);
+          } else if (frame?.control === "handle-adopted") {
+            incomingFrameOrder.adopt(
+              frame.handleSeq,
+              () => ipcWritable?.write?.(encodeWindowsIpcHandleAck(frame.handleSeq)),
+            );
+          } else if (frame != null) {
+            incomingFrameOrder.receive(frame);
+          }
         } catch (error) {
           processObject.emit?.("error", error);
         }
       }
     });
-    processObject.stdin?.on?.("end", () => {
+    ipcReadable?.on?.("end", () => {
       if (processObject.connected) processObject.disconnect();
     });
-    processObject.stdin?.resume?.();
+    ipcReadable?.resume?.();
+    const channelEventNames = new Set(["message", "disconnect"]);
+    const updateChannelRef = () => {
+      if (pipeIpcStream == null) return;
+      const count = (processObject.listenerCount?.("message") ?? 0) +
+        (processObject.listenerCount?.("disconnect") ?? 0);
+      if (count > 0) pipeIpcStream.ref();
+      else pipeIpcStream.unref();
+    };
+    queueMicrotask(() => {
+      try {
+        for (const methodName of ["on", "addListener", "once", "prependListener", "prependOnceListener"]) {
+          const original = processObject[methodName];
+          if (typeof original !== "function") continue;
+          processObject[methodName] = function (name, ...rest) {
+            const result = original.call(this, name, ...rest);
+            if (channelEventNames.has(name)) {
+              pipeIpcStream?.ref();
+              if (name === "message") announceReady();
+            }
+            return result;
+          };
+        }
+        for (const methodName of ["off", "removeListener", "removeAllListeners"]) {
+          const original = processObject[methodName];
+          if (typeof original !== "function") continue;
+          processObject[methodName] = function (name, ...rest) {
+            const result = original.call(this, name, ...rest);
+            if (name === undefined || channelEventNames.has(name)) updateChannelRef();
+            return result;
+          };
+        }
+      } catch {}
+      updateChannelRef();
+      if ((processObject.listenerCount?.("message") ?? 0) > 0) announceReady();
+    });
   }
 }
 

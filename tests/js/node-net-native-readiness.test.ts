@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { setSocketOptions } from "bun:internal-for-testing";
 import { once } from "node:events";
 import net from "node:net";
 
@@ -66,6 +67,7 @@ test("blocked socket writes resume from native writable readiness", async () => 
     client = net.connect({ host: address.address, port: address.port, highWaterMark: 16 * 1024 });
     await withTimeout(once(client, "connect"), "client connect");
     peer = await withTimeout(accepted.promise, "server accept");
+    setSocketOptions(client, 1, 64 * 1024);
 
     let received = 0;
     peer.on("data", chunk => { received += chunk.length; });

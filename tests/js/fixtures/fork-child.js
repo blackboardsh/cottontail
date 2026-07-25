@@ -8,8 +8,7 @@ process.on("message", (message, handle) => {
     handle.setEncoding?.("utf8");
     handle.on?.("data", (chunk) => {
       process.send({ socketData: String(chunk) });
-      handle.end?.("from-child-socket");
-      process.exit(0);
+      handle.end?.("from-child-socket", () => process.exit(0));
     });
     process.send({ socketReceived: true });
     return;

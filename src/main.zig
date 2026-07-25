@@ -354,6 +354,8 @@ fn runtimeFlagTakesValue(arg: []const u8) bool {
         "--diagnostic-dir",
         "--redirect-warnings",
         "--snapshot-blob",
+        "--allow-fs-read",
+        "--allow-fs-write",
         "--test-name-pattern",
         "--test-reporter",
         "--test-reporter-destination",
@@ -1282,7 +1284,10 @@ fn runOnePackageScript(
     const use_bun_shell = flags.shell == .bun or (flags.shell == null and builtin.os.tag == .windows);
     const shell_args: []const []const u8 = if (use_bun_shell) blk: {
         var source: std.ArrayList(u8) = .empty;
-        try source.appendSlice(init.arena.allocator(), "const { $ } = await import(\"bun\"); const __s = [");
+        // The runtime has already initialized Bun before evaluating this
+        // source. Avoid making the bare "bun" specifier look like an
+        // auto-install candidate in a fresh package directory.
+        try source.appendSlice(init.arena.allocator(), "const $ = Bun.$; const __s = [");
         try appendJavaScriptStringLiteral(init.arena.allocator(), &source, rewritten_command);
         try source.appendSlice(init.arena.allocator(), "]; __s.raw = __s; const __result = await $(__s).nothrow(); process.exitCode = __result.exitCode;\n");
         bun_shell_args = .{
@@ -3646,17 +3651,27 @@ pub fn main(init: std.process.Init) !void {
             try stderr.flush();
             std.process.exit(1);
         }
-        if (builtin.os.tag == .windows) {
-            try stderr.print("cottontail: exec is unavailable on this platform yet\n", .{});
-            try stderr.flush();
-            std.process.exit(1);
-        }
 
         const command_parts = try allocator.alloc([]const u8, args.len - 2);
         for (command_parts, 0..) |*part, index| {
             part.* = args[index + 2];
         }
         const command = try std.mem.joinZ(allocator, " ", command_parts);
+
+        if (builtin.os.tag == .windows) {
+            // Windows has no execve-compatible system shell. Enter the same
+            // Bun shell runtime used by `$` and package scripts, and preserve
+            // the shell command's status without surfacing a ShellError.
+            var source: std.ArrayList(u8) = .empty;
+            try source.appendSlice(allocator, "const $ = Bun.$; const __s = [");
+            try appendJavaScriptStringLiteral(allocator, &source, command);
+            try source.appendSlice(allocator, "]; __s.raw = __s; const __result = await $(__s).nothrow(); process.exitCode = __result.exitCode;\n");
+            const source_z = try allocator.dupeZ(u8, source.items);
+            const exit_code = try script_runner.runEval(init, source_z, &.{}, &.{}, false);
+            if (exit_code != 0) std.process.exit(exit_code);
+            return;
+        }
+
         const shell = "/bin/sh";
         const shell_arg = "-c";
         const exec_args = [_:null]?[*:0]const u8{ shell.ptr, shell_arg.ptr, command.ptr };

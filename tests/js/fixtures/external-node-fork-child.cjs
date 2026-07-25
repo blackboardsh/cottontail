@@ -5,9 +5,14 @@ if (typeof process.send !== "function") {
 process.send({
   ready: true,
   runtime: process.release?.name,
+  framingProbe: `node-ipc-\ud83d\ude42-${"x".repeat(96 * 1024)}-tail`,
 });
 
 process.once("message", message => {
-  process.send({ pong: message?.ping });
+  process.send({
+    pong: message?.ping,
+    unicodeEcho: message?.unicode,
+    backpressureLength: message?.backpressureProbe?.length,
+  });
   process.disconnect();
 });

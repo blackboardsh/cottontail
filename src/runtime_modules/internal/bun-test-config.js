@@ -1,4 +1,3 @@
-import { readFileSync } from "../node/fs.js";
 import { resolve } from "../node/path.js";
 import { parse as parseTOML } from "../bun/toml.js";
 
@@ -213,14 +212,18 @@ export function bunTestConfig() {
   const cwd = String(globalThis.process?.cwd?.() ?? ".");
   const path = resolve(cwd, configuredPath());
   try {
-    const source = String(readFileSync(path, "utf8"));
+    // Runtime bootstrap configuration is trusted host input. Reading it
+    // through node:fs would make every permission-enabled process require an
+    // unrelated grant for an optional bunfig.toml before user code can run.
+    const source = String(cottontail.readFile(path));
     const document = parseTOML(source);
     const config = document?.test && typeof document.test === "object"
       ? document.test
       : Object.create(null);
     cachedConfig = validateConfig(config, source, path);
   } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
+    const detail = String(error?.message ?? error);
+    if (error?.code !== "ENOENT" && !/FileNotFound|no such file or directory/i.test(detail)) throw error;
     cachedConfig = Object.create(null);
   }
   return cachedConfig;

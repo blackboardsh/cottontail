@@ -1,6 +1,7 @@
 // Cross-platform-independent values were generated from Node v24.11.1.
 // Errno, filesystem, signal, and dlopen values come from the target host.
 
+const isWindows = cottontail.platform() === "win32";
 const hostConstants = globalThis.cottontail?.platformConstants?.() ?? {};
 const hostConstant = (name, fallback = undefined) => {
   const value = hostConstants[name];
@@ -16,44 +17,44 @@ export const DH_NOT_SUITABLE_GENERATOR = 8;
 export const DH_UNABLE_TO_CHECK_GENERATOR = 4;
 export const E2BIG = hostConstant("E2BIG", 7);
 export const EACCES = hostConstant("EACCES", 13);
-export const EADDRINUSE = hostConstant("EADDRINUSE", 48);
-export const EADDRNOTAVAIL = hostConstant("EADDRNOTAVAIL", 49);
-export const EAFNOSUPPORT = hostConstant("EAFNOSUPPORT", 47);
-export const EAGAIN = hostConstant("EAGAIN", 35);
-export const EALREADY = hostConstant("EALREADY", 37);
+export const EADDRINUSE = hostConstant("EADDRINUSE", isWindows ? 100 : 48);
+export const EADDRNOTAVAIL = hostConstant("EADDRNOTAVAIL", isWindows ? 101 : 49);
+export const EAFNOSUPPORT = hostConstant("EAFNOSUPPORT", isWindows ? 102 : 47);
+export const EAGAIN = hostConstant("EAGAIN", isWindows ? 11 : 35);
+export const EALREADY = hostConstant("EALREADY", isWindows ? 103 : 37);
 export const EBADF = hostConstant("EBADF", 9);
-export const EBADMSG = hostConstant("EBADMSG", 94);
+export const EBADMSG = hostConstant("EBADMSG", isWindows ? 104 : 94);
 export const EBUSY = hostConstant("EBUSY", 16);
-export const ECANCELED = hostConstant("ECANCELED", 89);
+export const ECANCELED = hostConstant("ECANCELED", isWindows ? 105 : 89);
 export const ECHILD = hostConstant("ECHILD", 10);
-export const ECONNABORTED = hostConstant("ECONNABORTED", 53);
-export const ECONNREFUSED = hostConstant("ECONNREFUSED", 61);
-export const ECONNRESET = hostConstant("ECONNRESET", 54);
-export const EDEADLK = hostConstant("EDEADLK", 11);
-export const EDESTADDRREQ = hostConstant("EDESTADDRREQ", 39);
+export const ECONNABORTED = hostConstant("ECONNABORTED", isWindows ? 106 : 53);
+export const ECONNREFUSED = hostConstant("ECONNREFUSED", isWindows ? 107 : 61);
+export const ECONNRESET = hostConstant("ECONNRESET", isWindows ? 108 : 54);
+export const EDEADLK = hostConstant("EDEADLK", isWindows ? 36 : 11);
+export const EDESTADDRREQ = hostConstant("EDESTADDRREQ", isWindows ? 109 : 39);
 export const EDOM = hostConstant("EDOM", 33);
 export const EDQUOT = hostConstant("EDQUOT", 69);
 export const EEXIST = hostConstant("EEXIST", 17);
 export const EFAULT = hostConstant("EFAULT", 14);
 export const EFBIG = hostConstant("EFBIG", 27);
-export const EHOSTUNREACH = hostConstant("EHOSTUNREACH", 65);
-export const EIDRM = hostConstant("EIDRM", 90);
-export const EILSEQ = hostConstant("EILSEQ", 92);
-export const EINPROGRESS = hostConstant("EINPROGRESS", 36);
+export const EHOSTUNREACH = hostConstant("EHOSTUNREACH", isWindows ? 110 : 65);
+export const EIDRM = hostConstant("EIDRM", isWindows ? 111 : 90);
+export const EILSEQ = hostConstant("EILSEQ", isWindows ? 42 : 92);
+export const EINPROGRESS = hostConstant("EINPROGRESS", isWindows ? 112 : 36);
 export const EINTR = hostConstant("EINTR", 4);
 export const EINVAL = hostConstant("EINVAL", 22);
 export const EIO = hostConstant("EIO", 5);
-export const EISCONN = hostConstant("EISCONN", 56);
+export const EISCONN = hostConstant("EISCONN", isWindows ? 113 : 56);
 export const EISDIR = hostConstant("EISDIR", 21);
-export const ELOOP = hostConstant("ELOOP", 62);
+export const ELOOP = hostConstant("ELOOP", isWindows ? 114 : 62);
 export const EMFILE = hostConstant("EMFILE", 24);
 export const EMLINK = hostConstant("EMLINK", 31);
-export const EMSGSIZE = hostConstant("EMSGSIZE", 40);
+export const EMSGSIZE = hostConstant("EMSGSIZE", isWindows ? 115 : 40);
 export const EMULTIHOP = hostConstant("EMULTIHOP", 95);
-export const ENAMETOOLONG = hostConstant("ENAMETOOLONG", 63);
-export const ENETDOWN = hostConstant("ENETDOWN", 50);
-export const ENETRESET = hostConstant("ENETRESET", 52);
-export const ENETUNREACH = hostConstant("ENETUNREACH", 51);
+export const ENAMETOOLONG = hostConstant("ENAMETOOLONG", isWindows ? 38 : 63);
+export const ENETDOWN = hostConstant("ENETDOWN", isWindows ? 116 : 50);
+export const ENETRESET = hostConstant("ENETRESET", isWindows ? 117 : 52);
+export const ENETUNREACH = hostConstant("ENETUNREACH", isWindows ? 118 : 51);
 export const ENFILE = hostConstant("ENFILE", 23);
 export const ENGINE_METHOD_ALL = 65535;
 export const ENGINE_METHOD_CIPHERS = 64;
@@ -66,52 +67,52 @@ export const ENGINE_METHOD_PKEY_ASN1_METHS = 1024;
 export const ENGINE_METHOD_PKEY_METHS = 512;
 export const ENGINE_METHOD_RAND = 8;
 export const ENGINE_METHOD_RSA = 1;
-export const ENOBUFS = hostConstant("ENOBUFS", 55);
-export const ENODATA = hostConstant("ENODATA", 96);
+export const ENOBUFS = hostConstant("ENOBUFS", isWindows ? 119 : 55);
+export const ENODATA = hostConstant("ENODATA", isWindows ? 120 : 96);
 export const ENODEV = hostConstant("ENODEV", 19);
 export const ENOENT = hostConstant("ENOENT", 2);
 export const ENOEXEC = hostConstant("ENOEXEC", 8);
-export const ENOLCK = hostConstant("ENOLCK", 77);
-export const ENOLINK = hostConstant("ENOLINK", 97);
+export const ENOLCK = hostConstant("ENOLCK", isWindows ? 39 : 77);
+export const ENOLINK = hostConstant("ENOLINK", isWindows ? 121 : 97);
 export const ENOMEM = hostConstant("ENOMEM", 12);
-export const ENOMSG = hostConstant("ENOMSG", 91);
-export const ENOPROTOOPT = hostConstant("ENOPROTOOPT", 42);
+export const ENOMSG = hostConstant("ENOMSG", isWindows ? 122 : 91);
+export const ENOPROTOOPT = hostConstant("ENOPROTOOPT", isWindows ? 123 : 42);
 export const ENOSPC = hostConstant("ENOSPC", 28);
-export const ENOSR = hostConstant("ENOSR", 98);
-export const ENOSTR = hostConstant("ENOSTR", 99);
-export const ENOSYS = hostConstant("ENOSYS", 78);
-export const ENOTCONN = hostConstant("ENOTCONN", 57);
+export const ENOSR = hostConstant("ENOSR", isWindows ? 124 : 98);
+export const ENOSTR = hostConstant("ENOSTR", isWindows ? 125 : 99);
+export const ENOSYS = hostConstant("ENOSYS", isWindows ? 40 : 78);
+export const ENOTCONN = hostConstant("ENOTCONN", isWindows ? 126 : 57);
 export const ENOTDIR = hostConstant("ENOTDIR", 20);
-export const ENOTEMPTY = hostConstant("ENOTEMPTY", 66);
-export const ENOTSOCK = hostConstant("ENOTSOCK", 38);
-export const ENOTSUP = hostConstant("ENOTSUP", 45);
+export const ENOTEMPTY = hostConstant("ENOTEMPTY", isWindows ? 41 : 66);
+export const ENOTSOCK = hostConstant("ENOTSOCK", isWindows ? 128 : 38);
+export const ENOTSUP = hostConstant("ENOTSUP", isWindows ? 129 : 45);
 export const ENOTTY = hostConstant("ENOTTY", 25);
 export const ENXIO = hostConstant("ENXIO", 6);
-export const EOPNOTSUPP = hostConstant("EOPNOTSUPP", 102);
-export const EOVERFLOW = hostConstant("EOVERFLOW", 84);
+export const EOPNOTSUPP = hostConstant("EOPNOTSUPP", isWindows ? 130 : 102);
+export const EOVERFLOW = hostConstant("EOVERFLOW", isWindows ? 132 : 84);
 export const EPERM = hostConstant("EPERM", 1);
 export const EPIPE = hostConstant("EPIPE", 32);
-export const EPROTO = hostConstant("EPROTO", 100);
-export const EPROTONOSUPPORT = hostConstant("EPROTONOSUPPORT", 43);
-export const EPROTOTYPE = hostConstant("EPROTOTYPE", 41);
+export const EPROTO = hostConstant("EPROTO", isWindows ? 134 : 100);
+export const EPROTONOSUPPORT = hostConstant("EPROTONOSUPPORT", isWindows ? 135 : 43);
+export const EPROTOTYPE = hostConstant("EPROTOTYPE", isWindows ? 136 : 41);
 export const ERANGE = hostConstant("ERANGE", 34);
 export const EROFS = hostConstant("EROFS", 30);
 export const ESPIPE = hostConstant("ESPIPE", 29);
 export const ESRCH = hostConstant("ESRCH", 3);
 export const ESTALE = hostConstant("ESTALE", 70);
-export const ETIME = hostConstant("ETIME", 101);
-export const ETIMEDOUT = hostConstant("ETIMEDOUT", 60);
-export const ETXTBSY = hostConstant("ETXTBSY", 26);
-export const EWOULDBLOCK = hostConstant("EWOULDBLOCK", 35);
+export const ETIME = hostConstant("ETIME", isWindows ? 137 : 101);
+export const ETIMEDOUT = hostConstant("ETIMEDOUT", isWindows ? 138 : 60);
+export const ETXTBSY = hostConstant("ETXTBSY", isWindows ? 139 : 26);
+export const EWOULDBLOCK = hostConstant("EWOULDBLOCK", isWindows ? 140 : 35);
 export const EXDEV = hostConstant("EXDEV", 18);
 export const F_OK = hostConstant("F_OK", 0);
 export const OPENSSL_VERSION_NUMBER = 810549312;
 export const O_APPEND = hostConstant("O_APPEND", 8);
-export const O_CREAT = hostConstant("O_CREAT", 512);
+export const O_CREAT = hostConstant("O_CREAT", isWindows ? 256 : 512);
 export const O_DIRECTORY = hostConstant("O_DIRECTORY", 1048576);
 export const O_DIRECT = hostConstant("O_DIRECT");
 export const O_DSYNC = hostConstant("O_DSYNC", 4194304);
-export const O_EXCL = hostConstant("O_EXCL", 2048);
+export const O_EXCL = hostConstant("O_EXCL", isWindows ? 1024 : 2048);
 export const O_NOATIME = hostConstant("O_NOATIME");
 export const O_NOCTTY = hostConstant("O_NOCTTY", 131072);
 export const O_NOFOLLOW = hostConstant("O_NOFOLLOW", 256);
@@ -120,7 +121,7 @@ export const O_RDONLY = hostConstant("O_RDONLY", 0);
 export const O_RDWR = hostConstant("O_RDWR", 2);
 export const O_SYMLINK = hostConstant("O_SYMLINK");
 export const O_SYNC = hostConstant("O_SYNC", 128);
-export const O_TRUNC = hostConstant("O_TRUNC", 1024);
+export const O_TRUNC = hostConstant("O_TRUNC", isWindows ? 512 : 1024);
 export const O_WRONLY = hostConstant("O_WRONLY", 1);
 export const POINT_CONVERSION_COMPRESSED = 2;
 export const POINT_CONVERSION_HYBRID = 6;
@@ -140,45 +141,45 @@ export const RSA_PSS_SALTLEN_DIGEST = -1;
 export const RSA_PSS_SALTLEN_MAX_SIGN = -2;
 export const RSA_X931_PADDING = 5;
 export const RTLD_DEEPBIND = hostConstant("RTLD_DEEPBIND");
-export const RTLD_GLOBAL = hostConstant("RTLD_GLOBAL", 8);
-export const RTLD_LAZY = hostConstant("RTLD_LAZY", 1);
-export const RTLD_LOCAL = hostConstant("RTLD_LOCAL", 4);
-export const RTLD_NOW = hostConstant("RTLD_NOW", 2);
+export const RTLD_GLOBAL = hostConstant("RTLD_GLOBAL", isWindows ? undefined : 8);
+export const RTLD_LAZY = hostConstant("RTLD_LAZY", isWindows ? undefined : 1);
+export const RTLD_LOCAL = hostConstant("RTLD_LOCAL", isWindows ? undefined : 4);
+export const RTLD_NOW = hostConstant("RTLD_NOW", isWindows ? undefined : 2);
 export const R_OK = hostConstant("R_OK", 4);
-export const SIGABRT = hostConstant("SIGABRT", 6);
-export const SIGALRM = hostConstant("SIGALRM", 14);
-export const SIGBUS = hostConstant("SIGBUS", 10);
-export const SIGCHLD = hostConstant("SIGCHLD", 20);
-export const SIGCONT = hostConstant("SIGCONT", 19);
+export const SIGABRT = hostConstant("SIGABRT", isWindows ? 22 : 6);
+export const SIGALRM = hostConstant("SIGALRM", isWindows ? undefined : 14);
+export const SIGBUS = hostConstant("SIGBUS", isWindows ? undefined : 10);
+export const SIGCHLD = hostConstant("SIGCHLD", isWindows ? undefined : 20);
+export const SIGCONT = hostConstant("SIGCONT", isWindows ? undefined : 19);
 export const SIGFPE = hostConstant("SIGFPE", 8);
 export const SIGHUP = hostConstant("SIGHUP", 1);
 export const SIGILL = hostConstant("SIGILL", 4);
 export const SIGINFO = hostConstant("SIGINFO");
 export const SIGINT = hostConstant("SIGINT", 2);
-export const SIGIO = hostConstant("SIGIO", 23);
-export const SIGIOT = hostConstant("SIGIOT", 6);
+export const SIGIO = hostConstant("SIGIO", isWindows ? undefined : 23);
+export const SIGIOT = hostConstant("SIGIOT", isWindows ? undefined : 6);
 export const SIGKILL = hostConstant("SIGKILL", 9);
-export const SIGPIPE = hostConstant("SIGPIPE", 13);
+export const SIGPIPE = hostConstant("SIGPIPE", isWindows ? undefined : 13);
 export const SIGPOLL = hostConstant("SIGPOLL");
-export const SIGPROF = hostConstant("SIGPROF", 27);
+export const SIGPROF = hostConstant("SIGPROF", isWindows ? undefined : 27);
 export const SIGPWR = hostConstant("SIGPWR");
 export const SIGQUIT = hostConstant("SIGQUIT", 3);
 export const SIGSEGV = hostConstant("SIGSEGV", 11);
 export const SIGSTKFLT = hostConstant("SIGSTKFLT");
-export const SIGSTOP = hostConstant("SIGSTOP", 17);
-export const SIGSYS = hostConstant("SIGSYS", 12);
+export const SIGSTOP = hostConstant("SIGSTOP", isWindows ? undefined : 17);
+export const SIGSYS = hostConstant("SIGSYS", isWindows ? undefined : 12);
 export const SIGTERM = hostConstant("SIGTERM", 15);
-export const SIGTRAP = hostConstant("SIGTRAP", 5);
-export const SIGTSTP = hostConstant("SIGTSTP", 18);
-export const SIGTTIN = hostConstant("SIGTTIN", 21);
-export const SIGTTOU = hostConstant("SIGTTOU", 22);
-export const SIGURG = hostConstant("SIGURG", 16);
-export const SIGUSR1 = hostConstant("SIGUSR1", 30);
-export const SIGUSR2 = hostConstant("SIGUSR2", 31);
-export const SIGVTALRM = hostConstant("SIGVTALRM", 26);
+export const SIGTRAP = hostConstant("SIGTRAP", isWindows ? undefined : 5);
+export const SIGTSTP = hostConstant("SIGTSTP", isWindows ? undefined : 18);
+export const SIGTTIN = hostConstant("SIGTTIN", isWindows ? undefined : 21);
+export const SIGTTOU = hostConstant("SIGTTOU", isWindows ? undefined : 22);
+export const SIGURG = hostConstant("SIGURG", isWindows ? undefined : 16);
+export const SIGUSR1 = hostConstant("SIGUSR1", isWindows ? undefined : 30);
+export const SIGUSR2 = hostConstant("SIGUSR2", isWindows ? undefined : 31);
+export const SIGVTALRM = hostConstant("SIGVTALRM", isWindows ? undefined : 26);
 export const SIGWINCH = hostConstant("SIGWINCH", 28);
-export const SIGXCPU = hostConstant("SIGXCPU", 24);
-export const SIGXFSZ = hostConstant("SIGXFSZ", 25);
+export const SIGXCPU = hostConstant("SIGXCPU", isWindows ? undefined : 24);
+export const SIGXFSZ = hostConstant("SIGXFSZ", isWindows ? undefined : 25);
 export const SSL_OP_ALL = 2147485776;
 export const SSL_OP_ALLOW_NO_DHE_KEX = 1024;
 export const SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION = 262144;
@@ -237,14 +238,14 @@ export const UV_DIRENT_UNKNOWN = 0;
 export const UV_FS_COPYFILE_EXCL = 1;
 export const UV_FS_COPYFILE_FICLONE = 2;
 export const UV_FS_COPYFILE_FICLONE_FORCE = 4;
-export const UV_FS_O_FILEMAP = 0;
+export const UV_FS_O_FILEMAP = isWindows ? 536870912 : 0;
 export const UV_FS_SYMLINK_DIR = 1;
 export const UV_FS_SYMLINK_JUNCTION = 2;
 export const W_OK = hostConstant("W_OK", 2);
 export const X_OK = hostConstant("X_OK", 1);
 export const defaultCoreCipherList = "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384:DHE-RSA-AES256-SHA384:ECDHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA256:HIGH:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA";
 
-export default Object.freeze({
+const defaultConstants = {
   COPYFILE_EXCL,
   COPYFILE_FICLONE,
   COPYFILE_FICLONE_FORCE,
@@ -481,4 +482,122 @@ export default Object.freeze({
   W_OK,
   X_OK,
   defaultCoreCipherList,
-});
+};
+
+if (isWindows) {
+  Object.assign(defaultConstants, {
+    WSAEINTR: 10004,
+    WSAEBADF: 10009,
+    WSAEACCES: 10013,
+    WSAEFAULT: 10014,
+    WSAEINVAL: 10022,
+    WSAEMFILE: 10024,
+    WSAEWOULDBLOCK: 10035,
+    WSAEINPROGRESS: 10036,
+    WSAEALREADY: 10037,
+    WSAENOTSOCK: 10038,
+    WSAEDESTADDRREQ: 10039,
+    WSAEMSGSIZE: 10040,
+    WSAEPROTOTYPE: 10041,
+    WSAENOPROTOOPT: 10042,
+    WSAEPROTONOSUPPORT: 10043,
+    WSAESOCKTNOSUPPORT: 10044,
+    WSAEOPNOTSUPP: 10045,
+    WSAEPFNOSUPPORT: 10046,
+    WSAEAFNOSUPPORT: 10047,
+    WSAEADDRINUSE: 10048,
+    WSAEADDRNOTAVAIL: 10049,
+    WSAENETDOWN: 10050,
+    WSAENETUNREACH: 10051,
+    WSAENETRESET: 10052,
+    WSAECONNABORTED: 10053,
+    WSAECONNRESET: 10054,
+    WSAENOBUFS: 10055,
+    WSAEISCONN: 10056,
+    WSAENOTCONN: 10057,
+    WSAESHUTDOWN: 10058,
+    WSAETOOMANYREFS: 10059,
+    WSAETIMEDOUT: 10060,
+    WSAECONNREFUSED: 10061,
+    WSAELOOP: 10062,
+    WSAENAMETOOLONG: 10063,
+    WSAEHOSTDOWN: 10064,
+    WSAEHOSTUNREACH: 10065,
+    WSAENOTEMPTY: 10066,
+    WSAEPROCLIM: 10067,
+    WSAEUSERS: 10068,
+    WSAEDQUOT: 10069,
+    WSAESTALE: 10070,
+    WSAEREMOTE: 10071,
+    WSASYSNOTREADY: 10091,
+    WSAVERNOTSUPPORTED: 10092,
+    WSANOTINITIALISED: 10093,
+    WSAEDISCON: 10101,
+    WSAENOMORE: 10102,
+    WSAECANCELLED: 10103,
+    WSAEINVALIDPROCTABLE: 10104,
+    WSAEINVALIDPROVIDER: 10105,
+    WSAEPROVIDERFAILEDINIT: 10106,
+    WSASYSCALLFAILURE: 10107,
+    WSASERVICE_NOT_FOUND: 10108,
+    WSATYPE_NOT_FOUND: 10109,
+    WSA_E_NO_MORE: 10110,
+    WSA_E_CANCELLED: 10111,
+    WSAEREFUSED: 10112,
+    SIGBREAK: 21,
+  });
+
+  for (const name of [
+    "EDQUOT",
+    "EMULTIHOP",
+    "ESTALE",
+    "O_DIRECTORY",
+    "O_DSYNC",
+    "O_NOCTTY",
+    "O_NOFOLLOW",
+    "O_NONBLOCK",
+    "O_SYMLINK",
+    "O_SYNC",
+    "RTLD_GLOBAL",
+    "RTLD_LAZY",
+    "RTLD_LOCAL",
+    "RTLD_NOW",
+    "SIGALRM",
+    "SIGBUS",
+    "SIGCHLD",
+    "SIGCONT",
+    "SIGINFO",
+    "SIGIO",
+    "SIGIOT",
+    "SIGPIPE",
+    "SIGPROF",
+    "SIGSTOP",
+    "SIGSYS",
+    "SIGTRAP",
+    "SIGTSTP",
+    "SIGTTIN",
+    "SIGTTOU",
+    "SIGURG",
+    "SIGUSR1",
+    "SIGUSR2",
+    "SIGVTALRM",
+    "SIGXCPU",
+    "SIGXFSZ",
+    "S_IFBLK",
+    "S_IFSOCK",
+    "S_IRGRP",
+    "S_IROTH",
+    "S_IRWXG",
+    "S_IRWXO",
+    "S_IRWXU",
+    "S_IWGRP",
+    "S_IWOTH",
+    "S_IXGRP",
+    "S_IXOTH",
+    "S_IXUSR",
+  ]) {
+    delete defaultConstants[name];
+  }
+}
+
+export default Object.freeze(defaultConstants);

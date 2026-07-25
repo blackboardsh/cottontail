@@ -366,6 +366,20 @@ if (hasCrypto) {
   knownGlobals.add(globalThis.SubtleCrypto);
 }
 
+const isCottontailUpstreamRuntime =
+  process.env.COTTONTAIL_UPSTREAM_RUNTIME === 'node' &&
+  process.versions?.cottontail;
+
+if (isCottontailUpstreamRuntime) {
+  // COTTONTAIL-COMPAT: The copied Node harness assumes a Node-only global
+  // surface, while Cottontail intentionally exposes Bun globals. Snapshot the
+  // runtime's initial values so globals added after loading common still fail
+  // the leak check.
+  for (const key in globalThis) {
+    knownGlobals.add(globalThis[key]);
+  }
+}
+
 function allowGlobals(...allowlist) {
   for (const val of allowlist) {
     knownGlobals.add(val);
@@ -385,6 +399,14 @@ if (process.env.NODE_TEST_KNOWN_GLOBALS !== '0') {
       // globalThis.crypto is a getter that throws if Node.js was compiled
       // without OpenSSL so we'll skip it if it is not available.
       if (val === 'crypto' && !hasCrypto) {
+        continue;
+      }
+      // The loader creates some private Cottontail state lazily after common
+      // is loaded. It is runtime plumbing rather than a test-created global.
+      if (
+        isCottontailUpstreamRuntime &&
+        (val.startsWith('__cottontail') || val.startsWith('__ct'))
+      ) {
         continue;
       }
       if (!knownGlobals.has(globalThis[val])) {

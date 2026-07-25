@@ -5,7 +5,7 @@
 
 pub const ntdll = windows.ntdll;
 pub const kernel32 = windows.kernel32;
-pub const GetLastError = kernel32.GetLastError;
+pub const GetLastError = windows.GetLastError;
 
 pub const PATH_MAX_WIDE = windows.PATH_MAX_WIDE;
 pub const MAX_PATH = windows.MAX_PATH;
@@ -22,13 +22,13 @@ pub const LPSTR = windows.LPSTR;
 pub const WCHAR = windows.WCHAR;
 pub const LPCSTR = windows.LPCSTR;
 pub const PWSTR = windows.PWSTR;
-pub const FALSE = windows.FALSE;
-pub const TRUE = windows.TRUE;
+pub const FALSE: BOOL = .FALSE;
+pub const TRUE: BOOL = BOOL.TRUE;
 pub const COORD = windows.COORD;
 pub const INVALID_HANDLE_VALUE = windows.INVALID_HANDLE_VALUE;
-pub const FILE_BEGIN = windows.FILE_BEGIN;
-pub const FILE_END = windows.FILE_END;
-pub const FILE_CURRENT = windows.FILE_CURRENT;
+pub const FILE_BEGIN: DWORD = 0;
+pub const FILE_CURRENT: DWORD = 1;
+pub const FILE_END: DWORD = 2;
 pub const ULONG = windows.ULONG;
 pub const ULONGLONG = windows.ULONGLONG;
 pub const UINT = windows.UINT;
@@ -3183,7 +3183,7 @@ pub fn userUniqueId() u32 {
     // UNLEN + 1
     var buf: [257]u16 = undefined;
     var size: u32 = buf.len;
-    if (GetUserNameW(@ptrCast(&buf), &size) == 0) {
+    if (GetUserNameW(@ptrCast(&buf), &size) == FALSE) {
         if (Environment.isDebug) std.debug.panic("GetUserNameW failed: {}", .{bun.windows.GetLastError()});
         return 0;
     }
@@ -3502,9 +3502,13 @@ pub const STARTUPINFOEXW = extern struct {
 
 pub const InitializeProcThreadAttributeList = @import("../../windows_sys/externs.zig").InitializeProcThreadAttributeList;
 
+pub const DeleteProcThreadAttributeList = @import("../../windows_sys/externs.zig").DeleteProcThreadAttributeList;
+
 pub const UpdateProcThreadAttribute = @import("../../windows_sys/externs.zig").UpdateProcThreadAttribute;
 
 pub const IsProcessInJob = @import("../../windows_sys/externs.zig").IsProcessInJob;
+
+pub const GetExitCodeProcess = @import("../../windows_sys/externs.zig").GetExitCodeProcess;
 
 pub const EXTENDED_STARTUPINFO_PRESENT = 0x80000;
 pub const PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x2000D;
@@ -3532,12 +3536,17 @@ pub const Subsystem = enum(u16) {
 
 pub fn editWin32BinarySubsystem(fd: bun.sys.File, subsystem: Subsystem) !void {
     comptime bun.assert(bun.Environment.isWindows);
-    if (bun.windows.SetFilePointerEx(fd.handle.cast(), pe_header_offset_location, null, std.os.windows.FILE_BEGIN) == 0)
-        return error.Win32Error;
-    const offset = try fd.reader().readInt(u32, .little);
-    if (bun.windows.SetFilePointerEx(fd.handle.cast(), offset + subsystem_offset, null, std.os.windows.FILE_BEGIN) == 0)
-        return error.Win32Error;
-    try fd.writer().writeInt(u16, @intFromEnum(subsystem), .little);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = fd.handle.stdFile();
+
+    var pe_offset_bytes: [4]u8 = undefined;
+    const bytes_read = try std.Io.File.readPositional(file, io, &.{&pe_offset_bytes}, pe_header_offset_location);
+    if (bytes_read != pe_offset_bytes.len) return error.UnexpectedEndOfFile;
+
+    const pe_offset = std.mem.readInt(u32, &pe_offset_bytes, .little);
+    var subsystem_bytes: [2]u8 = undefined;
+    std.mem.writeInt(u16, &subsystem_bytes, @intFromEnum(subsystem), .little);
+    try std.Io.File.writePositionalAll(file, io, &subsystem_bytes, pe_offset + subsystem_offset);
 }
 
 pub const rescle = struct {
@@ -3685,32 +3694,32 @@ pub const spawn = @import("../../runtime/api/bun/spawn.zig").PosixSpawn;
 
 pub fn isWatcherChild() bool {
     var buf: [1]u16 = undefined;
-    return c.GetEnvironmentVariableW(@constCast(watcherChildEnv.ptr), &buf, 1) > 0;
+    return (GetEnvironmentVariableW(@constCast(watcherChildEnv.ptr), &buf, 1) catch 0) > 0;
 }
 
 pub fn becomeWatcherManager(allocator: std.mem.Allocator) noreturn {
     // this process will be the parent of the child process that actually runs the script
-    var procinfo: std.os.windows.PROCESS_INFORMATION = undefined;
+    var procinfo: std.os.windows.PROCESS.INFORMATION = undefined;
     windows_enable_stdio_inheritance();
     const job = CreateJobObjectA(null, null) orelse Output.panic(
         "Could not create watcher Job Object: {s}",
-        .{@tagName(std.os.windows.kernel32.GetLastError())},
+        .{@tagName(std.os.windows.GetLastError())},
     );
-    var jeli = std.mem.zeroes(c.JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
+    var jeli = std.mem.zeroes(JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
     jeli.BasicLimitInformation.LimitFlags =
-        c.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
-        c.JOB_OBJECT_LIMIT_BREAKAWAY_OK |
-        c.JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK |
-        c.JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-    if (c.SetInformationJobObject(
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+        JOB_OBJECT_LIMIT_BREAKAWAY_OK |
+        JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK |
+        JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+    if (SetInformationJobObject(
         job,
-        c.JobObjectExtendedLimitInformation,
+        JobObjectExtendedLimitInformation,
         &jeli,
-        @sizeOf(c.JOBOBJECT_EXTENDED_LIMIT_INFORMATION),
-    ) == 0) {
+        @sizeOf(JOBOBJECT_EXTENDED_LIMIT_INFORMATION),
+    ) == FALSE) {
         Output.panic(
             "Could not configure watcher Job Object: {s}",
-            .{@tagName(std.os.windows.kernel32.GetLastError())},
+            .{@tagName(std.os.windows.GetLastError())},
         );
     }
 
@@ -3722,16 +3731,21 @@ pub fn becomeWatcherManager(allocator: std.mem.Allocator) noreturn {
             }
             Output.panic("Failed to spawn process: {s}\n", .{@errorName(err)});
         };
-        windows.WaitForSingleObject(procinfo.hProcess, c.INFINITE) catch |err| {
-            Output.panic("Failed to wait for child process: {s}\n", .{@errorName(err)});
-        };
+        const infinite_timeout: LARGE_INTEGER = std.math.minInt(LARGE_INTEGER);
+        switch (std.os.windows.ntdll.NtWaitForSingleObject(procinfo.hProcess, .FALSE, &infinite_timeout)) {
+            .WAIT_0 => {},
+            else => |status| Output.panic(
+                "Failed to wait for child process: NTSTATUS 0x{x}\n",
+                .{@intFromEnum(status)},
+            ),
+        }
         var exit_code: DWORD = 0;
-        if (c.GetExitCodeProcess(procinfo.hProcess, &exit_code) == 0) {
+        if (GetExitCodeProcess(procinfo.hProcess, &exit_code) == FALSE) {
             const err = windows.GetLastError();
-            _ = c.NtClose(procinfo.hProcess);
+            _ = std.os.windows.ntdll.NtClose(procinfo.hProcess);
             Output.panic("Failed to get exit code of child process: {s}\n", .{@tagName(err)});
         }
-        _ = c.NtClose(procinfo.hProcess);
+        _ = std.os.windows.ntdll.NtClose(procinfo.hProcess);
 
         // magic exit code to indicate that the child process should be re-spawned
         if (exit_code == watcher_reload_exit) {
@@ -3744,7 +3758,7 @@ pub fn becomeWatcherManager(allocator: std.mem.Allocator) noreturn {
 
 pub fn spawnWatcherChild(
     allocator: std.mem.Allocator,
-    procinfo: *std.os.windows.PROCESS_INFORMATION,
+    procinfo: *std.os.windows.PROCESS.INFORMATION,
     job: HANDLE,
 ) !void {
     // https://devblogs.microsoft.com/oldnewthing/20230209-00/?p=107812
@@ -3752,18 +3766,19 @@ pub fn spawnWatcherChild(
     _ = InitializeProcThreadAttributeList(null, 1, 0, &attr_size);
     const p = try allocator.alloc(u8, attr_size);
     defer allocator.free(p);
-    if (InitializeProcThreadAttributeList(p.ptr, 1, 0, &attr_size) == 0) {
+    if (InitializeProcThreadAttributeList(p.ptr, 1, 0, &attr_size) == FALSE) {
         return error.Win32Error;
     }
+    defer DeleteProcThreadAttributeList(p.ptr);
     if (UpdateProcThreadAttribute(
         p.ptr,
         0,
-        c.PROC_THREAD_ATTRIBUTE_JOB_LIST,
+        PROC_THREAD_ATTRIBUTE_JOB_LIST,
         @ptrCast(&job),
         @sizeOf(HANDLE),
         null,
         null,
-    ) == 0) {
+    ) == FALSE) {
         return error.Win32Error;
     }
 
@@ -3816,36 +3831,36 @@ pub fn spawnWatcherChild(
             .dwXCountChars = 0,
             .dwYCountChars = 0,
             .dwFillAttribute = 0,
-            .dwFlags = c.STARTF_USESTDHANDLES,
+            .dwFlags = std.os.windows.STARTF_USESTDHANDLES,
             .wShowWindow = 0,
             .cbReserved2 = 0,
             .lpReserved2 = null,
-            .hStdInput = std.fs.File.stdin().handle,
-            .hStdOutput = std.fs.File.stdout().handle,
-            .hStdError = std.fs.File.stderr().handle,
+            .hStdInput = std.Io.File.stdin().handle,
+            .hStdOutput = std.Io.File.stdout().handle,
+            .hStdError = std.Io.File.stderr().handle,
         },
         .lpAttributeList = p.ptr,
     };
     @memset(std.mem.asBytes(procinfo), 0);
     const rc = kernel32.CreateProcessW(
         image_pathZ.ptr,
-        c.GetCommandLineW(),
+        GetCommandLineW(),
         null,
         null,
-        1,
+        TRUE,
         flags,
-        envbuf.ptr,
+        envbuf[0 .. envbuf.len - 1 :0].ptr,
         null,
         @ptrCast(&startupinfo),
         procinfo,
     );
-    if (rc == 0) {
+    if (rc == FALSE) {
         return error.Win32Error;
     }
-    var is_in_job: c.BOOL = 0;
-    _ = c.IsProcessInJob(procinfo.hProcess, job, &is_in_job);
-    bun.debugAssert(is_in_job != 0);
-    _ = c.NtClose(procinfo.hThread);
+    var is_in_job: BOOL = .FALSE;
+    _ = IsProcessInJob(procinfo.hProcess, job, &is_in_job);
+    bun.debugAssert(is_in_job != FALSE);
+    _ = std.os.windows.ntdll.NtClose(procinfo.hThread);
 }
 
 /// Returns null on error. Use windows API to lookup the actual error.

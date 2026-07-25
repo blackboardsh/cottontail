@@ -12,12 +12,20 @@ const server = Bun.serve({
   },
 });
 
-Bun.spawn(["curl", "-s", "--max-time", "2", "-o", outputPath, new URL("hello", server.url).href], {
+const requestUrl = new URL("/hello", server.url).href;
+Bun.spawn([
+  process.execPath,
+  "-e",
+  "fetch(process.argv[1]).then(async response => require('node:fs').writeFileSync(process.argv[2], await response.text())).catch(error => { console.error(error); process.exitCode = 1; })",
+  requestUrl,
+  outputPath,
+], {
   detached: true,
 });
 
 let body = "";
-for (let index = 0; index < 2000; index += 1) {
+const deadline = Date.now() + 15_000;
+while (Date.now() < deadline) {
   globalThis.__cottontailRunLoopTick();
   if (cottontail.existsSync(outputPath)) {
     body = cottontail.readFile(outputPath);

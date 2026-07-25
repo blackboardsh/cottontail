@@ -145,7 +145,13 @@ assert(resolveUrl("http://example.com/a/b", "../c") === "http://example.com/c", 
 assert(resolveObject("http://example.com/a/b", "../c").pathname === "/c", "url resolveObject mismatch");
 assert(domainToASCII("mañana.com") === "xn--maana-pta.com", "domainToASCII mismatch");
 assert(domainToUnicode("xn--maana-pta.com") === "mañana.com", "domainToUnicode mismatch");
-assert(fileURLToPathBuffer("file:///tmp/cottontail").toString().endsWith("/tmp/cottontail"), "fileURLToPathBuffer mismatch");
+const bufferFileUrl = process.platform === "win32"
+  ? "file:///C:/tmp/cottontail"
+  : "file:///tmp/cottontail";
+const expectedBufferPath = process.platform === "win32"
+  ? "C:\\tmp\\cottontail"
+  : "/tmp/cottontail";
+assert(fileURLToPathBuffer(bufferFileUrl).toString() === expectedBufferPath, "fileURLToPathBuffer mismatch");
 assert(pathToFileURL("[").href.includes("%5B"), "pathToFileURL should escape square brackets");
 const expectedDrivePath = process.platform === "win32" ? "C:\\firebase-gen-{{ firebase.gen }}" : "/C:/firebase-gen-{{ firebase.gen }}";
 assert(fileURLToPath("file://C:/firebase-gen-%7B%7B%20firebase.gen%20%7D%7D") === expectedDrivePath, "drive-letter file URL mismatch");

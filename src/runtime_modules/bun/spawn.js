@@ -9,9 +9,11 @@ import {
   encodeBunSpawnIpc,
   isCottontailIpcFrame,
 } from "../internal/bun-spawn-ipc.js";
+import { Socket as NetSocket } from "../node/net.js";
 
 const Promise = globalThis.Promise;
 const queueMicrotask = globalThis.queueMicrotask.bind(globalThis);
+const nodeIpcEnvelopeKey = "__cottontailIpcEnvelope";
 
 function normalizeResourceUsage(usage) {
   if (usage == null) return undefined;
@@ -273,11 +275,36 @@ class ProcessReadableSlot {
   }
 }
 
+function installSpawnFdDispatcher() {
+  const listeners = globalThis.__cottontailFdWatchListeners ??= new Map();
+  if (!globalThis.__cottontailFdWatchHandlerInstalled && typeof cottontail.fdSetEventHandler === "function") {
+    globalThis.__cottontailFdWatchHandlerInstalled = true;
+    cottontail.fdSetEventHandler((event) => {
+      const id = Number(event?.id);
+      const connectListener = globalThis.__cottontailTcpConnectListeners?.get?.(id);
+      if (typeof connectListener === "function") {
+        connectListener(event);
+        return;
+      }
+      const fdListener = globalThis.__cottontailFdWatchListeners?.get?.(id);
+      if (typeof fdListener === "function") {
+        fdListener(event);
+        return;
+      }
+      const tlsListener = globalThis.__cottontailTlsListeners?.get?.(id);
+      if (typeof tlsListener === "function") tlsListener(event);
+    });
+  }
+  return listeners;
+}
+
 class ProcessWritable {
-  constructor(host, processId, asBuffer) {
+  constructor(host, processId, asBuffer, fd = undefined) {
     this._host = host;
     this._processId = processId;
     this._asBuffer = asBuffer;
+    this._fd = Number.isInteger(fd) && fd >= 0 ? Number(fd) : null;
+    this._pipeWriteId = 0;
     this._listeners = new Map();
     this._queue = [];
     this._draining = false;
@@ -292,6 +319,66 @@ class ProcessWritable {
     this.writableEnded = false;
     this.writableFinished = false;
     this.destroyed = false;
+  }
+
+  _closeNativeStdin() {
+    if (this._fd != null) {
+      const fd = this._fd;
+      this._fd = null;
+      try { this._host.closeFd?.(fd); } catch {}
+      return;
+    }
+    this._host.spawnCloseStdin?.(this._processId);
+  }
+
+  async _writeBytes(bytes) {
+    if (
+      this._fd == null ||
+      process.platform !== "win32" ||
+      typeof this._host.windowsPipeWriteStart !== "function"
+    ) {
+      if (this._host.spawnWrite?.(this._processId, bytes) !== true) {
+        throw new Error("write failed");
+      }
+      return bytes.byteLength;
+    }
+
+    const listeners = installSpawnFdDispatcher();
+    return await new Promise((resolve, reject) => {
+      let requestId;
+      try {
+        requestId = Number(this._host.windowsPipeWriteStart(this._fd, bytes, true));
+        if (!Number.isInteger(requestId) || requestId <= 0) {
+          throw new Error("failed to queue Windows pipe write");
+        }
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      this._pipeWriteId = requestId;
+      listeners.set(requestId, event => {
+        listeners.delete(requestId);
+        try { this._host.windowsPipeWriteRelease?.(requestId); } catch {}
+        if (this._pipeWriteId === requestId) this._pipeWriteId = 0;
+        if (
+          event?.type === "error" ||
+          event?.type === "fs-cancel" ||
+          event?.type === "pipe-write-cancel"
+        ) {
+          const error = new Error(event?.message || "Windows pipe write failed");
+          if (event?.code != null) error.code = String(event.code);
+          if (event?.errno != null) error.errno = Number(event.errno);
+          reject(error);
+          return;
+        }
+        const written = Number(event?.result ?? 0);
+        if (!Number.isFinite(written) || written <= 0) {
+          reject(new Error("Windows pipe write failed"));
+          return;
+        }
+        resolve(Math.min(bytes.byteLength, Math.trunc(written)));
+      });
+    });
   }
 
   on(name, handler) {
@@ -343,7 +430,7 @@ class ProcessWritable {
 
   _closeAfterDrain() {
     if (!this._endRequested || this._draining || this._queue.length > 0 || this.destroyed) return;
-    this._host.spawnCloseStdin?.(this._processId);
+    this._closeNativeStdin();
     this.writableFinished = true;
     this.destroyed = true;
     this.emit("finish");
@@ -387,11 +474,9 @@ class ProcessWritable {
             const chunk = item.offset === 0 && end === item.bytes.byteLength
               ? item.bytes
               : item.bytes.subarray(item.offset, end);
-            if (this._host.spawnWrite?.(this._processId, chunk) !== true) {
-              throw new Error("write failed");
-            }
-            const count = end - item.offset;
-            item.offset = end;
+            const count = await this._writeBytes(chunk);
+            if (count <= 0) throw new Error("write failed");
+            item.offset += count;
             this._queuedBytes -= count;
             bytesSinceYield += count;
             if (bytesSinceYield >= 1024 * 1024 &&
@@ -430,7 +515,7 @@ class ProcessWritable {
     const bytes = typeof chunk === "string" && typeof encoding === "string" && globalThis.Buffer?.from
       ? globalThis.Buffer.from(chunk, encoding)
       : this._asBuffer(chunk);
-    if (!this._draining && this._queue.length === 0 && bytes.byteLength <= 16 * 1024 &&
+    if (this._fd == null && !this._draining && this._queue.length === 0 && bytes.byteLength <= 16 * 1024 &&
         this._syncBytes + bytes.byteLength <= 64 * 1024) {
       const ok = this._host.spawnWrite?.(this._processId, bytes) === true;
       if (ok) {
@@ -488,6 +573,10 @@ class ProcessWritable {
     if (this._queue.length > 0 || this._flushWaiters.length > 0 || this._endWaiters.length > 0) {
       this._failWrites(new Error("Subprocess exited"));
     }
+    if (this._pipeWriteId) {
+      try { this._host.windowsPipeWriteCancel?.(this._pipeWriteId); } catch {}
+    }
+    this._closeNativeStdin();
     this.writable = false;
     this.writableEnded = true;
     this.writableFinished = true;
@@ -504,7 +593,10 @@ class ProcessWritable {
     if (this._queue.length > 0 || this._flushWaiters.length > 0 || this._endWaiters.length > 0) {
       this._failWrites(error ?? new Error("Subprocess stdin destroyed"));
     }
-    this._host.spawnCloseStdin?.(this._processId);
+    if (this._pipeWriteId) {
+      try { this._host.windowsPipeWriteCancel?.(this._pipeWriteId); } catch {}
+    }
+    this._closeNativeStdin();
     this.writable = false;
     this.writableEnded = true;
     this.destroyed = true;
@@ -534,6 +626,7 @@ export function createBunSpawnRuntime(deps) {
     writeOutputBuffer,
   } = deps;
   const host = globalThis.cottontail;
+  const isWindowsPlatform = host.platform?.() === "win32";
   const extraFdFinalizer = typeof FinalizationRegistry === "function"
     ? new FinalizationRegistry(fds => {
         for (const fd of fds) {
@@ -660,7 +753,9 @@ export function createBunSpawnRuntime(deps) {
             }
             const bytes = asBuffer(value);
             for (let offset = 0; offset < bytes.byteLength; offset += 16 * 1024) {
-              if (write(bytes.subarray(offset, Math.min(offset + 16 * 1024, bytes.byteLength))) !== true) {
+              const chunk = bytes.subarray(offset, Math.min(offset + 16 * 1024, bytes.byteLength));
+              const written = await write(chunk);
+              if (written !== true && Number(written) !== chunk.byteLength) {
                 await this.cancel(new Error("Subprocess stdin closed"));
                 return null;
               }
@@ -690,6 +785,30 @@ export function createBunSpawnRuntime(deps) {
       normalizeOptions(options, { stdin: "ignore", stdout: "pipe", stderr: "inherit" }, false),
       args,
     );
+    const useWindowsPipeIpc = isWindowsPlatform && nativeOptions.ipc && isCurrentExecutable(file);
+    let windowsPipeIpcIndex = -1;
+    if (useWindowsPipeIpc) {
+      const extraStdio = Array.from(nativeOptions.extraStdio ?? []);
+      windowsPipeIpcIndex = extraStdio.indexOf("ipc");
+      if (windowsPipeIpcIndex < 0) {
+        windowsPipeIpcIndex = extraStdio.length;
+        extraStdio.push("pipe");
+      } else {
+        extraStdio[windowsPipeIpcIndex] = "pipe";
+      }
+      const env = { ...(nativeOptions.env ?? globalThis.process?.env ?? {}) };
+      env.COTTONTAIL_IPC_BOOTSTRAP = "node";
+      env.COTTONTAIL_IPC_PIPE = "1";
+      env.COTTONTAIL_IPC_FD = String(windowsPipeIpcIndex + 3);
+      env.COTTONTAIL_IPC_SERIALIZATION = nativeOptions.serialization;
+      env.COTTONTAIL_IPC_PEER_PID = String(globalThis.process?.pid ?? 0);
+      delete env.COTTONTAIL_IPC_STDIO;
+      delete env.NODE_CHANNEL_FD;
+      delete env.NODE_CHANNEL_SERIALIZATION_MODE;
+      nativeOptions.extraStdio = extraStdio;
+      nativeOptions.env = env;
+      nativeOptions.clearEnv = true;
+    }
     const readableInput = prepareReadableInput(nativeOptions.input);
     const listeners = new Map();
     let killed = false;
@@ -715,6 +834,11 @@ export function createBunSpawnRuntime(deps) {
     let extraFds = [];
     let stdoutPipe = null;
     let stderrPipe = null;
+    let ipcPipe = null;
+    let ipcPipeFd = -1;
+    let ipcPipePollTimer = null;
+    let ipcPipeReady = !useWindowsPipeIpc;
+    const pendingPipeIpcSends = [];
     const terminal = nativeOptions.terminal;
 
     const child = {
@@ -785,14 +909,20 @@ export function createBunSpawnRuntime(deps) {
         } else if (sendOptions !== undefined && (sendOptions === null || typeof sendOptions !== "object")) {
           throw new TypeError('The "options" argument must be of type object.');
         }
-        if (!nativeOptions.ipc || disconnected || !Number.isInteger(child._ipcFd) || child._ipcFd < 0) {
+        if (
+          !nativeOptions.ipc ||
+          disconnected ||
+          (useWindowsPipeIpc
+            ? ipcPipe == null
+            : !Number.isInteger(child._ipcFd) || child._ipcFd < 0)
+        ) {
           const error = new Error("Channel closed");
           error.code = "ERR_IPC_CHANNEL_CLOSED";
           if (typeof callback === "function") queueMicrotask(() => callback(error));
           else emit("error", error);
           return false;
         }
-        let ok = false;
+        let record;
         try {
           const handleInfo = bunSpawnIpcHandleInfo(sendHandle);
           if (sendHandle != null && handleInfo == null) {
@@ -800,23 +930,33 @@ export function createBunSpawnRuntime(deps) {
             error.code = "ERR_INVALID_HANDLE_TYPE";
             throw error;
           }
-          ok = host.ipcSend?.(
-            child._ipcFd,
-            encodeBunSpawnIpc(message, child._nodeIpcProtocol, nativeOptions.serialization),
-            handleInfo?.fd ?? -1,
-          ) === true;
+          if (useWindowsPipeIpc && handleInfo != null) {
+            throw new Error("IPC handle passing is unavailable on this platform");
+          }
+          record = {
+            callback: typeof callback === "function" ? callback : null,
+            frame: encodeBunSpawnIpc(message, child._nodeIpcProtocol, nativeOptions.serialization),
+            handleFd: handleInfo?.fd ?? -1,
+          };
         } catch (error) {
           if (typeof callback === "function") queueMicrotask(() => callback(error));
           else emit("error", error);
           return false;
         }
-        if (typeof callback === "function") queueMicrotask(() => callback(ok ? null : new Error("write failed")));
-        return ok;
+        if (useWindowsPipeIpc && !ipcPipeReady) {
+          pendingPipeIpcSends.push(record);
+          return true;
+        }
+        return writeIpcRecord(record);
       },
       disconnect() {
         if (!nativeOptions.ipc || disconnected) return;
         disconnected = true;
-        host.spawnCloseIpc?.(child._id);
+        if (useWindowsPipeIpc) {
+          failPendingPipeIpcSends();
+          ipcPipe?.end?.();
+        }
+        else host.spawnCloseIpc?.(child._id);
       },
       resourceUsage() { return resourceUsage; },
       [Symbol.dispose]() {
@@ -832,10 +972,150 @@ export function createBunSpawnRuntime(deps) {
       for (const handler of [...(listeners.get(name) ?? [])]) handler(...args);
     }
 
+    function writeIpcRecord(record) {
+      let ok = false;
+      try {
+        if (useWindowsPipeIpc) {
+          if (ipcPipe == null || ipcPipe.destroyed) throw channelClosedError();
+          ok = ipcPipe.write(record.frame, error => record.callback?.(error ?? null)) !== false;
+        } else {
+          ok = host.ipcSend?.(child._ipcFd, record.frame, record.handleFd) === true;
+          if (record.callback) queueMicrotask(() => record.callback(ok ? null : new Error("write failed")));
+        }
+      } catch (error) {
+        if (record.callback) queueMicrotask(() => record.callback(error));
+        else emit("error", error);
+        return false;
+      }
+      return ok;
+    }
+
+    function channelClosedError() {
+      const error = new Error("Channel closed");
+      error.code = "ERR_IPC_CHANNEL_CLOSED";
+      return error;
+    }
+
+    function markPipeIpcReady() {
+      if (!useWindowsPipeIpc || ipcPipeReady) return;
+      ipcPipeReady = true;
+      for (const record of pendingPipeIpcSends.splice(0)) {
+        if (disconnected || ipcPipe == null || ipcPipe.destroyed) {
+          if (record.callback) queueMicrotask(() => record.callback(channelClosedError()));
+          continue;
+        }
+        writeIpcRecord(record);
+      }
+    }
+
+    function failPendingPipeIpcSends(error = channelClosedError()) {
+      for (const record of pendingPipeIpcSends.splice(0)) {
+        if (record.callback) queueMicrotask(() => record.callback(error));
+      }
+    }
+
+    function handleIpcChunk(data, receivedFd = undefined) {
+      if (Number.isInteger(receivedFd) && receivedFd >= 0) {
+        if (Number.isInteger(ipcPendingFd) && ipcPendingFd >= 0) {
+          try { host.closeFd?.(ipcPendingFd); } catch {}
+        }
+        ipcPendingFd = Number(receivedFd);
+      }
+      ipcBuffer += typeof data === "string"
+        ? data
+        : ipcDecoder.decode(data ?? new ArrayBuffer(0), { stream: true });
+      for (;;) {
+        const newline = ipcBuffer.indexOf("\n");
+        if (newline < 0) break;
+        const line = ipcBuffer.slice(0, newline).replace(/\r$/, "");
+        ipcBuffer = ipcBuffer.slice(newline + 1);
+        if (line.trim() === "") continue;
+        const frameFd = ipcPendingFd;
+        ipcPendingFd = undefined;
+        let message;
+        try { message = decodeBunSpawnIpc(line); }
+        catch (error) {
+          if (Number.isInteger(frameFd) && frameFd >= 0) {
+            try { host.closeFd?.(frameFd); } catch {}
+          }
+          if (!isCottontailIpcFrame(line)) continue;
+          emit("error", error);
+          continue;
+        }
+        if (
+          useWindowsPipeIpc &&
+          message != null &&
+          typeof message === "object" &&
+          message[nodeIpcEnvelopeKey] === 2
+        ) {
+          if (Number.isInteger(frameFd) && frameFd >= 0) {
+            try { host.closeFd?.(frameFd); } catch {}
+          }
+          markPipeIpcReady();
+          continue;
+        }
+        const handle = adoptBunSpawnIpcHandle(host, frameFd);
+        if (typeof nativeOptions.ipcCallback !== "function") {
+          handle?.destroy?.();
+          continue;
+        }
+        try { nativeOptions.ipcCallback.call(child, message, child, handle); }
+        catch (error) { queueMicrotask(() => { throw error; }); }
+      }
+    }
+
+    function finishIpcRead() {
+      ipcBuffer += ipcDecoder.decode();
+      if (Number.isInteger(ipcPendingFd) && ipcPendingFd >= 0) {
+        try { host.closeFd?.(ipcPendingFd); } catch {}
+        ipcPendingFd = undefined;
+      }
+    }
+
+    function stopPipeIpcReader() {
+      if (ipcPipePollTimer != null) {
+        clearInterval(ipcPipePollTimer);
+        ipcPipePollTimer = null;
+      }
+    }
+
+    function pollPipeIpc() {
+      if (!useWindowsPipeIpc || ipcPipeFd < 0) return;
+      try {
+        for (;;) {
+          const data = host.readFd?.(ipcPipeFd, 1024 * 1024);
+          if (data == null) return;
+          const length = Number(data.byteLength ?? 0);
+          if (length === 0) {
+            stopPipeIpcReader();
+            finishIpcRead();
+            notifyDisconnect();
+            ipcPipeFd = -1;
+            ipcPipe?.destroy?.();
+            return;
+          }
+          handleIpcChunk(data);
+        }
+      } catch (error) {
+        stopPipeIpcReader();
+        if (!processExited && !nativeClosed) emit("error", error);
+        notifyDisconnect();
+        ipcPipeFd = -1;
+        ipcPipe?.destroy?.();
+      }
+    }
+
+    function startPipeIpcReader() {
+      if (!useWindowsPipeIpc || ipcPipeFd < 0 || ipcPipePollTimer != null) return;
+      ipcPipePollTimer = setInterval(pollPipeIpc, 1);
+      pollPipeIpc();
+    }
+
     function notifyDisconnect() {
       if (disconnectNotified || !nativeOptions.ipc) return;
       disconnectNotified = true;
       disconnected = true;
+      failPendingPipeIpcSends();
       if (typeof nativeOptions.onDisconnect === "function") {
         try { nativeOptions.onDisconnect.call(child, true); }
         catch (error) { queueMicrotask(() => { throw error; }); }
@@ -858,10 +1138,13 @@ export function createBunSpawnRuntime(deps) {
       }
       native = host.spawnStart(file, args, {
         ...nativeOptions,
+        ipc: useWindowsPipeIpc ? false : nativeOptions.ipc,
         stdin: nativeOptions.stdinFd ?? nativeOptions.stdin,
         stdout: nativeOptions.stdoutFd ?? stdoutRedirectFd ?? nativeOptions.stdout,
         stderr: nativeOptions.stderrFd ?? stderrRedirectFd ?? nativeOptions.stderr,
         extraStdio: nativeOptions.extraStdio,
+        windowsOverlappedStdioFd:
+          useWindowsPipeIpc ? windowsPipeIpcIndex + 3 : undefined,
         nodeIpc: child._nodeIpcProtocol,
         argv0: nativeOptions.argv0,
         detached: nativeOptions.detached,
@@ -888,13 +1171,42 @@ export function createBunSpawnRuntime(deps) {
         nativeOptions.stderrFilePath == null && nativeOptions.stderrBuffer == null) {
       stderrPipe = new ProcessReadableSlot(concatChunks, () => host.spawnCloseOutput?.(native.id, 2));
     }
-    extraFds = Array.isArray(native.extraFds) ? native.extraFds : [];
+    extraFds = Array.isArray(native.extraFds) ? Array.from(native.extraFds) : [];
+    if (useWindowsPipeIpc) {
+      const ipcFd = Number(extraFds[windowsPipeIpcIndex]);
+      if (!Number.isInteger(ipcFd) || ipcFd < 0) {
+        try { host.spawnKill?.(native.id, 15); } catch {}
+        try { host.spawnDispose?.(native.id); } catch {}
+        throw new Error("Failed to create the Windows IPC pipe");
+      }
+      try {
+        ipcPipe = new NetSocket({
+          fd: ipcFd,
+          pipe: true,
+          readable: false,
+          readableHighWaterMark: 1024 * 1024,
+          writableHighWaterMark: 1024 * 1024,
+        });
+        ipcPipeFd = ipcFd;
+      } catch (error) {
+        try { host.closeFd?.(ipcFd); } catch {}
+        try { host.spawnKill?.(native.id, 15); } catch {}
+        try { host.spawnDispose?.(native.id); } catch {}
+        throw error;
+      }
+      // The IPC descriptor belongs to its duplex socket and is not public
+      // subprocess stdio or finalizer-owned extra stdio.
+      extraFds[windowsPipeIpcIndex] = null;
+    }
     while (extraFds.length > 0 && extraFds.at(-1) == null) extraFds.pop();
     const ownedExtraFds = extraFds.filter((fd, index) =>
       Number.isInteger(fd) && fd >= 0 && nativeOptions.extraStdio?.[index] === "pipe"
     );
     if (ownedExtraFds.length > 0) extraFdFinalizer?.register(child, ownedExtraFds);
     child.pid = native.pid;
+    const stdinWriter = nativeOptions.stdin === "pipe" && nativeOptions.stdinFd == null
+      ? new ProcessWritable(host, native.id, asBuffer, native.stdinFd)
+      : null;
     child.stdin = terminal
       ? null
       : nativeOptions.stdinFd != null && nativeOptions.stdinFd !== 0
@@ -902,21 +1214,26 @@ export function createBunSpawnRuntime(deps) {
         : readableInput != null
           ? nativeOptions.input
           : nativeOptions.stdin === "pipe" && nativeOptions.input === undefined
-            ? new ProcessWritable(host, native.id, asBuffer)
+            ? stdinWriter
             : undefined;
 
     if (nativeOptions.input !== undefined) {
       void (async () => {
         try {
-          if (readableInput != null) return await readableInput.pump(bytes => host.spawnWrite?.(native.id, bytes));
+          if (readableInput != null) return await readableInput.pump(bytes => stdinWriter?.write(bytes) ?? false);
           const bytes = await bytesFromBody(nativeOptions.input);
-          if (bytes.byteLength > 0 && host.spawnWrite?.(native.id, bytes) !== true) return new Error("write failed");
+          if (bytes.byteLength > 0) {
+            const written = await stdinWriter?.write(bytes);
+            if (Number(written) !== bytes.byteLength) return new Error("write failed");
+          }
           return null;
         } catch (error) {
           return error;
         }
-      })().then(error => {
-        host.spawnCloseStdin?.(native.id);
+      })().then(async error => {
+        try { await stdinWriter?.end(); } catch (closeError) {
+          error ??= closeError;
+        }
         if (error != null && (listeners.get("error")?.length ?? 0) > 0) emit("error", error);
       });
     }
@@ -951,7 +1268,7 @@ export function createBunSpawnRuntime(deps) {
         try {
           terminalProcessExited(terminal, exitCode, signalCode);
           if (readableInput != null && !readableInput.finished) void readableInput.cancel(new Error("Subprocess exited"));
-          child.stdin?._processExited?.();
+          stdinWriter?._processExited?.();
           resolve(exitCode ?? (signalNumber > 0 ? 128 + signalNumber : null));
           if (typeof nativeOptions.onExit === "function") {
             try { nativeOptions.onExit.call(child, child, exitCode, signalCode, undefined); }
@@ -1012,47 +1329,11 @@ export function createBunSpawnRuntime(deps) {
           return;
         }
         if (event.type === "ipc") {
-          if (Number.isInteger(event.fd) && event.fd >= 0) {
-            if (Number.isInteger(ipcPendingFd) && ipcPendingFd >= 0) {
-              try { host.closeFd?.(ipcPendingFd); } catch {}
-            }
-            ipcPendingFd = Number(event.fd);
-          }
-          ipcBuffer += ipcDecoder.decode(event.data ?? new ArrayBuffer(0), { stream: true });
-          for (;;) {
-            const newline = ipcBuffer.indexOf("\n");
-            if (newline < 0) break;
-            const line = ipcBuffer.slice(0, newline).replace(/\r$/, "");
-            ipcBuffer = ipcBuffer.slice(newline + 1);
-            if (line.trim() === "") continue;
-            const frameFd = ipcPendingFd;
-            ipcPendingFd = undefined;
-            let message;
-            try { message = decodeBunSpawnIpc(line); }
-            catch (error) {
-              if (Number.isInteger(frameFd) && frameFd >= 0) {
-                try { host.closeFd?.(frameFd); } catch {}
-              }
-              if (!isCottontailIpcFrame(line)) continue;
-              emit("error", error);
-              continue;
-            }
-            const handle = adoptBunSpawnIpcHandle(host, frameFd);
-            if (typeof nativeOptions.ipcCallback !== "function") {
-              handle?.destroy?.();
-              continue;
-            }
-            try { nativeOptions.ipcCallback.call(child, message, child, handle); }
-            catch (error) { queueMicrotask(() => { throw error; }); }
-          }
+          handleIpcChunk(event.data, event.fd);
           return;
         }
         if (event.type === "ipc_end") {
-          ipcBuffer += ipcDecoder.decode();
-          if (Number.isInteger(ipcPendingFd) && ipcPendingFd >= 0) {
-            try { host.closeFd?.(ipcPendingFd); } catch {}
-            ipcPendingFd = undefined;
-          }
+          finishIpcRead();
           notifyDisconnect();
           return;
         }
@@ -1063,6 +1344,14 @@ export function createBunSpawnRuntime(deps) {
         if (event.type === "close") completeClose();
       });
     });
+
+    if (ipcPipe != null) {
+      ipcPipe.on("error", error => {
+        stopPipeIpcReader();
+        emit("error", error);
+      });
+      startPipeIpcReader();
+    }
 
     // A Cottontail child can publish IPC or exit before the host listener is
     // registered. Release it only after this listener owns every process event.

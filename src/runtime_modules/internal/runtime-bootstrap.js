@@ -8,6 +8,27 @@ const bunSleepSetTimeout = globalThis.setTimeout.bind(globalThis);
 
 globalThis.__cottontailRemapStackString ??= remapStackString;
 globalThis.__cottontailSourceContextForLocation ??= sourceContextForLocation;
+
+function normalizeUncaughtReferenceError(error) {
+  if (error?.name !== "ReferenceError" ||
+      typeof error.message !== "string" ||
+      !error.message.startsWith("Can't find variable: ")) {
+    return undefined;
+  }
+  const normalizedMessage = `${error.message.slice("Can't find variable: ".length)} is not defined`;
+  const headers = [`ReferenceError: ${error.message}`, `ReferenceError: ${normalizedMessage}`];
+  try { error.message = normalizedMessage; } catch {}
+  if (typeof error.stack === "string") {
+    try { error.stack = error.stack.replace(headers[0], headers[1]); } catch {}
+  }
+  return headers;
+}
+
+globalThis.__cottontailNormalizeUncaughtException ??= error => {
+  normalizeUncaughtReferenceError(error);
+  return error;
+};
+
 globalThis.__cottontailFormatUncaughtException ??= (error) => {
   if (error?.__cottontailFormattedStack === true && typeof error.stack === "string") {
     return error.stack;
@@ -15,12 +36,7 @@ globalThis.__cottontailFormatUncaughtException ??= (error) => {
   if (error?.name === "ResolveMessage" && typeof error.message === "string") {
     return `error: ${error.message}`;
   }
-  let referenceErrorHeaders;
-  if (error?.name === "ReferenceError" && typeof error.message === "string" && error.message.startsWith("Can't find variable: ")) {
-    const normalizedMessage = `${error.message.slice("Can't find variable: ".length)} is not defined`;
-    referenceErrorHeaders = [`ReferenceError: ${error.message}`, `ReferenceError: ${normalizedMessage}`];
-    try { error.message = normalizedMessage; } catch {}
-  }
+  const referenceErrorHeaders = normalizeUncaughtReferenceError(error);
   if (error && typeof error.stack === "string") {
     let stack = remapStackString(error.stack);
     if (referenceErrorHeaders) stack = stack.replace(referenceErrorHeaders[0], referenceErrorHeaders[1]);
