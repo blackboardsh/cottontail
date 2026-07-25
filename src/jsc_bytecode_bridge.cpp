@@ -292,14 +292,7 @@ private:
     WTF::Vector<CacheUpdate> m_updates;
 };
 
-#if OS(LINUX)
-// COTTONTAIL-COMPAT: The pinned Linux JSC SDK has a smaller release-mode
-// WTF::Variant layout than Darwin.
-constexpr size_t expected_cache_payload_size = 0x18;
-constexpr size_t expected_function_update_size = 0x28;
-constexpr size_t expected_cache_update_size = 0x30;
-constexpr size_t expected_cached_bytecode_size = 0x40;
-#elif OS(WINDOWS)
+#if OS(WINDOWS)
 // MSVC's pinned WTF::Variant layout carries one additional pointer-sized
 // word compared with Darwin's release layout.
 constexpr size_t expected_cache_payload_size = 0x28;
@@ -307,6 +300,7 @@ constexpr size_t expected_function_update_size = 0x38;
 constexpr size_t expected_cache_update_size = 0x40;
 constexpr size_t expected_cached_bytecode_size = 0x50;
 #else
+// Darwin and the HAVE_MMAP-enabled Linux archive share these release layouts.
 constexpr size_t expected_cache_payload_size = 0x20;
 constexpr size_t expected_function_update_size = 0x30;
 constexpr size_t expected_cache_update_size = 0x38;

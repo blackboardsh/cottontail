@@ -212,7 +212,6 @@ fn compileLinuxCppSource(
         "-stdlib=libstdc++",
         "-DJS_NO_EXPORT=1",
         "-fno-rtti",
-        "-Wno-character-conversion",
         "-fPIC",
         "-c",
     });
