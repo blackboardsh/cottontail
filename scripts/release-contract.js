@@ -26,7 +26,7 @@ export function parseSemver(version) {
 export function releaseChannel(version) {
   const parsed = parseSemver(version);
   if (!parsed) throw new Error(`Invalid semantic version: ${version}`);
-  return parsed.prerelease.length === 0 ? 'stable' : 'canary';
+  return parsed.prerelease.length === 0 ? 'production' : 'canary';
 }
 
 export function validateReleaseTag(tag, version) {
@@ -196,7 +196,7 @@ function validatePlatform(platform) {
 }
 
 function validateChannel(channel) {
-  if (channel !== 'stable' && channel !== 'canary') {
+  if (channel !== 'production' && channel !== 'canary') {
     throw new Error(`Unsupported release channel: ${channel}`);
   }
 }

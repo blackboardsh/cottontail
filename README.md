@@ -113,15 +113,15 @@ The native matrix exercises the platform host bridge on each supported target.
 ### Release publishing
 
 Tags are the only release trigger. A tag must exactly match the version in
-`package.json` and `src/version.zig`. A plain `vX.Y.Z` tag advances the stable
-channel; any valid semantic-version prerelease tag, such as
+`package.json` and `src/version.zig`. A plain `vX.Y.Z` tag advances the production
+target; any valid semantic-version prerelease tag, such as
 `vX.Y.Z-canary.N`, advances the canary channel.
 
 Run `dash push:canary` to propose the next `canary.N` release, or
-`dash push:stable` to propose the matching stable version. Both commands allow
+`dash push:production` to propose a production version. Both commands allow
 editing the proposed semantic version before they commit, tag, and atomically
 push `main` and the tag. Running `node scripts/tag-release.js` directly
-proposes the next minor stable version.
+proposes the next minor production version.
 
 After every tagged matrix job succeeds, a fan-in job uploads the complete release
 to Cloudflare R2. Configure these GitHub repository secrets:
@@ -145,7 +145,7 @@ revision and version paths:
 Version manifests reference the same revision archives rather than uploading a
 second copy. Consumers discover the current releases through:
 
-- `cottontail/channels/stable.json`
+- `cottontail/channels/production.json`
 - `cottontail/channels/canary.json`
 
 The publisher uploads every archive and both immutable manifests before replacing

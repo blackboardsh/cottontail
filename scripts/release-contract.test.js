@@ -28,8 +28,8 @@ const artifacts = [
   size: 100 + index,
 }));
 
-test('classifies stable and prerelease semver channels', () => {
-  assert.equal(releaseChannel('1.2.3'), 'stable');
+test('classifies production and canary release targets', () => {
+  assert.equal(releaseChannel('1.2.3'), 'production');
   assert.equal(releaseChannel('1.2.3-canary.7'), 'canary');
   assert.equal(releaseChannel('1.2.3-rc.1+build.4'), 'canary');
   assert.deepEqual(parseSemver('0.1.0-beta.1')?.prerelease, ['beta', '1']);
@@ -46,7 +46,7 @@ test('rejects malformed versions and mismatched tags', () => {
   assert.deepEqual(validateReleaseTag('v1.2.3', '1.2.3'), {
     tag: 'v1.2.3',
     version: '1.2.3',
-    channel: 'stable',
+    channel: 'production',
   });
 });
 

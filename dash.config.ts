@@ -2,6 +2,6 @@
 export default {
   scripts: {
     "push:canary": "node scripts/tag-release.js canary",
-    "push:stable": "node scripts/tag-release.js stable",
+    "push:production": "node scripts/tag-release.js production",
   },
 };

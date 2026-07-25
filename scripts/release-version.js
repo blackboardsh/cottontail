@@ -50,6 +50,17 @@ export function compareReleaseVersions(left, right) {
   return 0;
 }
 
+export function releaseTargetForVersion(value) {
+  const version = typeof value === "string" ? parseReleaseVersion(value) : value;
+  if (!version) throw new Error("Cannot classify an invalid semantic version");
+  return version.prerelease.length === 0 ? "production" : "canary";
+}
+
+export function isReleaseVersionForMode(mode, value) {
+  if (mode === "manual") return true;
+  return releaseTargetForVersion(value) === mode;
+}
+
 function formatCore(core) {
   return core.join(".");
 }
@@ -59,7 +70,7 @@ function nextMinor(version, suffix = "") {
 }
 
 export function suggestReleaseVersion(mode, currentValue, latestValue = null) {
-  if (!["canary", "stable", "manual"].includes(mode)) {
+  if (!["canary", "production", "manual"].includes(mode)) {
     throw new Error(`Unsupported release mode: ${mode}`);
   }
   const current = parseReleaseVersion(currentValue);
@@ -70,7 +81,7 @@ export function suggestReleaseVersion(mode, currentValue, latestValue = null) {
   const base = latest && compareReleaseVersions(latest, current) > 0 ? latest : current;
 
   if (mode === "manual") return nextMinor(base);
-  if (mode === "stable") {
+  if (mode === "production") {
     return base.prerelease.length > 0 ? formatCore(base.core) : nextMinor(base);
   }
 

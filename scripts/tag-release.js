@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   compareReleaseVersions,
+  isReleaseVersionForMode,
   parseReleaseVersion,
   suggestReleaseVersion,
 } from "./release-version.js";
@@ -40,14 +41,14 @@ function updateDashPin(path, field, version) {
 }
 
 if (process.argv.includes("--help")) {
-  console.log("Usage: node scripts/tag-release.js [canary|stable]");
+  console.log("Usage: node scripts/tag-release.js [canary|production]");
   console.log("Prompt for a semantic version, then commit, tag, and atomically push it.");
   process.exit(0);
 }
 
 const mode = process.argv[2] ?? "manual";
-if (!["canary", "stable", "manual"].includes(mode)) {
-  fail(`expected canary or stable, received ${JSON.stringify(mode)}`);
+if (!["canary", "production", "manual"].includes(mode)) {
+  fail(`expected canary or production, received ${JSON.stringify(mode)}`);
 }
 
 if (git(["branch", "--show-current"]) !== "main") {
@@ -71,7 +72,10 @@ const versions = git(["tag", "--list", "v*"])
   .map((tag) => ({ tag, version: parseReleaseVersion(tag.replace(/^v/, "")) }))
   .filter((entry) => entry.version)
   .sort((left, right) => compareReleaseVersions(right.version, left.version));
-const latest = versions[0] ?? null;
+const targetVersions = versions.filter((entry) =>
+  isReleaseVersionForMode(mode, entry.version)
+);
+const latest = targetVersions[0] ?? null;
 const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
 const current = parseReleaseVersion(packageJson.version);
 if (!current) fail(`package.json contains an invalid version: ${packageJson.version}`);
@@ -81,7 +85,7 @@ const suggested = suggestReleaseVersion(
   latest?.version.version,
 );
 
-console.log(`Latest tag:      ${latest?.tag ?? "(none)"}`);
+console.log(`Latest ${mode} tag: ${latest?.tag ?? "(none)"}`);
 console.log(`Package version: v${packageJson.version}`);
 if (ahead > 0) console.log(`Local main:      ${ahead} unpushed commit(s) ahead of origin/main`);
 
@@ -93,6 +97,10 @@ const next = parseReleaseVersion(answer);
 if (!next) {
   prompt.close();
   fail(`"${answer}" is not a valid semantic version`);
+}
+if (!isReleaseVersionForMode(mode, next)) {
+  prompt.close();
+  fail(`v${answer} is not a ${mode} release version`);
 }
 if (latest && compareReleaseVersions(next, latest.version) <= 0) {
   prompt.close();
