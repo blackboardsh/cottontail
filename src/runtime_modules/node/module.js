@@ -946,6 +946,8 @@ const kUnwrapDefaultBuiltins = new Set([
   "node:fs/promises",
   "dns/promises",
   "node:dns/promises",
+  "stream/promises",
+  "node:stream/promises",
   // Node's HTTP interceptors replace methods on the mutable CommonJS export.
   // Keep require(), ESM default imports, and named wrappers on that one object.
   "http",
@@ -955,10 +957,13 @@ const kUnwrapDefaultBuiltins = new Set([
   "stream",
   "node:stream",
 ]);
-const kBuiltinNonEnumerableNamedExports = new Map([
-  // The CommonJS stream export is the Stream constructor. Its ESM namespace
-  // additionally exposes the deliberately non-enumerable `promises` property.
+const kBuiltinSharedSyntheticNamespaceExports = new Map([
+  // The CommonJS stream export is the Stream constructor. Keep the bare and
+  // node: ESM aliases on one synthetic namespace with the documented binding.
   ["stream", ["promises"]],
+  // Preserve the real ESM namespace while unwrapping require() to the exact
+  // object exposed as require("stream").promises.
+  ["stream/promises", ["finished", "pipeline"]],
 ]);
 const bufferMaxLengthStateKey = Symbol.for("cottontail.node.buffer.kMaxLength");
 
@@ -989,7 +994,7 @@ export function __setBuiltinModules(modules) {
       Object.hasOwn(value, "default");
     let importNamespace;
     const canonicalName = name.replace(/^node:/, "");
-    const additionalNamedExports = kBuiltinNonEnumerableNamedExports.get(canonicalName);
+    const additionalNamedExports = kBuiltinSharedSyntheticNamespaceExports.get(canonicalName);
     if (additionalNamedExports !== undefined) {
       if (isNamespace) {
         importNamespace = value;

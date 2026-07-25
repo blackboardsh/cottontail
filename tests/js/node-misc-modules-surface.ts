@@ -39,6 +39,17 @@ assert(normalizedImportMetaPath.endsWith("/tests/js/node-misc-modules-surface.ts
 assert(importMetaDir.replaceAll("\\", "/").endsWith("/tests/js"), "destructured import.meta.dir mismatch");
 assert(importMetaURL.endsWith("/tests/js/node-misc-modules-surface.ts"), "destructured import.meta.url mismatch");
 
+const spacedImportMeta = await import("./fixtures/import meta ~@% target.ts");
+assert(
+  spacedImportMeta.path.replaceAll("\\", "/").endsWith("/tests/js/fixtures/import meta ~@% target.ts"),
+  "space-containing import.meta.path mismatch",
+);
+assert(
+  spacedImportMeta.url.endsWith("/tests/js/fixtures/import%20meta%20%7E@%25%20target.ts") &&
+    !spacedImportMeta.url.includes("\\"),
+  "escaped import.meta.url mismatch",
+);
+
 class AsyncPrivateMethod {
   async #import() { return 42; }
   read() { return this.#import(); }

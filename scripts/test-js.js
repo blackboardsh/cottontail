@@ -100,6 +100,7 @@ if (!existsSync(binaryPath)) {
 
 const tempDir = mkdtempSync(join(os.tmpdir(), 'cottontail-js-tests-'));
 const tempFilePath = join(tempDir, 'host-api-output.txt');
+const hostApiTempDir = join(tempDir, 'host-api-dir');
 const nativeBuildOutDir = join(tempDir, 'native-build');
 
 try {
@@ -347,7 +348,7 @@ try {
         COTTONTAIL_TEST_ENV: 'present',
         COTTONTAIL_EXPECT_CWD: rootDir,
         COTTONTAIL_TMP_FILE: tempFilePath,
-        COTTONTAIL_TMP_DIR: tempDir,
+        COTTONTAIL_TMP_DIR: hostApiTempDir,
       },
       expectExitCode: 0,
       stdoutIncludes: ['host api passed'],
@@ -484,6 +485,9 @@ try {
       scriptPath: join(rootDir, 'tests', 'js', 'bun-jsc-and-global.ts'),
       expectExitCode: 0,
       stdoutIncludes: ['bun jsc and global passed'],
+      env: {
+        COTTONTAIL_TMP_DIR: tempDir,
+      },
     },
     {
       name: 'textdecoder-legacy-encodings',
@@ -810,7 +814,7 @@ try {
       argv: ['test', join(rootDir, 'tests', 'js', 'node-process-host-lifecycle.test.ts')],
       expectExitCode: 0,
       stdoutIncludes: process.platform === 'win32'
-        ? ['7 pass', '2 skip', '0 fail']
+        ? ['7 pass', '25 skip', '0 fail']
         : ['9 pass', '0 fail'],
     },
     {

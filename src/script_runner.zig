@@ -8868,8 +8868,6 @@ fn appendDynamicTargetFactory(
     );
     const path_literal = try jsonStringLiteral(ctx, target.path);
     const raw_literal = try jsonStringLiteral(ctx, raw_source);
-    const file_url = try std.fmt.allocPrint(ctx.allocator, "file://{s}", .{target.path});
-    const url_literal = try jsonStringLiteral(ctx, file_url);
     const dirname = std.fs.path.dirname(target.path) orelse ctx.project_root;
     const dirname_literal = try jsonStringLiteral(ctx, dirname);
     const basename_literal = try jsonStringLiteral(ctx, std.fs.path.basename(target.path));
@@ -8888,7 +8886,7 @@ fn appendDynamicTargetFactory(
 
     const prefix = try std.fmt.allocPrint(ctx.allocator,
         \\const __ctPath{d} = {s};
-        \\const __ctURL{d} = {s};
+        \\const __ctURL{d} = __ctDynamicPathToFileURL(__ctPath{d}).href;
         \\function __ctLoad{d}(specifier, options) {{
         \\  const __ctText = String(specifier);
         \\  const __ctMarker = __ctText.search(/[?#]/);
@@ -8930,7 +8928,7 @@ fn appendDynamicTargetFactory(
         \\    const module = {{ exports: {{}} }};
         \\    const exports = module.exports;
         \\
-    , .{ index, path_literal, index, url_literal, index, index, index, inferred_loader_literal, index, index, dirname_literal, dirname_literal, basename_literal, index, index, index, index, index, raw_literal, index, index, index, index });
+    , .{ index, path_literal, index, index, index, index, index, inferred_loader_literal, index, index, dirname_literal, dirname_literal, basename_literal, index, index, index, index, index, raw_literal, index, index, index, index });
     try output.appendSlice(ctx.allocator, prefix);
     try output.appendSlice(ctx.allocator, "    const __ctDefaultFactorySource = ");
     try appendDynamicFactorySourceLiteral(
@@ -8958,7 +8956,11 @@ fn appendDynamicTargetFactory(
     }
     try output.appendSlice(ctx.allocator, "};\n    const __ctFactorySource = __ctType == null || (__ctType === __ctInferredType && __ctJavaScriptFactories[__ctType] == null) ? __ctDefaultFactorySource : __ctJavaScriptFactories[__ctType];\n    if (__ctFactorySource == null) ");
     try output.appendSlice(ctx.allocator, factory_error);
-    try output.appendSlice(ctx.allocator, "\n    new Function(\"module\", \"exports\", \"require\", \"__ctImportMeta\", \"__ctDynamicImport\", __ctFactorySource)(module, exports, __ctCreateRequire(__ctPath");
+    if (builtin.os.tag == .windows) {
+        try output.appendSlice(ctx.allocator, "\n    globalThis.cottontail.compileFunction(\"(function anonymous(module, exports, require, __ctImportMeta, __ctDynamicImport\\n) {\\n\" + __ctFactorySource + \"\\n})\", __ctImportMeta.url)(module, exports, __ctCreateRequire(__ctPath");
+    } else {
+        try output.appendSlice(ctx.allocator, "\n    new Function(\"module\", \"exports\", \"require\", \"__ctImportMeta\", \"__ctDynamicImport\", __ctFactorySource)(module, exports, __ctCreateRequire(__ctPath");
+    }
     try output.appendSlice(ctx.allocator, try std.fmt.allocPrint(ctx.allocator, "{d}", .{index}));
     // The target promise's normalization catch adds one reaction of its own.
     // Two empty reactions keep nested evaluation behind both that propagation
@@ -9010,12 +9012,10 @@ fn appendDynamicDispatcher(
     );
     for (targets, 0..) |target, index| {
         const path_literal = try jsonStringLiteral(ctx, target.path);
-        const file_url = try std.fmt.allocPrint(ctx.allocator, "file://{s}", .{target.path});
-        const url_literal = try jsonStringLiteral(ctx, file_url);
         const branch = try std.fmt.allocPrint(
             ctx.allocator,
-            "  if (__ctBare === {s} || __ctBare === {s}) return __ctLoad{d}(__ctText, options);\n",
-            .{ path_literal, url_literal, index },
+            "  if (__ctBare === {s} || __ctBare === __ctURL{d}) return __ctLoad{d}(__ctText, options);\n",
+            .{ path_literal, index, index },
         );
         try output.appendSlice(ctx.allocator, branch);
     }
@@ -9201,6 +9201,7 @@ fn rewriteQueryImports(
     try output.appendSlice(ctx.allocator,
         \\import { Database as __ctLoaderDatabase } from "bun:sqlite";
         \\import { createRequire as __ctCreateRequire } from "node:module";
+        \\import { pathToFileURL as __ctDynamicPathToFileURL } from "node:url";
         \\import { parse as __ctParseJSON5 } from 
     );
     try output.appendSlice(ctx.allocator, json5_literal);

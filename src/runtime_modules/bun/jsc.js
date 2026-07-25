@@ -259,19 +259,53 @@ export function setTimezone(value) {
   return setTimeZone(value);
 }
 
+function normalizeNativeCallerSourceOrigin(origin) {
+  if (typeof origin !== "string" || origin.length === 0) return "";
+  const normalized = origin.replaceAll("\\", "/");
+  const lowerOrigin = normalized.toLowerCase();
+  if (
+    lowerOrigin.includes("/cottontail/cache/esm-entry-") ||
+    /\/run\/[0-9a-f]+\/script\.bundle\.mjs(?:[?#]|$)/.test(lowerOrigin)
+  ) {
+    return "";
+  }
+
+  let drivePath;
+  if (/^[A-Za-z]:\//.test(normalized)) {
+    drivePath = normalized;
+  } else if (/^file:\/\/\/[A-Za-z]:\//.test(normalized)) {
+    drivePath = normalized.slice("file:///".length);
+  } else if (/^file:\/\/[A-Za-z]:\//.test(normalized)) {
+    drivePath = normalized.slice("file://".length);
+  } else {
+    return normalized.startsWith("file://") ? normalized : "";
+  }
+
+  drivePath = drivePath[0].toUpperCase() + drivePath.slice(1);
+  return new URL(`file:///${drivePath}`).href;
+}
+
 export function callerSourceOrigin() {
+  if (typeof cottontail.jscCallerSourceOrigin === "function") {
+    const exactOrigin = normalizeNativeCallerSourceOrigin(cottontail.jscCallerSourceOrigin());
+    if (exactOrigin !== "") return exactOrigin;
+  }
   const stack = String(new Error().stack ?? "");
   for (const line of stack.split("\n").slice(1)) {
-    const match = line.match(/(?:\(|@|\s)((?:file:\/\/)?\/.*\.[cm]?[jt]sx?(?:[?#][^\s)]*)?):\d+:\d+\)?$/);
+    const match = line.match(
+      /(?:\(|@|\s)((?:file:\/\/)?(?:\/|[A-Za-z]:[\\/]).*\.[cm]?[jt]sx?(?:[?#][^\s)]*)?):\d+:\d+\)?$/,
+    );
+    const normalizedSourcePath = match?.[1].replaceAll("\\", "/");
     if (
       !match ||
-      match[1].includes("runtime_modules/bun/jsc") ||
-      match[1].includes(".cottontail-embedded-runtime/bun/jsc.js")
+      normalizedSourcePath.includes("runtime_modules/bun/jsc") ||
+      normalizedSourcePath.includes(".cottontail-embedded-runtime/bun/jsc.js")
     ) {
       continue;
     }
     const sourcePath = match[1];
-    return sourcePath.startsWith("file://") ? sourcePath : `file://${sourcePath}`;
+    const normalizedOrigin = normalizeNativeCallerSourceOrigin(sourcePath);
+    if (normalizedOrigin !== "") return normalizedOrigin;
   }
   return "";
 }

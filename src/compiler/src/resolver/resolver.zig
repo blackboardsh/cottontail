@@ -2988,7 +2988,7 @@ pub const Resolver = struct {
                             // A missing or unreadable directory during module
                             // resolution is a soft cache-miss (the directory is
                             // treated as absent), never a fatal bundle error.
-                            error.ENOENT, error.FileNotFound, error.EACCES, error.EPERM, error.AccessDenied, error.PermissionDenied => {},
+                            error.ENOENT, error.FileNotFound, error.BadPathName, error.EACCES, error.EPERM, error.AccessDenied, error.PermissionDenied => {},
                             else => {
                                 if (comptime enable_logging) {
                                     const pretty = queue_top.unsafe_path;
@@ -3881,7 +3881,7 @@ pub const Resolver = struct {
                 // Missing, non-directory, or unreadable parents are a soft
                 // miss: the path simply does not resolve here. Only truly
                 // unexpected I/O failures should surface as bundle errors.
-                error.ENOENT, error.FileNotFound, error.ENOTDIR, error.NotDir, error.EACCES, error.EPERM, error.AccessDenied, error.PermissionDenied => {},
+                error.ENOENT, error.FileNotFound, error.BadPathName, error.ENOTDIR, error.NotDir, error.EACCES, error.EPERM, error.AccessDenied, error.PermissionDenied => {},
                 else => {
                     r.log.addErrorFmt(
                         null,

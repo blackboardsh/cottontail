@@ -1173,7 +1173,7 @@ fn runPublish(
         };
     }
     if (!options.silent) {
-        try stdout.print("bun publish v{s} (cottontail)\n", .{bun_compat_version});
+        try stdout.print("bun publish v{s} (cottontail v{s})\n", .{ bun_compat_version, version });
         try stdout.flush();
     }
 

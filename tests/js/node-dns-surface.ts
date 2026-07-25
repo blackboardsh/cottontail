@@ -137,8 +137,22 @@ const service = await dnsPromises.lookupService("127.0.0.1", 80);
 ok(service.hostname.length > 0, "dns lookupService should return hostname");
 ok(service.service.length > 0, "dns lookupService should return service");
 
-const reverse = await dnsPromises.reverse("127.0.0.1");
-ok(reverse.length > 0, "dns reverse should return at least one hostname");
+try {
+  const reverse = await dnsPromises.reverse("127.0.0.1");
+  ok(reverse.length > 0, "dns reverse should return at least one hostname");
+} catch (error) {
+  // A loopback PTR record is not guaranteed. Stock Node also rejects this
+  // lookup on Windows hosts whose configured resolver has no 127.0.0.1 PTR.
+  ok(
+    ["ENOTFOUND", "ESERVFAIL"].includes((error as NodeJS.ErrnoException).code ?? ""),
+    "dns reverse should only fail with a resolver lookup error",
+  );
+  strictEqual(
+    (error as NodeJS.ErrnoException).syscall,
+    "getHostByAddr",
+    "dns reverse failure syscall mismatch",
+  );
+}
 
 const resolver = new dns.Resolver();
 deepStrictEqual(resolver.getServers(), [], "dns Resolver should copy the configured global server list");

@@ -55,7 +55,21 @@ assert(address && address.port > 0, "server should report a bound port");
 assert(address.address === "127.0.0.1", "server should bind requested address");
 
 const conflictingServer = createServer();
-const addressInUseError = new Promise<any>((resolve) => conflictingServer.once("error", resolve));
+const addressInUseError = new Promise<any>((resolve, reject) => {
+  const timeout = setTimeout(() => {
+    try { conflictingServer.close(); } catch {}
+    reject(new Error("duplicate listen did not settle"));
+  }, 2500);
+  conflictingServer.once("error", (error) => {
+    clearTimeout(timeout);
+    resolve(error);
+  });
+  conflictingServer.once("listening", () => {
+    clearTimeout(timeout);
+    conflictingServer.close();
+    reject(new Error("duplicate listen unexpectedly succeeded"));
+  });
+});
 conflictingServer.listen(address.port, "127.0.0.1");
 const bindError = await addressInUseError;
 assert(bindError.code === "EADDRINUSE", "duplicate listen error code mismatch");

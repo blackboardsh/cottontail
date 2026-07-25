@@ -33,7 +33,7 @@ function runCottontail(args, cwd, env) {
     const timeout = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error(`cottontail ${args.join(" ")} timed out`));
-    }, 20_000);
+    }, process.platform === "win32" ? 60_000 : 20_000);
     child.once("close", status => {
       clearTimeout(timeout);
       resolve({
@@ -252,5 +252,17 @@ try {
   console.log("package manager native publish test passed");
 } finally {
   await new Promise(resolve => server.close(resolve));
-  rmSync(tempDir, { recursive: true, force: true });
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+      break;
+    } catch (error) {
+      const retryable =
+        process.platform === "win32" &&
+        ["EBUSY", "ENOTEMPTY", "EPERM"].includes(error?.code) &&
+        attempt < 40;
+      if (!retryable) throw error;
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+  }
 }

@@ -11245,6 +11245,17 @@ function installBunTlsServerEvent(serverId, callback) {
   return eventId;
 }
 
+function normalizeServeListenErrorCode(error, reason = error?.message) {
+  if (error?.code != null) return error;
+  const text = String(reason ?? "");
+  if (/(?:EADDRNOTAVAIL|cannot assign requested address|requested address is not valid)/i.test(text)) {
+    error.code = "EADDRNOTAVAIL";
+  } else if (/(?:EADDRINUSE|address (?:already )?in use|only one usage of each socket address)/i.test(text)) {
+    error.code = "EADDRINUSE";
+  }
+  return error;
+}
+
 function serveNodeBacked(options, context) {
   const { hostname, unixPath, tlsConfigs, inspectorReload } = context;
   const isUnix = unixPath.length > 0;
@@ -11296,8 +11307,7 @@ function serveNodeBacked(options, context) {
         try { cottontail.tlsServerClose(native.id); } catch {}
       }
       const error = rawError instanceof Error ? rawError : new Error(String(rawError));
-      if (error.code == null && /(in use|EADDRINUSE)/i.test(String(error.message))) error.code = "EADDRINUSE";
-      throw error;
+      throw normalizeServeListenErrorCode(error);
     }
     // node/tls.js Server.listen() binds asynchronously, but Bun.serve must
     // expose the bound port synchronously; graft the native listener onto the
@@ -11339,16 +11349,15 @@ function serveNodeBacked(options, context) {
           : { host: listenHost, port: requestedPort, family: listenHost.includes(":") ? 6 : 4 });
       }
     } catch (rawError) {
-      if (rawError instanceof Error) throw rawError;
-      const reason = String(rawError);
-      const error = new Error(
-        isUnix
-          ? `Failed to listen on unix socket ${unixPath}: ${reason}`
-          : `Failed to start server. ${reason}`,
-      );
-      if (/assign requested address/i.test(reason)) error.code = "EADDRNOTAVAIL";
-      else if (/in use/i.test(reason)) error.code = "EADDRINUSE";
-      throw error;
+      const reason = rawError instanceof Error ? rawError.message : String(rawError);
+      const error = rawError instanceof Error
+        ? rawError
+        : new Error(
+            isUnix
+              ? `Failed to listen on unix socket ${unixPath}: ${reason}`
+              : `Failed to start server. ${reason}`,
+          );
+      throw normalizeServeListenErrorCode(error, reason);
     }
     if (!nodeServer._native?.listening) {
       const error = new Error(
@@ -11857,16 +11866,15 @@ export function serve(options) {
       );
     }
   } catch (rawError) {
-    if (rawError instanceof Error) throw rawError;
-    const reason = String(rawError);
-    const error = new Error(
-      unixPath
-        ? `Failed to listen on unix socket ${unixPath}: ${reason}`
-        : `Failed to start server. ${reason}`,
-    );
-    if (/assign requested address/i.test(reason)) error.code = "EADDRNOTAVAIL";
-    else if (/in use/i.test(reason)) error.code = "EADDRINUSE";
-    throw error;
+    const reason = rawError instanceof Error ? rawError.message : String(rawError);
+    const error = rawError instanceof Error
+      ? rawError
+      : new Error(
+          unixPath
+            ? `Failed to listen on unix socket ${unixPath}: ${reason}`
+            : `Failed to start server. ${reason}`,
+        );
+    throw normalizeServeListenErrorCode(error, reason);
   }
   const isUnix = unixPath.length > 0;
   const nativeDisplayHostname = String(native.hostname ?? hostname).includes(":") && !String(native.hostname ?? hostname).startsWith("[")

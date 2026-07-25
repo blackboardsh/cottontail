@@ -441,8 +441,81 @@ pub const jsc = struct {
         pub const FileURL = struct {
             value: []const u8,
 
+            fn isPathByteSafe(byte: u8) bool {
+                return switch (byte) {
+                    'A'...'Z',
+                    'a'...'z',
+                    '0'...'9',
+                    '!',
+                    '$',
+                    '&',
+                    0x27,
+                    '(',
+                    ')',
+                    '*',
+                    '+',
+                    ',',
+                    '-',
+                    '.',
+                    '/',
+                    ':',
+                    ';',
+                    '=',
+                    '@',
+                    '_',
+                    => true,
+                    else => false,
+                };
+            }
+
+            fn writeEncodedPath(writer: *std.Io.Writer, path_text: []const u8, comptime windows_path: bool) !void {
+                const hex = "0123456789ABCDEF";
+                for (path_text) |raw_byte| {
+                    const byte = if (windows_path and raw_byte == '\\') '/' else raw_byte;
+                    if (isPathByteSafe(byte)) {
+                        try writer.writeByte(byte);
+                    } else {
+                        try writer.writeByte('%');
+                        try writer.writeByte(hex[byte >> 4]);
+                        try writer.writeByte(hex[byte & 0x0f]);
+                    }
+                }
+            }
+
             pub fn format(this: FileURL, writer: *std.Io.Writer) !void {
-                try writer.print("file://{s}", .{this.value});
+                var path_text = this.value;
+                if (Environment.isWindows) {
+                    var is_unc = false;
+                    if (path_text.len >= "\\\\?\\UNC\\".len and
+                        std.ascii.eqlIgnoreCase(path_text[0.."\\\\?\\UNC\\".len], "\\\\?\\UNC\\"))
+                    {
+                        path_text = path_text["\\\\?\\UNC\\".len..];
+                        is_unc = true;
+                    } else if (std.mem.startsWith(u8, path_text, "\\\\?\\")) {
+                        path_text = path_text["\\\\?\\".len..];
+                    } else if (std.mem.startsWith(u8, path_text, "\\\\") or
+                        std.mem.startsWith(u8, path_text, "//"))
+                    {
+                        path_text = path_text[2..];
+                        is_unc = true;
+                    }
+
+                    if (is_unc) {
+                        try writer.writeAll("file://");
+                    } else if (path_text.len >= 3 and
+                        std.ascii.isAlphabetic(path_text[0]) and
+                        path_text[1] == ':' and
+                        (path_text[2] == '/' or path_text[2] == '\\'))
+                    {
+                        try writer.writeAll("file:///");
+                    } else {
+                        try writer.writeAll("file://");
+                    }
+                    return writeEncodedPath(writer, path_text, true);
+                }
+
+                try writer.writeAll("file://");
+                try writeEncodedPath(writer, path_text, false);
             }
         };
 

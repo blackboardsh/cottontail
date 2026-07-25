@@ -36,7 +36,8 @@
 #include <sstream> // wstringstream
 #include <iomanip> // setw, setfill
 #include <fstream>
-#include <codecvt>
+#include <iterator>
+#include <limits>
 #include <algorithm>
 
 namespace rescle {
@@ -108,13 +109,57 @@ inline T round(T value, int modula = 4)
     return value + ((value % modula > 0) ? (modula - value % modula) : 0);
 }
 
-std::wstring ReadFileToString(const wchar_t* filename)
+bool Utf8ToWide(const std::string& input, std::wstring* output)
 {
-    std::wifstream wif(filename);
-    wif.imbue(std::locale(std::locale::empty(), new std::codecvt_utf8<wchar_t>));
-    std::wstringstream wss;
-    wss << wif.rdbuf();
-    return wss.str();
+    output->clear();
+    if (input.empty())
+        return true;
+    if (input.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+        return false;
+
+    const int inputLength = static_cast<int>(input.size());
+    const int outputLength = MultiByteToWideChar(
+        CP_UTF8, MB_ERR_INVALID_CHARS, input.data(), inputLength, nullptr, 0);
+    if (outputLength <= 0)
+        return false;
+
+    output->resize(static_cast<size_t>(outputLength));
+    return MultiByteToWideChar(
+               CP_UTF8, MB_ERR_INVALID_CHARS, input.data(), inputLength,
+               output->data(), outputLength) == outputLength;
+}
+
+bool WideToUtf8(const std::wstring& input, std::string* output)
+{
+    output->clear();
+    if (input.empty())
+        return true;
+    if (input.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+        return false;
+
+    const int inputLength = static_cast<int>(input.size());
+    const int outputLength = WideCharToMultiByte(
+        CP_UTF8, WC_ERR_INVALID_CHARS, input.data(), inputLength,
+        nullptr, 0, nullptr, nullptr);
+    if (outputLength <= 0)
+        return false;
+
+    output->resize(static_cast<size_t>(outputLength));
+    return WideCharToMultiByte(
+               CP_UTF8, WC_ERR_INVALID_CHARS, input.data(), inputLength,
+               output->data(), outputLength, nullptr, nullptr) == outputLength;
+}
+
+bool ReadFileToString(const wchar_t* filename, std::wstring* output)
+{
+    std::ifstream input(filename, std::ios::binary);
+    if (!input)
+        return false;
+
+    const std::string bytes(
+        (std::istreambuf_iterator<char>(input)),
+        std::istreambuf_iterator<char>());
+    return Utf8ToWide(bytes, output);
 }
 
 class ScopedFile {
@@ -812,8 +857,10 @@ bool ResourceUpdater::Commit()
 
         // convert the wchar back into char, so that it encodes correctly for Windows to read the XML.
         std::wstring stringSectionW = trimmedStr + padding;
-        std::wstring_convert<std::codecvt_utf8<wchar_t>, wchar_t> converter;
-        std::string stringSection = converter.to_bytes(stringSectionW);
+        std::string stringSection;
+        if (!WideToUtf8(stringSectionW, &stringSection)) {
+            return false;
+        }
 
         if (!UpdateResourceW(ru.Get(), RT_MANIFEST, MAKEINTRESOURCEW(1),
                 kLangEnUs, // this is hardcoded at 1033, ie, en-us, as that is what RT_MANIFEST default uses
@@ -824,7 +871,10 @@ bool ResourceUpdater::Commit()
 
     // load file contents and replace the manifest
     if (!applicationManifestPath_.empty()) {
-        std::wstring fileContents = ReadFileToString(applicationManifestPath_.c_str());
+        std::wstring fileContents;
+        if (!ReadFileToString(applicationManifestPath_.c_str(), &fileContents)) {
+            return false;
+        }
 
         // clean old padding and add new padding, ensuring that the size is a multiple of 4
         std::wstring::size_type padPos = fileContents.find(L"</assembly>");
@@ -844,8 +894,10 @@ bool ResourceUpdater::Commit()
 
         // convert the wchar back into char, so that it encodes correctly for Windows to read the XML.
         std::wstring stringSectionW = fileContents + padding;
-        std::wstring_convert<std::codecvt_utf8<wchar_t>, wchar_t> converter;
-        std::string stringSection = converter.to_bytes(stringSectionW);
+        std::string stringSection;
+        if (!WideToUtf8(stringSectionW, &stringSection)) {
+            return false;
+        }
 
         if (!UpdateResourceW(ru.Get(), RT_MANIFEST, MAKEINTRESOURCEW(1),
                 kLangEnUs, // this is hardcoded at 1033, ie, en-us, as that is what RT_MANIFEST default uses
@@ -1014,9 +1066,6 @@ BOOL CALLBACK ResourceUpdater::OnEnumResourceLanguage(HANDLE hModule, LPCWSTR lp
             const auto* pResource = (const BYTE*)LockResource(hResData);
             const auto resId = reinterpret_cast<ptrdiff_t>(lpszName);
             instance->rcDataLngMap_[wIDLanguage][resId] = std::vector<BYTE>(pResource, pResource + cbResource);
-
-            UnlockResource(hResData);
-            FreeResource(hResData);
         }
         default:
             break;
@@ -1066,9 +1115,6 @@ BOOL CALLBACK ResourceUpdater::OnEnumResourceManifest(HMODULE hModule, LPCTSTR l
 
     // also store original manifestString
     instance->manifestString_ = manifestStringLocal;
-
-    UnlockResource(hResData);
-    FreeResource(hResData);
 
     return TRUE; // Keep going
 }

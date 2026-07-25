@@ -73,7 +73,7 @@ const requiredStream = require("node:stream");
 assert(requiredStream === StreamDefault, "require node:stream default mismatch");
 assert(requiredStream.Readable === Readable, "require node:stream Readable mismatch");
 assert(
-  Object.getOwnPropertyDescriptor(requiredStream, "promises")?.enumerable === false,
+  Object.getOwnPropertyDescriptor(requiredStream, "promises")?.enumerable === true,
   "require node:stream promises enumerability mismatch",
 );
 const bareStreamNamespace = await import("stream");
@@ -84,8 +84,13 @@ assert(
   "import node:stream promises enumerability mismatch",
 );
 assert(require("stream/consumers").text === text, "require stream/consumers mismatch");
-assert(require("node:stream/promises").pipeline === pipelinePromise, "require stream/promises mismatch");
+assert(require("node:stream/promises") === streamPromises, "require node:stream/promises identity mismatch");
+assert(require("stream/promises") === streamPromises, "require stream/promises identity mismatch");
 assert(require("stream/web").ReadableStream === ReadableStream, "require stream/web mismatch");
+const bareStreamPromisesNamespace = await import("stream/promises");
+const nodeStreamPromisesNamespace = await import("node:stream/promises");
+assert(bareStreamPromisesNamespace === nodeStreamPromisesNamespace, "stream/promises builtin namespace alias mismatch");
+assert(nodeStreamPromisesNamespace.default === streamPromises, "stream/promises default identity mismatch");
 
 assert(await text(Readable.from(["hello", " ", "stream"])) === "hello stream", "stream consumers text mismatch");
 assert((await json(Readable.from(['{"ok":true}']))).ok === true, "stream consumers json mismatch");

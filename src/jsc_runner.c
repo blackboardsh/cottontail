@@ -34,6 +34,9 @@ extern bool ct_jsc_array_buffer_view_has_buffer(JSValueRef value);
 extern JSObjectRef ct_jsc_create_buffer_is_ascii(JSContextRef context);
 extern JSObjectRef ct_jsc_create_buffer_transcode(JSContextRef context);
 extern JSObjectRef ct_jsc_create_test_coverage_collector(JSContextRef context);
+#if defined(_WIN32)
+extern JSObjectRef ct_jsc_create_caller_source_origin(JSContextRef context);
+#endif
 extern bool ct_jsc_enable_control_flow_profiler(JSContextRef context);
 extern uint32_t ct_jsc_cached_data_version_tag(void);
 extern char *ct_jsc_heap_snapshot(JSContextRef context, int gc_debugging);
@@ -13581,6 +13584,7 @@ static JSValueRef ct_tcp_server_listen(JSContextRef ctx, JSObjectRef function, J
     bool ipv6_only = argc >= 5 && ct_value_to_bool(ctx, argv[4]);
     bool reuse_port = argc >= 6 && ct_value_to_bool(ctx, argv[5]);
     bool exclusive = argc >= 7 && ct_value_to_bool(ctx, argv[6]);
+    (void)exclusive;
 
     struct addrinfo *results = NULL;
     if (ct_tcp_resolve_address(ctx, address, port, family, true, &results, exception) != 0) {
@@ -13593,19 +13597,10 @@ static JSValueRef ct_tcp_server_listen(JSContextRef ctx, JSObjectRef function, J
     for (struct addrinfo *entry = results; entry != NULL; entry = entry->ai_next) {
         listen_fd = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
         if (listen_fd < 0) continue;
+#if !defined(_WIN32)
         int yes = 1;
-#if defined(_WIN32) && defined(SO_EXCLUSIVEADDRUSE)
-        if (exclusive) {
-            if (setsockopt(listen_fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, &yes, sizeof(yes)) != 0) {
-                close(listen_fd);
-                listen_fd = -1;
-                continue;
-            }
-        } else
+        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 #endif
-        if (!exclusive) {
-            setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-        }
 #if defined(IPV6_V6ONLY)
         if (entry->ai_family == AF_INET6) {
             int only = ipv6_only ? 1 : 0;
@@ -13623,7 +13618,7 @@ static JSValueRef ct_tcp_server_listen(JSContextRef ctx, JSObjectRef function, J
             continue;
         }
 #endif
-        if (reuse_port && !exclusive) {
+        if (reuse_port) {
 #if defined(SO_REUSEPORT) && !defined(_WIN32)
             if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes)) != 0) {
                 close(listen_fd);
@@ -18530,8 +18525,10 @@ static JSValueRef ct_tls_server_listen(JSContextRef ctx, JSObjectRef function, J
     for (struct addrinfo *entry = results; entry != NULL; entry = entry->ai_next) {
         listen_fd = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
         if (listen_fd < 0) continue;
+#if !defined(_WIN32)
         int yes = 1;
         setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#endif
         if (bind(listen_fd, entry->ai_addr, (socklen_t)entry->ai_addrlen) == 0 && listen(listen_fd, 128) == 0) {
             ct_set_nonblocking_fd(listen_fd);
             break;
@@ -32083,8 +32080,10 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
         free(unix_path);
         return JSValueMakeUndefined(ctx);
     }
+#if !defined(_WIN32)
     int yes = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#endif
 
     uint16_t bound_port = 0;
     if (unix_path != NULL) {
@@ -33844,6 +33843,12 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     if (coverage_collector != NULL) {
         ct_set_property(ctx, host, "collectTestCoverage", coverage_collector, &exception);
     }
+#if defined(_WIN32)
+    JSObjectRef caller_source_origin = ct_jsc_create_caller_source_origin(ctx);
+    if (caller_source_origin != NULL) {
+        ct_set_property(ctx, host, "jscCallerSourceOrigin", caller_source_origin, &exception);
+    }
+#endif
     JSObjectRef args = ct_make_array(ctx, 0, NULL, &exception);
     ct_set_property(ctx, host, "args", args, &exception);
 #if defined(COTTONTAIL_VENDORED_JSC)
@@ -35039,13 +35044,100 @@ static char *ct_path_basename_copy(const char *path) {
 static char *ct_file_url_for_path(const char *path) {
     if (path == NULL) return ct_duplicate_string("file://");
     if (strncmp(path, "file://", 7) == 0) return ct_duplicate_string(path);
-    size_t len = strlen(path);
-    char *out = (char *)malloc(strlen("file://") + len + 1);
+
+    const char *source = path;
+    const char *prefix = "file://";
+#if defined(_WIN32)
+    bool is_unc = false;
+    if (strlen(source) >= 8 && strncasecmp(source, "\\\\?\\UNC\\", 8) == 0) {
+        source += 8;
+        is_unc = true;
+    } else if (strncmp(source, "\\\\?\\", 4) == 0) {
+        source += 4;
+    } else if (strncmp(source, "\\\\", 2) == 0 || strncmp(source, "//", 2) == 0) {
+        source += 2;
+        is_unc = true;
+    }
+    size_t source_len = strlen(source);
+    if (!is_unc && source_len >= 3 &&
+        ((source[0] >= 'A' && source[0] <= 'Z') || (source[0] >= 'a' && source[0] <= 'z')) &&
+        source[1] == ':' && (source[2] == '/' || source[2] == '\\')) {
+        prefix = "file:///";
+    }
+#else
+    size_t source_len = strlen(source);
+#endif
+
+    size_t prefix_len = strlen(prefix);
+    if (source_len > (SIZE_MAX - prefix_len - 1) / 3) return NULL;
+    char *out = (char *)malloc(prefix_len + source_len * 3 + 1);
     if (out == NULL) return NULL;
-    memcpy(out, "file://", strlen("file://"));
-    memcpy(out + strlen("file://"), path, len);
-    out[strlen("file://") + len] = 0;
+    memcpy(out, prefix, prefix_len);
+    size_t out_len = prefix_len;
+    static const char hex[] = "0123456789ABCDEF";
+    for (size_t index = 0; index < source_len; index += 1) {
+        unsigned char byte = (unsigned char)source[index];
+#if defined(_WIN32)
+        if (byte == '\\') byte = '/';
+#endif
+        bool safe =
+            (byte >= 'A' && byte <= 'Z') ||
+            (byte >= 'a' && byte <= 'z') ||
+            (byte >= '0' && byte <= '9') ||
+            byte == '!' || byte == '$' || byte == '&' || byte == '\'' ||
+            byte == '(' || byte == ')' || byte == '*' || byte == '+' ||
+            byte == ',' || byte == '-' || byte == '.' || byte == '/' ||
+            byte == ':' || byte == ';' || byte == '=' || byte == '@' ||
+            byte == '_';
+        if (safe) {
+            out[out_len++] = (char)byte;
+        } else {
+            out[out_len++] = '%';
+            out[out_len++] = hex[byte >> 4];
+            out[out_len++] = hex[byte & 0x0f];
+        }
+    }
+    out[out_len] = 0;
     return out;
+}
+
+static char *ct_source_url_for_filename(const char *filename) {
+    if (filename == NULL) return ct_duplicate_string("<script>");
+    if (strncmp(filename, "file://", 7) == 0) {
+#if defined(_WIN32)
+        const char *url_path = filename + 7;
+        size_t url_path_len = strlen(url_path);
+        bool has_backslash = strchr(url_path, '\\') != NULL;
+        bool has_unrooted_drive =
+            url_path_len >= 2 &&
+            ((url_path[0] >= 'A' && url_path[0] <= 'Z') ||
+             (url_path[0] >= 'a' && url_path[0] <= 'z')) &&
+            url_path[1] == ':';
+        if (has_backslash || has_unrooted_drive) {
+            char *native_path = ct_file_url_to_path(filename);
+            if (native_path == NULL) return NULL;
+            char *normalized = ct_file_url_for_path(native_path);
+            free(native_path);
+            return normalized;
+        }
+#endif
+        return ct_duplicate_string(filename);
+    }
+#if defined(_WIN32)
+    size_t len = strlen(filename);
+    bool is_drive_path =
+        len >= 3 &&
+        ((filename[0] >= 'A' && filename[0] <= 'Z') ||
+         (filename[0] >= 'a' && filename[0] <= 'z')) &&
+        filename[1] == ':' &&
+        (filename[2] == '/' || filename[2] == '\\');
+    bool is_unc_path =
+        (len >= 2 && (strncmp(filename, "\\\\", 2) == 0 || strncmp(filename, "//", 2) == 0));
+    if (is_drive_path || is_unc_path) return ct_file_url_for_path(filename);
+#else
+    if (filename[0] == '/') return ct_file_url_for_path(filename);
+#endif
+    return ct_duplicate_string(filename);
 }
 
 static bool ct_match_import_meta_property(
@@ -35559,7 +35651,15 @@ static int ct_jsc_runtime_eval_internal(
     }
 
     JSStringRef script = ct_js_string(wrapped);
-    JSStringRef source_url = ct_js_string(filename != NULL ? filename : "<script>");
+    char *source_url_text = ct_source_url_for_filename(filename);
+    if (source_url_text == NULL) {
+        JSStringRelease(script);
+        free(wrapped);
+        ct_set_error_out(error_out, ct_duplicate_bytes("Out of memory", 13));
+        return -1;
+    }
+    JSStringRef source_url = ct_js_string(source_url_text);
+    free(source_url_text);
     JSValueRef exception = NULL;
     if (runtime->host_object != NULL && runtime->control_flow_profiler_enabled) {
         ct_set_property(
@@ -35770,7 +35870,16 @@ int ct_jsc_generate_bytecode(
     }
 
     JSStringRef script = ct_js_string(wrapped);
-    JSStringRef source_url = ct_js_string(filename != NULL ? filename : "<script>");
+    char *source_url_text = ct_source_url_for_filename(filename);
+    if (source_url_text == NULL) {
+        JSStringRelease(script);
+        JSGlobalContextRelease(context);
+        free(wrapped);
+        ct_set_error_out(error_out, ct_duplicate_bytes("Out of memory", 13));
+        return -1;
+    }
+    JSStringRef source_url = ct_js_string(source_url_text);
+    free(source_url_text);
     JSStringRef generation_error = NULL;
     const int status = ct_jsc_bytecode_generate(
         JSContextGetGroup(context),
@@ -35815,7 +35924,15 @@ int ct_jsc_runtime_eval_immediate(
     }
 
     JSStringRef script = ct_js_string(wrapped);
-    JSStringRef source_url = ct_js_string(filename != NULL ? filename : "<script>");
+    char *source_url_text = ct_source_url_for_filename(filename);
+    if (source_url_text == NULL) {
+        JSStringRelease(script);
+        free(wrapped);
+        ct_set_error_out(error_out, ct_duplicate_bytes("Out of memory", 13));
+        return -1;
+    }
+    JSStringRef source_url = ct_js_string(source_url_text);
+    free(source_url_text);
     JSValueRef exception = NULL;
     JSEvaluateScript(runtime->context, script, NULL, source_url, 1, &exception);
     JSStringRelease(script);

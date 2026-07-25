@@ -497,6 +497,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
         }
         if (resolved_target.os.tag == .windows) {
             inline for (&.{
+                "src/jsc_caller_origin_bridge.cpp",
                 "src/compiler/src/jsc/bindings/windows/rescle.cpp",
                 "src/compiler/src/jsc/bindings/windows/rescle-binding.cpp",
             }) |source| {

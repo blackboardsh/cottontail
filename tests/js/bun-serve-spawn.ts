@@ -1,5 +1,22 @@
+import { cert, key } from "./fixtures/tls-cert.js";
+
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
+}
+
+async function expectAddressInUse(options: Parameters<typeof Bun.serve>[0], label: string) {
+  let duplicate;
+  try {
+    duplicate = Bun.serve(options);
+  } catch (error) {
+    assert(
+      (error as NodeJS.ErrnoException).code === "EADDRINUSE",
+      `${label} error code mismatch: ${String(error)} (code=${String((error as NodeJS.ErrnoException).code)})`,
+    );
+    return;
+  }
+  await duplicate.stop(true);
+  throw new Error(`${label} duplicate listen unexpectedly succeeded`);
 }
 
 const proc = Bun.spawn([
@@ -81,6 +98,19 @@ const server = Bun.serve({
 try {
   assert(server.url instanceof URL, "Bun.serve url should be a URL");
   assert(String(server.url).startsWith("http://127.0.0.1:"), "Bun.serve url string mismatch");
+  await expectAddressInUse({
+    hostname: "127.0.0.1",
+    port: server.port,
+    fetch: () => new Response("duplicate"),
+  }, "plain Bun.serve");
+  await expectAddressInUse({
+    hostname: "127.0.0.1",
+    port: server.port,
+    fetch: () => new Response("duplicate"),
+    websocket: {
+      message() {},
+    },
+  }, "websocket Bun.serve");
 
   const routeText = await fetchFromChild(new URL("/hello/cottontail", server.url));
   const parsed = JSON.parse(routeText);
@@ -97,6 +127,23 @@ try {
   assert(await fallback.text() === "/fallback", "Bun.serve server.fetch fallback mismatch");
 } finally {
   await server.stop();
+}
+
+const tlsServer = Bun.serve({
+  hostname: "127.0.0.1",
+  port: 0,
+  tls: { cert, key },
+  fetch: () => new Response("secure"),
+});
+try {
+  await expectAddressInUse({
+    hostname: "127.0.0.1",
+    port: tlsServer.port,
+    tls: { cert, key },
+    fetch: () => new Response("duplicate"),
+  }, "TLS Bun.serve");
+} finally {
+  await tlsServer.stop();
 }
 
 console.log("bun serve spawn ts passed");
