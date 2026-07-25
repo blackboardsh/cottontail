@@ -48,7 +48,9 @@ jobs:
 
       - name: Validate release tag
         if: startsWith(github.ref, 'refs/tags/v')
-        run: node scripts/validate-release-tag.js
+        run: |
+          node --test scripts/release-contract.test.js scripts/release-version.test.js
+          node scripts/validate-release-tag.js
 
       - name: Restore vendored toolchains
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

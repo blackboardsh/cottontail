@@ -6,10 +6,16 @@ import { dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 
+import {
+  compareReleaseVersions,
+  parseReleaseVersion,
+  suggestReleaseVersion,
+} from "./release-version.js";
+
 const rootDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const packageJsonPath = join(rootDir, "package.json");
 const versionZigPath = join(rootDir, "src", "version.zig");
-const semverPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
+const dashConfigPath = join(rootDir, "dash.config.ts");
 
 function fail(message) {
   console.error(`cottontail release: ${message}`);
@@ -25,44 +31,23 @@ function git(args, options = {}) {
   return typeof output === "string" ? output.trim() : "";
 }
 
-function parseSemver(value) {
-  const match = value.match(semverPattern);
-  if (!match) return null;
-  return {
-    raw: value,
-    core: [Number(match[1]), Number(match[2]), Number(match[3])],
-    prerelease: match[4]?.split(".") ?? [],
-  };
-}
-
-function compareIdentifiers(left, right) {
-  const leftNumeric = /^\d+$/.test(left);
-  const rightNumeric = /^\d+$/.test(right);
-  if (leftNumeric && rightNumeric) return Number(left) - Number(right);
-  if (leftNumeric) return -1;
-  if (rightNumeric) return 1;
-  return left.localeCompare(right);
-}
-
-function compareSemver(left, right) {
-  for (let index = 0; index < 3; index += 1) {
-    if (left.core[index] !== right.core[index]) return left.core[index] - right.core[index];
-  }
-  if (left.prerelease.length === 0 && right.prerelease.length > 0) return 1;
-  if (right.prerelease.length === 0 && left.prerelease.length > 0) return -1;
-  for (let index = 0; index < Math.max(left.prerelease.length, right.prerelease.length); index += 1) {
-    if (left.prerelease[index] === undefined) return -1;
-    if (right.prerelease[index] === undefined) return 1;
-    const comparison = compareIdentifiers(left.prerelease[index], right.prerelease[index]);
-    if (comparison !== 0) return comparison;
-  }
-  return 0;
+function updateDashPin(path, field, version) {
+  const source = readFileSync(path, "utf8");
+  const pattern = new RegExp(`^(// @dash .*\\b${field}=)[^\\s]+`, "m");
+  const updated = source.replace(pattern, (_, prefix) => `${prefix}${version}`);
+  if (updated === source) fail(`could not update ${field} in ${path}`);
+  writeFileSync(path, updated);
 }
 
 if (process.argv.includes("--help")) {
-  console.log("Usage: npm run release");
-  console.log("Fetch tags, prompt for a new semantic version, then commit, tag, and push it.");
+  console.log("Usage: node scripts/tag-release.js [canary|stable]");
+  console.log("Prompt for a semantic version, then commit, tag, and atomically push it.");
   process.exit(0);
+}
+
+const mode = process.argv[2] ?? "manual";
+if (!["canary", "stable", "manual"].includes(mode)) {
+  fail(`expected canary or stable, received ${JSON.stringify(mode)}`);
 }
 
 if (git(["branch", "--show-current"]) !== "main") {
@@ -82,24 +67,34 @@ if (behind > 0) fail(`main is ${behind} commit(s) behind origin/main; pull or re
 
 const versions = git(["tag", "--list", "v*"])
   .split("\n")
-  .map((tag) => ({ tag, version: parseSemver(tag.replace(/^v/, "")) }))
+  .filter(Boolean)
+  .map((tag) => ({ tag, version: parseReleaseVersion(tag.replace(/^v/, "")) }))
   .filter((entry) => entry.version)
-  .sort((left, right) => compareSemver(right.version, left.version));
+  .sort((left, right) => compareReleaseVersions(right.version, left.version));
 const latest = versions[0] ?? null;
 const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+const current = parseReleaseVersion(packageJson.version);
+if (!current) fail(`package.json contains an invalid version: ${packageJson.version}`);
+const suggested = suggestReleaseVersion(
+  mode,
+  current.version,
+  latest?.version.version,
+);
 
 console.log(`Latest tag:      ${latest?.tag ?? "(none)"}`);
 console.log(`Package version: v${packageJson.version}`);
 if (ahead > 0) console.log(`Local main:      ${ahead} unpushed commit(s) ahead of origin/main`);
 
 const prompt = createInterface({ input: process.stdin, output: process.stdout });
-const answer = (await prompt.question("New semantic version: ")).trim().replace(/^v/, "");
-const next = parseSemver(answer);
+const label = mode === "manual" ? "release" : mode;
+const response = await prompt.question(`New ${label} semantic version [${suggested}]: `);
+const answer = (response.trim() || suggested).replace(/^v/, "");
+const next = parseReleaseVersion(answer);
 if (!next) {
   prompt.close();
   fail(`"${answer}" is not a valid semantic version`);
 }
-if (latest && compareSemver(next, latest.version) <= 0) {
+if (latest && compareReleaseVersions(next, latest.version) <= 0) {
   prompt.close();
   fail(`v${answer} must be newer than ${latest.tag}`);
 }
@@ -125,9 +120,10 @@ const updatedVersionZig = versionZig.replace(
 );
 if (updatedVersionZig === versionZig) fail("could not update src/version.zig");
 writeFileSync(versionZigPath, updatedVersionZig);
+updateDashPin(dashConfigPath, "cottontail", answer);
 
 const tag = `v${answer}`;
-git(["add", "package.json", "src/version.zig"], { inherit: true });
+git(["add", "package.json", "src/version.zig", "dash.config.ts"], { inherit: true });
 git(["commit", "-m", tag], { inherit: true });
 git(["tag", "--annotate", tag, "--message", tag], { inherit: true });
 git(["push", "--atomic", "origin", "HEAD:main", `refs/tags/${tag}`], { inherit: true });
