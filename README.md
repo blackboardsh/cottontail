@@ -87,7 +87,7 @@ embedded in the executable at build time.
 For native VM setup, exact workflow-equivalent commands, diagnostics, and the
 cross-platform working loop, see [`docs/cross-platform-bringup.md`](docs/cross-platform-bringup.md).
 
-The schema 2 archive layout contains a standalone executable for Dash CLI consumption:
+The schema 1 archive layout contains a standalone executable for Dash CLI consumption:
 
 - `bin/cottontail` (`bin/cottontail.exe` on Windows)
 - `runtime_modules/` for downstream bundlers that need physical module paths
@@ -110,10 +110,16 @@ filesystem read-only.
 
 The native matrix exercises the platform host bridge on each supported target.
 
-### Preview publishing
+### Release publishing
 
-After every `main` branch matrix job succeeds, a fan-in job uploads the complete
-release to Cloudflare R2. Configure these GitHub repository secrets:
+Tags are the only release trigger. A tag must exactly match the version in
+`package.json` and `src/version.zig`. A plain `vX.Y.Z` tag advances the stable
+channel; any valid semantic-version prerelease tag, such as
+`vX.Y.Z-canary.N`, advances the canary channel. Main-branch, pull-request, and
+manual workflows build and retain artifacts without publishing them.
+
+After every tagged matrix job succeeds, a fan-in job uploads the complete release
+to Cloudflare R2. Configure these GitHub repository secrets:
 
 - `COTTONTAIL_R2_ACCOUNT_ID`: Cloudflare account ID used to derive the R2 S3 endpoint.
 - `COTTONTAIL_R2_ACCESS_KEY_ID`: access key from an R2 Object Read & Write token scoped to the release bucket.
@@ -124,33 +130,24 @@ secret takes precedence when both exist:
 
 - `COTTONTAIL_R2_PUBLIC_BASE_URL`: public custom-domain or `r2.dev` origin for the bucket, without a trailing slash.
 
-The target bucket is `electrobun-artifacts`. Continuous preview archives use
-immutable revision paths:
+The target bucket is `electrobun-artifacts`. Archives and manifests use immutable
+revision and version paths:
 
-- `cottontail/preview/builds/<git-sha>/<platform>/cottontail.tar.gz`
-
-Consumers discover the newest complete preview matrix through
-`cottontail/preview/latest.json`. The checksum remains in the manifest and the
-adjacent `.sha256` object; it is not part of the object path.
-
-Commits tagged `v<version>` also publish an immutable, derivable version release:
-
-- `cottontail/releases/<version>/<platform>/cottontail.tar.gz`
+- `cottontail/builds/<git-sha>/<platform>/cottontail.tar.gz`
+- `cottontail/builds/<git-sha>/manifest.json`
 - `cottontail/releases/<version>/manifest.json`
 
-For example, version `0.1.1-beta.0` on macOS ARM64 is always located at
-`cottontail/releases/0.1.1-beta.0/macos-arm64/cottontail.tar.gz`. The preview
-channel pointers are:
+Version manifests reference the same revision archives rather than uploading a
+second copy. Consumers discover the current releases through:
 
-- `cottontail/preview/latest.json`
-- `cottontail/preview/versions/<version>.json`
+- `cottontail/channels/stable.json`
+- `cottontail/channels/canary.json`
 
-The publisher uploads every archive before replacing `latest.json`, so a failed
-build or upload cannot advertise a partial matrix. Pull requests run tests and
-packaging but skip R2 publishing. Run
-`node scripts/upload-release-r2.js --dry-run` after local packaging to inspect a
-single-platform dry run without requiring credentials. Real publication requires
-all four archives and the `--all` option.
+The publisher uploads every archive and both immutable manifests before replacing
+the relevant channel pointer, so a failed build or upload cannot advertise a
+partial matrix. Run `node scripts/upload-release-r2.js --dry-run --all` after
+placing all four platform archives in `release/` to inspect the object sequence
+without requiring credentials.
 
 ## Bootstrap
 

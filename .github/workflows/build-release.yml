@@ -52,6 +52,10 @@ jobs:
           node-version: 24.18.0
           package-manager-cache: false
 
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node scripts/validate-release-tag.js
+
       - name: Restore vendored toolchains
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -223,8 +227,8 @@ jobs:
     needs:
       - build
     if: >-
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
-      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     concurrency:
@@ -242,6 +246,9 @@ jobs:
         with:
           node-version: 24.18.0
           package-manager-cache: false
+
+      - name: Validate release tag
+        run: node scripts/validate-release-tag.js
 
       - name: Download complete release matrix
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1

@@ -60,7 +60,7 @@ function compareSemver(left, right) {
 }
 
 if (process.argv.includes("--help")) {
-  console.log("Usage: bun run release");
+  console.log("Usage: npm run release");
   console.log("Fetch tags, prompt for a new semantic version, then commit, tag, and push it.");
   process.exit(0);
 }

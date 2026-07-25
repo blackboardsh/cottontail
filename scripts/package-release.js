@@ -5,6 +5,8 @@ import { createHash } from 'crypto';
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
 import { basename, join } from 'path';
 
+import { releaseChannel } from './release-contract.js';
+
 const rootDir = process.cwd();
 const packageJson = JSON.parse(readFileSync(join(rootDir, 'package.json'), 'utf8'));
 const jscManifest = JSON.parse(readFileSync(join(rootDir, 'scripts', 'jsc-manifest.json'), 'utf8'));
@@ -108,8 +110,10 @@ if (process.platform !== 'win32') {
 }
 
 const manifest = {
-  schema: 2,
-  name: packageJson.name,
+  schema: 1,
+  kind: 'archive',
+  product: packageJson.name,
+  channel: releaseChannel(packageJson.version),
   version: packageJson.version,
   platform,
   revision: gitRevision(),

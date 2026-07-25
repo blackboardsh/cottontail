@@ -16,7 +16,8 @@
     "build:local": "node scripts/build-local.js",
     "build:release": "bun run setup && node scripts/build-release.js",
     "package:release": "node scripts/package-release.js",
-    "publish:preview": "node scripts/upload-release-r2.js --all",
+    "publish:release": "node scripts/upload-release-r2.js --all",
+    "test:release": "node --test scripts/release-contract.test.js",
     "run": "bun run setup && node scripts/run.js",
     "dev": "bun run run -- test.js",
     "bench:build": "bun run build:release",
@@ -35,12 +36,7 @@
     "electrobun:window": "bun run run -- electrobun examples/electrobun-window.js",
     "test": "bun run test:zig && bun run test:js",
     "test:blocking": "bun run test && bun run test:electrobun && bun run test:electrobun:cli",
-    "release": "bun scripts/tag-release.js",
-    "push:beta": "bun run test:blocking && bun scripts/push-version.js beta",
-    "push:patch": "bun run test:blocking && bun scripts/push-version.js patch",
-    "push:minor": "bun run test:blocking && bun scripts/push-version.js minor",
-    "push:major": "bun run test:blocking && bun scripts/push-version.js major",
-    "push:stable": "bun run test:blocking && bun scripts/push-version.js stable"
+    "release": "node scripts/tag-release.js"
   },
   "devDependencies": {
     "fast-glob": "3.3.1",

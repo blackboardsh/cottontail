@@ -5,54 +5,49 @@ import { createHash, createHmac } from 'node:crypto';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
+import {
+  RELEASE_PLATFORMS,
+  buildArchiveKey,
+  buildManifestKey,
+  channelManifestKey,
+  createBuildManifest,
+  createChannelManifest,
+  createReleaseManifest,
+  releaseManifestKey,
+  validateReleaseTag,
+  validateRevision,
+} from './release-contract.js';
+
 const rootDir = process.cwd();
 const packageJson = JSON.parse(readFileSync(join(rootDir, 'package.json'), 'utf8'));
 const dryRun = process.argv.includes('--dry-run') || process.env.COTTONTAIL_R2_DRY_RUN === '1';
 const publishAll = process.argv.includes('--all');
-const forceVersionRelease = process.argv.includes('--release');
 const bucket = 'electrobun-artifacts';
-const rootPrefix = 'cottontail';
-const previewPrefix = `${rootPrefix}/preview`;
-const releasePlatforms = ['macos-arm64', 'linux-x64', 'linux-arm64', 'windows-x64'];
+const product = 'cottontail';
 
 function fail(message) {
-  console.error(message);
+  console.error(`cottontail publish: ${message}`);
   process.exit(1);
-}
-
-function platformKey() {
-  const key = `${process.platform}-${process.arch}`;
-  return {
-    'darwin-arm64': 'macos-arm64',
-    'linux-x64': 'linux-x64',
-    'linux-arm64': 'linux-arm64',
-    'win32-x64': 'windows-x64',
-  }[key] ?? fail(`Unsupported release platform: ${key}`);
 }
 
 function gitRevision() {
   if (process.env.GITHUB_SHA) return process.env.GITHUB_SHA;
-  if (process.env.CIRCLE_SHA1) return process.env.CIRCLE_SHA1;
   try {
-    return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: rootDir, encoding: 'utf8' }).trim();
+    return execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: rootDir,
+      encoding: 'utf8',
+    }).trim();
   } catch {
-    return fail('Unable to determine the release revision');
+    return fail('unable to determine the release revision');
   }
 }
 
-function isVersionTag(version) {
-  if (process.env.GITHUB_ACTIONS === 'true') {
-    return process.env.GITHUB_REF === `refs/tags/v${version}`;
-  }
-  try {
-    const tags = execFileSync('git', ['tag', '--points-at', 'HEAD'], {
-      cwd: rootDir,
-      encoding: 'utf8',
-    }).trim().split(/\s+/);
-    return tags.includes(`v${version}`);
-  } catch {
-    return false;
-  }
+function releaseTag() {
+  if (process.env.GITHUB_REF_TYPE === 'tag') return process.env.GITHUB_REF_NAME;
+  const argument = process.argv.find((value) => value.startsWith('--tag='));
+  if (argument) return argument.slice('--tag='.length);
+  if (dryRun) return `v${packageJson.version}`;
+  return fail('publishing is only allowed from a release tag');
 }
 
 function sha256(value, encoding = 'hex') {
@@ -69,9 +64,19 @@ function awsEncode(value) {
   );
 }
 
-function signingHeaders({ accountId, accessKeyId, secretAccessKey, bucket, key, body, contentType, cacheControl, now = new Date() }) {
+function signingHeaders({
+  accountId,
+  accessKeyId,
+  secretAccessKey,
+  bucket: bucketName,
+  key,
+  body,
+  contentType,
+  cacheControl,
+  now = new Date(),
+}) {
   const endpoint = new URL(`https://${accountId}.r2.cloudflarestorage.com`);
-  const canonicalUri = `/${[bucket, ...key.split('/')].map(awsEncode).join('/')}`;
+  const canonicalUri = `/${[bucketName, ...key.split('/')].map(awsEncode).join('/')}`;
   const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
   const date = amzDate.slice(0, 8);
   const payloadHash = sha256(body);
@@ -124,23 +129,41 @@ async function putObject(config, object) {
   });
   if (!response.ok) {
     const details = await response.text();
-    throw new Error(`R2 upload failed for ${object.key}: ${response.status} ${response.statusText}\n${details}`);
+    throw new Error(
+      `R2 upload failed for ${object.key}: ${response.status} ${response.statusText}\n${details}`,
+    );
   }
   console.log(`uploaded ${object.key}`);
 }
 
-if (process.env.CIRCLECI === 'true' && process.env.CIRCLE_BRANCH !== 'main') {
-  console.log(`Skipping R2 preview upload from branch ${process.env.CIRCLE_BRANCH ?? '(unknown)'}`);
-  process.exit(0);
+function readArtifact(platform) {
+  const archiveName = `cottontail-v${packageJson.version}-${platform}.tar.gz`;
+  const archivePath = join(rootDir, 'release', archiveName);
+  const checksumPath = `${archivePath}.sha256`;
+  if (!existsSync(archivePath) || !existsSync(checksumPath)) {
+    fail(`release matrix is incomplete; missing ${archivePath} or its checksum`);
+  }
+
+  const archive = readFileSync(archivePath);
+  const checksumFile = readFileSync(checksumPath);
+  const checksum = sha256(archive);
+  const recordedChecksum = checksumFile.toString('utf8').trim().split(/\s+/, 1)[0];
+  if (checksum !== recordedChecksum) fail(`release checksum mismatch for ${basename(archivePath)}`);
+
+  return {
+    platform,
+    archivePath,
+    checksumFile,
+    sha256: checksum,
+    size: statSync(archivePath).size,
+  };
 }
-if (
-  process.env.GITHUB_ACTIONS === 'true'
-  && process.env.GITHUB_REF !== 'refs/heads/main'
-  && !process.env.GITHUB_REF?.startsWith('refs/tags/v')
-) {
-  console.log(`Skipping R2 upload from ref ${process.env.GITHUB_REF ?? '(unknown)'}`);
-  process.exit(0);
+
+function jsonBody(value) {
+  return Buffer.from(`${JSON.stringify(value, null, 2)}\n`);
 }
+
+if (!publishAll) fail('publishing requires --all and a complete platform matrix');
 
 const requiredVariables = [
   'COTTONTAIL_R2_ACCOUNT_ID',
@@ -150,75 +173,35 @@ const requiredVariables = [
 ];
 if (!dryRun) {
   const missing = requiredVariables.filter((name) => !process.env[name]);
-  if (missing.length > 0) fail(`Missing required R2 environment variables: ${missing.join(', ')}`);
-  if (!publishAll) fail('Real preview publishing requires --all and a complete platform matrix');
+  if (missing.length > 0) fail(`missing required R2 environment variables: ${missing.join(', ')}`);
 }
 
 const version = packageJson.version;
 const revision = gitRevision();
-const publicBaseUrl = (process.env.COTTONTAIL_R2_PUBLIC_BASE_URL ?? 'https://preview.invalid').replace(/\/+$/, '');
-
-function readArtifact(platform) {
-  const archiveName = `cottontail-v${version}-${platform}.tar.gz`;
-  const archivePath = join(rootDir, 'release', archiveName);
-  const checksumPath = `${archivePath}.sha256`;
-  if (!existsSync(archivePath) || !existsSync(checksumPath)) {
-    fail(`Release matrix is incomplete; missing ${archivePath} or its checksum`);
-  }
-
-  const archive = readFileSync(archivePath);
-  const checksumFile = readFileSync(checksumPath);
-  const checksum = sha256(archive);
-  const recordedChecksum = checksumFile.toString('utf8').trim().split(/\s+/, 1)[0];
-  if (checksum !== recordedChecksum) fail(`Release checksum mismatch for ${basename(archivePath)}`);
-
-  return {
-    platform,
-    archivePath,
-    checksumFile,
-    checksum,
-    size: statSync(archivePath).size,
-  };
+let release;
+try {
+  validateRevision(revision);
+  release = validateReleaseTag(releaseTag(), version);
+} catch (error) {
+  fail(error.message);
 }
 
-const platforms = publishAll ? releasePlatforms : [platformKey()];
-const artifacts = platforms.map(readArtifact);
+const publicBaseUrl = (
+  process.env.COTTONTAIL_R2_PUBLIC_BASE_URL ?? 'https://artifacts.invalid'
+).replace(/\/+$/, '');
+const artifacts = RELEASE_PLATFORMS.map(readArtifact);
 const publishedAt = new Date().toISOString();
-const taggedVersionRelease = isVersionTag(version);
-if (!dryRun && forceVersionRelease && !taggedVersionRelease) {
-  fail(`Refusing to publish releases/${version}: HEAD is not tagged v${version}`);
-}
-const publishVersionRelease = taggedVersionRelease || (dryRun && forceVersionRelease);
-
-function snapshotArchiveKey(platform) {
-  return `${previewPrefix}/builds/${revision}/${platform}/cottontail.tar.gz`;
-}
-
-function versionArchiveKey(platform) {
-  return `${rootPrefix}/releases/${version}/${platform}/cottontail.tar.gz`;
-}
-
-function createManifest(channel, archiveKeyForPlatform) {
-  return Buffer.from(`${JSON.stringify({
-    schema: 2,
-    channel,
-    name: packageJson.name,
-    version,
-    revision,
-    publishedAt,
-    platforms: Object.fromEntries(artifacts.map((artifact) => [artifact.platform, {
-      archive: {
-        url: `${publicBaseUrl}/${archiveKeyForPlatform(artifact.platform)}`,
-        sha256: artifact.checksum,
-        size: artifact.size,
-      },
-    }])),
-  }, null, 2)}\n`);
-}
-
-const previewManifest = createManifest('preview', snapshotArchiveKey);
-const versionManifest = createManifest('release', versionArchiveKey);
-
+const manifestOptions = {
+  product,
+  version,
+  revision,
+  publishedAt,
+  publicBaseUrl,
+  artifacts,
+};
+const buildManifest = jsonBody(createBuildManifest(manifestOptions));
+const versionManifest = jsonBody(createReleaseManifest(manifestOptions));
+const channelManifest = jsonBody(createChannelManifest(manifestOptions));
 const config = {
   accountId: process.env.COTTONTAIL_R2_ACCOUNT_ID ?? 'dry-run-account',
   accessKeyId: process.env.COTTONTAIL_R2_ACCESS_KEY_ID ?? 'dry-run-access-key',
@@ -229,7 +212,7 @@ const immutable = 'public, max-age=31536000, immutable';
 const mutable = 'no-cache, no-store, must-revalidate';
 
 for (const artifact of artifacts) {
-  const archiveKey = snapshotArchiveKey(artifact.platform);
+  const archiveKey = buildArchiveKey(product, revision, artifact.platform);
   await putObject(config, {
     key: archiveKey,
     body: readFileSync(artifact.archivePath),
@@ -245,48 +228,31 @@ for (const artifact of artifacts) {
 }
 
 await putObject(config, {
-  key: `${previewPrefix}/builds/${revision}/manifest.json`,
-  body: previewManifest,
+  key: buildManifestKey(product, revision),
+  body: buildManifest,
   contentType: 'application/json; charset=utf-8',
   cacheControl: immutable,
 });
 await putObject(config, {
-  // Compatibility channel pointer. New version consumers should use
-  // cottontail/releases/<version>/manifest.json instead.
-  key: `${previewPrefix}/versions/${version}.json`,
-  body: previewManifest,
+  key: releaseManifestKey(product, version),
+  body: versionManifest,
   contentType: 'application/json; charset=utf-8',
-  cacheControl: mutable,
+  cacheControl: immutable,
 });
+
+// The mutable channel pointer is deliberately last. A failed matrix or manifest
+// upload can leave unused immutable objects, but it cannot publish a partial release.
 await putObject(config, {
-  key: `${previewPrefix}/latest.json`,
-  body: previewManifest,
+  key: channelManifestKey(product, release.channel),
+  body: channelManifest,
   contentType: 'application/json; charset=utf-8',
   cacheControl: mutable,
 });
 
-if (publishVersionRelease) {
-  for (const artifact of artifacts) {
-    const archiveKey = versionArchiveKey(artifact.platform);
-    await putObject(config, {
-      key: archiveKey,
-      body: readFileSync(artifact.archivePath),
-      contentType: 'application/gzip',
-      cacheControl: immutable,
-    });
-    await putObject(config, {
-      key: `${archiveKey}.sha256`,
-      body: artifact.checksumFile,
-      contentType: 'text/plain; charset=utf-8',
-      cacheControl: immutable,
-    });
-  }
-  await putObject(config, {
-    key: `${rootPrefix}/releases/${version}/manifest.json`,
-    body: versionManifest,
-    contentType: 'application/json; charset=utf-8',
-    cacheControl: immutable,
-  });
-}
-
-console.log(JSON.stringify({ version, revision, platforms, publishVersionRelease }, null, 2));
+console.log(JSON.stringify({
+  product,
+  channel: release.channel,
+  version,
+  revision,
+  platforms: RELEASE_PLATFORMS,
+}, null, 2));
