@@ -485,7 +485,7 @@ The final proof is a real project, not only upstream tests.
 On Windows and both Linux architectures:
 
 1. Remove Bun from `PATH`.
-2. Point dash-cli and Electrobun at the exact packaged Cottontail artifact.
+2. Point Hutch and Electrobun at the exact packaged Cottontail artifact.
 3. Install a clean dependency graph using Cottontail.
 4. Build Dash Desktop and the Dash platform applications.
 5. Launch the applications and exercise main-process startup, workers, child

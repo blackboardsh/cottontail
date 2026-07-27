@@ -87,7 +87,7 @@ embedded in the executable at build time.
 For native VM setup, exact workflow-equivalent commands, diagnostics, and the
 cross-platform working loop, see [`docs/cross-platform-bringup.md`](docs/cross-platform-bringup.md).
 
-The schema 1 archive layout contains a standalone executable for Dash CLI consumption:
+The schema 1 archive layout contains a standalone executable for Hutch consumption:
 
 - `bin/cottontail` (`bin/cottontail.exe` on Windows)
 - `runtime_modules/` for downstream bundlers that need physical module paths
@@ -117,8 +117,8 @@ Tags are the only release trigger. A tag must exactly match the version in
 target; any valid semantic-version prerelease tag, such as
 `vX.Y.Z-canary.N`, advances the canary channel.
 
-Run `dash push:canary` to propose the next `canary.N` release, or
-`dash push:production` to propose a production version. Both commands allow
+Run `hutch push:canary` to propose the next `canary.N` release, or
+`hutch push:production` to propose a production version. Both commands allow
 editing the proposed semantic version before they commit, tag, and atomically
 push `main` and the tag. Running `node scripts/tag-release.js` directly
 proposes the next minor production version.
