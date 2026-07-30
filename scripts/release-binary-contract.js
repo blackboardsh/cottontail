@@ -45,6 +45,30 @@ export function elfExportSymbolsFromVersionScript(source) {
   return symbols;
 }
 
+export function peExportSymbolsFromModuleDefinition(source) {
+  const text = Buffer.isBuffer(source) ? source.toString('utf8') : String(source);
+  const symbols = [];
+  let inExports = false;
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.replace(/;.*$/, '').trim();
+    if (line === '') continue;
+    if (!inExports) {
+      if (line.toUpperCase() === 'EXPORTS') inExports = true;
+      continue;
+    }
+    if (/[\s=@]/.test(line)) {
+      throw new Error(`Unsupported PE export entry: ${JSON.stringify(line)}`);
+    }
+    symbols.push(line);
+  }
+
+  if (!inExports || symbols.length === 0) {
+    throw new Error('PE module definition does not contain any exported symbols');
+  }
+  return symbols;
+}
+
 function requireRange(buffer, offset, size, label) {
   if (
     !Number.isSafeInteger(offset) ||
@@ -352,7 +376,7 @@ function inspectPortableExecutable(buffer) {
   };
 }
 
-function listPortableExecutableExports(buffer) {
+function portableExecutableExportMetadata(buffer) {
   requireRange(buffer, 0, 64, 'PE DOS header');
   const peOffset = buffer.readUInt32LE(0x3c);
   requireRange(buffer, peOffset, 24, 'PE header');
@@ -371,7 +395,7 @@ function listPortableExecutableExports(buffer) {
 
   const exportRva = buffer.readUInt32LE(optionalOffset + 112);
   const exportBytes = buffer.readUInt32LE(optionalOffset + 116);
-  if (exportRva === 0 || exportBytes === 0) return [];
+  if (exportRva === 0 || exportBytes === 0) return null;
 
   const sectionOffset = optionalOffset + optionalHeaderBytes;
   requireRange(buffer, sectionOffset, sectionCount * 40, 'PE section table');
@@ -394,25 +418,92 @@ function listPortableExecutableExports(buffer) {
     if (!section) {
       throw new Error(`Malformed release binary: ${label} RVA is not mapped`);
     }
-    const offset = section.rawOffset + rva - section.virtualAddress;
+    const sectionOffset = rva - section.virtualAddress;
+    if (sectionOffset >= section.rawSize) {
+      throw new Error(`Malformed release binary: ${label} RVA has no file data`);
+    }
+    const offset = section.rawOffset + sectionOffset;
     requireRange(buffer, offset, 1, label);
     return offset;
   };
 
   const directoryOffset = rvaToOffset(exportRva, 'PE export directory');
   requireRange(buffer, directoryOffset, 40, 'PE export directory');
+  const functionCount = buffer.readUInt32LE(directoryOffset + 20);
   const nameCount = buffer.readUInt32LE(directoryOffset + 24);
   const nameArrayRva = buffer.readUInt32LE(directoryOffset + 32);
+  const ordinalArrayRva = buffer.readUInt32LE(directoryOffset + 36);
+  if (nameCount === 0) {
+    return {
+      directoryOffset,
+      functionCount,
+      nameArrayOffset: null,
+      nameCount,
+      ordinalArrayOffset: null,
+      rvaToOffset,
+    };
+  }
   const nameArrayOffset = rvaToOffset(nameArrayRva, 'PE export name array');
+  const ordinalArrayOffset = rvaToOffset(ordinalArrayRva, 'PE export ordinal array');
   requireRange(buffer, nameArrayOffset, nameCount * 4, 'PE export name array');
+  requireRange(buffer, ordinalArrayOffset, nameCount * 2, 'PE export ordinal array');
 
+  return {
+    directoryOffset,
+    functionCount,
+    nameArrayOffset,
+    nameCount,
+    ordinalArrayOffset,
+    rvaToOffset,
+  };
+}
+
+function listPortableExecutableExports(buffer) {
+  const metadata = portableExecutableExportMetadata(buffer);
+  if (metadata === null) return [];
   const result = [];
-  for (let index = 0; index < nameCount; index += 1) {
-    const nameRva = buffer.readUInt32LE(nameArrayOffset + index * 4);
-    const nameOffset = rvaToOffset(nameRva, `PE export name ${index}`);
+  for (let index = 0; index < metadata.nameCount; index += 1) {
+    const nameRva = buffer.readUInt32LE(metadata.nameArrayOffset + index * 4);
+    const nameOffset = metadata.rvaToOffset(nameRva, `PE export name ${index}`);
+    const ordinal = buffer.readUInt16LE(metadata.ordinalArrayOffset + index * 2);
+    if (ordinal >= metadata.functionCount) {
+      throw new Error(`Malformed release binary: PE export ordinal ${index} is invalid`);
+    }
     result.push(readCString(buffer, nameOffset, buffer.length, `PE export name ${index}`));
   }
   return result;
+}
+
+export function restrictPortableExecutableExports(source, allowedSymbols) {
+  const buffer = Buffer.isBuffer(source) ? source : Buffer.from(source);
+  const metadata = portableExecutableExportMetadata(buffer);
+  if (metadata === null) {
+    return { buffer, hiddenSymbols: 0, retainedSymbols: 0 };
+  }
+
+  const allowed = allowedSymbols instanceof Set ? allowedSymbols : new Set(allowedSymbols);
+  let hiddenSymbols = 0;
+  let retainedSymbols = 0;
+  for (let index = 0; index < metadata.nameCount; index += 1) {
+    const nameRva = buffer.readUInt32LE(metadata.nameArrayOffset + index * 4);
+    const nameOffset = metadata.rvaToOffset(nameRva, `PE export name ${index}`);
+    const name = readCString(buffer, nameOffset, buffer.length, `PE export name ${index}`);
+    const ordinal = buffer.readUInt16LE(metadata.ordinalArrayOffset + index * 2);
+    if (ordinal >= metadata.functionCount) {
+      throw new Error(`Malformed release binary: PE export ordinal ${index} is invalid`);
+    }
+
+    if (!allowed.has(name)) {
+      hiddenSymbols += 1;
+      continue;
+    }
+    buffer.writeUInt32LE(nameRva, metadata.nameArrayOffset + retainedSymbols * 4);
+    buffer.writeUInt16LE(ordinal, metadata.ordinalArrayOffset + retainedSymbols * 2);
+    retainedSymbols += 1;
+  }
+  buffer.writeUInt32LE(retainedSymbols, metadata.directoryOffset + 24);
+
+  return { buffer, hiddenSymbols, retainedSymbols };
 }
 
 export function inspectReleaseBinary(source) {

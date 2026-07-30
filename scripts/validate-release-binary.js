@@ -9,6 +9,7 @@ import {
   assertStrippedReleaseBinary,
   elfExportSymbolsFromVersionScript,
   listExportedSymbols,
+  peExportSymbolsFromModuleDefinition,
 } from './release-binary-contract.js';
 
 const rootDir = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -17,6 +18,7 @@ const executablePath = process.argv[2]
   ? resolve(process.argv[2])
   : join(rootDir, 'zig-out', 'bin', executableName);
 const linuxVersionScriptPath = join(rootDir, 'src', 'compiler', 'src', 'symbols.dyn');
+const windowsModuleDefinitionPath = join(rootDir, 'src', 'compiler', 'src', 'symbols.def');
 
 function fail(message) {
   console.error(`Cottontail release binary validation failed: ${message}`);
@@ -41,10 +43,10 @@ if (exportedSymbols.length > maximumExportedSymbols) {
   );
 }
 
-if (details.format === 'elf64') {
-  const allowedExports = new Set(
-    elfExportSymbolsFromVersionScript(readFileSync(linuxVersionScriptPath)),
-  );
+if (details.format === 'elf64' || details.format === 'pe') {
+  const allowedExports = new Set(details.format === 'elf64'
+    ? elfExportSymbolsFromVersionScript(readFileSync(linuxVersionScriptPath))
+    : peExportSymbolsFromModuleDefinition(readFileSync(windowsModuleDefinitionPath)));
   const unexpectedExports = exportedSymbols.filter((symbol) => !allowedExports.has(symbol));
   if (unexpectedExports.length > 0) {
     fail(

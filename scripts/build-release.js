@@ -16,7 +16,9 @@ import { dirname, join } from 'node:path';
 
 import {
   elfExportSymbolsFromVersionScript,
+  peExportSymbolsFromModuleDefinition,
   restrictElfDynamicExports,
+  restrictPortableExecutableExports,
 } from './release-binary-contract.js';
 
 const rootDir = process.cwd();
@@ -27,6 +29,7 @@ const executablePath = join(rootDir, 'zig-out', 'bin', executableName);
 const validatorPath = join(rootDir, 'scripts', 'validate-release-binary.js');
 const macosExportListPath = join(rootDir, 'src', 'compiler', 'src', 'symbols.txt');
 const linuxVersionScriptPath = join(rootDir, 'src', 'compiler', 'src', 'symbols.dyn');
+const windowsModuleDefinitionPath = join(rootDir, 'src', 'compiler', 'src', 'symbols.def');
 
 if (!existsSync(zigPath)) {
   console.error(`Vendored Zig compiler not found at ${zigPath}. Run the cottontail setup first.`);
@@ -88,6 +91,19 @@ try {
     console.log(
       `Restricted Linux native-addon ABI: ${restricted.retainedSymbols} retained, ` +
         `${restricted.exposedSymbols} exposed, ${restricted.hiddenSymbols} hidden`,
+    );
+  } else if (process.platform === 'win32') {
+    const windowsExportSymbols = peExportSymbolsFromModuleDefinition(
+      readFileSync(windowsModuleDefinitionPath),
+    );
+    const restricted = restrictPortableExecutableExports(
+      readFileSync(stagedExecutable),
+      windowsExportSymbols,
+    );
+    writeFileSync(stagedExecutable, restricted.buffer);
+    console.log(
+      `Restricted Windows native-addon ABI: ${restricted.retainedSymbols} retained, ` +
+        `${restricted.hiddenSymbols} hidden`,
     );
   }
   run(

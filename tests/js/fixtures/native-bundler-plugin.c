@@ -193,20 +193,20 @@ static napi_value abi_visibility(napi_env env, napi_callback_info info) {
     (void)info;
     napi_value result = NULL;
     napi_value napi_visible = NULL;
-    napi_value openssl_hidden = NULL;
+    napi_value internal_hidden = NULL;
     int has_napi = 1;
-    int hides_openssl = 1;
+    int hides_internal = 1;
 
 #if defined(__linux__)
     has_napi = dlsym(RTLD_DEFAULT, "napi_create_object") != NULL;
-    hides_openssl = dlsym(RTLD_DEFAULT, "SSL_new") == NULL;
+    hides_internal = dlsym(RTLD_DEFAULT, "ct_bundle_build") == NULL;
 #endif
 
     if (napi_create_object(env, &result) != napi_ok ||
         napi_get_boolean(env, has_napi, &napi_visible) != napi_ok ||
-        napi_get_boolean(env, hides_openssl, &openssl_hidden) != napi_ok ||
+        napi_get_boolean(env, hides_internal, &internal_hidden) != napi_ok ||
         napi_set_named_property(env, result, "napiVisible", napi_visible) != napi_ok ||
-        napi_set_named_property(env, result, "opensslHidden", openssl_hidden) != napi_ok) {
+        napi_set_named_property(env, result, "internalHidden", internal_hidden) != napi_ok) {
         return NULL;
     }
     return result;

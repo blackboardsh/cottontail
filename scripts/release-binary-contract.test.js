@@ -7,7 +7,9 @@ import {
   elfExportSymbolsFromVersionScript,
   inspectReleaseBinary,
   listExportedSymbols,
+  peExportSymbolsFromModuleDefinition,
   restrictElfDynamicExports,
+  restrictPortableExecutableExports,
 } from './release-binary-contract.js';
 
 function machoFixture(localSymbols) {
@@ -108,7 +110,7 @@ function elfExportFixture({
   return buffer;
 }
 
-function peExportFixture() {
+function peExportFixture(names = ['exported']) {
   const buffer = Buffer.alloc(1024);
   buffer.set([0x4d, 0x5a], 0);
   buffer.writeUInt32LE(128, 0x3c);
@@ -130,11 +132,19 @@ function peExportFixture() {
   buffer.writeUInt32LE(512, sectionOffset + 20);
 
   const exportDirectory = 512;
-  buffer.writeUInt32LE(1, exportDirectory + 20);
-  buffer.writeUInt32LE(1, exportDirectory + 24);
+  buffer.writeUInt32LE(names.length, exportDirectory + 20);
+  buffer.writeUInt32LE(names.length, exportDirectory + 24);
   buffer.writeUInt32LE(0x1030, exportDirectory + 32);
-  buffer.writeUInt32LE(0x1040, 560);
-  buffer.write('exported\0', 576);
+  buffer.writeUInt32LE(0x1050, exportDirectory + 36);
+  let nameRva = 0x1080;
+  let nameOffset = 640;
+  for (let index = 0; index < names.length; index += 1) {
+    buffer.writeUInt32LE(nameRva, 560 + index * 4);
+    buffer.writeUInt16LE(index, 592 + index * 2);
+    buffer.write(`${names[index]}\0`, nameOffset);
+    nameRva += Buffer.byteLength(names[index]) + 1;
+    nameOffset += Buffer.byteLength(names[index]) + 1;
+  }
   return buffer;
 }
 
@@ -224,6 +234,53 @@ test('derives the Linux native-addon ABI from the linker version script', () => 
 
   const exports = elfExportSymbolsFromVersionScript(
     readFileSync(new URL('../src/compiler/src/symbols.dyn', import.meta.url)),
+  );
+  assert.ok(exports.length > 100);
+  assert.ok(exports.length <= 1024);
+  assert.equal(new Set(exports).size, exports.length);
+  for (const required of [
+    'napi_create_object',
+    'napi_create_threadsafe_function',
+    'node_module_register',
+    'uv_dlopen',
+    'uv_queue_work',
+  ]) {
+    assert.ok(exports.includes(required), `missing ${required}`);
+  }
+});
+
+test('restricts Windows exports to the declared native-addon ABI', () => {
+  const executable = peExportFixture(['allowed', 'hidden']);
+  assert.deepEqual(listExportedSymbols(executable), ['allowed', 'hidden']);
+
+  const restricted = restrictPortableExecutableExports(executable, ['allowed']);
+  assert.equal(restricted.retainedSymbols, 1);
+  assert.equal(restricted.hiddenSymbols, 1);
+  assert.deepEqual(listExportedSymbols(executable), ['allowed']);
+});
+
+test('derives the Windows native-addon ABI from the module definition', () => {
+  assert.deepEqual(
+    peExportSymbolsFromModuleDefinition(`
+      ; generated comments are ignored
+      LIBRARY cottontail
+      EXPORTS
+        napi_create_object
+        uv_queue_work ; trailing comment
+    `),
+    ['napi_create_object', 'uv_queue_work'],
+  );
+  assert.throws(
+    () => peExportSymbolsFromModuleDefinition('LIBRARY cottontail'),
+    /does not contain any exported symbols/,
+  );
+  assert.throws(
+    () => peExportSymbolsFromModuleDefinition('EXPORTS\n  public=internal'),
+    /Unsupported PE export entry/,
+  );
+
+  const exports = peExportSymbolsFromModuleDefinition(
+    readFileSync(new URL('../src/compiler/src/symbols.def', import.meta.url)),
   );
   assert.ok(exports.length > 100);
   assert.ok(exports.length <= 1024);
