@@ -853,32 +853,6 @@ pub const JSONParseResult = struct {
     };
 };
 
-pub fn parseForBundling(source: *const logger.Source, log: *logger.Log, allocator: std.mem.Allocator) !JSONParseResult {
-    switch (source.contents.len) {
-        // This is to be consisntent with how disabled JS files are handled
-        0 => {
-            return JSONParseResult{ .expr = Expr{ .loc = logger.Loc{ .start = 0 }, .data = empty_object_data }, .tag = .empty };
-        },
-        // This is a fast pass I guess
-        2 => {
-            if (strings.eqlComptime(source.contents[0..1], "\"\"") or strings.eqlComptime(source.contents[0..1], "''")) {
-                return JSONParseResult{ .expr = Expr{ .loc = logger.Loc{ .start = 0 }, .data = empty_string_data }, .tag = .expr };
-            } else if (strings.eqlComptime(source.contents[0..1], "{}")) {
-                return JSONParseResult{ .expr = Expr{ .loc = logger.Loc{ .start = 0 }, .data = empty_object_data }, .tag = .expr };
-            } else if (strings.eqlComptime(source.contents[0..1], "[]")) {
-                return JSONParseResult{ .expr = Expr{ .loc = logger.Loc{ .start = 0 }, .data = empty_array_data }, .tag = .expr };
-            }
-        },
-        else => {},
-    }
-
-    var parser = try JSONParser.init(allocator, source.*, log);
-    const result = try parser.parseExpr(false, true);
-    return JSONParseResult{
-        .tag = if (!LEXER_DEBUGGER_WORKAROUND and parser.lexer.is_ascii_only) JSONParseResult.Tag.ascii else JSONParseResult.Tag.expr,
-        .expr = result,
-    };
-}
 
 // threadlocal var env_json_auto_quote_buffer: MutableString = undefined;
 // threadlocal var env_json_auto_quote_buffer_loaded: bool = false;

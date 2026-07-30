@@ -69,21 +69,7 @@ pub fn wait(self: *Condition, mutex: *Mutex) void {
     };
 }
 
-/// Atomically releases the Mutex, blocks the caller thread, then re-acquires the Mutex on return.
-/// "Atomically" here refers to accesses done on the Condition after acquiring the Mutex.
-///
-/// The Mutex must be locked by the caller's thread when this function is called.
-/// A Mutex can have multiple Conditions waiting with it concurrently, but not the opposite.
-/// It is undefined behavior for multiple threads to wait ith different mutexes using the same Condition concurrently.
-/// Once threads have finished waiting with one Mutex, the Condition can be used to wait with another Mutex.
-///
-/// A blocking call to `timedWait()` is unblocked from one of the following conditions:
-/// - a spurious ("at random") wake occurs
-/// - the caller was blocked for around `timeout_ns` nanoseconds, in which `error.Timeout` is returned.
-/// - a future call to `signal()` or `broadcast()` which has acquired the Mutex and is sequenced after this `timedWait()`.
-///
-/// Given `timedWait()` can be interrupted spuriously, the blocking condition should be checked continuously
-/// irrespective of any notifications from `signal()` or `broadcast()`.
+/// Atomically releases the mutex, waits until notified or timed out, then re-acquires it.
 pub fn timedWait(self: *Condition, mutex: *Mutex, timeout_ns: u64) error{Timeout}!void {
     return self.impl.wait(mutex, timeout_ns);
 }

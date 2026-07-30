@@ -134,11 +134,6 @@ pub fn ArrayListAlignedIn(
             return self._unmanaged;
         }
 
-        /// Unlike `moveToUnmanaged`, this method *invalidates* `self`.
-        pub fn intoUnmanagedWithAllocator(self: *Self) struct { Unmanaged, Allocator } {
-            defer self.* = undefined;
-            return .{ self._unmanaged, self._allocator };
-        }
 
         /// The contents of `unmanaged` must have been allocated by `allocator`.
         /// This function invalidates `unmanaged`; don't call `deinit` on it.

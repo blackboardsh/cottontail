@@ -988,13 +988,6 @@ pub const Platform = enum {
         };
     }
 
-    pub inline fn separatorString(comptime platform: Platform) []const u8 {
-        return switch (platform) {
-            .loose, .posix => std.fs.path.sep_str_posix,
-            .nt, .windows => std.fs.path.sep_str_windows,
-        };
-    }
-
     pub fn getSeparatorFunc(comptime platform: Platform) IsSeparatorFunc {
         return switch (platform) {
             .loose => isSepAny,

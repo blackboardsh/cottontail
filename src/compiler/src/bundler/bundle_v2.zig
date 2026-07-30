@@ -4203,15 +4203,7 @@ pub const EntryPoint = struct {
         }
 
         // TODO: delete
-        pub inline fn isServerEntryPoint(this: Kind) bool {
-            return this == .user_specified;
-        }
     };
-};
-
-const AstSourceIDMapping = struct {
-    id: Index.Int,
-    source_index: Index.Int,
 };
 
 pub const PartRange = struct {

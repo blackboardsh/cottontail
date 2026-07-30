@@ -7,7 +7,6 @@ pub var Bun__Node__ProcessTitle: ?string = null;
 pub const Cli = struct {
     pub const CompileTarget = @import("../options_types/CompileTarget.zig");
     pub var log_: logger.Log = undefined;
-    pub fn startTransform(_: std.mem.Allocator, _: api.TransformOptions, _: *logger.Log) anyerror!void {}
     pub fn start(allocator: std.mem.Allocator) void {
         is_main_thread = true;
         start_time = std.time.nanoTimestamp();

@@ -60,13 +60,6 @@ pub const Fallback = struct {
 
     pub const version_hash = @import("build_options").fallback_html_version;
     var version_hash_int: u32 = 0;
-    pub fn versionHash() u32 {
-        if (version_hash_int == 0) {
-            version_hash_int = @as(u32, @truncate(std.fmt.parseInt(u64, version(), 16) catch unreachable));
-        }
-        return version_hash_int;
-    }
-
     pub fn version() string {
         return version_hash;
     }
@@ -121,10 +114,6 @@ pub const Runtime = struct {
         return @embedFile("../runtime.js");
     }
 
-    pub fn versionHash() u32 {
-        const hash = bun.Wyhash11.hash(0, sourceCode());
-        return @truncate(hash);
-    }
 
     pub const Features = struct {
         /// Enable the React Fast Refresh transform. What this does exactly

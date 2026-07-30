@@ -7,11 +7,6 @@ pub fn noop_resolver(in: string) !string {
     return in;
 }
 
-pub fn fileReadError(err: anyerror, stderr: anytype, filename: string, kind: string) noreturn {
-    stderr.writer().print("Error reading file \"{s}\" for {s}: {s}", .{ filename, kind, @errorName(err) }) catch {};
-    std.process.exit(1);
-}
-
 pub fn readFile(
     allocator: std.mem.Allocator,
     cwd: string,

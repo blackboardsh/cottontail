@@ -105,10 +105,5 @@ pub fn ExternalShared(comptime T: type) type {
             }
         };
 
-        /// Invalidates `self`.
-        pub fn intoOptional(self: *Self) Optional {
-            defer self.* = undefined;
-            return .{ ._impl = self._impl };
-        }
     };
 }

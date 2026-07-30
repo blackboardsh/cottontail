@@ -129,9 +129,6 @@ pub const T = enum(u8) {
         return @intFromEnum(self) >= @intFromEnum(T.t_ampersand_ampersand_equals) and @intFromEnum(self) <= @intFromEnum(T.t_slash_equals);
     }
 
-    pub fn isReservedWord(self: T) bool {
-        return @intFromEnum(self) >= @intFromEnum(T.t_break) and @intFromEnum(self) <= @intFromEnum(T.t_with);
-    }
 
     pub fn isString(self: T) bool {
         switch (self) {

@@ -579,31 +579,6 @@ pub const MatchedRoute = struct {
         return value;
     }
 
-    pub fn getScriptSrcString(
-        origin: []const u8,
-        comptime Writer: type,
-        writer: Writer,
-        file_path: string,
-        client_framework_enabled: bool,
-    ) void {
-        var entry_point_tempbuf: bun.PathBuffer = undefined;
-        // We don't store the framework config including the client parts in the server
-        // instead, we just store a boolean saying whether we should generate this whenever the script is requested
-        // this is kind of bad. we should consider instead a way to inline the contents of the script.
-        if (client_framework_enabled) {
-            jsc.API.Bun.getPublicPath(
-                Transpiler.ClientEntryPoint.generateEntryPointPath(
-                    &entry_point_tempbuf,
-                    Fs.PathName.init(file_path),
-                ),
-                origin,
-                Writer,
-                writer,
-            );
-        } else {
-            jsc.API.Bun.getPublicPath(file_path, origin, Writer, writer);
-        }
-    }
 
     pub fn getScriptSrc(
         this: *MatchedRoute,

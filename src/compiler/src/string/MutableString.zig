@@ -242,9 +242,6 @@ pub inline fn appendCharNTimes(self: *MutableString, char: u8, n: usize) Allocat
 pub inline fn appendChar(self: *MutableString, char: u8) Allocator.Error!void {
     try self.list.append(self.allocator, char);
 }
-pub inline fn appendCharAssumeCapacity(self: *MutableString, char: u8) void {
-    self.list.appendAssumeCapacity(char);
-}
 pub inline fn append(self: *MutableString, char: []const u8) Allocator.Error!void {
     try self.list.appendSlice(self.allocator, char);
 }
@@ -261,10 +258,6 @@ pub inline fn appendAssumeCapacity(self: *MutableString, char: []const u8) void 
         char,
     );
 }
-pub inline fn lenI(self: *MutableString) i32 {
-    return @as(i32, @intCast(self.list.items.len));
-}
-
 pub fn takeSlice(self: *MutableString) []u8 {
     const out = self.list.items;
     self.list = .empty;
@@ -273,10 +266,6 @@ pub fn takeSlice(self: *MutableString) []u8 {
 
 pub fn toOwnedSlice(self: *MutableString) []u8 {
     return bun.handleOom(self.list.toOwnedSlice(self.allocator)); // TODO
-}
-
-pub fn toDynamicOwned(self: *MutableString) DynamicOwned([]u8) {
-    return .fromRawIn(self.toOwnedSlice(), self.allocator);
 }
 
 /// `self.allocator` must be `bun.default_allocator`.
@@ -324,17 +313,6 @@ pub fn indexOf(self: *const MutableString, str: u8) ?usize {
 
 pub fn eql(self: *MutableString, other: anytype) bool {
     return std.mem.eql(u8, self.list.items, other);
-}
-
-pub fn toSocketBuffers(self: *MutableString, comptime count: usize, ranges: anytype) [count]std.posix.iovec_const {
-    var buffers: [count]std.posix.iovec_const = undefined;
-    inline for (&buffers, ranges) |*b, r| {
-        b.* = .{
-            .iov_base = self.list.items[r[0]..r[1]].ptr,
-            .iov_len = self.list.items[r[0]..r[1]].len,
-        };
-    }
-    return buffers;
 }
 
 pub const BufferedWriter = struct {
@@ -421,60 +399,6 @@ pub const BufferedWriter = struct {
         return pending.len;
     }
 
-    pub fn writeHTMLAttributeValueString(this: *BufferedWriter, str: *E.String) Allocator.Error!void {
-        if (str.isUTF8()) {
-            try this.writeHTMLAttributeValue(str.slice(this.context.allocator));
-            return;
-        }
-
-        try this.writeHTMLAttributeValue16(str.slice16());
-    }
-
-    pub fn writeHTMLAttributeValue(this: *BufferedWriter, bytes: []const u8) Allocator.Error!void {
-        var items = bytes;
-        while (items.len > 0) {
-            // TODO: SIMD
-            if (strings.indexOfAny(items, "\"<>")) |j| {
-                _ = try this.writeAll(items[0..j]);
-                _ = switch (items[j]) {
-                    '"' => try this.writeAll("&quot;"),
-                    '<' => try this.writeAll("&lt;"),
-                    '>' => try this.writeAll("&gt;"),
-                    else => unreachable,
-                };
-
-                items = items[j + 1 ..];
-                continue;
-            }
-
-            _ = try this.writeAll(items);
-            break;
-        }
-    }
-
-    pub fn writeHTMLAttributeValue16(this: *BufferedWriter, bytes: []const u16) Allocator.Error!void {
-        var items = bytes;
-        while (items.len > 0) {
-            if (strings.indexOfAny16(items, "\"<>")) |j| {
-                // this won't handle strings larger than 4 GB
-                // that's fine though, 4 GB of SSR'd HTML is quite a lot...
-                _ = try this.writeAll16(items[0..j]);
-                _ = switch (items[j]) {
-                    '"' => try this.writeAll("&quot;"),
-                    '<' => try this.writeAll("&lt;"),
-                    '>' => try this.writeAll("&gt;"),
-                    else => unreachable,
-                };
-
-                items = items[j + 1 ..];
-                continue;
-            }
-
-            _ = try this.writeAll16(items);
-            break;
-        }
-    }
-
     pub fn writer(this: *BufferedWriter) BufferedWriter.Writer {
         return BufferedWriter.Writer{ .context = this };
     }
@@ -494,5 +418,4 @@ const bun = @import("bun");
 const js_lexer = bun.js_lexer;
 const strings = bun.strings;
 
-const DynamicOwned = bun.ptr.DynamicOwned;
 const Owned = bun.ptr.Owned;

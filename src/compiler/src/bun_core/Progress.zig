@@ -145,21 +145,6 @@ pub const Node = struct {
         }
     }
 
-    /// Thread-safe.
-    pub fn setUnit(self: *Node, unit: []const u8) void {
-        const progress = self.context;
-        progress.update_mutex.lock();
-        defer progress.update_mutex.unlock();
-        self.unit = unit;
-        if (self.parent) |parent| {
-            @atomicStore(?*Node, &parent.recently_updated_child, self, .release);
-            if (parent.parent) |grand_parent| {
-                @atomicStore(?*Node, &grand_parent.recently_updated_child, parent, .release);
-            }
-            if (progress.timer) |*timer| progress.maybeRefreshWithHeldLock(timer);
-        }
-    }
-
     /// Thread-safe. 0 means unknown.
     pub fn setEstimatedTotalItems(self: *Node, count: usize) void {
         @atomicStore(usize, &self.unprotected_estimated_total_items, count, .monotonic);
@@ -388,26 +373,6 @@ pub fn log(self: *Progress, comptime format: []const u8, args: anytype) void {
     self.columns_written = 0;
 }
 
-/// Allows the caller to freely write to stderr until unlock_stderr() is called.
-/// During the lock, the progress information is cleared from the terminal.
-pub fn lock_stderr(p: *Progress) void {
-    p.update_mutex.lock();
-    if (p.terminal) |file| {
-        var end: usize = 0;
-        clearWithHeldLock(p, &end);
-        var file_writer = file.writerStreaming(std.Io.Threaded.global_single_threaded.io(), &.{});
-        file_writer.interface.writeAll(p.output_buffer[0..end]) catch {
-            // stop trying to write to this file
-            p.terminal = null;
-        };
-    }
-    std.debug.getStderrMutex().lock();
-}
-
-pub fn unlock_stderr(p: *Progress) void {
-    std.debug.getStderrMutex().unlock();
-    p.update_mutex.unlock();
-}
 
 fn bufWrite(self: *Progress, end: *usize, comptime format: []const u8, args: anytype) void {
     if (std.fmt.bufPrint(self.output_buffer[end.*..], format, args)) |written| {

@@ -51,17 +51,6 @@ pub fn getEntryPoints(this: *const Router) []const string {
     return this.routes.list.items(.filepath);
 }
 
-pub fn getPublicPaths(this: *const Router) []const string {
-    return this.routes.list.items(.public_path);
-}
-
-pub fn routeIndexByHash(this: *const Router, hash: u32) ?usize {
-    if (hash == index_route_hash) {
-        return this.routes.index_id;
-    }
-
-    return std.mem.indexOfScalar(u32, this.routes.list.items(.hash), hash);
-}
 
 pub fn getNames(this: *const Router) []const string {
     return this.routes.list.items(.name);
@@ -492,10 +481,6 @@ pub const TinyPtr = packed struct(u32) {
     pub inline fn str(this: TinyPtr, slice: string) string {
         return if (this.len > 0) slice[this.offset .. this.offset + this.len] else "";
     }
-    pub inline fn toStringPointer(this: TinyPtr) api.StringPointer {
-        return api.StringPointer{ .offset = this.offset, .length = this.len };
-    }
-
     pub inline fn eql(a: TinyPtr, b: TinyPtr) bool {
         return @as(u32, @bitCast(a)) == @as(u32, @bitCast(b));
     }
@@ -863,22 +848,6 @@ pub const Match = struct {
         return this.params.len > 0;
     }
 
-    pub fn paramsIterator(this: *const Match) PathnameScanner {
-        return PathnameScanner.init(this.pathname, this.name, this.params);
-    }
-
-    pub fn nameWithBasename(file_path: string, dir: string) string {
-        var name = file_path;
-        if (strings.indexOf(name, dir)) |i| {
-            name = name[i + dir.len ..];
-        }
-
-        return name[0 .. name.len - std.fs.path.extension(name).len];
-    }
-
-    pub fn pathnameWithoutLeadingSlash(this: *const Match) string {
-        return std.mem.trimStart(u8, this.pathname, "/");
-    }
 };
 
 const MockRequestContextType = struct {
@@ -940,61 +909,6 @@ fn makeTest(cwd_path: string, data: anytype) !void {
 }
 
 pub const Test = struct {
-    pub fn makeRoutes(comptime testName: string, data: anytype) !Routes {
-        Output.initTest();
-        try makeTest(testName, data);
-        const JSAst = bun.ast;
-        JSAst.Expr.Data.Store.create(default_allocator);
-        JSAst.Stmt.Data.Store.create(default_allocator);
-        const fs = try FileSystem.init(null);
-        const top_level_dir = fs.top_level_dir;
-
-        var pages_parts = [_]string{ top_level_dir, "pages" };
-        const pages_dir = try Fs.FileSystem.instance.absAlloc(default_allocator, &pages_parts);
-        // _ = try std.fs.makeDirAbsolute(
-        //     pages_dir,
-        // );
-        const router = try Router.init(&FileSystem.instance, default_allocator, Options.RouteConfig{
-            .dir = pages_dir,
-            .routes_enabled = true,
-            .extensions = &.{"js"},
-        });
-
-        const Resolver = @import("../resolver/resolver.zig").Resolver;
-        var logger = Logger.Log.init(default_allocator);
-        errdefer {
-            logger.print(Output.errorWriter()) catch {};
-        }
-
-        const opts = Options.BundleOptions{
-            .target = .browser,
-            .loaders = undefined,
-            .define = undefined,
-            .log = &logger,
-            .routes = router.config,
-            .entry_points = &.{},
-            .out_extensions = bun.StringHashMap(string).init(default_allocator),
-            .transform_options = std.mem.zeroes(api.TransformOptions),
-            .external = Options.ExternalModules.init(
-                default_allocator,
-                &FileSystem.instance.fs,
-                FileSystem.instance.top_level_dir,
-                &.{},
-                &logger,
-                .browser,
-            ),
-        };
-
-        var resolver = Resolver.init1(default_allocator, &logger, &FileSystem.instance, opts);
-
-        const root_dir = (try resolver.readDirInfo(pages_dir)).?;
-        return RouteLoader.loadAll(default_allocator, opts.routes, &logger, Resolver, &resolver, root_dir);
-        // try router.loadRoutes(root_dir, Resolver, &resolver, 0, true);
-        // var entry_points = try router.getEntryPoints(default_allocator);
-
-        // try expectEqual(std.meta.fieldNames(@TypeOf(data)).len, entry_points.len);
-        // return router;
-    }
 
     pub fn make(comptime testName: string, data: anytype) !Router {
         try makeTest(testName, data);

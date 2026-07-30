@@ -169,10 +169,6 @@ pub const CowFd = struct {
         return this.dup();
     }
 
-    pub fn doneUsing(this: *CowFd) void {
-        this.being_used = false;
-    }
-
     pub fn ref(this: *CowFd) void {
         this.refcount += 1;
     }
@@ -1665,15 +1661,6 @@ pub fn StatePtrUnion(comptime TypesValue: anytype) type {
     };
 }
 
-pub fn MaybeChild(comptime T: type) type {
-    return switch (@typeInfo(T)) {
-        .Array => |info| info.child,
-        .Vector => |info| info.child,
-        .pointer => |info| info.child,
-        .Optional => |info| info.child,
-        else => T,
-    };
-}
 
 pub fn closefd(fd: bun.FD) void {
     if (fd.closeAllowingBadFileDescriptor(null)) |err| {
