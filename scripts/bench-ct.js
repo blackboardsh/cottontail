@@ -11,6 +11,19 @@ const benches = [
     warmupRuns: 1,
   },
   {
+    name: 'startup-full-runtime',
+    scriptPath: path.join(rootDir, 'bench', 'full-runtime.js'),
+    iterations: 12,
+    warmupRuns: 1,
+  },
+  {
+    name: 'module-resolve',
+    scriptPath: path.join(rootDir, 'bench', 'module-resolve.js'),
+    iterations: 8,
+    warmupRuns: 1,
+    expectInternalMetric: true,
+  },
+  {
     name: 'loop',
     scriptPath: path.join(rootDir, 'bench', 'loop.js'),
     iterations: 12,
@@ -110,6 +123,7 @@ if (!fs.existsSync(binaryPath)) {
 
 console.log('cottontail benchmarks (ReleaseSmall)');
 console.log('startup-empty wall time approximates process startup + runtime init + empty script eval');
+console.log('startup-full-runtime includes initialization of the complete Bun compatibility surface');
 
 for (const bench of benches) {
   for (let index = 0; index < bench.warmupRuns; index += 1) {
