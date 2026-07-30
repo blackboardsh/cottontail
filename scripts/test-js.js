@@ -211,8 +211,8 @@ try {
       stderrIncludes: ['8 pass', '0 fail'],
     },
     {
-      name: 'bun-strip-ansi-native',
-      argv: ['test', join(rootDir, 'tests', 'js', 'bun-strip-ansi-native.test.ts')],
+      name: 'bun-strip-ansi',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-strip-ansi.test.ts')],
       expectExitCode: 0,
       stderrIncludes: ['8 pass', '0 fail'],
     },

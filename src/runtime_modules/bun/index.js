@@ -13776,22 +13776,12 @@ export function escapeHTML(value, attribute = false) {
   return escaped;
 }
 
-const stripANSINative = typeof cottontail.stripANSINative === "function"
-  ? cottontail.stripANSINative
-  : null;
 const stripANSIControlPattern = /[\x1b\x90\x98\x9b-\x9f]/;
-const stripANSINativeThreshold = 2048;
 
 export function stripANSI(value) {
   const text = String(value);
   if (text.indexOf("\x1b") === -1 && text.indexOf("\x9b") === -1) {
-    if (stripANSINative !== null && text.length >= stripANSINativeThreshold) {
-      return stripANSINative(text);
-    }
     if (!stripANSIControlPattern.test(text)) return text;
-  }
-  if (stripANSINative !== null && text.length >= stripANSINativeThreshold) {
-    return stripANSINative(text);
   }
   const length = text.length;
   let out = "";

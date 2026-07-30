@@ -90,8 +90,8 @@ function expectDifferential(input: unknown): void {
   expect(Bun.stripANSI(input as string)).toBe(referenceStripANSI(input));
 }
 
-describe("Bun.stripANSI native fast path", () => {
-  test("matches below, at, and above the native threshold", () => {
+describe("Bun.stripANSI", () => {
+  test("matches across representative input sizes", () => {
     for (const length of [0, 1, 32, 2047, 2048, 2049, 4096, 65536]) {
       expectDifferential("x".repeat(length) + "\x1b[31mred\x1b[0m");
       expectDifferential("\x1b[31m" + "x".repeat(length) + "\x1b[0m");

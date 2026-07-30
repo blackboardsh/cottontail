@@ -102,10 +102,6 @@ static const JSObjectCallAsFunctionCallback ct_uuid_native_callbacks[] = {
 #include "uuid.inc"
 };
 
-static const JSObjectCallAsFunctionCallback ct_strip_ansi_native_callbacks[] = {
-#include "strip_ansi.inc"
-};
-
 #undef CT_NATIVE_BINDING
 
 #define CT_NATIVE_CALLBACK_COUNT(callbacks) (sizeof(callbacks) / sizeof(callbacks[0]))
@@ -147,7 +143,6 @@ static void ct_register_host_native_bindings(
     CT_REGISTER_NATIVE_BINDINGS(platform);
     CT_REGISTER_NATIVE_BINDINGS(path);
     CT_REGISTER_NATIVE_BINDINGS(uuid);
-    CT_REGISTER_NATIVE_BINDINGS(strip_ansi);
 }
 
 #undef CT_REGISTER_NATIVE_BINDINGS

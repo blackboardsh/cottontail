@@ -35545,7 +35545,6 @@ static JSValueRef ct_unhandled_rejection(
 #include "native_bindings/text_encoding_jsc.inc"
 #include "native_bindings/uuid_jsc.inc"
 #include "native_bindings/websocket_frame_jsc.inc" /* Native WebSocket frame bytes. */
-#include "native_bindings/strip_ansi_jsc.inc"
 #include "native_bindings/string_width_jsc.inc"
 #include "native_bindings/crypto_hasher_jsc.inc"
 #include "native_bindings/callbacks.h"
