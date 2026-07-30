@@ -476,6 +476,12 @@ try {
       expectExitCode: 0,
       stdoutIncludes: ['4 pass', '0 fail'],
     },
+    {
+      name: 'text-encoding-native-fast-path',
+      argv: ['test', join(rootDir, 'tests', 'js', 'text-encoding-native-fast-path.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['6 pass', '0 fail'],
+    },
     ...(process.platform === 'win32'
       ? [
           {

@@ -25,6 +25,7 @@
     "bench:build": "bun run build:release",
     "bench": "bun run bench:build && node scripts/bench.js",
     "bench:fs-bulk": "./zig-out/bin/cottontail bench/fs-bulk.js",
+    "bench:encoding": "./zig-out/bin/cottontail scripts/bench-encoding.js",
     "compat:surface": "node scripts/generate-api-surface.js",
     "compat:surface:view": "node scripts/show-api-surface.js",
     "compat:surface:all": "bun run compat:surface && bun run compat:surface:view",
