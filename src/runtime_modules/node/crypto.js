@@ -83,7 +83,7 @@ const supportedCiphers = [
 }));
 const supportedCipherMap = Object.fromEntries(supportedCiphers.map((cipher) => [cipher.name, cipher]));
 const ed25519StreamErrorMessage = "Unsupported crypto operation";
-const supportedNativeEcCurves = ["secp256k1", "secp384r1", "secp521r1"];
+const supportedNativeEcCurves = ["prime256v1", "secp256k1", "secp384r1", "secp521r1"];
 const smallPrimeBases = [2n, 3n, 5n, 7n, 11n, 13n, 17n, 19n, 23n, 29n, 31n, 37n];
 const dhGroupPrimes = {
   // RFC 3526 1536-bit MODP group (group 5).
@@ -610,12 +610,18 @@ function digestBytes(algorithm, data, outputLength = undefined) {
   if (normalized === "md5-sha1") {
     return concatBytes([digestBytes("md5", data), digestBytes("sha1", data)]);
   }
-  if (normalized === "md4") return md4Digest(data);
-  if (normalized === "blake2b256") return blake2bDigest(data, 32);
   if (typeof cottontail.cryptoHashSync !== "function") {
+    if (normalized === "md4") return md4Digest(data);
+    if (normalized === "blake2b256") return blake2bDigest(data, 32);
     throw new Error("native crypto hashing is unavailable");
   }
-  return new Uint8Array(cottontail.cryptoHashSync(normalized, data, outputLength));
+  try {
+    return new Uint8Array(cottontail.cryptoHashSync(normalized, data, outputLength));
+  } catch (error) {
+    if (normalized === "md4") return md4Digest(data);
+    if (normalized === "blake2b256") return blake2bDigest(data, 32);
+    throw error;
+  }
 }
 
 function hmacBytes(algorithm, key, data) {
@@ -623,11 +629,15 @@ function hmacBytes(algorithm, key, data) {
   if (!isSupportedDigest(normalized)) {
     throw new Error(`HMAC algorithm is not supported in Cottontail yet: ${algorithm}`);
   }
-  if (normalized === "md4" || normalized === "blake2b256") return hmacFallback(normalized, key, data);
-  if (typeof cottontail.cryptoHmacSync !== "function") {
-    throw new Error("native crypto HMAC is unavailable");
+  if (typeof cottontail.cryptoHmacSync === "function") {
+    try {
+      return new Uint8Array(cottontail.cryptoHmacSync(normalized, key, data));
+    } catch (error) {
+      if (normalized !== "md4" && normalized !== "blake2b256") throw error;
+    }
   }
-  return new Uint8Array(cottontail.cryptoHmacSync(normalized, key, data));
+  if (normalized === "md4" || normalized === "blake2b256") return hmacFallback(normalized, key, data);
+  throw new Error("native crypto HMAC is unavailable");
 }
 
 function bufferFromBytes(bytes) {
@@ -1593,10 +1603,8 @@ function keyObjectFromNativeKey(nativeKey, requestedType = undefined) {
     const publicKey = bytesFromData(nativeKey.publicKey);
     if (nativeKey.type === "private" && requestedType !== "public") {
       const privateKey = bytesFromData(nativeKey.privateKey);
-      if (namedCurve === "prime256v1") return createEcPrivateKey(privateKey);
       return createNativeEcPrivateKey(namedCurve, privateKey, publicKey);
     }
-    if (namedCurve === "prime256v1") return createEcPublicKey(p256DecodePoint(publicKey));
     return createNativeEcPublicKey(namedCurve, publicKey);
   }
   if (type === "ed25519") {
@@ -1706,6 +1714,38 @@ function rsaPrivateApply(keyObject, input) {
   return rsaApply(keyObject.rsa.d, keyObject.rsa.n, input);
 }
 
+function rsaNativeCrypt(operation, keyObject, input, options) {
+  if (typeof cottontail.cryptoRsaCrypt !== "function") cryptoFeatureError(`crypto.${operation}`);
+  const parts = keyObject.rsa;
+  const label = options.oaepLabel == null ? undefined : bytesFromData(options.oaepLabel);
+  try {
+    return bufferFromBytes(new Uint8Array(cottontail.cryptoRsaCrypt(
+      operation,
+      options.padding,
+      normalizeAlgorithm(options.oaepHash ?? "sha1"),
+      label,
+      rsaPartBytes(parts, "n"),
+      rsaPartBytes(parts, "e"),
+      rsaPartBytes(parts, "d"),
+      rsaPartBytes(parts, "p"),
+      rsaPartBytes(parts, "q"),
+      rsaPartBytes(parts, "dp"),
+      rsaPartBytes(parts, "dq"),
+      rsaPartBytes(parts, "qi"),
+      input,
+    )));
+  } catch (cause) {
+    if (operation === "privateDecrypt" && options.padding === constantsObject.RSA_PKCS1_OAEP_PADDING) {
+      const error = new Error("error:02000079:rsa routines::oaep decoding error");
+      error.code = "ERR_OSSL_RSA_OAEP_DECODING_ERROR";
+      error.library = "rsa routines";
+      error.reason = "oaep decoding error";
+      throw error;
+    }
+    throw cause instanceof Error ? cause : new Error(String(cause ?? "RSA operation failed"));
+  }
+}
+
 function rsaPkcs1DigestInfo(algorithm, digest) {
   const normalized = normalizeAlgorithm(algorithm);
   const prefix = rsaDigestInfoPrefixes[normalized];
@@ -1804,136 +1844,13 @@ function rsaVerifyDigest(algorithm, digest, keyObject, signature, options = unde
   return timingSafeEqual(actual, expected);
 }
 
-function gcd(left, right) {
-  let a = left < 0n ? -left : left;
-  let b = right < 0n ? -right : right;
-  while (b !== 0n) {
-    [a, b] = [b, a % b];
-  }
-  return a;
-}
-
-function generateRsaPrime(bits, exponent) {
-  for (;;) {
-    const prime = generatePrimeBigint(bits);
-    if (gcd(exponent, prime - 1n) === 1n) return prime;
-  }
-}
-
 function generateRsaKeyPair(modulusLength, publicExponent) {
   const bits = positiveInteger(modulusLength, "modulusLength");
   if (bits < 512) throw new RangeError("RSA modulusLength must be at least 512 bits");
   const e = normalizePublicExponent(publicExponent ?? 0x10001);
-  const pBits = Math.ceil(bits / 2);
-  const qBits = Math.floor(bits / 2);
-  for (;;) {
-    const p = generateRsaPrime(pBits, e);
-    let q = generateRsaPrime(qBits, e);
-    if (p === q) continue;
-    const n = p * q;
-    if (bitLength(n) !== bits) continue;
-    const phi = (p - 1n) * (q - 1n);
-    if (gcd(e, phi) !== 1n) continue;
-    const d = modInverse(e, phi);
-    return {
-      n,
-      e,
-      d,
-      p,
-      q,
-      dp: d % (p - 1n),
-      dq: d % (q - 1n),
-      qi: modInverse(q, p),
-    };
-  }
-}
-
-function mgf1(seed, length, algorithm) {
-  const chunks = [];
-  for (let counter = 0; concatBytes(chunks).byteLength < length; counter += 1) {
-    chunks.push(digestBytes(algorithm, concatBytes([seed, new Uint8Array([
-      (counter >>> 24) & 0xff,
-      (counter >>> 16) & 0xff,
-      (counter >>> 8) & 0xff,
-      counter & 0xff,
-    ])])));
-  }
-  return concatBytes(chunks).slice(0, length);
-}
-
-function nonZeroRandomBytes(length) {
-  const out = new Uint8Array(length);
-  let offset = 0;
-  while (offset < length) {
-    const chunk = randomBytes(length - offset);
-    for (const byte of chunk) {
-      if (byte === 0) continue;
-      out[offset++] = byte;
-      if (offset === length) break;
-    }
-  }
-  return out;
-}
-
-function rsaOaepEncode(message, length, algorithm = "sha1", label = undefined) {
-  const hashLength = digestBytes(algorithm, new Uint8Array()).byteLength;
-  if (message.byteLength > length - 2 * hashLength - 2) throw new RangeError("RSA OAEP message is too long");
-  const labelHash = digestBytes(algorithm, bytesFromData(label ?? new Uint8Array()));
-  const ps = new Uint8Array(length - message.byteLength - 2 * hashLength - 2);
-  const db = concatBytes([labelHash, ps, new Uint8Array([1]), message]);
-  const seed = randomBytes(hashLength);
-  const dbMask = mgf1(seed, length - hashLength - 1, algorithm);
-  const maskedDb = xorBytes(db, dbMask);
-  const seedMask = mgf1(maskedDb, hashLength, algorithm);
-  const maskedSeed = xorBytes(seed, seedMask);
-  return concatBytes([new Uint8Array([0]), maskedSeed, maskedDb]);
-}
-
-function rsaOaepDecode(encoded, algorithm = "sha1", label = undefined) {
-  const bytes = bytesFromData(encoded);
-  const hashLength = digestBytes(algorithm, new Uint8Array()).byteLength;
-  if (bytes.byteLength < 2 * hashLength + 2 || bytes[0] !== 0) throw new Error("RSA OAEP decoding failed");
-  const maskedSeed = bytes.slice(1, 1 + hashLength);
-  const maskedDb = bytes.slice(1 + hashLength);
-  const seedMask = mgf1(maskedDb, hashLength, algorithm);
-  const seed = xorBytes(maskedSeed, seedMask);
-  const dbMask = mgf1(seed, bytes.byteLength - hashLength - 1, algorithm);
-  const db = xorBytes(maskedDb, dbMask);
-  const labelHash = digestBytes(algorithm, bytesFromData(label ?? new Uint8Array()));
-  if (!timingSafeEqual(db.slice(0, hashLength), labelHash)) throw new Error("RSA OAEP label hash mismatch");
-  let index = hashLength;
-  while (index < db.byteLength && db[index] === 0) index += 1;
-  if (index >= db.byteLength || db[index] !== 1) throw new Error("RSA OAEP separator not found");
-  return bufferFromBytes(db.slice(index + 1));
-}
-
-function rsaPkcs1EncryptBlock(message, length) {
-  if (message.byteLength > length - 11) throw new RangeError("RSA message is too long");
-  const padding = nonZeroRandomBytes(length - message.byteLength - 3);
-  return concatBytes([new Uint8Array([0, 2]), padding, new Uint8Array([0]), message]);
-}
-
-function rsaPkcs1DecryptBlock(encoded, expectedType) {
-  const bytes = bytesFromData(encoded);
-  if (bytes.byteLength < 11 || bytes[0] !== 0 || bytes[1] !== expectedType) throw new Error("RSA PKCS#1 decoding failed");
-  let index = 2;
-  while (index < bytes.byteLength && bytes[index] !== 0) {
-    if (expectedType === 1 && bytes[index] !== 0xff) throw new Error("RSA PKCS#1 block type mismatch");
-    index += 1;
-  }
-  if (index < 10 || index >= bytes.byteLength) throw new Error("RSA PKCS#1 separator not found");
-  return bufferFromBytes(bytes.slice(index + 1));
-}
-
-function rsaPrivateEncryptBlock(message, length) {
-  if (message.byteLength > length - 11) throw new RangeError("RSA message is too long");
-  const out = new Uint8Array(length);
-  out[0] = 0;
-  out[1] = 1;
-  out.fill(0xff, 2, length - message.byteLength - 1);
-  out[length - message.byteLength - 1] = 0;
-  out.set(message, length - message.byteLength);
-  return out;
+  if (e > 0xffffffffn) throw new RangeError("RSA publicExponent must be at most 2^32 - 1");
+  if (typeof cottontail.cryptoRsaGenerateKeyPair !== "function") cryptoFeatureError("crypto.generateKeyPairSync(rsa)");
+  return rsaPartsFromNativeKey(cottontail.cryptoRsaGenerateKeyPair(bits, Number(e)));
 }
 
 function parseX509Algorithm(node) {
@@ -1974,9 +1891,7 @@ function parseX509PublicKeyInfo(node) {
     const curve = x509EcCurveOids[asn1Oid(algorithmChildren[1])];
     if (curve == null) throw new Error(`X.509 EC curve is not available: ${asn1Oid(algorithmChildren[1])}`);
     return {
-      keyObject: nativeKeyObject ?? (curve.asn1Curve === "prime256v1"
-        ? createEcPublicKey(p256DecodePoint(publicKeyBytes))
-        : createNativeEcPublicKey(curve.asn1Curve, publicKeyBytes)),
+      keyObject: nativeKeyObject ?? createNativeEcPublicKey(curve.asn1Curve, publicKeyBytes),
       legacy: {
         pubkey: bufferFromBytes(node.bytes),
         asn1Curve: curve.asn1Curve,
@@ -2223,126 +2138,122 @@ function rotateLeft32(value, shift) {
   return ((value << shift) | (value >>> (32 - shift))) >>> 0;
 }
 
-function readUint32LE(bytes, offset) {
-  return (
-    bytes[offset] |
-    (bytes[offset + 1] << 8) |
-    (bytes[offset + 2] << 16) |
-    (bytes[offset + 3] << 24)
-  ) >>> 0;
-}
-
-function writeUint32LE(bytes, offset, value) {
-  bytes[offset] = value & 0xff;
-  bytes[offset + 1] = (value >>> 8) & 0xff;
-  bytes[offset + 2] = (value >>> 16) & 0xff;
-  bytes[offset + 3] = (value >>> 24) & 0xff;
-}
-
-function salsa208(block) {
-  const input = new Uint32Array(16);
-  const x = new Uint32Array(16);
-  for (let index = 0; index < 16; index += 1) {
-    input[index] = readUint32LE(block, index * 4);
-    x[index] = input[index];
-  }
-
-  for (let round = 0; round < 8; round += 2) {
-    x[4] ^= rotateLeft32((x[0] + x[12]) >>> 0, 7);
-    x[8] ^= rotateLeft32((x[4] + x[0]) >>> 0, 9);
-    x[12] ^= rotateLeft32((x[8] + x[4]) >>> 0, 13);
-    x[0] ^= rotateLeft32((x[12] + x[8]) >>> 0, 18);
-    x[9] ^= rotateLeft32((x[5] + x[1]) >>> 0, 7);
-    x[13] ^= rotateLeft32((x[9] + x[5]) >>> 0, 9);
-    x[1] ^= rotateLeft32((x[13] + x[9]) >>> 0, 13);
-    x[5] ^= rotateLeft32((x[1] + x[13]) >>> 0, 18);
-    x[14] ^= rotateLeft32((x[10] + x[6]) >>> 0, 7);
-    x[2] ^= rotateLeft32((x[14] + x[10]) >>> 0, 9);
-    x[6] ^= rotateLeft32((x[2] + x[14]) >>> 0, 13);
-    x[10] ^= rotateLeft32((x[6] + x[2]) >>> 0, 18);
-    x[3] ^= rotateLeft32((x[15] + x[11]) >>> 0, 7);
-    x[7] ^= rotateLeft32((x[3] + x[15]) >>> 0, 9);
-    x[11] ^= rotateLeft32((x[7] + x[3]) >>> 0, 13);
-    x[15] ^= rotateLeft32((x[11] + x[7]) >>> 0, 18);
-
-    x[1] ^= rotateLeft32((x[0] + x[3]) >>> 0, 7);
-    x[2] ^= rotateLeft32((x[1] + x[0]) >>> 0, 9);
-    x[3] ^= rotateLeft32((x[2] + x[1]) >>> 0, 13);
-    x[0] ^= rotateLeft32((x[3] + x[2]) >>> 0, 18);
-    x[6] ^= rotateLeft32((x[5] + x[4]) >>> 0, 7);
-    x[7] ^= rotateLeft32((x[6] + x[5]) >>> 0, 9);
-    x[4] ^= rotateLeft32((x[7] + x[6]) >>> 0, 13);
-    x[5] ^= rotateLeft32((x[4] + x[7]) >>> 0, 18);
-    x[11] ^= rotateLeft32((x[10] + x[9]) >>> 0, 7);
-    x[8] ^= rotateLeft32((x[11] + x[10]) >>> 0, 9);
-    x[9] ^= rotateLeft32((x[8] + x[11]) >>> 0, 13);
-    x[10] ^= rotateLeft32((x[9] + x[8]) >>> 0, 18);
-    x[12] ^= rotateLeft32((x[15] + x[14]) >>> 0, 7);
-    x[13] ^= rotateLeft32((x[12] + x[15]) >>> 0, 9);
-    x[14] ^= rotateLeft32((x[13] + x[12]) >>> 0, 13);
-    x[15] ^= rotateLeft32((x[14] + x[13]) >>> 0, 18);
-  }
-
-  const out = new Uint8Array(64);
-  for (let index = 0; index < 16; index += 1) {
-    writeUint32LE(out, index * 4, (x[index] + input[index]) >>> 0);
-  }
-  return out;
-}
-
-function xorBytes(left, right) {
-  const out = new Uint8Array(left.byteLength);
-  for (let index = 0; index < left.byteLength; index += 1) out[index] = left[index] ^ right[index];
-  return out;
-}
-
-function scryptBlockMix(block, r) {
-  const chunkCount = 2 * r;
-  let x = block.slice((chunkCount - 1) * 64, chunkCount * 64);
-  const y = new Array(chunkCount);
-  for (let index = 0; index < chunkCount; index += 1) {
-    x = salsa208(xorBytes(x, block.slice(index * 64, (index + 1) * 64)));
-    y[index] = x;
-  }
-  const out = new Uint8Array(block.byteLength);
-  let offset = 0;
-  for (let index = 0; index < chunkCount; index += 2) {
-    out.set(y[index], offset);
-    offset += 64;
-  }
-  for (let index = 1; index < chunkCount; index += 2) {
-    out.set(y[index], offset);
-    offset += 64;
-  }
-  return out;
-}
-
-function scryptIntegerify(block, r) {
-  return readUint32LE(block, (2 * r - 1) * 64);
-}
-
-function scryptRomix(block, N, r) {
-  let x = new Uint8Array(block);
-  const v = new Array(N);
-  for (let index = 0; index < N; index += 1) {
-    v[index] = x;
-    x = scryptBlockMix(x, r);
-  }
-  for (let index = 0; index < N; index += 1) {
-    const j = scryptIntegerify(x, r) & (N - 1);
-    x = scryptBlockMix(xorBytes(x, v[j]), r);
-  }
-  return x;
-}
-
 function scryptOptions(options = {}) {
-  const N = positiveInteger(options.N ?? options.cost ?? 16384, "N");
-  const r = positiveInteger(options.r ?? options.blockSize ?? 8, "r");
-  const p = positiveInteger(options.p ?? options.parallelization ?? 1, "p");
-  const maxmem = positiveInteger(options.maxmem ?? 32 * 1024 * 1024, "maxmem");
-  if ((N & (N - 1)) !== 0 || N <= 1) throw new RangeError("N must be a power of two greater than 1");
-  if (128 * N * r + 128 * r * p > maxmem) throw new RangeError("Invalid scrypt params: memory limit exceeded");
-  return { N, r, p };
+  if (options == null || typeof options !== "object") {
+    throw nodeCryptoError(
+      TypeError,
+      "ERR_INVALID_ARG_TYPE",
+      `The "options" argument must be of type object. Received ${describeReceivedValue(options)}`,
+    );
+  }
+
+  function option(shortName, longName, fallback) {
+    const shortValue = options[shortName];
+    const longValue = options[longName];
+    if (shortValue !== undefined && longValue !== undefined) {
+      throw nodeCryptoError(
+        Error,
+        "ERR_INCOMPATIBLE_OPTION_PAIR",
+        `Option "${shortName}" cannot be used in combination with option "${longName}"`,
+      );
+    }
+    const value = shortValue ?? longValue ?? fallback;
+    if (typeof value !== "number") {
+      throw nodeCryptoError(
+        TypeError,
+        "ERR_INVALID_ARG_TYPE",
+        `The "${shortName}" argument must be of type number. Received ${describeReceivedValue(value)}`,
+      );
+    }
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw nodeCryptoError(
+        RangeError,
+        "ERR_OUT_OF_RANGE",
+        `The value of "${shortName}" is out of range. It must be a positive safe integer. Received ${value}`,
+      );
+    }
+    return value;
+  }
+
+  const N = option("N", "cost", 16384);
+  const r = option("r", "blockSize", 8);
+  const p = option("p", "parallelization", 1);
+  const maxmem = options.maxmem ?? 32 * 1024 * 1024;
+  if (typeof maxmem !== "number") {
+    throw nodeCryptoError(
+      TypeError,
+      "ERR_INVALID_ARG_TYPE",
+      `The "maxmem" argument must be of type number. Received ${describeReceivedValue(maxmem)}`,
+    );
+  }
+  if (!Number.isSafeInteger(maxmem) || maxmem < 1) {
+    throw nodeCryptoError(
+      RangeError,
+      "ERR_OUT_OF_RANGE",
+      `The value of "maxmem" is out of range. It must be a positive safe integer. Received ${maxmem}`,
+    );
+  }
+  if (128 * N * r + 128 * r * p > maxmem ||
+      N >= 2 ** (16 * r) ||
+      p > Math.floor((2 ** 30 - 1) / r)) {
+    throw nodeCryptoError(
+      RangeError,
+      "ERR_CRYPTO_INVALID_SCRYPT_PARAMS",
+      "Invalid scrypt params: memory limit exceeded",
+    );
+  }
+  if (!Number.isInteger(Math.log2(N)) || N <= 1) {
+    throw nodeCryptoError(RangeError, "ERR_CRYPTO_INVALID_SCRYPT_PARAMS", "Invalid scrypt params");
+  }
+  return { N, r, p, maxmem };
+}
+
+function scryptInput(value, name) {
+  if (typeof value !== "string" && !(value instanceof ArrayBuffer) && !ArrayBuffer.isView(value)) {
+    throw nodeCryptoError(
+      TypeError,
+      "ERR_INVALID_ARG_TYPE",
+      `The "${name}" argument must be of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer. Received ${describeReceivedValue(value)}`,
+    );
+  }
+  return bytesFromData(value);
+}
+
+function scryptParameters(password, salt, keylen, options) {
+  const passwordBytes = scryptInput(password, "password");
+  const saltBytes = scryptInput(salt, "salt");
+  if (typeof keylen !== "number") {
+    throw nodeCryptoError(
+      TypeError,
+      "ERR_INVALID_ARG_TYPE",
+      `The "keylen" argument must be of type number. Received ${describeReceivedValue(keylen)}`,
+    );
+  }
+  if (!Number.isInteger(keylen) || keylen < 0 || keylen > 2147483647) {
+    throw nodeCryptoError(
+      RangeError,
+      "ERR_OUT_OF_RANGE",
+      `The value of "keylen" is out of range. It must be >= 0 and <= 2147483647. Received ${keylen}`,
+    );
+  }
+  return { passwordBytes, saltBytes, keylen, ...scryptOptions(options) };
+}
+
+function deriveScrypt({ passwordBytes, saltBytes, keylen, N, r, p, maxmem }) {
+  if (typeof cottontail.cryptoScryptSync !== "function") cryptoFeatureError("crypto.scryptSync");
+  try {
+    return bufferFromBytes(new Uint8Array(cottontail.cryptoScryptSync(
+      passwordBytes,
+      saltBytes,
+      keylen,
+      N,
+      r,
+      p,
+      maxmem,
+    )));
+  } catch {
+    throw nodeCryptoError(RangeError, "ERR_CRYPTO_INVALID_SCRYPT_PARAMS", "Invalid scrypt params");
+  }
 }
 
 // The events shim may invoke listeners without binding `this` to the
@@ -2551,18 +2462,13 @@ export class KeyObject {
     }
     const namedCurve = ecCurveName(options.asymmetricKeyDetails?.namedCurve);
     this.asymmetricKeyDetails = { namedCurve };
-    if (namedCurve !== "prime256v1") {
-      this.namedCurve = namedCurve;
-      if (normalizedType === "private") {
-        this.privateKeyBytes = bytesFromData(data.privateKey ?? data);
-        this.publicKeyBytes = data.publicKey == null ? ecPublicFromPrivate(namedCurve, this.privateKeyBytes) : bytesFromData(data.publicKey);
-      } else {
-        this.publicKeyBytes = bytesFromData(data);
-      }
-      return;
+    this.namedCurve = namedCurve;
+    if (normalizedType === "private") {
+      this.privateKeyBytes = bytesFromData(data.privateKey ?? data);
+      this.publicKeyBytes = data.publicKey == null ? ecPublicFromPrivate(namedCurve, this.privateKeyBytes) : bytesFromData(data.publicKey);
+    } else {
+      this.publicKeyBytes = bytesFromData(data);
     }
-    this.privateKey = normalizedType === "private" ? p256PrivateFromValue(data) : undefined;
-    this.publicPoint = normalizedType === "private" ? p256PublicFromPrivate(this.privateKey) : data;
   }
 
   get symmetricKeySize() {
@@ -2711,17 +2617,22 @@ function keyObjectFromJwk(jwk, type = undefined) {
     if (jwk?.d != null && type !== "public") return createRsaPrivateKey(rsaPrivatePartsFromJwk(jwk));
     return createRsaPublicKey(rsaPublicPartsFromJwk(jwk));
   }
-  if (String(jwk?.kty ?? "").toUpperCase() === "EC" && p256CurveName(jwk?.crv) !== "prime256v1") {
+  if (String(jwk?.kty ?? "").toUpperCase() === "EC") {
     const namedCurve = ecCurveName(jwk.crv);
+    if (!supportedNativeEcCurves.includes(namedCurve)) throw new TypeError(`Unsupported EC JWK curve: ${jwk.crv}`);
     const publicKey = nativeEcPublicBytesFromJwk(jwk);
-    if (jwk?.d != null && type !== "public") return createNativeEcPrivateKey(namedCurve, bytesFromBase64Url(jwk.d), publicKey);
+    if (jwk?.d != null && type !== "public") {
+      const privateKey = bytesFromBase64Url(jwk.d);
+      const derivedPublicKey = ecPublicFromPrivate(namedCurve, privateKey);
+      if (derivedPublicKey.byteLength !== publicKey.byteLength ||
+          !timingSafeEqual(derivedPublicKey, publicKey)) {
+        throw new Error("EC private JWK public coordinates do not match d");
+      }
+      return createNativeEcPrivateKey(namedCurve, privateKey, publicKey);
+    }
     return createNativeEcPublicKey(namedCurve, publicKey);
   }
-  if (jwk?.d != null && type !== "public") {
-    const parsed = p256PrivateFromJwk(jwk);
-    return createEcPrivateKey(parsed.privateKey);
-  }
-  return createEcPublicKey(p256PointFromJwk(jwk));
+  throw new TypeError("Unsupported JWK key type");
 }
 
 function keyObjectFromInput(input, type = undefined) {
@@ -2780,13 +2691,20 @@ function rsaOperationOptions(key, fallbackPadding) {
 function encapsulateSync(key) {
   const publicKey = resolvePublicKeyObject(key);
   if (publicKey.asymmetricKeyType === "ec") {
-    const ephemeralPrivate = p256RandomPrivateKey();
-    const ephemeralPublic = p256PublicFromPrivate(ephemeralPrivate);
-    const secret = p256Multiply(ephemeralPrivate, publicKey.publicPoint);
-    if (secret == null) throw new Error("Failed to compute KEM shared key");
+    const namedCurve = publicKey.namedCurve ?? publicKey.asymmetricKeyDetails?.namedCurve;
+    if (typeof cottontail.cryptoEcGenerateKeyPair !== "function" ||
+        typeof cottontail.cryptoEcDiffieHellman !== "function") {
+      cryptoFeatureError(`crypto.encapsulate(${namedCurve})`);
+    }
+    const ephemeral = cottontail.cryptoEcGenerateKeyPair(namedCurve);
+    const secret = new Uint8Array(cottontail.cryptoEcDiffieHellman(
+      namedCurve,
+      ephemeral.privateKey,
+      publicKey.publicKeyBytes,
+    ));
     return {
-      sharedKey: bufferFromBytes(digestBytes("sha256", bytesFromBigint(secret.x, p256.size))),
-      ciphertext: p256EncodePoint(ephemeralPublic),
+      sharedKey: bufferFromBytes(digestBytes("sha256", secret)),
+      ciphertext: bufferFromBytes(ephemeral.publicKey),
     };
   }
   if (publicKey.asymmetricKeyType === "rsa") {
@@ -2807,10 +2725,16 @@ function decapsulateSync(key, ciphertext) {
   const privateKey = keyObjectFromInput(key, "private");
   const bytes = bytesFromData(ciphertext);
   if (privateKey.asymmetricKeyType === "ec") {
-    const publicPoint = p256DecodePoint(bytes);
-    const secret = p256Multiply(privateKey.privateKey, publicPoint);
-    if (secret == null) throw new Error("Failed to compute KEM shared key");
-    return bufferFromBytes(digestBytes("sha256", bytesFromBigint(secret.x, p256.size)));
+    const namedCurve = privateKey.namedCurve ?? privateKey.asymmetricKeyDetails?.namedCurve;
+    if (typeof cottontail.cryptoEcDiffieHellman !== "function") {
+      cryptoFeatureError(`crypto.decapsulate(${namedCurve})`);
+    }
+    const secret = new Uint8Array(cottontail.cryptoEcDiffieHellman(
+      namedCurve,
+      privateKey.privateKeyBytes,
+      bytes,
+    ));
+    return bufferFromBytes(digestBytes("sha256", secret));
   }
   if (privateKey.asymmetricKeyType === "rsa") {
     return bufferFromBytes(digestBytes("sha512", rsaPrivateApply(privateKey, bytes)));
@@ -3070,16 +2994,10 @@ export class Decipheriv extends CipherBase {
 export class ECDH {
   constructor(curveName) {
     const normalized = ecCurveName(curveName);
-    if (normalized !== "prime256v1") {
-      if (!supportedNativeEcCurves.includes(normalized)) cryptoFeatureError(`crypto.ECDH(${curveName})`);
-      this.nativeCurveName = normalized;
-      this.privateKeyBytes = undefined;
-      this.publicKeyBytes = undefined;
-      return;
-    }
-    this.curve = p256;
-    this.privateKey = undefined;
-    this.publicKey = undefined;
+    if (!supportedNativeEcCurves.includes(normalized)) cryptoFeatureError(`crypto.ECDH(${curveName})`);
+    this.nativeCurveName = normalized;
+    this.privateKeyBytes = undefined;
+    this.publicKeyBytes = undefined;
   }
 
   generateKeys(encoding = undefined, format = "uncompressed") {
@@ -3589,8 +3507,12 @@ function validatePbkdf2Parameters(password, salt, iterations, keylen, digest) {
 }
 
 function derivePbkdf2({ algorithm, passwordBytes, saltBytes, iterations, keylen }) {
-  if (typeof cottontail.cryptoPbkdf2Sync === "function" && algorithm !== "md4" && algorithm !== "blake2b256") {
-    return bufferFromBytes(new Uint8Array(cottontail.cryptoPbkdf2Sync(algorithm, passwordBytes, saltBytes, iterations, keylen)));
+  if (typeof cottontail.cryptoPbkdf2Sync === "function") {
+    try {
+      return bufferFromBytes(new Uint8Array(cottontail.cryptoPbkdf2Sync(algorithm, passwordBytes, saltBytes, iterations, keylen)));
+    } catch (error) {
+      if (algorithm !== "md4" && algorithm !== "blake2b256") throw error;
+    }
   }
   const hashLength = hmacBytes(algorithm, passwordBytes, new Uint8Array()).byteLength;
   const blocks = Math.ceil(keylen / hashLength);
@@ -3642,16 +3564,7 @@ export function pbkdf2(password, salt, iterations, keylen, digest, callback) {
 }
 
 export function scryptSync(password, salt, keylen, options = {}) {
-  const length = positiveInteger(keylen, "keylen", true);
-  const { N, r, p } = scryptOptions(options ?? {});
-  const blockLength = 128 * r;
-  const initial = pbkdf2Sync(password, salt, 1, p * blockLength, "sha256");
-  const mixed = new Uint8Array(initial.byteLength);
-  for (let index = 0; index < p; index += 1) {
-    const start = index * blockLength;
-    mixed.set(scryptRomix(initial.slice(start, start + blockLength), N, r), start);
-  }
-  return pbkdf2Sync(password, mixed, 1, length, "sha256");
+  return deriveScrypt(scryptParameters(password, salt, keylen, options));
 }
 
 export function scrypt(password, salt, keylen, options = undefined, callback = undefined) {
@@ -3659,7 +3572,21 @@ export function scrypt(password, salt, keylen, options = undefined, callback = u
     callback = options;
     options = {};
   }
-  callbackify(() => scryptSync(password, salt, keylen, options ?? {}), callback);
+  const parameters = scryptParameters(password, salt, keylen, options ?? {});
+  if (typeof callback !== "function") {
+    throw nodeCryptoError(
+      TypeError,
+      "ERR_INVALID_ARG_TYPE",
+      `The "callback" argument must be of type function. Received ${describeReceivedValue(callback)}`,
+    );
+  }
+  queueMicrotask(() => {
+    try {
+      callback(null, deriveScrypt(parameters));
+    } catch (error) {
+      callback(error);
+    }
+  });
 }
 
 export function checkPrimeSync(candidate) {
@@ -3786,17 +3713,12 @@ export function generateKeyPairSync(type, options = {}) {
   let publicKey;
   if (normalized === "ec") {
     const namedCurve = ecCurveName(options?.namedCurve);
-    if (namedCurve === "prime256v1") {
-      privateKey = createEcPrivateKey(p256RandomPrivateKey());
-      publicKey = createEcPublicKey(privateKey.publicPoint);
-    } else {
-      if (!supportedNativeEcCurves.includes(namedCurve) || typeof cottontail.cryptoEcGenerateKeyPair !== "function") cryptoFeatureError(`crypto.generateKeyPairSync(${options?.namedCurve})`);
-      const pair = cottontail.cryptoEcGenerateKeyPair(namedCurve);
-      const nativePrivateKey = new Uint8Array(pair.privateKey);
-      const nativePublicKey = new Uint8Array(pair.publicKey);
-      privateKey = createNativeEcPrivateKey(namedCurve, nativePrivateKey, nativePublicKey);
-      publicKey = createNativeEcPublicKey(namedCurve, nativePublicKey);
-    }
+    if (!supportedNativeEcCurves.includes(namedCurve) || typeof cottontail.cryptoEcGenerateKeyPair !== "function") cryptoFeatureError(`crypto.generateKeyPairSync(${options?.namedCurve})`);
+    const pair = cottontail.cryptoEcGenerateKeyPair(namedCurve);
+    const nativePrivateKey = new Uint8Array(pair.privateKey);
+    const nativePublicKey = new Uint8Array(pair.publicKey);
+    privateKey = createNativeEcPrivateKey(namedCurve, nativePrivateKey, nativePublicKey);
+    publicKey = createNativeEcPublicKey(namedCurve, nativePublicKey);
   } else if (normalized === "rsa") {
     if (typeof options?.modulusLength !== "number") throw new TypeError("RSA key generation requires options.modulusLength");
     const privateParts = generateRsaKeyPair(options.modulusLength, options?.publicExponent);
@@ -3898,7 +3820,7 @@ export function getCipherInfo(nameOrNid) {
 }
 
 export function getCurves() {
-  return ["prime256v1", ...supportedNativeEcCurves];
+  return supportedNativeEcCurves.slice();
 }
 
 function validateOaepOptions(input) {
@@ -3938,10 +3860,10 @@ export function privateDecrypt(privateKey, buffer) {
   }
   const key = keyObjectFromInput(options.key, "private");
   if (key.asymmetricKeyType !== "rsa") throw new TypeError("privateDecrypt requires an RSA private KeyObject");
-  const decrypted = rsaPrivateApply(key, bytesFromData(buffer, options.encoding));
-  if (options.padding === constantsObject.RSA_NO_PADDING) return decrypted;
-  if (options.padding === constantsObject.RSA_PKCS1_PADDING) return rsaPkcs1DecryptBlock(decrypted, 2);
-  if (options.padding === constantsObject.RSA_PKCS1_OAEP_PADDING) return rsaOaepDecode(decrypted, options.oaepHash, options.oaepLabel);
+  if (options.padding === constantsObject.RSA_NO_PADDING ||
+      options.padding === constantsObject.RSA_PKCS1_OAEP_PADDING) {
+    return rsaNativeCrypt("privateDecrypt", key, bytesFromData(buffer, options.encoding), options);
+  }
   throw new TypeError("Invalid RSA privateDecrypt padding");
 }
 
@@ -3952,9 +3874,9 @@ export function privateEncrypt(privateKey, buffer) {
   const input = bytesFromData(buffer, options.encoding);
   if (options.padding === constantsObject.RSA_NO_PADDING) {
     if (input.byteLength !== rsaModulusLength(key)) throw new RangeError("RSA_NO_PADDING input must match modulus length");
-    return rsaPrivateApply(key, input);
+    return rsaNativeCrypt("privateEncrypt", key, input, options);
   }
-  if (options.padding === constantsObject.RSA_PKCS1_PADDING) return rsaPrivateApply(key, rsaPrivateEncryptBlock(input, rsaModulusLength(key)));
+  if (options.padding === constantsObject.RSA_PKCS1_PADDING) return rsaNativeCrypt("privateEncrypt", key, input, options);
   throw new TypeError("Invalid RSA privateEncrypt padding");
 }
 
@@ -3962,9 +3884,11 @@ export function publicDecrypt(publicKey, buffer) {
   const options = rsaOperationOptions(publicKey, constantsObject.RSA_PKCS1_PADDING);
   const key = resolvePublicKeyObject(options.key);
   if (key.asymmetricKeyType !== "rsa") throw new TypeError("publicDecrypt requires an RSA public KeyObject");
-  const decrypted = rsaPublicApply(key, bytesFromData(buffer, options.encoding));
-  if (options.padding === constantsObject.RSA_NO_PADDING) return decrypted;
-  if (options.padding === constantsObject.RSA_PKCS1_PADDING) return rsaPkcs1DecryptBlock(decrypted, 1);
+  const input = bytesFromData(buffer, options.encoding);
+  if (options.padding === constantsObject.RSA_NO_PADDING ||
+      options.padding === constantsObject.RSA_PKCS1_PADDING) {
+    return rsaNativeCrypt("publicDecrypt", key, input, options);
+  }
   throw new TypeError("Invalid RSA publicDecrypt padding");
 }
 
@@ -3976,10 +3900,12 @@ export function publicEncrypt(publicKey, buffer) {
   const input = bytesFromData(buffer, options.encoding);
   if (options.padding === constantsObject.RSA_NO_PADDING) {
     if (input.byteLength !== rsaModulusLength(key)) throw new RangeError("RSA_NO_PADDING input must match modulus length");
-    return rsaPublicApply(key, input);
+    return rsaNativeCrypt("publicEncrypt", key, input, options);
   }
-  if (options.padding === constantsObject.RSA_PKCS1_PADDING) return rsaPublicApply(key, rsaPkcs1EncryptBlock(input, rsaModulusLength(key)));
-  if (options.padding === constantsObject.RSA_PKCS1_OAEP_PADDING) return rsaPublicApply(key, rsaOaepEncode(input, rsaModulusLength(key), options.oaepHash, options.oaepLabel));
+  if (options.padding === constantsObject.RSA_PKCS1_PADDING ||
+      options.padding === constantsObject.RSA_PKCS1_OAEP_PADDING) {
+    return rsaNativeCrypt("publicEncrypt", key, input, options);
+  }
   throw new TypeError("Invalid RSA publicEncrypt padding");
 }
 
@@ -4894,7 +4820,7 @@ const subtleCrypto = {
       if (normalizedAlgorithm.name === "ECDSA" || normalizedAlgorithm.name === "ECDH") {
         const namedCurve = String(algorithm.namedCurve);
         const nodeCurve = webcryptoEcNodeCurve(namedCurve);
-        const publicKey = nodeCurve === "prime256v1" ? createEcPublicKey(p256DecodePoint(keyData)) : createNativeEcPublicKey(nodeCurve, bytesFromData(keyData));
+        const publicKey = createNativeEcPublicKey(nodeCurve, bytesFromData(keyData));
         return webcryptoKeyFromKeyObject(publicKey, { name: normalizedAlgorithm.name, namedCurve }, extractable, keyUsages);
       }
       if (normalizedAlgorithm.name === "Ed25519") {

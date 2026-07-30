@@ -1739,6 +1739,12 @@ extern void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx);
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/kdf.h>
+#if __has_include(<openssl/md4.h>)
+#define CT_HAS_OPENSSL_MD4 1
+#include <openssl/md4.h>
+#else
+#define CT_HAS_OPENSSL_MD4 0
+#endif
 #include <openssl/params.h>
 #include <openssl/pkcs12.h>
 #include <openssl/pem.h>
@@ -1752,6 +1758,7 @@ extern void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx);
 #endif
 #else
 #define CT_HAS_OPENSSL 0
+#define CT_HAS_OPENSSL_MD4 0
 #endif
 
 #if defined(__APPLE__)
@@ -5937,6 +5944,56 @@ static bool ct_hash_encoding_is_hex(JSContextRef ctx, size_t argc, const JSValue
     return is_hex;
 }
 
+#if CT_HAS_OPENSSL
+static const EVP_MD *ct_crypto_fixed_digest(const char *algorithm_name) {
+#if defined(OPENSSL_IS_BORINGSSL)
+    if (strcasecmp(algorithm_name, "md4") == 0) return EVP_md4();
+    if (strcasecmp(algorithm_name, "blake2b256") == 0) return EVP_blake2b256();
+#endif
+    return EVP_get_digestbyname(algorithm_name);
+}
+
+static int ct_crypto_digest_init(
+    EVP_MD_CTX *md_ctx,
+    const char *algorithm_name,
+    const EVP_MD **md_out,
+    size_t *output_len_out
+) {
+    const bool blake2b256 = strcasecmp(algorithm_name, "blake2b256") == 0;
+#if defined(OPENSSL_IS_BORINGSSL)
+    const EVP_MD *md = blake2b256 ? EVP_blake2b256() : ct_crypto_fixed_digest(algorithm_name);
+    if (md == NULL || EVP_DigestInit_ex(md_ctx, md, NULL) != 1) return 0;
+    *md_out = md;
+    *output_len_out = (size_t)EVP_MD_get_size(md);
+    return 1;
+#else
+    const EVP_MD *md = EVP_get_digestbyname(blake2b256 ? "blake2b512" : algorithm_name);
+    if (md == NULL) return 0;
+#if defined(OPENSSL_VERSION_MAJOR) && defined(OPENSSL_VERSION_MINOR) && \
+    (OPENSSL_VERSION_MAJOR > 3 || (OPENSSL_VERSION_MAJOR == 3 && OPENSSL_VERSION_MINOR >= 2)) && \
+    defined(OSSL_DIGEST_PARAM_SIZE)
+    if (blake2b256) {
+        size_t digest_size = 32;
+        OSSL_PARAM params[] = {
+            OSSL_PARAM_construct_size_t(OSSL_DIGEST_PARAM_SIZE, &digest_size),
+            OSSL_PARAM_construct_end(),
+        };
+        if (EVP_DigestInit_ex2(md_ctx, md, params) != 1) return 0;
+        *md_out = md;
+        *output_len_out = digest_size;
+        return 1;
+    }
+#else
+    if (blake2b256) return 0;
+#endif
+    if (EVP_DigestInit_ex(md_ctx, md, NULL) != 1) return 0;
+    *md_out = md;
+    *output_len_out = (size_t)EVP_MD_get_size(md);
+    return 1;
+#endif
+}
+#endif
+
 static JSValueRef ct_crypto_hash_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -5964,27 +6021,50 @@ static JSValueRef ct_crypto_hash_sync(JSContextRef ctx, JSObjectRef function, JS
     }
 
 #if CT_HAS_OPENSSL
-    const EVP_MD *md = EVP_get_digestbyname(algorithm_name);
-    if (md != NULL) {
-        EVP_MD_CTX *md_ctx = EVP_MD_CTX_new();
-        if (md_ctx == NULL) {
+    if (strcasecmp(algorithm_name, "md4") == 0) {
+#if CT_HAS_OPENSSL_MD4 && !defined(OPENSSL_NO_MD4)
+        uint8_t *output = (uint8_t *)malloc(MD4_DIGEST_LENGTH);
+        if (output == NULL) {
             free(algorithm_name);
-            ct_throw_message(ctx, exception, "Failed to allocate digest context");
+            ct_throw_message(ctx, exception, "Out of memory");
             return JSValueMakeUndefined(ctx);
         }
+        MD4_CTX md4_ctx;
+        int digest_ok = MD4_Init(&md4_ctx) == 1 &&
+            MD4_Update(&md4_ctx, input, input_len) == 1 &&
+            MD4_Final(output, &md4_ctx) == 1;
+        free(algorithm_name);
+        if (!digest_ok) {
+            free(output);
+            ct_throw_message(ctx, exception, "Digest operation failed");
+            return JSValueMakeUndefined(ctx);
+        }
+        return ct_hash_bytes_result(ctx, output, MD4_DIGEST_LENGTH, ct_hash_encoding_is_hex(ctx, argc, argv, 3), exception);
+#endif
+    }
+
+    EVP_MD_CTX *md_ctx = EVP_MD_CTX_new();
+    const EVP_MD *md = NULL;
+    size_t configured_output_len = 0;
+    if (md_ctx != NULL && ct_crypto_digest_init(md_ctx, algorithm_name, &md, &configured_output_len)) {
         const int md_size = EVP_MD_get_size(md);
         const bool is_xof = (EVP_MD_get_flags(md) & EVP_MD_FLAG_XOF) != 0;
-        size_t output_len = requested_output_len > 0 ? requested_output_len : (md_size > 0 ? (size_t)md_size : 0);
+        size_t output_len = requested_output_len > 0
+            ? requested_output_len
+            : (configured_output_len > 0 ? configured_output_len : (md_size > 0 ? (size_t)md_size : 0));
         if (output_len == 0) output_len = is_xof ? 32 : 1;
-        uint8_t *output = (uint8_t *)malloc(output_len);
+        size_t output_capacity = output_len;
+        if (!is_xof && md_size > 0 && output_capacity < (size_t)md_size) {
+            output_capacity = (size_t)md_size;
+        }
+        uint8_t *output = (uint8_t *)malloc(output_capacity);
         if (output == NULL) {
             EVP_MD_CTX_free(md_ctx);
             free(algorithm_name);
             ct_throw_message(ctx, exception, "Out of memory");
             return JSValueMakeUndefined(ctx);
         }
-        int ok = EVP_DigestInit_ex(md_ctx, md, NULL) == 1 &&
-            EVP_DigestUpdate(md_ctx, input, input_len) == 1;
+        int ok = EVP_DigestUpdate(md_ctx, input, input_len) == 1;
         if (ok && is_xof) {
             ok = EVP_DigestFinalXOF(md_ctx, output, output_len) == 1;
         } else if (ok) {
@@ -6001,6 +6081,7 @@ static JSValueRef ct_crypto_hash_sync(JSContextRef ctx, JSObjectRef function, JS
         }
         return ct_hash_bytes_result(ctx, output, output_len, ct_hash_encoding_is_hex(ctx, argc, argv, 3), exception);
     }
+    if (md_ctx != NULL) EVP_MD_CTX_free(md_ctx);
 #endif
 
     const CtDigestAlgorithm *algorithm = ct_digest_algorithm(algorithm_name);
@@ -6049,7 +6130,7 @@ static JSValueRef ct_crypto_hmac_sync(JSContextRef ctx, JSObjectRef function, JS
     }
 
 #if CT_HAS_OPENSSL
-    const EVP_MD *md = EVP_get_digestbyname(algorithm_name);
+    const EVP_MD *md = ct_crypto_fixed_digest(algorithm_name);
     if (md != NULL) {
         const int md_size = EVP_MD_get_size(md);
         if (md_size <= 0 || (EVP_MD_get_flags(md) & EVP_MD_FLAG_XOF) != 0) {
@@ -6132,7 +6213,7 @@ static JSValueRef ct_crypto_pbkdf2_sync(JSContextRef ctx, JSObjectRef function, 
         return JSValueMakeUndefined(ctx);
     }
 
-    const EVP_MD *md = EVP_get_digestbyname(algorithm_name);
+    const EVP_MD *md = ct_crypto_fixed_digest(algorithm_name);
     free(algorithm_name);
     if (md == NULL || EVP_MD_get_size(md) <= 0 || (EVP_MD_get_flags(md) & EVP_MD_FLAG_XOF) != 0) {
         ct_throw_message(ctx, exception, "PBKDF2 digest is not available");
@@ -6163,6 +6244,68 @@ static JSValueRef ct_crypto_pbkdf2_sync(JSContextRef ctx, JSObjectRef function, 
     return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, (size_t)output_len, ct_array_buffer_free, NULL, exception);
 #else
     ct_throw_message(ctx, exception, "Native PBKDF2 is not available on this platform");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_scrypt_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 7) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoScryptSync(password, salt, keyLength, N, r, p, maxmem) requires seven arguments");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    uint8_t *password = NULL;
+    size_t password_len = 0;
+    uint8_t *salt = NULL;
+    size_t salt_len = 0;
+    if (ct_get_bytes(ctx, argv[0], &password, &password_len) != 0 ||
+        ct_get_bytes(ctx, argv[1], &salt, &salt_len) != 0) {
+        ct_throw_message(ctx, exception, "scrypt password and salt must be ArrayBuffers or typed arrays");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    const double output_len_number = ct_value_to_number(ctx, argv[2]);
+    const double n_number = ct_value_to_number(ctx, argv[3]);
+    const double r_number = ct_value_to_number(ctx, argv[4]);
+    const double p_number = ct_value_to_number(ctx, argv[5]);
+    const double maxmem_number = ct_value_to_number(ctx, argv[6]);
+    if (output_len_number < 0 || output_len_number > INT_MAX ||
+        n_number < 2 || n_number > UINT64_MAX ||
+        r_number < 1 || r_number > UINT64_MAX ||
+        p_number < 1 || p_number > UINT64_MAX ||
+        maxmem_number < 1 || maxmem_number > SIZE_MAX) {
+        ct_throw_message(ctx, exception, "scrypt parameters are out of range");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    const size_t output_len = (size_t)output_len_number;
+    uint8_t *output = (uint8_t *)malloc(output_len > 0 ? output_len : 1);
+    if (output == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    const int ok = EVP_PBE_scrypt(
+        (const char *)password,
+        password_len,
+        salt,
+        salt_len,
+        (uint64_t)n_number,
+        (uint64_t)r_number,
+        (uint64_t)p_number,
+        (uint64_t)maxmem_number,
+        output,
+        output_len
+    );
+    if (ok != 1) {
+        free(output);
+        ct_throw_message(ctx, exception, "Invalid scrypt params");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
+#else
+    ct_throw_message(ctx, exception, "Native scrypt is not available on this platform");
     return JSValueMakeUndefined(ctx);
 #endif
 }
@@ -7134,7 +7277,183 @@ static int ct_rsa_configure_pkey_ctx(EVP_PKEY_CTX *pkey_ctx, int node_padding, i
     }
     return 1;
 }
+
+static int ct_rsa_crypt_padding_from_node(int node_padding) {
+    if (node_padding == 1) return RSA_PKCS1_PADDING;
+    if (node_padding == 3) return RSA_NO_PADDING;
+    if (node_padding == 4) return RSA_PKCS1_OAEP_PADDING;
+    return -1;
+}
 #endif
+
+static JSValueRef ct_crypto_rsa_generate_key_pair(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoRsaGenerateKeyPair(modulusLength, publicExponent) requires two arguments");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    const double modulus_bits_number = ct_value_to_number(ctx, argv[0]);
+    const double public_exponent_number = ct_value_to_number(ctx, argv[1]);
+    if (modulus_bits_number < 16 || modulus_bits_number > INT_MAX ||
+        public_exponent_number < 3 || public_exponent_number > UINT32_MAX) {
+        ct_throw_message(ctx, exception, "RSA key generation parameters are out of range");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    RSA *rsa = RSA_new();
+    BIGNUM *public_exponent = BN_new();
+    if (rsa == NULL || public_exponent == NULL ||
+        BN_set_word(public_exponent, (BN_ULONG)public_exponent_number) != 1 ||
+        RSA_generate_key_ex(rsa, (int)modulus_bits_number, public_exponent, NULL) != 1) {
+        if (rsa != NULL) RSA_free(rsa);
+        if (public_exponent != NULL) BN_free(public_exponent);
+        ct_throw_message(ctx, exception, "RSA key generation failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    BN_free(public_exponent);
+
+    EVP_PKEY *pkey = EVP_PKEY_new();
+    if (pkey == NULL || EVP_PKEY_assign_RSA(pkey, rsa) != 1) {
+        if (pkey != NULL) EVP_PKEY_free(pkey);
+        RSA_free(rsa);
+        ct_throw_message(ctx, exception, "Failed to initialize generated RSA key");
+        return JSValueMakeUndefined(ctx);
+    }
+    JSObjectRef result = ct_js_from_rsa_pkey(ctx, pkey, "private", exception);
+    EVP_PKEY_free(pkey);
+    return result != NULL ? result : JSValueMakeUndefined(ctx);
+#else
+    ct_throw_message(ctx, exception, "RSA key generation is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_rsa_crypt(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 13) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoRsaCrypt requires operation, padding, OAEP options, RSA parts, and data");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    char *operation = ct_value_to_string_copy(ctx, argv[0]);
+    char *oaep_hash_name = ct_value_to_string_copy(ctx, argv[2]);
+    if (operation == NULL || oaep_hash_name == NULL) {
+        free(operation);
+        free(oaep_hash_name);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    const bool public_encrypt = strcmp(operation, "publicEncrypt") == 0;
+    const bool private_decrypt = strcmp(operation, "privateDecrypt") == 0;
+    const bool private_encrypt = strcmp(operation, "privateEncrypt") == 0;
+    const bool public_decrypt = strcmp(operation, "publicDecrypt") == 0;
+    const bool private_key = private_decrypt || private_encrypt;
+    const int padding = ct_rsa_crypt_padding_from_node((int)ct_value_to_number(ctx, argv[1]));
+    if ((!public_encrypt && !private_decrypt && !private_encrypt && !public_decrypt) || padding < 0) {
+        free(operation);
+        free(oaep_hash_name);
+        ct_throw_message(ctx, exception, "Invalid RSA operation or padding");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    uint8_t *label = NULL;
+    size_t label_len = 0;
+    if (!JSValueIsUndefined(ctx, argv[3]) && !JSValueIsNull(ctx, argv[3]) &&
+        ct_get_bytes(ctx, argv[3], &label, &label_len) != 0) {
+        free(operation);
+        free(oaep_hash_name);
+        ct_throw_message(ctx, exception, "RSA OAEP label must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *input = NULL;
+    size_t input_len = 0;
+    if (ct_get_bytes(ctx, argv[12], &input, &input_len) != 0 || input_len > INT_MAX || label_len > INT_MAX) {
+        free(operation);
+        free(oaep_hash_name);
+        ct_throw_message(ctx, exception, "RSA input must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    EVP_PKEY *pkey = ct_rsa_pkey_from_js(ctx, argv, 4, private_key);
+    if (pkey == NULL) {
+        free(operation);
+        free(oaep_hash_name);
+        ct_throw_message(ctx, exception, "Failed to initialize RSA key");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    uint8_t *output = NULL;
+    size_t output_len = 0;
+    int ok = 0;
+    if (public_encrypt || private_decrypt) {
+        EVP_PKEY_CTX *pkey_ctx = EVP_PKEY_CTX_new(pkey, NULL);
+        ok = pkey_ctx != NULL &&
+            (public_encrypt ? EVP_PKEY_encrypt_init(pkey_ctx) : EVP_PKEY_decrypt_init(pkey_ctx)) == 1 &&
+            EVP_PKEY_CTX_set_rsa_padding(pkey_ctx, padding) == 1;
+        if (ok && padding == RSA_PKCS1_OAEP_PADDING) {
+            const EVP_MD *md = EVP_get_digestbyname(oaep_hash_name);
+            ok = md != NULL &&
+                EVP_PKEY_CTX_set_rsa_oaep_md(pkey_ctx, md) == 1 &&
+                EVP_PKEY_CTX_set_rsa_mgf1_md(pkey_ctx, md) == 1;
+            if (ok && label_len > 0) {
+                unsigned char *owned_label = (unsigned char *)OPENSSL_malloc(label_len);
+                if (owned_label == NULL) {
+                    ok = 0;
+                } else {
+                    memcpy(owned_label, label, label_len);
+                    if (EVP_PKEY_CTX_set0_rsa_oaep_label(pkey_ctx, owned_label, (int)label_len) != 1) {
+                        OPENSSL_free(owned_label);
+                        ok = 0;
+                    }
+                }
+            }
+        }
+        if (ok) {
+            ok = (public_encrypt
+                ? EVP_PKEY_encrypt(pkey_ctx, NULL, &output_len, input, input_len)
+                : EVP_PKEY_decrypt(pkey_ctx, NULL, &output_len, input, input_len)) == 1;
+        }
+        if (ok) {
+            output = (uint8_t *)malloc(output_len > 0 ? output_len : 1);
+            ok = output != NULL &&
+                (public_encrypt
+                    ? EVP_PKEY_encrypt(pkey_ctx, output, &output_len, input, input_len)
+                    : EVP_PKEY_decrypt(pkey_ctx, output, &output_len, input, input_len)) == 1;
+        }
+        if (pkey_ctx != NULL) EVP_PKEY_CTX_free(pkey_ctx);
+    } else {
+        RSA *rsa = EVP_PKEY_get1_RSA(pkey);
+        const int rsa_size = rsa != NULL ? RSA_size(rsa) : 0;
+        output = rsa_size > 0 ? (uint8_t *)malloc((size_t)rsa_size) : NULL;
+        int result_len = -1;
+        if (output != NULL) {
+            result_len = private_encrypt
+                ? RSA_private_encrypt((int)input_len, input, output, rsa, padding)
+                : RSA_public_decrypt((int)input_len, input, output, rsa, padding);
+        }
+        if (rsa != NULL) RSA_free(rsa);
+        ok = result_len >= 0;
+        output_len = ok ? (size_t)result_len : 0;
+    }
+
+    EVP_PKEY_free(pkey);
+    free(operation);
+    free(oaep_hash_name);
+    if (!ok) {
+        free(output);
+        ct_throw_message(ctx, exception, "RSA operation failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
+#else
+    ct_throw_message(ctx, exception, "RSA operations are unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
 
 static JSValueRef ct_crypto_rsa_export_key(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;

@@ -951,6 +951,12 @@ try {
       stdoutIncludes: ['node crypto kdf dh surface passed'],
     },
     {
+      name: 'node-crypto-native-backend',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-crypto-native-backend.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node crypto native backend passed'],
+    },
+    {
       name: 'node-crypto-webcrypto-conformance',
       scriptPath: join(rootDir, 'tests', 'js', 'node-crypto-webcrypto-conformance.ts'),
       expectExitCode: 0,
