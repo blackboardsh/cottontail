@@ -5,7 +5,10 @@ import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { assertStrippedReleaseBinary } from './release-binary-contract.js';
+import {
+  assertStrippedReleaseBinary,
+  listExportedSymbols,
+} from './release-binary-contract.js';
 
 const rootDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const executableName = process.platform === 'win32' ? 'cottontail.exe' : 'cottontail';
@@ -19,10 +22,39 @@ function fail(message) {
 }
 
 let details;
+let exportedSymbols;
 try {
-  details = assertStrippedReleaseBinary(readFileSync(executablePath));
+  const executable = readFileSync(executablePath);
+  details = assertStrippedReleaseBinary(executable);
+  exportedSymbols = listExportedSymbols(executable);
 } catch (error) {
   fail(`${executablePath}: ${error.message}`);
+}
+
+const maximumExportedSymbols = 1024;
+if (exportedSymbols.length > maximumExportedSymbols) {
+  fail(
+    `${executablePath} exports ${exportedSymbols.length} symbols; ` +
+      `the native-addon ABI limit is ${maximumExportedSymbols}`,
+  );
+}
+
+const symbolPrefix = details.format === 'mach-o' ? '_' : '';
+const exportedSet = new Set(exportedSymbols);
+for (const symbol of [
+  'napi_create_object',
+  'napi_create_threadsafe_function',
+  'napi_get_version',
+  'napi_module_register',
+  'node_api_get_module_file_name',
+  'node_module_register',
+  'uv_dlopen',
+  'uv_queue_work',
+  'uv_thread_create',
+]) {
+  if (!exportedSet.has(`${symbolPrefix}${symbol}`)) {
+    fail(`${executablePath} does not export required native-addon symbol ${symbol}`);
+  }
 }
 
 if (process.platform === 'darwin') {
@@ -43,3 +75,4 @@ const symbolSummary = details.format === 'mach-o'
     ? `${details.staticSymbolTables} static symbol tables`
     : `${details.symbols} COFF symbols`;
 console.log(`Validated stripped ${details.format} release binary (${symbolSummary}): ${executablePath}`);
+console.log(`Validated native-addon ABI (${exportedSymbols.length} exported symbols): ${executablePath}`);

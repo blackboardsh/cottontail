@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   assertStrippedReleaseBinary,
   inspectReleaseBinary,
+  listExportedSymbols,
 } from './release-binary-contract.js';
 
 function machoFixture(localSymbols) {
@@ -48,6 +49,88 @@ function peFixture(symbols) {
   return buffer;
 }
 
+function machoExportFixture() {
+  const buffer = Buffer.alloc(256);
+  buffer.writeUInt32LE(0xfeedfacf, 0);
+  buffer.writeUInt32LE(2, 16);
+  buffer.writeUInt32LE(104, 20);
+
+  let offset = 32;
+  buffer.writeUInt32LE(0x2, offset);
+  buffer.writeUInt32LE(24, offset + 4);
+  buffer.writeUInt32LE(136, offset + 8);
+  buffer.writeUInt32LE(2, offset + 12);
+  buffer.writeUInt32LE(168, offset + 16);
+  buffer.writeUInt32LE(32, offset + 20);
+
+  offset += 24;
+  buffer.writeUInt32LE(0xb, offset);
+  buffer.writeUInt32LE(80, offset + 4);
+  buffer.writeUInt32LE(0, offset + 16);
+  buffer.writeUInt32LE(1, offset + 20);
+
+  buffer.writeUInt32LE(1, 136);
+  buffer.writeUInt32LE(11, 152);
+  buffer.write('\0_exported\0_unused\0', 168);
+  return buffer;
+}
+
+function elfExportFixture() {
+  const buffer = Buffer.alloc(336);
+  buffer.set([0x7f, 0x45, 0x4c, 0x46, 2, 1], 0);
+  buffer.writeBigUInt64LE(64n, 40);
+  buffer.writeUInt16LE(64, 58);
+  buffer.writeUInt16LE(3, 60);
+
+  const dynamicSymbols = 128;
+  buffer.writeUInt32LE(11, dynamicSymbols + 4);
+  buffer.writeBigUInt64LE(256n, dynamicSymbols + 24);
+  buffer.writeBigUInt64LE(48n, dynamicSymbols + 32);
+  buffer.writeUInt32LE(2, dynamicSymbols + 40);
+  buffer.writeBigUInt64LE(24n, dynamicSymbols + 56);
+
+  const dynamicStrings = 192;
+  buffer.writeUInt32LE(3, dynamicStrings + 4);
+  buffer.writeBigUInt64LE(304n, dynamicStrings + 24);
+  buffer.writeBigUInt64LE(32n, dynamicStrings + 32);
+
+  buffer.writeUInt32LE(1, 280);
+  buffer[284] = 0x12;
+  buffer.writeUInt16LE(1, 286);
+  buffer.write('\0exported\0', 304);
+  return buffer;
+}
+
+function peExportFixture() {
+  const buffer = Buffer.alloc(1024);
+  buffer.set([0x4d, 0x5a], 0);
+  buffer.writeUInt32LE(128, 0x3c);
+  buffer.writeUInt32LE(0x00004550, 128);
+
+  const coffOffset = 132;
+  buffer.writeUInt16LE(1, coffOffset + 2);
+  buffer.writeUInt16LE(240, coffOffset + 16);
+
+  const optionalOffset = 152;
+  buffer.writeUInt16LE(0x20b, optionalOffset);
+  buffer.writeUInt32LE(0x1000, optionalOffset + 112);
+  buffer.writeUInt32LE(96, optionalOffset + 116);
+
+  const sectionOffset = optionalOffset + 240;
+  buffer.writeUInt32LE(512, sectionOffset + 8);
+  buffer.writeUInt32LE(0x1000, sectionOffset + 12);
+  buffer.writeUInt32LE(512, sectionOffset + 16);
+  buffer.writeUInt32LE(512, sectionOffset + 20);
+
+  const exportDirectory = 512;
+  buffer.writeUInt32LE(1, exportDirectory + 20);
+  buffer.writeUInt32LE(1, exportDirectory + 24);
+  buffer.writeUInt32LE(0x1030, exportDirectory + 32);
+  buffer.writeUInt32LE(0x1040, 560);
+  buffer.write('exported\0', 576);
+  return buffer;
+}
+
 test('accepts stripped Mach-O, ELF, and PE release binaries', () => {
   assert.equal(assertStrippedReleaseBinary(machoFixture(0)).format, 'mach-o');
   assert.equal(assertStrippedReleaseBinary(elfFixture(false)).format, 'elf64');
@@ -79,4 +162,10 @@ test('rejects malformed and unsupported release files', () => {
     () => inspectReleaseBinary(machoFixture(0).subarray(0, 40)),
     /out of range/,
   );
+});
+
+test('lists exported symbols from Mach-O, ELF, and PE binaries', () => {
+  assert.deepEqual(listExportedSymbols(machoExportFixture()), ['_exported']);
+  assert.deepEqual(listExportedSymbols(elfExportFixture()), ['exported']);
+  assert.deepEqual(listExportedSymbols(peExportFixture()), ['exported']);
 });

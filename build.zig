@@ -315,7 +315,16 @@ fn configureLibuv(step: *std.Build.Step.Compile, b: *std.Build) void {
 }
 
 fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
-    step.rdynamic = true;
+    const resolved_target = step.root_module.resolved_target.?.result;
+    step.rdynamic = resolved_target.os.tag != .windows;
+    if (resolved_target.os.tag == .linux) {
+        step.setVersionScript(b.path("src/compiler/src/symbols.dyn"));
+        // The compatibility manifest is shared across supported Unix targets,
+        // so platform-specific entries may be absent from one target.
+        step.linker_allow_undefined_version = true;
+    } else if (resolved_target.os.tag == .windows) {
+        step.win32_module_definition = b.path("src/compiler/src/symbols.def");
+    }
     // Static JSC uses indirectly referenced LLInt/JIT entry points that the
     // release linker otherwise discards, producing SIGBUS at runtime.
     step.link_gc_sections = false;
@@ -325,7 +334,6 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
     step.root_module.addIncludePath(b.path("src/jsc_sdk_compat"));
     step.root_module.addIncludePath(b.path("src/compiler/src/jsc/bindings/sqlite"));
     step.root_module.addCMacro("COTTONTAIL_VERSION", b.fmt("\"{s}\"", .{cottontail_version}));
-    const resolved_target = step.root_module.resolved_target.?.result;
     if (resolved_target.os.tag == .linux) {
         // The POSIX libuv shims and synchronous signal forwarding use APIs
         // hidden by glibc's strict C11 feature set unless these are defined

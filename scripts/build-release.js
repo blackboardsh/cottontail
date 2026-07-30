@@ -18,6 +18,7 @@ const executableName = process.platform === 'win32' ? 'cottontail.exe' : 'cotton
 const zigPath = join(rootDir, 'vendors', 'zig', zigName);
 const executablePath = join(rootDir, 'zig-out', 'bin', executableName);
 const validatorPath = join(rootDir, 'scripts', 'validate-release-binary.js');
+const macosExportListPath = join(rootDir, 'src', 'compiler', 'src', 'symbols.txt');
 
 if (!existsSync(zigPath)) {
   console.error(`Vendored Zig compiler not found at ${zigPath}. Run the cottontail setup first.`);
@@ -51,11 +52,15 @@ try {
 
   run(zigPath, args, 'Cottontail release build');
   if (process.platform === 'darwin') {
-    // Keep external host symbols used by N-API, FFI, and native bundler plugins.
-    run('/usr/bin/strip', ['-x', stagedExecutable], 'Cottontail release strip');
+    // Keep only the host ABI consumed by N-API and native Bun/Node addons.
+    run(
+      '/usr/bin/strip',
+      ['-i', '-s', macosExportListPath, stagedExecutable],
+      'Cottontail release strip',
+    );
     run(
       '/usr/bin/codesign',
-      ['--force', '--sign', '-', stagedExecutable],
+      ['--force', '--sign', '-', '--pagesize', '16384', stagedExecutable],
       'Cottontail release ad-hoc signing',
     );
   } else if (process.platform === 'linux') {
