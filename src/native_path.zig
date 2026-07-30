@@ -126,8 +126,8 @@ fn normalizeString(
                 const component = path[slice_start..index];
                 @memcpy(buffer[buffer_size..][0..component.len], component);
                 buffer_size += component.len;
-                const subtract = if (last_slash) |position| position + 1 else 2;
-                last_segment_length = if (index >= subtract) index - subtract else 0;
+                const segment_start = if (last_slash) |position| position + 1 else 0;
+                last_segment_length = index - segment_start;
             }
             last_slash = index;
             dots = 0;

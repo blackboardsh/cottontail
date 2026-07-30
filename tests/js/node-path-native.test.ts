@@ -62,6 +62,23 @@ describe("native node:path normalize", () => {
     }
   });
 
+  test("long first components ending in three or more dots are popped by ..", () => {
+    for (const [windows, implementation, separator] of [
+      [false, path.posix, "/"],
+      [true, path.win32, "\\"],
+    ] as const) {
+      const tail = ["δ...", ...Array.from({ length: 64 }, (_, index) => `tail-${index}`)].join(
+        separator,
+      );
+      for (const firstComponent of ["...", "a...", "....", "a....", "δ..."]) {
+        const value = `${firstComponent}${separator}..${separator}${tail}`;
+        expect(value.length).toBeGreaterThanOrEqual(256);
+        expect(nativeNormalize(windows, value)).toBe(tail);
+        expect(implementation.normalize(value)).toBe(tail);
+      }
+    }
+  });
+
   test("public POSIX normalize uses the native-safe long-input behavior", () => {
     const cases = [
       [`${"segment/../".repeat(80)}dist//tool.js`, "dist/tool.js"],
