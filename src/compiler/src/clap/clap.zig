@@ -300,13 +300,6 @@ pub const Diagnostic = struct {
     }
 };
 
-fn testDiag(diag: Diagnostic, err: anyerror, expected: []const u8) void {
-    var buf: [1024]u8 = undefined;
-    var slice_stream = io.fixedBufferStream(&buf);
-    diag.report(slice_stream.writer(), err) catch unreachable;
-    testing.expectEqualStrings(expected, slice_stream.getWritten());
-}
-
 pub fn Args(comptime Id: type, comptime params: []const Param(Id)) type {
     return struct {
         arena: bun.ArenaAllocator,
@@ -715,13 +708,6 @@ pub fn usageEx(
 /// A wrapper around usageEx that takes a Param(Help).
 pub fn usage(stream: anytype, params: []const Param(Help)) !void {
     try usageEx(stream, Help, params, getValueSimple);
-}
-
-fn testUsage(expected: []const u8, params: []const Param(Help)) !void {
-    var buf: [1024]u8 = undefined;
-    var fbs = io.fixedBufferStream(&buf);
-    try usage(fbs.writer(), params);
-    testing.expectEqualStrings(expected, fbs.getWritten());
 }
 
 const Output = @import("../bun_core/output.zig");

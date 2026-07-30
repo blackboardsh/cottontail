@@ -3301,11 +3301,6 @@ fn getOrPutRouteBundle(dev: *DevServer, route: RouteBundle.UnresolvedIndex) !Rou
     return bundle_index;
 }
 
-fn registerCatchAllHtmlRoute(dev: *DevServer, html: *HTMLBundle.HTMLBundleRoute) !void {
-    const bundle_index = try getOrPutRouteBundle(dev, .{ .html = html });
-    dev.html_router.fallback = bundle_index.toOptional();
-}
-
 const ErrorPageKind = enum {
     /// Modules failed to bundle
     bundler,

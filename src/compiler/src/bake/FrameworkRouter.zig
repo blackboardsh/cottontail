@@ -1346,15 +1346,6 @@ pub const JSFrameworkRouter = struct {
         return obj;
     }
 
-    fn encodedPatternToJS(global: *JSGlobalObject, pattern: EncodedPattern, temp_allocator: Allocator) !JSValue {
-        var rendered = try std.array_list.Managed(u8).initCapacity(temp_allocator, pattern.data.len);
-        defer rendered.deinit();
-        var it = pattern.iterate();
-        while (it.next()) |part| try part.toStringForInternalUse(rendered.writer());
-        var str = bun.String.cloneUTF8(rendered.items);
-        return try str.transferToJS(global);
-    }
-
     fn partToJS(global: *JSGlobalObject, part: Part, temp_allocator: Allocator) !JSValue {
         var rendered = std.array_list.Managed(u8).init(temp_allocator);
         defer rendered.deinit();
