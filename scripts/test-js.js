@@ -556,7 +556,7 @@ try {
       name: 'bun-spawn-native-routing',
       argv: ['test', join(rootDir, 'tests', 'js', 'bun-spawn-native-routing.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: [process.platform === 'win32' ? '5 pass' : '6 pass', '0 fail'],
+      stdoutIncludes: [process.platform === 'win32' ? '6 pass' : '7 pass', '0 fail'],
     },
     {
       name: 'bun-spawn-ipc-contract',

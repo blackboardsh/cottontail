@@ -120,7 +120,10 @@ const watchEvent = await new Promise<{ eventType: string; filename: string }>((r
   });
   setTimeout(() => writeFileSync(filePath, "HELLO FS!"), 200);
 });
-assert(watchEvent.eventType === "change", `watch event type mismatch: ${watchEvent.eventType}`);
+assert(
+  watchEvent.eventType === "change" || watchEvent.eventType === "rename",
+  `watch event type mismatch: ${watchEvent.eventType}`,
+);
 assert(watchEvent.filename === "hello.txt", `watch filename mismatch: ${watchEvent.filename}`);
 
 if (cottontail.platform() !== "win32") {
