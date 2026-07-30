@@ -34998,6 +34998,7 @@ static JSValueRef ct_unhandled_rejection(
     return JSValueMakeUndefined(ctx);
 }
 
+#include "native_bindings/buffer_jsc.inc"
 #include "native_bindings/sql_wire_jsc.inc"
 #include "native_bindings/callbacks.h"
 

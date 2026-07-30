@@ -199,6 +199,12 @@ try {
       stderrIncludes: ['8 pass', '0 fail'],
     },
     {
+      name: 'node-buffer-native-hot-paths',
+      argv: ['test', join(rootDir, 'tests', 'js', 'node-buffer-native-hot-paths.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['5 pass', '0 fail'],
+    },
+    {
       name: 'cli-version-identity-regressions',
       argv: ['test', join(rootDir, 'tests', 'js', 'cli-version-identity.test.ts')],
       expectExitCode: 0,

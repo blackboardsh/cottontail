@@ -60,6 +60,14 @@ const originalBufferIsEncoding = Buffer.isEncoding.bind(Buffer);
 const originalBufferToString = Buffer.prototype.toString;
 const originalBufferWrite = Buffer.prototype.write;
 const originalBufferFill = Buffer.prototype.fill;
+const nativeBufferCompare = globalThis.cottontail?.bufferCompare;
+const nativeBufferIndexOf = globalThis.cottontail?.bufferIndexOf;
+const nativeBufferFillPattern = globalThis.cottontail?.bufferFillPattern;
+// Measured with bench/buffer-hot-paths.js. Below these crossovers JSC's
+// optimized JS/TypedArray paths are faster than entering the host API.
+const nativeBufferCompareThreshold = 4_096;
+const nativeBufferSearchThreshold = 32;
+const nativeBufferFillThreshold = 32;
 const utf8TextDecoder = typeof TextDecoder === "function" ? new TextDecoder() : null;
 const customInspectSymbol = Symbol.for("nodejs.util.inspect.custom");
 const arrayBufferByteLengthGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
@@ -165,6 +173,9 @@ function isUint8Array(value) {
 
 function compareBytes(left, leftStart, leftEnd, right, rightStart, rightEnd) {
   const length = Math.min(leftEnd - leftStart, rightEnd - rightStart);
+  if (length >= nativeBufferCompareThreshold && typeof nativeBufferCompare === "function") {
+    return nativeBufferCompare(left, leftStart, leftEnd, right, rightStart, rightEnd);
+  }
   for (let index = 0; index < length; index += 1) {
     const leftByte = left[leftStart + index];
     const rightByte = right[rightStart + index];
@@ -267,6 +278,10 @@ function fillBufferPattern(target, pattern, start, end) {
     Uint8Array.prototype.fill.call(target, pattern[0], start, end);
     return target;
   }
+  if (length >= nativeBufferFillThreshold && typeof nativeBufferFillPattern === "function") {
+    nativeBufferFillPattern(target, pattern, start, end);
+    return target;
+  }
 
   let filled = Math.min(pattern.length, length);
   Uint8Array.prototype.set.call(target, pattern.subarray(0, filled), start);
@@ -291,8 +306,10 @@ function tryFastBufferFill(target, value, start, end, encoding) {
       return true;
     }
     pattern = originalBufferFrom(value, encoding);
-  } else if (Buffer.isBuffer(value) || ArrayBuffer.isView(value)) {
+  } else if (Buffer.isBuffer(value)) {
     pattern = value;
+  } else if (ArrayBuffer.isView(value)) {
+    pattern = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
   } else {
     return false;
   }
@@ -671,6 +688,8 @@ Buffer.prototype.copy = function copy(target, targetStart, sourceStart, sourceEn
   const count = Math.min(sourceEnd, this.length) - sourceStart;
   const copied = Math.min(count, target.length - targetStart);
   if (copied <= 0) return 0;
+  // TypedArray#set is already JSC's native overlap-safe copy. The benchmark
+  // tracks this path, and another host boundary would not remove the copy.
   const source = this.subarray(sourceStart, sourceStart + copied);
   Uint8Array.prototype.set.call(target, source, targetStart);
   return copied;
@@ -753,6 +772,10 @@ function searchBuffer(buffer, value, byteOffset, encoding, forward) {
     return -1;
   }
 
+  const candidateCount = forward ? maximum - offset + 1 : offset + 1;
+  if (candidateCount >= nativeBufferSearchThreshold && typeof nativeBufferIndexOf === "function") {
+    return nativeBufferIndexOf(buffer, needle, offset, !forward);
+  }
   const haystack = byteSearchDecoder.decode(buffer);
   const pattern = byteSearchDecoder.decode(needle);
   return forward ? haystack.indexOf(pattern, offset) : haystack.lastIndexOf(pattern, offset);
@@ -1027,6 +1050,8 @@ Buffer.concat = function concat(list, totalLength) {
 
   const result = Buffer.alloc(length);
   let offset = 0;
+  // The benchmark tracks this aggregate path; the existing sets keep each copy
+  // inside JSC without adding one host call per list entry.
   for (const item of list) {
     if (offset >= length) break;
     const count = Math.min(item.length, length - offset);
