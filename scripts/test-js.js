@@ -335,6 +335,12 @@ try {
       stdoutIncludes: ['bun which windows extension passed'],
     },
     {
+      name: 'bun-which-native',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-which-native.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['3 pass', '0 fail'],
+    },
+    {
       name: 'host-api',
       scriptPath: join(rootDir, 'tests', 'js', 'host-api.js'),
       args: ['alpha', 'beta'],

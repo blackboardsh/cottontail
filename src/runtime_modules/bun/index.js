@@ -2633,28 +2633,18 @@ function executableCandidates(path, isWindows) {
   return windowsExecutableExtensions.map(extension => `${path}${extension}`);
 }
 
-function windowsSearchDirectory(path, env) {
-  const value = String(path);
+function windowsSystemRootInfo(env) {
   const systemRootValue = env.SystemRoot ?? env.SYSTEMROOT ?? env.systemroot;
-  if (systemRootValue == null) return value;
+  if (systemRootValue == null) return ["", ""];
   const systemRoot = String(systemRootValue).replace(/[\\/]+$/, "");
-  if (!systemRoot) return value;
-  const comparablePath = value.replaceAll("/", "\\").toLowerCase();
+  if (!systemRoot) return ["", ""];
   const comparableRoot = systemRoot.replaceAll("/", "\\").toLowerCase();
-  if (!comparablePath.startsWith(comparableRoot) ||
-      (comparablePath.length > comparableRoot.length && comparablePath[comparableRoot.length] !== "\\")) {
-    return value;
-  }
-
-  // Windows commonly exports SystemRoot as C:\WINDOWS even though the
-  // filesystem spelling is C:\Windows. Canonicalize that stable prefix while
-  // retaining the PATH entry's spelling for all remaining components.
   let canonicalRoot = canonicalWindowsSystemRoots.get(comparableRoot);
   if (canonicalRoot === undefined) {
     try { canonicalRoot = cottontail.realpathSync(systemRoot); } catch { canonicalRoot = null; }
     canonicalWindowsSystemRoots.set(comparableRoot, canonicalRoot);
   }
-  return canonicalRoot == null ? value : `${canonicalRoot}${value.slice(systemRoot.length)}`;
+  return [systemRoot, canonicalRoot ?? ""];
 }
 
 function which(command, options = undefined) {
@@ -2681,22 +2671,16 @@ function which(command, options = undefined) {
 
   const env = BunObject.env ?? cottontail.env();
   const pathValue = String(options?.PATH ?? options?.Path ?? options?.path ?? env.PATH ?? env.Path ?? env.path ?? "");
-
-  for (const dir of pathValue.split(isWindows ? ";" : ":")) {
-    if (!dir) continue;
-    const searchDirectory = isWindows ? windowsSearchDirectory(dir, env) : dir;
-    const displayedCandidates = executableCandidates(nodePathJoin(searchDirectory, value), isWindows);
-    const resolvedDirectory = nodePathIsAbsolute(searchDirectory)
-      ? searchDirectory
-      : nodePathResolve(lookupCwd, searchDirectory);
-    const resolvedCandidates = executableCandidates(nodePathJoin(resolvedDirectory, value), isWindows);
-    for (let index = 0; index < resolvedCandidates.length; index += 1) {
-      if (isExecutableFile(resolvedCandidates[index])) {
-        return displayedCandidates[index];
-      }
-    }
-  }
-  return null;
+  const [systemRoot, canonicalSystemRoot] = isWindows
+    ? windowsSystemRootInfo(env)
+    : ["", ""];
+  return cottontail.whichPathNative(
+    pathValue,
+    lookupCwd,
+    value,
+    systemRoot,
+    canonicalSystemRoot,
+  );
 }
 
 class BuildMessage {
