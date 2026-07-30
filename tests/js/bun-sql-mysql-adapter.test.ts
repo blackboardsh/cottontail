@@ -23,16 +23,39 @@ function packet(payload: Buffer, sequence: number): Buffer {
 
 function lengthEncoded(value: string | Buffer): Buffer {
   const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value);
-  if (bytes.length >= 0xfb) throw new Error("test fixture only supports short values");
-  return Buffer.concat([Buffer.from([bytes.length]), bytes]);
+  if (bytes.length < 0xfb) return Buffer.concat([Buffer.from([bytes.length]), bytes]);
+  if (bytes.length <= 0xffff) {
+    const header = Buffer.alloc(3);
+    header[0] = 0xfc;
+    header.writeUInt16LE(bytes.length, 1);
+    return Buffer.concat([header, bytes]);
+  }
+  if (bytes.length <= 0xffffff) {
+    const header = Buffer.from([
+      0xfd,
+      bytes.length & 0xff,
+      (bytes.length >>> 8) & 0xff,
+      (bytes.length >>> 16) & 0xff,
+    ]);
+    return Buffer.concat([header, bytes]);
+  }
+  const header = Buffer.alloc(9);
+  header[0] = 0xfe;
+  header.writeBigUInt64LE(BigInt(bytes.length), 1);
+  return Buffer.concat([header, bytes]);
 }
 
-function columnDefinition(name: string, type: number): Buffer {
+function columnDefinition(
+  name: string,
+  type: number,
+  options: { characterSet?: number; columnLength?: number; flags?: number } = {},
+): Buffer {
   const fixed = Buffer.alloc(13);
   fixed[0] = 0x0c;
-  fixed.writeUInt16LE(45, 1);
-  fixed.writeUInt32LE(11, 3);
+  fixed.writeUInt16LE(options.characterSet ?? 45, 1);
+  fixed.writeUInt32LE(options.columnLength ?? 11, 3);
   fixed[7] = type;
+  fixed.writeUInt16LE(options.flags ?? 0, 8);
   return Buffer.concat([
     lengthEncoded("def"),
     lengthEncoded("testdb"),
@@ -133,6 +156,7 @@ test("MySQL and MariaDB construction is lazy and normalizes adapter options", as
 
 test("MySQL adapter authenticates and executes a text-protocol query", async () => {
   const seed = Buffer.from("12345678abcdefghijkl");
+  const binaryValue = Buffer.from(Array.from({ length: 300 }, (_, index) => index & 0xff));
   const capabilities =
     CAP_CONNECT_WITH_DB |
     CAP_PROTOCOL_41 |
@@ -202,10 +226,24 @@ test("MySQL adapter authenticates and executes a text-protocol query", async () 
       expect(query.payload[0]).toBe(0x03);
       expect(query.payload.toString("utf8", 1)).toBe("SELECT 42 AS answer");
 
-      socket.write(packet(Buffer.from([1]), 1));
+      socket.write(packet(Buffer.from([5]), 1));
       socket.write(packet(columnDefinition("answer", 0x03), 2));
-      socket.write(packet(lengthEncoded("42"), 3));
-      socket.write(packet(Buffer.from([0xfe, 0, 0, 2, 0, 0, 0]), 4));
+      socket.write(packet(columnDefinition("label", 0xfd), 3));
+      socket.write(packet(columnDefinition("payload", 0xfc, {
+        characterSet: 63,
+        columnLength: binaryValue.length,
+        flags: 1 << 7,
+      }), 4));
+      socket.write(packet(columnDefinition("missing", 0xfd), 5));
+      socket.write(packet(columnDefinition("empty", 0xfd), 6));
+      socket.write(packet(Buffer.concat([
+        lengthEncoded("42"),
+        lengthEncoded("cottontail"),
+        lengthEncoded(binaryValue),
+        Buffer.from([0xfb]),
+        lengthEncoded(""),
+      ]), 7));
+      socket.write(packet(Buffer.from([0xfe, 0, 0, 2, 0, 0, 0]), 8));
 
       const quit = await read();
       expect(quit.payload).toEqual(Buffer.from([0x01]));
@@ -226,7 +264,11 @@ test("MySQL adapter authenticates and executes a text-protocol query", async () 
   try {
     expect(acceptedConnections).toBe(0);
     const result = await sql`SELECT ${42} AS answer`;
-    expect(result).toEqual([{ answer: 42 }]);
+    expect(result[0].answer).toBe(42);
+    expect(result[0].label).toBe("cottontail");
+    expect(Buffer.from(result[0].payload)).toEqual(binaryValue);
+    expect(result[0].missing).toBeNull();
+    expect(result[0].empty).toBe("");
     expect(result.count).toBe(1);
     expect(result.command).toBe("SELECT");
   } finally {

@@ -429,6 +429,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             "src/native_bindings/sockets.c",
             "src/native_bindings/tls.c",
             "src/native_bindings/sqlite.c",
+            "src/native_bindings/sql_wire.c",
             "src/native_bindings/platform.c",
         },
         .flags = if (resolved_target.os.tag == .windows)

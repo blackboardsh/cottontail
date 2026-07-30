@@ -199,6 +199,18 @@ function resultForStatement(statement: string): {
   values: Array<string | Buffer | null>;
   tag: string;
 } | null {
+  if (/wire_types/i.test(statement)) {
+    return {
+      columns: [
+        { name: "text_value", oid: 25 },
+        { name: "binary_value", oid: 17 },
+        { name: "null_value", oid: 25 },
+        { name: "empty_value", oid: 25 },
+      ],
+      values: ["hello", "\\x00ff7e", null, ""],
+      tag: "SELECT 1",
+    };
+  }
   if (/answer/i.test(statement)) {
     return {
       columns: [
@@ -497,6 +509,18 @@ test("PostgreSQL adapter pools, binds, decodes, and manages transactions", async
     expect(bound.values).toEqual(["42", "t", '{"nested":true}', "9007199254740993"]);
     expect(bound.statement).toContain("$1 ::int4");
     expect(bound.statement).toContain("$4 ::int8");
+
+    const binaryParameter = Uint8Array.from([0xee, 0x00, 0xab, 0xff, 0xdd]);
+    await sql`UPDATE wire_parameters SET value = ${new DataView(binaryParameter.buffer, 1, 3)}`;
+    const binaryBound = fixture.queries.at(-1)!;
+    expect(binaryBound.oids).toEqual([17]);
+    expect(binaryBound.values).toEqual(["\\x00abff"]);
+
+    const [wireTypes] = await sql`SELECT wire_types`;
+    expect(wireTypes.text_value).toBe("hello");
+    expect(Buffer.from(wireTypes.binary_value)).toEqual(Buffer.from([0x00, 0xff, 0x7e]));
+    expect(wireTypes.null_value).toBeNull();
+    expect(wireTypes.empty_value).toBe("");
 
     const [{ items }] = await sql`SELECT ${sql.array([1, 2, 3], "INT")} AS items`;
     expect(items).toEqual(new Int32Array([1, 2, 3]));

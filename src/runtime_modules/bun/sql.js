@@ -187,18 +187,19 @@ class PostgresMessageStream {
   }
 
   _drain() {
-    while (this.buffer.length >= 5) {
-      const length = this.buffer.readInt32BE(1);
-      if (length < 4) {
-        this.fail(postgresProtocolError(`Invalid PostgreSQL message length: ${length}`));
-        return;
-      }
-      if (this.buffer.length < length + 1) return;
+    let framed;
+    try {
+      framed = globalThis.cottontail.sqlPostgresFrameMessages(this.buffer);
+    } catch (error) {
+      this.fail(postgresProtocolError(String(error)));
+      return;
+    }
+    this.buffer = this.buffer.subarray(framed.consumed);
+    for (const nativeMessage of framed.messages) {
       const message = {
-        type: String.fromCharCode(this.buffer[0]),
-        body: Buffer.from(this.buffer.subarray(5, length + 1)),
+        type: nativeMessage.type,
+        body: Buffer.from(nativeMessage.body),
       };
-      this.buffer = this.buffer.subarray(length + 1);
       const waiter = this.waiters.shift();
       if (waiter) waiter.resolve(message);
       else this.messages.push(message);
@@ -386,110 +387,68 @@ function postgresParameterOID(value) {
   return 0;
 }
 
-function serializePostgresParameter(value) {
-  if (value === null || value === undefined) return null;
+function normalizePostgresParameter(value) {
+  const oid = postgresParameterOID(value);
+  if (value === null || value === undefined) return [oid, null, false];
+  let bytes;
   switch (typeof value) {
     case "string":
-      return Buffer.from(value);
+      bytes = Buffer.from(value);
+      break;
     case "boolean":
-      return Buffer.from(value ? "t" : "f");
+      bytes = Buffer.from(value ? "t" : "f");
+      break;
     case "number":
-      return Buffer.from(String(value));
+      bytes = Buffer.from(String(value));
+      break;
     case "bigint":
       if (value < -(2n ** 63n) || value > 2n ** 63n - 1n) {
         throw new RangeError("The value is out of range. It must fit in a PostgreSQL signed 64-bit integer");
       }
-      return Buffer.from(value.toString());
+      bytes = Buffer.from(value.toString());
+      break;
     case "function":
     case "symbol":
       throw new TypeError("Cannot bind this type to a PostgreSQL query parameter");
     case "object":
       break;
     default:
-      return Buffer.from(String(value));
+      bytes = Buffer.from(String(value));
+      break;
   }
 
-  if (value instanceof SQLArrayParameter) return Buffer.from(String(value.serializedValues));
+  if (bytes !== undefined) return [oid, bytes, false];
+  if (value instanceof SQLArrayParameter) {
+    return [oid, Buffer.from(String(value.serializedValues)), false];
+  }
   if (value instanceof Date) {
     if (Number.isNaN(value.getTime())) throw new TypeError("Invalid Date cannot be bound to a PostgreSQL query");
-    return Buffer.from(value.toISOString());
+    return [oid, Buffer.from(value.toISOString()), false];
   }
   if (value instanceof ArrayBuffer) value = new Uint8Array(value);
   if (ArrayBuffer.isView(value)) {
-    const bytes = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
-    return Buffer.from(`\\x${bytes.toString("hex")}`);
+    return [oid, new Uint8Array(value.buffer, value.byteOffset, value.byteLength), true];
   }
   const json = JSON.stringify(value);
   if (json === undefined) throw new TypeError("Cannot serialize PostgreSQL query parameter");
-  return Buffer.from(json);
+  return [oid, Buffer.from(json), false];
 }
 
 function buildPostgresExtendedQuery(statement, values) {
-  const parseParts = [cstringBuffer(""), cstringBuffer(statement)];
-  const parameterCount = Buffer.alloc(2);
-  parameterCount.writeUInt16BE(values.length);
-  parseParts.push(parameterCount);
-  for (const value of values) {
-    const oid = Buffer.alloc(4);
-    oid.writeUInt32BE(postgresParameterOID(value));
-    parseParts.push(oid);
+  const normalized = values.map(normalizePostgresParameter);
+  try {
+    return Buffer.from(globalThis.cottontail.sqlPostgresBuildExtendedQuery(statement, normalized));
+  } catch (error) {
+    throw postgresProtocolError(String(error), "ERR_POSTGRES_INVALID_QUERY_BINDING");
   }
-
-  const bindParts = [cstringBuffer(""), cstringBuffer("")];
-  const noFormats = Buffer.alloc(2);
-  bindParts.push(noFormats);
-  const bindCount = Buffer.alloc(2);
-  bindCount.writeUInt16BE(values.length);
-  bindParts.push(bindCount);
-  for (const value of values) {
-    const bytes = serializePostgresParameter(value);
-    const length = Buffer.alloc(4);
-    length.writeInt32BE(bytes === null ? -1 : bytes.length);
-    bindParts.push(length);
-    if (bytes !== null) bindParts.push(bytes);
-  }
-  bindParts.push(Buffer.alloc(2));
-
-  const describe = Buffer.from([0x50, 0]);
-  const execute = Buffer.alloc(5);
-  execute[0] = 0;
-  execute.writeUInt32BE(0, 1);
-  return Buffer.concat([
-    typedMessage("P", Buffer.concat(parseParts)),
-    typedMessage("B", Buffer.concat(bindParts)),
-    typedMessage("D", describe),
-    typedMessage("E", execute),
-    typedMessage("S"),
-  ]);
 }
 
 function parsePostgresRowDescription(body) {
-  if (body.length < 2) throw postgresProtocolError("Truncated PostgreSQL row description");
-  const count = body.readUInt16BE(0);
-  const columns = [];
-  let offset = 2;
-  for (let index = 0; index < count; index++) {
-    const end = body.indexOf(0, offset);
-    if (end < 0 || end + 19 > body.length) {
-      throw postgresProtocolError("Truncated PostgreSQL field description");
-    }
-    const name = body.toString("utf8", offset, end);
-    offset = end + 1;
-    const tableOID = body.readUInt32BE(offset);
-    offset += 4;
-    const attribute = body.readUInt16BE(offset);
-    offset += 2;
-    const typeOID = body.readUInt32BE(offset);
-    offset += 4;
-    const typeSize = body.readInt16BE(offset);
-    offset += 2;
-    const typeModifier = body.readInt32BE(offset);
-    offset += 4;
-    const format = body.readUInt16BE(offset);
-    offset += 2;
-    columns.push({ name, tableOID, attribute, typeOID, typeSize, typeModifier, format });
+  try {
+    return globalThis.cottontail.sqlPostgresDecodeRowDescription(body);
+  } catch (error) {
+    throw postgresProtocolError(String(error));
   }
-  return columns;
 }
 
 const POSTGRES_ARRAY_ELEMENTS = {
@@ -666,23 +625,16 @@ function setSQLRowValue(row, name, value) {
 }
 
 function parsePostgresDataRow(body, columns, options, mode) {
-  if (body.length < 2) throw postgresProtocolError("Truncated PostgreSQL data row");
-  const count = body.readUInt16BE(0);
-  let offset = 2;
-  const values = [];
-  for (let index = 0; index < count; index++) {
-    if (offset + 4 > body.length) throw postgresProtocolError("Truncated PostgreSQL data row value");
-    const length = body.readInt32BE(offset);
-    offset += 4;
-    let bytes = null;
-    if (length >= 0) {
-      if (offset + length > body.length) throw postgresProtocolError("Truncated PostgreSQL data row value");
-      bytes = body.subarray(offset, offset + length);
-      offset += length;
-    }
-    const column = columns[index] ?? { typeOID: 25, format: 0, name: String(index) };
-    values.push(parsePostgresValue(bytes, column, options, mode === "raw"));
+  let fields;
+  try {
+    fields = globalThis.cottontail.sqlPostgresDecodeDataRow(body);
+  } catch (error) {
+    throw postgresProtocolError(String(error));
   }
+  const values = fields.map((field, index) => {
+    const column = columns[index] ?? { typeOID: 25, format: 0, name: String(index) };
+    return parsePostgresValue(field === null ? null : Buffer.from(field), column, options, mode === "raw");
+  });
   if (mode === "values" || mode === "raw") return values;
   const row = {};
   for (let index = 0; index < values.length; index++) {
@@ -1774,27 +1726,10 @@ function mysqlProtocolError(message, code = "ERR_MYSQL_PROTOCOL_ERROR") {
   return new MySQLError(message, { code });
 }
 
-function readUInt24LE(buffer, offset = 0) {
-  return buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16);
-}
-
-function writeUInt24LE(buffer, value, offset = 0) {
-  buffer[offset] = value & 0xff;
-  buffer[offset + 1] = (value >>> 8) & 0xff;
-  buffer[offset + 2] = (value >>> 16) & 0xff;
-}
-
 function readNullTerminated(buffer, offset) {
   let end = buffer.indexOf(0, offset);
   if (end < 0) end = buffer.length;
   return { value: buffer.toString("utf8", offset, end), offset: Math.min(end + 1, buffer.length) };
-}
-
-function mysqlPacket(payload, sequenceId) {
-  const header = Buffer.alloc(4);
-  writeUInt24LE(header, payload.length);
-  header[3] = sequenceId & 0xff;
-  return Buffer.concat([header, payload]);
 }
 
 class MySQLPacketStream {
@@ -1834,14 +1769,19 @@ class MySQLPacketStream {
   }
 
   _drain() {
-    while (this.buffer.length >= 4) {
-      const length = readUInt24LE(this.buffer);
-      if (this.buffer.length < length + 4) return;
+    let framed;
+    try {
+      framed = globalThis.cottontail.sqlMysqlFramePackets(this.buffer);
+    } catch (error) {
+      this.fail(mysqlProtocolError(String(error)));
+      return;
+    }
+    this.buffer = this.buffer.subarray(framed.consumed);
+    for (const nativePacket of framed.packets) {
       const packet = {
-        sequenceId: this.buffer[3],
-        payload: Buffer.from(this.buffer.subarray(4, 4 + length)),
+        sequenceId: nativePacket.sequenceId,
+        payload: Buffer.from(nativePacket.payload),
       };
-      this.buffer = this.buffer.subarray(4 + length);
       const waiter = this.waiters.shift();
       if (waiter) waiter.resolve(packet);
       else this.packets.push(packet);
@@ -1872,23 +1812,13 @@ class MySQLPacketStream {
       throw this.failure ?? new MySQLError("Connection closed", { code: "ERR_MYSQL_CONNECTION_CLOSED" });
     }
     const bytes = Buffer.from(payload);
-    let offset = 0;
-    let sequence = sequenceId & 0xff;
-    if (bytes.length === 0) {
-      this.socket.write(mysqlPacket(bytes, sequence));
-      return (sequence + 1) & 0xff;
+    try {
+      const framed = globalThis.cottontail.sqlMysqlFramePayload(bytes, sequenceId & 0xff);
+      this.socket.write(Buffer.from(framed.bytes));
+      return framed.nextSequenceId;
+    } catch (error) {
+      throw mysqlProtocolError(String(error));
     }
-    while (offset < bytes.length) {
-      const length = Math.min(0xffffff, bytes.length - offset);
-      this.socket.write(mysqlPacket(bytes.subarray(offset, offset + length), sequence));
-      offset += length;
-      sequence = (sequence + 1) & 0xff;
-    }
-    if (bytes.length % 0xffffff === 0) {
-      this.socket.write(mysqlPacket(Buffer.alloc(0), sequence));
-      sequence = (sequence + 1) & 0xff;
-    }
-    return sequence;
   }
 
   fail(error) {
@@ -2089,38 +2019,13 @@ function parseMySQLError(payload) {
 }
 
 function readLengthEncodedInteger(buffer, state) {
-  if (state.offset >= buffer.length) throw mysqlProtocolError("Truncated length-encoded integer");
-  const first = buffer[state.offset++];
-  if (first < 0xfb) return first;
-  if (first === 0xfb) return null;
-  if (first === 0xfc) {
-    const value = buffer.readUInt16LE(state.offset);
-    state.offset += 2;
-    return value;
+  try {
+    const decoded = globalThis.cottontail.sqlMysqlReadLengthEncodedInteger(buffer, state.offset);
+    state.offset = decoded.offset;
+    return decoded.value;
+  } catch (error) {
+    throw mysqlProtocolError(String(error));
   }
-  if (first === 0xfd) {
-    const value = readUInt24LE(buffer, state.offset);
-    state.offset += 3;
-    return value;
-  }
-  if (first === 0xfe) {
-    const value = buffer.readBigUInt64LE(state.offset);
-    state.offset += 8;
-    return value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : value;
-  }
-  throw mysqlProtocolError("Invalid length-encoded integer");
-}
-
-function readLengthEncodedBuffer(buffer, state) {
-  const length = readLengthEncodedInteger(buffer, state);
-  if (length === null) return null;
-  const number = Number(length);
-  if (!Number.isSafeInteger(number) || number < 0 || state.offset + number > buffer.length) {
-    throw mysqlProtocolError("Truncated length-encoded string");
-  }
-  const value = Buffer.from(buffer.subarray(state.offset, state.offset + number));
-  state.offset += number;
-  return value;
 }
 
 function parseMySQLOKPacket(payload) {
@@ -2145,36 +2050,11 @@ function mysqlTerminatorStatus(payload) {
 }
 
 function parseMySQLColumn(payload) {
-  const state = { offset: 0 };
-  const catalog = readLengthEncodedBuffer(payload, state);
-  const schema = readLengthEncodedBuffer(payload, state);
-  const table = readLengthEncodedBuffer(payload, state);
-  const originalTable = readLengthEncodedBuffer(payload, state);
-  const name = readLengthEncodedBuffer(payload, state);
-  const originalName = readLengthEncodedBuffer(payload, state);
-  readLengthEncodedInteger(payload, state);
-  if (state.offset + 10 > payload.length) throw mysqlProtocolError("Truncated MySQL column definition");
-  const characterSet = payload.readUInt16LE(state.offset);
-  state.offset += 2;
-  const columnLength = payload.readUInt32LE(state.offset);
-  state.offset += 4;
-  const type = payload[state.offset++];
-  const flags = payload.readUInt16LE(state.offset);
-  state.offset += 2;
-  const decimals = payload[state.offset];
-  return {
-    catalog: catalog?.toString("utf8") ?? "",
-    schema: schema?.toString("utf8") ?? "",
-    table: table?.toString("utf8") ?? "",
-    originalTable: originalTable?.toString("utf8") ?? "",
-    name: name?.toString("utf8") ?? "",
-    originalName: originalName?.toString("utf8") ?? "",
-    characterSet,
-    columnLength,
-    type,
-    flags,
-    decimals,
-  };
+  try {
+    return globalThis.cottontail.sqlMysqlDecodeColumn(payload);
+  } catch (error) {
+    throw mysqlProtocolError(String(error));
+  }
 }
 
 function parseMySQLValue(bytes, column, options, raw) {
@@ -2222,10 +2102,16 @@ function parseMySQLValue(bytes, column, options, raw) {
 }
 
 function parseMySQLRow(payload, columns, options, mode) {
-  const state = { offset: 0 };
-  const values = columns.map((column) =>
-    parseMySQLValue(readLengthEncodedBuffer(payload, state), column, options, mode === "raw"),
-  );
+  let fields;
+  try {
+    fields = globalThis.cottontail.sqlMysqlDecodeRow(payload, columns.length);
+  } catch (error) {
+    throw mysqlProtocolError(String(error));
+  }
+  const values = columns.map((column, index) => {
+    const field = fields[index];
+    return parseMySQLValue(field === null ? null : Buffer.from(field), column, options, mode === "raw");
+  });
   if (mode === "values" || mode === "raw") return values;
   const row = {};
   for (let index = 0; index < columns.length; index++) {
