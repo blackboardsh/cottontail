@@ -24,6 +24,8 @@ import {
   lstatSync,
   lutimesSync,
   mkdirSync,
+  makeCopyFileError,
+  makeFsError,
   mkdtempDisposableSync,
   mkdtempSync,
   openSync,
@@ -34,6 +36,8 @@ import {
   readlinkSync,
   realpathSync,
   renameSync,
+  prepareCopyFile,
+  prepareRm,
   rmSync,
   rmdirSync,
   statSync,
@@ -57,7 +61,7 @@ import {
   validateFd,
   validatePosition,
 } from "./internal.js";
-import { cpPromiseImpl, normalizeCopyPath } from "./cp.js";
+import { cpPromiseImpl, nativeCopyError, normalizeCopyPath } from "./cp.js";
 
 // fs.constants must be the exact same object as fsPromises.constants. Because
 // fs.js and fs/promises.js form an import cycle whose evaluation order depends
@@ -166,6 +170,41 @@ function nativeFsError(event, fd, syscall) {
   error.syscall = syscall;
   error.fd = fd;
   return error;
+}
+
+function nativePathError(event, path, syscall, destination = undefined) {
+  const error = new Error(event?.message || `${event?.code || "EIO"}: ${syscall}`);
+  if (event?.code) error.code = event.code;
+  return makeFsError(error, path, syscall, destination);
+}
+
+function nativePathRequest(start, makeError) {
+  return new Promise((resolve, reject) => {
+    const activeRequest = new FSReqPromise();
+    globalThis.cottontail?.activeRequestRegister?.(activeRequest);
+    const listeners = installNativeFsDispatcher();
+    let id;
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      if (id !== undefined) listeners.delete(id);
+      globalThis.cottontail?.activeRequestUnregister?.(activeRequest);
+      callback(value);
+    };
+    try {
+      id = Number(start());
+      listeners.set(id, event => {
+        if (event?.type === "error" || event?.type === "fs-bulk-error") {
+          finish(reject, makeError(event));
+        } else {
+          finish(resolve);
+        }
+      });
+    } catch (error) {
+      finish(reject, error);
+    }
+  });
 }
 
 class FSReqPromise {}
@@ -414,7 +453,20 @@ export async function writev(fd, buffers, position = null) {
 }
 
 export async function copyFile(source, destination, mode = 0) {
-  return copyFileSync(source, destination, mode);
+  const prepared = prepareCopyFile(source, destination, mode);
+  if (prepared.skip) return;
+  return nativePathRequest(
+    () => cottontail.fsAsyncCopyFileStart(
+      prepared.sourceText,
+      prepared.destinationText,
+      prepared.mode,
+    ),
+    event => makeCopyFileError(
+      nativePathError(event, prepared.sourceText, "copyfile", prepared.destinationText),
+      prepared.sourceText,
+      prepared.destinationText,
+    ),
+  );
 }
 
 export function cp(source, destination, options) {
@@ -429,7 +481,20 @@ export function cp(source, destination, options) {
 function getCpOperations() {
   return {
     chmodSync,
+    copyFile,
     copyFileSync,
+    copyTree(source, destination, recursive, force, errorOnExist) {
+      return nativePathRequest(
+        () => cottontail.fsCopyTreeStart(
+          source,
+          destination,
+          recursive,
+          force,
+          errorOnExist,
+        ),
+        event => nativeCopyError(event, destination, source),
+      );
+    },
     lstatSync,
     mkdirSync,
     readlinkSync,
@@ -795,7 +860,17 @@ export async function rename(oldPath, newPath) {
 }
 
 export async function rm(path, options = {}) {
-  return rmSync(path, options);
+  const { normalizedOptions, normalizedPath } = prepareRm(path, options);
+  return nativePathRequest(
+    () => cottontail.fsRmStart(
+      normalizedPath,
+      normalizedOptions.recursive,
+      normalizedOptions.force,
+      normalizedOptions.maxRetries,
+      normalizedOptions.retryDelay,
+    ),
+    event => nativePathError(event, normalizedPath, "rm"),
+  );
 }
 
 export async function rmdir(path, options = {}) {

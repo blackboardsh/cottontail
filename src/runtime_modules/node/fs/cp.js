@@ -54,15 +54,65 @@ function cpError(code, message, path) {
   return error;
 }
 
+function copyExistsError(destination, options) {
+  const error = cpError("EEXIST", `${destination} already exists`, destination);
+  if (options.fallback) error.code = "ERR_FS_CP_EEXIST";
+  return error;
+}
+
+function normalizeCopyMode(mode) {
+  if (mode == null) return 0;
+  if (typeof mode !== "number") {
+    const error = new TypeError(`The "mode" argument must be of type number. Received ${typeof mode}`);
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  if (!Number.isInteger(mode) || mode < 0 || mode > 7) {
+    const error = new RangeError(`The value of "mode" is out of range. It must be >= 0 && <= 7. Received ${mode}`);
+    error.code = "ERR_OUT_OF_RANGE";
+    throw error;
+  }
+  return mode;
+}
+
+export function nativeCopyError(error, destination, sourcePath = undefined) {
+  if (error?.code) return error;
+  const source = String(error?.message ?? error ?? "");
+  const lower = source.toLowerCase();
+  let code = "EIO";
+  if (lower.includes("filenotfound") || lower.includes("no such file")) code = "ENOENT";
+  else if (lower.includes("pathalreadyexists") || lower.includes("already exists")) code = "EEXIST";
+  else if (lower.includes("isdir") || lower.includes("is a directory")) code = "EISDIR";
+  else if (lower.includes("notdir") || lower.includes("not a directory")) code = "ENOTDIR";
+  else if (lower.includes("symlinkloop")) code = "ELOOP";
+  else if (lower.includes("symlinktosubdirectory")) code = "ERR_FS_CP_SYMLINK_TO_SUBDIRECTORY";
+  else if (lower.includes("copyinvalid")) code = "ERR_FS_CP_EINVAL";
+  else if (lower.includes("nametoolong")) code = "ENAMETOOLONG";
+  else if (lower.includes("permissiondenied") || lower.includes("accessdenied")) code = "EACCES";
+  else if (lower.includes("operationunsupported")) code = "ENOTSUP";
+  else if (lower.includes("invalidargument")) code = "EINVAL";
+  const path = code === "EEXIST"
+    ? error?.dest ?? destination
+    : code === "EISDIR"
+      ? error?.path ?? sourcePath ?? destination
+      : error?.path ?? error?.dest ?? destination;
+  const out = cpError(code, source || code, path);
+  out.path = path;
+  if (error?.dest !== undefined) out.dest = error.dest;
+  return out;
+}
+
 function copyOptions(options) {
   if (!options) options = {};
   if (typeof options !== "object") throw new TypeError("options must be an object");
 
+  const mode = normalizeCopyMode(options.mode);
   const fallback = Boolean(
     options.dereference ||
     options.filter ||
     options.preserveTimestamps ||
-    options.verbatimSymlinks
+    options.verbatimSymlinks ||
+    mode !== 0
   );
   if (options.filter && typeof options.filter !== "function") {
     throw new TypeError("options.filter must be a function");
@@ -73,13 +123,11 @@ function copyOptions(options) {
     errorOnExist: Boolean(options.errorOnExist),
     fallback,
     filter: options.filter || null,
-    // Bun's JS fallback receives the un-normalized options object. Its force
-    // default therefore differs from the native fast path in 1.3.10.
-    force: fallback ? Boolean(options.force) : options.force == null ? true : Boolean(options.force),
-    mode: fallback ? options.mode : 0,
+    force: options.force == null ? true : Boolean(options.force),
+    mode,
     preserveTimestamps: Boolean(options.preserveTimestamps),
     recursive: Boolean(options.recursive),
-    verbatimSymlinks: fallback ? Boolean(options.verbatimSymlinks) : true,
+    verbatimSymlinks: Boolean(options.verbatimSymlinks),
   };
 }
 
@@ -187,7 +235,7 @@ function copyFileEntry(source, destination, sourceStat, destinationStat, options
     if (options.force) {
       operations.unlinkSync(destination);
     } else if (options.errorOnExist) {
-      throw cpError("EEXIST", `${destination} already exists`, destination);
+      throw copyExistsError(destination, options);
     } else {
       return;
     }
@@ -199,6 +247,32 @@ function copyFileEntry(source, destination, sourceStat, destinationStat, options
       operations.chmodSync(destination, Number(sourceStat.mode) | 0o200);
     }
     // Reading the source can update atime, so fetch the timestamps again.
+    const updated = operations.statSync(source);
+    operations.utimesSync(destination, updated.atime, updated.mtime);
+  }
+  operations.chmodSync(destination, Number(sourceStat.mode));
+}
+
+async function copyFileEntryAsync(source, destination, sourceStat, destinationStat, options, operations) {
+  if (destinationStat) {
+    if (options.force) {
+      operations.unlinkSync(destination);
+    } else if (options.errorOnExist) {
+      throw copyExistsError(destination, options);
+    } else {
+      return;
+    }
+  }
+
+  if (typeof operations.copyFile === "function") {
+    await operations.copyFile(source, destination, options.mode);
+  } else {
+    operations.copyFileSync(source, destination, options.mode);
+  }
+  if (options.preserveTimestamps) {
+    if ((Number(sourceStat.mode) & 0o200) === 0) {
+      operations.chmodSync(destination, Number(sourceStat.mode) | 0o200);
+    }
     const updated = operations.statSync(source);
     operations.utimesSync(destination, updated.atime, updated.mtime);
   }
@@ -352,10 +426,24 @@ export function cpSyncImpl(source, destination, rawOptions, operations) {
   const options = copyOptions(rawOptions);
   const destinationStat = checkRootSync(source, destination, options, operations);
   if (destinationStat === skippedCopy) return;
+  if (!options.fallback && typeof operations.copyTreeSync === "function") {
+    try {
+      operations.copyTreeSync(
+        source,
+        destination,
+        options.recursive,
+        options.force,
+        options.errorOnExist,
+      );
+      return;
+    } catch (error) {
+      throw nativeCopyError(error, destination, source);
+    }
+  }
   copyEntrySync(source, destination, destinationStat, options, operations, new Set());
 }
 
-async function copyEntryWithFilter(source, destination, destinationStat, options, operations, activeDirectories) {
+async function copyEntryAsync(source, destination, destinationStat, options, operations, activeDirectories) {
   const stats = sourceStats(source, options, operations);
   if (stats.isDirectory()) {
     if (!options.recursive) {
@@ -372,7 +460,7 @@ async function copyEntryWithFilter(source, destination, destinationStat, options
       for (const entry of operations.readdirSync(source, { withFileTypes: true })) {
         const childSource = join(source, String(entry.name));
         const childDestination = join(destination, String(entry.name));
-        if (!(await options.filter(childSource, childDestination))) continue;
+        if (options.filter && !(await options.filter(childSource, childDestination))) continue;
         const childSourceStat = sourceStats(childSource, options, operations, true);
         const childDestinationStat = destinationStats(childDestination, options, operations);
         if (!checkRelationship(
@@ -382,7 +470,7 @@ async function copyEntryWithFilter(source, destination, destinationStat, options
           childDestinationStat,
           options,
         )) continue;
-        await copyEntryWithFilter(
+        await copyEntryAsync(
           childSource,
           childDestination,
           childDestinationStat,
@@ -399,7 +487,7 @@ async function copyEntryWithFilter(source, destination, destinationStat, options
   }
 
   if (stats.isFile() || stats.isCharacterDevice() || stats.isBlockDevice()) {
-    copyFileEntry(source, destination, stats, destinationStat, options, operations);
+    await copyFileEntryAsync(source, destination, stats, destinationStat, options, operations);
     return;
   }
   if (stats.isSymbolicLink()) {
@@ -416,7 +504,7 @@ async function cpWithFilter(source, destination, options, operations) {
   if (!checkRelationship(source, destination, sourceStat, destinationStat, options)) return;
   checkParentPaths(source, sourceStat, destination, operations);
   ensureParent(destination, operations);
-  return copyEntryWithFilter(
+  return copyEntryAsync(
     source,
     destination,
     destinationStat,
@@ -432,6 +520,17 @@ export function cpPromiseImpl(source, destination, rawOptions, operations) {
   return Promise.resolve().then(() => {
     const destinationStat = checkRootSync(source, destination, options, operations);
     if (destinationStat === skippedCopy) return;
-    copyEntrySync(source, destination, destinationStat, options, operations, new Set());
+    if (!options.fallback && typeof operations.copyTree === "function") {
+      return operations.copyTree(
+        source,
+        destination,
+        options.recursive,
+        options.force,
+        options.errorOnExist,
+      ).catch(error => {
+        throw nativeCopyError(error, destination, source);
+      });
+    }
+    return copyEntryAsync(source, destination, destinationStat, options, operations, new Set());
   });
 }

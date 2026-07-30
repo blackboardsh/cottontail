@@ -272,6 +272,29 @@ typedef unsigned int gid_t;
 #include <uv.h>
 #include <zlib.h>
 
+int ct_paths_are_same_file(const char *source, const char *destination) {
+    uv_fs_t source_request;
+    uv_fs_t destination_request;
+    int source_status = uv_fs_lstat(NULL, &source_request, source, NULL);
+    if (source_status < 0) {
+        uv_fs_req_cleanup(&source_request);
+        return 0;
+    }
+    int destination_status = uv_fs_lstat(NULL, &destination_request, destination, NULL);
+    if (destination_status < 0) {
+        uv_fs_req_cleanup(&source_request);
+        uv_fs_req_cleanup(&destination_request);
+        return 0;
+    }
+    const uv_stat_t *source_stat = uv_fs_get_statbuf(&source_request);
+    const uv_stat_t *destination_stat = uv_fs_get_statbuf(&destination_request);
+    int same = source_stat->st_dev == destination_stat->st_dev &&
+        source_stat->st_ino == destination_stat->st_ino;
+    uv_fs_req_cleanup(&source_request);
+    uv_fs_req_cleanup(&destination_request);
+    return same;
+}
+
 #if !defined(_WIN32)
 static pthread_once_t ct_process_signal_defaults_once = PTHREAD_ONCE_INIT;
 
@@ -1887,8 +1910,35 @@ extern uint8_t *ct_host_walk_dir(
     char **error_path_out,
     char **error_syscall_out
 );
+extern int ct_host_copy_file(
+    const char *source,
+    const char *destination,
+    bool exclusive,
+    char **error_out,
+    char **error_path_out,
+    char **error_destination_out,
+    char **error_syscall_out
+);
+extern int ct_host_copy_tree(
+    const char *source,
+    const char *destination,
+    bool recursive,
+    bool force,
+    bool error_on_exist,
+    char **error_out,
+    char **error_path_out,
+    char **error_destination_out,
+    char **error_syscall_out
+);
 extern int ct_host_mkdir(const char *path, bool recursive, char **error_out);
-extern int ct_host_rm(const char *path, bool recursive, bool force, char **error_out);
+extern int ct_host_rm(
+    const char *path,
+    bool recursive,
+    bool force,
+    uint32_t max_retries,
+    uint32_t retry_delay_ms,
+    char **error_out
+);
 extern int ct_host_rmdir(const char *path, char **error_out);
 extern int ct_host_unlink(const char *path, char **error_out);
 extern int ct_host_chmod(const char *path, unsigned int mode, char **error_out);
@@ -2098,6 +2148,9 @@ typedef struct CtFdEvent {
     char *data;
     size_t data_len;
     char *message;
+    char *path;
+    char *destination;
+    char *syscall;
     int error_code;
     bool has_error_code;
     int64_t result;
@@ -2267,6 +2320,7 @@ struct CtFsWatcher {
 typedef enum {
     CT_FS_ASYNC_READ,
     CT_FS_ASYNC_WRITE,
+    CT_FS_ASYNC_COPY_FILE,
 } CtFsAsyncKind;
 
 typedef struct CtFsAsyncRequest {
@@ -2275,6 +2329,8 @@ typedef struct CtFsAsyncRequest {
     JSValueRef buffer_value;
     uv_buf_t buffer;
     uint8_t *owned_bytes;
+    char *source_path;
+    char *destination_path;
     size_t buffer_offset;
     size_t buffer_length;
     uint32_t id;
@@ -2283,6 +2339,33 @@ typedef struct CtFsAsyncRequest {
     bool suppress_event;
     struct CtFsAsyncRequest *next;
 } CtFsAsyncRequest;
+
+typedef enum {
+    CT_FS_BULK_COPY_TREE,
+    CT_FS_BULK_RM,
+} CtFsBulkKind;
+
+typedef struct CtFsBulkRequest {
+    uv_work_t request;
+    CtJscRuntime *runtime;
+    char *source_path;
+    char *destination_path;
+    char *error;
+    char *error_path;
+    char *error_destination;
+    char *error_syscall;
+    uint32_t id;
+    uint32_t max_retries;
+    uint32_t retry_delay_ms;
+    CtFsBulkKind kind;
+    bool recursive;
+    bool force;
+    bool error_on_exist;
+    bool canceled;
+    bool suppress_event;
+    int status;
+    struct CtFsBulkRequest *next;
+} CtFsBulkRequest;
 
 #if defined(_WIN32)
 typedef struct CtWindowsPipeWrite {
@@ -2796,6 +2879,7 @@ struct CtJscRuntime {
     CtDnsRequest *dns_requests;
     CtFsWatcher *fs_watchers;
     CtFsAsyncRequest *fs_async_requests;
+    CtFsBulkRequest *fs_bulk_requests;
     CtTimer **timer_heap;
     size_t timer_heap_len;
     size_t timer_heap_cap;
@@ -24363,6 +24447,137 @@ static bool ct_fs_walk_read_string(
     return true;
 }
 
+static void ct_throw_native_copy_error(
+    JSContextRef ctx,
+    JSValueRef *exception,
+    const char *message,
+    const char *path,
+    const char *destination,
+    const char *syscall
+) {
+    if (exception == NULL) return;
+    JSValueRef argument = ct_make_string(ctx, message != NULL ? message : "Filesystem copy failed");
+    JSObjectRef error_object = JSObjectMakeError(ctx, 1, &argument, NULL);
+    if (path != NULL) {
+        ct_set_property(ctx, error_object, "path", ct_make_string(ctx, path), NULL);
+    }
+    if (destination != NULL) {
+        ct_set_property(ctx, error_object, "dest", ct_make_string(ctx, destination), NULL);
+    }
+    if (syscall != NULL) {
+        ct_set_property(ctx, error_object, "syscall", ct_make_string(ctx, syscall), NULL);
+    }
+    *exception = error_object;
+}
+
+static void ct_free_native_copy_error(
+    char *error,
+    char *path,
+    char *destination,
+    char *syscall
+) {
+    if (error != NULL) ct_host_string_free(error);
+    if (path != NULL) ct_host_string_free(path);
+    if (destination != NULL) ct_host_string_free(destination);
+    if (syscall != NULL) ct_host_string_free(syscall);
+}
+
+static JSValueRef ct_copy_file_native_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "copyFileNativeSync(source, destination[, exclusive]) requires source and destination");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *source = ct_value_to_string_copy(ctx, argv[0]);
+    char *destination = ct_value_to_string_copy(ctx, argv[1]);
+    bool exclusive = argc >= 3 && ct_value_to_bool(ctx, argv[2]);
+    if (source == NULL || destination == NULL) {
+        free(source);
+        free(destination);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    char *error = NULL;
+    char *error_path = NULL;
+    char *error_destination = NULL;
+    char *error_syscall = NULL;
+    int status = ct_host_copy_file(
+        source,
+        destination,
+        exclusive,
+        &error,
+        &error_path,
+        &error_destination,
+        &error_syscall
+    );
+    free(source);
+    free(destination);
+    if (status != 0) {
+        ct_throw_native_copy_error(
+            ctx,
+            exception,
+            error,
+            error_path,
+            error_destination,
+            error_syscall
+        );
+    }
+    ct_free_native_copy_error(error, error_path, error_destination, error_syscall);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_copy_tree_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "copyTreeSync(source, destination[, recursive, force, errorOnExist]) requires source and destination");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *source = ct_value_to_string_copy(ctx, argv[0]);
+    char *destination = ct_value_to_string_copy(ctx, argv[1]);
+    bool recursive = argc >= 3 && ct_value_to_bool(ctx, argv[2]);
+    bool force = argc < 4 || ct_value_to_bool(ctx, argv[3]);
+    bool error_on_exist = argc >= 5 && ct_value_to_bool(ctx, argv[4]);
+    if (source == NULL || destination == NULL) {
+        free(source);
+        free(destination);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    char *error = NULL;
+    char *error_path = NULL;
+    char *error_destination = NULL;
+    char *error_syscall = NULL;
+    int status = ct_host_copy_tree(
+        source,
+        destination,
+        recursive,
+        force,
+        error_on_exist,
+        &error,
+        &error_path,
+        &error_destination,
+        &error_syscall
+    );
+    free(source);
+    free(destination);
+    if (status != 0) {
+        ct_throw_native_copy_error(
+            ctx,
+            exception,
+            error,
+            error_path,
+            error_destination,
+            error_syscall
+        );
+    }
+    ct_free_native_copy_error(error, error_path, error_destination, error_syscall);
+    return JSValueMakeUndefined(ctx);
+}
+
 static JSValueRef ct_walk_dir_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -24489,8 +24704,12 @@ static JSValueRef ct_rm_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef
     char *path = ct_value_to_string_copy(ctx, argv[0]);
     bool recursive = argc >= 2 && ct_value_to_bool(ctx, argv[1]);
     bool force = argc >= 3 && ct_value_to_bool(ctx, argv[2]);
+    uint32_t max_retries = argc >= 4 ? (uint32_t)ct_value_to_number(ctx, argv[3]) : 0;
+    uint32_t retry_delay_ms = argc >= 5 ? (uint32_t)ct_value_to_number(ctx, argv[4]) : 100;
     char *error = NULL;
-    if (ct_host_rm(path, recursive, force, &error) != 0) ct_throw_message(ctx, exception, error != NULL ? error : "rm failed");
+    if (ct_host_rm(path, recursive, force, max_retries, retry_delay_ms, &error) != 0) {
+        ct_throw_message(ctx, exception, error != NULL ? error : "rm failed");
+    }
     if (error != NULL) ct_host_string_free(error);
     free(path);
     return JSValueMakeUndefined(ctx);
@@ -25420,6 +25639,38 @@ static void ct_queue_fd_simple_with_code(
 
 static void ct_queue_fd_simple(CtJscRuntime *runtime, uint32_t id, const char *type, const char *message) {
     ct_queue_fd_simple_with_code(runtime, id, type, message, 0, false);
+}
+
+static void ct_queue_fd_fs_error(
+    CtJscRuntime *runtime,
+    uint32_t id,
+    const char *message,
+    const char *path,
+    const char *destination,
+    const char *syscall
+) {
+    CtFdEvent *event = (CtFdEvent *)calloc(1, sizeof(CtFdEvent));
+    if (event == NULL) return;
+    event->watch_id = id;
+    event->type = ct_duplicate_string("fs-bulk-error");
+    if (message != NULL) event->message = ct_duplicate_string(message);
+    if (path != NULL) event->path = ct_duplicate_string(path);
+    if (destination != NULL) event->destination = ct_duplicate_string(destination);
+    if (syscall != NULL) event->syscall = ct_duplicate_string(syscall);
+    if (event->type == NULL ||
+        (message != NULL && event->message == NULL) ||
+        (path != NULL && event->path == NULL) ||
+        (destination != NULL && event->destination == NULL) ||
+        (syscall != NULL && event->syscall == NULL)) {
+        free(event->type);
+        free(event->message);
+        free(event->path);
+        free(event->destination);
+        free(event->syscall);
+        free(event);
+        return;
+    }
+    ct_queue_fd_event(runtime, event);
 }
 
 static void ct_queue_fd_result(CtJscRuntime *runtime, uint32_t id, const char *type, int64_t result) {
@@ -29857,6 +30108,15 @@ static JSValueRef ct_dispatch_fd_events(JSContextRef ctx, CtJscRuntime *runtime,
         if (event->message != NULL) {
             ct_set_property(ctx, item, "message", ct_make_string(ctx, event->message), exception);
         }
+        if (event->path != NULL) {
+            ct_set_property(ctx, item, "path", ct_make_string(ctx, event->path), exception);
+        }
+        if (event->destination != NULL) {
+            ct_set_property(ctx, item, "dest", ct_make_string(ctx, event->destination), exception);
+        }
+        if (event->syscall != NULL) {
+            ct_set_property(ctx, item, "syscall", ct_make_string(ctx, event->syscall), exception);
+        }
         if (event->has_error_code) {
             ct_set_property(ctx, item, "errno", JSValueMakeNumber(ctx, event->error_code), exception);
             ct_set_property(ctx, item, "code", ct_make_string(ctx, ct_socket_error_code(event->error_code)), exception);
@@ -29873,6 +30133,9 @@ static JSValueRef ct_dispatch_fd_events(JSContextRef ctx, CtJscRuntime *runtime,
         free(event->type);
         free(event->data);
         free(event->message);
+        free(event->path);
+        free(event->destination);
+        free(event->syscall);
         free(event);
         if (exception != NULL && *exception != NULL) {
             runtime->dispatching_fd_events = false;
@@ -31995,14 +32258,20 @@ static void ct_fs_async_complete(uv_fs_t *request) {
             ct_queue_fd_result(
                 runtime,
                 operation->id,
-                operation->kind == CT_FS_ASYNC_READ ? "fs-read" : "fs-write",
+                operation->kind == CT_FS_ASYNC_READ
+                    ? "fs-read"
+                    : operation->kind == CT_FS_ASYNC_WRITE ? "fs-write" : "fs-copy-file",
                 (int64_t)request->result
             );
         }
     }
     uv_fs_req_cleanup(request);
-    JSValueUnprotect(runtime->context, operation->buffer_value);
+    if (operation->kind != CT_FS_ASYNC_COPY_FILE) {
+        JSValueUnprotect(runtime->context, operation->buffer_value);
+    }
     free(operation->owned_bytes);
+    free(operation->source_path);
+    free(operation->destination_path);
     free(operation);
 }
 
@@ -32095,12 +32364,224 @@ static JSValueRef ct_fs_async_write_start(JSContextRef ctx, JSObjectRef function
     return ct_fs_async_start(ctx, function, argc, argv, exception, CT_FS_ASYNC_WRITE);
 }
 
+static JSValueRef ct_fs_async_copy_file_start(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 2) {
+        ct_throw_message(ctx, exception, "fsAsyncCopyFileStart(source, destination[, mode]) requires source and destination");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    char *source = ct_value_to_string_copy(ctx, argv[0]);
+    char *destination = ct_value_to_string_copy(ctx, argv[1]);
+    int mode = argc >= 3 ? (int)ct_value_to_number(ctx, argv[2]) : 0;
+    if (source == NULL || destination == NULL) {
+        free(source);
+        free(destination);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtFsAsyncRequest *operation = (CtFsAsyncRequest *)calloc(1, sizeof(CtFsAsyncRequest));
+    if (operation == NULL) {
+        free(source);
+        free(destination);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    operation->runtime = runtime;
+    operation->kind = CT_FS_ASYNC_COPY_FILE;
+    operation->source_path = source;
+    operation->destination_path = destination;
+    operation->id = ct_next_fd_event_id();
+    operation->request.data = operation;
+
+    int status = uv_fs_copyfile(
+        &runtime->uv_loop,
+        &operation->request,
+        source,
+        destination,
+        mode,
+        ct_fs_async_complete
+    );
+    if (status < 0) {
+        uv_fs_req_cleanup(&operation->request);
+        free(source);
+        free(destination);
+        free(operation);
+        ct_throw_message(ctx, exception, uv_strerror(status));
+        return JSValueMakeUndefined(ctx);
+    }
+    operation->next = runtime->fs_async_requests;
+    runtime->fs_async_requests = operation;
+    return JSValueMakeNumber(ctx, operation->id);
+}
+
+static void ct_fs_bulk_remove(CtFsBulkRequest *operation) {
+    CtFsBulkRequest **cursor = &operation->runtime->fs_bulk_requests;
+    while (*cursor != NULL) {
+        if (*cursor == operation) {
+            *cursor = operation->next;
+            operation->next = NULL;
+            return;
+        }
+        cursor = &(*cursor)->next;
+    }
+}
+
+static void ct_fs_bulk_work(uv_work_t *request) {
+    CtFsBulkRequest *operation = request != NULL ? (CtFsBulkRequest *)request->data : NULL;
+    if (operation == NULL) return;
+    if (operation->kind == CT_FS_BULK_COPY_TREE) {
+        operation->status = ct_host_copy_tree(
+            operation->source_path,
+            operation->destination_path,
+            operation->recursive,
+            operation->force,
+            operation->error_on_exist,
+            &operation->error,
+            &operation->error_path,
+            &operation->error_destination,
+            &operation->error_syscall
+        );
+    } else {
+        operation->status = ct_host_rm(
+            operation->source_path,
+            operation->recursive,
+            operation->force,
+            operation->max_retries,
+            operation->retry_delay_ms,
+            &operation->error
+        );
+    }
+}
+
+static void ct_fs_bulk_complete(uv_work_t *request, int completion_status) {
+    CtFsBulkRequest *operation = request != NULL ? (CtFsBulkRequest *)request->data : NULL;
+    if (operation == NULL) return;
+    CtJscRuntime *runtime = operation->runtime;
+    ct_fs_bulk_remove(operation);
+
+    if (!operation->suppress_event) {
+        if (operation->canceled || completion_status == UV_ECANCELED) {
+            ct_queue_fd_result(runtime, operation->id, "fs-cancel", 0);
+        } else if (completion_status < 0) {
+            ct_queue_fd_error(runtime, operation->id, -completion_status, uv_strerror(completion_status));
+        } else if (operation->status != 0) {
+            ct_queue_fd_fs_error(
+                runtime,
+                operation->id,
+                operation->error != NULL ? operation->error : "Filesystem operation failed",
+                operation->error_path,
+                operation->error_destination,
+                operation->error_syscall
+            );
+        } else {
+            ct_queue_fd_result(
+                runtime,
+                operation->id,
+                operation->kind == CT_FS_BULK_COPY_TREE ? "fs-copy-tree" : "fs-rm",
+                0
+            );
+        }
+    }
+
+    ct_free_native_copy_error(
+        operation->error,
+        operation->error_path,
+        operation->error_destination,
+        operation->error_syscall
+    );
+    free(operation->source_path);
+    free(operation->destination_path);
+    free(operation);
+}
+
+static JSValueRef ct_fs_bulk_start(
+    JSContextRef ctx,
+    JSObjectRef function,
+    size_t argc,
+    const JSValueRef argv[],
+    JSValueRef *exception,
+    CtFsBulkKind kind
+) {
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    const size_t minimum_args = kind == CT_FS_BULK_COPY_TREE ? 2 : 1;
+    if (runtime == NULL || argc < minimum_args) {
+        ct_throw_message(ctx, exception, "native bulk filesystem operation requires a path");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtFsBulkRequest *operation = (CtFsBulkRequest *)calloc(1, sizeof(CtFsBulkRequest));
+    if (operation == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    operation->runtime = runtime;
+    operation->kind = kind;
+    operation->source_path = ct_value_to_string_copy(ctx, argv[0]);
+    if (kind == CT_FS_BULK_COPY_TREE) {
+        operation->destination_path = ct_value_to_string_copy(ctx, argv[1]);
+        operation->recursive = argc >= 3 && ct_value_to_bool(ctx, argv[2]);
+        operation->force = argc < 4 || ct_value_to_bool(ctx, argv[3]);
+        operation->error_on_exist = argc >= 5 && ct_value_to_bool(ctx, argv[4]);
+    } else {
+        operation->recursive = argc >= 2 && ct_value_to_bool(ctx, argv[1]);
+        operation->force = argc >= 3 && ct_value_to_bool(ctx, argv[2]);
+        operation->max_retries = argc >= 4 ? (uint32_t)ct_value_to_number(ctx, argv[3]) : 0;
+        operation->retry_delay_ms = argc >= 5 ? (uint32_t)ct_value_to_number(ctx, argv[4]) : 100;
+    }
+    if (operation->source_path == NULL ||
+        (kind == CT_FS_BULK_COPY_TREE && operation->destination_path == NULL)) {
+        free(operation->source_path);
+        free(operation->destination_path);
+        free(operation);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    operation->id = ct_next_fd_event_id();
+    operation->request.data = operation;
+    int status = uv_queue_work(
+        &runtime->uv_loop,
+        &operation->request,
+        ct_fs_bulk_work,
+        ct_fs_bulk_complete
+    );
+    if (status < 0) {
+        free(operation->source_path);
+        free(operation->destination_path);
+        free(operation);
+        ct_throw_message(ctx, exception, uv_strerror(status));
+        return JSValueMakeUndefined(ctx);
+    }
+    operation->next = runtime->fs_bulk_requests;
+    runtime->fs_bulk_requests = operation;
+    return JSValueMakeNumber(ctx, operation->id);
+}
+
+static JSValueRef ct_fs_copy_tree_start(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    return ct_fs_bulk_start(ctx, function, argc, argv, exception, CT_FS_BULK_COPY_TREE);
+}
+
+static JSValueRef ct_fs_rm_start(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    return ct_fs_bulk_start(ctx, function, argc, argv, exception, CT_FS_BULK_RM);
+}
+
 static JSValueRef ct_fs_async_cancel(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
     (void)exception;
     CtJscRuntime *runtime = ct_callback_runtime(function);
     uint32_t id = argc >= 1 ? (uint32_t)ct_value_to_number(ctx, argv[0]) : 0;
     for (CtFsAsyncRequest *operation = runtime != NULL ? runtime->fs_async_requests : NULL; operation != NULL; operation = operation->next) {
+        if (operation->id != id || operation->canceled) continue;
+        operation->canceled = true;
+        (void)uv_cancel((uv_req_t *)&operation->request);
+        return JSValueMakeBoolean(ctx, true);
+    }
+    for (CtFsBulkRequest *operation = runtime != NULL ? runtime->fs_bulk_requests : NULL; operation != NULL; operation = operation->next) {
         if (operation->id != id || operation->canceled) continue;
         operation->canceled = true;
         (void)uv_cancel((uv_req_t *)&operation->request);
@@ -32409,6 +32890,11 @@ static JSValueRef ct_memfd_create_for_testing(JSContextRef ctx, JSObjectRef func
 
 static void ct_fs_async_cancel_runtime(CtJscRuntime *runtime) {
     for (CtFsAsyncRequest *operation = runtime != NULL ? runtime->fs_async_requests : NULL; operation != NULL; operation = operation->next) {
+        operation->canceled = true;
+        operation->suppress_event = true;
+        (void)uv_cancel((uv_req_t *)&operation->request);
+    }
+    for (CtFsBulkRequest *operation = runtime != NULL ? runtime->fs_bulk_requests : NULL; operation != NULL; operation = operation->next) {
         operation->canceled = true;
         operation->suppress_event = true;
         (void)uv_cancel((uv_req_t *)&operation->request);
@@ -34962,7 +35448,7 @@ static JSValueRef ct_exit(JSContextRef ctx, JSObjectRef function, JSObjectRef th
     }
     if (runtime != NULL && runtime->exit_cleanup_path != NULL) {
         char *cleanup_error = NULL;
-        (void)ct_host_rm(runtime->exit_cleanup_path, true, true, &cleanup_error);
+        (void)ct_host_rm(runtime->exit_cleanup_path, true, true, 0, 100, &cleanup_error);
         if (cleanup_error != NULL) ct_host_string_free(cleanup_error);
     }
     exit(code);
@@ -35542,6 +36028,9 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
         free(event->type);
         free(event->data);
         free(event->message);
+        free(event->path);
+        free(event->destination);
+        free(event->syscall);
         free(event);
     }
     while (runtime->worker_events_head != NULL) {

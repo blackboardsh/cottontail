@@ -699,6 +699,12 @@ try {
       stdoutIncludes: ['4 pass', '0 fail'],
     },
     {
+      name: 'node-fs-native-bulk',
+      argv: ['test', join(rootDir, 'tests', 'js', 'node-fs-native-bulk.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['18 pass', '0 fail'],
+    },
+    {
       name: 'node-child-process-inherited-sync',
       scriptPath: join(rootDir, 'tests', 'js', 'node-child-process-inherited-sync.ts'),
       expectExitCode: 0,

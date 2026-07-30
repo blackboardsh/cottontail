@@ -58,6 +58,7 @@ const BunLockfile = compiler.install.Lockfile;
 const PackageManagerBunLockfile = @import("package_manager_bun_lockfile.zig");
 
 extern "c" fn _get_osfhandle(fd: c_int) isize;
+extern "c" fn ct_paths_are_same_file(source: [*:0]const u8, destination: [*:0]const u8) c_int;
 
 pub const CtHostEnvEntry = extern struct {
     name: [*:0]const u8,
@@ -1439,6 +1440,340 @@ pub export fn ct_host_walk_dir(
     return owned.ptr;
 }
 
+const NativeCopyContext = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    recursive: bool,
+    force: bool,
+    error_on_exist: bool,
+    error_path: ?[]const u8 = null,
+    error_destination: ?[]const u8 = null,
+    error_syscall: []const u8 = "cp",
+
+    fn pathsEqual(left: []const u8, right: []const u8) bool {
+        if (comptime builtin.os.tag == .windows) {
+            return std.ascii.eqlIgnoreCase(left, right);
+        }
+        return std.mem.eql(u8, left, right);
+    }
+
+    fn isSubdirectory(parent: []const u8, candidate: []const u8) bool {
+        if (candidate.len <= parent.len) return false;
+        const prefix_matches = if (comptime builtin.os.tag == .windows)
+            std.ascii.eqlIgnoreCase(parent, candidate[0..parent.len])
+        else
+            std.mem.eql(u8, parent, candidate[0..parent.len]);
+        if (!prefix_matches) return false;
+        return std.fs.path.isSep(parent[parent.len - 1]) or
+            std.fs.path.isSep(candidate[parent.len]);
+    }
+
+    fn fail(
+        self: *NativeCopyContext,
+        source: []const u8,
+        destination: []const u8,
+        syscall: []const u8,
+        err: anyerror,
+    ) anyerror {
+        self.error_path = source;
+        self.error_destination = destination;
+        self.error_syscall = syscall;
+        return err;
+    }
+
+    fn statIfPresent(
+        self: *NativeCopyContext,
+        path: []const u8,
+        follow_symlinks: bool,
+        source: []const u8,
+        destination: []const u8,
+    ) !?std.Io.File.Stat {
+        return std.Io.Dir.cwd().statFile(self.io, path, .{
+            .follow_symlinks = follow_symlinks,
+        }) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return self.fail(source, destination, "lstat", err),
+        };
+    }
+
+    fn copyFileBytes(
+        self: *NativeCopyContext,
+        source: []const u8,
+        destination: []const u8,
+        exclusive: bool,
+    ) !void {
+        const cwd = std.Io.Dir.cwd();
+        const source_file = cwd.openFile(self.io, source, .{}) catch |err|
+            return self.fail(source, destination, "open", err);
+        defer source_file.close(self.io);
+
+        const source_stat = source_file.stat(self.io) catch |err|
+            return self.fail(source, destination, "fstat", err);
+        if (source_stat.kind != .file and
+            source_stat.kind != .block_device and
+            source_stat.kind != .character_device)
+        {
+            return self.fail(source, destination, "copyfile", error.OperationUnsupported);
+        }
+
+        const destination_file = cwd.createFile(self.io, destination, .{
+            .truncate = true,
+            .exclusive = exclusive,
+            .permissions = source_stat.permissions,
+        }) catch |err| return self.fail(source, destination, "open", err);
+        defer destination_file.close(self.io);
+
+        var source_reader: std.Io.File.Reader = .init(source_file, self.io, &.{});
+        if (source_stat.kind == .file) source_reader.size = source_stat.size;
+        var buffer: [64 * 1024]u8 = undefined;
+        var destination_writer = destination_file.writer(self.io, &buffer);
+        _ = destination_writer.interface.sendFileAll(&source_reader, .unlimited) catch |err| switch (err) {
+            error.ReadFailed => return self.fail(source, destination, "read", source_reader.err.?),
+            error.WriteFailed => return self.fail(source, destination, "write", destination_writer.err.?),
+        };
+        destination_writer.flush() catch |err|
+            return self.fail(source, destination, "write", err);
+        destination_file.setPermissions(self.io, source_stat.permissions) catch |err|
+            return self.fail(source, destination, "chmod", err);
+    }
+
+    fn copySymlink(
+        self: *NativeCopyContext,
+        source: []const u8,
+        destination: []const u8,
+        destination_stat: ?std.Io.File.Stat,
+    ) !void {
+        const cwd = std.Io.Dir.cwd();
+        if (destination_stat) |existing| {
+            if (!self.force) {
+                if (self.error_on_exist) {
+                    return self.fail(source, destination, "symlink", error.PathAlreadyExists);
+                }
+                return;
+            }
+            if (existing.kind != .sym_link) {
+                return self.fail(source, destination, "symlink", error.PathAlreadyExists);
+            }
+        }
+
+        var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const target_len = cwd.readLink(self.io, source, &target_buffer) catch |err|
+            return self.fail(source, destination, "readlink", err);
+        const raw_target = target_buffer[0..target_len];
+        const target = if (std.fs.path.isAbsolute(raw_target))
+            raw_target
+        else
+            std.fs.path.resolve(
+                self.allocator,
+                &.{ std.fs.path.dirname(source) orelse ".", raw_target },
+            ) catch |err| return self.fail(source, destination, "symlink", err);
+        const followed_source: ?std.Io.File.Stat = cwd.statFile(self.io, source, .{
+            .follow_symlinks = true,
+        }) catch null;
+        const target_is_directory = if (followed_source) |stat|
+            stat.kind == .directory
+        else
+            false;
+
+        if (destination_stat != null) {
+            var destination_target_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const destination_target_len = cwd.readLink(
+                self.io,
+                destination,
+                &destination_target_buffer,
+            ) catch |err| return self.fail(source, destination, "readlink", err);
+            const raw_destination_target = destination_target_buffer[0..destination_target_len];
+            const destination_target = if (std.fs.path.isAbsolute(raw_destination_target))
+                raw_destination_target
+            else
+                std.fs.path.resolve(
+                    self.allocator,
+                    &.{ std.fs.path.dirname(destination) orelse ".", raw_destination_target },
+                ) catch |err| return self.fail(source, destination, "symlink", err);
+            if (target_is_directory) {
+                if (pathsEqual(target, destination_target)) {
+                    return self.fail(source, destination, "cp", error.CopyInvalid);
+                }
+                if (isSubdirectory(target, destination_target) or
+                    isSubdirectory(destination_target, target))
+                {
+                    return self.fail(source, destination, "cp", error.SymlinkToSubdirectory);
+                }
+            }
+            cwd.deleteFile(self.io, destination) catch |err|
+                return self.fail(source, destination, "unlink", err);
+        }
+        cwd.symLink(self.io, target, destination, .{
+            .is_directory = target_is_directory,
+        }) catch |err| return self.fail(source, destination, "symlink", err);
+    }
+
+    fn copyEntry(self: *NativeCopyContext, source: [:0]const u8, destination: [:0]const u8) !void {
+        const cwd = std.Io.Dir.cwd();
+        const source_stat = cwd.statFile(self.io, source, .{
+            .follow_symlinks = false,
+        }) catch |err| return self.fail(source, destination, "lstat", err);
+        const destination_stat = try self.statIfPresent(destination, false, source, destination);
+
+        if (destination_stat) |existing| {
+            if (source_stat.inode == existing.inode and
+                ct_paths_are_same_file(source.ptr, destination.ptr) != 0)
+            {
+                return;
+            }
+            if (source_stat.kind == .directory and existing.kind != .directory) {
+                return self.fail(source, destination, "cp", error.IsDir);
+            }
+            if (source_stat.kind != .directory and existing.kind == .directory) {
+                return self.fail(source, destination, "cp", error.NotDir);
+            }
+        }
+
+        switch (source_stat.kind) {
+            .directory => {
+                if (!self.recursive) {
+                    return self.fail(source, destination, "cp", error.IsDir);
+                }
+                const created = destination_stat == null;
+                if (created) {
+                    cwd.createDir(self.io, destination, .default_dir) catch |err|
+                        return self.fail(source, destination, "mkdir", err);
+                }
+
+                var directory = cwd.openDir(self.io, source, .{ .iterate = true }) catch |err|
+                    return self.fail(source, destination, "scandir", err);
+                defer directory.close(self.io);
+                var iterator = directory.iterate();
+                while (iterator.next(self.io) catch |err|
+                    return self.fail(source, destination, "scandir", err)) |entry|
+                {
+                    const child_source = std.fs.path.joinZ(self.allocator, &.{ source, entry.name }) catch |err|
+                        return self.fail(source, destination, "cp", err);
+                    const child_destination = std.fs.path.joinZ(self.allocator, &.{ destination, entry.name }) catch |err|
+                        return self.fail(source, destination, "cp", err);
+                    try self.copyEntry(child_source, child_destination);
+                }
+
+                if (created) {
+                    cwd.setFilePermissions(
+                        self.io,
+                        destination,
+                        source_stat.permissions,
+                        .{},
+                    ) catch |err| return self.fail(source, destination, "chmod", err);
+                }
+            },
+            .file, .block_device, .character_device => {
+                if (destination_stat != null) {
+                    if (!self.force) {
+                        if (self.error_on_exist) {
+                            return self.fail(source, destination, "copyfile", error.PathAlreadyExists);
+                        }
+                        return;
+                    }
+                    cwd.deleteFile(self.io, destination) catch |err|
+                        return self.fail(source, destination, "unlink", err);
+                }
+                try self.copyFileBytes(source, destination, false);
+            },
+            .sym_link => try self.copySymlink(source, destination, destination_stat),
+            .named_pipe, .unix_domain_socket, .whiteout, .door, .event_port, .unknown => {
+                return self.fail(source, destination, "cp", error.InvalidArgument);
+            },
+        }
+    }
+};
+
+fn setNativeCopyError(
+    error_out: *?[*:0]u8,
+    error_path_out: *?[*:0]u8,
+    error_destination_out: *?[*:0]u8,
+    error_syscall_out: *?[*:0]u8,
+    context: *const NativeCopyContext,
+    err: anyerror,
+) void {
+    setErrorOut(error_out, @errorName(err));
+    if (context.error_path) |path| setErrorOut(error_path_out, path);
+    if (context.error_destination) |destination| setErrorOut(error_destination_out, destination);
+    setErrorOut(error_syscall_out, context.error_syscall);
+}
+
+pub export fn ct_host_copy_file(
+    source: [*:0]const u8,
+    destination: [*:0]const u8,
+    exclusive: bool,
+    error_out: *?[*:0]u8,
+    error_path_out: *?[*:0]u8,
+    error_destination_out: *?[*:0]u8,
+    error_syscall_out: *?[*:0]u8,
+) c_int {
+    error_out.* = null;
+    error_path_out.* = null;
+    error_destination_out.* = null;
+    error_syscall_out.* = null;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    var context: NativeCopyContext = .{
+        .allocator = arena.allocator(),
+        .io = getIo(),
+        .recursive = false,
+        .force = !exclusive,
+        .error_on_exist = exclusive,
+    };
+    context.copyFileBytes(std.mem.span(source), std.mem.span(destination), exclusive) catch |err| {
+        setNativeCopyError(
+            error_out,
+            error_path_out,
+            error_destination_out,
+            error_syscall_out,
+            &context,
+            err,
+        );
+        return -1;
+    };
+    return 0;
+}
+
+pub export fn ct_host_copy_tree(
+    source: [*:0]const u8,
+    destination: [*:0]const u8,
+    recursive: bool,
+    force: bool,
+    error_on_exist: bool,
+    error_out: *?[*:0]u8,
+    error_path_out: *?[*:0]u8,
+    error_destination_out: *?[*:0]u8,
+    error_syscall_out: *?[*:0]u8,
+) c_int {
+    error_out.* = null;
+    error_path_out.* = null;
+    error_destination_out.* = null;
+    error_syscall_out.* = null;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    var context: NativeCopyContext = .{
+        .allocator = arena.allocator(),
+        .io = getIo(),
+        .recursive = recursive,
+        .force = force,
+        .error_on_exist = error_on_exist,
+    };
+    context.copyEntry(std.mem.span(source), std.mem.span(destination)) catch |err| {
+        setNativeCopyError(
+            error_out,
+            error_path_out,
+            error_destination_out,
+            error_syscall_out,
+            &context,
+            err,
+        );
+        return -1;
+    };
+    return 0;
+}
+
 pub export fn ct_host_mkdir(path: [*:0]const u8, recursive: bool, error_out: *?[*:0]u8) c_int {
     error_out.* = null;
 
@@ -1464,30 +1799,55 @@ pub export fn ct_host_rm(
     path: [*:0]const u8,
     recursive: bool,
     force: bool,
+    max_retries: u32,
+    retry_delay_ms: u32,
     error_out: *?[*:0]u8,
 ) c_int {
     error_out.* = null;
 
     const cwd = std.Io.Dir.cwd();
     const sub_path = std.mem.span(path);
+    const io = getIo();
 
-    if (force and !ct_host_exists(path)) {
+    if (recursive and !force) {
+        _ = cwd.statFile(io, sub_path, .{ .follow_symlinks = false }) catch |err| {
+            setErrorOut(error_out, @errorName(err));
+            return -1;
+        };
+    }
+
+    var attempt: u32 = 0;
+    while (true) {
+        const result = if (recursive)
+            cwd.deleteTree(io, sub_path)
+        else
+            cwd.deleteFile(io, sub_path);
+        result catch |err| {
+            if (force and err == error.FileNotFound) return 0;
+            const retryable = blk: {
+                const name = @errorName(err);
+                break :blk std.mem.eql(u8, name, "FileBusy") or
+                    std.mem.eql(u8, name, "DirNotEmpty") or
+                    std.mem.eql(u8, name, "ProcessFdQuotaExceeded") or
+                    std.mem.eql(u8, name, "SystemFdQuotaExceeded") or
+                    std.mem.eql(u8, name, "PermissionDenied") or
+                    std.mem.eql(u8, name, "AccessDenied");
+            };
+            if (!recursive or !retryable or attempt >= max_retries) {
+                setErrorOut(error_out, @errorName(err));
+                return -1;
+            }
+            attempt += 1;
+            const delay_ms = @as(u64, retry_delay_ms) * @as(u64, attempt);
+            std.Io.sleep(
+                io,
+                .fromMilliseconds(@intCast(@min(delay_ms, std.math.maxInt(i64)))),
+                .awake,
+            ) catch {};
+            continue;
+        };
         return 0;
     }
-
-    if (recursive) {
-        cwd.deleteTree(getIo(), sub_path) catch |err| {
-            setErrorOut(error_out, @errorName(err));
-            return -1;
-        };
-    } else {
-        cwd.deleteFile(getIo(), sub_path) catch |err| {
-            setErrorOut(error_out, @errorName(err));
-            return -1;
-        };
-    }
-
-    return 0;
 }
 
 pub export fn ct_host_rmdir(path: [*:0]const u8, error_out: *?[*:0]u8) c_int {

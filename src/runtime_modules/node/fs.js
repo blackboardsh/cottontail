@@ -160,7 +160,7 @@ function fsErrno(code) {
   return uvErrnoFromCode(code, -(Number(constantsObject[code]) || 5));
 }
 
-function makeFsError(error, path, syscall = "open", destination = undefined) {
+export function makeFsError(error, path, syscall = "open", destination = undefined) {
   const hasPath = path !== undefined;
   const hasDestination = destination !== undefined;
   const normalizedPath = hasPath ? normalizePath(path) : undefined;
@@ -947,7 +947,7 @@ function normalizeCopyMode(mode) {
   return Math.trunc(mode);
 }
 
-function makeCopyFileError(error, source, destination) {
+export function makeCopyFileError(error, source, destination) {
   const normalized = error?.code ? error : makeFsError(error, source, "copyfile");
   const code = normalized.code || "EIO";
   const reason = messageByCode[code] ?? String(normalized.message ?? code)
@@ -962,7 +962,7 @@ function makeCopyFileError(error, source, destination) {
   return normalized;
 }
 
-export function copyFileSync(source, destination, mode = 0) {
+export function prepareCopyFile(source, destination, mode = 0) {
   validatePathArg(source, "src");
   validatePathArg(destination, "dest");
   mode = normalizeCopyMode(mode);
@@ -993,12 +993,47 @@ export function copyFileSync(source, destination, mode = 0) {
     if (!exclusive && destinationLinkStat) {
       try {
         const destinationStat = statSync(destinationText);
-        if (sourceStat.dev === destinationStat.dev && sourceStat.ino === destinationStat.ino && !forceClone) return;
+        if (sourceStat.dev === destinationStat.dev && sourceStat.ino === destinationStat.ino && !forceClone) {
+          return {
+            destinationText,
+            exclusive,
+            forceClone,
+            mode,
+            preferClone,
+            skip: true,
+            sourceText,
+          };
+        }
       } catch (error) {
         if (error?.code !== "ENOENT") throw error;
       }
     }
 
+    return {
+      destinationText,
+      exclusive,
+      forceClone,
+      mode,
+      preferClone,
+      skip: false,
+      sourceText,
+    };
+  } catch (error) {
+    throw makeCopyFileError(error, sourceText, destinationText);
+  }
+}
+
+export function copyFileSync(source, destination, mode = 0) {
+  const prepared = prepareCopyFile(source, destination, mode);
+  if (prepared.skip) return;
+  const {
+    destinationText,
+    exclusive,
+    forceClone,
+    preferClone,
+    sourceText,
+  } = prepared;
+  try {
     if (preferClone) {
       try {
         cottontail.cloneFileSync(sourceText, destinationText, exclusive);
@@ -1008,29 +1043,7 @@ export function copyFileSync(source, destination, mode = 0) {
       }
     }
 
-    const sourceFd = openSync(sourceText, "r");
-    let destinationFd = -1;
-    try {
-      destinationFd = openSync(destinationText, exclusive ? "wx" : "w", Number(sourceStat.mode));
-      const buffer = new Uint8Array(64 * 1024);
-      for (;;) {
-        const bytesRead = readSync(sourceFd, buffer, 0, buffer.byteLength, null);
-        if (bytesRead === 0) break;
-        let written = 0;
-        while (written < bytesRead) {
-          const count = writeSync(destinationFd, buffer, written, bytesRead - written, null);
-          if (count === 0) throw makeCodedFsError("EIO", "short write", destinationText, "copyfile");
-          written += count;
-        }
-      }
-      fchmodSync(destinationFd, Number(sourceStat.mode));
-    } finally {
-      try {
-        if (destinationFd >= 0) closeSync(destinationFd);
-      } finally {
-        closeSync(sourceFd);
-      }
-    }
+    cottontail.copyFileNativeSync(sourceText, destinationText, exclusive);
   } catch (error) {
     throw makeCopyFileError(error, sourceText, destinationText);
   }
@@ -1052,6 +1065,7 @@ export function cpSync(source, destination, options) {
 const cpOperations = {
   chmodSync,
   copyFileSync,
+  copyTreeSync: (...args) => cottontail.copyTreeSync(...args),
   lstatSync,
   mkdirSync,
   readlinkSync,
@@ -1246,13 +1260,45 @@ export function mkdtempDisposableSync(prefix) {
   return disposable;
 }
 
-export function rmSync(path, options = {}) {
+export function parseRmOptions(options = {}) {
+  if (options === null || typeof options !== "object") {
+    throw invalidArgType("options", "an object", options);
+  }
+  const recursive = options.recursive ?? false;
+  const force = options.force ?? false;
+  if (typeof recursive !== "boolean") {
+    throw invalidArgType("options.recursive", "of type boolean", recursive);
+  }
+  if (typeof force !== "boolean") {
+    throw invalidArgType("options.force", "of type boolean", force);
+  }
+  return {
+    force,
+    maxRetries: validateInteger(options.maxRetries ?? 0, "options.maxRetries", 0, 0xffffffff),
+    recursive,
+    retryDelay: validateInteger(options.retryDelay ?? 100, "options.retryDelay", 0, 0x7fffffff),
+  };
+}
+
+export function prepareRm(path, options = {}) {
   const normalizedPath = normalizePath(path);
   assertFsWrite(normalizedPath);
+  const normalizedOptions = parseRmOptions(options);
+  return { normalizedOptions, normalizedPath };
+}
+
+export function rmSync(path, options = {}) {
+  const { normalizedOptions, normalizedPath } = prepareRm(path, options);
   try {
-    cottontail.rmSync(normalizedPath, Boolean(options?.recursive), Boolean(options?.force));
+    cottontail.rmSync(
+      normalizedPath,
+      normalizedOptions.recursive,
+      normalizedOptions.force,
+      normalizedOptions.maxRetries,
+      normalizedOptions.retryDelay,
+    );
   } catch (error) {
-    if (options?.force && String(error?.message ?? error).includes("No such file")) return;
+    if (normalizedOptions.force && String(error?.message ?? error).includes("FileNotFound")) return;
     throw makeFsError(error, normalizedPath, "rm");
   }
 }
@@ -2191,10 +2237,19 @@ export function close(fd, callback = undefined) {
     }
   });
 }
-export const copyFile = callbackify(copyFileSync, "callback", (source, destination, mode = 0) => {
+export function copyFile(source, destination, mode, callback) {
+  if (typeof mode === "function") {
+    callback = mode;
+    mode = 0;
+  }
+  if (typeof callback !== "function") throw makeInvalidCallbackError("callback", callback);
   validateTwoPaths(source, destination, "src", "dest");
-  normalizeCopyMode(mode);
-});
+  normalizeCopyMode(mode ?? 0);
+  fsPromisesDefault.copyFile(source, destination, mode ?? 0).then(
+    () => callback(null),
+    callback,
+  );
+}
 export function cp(source, destination, options, callback) {
   if (typeof options === "function") {
     callback = options;
@@ -2202,7 +2257,7 @@ export function cp(source, destination, options, callback) {
   }
   if (typeof callback !== "function") throw makeInvalidCallbackError("cb", callback);
   fsPromisesDefault.cp(source, destination, options).then(
-    () => callback(),
+    () => callback(null),
     callback,
   );
 }
@@ -2300,7 +2355,19 @@ realpath.native = callbackify(realpathNativeSync, "callback", (path, options) =>
 export const rename = callbackify(renameSync, "callback", (oldPath, newPath) => {
   validateTwoPaths(oldPath, newPath, "oldPath", "newPath");
 });
-export const rm = callbackify(rmSync, "callback", path => validateNormalizedPath(path));
+export function rm(path, options, callback) {
+  if (typeof options === "function") {
+    callback = options;
+    options = {};
+  }
+  if (typeof callback !== "function") throw makeInvalidCallbackError("callback", callback);
+  const normalizedOptions = options === undefined ? {} : options;
+  prepareRm(path, normalizedOptions);
+  fsPromisesDefault.rm(path, normalizedOptions).then(
+    () => callback(null),
+    callback,
+  );
+}
 export const rmdir = callbackify(rmdirSync, "callback", path => validateNormalizedPath(path));
 export const stat = callbackify(statSync, "callback", path => validateNormalizedPath(path));
 export const statfs = callbackify(statfsSync, "callback", path => validateNormalizedPath(path));
