@@ -693,6 +693,12 @@ pub fn build(b: *std.Build) void {
         native_plugin_fixture.getEmittedBin(),
         "lib/native-bundler-plugin.node",
     );
+    const build_native_plugin_step = b.step(
+        "build-native-plugin",
+        "Build the native Bun plugin integration fixture",
+    );
+    build_native_plugin_step.dependOn(&install_native_plugin_fixture.step);
+
     const run_native_plugin_test = b.addRunArtifact(exe);
     run_native_plugin_test.step.dependOn(&install_native_plugin_fixture.step);
     run_native_plugin_test.addArg("run");

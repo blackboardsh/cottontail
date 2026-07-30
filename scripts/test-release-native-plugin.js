@@ -26,7 +26,7 @@ if (!existsSync(executablePath)) {
   throw new Error(`Release executable is missing: ${executablePath}`);
 }
 
-const buildArgs = ['build', 'test-native-plugin', '-Doptimize=ReleaseSmall'];
+const buildArgs = ['build', 'build-native-plugin', '-Doptimize=ReleaseSmall'];
 if (process.platform === 'win32') {
   buildArgs.push('-Dtarget=x86_64-windows-msvc');
 }
