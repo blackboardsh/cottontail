@@ -121,7 +121,7 @@ function formatInteger(value) {
 }
 
 function upstreamStatusSummary(upstreamStatus) {
-  const fields = ['enabled', 'expectedFailure', 'disabled', 'notEnabled'];
+  const fields = ['enabled', 'delegated', 'expectedFailure', 'disabled', 'notEnabled'];
   const values = Object.fromEntries(fields.map((field) => [field, upstreamStatus[field] ?? 0]));
   for (const [field, value] of Object.entries(values)) {
     if (!Number.isInteger(value) || value < 0) {
@@ -129,7 +129,8 @@ function upstreamStatusSummary(upstreamStatus) {
     }
   }
 
-  const categoryTotal = values.enabled + values.expectedFailure + values.disabled;
+  const categoryTotal =
+    values.enabled + values.delegated + values.expectedFailure + values.disabled;
   const classifiedTests = upstreamStatus.classifiedTests ?? upstreamStatus.trackedTests ?? categoryTotal;
   const discoveredRunnableFiles = upstreamStatus.discoveredRunnableFiles ?? classifiedTests + values.notEnabled;
   if (!Number.isInteger(classifiedTests) || classifiedTests < 0) {
@@ -164,11 +165,18 @@ function printUpstreamMetric(label, upstreamStatus) {
   }
 
   const tierDetail = [
-    'current classified tier',
+    'current repository-owned tier',
+    `${summary.delegated} delegated to Hutch`,
     `${summary.expectedFailure} expected-failure`,
     `${summary.disabled} disabled`,
   ].join('; ');
-  printMetric(label, summary.enabled, summary.classifiedTests, tierDetail);
+  const repositoryOwnedTier = summary.classifiedTests - summary.delegated;
+  printMetric(
+    label,
+    summary.enabled,
+    repositoryOwnedTier,
+    tierDetail,
+  );
   console.log(
     `${pad('', 22)} ${paint(
       `${formatInteger(summary.discoveredRunnableFiles)} discovered runnable files; ` +
@@ -176,6 +184,14 @@ function printUpstreamMetric(label, upstreamStatus) {
       'dim'
     )}`
   );
+  if (summary.delegated > 0) {
+    console.log(
+      `${pad('', 22)} ${paint(
+        'Delegated behavior is reported by Hutch; it is not counted as a Cottontail pass.',
+        'dim'
+      )}`
+    );
+  }
 }
 
 function printRows(rows, options = {}) {

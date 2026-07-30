@@ -59,6 +59,29 @@ test("argv0 overrides do not replace arbitrary executables", async () => {
   }
 });
 
+test("overriding process.execPath does not retarget an external executable", async () => {
+  const externalNode = Bun.which("node");
+  expect(externalNode).not.toBeNull();
+  const originalExecPath = process.execPath;
+
+  try {
+    process.execPath = externalNode!;
+    const child = Bun.spawn([
+      process.execPath,
+      "-e",
+      'process.stdout.write(process.versions.cottontail ? "cottontail" : "node")',
+    ], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(await child.stdout.text()).toBe("node");
+    expect(await child.exited).toBe(0);
+  } finally {
+    process.execPath = originalExecPath;
+  }
+});
+
 test("numeric stdout descriptors route directly in async and sync spawn", async () => {
   const directory = mkdtempSync(join(tmpdir(), "cottontail-spawn-fd-"));
   using cleanup = { [Symbol.dispose]: () => rmSync(directory, { recursive: true, force: true }) };

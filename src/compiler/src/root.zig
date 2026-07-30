@@ -18,8 +18,8 @@ pub const Maybe = jsc.Node.Maybe;
 // allocations flow through arenas, so per-allocation page rounding is mostly
 // amortized.
 pub const default_allocator = std.heap.page_allocator;
-/// Package-manager sources are owned by Cottontail. Resolver auto-install stays
-/// disabled until its network and event-loop path is integrated with the runtime.
+/// The retained install sources support compiler data types and Hutch's narrow
+/// lockfile services. Hutch owns package management; runtime auto-install is off.
 pub const enable_package_manager = false;
 pub const DefaultAllocator = struct {
     pub fn allocator(_: DefaultAllocator) std.mem.Allocator {

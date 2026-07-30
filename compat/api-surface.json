@@ -8789,9 +8789,11 @@
           "F_OK",
           "O_APPEND",
           "O_CREAT",
+          "O_DIRECT",
           "O_DIRECTORY",
           "O_DSYNC",
           "O_EXCL",
+          "O_NOATIME",
           "O_NOCTTY",
           "O_NOFOLLOW",
           "O_NONBLOCK",
@@ -8820,6 +8822,7 @@
           "RSA_PSS_SALTLEN_DIGEST",
           "RSA_PSS_SALTLEN_MAX_SIGN",
           "RSA_X931_PADDING",
+          "RTLD_DEEPBIND",
           "RTLD_GLOBAL",
           "RTLD_LAZY",
           "RTLD_LOCAL",
@@ -8858,9 +8861,12 @@
           "SIGIOT",
           "SIGKILL",
           "SIGPIPE",
+          "SIGPOLL",
           "SIGPROF",
+          "SIGPWR",
           "SIGQUIT",
           "SIGSEGV",
+          "SIGSTKFLT",
           "SIGSTOP",
           "SIGSYS",
           "SIGTERM",
@@ -9025,9 +9031,11 @@
           "F_OK",
           "O_APPEND",
           "O_CREAT",
+          "O_DIRECT",
           "O_DIRECTORY",
           "O_DSYNC",
           "O_EXCL",
+          "O_NOATIME",
           "O_NOCTTY",
           "O_NOFOLLOW",
           "O_NONBLOCK",
@@ -9056,6 +9064,7 @@
           "RSA_PSS_SALTLEN_DIGEST",
           "RSA_PSS_SALTLEN_MAX_SIGN",
           "RSA_X931_PADDING",
+          "RTLD_DEEPBIND",
           "RTLD_GLOBAL",
           "RTLD_LAZY",
           "RTLD_LOCAL",
@@ -9094,9 +9103,12 @@
           "SIGIOT",
           "SIGKILL",
           "SIGPIPE",
+          "SIGPOLL",
           "SIGPROF",
+          "SIGPWR",
           "SIGQUIT",
           "SIGSEGV",
+          "SIGSTKFLT",
           "SIGSTOP",
           "SIGSYS",
           "SIGTERM",
@@ -9378,6 +9390,8 @@
           "EOF",
           "FILE",
           "FORMERR",
+          "getDefaultResultOrder",
+          "getServers",
           "LOADIPHLPAPI",
           "lookup",
           "lookupService",
@@ -9428,6 +9442,8 @@
           "EOF",
           "FILE",
           "FORMERR",
+          "getDefaultResultOrder",
+          "getServers",
           "LOADIPHLPAPI",
           "lookup",
           "lookupService",
@@ -10377,6 +10393,34 @@
         ],
         "hasDefaultExport": true
       },
+      "internal/permissions": {
+        "file": "src/runtime_modules/node/internal/permissions.js",
+        "exports": [
+          "accessDenied",
+          "assertFsRead",
+          "assertFsWrite",
+          "assertPermission",
+          "hasPermission",
+          "permission",
+          "permissionsEnabled",
+          "permissionState"
+        ],
+        "hasDefaultExport": false
+      },
+      "node:internal/permissions": {
+        "file": "src/runtime_modules/node/internal/permissions.js",
+        "exports": [
+          "accessDenied",
+          "assertFsRead",
+          "assertFsWrite",
+          "assertPermission",
+          "hasPermission",
+          "permission",
+          "permissionsEnabled",
+          "permissionState"
+        ],
+        "hasDefaultExport": false
+      },
       "internal/test/binding": {
         "file": "src/runtime_modules/node/internal/test/binding.js",
         "exports": [
@@ -10390,6 +10434,28 @@
           "internalBinding"
         ],
         "hasDefaultExport": true
+      },
+      "internal/uv-errors": {
+        "file": "src/runtime_modules/node/internal/uv-errors.js",
+        "exports": [
+          "uvCodeFromMessage",
+          "uvErrnoFromCode",
+          "uvErrorByCode",
+          "uvErrorMap",
+          "uvMessageFromCode"
+        ],
+        "hasDefaultExport": false
+      },
+      "node:internal/uv-errors": {
+        "file": "src/runtime_modules/node/internal/uv-errors.js",
+        "exports": [
+          "uvCodeFromMessage",
+          "uvErrnoFromCode",
+          "uvErrorByCode",
+          "uvErrorMap",
+          "uvMessageFromCode"
+        ],
+        "hasDefaultExport": false
       },
       "internal/v8_serializer": {
         "file": "src/runtime_modules/node/internal/v8_serializer.js",
@@ -10857,6 +10923,7 @@
           "on",
           "once",
           "openStdin",
+          "permission",
           "pid",
           "platform",
           "ppid",
@@ -10950,6 +11017,7 @@
           "on",
           "once",
           "openStdin",
+          "permission",
           "pid",
           "platform",
           "ppid",
@@ -13911,12 +13979,14 @@
           "__cottontailPromisePeekStates",
           "__cottontailRemapPosition",
           "__cottontailRemapStackString",
+          "__cottontailResolveWindowsUnixSocketAlias",
           "__cottontailServeEverCalled",
           "__cottontailSourceContextForLocation",
           "__cottontailWebDecodeIncoming",
           "__cottontailWebHasActiveHandles",
           "__cottontailWebInterceptWorkerMessage",
           "__cottontailWebPollAlways",
+          "__cottontailWindowsUnixSocketAliases",
           "AbortController",
           "AbortSignal",
           "addEventListener",
@@ -14182,7 +14252,10 @@
           "createBunSpawnRuntime"
         ],
         "bunObjectProperties": [],
-        "globalProperties": []
+        "globalProperties": [
+          "__cottontailFdWatchHandlerInstalled",
+          "__cottontailFdWatchListeners"
+        ]
       },
       "src/runtime_modules/bun/sql.js": {
         "file": "src/runtime_modules/bun/sql.js",
@@ -14429,7 +14502,9 @@
           "bunTestRuntimeOptions"
         ],
         "bunObjectProperties": [],
-        "globalProperties": []
+        "globalProperties": [
+          "__cottontailBunTestHeaderPrinted"
+        ]
       },
       "src/runtime_modules/internal/bun-test-coverage.js": {
         "file": "src/runtime_modules/internal/bun-test-coverage.js",
@@ -14569,6 +14644,7 @@
         "bunObjectProperties": [],
         "globalProperties": [
           "__cottontailFormatUncaughtException",
+          "__cottontailNormalizeUncaughtException",
           "__cottontailRemapStackString",
           "__cottontailSourceContextForLocation",
           "Bun"
@@ -14932,9 +15008,11 @@
           "F_OK",
           "O_APPEND",
           "O_CREAT",
+          "O_DIRECT",
           "O_DIRECTORY",
           "O_DSYNC",
           "O_EXCL",
+          "O_NOATIME",
           "O_NOCTTY",
           "O_NOFOLLOW",
           "O_NONBLOCK",
@@ -14963,6 +15041,7 @@
           "RSA_PSS_SALTLEN_DIGEST",
           "RSA_PSS_SALTLEN_MAX_SIGN",
           "RSA_X931_PADDING",
+          "RTLD_DEEPBIND",
           "RTLD_GLOBAL",
           "RTLD_LAZY",
           "RTLD_LOCAL",
@@ -15001,9 +15080,12 @@
           "SIGIOT",
           "SIGKILL",
           "SIGPIPE",
+          "SIGPOLL",
           "SIGPROF",
+          "SIGPWR",
           "SIGQUIT",
           "SIGSEGV",
+          "SIGSTKFLT",
           "SIGSTOP",
           "SIGSYS",
           "SIGTERM",
@@ -15195,6 +15277,8 @@
           "EOF",
           "FILE",
           "FORMERR",
+          "getDefaultResultOrder",
+          "getServers",
           "LOADIPHLPAPI",
           "lookup",
           "lookupService",
@@ -15541,7 +15625,8 @@
           "__cottontailFdWatchListeners",
           "__cottontailFileWatchers",
           "__cottontailFsConstants",
-          "__cottontailHotReloadHooks"
+          "__cottontailHotReloadHooks",
+          "__cottontailPermissionFdPaths"
         ]
       },
       "src/runtime_modules/node/http-interception.js": {
@@ -15746,11 +15831,40 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
+      "src/runtime_modules/node/internal/permissions.js": {
+        "file": "src/runtime_modules/node/internal/permissions.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "accessDenied",
+          "assertFsRead",
+          "assertFsWrite",
+          "assertPermission",
+          "hasPermission",
+          "permission",
+          "permissionsEnabled",
+          "permissionState"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/node/internal/test/binding.js": {
         "file": "src/runtime_modules/node/internal/test/binding.js",
         "hasDefaultExport": true,
         "namedExports": [
           "internalBinding"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/internal/uv-errors.js": {
+        "file": "src/runtime_modules/node/internal/uv-errors.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "uvCodeFromMessage",
+          "uvErrnoFromCode",
+          "uvErrorByCode",
+          "uvErrorMap",
+          "uvMessageFromCode"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -15864,7 +15978,8 @@
           "__cottontailHeapObjectCountProviders",
           "__cottontailHeapObjectFinalizer",
           "__cottontailHeapObjectRefs",
-          "__cottontailTcpConnectListeners"
+          "__cottontailTcpConnectListeners",
+          "__cottontailWindowsPipeConnectQueues"
         ]
       },
       "src/runtime_modules/node/os.js": {
@@ -16071,6 +16186,7 @@
           "on",
           "once",
           "openStdin",
+          "permission",
           "pid",
           "platform",
           "ppid",
@@ -17834,9 +17950,11 @@
       "__cottontailMakeMessageEvent",
       "__cottontailMarkSharedArrayBuffer",
       "__cottontailModuleBindingValues",
+      "__cottontailNormalizeUncaughtException",
       "__cottontailNormalizeWorkerEvalError",
       "__cottontailNoteDanglingProcessKilled",
       "__cottontailNotifyModuleBindings",
+      "__cottontailPermissionFdPaths",
       "__cottontailProcessIpcGeneration",
       "__cottontailProcessIpcPending",
       "__cottontailPromisePeekStates",
@@ -17850,6 +17968,7 @@
       "__cottontailRemapPosition",
       "__cottontailRemapStackString",
       "__cottontailResolvePluginEntrypoint",
+      "__cottontailResolveWindowsUnixSocketAlias",
       "__cottontailServeEverCalled",
       "__cottontailSharedBufferGrowState",
       "__cottontailSharedBufferRegistry",
@@ -17868,6 +17987,8 @@
       "__cottontailWebHasActiveHandles",
       "__cottontailWebInterceptWorkerMessage",
       "__cottontailWebPollAlways",
+      "__cottontailWindowsPipeConnectQueues",
+      "__cottontailWindowsUnixSocketAliases",
       "__cottontailWorkerBootstrap",
       "__cottontailWorkerEvalSource",
       "__cottontailWorkerRuntimeCacheId",
@@ -18388,7 +18509,14 @@
           "defaultCoreCipherList"
         ],
         "missing": [],
-        "extra": []
+        "extra": [
+          "O_DIRECT",
+          "O_NOATIME",
+          "RTLD_DEEPBIND",
+          "SIGPOLL",
+          "SIGPWR",
+          "SIGSTKFLT"
+        ]
       },
       "crypto": {
         "module": "present",
@@ -18583,6 +18711,8 @@
           "Resolver",
           "SERVFAIL",
           "TIMEOUT",
+          "getDefaultResultOrder",
+          "getServers",
           "lookup",
           "lookupService",
           "resolve",
@@ -18603,10 +18733,7 @@
           "setDefaultResultOrder",
           "setServers"
         ],
-        "missing": [
-          "getDefaultResultOrder",
-          "getServers"
-        ],
+        "missing": [],
         "extra": []
       },
       "domain": {
@@ -19283,7 +19410,8 @@
           "emit",
           "off",
           "on",
-          "once"
+          "once",
+          "permission"
         ]
       },
       "punycode": {
@@ -20364,6 +20492,7 @@
       "copiedFiles": 9615,
       "discoveredRunnableFiles": 7015,
       "enabled": 7015,
+      "delegated": 0,
       "expectedFailure": 0,
       "disabled": 0,
       "notEnabled": 0,
@@ -20376,7 +20505,8 @@
       "snapshot": "compat/upstream/bun/v1.3.10",
       "copiedFiles": 8078,
       "discoveredRunnableFiles": 1445,
-      "enabled": 1440,
+      "enabled": 1338,
+      "delegated": 102,
       "expectedFailure": 5,
       "disabled": 0,
       "notEnabled": 0,
@@ -20388,16 +20518,16 @@
     "node": {
       "note": "Heuristic behavioral-readiness signal from inline COTTONTAIL-COMPAT comments, explicit unsupported/native markers, and Node-focused test files. This is not a conformance result.",
       "estimate": {
-        "implementedPercentLower": 74,
-        "implementedPercentUpper": 84,
-        "gapPercentLower": 16,
-        "gapPercentUpper": 26
+        "implementedPercentLower": 75,
+        "implementedPercentUpper": 85,
+        "gapPercentLower": 15,
+        "gapPercentUpper": 25
       },
       "signals": {
         "publicNodeModules": 58,
-        "nodeTestFiles": 96,
-        "compatMarkers": 23,
-        "modulesWithCompatMarkers": 15,
+        "nodeTestFiles": 108,
+        "compatMarkers": 20,
+        "modulesWithCompatMarkers": 14,
         "explicitUnsupportedMarkers": 35,
         "nativeAvailabilityGuards": 0,
         "modulesWithUnsupportedMarkers": 11
@@ -20424,11 +20554,11 @@
         {
           "name": "process",
           "file": "src/runtime_modules/node/process.js",
-          "compatMarkers": 6,
+          "compatMarkers": 4,
           "unsupportedMarkers": 0,
           "nativeAvailabilityGuards": 0,
-          "tests": 12,
-          "gapScore": 18
+          "tests": 18,
+          "gapScore": 12
         },
         {
           "name": "module",
@@ -20454,7 +20584,7 @@
           "compatMarkers": 2,
           "unsupportedMarkers": 0,
           "nativeAvailabilityGuards": 0,
-          "tests": 8,
+          "tests": 11,
           "gapScore": 6
         },
         {
@@ -20485,21 +20615,12 @@
           "gapScore": 3
         },
         {
-          "name": "fs",
-          "file": "src/runtime_modules/node/fs.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 0,
-          "nativeAvailabilityGuards": 0,
-          "tests": 8,
-          "gapScore": 3
-        },
-        {
           "name": "fs/promises",
           "file": "src/runtime_modules/node/fs/promises.js",
           "compatMarkers": 1,
           "unsupportedMarkers": 0,
           "nativeAvailabilityGuards": 0,
-          "tests": 8,
+          "tests": 11,
           "gapScore": 3
         },
         {
@@ -20690,7 +20811,10 @@
             "tests/js/node-fs-source-conformance.ts",
             "tests/js/node-fs-surface.ts",
             "tests/js/node-fs-unlink-directory-link.ts",
+            "tests/js/node-fs-windows-errors.ts",
             "tests/js/node-fs-windows-long-path.ts",
+            "tests/js/node-fs-windows-permissions.test.ts",
+            "tests/js/node-fs-windows-symlink-types.ts",
             "tests/js/node-fs.ts",
             "tests/js/node-http-fs-watch-id.test.ts"
           ]
@@ -20708,25 +20832,10 @@
             "tests/js/node-fs-source-conformance.ts",
             "tests/js/node-fs-surface.ts",
             "tests/js/node-fs-unlink-directory-link.ts",
+            "tests/js/node-fs-windows-errors.ts",
             "tests/js/node-fs-windows-long-path.ts",
-            "tests/js/node-fs.ts",
-            "tests/js/node-http-fs-watch-id.test.ts"
-          ]
-        },
-        "fs": {
-          "file": "src/runtime_modules/node/fs.js",
-          "compatMarkers": [
-            "the current host close primitive has no return"
-          ],
-          "unsupportedMarkers": [],
-          "nativeAvailabilityGuards": [],
-          "tests": [
-            "tests/js/node-fs-binary-io.ts",
-            "tests/js/node-fs-focused-regressions.test.ts",
-            "tests/js/node-fs-source-conformance.ts",
-            "tests/js/node-fs-surface.ts",
-            "tests/js/node-fs-unlink-directory-link.ts",
-            "tests/js/node-fs-windows-long-path.ts",
+            "tests/js/node-fs-windows-permissions.test.ts",
+            "tests/js/node-fs-windows-symlink-types.ts",
             "tests/js/node-fs.ts",
             "tests/js/node-http-fs-watch-id.test.ts"
           ]
@@ -20815,23 +20924,23 @@
           "compatMarkers": [],
           "unsupportedMarkers": [
             {
-              "line": 730,
+              "line": 734,
               "text": "throw new TypeError(`require() async module \"${descriptor.key}\" is unsupported. use \"await import()\" instead.`);"
             },
             {
-              "line": 735,
+              "line": 739,
               "text": "throw new TypeError(`require() async module \"${descriptor.key}\" is unsupported. use \"await import()\" instead.`);"
             },
             {
-              "line": 2743,
+              "line": 2855,
               "text": "throw new TypeError(`require() async module \"${filename}\" is unsupported. use \"await import()\" instead.`);"
             },
             {
-              "line": 2804,
+              "line": 2916,
               "text": "throw new TypeError(`require() async module \"${filename}\" is unsupported. use \"await import()\" instead.`);"
             },
             {
-              "line": 3639,
+              "line": 3814,
               "text": "throw new TypeError(`require() async module \"${filename}\" is unsupported. use \"await import()\" instead.`);"
             }
           ],
@@ -20876,24 +20985,28 @@
             "Complete POSIX name lookup needs native getpwnam/getgrnam for NSS identities.",
             "process.env accepts unsupported TZ values even when JSC rejects them.",
             "Assignments update the JS value; changing the operating-system process title needs a native host API.",
-            "The native execve host must enforce Cottontail's process permission policy.",
-            "Filesystem permission enforcement requires a shared native permission service.",
             "node:process addon ABI - process metadata, credentials, signals, reports, env loading, execve, and common internal bindings use native host APIs; N-API module initialization still needs a Node-compatible ABI entrypoint."
           ],
           "unsupportedMarkers": [],
           "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-child-process-conformance.ts",
+            "tests/js/node-child-process-direct-ipc.test.ts",
             "tests/js/node-child-process-external-fork.ts",
             "tests/js/node-child-process-fork.ts",
             "tests/js/node-child-process-inherited-sync.ts",
             "tests/js/node-child-process-ipc-startup-backpressure.test.ts",
             "tests/js/node-child-process-relative-cwd.test.ts",
             "tests/js/node-child-process-spawn-gate.ts",
+            "tests/js/node-child-process-windows-env-case-dedup.ts",
+            "tests/js/node-child-process-windows-handle-isolation.ts",
+            "tests/js/node-child-process-windows-ipc-ack-scope.ts",
             "tests/js/node-child-process.ts",
             "tests/js/node-process-behavior.test.ts",
             "tests/js/node-process-host-lifecycle.test.ts",
+            "tests/js/node-process-nexttick-uncaught.js",
             "tests/js/node-process-surface.ts",
+            "tests/js/node-process-windows-console-signals.test.ts",
             "tests/js/node-process.ts"
           ]
         },
@@ -20948,7 +21061,7 @@
           "compatMarkers": [],
           "unsupportedMarkers": [
             {
-              "line": 479,
+              "line": 412,
               "text": "throw new Error(`cottontail loader: internalBinding('${name}') is not implemented`);"
             }
           ],
@@ -21094,7 +21207,7 @@
       "note": "Source caveat and local test-inventory signals only. These are not conformance results and do not support a Bun compatibility percentage.",
       "signals": {
         "publicBunModules": 5,
-        "bunTestFiles": 69,
+        "bunTestFiles": 72,
         "compatMarkers": 19,
         "modulesWithCompatMarkers": 7,
         "explicitUnsupportedMarkers": 18,
@@ -21108,7 +21221,7 @@
           "compatMarkers": 9,
           "unsupportedMarkers": 6,
           "nativeAvailabilityGuards": 0,
-          "tests": 69,
+          "tests": 72,
           "gapScore": 39
         },
         {
@@ -21267,7 +21380,7 @@
           ],
           "unsupportedMarkers": [
             {
-              "line": 3037,
+              "line": 3170,
               "text": "throw new TypeError(`Unsupported type ${String(type)}. Must be one of: ${supportedFFITypes}`);"
             }
           ],
@@ -21293,27 +21406,27 @@
           ],
           "unsupportedMarkers": [
             {
-              "line": 8389,
+              "line": 8486,
               "text": "throw new TypeError(`Unsupported URL scheme: ${parsedUrl.protocol}`);"
             },
             {
-              "line": 17143,
+              "line": 17327,
               "text": "if (!(label in passwordAlgorithmIds)) throw new TypeError(\"Unsupported password algorithm\");"
             },
             {
-              "line": 17174,
+              "line": 17358,
               "text": "throw new TypeError(\"Unsupported password algorithm\");"
             },
             {
-              "line": 17547,
+              "line": 17731,
               "text": "throw new TypeError(`Unsupported CSRF token encoding: ${encoding}`);"
             },
             {
-              "line": 17563,
+              "line": 17747,
               "text": "throw new TypeError(`Unsupported CSRF token encoding: ${encoding}`);"
             },
             {
-              "line": 18752,
+              "line": 18936,
               "text": "throw new TypeError(`WebAssembly response has unsupported MIME type '${type}'`);"
             }
           ],
@@ -21325,11 +21438,13 @@
             "tests/js/bun-build-html-no-bundle.test.ts",
             "tests/js/bun-build-native.ts",
             "tests/js/bun-build-plugin-import-scan.test.ts",
+            "tests/js/bun-build-windows-metadata.test.ts",
             "tests/js/bun-cjs-interop.ts",
             "tests/js/bun-color-source-conformance.test.ts",
             "tests/js/bun-direct-readable-stream.test.ts",
             "tests/js/bun-dns-cache.ts",
             "tests/js/bun-dns-rejects-matcher.test.ts",
+            "tests/js/bun-exec-cli.test.ts",
             "tests/js/bun-fetch-verbose.test.ts",
             "tests/js/bun-ffi-compat.test.ts",
             "tests/js/bun-ffi-int64-returns.test.ts",
@@ -21341,13 +21456,13 @@
             "tests/js/bun-native-plugin.ts",
             "tests/js/bun-net-socket-compat.test.ts",
             "tests/js/bun-package-manager-internals.ts",
-            "tests/js/bun-package-manager-link.ts",
             "tests/js/bun-plugin-lifecycle.test.ts",
             "tests/js/bun-redis-client.test.ts",
             "tests/js/bun-repl.ts",
             "tests/js/bun-resolver-source-port.test.ts",
             "tests/js/bun-response-array-body.test.ts",
             "tests/js/bun-s3-compat.test.ts",
+            "tests/js/bun-secrets-windows.test.ts",
             "tests/js/bun-semver.ts",
             "tests/js/bun-serve-detached.ts",
             "tests/js/bun-serve-response-lifecycle.test.ts",
@@ -21385,6 +21500,7 @@
             "tests/js/bun-test-snapshot-scope.test.ts",
             "tests/js/bun-test-to-throw-with-code.test.ts",
             "tests/js/bun-test-unawaited-promise-matchers.test.ts",
+            "tests/js/bun-transpiled-dynamic-import.js",
             "tests/js/bun-transpiler-repeat.test.ts",
             "tests/js/bun-typescript-compiler-parity.test.ts",
             "tests/js/bun-which-windows-extension.ts"
@@ -21407,7 +21523,7 @@
           "compatMarkers": [],
           "unsupportedMarkers": [
             {
-              "line": 942,
+              "line": 952,
               "text": "if (!useTls) throw new Error(\"addServerName requires SSL support\");"
             }
           ],
@@ -21469,7 +21585,7 @@
           ],
           "unsupportedMarkers": [
             {
-              "line": 3041,
+              "line": 3045,
               "text": "expect.addSnapshotSerializer = (_serializer) => { throw new Error(\"Not implemented\"); };"
             }
           ],

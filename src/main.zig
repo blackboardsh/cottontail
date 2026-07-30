@@ -6,21 +6,15 @@ const cottontail_diff = @import("cottontail_diff.zig");
 const cottontail_hash = @import("cottontail_hash.zig");
 const cottontail_markdown = @import("cottontail_markdown.zig");
 const cottontail_password = @import("cottontail_password.zig");
-const package_manager_bun_lockfile = @import("package_manager_bun_lockfile.zig");
-const package_manager_lockfile = @import("package_manager_lockfile.zig");
-const package_manager_bunx = @import("package_manager_bunx.zig");
-const package_manager_cli = @import("package_manager_cli.zig");
-const package_manager_create = @import("package_manager_create.zig");
-const package_manager_upgrade = @import("package_manager_upgrade.zig");
-const cli_script_command = @import("cli_script_command.zig");
+const jsonc = @import("jsonc.zig");
+const package_manager_host = @import("package_manager_host.zig");
+const package_manager_lockfile_service = @import("package_manager_lockfile_service.zig");
+const cli_create_source_service = @import("cli_create_source_service.zig");
 const repl = @import("repl.zig");
 const signal_forwarding = @import("signal_forwarding.zig");
 const cottontail_transpiler = @import("cottontail_transpiler.zig");
 const completions = @import("completions.zig");
 const native_bindings = @import("native_bindings.zig");
-const cli_create_source = @import("cli_create_source.zig");
-const cli_init = @import("cli_init.zig");
-const cli_run = @import("cli_run.zig");
 const cli_run_execution = @import("cli_run_execution.zig");
 const script_runner = @import("script_runner.zig");
 const standalone_executable = @import("standalone_executable.zig");
@@ -41,7 +35,7 @@ const bun_compat_version = "1.3.10";
 // Build-metadata suffix reported by `--revision` (`<version>+<suffix>`),
 // mirroring how bun reports `<version>+<git sha>`.
 const revision_suffix = "cottontail";
-const completion_commands = [_][]const u8{ "run", "test", "build", "init", "create", "repl", "x", "exec", "completions", "getcompletes" };
+const completion_commands = [_][]const u8{ "run", "test", "build", "repl", "exec", "completions", "getcompletes" };
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "kernel32" fn GetCurrentProcess() callconv(.winapi) std.os.windows.HANDLE;
 extern "kernel32" fn TerminateProcess(
@@ -58,22 +52,20 @@ fn commandDisplayVersion(init: std.process.Init) []const u8 {
 }
 const help_text_template =
     \\cottontail {s}
-    \\Bun is a fast JavaScript runtime, package manager, bundler, and test runner.
-    \\Cottontail provides a Bun-compatible Zig and JavaScriptCore implementation.
+    \\Cottontail is a Bun-compatible JavaScript runtime built with Zig and JavaScriptCore.
     \\
     \\Usage:
     \\  cottontail <entrypoint.js|entrypoint.ts> [args...]
     \\  cottontail run <entrypoint.js|entrypoint.ts> [args...]
     \\  cottontail test [args...]
-    \\  cottontail init [flags] [destination]
+    \\  cottontail build <entrypoint...> [flags]
     \\  cottontail repl [-e|--eval <script> | -p|--print <expression>]
-    \\  cottontail install|add|remove|update [packages...] [flags]
-    \\  cottontail create <template> [destination] [flags]
-    \\  cottontail x [--package <package>] <package-or-bin> [args...]
     \\  cottontail -e|--eval <script> [args...]
     \\  cottontail -p|--print <expression> [args...]
     \\  cottontail --help
     \\  cottontail --version
+    \\
+    \\Project setup, package management, package scripts, and package executables are provided by Hutch.
     \\
     \\Status:
     \\  JavaScriptCore is embedded with ESM imports, async job draining, and a small cottontail host API.
@@ -83,6 +75,97 @@ const help_text_template =
 
 fn printHelp(writer: anytype) !void {
     try writer.print(help_text_template, .{version});
+}
+
+const HutchCommand = struct {
+    requested: []const u8,
+    replacement: []const u8,
+};
+
+fn hutchCommandForName(command: []const u8) ?HutchCommand {
+    const replacement = if (std.mem.eql(u8, command, "c"))
+        "create"
+    else if (std.mem.eql(u8, command, "bunx"))
+        "x"
+    else if (std.mem.eql(u8, command, "upgrade"))
+        "cottontail update"
+    else if (std.mem.eql(u8, command, "audit") or
+        std.mem.eql(u8, command, "install") or
+        std.mem.eql(u8, command, "i") or
+        std.mem.eql(u8, command, "ci") or
+        std.mem.eql(u8, command, "add") or
+        std.mem.eql(u8, command, "a") or
+        std.mem.eql(u8, command, "remove") or
+        std.mem.eql(u8, command, "rm") or
+        std.mem.eql(u8, command, "uninstall") or
+        std.mem.eql(u8, command, "update") or
+        std.mem.eql(u8, command, "up") or
+        std.mem.eql(u8, command, "outdated") or
+        std.mem.eql(u8, command, "link") or
+        std.mem.eql(u8, command, "unlink") or
+        std.mem.eql(u8, command, "patch") or
+        std.mem.eql(u8, command, "patch-commit") or
+        std.mem.eql(u8, command, "publish") or
+        std.mem.eql(u8, command, "pm") or
+        std.mem.eql(u8, command, "list") or
+        std.mem.eql(u8, command, "info") or
+        std.mem.eql(u8, command, "whoami") or
+        std.mem.eql(u8, command, "why") or
+        std.mem.eql(u8, command, "init") or
+        std.mem.eql(u8, command, "create") or
+        std.mem.eql(u8, command, "x"))
+        command
+    else
+        return null;
+    return .{ .requested = command, .replacement = replacement };
+}
+
+fn hutchCommandForArgs(args: []const [:0]const u8) ?HutchCommand {
+    if (args.len == 0) return null;
+    const executable_name = std.fs.path.basename(args[0]);
+    if (std.ascii.eqlIgnoreCase(executable_name, "bunx") or
+        std.ascii.eqlIgnoreCase(executable_name, "bunx.exe"))
+    {
+        return .{ .requested = "bunx", .replacement = "x" };
+    }
+    if (args.len <= 1) return null;
+
+    var index: usize = 1;
+    while (index < args.len) {
+        const argument: []const u8 = args[index];
+        if (std.mem.eql(u8, argument, "--save") or std.mem.eql(u8, argument, "--bun")) {
+            index += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, argument, "-c=") or
+            std.mem.startsWith(u8, argument, "--config="))
+        {
+            index += 1;
+            continue;
+        }
+        if ((std.mem.eql(u8, argument, "-c") or std.mem.eql(u8, argument, "--config")) and
+            index + 1 < args.len)
+        {
+            index += 2;
+            continue;
+        }
+        return hutchCommandForName(argument);
+    }
+    return null;
+}
+
+fn reportHutchCommand(stderr: *std.Io.Writer, command: HutchCommand) !void {
+    try stderr.print(
+        "error: `cottontail {s}` is a build-time command provided by Hutch.\nRun `hutch {s}` instead.\n",
+        .{ command.requested, command.replacement },
+    );
+}
+
+fn reportHutchScript(stderr: *std.Io.Writer, script_name: []const u8) !void {
+    try stderr.print(
+        "error: package scripts and package executables are provided by Hutch.\nRun `hutch run {s}` instead.\n",
+        .{script_name},
+    );
 }
 
 const test_help_text =
@@ -125,15 +208,8 @@ fn printTestHelp(writer: anytype) !void {
 
 const CliMode = enum { script, eval, print, stdin };
 
-const RunShell = enum { bun, system };
-
 const RunScriptFlags = struct {
-    if_present: bool = false,
-    silent: bool = false,
-    bun: bool = false,
-    explicit_run: bool = false,
     debug: bool = false,
-    shell: ?RunShell = null,
     config_path: ?[]const u8 = null,
 };
 
@@ -268,31 +344,6 @@ fn normalizeLeadingTestRuntimeFlags(
         if (runtimeFlagTakesValue(flag) and command_index < args.len) command_index += 1;
     }
     if (command_index >= args.len or !std.mem.eql(u8, args[command_index], "test")) return args;
-
-    const normalized = try allocator.alloc([:0]const u8, args.len);
-    normalized[0] = args[0];
-    normalized[1] = args[command_index];
-    @memcpy(normalized[2 .. command_index + 1], args[1..command_index]);
-    @memcpy(normalized[command_index + 1 ..], args[command_index + 1 ..]);
-    return normalized;
-}
-
-fn normalizeLeadingPackageManagerConfig(
-    allocator: std.mem.Allocator,
-    args: []const [:0]const u8,
-) ![]const [:0]const u8 {
-    if (args.len < 3) return args;
-    const first = args[1];
-    const command_index: usize = if (std.mem.eql(u8, first, "--save"))
-        2
-    else if (std.mem.startsWith(u8, first, "-c=") or
-        std.mem.startsWith(u8, first, "--config="))
-        2
-    else if ((std.mem.eql(u8, first, "-c") or std.mem.eql(u8, first, "--config")) and args.len > 3)
-        3
-    else
-        return args;
-    if (command_index >= args.len or !package_manager_cli.recognizes(args[command_index])) return args;
 
     const normalized = try allocator.alloc([:0]const u8, args.len);
     normalized[0] = args[0];
@@ -612,7 +663,7 @@ fn resolveRunEntrypointDepth(
     if (!pathIsDirectory(io, requested)) return null;
     const package_json = try std.fs.path.join(allocator, &.{ requested, "package.json" });
     if (std.Io.Dir.cwd().readFileAlloc(io, package_json, allocator, .limited(16 * 1024 * 1024)) catch null) |source| {
-        if (package_manager_lockfile.normalizeJsonc(allocator, source) catch null) |normalized| {
+        if (jsonc.normalize(allocator, source) catch null) |normalized| {
             if (std.json.parseFromSliceLeaky(std.json.Value, allocator, normalized, .{
                 .duplicate_field_behavior = .use_last,
             }) catch null) |manifest| {
@@ -847,114 +898,8 @@ fn runHtmlEntrypoints(init: std.process.Init, invocation: CliInvocation) !?u8 {
     return try script_runner.runHtmlDevServer(init, source_z, early_source, &.{}, invocation.exec_args);
 }
 
-const PackageScripts = struct {
-    dir: []const u8,
-    pre: ?[]const u8,
-    main: []const u8,
-    post: ?[]const u8,
-    script_name: []const u8,
-    package_name: []const u8,
-    package_version: []const u8,
-    package_json: []const u8,
-    config: []const PackageConfigEntry,
-};
-
-const PackageConfigEntry = struct {
-    name: []const u8,
-    value: []const u8,
-};
-
-fn packageConfigValue(allocator: std.mem.Allocator, value: std.json.Value) ![]const u8 {
-    return switch (value) {
-        .string => |text| text,
-        .bool => |flag| if (flag) "true" else "false",
-        .integer => |number| try std.fmt.allocPrint(allocator, "{d}", .{number}),
-        .float => |number| try std.fmt.allocPrint(allocator, "{d}", .{number}),
-        .null => "",
-        else => try std.json.Stringify.valueAlloc(allocator, value, .{}),
-    };
-}
-
-fn jsonScriptValue(scripts: std.json.Value, name: []const u8) ?[]const u8 {
-    const value = scripts.object.get(name) orelse return null;
-    return switch (value) {
-        .string => |text| text,
-        else => null,
-    };
-}
-
-fn findPackageScripts(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    name: []const u8,
-) !?PackageScripts {
-    const cwd_abs = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch return null;
-    var current: []const u8 = cwd_abs;
-    while (true) {
-        const package_json = try std.fs.path.join(allocator, &.{ current, "package.json" });
-        if (cliPathExists(io, package_json)) {
-            const source = std.Io.Dir.cwd().readFileAlloc(
-                io,
-                package_json,
-                allocator,
-                .limited(16 * 1024 * 1024),
-            ) catch null;
-            if (source) |contents| {
-                const normalized = package_manager_lockfile.normalizeJsonc(allocator, contents) catch null;
-                if (normalized) |json| {
-                    const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{
-                        .duplicate_field_behavior = .use_last,
-                    }) catch null;
-                    if (parsed) |root| {
-                        if (root == .object) {
-                            if (root.object.get("scripts")) |scripts| {
-                                if (scripts == .object) {
-                                    if (jsonScriptValue(scripts, name)) |main_command| {
-                                        const pre_name = try std.mem.concat(allocator, u8, &.{ "pre", name });
-                                        const post_name = try std.mem.concat(allocator, u8, &.{ "post", name });
-                                        var config_entries = std.array_list.Managed(PackageConfigEntry).init(allocator);
-                                        if (root.object.get("config")) |config| {
-                                            if (config == .object) {
-                                                for (config.object.keys(), config.object.values()) |key, value| {
-                                                    try config_entries.append(.{
-                                                        .name = try std.fmt.allocPrint(allocator, "npm_package_config_{s}", .{key}),
-                                                        .value = try packageConfigValue(allocator, value),
-                                                    });
-                                                }
-                                            }
-                                        }
-                                        return .{
-                                            .dir = try allocator.dupe(u8, current),
-                                            .pre = jsonScriptValue(scripts, pre_name),
-                                            .main = try allocator.dupe(u8, main_command),
-                                            .post = jsonScriptValue(scripts, post_name),
-                                            .script_name = name,
-                                            .package_name = if (root.object.get("name")) |value| if (value == .string) value.string else "" else "",
-                                            .package_version = if (root.object.get("version")) |value| if (value == .string) value.string else "" else "",
-                                            .package_json = package_json,
-                                            .config = try config_entries.toOwnedSlice(),
-                                        };
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            return null;
-        }
-        const parent = std.fs.path.dirname(current) orelse break;
-        if (std.mem.eql(u8, parent, current)) break;
-        current = parent;
-    }
-    return null;
-}
-
 const RunBunfig = struct {
-    silent: bool = false,
-    bun: bool = false,
     debug: bool = false,
-    shell: ?RunShell = null,
 };
 
 fn parseRunBunfig(allocator: std.mem.Allocator, path: []const u8, contents: []const u8) RunBunfig {
@@ -973,18 +918,6 @@ fn parseRunBunfig(allocator: std.mem.Allocator, path: []const u8, contents: []co
             config.debug = std.mem.eql(u8, level, "debug");
         }
     }
-    const run = root.get("run") orelse return config;
-    if (run.get("silent")) |value| config.silent = value.asBool() orelse false;
-    if (run.get("bun")) |value| config.bun = value.asBool() orelse false;
-    if (run.get("shell")) |value| {
-        if (value.asString(allocator)) |shell| {
-            if (std.mem.eql(u8, shell, "bun")) {
-                config.shell = .bun;
-            } else if (std.mem.eql(u8, shell, "system")) {
-                config.shell = .system;
-            }
-        }
-    }
     return config;
 }
 
@@ -998,10 +931,7 @@ fn configuredRunScriptFlags(init: std.process.Init, flags: RunScriptFlags) !RunS
         .limited(16 * 1024 * 1024),
     ) catch return configured;
     const bunfig = parseRunBunfig(init.arena.allocator(), path, contents);
-    configured.silent = configured.silent or bunfig.silent;
-    configured.bun = configured.bun or bunfig.bun;
     configured.debug = configured.debug or bunfig.debug;
-    if (configured.shell == null) configured.shell = bunfig.shell;
     return configured;
 }
 
@@ -1030,7 +960,7 @@ fn reportMissingDebugTsconfigExtends(
     while (true) {
         const tsconfig_path = try std.fs.path.join(allocator, &.{ current, "tsconfig.json" });
         if (std.Io.Dir.cwd().readFileAlloc(init.io, tsconfig_path, allocator, .limited(16 * 1024 * 1024)) catch null) |source| {
-            const normalized = package_manager_lockfile.normalizeJsonc(allocator, source) catch return;
+            const normalized = jsonc.normalize(allocator, source) catch return;
             const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, normalized, .{
                 .duplicate_field_behavior = .use_last,
             }) catch return;
@@ -1056,24 +986,6 @@ fn reportMissingDebugTsconfigExtends(
         if (std.mem.eql(u8, parent, current)) return;
         current = parent;
     }
-}
-
-fn prependAncestorBinPaths(
-    allocator: std.mem.Allocator,
-    env: *std.process.Environ.Map,
-    start_dir: []const u8,
-) !void {
-    var parts = std.array_list.Managed([]const u8).init(allocator);
-    var current = start_dir;
-    while (true) {
-        try parts.append(try std.fs.path.join(allocator, &.{ current, "node_modules", ".bin" }));
-        const parent = std.fs.path.dirname(current) orelse break;
-        if (std.mem.eql(u8, parent, current)) break;
-        current = parent;
-    }
-    if (env.get("PATH")) |path| try parts.append(path);
-    const separator = if (builtin.os.tag == .windows) ";" else ":";
-    try env.put("PATH", try std.mem.join(allocator, separator, parts.items));
 }
 
 fn nonEmptyEnvironment(env: *const std.process.Environ.Map, name: []const u8) ?[]const u8 {
@@ -1138,254 +1050,6 @@ fn forcesBunRuntime(exec_args: []const [:0]const u8) bool {
         if (std.mem.eql(u8, arg, "--bun") or std.mem.eql(u8, arg, "-b")) return true;
     }
     return false;
-}
-
-fn findAncestorBin(io: std.Io, allocator: std.mem.Allocator, name: []const u8) !?[]const u8 {
-    const cwd_abs = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch return null;
-    var current: []const u8 = cwd_abs;
-    while (true) {
-        const bin_dir = try std.fs.path.join(allocator, &.{ current, "node_modules", ".bin" });
-        const candidate = try std.fs.path.join(allocator, &.{ bin_dir, name });
-        if (pathIsFile(io, candidate)) return candidate;
-        if (builtin.os.tag == .windows) {
-            for ([_][]const u8{ ".exe", ".cmd", ".bat" }) |extension| {
-                const with_extension = try std.mem.concat(allocator, u8, &.{ candidate, extension });
-                if (pathIsFile(io, with_extension)) return with_extension;
-            }
-        }
-        const parent = std.fs.path.dirname(current) orelse break;
-        if (std.mem.eql(u8, parent, current)) break;
-        current = parent;
-    }
-    return null;
-}
-
-fn runAncestorBin(
-    init: std.process.Init,
-    executable: []const u8,
-    args: []const [:0]const u8,
-    force_runtime: bool,
-    silent: bool,
-) !u8 {
-    const allocator = init.arena.allocator();
-    const cwd_abs = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
-    var env = try init.environ_map.clone(allocator);
-    try prependAncestorBinPaths(allocator, &env, cwd_abs);
-    if (force_runtime) try prependForcedBunRuntimePath(init, allocator, &env);
-
-    const argv = try allocator.alloc([]const u8, args.len + 1);
-    argv[0] = executable;
-    for (args, 0..) |arg, index| argv[index + 1] = arg;
-    var signal_scope = signal_forwarding.Scope.begin();
-    defer signal_scope.deinit();
-    var child = try std.process.spawn(init.io, .{
-        .argv = argv,
-        .environ_map = &env,
-        .stdin = .inherit,
-        .stdout = .inherit,
-        .stderr = .inherit,
-        .create_no_window = true,
-    });
-    defer child.kill(init.io);
-    const term = try signal_scope.wait(init.io, &child);
-    return switch (term) {
-        .exited => |code| blk: {
-            const narrowed: u8 = @intCast(@min(code, 255));
-            if (narrowed != 0 and !silent) {
-                var buffer: [1024]u8 = undefined;
-                var writer = std.Io.File.stderr().writer(init.io, &buffer);
-                try writer.interface.print("error: \"{s}\" exited with code {d}\n", .{ std.fs.path.basename(executable), narrowed });
-                try writer.interface.flush();
-            }
-            break :blk narrowed;
-        },
-        .signal => |signal_number| {
-            if (!silent) {
-                var buffer: [1024]u8 = undefined;
-                var writer = std.Io.File.stderr().writer(init.io, &buffer);
-                try writer.interface.print("error: \"{s}\" exited with signal SIG{s}\n", .{
-                    std.fs.path.basename(executable),
-                    @tagName(signal_number),
-                });
-                try writer.interface.flush();
-            }
-            signal_forwarding.exitWithSignal(signal_number);
-        },
-        .stopped, .unknown => 1,
-    };
-}
-
-fn findSystemExecutable(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    path_value: []const u8,
-    name: []const u8,
-) !?[]const u8 {
-    if (std.mem.indexOfAny(u8, name, "/\\") != null) return null;
-    var directories = std.mem.tokenizeScalar(u8, path_value, std.fs.path.delimiter);
-    while (directories.next()) |directory| {
-        if (directory.len == 0) continue;
-        const candidate = try std.fs.path.join(allocator, &.{ directory, name });
-        if (pathIsFile(io, candidate)) return candidate;
-        if (builtin.os.tag == .windows and std.fs.path.extension(name).len == 0) {
-            for ([_][]const u8{ ".exe", ".cmd", ".bat", ".com" }) |extension| {
-                const with_extension = try std.mem.concat(allocator, u8, &.{ candidate, extension });
-                if (pathIsFile(io, with_extension)) return with_extension;
-            }
-        }
-    }
-    return null;
-}
-
-fn shellEscapeArg(allocator: std.mem.Allocator, arg: []const u8) ![]const u8 {
-    var plain = arg.len > 0;
-    for (arg) |byte| {
-        const safe = std.ascii.isAlphanumeric(byte) or switch (byte) {
-            '-', '_', '.', '/', ':', '=', '@', '%', '+', ',' => true,
-            else => false,
-        };
-        if (!safe) {
-            plain = false;
-            break;
-        }
-    }
-    if (plain) return arg;
-    var buffer = std.array_list.Managed(u8).init(allocator);
-    try buffer.append('"');
-    for (arg) |byte| {
-        if (byte == '"' or byte == '\\' or byte == '$' or byte == '`') try buffer.append('\\');
-        try buffer.append(byte);
-    }
-    try buffer.append('"');
-    return buffer.items;
-}
-
-fn runOnePackageScript(
-    init: std.process.Init,
-    env: *std.process.Environ.Map,
-    dir: []const u8,
-    stage_name: []const u8,
-    command: []const u8,
-    flags: RunScriptFlags,
-) !u8 {
-    try env.put("npm_lifecycle_event", stage_name);
-    try env.put("npm_lifecycle_script", command);
-    const rewritten_command = try cli_script_command.replacePackageManagerRun(init.arena.allocator(), init.io, command);
-    if (!flags.silent) {
-        var stderr_buffer: [4096]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
-        const stderr = &stderr_writer.interface;
-        const display_command = try cli_script_command.displayPackageManagerRun(init.arena.allocator(), command);
-        try stderr.print("$ {s}\n", .{display_command});
-        try stderr.flush();
-    }
-    var bun_shell_args: [3][]const u8 = undefined;
-    var system_shell_args: [5][]const u8 = undefined;
-    const use_bun_shell = flags.shell == .bun or (flags.shell == null and builtin.os.tag == .windows);
-    const shell_args: []const []const u8 = if (use_bun_shell) blk: {
-        var source: std.ArrayList(u8) = .empty;
-        // The runtime has already initialized Bun before evaluating this
-        // source. Avoid making the bare "bun" specifier look like an
-        // auto-install candidate in a fresh package directory.
-        try source.appendSlice(init.arena.allocator(), "const $ = Bun.$; const __s = [");
-        try appendJavaScriptStringLiteral(init.arena.allocator(), &source, rewritten_command);
-        try source.appendSlice(init.arena.allocator(), "]; __s.raw = __s; const __result = await $(__s).nothrow(); process.exitCode = __result.exitCode;\n");
-        bun_shell_args = .{
-            try std.process.executablePathAlloc(init.io, init.arena.allocator()),
-            "-e",
-            try init.arena.allocator().dupeZ(u8, source.items),
-        };
-        break :blk &bun_shell_args;
-    } else if (builtin.os.tag == .windows) blk: {
-        system_shell_args = .{ "cmd.exe", "/d", "/s", "/c", rewritten_command };
-        break :blk &system_shell_args;
-    } else blk: {
-        system_shell_args = .{ "/bin/sh", "-c", rewritten_command, "", "" };
-        break :blk system_shell_args[0..3];
-    };
-    var signal_scope = signal_forwarding.Scope.begin();
-    defer signal_scope.deinit();
-    var child = try std.process.spawn(init.io, .{
-        .argv = shell_args,
-        .cwd = .{ .path = dir },
-        .environ_map = env,
-        .stdin = .inherit,
-        .stdout = .inherit,
-        .stderr = .inherit,
-        .create_no_window = true,
-    });
-    defer child.kill(init.io);
-    return signal_scope.waitAndPropagate(init.io, &child);
-}
-
-fn reportPackageScriptExit(init: std.process.Init, name: []const u8, code: u8, flags: RunScriptFlags) void {
-    if (code == 0 or code == 2 or flags.silent) return;
-    var buffer: [1024]u8 = undefined;
-    var writer = std.Io.File.stderr().writer(init.io, &buffer);
-    writer.interface.print("error: script \"{s}\" exited with code {d}\n", .{ name, code }) catch {};
-    writer.interface.flush() catch {};
-}
-
-fn runPackageScripts(
-    init: std.process.Init,
-    pkg: PackageScripts,
-    flags: RunScriptFlags,
-    extra_args: []const [:0]const u8,
-    force_runtime: bool,
-) !u8 {
-    const allocator = init.arena.allocator();
-    var env = try init.environ_map.clone(allocator);
-    defer env.deinit();
-    const executable = try std.process.executablePathAlloc(init.io, allocator);
-    try env.put("BUN", executable);
-    try env.put("npm_execpath", executable);
-    try env.put("npm_node_execpath", executable);
-    const init_cwd = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
-    try env.put("INIT_CWD", init_cwd);
-    try env.put("npm_command", "run-script");
-    try env.put("npm_config_local_prefix", init_cwd);
-    try env.put("npm_config_user_agent", "bun/1.3.10 npm/? node/? cottontail");
-    if (pkg.package_name.len > 0) try env.put("npm_package_name", pkg.package_name);
-    if (pkg.package_version.len > 0) try env.put("npm_package_version", pkg.package_version);
-    try env.put("npm_package_json", pkg.package_json);
-    try prependAncestorBinPaths(allocator, &env, pkg.dir);
-    if (force_runtime or flags.bun) try prependForcedBunRuntimePath(init, allocator, &env);
-    for (pkg.config) |entry| try env.put(entry.name, entry.value);
-
-    if (pkg.pre) |pre_command| {
-        const stage_name = try std.mem.concat(allocator, u8, &.{ "pre", pkg.script_name });
-        const code = try runOnePackageScript(init, &env, pkg.dir, stage_name, pre_command, flags);
-        if (code != 0) {
-            reportPackageScriptExit(init, stage_name, code, flags);
-            return code;
-        }
-    }
-
-    var main_command: []const u8 = pkg.main;
-    if (extra_args.len > 0) {
-        var buffer = std.array_list.Managed(u8).init(allocator);
-        try buffer.appendSlice(pkg.main);
-        for (extra_args) |extra| {
-            try buffer.append(' ');
-            try buffer.appendSlice(try shellEscapeArg(allocator, extra));
-        }
-        main_command = buffer.items;
-    }
-    const main_code = try runOnePackageScript(init, &env, pkg.dir, pkg.script_name, main_command, flags);
-    if (main_code != 0) {
-        reportPackageScriptExit(init, pkg.script_name, main_code, flags);
-        return main_code;
-    }
-
-    if (pkg.post) |post_command| {
-        const stage_name = try std.mem.concat(allocator, u8, &.{ "post", pkg.script_name });
-        const code = try runOnePackageScript(init, &env, pkg.dir, stage_name, post_command, flags);
-        if (code != 0) {
-            reportPackageScriptExit(init, stage_name, code, flags);
-            return code;
-        }
-    }
-    return 0;
 }
 
 const fake_node_extensions = [_][]const u8{ ".tsx", ".jsx", ".mts", ".ts", ".cts", ".js", ".mjs", ".cjs" };
@@ -3075,7 +2739,6 @@ fn parseRunInvocation(
     exec_len: *usize,
     flags: *RunScriptFlags,
 ) !CliInvocation {
-    flags.explicit_run = true;
     var index: usize = start_index;
     while (index < args.len) {
         const arg = args[index];
@@ -3105,39 +2768,23 @@ fn parseRunInvocation(
             continue;
         }
         if (std.mem.eql(u8, arg, "--if-present")) {
-            flags.if_present = true;
             index += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--silent")) {
-            flags.silent = true;
             index += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--bun") or std.mem.eql(u8, arg, "-b")) {
-            flags.bun = true;
             appendExecArg(exec_args_storage, exec_len, arg);
             index += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--shell") and index + 1 < args.len) {
-            flags.shell = if (std.mem.eql(u8, args[index + 1], "bun"))
-                .bun
-            else if (std.mem.eql(u8, args[index + 1], "system"))
-                .system
-            else
-                null;
             index += 2;
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--shell=")) {
-            const shell = arg["--shell=".len..];
-            flags.shell = if (std.mem.eql(u8, shell, "bun"))
-                .bun
-            else if (std.mem.eql(u8, shell, "system"))
-                .system
-            else
-                null;
             index += 1;
             continue;
         }
@@ -3283,43 +2930,27 @@ fn parseInvocation(io: std.Io, allocator: std.mem.Allocator, args: []const [:0]c
         }
 
         if (std.mem.eql(u8, arg, "--if-present")) {
-            flags.if_present = true;
             index += 1;
             continue;
         }
 
         if (std.mem.eql(u8, arg, "--silent")) {
-            flags.silent = true;
             index += 1;
             continue;
         }
 
         if (std.mem.eql(u8, arg, "--bun") or std.mem.eql(u8, arg, "-b")) {
-            flags.bun = true;
             appendExecArg(exec_args_storage, &exec_len, arg);
             index += 1;
             continue;
         }
 
         if (std.mem.eql(u8, arg, "--shell") and index + 1 < args.len) {
-            flags.shell = if (std.mem.eql(u8, args[index + 1], "bun"))
-                .bun
-            else if (std.mem.eql(u8, args[index + 1], "system"))
-                .system
-            else
-                null;
             index += 2;
             continue;
         }
 
         if (std.mem.startsWith(u8, arg, "--shell=")) {
-            const shell = arg["--shell=".len..];
-            flags.shell = if (std.mem.eql(u8, shell, "bun"))
-                .bun
-            else if (std.mem.eql(u8, shell, "system"))
-                .system
-            else
-                null;
             index += 1;
             continue;
         }
@@ -3491,7 +3122,6 @@ pub fn main(init: std.process.Init) !void {
     }
     var args = try argsWithBunOptions(allocator, process_args, init.environ_map);
     args = try normalizeLeadingTestRuntimeFlags(allocator, args);
-    args = try normalizeLeadingPackageManagerConfig(allocator, args);
 
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
@@ -3501,10 +3131,77 @@ pub fn main(init: std.process.Init) !void {
     var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
-    if (package_manager_bunx.detectInvocation(args, init.environ_map.get("BUN_INTERNAL_BUNX_INSTALL") != null)) |invocation| {
-        const exit_code = try package_manager_bunx.run(init, args, invocation, stdout, stderr);
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--cottontail-lockfile-service")) {
+        const exit_code = package_manager_lockfile_service.run(
+            init,
+            args[2..],
+            stdout,
+            stderr,
+        ) catch |err| {
+            try stderr.print("cottontail: lockfile service failed: {s}\n", .{@errorName(err)});
+            try stderr.flush();
+            std.process.exit(1);
+        };
+        try stdout.flush();
+        try stderr.flush();
         if (exit_code != 0) std.process.exit(exit_code);
         return;
+    }
+
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--cottontail-scan-package-imports")) {
+        if (args.len < 4) {
+            try stderr.writeAll("cottontail: package import scan requires a working directory and entrypoint\n");
+            try stderr.flush();
+            std.process.exit(1);
+        }
+        const entry_points = try allocator.alloc([]const u8, args.len - 3);
+        for (args[3..], 0..) |entry_point, index| entry_points[index] = entry_point;
+        const working_dir = if (std.fs.path.isAbsolute(args[2]))
+            args[2]
+        else
+            std.Io.Dir.cwd().realPathFileAlloc(init.io, args[2], allocator) catch {
+                try stderr.print("cottontail: package import scan working directory not found: {s}\n", .{args[2]});
+                try stderr.flush();
+                std.process.exit(1);
+            };
+        const dependencies = package_manager_host.scanDependencies(
+            init,
+            allocator,
+            entry_points,
+            working_dir,
+            stderr,
+        ) catch |err| {
+            try stderr.print("cottontail: package import scan failed: {s}\n", .{@errorName(err)});
+            try stderr.flush();
+            std.process.exit(1);
+        };
+        try std.json.Stringify.value(dependencies, .{}, stdout);
+        try stdout.writeByte('\n');
+        try stdout.flush();
+        return;
+    }
+
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--cottontail-create-source-service")) {
+        const exit_code = cli_create_source_service.run(
+            init,
+            args[2..],
+            stdout,
+            stderr,
+        ) catch |err| {
+            try stderr.print("cottontail: create-source service failed: {s}\n", .{@errorName(err)});
+            try stderr.flush();
+            std.process.exit(1);
+        };
+        try stdout.flush();
+        try stderr.flush();
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
+    if (hutchCommandForArgs(args)) |command| {
+        try reportHutchCommand(stderr, command);
+        try stderr.flush();
+        std.process.exit(1);
     }
 
     if (args.len <= 1) {
@@ -3547,38 +3244,8 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
-    if (std.mem.eql(u8, arg, "init")) {
-        const exit_code = try cli_init.run(init, args[2..], stdout, stderr);
-        if (exit_code != 0) std.process.exit(exit_code);
-        return;
-    }
-
     if (std.mem.eql(u8, arg, "repl")) {
         const exit_code = try repl.run(init, args[2..]);
-        if (exit_code != 0) std.process.exit(exit_code);
-        return;
-    }
-
-    if (std.mem.eql(u8, arg, "create") or std.mem.eql(u8, arg, "c")) {
-        if (try cli_create_source.tryRun(init, args, stdout, stderr)) |result| {
-            switch (result) {
-                .exit_code => |exit_code| {
-                    if (exit_code != 0) std.process.exit(exit_code);
-                    return;
-                },
-                .start_dev => {
-                    const pkg = (try findPackageScripts(init.io, allocator, "dev")) orelse {
-                        try stderr.writeAll("error: Script not found \"dev\"\n");
-                        try stderr.flush();
-                        std.process.exit(1);
-                    };
-                    const exit_code = try runPackageScripts(init, pkg, .{}, &.{}, false);
-                    if (exit_code != 0) std.process.exit(exit_code);
-                    return;
-                },
-            }
-        }
-        const exit_code = try package_manager_create.run(init, args, stdout, stderr);
         if (exit_code != 0) std.process.exit(exit_code);
         return;
     }
@@ -3591,57 +3258,12 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, arg, "getcompletes")) {
-        // Mirrors `bun getcompletes`: emit completion candidates (builtin
-        // commands plus package.json scripts), one per line.
+        // Cottontail completion candidates are runtime commands only. Hutch
+        // owns project scripts and project-mutating commands.
         for (completion_commands) |name| {
             try stdout.print("{s}\n", .{name});
         }
-        if (std.Io.Dir.cwd().readFileAlloc(
-            init.io,
-            "package.json",
-            init.arena.allocator(),
-            .limited(16 * 1024 * 1024),
-        ) catch null) |source| {
-            if (std.json.parseFromSlice(std.json.Value, init.arena.allocator(), source, .{}) catch null) |parsed| {
-                if (parsed.value == .object) {
-                    if (parsed.value.object.get("scripts")) |scripts| {
-                        if (scripts == .object) {
-                            for (scripts.object.keys()) |script_name| {
-                                try stdout.print("{s}\n", .{script_name});
-                            }
-                        }
-                    }
-                }
-            }
-        }
         try stdout.flush();
-        return;
-    }
-
-    if (std.mem.endsWith(u8, arg, ".lockb")) {
-        if (std.Io.Dir.cwd().readFileAlloc(
-            init.io,
-            arg,
-            allocator,
-            .limited(256 * 1024 * 1024),
-        ) catch null) |lockfile_bytes| {
-            if (package_manager_bun_lockfile.isBinaryLockfile(lockfile_bytes)) {
-                try package_manager_bun_lockfile.writeYarnFromBinary(allocator, lockfile_bytes, stdout);
-                try stdout.flush();
-                return;
-            }
-        }
-    }
-
-    if (std.mem.eql(u8, arg, "upgrade")) {
-        const exit_code = try package_manager_upgrade.run(init, args, stdout, stderr);
-        if (exit_code != 0) std.process.exit(exit_code);
-        return;
-    }
-
-    if (package_manager_cli.recognizes(arg)) {
-        const exit_code = try package_manager_cli.run(init, args, stdout, stderr);
-        if (exit_code != 0) std.process.exit(exit_code);
         return;
     }
 
@@ -3683,11 +3305,6 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, arg, "build")) {
         const exit_code = try nativeBuild(init, args);
-        if (exit_code != 0) std.process.exit(exit_code);
-        return;
-    }
-
-    if (try cli_run.tryRun(init, args)) |exit_code| {
         if (exit_code != 0) std.process.exit(exit_code);
         return;
     }
@@ -3764,20 +3381,6 @@ pub fn main(init: std.process.Init) !void {
         const payload = invocation.payload;
         const path_like = std.mem.indexOfScalar(u8, payload, '/') != null or
             std.mem.indexOfScalar(u8, payload, '\\') != null;
-        if (!path_like and (invocation.flags.explicit_run or resolved_run_entrypoint == null)) {
-            if (try findPackageScripts(init.io, init.arena.allocator(), payload)) |pkg| {
-                const flags = try configuredRunScriptFlags(init, invocation.flags);
-                const script_exit = try runPackageScripts(
-                    init,
-                    pkg,
-                    flags,
-                    invocation.args,
-                    forcesBunRuntime(invocation.exec_args),
-                );
-                if (script_exit != 0) std.process.exit(script_exit);
-                return;
-            }
-        }
 
         const resolved_loader = if (resolved_run_entrypoint) |resolved|
             unsupportedEntrypointLoader(resolved)
@@ -3795,47 +3398,14 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        const fallback_can_yield_to_bin = resolved_loader != null and std.fs.path.extension(payload).len == 0;
-        if ((resolved_run_entrypoint == null or fallback_can_yield_to_bin) and !path_like) {
-            if (try findAncestorBin(init.io, init.arena.allocator(), payload)) |executable| {
-                const binary_exit = try runAncestorBin(
-                    init,
-                    executable,
-                    invocation.args,
-                    forcesBunRuntime(invocation.exec_args),
-                    invocation.flags.silent,
-                );
-                if (binary_exit != 0) std.process.exit(binary_exit);
-                return;
-            }
-            if (resolved_run_entrypoint == null and invocation.flags.explicit_run) {
-                if (try findSystemExecutable(
-                    init.io,
-                    init.arena.allocator(),
-                    init.environ_map.get("PATH") orelse "",
-                    payload,
-                )) |executable| {
-                    const binary_exit = try runAncestorBin(
-                        init,
-                        executable,
-                        invocation.args,
-                        forcesBunRuntime(invocation.exec_args),
-                        invocation.flags.silent,
-                    );
-                    if (binary_exit != 0) std.process.exit(binary_exit);
-                    return;
-                }
-            }
-        }
         if (resolved_loader) |loader| {
             try stderr.print("error: Cannot run \"{s}\" with the \"{s}\" loader\n", .{ resolved_run_entrypoint.?, loader });
             try stderr.flush();
             std.process.exit(1);
         }
         if (resolved_run_entrypoint == null) {
-            if (invocation.flags.if_present) return;
             if (!path_like and std.fs.path.extension(payload).len == 0) {
-                try stderr.print("error: Script not found \"{s}\"\n", .{payload});
+                try reportHutchScript(stderr, payload);
             } else {
                 try stderr.print("error: Module not found \"{s}\"\n", .{payload});
             }
@@ -3879,10 +3449,26 @@ pub fn main(init: std.process.Init) !void {
 
 test "help text mentions cottontail and script usage" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "cottontail") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "Bun is a fast JavaScript runtime") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "Bun-compatible JavaScript runtime") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "JavaScriptCore") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<entrypoint.js|entrypoint.ts>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "cottontail create") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "cottontail build") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "provided by Hutch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "cottontail create") == null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "cottontail install") == null);
+}
+
+test "build-time commands redirect to Hutch" {
+    const install = [_][:0]const u8{ "cottontail", "install" };
+    const configured_add = [_][:0]const u8{ "cottontail", "--config", "bunfig.toml", "add", "left-pad" };
+    const bunx = [_][:0]const u8{ "/tmp/bunx", "tool" };
+    const runtime = [_][:0]const u8{ "cottontail", "run", "index.ts" };
+
+    try std.testing.expectEqualStrings("install", hutchCommandForArgs(&install).?.replacement);
+    try std.testing.expectEqualStrings("add", hutchCommandForArgs(&configured_add).?.replacement);
+    try std.testing.expectEqualStrings("x", hutchCommandForArgs(&bunx).?.replacement);
+    try std.testing.expect(hutchCommandForArgs(&runtime) == null);
+    try std.testing.expectEqualStrings("cottontail update", hutchCommandForName("upgrade").?.replacement);
 }
 
 test "runtime flags can precede the test command" {

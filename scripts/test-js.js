@@ -205,24 +205,6 @@ try {
       stderrIncludes: ['3 pass', '0 fail'],
     },
     {
-      name: 'cli-init-regressions',
-      argv: ['test', join(rootDir, 'tests', 'js', 'cli-init.test.ts')],
-      env: {
-        COTTONTAIL_INIT_TEST_ROOT: join(rootDir, '.cottontail-tmp'),
-      },
-      expectExitCode: 0,
-      stderrIncludes: ['5 pass', '0 fail'],
-    },
-    {
-      name: 'cli-run-package-script-regressions',
-      argv: ['test', join(rootDir, 'tests', 'js', 'cli-run-package-scripts.test.ts')],
-      env: {
-        COTTONTAIL_CLI_RUN_TEST_ROOT: join(rootDir, '.cottontail-tmp'),
-      },
-      expectExitCode: 0,
-      stderrIncludes: ['3 pass', '0 fail'],
-    },
-    {
       name: 'module-syntax-in-multiline-string',
       scriptPath: join(rootDir, 'tests', 'js', 'module-syntax-in-multiline-string.js'),
       expectExitCode: 0,
@@ -385,31 +367,6 @@ try {
       },
       expectExitCode: 0,
       stdoutIncludes: ['bun package manager internals passed'],
-    },
-    {
-      name: 'package-manager-install-edges',
-      scriptPath: join(rootDir, 'tests', 'js', 'package-manager-install-edges.cjs'),
-      args: [binaryPath],
-      expectExitCode: 0,
-      stdoutIncludes: ['package-manager install edges: pass'],
-    },
-    {
-      name: 'bun-package-manager-link',
-      scriptPath: join(rootDir, 'tests', 'js', 'bun-package-manager-link.ts'),
-      env: {
-        COTTONTAIL_TMP_DIR: tempDir,
-      },
-      expectExitCode: 0,
-      stdoutIncludes: ['bun package manager link passed'],
-    },
-    {
-      name: 'package-manager-external-file-dependencies',
-      scriptPath: join(rootDir, 'tests', 'js', 'package-manager-external-file-dependencies.ts'),
-      env: {
-        COTTONTAIL_TMP_DIR: tempDir,
-      },
-      expectExitCode: 0,
-      stdoutIncludes: ['package manager external file dependencies passed'],
     },
     {
       name: 'bun-sqlite',

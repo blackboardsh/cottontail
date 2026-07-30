@@ -23,10 +23,20 @@ bun run compat:surface:all
 
 ## Upstream Test Snapshots
 
-`compat/upstream/` contains owned Cottontail snapshots copied from the Node and
-Bun repositories. These are intentionally committed into this repo so Cottontail
-can keep testing against known Node/Bun behavior even if those projects change,
-slow down, or Cottontail intentionally diverges.
+`compat/upstream/` contains snapshots copied from the Node and Bun repositories.
+Runtime tests remain owned here. Hutch owns 102 package-manager, project
+mutation, and package-script files copied into its own compatibility directory;
+the ownership index there assigns all 1,445 Bun v1.3.10 runnable files to
+exactly one repository. Together the repositories preserve the canonical
+denominator without double-counting tests. Hutch's executable report currently
+classifies those 102 files as 83 enabled and 19 inherited expected failures;
+run its `scripts/run-bun-package-manager-tests.js --check` command for the
+authoritative package-manager count.
+
+Cottontail-local package-manager and project-command regressions also live
+under Hutch's `tests/package-manager/` directory and run through
+`scripts/run-local-package-manager-tests.js`. Runtime-facing
+`bun:internal-for-testing` coverage remains here.
 
 The pinned upstream targets are recorded in:
 

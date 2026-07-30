@@ -10,7 +10,9 @@ code imports the subsystem as `cottontail_compiler`. Those internal names will
 be removed as the imported source is reduced to the compiler components used by
 Cottontail.
 
-The package-manager source is intentionally retained. Resolver auto-install is
-currently disabled at the compiler boundary until its network and event-loop
-dependencies are connected to Cottontail's runtime; it is not a dependency on
-an external Bun installation.
+Compiler-internal install data types and the legacy binary-lockfile codec are
+temporarily retained for narrow services invoked by Hutch. Public package
+management and project mutation live in Hutch. Cottontail does not expose
+package mutation or launch-time auto-install; runtime module resolution only
+reads modules already present on disk. This source is not a dependency on an
+external Bun installation.

@@ -784,7 +784,9 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
   const stdoutSourceFd = stdioSourceFd(stdoutOption);
   const stderrSourceFd = stdioSourceFd(stderrOption);
   const ipcRequested = options.ipc === true || ipcIndex !== -1;
-  const currentExecutable = command.file === globalThis.process?.execPath;
+  const currentExecutable = command.file === String(
+    globalThis.cottontail?.execPath?.() ?? globalThis.process?.execPath ?? "",
+  );
   const nodeIpcProtocol = options.__nodeIpcProtocol === true ||
     (options.__nodeIpcProtocol == null && ipcRequested && !currentExecutable);
   const useWindowsPipeIpc = isWindowsPlatform && ipcRequested;
@@ -832,7 +834,7 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
       delete nativeOptions.env.COTTONTAIL_IPC_STDIO;
     }
   }
-  const deferStart = command.file === globalThis.process?.execPath || options.__deferStart === true;
+  const deferStart = currentExecutable || options.__deferStart === true;
   let native = { id: -1, pid: 0, ipcFd: null };
   let windowsPipeIpcStream = null;
   let startReleased = !deferStart;

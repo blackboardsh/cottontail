@@ -4424,7 +4424,7 @@ function withoutElectrobunHostEnv(env) {
 }
 
 function isCurrentCottontailExecutable(file) {
-  const execPath = String(globalThis.process?.execPath ?? cottontail.execPath?.() ?? "");
+  const execPath = String(cottontail.execPath?.() ?? globalThis.process?.execPath ?? "");
   return execPath.length > 0 && String(file) === execPath;
 }
 

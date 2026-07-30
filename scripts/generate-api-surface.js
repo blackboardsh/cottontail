@@ -358,7 +358,8 @@ function upstreamStatusEntryForPath(status, path, defaultStatus = status.default
 }
 
 function assertUpstreamStatusSummary(summary) {
-  const classifiedTests = summary.enabled + summary.expectedFailure + summary.disabled;
+  const classifiedTests =
+    summary.enabled + summary.delegated + summary.expectedFailure + summary.disabled;
   if (summary.classifiedTests !== classifiedTests) {
     throw new Error(`classified upstream count mismatch: ${summary.classifiedTests} !== ${classifiedTests}`);
   }
@@ -374,6 +375,7 @@ function summarizeUpstreamRunnableStatuses(entries) {
   const summary = {
     discoveredRunnableFiles: entries.length,
     enabled: 0,
+    delegated: 0,
     expectedFailure: 0,
     disabled: 0,
     notEnabled: 0,
@@ -382,7 +384,8 @@ function summarizeUpstreamRunnableStatuses(entries) {
   const unknown = [];
 
   for (const entry of entries) {
-    if (entry.status === 'enabled') summary.enabled += 1;
+    if (entry.owner === 'hutch-package-manager') summary.delegated += 1;
+    else if (entry.status === 'enabled') summary.enabled += 1;
     else if (entry.status === 'expected-failure') summary.expectedFailure += 1;
     else if (upstreamDisabledStatuses.has(entry.status)) summary.disabled += 1;
     else if (entry.status === 'not-enabled') summary.notEnabled += 1;
@@ -393,7 +396,8 @@ function summarizeUpstreamRunnableStatuses(entries) {
     throw new Error(`unknown upstream test status(es): ${unknown.join(', ')}`);
   }
 
-  summary.classifiedTests = summary.enabled + summary.expectedFailure + summary.disabled;
+  summary.classifiedTests =
+    summary.enabled + summary.delegated + summary.expectedFailure + summary.disabled;
   assertUpstreamStatusSummary(summary);
   return summary;
 }

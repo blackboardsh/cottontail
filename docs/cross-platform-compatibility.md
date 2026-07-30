@@ -1,8 +1,9 @@
 # Cross-platform Node and Bun compatibility
 
 This runbook covers the work required for Cottontail to replace Bun as the
-runtime, test runner, build runner, and package manager in Electrobun, Dash
-Desktop, and Dash platform applications on macOS, Linux, and Windows.
+runtime and test runner, with Hutch owning project builds and package
+management, in Electrobun, Dash Desktop, and Dash platform applications on
+macOS, Linux, and Windows.
 
 Use `docs/cross-platform-bringup.md` first when a target does not build, link,
 smoke test, or package. This document starts where native release bring-up ends:
@@ -16,7 +17,10 @@ Cottontail owns these pinned upstream snapshots:
 - Node 24.11.1: on Linux, 4,969 source files recognized by Node's own
   `tools/test.py`, mapping to 4,962 harness selectors; all are currently
   enabled by the common Cottontail status contract.
-- Bun 1.3.10: 1,440 enabled files and five performance-only expected failures.
+- Bun 1.3.10: Cottontail owns 1,343 runtime files; Hutch owns 102
+  package-manager and project-command files. Cottontail's runtime tier contains
+  1,338 enabled files and five performance expected failures. Hutch currently
+  records 83 passing files and 19 inherited functional expected failures.
 
 The Node inventory is harness-derived rather than an extension scan. Files
 under `test/fixtures` and other helpers that Node's harness cannot select are
@@ -71,8 +75,8 @@ compatibility. Synchronous fatal signals remain owned by Cottontail's native
 crash handler rather than exposed as JavaScript signal events.
 
 Performance benchmarking and tuning remain deferred during this functional
-bring-up. The five existing Bun performance-only expected failures remain the
-only performance quarantines.
+bring-up. Cottontail's five performance expected failures remain separate from
+Hutch's 19 measured package-manager parity gaps.
 
 ## Definition of done
 
@@ -89,12 +93,13 @@ Each target must:
 1. Pass the native test, release build, smoke test, and packaging sequence.
 2. Pass Cottontail's local JavaScript behavior suite.
 3. Pass every platform-applicable enabled Node 24.11.1 upstream test.
-4. Pass every platform-applicable enabled Bun 1.3.10 upstream test.
-5. Preserve the five existing performance-only expected failures without adding
-   new expected failures, disabled tests, stubs, or Cottontail-only platform
-   skips.
-6. Install the Bun snapshot dependencies using Cottontail itself on a clean
-   platform-native `node_modules` tree.
+4. Pass every platform-applicable enabled Cottontail-owned Bun 1.3.10 runtime
+   test and every Hutch-owned enabled package-manager test.
+5. Preserve the five runtime performance expected failures and the 19 global
+   Hutch package-manager expected failures without adding platform-specific
+   expected failures, disabled tests, stubs, or Cottontail-only skips.
+6. Install the Bun snapshot dependencies using Hutch on a clean platform-native
+   `node_modules` tree.
 7. Run from the packaged archive outside the source checkout.
 8. Build and launch the real Dash Desktop and Dash platform application
    canaries with Bun absent from `PATH`.
@@ -192,11 +197,11 @@ Never copy the macOS Bun snapshot `node_modules` tree onto Linux or Windows.
 Optional packages and native addons are selected by operating system and
 architecture.
 
-Remove the ignored tree and bootstrap it with the Cottontail binary under test:
+Remove the ignored tree and bootstrap it with Hutch:
 
 ```sh
 rm -rf compat/upstream/bun/v1.3.10/test/node_modules
-./zig-out/bin/cottontail install \
+hutch install \
   --cwd compat/upstream/bun/v1.3.10/test \
   --ignore-scripts
 ```
@@ -208,14 +213,14 @@ Remove-Item -Recurse -Force `
   compat\upstream\bun\v1.3.10\test\node_modules `
   -ErrorAction SilentlyContinue
 
-.\zig-out\bin\cottontail.exe install `
+hutch.exe install `
   --cwd compat\upstream\bun\v1.3.10\test `
   --ignore-scripts
 ```
 
-If this fails, treat it as the first package-manager compatibility failure.
+If this fails, treat it as the first Hutch package-manager compatibility failure.
 An external Bun installation may be used temporarily to unblock unrelated
-runtime diagnosis, but the final platform gate must bootstrap with Cottontail.
+runtime diagnosis, but the final platform gate must bootstrap through Hutch.
 The upstream runner prepares its pinned DuckDB and Svelte fixtures when those
 tests are selected.
 
@@ -304,8 +309,9 @@ Fix shared behavior in the lowest correct layer:
 - Compiler and module loading: `src/cottontail_transpiler.zig`,
   `src/cottontail_bundler.zig`, `src/script_runner.zig`, and
   `src/compiler/src/`.
-- Package management: `src/package_manager_*.zig` and
-  `src/compiler/src/install/`.
+- Package management belongs to Hutch. Cottontail's narrow lockfile/service
+  adapters and retained `src/compiler/src/install/` data types only support
+  compiler and legacy-lockfile services during the migration.
 - JSC private ABI adapters: `src/jsc_*_bridge.cpp` and `src/napi_bridge.cpp`.
 
 Prefer Zig, libuv, OpenSSL, and the existing native host boundaries over
@@ -440,8 +446,9 @@ JSC ABI, atomics, or package optional dependencies are involved.
 
 - A timeout, crash, or missing fixture is not evidence that API behavior is
   implemented.
-- The five current Bun expected failures are performance quarantines. Functional
-  parity work must not add to that list.
+- The five Cottontail-owned expected failures are performance quarantines.
+  Hutch separately records 19 pre-existing functional package-manager gaps.
+  Cross-platform work must not add platform-specific exceptions to either list.
 
 ## Final native gate
 
@@ -455,6 +462,8 @@ node scripts/run-upstream-tests.js node
 node scripts/run-upstream-tests.js bun --jobs 2
 node scripts/run-upstream-tests.js bun \
   --include-expected-failures --jobs 2
+(cd ../dash-cloud/hutch && \
+  node scripts/run-bun-package-manager-tests.js --all --jobs 4)
 node scripts/package-release.js
 ```
 
@@ -474,7 +483,7 @@ Extract the packaged archive into a clean directory and repeat:
 - `bun:sqlite` imports for `Database`, `SQLiteError`, and `constants`
 - `cottontail test`
 - `cottontail build`
-- `cottontail install` in a clean fixture
+- `hutch install` in a clean fixture
 
 The packaged binary must not load libraries or runtime source from the checkout.
 
@@ -486,7 +495,7 @@ On Windows and both Linux architectures:
 
 1. Remove Bun from `PATH`.
 2. Point Hutch and Electrobun at the exact packaged Cottontail artifact.
-3. Install a clean dependency graph using Cottontail.
+3. Install a clean dependency graph using Hutch.
 4. Build Dash Desktop and the Dash platform applications.
 5. Launch the applications and exercise main-process startup, workers, child
    processes, filesystem access, networking, test execution, and rebuild/watch.
@@ -520,8 +529,10 @@ Use this prompt from the repository root on a native VM:
 > `docs/cross-platform-compatibility.md`. Work from the same committed revision
 > as the other platforms. First make the native build and local JavaScript suite
 > pass, then establish the upstream Node and Bun failure baseline. Group
-> failures by root cause and fix actual behavior in the lowest correct native or
-> runtime layer. Do not add stubs, expected failures, disabled tests, or
-> Cottontail-only platform skips. Use focused upstream files and subsystem runs
-> while iterating, preserve macOS behavior, and continue until the complete
-> platform-applicable enabled suites pass. Record exact commands and logs.
+> failures by root cause and fix actual behavior in the lowest correct native,
+> runtime, or Hutch package-manager layer. Run Cottontail-owned runtime files
+> here and Hutch-owned package-manager files from the sibling Hutch checkout.
+> Do not add stubs, expected failures, disabled tests, or Cottontail-only
+> platform skips. Use focused upstream files and subsystem runs while iterating,
+> preserve macOS behavior, and continue until the complete platform-applicable
+> enabled suites pass. Record exact commands and logs.

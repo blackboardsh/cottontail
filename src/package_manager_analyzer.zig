@@ -1,6 +1,12 @@
 const std = @import("std");
 const compiler = @import("cottontail_compiler");
 const bundler = @import("cottontail_bundler.zig");
+const native_transpiler = @import("cottontail_transpiler.zig");
+
+const ScannedImport = struct {
+    path: []const u8,
+    kind: []const u8,
+};
 
 pub fn scan(
     allocator: std.mem.Allocator,
@@ -17,6 +23,20 @@ pub fn scan(
             try std.fs.path.resolve(allocator, &.{entry_point})
         else
             try std.fs.path.resolve(allocator, &.{ working_dir, entry_point });
+
+        const entry_source = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            absolute_entry,
+            allocator,
+            .limited(64 * 1024 * 1024),
+        );
+        try collectImports(
+            allocator,
+            entry_source,
+            loaderForPath(absolute_entry),
+            &dependencies,
+            &seen,
+        );
 
         var error_message: ?[*:0]u8 = null;
         const bundled = bundler.bundleEntryPointWithOptions(
@@ -40,32 +60,58 @@ pub fn scan(
         defer bundler.ct_bundle_free(bundled.ptr, bundled.len);
         defer if (error_message) |message| bundler.ct_bundle_string_free(message);
 
-        var log = compiler.logger.Log.init(allocator);
-        const source = compiler.logger.Source.initPathString(absolute_entry, bundled);
-        const define = try compiler.Define.init(allocator, null, null, false, false);
-        var options = compiler.js_parser.Parser.Options.init(.{}, .js);
-        var macro_context = compiler.ast.Macro.MacroContext.initStandalone();
-        options.macro_context = &macro_context;
-        options.bundle = false;
-        var parser = try compiler.js_parser.Parser.init(options, &log, &source, define, allocator);
-        var scan_pass = compiler.js_parser.ScanPassResult.init(allocator);
-        try parser.scanImports(&scan_pass);
-        if (log.errors > 0) {
-            log.print(stderr) catch {};
-            return error.PackageManagerErrorReported;
-        }
-
-        for (scan_pass.import_records.items) |record| {
-            if (record.flags.is_unused) continue;
-            const package_name = packageName(record.path.text) orelse continue;
-            if (seen.contains(package_name)) continue;
-            try seen.put(try allocator.dupe(u8, package_name), {});
-            try dependencies.append(allocator, try allocator.dupe(u8, package_name));
-        }
+        try collectImports(
+            allocator,
+            bundled,
+            "js",
+            &dependencies,
+            &seen,
+        );
     }
 
-    _ = io;
     return dependencies.toOwnedSlice(allocator);
+}
+
+fn collectImports(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    loader: []const u8,
+    dependencies: *std.ArrayList([]const u8),
+    seen: *std.StringHashMap(void),
+) !void {
+    const imports_json = try native_transpiler.scanImportsJson(source, loader);
+    defer std.heap.c_allocator.free(imports_json);
+    const parsed = try std.json.parseFromSlice(
+        []const ScannedImport,
+        allocator,
+        imports_json,
+        .{},
+    );
+    defer parsed.deinit();
+
+    for (parsed.value) |record| {
+        const package_name = packageName(record.path) orelse continue;
+        if (seen.contains(package_name)) continue;
+        try seen.put(try allocator.dupe(u8, package_name), {});
+        try dependencies.append(allocator, try allocator.dupe(u8, package_name));
+    }
+}
+
+fn loaderForPath(path: []const u8) []const u8 {
+    const extension = std.fs.path.extension(path);
+    inline for (&.{
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".mjs",
+        ".mts",
+        ".cjs",
+        ".cts",
+    }) |candidate| {
+        if (std.mem.eql(u8, extension, candidate)) return candidate[1..];
+    }
+    return "js";
 }
 
 fn packageName(specifier: []const u8) ?[]const u8 {
