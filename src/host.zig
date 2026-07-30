@@ -1259,6 +1259,16 @@ pub export fn ct_host_exists(path: [*:0]const u8) bool {
     return true;
 }
 
+pub export fn ct_host_mime_type_by_extension(
+    extension_ptr: [*]const u8,
+    extension_len: usize,
+    result_len_out: *usize,
+) [*]const u8 {
+    const mime_type = compiler.http.MimeType.byExtension(extension_ptr[0..extension_len]);
+    result_len_out.* = mime_type.value.len;
+    return mime_type.value.ptr;
+}
+
 const fs_walk_magic = "CTFW";
 
 // Wire format: magic, entry count, then mode/descend and four length-prefixed

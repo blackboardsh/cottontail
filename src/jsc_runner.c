@@ -1903,6 +1903,11 @@ typedef struct {
 extern void ct_host_string_free(char *value);
 extern void ct_host_buffer_free(char *value);
 extern bool ct_host_exists(const char *path);
+extern const uint8_t *ct_host_mime_type_by_extension(
+    const uint8_t *extension,
+    size_t extension_len,
+    size_t *result_len_out
+);
 extern uint8_t *ct_host_walk_dir(
     const char *root,
     const char *prefix,
@@ -24056,6 +24061,52 @@ static JSValueRef ct_exists_sync(JSContextRef ctx, JSObjectRef function, JSObjec
     bool exists = path != NULL && ct_host_exists(ct_platform_file_path(path));
     free(path);
     return JSValueMakeBoolean(ctx, exists);
+}
+
+static JSValueRef ct_mime_type_by_extension(
+    JSContextRef ctx,
+    JSObjectRef function,
+    JSObjectRef thisObject,
+    size_t argc,
+    const JSValueRef argv[],
+    JSValueRef *exception
+) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1 || !JSValueIsString(ctx, argv[0])) {
+        ct_throw_type_error(ctx, exception, "mimeTypeByExtension(extension) requires a string");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSStringRef extension_string = JSValueToStringCopy(ctx, argv[0], exception);
+    if (extension_string == NULL || (exception != NULL && *exception != NULL)) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    const size_t extension_len = JSStringGetLength(extension_string);
+    if (extension_len > 64) {
+        JSStringRelease(extension_string);
+        return ct_make_string(ctx, "application/octet-stream");
+    }
+
+    const JSChar *characters = JSStringGetCharactersPtr(extension_string);
+    uint8_t extension[64];
+    for (size_t index = 0; index < extension_len; index += 1) {
+        if (characters[index] > 0x7f) {
+            JSStringRelease(extension_string);
+            return ct_make_string(ctx, "application/octet-stream");
+        }
+        extension[index] = (uint8_t)characters[index];
+    }
+    JSStringRelease(extension_string);
+
+    size_t result_len = 0;
+    const uint8_t *result = ct_host_mime_type_by_extension(
+        extension,
+        extension_len,
+        &result_len
+    );
+    return ct_make_string_len(ctx, (const char *)result, result_len);
 }
 
 typedef struct CtStatTimestamp {
