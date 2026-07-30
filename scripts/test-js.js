@@ -1132,7 +1132,15 @@ try {
     },
   ];
 
-  for (const testCase of tests) {
+  const startAtOption = process.argv.indexOf('--start-at');
+  const startAtName = startAtOption === -1 ? null : process.argv[startAtOption + 1];
+  if (startAtOption !== -1 && !startAtName) fail('--start-at requires a test case name');
+  const startAtIndex = startAtName == null
+    ? 0
+    : tests.findIndex(testCase => testCase.name === startAtName);
+  if (startAtIndex === -1) fail(`Unknown --start-at test case: ${startAtName}`);
+
+  for (const testCase of tests.slice(startAtIndex)) {
     runCase(testCase);
     assertRepositoryMetadataUnchanged(testCase.name);
   }
