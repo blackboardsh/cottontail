@@ -13979,10 +13979,17 @@ function consumeEmojiSequence(text, index) {
   }
 }
 
+const STRING_WIDTH_NATIVE_MIN_LENGTH = 16;
+
 export function stringWidth(value, options = undefined) {
   const text = String(value ?? "");
   const countAnsiEscapeCodes = options?.countAnsiEscapeCodes === true;
   const ambiguousIsNarrow = options?.ambiguousIsNarrow !== false;
+  if (text.length >= STRING_WIDTH_NATIVE_MIN_LENGTH) {
+    const nativeWidth = cottontail.stringWidthNative(text, countAnsiEscapeCodes, ambiguousIsNarrow);
+    if (nativeWidth >= 0) return nativeWidth;
+  }
+
   let width = 0;
   for (let index = 0; index < text.length;) {
     const ansiEnd = countAnsiEscapeCodes ? index : skipAnsiSequence(text, index);

@@ -217,6 +217,12 @@ try {
       stderrIncludes: ['8 pass', '0 fail'],
     },
     {
+      name: 'bun-string-width-native',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-string-width-native.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['7 pass', '0 fail'],
+    },
+    {
       name: 'bun-glob-native',
       argv: ['test', join(rootDir, 'tests', 'js', 'bun-glob-native.test.ts')],
       expectExitCode: 0,

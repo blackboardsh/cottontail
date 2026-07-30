@@ -434,6 +434,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             "src/native_bindings/tls.c",
             "src/native_bindings/sqlite.c",
             "src/native_bindings/sql_wire.c",
+            "src/native_bindings/string_width.c",
             "src/native_bindings/url.c",
             "src/native_bindings/platform.c",
             "src/native_bindings/path.c",

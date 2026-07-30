@@ -8,6 +8,7 @@ const process = @import("native_bindings/host/process.zig");
 const sql_wire = @import("native_bindings/host/sql_wire.zig");
 const text_encoding = @import("native_bindings/host/text_encoding.zig");
 const strip_ansi = @import("native_bindings/host/strip_ansi.zig");
+const string_width = @import("native_bindings/host/string_width.zig");
 const tooling = @import("native_bindings/host/tooling.zig");
 const uuid = @import("native_bindings/host/uuid.zig");
 const websocket_frame = @import("native_bindings/host/websocket_frame.zig");
@@ -23,6 +24,7 @@ pub fn forceLink() void {
     sql_wire.forceLink();
     text_encoding.forceLink();
     strip_ansi.forceLink();
+    string_width.forceLink();
     tooling.forceLink();
     uuid.forceLink();
     websocket_frame.forceLink();
