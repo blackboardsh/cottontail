@@ -119,6 +119,39 @@ static JSValueRef ct_buffer_index_of_native(
     return JSValueMakeNumber(context, (double)result);
 }
 
+static JSValueRef ct_buffer_index_of_line_native(
+    JSContextRef context,
+    JSObjectRef function,
+    JSObjectRef this_object,
+    size_t argument_count,
+    const JSValueRef arguments[],
+    JSValueRef *exception
+) {
+    (void)function;
+    (void)this_object;
+    if (argument_count < 3) {
+        ct_throw_type_error(context, exception, "bufferIndexOfLine requires a buffer, offset, and end");
+        return JSValueMakeUndefined(context);
+    }
+
+    uint8_t *buffer = NULL;
+    size_t buffer_length = 0;
+    size_t offset = 0;
+    size_t end = 0;
+    if (!ct_buffer_get_bytes(context, arguments[0], &buffer, &buffer_length, exception) ||
+        !ct_buffer_get_index(context, arguments[1], &offset, exception) ||
+        !ct_buffer_get_index(context, arguments[2], &end, exception)) {
+        return JSValueMakeUndefined(context);
+    }
+    if (offset >= end || offset >= buffer_length) {
+        return JSValueMakeNumber(context, -1);
+    }
+
+    end = end < buffer_length ? end : buffer_length;
+    ptrdiff_t result = ct_buffer_index_of_line(buffer, end, offset);
+    return JSValueMakeNumber(context, (double)result);
+}
+
 static JSValueRef ct_buffer_fill_pattern_native(
     JSContextRef context,
     JSObjectRef function,

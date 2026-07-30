@@ -57,6 +57,16 @@ pub export fn ct_buffer_index_of(
     return @intCast(found);
 }
 
+pub export fn ct_buffer_index_of_line(
+    buffer_pointer: ?[*]const u8,
+    buffer_length: usize,
+    offset: usize,
+) isize {
+    const buffer = constBytes(buffer_pointer, buffer_length) orelse return -1;
+    const found = std.mem.findScalarPos(u8, buffer, offset, '\n') orelse return -1;
+    return @intCast(found);
+}
+
 fn rangesOverlap(left: []const u8, right: []const u8) bool {
     if (left.len == 0 or right.len == 0) return false;
     const left_address = @intFromPtr(left.ptr);
@@ -126,6 +136,30 @@ test "buffer search handles both directions" {
         needle.len,
         haystack.len - needle.len,
         1,
+    ));
+}
+
+test "line search uses byte offsets" {
+    const buffer = "one\r\ntwo\nthree";
+    try std.testing.expectEqual(@as(isize, 4), ct_buffer_index_of_line(
+        buffer.ptr,
+        buffer.len,
+        0,
+    ));
+    try std.testing.expectEqual(@as(isize, 8), ct_buffer_index_of_line(
+        buffer.ptr,
+        buffer.len,
+        5,
+    ));
+    try std.testing.expectEqual(@as(isize, -1), ct_buffer_index_of_line(
+        buffer.ptr,
+        buffer.len,
+        9,
+    ));
+    try std.testing.expectEqual(@as(isize, -1), ct_buffer_index_of_line(
+        buffer.ptr,
+        buffer.len,
+        buffer.len,
     ));
 }
 

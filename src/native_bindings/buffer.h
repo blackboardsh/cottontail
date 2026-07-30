@@ -20,6 +20,12 @@ ptrdiff_t ct_buffer_index_of(
     uint8_t reverse
 );
 
+ptrdiff_t ct_buffer_index_of_line(
+    const uint8_t *buffer,
+    size_t buffer_length,
+    size_t offset
+);
+
 int ct_buffer_fill_pattern(
     uint8_t *target,
     size_t target_length,

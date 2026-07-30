@@ -205,6 +205,12 @@ try {
       stderrIncludes: ['5 pass', '0 fail'],
     },
     {
+      name: 'bun-index-of-line-native',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-index-of-line-native.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['8 pass', '0 fail'],
+    },
+    {
       name: 'bun-glob-native',
       argv: ['test', join(rootDir, 'tests', 'js', 'bun-glob-native.test.ts')],
       expectExitCode: 0,

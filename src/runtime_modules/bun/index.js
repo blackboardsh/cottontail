@@ -14213,14 +14213,81 @@ export function wrapAnsi(value, columns = 80, options = {}) {
   return output;
 }
 
+const nativeIndexOfLine = globalThis.cottontail?.bufferIndexOfLine;
+const nativeIndexOfLineThreshold = 256 * 1_024;
+const jscIndexOfLineThreshold = 128;
+const typedArrayIndexOf = Uint8Array.prototype.indexOf;
+const indexOfLineTypedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const indexOfLineTypedArrayBufferGetter = Object.getOwnPropertyDescriptor(
+  indexOfLineTypedArrayPrototype,
+  "buffer",
+)?.get;
+const indexOfLineTypedArrayByteLengthGetter = Object.getOwnPropertyDescriptor(
+  indexOfLineTypedArrayPrototype,
+  "byteLength",
+)?.get;
+
+function indexOfLineJSTail(bytes, index) {
+  for (; index < bytes.byteLength; index += 1) {
+    if (bytes[index] === 10) return index;
+  }
+  return -1;
+}
+
+function indexOfLineTail(bytes, index, byteLength) {
+  if (
+    !ArrayBuffer.isView(bytes) ||
+    typeof indexOfLineTypedArrayByteLengthGetter !== "function"
+  ) {
+    return indexOfLineJSTail(bytes, index);
+  }
+
+  let actualByteLength;
+  try {
+    actualByteLength = indexOfLineTypedArrayByteLengthGetter.call(bytes);
+  } catch {
+    return indexOfLineJSTail(bytes, index);
+  }
+
+  // An own byteLength getter can detach the view after reporting a length.
+  if (actualByteLength === 0 && byteLength > 0) return -1;
+
+  // An overridden shorter byteLength is observable in the original loop.
+  if (byteLength < actualByteLength) return indexOfLineJSTail(bytes, index);
+
+  const scanEnd = Math.min(byteLength, actualByteLength);
+  const hasSharedStorage =
+    typeof SharedArrayBuffer === "function" &&
+    typeof indexOfLineTypedArrayBufferGetter === "function" &&
+    indexOfLineTypedArrayBufferGetter.call(bytes) instanceof SharedArrayBuffer;
+  if (
+    !hasSharedStorage &&
+    typeof nativeIndexOfLine === "function" &&
+    scanEnd - index >= nativeIndexOfLineThreshold
+  ) {
+    return nativeIndexOfLine(bytes, index, byteLength);
+  }
+  return typedArrayIndexOf.call(bytes, 10, index);
+}
+
 export function indexOfLine(value, offset = 0) {
   const bytes = asBuffer(value);
   const startNumber = Number(offset);
   const start = Number.isFinite(startNumber) ? Math.max(0, Math.trunc(startNumber)) : 0;
-  for (let index = start; index < bytes.byteLength; index += 1) {
+  let index = start;
+  const byteLength = bytes.byteLength;
+  if (
+    !Number.isSafeInteger(byteLength) ||
+    byteLength - start < jscIndexOfLineThreshold
+  ) {
+    return indexOfLineJSTail(bytes, index);
+  }
+
+  const earlyEnd = Math.min(byteLength, start + 2);
+  for (; index < earlyEnd; index += 1) {
     if (bytes[index] === 10) return index;
   }
-  return -1;
+  return indexOfLineTail(bytes, index, byteLength);
 }
 
 export function fileURLToPath(value) {
