@@ -2820,7 +2820,7 @@ function makeExcludeMatcher(exclude) {
   return path => matchers.some(matcher => matcher(path.replaceAll("\\", "/")));
 }
 
-function walkGlobEntries(root, prefix = "", seenDirectories = new Set()) {
+function walkGlobEntriesFallback(root, prefix = "", seenDirectories = new Set()) {
   const out = [];
   for (const dirent of readdirSync(root, { withFileTypes: true })) {
     const name = String(dirent.name);
@@ -2850,9 +2850,23 @@ function walkGlobEntries(root, prefix = "", seenDirectories = new Set()) {
     try { real = realpathSync(fullPath); } catch {}
     if (seenDirectories.has(real)) continue;
     seenDirectories.add(real);
-    out.push(...walkGlobEntries(fullPath, relative, seenDirectories));
+    out.push(...walkGlobEntriesFallback(fullPath, relative, seenDirectories));
   }
   return out;
+}
+
+function walkGlobEntries(root, prefix = "") {
+  assertFsRead(root);
+  if (typeof cottontail.walkDirSync !== "function") {
+    const seenDirectories = new Set();
+    try { seenDirectories.add(realpathSync(root)); } catch {}
+    return walkGlobEntriesFallback(root, prefix, seenDirectories);
+  }
+  try {
+    return cottontail.walkDirSync(root, prefix);
+  } catch (error) {
+    throw makeFsError(error, error?.path ?? root, error?.syscall ?? "scandir");
+  }
 }
 
 function hasHiddenGlobSegment(path) {
@@ -2867,11 +2881,9 @@ function globEntriesForPattern(pattern, cwd) {
   const root = normalizePath(resolve(cwd, scan.isGlob ? base : dirname(patternBody)));
   const outputPrefix = absolute ? "" : normalizeGlobPattern(relative(cwd, root));
   const prefix = outputPrefix === "." ? "" : outputPrefix;
-  const seenDirectories = new Set();
-  try { seenDirectories.add(realpathSync(root)); } catch {}
   let entries;
   try {
-    entries = walkGlobEntries(root, prefix, seenDirectories);
+    entries = walkGlobEntries(root, prefix);
   } catch (error) {
     if (root !== cwd && (error?.code === "ENOENT" || error?.code === "ENOTDIR")) return [];
     throw error;
@@ -2926,7 +2938,7 @@ export function globSync(pattern, options) {
       if (excludedDirectoryPrefixes.some(prefix => entry.candidate.startsWith(prefix))) continue;
       const outputPath = globPathOutput(entry.candidate);
       const output = withFileTypes
-        ? new Dirent(entry.entry.name, entry.entry.stats, entry.entry.parentPath)
+        ? new Dirent(entry.entry.name, entry.entry.stats ?? entry.entry, entry.entry.parentPath)
         : outputPath;
       const excludeValue = withFileTypes && typeof excludeOption === "function" ? output : outputPath;
       let excludeChecked = false;

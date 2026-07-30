@@ -1258,6 +1258,187 @@ pub export fn ct_host_exists(path: [*:0]const u8) bool {
     return true;
 }
 
+const fs_walk_magic = "CTFW";
+
+// Wire format: magic, entry count, then mode/descend and four length-prefixed
+// strings (name, full path, parent path, relative path) for each entry.
+fn appendU32Le(output: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u32) !void {
+    try output.appendSlice(allocator, &.{
+        @truncate(value),
+        @truncate(value >> 8),
+        @truncate(value >> 16),
+        @truncate(value >> 24),
+    });
+}
+
+fn appendWalkString(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    value: []const u8,
+) !void {
+    if (value.len > std.math.maxInt(u32)) return error.NameTooLong;
+    try appendU32Le(output, allocator, @intCast(value.len));
+    try output.appendSlice(allocator, value);
+}
+
+fn fileKindMode(kind: std.Io.File.Kind) u32 {
+    return switch (kind) {
+        .named_pipe => 0o010000,
+        .character_device => 0o020000,
+        .directory => 0o040000,
+        .block_device => 0o060000,
+        .file => 0o100000,
+        .sym_link => 0o120000,
+        .unix_domain_socket => 0o140000,
+        else => 0,
+    };
+}
+
+const FsWalkContext = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    output: *std.ArrayList(u8),
+    seen_directories: *std.StringHashMap(void),
+    count: u32 = 0,
+    error_path: ?[]const u8 = null,
+    error_syscall: []const u8 = "scandir",
+
+    fn appendEntry(
+        self: *FsWalkContext,
+        name: []const u8,
+        full_path: []const u8,
+        parent_path: []const u8,
+        relative_path: []const u8,
+        mode: u32,
+        descends: bool,
+    ) !void {
+        if (self.count == std.math.maxInt(u32)) return error.TooManyFiles;
+        const output_allocator = std.heap.c_allocator;
+        try appendU32Le(self.output, output_allocator, mode);
+        try self.output.append(output_allocator, @intFromBool(descends));
+        try appendWalkString(self.output, output_allocator, name);
+        try appendWalkString(self.output, output_allocator, full_path);
+        try appendWalkString(self.output, output_allocator, parent_path);
+        try appendWalkString(self.output, output_allocator, relative_path);
+        self.count += 1;
+    }
+
+    fn walk(self: *FsWalkContext, directory: []const u8, prefix: []const u8) !void {
+        const cwd = std.Io.Dir.cwd();
+        var dir = cwd.openDir(self.io, directory, .{ .iterate = true }) catch |err| {
+            self.error_path = directory;
+            self.error_syscall = "scandir";
+            return err;
+        };
+        defer dir.close(self.io);
+
+        var iterator = dir.iterate();
+        while (iterator.next(self.io) catch |err| {
+            self.error_path = directory;
+            self.error_syscall = "scandir";
+            return err;
+        }) |entry| {
+            const name = try self.allocator.dupe(u8, entry.name);
+            const full_path = try std.fs.path.join(self.allocator, &.{ directory, name });
+            const relative_path = if (prefix.len == 0)
+                try self.allocator.dupe(u8, name)
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ prefix, name });
+
+            const link_stat = cwd.statFile(self.io, full_path, .{ .follow_symlinks = false }) catch |err| {
+                self.error_path = full_path;
+                self.error_syscall = "lstat";
+                return err;
+            };
+            var descends = link_stat.kind == .directory;
+            if (!descends and link_stat.kind == .sym_link) {
+                const followed = cwd.statFile(self.io, full_path, .{ .follow_symlinks = true }) catch null;
+                descends = followed != null and followed.?.kind == .directory;
+            }
+
+            try self.appendEntry(
+                name,
+                full_path,
+                directory,
+                relative_path,
+                fileKindMode(link_stat.kind),
+                descends,
+            );
+            if (!descends) continue;
+
+            const canonical = cwd.realPathFileAlloc(self.io, full_path, self.allocator) catch
+                try self.allocator.dupeZ(u8, full_path);
+            if (self.seen_directories.contains(canonical)) continue;
+            try self.seen_directories.put(canonical, {});
+            try self.walk(full_path, relative_path);
+        }
+    }
+};
+
+pub export fn ct_host_walk_dir(
+    root: [*:0]const u8,
+    prefix: [*:0]const u8,
+    output_len: *usize,
+    error_out: *?[*:0]u8,
+    error_path_out: *?[*:0]u8,
+    error_syscall_out: *?[*:0]u8,
+) ?[*]u8 {
+    output_len.* = 0;
+    error_out.* = null;
+    error_path_out.* = null;
+    error_syscall_out.* = null;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root_path = std.mem.span(root);
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.heap.c_allocator);
+    output.appendSlice(std.heap.c_allocator, fs_walk_magic) catch {
+        setErrorOut(error_out, "OutOfMemory");
+        return null;
+    };
+    appendU32Le(&output, std.heap.c_allocator, 0) catch {
+        setErrorOut(error_out, "OutOfMemory");
+        return null;
+    };
+
+    var seen_directories = std.StringHashMap(void).init(allocator);
+    defer seen_directories.deinit();
+    const cwd = std.Io.Dir.cwd();
+    if (cwd.realPathFileAlloc(getIo(), root_path, allocator)) |canonical_root| {
+        seen_directories.put(canonical_root, {}) catch {
+            setErrorOut(error_out, "OutOfMemory");
+            return null;
+        };
+    } else |_| {}
+
+    var context: FsWalkContext = .{
+        .allocator = allocator,
+        .io = getIo(),
+        .output = &output,
+        .seen_directories = &seen_directories,
+    };
+    context.walk(root_path, std.mem.span(prefix)) catch |err| {
+        setFormattedErrorOut(error_out, "{s}: {s}", .{ @errorName(err), root_path });
+        setErrorOut(error_path_out, context.error_path orelse root_path);
+        setErrorOut(error_syscall_out, context.error_syscall);
+        return null;
+    };
+
+    output.items[4] = @truncate(context.count);
+    output.items[5] = @truncate(context.count >> 8);
+    output.items[6] = @truncate(context.count >> 16);
+    output.items[7] = @truncate(context.count >> 24);
+    const owned = output.toOwnedSlice(std.heap.c_allocator) catch {
+        setErrorOut(error_out, "OutOfMemory");
+        return null;
+    };
+    output_len.* = owned.len;
+    return owned.ptr;
+}
+
 pub export fn ct_host_mkdir(path: [*:0]const u8, recursive: bool, error_out: *?[*:0]u8) c_int {
     error_out.* = null;
 

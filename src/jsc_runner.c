@@ -1879,6 +1879,14 @@ typedef struct {
 extern void ct_host_string_free(char *value);
 extern void ct_host_buffer_free(char *value);
 extern bool ct_host_exists(const char *path);
+extern uint8_t *ct_host_walk_dir(
+    const char *root,
+    const char *prefix,
+    size_t *output_len,
+    char **error_out,
+    char **error_path_out,
+    char **error_syscall_out
+);
 extern int ct_host_mkdir(const char *path, bool recursive, char **error_out);
 extern int ct_host_rm(const char *path, bool recursive, bool force, char **error_out);
 extern int ct_host_rmdir(const char *path, char **error_out);
@@ -24321,6 +24329,138 @@ static JSValueRef ct_read_dir_sync(JSContextRef ctx, JSObjectRef function, JSObj
     free(path);
     return result;
 #endif
+}
+
+static bool ct_fs_walk_read_u32(
+    const uint8_t *data,
+    size_t data_len,
+    size_t *offset,
+    uint32_t *value_out
+) {
+    if (*offset > data_len || data_len - *offset < 4) return false;
+    const uint8_t *value = data + *offset;
+    *value_out =
+        (uint32_t)value[0] |
+        ((uint32_t)value[1] << 8) |
+        ((uint32_t)value[2] << 16) |
+        ((uint32_t)value[3] << 24);
+    *offset += 4;
+    return true;
+}
+
+static bool ct_fs_walk_read_string(
+    JSContextRef ctx,
+    const uint8_t *data,
+    size_t data_len,
+    size_t *offset,
+    JSValueRef *value_out
+) {
+    uint32_t length = 0;
+    if (!ct_fs_walk_read_u32(data, data_len, offset, &length)) return false;
+    if (*offset > data_len || data_len - *offset < (size_t)length) return false;
+    *value_out = ct_make_string_len(ctx, (const char *)(data + *offset), (size_t)length);
+    *offset += (size_t)length;
+    return true;
+}
+
+static JSValueRef ct_walk_dir_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "walkDirSync(root[, prefix]) requires a root path");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    char *root = ct_value_to_string_copy(ctx, argv[0]);
+    char *prefix = argc >= 2 ? ct_value_to_string_copy(ctx, argv[1]) : strdup("");
+    if (root == NULL || prefix == NULL) {
+        free(root);
+        free(prefix);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t data_len = 0;
+    char *error = NULL;
+    char *error_path = NULL;
+    char *error_syscall = NULL;
+    uint8_t *data = ct_host_walk_dir(root, prefix, &data_len, &error, &error_path, &error_syscall);
+    free(root);
+    free(prefix);
+    if (data == NULL) {
+        if (exception != NULL) {
+            JSValueRef argument = ct_make_string(ctx, error != NULL ? error : "Filesystem walk failed");
+            JSObjectRef error_object = JSObjectMakeError(ctx, 1, &argument, NULL);
+            if (error_path != NULL) {
+                ct_set_property(ctx, error_object, "path", ct_make_string(ctx, error_path), NULL);
+            }
+            if (error_syscall != NULL) {
+                ct_set_property(ctx, error_object, "syscall", ct_make_string(ctx, error_syscall), NULL);
+            }
+            *exception = error_object;
+        }
+        if (error != NULL) ct_host_string_free(error);
+        if (error_path != NULL) ct_host_string_free(error_path);
+        if (error_syscall != NULL) ct_host_string_free(error_syscall);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (error_path != NULL) ct_host_string_free(error_path);
+    if (error_syscall != NULL) ct_host_string_free(error_syscall);
+
+    size_t offset = 0;
+    uint32_t count = 0;
+    if (data_len < 8 || memcmp(data, "CTFW", 4) != 0) goto invalid_data;
+    offset = 4;
+    if (!ct_fs_walk_read_u32(data, data_len, &offset, &count)) goto invalid_data;
+
+    JSObjectRef result = ct_make_array(ctx, 0, NULL, exception);
+    if (result == NULL || (exception != NULL && *exception != NULL)) {
+        ct_host_buffer_free((char *)data);
+        return JSValueMakeUndefined(ctx);
+    }
+    for (uint32_t index = 0; index < count; index++) {
+        uint32_t mode = 0;
+        if (!ct_fs_walk_read_u32(data, data_len, &offset, &mode)) goto invalid_data;
+        if (offset >= data_len) goto invalid_data;
+        bool descends = data[offset++] != 0;
+
+        JSValueRef name = NULL;
+        JSValueRef full_path = NULL;
+        JSValueRef parent_path = NULL;
+        JSValueRef relative = NULL;
+        if (!ct_fs_walk_read_string(ctx, data, data_len, &offset, &name) ||
+            !ct_fs_walk_read_string(ctx, data, data_len, &offset, &full_path) ||
+            !ct_fs_walk_read_string(ctx, data, data_len, &offset, &parent_path) ||
+            !ct_fs_walk_read_string(ctx, data, data_len, &offset, &relative)) {
+            goto invalid_data;
+        }
+
+        JSObjectRef item = ct_make_object(ctx);
+        ct_set_property(ctx, item, "name", name, exception);
+        ct_set_property(ctx, item, "fullPath", full_path, exception);
+        ct_set_property(ctx, item, "parentPath", parent_path, exception);
+        ct_set_property(ctx, item, "relative", relative, exception);
+        ct_set_property(ctx, item, "mode", JSValueMakeNumber(ctx, (double)mode), exception);
+        ct_set_property(ctx, item, "descends", JSValueMakeBoolean(ctx, descends), exception);
+        if (exception != NULL && *exception != NULL) {
+            ct_host_buffer_free((char *)data);
+            return JSValueMakeUndefined(ctx);
+        }
+        JSObjectSetPropertyAtIndex(ctx, result, index, item, exception);
+        if (exception != NULL && *exception != NULL) {
+            ct_host_buffer_free((char *)data);
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+    if (offset != data_len) goto invalid_data;
+
+    ct_host_buffer_free((char *)data);
+    return result;
+
+invalid_data:
+    ct_host_buffer_free((char *)data);
+    ct_throw_message(ctx, exception, "Invalid native filesystem walk response");
+    return JSValueMakeUndefined(ctx);
 }
 
 static JSValueRef ct_mkdir_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
