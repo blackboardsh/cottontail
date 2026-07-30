@@ -2,8 +2,6 @@ import "../internal/v8-date-parser.js";
 import * as FFI from "./ffi.js";
 import { plugin } from "./plugin.js";
 export { plugin };
-import { dns } from "./dns.js";
-export { dns };
 import * as nodeHttp from "../node/http.js";
 import * as nodeHttps from "../node/https.js";
 import * as nodeNet from "../node/net.js";
@@ -31,13 +29,6 @@ import * as streamWeb from "../node/stream/web.js";
 import { fileURLToPath as nodeFileURLToPath, pathToFileURL as nodePathToFileURL } from "../node/url.js";
 import { inspect as nodeInspect, isDeepStrictEqual, stripVTControlCharacters } from "../node/util.js";
 import { _patchAsyncContextGlobals, _wrapAsyncCallback } from "../node/async_hooks.js";
-import * as bunSqliteModule from "./sqlite.js";
-import { Database as SQLiteDatabase } from "./sqlite.js";
-import { parse as parseJSON5, stringify as stringifyJSON5 } from "./json5.js";
-import { parse as parseTOML, stringify as stringifyTOML } from "./toml.js";
-import { parse as parseYAML, stringify as stringifyYAML } from "./yaml.js";
-import picomatch from "../vendor/picomatch.js";
-import wsBuiltin from "../vendor/ws.js";
 import {
   remapErrorPosition as remapBundleErrorPosition,
   remapPosition as remapBundlePosition,
@@ -46,14 +37,49 @@ import {
 } from "../vendor/sourcemap.js";
 import { URL, URLSearchParams } from "../vendor/whatwg-url.js";
 import { URLPattern as CottontailURLPattern } from "../vendor/urlpattern.js";
-import { S3Client, s3 } from "./s3.js";
-import { RedisClient, redis } from "./redis.js";
-import { SQL, postgres as postgresSQL, sql } from "./sql.js";
-import { color as bunColor } from "./color.js";
-import { connect, listen } from "./socket.js";
-export { connect, listen };
-import * as bunTestModule from "./test.js";
-import * as bunJscModule from "./jsc.js";
+import {
+  bunJSCBuiltin,
+  bunSQLiteBuiltin,
+  bunTestBuiltin,
+  color,
+  connect,
+  dns,
+  JSON5,
+  listen,
+  loadBunJSCModule,
+  loadBunTestModule,
+  loadTOMLModule,
+  postgres,
+  redis,
+  RedisClient,
+  s3,
+  S3Client,
+  sql,
+  SQL,
+  TOML,
+  webSocketBuiltin,
+  YAML,
+} from "./lazy-subsystems.js";
+export {
+  color,
+  connect,
+  dns,
+  JSON5,
+  listen,
+  postgres,
+  redis,
+  RedisClient,
+  s3,
+  S3Client,
+  sql,
+  SQL,
+  TOML,
+  YAML,
+};
+import {
+  createLazyModule,
+  installLazyGlobal,
+} from "./lazy-runtime.js";
 import * as bunInternalForTestingModule from "./internal-for-testing.js";
 import { captureV8HeapSnapshot } from "../node/internal/heap_snapshot.js";
 import {
@@ -97,6 +123,16 @@ import {
   pathDirname,
   write,
 } from "./file-io.js";
+
+const loadPicomatchModule = createLazyModule(
+  "vendor:picomatch",
+  () => require("../vendor/picomatch.js"),
+);
+
+function lazyPicomatch(...args) {
+  const module = loadPicomatchModule();
+  return (module.default ?? module)(...args);
+}
 
 const bunFileServeEmptySlices = new WeakSet();
 const wrappedBunFileSlices = new WeakSet();
@@ -9939,7 +9975,7 @@ async function loadServeHtmlStaticConfig() {
   const bunfigPath = nodePathResolve(cwd, "bunfig.toml");
   let staticConfig = {};
   try {
-    staticConfig = parseTOML(cottontail.readFile(bunfigPath))?.serve?.static ?? {};
+    staticConfig = TOML.parse(cottontail.readFile(bunfigPath))?.serve?.static ?? {};
   } catch {}
   const pluginSpecifiers = [];
   for (const pluginPath of Array.isArray(staticConfig.plugins) ? staticConfig.plugins : []) {
@@ -12873,7 +12909,6 @@ export const stdin = {
 };
 export const stdout = globalThis.process?.stdout;
 export const stderr = globalThis.process?.stderr;
-export { SQL, sql };
 export function jest(_source = undefined) {
   const inTestRunner = globalThis.__cottontailRegisteringTestFile != null ||
     globalThis.__cottontailCurrentTestFile?.() != null ||
@@ -12881,7 +12916,8 @@ export function jest(_source = undefined) {
   if (inTestRunner && typeof _source !== "string") {
     throw new Error("Bun.jest() expects a string filename");
   }
-  return bunTestModule.default ?? bunTestModule;
+  const module = loadBunTestModule();
+  return module.default ?? module;
 }
 
 const bunSleepSetTimeout = globalThis.setTimeout.bind(globalThis);
@@ -14555,7 +14591,7 @@ export function generateHeapSnapshot(format = undefined, output = undefined) {
   }
 
   if (useV8) return snapshot;
-  return bunJscModule.accountForExternallyAllocatedMemory(JSON.parse(snapshot));
+  return loadBunJSCModule().accountForExternallyAllocatedMemory(JSON.parse(snapshot));
 }
 
 function outputAnsiColorsEnabled() {
@@ -14566,8 +14602,6 @@ function outputAnsiColorsEnabled() {
 }
 
 export const enableANSIColors = outputAnsiColorsEnabled();
-
-export const color = bunColor;
 
 export function shrink() {
   bunForceGc();
@@ -14744,13 +14778,6 @@ export function zstdDecompress(data, options = undefined) {
   return Promise.resolve(zstdDecompressSync(data, options));
 }
 export { FFI };
-
-export const TOML = {
-  parse(text) {
-    return parseTOML(text);
-  },
-  stringify: stringifyTOML,
-};
 
 function jsonTextInput(value) {
   if (value == null) throw new TypeError("Expected a string or typed array");
@@ -15099,13 +15126,6 @@ export const JSONC = {
   },
 };
 
-export const JSON5 = {
-  parse(text) {
-    return parseJSON5(jsonTextInput(text));
-  },
-  stringify: stringifyJSON5,
-};
-
 export const JSONL = {
   [Symbol.toStringTag]: "JSONL",
   parse(input) {
@@ -15116,11 +15136,6 @@ export const JSONL = {
   parseChunk(input, start = 0, end = undefined) {
     return parseJSONLChunk(input, start, end);
   },
-};
-
-export const YAML = {
-  parse: parseYAML,
-  stringify: stringifyYAML,
 };
 
 function normalizeCookieText(value) {
@@ -15493,7 +15508,7 @@ export class Glob {
     this._matchesEmpty = patterns.some((expanded) => expanded === "*" || expanded === "**");
     this._matchers = patterns.map((expanded) => ({
       pattern: expanded,
-      matcher: expanded === "" ? (text) => text === "" : picomatch(expanded, { dot: true }),
+      matcher: expanded === "" ? (text) => text === "" : lazyPicomatch(expanded, { dot: true }),
       trailingGlobstarBase: trailingGlobstarBase(expanded),
     }));
   }
@@ -17192,9 +17207,6 @@ export class Terminal {
     this.close();
   }
 }
-export { S3Client, s3 };
-export { RedisClient, redis };
-export const postgres = postgresSQL;
 function secretsError(message, code = "ERR_INVALID_ARG_TYPE") {
   const error = new TypeError(message);
   error.code = code;
@@ -20275,14 +20287,14 @@ const undiciBuiltin = createUndiciModule({
 });
 nodeSetBuiltinModules({
   bun: BunObject,
-  "bun:test": bunTestModule.default ?? bunTestModule,
-  "bun:jsc": bunJscModule.default ?? bunJscModule,
+  "bun:test": bunTestBuiltin,
+  "bun:jsc": bunJSCBuiltin,
   "bun:ffi": FFI.default ?? FFI,
-  "bun:sqlite": bunSqliteModule,
+  "bun:sqlite": bunSQLiteBuiltin,
   "bun:internal-for-testing": bunInternalForTestingModule,
-  ws: wsBuiltin,
-  "ws/lib/websocket": wsBuiltin,
-  "next/dist/compiled/ws": wsBuiltin,
+  ws: webSocketBuiltin,
+  "ws/lib/websocket": webSocketBuiltin,
+  "next/dist/compiled/ws": webSocketBuiltin,
   undici: undiciBuiltin,
   "node:undici": undiciBuiltin,
 });
@@ -20297,18 +20309,22 @@ globalThis.__cottontailImportMetaResolve ??= (specifier, parent = globalThis.__c
   const resolved = resolveSync(text, parent);
   return String(resolved).startsWith("/") ? pathToFileURL(resolved).href : resolved;
 };
-globalThis.test ??= bunTestModule.test;
-globalThis.it ??= bunTestModule.it;
-globalThis.describe ??= bunTestModule.describe;
-globalThis.expect ??= bunTestModule.expect;
-globalThis.expectTypeOf ??= bunTestModule.expectTypeOf;
-globalThis.beforeAll ??= bunTestModule.beforeAll;
-globalThis.afterAll ??= bunTestModule.afterAll;
-globalThis.beforeEach ??= bunTestModule.beforeEach;
-globalThis.afterEach ??= bunTestModule.afterEach;
-globalThis.xit ??= bunTestModule.xit;
-globalThis.xtest ??= bunTestModule.xtest;
-globalThis.xdescribe ??= bunTestModule.xdescribe;
+for (const name of [
+  "test",
+  "it",
+  "describe",
+  "expect",
+  "expectTypeOf",
+  "beforeAll",
+  "afterAll",
+  "beforeEach",
+  "afterEach",
+  "xit",
+  "xtest",
+  "xdescribe",
+]) {
+  installLazyGlobal(name, () => loadBunTestModule()[name]);
+}
 if (globalThis.Headers?.prototype && typeof globalThis.Headers.prototype.getAll !== "function") {
   Object.defineProperty(globalThis.Headers.prototype, "getAll", {
     value: headersGetAll,

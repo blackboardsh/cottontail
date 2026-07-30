@@ -3,10 +3,29 @@ import { BlockList } from "../node/net.js";
 import fsDefault, { readFileSync } from "../node/fs.js";
 import { createHash } from "../node/crypto.js";
 import { gunzipSync } from "../node/zlib.js";
-import { serializeShellLex, serializeShellParse } from "../internal/bun-shell-parser.js";
-import { frameworkRouterInternals } from "./bake-framework-router.js";
-import { getDevServerDeinitCount as getBakeDevServerDeinitCount } from "./bake-dev-server.js";
-import { SQL as SQLConstructor } from "./sql.js";
+import {
+  createLazyModule,
+  createLazyObject,
+} from "./lazy-runtime.js";
+import { SQL } from "./lazy-subsystems.js";
+
+const loadShellParserModule = createLazyModule(
+  "internal:bun-shell-parser",
+  () => require("../internal/bun-shell-parser.js"),
+);
+const loadFrameworkRouterModule = createLazyModule(
+  "bun:bake-framework-router",
+  () => require("./bake-framework-router.js"),
+);
+const loadBakeDevServerModule = createLazyModule(
+  "bun:bake-dev-server",
+  () => require("./bake-dev-server.js"),
+);
+
+export const frameworkRouterInternals = createLazyObject(
+  loadFrameworkRouterModule,
+  "frameworkRouterInternals",
+);
 
 export const jscInternals = {
   isLatin1String(value) {
@@ -76,8 +95,12 @@ export const shellInternals = {
   builtinDisabled() {
     return false;
   },
-  lex: serializeShellLex,
-  parse: serializeShellParse,
+  lex(...args) {
+    return loadShellParserModule().serializeShellLex(...args);
+  },
+  parse(...args) {
+    return loadShellParserModule().serializeShellParse(...args);
+  },
 };
 
 function bytesToText(value) {
@@ -868,7 +891,7 @@ export class Dequeue {
 }
 
 export function getDevServerDeinitCount() {
-  return getBakeDevServerDeinitCount();
+  return loadBakeDevServerModule().getDevServerDeinitCount();
 }
 
 export function memfd_create(size) {
@@ -1084,7 +1107,7 @@ export const bindgen = Object.freeze({
 
 export function noOpForTesting() {}
 
-export const SQL = SQLConstructor;
+export { SQL };
 export const fs = fsDefault.promises;
 
 const kWriteStreamFastPath = Symbol.for("cottontail.node.fs.writeStreamFastPath");
@@ -1107,7 +1130,6 @@ export const timerInternals = Object.freeze({
     return cottontail.timerClockMs();
   },
 });
-export { frameworkRouterInternals };
 export const hostedGitInfo = {
   parseUrl(value) {
     if (arguments.length !== 1) {
