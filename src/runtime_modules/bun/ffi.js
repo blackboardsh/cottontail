@@ -3531,33 +3531,6 @@ function callbackValue(value, type) {
   }
 }
 
-function returnForType(type, value) {
-  const id = typeof type === "number" ? type : ffiTypeId(type);
-  switch (id) {
-    case 13:
-      return undefined;
-    case 11:
-      return Boolean(value);
-    case 14:
-      return new CString(value || 0);
-    case 19:
-      return value;
-    case 7:
-    case 8:
-      return typeof value === "bigint" ? value : BigInt(Math.trunc(Number(value || 0)));
-    case 15:
-    case 16:
-      if (typeof value !== "bigint") return Number(value || 0);
-      if (value <= BigInt(Number.MAX_SAFE_INTEGER) && (id === 15 || value >= 0n)) return Number(value);
-      return value;
-    case 12:
-    case 17:
-      return value ? Number(value) : null;
-    default:
-      return value == null ? 0 : Number(value);
-  }
-}
-
 function validateSymbolOptions(symbols) {
   if (symbols == null || typeof symbols !== "object" || Array.isArray(symbols)) {
     throw new TypeError("Expected an options object with symbol names");
@@ -3584,29 +3557,49 @@ function symbolSpec(name, value, requirePointer) {
   return { args, returns, pointer };
 }
 
-function arityWrapper(call, count) {
+function preparedArityWrapper(prepared, count, returnsCString) {
+  if (returnsCString) {
+    switch (count) {
+      case 0: return function () { return new CString(prepared() || 0); };
+      case 1: return function (a) { return new CString(prepared(a) || 0); };
+      case 2: return function (a, b) { return new CString(prepared(a, b) || 0); };
+      case 3: return function (a, b, c) { return new CString(prepared(a, b, c) || 0); };
+      case 4: return function (a, b, c, d) { return new CString(prepared(a, b, c, d) || 0); };
+      case 5: return function (a, b, c, d, e) { return new CString(prepared(a, b, c, d, e) || 0); };
+      case 6: return function (a, b, c, d, e, f) { return new CString(prepared(a, b, c, d, e, f) || 0); };
+      case 7: return function (a, b, c, d, e, f, h) { return new CString(prepared(a, b, c, d, e, f, h) || 0); };
+      case 8: return function (a, b, c, d, e, f, h, i) { return new CString(prepared(a, b, c, d, e, f, h, i) || 0); };
+      default: return function (...args) { return new CString(prepared(...args) || 0); };
+    }
+  }
+
   switch (count) {
-    case 0: return function () { return call([]); };
-    case 1: return function (a) { return call([a]); };
-    case 2: return function (a, b) { return call([a, b]); };
-    case 3: return function (a, b, c) { return call([a, b, c]); };
-    case 4: return function (a, b, c, d) { return call([a, b, c, d]); };
-    case 5: return function (a, b, c, d, e) { return call([a, b, c, d, e]); };
-    case 6: return function (a, b, c, d, e, f) { return call([a, b, c, d, e, f]); };
-    case 7: return function (a, b, c, d, e, f, h) { return call([a, b, c, d, e, f, h]); };
-    case 8: return function (a, b, c, d, e, f, h, i) { return call([a, b, c, d, e, f, h, i]); };
-    default: return function (...args) { return call(args); };
+    case 0: return function () { return prepared(); };
+    case 1: return function (a) { return prepared(a); };
+    case 2: return function (a, b) { return prepared(a, b); };
+    case 3: return function (a, b, c) { return prepared(a, b, c); };
+    case 4: return function (a, b, c, d) { return prepared(a, b, c, d); };
+    case 5: return function (a, b, c, d, e) { return prepared(a, b, c, d, e); };
+    case 6: return function (a, b, c, d, e, f) { return prepared(a, b, c, d, e, f); };
+    case 7: return function (a, b, c, d, e, f, h) { return prepared(a, b, c, d, e, f, h); };
+    case 8: return function (a, b, c, d, e, f, h, i) { return prepared(a, b, c, d, e, f, h, i); };
+    default: return function (...args) { return prepared(...args); };
   }
 }
 
-function ffiCallable(name, spec, invoke) {
-  const call = (args) => {
-    const nativeArgs = spec.args.map((type, index) => nativeArg(args[index], type));
-    return returnForType(spec.returns, invoke(nativeArgs));
-  };
-  const nativeFunction = arityWrapper(call, spec.args.length);
-  const wrapped = spec.args.length > 0 || spec.returns === FFIType.cstring
-    ? arityWrapper(call, spec.args.length)
+function ffiCallable(name, spec, pointer, napiIdentity = undefined) {
+  const prepared = cottontail.prepareNativeCall(
+    pointer,
+    spec.returns,
+    spec.args,
+    napiIdentity,
+    JSCallback,
+    CString,
+  );
+  const returnsCString = spec.returns === FFIType.cstring;
+  const nativeFunction = preparedArityWrapper(prepared, spec.args.length, returnsCString);
+  const wrapped = spec.args.length > 0 || returnsCString
+    ? preparedArityWrapper(prepared, spec.args.length, returnsCString)
     : nativeFunction;
   Object.defineProperty(nativeFunction, "name", { value: name, configurable: true });
   if (wrapped !== nativeFunction) Object.defineProperty(wrapped, "name", { value: name, configurable: true });
@@ -3653,8 +3646,7 @@ export function dlopen(path, symbols) {
     } catch (error) {
       wrapLibraryError(error, libraryPath, name);
     }
-    const callable = ffiCallable(name, spec, (nativeArgs) =>
-      cottontail.nativeCall(libraryPath, name, ffiNativeTypes[spec.returns], spec.args.map((id) => ffiNativeTypes[id]), nativeArgs));
+    const callable = ffiCallable(name, spec, pointer, libraryPath);
     callable.ptr = pointer;
     callable.native.ptr = pointer;
     defineSymbol(wrapped, name, callable);
@@ -3670,8 +3662,7 @@ export function CFunction(pointerOrSpec, options = {}) {
     : { ptr: pointerOrSpec, ...options };
   const name = `CFunction${cFunctionId++}`;
   const spec = symbolSpec(name, value, true);
-  const callable = ffiCallable(name, spec, (nativeArgs) =>
-    cottontail.nativeCallPointer(spec.pointer, ffiNativeTypes[spec.returns], spec.args.map((id) => ffiNativeTypes[id]), nativeArgs));
+  const callable = ffiCallable(name, spec, spec.pointer);
   callable.ptr = spec.pointer;
   callable.native.ptr = spec.pointer;
   callable.close = closeHandle();
@@ -3683,8 +3674,7 @@ export function linkSymbols(symbols) {
   const wrapped = {};
   for (const [name, value] of validateSymbolOptions(symbols)) {
     const spec = symbolSpec(name, value, true);
-    const callable = ffiCallable(name, spec, (nativeArgs) =>
-      cottontail.nativeCallPointer(spec.pointer, ffiNativeTypes[spec.returns], spec.args.map((id) => ffiNativeTypes[id]), nativeArgs));
+    const callable = ffiCallable(name, spec, spec.pointer);
     callable.ptr = spec.pointer;
     callable.native.ptr = spec.pointer;
     defineSymbol(wrapped, name, callable);

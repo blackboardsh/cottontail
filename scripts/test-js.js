@@ -384,6 +384,12 @@ try {
       stdoutIncludes: ['bun ffi surface passed'],
     },
     {
+      name: 'bun-ffi-prepared-calls',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-ffi-prepared-calls.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['5 pass', '0 fail'],
+    },
+    {
       name: 'bun-test-module',
       scriptPath: join(rootDir, 'tests', 'js', 'bun-test-module.ts'),
       expectExitCode: 0,

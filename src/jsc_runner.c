@@ -20777,8 +20777,24 @@ typedef struct CtNativeLibrary {
     struct CtNativeLibrary *next;
 } CtNativeLibrary;
 
+typedef struct CtPreparedFfiCall {
+    void *function_pointer;
+    CtFfiType returns;
+    CtFfiType arg_types[CT_FFI_MAX_ARGS];
+    uint8_t return_type_id;
+    uint8_t arg_type_ids[CT_FFI_MAX_ARGS];
+    ffi_type *ffi_arg_types[CT_FFI_MAX_ARGS];
+    size_t argc;
+    ffi_cif cif;
+    CtNapiEnv *napi_env;
+    JSObjectRef callback_constructor;
+    JSObjectRef cstring_constructor;
+} CtPreparedFfiCall;
+
 static pthread_mutex_t ct_native_libraries_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtNativeLibrary *ct_native_libraries = NULL;
+static pthread_mutex_t ct_prepared_ffi_class_mutex = PTHREAD_MUTEX_INITIALIZER;
+static JSClassRef ct_prepared_ffi_class = NULL;
 
 static CtNativeLibrary *ct_find_native_library_locked(const char *path) {
     for (CtNativeLibrary *entry = ct_native_libraries; entry != NULL; entry = entry->next) {
@@ -20892,6 +20908,133 @@ static bool ct_ffi_type_from_name(const char *name, CtFfiType *out) {
     else if (strcmp(name, "napi_value") == 0) *out = CT_FFI_TYPE_NAPI_VALUE;
     else return false;
     return true;
+}
+
+static bool ct_ffi_type_from_id(uint8_t id, CtFfiType *out) {
+    switch (id) {
+        case 0:
+        case 1:
+            *out = CT_FFI_TYPE_I8;
+            return true;
+        case 2:
+            *out = CT_FFI_TYPE_U8;
+            return true;
+        case 3:
+            *out = CT_FFI_TYPE_I16;
+            return true;
+        case 4:
+            *out = CT_FFI_TYPE_U16;
+            return true;
+        case 5:
+            *out = CT_FFI_TYPE_I32;
+            return true;
+        case 6:
+            *out = CT_FFI_TYPE_U32;
+            return true;
+        case 7:
+        case 15:
+            *out = CT_FFI_TYPE_I64;
+            return true;
+        case 8:
+        case 16:
+            *out = CT_FFI_TYPE_U64;
+            return true;
+        case 9:
+            *out = CT_FFI_TYPE_F64;
+            return true;
+        case 10:
+            *out = CT_FFI_TYPE_F32;
+            return true;
+        case 11:
+            *out = CT_FFI_TYPE_BOOL;
+            return true;
+        case 12:
+        case 20:
+            *out = CT_FFI_TYPE_PTR;
+            return true;
+        case 13:
+            *out = CT_FFI_TYPE_VOID;
+            return true;
+        case 14:
+            *out = CT_FFI_TYPE_CSTRING;
+            return true;
+        case 17:
+            *out = CT_FFI_TYPE_FUNCTION;
+            return true;
+        case 18:
+            *out = CT_FFI_TYPE_NAPI_ENV;
+            return true;
+        case 19:
+            *out = CT_FFI_TYPE_NAPI_VALUE;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static int ct_parse_ffi_type_id(
+    JSContextRef ctx,
+    JSValueRef value,
+    uint8_t *id_out,
+    CtFfiType *type_out,
+    JSValueRef *exception
+) {
+    JSValueRef local_exception = NULL;
+    double number = JSValueToNumber(ctx, value, &local_exception);
+    if (local_exception != NULL) {
+        if (exception != NULL) *exception = local_exception;
+        return -1;
+    }
+    if (!isfinite(number) || number < 0 || number > 20 || trunc(number) != number) {
+        ct_throw_type_error(ctx, exception, "Unsupported FFI type id");
+        return -1;
+    }
+
+    uint8_t id = (uint8_t)number;
+    if (!ct_ffi_type_from_id(id, type_out)) {
+        ct_throw_type_error(ctx, exception, "Unsupported FFI type id");
+        return -1;
+    }
+    *id_out = id;
+    return 0;
+}
+
+static int ct_parse_ffi_type_id_array(
+    JSContextRef ctx,
+    JSValueRef value,
+    uint8_t *out_ids,
+    CtFfiType *out_types,
+    ffi_type **out_ffi_types,
+    size_t *out_count,
+    JSValueRef *exception
+) {
+    *out_count = 0;
+    if (value == NULL || !JSValueIsObject(ctx, value)) {
+        ct_throw_type_error(ctx, exception, "FFI args must be an array of type ids");
+        return -1;
+    }
+
+    JSObjectRef object = (JSObjectRef)value;
+    JSValueRef length_value = ct_get_property(ctx, object, "length", exception);
+    if (exception != NULL && *exception != NULL) return -1;
+    double length_number = JSValueToNumber(ctx, length_value, exception);
+    if (exception != NULL && *exception != NULL) return -1;
+    if (!isfinite(length_number) || length_number < 0 || trunc(length_number) != length_number ||
+        length_number > CT_FFI_MAX_ARGS) {
+        ct_throw_type_error(ctx, exception, "Cottontail FFI currently supports up to 64 arguments");
+        return -1;
+    }
+
+    size_t length = (size_t)length_number;
+    for (size_t index = 0; index < length; index += 1) {
+        JSValueRef item = JSObjectGetPropertyAtIndex(ctx, object, (unsigned)index, exception);
+        if (exception != NULL && *exception != NULL) return -1;
+        if (ct_parse_ffi_type_id(ctx, item, &out_ids[index], &out_types[index], exception) != 0) return -1;
+        out_ffi_types[index] = ct_ffi_libffi_type(out_types[index]);
+    }
+
+    *out_count = length;
+    return 0;
 }
 
 static int ct_parse_ffi_type(JSContextRef ctx, JSValueRef value, CtFfiType *out, JSValueRef *exception) {
@@ -22499,6 +22642,589 @@ static JSValueRef ct_native_call_pointer(JSContextRef ctx, JSObjectRef function,
         }
     }
     return ct_ffi_value_to_js(ctx, return_type, result, exception);
+}
+
+static uint32_t ct_ffi_to_uint32(double number) {
+    if (!isfinite(number) || number == 0) return 0;
+    double wrapped = fmod(trunc(number), 4294967296.0);
+    if (wrapped < 0) wrapped += 4294967296.0;
+    return (uint32_t)wrapped;
+}
+
+static int ct_ffi_number_from_js(
+    JSContextRef ctx,
+    JSValueRef value,
+    double *out,
+    JSValueRef *exception
+) {
+    if (JSValueIsBigInt(ctx, value)) {
+        char *text = ct_value_to_string_copy(ctx, value);
+        if (text == NULL) {
+            ct_throw_type_error(ctx, exception, "Unable to convert FFI argument to a number");
+            return -1;
+        }
+        *out = strtod(text, NULL);
+        free(text);
+        return 0;
+    }
+
+    JSValueRef local_exception = NULL;
+    *out = JSValueToNumber(ctx, value, &local_exception);
+    if (local_exception != NULL) {
+        if (exception != NULL) *exception = local_exception;
+        return -1;
+    }
+    return 0;
+}
+
+static uint64_t ct_ffi_decimal_word(const char *text) {
+    if (text == NULL) return 0;
+    bool negative = false;
+    if (*text == '-' || *text == '+') {
+        negative = *text == '-';
+        text += 1;
+    }
+
+    uint64_t value = 0;
+    while (*text >= '0' && *text <= '9') {
+        value = value * 10u + (uint64_t)(*text - '0');
+        text += 1;
+    }
+    return negative ? (uint64_t)(0u - value) : value;
+}
+
+static uint64_t ct_ffi_word_from_number(double number) {
+    if (!isfinite(number)) return 0;
+
+    char number_text[512];
+    snprintf(number_text, sizeof(number_text), "%.0f", trunc(number));
+    return ct_ffi_decimal_word(number_text);
+}
+
+static uint64_t ct_ffi_word_from_js(JSContextRef ctx, JSValueRef value) {
+    char *text = NULL;
+    uint64_t result = 0;
+
+    if (JSValueIsBigInt(ctx, value)) {
+        text = ct_value_to_string_copy(ctx, value);
+        result = ct_ffi_decimal_word(text);
+        free(text);
+        return result;
+    }
+
+    JSValueRef local_exception = NULL;
+    double number = JSValueToNumber(ctx, value, &local_exception);
+    if (local_exception != NULL || !isfinite(number)) return 0;
+    return ct_ffi_word_from_number(number);
+}
+
+static int ct_prepared_ffi_pointer_from_js(
+    JSContextRef ctx,
+    JSValueRef value,
+    const CtPreparedFfiCall *call,
+    size_t argument_index,
+    uint64_t *out,
+    JSValueRef *exception
+) {
+    uint8_t type_id = call->arg_type_ids[argument_index];
+    bool function_pointer = type_id == 17;
+    bool typed_array_only = type_id == 20;
+    *out = 0;
+
+    if (value == NULL || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value)) return 0;
+
+    if (JSValueIsObject(ctx, value)) {
+        JSValueRef local_exception = NULL;
+        JSTypedArrayType array_type = JSValueGetTypedArrayType(ctx, value, &local_exception);
+        if (local_exception != NULL) {
+            if (exception != NULL) *exception = local_exception;
+            return -1;
+        }
+        if (array_type != kJSTypedArrayTypeNone) {
+            if (typed_array_only && array_type == kJSTypedArrayTypeArrayBuffer) {
+                ct_throw_type_error(ctx, exception, "Expected a TypedArray");
+                return -1;
+            }
+
+            uint8_t *bytes = NULL;
+            size_t byte_len = 0;
+            if (ct_get_bytes(ctx, value, &bytes, &byte_len) != 0) {
+                ct_throw_type_error(ctx, exception, "Unable to convert buffer to a pointer");
+                return -1;
+            }
+            if (array_type == kJSTypedArrayTypeArrayBuffer && byte_len == 0) {
+                ct_throw_type_error(ctx, exception, "ArrayBufferView must have a length > 0. A pointer to empty memory doesn't work");
+                return -1;
+            }
+            *out = (uint64_t)(uintptr_t)bytes;
+            return 0;
+        }
+
+        if (typed_array_only) {
+            ct_throw_type_error(ctx, exception, "Expected a TypedArray");
+            return -1;
+        }
+
+        bool pointer_wrapper = function_pointer;
+        if (!pointer_wrapper && call->callback_constructor != NULL) {
+            pointer_wrapper = JSValueIsInstanceOfConstructor(
+                ctx,
+                value,
+                call->callback_constructor,
+                exception
+            );
+            if (exception != NULL && *exception != NULL) return -1;
+        }
+        if (!pointer_wrapper && call->cstring_constructor != NULL) {
+            pointer_wrapper = JSValueIsInstanceOfConstructor(
+                ctx,
+                value,
+                call->cstring_constructor,
+                exception
+            );
+            if (exception != NULL && *exception != NULL) return -1;
+        }
+        if (pointer_wrapper) {
+            JSValueRef pointer_value = ct_get_property(ctx, (JSObjectRef)value, "ptr", exception);
+            if (exception != NULL && *exception != NULL) return -1;
+            if (JSValueIsBigInt(ctx, pointer_value)) {
+                if (!function_pointer) {
+                    ct_throw_type_error(ctx, exception, "Unable to convert BigInt to a pointer");
+                    return -1;
+                }
+                double pointer = 0;
+                if (ct_ffi_number_from_js(ctx, pointer_value, &pointer, exception) != 0) return -1;
+                if (!isfinite(pointer) || pointer < 0) {
+                    ct_throw_type_error(ctx, exception, "Expected function to be a JSCallback or a number");
+                    return -1;
+                }
+                *out = (uint64_t)pointer;
+                return 0;
+            }
+            if (JSValueIsNumber(ctx, pointer_value)) {
+                double pointer = JSValueToNumber(ctx, pointer_value, NULL);
+                if (!isfinite(pointer) || pointer < 0) {
+                    ct_throw_type_error(
+                        ctx,
+                        exception,
+                        function_pointer
+                            ? "Expected function to be a JSCallback or a number"
+                            : "Unable to convert value to a pointer"
+                    );
+                    return -1;
+                }
+                *out = (uint64_t)pointer;
+                return 0;
+            }
+
+            ct_throw_type_error(
+                ctx,
+                exception,
+                function_pointer
+                    ? "Expected function to be a JSCallback or a number"
+                    : "Unable to convert value to a pointer"
+            );
+            return -1;
+        }
+
+        ct_throw_type_error(
+            ctx,
+            exception,
+            function_pointer
+                ? "Expected function to be a JSCallback or a number"
+                : "Unable to convert value to a pointer"
+        );
+        return -1;
+    }
+
+    if (typed_array_only) {
+        ct_throw_type_error(ctx, exception, "Expected a TypedArray");
+        return -1;
+    }
+    if (JSValueIsString(ctx, value)) {
+        ct_throw_type_error(ctx, exception, "To convert a string to a pointer, encode it as a buffer");
+        return -1;
+    }
+    if (JSValueIsBigInt(ctx, value)) {
+        if (!function_pointer) {
+            ct_throw_type_error(ctx, exception, "Unable to convert BigInt to a pointer");
+            return -1;
+        }
+        double pointer = 0;
+        if (ct_ffi_number_from_js(ctx, value, &pointer, exception) != 0) return -1;
+        if (!isfinite(pointer) || pointer < 0) {
+            ct_throw_type_error(ctx, exception, "Expected function to be a JSCallback or a number");
+            return -1;
+        }
+        *out = (uint64_t)pointer;
+        return 0;
+    }
+
+    if (JSValueIsNumber(ctx, value)) {
+        double pointer = JSValueToNumber(ctx, value, NULL);
+        if (!isfinite(pointer) || pointer < 0) {
+            ct_throw_type_error(
+                ctx,
+                exception,
+                function_pointer
+                    ? "Expected function to be a JSCallback or a number"
+                    : "Unable to convert value to a pointer"
+            );
+            return -1;
+        }
+        *out = (uint64_t)pointer;
+        return 0;
+    }
+
+    ct_throw_type_error(
+        ctx,
+        exception,
+        function_pointer
+            ? "Expected function to be a JSCallback or a number"
+            : "Unable to convert value to a pointer"
+    );
+    return -1;
+}
+
+static int ct_prepared_ffi_argument_from_js(
+    JSContextRef ctx,
+    JSValueRef value,
+    const CtPreparedFfiCall *call,
+    size_t argument_index,
+    CtFfiValue *out,
+    JSValueRef *exception
+) {
+    uint8_t type_id = call->arg_type_ids[argument_index];
+    double number = 0;
+    uint32_t int32_bits = 0;
+    uint64_t pointer = 0;
+    memset(out, 0, sizeof(*out));
+
+    switch (type_id) {
+        case 0:
+        case 1:
+            if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) return -1;
+            int32_bits = ct_ffi_to_uint32(number);
+            out->i8 = (int8_t)(uint8_t)int32_bits;
+            return 0;
+        case 2:
+            if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) return -1;
+            if (isnan(number) || number <= 0) out->u8 = 0;
+            else if (number >= UINT8_MAX) out->u8 = UINT8_MAX;
+            else out->u8 = (uint8_t)ct_ffi_to_uint32(number);
+            return 0;
+        case 3:
+            if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) return -1;
+            if (isnan(number)) number = 0;
+            if (number <= INT16_MIN) out->i16 = INT16_MIN;
+            else if (number >= 32768.0) out->i16 = INT16_MIN;
+            else out->i16 = (int16_t)(uint16_t)ct_ffi_to_uint32(number);
+            return 0;
+        case 4:
+            if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) return -1;
+            int32_bits = ct_ffi_to_uint32(number);
+            if ((int32_t)int32_bits <= 0) out->u16 = 0;
+            else if (int32_bits > UINT16_MAX) out->u16 = UINT16_MAX;
+            else out->u16 = (uint16_t)int32_bits;
+            return 0;
+        case 5:
+            if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) return -1;
+            out->i32 = (int32_t)ct_ffi_to_uint32(number);
+            return 0;
+        case 6:
+            if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) return -1;
+            if (isnan(number) || number <= 0) out->u32 = 0;
+            else if (number > UINT32_MAX) out->u32 = UINT32_MAX;
+            else out->u32 = ct_ffi_to_uint32(number);
+            return 0;
+        case 7:
+        case 15:
+            out->u64 = ct_ffi_word_from_js(ctx, value);
+            return 0;
+        case 8:
+        case 16:
+            if (JSValueIsBigInt(ctx, value)) {
+                out->u64 = ct_ffi_word_from_js(ctx, value);
+                return 0;
+            }
+            if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) return -1;
+            out->u64 = number > 0 ? ct_ffi_word_from_number(number) : 0;
+            return 0;
+        case 9:
+            if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) return -1;
+            out->f64 = isnan(number) || number == 0 ? 0 : number;
+            return 0;
+        case 10:
+            if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) return -1;
+            out->f32 = isnan(number) || number == 0 ? 0 : (float)number;
+            return 0;
+        case 11:
+            out->u8 = JSValueToBoolean(ctx, value) ? 1 : 0;
+            return 0;
+        case 12:
+        case 14:
+        case 17:
+        case 20:
+            if (ct_prepared_ffi_pointer_from_js(
+                    ctx,
+                    value,
+                    call,
+                    argument_index,
+                    &pointer,
+                    exception
+                ) != 0) {
+                return -1;
+            }
+            out->u64 = pointer;
+            return 0;
+        case 13:
+            return 0;
+        case 18:
+        case 19:
+            return 0;
+        default:
+            ct_throw_type_error(ctx, exception, "Unsupported FFI argument type");
+            return -1;
+    }
+}
+
+static JSValueRef ct_prepared_ffi_result_to_js(
+    JSContextRef ctx,
+    const CtPreparedFfiCall *call,
+    CtFfiValue result,
+    JSValueRef *exception
+) {
+    switch (call->return_type_id) {
+        case 12:
+        case 17:
+            return result.ptr == NULL
+                ? JSValueMakeNull(ctx)
+                : JSValueMakeNumber(ctx, (double)(uintptr_t)result.ptr);
+        case 14:
+        case 20:
+            return JSValueMakeNumber(ctx, (double)(uintptr_t)result.ptr);
+        case 15:
+            return JSValueMakeNumber(ctx, (double)result.i64);
+        case 16:
+            if (result.u64 <= 9007199254740991ULL) return JSValueMakeNumber(ctx, (double)result.u64);
+            return JSBigIntCreateWithUInt64(ctx, result.u64, exception);
+        default:
+            return ct_ffi_value_to_js(ctx, call->returns, result, exception);
+    }
+}
+
+static JSValueRef ct_prepared_ffi_call_as_function(
+    JSContextRef ctx,
+    JSObjectRef function,
+    JSObjectRef thisObject,
+    size_t argc,
+    const JSValueRef argv[],
+    JSValueRef *exception
+) {
+    (void)thisObject;
+    CtPreparedFfiCall *call = (CtPreparedFfiCall *)JSObjectGetPrivate(function);
+    if (call == NULL || call->function_pointer == NULL) {
+        ct_throw_type_error(ctx, exception, "FFI function is unavailable");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtFfiValue arg_values[CT_FFI_MAX_ARGS];
+    void *arg_value_ptrs[CT_FFI_MAX_ARGS];
+    CtFfiValue result;
+    memset(&result, 0, sizeof(result));
+
+    for (size_t index = 0; index < call->argc; index += 1) {
+        JSValueRef value = index < argc ? argv[index] : JSValueMakeUndefined(ctx);
+        if (call->arg_types[index] == CT_FFI_TYPE_NAPI_ENV) {
+            arg_values[index].u64 = (uint64_t)(uintptr_t)call->napi_env;
+        } else if (call->arg_types[index] == CT_FFI_TYPE_NAPI_VALUE) {
+            arg_values[index].u64 = (uint64_t)(uintptr_t)value;
+        } else if (ct_prepared_ffi_argument_from_js(
+                       ctx,
+                       value,
+                       call,
+                       index,
+                       &arg_values[index],
+                       exception
+                   ) != 0) {
+            return JSValueMakeUndefined(ctx);
+        }
+        arg_value_ptrs[index] = ct_ffi_value_ptr(&arg_values[index], call->arg_types[index]);
+    }
+
+    ffi_call(
+        &call->cif,
+        FFI_FN(call->function_pointer),
+        ct_ffi_value_ptr(&result, call->returns),
+        arg_value_ptrs
+    );
+    if (call->napi_env != NULL) {
+        JSValueRef napi_exception = ct_napi_env_take_exception(call->napi_env);
+        if (napi_exception != NULL) {
+            if (exception != NULL) *exception = napi_exception;
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+    return ct_prepared_ffi_result_to_js(ctx, call, result, exception);
+}
+
+static void ct_prepared_ffi_call_destroy(CtPreparedFfiCall *call) {
+    if (call == NULL) return;
+    free(call);
+}
+
+static void ct_prepared_ffi_call_finalize(JSObjectRef object) {
+    CtPreparedFfiCall *call = (CtPreparedFfiCall *)JSObjectGetPrivate(object);
+    ct_prepared_ffi_call_destroy(call);
+}
+
+static JSClassRef ct_get_prepared_ffi_class(void) {
+    pthread_mutex_lock(&ct_prepared_ffi_class_mutex);
+    if (ct_prepared_ffi_class == NULL) {
+        JSClassDefinition definition = kJSClassDefinitionEmpty;
+        definition.className = "CottontailPreparedFFI";
+        definition.callAsFunction = ct_prepared_ffi_call_as_function;
+        definition.finalize = ct_prepared_ffi_call_finalize;
+        ct_prepared_ffi_class = JSClassCreate(&definition);
+    }
+    JSClassRef result = ct_prepared_ffi_class;
+    pthread_mutex_unlock(&ct_prepared_ffi_class_mutex);
+    return result;
+}
+
+static JSValueRef ct_prepare_native_call(
+    JSContextRef ctx,
+    JSObjectRef function,
+    JSObjectRef thisObject,
+    size_t argc,
+    const JSValueRef argv[],
+    JSValueRef *exception
+) {
+    (void)thisObject;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    uint64_t pointer = 0;
+    if (argc < 3 || ct_value_to_u64(ctx, argv[0], &pointer) != 0 || pointer == 0) {
+        ct_throw_type_error(ctx, exception, "prepareNativeCall requires a function pointer and FFI signature");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtPreparedFfiCall *call = (CtPreparedFfiCall *)calloc(1, sizeof(*call));
+    if (call == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    call->function_pointer = (void *)(uintptr_t)pointer;
+
+    if (ct_parse_ffi_type_id(ctx, argv[1], &call->return_type_id, &call->returns, exception) != 0 ||
+        ct_parse_ffi_type_id_array(
+            ctx,
+            argv[2],
+            call->arg_type_ids,
+            call->arg_types,
+            call->ffi_arg_types,
+            &call->argc,
+            exception
+        ) != 0) {
+        ct_prepared_ffi_call_destroy(call);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    bool needs_pointer_constructors = false;
+    for (size_t index = 0; index < call->argc && !needs_pointer_constructors; index += 1) {
+        needs_pointer_constructors = call->arg_type_ids[index] == 12 ||
+            call->arg_type_ids[index] == 14;
+    }
+    if (needs_pointer_constructors) {
+        if (argc < 6 || !JSValueIsObject(ctx, argv[4]) || !JSValueIsObject(ctx, argv[5])) {
+            ct_prepared_ffi_call_destroy(call);
+            ct_throw_message(ctx, exception, "prepareNativeCall requires FFI pointer constructors");
+            return JSValueMakeUndefined(ctx);
+        }
+        call->callback_constructor = (JSObjectRef)argv[4];
+        call->cstring_constructor = (JSObjectRef)argv[5];
+    }
+
+    bool uses_napi = call->returns == CT_FFI_TYPE_NAPI_ENV || call->returns == CT_FFI_TYPE_NAPI_VALUE;
+    for (size_t index = 0; index < call->argc && !uses_napi; index += 1) {
+        uses_napi = call->arg_types[index] == CT_FFI_TYPE_NAPI_ENV ||
+            call->arg_types[index] == CT_FFI_TYPE_NAPI_VALUE;
+    }
+    if (uses_napi) {
+        if (runtime == NULL) {
+            ct_prepared_ffi_call_destroy(call);
+            ct_throw_message(ctx, exception, "N-API FFI calls require an active Cottontail runtime");
+            return JSValueMakeUndefined(ctx);
+        }
+        if (runtime->napi_env == NULL) {
+            runtime->napi_env = ct_napi_env_create(runtime->context, &runtime->uv_loop, runtime, ct_napi_wake);
+            if (runtime->napi_env == NULL) {
+                ct_prepared_ffi_call_destroy(call);
+                ct_throw_message(ctx, exception, "failed to initialize the Node-API environment");
+                return JSValueMakeUndefined(ctx);
+            }
+        }
+
+        char pointer_identity[64];
+        char *identity = NULL;
+        if (argc >= 4 && !JSValueIsUndefined(ctx, argv[3]) && !JSValueIsNull(ctx, argv[3])) {
+            identity = ct_value_to_string_copy(ctx, argv[3]);
+        } else {
+            snprintf(pointer_identity, sizeof(pointer_identity), "pointer:%" PRIu64, pointer);
+            identity = ct_duplicate_string(pointer_identity);
+        }
+        if (identity == NULL) {
+            ct_prepared_ffi_call_destroy(call);
+            ct_throw_message(ctx, exception, "Out of memory");
+            return JSValueMakeUndefined(ctx);
+        }
+        call->napi_env = ct_napi_env_for_ffi_library(runtime->napi_env, identity);
+        free(identity);
+        if (call->napi_env == NULL) {
+            ct_prepared_ffi_call_destroy(call);
+            ct_throw_message(ctx, exception, "failed to initialize the FFI Node-API environment");
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+
+    if (ffi_prep_cif(
+            &call->cif,
+            FFI_DEFAULT_ABI,
+            (unsigned int)call->argc,
+            ct_ffi_libffi_type(call->returns),
+            call->ffi_arg_types
+        ) != FFI_OK) {
+        ct_prepared_ffi_call_destroy(call);
+        ct_throw_message(ctx, exception, "ffi_prep_cif failed for function pointer");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef prepared = JSObjectMake(ctx, ct_get_prepared_ffi_class(), call);
+    if (prepared == NULL) {
+        ct_prepared_ffi_call_destroy(call);
+        ct_throw_message(ctx, exception, "failed to create prepared FFI function");
+        return JSValueMakeUndefined(ctx);
+    }
+    /* Root pointer constructors through the callable; JSC finalizers may run on any thread. */
+    if (needs_pointer_constructors &&
+        (!ct_set_property(
+             ctx,
+             prepared,
+             "__cottontailFFICallbackConstructor",
+             call->callback_constructor,
+             exception
+         ) ||
+         !ct_set_property(
+             ctx,
+             prepared,
+             "__cottontailFFICStringConstructor",
+             call->cstring_constructor,
+             exception
+         ))) {
+        JSObjectSetPrivate(prepared, NULL);
+        ct_prepared_ffi_call_destroy(call);
+        return JSValueMakeUndefined(ctx);
+    }
+    return prepared;
 }
 
 static JSValueRef ct_create_callback(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
