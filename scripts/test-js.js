@@ -223,6 +223,18 @@ try {
       stderrIncludes: ['7 pass', '0 fail'],
     },
     {
+      name: 'bun-file-mime-native',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-file-mime-native.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['3 pass', '0 fail'],
+    },
+    {
+      name: 'bun-cryptohasher-native',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-cryptohasher-native.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['59 pass', '0 fail'],
+    },
+    {
       name: 'bun-glob-native',
       argv: ['test', join(rootDir, 'tests', 'js', 'bun-glob-native.test.ts')],
       expectExitCode: 0,
