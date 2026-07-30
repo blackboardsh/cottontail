@@ -82,6 +82,10 @@ static const JSObjectCallAsFunctionCallback ct_sql_wire_native_callbacks[] = {
 #include "sql_wire.inc"
 };
 
+static const JSObjectCallAsFunctionCallback ct_url_native_callbacks[] = {
+#include "url.inc"
+};
+
 static const JSObjectCallAsFunctionCallback ct_platform_native_callbacks[] = {
 #include "platform.inc"
 };
@@ -126,6 +130,7 @@ static void ct_register_host_native_bindings(
     CT_REGISTER_NATIVE_BINDINGS(tls);
     CT_REGISTER_NATIVE_BINDINGS(sqlite);
     CT_REGISTER_NATIVE_BINDINGS(sql_wire);
+    CT_REGISTER_NATIVE_BINDINGS(url);
     CT_REGISTER_NATIVE_BINDINGS(platform);
     CT_REGISTER_NATIVE_BINDINGS(path);
 }

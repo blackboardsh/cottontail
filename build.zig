@@ -434,6 +434,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             "src/native_bindings/tls.c",
             "src/native_bindings/sqlite.c",
             "src/native_bindings/sql_wire.c",
+            "src/native_bindings/url.c",
             "src/native_bindings/platform.c",
             "src/native_bindings/path.c",
             "src/compiler/src/jsc/bindings/node/http/llhttp/api.c",
@@ -472,6 +473,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             .{ "src/inspector_bridge.cpp", "inspector_bridge.o" },
             .{ "src/jsc_stock_bridge.cpp", "jsc_stock_bridge.o" },
             .{ "src/napi_bridge.cpp", "napi_bridge.o" },
+            .{ "src/url_bridge.cpp", "url_bridge.o" },
         }) |bridge| {
             step.root_module.addObjectFile(compileLinuxCppSource(b, vendor_dir, bridge[0], bridge[1]));
         }
@@ -505,6 +507,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             "src/inspector_bridge.cpp",
             "src/jsc_stock_bridge.cpp",
             "src/napi_bridge.cpp",
+            "src/url_bridge.cpp",
         }) |source| {
             step.root_module.addCSourceFile(.{
                 .file = b.path(source),

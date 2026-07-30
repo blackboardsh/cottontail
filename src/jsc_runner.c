@@ -8,6 +8,7 @@
 #include "jsc_runner.h"
 #include "icu_bridge/icu-bridge.h"
 #include "napi_bridge.h"
+#include "url_bridge.h"
 
 #include <JavaScriptCore/JavaScript.h>
 
@@ -35489,6 +35490,7 @@ static JSValueRef ct_unhandled_rejection(
 #include "native_bindings/data_parser_jsc.inc"
 #include "native_bindings/path_jsc.inc"
 #include "native_bindings/glob_jsc.inc"
+#include "native_bindings/url_jsc.inc"
 #include "native_bindings/callbacks.h"
 
 static int ct_install_host_api(CtJscRuntime *runtime) {
