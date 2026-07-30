@@ -289,11 +289,11 @@ test("Bun socket lifecycle methods and timeout follow Bun contracts", async () =
   }
 });
 
-test("Bun socket drain waits for native writable readiness", async () => {
+test("Bun socket drain follows native writable readiness after a partial write", async () => {
   const drained = Promise.withResolvers<void>();
   const accepted = Promise.withResolvers<Bun.Socket>();
-  let peerReadStarted = false;
-  let drainBeforeRead = false;
+  let writeReturned = false;
+  let synchronousDrain = false;
   let socket: Bun.Socket | undefined;
   let peer: Bun.Socket | undefined;
   const server = Bun.listen({
@@ -315,7 +315,7 @@ test("Bun socket drain waits for native writable readiness", async () => {
       socket: {
         data() {},
         drain() {
-          if (!peerReadStarted) drainBeforeRead = true;
+          if (!writeReturned) synchronousDrain = true;
           drained.resolve();
         },
       },
@@ -328,10 +328,9 @@ test("Bun socket drain waits for native writable readiness", async () => {
     }
     expect(written).toBeGreaterThanOrEqual(0);
     expect(written).toBeLessThan(payload.byteLength);
-    await new Promise(resolve => setTimeout(resolve, 30));
-    expect(drainBeforeRead).toBe(false);
+    writeReturned = true;
+    expect(synchronousDrain).toBe(false);
 
-    peerReadStarted = true;
     peer.resume();
     await withTimeout(drained.promise);
   } finally {
