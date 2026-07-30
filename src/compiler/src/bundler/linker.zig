@@ -311,10 +311,8 @@ pub const Linker = struct {
                 } else {
                     var absolute_pathname = Fs.PathName.init(source_path);
 
-                    if (!linker.options.preserve_extensions) {
-                        if (linker.options.out_extensions.get(absolute_pathname.ext)) |ext| {
-                            absolute_pathname.ext = ext;
-                        }
+                    if (linker.options.out_extensions.get(absolute_pathname.ext)) |ext| {
+                        absolute_pathname.ext = ext;
                     }
 
                     var base = linker.fs.relativeTo(source_path);

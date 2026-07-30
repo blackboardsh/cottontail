@@ -1576,7 +1576,6 @@ pub const BundleOptions = struct {
 
     write: bool = false,
     preserve_symlinks: bool = false,
-    preserve_extensions: bool = false,
     production: bool = false,
 
     // only used by bundle_v2

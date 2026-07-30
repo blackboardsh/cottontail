@@ -1219,7 +1219,6 @@ pub fn NewServer(protocol_enum: enum { http, https }, development_kind: enum { d
             var new_config: ServerConfig = .{};
             try ServerConfig.fromJS(globalThis, &new_config, &args_slice, .{
                 .allow_bake_config = false,
-                .is_fetch_required = true,
                 .has_user_routes = this.user_routes.items.len > 0,
             });
             if (globalThis.hasException()) {

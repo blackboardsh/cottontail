@@ -159,8 +159,6 @@ pub const ImportRecord = struct {
         /// If true, this was originally written as a bare "import 'file'" statement
         was_originally_bare_import: bool = false,
 
-        was_originally_require: bool = false,
-
         /// If a macro used <import>, it will be tracked here.
         was_injected_by_macro: bool = false,
 
@@ -179,6 +177,7 @@ pub const ImportRecord = struct {
         /// Route a dynamic runtime alias through Cottontail's module registry
         /// instead of statically collapsing it into the application bundle.
         use_runtime_dynamic_import: bool = false,
+        _padding: u1 = 0,
     };
 
     pub const List = bun.BabyList(ImportRecord);

@@ -61,7 +61,6 @@ pub const FileOperation = struct {
     pathname: string,
     fd: FileDescriptorType = bun.invalid_fd,
     dir: FileDescriptorType = bun.invalid_fd,
-    is_tmpdir: bool = false,
 
     pub fn fromFile(fd: bun.FD, pathname: string) FileOperation {
         return .{
@@ -71,11 +70,7 @@ pub const FileOperation = struct {
     }
 
     pub fn getPathname(file: *const FileOperation) string {
-        if (file.is_tmpdir) {
-            return resolve_path.joinAbs(Fs.FileSystem.RealFS.tmpdirPath(), .auto, file.pathname);
-        } else {
-            return file.pathname;
-        }
+        return file.pathname;
     }
 };
 

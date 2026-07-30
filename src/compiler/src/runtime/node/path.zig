@@ -910,7 +910,7 @@ pub fn formatJS_T(comptime T: type, globalObject: *jsc.JSGlobalObject, allocator
 pub fn format(globalObject: *jsc.JSGlobalObject, isWindows: bool, args_ptr: [*]jsc.JSValue, args_len: u16) bun.JSError!jsc.JSValue {
     const pathObject_ptr: jsc.JSValue = if (args_len > 0) args_ptr[0] else .js_undefined;
     // Supress exeption in zig. It does globalThis.vm().throwError() in JS land.
-    try validateObject(globalObject, pathObject_ptr, "pathObject", .{}, .{});
+    try validateObject(globalObject, pathObject_ptr, "pathObject", .{});
 
     var stack_fallback = std.heap.stackFallback(stack_fallback_size_small, bun.default_allocator);
     const allocator = stack_fallback.get();
