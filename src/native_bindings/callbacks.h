@@ -22,6 +22,10 @@ static const JSObjectCallAsFunctionCallback ct_filesystem_native_callbacks[] = {
 #include "filesystem.inc"
 };
 
+static const JSObjectCallAsFunctionCallback ct_glob_native_callbacks[] = {
+#include "glob.inc"
+};
+
 static const JSObjectCallAsFunctionCallback ct_process_native_callbacks[] = {
 #include "process.inc"
 };
@@ -107,6 +111,7 @@ static void ct_register_host_native_bindings(
     CT_REGISTER_NATIVE_BINDINGS(inspector);
     CT_REGISTER_NATIVE_BINDINGS(buffer);
     CT_REGISTER_NATIVE_BINDINGS(filesystem);
+    CT_REGISTER_NATIVE_BINDINGS(glob);
     CT_REGISTER_NATIVE_BINDINGS(process);
     CT_REGISTER_NATIVE_BINDINGS(http);
     CT_REGISTER_NATIVE_BINDINGS(tooling);

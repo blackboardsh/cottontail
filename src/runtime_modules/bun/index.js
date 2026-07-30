@@ -15504,17 +15504,18 @@ export class Glob {
   constructor(pattern) {
     this.pattern = String(pattern);
     const compiledPattern = normalizeGlobCharacterClasses(normalizeGlobSeparators(this.pattern));
-    const patterns = expandBunGlobBraces(compiledPattern);
-    this._matchesEmpty = patterns.some((expanded) => expanded === "*" || expanded === "**");
-    this._matchers = patterns.map((expanded) => ({
-      pattern: expanded,
-      matcher: expanded === "" ? (text) => text === "" : lazyPicomatch(expanded, { dot: true }),
-      trailingGlobstarBase: trailingGlobstarBase(expanded),
-    }));
+    const nativeCompile = globalThis.cottontail?.globCompileNative;
+    this._nativeMatcher =
+      typeof nativeCompile === "function" && shouldUseNativeGlobMatcher(compiledPattern)
+        ? nativeCompile(compiledPattern)
+        : null;
+    if (this._nativeMatcher) return;
+    installGlobJsMatchers(this, compiledPattern);
   }
   match(value) {
     if (typeof value !== "string") throw new TypeError("Glob.match expects a string");
     const text = normalizeGlobSeparators(value);
+    if (this._nativeMatcher) return this._nativeMatcher(text);
     if (text === "" && this._matchesEmpty) return true;
     for (const { matcher, trailingGlobstarBase } of this._matchers) {
       if (trailingGlobstarBase !== null && text === trailingGlobstarBase && trailingGlobstarBase !== "") continue;
@@ -15551,6 +15552,56 @@ export class Glob {
       yield* entries;
     })();
   }
+}
+
+function installGlobJsMatchers(glob, compiledPattern) {
+  const patterns = expandBunGlobBraces(compiledPattern);
+  glob._matchesEmpty = patterns.some((expanded) => expanded === "*" || expanded === "**");
+  glob._matchers = patterns.map((expanded) => ({
+    pattern: expanded,
+    matcher: expanded === "" ? (text) => text === "" : lazyPicomatch(expanded, { dot: true }),
+    trailingGlobstarBase: trailingGlobstarBase(expanded),
+  }));
+}
+
+// Measured by scripts/bench-glob.js. JSC regex wins for compact, reused
+// patterns; native matching wins once brace expansion creates a large matcher set.
+function shouldUseNativeGlobMatcher(pattern) {
+  let escaped = false;
+  let inClass = false;
+  let braceDepth = 0;
+  let braceGroups = 0;
+  let braceCommas = 0;
+  let validBraces = true;
+  for (const char of pattern) {
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === "[" && !inClass) {
+      inClass = true;
+      continue;
+    }
+    if (char === "]" && inClass) {
+      inClass = false;
+      continue;
+    }
+    if (inClass) continue;
+    if (char === "{") {
+      braceDepth += 1;
+      braceGroups += 1;
+    } else if (char === "}") {
+      if (braceDepth === 0) validBraces = false;
+      else braceDepth -= 1;
+    } else if (char === "," && braceDepth > 0) {
+      braceCommas += 1;
+    }
+  }
+  return validBraces && braceDepth === 0 && braceGroups * braceCommas >= 24;
 }
 
 function normalizeGlobScanOptions(options) {

@@ -1,6 +1,7 @@
 const buffer = @import("native_bindings/host/buffer.zig");
 const data_parser = @import("native_bindings/host/data_parser.zig");
 const filesystem = @import("native_bindings/host/filesystem.zig");
+const glob = @import("native_bindings/host/glob.zig");
 const memory = @import("native_bindings/host/memory.zig");
 const path = @import("native_bindings/host/path.zig");
 const process = @import("native_bindings/host/process.zig");
@@ -13,6 +14,7 @@ pub fn forceLink() void {
     memory.forceLink();
     path.forceLink();
     filesystem.forceLink();
+    glob.forceLink();
     process.forceLink();
     sql_wire.forceLink();
     tooling.forceLink();

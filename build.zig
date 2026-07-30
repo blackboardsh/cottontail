@@ -418,6 +418,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             "src/native_bindings/inspector.c",
             "src/native_bindings/buffer.c",
             "src/native_bindings/filesystem.c",
+            "src/native_bindings/glob.c",
             "src/native_bindings/process.c",
             "src/native_bindings/http.c",
             "src/native_bindings/http_parser.c",
