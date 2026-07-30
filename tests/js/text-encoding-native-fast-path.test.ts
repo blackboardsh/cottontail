@@ -56,4 +56,25 @@ describe("native text encoding fast paths", () => {
     expect(Array.from(encoder.encode(`${prefix}\ud800`).slice(-3))).toEqual([0xef, 0xbf, 0xbd]);
     expect(Array.from(encoder.encode(`${prefix}\udc00`).slice(-3))).toEqual([0xef, 0xbf, 0xbd]);
   });
+
+  test("uses native encoding for sampled ASCII and the JS path for sampled Unicode", () => {
+    const original = globalThis.cottontail.textEncode;
+    let calls = 0;
+    globalThis.cottontail.textEncode = (value: string) => {
+      calls += 1;
+      return original(value);
+    };
+
+    try {
+      const encoder = new TextEncoder();
+      expect(encoder.encode("a".repeat(2048)).byteLength).toBe(2048);
+      expect(calls).toBe(1);
+      expect(new TextDecoder().decode(encoder.encode(`\u2603${"a".repeat(2048)}`))).toBe(
+        `\u2603${"a".repeat(2048)}`,
+      );
+      expect(calls).toBe(1);
+    } finally {
+      globalThis.cottontail.textEncode = original;
+    }
+  });
 });

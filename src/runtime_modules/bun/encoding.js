@@ -467,6 +467,22 @@ function utf8EncodeString(text) {
   return out.slice(0, w);
 }
 
+function shouldUseNativeTextEncoder(text) {
+  const length = text.length;
+  if (length < 1024) return false;
+
+  const sampleWidth = 64;
+  const lastStart = Math.max(0, length - sampleWidth);
+  for (let sample = 0; sample < 5; sample++) {
+    const center = Math.floor(lastStart * sample / 4);
+    const end = Math.min(length, center + sampleWidth);
+    for (let index = center; index < end; index++) {
+      if (text.charCodeAt(index) > 0x7f) return false;
+    }
+  }
+  return true;
+}
+
 class TextEncoder {
   constructor() {
     // No options per spec.
@@ -480,7 +496,7 @@ class TextEncoder {
     if (input === undefined) return new Uint8Array(0);
     const text = String(input);
     const encode = g.cottontail?.textEncode;
-    if (text.length >= 1024 && typeof encode === "function") return encode(text);
+    if (typeof encode === "function" && shouldUseNativeTextEncoder(text)) return encode(text);
     return utf8EncodeString(text);
   }
 
