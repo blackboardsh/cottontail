@@ -378,6 +378,15 @@ pub fn indexAnyComptime(target: string, comptime chars: string) ?usize {
     return null;
 }
 
+pub fn indexAnyComptimeT(comptime T: type, target: []const T, comptime chars: []const T) ?usize {
+    for (target, 0..) |parent, i| {
+        inline for (chars) |char| {
+            if (char == parent) return i;
+        }
+    }
+    return null;
+}
+
 pub fn indexEqualAny(in: anytype, target: string) ?usize {
     for (in, 0..) |str, i| if (eqlLong(str, target, true)) return i;
     return null;
@@ -1832,7 +1841,6 @@ pub fn NewGlobLengthSorter(comptime Type: type, comptime field: string) type {
     };
 }
 
-
 pub const ExactSizeMatcher = @import("./immutable/exact_size_matcher.zig").ExactSizeMatcher;
 
 pub const unicode_replacement = 0xFFFD;
@@ -2036,6 +2044,13 @@ pub fn withoutSuffixComptime(input: []const u8, comptime suffix: []const u8) []c
 }
 
 pub fn withoutPrefixComptime(input: []const u8, comptime prefix: []const u8) []const u8 {
+    if (hasPrefixComptime(input, prefix)) {
+        return input[prefix.len..];
+    }
+    return input;
+}
+
+pub fn withoutPrefixComptimeZ(input: [:0]const u8, comptime prefix: []const u8) [:0]const u8 {
     if (hasPrefixComptime(input, prefix)) {
         return input[prefix.len..];
     }

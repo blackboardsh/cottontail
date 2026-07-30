@@ -51,7 +51,6 @@ pub fn getEntryPoints(this: *const Router) []const string {
     return this.routes.list.items(.filepath);
 }
 
-
 pub fn getNames(this: *const Router) []const string {
     return this.routes.list.items(.name);
 }
@@ -849,6 +848,13 @@ pub const Match = struct {
         return this.params.len > 0;
     }
 
+    pub fn paramsIterator(this: *const Match) PathnameScanner {
+        return PathnameScanner.init(this.pathname, this.name, this.params);
+    }
+
+    pub fn pathnameWithoutLeadingSlash(this: *const Match) string {
+        return std.mem.trimStart(u8, this.pathname, "/");
+    }
 };
 
 const MockRequestContextType = struct {
@@ -903,7 +909,6 @@ fn makeTest(cwd_path: string, data: anytype) !void {
 }
 
 pub const Test = struct {
-
     pub fn make(comptime testName: string, data: anytype) !Router {
         try makeTest(testName, data);
         const JSAst = bun.ast;

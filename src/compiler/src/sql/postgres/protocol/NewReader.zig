@@ -67,6 +67,10 @@ pub fn NewReaderWrap(
             return @byteSwap(@as(Int, @bitCast(slice[0..@sizeOf(Int)].*)));
         }
 
+        pub fn expectInt(this: @This(), comptime Int: type, comptime value: comptime_int) !bool {
+            const actual = try this.int(Int);
+            return actual == value;
+        }
 
         pub fn int4(this: @This()) !PostgresInt32 {
             return this.int(PostgresInt32);

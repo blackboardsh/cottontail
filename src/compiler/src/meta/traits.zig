@@ -57,6 +57,10 @@ pub inline fn isContainer(comptime T: type) bool {
     };
 }
 
+pub fn isConstPtr(comptime T: type) bool {
+    const info = @typeInfo(T);
+    return info == .pointer and info.pointer.is_const;
+}
 
 pub fn isExternContainer(comptime T: type) bool {
     return switch (@typeInfo(T)) {
@@ -65,7 +69,6 @@ pub fn isExternContainer(comptime T: type) bool {
         else => false,
     };
 }
-
 
 pub fn isIndexable(comptime T: type) bool {
     const info = @typeInfo(T);

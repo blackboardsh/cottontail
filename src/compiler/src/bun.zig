@@ -20,7 +20,6 @@ pub const z_allocator: std.mem.Allocator = allocators.z_allocator;
 pub const callmod_inline: std.builtin.CallModifier = if (builtin.mode == .Debug) .auto else .always_inline;
 pub const callconv_inline: std.builtin.CallingConvention = if (builtin.mode == .Debug) .auto else .@"inline";
 
-
 pub const debug_allocator_data = struct {
     comptime {
         if (!Environment.isDebug) @compileError("only available in debug");
@@ -703,7 +702,6 @@ pub const ptr = @import("./ptr/ptr.zig");
 pub const TaggedPointer = ptr.TaggedPointer;
 pub const TaggedPointerUnion = ptr.TaggedPointerUnion;
 
-
 pub const memory = @import("./bun_alloc/memory.zig");
 pub const allocators = @import("./bun_alloc/bun_alloc.zig");
 pub const mimalloc = allocators.mimalloc;
@@ -714,6 +712,34 @@ pub const MaxHeapAllocator = allocators.MaxHeapAllocator;
 
 pub const isSliceInBuffer = allocators.isSliceInBuffer;
 pub const isSliceInBufferT = allocators.isSliceInBufferT;
+
+pub fn onceUnsafe(comptime function: anytype, comptime ReturnType: type) ReturnType {
+    const Result = struct {
+        var value: ReturnType = undefined;
+        var ran = false;
+
+        pub fn execute() ReturnType {
+            if (ran) return value;
+            ran = true;
+            value = function();
+            return value;
+        }
+    };
+
+    return Result.execute();
+}
+
+pub fn rangeOfSliceInBuffer(slice: []const u8, buffer: []const u8) ?[2]u32 {
+    if (!isSliceInBuffer(slice, buffer)) return null;
+    const range = [_]u32{
+        @as(u32, @truncate(@intFromPtr(slice.ptr) -| @intFromPtr(buffer.ptr))),
+        @as(u32, @truncate(slice.len)),
+    };
+    if (comptime Environment.allow_assert) {
+        assert(strings.eqlLong(slice, buffer[range[0]..][0..range[1]], false));
+    }
+    return range;
+}
 
 // TODO: prefer .invalid decl literal over this
 // Please prefer `bun.FD.Optional.none` over this
