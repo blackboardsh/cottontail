@@ -211,6 +211,12 @@ try {
       stderrIncludes: ['6 pass', '0 fail'],
     },
     {
+      name: 'bun-random-uuid-native',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-random-uuid-native.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['10 pass', '0 fail'],
+    },
+    {
       name: 'cli-version-identity-regressions',
       argv: ['test', join(rootDir, 'tests', 'js', 'cli-version-identity.test.ts')],
       expectExitCode: 0,

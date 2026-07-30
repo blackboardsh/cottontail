@@ -437,6 +437,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             "src/native_bindings/url.c",
             "src/native_bindings/platform.c",
             "src/native_bindings/path.c",
+            "src/native_bindings/uuid.c",
             "src/compiler/src/jsc/bindings/node/http/llhttp/api.c",
             "src/compiler/src/jsc/bindings/node/http/llhttp/http.c",
             "src/compiler/src/jsc/bindings/node/http/llhttp/llhttp.c",

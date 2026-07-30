@@ -94,6 +94,10 @@ static const JSObjectCallAsFunctionCallback ct_path_native_callbacks[] = {
 #include "path.inc"
 };
 
+static const JSObjectCallAsFunctionCallback ct_uuid_native_callbacks[] = {
+#include "uuid.inc"
+};
+
 #undef CT_NATIVE_BINDING
 
 #define CT_NATIVE_CALLBACK_COUNT(callbacks) (sizeof(callbacks) / sizeof(callbacks[0]))
@@ -133,6 +137,7 @@ static void ct_register_host_native_bindings(
     CT_REGISTER_NATIVE_BINDINGS(url);
     CT_REGISTER_NATIVE_BINDINGS(platform);
     CT_REGISTER_NATIVE_BINDINGS(path);
+    CT_REGISTER_NATIVE_BINDINGS(uuid);
 }
 
 #undef CT_REGISTER_NATIVE_BINDINGS

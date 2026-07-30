@@ -8,6 +8,7 @@ const process = @import("native_bindings/host/process.zig");
 const sql_wire = @import("native_bindings/host/sql_wire.zig");
 const text_encoding = @import("native_bindings/host/text_encoding.zig");
 const tooling = @import("native_bindings/host/tooling.zig");
+const uuid = @import("native_bindings/host/uuid.zig");
 
 pub fn forceLink() void {
     buffer.forceLink();
@@ -20,4 +21,5 @@ pub fn forceLink() void {
     sql_wire.forceLink();
     text_encoding.forceLink();
     tooling.forceLink();
+    uuid.forceLink();
 }
