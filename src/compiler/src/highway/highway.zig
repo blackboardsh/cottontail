@@ -126,8 +126,20 @@ fn highway_fill_with_skip_mask(
         return;
     }
 
-    for (input[0..length], 0..) |byte, i| {
-        output[i] = byte ^ mask[i % mask_len];
+    const MaskVector = @Vector(16, u8);
+    const mask_vector: MaskVector = .{
+        mask[0], mask[1], mask[2], mask[3],
+        mask[0], mask[1], mask[2], mask[3],
+        mask[0], mask[1], mask[2], mask[3],
+        mask[0], mask[1], mask[2], mask[3],
+    };
+    var index: usize = 0;
+    while (length - index >= 16) : (index += 16) {
+        const input_vector: MaskVector = input[index..][0..16].*;
+        output[index..][0..16].* = @bitCast(input_vector ^ mask_vector);
+    }
+    while (index < length) : (index += 1) {
+        output[index] = input[index] ^ mask[index % mask_len];
     }
 }
 
@@ -324,6 +336,23 @@ pub fn fillWithSkipMask(mask: [4]u8, output: []u8, input: []const u8, skip_mask:
         input.len,
         skip_mask,
     );
+}
+
+test "fillWithSkipMask vector body and scalar tail match WebSocket masking" {
+    const mask = [4]u8{ 0x37, 0xfa, 0x21, 0x3d };
+    var input: [259]u8 = undefined;
+    for (&input, 0..) |*byte, index| byte.* = @truncate(index * 37 + 11);
+
+    var expected: [input.len]u8 = undefined;
+    for (input, 0..) |byte, index| expected[index] = byte ^ mask[index % mask.len];
+
+    var output: [input.len]u8 = undefined;
+    fillWithSkipMask(mask, &output, &input, false);
+    try std.testing.expectEqualSlices(u8, &expected, &output);
+
+    var copied: [input.len]u8 = undefined;
+    fillWithSkipMask(mask, &copied, &input, true);
+    try std.testing.expectEqualSlices(u8, &input, &copied);
 }
 
 /// Useful for single-line JavaScript comments.

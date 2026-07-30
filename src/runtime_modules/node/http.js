@@ -9,6 +9,12 @@ import { AsyncResource } from "./async_hooks.js";
 import { HTTPParser as BindingHTTPParser, allMethods as bindingHTTPMethods } from "../internal/node-http-parser.js";
 import { normalizeIncomingMessageArgument } from "./http-interception.js";
 
+const nativeWebSocketFrameEncode = globalThis.cottontail?.websocketFrameEncode;
+const nativeWebSocketUnmaskCopy = globalThis.cottontail?.websocketUnmaskCopy;
+const nativeWebSocketMaskedEncodeThreshold = 256;
+const nativeWebSocketUnmaskedEncodeThreshold = 256;
+const nativeWebSocketUnmaskedEncodeLimit = 2048;
+const nativeWebSocketUnmaskThreshold = 4096;
 const asyncIdSymbol = Symbol.for("nodejs.async_id_symbol");
 const captureRejectionSymbol = Symbol.for("nodejs.rejection");
 const socketAsyncResourceSymbol = Symbol("cottontail.http.socketAsyncResource");
@@ -1236,6 +1242,13 @@ export function websocketFrame(opcode, payload = Buffer.alloc(0), masked = true,
   if ((opcode & 0x08) !== 0 && body.byteLength > 125) {
     throw new RangeError("WebSocket control frame payload must not exceed 125 bytes");
   }
+  const useNativeEncode = masked
+    ? body.byteLength >= nativeWebSocketMaskedEncodeThreshold
+    : body.byteLength >= nativeWebSocketUnmaskedEncodeThreshold
+      && body.byteLength < nativeWebSocketUnmaskedEncodeLimit;
+  if (useNativeEncode && typeof nativeWebSocketFrameEncode === "function") {
+    return Buffer.from(nativeWebSocketFrameEncode(body, opcode & 0xff, masked, rsv1));
+  }
   const header = [];
   header.push(0x80 | (rsv1 ? 0x40 : 0) | (opcode & 0x0f));
   if (body.byteLength < 126) {
@@ -1313,10 +1326,16 @@ export function parseWebSocketFrames(buffer, options = {}) {
     const mask = masked ? buffer.subarray(offset, offset + 4) : null;
     if (masked) offset += 4;
     if (buffer.byteLength - offset < length) return { frames, remaining: buffer.subarray(frameStart) };
-    const payload = Buffer.from(buffer.subarray(offset, offset + length));
+    const encodedPayload = buffer.subarray(offset, offset + length);
     offset += length;
-    if (mask) {
-      for (let index = 0; index < payload.byteLength; index += 1) payload[index] ^= mask[index % 4];
+    let payload;
+    if (mask && length >= nativeWebSocketUnmaskThreshold && typeof nativeWebSocketUnmaskCopy === "function") {
+      payload = Buffer.from(nativeWebSocketUnmaskCopy(encodedPayload, mask));
+    } else {
+      payload = Buffer.from(encodedPayload);
+      if (mask) {
+        for (let index = 0; index < payload.byteLength; index += 1) payload[index] ^= mask[index % 4];
+      }
     }
     frames.push({ fin, rsv1, rsv2, rsv3, opcode, masked, payload });
   }

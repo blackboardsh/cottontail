@@ -1023,6 +1023,12 @@ try {
       stderrIncludes: ['6 pass', '0 fail'],
     },
     {
+      name: 'websocket-native-frame',
+      argv: ['test', join(rootDir, 'tests', 'js', 'websocket-native-frame.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['4 pass', '0 fail'],
+    },
+    {
       name: 'node-dns-surface',
       scriptPath: join(rootDir, 'tests', 'js', 'node-dns-surface.ts'),
       expectExitCode: 0,
