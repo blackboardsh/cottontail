@@ -15567,13 +15567,15 @@ function installGlobJsMatchers(glob, compiledPattern) {
 // Measured by scripts/bench-glob.js. JSC regex wins for compact, reused
 // patterns; native matching wins once brace expansion creates a large matcher set.
 function shouldUseNativeGlobMatcher(pattern) {
+  if (pattern.startsWith("!")) return false;
   let escaped = false;
   let inClass = false;
   let braceDepth = 0;
   let braceGroups = 0;
   let braceCommas = 0;
   let validBraces = true;
-  for (const char of pattern) {
+  for (let index = 0; index < pattern.length; index++) {
+    const char = pattern[index];
     if (escaped) {
       escaped = false;
       continue;
@@ -15591,6 +15593,12 @@ function shouldUseNativeGlobMatcher(pattern) {
       continue;
     }
     if (inClass) continue;
+    if (
+      pattern[index + 1] === "(" &&
+      (char === "?" || char === "*" || char === "+" || char === "@" || char === "!")
+    ) {
+      return false;
+    }
     if (char === "{") {
       braceDepth += 1;
       braceGroups += 1;
