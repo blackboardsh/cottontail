@@ -278,7 +278,8 @@ function normalizeNativeCallerSourceOrigin(origin) {
   } else if (/^file:\/\/[A-Za-z]:\//.test(normalized)) {
     drivePath = normalized.slice("file://".length);
   } else {
-    return normalized.startsWith("file://") ? normalized : "";
+    if (normalized.startsWith("file://")) return normalized;
+    return normalized.startsWith("/") ? new URL(`file://${normalized}`).href : "";
   }
 
   drivePath = drivePath[0].toUpperCase() + drivePath.slice(1);
