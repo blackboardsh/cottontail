@@ -479,12 +479,6 @@ pub fn NewRequestContext(comptime ssl_enabled: bool, comptime debug_mode: bool, 
             }
         }
 
-        pub fn renderResponseBuffer(this: *RequestContext) void {
-            if (this.resp) |resp| {
-                resp.onWritable(*RequestContext, onWritableResponseBuffer, this);
-            }
-        }
-
         /// Drain a partial response buffer
         pub fn drainResponseBufferAndMetadata(this: *RequestContext) void {
             if (this.resp) |resp| {

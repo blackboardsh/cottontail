@@ -1,5 +1,4 @@
 pub const InstallCompletionsCommand = struct {
-    pub fn testPath(_: string) !std.fs.Dir {}
 
     const bunx_name = if (Environment.isDebug) "bunx-debug" else "bunx";
 

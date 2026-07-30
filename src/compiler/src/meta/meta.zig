@@ -104,45 +104,6 @@ pub inline fn ConcatArgs2(
 
 pub const TaggedUnion = @import("./tagged_union.zig").TaggedUnion;
 
-pub fn hasStableMemoryLayout(comptime T: type) bool {
-    const tyinfo = @typeInfo(T);
-    return switch (tyinfo) {
-        .Type => true,
-        .Void => true,
-        .Bool => true,
-        .Int => true,
-        .Float => true,
-        .@"enum" => {
-            // not supporting this rn
-            if (tyinfo.@"enum".is_exhaustive) return false;
-            return hasStableMemoryLayout(tyinfo.@"enum".tag_type);
-        },
-        .@"struct" => switch (tyinfo.@"struct".layout) {
-            .auto => {
-                inline for (tyinfo.@"struct".fields) |field| {
-                    if (!hasStableMemoryLayout(field.field_type)) return false;
-                }
-                return true;
-            },
-            .@"extern" => true,
-            .@"packed" => false,
-        },
-        .@"union" => switch (tyinfo.@"union".layout) {
-            .auto => {
-                if (tyinfo.@"union".tag_type == null or !hasStableMemoryLayout(tyinfo.@"union".tag_type.?)) return false;
-
-                inline for (tyinfo.@"union".fields) |field| {
-                    if (!hasStableMemoryLayout(field.type)) return false;
-                }
-
-                return true;
-            },
-            .@"extern" => true,
-            .@"packed" => false,
-        },
-        else => true,
-    };
-}
 
 pub fn isSimpleCopyType(comptime T: type) bool {
     @setEvalBranchQuota(1_000_000);

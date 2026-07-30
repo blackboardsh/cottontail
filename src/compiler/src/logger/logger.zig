@@ -1201,26 +1201,12 @@ pub const Source = struct {
     contents: string,
     contents_is_recycled: bool = false,
 
-    /// Lazily-generated human-readable identifier name that is non-unique
-    /// Avoid accessing this directly most of the  time
-    identifier_name: string = "",
-
     index: Index = Index.source(0),
 
     pub fn fmtIdentifier(this: *const Source) bun.fmt.FormatValidIdentifier {
         return this.path.name.fmtIdentifier();
     }
 
-    pub fn identifierName(this: *Source, allocator: std.mem.Allocator) !string {
-        if (this.identifier_name.len > 0) {
-            return this.identifier_name;
-        }
-
-        bun.assert(this.path.text.len > 0);
-        const name = try this.path.name.nonUniqueNameString(allocator);
-        this.identifier_name = name;
-        return name;
-    }
 
     pub fn rangeOfIdentifier(this: *const Source, loc: Loc) Range {
         const js_lexer = @import("../js_parser/lexer.zig");

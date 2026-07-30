@@ -25,18 +25,6 @@ pub const Borrowed = struct {
         return .{ .ptr = self._heap, .vtable = &heap_allocator_vtable };
     }
 
-    /// Prefer `Default.allocator()` / `getThreadLocalDefault()` for a thread-safe
-    /// global allocator. This returns the process-wide main heap so that
-    /// `gc()` / `ownsPtr()` on the result remain meaningful.
-    pub fn getDefault() Borrowed {
-        const heap = mimalloc.mi_heap_main();
-        if (comptime !safety_checks) return .{ ._heap = heap };
-        const S = struct {
-            threadlocal var dbg: ?DebugHeap = null;
-        };
-        if (S.dbg == null) S.dbg = .{ .inner = heap, .thread_lock = .initLocked() };
-        return .{ ._heap = &S.dbg.? };
-    }
 
     pub fn gc(self: Borrowed) void {
         mimalloc.mi_heap_collect(self.getMimallocHeap(), false);

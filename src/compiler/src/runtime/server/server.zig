@@ -3427,15 +3427,6 @@ pub const AnyServer = struct {
         };
     }
 
-    pub fn getPlugins(this: AnyServer) PluginsResult {
-        return switch (this.ptr.tag()) {
-            Ptr.case(HTTPServer) => this.ptr.as(HTTPServer).getPlugins(),
-            Ptr.case(HTTPSServer) => this.ptr.as(HTTPSServer).getPlugins(),
-            Ptr.case(DebugHTTPServer) => this.ptr.as(DebugHTTPServer).getPlugins(),
-            Ptr.case(DebugHTTPSServer) => this.ptr.as(DebugHTTPSServer).getPlugins(),
-            else => bun.unreachablePanic("Invalid pointer tag", .{}),
-        };
-    }
 
     pub fn loadAndResolvePlugins(this: AnyServer, bundle: *HTMLBundle.HTMLBundleRoute, raw_plugins: []const []const u8, bunfig_path: []const u8) void {
         return switch (this.ptr.tag()) {

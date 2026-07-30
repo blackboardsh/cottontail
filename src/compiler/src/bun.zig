@@ -3061,7 +3061,6 @@ pub fn assert(ok: bool) callconv(callconv_inline) void {
 /// }
 /// ```
 ///
-/// Use `releaseAssert` for assertions that should not be stripped in release builds.
 pub fn assertf(ok: bool, comptime format: []const u8, args: anytype) callconv(callconv_inline) void {
     if (comptime !Environment.allow_assert) {
         return;
@@ -3069,16 +3068,6 @@ pub fn assertf(ok: bool, comptime format: []const u8, args: anytype) callconv(ca
 
     if (!ok) {
         assertionFailureWithMsg(format, args);
-    }
-}
-
-/// Asserts that some condition holds. These assertions are not stripped
-/// in any build mode. Use `assert` to have assertions stripped in release
-/// builds.
-pub fn releaseAssert(ok: bool, comptime msg: []const u8, args: anytype) callconv(callconv_inline) void {
-    if (!ok) {
-        @branchHint(.cold);
-        Output.panic(assertion_failure_msg ++ ": " ++ msg, args);
     }
 }
 

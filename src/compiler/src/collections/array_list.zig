@@ -108,16 +108,6 @@ pub fn ArrayListAlignedIn(
             };
         }
 
-        pub fn fromOwnedSliceSentinel(
-            allocator_: Allocator,
-            comptime sentinel: T,
-            slice: [:sentinel]T,
-        ) Self {
-            return .{
-                ._unmanaged = .fromOwnedSliceSentinel(sentinel, slice),
-                ._allocator = allocator_,
-            };
-        }
 
         pub fn writer(self: *Self) Unmanaged.Writer {
             return self._unmanaged.writer(self.getStdAllocator());
@@ -273,15 +263,6 @@ pub fn ArrayListAlignedIn(
             self._unmanaged.appendSliceAssumeCapacity(new_items);
         }
 
-        /// This method takes ownership of all elements in `new_items`.
-        pub fn appendUnalignedSlice(self: *Self, new_items: []align(1) const T) AllocError!void {
-            return self._unmanaged.appendUnalignedSlice(self.getStdAllocator(), new_items);
-        }
-
-        /// This method takes ownership of all elements in `new_items`.
-        pub fn appendUnalignedSliceAssumeCapacity(self: *Self, new_items: []align(1) const T) void {
-            self._unmanaged.appendUnalignedSliceAssumeCapacity(new_items);
-        }
 
         /// Note that this creates *shallow* copies of `value`.
         pub inline fn appendNTimes(self: *Self, value: T, n: usize) AllocError!void {
