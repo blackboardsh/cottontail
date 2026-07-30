@@ -645,6 +645,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = optimize == .ReleaseSmall,
         }),
     });
     exe.root_module.addImport("cottontail_compiler", createCompilerModule(b, target, optimize));

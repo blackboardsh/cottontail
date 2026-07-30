@@ -1,0 +1,82 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import {
+  assertStrippedReleaseBinary,
+  inspectReleaseBinary,
+} from './release-binary-contract.js';
+
+function machoFixture(localSymbols) {
+  const buffer = Buffer.alloc(32 + 24 + 80);
+  buffer.writeUInt32LE(0xfeedfacf, 0);
+  buffer.writeUInt32LE(2, 16);
+  buffer.writeUInt32LE(104, 20);
+
+  let offset = 32;
+  buffer.writeUInt32LE(0x2, offset);
+  buffer.writeUInt32LE(24, offset + 4);
+  buffer.writeUInt32LE(localSymbols + 5, offset + 12);
+  buffer.writeUInt32LE(localSymbols === 0 ? 64 : 8192, offset + 20);
+
+  offset += 24;
+  buffer.writeUInt32LE(0xb, offset);
+  buffer.writeUInt32LE(80, offset + 4);
+  buffer.writeUInt32LE(localSymbols, offset + 12);
+  buffer.writeUInt32LE(2, offset + 20);
+  buffer.writeUInt32LE(3, offset + 28);
+  return buffer;
+}
+
+function elfFixture(withStaticSymbols) {
+  const buffer = Buffer.alloc(128);
+  buffer.set([0x7f, 0x45, 0x4c, 0x46, 2, 1], 0);
+  buffer.writeBigUInt64LE(64n, 40);
+  buffer.writeUInt16LE(64, 58);
+  buffer.writeUInt16LE(1, 60);
+  buffer.writeUInt32LE(withStaticSymbols ? 2 : 3, 68);
+  buffer.writeBigUInt64LE(withStaticSymbols ? 4096n : 32n, 96);
+  return buffer;
+}
+
+function peFixture(symbols) {
+  const buffer = Buffer.alloc(256);
+  buffer.set([0x4d, 0x5a], 0);
+  buffer.writeUInt32LE(128, 0x3c);
+  buffer.writeUInt32LE(0x00004550, 128);
+  buffer.writeUInt32LE(symbols === 0 ? 0 : 192, 140);
+  buffer.writeUInt32LE(symbols, 144);
+  return buffer;
+}
+
+test('accepts stripped Mach-O, ELF, and PE release binaries', () => {
+  assert.equal(assertStrippedReleaseBinary(machoFixture(0)).format, 'mach-o');
+  assert.equal(assertStrippedReleaseBinary(elfFixture(false)).format, 'elf64');
+  assert.equal(assertStrippedReleaseBinary(peFixture(0)).format, 'pe');
+});
+
+test('reports symbol metadata retained by unstripped binaries', () => {
+  assert.deepEqual(inspectReleaseBinary(machoFixture(120_000)).localSymbols, 120_000);
+  assert.throws(
+    () => assertStrippedReleaseBinary(machoFixture(120_000)),
+    /oversized symbol table/,
+  );
+  assert.throws(
+    () => assertStrippedReleaseBinary(elfFixture(true)),
+    /static symbol table/,
+  );
+  assert.throws(
+    () => assertStrippedReleaseBinary(peFixture(8)),
+    /contains 8 COFF symbols/,
+  );
+});
+
+test('rejects malformed and unsupported release files', () => {
+  assert.throws(
+    () => inspectReleaseBinary(Buffer.from('not an executable')),
+    /Unsupported release binary format/,
+  );
+  assert.throws(
+    () => inspectReleaseBinary(machoFixture(0).subarray(0, 40)),
+    /out of range/,
+  );
+});

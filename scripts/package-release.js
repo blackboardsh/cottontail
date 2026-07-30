@@ -5,6 +5,7 @@ import { createHash } from 'crypto';
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
 import { basename, join } from 'path';
 
+import { assertStrippedReleaseBinary } from './release-binary-contract.js';
 import { releaseChannel } from './release-contract.js';
 
 const rootDir = process.cwd();
@@ -79,6 +80,11 @@ for (const [label, path] of [
   ['ICU fallback license', icuLicenseSource],
 ]) {
   if (!existsSync(path)) fail(`Missing ${label}: ${path}`);
+}
+try {
+  assertStrippedReleaseBinary(readFileSync(executablePath));
+} catch (error) {
+  fail(`Release executable is not stripped: ${error.message}`);
 }
 if (statSync(icuDataSource).size !== icuData.dataSize || sha256(icuDataSource) !== icuData.dataSha256) {
   fail(`Pinned ICU fallback data failed verification: ${icuDataSource}`);

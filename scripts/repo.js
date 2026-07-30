@@ -183,12 +183,7 @@ function build() {
 
 function buildRelease() {
   ensureSetup();
-  const args = ['build', '-Doptimize=ReleaseSmall'];
-  if (os.platform() === 'win32') {
-    args.push('-Dtarget=x86_64-windows-msvc');
-  }
-  args.push('-Dcpu=baseline');
-  runZig(args);
+  runChecked(process.execPath, [path.join(ROOT, 'scripts', 'build-release.js')]);
 }
 
 function runCommand(scriptArgs) {

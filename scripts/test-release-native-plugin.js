@@ -1,0 +1,44 @@
+#!/usr/bin/env node
+
+import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+
+const rootDir = process.cwd();
+const executableName = process.platform === 'win32' ? 'cottontail.exe' : 'cottontail';
+const zigName = process.platform === 'win32' ? 'zig.exe' : 'zig';
+const zigPath = join(rootDir, 'vendors', 'zig', zigName);
+const executablePath = join(rootDir, 'zig-out', 'bin', executableName);
+const pluginPath = join(rootDir, 'zig-out', 'lib', 'native-bundler-plugin.node');
+const testPath = join(rootDir, 'tests', 'js', 'bun-native-plugin.ts');
+
+function run(command, args, label) {
+  const result = spawnSync(command, args, {
+    cwd: rootDir,
+    encoding: 'utf8',
+  });
+  if (result.status === 0) return result;
+  const output = [result.stdout, result.stderr, result.error?.message].filter(Boolean).join('\n');
+  throw new Error(`${label} failed with exit code ${result.status ?? 'unknown'}:\n${output}`);
+}
+
+if (!existsSync(executablePath)) {
+  throw new Error(`Release executable is missing: ${executablePath}`);
+}
+
+const buildArgs = ['build', 'test-native-plugin', '-Doptimize=ReleaseSmall'];
+if (process.platform === 'win32') {
+  buildArgs.push('-Dtarget=x86_64-windows-msvc');
+}
+buildArgs.push('-Dcpu=baseline');
+run(zigPath, buildArgs, 'Native plugin fixture build');
+
+if (!existsSync(pluginPath)) {
+  throw new Error(`Native plugin fixture is missing: ${pluginPath}`);
+}
+const smoke = run(
+  executablePath,
+  ['run', testPath, pluginPath],
+  'Stripped release native plugin smoke test',
+);
+process.stdout.write(smoke.stdout);
