@@ -35491,7 +35491,6 @@ static JSValueRef ct_unhandled_rejection(
 #include "native_bindings/path_jsc.inc"
 #include "native_bindings/glob_jsc.inc"
 #include "native_bindings/url_jsc.inc"
-#include "native_bindings/text_utilities_jsc.inc"
 #include "native_bindings/callbacks.h"
 
 static int ct_install_host_api(CtJscRuntime *runtime) {

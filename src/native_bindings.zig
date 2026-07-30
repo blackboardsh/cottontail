@@ -6,7 +6,6 @@ const memory = @import("native_bindings/host/memory.zig");
 const path = @import("native_bindings/host/path.zig");
 const process = @import("native_bindings/host/process.zig");
 const sql_wire = @import("native_bindings/host/sql_wire.zig");
-const text_utilities = @import("native_bindings/host/text_utilities.zig");
 const tooling = @import("native_bindings/host/tooling.zig");
 
 pub fn forceLink() void {
@@ -18,6 +17,5 @@ pub fn forceLink() void {
     glob.forceLink();
     process.forceLink();
     sql_wire.forceLink();
-    text_utilities.forceLink();
     tooling.forceLink();
 }

@@ -1,1 +1,0 @@
-CT_NATIVE_BINDING("textASCIIWidthNative", ct_text_ascii_width_native)
