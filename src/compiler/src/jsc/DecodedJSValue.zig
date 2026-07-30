@@ -8,10 +8,6 @@ pub const DecodedJSValue = extern struct {
     pub const EncodedValueDescriptor = extern union {
         asInt64: i64,
         ptr: ?*jsc.JSCell,
-        asBits: extern struct {
-            payload: i32,
-            tag: i32,
-        },
     };
 
     /// Equivalent to `JSC::JSValue::encode`.
@@ -37,11 +33,6 @@ pub const DecodedJSValue = extern struct {
 
 comptime {
     bun.assertf(@sizeOf(usize) == 8, "EncodedValueDescriptor assumes a 64-bit system", .{});
-    bun.assertf(
-        @import("builtin").target.cpu.arch.endian() == .little,
-        "EncodedValueDescriptor.asBits assumes a little-endian system",
-        .{},
-    );
 }
 
 const bun = @import("bun");
