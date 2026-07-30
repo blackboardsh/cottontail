@@ -141,7 +141,6 @@ pub const LoadResult = union(enum) {
     },
     ok: struct {
         lockfile: *Lockfile,
-        loaded_from_binary_lockfile: bool,
         migrated: enum { none, npm, yarn, pnpm } = .none,
         serializer_result: Serializer.SerializerLoadResult,
         format: LockfileFormat,
@@ -353,7 +352,6 @@ pub fn loadFromDir(
             .ok = .{
                 .lockfile = this,
                 .serializer_result = .{},
-                .loaded_from_binary_lockfile = false,
                 .format = lockfile_format,
             },
         };
@@ -434,7 +432,6 @@ fn loadFromBytesImpl(this: *Lockfile, pm: anytype, buf: []u8, allocator: Allocat
         .ok = .{
             .lockfile = this,
             .serializer_result = load_result,
-            .loaded_from_binary_lockfile = true,
             .format = .binary,
         },
     };
@@ -864,7 +861,6 @@ pub const Cloner = struct {
     old: *Lockfile,
     mapping: []PackageID,
     trees: Tree.List = Tree.List{},
-    trees_count: u32 = 1,
     log: *logger.Log,
     old_preinstall_state: std.ArrayListUnmanaged(Install.PreinstallState),
     manager: *PackageManager,

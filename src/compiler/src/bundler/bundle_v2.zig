@@ -285,7 +285,6 @@ pub const BundleV2 = struct {
         all_loaders: []const Loader,
         all_urls_for_css: []const []const u8,
         redirects: []u32,
-        redirect_map: PathToSourceIndexMap,
         dynamic_import_entry_points: *bun.AutoArrayHashMap(Index.Int, void),
         /// Files which are Server Component Boundaries
         scb_bitset: ?bun.bit_set.DynamicBitSetUnmanaged,
@@ -415,7 +414,6 @@ pub const BundleV2 = struct {
             .all_import_records = this.graph.ast.items(.import_records),
             .all_loaders = this.graph.input_files.items(.loader),
             .all_urls_for_css = all_urls_for_css,
-            .redirect_map = this.pathToSourceIndexMap(this.transpiler.options.target).*,
             .dynamic_import_entry_points = &this.dynamic_import_entry_points,
             .scb_bitset = scb_bitset,
             .scb_list = if (scb_bitset != null)
@@ -2007,7 +2005,6 @@ pub const BundleV2 = struct {
                 }
                 this.graph.input_files.items(.loader)[load.source_index.get()] = code.loader;
                 this.graph.input_files.items(.source)[load.source_index.get()].contents = code.source_code;
-                this.graph.input_files.items(.flags)[load.source_index.get()].is_plugin_file = true;
                 var parse_task = load.parse_task;
                 parse_task.loader = code.loader;
                 if (!should_copy_for_bundling) this.free_list.append(code.source_code) catch unreachable;

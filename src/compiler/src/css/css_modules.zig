@@ -63,13 +63,10 @@ pub const CssModule = struct {
 
     pub fn getReference(this: *CssModule, allocator: Allocator, name: []const u8, source_index: u32) void {
         const gop = bun.handleOom(this.exports_by_source_index.items[source_index].getOrPut(allocator, name));
-        if (gop.found_existing) {
-            gop.value_ptr.is_referenced = true;
-        } else {
+        if (!gop.found_existing) {
             gop.value_ptr.* = CssModuleExport{
                 .name = this.config.pattern.writeToString(allocator, .empty, this.hashes.items[source_index], this.sources.items[source_index], name),
                 .composes = .empty,
-                .is_referenced = true,
             };
         }
     }
@@ -99,9 +96,7 @@ pub const CssModule = struct {
         } else {
             // Local export. Mark as used.
             const gop = bun.handleOom(this.exports_by_source_index.items[source_index].getOrPut(allocator, name));
-            if (gop.found_existing) {
-                gop.value_ptr.is_referenced = true;
-            } else {
+            if (!gop.found_existing) {
                 var res = ArrayList(u8).empty;
                 bun.handleOom(res.appendSlice(allocator, "--"));
                 gop.value_ptr.* = CssModuleExport{
@@ -113,7 +108,6 @@ pub const CssModule = struct {
                         name[2..],
                     ),
                     .composes = .empty,
-                    .is_referenced = true,
                 };
             }
             return null;
@@ -163,7 +157,6 @@ pub const CssModule = struct {
                     local[2..],
                 ),
                 .composes = .empty,
-                .is_referenced = false,
             };
         }
     }
@@ -181,7 +174,6 @@ pub const CssModule = struct {
                     local,
                 ),
                 .composes = .empty,
-                .is_referenced = false,
             };
         }
     }
@@ -350,8 +342,6 @@ pub const CssModuleExport = struct {
     name: []const u8,
     /// Other names that are composed by this export.
     composes: ArrayList(CssModuleReference),
-    /// Whether the export is referenced in this file.
-    is_referenced: bool,
 };
 
 /// A referenced name within a CSS module, e.g. via the `composes` property.

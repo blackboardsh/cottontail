@@ -224,7 +224,6 @@ pub const ShellLsTask = struct {
     output: std.array_list.Managed(u8),
     is_absolute: bool = false,
     err: ?Syscall.Error = null,
-    result_kind: enum { file, dir, idk } = .idk,
     /// Cached current time (seconds since epoch) for formatting timestamps.
     /// Cached once per task to avoid repeated syscalls.
     _now_secs: u64 = 0,
@@ -308,7 +307,6 @@ pub const ShellLsTask = struct {
                         this.err = this.errorWithPath(e, this.path);
                     },
                     .NOTDIR => {
-                        this.result_kind = .file;
                         this.addEntry(this.path, this.cwd);
                     },
                     else => {

@@ -1127,7 +1127,6 @@ fn migrateNPMLockfileWithManager(
         .ok = .{
             .lockfile = this,
             .migrated = .npm,
-            .loaded_from_binary_lockfile = false,
             .serializer_result = .{},
             .format = .binary,
         },
