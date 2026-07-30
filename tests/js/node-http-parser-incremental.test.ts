@@ -87,14 +87,15 @@ parseAtEverySplit(chunked, "123123456123456789");
 {
   const parser = new HTTPParser();
   parser.initialize(HTTPParser.REQUEST, {});
-  parser[kOnHeadersComplete] = () => { throw new Error("callback sentinel"); };
+  const callbackSentinel = new Error("callback sentinel");
+  parser[kOnHeadersComplete] = () => { throw callbackSentinel; };
   let callbackError: unknown;
   try {
     parser.execute(Buffer.from("GET /throw HTTP/1.1\r\n\r\n"));
   } catch (error) {
     callbackError = error;
   }
-  equal((callbackError as Error)?.message, "callback sentinel", "callback exception propagation");
+  equal(callbackError, callbackSentinel, "callback exception identity");
 
   let reinitialized = 0;
   parser.initialize(HTTPParser.REQUEST, {});
@@ -174,9 +175,12 @@ parseAtEverySplit(chunked, "123123456123456789");
 {
   const parser = new HTTPParser();
   parser.initialize(HTTPParser.REQUEST, {}, 48);
-  const overflow = parser.execute(Buffer.from(
+  const oversizedHeader = Buffer.from(
     "GET / HTTP/1.1\r\nX-Header-That-Is-Too-Large: some-value\r\n\r\n",
-  ));
+  );
+  const headerSplit = 30;
+  equal(parser.execute(oversizedHeader.subarray(0, headerSplit)), headerSplit, "header overflow prefix");
+  const overflow = parser.execute(oversizedHeader.subarray(headerSplit));
   equal(overflow.code, "HPE_HEADER_OVERFLOW", "header overflow code");
   equal(overflow.reason, "Header overflow", "header overflow reason");
   assert(overflow.bytesParsed > 0, "header overflow bytesParsed");
@@ -193,6 +197,25 @@ parseAtEverySplit(chunked, "123123456123456789");
   const invalidPrefix = invalidMethod.execute(Buffer.from([0x16, 0x03, 0x01, 0x00, 0x00]));
   equal(invalidPrefix.code, "HPE_INVALID_METHOD", "invalid method prefix code");
   equal(invalidPrefix.reason, "Invalid method encountered", "invalid method prefix reason");
+
+  const oversizedExtension = new HTTPParser();
+  oversizedExtension.initialize(HTTPParser.REQUEST, {});
+  const extensionWire = Buffer.from(
+    `POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1;${"x".repeat(16 * 1024 + 1)}=y\r\na\r\n0\r\n\r\n`,
+  );
+  const extensionSplit = extensionWire.indexOf(";") + 8 * 1024;
+  equal(
+    oversizedExtension.execute(extensionWire.subarray(0, extensionSplit)),
+    extensionSplit,
+    "chunk extension prefix",
+  );
+  const extensionError = oversizedExtension.execute(extensionWire.subarray(extensionSplit));
+  equal(extensionError.code, "HPE_CHUNK_EXTENSIONS_OVERFLOW", "chunk extension overflow code");
+  equal(extensionError.reason, "Chunk extensions overflow", "chunk extension overflow reason");
+  assert(
+    extensionSplit + extensionError.bytesParsed > 16 * 1024,
+    "chunk extension overflow bytesParsed",
+  );
 }
 
 {

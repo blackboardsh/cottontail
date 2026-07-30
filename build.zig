@@ -419,6 +419,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             "src/native_bindings/filesystem.c",
             "src/native_bindings/process.c",
             "src/native_bindings/http.c",
+            "src/native_bindings/http_parser.c",
             "src/native_bindings/tooling.c",
             "src/native_bindings/memory_ffi.c",
             "src/native_bindings/worker.c",
@@ -431,6 +432,9 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             "src/native_bindings/sqlite.c",
             "src/native_bindings/sql_wire.c",
             "src/native_bindings/platform.c",
+            "src/compiler/src/jsc/bindings/node/http/llhttp/api.c",
+            "src/compiler/src/jsc/bindings/node/http/llhttp/http.c",
+            "src/compiler/src/jsc/bindings/node/http/llhttp/llhttp.c",
         },
         .flags = if (resolved_target.os.tag == .windows)
             &.{

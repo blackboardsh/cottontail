@@ -2,6 +2,7 @@
 #define COTTONTAIL_NATIVE_BINDINGS_CALLBACKS_H
 
 #include "registry.h"
+#include "http_parser.h"
 
 #define CT_NATIVE_BINDING(name, callback) callback,
 

@@ -14,6 +14,7 @@ function equalArray(actual: unknown[], expected: unknown[], message: string) {
 
 const binding = process.binding("http_parser") as any;
 const { HTTPParser, ConnectionsList, methods, allMethods } = binding;
+const nativeHost = (globalThis as any).cottontail;
 const kOnMessageBegin = HTTPParser.kOnMessageBegin;
 const kOnHeaders = HTTPParser.kOnHeaders;
 const kOnHeadersComplete = HTTPParser.kOnHeadersComplete;
@@ -22,6 +23,8 @@ const kOnMessageComplete = HTTPParser.kOnMessageComplete;
 const kOnExecute = HTTPParser.kOnExecute;
 
 assert(process.binding("http_parser") === binding, "process.binding should cache http_parser");
+assert(typeof nativeHost?.httpParserCreate === "function", "native llhttp parser create binding");
+assert(typeof nativeHost?.httpParserExecute === "function", "native llhttp parser execute binding");
 equal(methods[3], "POST", "HTTP method ordering");
 equal(methods[24], "M - SEARCH", "Bun HTTP extension method stringification");
 equal(allMethods[34], "PRI", "allMethods should include HTTP/2 PRI");
@@ -43,6 +46,23 @@ equalArray(Object.getOwnPropertyNames(ConnectionsList.prototype), [
 ], "ConnectionsList prototype shape");
 equalArray(Object.getOwnPropertyNames(new HTTPParser()), [], "HTTPParser native-state shape");
 equalArray(Object.getOwnPropertyNames(new ConnectionsList()), [], "ConnectionsList native-state shape");
+
+{
+  const nativeExecute = nativeHost.httpParserExecute;
+  let nativeExecutions = 0;
+  nativeHost.httpParserExecute = function () {
+    nativeExecutions += 1;
+    return Reflect.apply(nativeExecute, this, arguments);
+  };
+  try {
+    const parser = new HTTPParser();
+    parser.initialize(HTTPParser.REQUEST, {});
+    parser.execute(Buffer.from("GET /native HTTP/1.1\r\n\r\n"));
+    equal(nativeExecutions, 1, "HTTPParser execute should route through native llhttp");
+  } finally {
+    nativeHost.httpParserExecute = nativeExecute;
+  }
+}
 
 {
   const parser = new HTTPParser();

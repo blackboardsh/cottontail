@@ -1,8 +1,7 @@
 import { Buffer } from "../node/buffer.js";
 
-// Portable port of Bun's llhttp-backed process.binding("http_parser") surface.
-// Keep the state transitions aligned with llhttp so this can later become a
-// thin adapter around the vendored C parser without changing the JS contract.
+// The public adapter remains JavaScript so callback properties and stream
+// consumption match Node. HTTP byte parsing is handled by vendored llhttp.
 
 export const methods = [
   "DELETE", "GET", "HEAD", "POST", "PUT", "CONNECT", "OPTIONS", "TRACE",
@@ -59,6 +58,31 @@ METHOD_ENUM.set("M-SEARCH", 24);
 const REQUEST_METHOD_TOKENS = Array.from(METHOD_ENUM.keys()).filter(method => !method.includes(" "));
 const parserStates = new WeakMap();
 const connectionsListStates = new WeakMap();
+const nativeHttpParser = (() => {
+  const host = globalThis.cottontail;
+  if (!host || typeof host !== "object") return null;
+  for (const name of [
+    "httpParserCreate",
+    "httpParserInitialize",
+    "httpParserExecute",
+    "httpParserFinish",
+    "httpParserPause",
+    "httpParserResume",
+    "httpParserDestroy",
+  ]) {
+    if (typeof host[name] !== "function") return null;
+  }
+  return host;
+})();
+
+const NATIVE_MESSAGE_BEGIN = 0;
+const NATIVE_URL = 1;
+const NATIVE_STATUS = 2;
+const NATIVE_HEADER_FIELD = 3;
+const NATIVE_HEADER_VALUE = 4;
+const NATIVE_HEADERS_COMPLETE = 5;
+const NATIVE_BODY = 6;
+const NATIVE_MESSAGE_COMPLETE = 7;
 
 function nowMilliseconds() {
   if (typeof globalThis.cottontail?.nanotime === "function") {
@@ -174,8 +198,163 @@ function shouldKeepAlive(parser, framed) {
 
 function HTTPParser() {
   if (!new.target) return undefined;
-  parserStates.set(this, new HTTPParserState(this));
+  parserStates.set(
+    this,
+    nativeHttpParser ? new NativeHTTPParserState(this) : new HTTPParserState(this),
+  );
 }
+
+function NativeHTTPParserState(owner) {
+  this.owner = owner;
+  this._native = true;
+  this._token = nativeHttpParser.httpParserCreate();
+  this._closed = false;
+  this._initialized = false;
+  this._type = HTTP_BOTH;
+  this._connectionsList = null;
+  this._currentBuffer = EMPTY_BUFFER;
+  this._pending = EMPTY_BUFFER;
+  this._latchedError = null;
+  this._paused = false;
+  this._consumed = null;
+  this._lastMessageStart = 0;
+  this._headersCompleted = false;
+  this._executing = false;
+  this._destroyAfterExecute = false;
+  this._upgrade = false;
+  this._dispatch = (event, ...args) => this._dispatchNative(event, args);
+  this._resetNativeMessageFields();
+}
+
+NativeHTTPParserState.prototype._resetNativeMessageFields = function _resetNativeMessageFields() {
+  this._headers = [];
+  this._headerPart = "";
+  this._haveFlushed = false;
+  this._url = "";
+  this._statusMessage = "";
+  this._typeForMessage = this._type;
+  this._upgrade = false;
+};
+
+NativeHTTPParserState.prototype._normalizedHeaders = function _normalizedHeaders() {
+  for (let index = 1; index < this._headers.length; index += 2) {
+    this._headers[index] = this._headers[index].replace(/[\t ]+$/g, "");
+  }
+  return this._headers;
+};
+
+NativeHTTPParserState.prototype._flushHeaders = function _flushHeaders() {
+  if (this._headers.length === 0) return false;
+  const callback = this.owner[kOnHeaders];
+  if (typeof callback !== "function") return false;
+  const headers = this._normalizedHeaders();
+  const url = this._typeForMessage === HTTP_REQUEST ? this._url : "";
+  this._headers = [];
+  this._headerPart = "";
+  this._url = "";
+  this._haveFlushed = true;
+  callback.call(this.owner, headers, url);
+  return true;
+};
+
+NativeHTTPParserState.prototype._appendHeaderField = function _appendHeaderField(value) {
+  if (this._headerPart !== "field") {
+    if (this._headers.length / 2 >= MAX_BUFFERED_HEADER_FIELDS - 1) this._flushHeaders();
+    this._headers.push(value, "");
+  } else {
+    this._headers[this._headers.length - 2] += value;
+  }
+  this._headerPart = "field";
+};
+
+NativeHTTPParserState.prototype._appendHeaderValue = function _appendHeaderValue(value) {
+  if (this._headers.length === 0) this._headers.push("", "");
+  this._headers[this._headers.length - 1] += value;
+  this._headerPart = "value";
+};
+
+NativeHTTPParserState.prototype._headersComplete = function _headersComplete(args) {
+  const [type, major, minor, method, statusCode, upgrade, keepAlive] = args;
+  this._headersCompleted = true;
+  this._typeForMessage = type;
+  this._upgrade = Boolean(upgrade);
+
+  const callback = this.owner[kOnHeadersComplete];
+  if (typeof callback !== "function") return 0;
+
+  let headers;
+  let url;
+  if (this._haveFlushed) {
+    this._flushHeaders();
+  } else {
+    headers = this._normalizedHeaders().slice();
+    if (type === HTTP_REQUEST) url = this._url;
+    this._headers = [];
+    this._headerPart = "";
+    this._url = "";
+  }
+
+  const result = callback.call(
+    this.owner,
+    major,
+    minor,
+    headers,
+    type === HTTP_REQUEST ? method : undefined,
+    type === HTTP_REQUEST ? url : undefined,
+    type === HTTP_RESPONSE ? statusCode : undefined,
+    type === HTTP_RESPONSE ? this._statusMessage : undefined,
+    this._upgrade,
+    Boolean(keepAlive),
+  );
+  const callbackResult = Number(result) | 0;
+  if (callbackResult === 2) this._upgrade = true;
+  return callbackResult;
+};
+
+NativeHTTPParserState.prototype._dispatchNative = function _dispatchNative(event, args) {
+  switch (event) {
+    case NATIVE_MESSAGE_BEGIN: {
+      this._headersCompleted = false;
+      this._lastMessageStart = nowMilliseconds();
+      this._resetNativeMessageFields();
+      activateConnection(this._connectionsList, this.owner);
+      const callback = this.owner[kOnMessageBegin];
+      if (typeof callback === "function") callback.call(this.owner);
+      return 0;
+    }
+    case NATIVE_URL:
+      this._url += args[0];
+      return 0;
+    case NATIVE_STATUS:
+      this._statusMessage += args[0];
+      return 0;
+    case NATIVE_HEADER_FIELD:
+      this._appendHeaderField(args[0]);
+      return 0;
+    case NATIVE_HEADER_VALUE:
+      this._appendHeaderValue(args[0]);
+      return 0;
+    case NATIVE_HEADERS_COMPLETE:
+      return this._headersComplete(args);
+    case NATIVE_BODY: {
+      const callback = this.owner[kOnBody];
+      if (typeof callback === "function") {
+        callback.call(this.owner, Buffer.from(new Uint8Array(args[0])));
+      }
+      return 0;
+    }
+    case NATIVE_MESSAGE_COMPLETE: {
+      if (this._headers.length > 0) this._flushHeaders();
+      completeConnection(this._connectionsList, this.owner);
+      this._lastMessageStart = 0;
+      const callback = this.owner[kOnMessageComplete];
+      if (typeof callback === "function") callback.call(this.owner);
+      return 0;
+    }
+    default:
+      return 0;
+  }
+};
 
 function HTTPParserState(owner) {
   this.owner = owner;
@@ -585,6 +764,33 @@ function initialize() {
   const parser = requireParser(this, "initialize");
   if (parser._closed) return undefined;
   const [type, resource, maxHeaderSize, lenientFlags, connectionsList] = arguments;
+  if (parser._native) {
+    parser._type = Number(type) | 0;
+    const requestedMax = Math.trunc(Number(maxHeaderSize) || 0);
+    parser._maxHeaderSize = requestedMax > 0 ? requestedMax : DEFAULT_MAX_HEADER_SIZE;
+    parser._lenientFlags = Number(lenientFlags) | 0;
+    parser._pending = EMPTY_BUFFER;
+    parser._latchedError = null;
+    parser._paused = false;
+    parser._headersCompleted = false;
+    parser._lastMessageStart = 0;
+    parser._upgrade = false;
+    parser._resetNativeMessageFields();
+    parser._connectionsList = connectionsListStates.has(connectionsList) ? connectionsList : null;
+    parser._initialized = true;
+    nativeHttpParser.httpParserInitialize(
+      parser._token,
+      parser._type,
+      parser._maxHeaderSize,
+      parser._lenientFlags,
+    );
+    if (parser._connectionsList) {
+      parser._lastMessageStart = nowMilliseconds();
+      initializeConnection(parser._connectionsList, parser.owner);
+    }
+    void resource;
+    return undefined;
+  }
   parser._type = Number(type) | 0;
   const requestedMax = Math.trunc(Number(maxHeaderSize) || 0);
   parser._maxHeaderSize = requestedMax > 0 ? requestedMax : DEFAULT_MAX_HEADER_SIZE;
@@ -613,9 +819,49 @@ function execute() {
   if (input === null) return undefined;
   if (parser._latchedError) return parser._latchedError;
   if (parser._paused) return pausedError();
-  if (parser._state === "upgrade") return 0;
+  if (parser._native ? parser._upgrade : parser._state === "upgrade") return 0;
 
   parser._currentBuffer = input;
+  if (parser._native) {
+    const pendingLength = parser._pending.length;
+    const combined = concatBuffers(parser._pending, input);
+    parser._pending = EMPTY_BUFFER;
+    parser._executing = true;
+    try {
+      const result = nativeHttpParser.httpParserExecute(
+        parser._token,
+        combined,
+        parser._dispatch,
+      );
+      if (result && typeof result === "object" && typeof result.code === "string") {
+        const error = parserError(
+          result.code,
+          result.reason,
+          Math.max(0, Number(result.bytesParsed) - pendingLength),
+        );
+        parser._latchedError = error;
+        return error;
+      }
+
+      const consumed = Math.max(0, Math.min(combined.length, Math.trunc(Number(result) || 0)));
+      if (parser._paused) {
+        if (consumed < combined.length) parser._pending = copyBuffer(combined.subarray(consumed));
+        return input.length;
+      }
+      if (parser._upgrade) {
+        return Math.max(0, Math.min(input.length, consumed - pendingLength));
+      }
+      return input.length;
+    } finally {
+      parser._executing = false;
+      parser._currentBuffer = EMPTY_BUFFER;
+      if (parser._destroyAfterExecute && parser._token) {
+        nativeHttpParser.httpParserDestroy(parser._token);
+        parser._token = null;
+        parser._destroyAfterExecute = false;
+      }
+    }
+  }
   parser._inputLength = input.length;
   parser._pendingBeforeExecute = parser._pending.length;
   parser._shifted = 0;
@@ -635,6 +881,27 @@ function finish() {
   if (parser._closed || !parser._initialized) return undefined;
   if (parser._latchedError) return parser._latchedError;
   parser._currentBuffer = EMPTY_BUFFER;
+  if (parser._native) {
+    if (parser._pending.length > 0 && !parser._paused) {
+      const pendingResult = execute.call(parser.owner, EMPTY_BUFFER);
+      if (pendingResult && typeof pendingResult === "object") return pendingResult;
+    }
+    parser._executing = true;
+    try {
+      const result = nativeHttpParser.httpParserFinish(parser._token, parser._dispatch);
+      if (result && typeof result === "object" && typeof result.code === "string") {
+        return parserError(result.code, result.reason, result.bytesParsed);
+      }
+      return undefined;
+    } finally {
+      parser._executing = false;
+      if (parser._destroyAfterExecute && parser._token) {
+        nativeHttpParser.httpParserDestroy(parser._token);
+        parser._token = null;
+        parser._destroyAfterExecute = false;
+      }
+    }
+  }
   if (parser._state === "eof-body") {
     if (parser._pending.length > 0) parser._emitBody(parser._shift(parser._pending.length));
     parser._completeMessage();
@@ -649,6 +916,7 @@ function pause() {
   const parser = requireParser(this, "pause");
   if (parser._closed || !parser._initialized) return undefined;
   parser._paused = true;
+  if (parser._native) nativeHttpParser.httpParserPause(parser._token);
   return undefined;
 }
 
@@ -656,6 +924,7 @@ function resume() {
   const parser = requireParser(this, "resume");
   if (parser._closed || !parser._initialized) return undefined;
   parser._paused = false;
+  if (parser._native) nativeHttpParser.httpParserResume(parser._token);
   return undefined;
 }
 
@@ -667,6 +936,15 @@ function close() {
   parser._initialized = false;
   parser._pending = EMPTY_BUFFER;
   parser._currentBuffer = EMPTY_BUFFER;
+  if (parser._native && parser._token) {
+    if (parser._executing) {
+      nativeHttpParser.httpParserPause(parser._token);
+      parser._destroyAfterExecute = true;
+    } else {
+      nativeHttpParser.httpParserDestroy(parser._token);
+      parser._token = null;
+    }
+  }
   return undefined;
 }
 
@@ -703,6 +981,9 @@ HTTPParserState.prototype._detachConsumedSource = function _detachConsumedSource
   }
   this._consumed = null;
 };
+
+NativeHTTPParserState.prototype._notifyExecute = HTTPParserState.prototype._notifyExecute;
+NativeHTTPParserState.prototype._detachConsumedSource = HTTPParserState.prototype._detachConsumedSource;
 
 function consume() {
   const parser = requireParser(this, "consume");
