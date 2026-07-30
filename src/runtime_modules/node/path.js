@@ -12,6 +12,10 @@ const CHAR_UPPERCASE_Z = 90;
 const CHAR_LOWERCASE_A = 97;
 const CHAR_LOWERCASE_Z = 122;
 
+const nativePathNormalize =
+  typeof cottontail.pathNormalizeNative === "function" ? cottontail.pathNormalizeNative : null;
+const NATIVE_NORMALIZE_MIN_LENGTH = 256;
+
 function validateString(value, name) {
   if (typeof value !== "string") {
     // Bun's native path functions coerce String objects (the upstream test
@@ -191,6 +195,13 @@ export const posix = {
     validateString(path, "path");
 
     if (path.length === 0) return ".";
+    if (
+      path.length >= NATIVE_NORMALIZE_MIN_LENGTH &&
+      typeof path === "string" &&
+      nativePathNormalize !== null
+    ) {
+      return nativePathNormalize(false, path);
+    }
 
     const isAbsolute = path.charCodeAt(0) === CHAR_FORWARD_SLASH;
     const trailingSeparator = path.charCodeAt(path.length - 1) === CHAR_FORWARD_SLASH;
@@ -660,6 +671,21 @@ export const win32 = {
     validateString(path, "path");
     const len = path.length;
     if (len === 0) return ".";
+    if (
+      len >= NATIVE_NORMALIZE_MIN_LENGTH &&
+      typeof path === "string" &&
+      nativePathNormalize !== null
+    ) {
+      const nativeColonIndex = path.indexOf(":");
+      if (
+        nativeColonIndex === -1 ||
+        (nativeColonIndex === 1 &&
+          isWindowsDeviceRoot(path.charCodeAt(0)) &&
+          path.indexOf(":", nativeColonIndex + 1) === -1)
+      ) {
+        return nativePathNormalize(true, path);
+      }
+    }
     let rootEnd = 0;
     let device;
     let isAbsolute = false;

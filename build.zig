@@ -434,6 +434,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             "src/native_bindings/sqlite.c",
             "src/native_bindings/sql_wire.c",
             "src/native_bindings/platform.c",
+            "src/native_bindings/path.c",
             "src/compiler/src/jsc/bindings/node/http/llhttp/api.c",
             "src/compiler/src/jsc/bindings/node/http/llhttp/http.c",
             "src/compiler/src/jsc/bindings/node/http/llhttp/llhttp.c",

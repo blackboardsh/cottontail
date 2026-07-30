@@ -82,6 +82,10 @@ static const JSObjectCallAsFunctionCallback ct_platform_native_callbacks[] = {
 #include "platform.inc"
 };
 
+static const JSObjectCallAsFunctionCallback ct_path_native_callbacks[] = {
+#include "path.inc"
+};
+
 #undef CT_NATIVE_BINDING
 
 #define CT_NATIVE_CALLBACK_COUNT(callbacks) (sizeof(callbacks) / sizeof(callbacks[0]))
@@ -118,6 +122,7 @@ static void ct_register_host_native_bindings(
     CT_REGISTER_NATIVE_BINDINGS(sqlite);
     CT_REGISTER_NATIVE_BINDINGS(sql_wire);
     CT_REGISTER_NATIVE_BINDINGS(platform);
+    CT_REGISTER_NATIVE_BINDINGS(path);
 }
 
 #undef CT_REGISTER_NATIVE_BINDINGS
