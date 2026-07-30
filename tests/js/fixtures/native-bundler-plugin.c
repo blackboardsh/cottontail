@@ -4,6 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
+
 typedef struct NativePluginArguments NativePluginArguments;
 typedef struct NativePluginResult NativePluginResult;
 
@@ -185,6 +189,29 @@ static napi_value state_counts(napi_env env, napi_callback_info info) {
     return result;
 }
 
+static napi_value abi_visibility(napi_env env, napi_callback_info info) {
+    (void)info;
+    napi_value result = NULL;
+    napi_value napi_visible = NULL;
+    napi_value openssl_hidden = NULL;
+    int has_napi = 1;
+    int hides_openssl = 1;
+
+#if defined(__linux__)
+    has_napi = dlsym(RTLD_DEFAULT, "napi_create_object") != NULL;
+    hides_openssl = dlsym(RTLD_DEFAULT, "SSL_new") == NULL;
+#endif
+
+    if (napi_create_object(env, &result) != napi_ok ||
+        napi_get_boolean(env, has_napi, &napi_visible) != napi_ok ||
+        napi_get_boolean(env, hides_openssl, &openssl_hidden) != napi_ok ||
+        napi_set_named_property(env, result, "napiVisible", napi_visible) != napi_ok ||
+        napi_set_named_property(env, result, "opensslHidden", openssl_hidden) != napi_ok) {
+        return NULL;
+    }
+    return result;
+}
+
 static int export_function(napi_env env, napi_value exports, const char *name, napi_callback callback) {
     napi_value function = NULL;
     if (napi_create_function(env, name, NAPI_AUTO_LENGTH, callback, NULL, &function) != napi_ok) return 0;
@@ -194,5 +221,6 @@ static int export_function(napi_env env, napi_value exports, const char *name, n
 NAPI_MODULE_INIT() {
     if (!export_function(env, exports, "createState", create_state)) return NULL;
     if (!export_function(env, exports, "stateCounts", state_counts)) return NULL;
+    if (!export_function(env, exports, "abiVisibility", abi_visibility)) return NULL;
     return exports;
 }

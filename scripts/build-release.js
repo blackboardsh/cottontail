@@ -14,7 +14,10 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { elfExportSymbolsFromVersionScript } from './release-binary-contract.js';
+import {
+  elfExportSymbolsFromVersionScript,
+  restrictElfDynamicExports,
+} from './release-binary-contract.js';
 
 const rootDir = process.cwd();
 const zigName = process.platform === 'win32' ? 'zig.exe' : 'zig';
@@ -69,17 +72,23 @@ try {
       'Cottontail release ad-hoc signing',
     );
   } else if (process.platform === 'linux') {
-    const linuxExportListPath = join(stagingRoot, 'linux-native-addon-exports.txt');
     const linuxExportSymbols = elfExportSymbolsFromVersionScript(
       readFileSync(linuxVersionScriptPath),
     );
-    writeFileSync(linuxExportListPath, `${linuxExportSymbols.join('\n')}\n`);
-    run(
-      process.env.OBJCOPY ?? 'objcopy',
-      [`--keep-global-symbols=${linuxExportListPath}`, stagedExecutable],
-      'Cottontail release export localization',
-    );
     run(process.env.STRIP ?? 'strip', [stagedExecutable], 'Cottontail release strip');
+
+    // Zig 0.16 accepts --version-script but its built-in ELF linker omits the
+    // script from the final link. Restrict the final .dynsym visibility until
+    // the linker applies the manifest itself.
+    const restricted = restrictElfDynamicExports(
+      readFileSync(stagedExecutable),
+      linuxExportSymbols,
+    );
+    writeFileSync(stagedExecutable, restricted.buffer);
+    console.log(
+      `Restricted Linux native-addon ABI: ${restricted.retainedSymbols} retained, ` +
+        `${restricted.exposedSymbols} exposed, ${restricted.hiddenSymbols} hidden`,
+    );
   }
   run(
     process.execPath,

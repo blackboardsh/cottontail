@@ -6,6 +6,11 @@ const elfDynamicSymbolTable = 11;
 const elfUndefinedSection = 0;
 const elfGlobalBinding = 1;
 const elfWeakBinding = 2;
+const elfGnuUniqueBinding = 10;
+const elfDefaultVisibility = 0;
+const elfHiddenVisibility = 2;
+const elfProtectedVisibility = 3;
+const elfVisibilityMask = 3;
 const maximumMachOSymbols = 50_000;
 const maximumMachOLocalSymbols = 4_096;
 const maximumMachOSymbolStringBytes = 2 * 1024 * 1024;
@@ -237,9 +242,8 @@ function readElfSection(buffer, sections, index, label) {
   };
 }
 
-function listElfExportedSymbols(buffer) {
+function visitElfDefinedDynamicSymbols(buffer, visitor) {
   const sections = elfSectionMetadata(buffer);
-  const result = [];
   for (let index = 0; index < sections.count; index += 1) {
     const symbols = readElfSection(buffer, sections, index, `ELF section ${index}`);
     if (symbols.type !== elfDynamicSymbolTable) continue;
@@ -255,24 +259,78 @@ function listElfExportedSymbols(buffer) {
     for (let symbolIndex = 0; symbolIndex < symbolCount; symbolIndex += 1) {
       const entryOffset = symbols.offset + symbolIndex * symbols.entrySize;
       const binding = buffer[entryOffset + 4] >> 4;
+      const visibility = buffer[entryOffset + 5] & elfVisibilityMask;
       const sectionIndex = buffer.readUInt16LE(entryOffset + 6);
       const stringIndex = buffer.readUInt32LE(entryOffset);
       if (
         stringIndex === 0 ||
         sectionIndex === elfUndefinedSection ||
-        (binding !== elfGlobalBinding && binding !== elfWeakBinding)
+        (
+          binding !== elfGlobalBinding &&
+          binding !== elfWeakBinding &&
+          binding !== elfGnuUniqueBinding
+        )
       ) {
         continue;
       }
-      result.push(readCString(
-        buffer,
-        strings.offset + stringIndex,
-        stringLimit,
-        `ELF dynamic symbol ${symbolIndex}`,
-      ));
+      visitor({
+        binding,
+        entryOffset,
+        name: readCString(
+          buffer,
+          strings.offset + stringIndex,
+          stringLimit,
+          `ELF dynamic symbol ${symbolIndex}`,
+        ),
+        visibility,
+      });
     }
   }
+}
+
+function isExternallyVisibleElfSymbol(visibility) {
+  return visibility === elfDefaultVisibility || visibility === elfProtectedVisibility;
+}
+
+function listElfExportedSymbols(buffer) {
+  const result = [];
+  visitElfDefinedDynamicSymbols(buffer, ({ name, visibility }) => {
+    if (isExternallyVisibleElfSymbol(visibility)) result.push(name);
+  });
   return result;
+}
+
+export function restrictElfDynamicExports(source, allowedSymbols) {
+  const buffer = Buffer.isBuffer(source) ? source : Buffer.from(source);
+  const allowed = allowedSymbols instanceof Set ? allowedSymbols : new Set(allowedSymbols);
+  let hiddenSymbols = 0;
+  let exposedSymbols = 0;
+  let retainedSymbols = 0;
+
+  visitElfDefinedDynamicSymbols(buffer, ({ entryOffset, name, visibility }) => {
+    const isAllowed = allowed.has(name);
+    const isVisible = isExternallyVisibleElfSymbol(visibility);
+    if (isAllowed === isVisible) {
+      if (isAllowed) retainedSymbols += 1;
+      return;
+    }
+
+    const other = buffer[entryOffset + 5];
+    if (isAllowed) {
+      buffer[entryOffset + 5] = (other & ~elfVisibilityMask) | elfDefaultVisibility;
+      exposedSymbols += 1;
+    } else {
+      buffer[entryOffset + 5] = (other & ~elfVisibilityMask) | elfHiddenVisibility;
+      hiddenSymbols += 1;
+    }
+  });
+
+  return {
+    buffer,
+    exposedSymbols,
+    hiddenSymbols,
+    retainedSymbols,
+  };
 }
 
 function inspectPortableExecutable(buffer) {

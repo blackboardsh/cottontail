@@ -7,6 +7,7 @@ import {
   elfExportSymbolsFromVersionScript,
   inspectReleaseBinary,
   listExportedSymbols,
+  restrictElfDynamicExports,
 } from './release-binary-contract.js';
 
 function machoFixture(localSymbols) {
@@ -77,7 +78,10 @@ function machoExportFixture() {
   return buffer;
 }
 
-function elfExportFixture() {
+function elfExportFixture({
+  binding = 1,
+  other = 0,
+} = {}) {
   const buffer = Buffer.alloc(336);
   buffer.set([0x7f, 0x45, 0x4c, 0x46, 2, 1], 0);
   buffer.writeBigUInt64LE(64n, 40);
@@ -97,7 +101,8 @@ function elfExportFixture() {
   buffer.writeBigUInt64LE(32n, dynamicStrings + 32);
 
   buffer.writeUInt32LE(1, 280);
-  buffer[284] = 0x12;
+  buffer[284] = (binding << 4) | 2;
+  buffer[285] = other;
   buffer.writeUInt16LE(1, 286);
   buffer.write('\0exported\0', 304);
   return buffer;
@@ -169,7 +174,34 @@ test('rejects malformed and unsupported release files', () => {
 test('lists exported symbols from Mach-O, ELF, and PE binaries', () => {
   assert.deepEqual(listExportedSymbols(machoExportFixture()), ['_exported']);
   assert.deepEqual(listExportedSymbols(elfExportFixture()), ['exported']);
+  assert.deepEqual(listExportedSymbols(elfExportFixture({ other: 3 })), ['exported']);
+  assert.deepEqual(listExportedSymbols(elfExportFixture({ binding: 10 })), ['exported']);
+  assert.deepEqual(listExportedSymbols(elfExportFixture({ other: 1 })), []);
+  assert.deepEqual(listExportedSymbols(elfExportFixture({ other: 2 })), []);
   assert.deepEqual(listExportedSymbols(peExportFixture()), ['exported']);
+});
+
+test('restricts Linux exports by changing final ELF dynamic-symbol visibility', () => {
+  const unwanted = elfExportFixture({ other: 0xa3 });
+  const hidden = restrictElfDynamicExports(unwanted, []);
+  assert.equal(hidden.hiddenSymbols, 1);
+  assert.equal(hidden.exposedSymbols, 0);
+  assert.equal(hidden.retainedSymbols, 0);
+  assert.equal(unwanted[285], 0xa2);
+  assert.deepEqual(listExportedSymbols(unwanted), []);
+
+  const wanted = elfExportFixture({ other: 0xa2 });
+  const exposed = restrictElfDynamicExports(wanted, ['exported']);
+  assert.equal(exposed.hiddenSymbols, 0);
+  assert.equal(exposed.exposedSymbols, 1);
+  assert.equal(exposed.retainedSymbols, 0);
+  assert.equal(wanted[285], 0xa0);
+  assert.deepEqual(listExportedSymbols(wanted), ['exported']);
+
+  const retained = restrictElfDynamicExports(wanted, new Set(['exported']));
+  assert.equal(retained.hiddenSymbols, 0);
+  assert.equal(retained.exposedSymbols, 0);
+  assert.equal(retained.retainedSymbols, 1);
 });
 
 test('derives the Linux native-addon ABI from the linker version script', () => {

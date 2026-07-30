@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   assertStrippedReleaseBinary,
+  elfExportSymbolsFromVersionScript,
   listExportedSymbols,
 } from './release-binary-contract.js';
 
@@ -15,6 +16,7 @@ const executableName = process.platform === 'win32' ? 'cottontail.exe' : 'cotton
 const executablePath = process.argv[2]
   ? resolve(process.argv[2])
   : join(rootDir, 'zig-out', 'bin', executableName);
+const linuxVersionScriptPath = join(rootDir, 'src', 'compiler', 'src', 'symbols.dyn');
 
 function fail(message) {
   console.error(`Cottontail release binary validation failed: ${message}`);
@@ -39,6 +41,19 @@ if (exportedSymbols.length > maximumExportedSymbols) {
   );
 }
 
+if (details.format === 'elf64') {
+  const allowedExports = new Set(
+    elfExportSymbolsFromVersionScript(readFileSync(linuxVersionScriptPath)),
+  );
+  const unexpectedExports = exportedSymbols.filter((symbol) => !allowedExports.has(symbol));
+  if (unexpectedExports.length > 0) {
+    fail(
+      `${executablePath} exports symbols outside the native-addon ABI: ` +
+        unexpectedExports.slice(0, 10).join(', '),
+    );
+  }
+}
+
 const symbolPrefix = details.format === 'mach-o' ? '_' : '';
 const exportedSet = new Set(exportedSymbols);
 for (const symbol of [
@@ -57,7 +72,7 @@ for (const symbol of [
   }
 }
 
-if (process.platform === 'darwin') {
+if (details.format === 'mach-o') {
   const signature = spawnSync('/usr/bin/codesign', ['--verify', '--strict', executablePath], {
     encoding: 'utf8',
   });

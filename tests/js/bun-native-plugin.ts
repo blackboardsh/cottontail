@@ -8,6 +8,9 @@ const addonPath = process.argv[2];
 assert(addonPath, "native addon path is required");
 const require = createRequire(import.meta.url);
 const addon = require(addonPath);
+const abiVisibility = addon.abiVisibility();
+assert(abiVisibility.napiVisible, "native addons should resolve the retained N-API ABI");
+assert(abiVisibility.opensslHidden, "non-ABI executable symbols should not resolve through dlsym");
 const external = addon.createState();
 const filter = /\.ts$/g;
 
