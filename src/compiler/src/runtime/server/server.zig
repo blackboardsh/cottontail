@@ -504,12 +504,6 @@ const ServePlugins = struct {
     }
 };
 
-const PluginsResult = union(enum) {
-    pending,
-    found: ?*bun.jsc.API.JSBundler.Plugin,
-    err,
-};
-
 pub fn NewServer(protocol_enum: enum { http, https }, development_kind: enum { debug, production }) type {
     return struct {
         pub const js = switch (protocol_enum) {

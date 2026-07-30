@@ -1266,7 +1266,6 @@ const unsupported_non_regular_file_error = SystemError{
 };
 
 pub const CopyFilePromiseTask = jsc.ConcurrentPromiseTask(CopyFile);
-pub const CopyFilePromiseTaskEventLoopTask = CopyFilePromiseTask.EventLoopTask;
 
 const std = @import("std");
 

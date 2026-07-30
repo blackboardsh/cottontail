@@ -209,13 +209,6 @@ pub const ImportRecord = struct {
             return @intFromEnum(this) >= @intFromEnum(Tag.runtime);
         }
     };
-
-    pub const PrintMode = enum {
-        normal,
-        import_path,
-        css,
-        napi_module,
-    };
 };
 
 const std = @import("std");

@@ -455,13 +455,6 @@ pub inline fn cleanup(force: bool) void {
     default_arena.gc(force);
 }
 
-pub const SOCKET_FLAGS: u32 = if (Environment.isLinux)
-    SOCK.CLOEXEC | posix.MSG.NOSIGNAL
-else
-    SOCK.CLOEXEC;
-
-pub const OPEN_SOCKET_FLAGS = SOCK.CLOEXEC;
-
 pub const extremely_verbose = false;
 
 fn writeProxyConnect(
@@ -3246,7 +3239,6 @@ pub const HTTPRequestBody = @import("./HTTPRequestBody.zig").HTTPRequestBody;
 pub const SendFile = @import("./SendFile.zig");
 pub const HeaderValueIterator = @import("./HeaderValueIterator.zig");
 pub const H2 = @import("./H2Client.zig");
-pub const H2Wire = @import("./H2FrameParser.zig");
 pub const H3 = @import("./H3Client.zig");
 
 const string = []const u8;

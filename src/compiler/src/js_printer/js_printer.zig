@@ -379,7 +379,6 @@ pub const SourceMapHandler = struct {
 
 pub const Options = struct {
     bundling: bool = false,
-    transform_imports: bool = true,
     to_commonjs_ref: Ref = Ref.None,
     to_esm_ref: Ref = Ref.None,
     require_ref: ?Ref = null,
@@ -387,7 +386,6 @@ pub const Options = struct {
     hmr_ref: Ref = Ref.None,
     indent: Indentation = .{},
     runtime_imports: runtime.Runtime.Imports = runtime.Runtime.Imports{},
-    module_hash: u32 = 0,
     source_path: ?fs.Path = null,
     /// Runtime execution bundles must resolve import() from the original source
     /// module instead of the generated bundle's directory.
@@ -5484,12 +5482,6 @@ fn NewPrinter(
         }
     };
 }
-
-pub const WriteResult = struct {
-    off: u32,
-    len: usize,
-    end_off: u32,
-};
 
 pub fn NewWriter(
     comptime ContextType: type,

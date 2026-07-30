@@ -1304,12 +1304,6 @@ pub const internal = struct {
 
         const This = @This();
 
-        const CacheResult = union(enum) {
-            inflight: *Request,
-            resolved: *Request,
-            none,
-        };
-
         fn get(
             this: *This,
             key: Request.Key,
@@ -2641,13 +2635,6 @@ pub const Resolver = struct {
             }
         }
     }
-
-    const DNSQuery = struct {
-        name: jsc.ZigString.Slice,
-        record_type: RecordType,
-
-        ttl: i32 = 0,
-    };
 
     pub const RecordType = enum(c_int) {
         A = 1,

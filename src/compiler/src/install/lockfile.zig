@@ -80,10 +80,7 @@ pub const Stream = struct {
         }
     };
 };
-pub const default_filename = "bun.lockb";
-
 pub const Scripts = struct {
-    const MAX_PARALLEL_PROCESSES = 10;
     pub const Entries = std.ArrayListUnmanaged(string);
 
     pub const names = [_]string{
@@ -443,6 +440,7 @@ fn loadFromBytesImpl(this: *Lockfile, pm: anytype, buf: []u8, allocator: Allocat
     };
 }
 
+
 fn hydrateWorkspaceDependencyVersions(this: *Lockfile) void {
     const package_resolutions = this.packages.items(.resolution);
     for (this.buffers.dependencies.items, this.buffers.resolutions.items) |*dependency, package_id| {
@@ -453,11 +451,6 @@ fn hydrateWorkspaceDependencyVersions(this: *Lockfile) void {
         dependency.version.value = .{ .workspace = resolution.value.workspace };
     }
 }
-
-pub const InstallResult = struct {
-    lockfile: *Lockfile,
-    summary: PackageInstall.Summary,
-};
 
 pub fn isResolvedDependencyDisabled(
     lockfile: *const Lockfile,

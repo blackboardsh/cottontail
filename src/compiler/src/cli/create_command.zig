@@ -1812,11 +1812,6 @@ const Commands = .{
     &[_]string{""},
 };
 
-pub const DownloadedExample = struct {
-    tarball_bytes: MutableString,
-    example: Example,
-};
-
 pub const Example = struct {
     name: string,
     version: string,

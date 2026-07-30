@@ -1,6 +1,5 @@
 pub const MacroImportReplacementMap = bun.StringArrayHashMap(string);
 pub const MacroMap = bun.StringArrayHashMapUnmanaged(MacroImportReplacementMap);
-pub const BundlePackageOverride = bun.StringArrayHashMapUnmanaged(options.BundleOverride);
 const LoaderMap = bun.StringArrayHashMapUnmanaged(options.Loader);
 
 // TODO: replace api.TransformOptions with Bunfig

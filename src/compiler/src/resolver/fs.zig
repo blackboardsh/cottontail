@@ -815,9 +815,6 @@ pub const FileSystem = struct {
             };
         }
 
-        pub const ModKeyError = error{
-            Unusable,
-        };
         pub const ModKey = struct {
             inode: std.fs.File.INode = 0,
             size: u64 = 0,
@@ -886,7 +883,6 @@ pub const FileSystem = struct {
                     // .uid = stat.
                 };
             }
-            pub const SafetyGap = 3;
         };
 
 
@@ -1594,7 +1590,6 @@ pub const PathName = struct {
     }
 };
 
-threadlocal var normalize_buf: [1024]u8 = undefined;
 threadlocal var join_buf: [1024]u8 = undefined;
 
 pub const Path = struct {
@@ -1611,10 +1606,8 @@ pub const Path = struct {
     is_disabled: bool = false,
     is_symlink: bool = false,
 
-    const ns_blob = "blob";
     const ns_bun = "bun";
     const ns_dataurl = "dataurl";
-    const ns_file = "file";
     const ns_macro = "macro";
 
     pub fn isFile(this: *const Path) bool {
@@ -1685,12 +1678,6 @@ pub const Path = struct {
         return strings.eqlComptime(this.namespace, ns_macro);
     }
 
-    pub const PackageRelative = struct {
-        path: string,
-        name: string,
-        is_parent_package: bool = false,
-    };
-
     pub inline fn sourceDir(this: *const Path) string {
         return this.name.dirWithTrailingSlash();
     }
@@ -1698,6 +1685,7 @@ pub const Path = struct {
     pub inline fn prettyDir(this: *const Path) string {
         return this.name.dirWithTrailingSlash();
     }
+
 
     /// The bundler will hash path.pretty, so it needs to be consistent across platforms.
     /// This assertion might be a bit too forceful though.

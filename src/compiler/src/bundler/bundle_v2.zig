@@ -135,7 +135,6 @@ pub const BundleV2 = struct {
     /// See the comment in `Chunk.OutputPiece`
     unique_key: u64 = 0,
     dynamic_import_entry_points: bun.AutoArrayHashMap(Index.Int, void) = undefined,
-    has_on_parse_plugins: bool = false,
 
     finalizers: std.ArrayListUnmanaged(CacheEntry.ExternalFreeFunction) = .empty,
 

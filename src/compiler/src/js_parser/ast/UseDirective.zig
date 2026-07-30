@@ -6,14 +6,6 @@ pub const UseDirective = enum(u2) {
     /// "use server"
     server,
 
-    pub const Boundering = enum(u2) {
-        client = @intFromEnum(UseDirective.client),
-        server = @intFromEnum(UseDirective.server),
-    };
-
-    pub const Flags = struct {
-        has_any_client: bool = false,
-    };
 
     pub fn isBoundary(this: UseDirective, other: UseDirective) bool {
         if (this == other or other == .none)

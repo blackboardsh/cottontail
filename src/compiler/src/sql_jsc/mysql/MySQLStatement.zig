@@ -164,10 +164,6 @@ pub fn structure(this: *MySQLStatement, owner: JSValue, globalObject: *jsc.JSGlo
     return this.cached_structure;
 }
 pub const Param = @import("../../sql/mysql/MySQLParam.zig").Param;
-const _ParamUnused = struct {
-    type: types.FieldType,
-    flags: ColumnDefinition41.ColumnFlags,
-};
 const debug = bun.Output.scoped(.MySQLStatement, .hidden);
 
 const CachedStructure = @import("../shared/CachedStructure.zig");
