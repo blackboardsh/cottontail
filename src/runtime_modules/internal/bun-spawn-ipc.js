@@ -437,6 +437,8 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
         (processObject.listenerCount?.("internalMessage") ?? 0) > 0) {
       announceReady();
     }
+    const frames = [];
+    let disconnected = false;
     try {
       for (;;) {
         const event = host.ipcRecv(fd, 64 * 1024);
@@ -445,8 +447,8 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
           if (Number.isInteger(event.fd) && event.fd >= 0) {
             try { host.closeFd?.(event.fd); } catch {}
           }
-          close();
-          return;
+          disconnected = true;
+          break;
         }
         if (Number.isInteger(event.fd) && event.fd >= 0) {
           if (Number.isInteger(pendingFd) && pendingFd >= 0) {
@@ -480,17 +482,27 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
           }
           if (frame == null) continue;
           traceInheritedNodeIpc("child-ipc-message", { fd, message: ipcMessageSummary(frame.message) });
-          if (frame.message?.cmd?.startsWith?.("NODE_")) {
-            processObject.emit?.("internalMessage", frame.message, frame.handle);
-          } else {
-            processObject.emit?.("message", frame.message, frame.handle);
-          }
-          updateChannelRef();
+          frames.push(frame);
         }
       }
     } catch (error) {
       processObject.emit?.("error", error);
+      return;
     }
+    const schedule = typeof processObject.nextTick === "function"
+      ? processObject.nextTick.bind(processObject)
+      : queueMicrotask;
+    for (const frame of frames) {
+      schedule(() => {
+        if (frame.message?.cmd?.startsWith?.("NODE_")) {
+          processObject.emit?.("internalMessage", frame.message, frame.handle);
+        } else {
+          processObject.emit?.("message", frame.message, frame.handle);
+        }
+        updateChannelRef();
+      });
+    }
+    if (disconnected) schedule(() => close());
   };
 
   processObject.connected = true;

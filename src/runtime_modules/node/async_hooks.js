@@ -724,7 +724,7 @@ export function _enqueueNextTick(job) {
 
 Object.defineProperty(globalThis, "__cottontailDrainNextTicks", {
   value(beginTurn = false) {
-    const drained = drainNextTickJobs();
+    const drained = drainNextTickJobs(true);
     if (beginTurn) nextTickPriorityArmed = true;
     syncNextTickHostState();
     return drained;

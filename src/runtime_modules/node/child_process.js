@@ -2078,15 +2078,16 @@ function installNativeIpcReader(
   let timer = null;
   const poll = () => {
     if (closed) return;
+    const frames = [];
+    let disconnected = false;
     try {
       for (;;) {
         const event = cottontail.ipcRecv(fd, 64 * 1024);
-        if (event == null) return;
+        if (event == null) break;
         if (event.end) {
           traceChildProcess("child-ipc-end", { fd });
-          close();
-          onDisconnect?.();
-          return;
+          disconnected = true;
+          break;
         }
         const chunk = Buffer.from(event.data ?? new ArrayBuffer(0)).toString("utf8");
         traceChildProcess("child-ipc-read", { fd, bytes: Buffer.byteLength(chunk) });
@@ -2106,13 +2107,21 @@ function installNativeIpcReader(
           const frame = decodeNativeIpcPayload(line.slice(ipcPrefix.length), frameFd, channelKey);
           if (frame != null) {
             traceChildProcess("child-ipc-message", { fd, message: ipcMessageSummary(frame.message) });
-            onFrame(frame.message, frame.handle);
+            frames.push(frame);
           }
         }
         if (Number.isInteger(pendingFd) && pendingFd >= 0) cottontail.closeFd?.(pendingFd);
       }
     } catch (error) {
       onError?.(error);
+      return;
+    }
+    // Keep user callback exceptions outside the transport error boundary.
+    // Host checkpoints may run queued next-tick work reentrantly.
+    for (const frame of frames) onFrame(frame.message, frame.handle);
+    if (disconnected) {
+      control.close();
+      onDisconnect?.();
     }
   };
   const control = {
