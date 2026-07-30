@@ -13692,73 +13692,97 @@ export function escapeHTML(value, attribute = false) {
   return escaped;
 }
 
+const stripANSINative = typeof cottontail.stripANSINative === "function"
+  ? cottontail.stripANSINative
+  : null;
+const stripANSIControlPattern = /[\x1b\x90\x98\x9b-\x9f]/;
+const stripANSINativeThreshold = 2048;
+
 export function stripANSI(value) {
   const text = String(value);
-  if (text.indexOf("\x1b") === -1 && text.indexOf("\x9b") === -1) return text;
+  if (text.indexOf("\x1b") === -1 && text.indexOf("\x9b") === -1) {
+    if (stripANSINative !== null && text.length >= stripANSINativeThreshold) {
+      return stripANSINative(text);
+    }
+    if (!stripANSIControlPattern.test(text)) return text;
+  }
+  if (stripANSINative !== null && text.length >= stripANSINativeThreshold) {
+    return stripANSINative(text);
+  }
   const length = text.length;
   let out = "";
   let plainStart = 0;
   let index = 0;
   while (index < length) {
     const code = text.charCodeAt(index);
-    if (code !== 0x1b && code !== 0x9b) {
+    if (!stripANSIIsControl(code)) {
       index += 1;
       continue;
     }
     out += text.slice(plainStart, index);
-    if (code === 0x9b) {
-      // C1 CSI: parse the control sequence body directly.
-      index = stripANSIConsumeCSI(text, index + 1);
-    } else if (index + 1 >= length) {
-      // Lone trailing ESC.
-      index = length;
-    } else {
-      const next = text.charCodeAt(index + 1);
-      if (next === 0x5b) {
-        // ESC [ - CSI sequence.
-        index = stripANSIConsumeCSI(text, index + 2);
-      } else if (next === 0x5d) {
-        // ESC ] - OSC sequence: payload runs to BEL, ST (ESC \ or 0x9C), or end.
-        index = stripANSIConsumeOSC(text, index + 2);
-      } else if (next >= 0x20 && next <= 0x2f) {
-        // ESC <intermediate> <final> - e.g. ESC ( B, ESC # 8, ESC % G, ESC SP x.
-        index = Math.min(index + 3, length);
-      } else {
-        // Two-character escape sequence - e.g. ESC 7, ESC =, ESC M.
-        index += 2;
-      }
-    }
+    const next = stripANSIConsume(text, index);
+    if (next === index) {
+      out += text[index];
+      index += 1;
+    } else index = next;
     plainStart = index;
   }
   return out + text.slice(plainStart);
 }
 
-function stripANSIConsumeCSI(text, index) {
-  const length = text.length;
-  while (index < length) {
-    const code = text.charCodeAt(index);
-    if (code >= 0x20 && code <= 0x3f) {
-      // Parameter (0x30-0x3F) and intermediate (0x20-0x2F) bytes.
-      index += 1;
-      continue;
-    }
-    if (code >= 0x40 && code <= 0x7e) return index + 1; // final byte
-    return index; // invalid byte ends the sequence without being consumed
-  }
-  return index; // unterminated sequence consumes the rest
+function stripANSIIsControl(code) {
+  return code === 0x1b ||
+    code === 0x90 ||
+    code === 0x98 ||
+    (code >= 0x9b && code <= 0x9f);
 }
 
-function stripANSIConsumeOSC(text, index) {
-  const length = text.length;
-  while (index < length) {
+function stripANSIConsume(text, start) {
+  let state = 0;
+  for (let index = start; index < text.length; index += 1) {
     const code = text.charCodeAt(index);
-    if (code === 0x07 || code === 0x9c) return index + 1; // BEL or C1 ST
-    if (code === 0x1b && index + 1 < length && text.charCodeAt(index + 1) === 0x5c) {
-      return index + 2; // ESC \ (ST)
+    switch (state) {
+      case 0:
+        if (code === 0x1b) state = 1;
+        else if (code === 0x9b) state = 3;
+        else if (code === 0x9d) state = 4;
+        else if (code === 0x90 || code === 0x98 || code === 0x9e || code === 0x9f) state = 6;
+        else return index;
+        break;
+      case 1:
+        if (code === 0x5b) state = 3;
+        else if (
+          code === 0x20 || code === 0x23 || code === 0x25 ||
+          code === 0x28 || code === 0x29 || code === 0x2a ||
+          code === 0x2b || code === 0x2e || code === 0x2f
+        ) state = 2;
+        else if (code === 0x5d) state = 4;
+        else if (code === 0x50 || code === 0x58 || code === 0x5e || code === 0x5f) state = 6;
+        else state = 0;
+        break;
+      case 2:
+        state = 0;
+        break;
+      case 3:
+        if (code >= 0x40 && code <= 0x7e) state = 0;
+        break;
+      case 4:
+        if (code === 0x07 || code === 0x9c) state = 0;
+        else if (code === 0x1b) state = 5;
+        break;
+      case 5:
+        state = code === 0x5c ? 0 : 4;
+        break;
+      case 6:
+        if (code === 0x9c) state = 0;
+        else if (code === 0x1b) state = 7;
+        break;
+      case 7:
+        state = code === 0x5c ? 0 : 6;
+        break;
     }
-    index += 1;
   }
-  return index; // unterminated OSC consumes the rest
+  return text.length;
 }
 
 function isCombiningCodePoint(codePoint) {
