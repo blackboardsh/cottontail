@@ -565,6 +565,15 @@ pub fn Parser(comptime enc: Encoding) type {
             return std.mem.startsWith(enc.unit(), self.remain(), cs);
         }
 
+        fn isAtLineStart(self: *const @This()) bool {
+            const pos = self.pos.cast();
+            if (pos == 0) return true;
+            return switch (self.input[pos - 1]) {
+                '\n', '\r' => true,
+                else => false,
+            };
+        }
+
         fn remainStartsWithChar(self: *const @This(), char: enc.unit()) bool {
             const r = self.remain();
             return r.len != 0 and r[0] == char;
@@ -2291,7 +2300,7 @@ pub fn Parser(comptime enc: Encoding) type {
                 },
 
                 '-' => {
-                    if (self.line_indent == .none and self.remainStartsWith("---") and self.isAnyOrEofAt(" \t\n\r", 3)) {
+                    if (self.line_indent == .none and self.isAtLineStart() and self.remainStartsWith("---") and self.isAnyOrEofAt(" \t\n\r", 3)) {
                         return ctx.done();
                     }
 
@@ -2308,7 +2317,7 @@ pub fn Parser(comptime enc: Encoding) type {
                 },
 
                 '.' => {
-                    if (self.line_indent == .none and self.remainStartsWith("...") and self.isAnyOrEofAt(" \t\n\r", 3)) {
+                    if (self.line_indent == .none and self.isAtLineStart() and self.remainStartsWith("...") and self.isAnyOrEofAt(" \t\n\r", 3)) {
                         return ctx.done();
                     }
 
@@ -2924,7 +2933,7 @@ pub fn Parser(comptime enc: Encoding) type {
                 },
 
                 '-' => {
-                    if (self.line_indent == .none and self.remainStartsWith("---") and self.isAnyOrEofAt(" \t\n\r", 3)) {
+                    if (self.line_indent == .none and self.isAtLineStart() and self.remainStartsWith("---") and self.isAnyOrEofAt(" \t\n\r", 3)) {
                         return ctx.done(false);
                     }
 
@@ -2943,7 +2952,7 @@ pub fn Parser(comptime enc: Encoding) type {
                 },
 
                 '.' => {
-                    if (self.line_indent == .none and self.remainStartsWith("...") and self.isAnyOrEofAt(" \t\n\r", 3)) {
+                    if (self.line_indent == .none and self.isAtLineStart() and self.remainStartsWith("...") and self.isAnyOrEofAt(" \t\n\r", 3)) {
                         return ctx.done(false);
                     }
 
@@ -3019,7 +3028,7 @@ pub fn Parser(comptime enc: Encoding) type {
                 0 => return error.UnexpectedCharacter,
 
                 '.' => {
-                    if (nl and self.line_indent == .none and self.remainStartsWith("...") and self.isSWhiteOrBCharAt(3)) {
+                    if (nl and self.line_indent == .none and self.isAtLineStart() and self.remainStartsWith("...") and self.isSWhiteOrBCharAt(3)) {
                         return error.UnexpectedDocumentEnd;
                     }
                     nl = false;
@@ -3029,7 +3038,7 @@ pub fn Parser(comptime enc: Encoding) type {
                 },
 
                 '-' => {
-                    if (nl and self.line_indent == .none and self.remainStartsWith("---") and self.isSWhiteOrBCharAt(3)) {
+                    if (nl and self.line_indent == .none and self.isAtLineStart() and self.remainStartsWith("---") and self.isSWhiteOrBCharAt(3)) {
                         return error.UnexpectedDocumentStart;
                     }
                     nl = false;
@@ -3120,7 +3129,7 @@ pub fn Parser(comptime enc: Encoding) type {
                 0 => return error.UnexpectedCharacter,
 
                 '.' => {
-                    if (nl and self.line_indent == .none and self.remainStartsWith("...") and self.isSWhiteOrBCharAt(3)) {
+                    if (nl and self.line_indent == .none and self.isAtLineStart() and self.remainStartsWith("...") and self.isSWhiteOrBCharAt(3)) {
                         return error.UnexpectedDocumentEnd;
                     }
                     nl = false;
@@ -3130,7 +3139,7 @@ pub fn Parser(comptime enc: Encoding) type {
                 },
 
                 '-' => {
-                    if (nl and self.line_indent == .none and self.remainStartsWith("---") and self.isSWhiteOrBCharAt(3)) {
+                    if (nl and self.line_indent == .none and self.isAtLineStart() and self.remainStartsWith("---") and self.isSWhiteOrBCharAt(3)) {
                         return error.UnexpectedDocumentStart;
                     }
                     nl = false;
@@ -3647,7 +3656,7 @@ pub fn Parser(comptime enc: Encoding) type {
                 '-' => {
                     const start = self.pos;
 
-                    if (self.line_indent == .none and self.remainStartsWith(enc.literal("---")) and self.isSWhiteOrBCharOrEofAt(3)) {
+                    if (self.line_indent == .none and self.isAtLineStart() and self.remainStartsWith(enc.literal("---")) and self.isSWhiteOrBCharOrEofAt(3)) {
                         self.inc(3);
                         break :next .documentStart(.{
                             .start = start,
@@ -3727,7 +3736,7 @@ pub fn Parser(comptime enc: Encoding) type {
                 '.' => {
                     const start = self.pos;
 
-                    if (self.line_indent == .none and self.remainStartsWith(enc.literal("...")) and self.isSWhiteOrBCharOrEofAt(3)) {
+                    if (self.line_indent == .none and self.isAtLineStart() and self.remainStartsWith(enc.literal("...")) and self.isSWhiteOrBCharOrEofAt(3)) {
                         self.inc(3);
                         break :next .documentEnd(.{
                             .start = start,

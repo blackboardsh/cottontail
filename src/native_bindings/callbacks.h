@@ -54,6 +54,10 @@ static const JSObjectCallAsFunctionCallback ct_crypto_native_callbacks[] = {
 #include "crypto.inc"
 };
 
+static const JSObjectCallAsFunctionCallback ct_data_parser_native_callbacks[] = {
+#include "data_parser.inc"
+};
+
 static const JSObjectCallAsFunctionCallback ct_dns_native_callbacks[] = {
 #include "dns.inc"
 };
@@ -107,6 +111,7 @@ static void ct_register_host_native_bindings(
     CT_REGISTER_NATIVE_BINDINGS(system);
     CT_REGISTER_NATIVE_BINDINGS(compression);
     CT_REGISTER_NATIVE_BINDINGS(crypto);
+    CT_REGISTER_NATIVE_BINDINGS(data_parser);
     CT_REGISTER_NATIVE_BINDINGS(dns);
     CT_REGISTER_NATIVE_BINDINGS(sockets);
     CT_REGISTER_NATIVE_BINDINGS(tls);

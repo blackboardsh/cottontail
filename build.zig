@@ -427,6 +427,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             "src/native_bindings/system.c",
             "src/native_bindings/compression.c",
             "src/native_bindings/crypto.c",
+            "src/native_bindings/data_parser.c",
             "src/native_bindings/dns.c",
             "src/native_bindings/sockets.c",
             "src/native_bindings/tls.c",

@@ -241,6 +241,8 @@ export function parse(input) {
   const source = yamlTextInput(input);
   const fast = tryFastParse(source);
   if (fast !== FAST_BAIL) return fast.value;
+  const nativeParse = globalThis.cottontail?.yamlParseNative;
+  if (typeof nativeParse === "function") return nativeParse(source);
   try {
     if (source.includes("%")) validateDirectives(source);
     const documents = parseAllYAMLDocuments(source, parseOptions);
