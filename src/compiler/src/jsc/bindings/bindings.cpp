@@ -3145,38 +3145,6 @@ JSC::EncodedJSValue JSC__JSModuleLoader__evaluate(JSC::JSGlobalObject* globalObj
     return JSValue::encode(usedStream);
 }
 
-JSC::EncodedJSValue JSC__JSValue__createRangeError(const ZigString* message, const ZigString* arg1,
-    JSC::JSGlobalObject* globalObject)
-{
-    auto& vm = JSC::getVM(globalObject);
-    ZigString code = *arg1;
-    JSC::JSObject* rangeError = Zig::getRangeErrorInstance(message, globalObject).asCell()->getObject();
-
-    if (code.len > 0) {
-        auto clientData = WebCore::clientData(vm);
-        JSC::JSValue codeValue = Zig::toJSString(code, globalObject);
-        rangeError->putDirect(vm, clientData->builtinNames().codePublicName(), codeValue,
-            JSC::PropertyAttribute::ReadOnly | 0);
-    }
-
-    return JSC::JSValue::encode(rangeError);
-}
-
-JSC::EncodedJSValue JSC__JSValue__createTypeError(const ZigString* message, const ZigString* arg1,
-    JSC::JSGlobalObject* globalObject)
-{
-    auto& vm = JSC::getVM(globalObject);
-    ZigString code = *arg1;
-    JSC::JSObject* typeError = Zig::getTypeErrorInstance(message, globalObject).asCell()->getObject();
-
-    if (code.len > 0) {
-        auto clientData = WebCore::clientData(vm);
-        JSC::JSValue codeValue = Zig::toJSString(code, globalObject);
-        typeError->putDirect(vm, clientData->builtinNames().codePublicName(), codeValue, 0);
-    }
-
-    return JSC::JSValue::encode(typeError);
-}
 
 JSC::EncodedJSValue JSC__JSValue__fromEntries(JSC::JSGlobalObject* globalObject, ZigString* keys,
     ZigString* values, size_t initialCapacity, bool clone)
