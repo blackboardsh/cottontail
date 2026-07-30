@@ -7,10 +7,14 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+
+import { elfExportSymbolsFromVersionScript } from './release-binary-contract.js';
 
 const rootDir = process.cwd();
 const zigName = process.platform === 'win32' ? 'zig.exe' : 'zig';
@@ -19,6 +23,7 @@ const zigPath = join(rootDir, 'vendors', 'zig', zigName);
 const executablePath = join(rootDir, 'zig-out', 'bin', executableName);
 const validatorPath = join(rootDir, 'scripts', 'validate-release-binary.js');
 const macosExportListPath = join(rootDir, 'src', 'compiler', 'src', 'symbols.txt');
+const linuxVersionScriptPath = join(rootDir, 'src', 'compiler', 'src', 'symbols.dyn');
 
 if (!existsSync(zigPath)) {
   console.error(`Vendored Zig compiler not found at ${zigPath}. Run the cottontail setup first.`);
@@ -64,6 +69,16 @@ try {
       'Cottontail release ad-hoc signing',
     );
   } else if (process.platform === 'linux') {
+    const linuxExportListPath = join(stagingRoot, 'linux-native-addon-exports.txt');
+    const linuxExportSymbols = elfExportSymbolsFromVersionScript(
+      readFileSync(linuxVersionScriptPath),
+    );
+    writeFileSync(linuxExportListPath, `${linuxExportSymbols.join('\n')}\n`);
+    run(
+      process.env.OBJCOPY ?? 'objcopy',
+      [`--keep-global-symbols=${linuxExportListPath}`, stagedExecutable],
+      'Cottontail release export localization',
+    );
     run(process.env.STRIP ?? 'strip', [stagedExecutable], 'Cottontail release strip');
   }
   run(

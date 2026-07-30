@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
   assertStrippedReleaseBinary,
+  elfExportSymbolsFromVersionScript,
   inspectReleaseBinary,
   listExportedSymbols,
 } from './release-binary-contract.js';
@@ -168,4 +170,39 @@ test('lists exported symbols from Mach-O, ELF, and PE binaries', () => {
   assert.deepEqual(listExportedSymbols(machoExportFixture()), ['_exported']);
   assert.deepEqual(listExportedSymbols(elfExportFixture()), ['exported']);
   assert.deepEqual(listExportedSymbols(peExportFixture()), ['exported']);
+});
+
+test('derives the Linux native-addon ABI from the linker version script', () => {
+  assert.deepEqual(
+    elfExportSymbolsFromVersionScript(`
+      {
+        global:
+          napi_create_object;
+          uv_queue_work;
+        local:
+          *;
+      };
+    `),
+    ['napi_create_object', 'uv_queue_work'],
+  );
+  assert.throws(
+    () => elfExportSymbolsFromVersionScript('{ local: *; };'),
+    /does not contain any global symbols/,
+  );
+
+  const exports = elfExportSymbolsFromVersionScript(
+    readFileSync(new URL('../src/compiler/src/symbols.dyn', import.meta.url)),
+  );
+  assert.ok(exports.length > 100);
+  assert.ok(exports.length <= 1024);
+  assert.equal(new Set(exports).size, exports.length);
+  for (const required of [
+    'napi_create_object',
+    'napi_create_threadsafe_function',
+    'node_module_register',
+    'uv_dlopen',
+    'uv_queue_work',
+  ]) {
+    assert.ok(exports.includes(required), `missing ${required}`);
+  }
 });

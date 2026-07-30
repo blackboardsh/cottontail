@@ -10,6 +10,36 @@ const maximumMachOSymbols = 50_000;
 const maximumMachOLocalSymbols = 4_096;
 const maximumMachOSymbolStringBytes = 2 * 1024 * 1024;
 
+export function elfExportSymbolsFromVersionScript(source) {
+  const text = Buffer.isBuffer(source) ? source.toString('utf8') : String(source);
+  const symbols = [];
+  let section = null;
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.replace(/#.*$/, '').trim();
+    if (line === 'global:') {
+      section = 'global';
+      continue;
+    }
+    if (line === 'local:') {
+      section = 'local';
+      continue;
+    }
+    if (section !== 'global' || line === '' || line === '{' || line === '};') continue;
+
+    const match = line.match(/^([^;\s]+)\s*;$/);
+    if (!match || match[1].includes('*')) {
+      throw new Error(`Unsupported ELF export entry: ${JSON.stringify(line)}`);
+    }
+    symbols.push(match[1]);
+  }
+
+  if (symbols.length === 0) {
+    throw new Error('ELF version script does not contain any global symbols');
+  }
+  return symbols;
+}
+
 function requireRange(buffer, offset, size, label) {
   if (
     !Number.isSafeInteger(offset) ||
