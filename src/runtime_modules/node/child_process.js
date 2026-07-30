@@ -1505,6 +1505,7 @@ execFile[kChildProcessPromisify] = (file, args = undefined, options = undefined)
 
 const ipcPrefix = "__COTTONTAIL_IPC__";
 const ipcEnvelopeKey = "__cottontailIpcEnvelope";
+const nodeIpcBackpressureThreshold = 2 * 65536;
 const inheritedNodeIpcSymbol = Symbol.for("cottontail.inheritedNodeIpc");
 const childProcessTraceEnabled = globalThis.process?.env?.COTTONTAIL_CHILD_PROCESS_TRACE === "1";
 // NODE_CHANNEL_FD is opened as a libuv IPC pipe. On Windows, libuv prefixes
@@ -2206,8 +2207,10 @@ function installParentIpcChannel(child, serialization = undefined, nodeProtocol 
         if (normalizedSend.sendHandle != null) {
           throw new Error("IPC handle passing to external runtimes is not available");
         }
-        ok = cottontail.ipcSend?.(Number(child._ipcFd), `${JSON.stringify(message)}\n`, -1) === true;
-        if (sendCallback) queueMicrotask(() => sendCallback(ok ? null : new Error("write failed")));
+        const payload = `${JSON.stringify(message)}\n`;
+        const sent = cottontail.ipcSend?.(Number(child._ipcFd), payload, -1) === true;
+        ok = sent && Buffer.byteLength(payload) < nodeIpcBackpressureThreshold;
+        if (sendCallback) queueMicrotask(() => sendCallback(sent ? null : new Error("write failed")));
       } else {
         ok = writeNativeIpc(child._ipcFd, message, child.serialization, normalizedSend.sendHandle,
           sendCallback ? () => sendCallback(ok ? null : new Error("write failed")) : undefined);
