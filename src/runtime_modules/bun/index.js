@@ -12640,15 +12640,76 @@ function nodeDigest(algorithm, chunks, encoding = undefined, key = undefined) {
   return encodeCryptoDigest(output, encoding);
 }
 
+const cryptoHasherNativeHandle = Symbol("CryptoHasher.nativeHandle");
+const cryptoHasherNativeKeyed = Symbol("CryptoHasher.nativeKeyed");
+
+function cryptoHasherNativeOutput(encoding) {
+  if (encoding != null && typeof encoding === "object" && (ArrayBuffer.isView(encoding) || encoding instanceof ArrayBuffer)) {
+    const target = encoding instanceof ArrayBuffer
+      ? new Uint8Array(encoding)
+      : new Uint8Array(encoding.buffer, encoding.byteOffset, encoding.byteLength);
+    return [8, target, encoding];
+  }
+  if (encoding == null || encoding === "buffer") return [0];
+
+  switch (String(encoding).toLowerCase()) {
+    case "hex":
+      return [1];
+    case "base64":
+      return [2];
+    case "base64url":
+      return [3];
+    case "latin1":
+    case "binary":
+      return [4];
+    case "ascii":
+      return [5];
+    case "utf8":
+    case "utf-8":
+      return [6];
+    case "ucs2":
+    case "ucs-2":
+    case "utf16le":
+    case "utf-16le":
+      return [7];
+    default:
+      // Delegate invalid-encoding validation to Buffer before finalizing the
+      // native state so a generic CryptoHasher remains retryable.
+      encodeCryptoDigest(new Uint8Array(0), encoding);
+      return [0];
+  }
+}
+
+function nativeCryptoHasherDigest(handle, encoding) {
+  const output = cryptoHasherNativeOutput(encoding);
+  const result = output.length === 3
+    ? globalThis.cottontail.cryptoHasherDigest(handle, output[0], output[1])
+    : globalThis.cottontail.cryptoHasherDigest(handle, output[0]);
+  if (output.length === 3) return output[2];
+  if (output[0] === 0) {
+    return globalThis.Buffer?.from ? globalThis.Buffer.from(result) : new Uint8Array(result);
+  }
+  return result;
+}
+
 export class CryptoHasher {
   constructor(algorithm, key = undefined) {
     if (algorithm == null) throw new TypeError("Expected an algorithm name as an argument");
     this.algorithm = normalizeCryptoHasherAlgorithm(algorithm);
-    this._key = key === undefined ? undefined : cryptoHasherBytes(key);
-    if (this._key !== undefined && !["md5", "sha1", "sha224", "sha256", "sha384", "sha512", "sha512-224", "sha512-256", "blake2b512"].includes(this.algorithm)) {
+    const keyBytes = key === undefined ? undefined : cryptoHasherBytes(key);
+    if (keyBytes !== undefined && !["md5", "sha1", "sha224", "sha256", "sha384", "sha512", "sha512-224", "sha512-256", "blake2b512"].includes(this.algorithm)) {
       throw new Error(`${this.algorithm} is not supported`);
     }
-    this._chunks = [];
+    const nativeCreate = globalThis.cottontail?.cryptoHasherCreate;
+    const nativeHandle = typeof nativeCreate === "function"
+      ? keyBytes === undefined
+        ? nativeCreate(this.algorithm)
+        : nativeCreate(this.algorithm, keyBytes)
+      : null;
+    this[cryptoHasherNativeHandle] = nativeHandle;
+    this[cryptoHasherNativeKeyed] = keyBytes !== undefined;
+    this._key = nativeHandle == null ? keyBytes : undefined;
+    this._chunks = nativeHandle == null ? [] : undefined;
     this._finished = false;
   }
 
@@ -12679,16 +12740,27 @@ export class CryptoHasher {
 
   update(data, encoding = undefined) {
     if (this._finished) throw new Error("Digest already called");
-    this._chunks.push(cryptoHasherBytes(data, encoding));
+    const bytes = cryptoHasherBytes(data, encoding);
+    const handle = this[cryptoHasherNativeHandle];
+    if (handle == null) {
+      this._chunks.push(bytes);
+    } else {
+      globalThis.cottontail.cryptoHasherUpdate(handle, bytes);
+    }
     return this;
   }
 
   digest(encoding = undefined) {
     if (this._finished) throw new Error("Digest already called");
-    const output = nodeDigest(this.algorithm, this._chunks, encoding, this._key);
-    if (this._key === undefined) {
-      this._chunks = [];
+    const handle = this[cryptoHasherNativeHandle];
+    const output = handle == null
+      ? nodeDigest(this.algorithm, this._chunks, encoding, this._key)
+      : nativeCryptoHasherDigest(handle, encoding);
+    if (!this[cryptoHasherNativeKeyed]) {
+      if (handle == null) this._chunks = [];
     } else {
+      this._key = undefined;
+      this._chunks = [];
       this._finished = true;
     }
     return output;
@@ -12696,9 +12768,21 @@ export class CryptoHasher {
 
   copy() {
     if (this._finished) throw new Error("CryptoHasher hasher already digested");
+    const handle = this[cryptoHasherNativeHandle];
+    if (handle != null) {
+      const next = Object.create(CryptoHasher.prototype);
+      next.algorithm = this.algorithm;
+      next[cryptoHasherNativeHandle] = globalThis.cottontail.cryptoHasherCopy(handle);
+      next[cryptoHasherNativeKeyed] = this[cryptoHasherNativeKeyed];
+      next._key = undefined;
+      next._chunks = undefined;
+      next._finished = false;
+      return next;
+    }
     const next = new CryptoHasher(this.algorithm);
     next._chunks = this._chunks.map((chunk) => asBuffer(chunk));
     next._key = this._key == null ? undefined : asBuffer(this._key);
+    next[cryptoHasherNativeKeyed] = this[cryptoHasherNativeKeyed];
     return next;
   }
 
