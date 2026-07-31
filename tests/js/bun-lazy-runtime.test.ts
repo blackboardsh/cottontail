@@ -10,10 +10,12 @@ const optionalModules = [
   "bun:redis",
   "bun:sql",
   "bun:color",
+  "bun:build",
   "bun:socket",
   "bun:test",
   "bun:jsc",
   "bun:sqlite",
+  "bun:shell",
   "vendor:ws",
   "vendor:picomatch",
   "internal:bun-shell-parser",
@@ -222,6 +224,79 @@ test("first use initializes once and preserves callable and constructor behavior
     });
     expect(descriptor.get).toBeUndefined();
   }
+});
+
+test("shell facade stays lazy and preserves attached export identity", () => {
+  const result = runRuntime(`
+    import { $, Shell, ShellError, ShellExpression, ShellOutput, ShellPromise } from "bun";
+
+    const status = globalThis[Symbol.for(${JSON.stringify(lazyDiagnosticsSymbol)})];
+    const before = status.get("bun:shell");
+    const bunDollar = Bun.$;
+    const afterRead = status.get("bun:shell");
+    const escaped = bunDollar.escape("a b");
+
+    console.log(JSON.stringify({
+      afterRead,
+      before,
+      escaped,
+      identities: {
+        dollar: bunDollar === $,
+        Shell: $.Shell === Shell,
+        ShellError: $.ShellError === ShellError,
+        ShellExpression: $.ShellExpression === ShellExpression,
+        ShellOutput: $.ShellOutput === ShellOutput,
+        ShellPromise: $.ShellPromise === ShellPromise,
+      },
+      instance: new ShellError() instanceof ShellError,
+      loaded: status.get("bun:shell"),
+    }));
+  `);
+
+  expect(result.before).toBe(false);
+  expect(result.afterRead).toBe(false);
+  expect(result.loaded).toBe(true);
+  expect(result.escaped).toBe('"a b"');
+  expect(Object.values(result.identities).every(Boolean)).toBe(true);
+  expect(result.instance).toBe(true);
+});
+
+test("build facade stays lazy and preserves global diagnostic constructors", () => {
+  const result = runRuntime(`
+    import { build } from "bun";
+
+    const status = globalThis[Symbol.for(${JSON.stringify(lazyDiagnosticsSymbol)})];
+    const before = status.get("bun:build");
+    const identitiesBefore = {
+      build: Bun.build === build,
+      buildError: BuildError === BuildMessage,
+      resolveError: ResolveError === ResolveMessage,
+    };
+    const afterRead = status.get("bun:build");
+    const diagnostic = new BuildMessage({ message: "deferred" });
+
+    console.log(JSON.stringify({
+      afterRead,
+      before,
+      constructorIdentity: diagnostic.constructor === BuildMessage,
+      identitiesBefore,
+      instance: diagnostic instanceof BuildMessage,
+      loaded: status.get("bun:build"),
+      message: diagnostic.message,
+    }));
+  `);
+
+  expect(result.before).toBe(false);
+  expect(result.afterRead).toBe(false);
+  expect(result.loaded).toBe(true);
+  expect(result.identitiesBefore).toEqual({
+    build: true,
+    buildError: true,
+    resolveError: true,
+  });
+  expect(result.constructorIdentity).toBe(true);
+  expect(result.instance).toBe(true);
+  expect(result.message).toBe("deferred");
 });
 
 test("test globals reify to the exact bun:test exports", () => {

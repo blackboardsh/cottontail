@@ -267,7 +267,7 @@ export function createLazyBuiltin(loadModule, select = value => value) {
   return load;
 }
 
-export function installLazyGlobal(name, loadValue) {
+export function installLazyGlobal(name, loadValue, afterMaterialize = undefined) {
   if (Object.hasOwn(globalThis, name)) return;
   Object.defineProperty(globalThis, name, {
     configurable: true,
@@ -280,7 +280,8 @@ export function installLazyGlobal(name, loadValue) {
         value,
         writable: true,
       });
-      return value;
+      afterMaterialize?.(name, value);
+      return globalThis[name];
     },
     set(value) {
       Object.defineProperty(globalThis, name, {

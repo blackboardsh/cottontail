@@ -56,6 +56,20 @@ int ct_text_encoding_decode_single_byte(
     uint16_t *output,
     int fatal
 );
+size_t ct_text_encoding_utf8_length_latin1(
+    const uint8_t *input,
+    size_t input_len
+);
+size_t ct_text_encoding_utf8_length_utf16(
+    const uint16_t *input,
+    size_t input_len
+);
+size_t ct_text_encoding_encode_latin1(
+    const uint8_t *input,
+    size_t input_len,
+    uint8_t *output,
+    size_t output_len
+);
 size_t ct_text_encoding_encode_utf16(
     const uint16_t *input,
     size_t input_len,

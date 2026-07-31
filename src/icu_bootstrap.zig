@@ -30,8 +30,12 @@ var initialized = false;
 var retained_data: ?[]u8 = null;
 
 pub fn ensure(init: std.process.Init) !void {
-    mutex.lockUncancelable(init.io);
-    defer mutex.unlock(init.io);
+    return ensureWithEnvironment(init.io, init.environ_map);
+}
+
+pub fn ensureWithEnvironment(io: std.Io, environ_map: *std.process.Environ.Map) !void {
+    mutex.lockUncancelable(io);
+    defer mutex.unlock(io);
     if (initialized) return;
 
     if (c.cottontail_icu_try_system() != 0) {
@@ -40,15 +44,15 @@ pub fn ensure(init: std.process.Init) !void {
     }
 
     const allocator = std.heap.smp_allocator;
-    if (try loadPackagedData(init.io, allocator)) |bytes| {
+    if (try loadPackagedData(io, allocator)) |bytes| {
         try activateFallback(allocator, bytes);
         initialized = true;
         return;
     }
 
-    const root = try dataRoot(init, allocator);
+    const root = try dataRoot(environ_map, allocator);
     defer allocator.free(root);
-    try std.Io.Dir.cwd().createDirPath(init.io, root);
+    try std.Io.Dir.cwd().createDirPath(io, root);
     const path = try std.fs.path.join(allocator, &.{ root, data_file });
     defer allocator.free(path);
     const marker_path = try std.mem.concat(allocator, u8, &.{ path, ".verified" });
@@ -56,14 +60,14 @@ pub fn ensure(init: std.process.Init) !void {
     const lock_path = try std.mem.concat(allocator, u8, &.{ path, ".lock" });
     defer allocator.free(lock_path);
 
-    const lock = try std.Io.Dir.cwd().createFile(init.io, lock_path, .{
+    const lock = try std.Io.Dir.cwd().createFile(io, lock_path, .{
         .read = true,
         .truncate = false,
         .lock = .exclusive,
     });
-    defer lock.close(init.io);
+    defer lock.close(io);
 
-    const bytes = try loadOrDownload(init, allocator, path, marker_path);
+    const bytes = try loadOrDownload(io, environ_map, allocator, path, marker_path);
     try activateFallback(allocator, bytes);
     initialized = true;
 }
@@ -108,9 +112,9 @@ fn loadPackagedData(io: std.Io, allocator: std.mem.Allocator) !?[]u8 {
     return bytes;
 }
 
-fn dataRoot(init: std.process.Init, allocator: std.mem.Allocator) ![]u8 {
+fn dataRoot(environ_map: *std.process.Environ.Map, allocator: std.mem.Allocator) ![]u8 {
     if (builtin.os.tag == .windows) {
-        if (init.environ_map.get("LOCALAPPDATA")) |root|
+        if (environ_map.get("LOCALAPPDATA")) |root|
             return std.fs.path.join(allocator, &.{ root, "Cottontail", "icu", version });
         var buffer: [windows_shell.max_path]u16 = undefined;
         const status = windows_shell.SHGetFolderPathW(
@@ -127,20 +131,20 @@ fn dataRoot(init: std.process.Init, allocator: std.mem.Allocator) ![]u8 {
             return std.fs.path.join(allocator, &.{ root, "Cottontail", "icu", version });
         }
     } else if (builtin.os.tag == .macos) {
-        if (init.environ_map.get("HOME")) |home|
+        if (environ_map.get("HOME")) |home|
             return std.fs.path.join(allocator, &.{ home, "Library", "Application Support", "Cottontail", "icu", version });
     } else {
-        if (init.environ_map.get("XDG_DATA_HOME")) |root|
+        if (environ_map.get("XDG_DATA_HOME")) |root|
             return std.fs.path.join(allocator, &.{ root, "cottontail", "icu", version });
-        if (init.environ_map.get("HOME")) |home|
+        if (environ_map.get("HOME")) |home|
             return std.fs.path.join(allocator, &.{ home, ".local", "share", "cottontail", "icu", version });
     }
     return error.MissingHomeDirectory;
 }
 
-fn markerMatches(init: std.process.Init, allocator: std.mem.Allocator, marker_path: []const u8) bool {
+fn markerMatches(io: std.Io, allocator: std.mem.Allocator, marker_path: []const u8) bool {
     const marker = std.Io.Dir.cwd().readFileAlloc(
-        init.io,
+        io,
         marker_path,
         allocator,
         .limited(256),
@@ -157,22 +161,24 @@ fn hashMatches(bytes: []const u8) bool {
 }
 
 fn loadOrDownload(
-    init: std.process.Init,
+    io: std.Io,
+    environ_map: *std.process.Environ.Map,
     allocator: std.mem.Allocator,
     path: []const u8,
     marker_path: []const u8,
 ) ![]u8 {
-    if (std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(max_data_size))) |bytes| {
-        const verified = markerMatches(init, allocator, marker_path);
+    if (std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_data_size))) |bytes| {
+        const verified = markerMatches(io, allocator, marker_path);
         if (bytes.len == expected_data_size and (verified or hashMatches(bytes))) {
             if (!verified)
-                try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = marker_path, .data = expected_sha256 ++ "\n" });
+                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = marker_path, .data = expected_sha256 ++ "\n" });
             return bytes;
         }
         allocator.free(bytes);
     } else |_| {}
 
-    var client: std.http.Client = .{ .allocator = allocator, .io = init.io };
+    _ = environ_map;
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
@@ -190,9 +196,9 @@ fn loadOrDownload(
 
     const temporary_path = try std.mem.concat(allocator, u8, &.{ path, ".tmp" });
     defer allocator.free(temporary_path);
-    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = temporary_path, .data = bytes });
-    try std.Io.Dir.cwd().rename(temporary_path, std.Io.Dir.cwd(), path, init.io);
-    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = marker_path, .data = expected_sha256 ++ "\n" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = temporary_path, .data = bytes });
+    try std.Io.Dir.cwd().rename(temporary_path, std.Io.Dir.cwd(), path, io);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = marker_path, .data = expected_sha256 ++ "\n" });
     return bytes;
 }
 

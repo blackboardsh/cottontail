@@ -5,12 +5,13 @@ import { spawnSync } from 'child_process';
 import { join } from 'path';
 
 const rootDir = process.cwd();
-const binaryPath = join(
+const binaryPath = process.env.COTTONTAIL_BENCH_BINARY || join(
   rootDir,
   'zig-out',
   'bin',
   process.platform === 'win32' ? 'cottontail.exe' : 'cottontail'
 );
+const runtimeLabel = process.env.COTTONTAIL_BENCH_LABEL || 'cottontail';
 
 const benches = [
   {
@@ -141,7 +142,7 @@ if (!existsSync(binaryPath)) {
   fail(`Release binary not found at ${binaryPath}. Run "bun run bench:build" first.`);
 }
 
-console.log('cottontail benchmarks (ReleaseSmall)');
+console.log(`${runtimeLabel} benchmarks`);
 console.log('startup-empty wall time approximates process startup + runtime init + empty script eval');
 console.log('startup-full-runtime includes initialization of the complete Bun compatibility surface');
 

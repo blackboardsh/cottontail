@@ -1,16 +1,19 @@
 #!/usr/bin/env node
 
-import { spawnSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import { existsSync } from 'fs';
 import { join } from 'path';
 
 const zigBinary = process.platform === 'win32' ? 'zig.exe' : 'zig';
 const zigPath = join(process.cwd(), 'vendors', 'zig', zigBinary);
+const nativeBindingsGenerator = join(process.cwd(), 'scripts', 'generate-native-bindings.js');
 
 if (!existsSync(zigPath)) {
   console.error(`Vendored Zig compiler not found at ${zigPath}. Run the cottontail setup first.`);
   process.exit(1);
 }
+
+execFileSync(process.execPath, [nativeBindingsGenerator], { stdio: 'inherit' });
 
 const result = spawnSync(zigPath, process.argv.slice(2), { stdio: 'inherit' });
 

@@ -321,6 +321,16 @@ if (g.process.env?.COTTONTAIL_TEST_CLI_HEADER_PRINTED === "1") {
 g.process.execPath ??= cottontailExecPath;
 g.process.argv0 ??= g.process.execPath;
 g.process.execArgv ??= Array.from(cottontail.execArgv || []);
+if (globalThis.__cottontailStandaloneFlags && Array.isArray(g.process.argv) && g.process.argv.length > 0) {
+  g.process.argv[0] = "bun";
+}
+for (let index = 0; index < g.process.execArgv.length; index += 1) {
+  const argument = String(g.process.execArgv[index]);
+  if (argument.startsWith("--title=")) g.process.title = argument.slice("--title=".length);
+  else if (argument === "--title" && index + 1 < g.process.execArgv.length) {
+    g.process.title = String(g.process.execArgv[++index]);
+  }
+}
 if (typeof cottontail.gc === "function" &&
     Array.prototype.some.call(g.process.execArgv, (arg) => arg === "--expose-gc" || arg === "--expose_gc")) {
   let exposedGc;
@@ -3573,9 +3583,12 @@ function preparedArityWrapper(prepared, count, returnsCString) {
     }
   }
 
+  const fastCall = prepared.__cottontailFastCall;
   switch (count) {
     case 0: return function () { return prepared(); };
-    case 1: return function (a) { return prepared(a); };
+    case 1: return typeof fastCall === "function"
+      ? function (a) { return typeof a === "number" ? fastCall(a) : prepared(a); }
+      : function (a) { return prepared(a); };
     case 2: return function (a, b) { return prepared(a, b); };
     case 3: return function (a, b, c) { return prepared(a, b, c); };
     case 4: return function (a, b, c, d) { return prepared(a, b, c, d); };

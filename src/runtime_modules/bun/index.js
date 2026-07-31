@@ -1,22 +1,24 @@
 import "../internal/v8-date-parser.js";
 import * as FFI from "./ffi.js";
+import * as NodeBufferNamespace from "../node/buffer.js";
+import * as NodeAsyncHooksNamespace from "../node/async_hooks.js";
+import * as NodePathNamespace from "../node/path.js";
+import * as NodeUrlNamespace from "../node/url.js";
+import * as NodeModuleNamespace from "../node/module.js";
+import * as WhatwgUrlNamespace from "../vendor/whatwg-url.js";
+import * as BunEncodingNamespace from "./encoding.js";
+import * as NodeStdioNamespace from "../node/stdio.js";
+import * as BunSpawnIpcNamespace from "../internal/bun-spawn-ipc.js";
 import { plugin } from "./plugin.js";
 export { plugin };
-import * as nodeHttp from "../node/http.js";
-import * as nodeHttps from "../node/https.js";
-import * as nodeNet from "../node/net.js";
-import { Readable as NodeReadable } from "../node/stream.js";
-import { connect as nodeTlsConnect } from "../node/tls.js";
-import * as zlib from "../node/zlib.js";
-import { createUndiciModule } from "../node/undici.js";
-import { CryptoKey, SubtleCrypto as NodeSubtleCrypto, createHash, createHmac, randomBytes, randomUUID, webcrypto as nodeWebcrypto } from "../node/crypto.js";
 import {
   _resolveForImport as nodeResolveForImport,
   __setBuiltinModules as nodeSetBuiltinModules,
   createRequire as nodeCreateRequire,
   isBuiltin as nodeIsBuiltin,
+  loadEmbeddedRuntimeModule,
+  registerEmbeddedRuntimeModules,
 } from "../node/module.js";
-import { cpSync as nodeCpSync } from "../node/fs.js";
 import {
   basename as nodePathBasename,
   dirname as nodePathDirname,
@@ -25,18 +27,9 @@ import {
   relative as nodePathRelative,
   resolve as nodePathResolve,
 } from "../node/path.js";
-import * as streamWeb from "../node/stream/web.js";
 import { fileURLToPath as nodeFileURLToPath, pathToFileURL as nodePathToFileURL } from "../node/url.js";
-import { inspect as nodeInspect, isDeepStrictEqual, stripVTControlCharacters } from "../node/util.js";
 import { _patchAsyncContextGlobals, _wrapAsyncCallback } from "../node/async_hooks.js";
-import {
-  remapErrorPosition as remapBundleErrorPosition,
-  remapPosition as remapBundlePosition,
-  remapStackString as remapBundleStack,
-  sourceContextForLocation as bundleSourceContextForLocation,
-} from "../vendor/sourcemap.js";
 import { URL, URLSearchParams } from "../vendor/whatwg-url.js";
-import { URLPattern as CottontailURLPattern } from "../vendor/urlpattern.js";
 import {
   bunJSCBuiltin,
   bunSQLiteBuiltin,
@@ -77,11 +70,12 @@ export {
   YAML,
 };
 import {
+  createLazyBuiltin,
+  createLazyFunction,
+  createLazyObject,
   createLazyModule,
   installLazyGlobal,
 } from "./lazy-runtime.js";
-import * as bunInternalForTestingModule from "./internal-for-testing.js";
-import { captureV8HeapSnapshot } from "../node/internal/heap_snapshot.js";
 import {
   assertBunAbortSignal,
   bunSignalNumber,
@@ -96,7 +90,6 @@ import {
   installInheritedBunIpcCodec,
   installInheritedNodeIpc,
 } from "../internal/bun-spawn-ipc.js";
-import { createBunShellRuntime, parseBunShellSource } from "../internal/bun-shell-runtime.js";
 import {
   bodyStreamFor as lifecycleBodyStreamFor,
   bodyStreamIsDisturbed,
@@ -106,16 +99,8 @@ import {
   registerFetchBodyFinalizer,
   takeBody as lifecycleTakeBody,
 } from "./web-body-lifecycle.js";
-import {
-  createNativeServeRequestOperation,
-  createNativeServeRequestState,
-  createServeLifecycle,
-  incomingRequestURLFactory,
-  trackServeReadableStream,
-} from "../internal/bun-http-server.js";
 import { installStandaloneRuntimeLoaders } from "../internal/standalone-runtime.js";
 import { runtimeDefaultUserAgent } from "../internal/runtime-options.js";
-import { createBunSpawnRuntime } from "./spawn.js";
 import {
   file as createBunFile,
   guessMimeType,
@@ -124,9 +109,102 @@ import {
   write,
 } from "./file-io.js";
 
+registerEmbeddedRuntimeModules({
+  "bun/encoding.js": BunEncodingNamespace,
+  "bun/ffi.js": FFI,
+  "internal/bun-spawn-ipc.js": BunSpawnIpcNamespace,
+  "node/async_hooks.js": NodeAsyncHooksNamespace,
+  "node/buffer.js": NodeBufferNamespace,
+  "node/module.js": NodeModuleNamespace,
+  "node/path.js": NodePathNamespace,
+  "node/stdio.js": NodeStdioNamespace,
+  "node/url.js": NodeUrlNamespace,
+  "vendor/whatwg-url.js": WhatwgUrlNamespace,
+});
+
+function lazyModuleObject(loadModule) {
+  return createLazyObject(() => ({ namespace: loadModule() }), "namespace");
+}
+
+function initializeNodeHttp() {
+  const runtimeRequire = globalThis.require ?? globalThis.__ctMetaRequire;
+  const namespace = typeof runtimeRequire === "function"
+    ? runtimeRequire("node:http")
+    : loadEmbeddedRuntimeModule("node/http.js");
+  const incomingPrototype = namespace.IncomingMessage?.prototype;
+  if (incomingPrototype && !Object.prototype.hasOwnProperty.call(incomingPrototype, "_read")) {
+    Object.defineProperty(incomingPrototype, "_read", {
+      value: function _read() {},
+      writable: true,
+      configurable: true,
+    });
+  }
+  const wsPrototype = namespace.WebSocket?.prototype;
+  const originalDispatch = wsPrototype?.dispatchEvent;
+  if (typeof originalDispatch === "function" && !originalDispatch.__cottontailSafeErrorDispatch) {
+    const dispatchEvent = function dispatchEvent(event) {
+      try {
+        return originalDispatch.call(this, event);
+      } catch (error) {
+        if (event?.type === "error") return true;
+        throw error;
+      }
+    };
+    Object.defineProperty(dispatchEvent, "__cottontailSafeErrorDispatch", { value: true });
+    wsPrototype.dispatchEvent = dispatchEvent;
+  }
+  return namespace;
+}
+
+const loadNodeHttpModule = createLazyModule("node:http", initializeNodeHttp);
+const loadNodeHttpsModule = createLazyModule("node:https", () => loadEmbeddedRuntimeModule("node/https.js"));
+const loadNodeNetModule = createLazyModule("node:net", () => loadEmbeddedRuntimeModule("node/net.js"));
+const loadNodeStreamModule = createLazyModule("node:stream", () => loadEmbeddedRuntimeModule("node/stream.js"));
+const loadNodeStreamWebModule = createLazyModule("node:stream/web", () => loadEmbeddedRuntimeModule("node/stream/web.js"));
+const loadNodeTlsModule = createLazyModule("node:tls", () => loadEmbeddedRuntimeModule("node/tls.js"));
+const loadNodeZlibModule = createLazyModule("node:zlib", () => loadEmbeddedRuntimeModule("node/zlib.js"));
+const loadNodeCryptoModule = createLazyModule("node:crypto", () => {
+  const namespace = loadEmbeddedRuntimeModule("node/crypto.js");
+  return namespace.default ?? namespace;
+});
+const nodeHttp = lazyModuleObject(loadNodeHttpModule);
+const nodeHttps = lazyModuleObject(loadNodeHttpsModule);
+const nodeNet = lazyModuleObject(loadNodeNetModule);
+const streamWeb = lazyModuleObject(loadNodeStreamWebModule);
+const zlib = lazyModuleObject(loadNodeZlibModule);
+const nodeTlsConnect = (...args) => loadNodeTlsModule().connect(...args);
+const nodeCpSync = (...args) => loadEmbeddedRuntimeModule("node/fs.js").cpSync(...args);
+const createHash = (...args) => loadNodeCryptoModule().createHash(...args);
+const createHmac = (...args) => loadNodeCryptoModule().createHmac(...args);
+const randomBytes = (...args) => loadNodeCryptoModule().randomBytes(...args);
+const randomUUID = (...args) => loadNodeCryptoModule().randomUUID(...args);
+const loadNodeUtilModule = createLazyModule("node:util", () => loadEmbeddedRuntimeModule("node/util.js"));
+const loadSourceMapModule = createLazyModule("vendor:sourcemap", () => loadEmbeddedRuntimeModule("vendor/sourcemap.js"));
+const loadBunHttpServerModule = createLazyModule("internal:bun-http-server", () => loadEmbeddedRuntimeModule("internal/bun-http-server.js"));
+const nodeInspect = (...args) => loadNodeUtilModule().inspect(...args);
+const isDeepStrictEqual = (...args) => loadNodeUtilModule().isDeepStrictEqual(...args);
+export const stripVTControlCharacters = (...args) => loadNodeUtilModule().stripVTControlCharacters(...args);
+const remapBundleErrorPosition = (...args) => loadSourceMapModule().remapErrorPosition(...args);
+const remapBundlePosition = (...args) => loadSourceMapModule().remapPosition(...args);
+const remapBundleStack = (...args) => loadSourceMapModule().remapStackString(...args);
+const bundleSourceContextForLocation = (...args) => loadSourceMapModule().sourceContextForLocation(...args);
+const captureV8HeapSnapshot = (...args) => loadEmbeddedRuntimeModule("node/internal/heap_snapshot.js").captureV8HeapSnapshot(...args);
+const parseBunShellSource = (...args) => loadEmbeddedRuntimeModule("internal/bun-shell-runtime.js").parseBunShellSource(...args);
+const createNativeServeRequestOperation = (...args) => loadBunHttpServerModule().createNativeServeRequestOperation(...args);
+const createNativeServeRequestState = (...args) => loadBunHttpServerModule().createNativeServeRequestState(...args);
+const createServeLifecycle = (...args) => loadBunHttpServerModule().createServeLifecycle(...args);
+const incomingRequestURLFactory = (...args) => loadBunHttpServerModule().incomingRequestURLFactory(...args);
+const trackServeReadableStream = (...args) => loadBunHttpServerModule().trackServeReadableStream(...args);
+const createBunSpawnRuntime = (...args) => loadEmbeddedRuntimeModule("bun/spawn.js").createBunSpawnRuntime(...args);
+const loadBunInternalForTestingModule = createLazyModule(
+  "bun:internal-for-testing",
+  () => loadEmbeddedRuntimeModule("bun/internal-for-testing.js"),
+);
+const bunInternalForTestingModule = createLazyBuiltin(loadBunInternalForTestingModule);
+
 const loadPicomatchModule = createLazyModule(
   "vendor:picomatch",
-  () => require("../vendor/picomatch.js"),
+  () => loadEmbeddedRuntimeModule("vendor/picomatch.js"),
 );
 
 function lazyPicomatch(...args) {
@@ -1099,9 +1177,13 @@ for (const name of [
   "TextEncoderStream",
   "TextDecoderStream",
 ]) {
-  if (typeof globalThis[name] !== "function" && typeof streamWeb[name] === "function") {
-    globalThis[name] = streamWeb[name];
-  }
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+  if (descriptor && (typeof descriptor.value === "function" || typeof descriptor.get === "function")) continue;
+  if (descriptor) delete globalThis[name];
+  installLazyGlobal(name, () => streamWeb[name], () => {
+    _patchAsyncContextGlobals();
+    installReadableStreamConversionHelpers();
+  });
 }
 _patchAsyncContextGlobals();
 installReadableStreamConversionHelpers();
@@ -1178,1133 +1260,57 @@ if (globalThis.console && typeof globalThis.console[Symbol.asyncIterator] !== "f
   };
 }
 
-function binaryOutputView(value) {
-  if (value instanceof ArrayBuffer) return new Uint8Array(value);
-  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-  return null;
-}
-
-function shellInterpolationText(value) {
-  if (isBunFileLike(value) && value.name != null) value = value.name;
-  if (value != null && typeof value === "object" &&
-    (typeof value.toString !== "function" || value.toString === Object.prototype.toString)) {
-    throw new TypeError("Invalid JS object used in shell, you might need to call `.toString()` on it");
-  }
-  const text = String(value);
-  validateNoNullByte(text, "shell argument");
-  return text;
-}
-
-function quotePosixShellValue(value) {
-  return `'${String(value).replace(/'/g, `'\\''`)}'`;
-}
-
-function isShellObjectReference(value) {
-  if (value == null || typeof value !== "object" || isBunFileLike(value)) return false;
-  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return true;
-  return (typeof Blob === "function" && value instanceof Blob)
-    || (typeof Response === "function" && value instanceof Response)
-    || (typeof ReadableStream === "function" && value instanceof ReadableStream);
-}
-
-function appendShellInterpolation(out, value, state) {
-  if (Array.isArray(value)) {
-    let first = true;
-    const appendArrayValue = item => {
-      if (Array.isArray(item)) {
-        for (const nested of item) appendArrayValue(nested);
-        return;
-      }
-      if (!first) out += " ";
-      first = false;
-      out = appendShellInterpolation(out, item, state);
-    };
-    for (const item of value) appendArrayValue(item);
-    return out;
-  }
-
-  if (isShellObjectReference(value)) {
-    if (state.quote === '"') throw new Error("JS object reference not allowed in double quotes");
-    throw new Error('expected a command or assignment but got: "JSObjRef"');
-  }
-
-  if (value && typeof value === "object" &&
-    Object.prototype.hasOwnProperty.call(value, "raw")) {
-    const raw = String(value.raw);
-    validateNoNullByte(raw, "shell argument");
-    scanShellQuoteState(state, raw);
-    return out + raw;
-  }
-
-  let text = shellInterpolationText(value);
-  if (state.escaped) {
-    out = out.slice(0, -1);
-    text = `\\${text}`;
-    state.escaped = false;
-  }
-
-  if (state.quote === "'") {
-    return out + text.replace(/'/g, `'\\''`);
-  }
-  if (state.quote === '"') {
-    return out + text.replace(/[$`"\\]/g, "\\$&");
-  }
-  if (out.endsWith("$")) {
-    return out.slice(0, -1) + quotePosixShellValue(`$${text}`);
-  }
-  return out + quotePosixShellValue(text);
-}
-
-function scanShellQuoteState(state, source) {
-  for (const char of String(source)) {
-    if (state.quote === "'") {
-      if (char === "'") state.quote = null;
-      continue;
-    }
-    if (state.escaped) {
-      state.escaped = false;
-      continue;
-    }
-    if (char === "\\") {
-      state.escaped = true;
-      continue;
-    }
-    if (state.quote === '"') {
-      if (char === '"') state.quote = null;
-      continue;
-    }
-    if (char === "'" || char === '"') state.quote = char;
-  }
-}
-
-function trailingRedirect(part, operator) {
-  let end = part.length;
-  while (end > 0 && /\s/.test(part[end - 1])) end -= 1;
-  if (part[end - 1] !== operator || part[end - 2] === operator) return null;
-  let start = end - 1;
-  if (/[012]/.test(part[start - 1] ?? "")) start -= 1;
-  return { fd: start < end - 1 ? Number(part[start]) : operator === "<" ? 0 : 1, start, end };
-}
-
-function validateWindowsShellObjectRedirects(node, outputTargets) {
-  if (cottontail.platform() !== "win32" || outputTargets.size === 0) return;
-  const visit = value => {
-    if (Array.isArray(value)) {
-      for (const item of value) visit(item);
-      return;
-    }
-    if (value == null || typeof value !== "object") return;
-
-    const redirects = Array.isArray(value.redirects) ? value.redirects : [];
-    const objectRedirects = redirects
-      .map((redirect, index) => ({ redirect, index }))
-      .filter(({ redirect }) => {
-        if (outputTargets.has(redirect.target?.raw)) return true;
-        const literalTarget = redirect.target?.parts
-          ?.map(part => typeof part?.text === "string" ? part.text : "")
-          .join("");
-        return literalTarget !== undefined && outputTargets.has(literalTarget);
-      });
-    if (value.type === "subshell" && objectRedirects.length > 0) {
-      throw new Error("Subshells with redirections are currently not supported. Please open a GitHub issue.");
-    }
-    if (objectRedirects.length > 0 && redirects.length > 1) {
-      const { index } = objectRedirects[0];
-      if (index === redirects.length - 1 && redirects[index - 1]?.operator === ">&2") {
-        throw new Error("Redirection with no file");
-      }
-      throw new Error('expected a command or assignment but got: "Redirect"');
-    }
-
-    for (const child of Object.values(value)) visit(child);
-  };
-  visit(node);
-}
-
-function interpolateShellCommand(strings, values) {
-  const parts = Array.isArray(strings?.raw) ? strings.raw : strings;
-  let out = "";
-  let outputBuffer = undefined;
-  let outputFd = 1;
-  const outputTargets = new Map();
-  let inputBody = undefined;
-  const state = { quote: null, escaped: false };
-  for (let index = 0; index < strings.length; index += 1) {
-    let part = parts[index];
-    const terminalTarget = index < values.length &&
-      parts.slice(index + 1).every((item) => String(item).trim() === "");
-    const outputRedirect = index < values.length ? trailingRedirect(part, ">") : null;
-    if (outputRedirect && binaryOutputView(values[index])) {
-      const target = `__cottontail_output_${index}_${outputTargets.size}__`;
-      out += part;
-      scanShellQuoteState(state, part);
-      if (state.quote === '"') {
-        throw new SyntaxError("JS object reference not allowed in double quotes");
-      }
-      out += quotePosixShellValue(target);
-      outputTargets.set(target, values[index]);
-      continue;
-    }
-    if (outputRedirect && values[index] != null && typeof values[index] === "object") {
-      const value = values[index];
-      if (!isBunFileLike(value) && (value instanceof Blob || value instanceof Response)) {
-        throw new TypeError("Shell output redirection requires a writable Buffer or TypedArray");
-      }
-    }
-    const inputRedirect = terminalTarget ? trailingRedirect(part, "<") : null;
-    if (inputRedirect && values[index] != null && typeof values[index] === "object") {
-      part = part.slice(0, inputRedirect.start) + part.slice(inputRedirect.end);
-      out += part;
-      inputBody = values[index];
-      continue;
-    }
-    out += part;
-    scanShellQuoteState(state, part);
-    if (index < values.length) {
-      out = appendShellInterpolation(out, values[index], state);
-    }
-  }
-  const command = out.trimEnd();
-  const parsed = parseBunShellSource(command);
-  validateWindowsShellObjectRedirects(parsed, outputTargets);
-  return { command, outputBuffer, outputFd, outputTargets, inputBody };
-}
-
-const largeShellInterpolationCache = new WeakMap();
-const largeShellInterpolationThreshold = 256 * 1024;
-const shellTransientAllocationBudget = 32 * 1024 * 1024;
-let shellTransientAllocationBytes = 0;
-let shellTransientCollectionQueued = false;
-
-function accountShellTransientAllocation(byteLength) {
-  shellTransientAllocationBytes += Number(byteLength) || 0;
-  if (shellTransientAllocationBytes < shellTransientAllocationBudget) return;
-  shellTransientAllocationBytes = 0;
-  if (shellTransientCollectionQueued) return;
-  shellTransientCollectionQueued = true;
-  queueMicrotask(() => {
-    shellTransientCollectionQueued = false;
-    cottontail.gc?.();
-  });
-}
-
-function largeRawInterpolationSignature(strings, values) {
-  if ((typeof strings !== "object" && typeof strings !== "function") || strings === null) return null;
-  const signature = [];
-  let length = 0;
-  for (const value of values) {
-    if (value == null || typeof value !== "object" ||
-        !Object.prototype.hasOwnProperty.call(value, "raw")) return null;
-    const raw = String(value.raw);
-    signature.push(raw);
-    length += raw.length;
-  }
-  return length >= largeShellInterpolationThreshold ? signature : null;
-}
-
-function sameShellInterpolationSignature(left, right) {
-  if (left?.length !== right?.length) return false;
-  for (let index = 0; index < left.length; index += 1) {
-    if (left[index] !== right[index]) return false;
-  }
-  return true;
-}
-
-function shellInterpolationError(error) {
-  return {
-    name: String(error?.name ?? "Error"),
-    message: String(error?.message ?? error),
-    position: error?.position,
-    code: error?.code,
-  };
-}
-
-function throwShellInterpolationError(cached) {
-  const error = cached.name === "SyntaxError"
-    ? new SyntaxError(cached.message)
-    : new Error(cached.message);
-  error.name = cached.name;
-  if (cached.position !== undefined) error.position = cached.position;
-  if (cached.code !== undefined) error.code = cached.code;
-  throw error;
-}
-
-const shellDefaults = {
-  cwd: undefined,
-  env: undefined,
-  throws: true,
-  quiet: false,
-};
-
-const internalShellOutput = Symbol("Cottontail.internalShellOutput");
-
-function shellOutputBuffer(value, copy) {
-  const output = asBuffer(value);
-  if (!globalThis.Buffer?.from) return output;
-  if (copy) return Buffer.from(output);
-  if (Buffer.isBuffer?.(output)) return output;
-  return Buffer.from(output.buffer, output.byteOffset, output.byteLength);
-}
-
-export class ShellOutput {
-  constructor(result = {}, ownership = undefined) {
-    const stdout = asBuffer(result.stdout ?? "");
-    const stderr = asBuffer(result.stderr ?? "");
-    const copy = ownership !== internalShellOutput;
-    this.stdout = shellOutputBuffer(stdout, copy);
-    this.stderr = shellOutputBuffer(stderr, copy);
-    this.exitCode = Number(result.exitCode ?? result.status ?? 0);
-    this.status = this.exitCode;
-    this.success = this.exitCode === 0;
-  }
-  text(encoding = "utf-8") {
-    return this.stdout.toString(encoding);
-  }
-  json() {
-    return JSON.parse(this.text());
-  }
-  bytes() {
-    return asBuffer(this.stdout);
-  }
-  arrayBuffer() {
-    const bytes = this.bytes();
-    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-  }
-  blob() {
-    let bytes = this.bytes();
-    if (bytes.byteLength > 0 && bytes[bytes.byteLength - 1] === 10) bytes = bytes.subarray(0, bytes.byteLength - 1);
-    return new Blob([bytes]);
-  }
-}
-
-export class ShellError extends Error {
-  constructor() {
-    super("");
-    this.info = undefined;
-    this.exitCode = undefined;
-    this.stdout = undefined;
-    this.stderr = undefined;
-  }
-  initialize(result, code = result?.exitCode) {
-    const output = result instanceof ShellOutput ? result : new ShellOutput(result);
-    this.message = `Failed with exit code ${code}`;
-    this.name = "ShellError";
-    this.exitCode = Number(code);
-    this.stdout = output.stdout;
-    this.stderr = output.stderr;
-    Object.defineProperty(this, "info", {
-      value: { exitCode: this.exitCode, stdout: this.stdout, stderr: this.stderr },
-      writable: true,
-      enumerable: false,
-      configurable: true,
-    });
-    if (typeof this.stack === "string") {
-      const remappedStack = ctRemapStackString(this.stack);
-      const firstFrame = remappedStack.indexOf("\n");
-      this.stack = `ShellError: ${this.message}${firstFrame < 0 ? "" : remappedStack.slice(firstFrame)}`;
-    }
-    return this;
-  }
-  text(encoding = "utf-8") {
-    return this.stdout.toString(encoding);
-  }
-  json() {
-    return JSON.parse(this.text());
-  }
-  bytes() {
-    return asBuffer(this.stdout);
-  }
-  arrayBuffer() {
-    const bytes = this.bytes();
-    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-  }
-  blob() {
-    let bytes = this.bytes();
-    if (bytes.byteLength > 0 && bytes[bytes.byteLength - 1] === 10) bytes = bytes.subarray(0, bytes.byteLength - 1);
-    return new Blob([bytes]);
-  }
-}
-
-export class ShellExpression {}
-
-function shellEnv(options) {
-  if (options.env == null) return undefined;
-  return { ...currentProcessEnv(), ...options.env };
-}
-
-function splitShellWords(command) {
-  const words = [];
-  let current = "";
-  let quote = "";
-  let escaped = false;
-  for (const char of String(command)) {
-    if (escaped) {
-      current += char;
-      escaped = false;
-    } else if (char === "\\" && !quote) {
-      escaped = true;
-    } else if (quote) {
-      if (char === quote) quote = "";
-      else current += char;
-    } else if (char === "\"" || char === "'") {
-      quote = char;
-    } else if (/\s/.test(char)) {
-      if (current) {
-        words.push(current);
-        current = "";
-      }
-    } else {
-      current += char;
-    }
-  }
-  if (escaped) current += "\\";
-  if (current) words.push(current);
-  return words;
-}
-
-function shellBasename(path) {
-  let text = String(path);
-  if (/^[\\/]+$/.test(text)) return "/";
-  text = text.replace(/[\\/]+$/g, "");
-  const index = Math.max(text.lastIndexOf("/"), text.lastIndexOf("\\"));
-  return index >= 0 ? text.slice(index + 1) : text;
-}
-
-function shellDirname(path) {
-  let text = String(path);
-  if (!text) return ".";
-  if (/^[\\/]+$/.test(text)) return "/";
-  text = text.replace(/[\\/]+$/g, "");
-  const index = Math.max(text.lastIndexOf("/"), text.lastIndexOf("\\"));
-  if (index < 0) return ".";
-  const directory = text.slice(0, index).replace(/[\\/]+$/g, "");
-  return directory || "/";
-}
-
-function shellPath(path, cwd = undefined) {
-  const text = String(path);
-  if (/^(?:[A-Za-z]:)?[\\/]/.test(text)) return text;
-  return cwd ? pathJoin(String(cwd), text) : text;
-}
-
-function shellStat(path, cwd = undefined) {
-  try {
-    return cottontail.statSync(shellPath(path, cwd), true);
-  } catch {
-    return null;
-  }
-}
-
-function runShellMv(words, options = {}) {
-  if (words.length < 3) return { exitCode: 1, stdout: "", stderr: "mv: missing file operand\n" };
-  const cwd = options.cwd;
-  const sources = words.slice(1, -1);
-  const destination = words[words.length - 1];
-  const destinationStat = shellStat(destination, cwd);
-  const destinationMustBeDirectory = sources.length > 1 || /[\\/]$/.test(destination);
-  if (destinationMustBeDirectory && !destinationStat?.isDirectory) {
-    const reason = destinationStat ? "Not a directory" : "No such file or directory";
-    return { exitCode: destinationStat ? 20 : 1, stdout: "", stderr: `mv: ${destination}: ${reason}\n` };
-  }
-
-  for (const source of sources) {
-    const sourceStat = shellStat(source, cwd);
-    if (!sourceStat) return { exitCode: 1, stdout: "", stderr: `mv: ${source}: No such file or directory\n` };
-    if (sourceStat.isDirectory && destinationStat && !destinationStat.isDirectory) {
-      return { exitCode: 20, stdout: "", stderr: `mv: ${destination}: Not a directory\n` };
-    }
-    const target = destinationStat?.isDirectory ? pathJoin(destination, shellBasename(source)) : destination;
-    try {
-      cottontail.renameSync(shellPath(source, cwd), shellPath(target, cwd));
-    } catch (error) {
-      const message = String(error?.message || error || "rename failed");
-      const notDir = message.includes("Not a directory") || message.includes("ENOTDIR");
-      return { exitCode: notDir ? 20 : 1, stdout: "", stderr: `mv: ${target}: ${notDir ? "Not a directory" : message}\n` };
-    }
-  }
-  return { exitCode: 0, stdout: "", stderr: "" };
-}
-
-function parseShellCpArguments(words) {
-  const options = { recursive: false, verbose: false };
-  let index = 1;
-  while (index < words.length) {
-    const argument = words[index];
-    if (argument === "--") {
-      index += 1;
-      break;
-    }
-    if (!argument.startsWith("-") || argument === "-") break;
-    for (const flag of argument.slice(1)) {
-      if (flag === "R" || flag === "r") options.recursive = true;
-      else if (flag === "v") options.verbose = true;
-      else if (flag === "n") continue;
-      else if ("fHiLPp".includes(flag)) {
-        return { error: `cp: unsupported option, please open a GitHub issue -- -${flag}\n` };
-      } else {
-        return { error: `cp: illegal option -- ${argument.slice(argument.indexOf(flag))}\n` };
-      }
-    }
-    index += 1;
-  }
-  return { options, operands: words.slice(index) };
-}
-
-function shellCpErrorMessage(error, path) {
-  const text = String(error?.message || error || "copy failed");
-  if (error?.code === "ENOENT" || /no such file|filenotfound/i.test(text)) return `${path}: No such file or directory`;
-  if (error?.code === "ENOTDIR" || /not a directory/i.test(text)) return `${path}: Not a directory`;
-  if (error?.code === "EACCES" || /permission denied/i.test(text)) return `${path}: Permission denied`;
-  return `${path}: ${text.replace(/^.*?:\s*/, "")}`;
-}
-
-function runShellCp(words, options = {}) {
-  const usage = "usage: cp [-R [-H | -L | -P]] [-fi | -n] [-aclpsvXx] source_file target_file\n" +
-    "       cp [-R [-H | -L | -P]] [-fi | -n] [-aclpsvXx] source_file ... target_directory\n";
-  const parsed = parseShellCpArguments(words);
-  if (parsed.error) return { exitCode: 1, stdout: "", stderr: parsed.error };
-  if (parsed.operands.length < 2) return { exitCode: 1, stdout: "", stderr: usage };
-
-  const cwd = String(options.cwd || cottontail.cwd());
-  const sources = parsed.operands.slice(0, -1);
-  const targetOperand = parsed.operands[parsed.operands.length - 1];
-  const targetAbsolute = nodePathResolve(cwd, targetOperand);
-  const targetStat = shellStat(targetOperand, cwd);
-  const targetHasTrailingSeparator = /[\\/]$/.test(targetOperand);
-  const stdout = [];
-  const stderr = [];
-
-  for (const sourceOperand of sources) {
-    const sourceAbsolute = nodePathResolve(cwd, sourceOperand);
-    const sourceStat = shellStat(sourceOperand, cwd);
-    if (!sourceStat) {
-      stderr.push(`cp: ${sourceOperand}: No such file or directory\n`);
-      continue;
-    }
-    if (sourceStat.isDirectory && !parsed.options.recursive) {
-      stderr.push(`cp: ${sourceOperand} is a directory (not copied)\n`);
-      continue;
-    }
-    if (!sourceStat.isDirectory && sourceAbsolute === targetAbsolute) {
-      stderr.push(`cp: ${sourceOperand} and ${sourceOperand} are identical (not copied)\n`);
-      continue;
-    }
-
-    let destinationAbsolute = targetAbsolute;
-    const targetIsDirectory = Boolean(targetStat?.isDirectory) || (!targetStat && targetHasTrailingSeparator);
-    if (!sourceStat.isDirectory && !targetIsDirectory && parsed.operands.length === 2) {
-      // source_file -> target_file
-    } else if (parsed.options.recursive) {
-      if (targetStat) destinationAbsolute = nodePathJoin(targetAbsolute, nodePathBasename(sourceAbsolute));
-      else if (parsed.operands.length !== 2) {
-        stderr.push(`cp: directory ${targetOperand} does not exist\n`);
-        continue;
-      }
-    } else {
-      if (!targetStat?.isDirectory) {
-        stderr.push(`cp: ${targetOperand} is not a directory\n`);
-        continue;
-      }
-      destinationAbsolute = nodePathJoin(targetAbsolute, nodePathBasename(sourceAbsolute));
-    }
-
-    if (sourceAbsolute === destinationAbsolute) {
-      stderr.push(`cp: ${sourceOperand} and ${sourceOperand} are identical (not copied)\n`);
-      continue;
-    }
-
-    try {
-      nodeCpSync(sourceAbsolute, destinationAbsolute, {
-        recursive: parsed.options.recursive,
-        force: true,
-        errorOnExist: false,
-        filter(source, destination) {
-          if (parsed.options.verbose) stdout.push(`${source} -> ${destination}\n`);
-          return true;
-        },
-      });
-    } catch (error) {
-      stderr.push(`cp: ${shellCpErrorMessage(error, sourceOperand)}\n`);
-    }
-  }
-
-  return {
-    exitCode: stderr.length === 0 ? 0 : 1,
-    stdout: stdout.join(""),
-    stderr: stderr.join(""),
-  };
-}
-
-function runShellSeq(words) {
-  const usage = "usage: seq [-w] [-f format] [-s string] [-t string] [first [incr]] last\n";
-  let separator = "\n";
-  let terminator = "";
-  let index = 1;
-
-  while (index < words.length) {
-    const argument = words[index];
-    if (argument === "-s" || argument === "--separator") {
-      if (index + 1 >= words.length) {
-        return { exitCode: 1, stdout: "", stderr: "seq: option requires an argument -- s\n" };
-      }
-      separator = words[index + 1];
-      index += 2;
-      continue;
-    }
-    if (argument.startsWith("-s")) {
-      separator = argument.slice(2);
-      index += 1;
-      continue;
-    }
-    if (argument === "-t" || argument === "--terminator") {
-      if (index + 1 >= words.length) {
-        return { exitCode: 1, stdout: "", stderr: "seq: option requires an argument -- t\n" };
-      }
-      terminator = words[index + 1];
-      index += 2;
-      continue;
-    }
-    if (argument.startsWith("-t")) {
-      terminator = argument.slice(2);
-      index += 1;
-      continue;
-    }
-    if (argument === "-w" || argument === "--fixed-width") {
-      index += 1;
-      continue;
-    }
-    break;
-  }
-
-  const numericArguments = words.slice(index);
-  if (numericArguments.length === 0) return { exitCode: 1, stdout: "", stderr: usage };
-  const values = numericArguments.slice(0, 3).map((argument) => Math.fround(Number(argument)));
-  if (values.some((value) => !Number.isFinite(value))) {
-    return { exitCode: 1, stdout: "", stderr: "seq: invalid argument\n" };
-  }
-
-  let start = 1;
-  let increment = 1;
-  let end = values[0];
-  if (values.length === 1) {
-    if (start > end) increment = -1;
-  } else if (values.length === 2) {
-    [start, end] = values;
-    if (start < end) increment = 1;
-    if (start > end) increment = -1;
-  } else {
-    [start, increment, end] = values;
-    if (increment === 0) return { exitCode: 1, stdout: "", stderr: "seq: zero increment\n" };
-    if (start > end && increment > 0) {
-      return { exitCode: 1, stdout: "", stderr: "seq: needs negative decrement\n" };
-    }
-    if (start < end && increment < 0) {
-      return { exitCode: 1, stdout: "", stderr: "seq: needs positive increment\n" };
-    }
-  }
-
-  let stdout = "";
-  for (let current = start; increment > 0 ? current <= end : current >= end; current = Math.fround(current + increment)) {
-    stdout += `${current}${separator}`;
-  }
-  return { exitCode: 0, stdout: stdout + terminator, stderr: "" };
-}
-
-function normalizeShellStderr(command, stderr) {
-  let text = String(stderr ?? "");
-  if (String(command).includes("mv ")) {
-    text = text.replace(/^mv: rename .*? to ([^:]+): Not a directory$/gm, "mv: $1: Not a directory");
-    text = text.replace(/^mv: ([^:]+) is not a directory$/gm, "mv: $1: No such file or directory");
-  } else {
-    text = text.replace(/^.*?: ([^\n]+): Not a directory$/gm, "bun: Not a directory: $1");
-  }
-  if (/\bbasename\s*(?:[|;&]|$)/.test(String(command))) {
-    text = text.replace(
-      /^usage: basename string \[suffix\]\n\s*basename \[-a\] \[-s suffix\] string \[\.\.\.\]\n$/,
-      "usage: basename string\n",
-    );
-  }
-  return text;
-}
-
-function assignmentOnlyPipelineStage(value) {
-  const assignment = String(value).trim();
-  if (!assignment) return false;
-  return /^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"\\]*(?:\\.[^"\\]*)*"|'[^']*'|\\.|[^\s|])*(?:\s+|$))+$/.test(assignment);
-}
-
-function normalizeAssignmentPipelines(command) {
-  const source = String(command);
-  const parts = [];
-  let start = 0;
-  let quote = "";
-  let escaped = false;
-  let parentheses = 0;
-  for (let index = 0; index < source.length; index += 1) {
-    const char = source[index];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (char === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      if (char === quote) quote = "";
-      continue;
-    }
-    if (char === "\"" || char === "'") {
-      quote = char;
-      continue;
-    }
-    if (char === "(") parentheses += 1;
-    else if (char === ")" && parentheses > 0) parentheses -= 1;
-    else if (char === "|" && parentheses === 0 && source[index - 1] !== "|" && source[index + 1] !== "|") {
-      parts.push(source.slice(start, index), "|");
-      start = index + 1;
-    }
-  }
-  if (parts.length === 0) return source;
-  parts.push(source.slice(start));
-  for (let index = 0; index < parts.length; index += 2) {
-    if (assignmentOnlyPipelineStage(parts[index])) parts[index] = `${parts[index].trimEnd()} cat `;
-  }
-  return parts.join("");
-}
-
-function normalizeCombinedAppendRedirect(command) {
-  const source = String(command);
-  let output = "";
-  let quote = "";
-  let escaped = false;
-  let index = 0;
-
-  while (index < source.length) {
-    const char = source[index];
-    if (escaped) {
-      output += char;
-      escaped = false;
-      index += 1;
-      continue;
-    }
-    if (char === "\\") {
-      output += char;
-      escaped = true;
-      index += 1;
-      continue;
-    }
-    if (quote) {
-      output += char;
-      if (char === quote) quote = "";
-      index += 1;
-      continue;
-    }
-    if (char === "\"" || char === "'") {
-      output += char;
-      quote = char;
-      index += 1;
-      continue;
-    }
-    if (!source.startsWith("&>>", index)) {
-      output += char;
-      index += 1;
-      continue;
-    }
-
-    output += ">>";
-    index += 3;
-    while (index < source.length && /\s/.test(source[index])) output += source[index++];
-
-    const targetStart = index;
-    let targetQuote = "";
-    let targetEscaped = false;
-    let substitutionDepth = 0;
-    while (index < source.length) {
-      const targetChar = source[index];
-      if (targetEscaped) {
-        targetEscaped = false;
-        index += 1;
-        continue;
-      }
-      if (targetChar === "\\") {
-        targetEscaped = true;
-        index += 1;
-        continue;
-      }
-      if (targetQuote) {
-        if (targetChar === targetQuote) targetQuote = "";
-        index += 1;
-        continue;
-      }
-      if (targetChar === "\"" || targetChar === "'") {
-        targetQuote = targetChar;
-        index += 1;
-        continue;
-      }
-      if (targetChar === "(" && source[index - 1] === "$") substitutionDepth += 1;
-      else if (targetChar === ")" && substitutionDepth > 0) substitutionDepth -= 1;
-      else if (substitutionDepth === 0 && (/\s/.test(targetChar) || /[;&|<>]/.test(targetChar))) break;
-      index += 1;
-    }
-    output += source.slice(targetStart, index);
-    if (index > targetStart) output += " 2>&1";
-  }
-
-  return output;
-}
-
 function writeOutputBuffer(buffer, data) {
-  const view = binaryOutputView(buffer);
+  const view = buffer instanceof ArrayBuffer
+    ? new Uint8Array(buffer)
+    : ArrayBuffer.isView(buffer)
+      ? new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+      : null;
   if (!view) return;
   const bytes = asBuffer(data);
   view.set(bytes.subarray(0, view.byteLength));
 }
 
-function fillOutputBuffer(buffer, pattern) {
-  const view = binaryOutputView(buffer);
-  if (!view) return;
-  const bytes = asBuffer(pattern);
-  if (bytes.byteLength === 0) return;
-  for (let offset = 0; offset < view.byteLength; offset += bytes.byteLength) {
-    view.set(bytes.subarray(0, Math.min(bytes.byteLength, view.byteLength - offset)), offset);
-  }
-}
-
-function decodeEchoEscapes(value) {
-  const input = String(value);
-  let output = "";
-  for (let index = 0; index < input.length; index += 1) {
-    const char = input[index];
-    if (char !== "\\" || index + 1 >= input.length) {
-      output += char;
-      continue;
-    }
-
-    const escape = input[++index];
-    const simple = {
-      "\\": "\\",
-      a: "\x07",
-      b: "\b",
-      e: "\x1b",
-      f: "\f",
-      n: "\n",
-      r: "\r",
-      t: "\t",
-      v: "\v",
-    }[escape];
-    if (simple != null) {
-      output += simple;
-      continue;
-    }
-    if (escape === "c") return { output, terminated: true };
-    if (escape === "0") {
-      let digits = "";
-      while (digits.length < 3 && /[0-7]/.test(input[index + 1] ?? "")) digits += input[++index];
-      output += String.fromCharCode(Number.parseInt(digits || "0", 8));
-      continue;
-    }
-    if (escape === "x") {
-      let digits = "";
-      while (digits.length < 2 && /[0-9a-fA-F]/.test(input[index + 1] ?? "")) digits += input[++index];
-      if (digits) output += String.fromCharCode(Number.parseInt(digits, 16));
-      else output += "\\x";
-      continue;
-    }
-    output += `\\${escape}`;
-  }
-  return { output, terminated: false };
-}
-
-function runShellBuiltin(command, options = {}) {
-  if (/[|&;<>()$`>]/.test(String(command))) return null;
-  const words = splitShellWords(command);
-  if (words[0] === "yes" && options.outputBuffer != null) {
-    const text = words.length > 1 ? words.slice(1).join(" ") : "y";
-    fillOutputBuffer(options.outputBuffer, `${text}\n`);
-    return { exitCode: 0, stdout: "", stderr: "" };
-  }
-  if (words[0] === "echo") {
-    let index = 1;
-    let newline = true;
-    let interpretEscapes = false;
-    while (/^-[nEe]+$/.test(words[index] ?? "")) {
-      for (const flag of words[index].slice(1)) {
-        if (flag === "n") newline = false;
-        else interpretEscapes = flag === "e";
-      }
-      index += 1;
-    }
-    let stdout = words.slice(index).join(" ");
-    if (interpretEscapes) {
-      const decoded = decodeEchoEscapes(stdout);
-      stdout = decoded.output;
-      if (decoded.terminated) newline = false;
-    }
-    return {
-      exitCode: 0,
-      stdout: `${stdout}${newline ? "\n" : ""}`,
-      stderr: "",
-    };
-  }
-  if (words[0] === "basename") {
-    if (words.length === 1) return { exitCode: 1, stdout: "", stderr: "usage: basename string\n" };
-    return {
-      exitCode: 0,
-      stdout: `${words.slice(1).map(shellBasename).join("\n")}\n`,
-      stderr: "",
-    };
-  }
-  if (words[0] === "dirname") {
-    if (words.length === 1) return { exitCode: 1, stdout: "", stderr: "usage: dirname string\n" };
-    return {
-      exitCode: 0,
-      stdout: `${words.slice(1).map(shellDirname).join("\n")}\n`,
-      stderr: "",
-    };
-  }
-  if (words[0] === "exit") {
-    if (words.length === 1) return { exitCode: 0, stdout: "", stderr: "" };
-    if (words.length > 2) return { exitCode: 1, stdout: "", stderr: "exit: too many arguments\n" };
-    if (!/^\+?\d+$/.test(words[1])) {
-      return { exitCode: 1, stdout: "", stderr: "exit: numeric argument required\n" };
-    }
-    const value = BigInt(words[1]);
-    if (value > 18446744073709551615n) {
-      return { exitCode: 1, stdout: "", stderr: "exit: numeric argument required\n" };
-    }
-    return { exitCode: Number(value % 256n), stdout: "", stderr: "" };
-  }
-  if (words[0] === "seq") return runShellSeq(words);
-  if (words[0] === "mv") return runShellMv(words, options);
-  if (words[0] === "cp") return runShellCp(words, options);
-  return null;
-}
-
-function parseTopLevelShellList(command) {
-  const source = String(command);
-  const commands = [];
-  const operators = [];
-  let pendingOperator = null;
-  let start = 0;
-  let quote = null;
-  let escaped = false;
-  let parentheses = 0;
-  let braces = 0;
-
-  const append = (end) => {
-    const value = source.slice(start, end).trim();
-    if (!value) return false;
-    if (commands.length > 0) operators.push(pendingOperator || ";");
-    commands.push(value);
-    pendingOperator = null;
-    return true;
-  };
-
-  for (let index = 0; index < source.length; index += 1) {
-    const char = source[index];
-    if (quote === "'") {
-      if (char === "'") quote = null;
-      continue;
-    }
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (char === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      if (char === quote) quote = null;
-      continue;
-    }
-    if (char === "'" || char === '"' || char === "`") {
-      quote = char;
-      continue;
-    }
-    if (char === "(") {
-      parentheses += 1;
-      continue;
-    }
-    if (char === ")" && parentheses > 0) {
-      parentheses -= 1;
-      continue;
-    }
-    if (char === "{") {
-      braces += 1;
-      continue;
-    }
-    if (char === "}" && braces > 0) {
-      braces -= 1;
-      continue;
-    }
-    if (parentheses > 0 || braces > 0) continue;
-
-    let operator = null;
-    let width = 1;
-    if (source.startsWith("&&", index)) {
-      operator = "&&";
-      width = 2;
-    } else if (source.startsWith("||", index)) {
-      operator = "||";
-      width = 2;
-    } else if (char === ";" || char === "\n") {
-      operator = ";";
-    } else if (char === "&" && source[index + 1] !== ">") {
-      return null;
-    }
-    if (!operator) continue;
-
-    const hadCommand = append(index);
-    if (!hadCommand && pendingOperator && pendingOperator !== ";") return null;
-    pendingOperator = operator;
-    index += width - 1;
-    start = index + 1;
-  }
-
-  if (quote || parentheses !== 0 || braces !== 0) return null;
-  append(source.length);
-  if (commands.length < 2 || operators.length !== commands.length - 1) return null;
-  return { commands, operators };
-}
-
-function shellCommandName(command) {
-  const words = splitShellWords(command);
-  let index = 0;
-  while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index] ?? "")) index += 1;
-  return words[index] ?? "";
-}
-
-async function runShellCommandList(command, options) {
-  if (options.input !== undefined) return null;
-  const list = parseTopLevelShellList(command);
-  if (!list) return null;
-  const names = list.commands.map(shellCommandName);
-  if (!names.includes("cp")) return null;
-  if (names.some((name) => ["cd", "export", "unset", "source", ".", "exec"].includes(name))) return null;
-
-  const stdout = [];
-  const stderr = [];
-  let exitCode = 0;
-  for (let index = 0; index < list.commands.length; index += 1) {
-    const operator = index === 0 ? ";" : list.operators[index - 1];
-    if (operator === "&&" && exitCode !== 0) continue;
-    if (operator === "||" && exitCode === 0) continue;
-
-    const segment = list.commands[index];
-    const builtin = runShellBuiltin(segment, options);
-    const result = builtin ?? await runHostShell(segment, options);
-    exitCode = Number(result.exitCode ?? result.status ?? 0);
-    if (result.stdout != null) stdout.push(asBuffer(result.stdout));
-    if (result.stderr != null) stderr.push(asBuffer(result.stderr));
-  }
-
-  return {
-    status: exitCode,
-    stdout: concatManyBuffers(stdout),
-    stderr: concatManyBuffers(stderr),
-  };
-}
-
-const shellCommandArgumentLimit = 64 * 1024;
-
-// COTTONTAIL-COMPAT: Bun.$ native interpreter - the production parser,
-// expansion engine, pipelines, and remaining builtins are vendored under
-// src/compiler/src/shell but still need a shell-specific JSC/event-loop bridge.
-async function runHostShell(command, options) {
-  const isWin = cottontail.platform() === "win32";
-  const shellExecutable = isWin ? "cmd" : cottontail.platform() === "darwin" ? "/bin/bash" : "sh";
-  let shellArgs;
-  let scriptPath;
-
-  if (asBuffer(command).byteLength > shellCommandArgumentLimit) {
-    const root = tmpRoot("shell");
-    cottontail.mkdirSync(root, true);
-    scriptPath = pathJoin(root, `script-${randomUUID()}${isWin ? ".cmd" : ".sh"}`);
-    cottontail.writeFile(scriptPath, asBuffer(`${command}\n`));
-    if (isWin) {
-      shellArgs = ["/d", "/s", "/c", `"${scriptPath}"`];
-    } else {
-      // Source the generated script after shifting it out of $@. This keeps the
-      // same $0/$1... layout as the normal `sh -c script $argv` path.
-      const argv = globalThis.process?.argv ?? [];
-      shellArgs = [
-        "-c",
-        '__cottontail_script=$1; shift; . "$__cottontail_script"',
-        argv[0] ?? "cottontail",
-        scriptPath,
-        ...argv.slice(1),
-      ];
-    }
-  } else if (isWin) {
-    shellArgs = ["/d", "/s", "/c", command];
-  } else {
-    shellArgs = ["-c", command, ...(globalThis.process?.argv ?? [])];
-  }
-
-  try {
-    const child = spawn([shellExecutable, ...shellArgs], {
-      cwd: options.cwd,
-      env: shellEnv(options),
-      stdin: options.input ?? "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const [exitCode, stdout, stderr] = await Promise.all([
-      child.exited,
-      child.stdout?.bytes?.() ?? Promise.resolve(asBuffer("")),
-      child.stderr?.bytes?.() ?? Promise.resolve(asBuffer("")),
-    ]);
-    return {
-      status: exitCode == null ? 1 : Number(exitCode),
-      stdout: asBuffer(stdout),
-      stderr: asBuffer(stderr),
-    };
-  } finally {
-    if (scriptPath != null) {
-      try { cottontail.unlinkSync(scriptPath); } catch {}
-    }
-  }
-}
-
-const runBunShellRuntime = createBunShellRuntime({
-  spawn,
-  which(command, options = {}) {
-    return which(String(command ?? ""), options);
-  },
-  execPath: String(globalThis.process?.execPath ?? cottontail.execPath?.() ?? "cottontail"),
-  cwd: () => globalThis.process?.cwd?.() ?? cottontail.cwd(),
-  env: currentProcessEnv,
-  argv: () => globalThis.process?.argv ?? [],
+const loadBunShellModule = createLazyModule("bun:shell", () => {
+  const { createBunShellFacade } = loadEmbeddedRuntimeModule("bun/shell.js");
+  const facade = createBunShellFacade({
+    asBuffer,
+    bytesFromBody,
+    concatManyBuffers,
+    cottontail,
+    ctRemapStackString,
+    currentProcessEnv,
+    isBunFileLike,
+    loadEmbeddedRuntimeModule,
+    nodeCpSync,
+    nodePathBasename,
+    nodePathJoin,
+    nodePathResolve,
+    parseBunShellSource,
+    pathJoin,
+    randomUUID,
+    shellEscape,
+    spawn,
+    tmpRoot,
+    validateNoNullByte,
+    which,
+  });
+  Object.assign(facade.$, {
+    Shell,
+    ShellError,
+    ShellExpression,
+    ShellOutput,
+    ShellPromise,
+  });
+  return facade;
 });
+export const $ = createLazyFunction(loadBunShellModule, "$", "$");
+export const Shell = createLazyFunction(loadBunShellModule, "Shell");
+export const ShellError = createLazyFunction(loadBunShellModule, "ShellError");
+export const ShellExpression = createLazyFunction(loadBunShellModule, "ShellExpression");
+export const ShellOutput = createLazyFunction(loadBunShellModule, "ShellOutput");
+export const ShellPromise = createLazyFunction(loadBunShellModule, "ShellPromise");
 
-async function runShell(command, options = {}) {
-  validateNoNullByte(command, "command");
-  const result = await runBunShellRuntime(command, options);
-  let stdout = result.stdout || asBuffer("");
-  let stderr = asBuffer(result.stderr || "");
-  if (options.outputBuffer != null) {
-    if (options.outputFd === 2) {
-      writeOutputBuffer(options.outputBuffer, stderr);
-      stderr = asBuffer("");
-    } else {
-      writeOutputBuffer(options.outputBuffer, stdout);
-      stdout = asBuffer("");
-    }
-  }
-  const exitCode = String(command).includes("mv ") && String(stderr).includes("Not a directory") ? 20 : result.status;
-  const output = new ShellOutput({
-    exitCode,
-    stdout,
-    stderr,
-  }, internalShellOutput);
-  accountShellTransientAllocation(output.stdout.byteLength + output.stderr.byteLength);
-  if (output.exitCode !== 0 && options.throws !== false) {
-    throw new ShellError().initialize(output, output.exitCode);
-  }
-  return output;
-}
 
 function getRandomValues(view) {
   if (!ArrayBuffer.isView(view) || view instanceof DataView) {
@@ -2318,288 +1324,6 @@ function getRandomValues(view) {
   return view;
 }
 
-export class ShellPromise extends Promise {
-  constructor(command, options = {}) {
-    let resolvePromise;
-    let rejectPromise;
-    super((resolve, reject) => {
-      resolvePromise = resolve;
-      rejectPromise = reject;
-    });
-    this.command = command;
-    this.options = { ...shellDefaults, ...options };
-    this.started = false;
-    this.resolvePromise = resolvePromise;
-    this.rejectPromise = rejectPromise;
-    this.potentialError = new ShellError();
-    if (typeof Error.captureStackTrace === "function") Error.captureStackTrace(this.potentialError, ShellPromise);
-  }
-  static get [Symbol.species]() {
-    return Promise;
-  }
-  throwIfRunning() {
-    if (this.started) throw new Error("Shell is already running");
-  }
-  quiet(_value = true) {
-    this.throwIfRunning();
-    this.options.quiet = Boolean(_value);
-    return this;
-  }
-  throws(value = true) {
-    this.options.throws = Boolean(value);
-    return this;
-  }
-  nothrow() {
-    return this.throws(false);
-  }
-  cwd(value) {
-    this.throwIfRunning();
-    this.options.cwd = String(value);
-    return this;
-  }
-  env(value) {
-    this.throwIfRunning();
-    this.options.env = { ...(value ?? {}) };
-    return this;
-  }
-  start() {
-    if (!this.started) {
-      this.started = true;
-      const command = this.command;
-      const options = this.options;
-      const resolvePromise = this.resolvePromise;
-      const rejectPromise = this.rejectPromise;
-      const potentialError = this.potentialError;
-      this.command = undefined;
-      this.options = undefined;
-      this.resolvePromise = undefined;
-      this.rejectPromise = undefined;
-      this.potentialError = undefined;
-      Promise.resolve().then(async () => {
-        if (options.inputBody !== undefined) {
-          options.input = await bytesFromBody(options.inputBody);
-        }
-        const result = await runShell(command, options);
-        if (!options.quiet) {
-          if (result.stdout.byteLength > 0) globalThis.process?.stdout?.write?.(result.stdout);
-          if (result.stderr.byteLength > 0) globalThis.process?.stderr?.write?.(result.stderr);
-        }
-        return result;
-      }).then(resolvePromise, (error) => {
-        if (error instanceof ShellError) {
-          rejectPromise(potentialError.initialize(error, error.exitCode));
-        } else {
-          rejectPromise(error);
-        }
-      });
-    }
-  }
-  run() {
-    this.start();
-    return this;
-  }
-  text() {
-    this.quiet(true);
-    return this.then((result) => result.text());
-  }
-  json() {
-    this.quiet(true);
-    return this.then((result) => result.json());
-  }
-  lines() {
-    this.quiet(true);
-    const command = this;
-    return (async function* iterateLines() {
-      const output = await command;
-      const separator = globalThis.process?.platform === "win32" ? /\r?\n/ : "\n";
-      for (const line of output.text().split(separator)) yield line;
-    })();
-  }
-  bytes() {
-    this.quiet(true);
-    return this.then((result) => new Uint8Array(result.bytes()));
-  }
-  arrayBuffer() {
-    this.quiet(true);
-    return this.then((result) => result.arrayBuffer());
-  }
-  blob() {
-    this.quiet(true);
-    return this.then((result) => new Blob([result.bytes()]));
-  }
-  then(resolve, reject) {
-    this.start();
-    return super.then(resolve, reject);
-  }
-}
-
-export class Shell {
-  constructor() {
-    const callable = (strings, ...values) => {
-      let command = $(strings, ...values).throws(callable._throws);
-      if (callable._cwd != null) command = command.cwd(callable._cwd);
-      if (callable._env != null) command = command.env(callable._env);
-      if (callable._quiet) command = command.quiet();
-      return command;
-    };
-    Object.setPrototypeOf(callable, new.target.prototype);
-    callable._cwd = undefined;
-    callable._env = undefined;
-    callable._throws = true;
-    callable._quiet = false;
-    return callable;
-  }
-  cwd(value) {
-    this._cwd = String(value);
-    return this;
-  }
-  env(value) {
-    this._env = { ...(value ?? {}) };
-    return this;
-  }
-  throws(value = true) {
-    this._throws = Boolean(value);
-    return this;
-  }
-  nothrow() {
-    return this.throws(false);
-  }
-  quiet(value = true) {
-    this._quiet = Boolean(value);
-    return this;
-  }
-}
-
-Object.setPrototypeOf(Shell.prototype, Function.prototype);
-
-export function $(strings, ...values) {
-  const signature = largeRawInterpolationSignature(strings, values);
-  const cached = signature == null ? null : largeShellInterpolationCache.get(strings);
-  let interpolation;
-  if (cached && sameShellInterpolationSignature(cached.signature, signature)) {
-    if (cached.error) throwShellInterpolationError(cached.error);
-    interpolation = cached.interpolation;
-  } else {
-    try {
-      interpolation = interpolateShellCommand(strings, values);
-      if (signature != null) largeShellInterpolationCache.set(strings, { signature, interpolation });
-    } catch (error) {
-      if (signature != null) {
-        largeShellInterpolationCache.set(strings, { signature, error: shellInterpolationError(error) });
-        accountShellTransientAllocation(signature.reduce((length, value) => length + value.length, 0));
-      }
-      throw error;
-    }
-  }
-  return new ShellPromise(interpolation.command, {
-    ...shellDefaults,
-    outputBuffer: interpolation.outputBuffer,
-    outputFd: interpolation.outputFd,
-    outputTargets: interpolation.outputTargets,
-    inputBody: interpolation.inputBody,
-  });
-}
-
-function expandBraces(input, output, depth = 0) {
-  if (depth > 64 || output.length >= 32768) throw new RangeError("Brace expansion is too large");
-  let open = -1;
-  let escaped = false;
-  for (let index = 0; index < input.length; index += 1) {
-    const char = input[index];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (char === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (char === "{") {
-      open = index;
-      break;
-    }
-  }
-  if (open < 0) {
-    output.push(input);
-    return;
-  }
-
-  let nesting = 0;
-  let close = -1;
-  escaped = false;
-  for (let index = open; index < input.length; index += 1) {
-    const char = input[index];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (char === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (char === "{") nesting += 1;
-    if (char === "}" && --nesting === 0) {
-      close = index;
-      break;
-    }
-  }
-  if (close < 0) {
-    output.push(input);
-    return;
-  }
-
-  const body = input.slice(open + 1, close);
-  const variants = [];
-  let start = 0;
-  nesting = 0;
-  escaped = false;
-  for (let index = 0; index <= body.length; index += 1) {
-    const char = body[index];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (char === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (char === "{") nesting += 1;
-    else if (char === "}") nesting -= 1;
-    if (index === body.length || (char === "," && nesting === 0)) {
-      variants.push(body.slice(start, index));
-      start = index + 1;
-    }
-  }
-
-  const prefix = input.slice(0, open);
-  const suffix = input.slice(close + 1);
-  for (const variant of variants) expandBraces(prefix + variant + suffix, output, depth + 1);
-}
-
-$.braces = (value) => {
-  const output = [];
-  expandBraces(String(value), output);
-  return output;
-};
-$.ShellError = ShellError;
-$.ShellExpression = ShellExpression;
-$.ShellOutput = ShellOutput;
-$.ShellPromise = ShellPromise;
-$.Shell = Shell;
-$.escape = shellEscape;
-$.throws = (value = true) => {
-  shellDefaults.throws = Boolean(value);
-  return $;
-};
-$.nothrow = () => $.throws(false);
-$.cwd = (value) => {
-  shellDefaults.cwd = String(value);
-  return $;
-};
-$.env = (value) => {
-  shellDefaults.env = { ...(value ?? {}) };
-  return $;
-};
 
 function pathJoin(...parts) {
   return parts.filter(Boolean).join("/").replace(/\/+/g, "/");
@@ -2683,1540 +1407,34 @@ function which(command, options = undefined) {
   );
 }
 
-class BuildMessage {
-  constructor({ name = "BuildMessage", message = "", level = "error", position = null, notes = [], rendered = null } = {}) {
-    this.name = name;
-    this.message = String(message);
-    this.level = level;
-    this.position = position;
-    this.notes = Array.isArray(notes) ? notes : [];
-    Object.defineProperty(this, "rendered", { value: rendered, enumerable: false, configurable: true, writable: true });
-  }
-  toString() {
-    return `${this.name}: ${this.message}`;
-  }
-  [Symbol.for("nodejs.util.inspect.custom")]() {
-    return this.rendered ?? `${this.level ?? "error"}: ${this.message}`;
-  }
-}
-
-function runBuildDriver(spec) {
-  const processCwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
-  const cwd = spec.__cottontailWorkingDirectory != null
-    ? nodePathResolve(processCwd, String(spec.__cottontailWorkingDirectory))
-    : processCwd;
-  const toAbsolute = (value) => (
-    value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value) ? value : nodePathResolve(cwd, value)
-  );
-  try {
-    const entrypoints = [];
-    const virtualFiles = spec.files && typeof spec.files === "object" ? spec.files : null;
-    for (const entrypoint of spec.entrypoints ?? []) {
-      const entry = String(entrypoint);
-      const absoluteEntry = toAbsolute(entry);
-      if (!Object.prototype.hasOwnProperty.call(virtualFiles ?? {}, absoluteEntry) && !cottontail.existsSync(absoluteEntry)) {
-        return {
-          ok: false,
-          name: "AggregateError",
-          message: "Bundle failed",
-          logs: [{
-            name: "BuildMessage",
-            level: "error",
-            message: `ModuleNotFound resolving "${entry}" (entry point)`,
-            position: null,
-          }],
-        };
-      }
-      entrypoints.push(absoluteEntry);
-    }
-    const request = { ...spec, plugins: undefined, __cottontailWorkingDirectory: undefined, entrypoints };
-    const parsed = JSON.parse(cottontail.buildNative(JSON.stringify(request), cwd));
-    const metafile = parsed.metafile == null ? null : JSON.parse(parsed.metafile);
-    const outdir = spec.outdir != null ? toAbsolute(String(spec.outdir)) : null;
-    const writeMetafile = (path, contents) => {
-      if (path == null || contents == null) return;
-      const value = String(path);
-      const absolute = value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value)
-        ? value
-        : nodePathResolve(outdir ?? cwd, value);
-      const parent = pathDirname(absolute);
-      if (parent && parent !== ".") cottontail.mkdirSync(parent, true);
-      cottontail.writeFile(absolute, contents);
-    };
-    if (typeof spec.metafile === "string") {
-      writeMetafile(spec.metafile, parsed.metafile);
-    } else if (spec.metafile && typeof spec.metafile === "object") {
-      writeMetafile(spec.metafile.json, parsed.metafile);
-      writeMetafile(spec.metafile.markdown, parsed.metafileMarkdown);
-    }
-    // Real Bun writes output files whenever `outdir` is set (the `write`
-    // option does not suppress it); in-memory builds have no outdir.
-    for (const output of parsed.outputs ?? []) {
-      const relative = String(output.path ?? "").replace(/^\.\//, "");
-      if (outdir) {
-        const absolute = nodePathResolve(outdir, relative);
-        const parent = pathDirname(absolute);
-        if (parent && parent !== ".") cottontail.mkdirSync(parent, true);
-        cottontail.writeFile(absolute, globalThis.Buffer.from(output.b64 ?? "", "base64"));
-        output.path = absolute;
-      } else {
-        output.path = `./${relative}`;
-      }
-    }
-    if (parsed.success === false) {
-      return {
-        ok: false,
-        name: "AggregateError",
-        message: "Bundle failed",
-        logs: parsed.logs ?? [],
-      };
-    }
-    return { ok: true, success: true, logs: parsed.logs ?? [], outputs: parsed.outputs ?? [], metafile };
-  } catch (error) {
-    return {
-      ok: false,
-      name: error?.name ?? "AggregateError",
-      message: error?.message ?? "Bundle failed",
-      logs: [{
-        name: error?.name ?? "BuildMessage",
-        level: "error",
-        message: error?.message ?? String(error),
-        position: error?.position ?? null,
-        rendered: error?.stack ?? String(error),
-      }],
-    };
-  }
-}
-
-function finalizeDriverResult(parsed, options) {
-  const logs = (parsed.logs || []).map((entry) => new BuildMessage(entry));
-  if (parsed.ok === false) {
-    if (options?.throw === false) return { success: false, logs, outputs: [] };
-    const errors = logs.filter((log) => (log?.level ?? "error") === "error");
-    const error = new AggregateError(errors.length > 0 ? errors : logs, parsed.message || "Bundle failed");
-    if (parsed.name) error.name = parsed.name;
-    throw error;
-  }
-  return {
-    success: parsed.success !== false,
-    logs,
-    outputs: (parsed.outputs || []).map((output) => new CTBuildArtifact(
-      globalThis.Buffer.from(output.b64 ?? "", "base64"),
-      {
-        path: output.path,
-        kind: output.kind ?? "entry-point",
-        hash: output.hash ?? null,
-        loader: output.loader ?? "js",
-      },
-    )),
-    ...(parsed.metafile != null ? { metafile: parsed.metafile } : {}),
-  };
-}
-
-async function finalizePluginDriverResult(parsed, options, onEndCallbacks) {
-  const result = finalizeDriverResult(parsed, { ...options, throw: false });
-  await ctRunOnEnd({ onEnd: onEndCallbacks }, result);
-  if (!result.success && options?.throw !== false) {
-    const errors = result.logs.filter((log) => (log?.level ?? "error") === "error");
-    const error = new AggregateError(errors.length > 0 ? errors : result.logs, parsed.message || "Bundle failed");
-    if (parsed.name) error.name = parsed.name;
-    throw error;
-  }
-  return result;
-}
-
-const bundleLoaderExtensions = {
-  js: ".js",
-  jsx: ".jsx",
-  ts: ".ts",
-  tsx: ".tsx",
-  css: ".css",
-  html: ".html",
-  json: ".json",
-  jsonc: ".jsonc",
-  json5: ".json5",
-  yaml: ".yaml",
-  toml: ".toml",
-  text: ".txt",
-  wasm: ".wasm",
-  napi: ".node",
-  base64: ".base64",
-  dataurl: ".dataurl",
-  bunsh: ".bun.sh",
-  sqlite: ".sqlite",
-  sqlite_embedded: ".sqlite-embedded",
-  md: ".md",
-};
-
-// Keep this table in lockstep with Bun's public native bundler plugin ABI.
-const nativePluginLoaderNames = [
-  "jsx", "js", "ts", "tsx", "css", "file", "json", "jsonc", "toml", "wasm",
-  "napi", "base64", "dataurl", "text", "bunsh", "sqlite", "sqlite_embedded",
-  "html", "yaml", "json5", "md",
-];
-const nativePluginLoaderIds = Object.fromEntries(
-  nativePluginLoaderNames.map((loader, id) => [loader, id]),
-);
-const nativePluginLogLevels = ["verbose", "debug", "info", "warning", "error"];
-
-function ctBuildContentsText(contents) {
-  if (typeof contents === "string") return contents;
-  if (contents instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(contents));
-  if (ArrayBuffer.isView(contents)) {
-    return new TextDecoder().decode(new Uint8Array(contents.buffer, contents.byteOffset, contents.byteLength));
-  }
-  return String(contents);
-}
-
-function ctNativePluginFilterMatches(filter, value) {
-  const lastIndex = filter.lastIndex;
-  filter.lastIndex = 0;
-  try {
-    return filter.test(value);
-  } finally {
-    filter.lastIndex = lastIndex;
-  }
-}
-
-function ctValidatePluginConstraints(constraints) {
-  if (!constraints || typeof constraints !== "object") {
-    throw new TypeError('Expected an object with "filter" RegExp');
-  }
-  let { filter, namespace = "file" } = constraints;
-  if (!filter) throw new TypeError('Expected an object with "filter" RegExp');
-  if (!(filter instanceof RegExp)) throw new TypeError("filter must be a RegExp");
-  if (namespace && typeof namespace !== "string") throw new TypeError("namespace must be a string");
-  if ((namespace?.length ?? 0) === 0) namespace = "file";
-  if (!/^([/$a-zA-Z0-9_-]+)$/.test(namespace)) {
-    throw new TypeError("namespace can only contain $a-zA-Z0-9_\\-");
-  }
-  return { filter, namespace };
-}
-
-function ctPluginInvalidArgument(message) {
-  const error = new TypeError(message);
-  error.code = "ERR_INVALID_ARG_TYPE";
-  error.name = "TypeError [ERR_INVALID_ARG_TYPE]";
-  return error;
-}
-
-async function ctNormalizeBuildFiles(options, preserveBinary = false) {
-  if (options?.files == null || typeof options.files !== "object") return options;
-  const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
-  const files = {};
-  for (const [path, value] of Object.entries(options.files)) {
-    const absolute = String(path).startsWith("/") || /^[A-Za-z]:[\\/]/.test(String(path))
-      ? String(path)
-      : nodePathResolve(cwd, String(path));
-    if (typeof value === "string") {
-      files[absolute] = value;
-    } else if (value instanceof ArrayBuffer) {
-      files[absolute] = preserveBinary ? value : ctBuildContentsText(value);
-    } else if (ArrayBuffer.isView(value)) {
-      const view = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-      files[absolute] = preserveBinary ? view : ctBuildContentsText(view);
-    } else if (preserveBinary && typeof value?.arrayBuffer === "function") {
-      const buffer = await value.arrayBuffer();
-      files[absolute] = buffer;
-    } else if (typeof value?.text === "function") {
-      files[absolute] = String(await value.text());
-    } else if (typeof value?.arrayBuffer === "function") {
-      files[absolute] = ctBuildContentsText(await value.arrayBuffer());
-    } else {
-      throw new TypeError(`Bun.build files[${JSON.stringify(path)}] must be a string, Blob, ArrayBuffer, or typed array`);
-    }
-  }
-  return { ...options, files };
-}
-
-function ctBuildVirtualFile(options, path) {
-  if (options?.files == null) return undefined;
-  return Object.prototype.hasOwnProperty.call(options.files, path) ? options.files[path] : undefined;
-}
-
-function bundleLoaderForPath(path) {
-  const match = /\.([a-zA-Z0-9]+)$/.exec(String(path));
-  switch ((match?.[1] ?? "").toLowerCase()) {
-    case "js": case "mjs": case "cjs": return "js";
-    case "ts": case "mts": case "cts": return "ts";
-    case "tsx": return "tsx";
-    case "jsx": return "jsx";
-    case "css": return "css";
-    case "html": case "htm": return "html";
-    case "json": return "json";
-    case "toml": return "toml";
-    case "yaml": case "yml": return "yaml";
-    case "txt": return "text";
-    case "wasm": return "wasm";
-    default: return "file";
-  }
-}
-
-function scanBundleImportsForLoader(source, loader) {
-  if (loader === "html" || loader === "js" || loader === "jsx" || loader === "ts" || loader === "tsx") {
-    try {
-      return JSON.parse(cottontail.transpilerScanImports(String(source), "{}", loader))
-        .map(({ path, kind }) => ({ specifier: path, kind }));
-    } catch {
-      // The delegated native build reports parser errors with full locations.
-      return [];
-    }
-  }
-  if (loader === "css") {
-    const found = new Map();
-    const push = (specifier, kind) => {
-      const value = String(specifier ?? "").trim();
-      if (!value || value.startsWith("#") || /^(?:data|https?):/i.test(value) || found.has(value)) return;
-      found.set(value, kind);
-    };
-    const text = String(source).replace(/\/\*[\s\S]*?\*\//g, "");
-    for (const match of text.matchAll(/@import\s+(?:url\(\s*)?["']([^"']+)["']/gi)) push(match[1], "import-rule");
-    for (const match of text.matchAll(/url\(\s*(?:["']([^"']+)["']|([^\s)'\"]+))\s*\)/gi)) {
-      push(match[1] ?? match[2], "url-token");
-    }
-    return [...found].map(([specifier, kind]) => ({ specifier, kind }));
-  }
-  return [];
-}
-
-function ctBuildPluginInitialOptions(options) {
-  const minify = options?.minify;
-  const minifyOptions = minify && typeof minify === "object" ? minify : null;
-  const minifyIdentifiers = minifyOptions?.identifiers === true ? true : undefined;
-  const minifySyntax = minifyOptions?.syntax === true ? true : undefined;
-  const minifyWhitespace = minifyOptions?.whitespace === true ? true : undefined;
-  return {
-    bundle: true,
-    entryPoints: [...(options?.entrypoints ?? [])],
-    external: options?.external,
-    format: options?.format ?? "esm",
-    minify: minify === true || (
-      minifyIdentifiers === true &&
-      minifySyntax === true &&
-      minifyWhitespace === true
-    ),
-    minifyIdentifiers,
-    minifySyntax,
-    minifyWhitespace,
-    outdir: options?.outdir,
-    platform: options?.target ?? "browser",
-    sourcemap: options?.sourcemap,
-  };
-}
-
-function ctPluginBuildMessage(error, path, namespace = "file") {
-  return new BuildMessage({
-    message: error?.message ?? String(error),
-    position: path ? { file: String(path), namespace: namespace || "file" } : null,
-  });
-}
-
-function ctBuildSourceExtension(path) {
-  const base = String(path).replace(/\\/g, "/").split("/").pop() ?? "";
-  const dot = base.lastIndexOf(".");
-  return dot > 0 ? base.slice(dot) : "";
-}
-
-// Runs Bun.build plugins in-process, materializes the
-// resolved module graph into a shadow directory, and delegates the actual
-// bundling of the materialized files to the plugin-free build pipeline.
-async function buildWithPlugins(options, plugins) {
-  options = await ctNormalizeBuildFiles(options, true);
-  const pluginGraphHook = typeof options?.__cottontailPluginGraph === "function"
-    ? options.__cottontailPluginGraph
-    : null;
-  const onResolveRules = [];
-  const onLoadRules = [];
-  const onBeforeParseRules = [];
-  const onStartPromises = [];
-  const onEndCallbacks = [];
-  const builder = {
-    config: options,
-    initialOptions: ctBuildPluginInitialOptions(options),
-    target: options?.target ?? "browser",
-    onResolve(constraints, callback) {
-      if (!callback || typeof callback !== "function") throw new TypeError("lmao callback must be a function");
-      onResolveRules.push({ ...ctValidatePluginConstraints(constraints), callback });
-      return this;
-    },
-    onLoad(constraints, callback) {
-      if (!callback || typeof callback !== "function") throw new TypeError("lmao callback must be a function");
-      onLoadRules.push({ ...ctValidatePluginConstraints(constraints), callback });
-      return this;
-    },
-    onStart(callback) {
-      if (typeof callback !== "function") throw new TypeError("callback must be a function");
-      const result = Reflect.apply(callback, undefined, []);
-      if (cottontail.promiseStatus?.(result) >= 0) onStartPromises.push(result);
-      return this;
-    },
-    onEnd(callback) {
-      if (typeof callback !== "function") throw new TypeError("onEnd() expects a callback function");
-      onEndCallbacks.push(callback);
-      return this;
-    },
-    onBeforeParse(constraints, { napiModule, external, symbol }) {
-      if (!constraints || typeof constraints !== "object") {
-        throw new TypeError('Expected an object with "filter" RegExp');
-      }
-      if (!napiModule || (typeof napiModule !== "object" && typeof napiModule !== "function")) {
-        throw new TypeError(
-          "onBeforeParse `napiModule` must be a Napi module which exports the `BUN_PLUGIN_NAME` symbol.",
-        );
-      }
-      if (typeof symbol !== "string") throw new TypeError("onBeforeParse `symbol` must be a string");
-      const rule = ctValidatePluginConstraints(constraints);
-      const validation = cottontail.nativeBundlerPluginValidate(napiModule, symbol, external);
-      if (validation?.status === "invalid-module") {
-        throw new TypeError(
-          "onBeforeParse `napiModule` must be a Napi module which exports the `BUN_PLUGIN_NAME` symbol.",
-        );
-      }
-      if (validation?.status === "missing-symbol") {
-        throw ctPluginInvalidArgument(`Could not find the symbol "${symbol}" in the given napi module.`);
-      }
-      if (validation?.status === "invalid-external") {
-        throw ctPluginInvalidArgument("Expected external (3rd argument) to be a NAPI external");
-      }
-      onBeforeParseRules.push({
-        ...rule,
-        filter: new RegExp(rule.filter.source, rule.filter.flags),
-        napiModule,
-        external,
-        symbol,
-        name: validation?.name ?? "<unknown>",
-      });
-      return this;
-    },
-  };
-  for (const plugin of plugins) {
-    if (typeof plugin?.setup !== "function") {
-      const error = new TypeError("Expected plugin to have a setup() function");
-      error.code = "ERR_INVALID_ARG_TYPE";
-      throw error;
-    }
-  }
-  for (const plugin of plugins) {
-    const setupResult = Reflect.apply(plugin.setup, undefined, [builder]);
-    if (cottontail.promiseStatus?.(setupResult) >= 0) await setupResult;
-  }
-  if (onStartPromises.length > 0) await Promise.all(onStartPromises);
-
-  if (onResolveRules.length === 0 && onLoadRules.length === 0 && onBeforeParseRules.length === 0) {
-    options = await ctNormalizeBuildFiles(options);
-    const compile = ctNormalizeCompileOptions(options);
-    if (compile) {
-      return ctRunCompiledBuild(options, compile, {
-        setupPromises: [],
-        onStart: [],
-        onEnd: onEndCallbacks,
-      });
-    }
-    return finalizePluginDriverResult(
-      runBuildDriver({ ...options, plugins: undefined }),
-      options,
-      onEndCallbacks,
-    );
-  }
-
-  const errors = [];
-  const pluginWarnings = [];
-  const pluginResolveFailures = [];
-  const moduleRecords = new Map();
-  const packageMetadata = new Map();
-  const materializedLoaders = {};
-  const usedShadowNames = new Set();
-  let depCounter = 0;
-  const shadowRootPath = pathJoin(tmpRoot("bun-build"), `plugin-${Date.now()}-${Math.floor(Math.random() * 1000000)}`);
-  cottontail.mkdirSync(shadowRootPath, true);
-  const shadowRoot = cottontail.realpathSync(shadowRootPath);
-  let activeOnLoadCallbacks = 0;
-  let deferredOnLoadCallbacks = [];
-  let deferredDrainScheduled = false;
-
-  const scheduleDeferredOnLoadDrain = () => {
-    if (activeOnLoadCallbacks !== 0 || deferredOnLoadCallbacks.length === 0 || deferredDrainScheduled) return;
-    deferredDrainScheduled = true;
-    queueMicrotask(() => {
-      deferredDrainScheduled = false;
-      if (activeOnLoadCallbacks !== 0 || deferredOnLoadCallbacks.length === 0) return;
-      const batch = deferredOnLoadCallbacks;
-      deferredOnLoadCallbacks = [];
-      for (const state of batch) {
-        if (!state.completed) {
-          state.resumed = true;
-          activeOnLoadCallbacks++;
-        }
-      }
-      for (const state of batch) state.resolve();
-    });
-  };
-
-  const invokeOnLoadCallback = async (callback, arguments_) => {
-    const state = {
-      called: false,
-      resumed: false,
-      completed: false,
-      resolve: null,
-    };
-    activeOnLoadCallbacks++;
-    const defer = () => {
-      if (state.called) throw new Error("Can't call .defer() more than once within an onLoad plugin");
-      state.called = true;
-      activeOnLoadCallbacks--;
-      const promise = new Promise((resolve) => {
-        state.resolve = resolve;
-      });
-      deferredOnLoadCallbacks.push(state);
-      scheduleDeferredOnLoadDrain();
-      return promise;
-    };
-
-    try {
-      return await Reflect.apply(callback, undefined, [{ ...arguments_, defer }]);
-    } finally {
-      state.completed = true;
-      if (!state.called || state.resumed) activeOnLoadCallbacks--;
-      scheduleDeferredOnLoadDrain();
-    }
-  };
-
-  const resolveWithPlugins = async (specifier, importer, importerNamespace, resolveDir, kind) => {
-    for (const rule of onResolveRules) {
-      if (rule.namespace !== importerNamespace) continue;
-      if (!rule.filter.test(specifier)) continue;
-      const result = await Reflect.apply(rule.callback, undefined, [{
-        path: specifier,
-        importer,
-        namespace: importerNamespace,
-        resolveDir: importerNamespace === "file" ? resolveDir : undefined,
-        kind,
-      }]);
-      if (result == null || typeof result !== "object") continue;
-      let { path, namespace: userNamespace = importerNamespace, external } = result;
-      if (path !== undefined && typeof path !== "string") {
-        throw new TypeError("onResolve plugins 'path' field must be a string if provided");
-      }
-      if (result.namespace !== undefined && typeof result.namespace !== "string") {
-        throw new TypeError("onResolve plugins 'namespace' field must be a string if provided");
-      }
-      if (!path) continue;
-      if (!userNamespace) userNamespace = importerNamespace;
-      if (typeof external !== "boolean" && external != null) {
-        throw new TypeError('onResolve plugins "external" field must be boolean or unspecified');
-      }
-      if (!external) {
-        if (userNamespace === "file" && (!nodePathIsAbsolute(path) || path.includes(".."))) {
-          throw new TypeError('onResolve plugin "path" must be absolute when the namespace is "file"');
-        }
-        if (userNamespace === "dataurl" && !path.startsWith("data:")) {
-          throw new TypeError('onResolve plugin "path" must start with "data:" when the namespace is "dataurl"');
-        }
-        if (userNamespace !== "file" && !onLoadRules.some(rule => rule.namespace === userNamespace)) {
-          throw new TypeError(`Expected onLoad plugin for namespace ${userNamespace} to exist`);
-        }
-      }
-      return external ? { external: true } : { path, namespace: userNamespace };
-    }
-    return null;
-  };
-
-  const applyBuildAlias = specifier => {
-    const aliases = options?.alias;
-    if (aliases === null || typeof aliases !== "object" || Array.isArray(aliases)) return specifier;
-    let matched = null;
-    for (const key of Object.keys(aliases)) {
-      if (specifier !== key && !specifier.startsWith(`${key}/`)) continue;
-      if (matched === null || key.length > matched.length) matched = key;
-    }
-    if (matched === null || typeof aliases[matched] !== "string") return specifier;
-    return `${aliases[matched]}${specifier.slice(matched.length)}`;
-  };
-
-  const buildResolveConditions = new Set([
-    "import",
-    "default",
-    ...(Array.isArray(options?.conditions) ? options.conditions : []),
-    options?.target === "browser" ? "browser" : "node",
-  ]);
-  const conditionalPackageCache = new Map();
-
-  const selectConditionalPackageTarget = (target, wildcard = "") => {
-    if (typeof target === "string") return target.replaceAll("*", wildcard);
-    if (Array.isArray(target)) {
-      for (const item of target) {
-        const selected = selectConditionalPackageTarget(item, wildcard);
-        if (selected !== null) return selected;
-      }
-      return null;
-    }
-    if (target === null || typeof target !== "object") return null;
-    for (const [condition, value] of Object.entries(target)) {
-      if (condition !== "default" && !buildResolveConditions.has(condition)) continue;
-      const selected = selectConditionalPackageTarget(value, wildcard);
-      if (selected !== null) return selected;
-    }
-    return null;
-  };
-
-  const conditionalPackageResolution = (specifier, fallback) => {
-    const cacheKey = `${specifier}\0${fallback}`;
-    if (conditionalPackageCache.has(cacheKey)) return conditionalPackageCache.get(cacheKey);
-
-    const parts = specifier.split("/");
-    const packageName = specifier.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
-    const subpathParts = specifier.startsWith("@") ? parts.slice(2) : parts.slice(1);
-    const subpath = subpathParts.length === 0 ? "." : `./${subpathParts.join("/")}`;
-    let directory = pathDirname(fallback);
-    let resolved = fallback;
-    while (true) {
-      const packageJsonPath = pathJoin(directory, "package.json");
-      try {
-        const packageJson = JSON.parse(String(cottontail.readFile(packageJsonPath)));
-        if (packageJson.name === packageName && packageJson.exports !== undefined) {
-          const exportsField = packageJson.exports;
-          let target = exportsField;
-          if (exportsField !== null && typeof exportsField === "object" && !Array.isArray(exportsField) &&
-              Object.keys(exportsField).some(key => key.startsWith("."))) {
-            target = exportsField[subpath];
-            if (target === undefined) {
-              const patterns = Object.keys(exportsField)
-                .filter(key => key.includes("*"))
-                .sort((left, right) => right.length - left.length);
-              for (const pattern of patterns) {
-                const [prefix, suffix] = pattern.split("*");
-                if (!subpath.startsWith(prefix) || !subpath.endsWith(suffix)) continue;
-                target = selectConditionalPackageTarget(
-                  exportsField[pattern],
-                  subpath.slice(prefix.length, subpath.length - suffix.length),
-                );
-                break;
-              }
-            }
-          }
-          const selected = typeof target === "string" ? target : selectConditionalPackageTarget(target);
-          if (typeof selected === "string" && selected.startsWith("./")) {
-            resolved = nodePathResolve(directory, selected);
-          }
-          break;
-        }
-      } catch {}
-      const parent = pathDirname(directory);
-      if (parent === directory) break;
-      directory = parent;
-    }
-    conditionalPackageCache.set(cacheKey, resolved);
-    return resolved;
-  };
-
-  const defaultResolveImport = (specifier, importerRecord) => {
-    specifier = applyBuildAlias(specifier);
-    if (!specifier.startsWith("./") && !specifier.startsWith("../") && !specifier.startsWith("/")) {
-      try {
-        let resolved = resolveSync(specifier, importerRecord.path);
-        if (resolved.startsWith("node:") || resolved.startsWith("bun:") || nodeIsBuiltin(resolved)) {
-          return { external: true };
-        }
-        resolved = conditionalPackageResolution(specifier, resolved);
-        return { path: resolved, namespace: "file" };
-      } catch {
-        return null;
-      }
-    }
-    if (importerRecord.namespace !== "file" && !specifier.startsWith("/")) {
-      return { error: `Could not resolve: "${specifier}"` };
-    }
-    const base = specifier.startsWith("/") ? specifier : nodePathResolve(pathDirname(importerRecord.path), specifier);
-    const candidates = [base];
-    for (const ext of [".tsx", ".ts", ".jsx", ".mjs", ".js", ".cjs", ".css", ".html", ".json"]) candidates.push(base + ext);
-    for (const ext of [".tsx", ".ts", ".jsx", ".mjs", ".js", ".cjs", ".css", ".html", ".json"]) candidates.push(`${base}/index${ext}`);
-    for (const candidate of candidates) {
-      if (ctBuildVirtualFile(options, candidate) !== undefined) return { path: candidate, namespace: "file" };
-      try {
-        if (cottontail.statSync(candidate, true)?.isFile) return { path: candidate, namespace: "file" };
-      } catch {}
-    }
-    return { error: `Could not resolve: "${specifier}"` };
-  };
-
-  const loadWithPlugins = async (record) => {
-    const defaultLoader = record.namespace === "file" ? bundleLoaderForPath(record.path) : "js";
-    for (const rule of onLoadRules) {
-      if (rule.namespace !== record.namespace) continue;
-      if (!rule.filter.test(record.path)) continue;
-      const result = await invokeOnLoadCallback(rule.callback, {
-        path: record.path,
-        namespace: record.namespace,
-        loader: defaultLoader,
-        side: options?.target === "browser" ? "client" : "server",
-      });
-      if (result == null || typeof result !== "object") continue;
-      let { contents, loader = defaultLoader } = result;
-      if (loader === "object") {
-        if (!("exports" in result)) {
-          throw new TypeError('onLoad plugin returning loader: "object" must have "exports" property');
-        }
-        try {
-          contents = JSON.stringify(result.exports);
-          loader = "json";
-        } catch (error) {
-          throw new TypeError(`When using Bun.build, onLoad plugin must return a JSON-serializable object: ${error}`);
-        }
-      }
-      if (typeof contents !== "string" && !ArrayBuffer.isView(contents)) {
-        throw new TypeError('onLoad plugins must return an object with "contents" as a string or Uint8Array');
-      }
-      if (typeof loader !== "string") {
-        throw new TypeError('onLoad plugins must return an object with "loader" as a string');
-      }
-      if (nativePluginLoaderIds[loader] === undefined) throw new TypeError(`Loader ${loader} is not supported.`);
-      const normalizedContents = typeof contents === "string"
-        ? contents
-        : new Uint8Array(contents.buffer, contents.byteOffset, contents.byteLength);
-      return { contents: normalizedContents, loader, fromOnLoad: true };
-    }
-    if (record.namespace === "file") {
-      const virtual = ctBuildVirtualFile(options, record.path);
-      const loader = bundleLoaderForPath(record.path);
-      if (virtual !== undefined) return { contents: virtual, loader };
-      return { contents: cottontail.readFileBuffer(record.path), loader };
-    }
-    throw new Error(`Could not load: "${record.namespace}:${record.path}" (no onLoad plugin returned contents)`);
-  };
-
-  const runNativeBeforeParse = (record, loaded) => {
-    if (loaded.fromOnLoad) return { loaded, failed: false };
-    const rules = onBeforeParseRules.filter(rule => rule.namespace === record.namespace);
-    if (rules.length === 0) return { loaded, failed: false };
-
-    const initialContents = loaded.contents;
-    const initialLoader = loaded.loader ?? bundleLoaderForPath(record.path);
-    const loaderId = nativePluginLoaderIds[initialLoader];
-    if (loaderId === undefined) {
-      errors.push(new BuildMessage({
-        message: `Native plugin received an invalid loader: ${String(initialLoader)}`,
-        position: { file: record.path, namespace: record.namespace },
-      }));
-      return { loaded, failed: true };
-    }
-
-    let sourceContents = initialContents;
-    let sourceFetched = false;
-    let finalHasSource = false;
-    let finalContents;
-    let finalLoader = initialLoader;
-    let matched = false;
-    let failed = false;
-
-    for (let index = 0; index < rules.length; index++) {
-      const rule = rules[index];
-      finalHasSource = sourceFetched;
-      finalContents = sourceFetched ? sourceContents : undefined;
-      finalLoader = initialLoader;
-      if (!ctNativePluginFilterMatches(rule.filter, record.path)) continue;
-      matched = true;
-
-      const result = cottontail.nativeBundlerPluginRun(
-        rule.napiModule,
-        rule.symbol,
-        rule.external,
-        record.path,
-        record.namespace,
-        sourceContents,
-        loaderId,
-        sourceFetched,
-      );
-
-      for (const log of result?.logs ?? []) {
-        const level = nativePluginLogLevels[log.level] ?? "info";
-        const line = Number.isFinite(Number(log.line)) ? Math.max(Number(log.line), -1) : -1;
-        const column = Number.isFinite(Number(log.column)) ? Math.max(Number(log.column), -1) : -1;
-        const columnEnd = Number.isFinite(Number(log.columnEnd))
-          ? Math.max(Number(log.columnEnd), column)
-          : column;
-        const message = new BuildMessage({
-          message: log.message ?? "",
-          level,
-          position: {
-            file: log.path || record.path,
-            namespace: record.namespace,
-            line,
-            column,
-            length: columnEnd - column,
-            lineText: log.sourceLineText || "",
-          },
-        });
-        if (level === "error") {
-          errors.push(message);
-          failed = true;
-        } else {
-          pluginWarnings.push(message);
-        }
-      }
-
-      if (result?.status === "invalid-context") {
-        errors.push(new BuildMessage({
-          message: "Native plugin set the `free_plugin_source_code_context` field without setting the `plugin_source_code_context` field.",
-        }));
-        failed = true;
-      } else if (result?.status === "out-of-memory") {
-        errors.push(new BuildMessage({ message: "Native plugin callback ran out of memory." }));
-        failed = true;
-      } else if (result?.status !== "ok") {
-        errors.push(new BuildMessage({ message: `Native plugin callback failed: ${result?.status ?? "unknown error"}` }));
-        failed = true;
-      }
-
-      if (result?.inputContents instanceof ArrayBuffer) sourceContents = result.inputContents;
-      sourceFetched ||= result?.fetchedSource === true;
-      finalHasSource = result?.hasSource === true;
-      finalContents = finalHasSource ? result.contents : undefined;
-      finalLoader = finalHasSource ? nativePluginLoaderNames[result.loader] : initialLoader;
-      if (finalHasSource && finalLoader === undefined) {
-        errors.push(new BuildMessage({
-          message: `Native plugin returned an invalid loader: ${String(result.loader)}`,
-          position: { file: record.path, namespace: record.namespace },
-        }));
-        failed = true;
-        finalLoader = initialLoader;
-      }
-      if (result?.stopsChain) break;
-    }
-
-    if (!matched || !finalHasSource) return { loaded: { contents: initialContents, loader: initialLoader }, failed };
-    return { loaded: { contents: finalContents, loader: finalLoader }, failed };
-  };
-
-  const packageLocation = sourcePath => {
-    const normalized = String(sourcePath).replace(/\\/g, "/");
-    const firstNodeModules = normalized.indexOf("/node_modules/");
-    const packageNodeModules = normalized.lastIndexOf("/node_modules/");
-    if (firstNodeModules < 0 || packageNodeModules < 0) return null;
-    const packageStart = packageNodeModules + "/node_modules/".length;
-    const firstSlash = normalized.indexOf("/", packageStart);
-    if (firstSlash < 0) return null;
-    const packageEnd = normalized[packageStart] === "@"
-      ? normalized.indexOf("/", firstSlash + 1)
-      : firstSlash;
-    const end = packageEnd < 0 ? normalized.length : packageEnd;
-    const packageName = normalized.slice(packageStart, end);
-    if (!packageName) return null;
-    return {
-      name: packageName,
-      sourceRoot: normalized.slice(0, end),
-      shadowRoot: pathJoin(shadowRoot, normalized.slice(firstNodeModules + 1, end)),
-      relativePath: normalized.slice(firstNodeModules + 1),
-    };
-  };
-
-  const preservePackageMetadata = sourcePath => {
-    const location = packageLocation(sourcePath);
-    if (!location) return;
-    const shadowPackageJson = pathJoin(location.shadowRoot, "package.json");
-    if (packageMetadata.has(shadowPackageJson)) return;
-    const sourcePackageJson = pathJoin(location.sourceRoot, "package.json");
-    let contents = ctBuildVirtualFile(options, sourcePackageJson);
-    if (contents === undefined) {
-      try { contents = cottontail.readFile(sourcePackageJson); } catch {}
-    }
-    if (contents !== undefined) packageMetadata.set(shadowPackageJson, ctBuildContentsText(contents));
-  };
-
-  const shadowName = (sourcePath, loader, entryName, namespace = "file") => {
-    const base = String(entryName ?? sourcePath).replace(/\\/g, "/").split("/").pop() || "module";
-    const known = /\.(tsx|ts|jsx|mjs|cjs|js|css|html|json|toml|txt|wasm)$/i.exec(base);
-    const stem = known ? base.slice(0, -known[0].length) : base;
-    const sourceExtension = ctBuildSourceExtension(base);
-    const ext = loader === "file"
-      ? (sourceExtension || ".bin")
-      : (bundleLoaderExtensions[loader] ?? (known ? known[0] : ".js"));
-    const location = namespace === "file" ? packageLocation(sourcePath) : null;
-    const sourceRoot = nodePathResolve(options?.root ?? cottontail.cwd());
-    const sourceRelative = namespace === "file"
-      ? nodePathRelative(sourceRoot, nodePathResolve(sourcePath)).replace(/\\/g, "/")
-      : "";
-    const sourceRelativeIsLocal = sourceRelative !== "" && sourceRelative !== ".." &&
-      !sourceRelative.startsWith("../") && !sourceRelative.startsWith("/");
-    const sourceRelativeDir = sourceRelativeIsLocal ? pathDirname(sourceRelative).replace(/\\/g, "/") : "";
-    const namespaceHash = namespace === "file"
-      ? ""
-      : BigInt.asUintN(64, hash(`${namespace}\0${sourcePath}`)).toString(16);
-    const namespaceName = String(namespace).replace(/[^a-zA-Z0-9_-]+/g, "-") || "virtual";
-    let name = location
-      ? `${location.relativePath.slice(0, location.relativePath.length - base.length)}${stem}${ext}`
-      : sourceRelativeIsLocal
-        ? `${sourceRelativeDir === "." ? "" : `${sourceRelativeDir}/`}${stem}${ext}`
-        : namespace !== "file"
-          ? `deps/${namespaceName}-${stem}-${namespaceHash}${ext}`
-        : `${entryName == null ? `deps/dep-${depCounter++}-` : ""}${stem}${ext}`;
-    let counter = 1;
-    const originalName = name;
-    while (usedShadowNames.has(name)) {
-      name = `${originalName.slice(0, -ext.length)}-${counter++}${ext}`;
-    }
-    usedShadowNames.add(name);
-    return pathJoin(shadowRoot, name);
-  };
-
-  async function discoverModuleEdges(record) {
-    const loader = record.loader;
-    if (loader !== "js" && loader !== "jsx" && loader !== "ts" && loader !== "tsx" && loader !== "html" && loader !== "css") {
-      return [];
-    }
-    record.contents = ctBuildContentsText(record.contents);
-    const edges = await Promise.all(scanBundleImportsForLoader(record.contents, loader).map(async ({ specifier, kind }) => {
-      const resolveDir = record.namespace === "file" ? pathDirname(record.path) : cottontail.cwd();
-      let target;
-      try {
-        target = await resolveWithPlugins(specifier, record.path, record.namespace, resolveDir, kind)
-          ?? defaultResolveImport(specifier, record);
-      } catch (error) {
-        errors.push(ctPluginBuildMessage(error, record.path, record.namespace));
-        pluginResolveFailures.push({ importer: record.path, specifier });
-        return null;
-      }
-      if (!target || target.external) return null;
-      if (target.error) {
-        // The lightweight graph scan can see import-looking text in comments
-        // and template literals. Leave unresolved text untouched so the
-        // native parser decides whether it is an actual dependency.
-        return null;
-      }
-      return { specifier, target: await addModule(target) };
-    }));
-    return edges.filter(Boolean);
-  }
-
-  const addModule = async (resolved, entryName = undefined) => {
-    const key = `${resolved.namespace}\0${resolved.path}`;
-    if (moduleRecords.has(key)) return moduleRecords.get(key);
-    const record = {
-      key,
-      path: resolved.path,
-      namespace: resolved.namespace,
-      shadowPath: null,
-      contents: "",
-      loader: "js",
-      edges: [],
-      pluginLoadFailed: false,
-    };
-    moduleRecords.set(key, record);
-    let loaded;
-    try {
-      loaded = await loadWithPlugins(record);
-    } catch (error) {
-      errors.push(ctPluginBuildMessage(error, record.path, record.namespace));
-      record.pluginLoadFailed = true;
-      record.shadowPath = shadowName(record.path, "js", entryName, record.namespace);
-      return record;
-    }
-    const nativeResult = runNativeBeforeParse(record, loaded);
-    loaded = nativeResult.loaded;
-    record.contents = loaded.contents;
-    const loader = loaded.loader ?? bundleLoaderForPath(record.path);
-    record.loader = loader;
-    record.shadowPath = shadowName(record.path, loader, entryName, record.namespace);
-    const materializedExtension = ctBuildSourceExtension(record.shadowPath);
-    if (materializedExtension) materializedLoaders[materializedExtension] = loader;
-    if (record.namespace === "file") preservePackageMetadata(record.path);
-    if (nativeResult.failed) {
-      record.pluginLoadFailed = true;
-      return record;
-    }
-    record.edges.push(...await discoverModuleEdges(record));
-    return record;
-  };
-
-  const shadowEntries = [];
-  for (const entry of (options?.entrypoints ?? []).map(String)) {
-    let resolved;
-    try {
-      resolved = await resolveWithPlugins(entry, "", "file", ".", "entry-point-build");
-    } catch (error) {
-      errors.push(ctPluginBuildMessage(error, entry.startsWith("/") ? entry : nodePathResolve(entry), "file"));
-      continue;
-    }
-    if (resolved?.external) continue;
-    if (!resolved) {
-      const abs = entry.startsWith("/") ? entry : nodePathResolve(entry);
-      if (ctBuildVirtualFile(options, abs) === undefined && !cottontail.existsSync(abs)) {
-        errors.push(new BuildMessage({ message: `ModuleNotFound resolving "${entry}" (entry point)` }));
-        continue;
-      }
-      resolved = { path: abs, namespace: "file" };
-    }
-    const record = await addModule(resolved, entry);
-    shadowEntries.push(record.shadowPath);
-  }
-
-  const jsxRecord = [...moduleRecords.values()].find(record => record.loader === "jsx" || record.loader === "tsx");
-  const implicitImports = new Set();
-  if (jsxRecord) {
-    const importSource = typeof options?.jsx?.importSource === "string" ? options.jsx.importSource : "react";
-    implicitImports.add(`${importSource}/jsx-runtime`);
-    implicitImports.add(`${importSource}/jsx-dev-runtime`);
-  }
-  if (options?.reactFastRefresh) implicitImports.add("react-refresh/runtime");
-  const implicitImporter = jsxRecord ?? moduleRecords.values().next().value;
-  if (implicitImporter) {
-    for (const specifier of implicitImports) {
-      const target = defaultResolveImport(specifier, implicitImporter);
-      if (target?.path && !target.external) await addModule(target);
-    }
-  }
-
-  if (pluginGraphHook !== null && errors.length === 0) {
-    const replacements = await pluginGraphHook([...moduleRecords.values()].map(record => ({
-      key: record.key,
-      id: nodePathRelative(shadowRoot, record.shadowPath).replace(/\\/g, "/"),
-      path: record.path,
-      namespace: record.namespace,
-      contents: record.contents,
-      loader: record.loader,
-    })));
-    if (replacements != null && !(replacements instanceof Map)) {
-      throw new TypeError("Bake's plugin graph hook must return a Map");
-    }
-    if (replacements) {
-      for (const record of moduleRecords.values()) {
-        if (!replacements.has(record.key)) continue;
-        const contents = replacements.get(record.key);
-        if (typeof contents !== "string" && !ArrayBuffer.isView(contents)) {
-          throw new TypeError("Bake's plugin graph replacement must be a string or Uint8Array");
-        }
-        record.contents = contents;
-        record.edges = await discoverModuleEdges(record);
-      }
-    }
-  }
-
-  for (const [path, contents] of packageMetadata) {
-    cottontail.mkdirSync(pathDirname(path), true);
-    cottontail.writeFile(path, contents);
-  }
-  for (const record of moduleRecords.values()) {
-    let contents = record.contents;
-    if (record.edges.length > 0 && typeof contents !== "string") contents = ctBuildContentsText(contents);
-    for (const edge of record.edges) {
-      if (!edge.target?.shadowPath) continue;
-      let relativeTarget = nodePathRelative(pathDirname(record.shadowPath), edge.target.shadowPath).replace(/\\/g, "/");
-      if (!relativeTarget.startsWith("./") && !relativeTarget.startsWith("../")) relativeTarget = `./${relativeTarget}`;
-      const replacement = JSON.stringify(relativeTarget);
-      for (const quote of ['"', "'", "`"]) {
-        contents = contents.split(`${quote}${edge.specifier}${quote}`).join(replacement);
-      }
-    }
-    cottontail.mkdirSync(pathDirname(record.shadowPath), true);
-    cottontail.writeFile(record.shadowPath, contents);
-  }
-
-  const sourceByShadowPath = new Map();
-  for (const record of moduleRecords.values()) {
-    if (record.shadowPath) sourceByShadowPath.set(nodePathResolve(record.shadowPath), record.path);
-  }
-
-  const shadowLoaderOptions = Object.keys(materializedLoaders).length > 0
-    ? {
-        ...(options?.loader && typeof options.loader === "object" ? options.loader : {}),
-        ...materializedLoaders,
-      }
-    : options?.loader;
-  const compile = ctNormalizeCompileOptions(options);
-  if (compile && errors.length === 0) {
-    const result = await ctRunCompiledBuild(
-      {
-        ...options,
-        __cottontailPluginGraph: undefined,
-        throw: false,
-        files: undefined,
-        plugins: undefined,
-        root: shadowRoot,
-        loader: shadowLoaderOptions,
-        entrypoints: shadowEntries,
-      },
-      compile,
-      { setupPromises: [], onStart: [], onEnd: [] },
-    );
-    result.logs = [...pluginWarnings, ...(result.logs ?? [])];
-    await ctRunOnEnd({ onEnd: onEndCallbacks }, result);
-    if (!result.success && options?.throw !== false) throw new AggregateError(result.logs, "Bundle failed");
-    return result;
-  }
-
-  const driverResult = runBuildDriver({
-    ...options,
-    __cottontailPluginGraph: undefined,
-    files: undefined,
-    plugins: undefined,
-    root: shadowRoot,
-    __cottontailWorkingDirectory: shadowRoot,
-    loader: shadowLoaderOptions,
-    entrypoints: shadowEntries,
-  });
-  for (const log of driverResult.logs ?? []) {
-    const file = log?.position?.file;
-    if (!file) continue;
-    const originalPath = sourceByShadowPath.get(nodePathResolve(String(file)));
-    if (originalPath) log.position = { ...log.position, file: originalPath };
-  }
-  const failedShadowNames = new Set(
-    Array.from(moduleRecords.values())
-      .filter((record) => record.pluginLoadFailed && record.shadowPath)
-      .map((record) => String(record.shadowPath).replace(/\\/g, "/").split("/").pop()),
-  );
-  driverResult.logs = (driverResult.logs ?? []).filter((log) => {
-    const message = String(log?.message ?? "");
-    for (const shadowName of failedShadowNames) {
-      if (shadowName && message.includes(shadowName)) return false;
-    }
-    const file = log?.position?.file;
-    for (const failure of pluginResolveFailures) {
-      if (file != null && nodePathResolve(String(file)) !== nodePathResolve(failure.importer)) continue;
-      if (message.includes(failure.specifier)) return false;
-    }
-    return true;
-  });
-  driverResult.logs = [...pluginWarnings, ...(driverResult.logs ?? [])];
-  if (errors.length > 0) {
-    driverResult.ok = false;
-    driverResult.success = false;
-    driverResult.name = "AggregateError";
-    driverResult.message = "Bundle failed";
-    driverResult.logs = [...errors, ...(driverResult.logs ?? [])];
-    driverResult.outputs = [];
-  }
-  return finalizePluginDriverResult(
-    driverResult,
-    options,
-    onEndCallbacks,
-  );
-}
-
-// Bun.build artifacts and plugin callbacks are implemented in-process. Plugin
-// module graphs are materialized into a temporary directory before bundling.
-
 const ctInspectSymbol = Symbol.for("nodejs.util.inspect.custom");
-
-const CTBuildMessage = class BuildMessage {
-  constructor(fields = {}) {
-    this.name = fields.name != null ? String(fields.name) : "BuildMessage";
-    this.message = fields.message != null ? String(fields.message) : "";
-    this.position = fields.position ?? null;
-    this.level = fields.level ?? "error";
-    this.notes = Array.isArray(fields.notes) ? fields.notes : [];
-    if (fields.rendered != null) {
-      Object.defineProperty(this, "__rendered", { value: fields.rendered, configurable: true, writable: true });
-    }
-  }
-  toString() {
-    return `${this.name}: ${this.message}`;
-  }
-  [ctInspectSymbol]() {
-    return this.__rendered ?? `${this.level ?? "error"}: ${this.message}`;
-  }
-};
-
-const CTResolveMessage = class ResolveMessage {
-  constructor(fields = {}) {
-    this.name = "ResolveMessage";
-    this.message = fields.message != null ? String(fields.message) : "";
-    this.position = fields.position ?? null;
-    this.level = fields.level ?? "error";
-    this.code = fields.code ?? "";
-    this.specifier = fields.specifier ?? "";
-    this.importKind = fields.importKind ?? "";
-    this.referrer = fields.referrer ?? "";
-    if (fields.rendered != null) {
-      Object.defineProperty(this, "__rendered", { value: fields.rendered, configurable: true, writable: true });
-    }
-  }
-  toString() {
-    return `${this.name}: ${this.message}`;
-  }
-  [ctInspectSymbol]() {
-    return this.__rendered ?? `${this.level ?? "error"}: ${this.message}`;
-  }
-};
-
+const ctBuildArtifactContentHashSymbol = Symbol.for("cottontail.buildArtifactContentHash");
+const loadBunBuildModule = createLazyModule("bun:build", () => {
+  const { createBunBuildFacade } = loadEmbeddedRuntimeModule("bun/build.js");
+  return createBunBuildFacade({
+    Transpiler,
+    cottontail,
+    file,
+    hash,
+    nodeIsBuiltin,
+    nodePathBasename,
+    nodePathIsAbsolute,
+    nodePathRelative,
+    nodePathResolve,
+    pathDirname,
+    pathJoin,
+    resolveSync,
+    tmpRoot,
+  });
+});
+const CTBuildMessage = createLazyFunction(loadBunBuildModule, "CTBuildMessage", "BuildMessage");
+const CTResolveMessage = createLazyFunction(loadBunBuildModule, "CTResolveMessage", "ResolveMessage");
+export const build = createLazyFunction(loadBunBuildModule, "build");
 if (typeof globalThis.BuildMessage !== "function") globalThis.BuildMessage = CTBuildMessage;
 if (typeof globalThis.ResolveMessage !== "function") globalThis.ResolveMessage = CTResolveMessage;
-// Bun 1.3.10 exposes the legacy Error spellings as exact constructor aliases.
 globalThis.BuildError = globalThis.BuildMessage;
 globalThis.ResolveError = globalThis.ResolveMessage;
 
-function ctBuildArtifactMime(meta) {
-  if (meta.type != null) return String(meta.type);
-  if (meta.kind === "sourcemap") return "application/json;charset=utf-8";
-  switch (meta.loader) {
-    case "js":
-    case "jsx":
-    case "ts":
-    case "tsx":
-      return "text/javascript;charset=utf-8";
-    case "css":
-      return "text/css;charset=utf-8";
-    case "html":
-      return "text/html;charset=utf-8";
-    case "json":
-    case "toml":
-      return "application/json;charset=utf-8";
-    case "wasm":
-      return "application/wasm";
-    default:
-      return "";
-  }
-}
-
-const ctBuildArtifactContentHashSymbol = Symbol("cottontail.buildArtifactContentHash");
-
-const CTBuildArtifact = class BuildArtifact extends Blob {
-  constructor(bytes, meta = {}) {
-    const type = ctBuildArtifactMime(meta);
-    super([bytes], type ? { type } : {});
-    this.path = meta.path ?? "";
-    this.loader = meta.loader ?? "file";
-    this.hash = meta.hash ?? null;
-    this.kind = meta.kind ?? "chunk";
-    this.sourcemap = null;
-    Object.defineProperty(this, ctBuildArtifactContentHashSymbol, { value: meta.contentHash ?? null });
-  }
-};
-
-function ctErrorMessage(error) {
-  if (error instanceof Error) return error.message != null ? String(error.message) : String(error);
-  return String(error);
-}
-
-function ctDecodeThrown(encoded) {
-  if (!encoded) return new Error("Unknown Bun.build error");
-  if (encoded.primitive) return encoded.value;
-  const error = new Error(encoded.message ?? "Unknown Bun.build error");
-  if (encoded.name) error.name = encoded.name;
-  if (encoded.stack) error.stack = encoded.stack;
-  return error;
-}
-
-function ctCheckInvalidJsonImports(options) {
-  for (const entrypoint of options.entrypoints ?? []) {
-    let source;
-    try { source = cottontail.readFile(String(entrypoint)); } catch { continue; }
-    let imports;
-    try { imports = new Transpiler().scanImports(source); } catch { continue; }
-    for (const imported of imports) {
-      const specifier = String(imported.path).split(/[?#]/, 1)[0];
-      if (!specifier.startsWith(".") || !specifier.endsWith(".json")) continue;
-      const basename = specifier.replace(/\\/g, "/").split("/").pop()?.toLowerCase();
-      if (basename === "tsconfig.json" || basename === "package.json") continue;
-      if (/\btype\s*:\s*["']jsonc["']/.test(source)) continue;
-      const target = pathJoin(pathDirname(String(entrypoint)), specifier);
-      try {
-        JSON.parse(cottontail.readFile(target));
-      } catch (error) {
-        return new SyntaxError(`Invalid JSON in ${target}: ${error?.message ?? error}`);
-      }
-    }
-  }
-  return null;
-}
-
-async function ctRunBuildDriver(options, state) {
-  const parsed = runBuildDriver(options);
-  if (parsed.ok === false) {
-    return { success: false, logs: parsed.logs ?? [], outputs: [], fatal: {
-      message: parsed.message ?? "Bundle failed",
-      name: parsed.name ?? "AggregateError",
-    } };
-  }
-  return {
-    success: parsed.success !== false,
-    logs: parsed.logs ?? [],
-    outputs: (parsed.outputs ?? []).map((output) => ({
-      path: output.path,
-      kind: output.kind ?? "entry-point",
-      hash: output.hash ?? null,
-      contentHash: output.contentHash ?? null,
-      loader: output.loader ?? "js",
-      b64: output.b64 ?? "",
-      sourcemapIndex: output.sourcemapIndex ?? null,
-    })),
-    metafile: parsed.metafile ?? null,
-  };
-}
-
-function ctMaterializeBuildResult(raw) {
-  const rawOutputs = raw.outputs ?? [];
-  const outputs = rawOutputs.map((output) => new CTBuildArtifact(
-    output.b64 ? globalThis.Buffer.from(output.b64, "base64") : new Uint8Array(0),
-    output,
-  ));
-  rawOutputs.forEach((output, index) => {
-    if (output.sourcemapIndex != null && output.sourcemapIndex >= 0 && outputs[output.sourcemapIndex]) {
-      outputs[index].sourcemap = outputs[output.sourcemapIndex];
-    }
-  });
-  const logs = (raw.logs ?? []).map((log) => (
-    log.name === "ResolveMessage" ? new CTResolveMessage(log) : new CTBuildMessage(log)
-  ));
-  const result = { success: raw.success !== false, outputs, logs };
-  if (raw.metafile != null) result.metafile = raw.metafile;
-  return result;
-}
-
-// Every callback starts in registration order. Bun turns synchronous throws
-// into rejected promises, then waits for all asynchronous callbacks together.
-async function ctRunOnEnd(state, result) {
-  if (state.onEnd.length === 0) return;
-  const promises = [];
-  for (const callback of state.onEnd) {
-    try {
-      const returned = Reflect.apply(callback, undefined, [result]);
-      if (cottontail.promiseStatus?.(returned) >= 0) promises.push(returned);
-    } catch (error) {
-      promises.push(Promise.reject(error));
-    }
-  }
-  if (promises.length > 0) await Promise.all(promises);
-}
-
-async function ctRunBuild(options, state) {
-  if (state.setupPromises.length > 0) await Promise.all(state.setupPromises);
-  options = await ctNormalizeBuildFiles(options);
-
-  const preError = ctCheckInvalidJsonImports(options);
-  if (preError) {
-    if (options.throw === false) return { success: false, logs: [preError], outputs: [] };
-    throw preError;
-  }
-
-  if (state.onStart.length > 0) {
-    try {
-      const pending = [];
-      for (const callback of state.onStart) {
-        const returned = callback();
-        if (returned && typeof returned.then === "function") pending.push(returned);
-      }
-      await Promise.all(pending);
-    } catch (error) {
-      const result = {
-        success: false,
-        outputs: [],
-        logs: [new CTBuildMessage({ message: ctErrorMessage(error) })],
-      };
-      await ctRunOnEnd(state, result);
-      if (options.throw !== false) throw error;
-      return result;
-    }
-  }
-
-  const raw = await ctRunBuildDriver(options, state);
-  if (raw.fatal) {
-    const logs = (raw.logs ?? []).map((log) => (
-      log.name === "ResolveMessage" ? new CTResolveMessage(log) : new CTBuildMessage(log)
-    ));
-    if (logs.length === 0) logs.push(new CTBuildMessage({ message: raw.fatal.message ?? "Bundle failed" }));
-    const result = { success: false, outputs: [], logs };
-    await ctRunOnEnd(state, result);
-    if (options.throw === false) return result;
-    const errors = result.logs.filter((log) => (log?.level ?? "error") === "error");
-    const error = new AggregateError(errors.length > 0 ? errors : result.logs, raw.fatal.message ?? "Bundle failed");
-    if (raw.fatal.name) error.name = raw.fatal.name;
-    throw error;
-  }
-
-  const result = ctMaterializeBuildResult(raw);
-  await ctRunOnEnd(state, result);
-  if (!result.success && options.throw !== false) {
-    const errors = result.logs.filter((log) => (log?.level ?? "error") === "error");
-    throw new AggregateError(errors.length > 0 ? errors : result.logs, "Bundle failed");
-  }
-  return result;
-}
-
-function ctCurrentCompileTargets() {
-  const platform = globalThis.process?.platform ?? cottontail.platform();
-  const arch = globalThis.process?.arch ?? "x64";
-  const os = platform === "win32" ? "windows" : platform;
-  const arches = arch === "arm64" || arch === "aarch64" ? ["arm64", "aarch64"] : [arch];
-  return new Set(arches.map(value => `bun-${os}-${value}`));
-}
-
-function ctNormalizeCompileOptions(options) {
-  const value = options?.compile;
-  if (value == null || value === false) return null;
-  if (value !== true && typeof value !== "string" && (typeof value !== "object" || Array.isArray(value))) {
-    throw new TypeError('Bun.build expects "compile" to be a boolean, target string, or object');
-  }
-
-  const compile = value === true ? {} : typeof value === "string" ? { target: value } : { ...value };
-  if (compile.target != null) {
-    if (typeof compile.target !== "string" || !ctCurrentCompileTargets().has(compile.target)) {
-      throw new Error(`Unknown compile target: ${String(compile.target)}`);
-    }
-  }
-  if (compile.outfile != null && typeof compile.outfile !== "string") {
-    throw new TypeError('Bun.build compile.outfile must be a string');
-  }
-  if (compile.execArgv != null && !Array.isArray(compile.execArgv)) {
-    throw new TypeError('Bun.build compile.execArgv must be an array');
-  }
-  if (compile.executablePath != null && typeof compile.executablePath !== "string") {
-    throw new TypeError('Bun.build compile.executablePath must be a string');
-  }
-  if (compile.windows != null) {
-    if (typeof compile.windows !== "object" || Array.isArray(compile.windows)) {
-      throw new TypeError("Bun.build compile.windows must be an object");
-    }
-    const windows = { ...compile.windows };
-    if (Object.hasOwn(windows, "hideConsole")) {
-      windows.hideConsole = Boolean(windows.hideConsole);
-    }
-    for (const name of ["icon", "title", "publisher", "version", "description", "copyright"]) {
-      if (windows[name] != null && typeof windows[name] !== "string") {
-        throw new TypeError(`Bun.build compile.windows.${name} must be a string`);
-      }
-    }
-    compile.windows = windows;
-  }
-  for (const name of ["autoloadDotenv", "autoloadBunfig", "autoloadTsconfig", "autoloadPackageJson"]) {
-    if (Object.hasOwn(compile, name)) compile[name] = Boolean(compile[name]);
-  }
-  return compile;
-}
-
-function ctIsStandaloneHtmlCompile(options, compile) {
-  return !!compile &&
-    (options?.target ?? "browser") === "browser" &&
-    options.entrypoints.every(entrypoint => /\.html?$/i.test(String(entrypoint)));
-}
-
-function ctCompiledOutputPath(options, compile, cwd) {
-  const entry = String(options.entrypoints[0]);
-  const entryName = nodePathBasename(entry);
-  const extension = /\.[^./\\]+$/.exec(entryName)?.[0] ?? "";
-  let outfile = compile.outfile != null
-    ? String(compile.outfile)
-    : entryName.slice(0, extension ? -extension.length : undefined) || "index";
-  if (!outfile.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(outfile)) {
-    outfile = nodePathResolve(options.outdir != null ? String(options.outdir) : cwd, outfile);
-  }
-  if ((globalThis.process?.platform ?? cottontail.platform()) === "win32" && !/\.exe$/i.test(outfile)) {
-    outfile += ".exe";
-  }
-  return outfile;
-}
-
-async function ctRunCompiledBuild(options, compile, state) {
-  if (options.entrypoints.length !== 1) {
-    throw new TypeError("Bun.build compile requires exactly one entrypoint");
-  }
-  if (state.setupPromises.length > 0) await Promise.all(state.setupPromises);
-  if (state.onStart.length > 0) {
-    for (const callback of state.onStart) await callback();
-  }
-
-  const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
-  const entry = nodePathResolve(cwd, String(options.entrypoints[0]));
-  const outfile = ctCompiledOutputPath(options, compile, cwd);
-  const request = {
-    ...options,
-    plugins: undefined,
-    entrypoints: [entry],
-    compile: {
-      ...compile,
-      execArgv: Array.isArray(compile.execArgv) ? compile.execArgv.map(String) : undefined,
-    },
-  };
-  let parsed;
-  try {
-    parsed = JSON.parse(cottontail.compileBuildNative(JSON.stringify(request), cwd, outfile));
-  } catch (error) {
-    const result = { success: false, outputs: [], logs: [new CTBuildMessage({ message: ctErrorMessage(error) })] };
-    await ctRunOnEnd(state, result);
-    if (options.throw === false) return result;
-    throw new AggregateError(result.logs, "Bundle failed");
-  }
-
-  const outputs = [];
-  for (const output of parsed.outputs ?? []) {
-    outputs.push(new CTBuildArtifact(new Uint8Array(await file(output.path).arrayBuffer()), {
-      path: output.path,
-      kind: output.kind,
-      loader: output.loader,
-      hash: null,
-    }));
-  }
-  const executableArtifact = outputs.find(output => output.kind === "entry-point");
-  const sourceMapArtifact = outputs.find(output => output.kind === "sourcemap");
-  if (executableArtifact && sourceMapArtifact) executableArtifact.sourcemap = sourceMapArtifact;
-  const result = {
-    success: parsed.success !== false,
-    outputs,
-    logs: [],
-  };
-  await ctRunOnEnd(state, result);
-  if (!result.success && options.throw !== false) {
-    throw new AggregateError(result.logs, "Bundle failed");
-  }
-  return result;
-}
-
-export function build(options) {
-  if (globalThis[Symbol.for("cottontail.macroMode")] === true ||
-      globalThis.process?.execArgv?.includes("--cottontail-macro-mode") ||
-      globalThis.process?.env?.COTTONTAIL_MACRO_MODE === "1") {
-    throw new Error("Bun.build cannot be called from within a macro");
-  }
-  if (options == null || typeof options !== "object") {
-    throw new TypeError("Expected a config object to be passed to Bun.build");
-  }
-  if (!Array.isArray(options.entrypoints) || options.entrypoints.length === 0) {
-    throw new TypeError('Bun.build expects "entrypoints" to be a non-empty array of strings');
-  }
-  for (const entry of options.entrypoints) {
-    if (typeof entry !== "string") {
-      throw new TypeError('Bun.build expects "entrypoints" to be an array of strings');
-    }
-  }
-  if (options.format != null && !["esm", "cjs", "iife", "internal_bake_dev"].includes(options.format)) {
-    throw new TypeError(`Invalid "format" value in Bun.build: ${String(options.format)}`);
-  }
-  if (options.target != null && !["browser", "bun", "node"].includes(options.target)) {
-    throw new TypeError(`Invalid "target" value in Bun.build: ${String(options.target)}`);
-  }
-  let compile = ctNormalizeCompileOptions(options);
-  if (ctIsStandaloneHtmlCompile(options, compile)) {
-    if (options.splitting === true) {
-      throw new TypeError("Cannot use compile with target 'browser' and splitting for standalone HTML");
-    }
-    options = { ...options, compile: undefined, compileToStandaloneHtml: true };
-    compile = null;
-  }
-  const sourcemap = options.sourcemap;
-  if (sourcemap != null && typeof sourcemap !== "boolean"
-      && !["none", "linked", "inline", "external"].includes(sourcemap)) {
-    throw new TypeError(`Invalid "sourcemap" value in Bun.build: ${String(sourcemap)}`);
-  }
-  if (options.plugins != null) {
-    if (!Array.isArray(options.plugins)) {
-      throw new TypeError("Expected plugins to be an array of objects");
-    }
-    for (const plugin of options.plugins) {
-      if (plugin === null || typeof plugin !== "object") {
-        throw new TypeError("Expected plugin to be an object");
-      }
-    }
-    return buildWithPlugins(options, options.plugins);
-  }
-
-  const state = {
-    onStart: [],
-    onEnd: [],
-    setupPromises: [],
-  };
-
-  if (compile) return ctRunCompiledBuild(options, compile, state);
-  return ctRunBuild(options, state);
-}
 
 function normalizeCommand(command, maybeArgs = undefined, maybeOptions = undefined) {
   return normalizeBunSpawnCommand(command, maybeArgs, maybeOptions);
@@ -4482,20 +1700,6 @@ function asBuffer(value) {
   if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
   if (globalThis.Buffer?.from) return globalThis.Buffer.from(value ?? "");
   return new TextEncoder().encode(String(value ?? ""));
-}
-
-// node/http.js's IncomingMessage pushes its buffered body from a queued
-// microtask; consumers that resume the stream in the same tick (body-parser's
-// raw-body) reach Readable's throwing default _read first. Give it the no-op
-// _read a push-style Readable needs. (Runtime patch: http.js is maintained
-// separately; this only adds the method when it is missing.)
-if (nodeHttp.IncomingMessage?.prototype &&
-    !Object.prototype.hasOwnProperty.call(nodeHttp.IncomingMessage.prototype, "_read")) {
-  Object.defineProperty(nodeHttp.IncomingMessage.prototype, "_read", {
-    value: function _read() {},
-    writable: true,
-    configurable: true,
-  });
 }
 
 // The host Blob lacks Bun's json()/formData() helpers and does not strip a
@@ -7639,13 +4843,17 @@ const reusableFetchHttpsAgents = new Map();
 const reusableCustomFetchHttpsAgents = new Map();
 const MAX_REUSABLE_CUSTOM_FETCH_HTTPS_AGENTS = 64;
 const proxyTunnelAgentSymbol = Symbol("cottontail.fetchProxyTunnelAgent");
-const reusableFetchHttpAgent = new nodeHttp.Agent({
-  keepAlive: true,
-  scheduling: "lifo",
-  timeout: 5000,
-  maxSockets: 16,
-  maxTotalSockets: 256,
-});
+let reusableFetchHttpAgent;
+
+function defaultFetchHttpAgent() {
+  return reusableFetchHttpAgent ??= new nodeHttp.Agent({
+    keepAlive: true,
+    scheduling: "lifo",
+    timeout: 5000,
+    maxSockets: 16,
+    maxTotalSockets: 256,
+  });
+}
 
 function defaultFetchHttpsAgent(tlsOptions, keepalive) {
   if (!keepalive) return new nodeHttps.Agent({ ...tlsOptions, keepAlive: false });
@@ -7784,7 +4992,7 @@ function dispatchNodeFetchRequest(request, redirected, transport, onResponse, ur
   let port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
   let path = `${url.pathname || "/"}${url.search || ""}`;
   const tlsOptions = fetchTlsOptions(url, transport.tlsConfig);
-  let agent = keepalive ? reusableFetchHttpAgent : false;
+  let agent = keepalive ? defaultFetchHttpAgent() : false;
   const proxyValue = transport.proxy?.explicit ?? transport.proxy?.environment;
   if (proxyValue) {
     const proxy = normalizedProxyUrl(proxyValue);
@@ -10952,7 +8160,7 @@ function encodeMaskedWebSocketFrame(opcode, data) {
 // a "nodebuffer" binaryType (the default), ping/pong events, and Blob
 // payload support. The base client lives in node/http.js; add the Bun
 // surface here.
-(function patchWebSocketClientForBun() {
+function patchWebSocketClientForBun() {
   const WS = globalThis.WebSocket;
   const proto = WS?.prototype;
   if (!proto || typeof proto.terminate === "function" || typeof proto._handleFrame !== "function") return;
@@ -11058,9 +8266,9 @@ function encodeMaskedWebSocketFrame(opcode, data) {
       source: this,
     }));
   };
-})();
+}
 
-(function installWebSocketMemoryAccounting() {
+function installWebSocketMemoryAccounting() {
   const proto = globalThis.WebSocket?.prototype;
   if (!proto || typeof proto.send !== "function" ||
       Object.getOwnPropertyDescriptor(proto, estimatedMemoryCostSymbol)) return;
@@ -11075,7 +8283,7 @@ function encodeMaskedWebSocketFrame(opcode, data) {
       return 256 + (this[webSocketSentBytesSymbol] ?? 0) + Math.max(0, Number(this.bufferedAmount) || 0);
     },
   });
-})();
+}
 
 function serveTlsMaterialText(value, name) {
   if (value == null) return null;
@@ -11230,7 +8438,7 @@ function requestFromNodeIncoming(message, protocol, fallbackHost, tunnelRequest 
     } else {
       const contentLength = Number(message.headers?.["content-length"] ?? 0);
       const hasStreamingBody = message.headers?.["transfer-encoding"] != null || contentLength > 0;
-      if (hasStreamingBody) request._body = trackServeReadableStream(NodeReadable.toWeb(message));
+      if (hasStreamingBody) request._body = trackServeReadableStream(loadNodeStreamModule().Readable.toWeb(message));
     }
   }
   return { request, controller };
@@ -12011,6 +9219,7 @@ export function serve(options) {
     bodyStateSymbol: activeServeRequestBodyStateSymbol,
     unreadBodyAbortReason: () => activeServeUnreadBodyAbortError,
     connectionClosedError: nativeConnectionClosedError,
+    createAbortController: () => new CottontailAbortController(),
   });
 
   const responseBody = (response) => {
@@ -13780,6 +10989,8 @@ const stripANSIControlPattern = /[\x1b\x90\x98\x9b-\x9f]/;
 
 export function stripANSI(value) {
   const text = String(value);
+  const nativeStrip = globalThis.cottontail?.stripANSINative;
+  if (typeof nativeStrip === "function") return nativeStrip(text);
   if (text.indexOf("\x1b") === -1 && text.indexOf("\x9b") === -1) {
     if (!stripANSIControlPattern.test(text)) return text;
   }
@@ -14767,7 +11978,9 @@ function assertReadableStreamThis(stream, method) {
 }
 
 function installReadableStreamConversionHelpers() {
-  const prototype = globalThis.ReadableStream?.prototype;
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "ReadableStream");
+  if (descriptor && typeof descriptor.get === "function" && !("value" in descriptor)) return;
+  const prototype = (descriptor && "value" in descriptor ? descriptor.value : globalThis.ReadableStream)?.prototype;
   if (!prototype) return;
   Object.defineProperties(prototype, {
     bytes: {
@@ -15017,12 +12230,12 @@ export function registerMacro(_name, _macro = undefined) {
   return undefined;
 }
 
-export const deflateSync = zlib.deflateSync;
-export const gzipSync = zlib.gzipSync;
-export const gunzipSync = zlib.gunzipSync;
-export const inflateSync = zlib.inflateSync;
-export const zstdCompressSync = zlib.zstdCompressSync;
-export const zstdDecompressSync = zlib.zstdDecompressSync;
+export const deflateSync = (...args) => zlib.deflateSync(...args);
+export const gzipSync = (...args) => zlib.gzipSync(...args);
+export const gunzipSync = (...args) => zlib.gunzipSync(...args);
+export const inflateSync = (...args) => zlib.inflateSync(...args);
+export const zstdCompressSync = (...args) => zlib.zstdCompressSync(...args);
+export const zstdDecompressSync = (...args) => zlib.zstdDecompressSync(...args);
 export function zstdCompress(data, options = undefined) {
   return Promise.resolve(zstdCompressSync(data, options));
 }
@@ -19196,6 +16409,27 @@ BunObject.zstdCompress = zstdCompress;
 BunObject.zstdCompressSync = zstdCompressSync;
 BunObject.zstdDecompress = zstdDecompress;
 BunObject.zstdDecompressSync = zstdDecompressSync;
+const bunRuntimeBridgeKey = Symbol.for("cottontail.internal.bunRuntimeBridge");
+if (globalThis[bunRuntimeBridgeKey] == null) {
+  Object.defineProperty(globalThis, bunRuntimeBridgeKey, {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: Object.freeze({
+      abiVersion: 1,
+      Bun: BunObject,
+      fetch,
+      FormData,
+      Headers,
+      HTMLRewriter,
+      Request,
+      Response,
+      serve,
+      stringWidth,
+      stripANSI,
+    }),
+  });
+}
 if (typeof globalThis.WebAssembly === "object" && typeof globalThis.WebAssembly.compileStreaming !== "function") {
   const invalidWasmStreamingSource = (source) => {
     let received;
@@ -19340,46 +16574,65 @@ if (globalThis.navigator == null) {
     hardwareConcurrency: Number(cottontail.cpuCount?.() ?? 1) || 1,
   };
 }
-const CryptoObject = globalThis.crypto ?? nodeWebcrypto;
-CryptoObject.randomUUID ??= randomUUID;
-// Bun's crypto.getRandomValues also accepts ArrayBuffer/SharedArrayBuffer and
-// has no 65536-byte quota; wrap the base implementation accordingly.
-CryptoObject.getRandomValues = function getRandomValuesCompat(view) {
-  let bytes;
-  if (view instanceof ArrayBuffer || (typeof SharedArrayBuffer === "function" && view instanceof SharedArrayBuffer)) {
-    bytes = new Uint8Array(view);
-  } else if (ArrayBuffer.isView(view)) {
-    bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-  } else {
-    throw new TypeError("crypto.getRandomValues requires an ArrayBuffer or ArrayBuffer view");
+const initialCryptoObject = globalThis.crypto;
+let initializedCryptoObject;
+function initializeCryptoGlobals() {
+  if (initializedCryptoObject !== undefined) return initializedCryptoObject;
+  const cryptoObject = initialCryptoObject ?? {};
+  // node:crypto adopts an existing global crypto object while it initializes.
+  // Publish the placeholder first to avoid re-entering this lazy accessor.
+  if (initialCryptoObject == null) {
+    Object.defineProperty(globalThis, "crypto", {
+      configurable: true,
+      enumerable: true,
+      value: cryptoObject,
+      writable: true,
+    });
   }
-  for (let offset = 0; offset < bytes.byteLength; offset += 65536) {
-    const chunk = Math.min(65536, bytes.byteLength - offset);
-    bytes.set(randomBytes(chunk), offset);
-  }
-  return view;
-};
-// crypto.subtle is a WebIDL readonly attribute: reads return the SubtleCrypto
-// instance and assignments are silently ignored (Node behaves the same so
-// polyfills that assign crypto.subtle keep working).
-{
-  const subtleInstance = CryptoObject.subtle ?? nodeWebcrypto.subtle;
-  Object.defineProperty(CryptoObject, "subtle", {
-    get() {
-      return subtleInstance;
-    },
+  const nodeCrypto = loadNodeCryptoModule();
+  cryptoObject.randomUUID ??= nodeCrypto.randomUUID;
+  // Bun accepts ArrayBuffer/SharedArrayBuffer and does not impose WebCrypto's
+  // 65536-byte quota on this convenience API.
+  cryptoObject.getRandomValues = function getRandomValuesCompat(view) {
+    let bytes;
+    if (view instanceof ArrayBuffer || (typeof SharedArrayBuffer === "function" && view instanceof SharedArrayBuffer)) {
+      bytes = new Uint8Array(view);
+    } else if (ArrayBuffer.isView(view)) {
+      bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+    } else {
+      throw new TypeError("crypto.getRandomValues requires an ArrayBuffer or ArrayBuffer view");
+    }
+    for (let offset = 0; offset < bytes.byteLength; offset += 65536) {
+      const chunk = Math.min(65536, bytes.byteLength - offset);
+      bytes.set(nodeCrypto.randomBytes(chunk), offset);
+    }
+    return view;
+  };
+  const subtleInstance = cryptoObject.subtle ?? nodeCrypto.webcrypto.subtle;
+  Object.defineProperty(cryptoObject, "subtle", {
+    get() { return subtleInstance; },
     set(_value) {},
     enumerable: true,
     configurable: true,
   });
+  initializedCryptoObject = cryptoObject;
+  return cryptoObject;
 }
-globalThis.crypto = CryptoObject;
-globalThis.Crypto ??= nodeWebcrypto.constructor;
-globalThis.CryptoKey ??= CryptoKey;
-globalThis.SubtleCrypto ??= NodeSubtleCrypto;
-// URLPattern (WHATWG URL Pattern spec) via the vendored urlpattern-polyfill.
-Object.defineProperty(CottontailURLPattern, "name", { value: "URLPattern", configurable: true });
-globalThis.URLPattern ??= CottontailURLPattern;
+if (initialCryptoObject == null) {
+  installLazyGlobal("crypto", initializeCryptoGlobals);
+} else {
+  globalThis.crypto = initializeCryptoGlobals();
+}
+installLazyGlobal("Crypto", () => loadNodeCryptoModule().webcrypto.constructor);
+installLazyGlobal("CryptoKey", () => loadNodeCryptoModule().CryptoKey);
+installLazyGlobal("SubtleCrypto", () => loadNodeCryptoModule().SubtleCrypto);
+// URLPattern is uncommon and the polyfill is sizeable, so materialize it on
+// first observation while preserving the ordinary writable global afterward.
+installLazyGlobal("URLPattern", () => {
+  const { URLPattern } = loadEmbeddedRuntimeModule("vendor/urlpattern.js");
+  Object.defineProperty(URLPattern, "name", { value: "URLPattern", configurable: true });
+  return URLPattern;
+});
 globalThis.DOMException ??= CottontailDOMException;
 activeServeUnreadBodyAbortError = new globalThis.DOMException("The operation was aborted.", "AbortError");
 globalThis.Event ??= CottontailEvent;
@@ -20481,25 +17734,20 @@ globalThis.MessageEvent ??= CottontailMessageEvent;
   globalThis.PerformanceTiming ??= PerformanceTiming;
 }
 
-// The WebSocket client in node/http.js is backed by EventEmitter, and
-// EventEmitter.emit("error", ...) throws when no "error" listeners exist. A
-// browser-style dispatchEvent must never throw for unhandled error events
-// (e.g. connection refused with only ws.onerror set). Remove this wrapper
-// once node/http.js's dispatchEvent guards the unhandled "error" emit itself.
-{
-  const wsPrototype = nodeHttp.WebSocket?.prototype;
-  const originalDispatch = wsPrototype?.dispatchEvent;
-  if (typeof originalDispatch === "function" && !originalDispatch.__cottontailSafeErrorDispatch) {
-    const dispatchEvent = function dispatchEvent(event) {
-      try {
-        return originalDispatch.call(this, event);
-      } catch (error) {
-        if (event?.type === "error") return true;
-        throw error;
+const webSocketDescriptor = Object.getOwnPropertyDescriptor(globalThis, "WebSocket");
+if (!webSocketDescriptor || typeof webSocketDescriptor.value !== "function") {
+  if (!webSocketDescriptor || webSocketDescriptor.configurable) {
+    if (webSocketDescriptor) delete globalThis.WebSocket;
+    installLazyGlobal("WebSocket", () => {
+      const WebSocket = initializeNodeHttp().WebSocket;
+      if (typeof WebSocket !== "function") {
+        throw new TypeError("node:http did not expose WebSocket");
       }
-    };
-    Object.defineProperty(dispatchEvent, "__cottontailSafeErrorDispatch", { value: true });
-    wsPrototype.dispatchEvent = dispatchEvent;
+      return WebSocket;
+    }, () => {
+      patchWebSocketClientForBun();
+      installWebSocketMemoryAccounting();
+    });
   }
 }
 // ffi.js installs the same public File contract early enough for node:buffer
@@ -20578,24 +17826,28 @@ if (typeof globalThis.TextEncoder === "function" && typeof globalThis.TextEncode
     writable: true,
   });
 }
-const undiciBuiltin = createUndiciModule({
-  fetch,
-  Response,
-  Request,
-  Headers,
-  FormData,
-  File: globalThis.File,
-  Blob: globalThis.Blob,
-  URL,
-  URLSearchParams,
-  AbortSignal: globalThis.AbortSignal,
-  AbortController: globalThis.AbortController,
-  WebSocket: globalThis.WebSocket ?? nodeHttp.WebSocket,
-  CloseEvent: globalThis.CloseEvent,
-  ErrorEvent: globalThis.ErrorEvent,
-  MessageEvent: globalThis.MessageEvent,
-  EventTarget: globalThis.EventTarget,
+const loadUndiciBuiltin = createLazyModule("node:undici", () => {
+  const { createUndiciModule } = loadEmbeddedRuntimeModule("node/undici.js");
+  return createUndiciModule({
+    fetch,
+    Response,
+    Request,
+    Headers,
+    FormData,
+    File: globalThis.File,
+    Blob: globalThis.Blob,
+    URL,
+    URLSearchParams,
+    AbortSignal: globalThis.AbortSignal,
+    AbortController: globalThis.AbortController,
+    WebSocket: globalThis.WebSocket,
+    CloseEvent: globalThis.CloseEvent,
+    ErrorEvent: globalThis.ErrorEvent,
+    MessageEvent: globalThis.MessageEvent,
+    EventTarget: globalThis.EventTarget,
+  });
 });
+const undiciBuiltin = createLazyBuiltin(loadUndiciBuiltin);
 nodeSetBuiltinModules({
   bun: BunObject,
   "bun:test": bunTestBuiltin,

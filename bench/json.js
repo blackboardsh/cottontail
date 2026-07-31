@@ -14,10 +14,11 @@ for (let i = 0; i < 4000; i += 1) {
   });
 }
 
-const start = cottontail.nanotime();
+const nanotime = globalThis.cottontail?.nanotime ?? process.hrtime.bigint;
+const start = nanotime();
 const encoded = JSON.stringify(rows);
 const decoded = JSON.parse(encoded);
-const elapsedNs = cottontail.nanotime() - start;
+const elapsedNs = nanotime() - start;
 
 if (decoded.length !== rows.length) {
   throw new Error("json benchmark roundtrip failed");

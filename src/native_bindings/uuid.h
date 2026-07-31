@@ -21,6 +21,11 @@ void ct_uuid_v5_utf16(
     CtUuidUtf16Slice name,
     uint8_t output[16]
 );
+void ct_uuid_v5_latin1(
+    CtUuidSlice namespace_bytes,
+    CtUuidSlice name,
+    uint8_t output[16]
+);
 size_t ct_uuid_format(uint8_t encoding, const uint8_t uuid[16], uint8_t output[36]);
 
 #endif

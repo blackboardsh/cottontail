@@ -3991,7 +3991,8 @@ function isWebSocketTlsHandshakeError(error) {
     /(?:certificate|self[- ]signed|tls handshake|ssl routines|unknown ca)/i.test(message);
 }
 
-export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEmitter {
+const existingWebSocket = Object.getOwnPropertyDescriptor(globalThis, "WebSocket")?.value;
+export const WebSocket = typeof existingWebSocket === "function" ? existingWebSocket : class WebSocket extends EventEmitter {
   static CONNECTING = 0;
   static OPEN = 1;
   static CLOSING = 2;
@@ -4653,8 +4654,9 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
   }
 };
 
-// Bun exposes the WebSocket client as a global.
-globalThis.WebSocket ??= WebSocket;
+// Bun exposes the WebSocket client as a global. A lazy Bun bootstrap may have
+// installed an accessor which is currently resolving this module.
+if (!Object.hasOwn(globalThis, "WebSocket")) globalThis.WebSocket = WebSocket;
 
 const httpDefault = {
   Agent,

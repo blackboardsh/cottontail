@@ -116,6 +116,17 @@ pub export fn ct_uuid_v5_utf16(
     finishV5(&hasher, output);
 }
 
+pub export fn ct_uuid_v5_latin1(
+    namespace_bytes: Slice,
+    name: Slice,
+    output: *[16]u8,
+) void {
+    var hasher = std.crypto.hash.Sha1.init(.{});
+    hasher.update(namespace_bytes.bytes());
+    hashLatin1AsUtf8(&hasher, name.bytes());
+    finishV5(&hasher, output);
+}
+
 fn finishV5(hasher: *std.crypto.hash.Sha1, output: *[16]u8) void {
     var digest: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
     hasher.final(&digest);
@@ -152,6 +163,26 @@ fn hashUtf16AsUtf8(hasher: *std.crypto.hash.Sha1, units: []const u16) void {
         used += std.unicode.utf8Encode(code_point, chunk[used..]) catch unreachable;
     }
 
+    if (used > 0) hasher.update(chunk[0..used]);
+}
+
+fn hashLatin1AsUtf8(hasher: *std.crypto.hash.Sha1, bytes: []const u8) void {
+    var chunk: [512]u8 = undefined;
+    var used: usize = 0;
+    for (bytes) |byte| {
+        if (used + 2 > chunk.len) {
+            hasher.update(chunk[0..used]);
+            used = 0;
+        }
+        if (byte < 0x80) {
+            chunk[used] = byte;
+            used += 1;
+        } else {
+            chunk[used] = 0xc0 | (byte >> 6);
+            chunk[used + 1] = 0x80 | (byte & 0x3f);
+            used += 2;
+        }
+    }
     if (used > 0) hasher.update(chunk[0..used]);
 }
 

@@ -2,7 +2,6 @@ import path from "../node/path.js";
 import { readFileSync, readdirSync, statSync, writeFileSync } from "../node/fs.js";
 import { pathToFileURL } from "../node/url.js";
 import { __setBuiltinModules } from "../node/module.js";
-import { Bun, HTMLRewriter, Response as RuntimeResponse, serve } from "./index.js";
 import bundledReactRefreshSource from "./bake-react-refresh.txt";
 import {
   bakeGraphAttributeFiles,
@@ -31,6 +30,10 @@ import {
   normalizeBakeClientSourceMap,
   registerBakeServerPatch,
 } from "./bake-source-map.js";
+
+const bunRuntime = globalThis[Symbol.for("cottontail.internal.bunRuntimeBridge")];
+if (bunRuntime?.abiVersion !== 1) throw new Error("Cottontail Bun runtime bridge ABI mismatch");
+const { Bun, HTMLRewriter, Response: RuntimeResponse, serve } = bunRuntime;
 
 let responseOptionsAsyncLocalStorage = null;
 let BakeResponse = null;

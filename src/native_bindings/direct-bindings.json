@@ -1,0 +1,127 @@
+[
+  {
+    "name": "bufferCompare",
+    "arity": 6,
+    "callback": "ct_direct_buffer_compare"
+  },
+  {
+    "name": "bufferIndexOf",
+    "arity": 4,
+    "callback": "ct_direct_buffer_index_of"
+  },
+  {
+    "name": "bufferIndexOfLine",
+    "arity": 3,
+    "callback": "ct_direct_buffer_index_of_line"
+  },
+  {
+    "name": "bufferFillPattern",
+    "arity": 4,
+    "callback": "ct_direct_buffer_fill_pattern"
+  },
+  {
+    "name": "websocketFrameEncode",
+    "arity": 5,
+    "callback": "ct_direct_websocket_frame_encode"
+  },
+  {
+    "name": "websocketUnmaskCopy",
+    "arity": 2,
+    "callback": "ct_direct_websocket_unmask_copy"
+  },
+  {
+    "name": "whichPathNative",
+    "arity": 5,
+    "callback": "ct_direct_which_path_native"
+  },
+  {
+    "name": "pathNormalizeNative",
+    "arity": 2,
+    "callback": "ct_direct_path_normalize_native"
+  },
+  {
+    "name": "mimeTypeByExtension",
+    "arity": 1,
+    "callback": "ct_direct_mime_type_by_extension"
+  },
+  {
+    "name": "textEncodingLookup",
+    "arity": 1,
+    "callback": "ct_direct_text_encoding_lookup"
+  },
+  {
+    "name": "textDecode",
+    "arity": 4,
+    "callback": "ct_direct_text_decode"
+  },
+  {
+    "name": "textEncode",
+    "arity": 1,
+    "callback": "ct_direct_text_encode"
+  },
+  {
+    "name": "globCompileNative",
+    "arity": 1,
+    "callback": "ct_direct_glob_compile"
+  },
+  {
+    "name": "stripANSINative",
+    "arity": 1,
+    "callback": "ct_direct_strip_ansi"
+  },
+  {
+    "name": "stringWidthNative",
+    "arity": 3,
+    "callback": "ct_direct_string_width_native"
+  },
+  {
+    "name": "randomUUIDv7Native",
+    "arity": 2,
+    "callback": "ct_direct_random_uuid_v7_native"
+  },
+  {
+    "name": "randomUUIDv5Native",
+    "arity": 3,
+    "callback": "ct_direct_random_uuid_v5_native"
+  },
+  {
+    "name": "cryptoHasherCreate",
+    "arity": 2,
+    "callback": "ct_direct_crypto_hasher_create"
+  },
+  {
+    "name": "cryptoHasherUpdate",
+    "arity": 2,
+    "callback": "ct_direct_crypto_hasher_update"
+  },
+  {
+    "name": "cryptoHasherCopy",
+    "arity": 1,
+    "callback": "ct_direct_crypto_hasher_copy"
+  },
+  {
+    "name": "cryptoHasherDigest",
+    "arity": 3,
+    "callback": "ct_direct_crypto_hasher_digest"
+  },
+  {
+    "name": "moduleResolveCacheGet",
+    "arity": 4,
+    "callback": "ct_direct_module_resolve_cache_get"
+  },
+  {
+    "name": "moduleResolveCachePut",
+    "arity": 5,
+    "callback": "ct_direct_module_resolve_cache_put"
+  },
+  {
+    "name": "moduleResolveCacheClear",
+    "arity": 0,
+    "callback": "ct_direct_module_resolve_cache_clear"
+  },
+  {
+    "name": "runtimeModuleSourceNative",
+    "arity": 1,
+    "callback": "ct_direct_runtime_module_source"
+  }
+]

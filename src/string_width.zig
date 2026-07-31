@@ -23,6 +23,35 @@ pub export fn ct_string_width_utf16(
     return @intCast(width);
 }
 
+pub export fn ct_string_width_latin1(
+    ptr: [*]const u8,
+    len: usize,
+    exclude_ansi: bool,
+    ambiguous_as_wide: bool,
+) isize {
+    const input = ptr[0..len];
+    if (ambiguous_as_wide or !supportsLatin1CompilerWidthSemantics(input, exclude_ansi)) {
+        return -1;
+    }
+    const width = if (exclude_ansi)
+        compiler.strings.visible.width.exclude_ansi_colors.latin1(input)
+    else
+        compiler.strings.visible.width.latin1(input);
+    return @intCast(width);
+}
+
+fn supportsLatin1CompilerWidthSemantics(input: []const u8, exclude_ansi: bool) bool {
+    var saw_escape = false;
+    for (input) |byte| {
+        if (byte == 0x1b) {
+            saw_escape = true;
+        } else if (exclude_ansi and saw_escape and byte >= 0x80) {
+            return false;
+        }
+    }
+    return true;
+}
+
 fn supportsCompilerWidthSemantics(
     input: []const u16,
     exclude_ansi: bool,
@@ -61,4 +90,5 @@ test "native string width delegates to the compiler Unicode implementation" {
     try expectEqual(@as(isize, 5), ct_string_width_utf16(&hello, hello.len, true, false));
     try expectEqual(@as(isize, 0), ct_string_width_utf16(&ansi, ansi.len, true, false));
     try expectEqual(@as(isize, 4), ct_string_width_utf16(&ansi, ansi.len, false, false));
+    try expectEqual(@as(isize, 5), ct_string_width_latin1("hello", 5, true, false));
 }

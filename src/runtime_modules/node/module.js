@@ -2,59 +2,9 @@ import { basename, dirname, isAbsolute, join, resolve } from "./path.js";
 import { fileURLToPath, pathToFileURL } from "./url.js";
 import { parse as parseTOML } from "../bun/toml.js";
 import { openRuntimeTranspilerCache } from "../internal/runtime-transpiler-cache.js";
-import * as assert from "./assert.js";
-import * as assertStrict from "./assert/strict.js";
-import * as asyncHooks from "./async_hooks.js";
-import * as buffer from "./buffer.js";
-import * as childProcess from "./child_process.js";
-import * as consoleModule from "./console.js";
-import nodeConstants from "./constants.js";
-import * as crypto from "./crypto.js";
-import * as diagnosticsChannel from "./diagnostics_channel.js";
-import * as dns from "./dns.js";
-import * as dnsPromises from "./dns/promises.js";
-import * as domain from "./domain.js";
-import * as events from "./events.js";
-import * as fs from "./fs.js";
-import * as fsPromises from "./fs/promises.js";
-import * as http from "./http.js";
-import * as https from "./https.js";
-import * as internalAssertMyersDiff from "./internal/assert/myers_diff.js";
-import * as internalAsyncHooks from "./internal/async_hooks.js";
-import * as internalEventTarget from "./internal/event_target.js";
-import { createHttpCommonBuiltin } from "./internal/http_common.js";
-import { assertFsRead, assertFsWrite } from "./internal/permissions.js";
-import * as internalTestBinding from "./internal/test/binding.js";
-import * as net from "./net.js";
-import * as os from "./os.js";
 import * as path from "./path.js";
-import * as pathPosix from "./path/posix.js";
-import * as pathWin32 from "./path/win32.js";
-import * as perfHooks from "./perf_hooks.js";
-import * as processModule from "./process.js";
-import * as punycode from "./punycode.js";
-import * as querystring from "./querystring.js";
-import * as stream from "./stream.js";
-import * as streamConsumers from "./stream/consumers.js";
-import * as streamPromises from "./stream/promises.js";
-import * as streamWeb from "./stream/web.js";
-import * as stringDecoder from "./string_decoder.js";
-import * as sys from "./sys.js";
-import * as timers from "./timers.js";
-import * as timersPromises from "./timers/promises.js";
-import * as tls from "./tls.js";
-import * as tty from "./tty.js";
 import * as url from "./url.js";
-import * as util from "./util.js";
-import * as utilTypes from "./util/types.js";
-import * as vm from "./vm.js";
-import * as zlib from "./zlib.js";
 
-// Heavy builtins that no startup path touches are pulled in through lazy
-// require() thunks instead of static imports. The native compiler still bundles the
-// modules (require of an internal path becomes a synchronous init call), but
-// their top-level code no longer executes during process startup, which
-// matters because every spawned cottontail process re-evaluates this graph.
 const kLazyBuiltin = Symbol.for("cottontail.lazyBuiltin");
 function lazyBuiltin(load) {
   let cached;
@@ -72,61 +22,112 @@ function lazyBuiltin(load) {
 function unwrapBuiltin(value) {
   return typeof value === "function" && value[kLazyBuiltin] === true ? value() : value;
 }
-const cluster = lazyBuiltin(() => require("./cluster.js"));
-const dgram = lazyBuiltin(() => require("./dgram.js"));
-const http2 = lazyBuiltin(() => require("./http2.js"));
-const inspector = lazyBuiltin(() => require("./inspector.js"));
-const inspectorPromises = lazyBuiltin(() => require("./inspector/promises.js"));
-const readline = lazyBuiltin(() => require("./readline.js"));
-const readlinePromises = lazyBuiltin(() => require("./readline/promises.js"));
-const repl = lazyBuiltin(() => require("./repl.js"));
-const sea = lazyBuiltin(() => require("./sea.js"));
-const sqlite = lazyBuiltin(() => require("./sqlite.js"));
+
+// Runtime builtins stay embedded in the executable, while their source and
+// bytecode stay outside the startup graph. The module loader retrieves and
+// compiles a source on first use, preserving synchronous require() semantics.
+const assert = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/assert.js"));
+const assertStrict = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/assert/strict.js"));
+const asyncHooks = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/async_hooks.js"));
+const buffer = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/buffer.js"));
+const childProcess = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/child_process.js"));
+const consoleModule = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/console.js"));
+const nodeConstants = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/constants.js"));
+const crypto = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/crypto.js"));
+const diagnosticsChannel = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/diagnostics_channel.js"));
+const dns = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/dns.js"));
+const dnsPromises = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/dns/promises.js"));
+const domain = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/domain.js"));
+const events = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/events.js"));
+const fs = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/fs.js"));
+const fsPromises = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/fs/promises.js"));
+const http = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/http.js"));
+const https = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/https.js"));
+const internalAssertMyersDiff = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/internal/assert/myers_diff.js"));
+const internalAsyncHooks = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/internal/async_hooks.js"));
+const internalEventTarget = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/internal/event_target.js"));
+const httpCommon = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/internal/http_common.js"));
+const permissions = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/internal/permissions.js"));
+const internalTestBinding = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/internal/test/binding.js"));
+const net = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/net.js"));
+const os = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/os.js"));
+const perfHooks = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/perf_hooks.js"));
+const processModule = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/process.js"));
+const punycode = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/punycode.js"));
+const querystring = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/querystring.js"));
+const stream = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/stream.js"));
+const streamConsumers = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/stream/consumers.js"));
+const streamPromises = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/stream/promises.js"));
+const streamWeb = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/stream/web.js"));
+const stringDecoder = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/string_decoder.js"));
+const sys = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/sys.js"));
+const timers = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/timers.js"));
+const timersPromises = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/timers/promises.js"));
+const tls = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/tls.js"));
+const tty = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/tty.js"));
+const util = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/util.js"));
+const utilTypes = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/util/types.js"));
+const vm = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/vm.js"));
+const zlib = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/zlib.js"));
+const bunWrap = lazyBuiltin(() => loadEmbeddedRuntimeModule("bun/wrap.js"));
+
+const assertFsRead = (...args) => unwrapBuiltin(permissions).assertFsRead(...args);
+const assertFsWrite = (...args) => unwrapBuiltin(permissions).assertFsWrite(...args);
+const cluster = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/cluster.js"));
+const dgram = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/dgram.js"));
+const http2 = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/http2.js"));
+const inspector = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/inspector.js"));
+const inspectorPromises = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/inspector/promises.js"));
+const readline = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/readline.js"));
+const readlinePromises = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/readline/promises.js"));
+const repl = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/repl.js"));
+const sea = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/sea.js"));
+const sqlite = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/sqlite.js"));
 const nodeTestBuiltin = lazyBuiltin(() => {
-  const namespace = require("./test.js");
+  const namespace = loadEmbeddedRuntimeModule("node/test.js");
   return namespace.default ?? namespace;
 });
-const testReporters = lazyBuiltin(() => require("./test/reporters.js"));
-const traceEvents = lazyBuiltin(() => require("./trace_events.js"));
-const v8 = lazyBuiltin(() => require("./v8.js"));
-const wasi = lazyBuiltin(() => require("./wasi.js"));
-const workerThreads = lazyBuiltin(() => require("./worker_threads.js"));
+const testReporters = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/test/reporters.js"));
+const traceEvents = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/trace_events.js"));
+const v8 = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/v8.js"));
+const wasi = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/wasi.js"));
+const workerThreads = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/worker_threads.js"));
 
 const runtimePackageReplacements = new Map([
   ["abort-controller", lazyBuiltin(() => {
-    const namespace = require("../vendor/abort-controller.js");
+    const namespace = loadEmbeddedRuntimeModule("vendor/abort-controller.js");
     return namespace.default ?? namespace;
   })],
   ["node-fetch", lazyBuiltin(() => {
-    const namespace = require("../bun/node-fetch.js");
+    const namespace = loadEmbeddedRuntimeModule("bun/node-fetch.js");
     return namespace.default ?? namespace;
   })],
   ["next/dist/compiled/node-fetch", lazyBuiltin(() => {
-    const namespace = require("../bun/node-fetch.js");
+    const namespace = loadEmbeddedRuntimeModule("bun/node-fetch.js");
     return namespace.default ?? namespace;
   })],
   ["isomorphic-fetch", lazyBuiltin(() => {
-    const namespace = require("../vendor/isomorphic-fetch.js");
+    const namespace = loadEmbeddedRuntimeModule("vendor/isomorphic-fetch.js");
     return namespace.default ?? namespace;
   })],
   ["@vercel/fetch", lazyBuiltin(() => {
-    const namespace = require("../vendor/vercel-fetch.js");
+    const namespace = loadEmbeddedRuntimeModule("vendor/vercel-fetch.js");
     return namespace.default ?? namespace;
   })],
   ["utf-8-validate", lazyBuiltin(() => {
-    const namespace = require("../bun/utf-8-validate.js");
+    const namespace = loadEmbeddedRuntimeModule("bun/utf-8-validate.js");
     return namespace.default ?? namespace;
   })],
   ["ws", lazyBuiltin(() => {
-    const namespace = require("../vendor/ws.js");
+    const namespace = loadEmbeddedRuntimeModule("vendor/ws.js");
     return namespace.default ?? namespace;
   })],
   ["ws/lib/websocket", lazyBuiltin(() => {
-    const namespace = require("../vendor/ws.js");
+    const namespace = loadEmbeddedRuntimeModule("vendor/ws.js");
     return namespace.default ?? namespace;
   })],
   ["next/dist/compiled/ws", lazyBuiltin(() => {
-    const namespace = require("../vendor/ws.js");
+    const namespace = loadEmbeddedRuntimeModule("vendor/ws.js");
     return namespace.default ?? namespace;
   })],
 ]);
@@ -240,6 +241,9 @@ const moduleParentKey = Symbol("cottontail.moduleParent");
 const runtimeEsmSourceModuleKey = Symbol("cottontail.runtimeEsmSourceModule");
 const hookResolvedFormats = new Map();
 const sourceMapCache = new Map();
+const nativeModuleResolveCacheGet = cottontail.moduleResolveCacheGet;
+const nativeModuleResolveCachePut = cottontail.moduleResolveCachePut;
+const nativeModuleResolveCacheClear = cottontail.moduleResolveCacheClear;
 let nextModuleHookId = 0;
 let mainModule = null;
 let moduleParentWarningEmitted = false;
@@ -268,7 +272,7 @@ hotReloadHooks.add(() => {
   builtinModuleMap.clear();
   builtinNamespaceEntries.clear();
   builtinImportNamespaces.clear();
-  for (const key of Object.keys(modulePathCache)) delete modulePathCache[key];
+  clearModulePathCache();
   moduleHooks.length = 0;
   hookResolvedFormats.clear();
   sourceMapCache.clear();
@@ -988,14 +992,15 @@ export function __setBuiltinModules(modules) {
     configurable: true,
   });
   for (let [name, value] of Object.entries(modules || {})) {
-    if (name.replace(/^node:/, "") === "buffer") installMutableBufferMaxLength(value);
+    const isLazy = typeof value === "function" && value[kLazyBuiltin] === true;
+    if (!isLazy && name.replace(/^node:/, "") === "buffer") installMutableBufferMaxLength(value);
     let isNamespace = value != null &&
       (typeof value === "object" || typeof value === "function") &&
       Object.hasOwn(value, "default");
     let importNamespace;
     const canonicalName = name.replace(/^node:/, "");
     const additionalNamedExports = kBuiltinSharedSyntheticNamespaceExports.get(canonicalName);
-    if (additionalNamedExports !== undefined) {
+    if (!isLazy && additionalNamedExports !== undefined) {
       if (isNamespace) {
         importNamespace = value;
       } else {
@@ -1008,7 +1013,7 @@ export function __setBuiltinModules(modules) {
         importNamespace ??= namespaceFromCommonJs(value, false, additionalNamedExports);
       }
     }
-    if (kUnwrapDefaultBuiltins.has(name) && value && typeof value === "object" && value.default) {
+    if (!isLazy && kUnwrapDefaultBuiltins.has(name) && value && typeof value === "object" && value.default) {
       value = value.default;
       isNamespace = false;
     }
@@ -1088,20 +1093,81 @@ function standaloneDirectoryExists(path) {
   return false;
 }
 
+const embeddedRuntimeDirectoryName = ".cottontail-embedded-runtime";
+const embeddedRuntimeSourceCache = new Map();
+const embeddedRuntimePreloadedModules = new Map();
+
+function embeddedRuntimeRelativePath(path) {
+  const text = String(path).replace(/\\/g, "/");
+  const marker = `/${embeddedRuntimeDirectoryName}/`;
+  const markerIndex = text.indexOf(marker);
+  if (markerIndex < 0) return null;
+  return text.slice(markerIndex + marker.length);
+}
+
+function embeddedRuntimeSourceEntry(path) {
+  const relativePath = embeddedRuntimeRelativePath(path);
+  if (relativePath == null) return { found: false, value: undefined };
+  if (embeddedRuntimeSourceCache.has(relativePath)) {
+    const value = embeddedRuntimeSourceCache.get(relativePath);
+    return { found: value !== undefined, value };
+  }
+
+  const overrideRoot = globalThis.process?.env?.COTTONTAIL_RUNTIME_MODULES_DIR;
+  if (typeof overrideRoot === "string" && overrideRoot.length > 0) {
+    const overridePath = join(overrideRoot, ...relativePath.split("/"));
+    try {
+      if (cottontail.existsSync(overridePath)) {
+        const source = cottontail.readFile(overridePath);
+        embeddedRuntimeSourceCache.set(relativePath, source);
+        return { found: true, value: source };
+      }
+    } catch {}
+  }
+
+  const source = cottontail.runtimeModuleSourceNative(relativePath);
+  embeddedRuntimeSourceCache.set(relativePath, source);
+  return { found: source !== undefined, value: source };
+}
+
+function embeddedRuntimePath(relativePath) {
+  const root = cottontail.platform() === "win32" ? "C:\\" : "/";
+  return resolve(root, embeddedRuntimeDirectoryName, ...String(relativePath).split("/"));
+}
+
+export function loadEmbeddedRuntimeModule(relativePath) {
+  const normalized = String(relativePath).replace(/\\/g, "/").replace(/^\/+/, "");
+  if (embeddedRuntimePreloadedModules.has(normalized)) {
+    return embeddedRuntimePreloadedModules.get(normalized);
+  }
+  return loadCommonJsModule(embeddedRuntimePath(relativePath));
+}
+
+export function registerEmbeddedRuntimeModules(modules) {
+  if (modules == null || typeof modules !== "object") return;
+  for (const [relativePath, namespace] of Object.entries(modules)) {
+    embeddedRuntimePreloadedModules.set(
+      String(relativePath).replace(/\\/g, "/").replace(/^\/+/, ""),
+      namespace,
+    );
+  }
+}
+
 function readModuleFile(path) {
   const embedded = standaloneFileEntry(path);
-  if (!embedded.found) {
+  const runtimeEmbedded = embedded.found ? embedded : embeddedRuntimeSourceEntry(path);
+  if (!runtimeEmbedded.found) {
     assertFsRead(String(path));
     return cottontail.readFile(path);
   }
-  if (typeof embedded.value === "string") return embedded.value;
-  if (embedded.value instanceof ArrayBuffer) return new TextDecoder().decode(embedded.value);
-  if (ArrayBuffer.isView(embedded.value)) {
+  if (typeof runtimeEmbedded.value === "string") return runtimeEmbedded.value;
+  if (runtimeEmbedded.value instanceof ArrayBuffer) return new TextDecoder().decode(runtimeEmbedded.value);
+  if (ArrayBuffer.isView(runtimeEmbedded.value)) {
     return new TextDecoder().decode(
-      new Uint8Array(embedded.value.buffer, embedded.value.byteOffset, embedded.value.byteLength),
+      new Uint8Array(runtimeEmbedded.value.buffer, runtimeEmbedded.value.byteOffset, runtimeEmbedded.value.byteLength),
     );
   }
-  return String(embedded.value);
+  return String(runtimeEmbedded.value);
 }
 
 function standaloneFileBytes(value) {
@@ -1114,7 +1180,7 @@ function standaloneFileBytes(value) {
 }
 
 function modulePathExists(path) {
-  if (standaloneFileEntry(path).found || standaloneDirectoryExists(path)) return true;
+  if (standaloneFileEntry(path).found || standaloneDirectoryExists(path) || embeddedRuntimeSourceEntry(path).found) return true;
   try {
     return cottontail.existsSync(String(path));
   } catch {
@@ -1124,6 +1190,9 @@ function modulePathExists(path) {
 
 function stat(path) {
   if (standaloneFileEntry(path).found) {
+    return { isFile: true, isDirectory: false, isSymbolicLink: false };
+  }
+  if (embeddedRuntimeSourceEntry(path).found) {
     return { isFile: true, isDirectory: false, isSymbolicLink: false };
   }
   if (standaloneDirectoryExists(path)) {
@@ -1303,7 +1372,7 @@ function packageDirectoryExists(candidate) {
 }
 
 function nodePathEntries() {
-  const value = globalThis.process?.env?.NODE_PATH ?? processModule.env?.NODE_PATH;
+  const value = currentProcessBuiltin().env?.NODE_PATH;
   const delimiter = path.delimiter || (globalThis.process?.platform === "win32" ? ";" : ":");
   const dynamicEntries = typeof value === "string"
     ? value.split(delimiter).filter(Boolean).map((entry) => resolve(entry))
@@ -1448,9 +1517,24 @@ function packageTargetResult(status, path = "", trailingSlash = false) {
   return { status, path, trailingSlash };
 }
 
+let cachedCustomResolverConditions;
+let cachedCustomResolverConditionsKey;
+let cachedCustomResolverArguments;
+
 function customResolverConditions() {
+  const args = currentProcessBuiltin().execArgv ?? [];
+  if (cachedCustomResolverArguments?.length === args.length) {
+    let unchanged = true;
+    for (let index = 0; index < args.length; index += 1) {
+      if (cachedCustomResolverArguments[index] !== args[index]) {
+        unchanged = false;
+        break;
+      }
+    }
+    if (unchanged) return cachedCustomResolverConditions;
+  }
+
   const conditions = [];
-  const args = globalThis.process?.execArgv ?? processModule.execArgv ?? [];
   for (let index = 0; index < args.length; index += 1) {
     const arg = String(args[index]);
     let value;
@@ -1461,7 +1545,15 @@ function customResolverConditions() {
       if (condition) conditions.push(condition);
     }
   }
-  return conditions;
+  cachedCustomResolverArguments = Array.from(args);
+  cachedCustomResolverConditions = conditions;
+  cachedCustomResolverConditionsKey = conditions.join("\0");
+  return cachedCustomResolverConditions;
+}
+
+function customResolverConditionsKey() {
+  if (cachedCustomResolverConditionsKey === undefined) customResolverConditions();
+  return cachedCustomResolverConditionsKey;
 }
 
 function resolverConditions(kind) {
@@ -1529,7 +1621,7 @@ function resolvePackageTarget(target, subpath, conditions, internal, pattern) {
       if (internal && !target.startsWith("../") && !target.startsWith("/")) {
         const packagePath = pattern
           ? target.replace(/\*/g, subpath)
-          : pathPosix.join(target, subpath);
+          : path.posix.join(target, subpath);
         return packageTargetResult(packageTargetStatus.packageResolve, packagePath);
       }
       return packageTargetResult(packageTargetStatus.invalidPackageTarget, target);
@@ -1539,7 +1631,7 @@ function resolvePackageTarget(target, subpath, conditions, internal, pattern) {
       return packageTargetResult(packageTargetStatus.invalidPackageTarget, target);
     }
 
-    const resolvedTarget = pathPosix.join("/", target);
+    const resolvedTarget = path.posix.join("/", target);
     if (findInvalidPackageSegment(resolvedTarget) != null) {
       return packageTargetResult(packageTargetStatus.invalidModuleSpecifier, target);
     }
@@ -1549,9 +1641,9 @@ function resolvePackageTarget(target, subpath, conditions, internal, pattern) {
       return packageTargetResult(packageTargetStatus.exact, path, /[\\/]$/.test(path));
     }
 
-    const path = pathPosix.join(resolvedTarget, subpath);
+    const resolvedPath = path.posix.join(resolvedTarget, subpath);
     const trailingSlash = /[\\/]$/.test(subpath || target);
-    return packageTargetResult(packageTargetStatus.exact, path, trailingSlash);
+    return packageTargetResult(packageTargetStatus.exact, resolvedPath, trailingSlash);
   }
 
   if (target === null) return packageTargetResult(packageTargetStatus.null);
@@ -2125,12 +2217,21 @@ function resolveRequest(request, basePath, useHooks = true, kind = "require") {
     return text;
   }
   if (!useHooks || !moduleHooks.some((hook) => typeof hook.resolve === "function")) {
-    const startDir = resolutionStartDir(basePath);
-    const cacheKey = `${kind}\0${customResolverConditions().join("\0")}\0${String(request)}\0${startDir}`;
-    if (Object.prototype.hasOwnProperty.call(modulePathCache, cacheKey)) return modulePathCache[cacheKey];
-    const resolved = resolveRequestCore(request, basePath, kind);
+    const requestText = String(request);
+    const baseText = String(basePath || cottontail.cwd());
+    const conditionKey = customResolverConditionsKey();
+    const importKind = kind === "import";
+    const nativeCached = nativeModuleResolveCacheGet(requestText, baseText, importKind, conditionKey);
+    if (nativeCached !== undefined) return nativeCached;
+
+    const startDir = resolutionStartDir(baseText);
+    const cacheKey = `${kind}\0${conditionKey}\0${requestText}\0${startDir}`;
+    if (Object.prototype.hasOwnProperty.call(modulePathCache, cacheKey)) {
+      return nativeModuleResolveCachePut(requestText, baseText, importKind, conditionKey, modulePathCache[cacheKey]);
+    }
+    const resolved = resolveRequestCore(requestText, baseText, kind);
     modulePathCache[cacheKey] = resolved;
-    return resolved;
+    return nativeModuleResolveCachePut(requestText, baseText, importKind, conditionKey, resolved);
   }
 
   const baseContext = {
@@ -2924,7 +3025,8 @@ function executeRuntimeEsmSourceModule(module, filename, originalSource, loader)
 function executeDefaultExtension(module, filename, loader) {
   const originalSource = readModuleFile(filename).replace(/^#![^\n]*(\n|$)/, "");
   const originalIsEsm = hasEsmSyntax(originalSource);
-  if (runtimeEsmSourceExecutionDepth > 0 && originalIsEsm) {
+  const isEmbeddedRuntimeSource = embeddedRuntimeSourceEntry(filename).found;
+  if (originalIsEsm && (runtimeEsmSourceExecutionDepth > 0 || isEmbeddedRuntimeSource)) {
     return executeRuntimeEsmSourceModule(module, filename, originalSource, loader);
   }
   if (originalIsEsm &&
@@ -3359,6 +3461,18 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
     /\bexport\s*\*\s*from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
     (_all, spec, attributeKeyword, attributes) => `{ const __ctNs = ${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)}; for (const __ctKey of Object.keys(__ctNs)) { if (__ctKey !== "default") Object.defineProperty(${ESM_EXPORTS_BINDING}, __ctKey, { configurable: true, enumerable: true, get: () => __ctNs[__ctKey] }); } }`,
   );
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`default\s+async\s+function\s*(\*?)\s*([A-Za-z_$][\w$]*)\s*\(`), (_all, trivia, star, name) => {
+    liveExportDeclarations.push(liveExportStatement("default", name));
+    return `${trivia}async function ${star}${name}(`;
+  });
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`default\s+function\s*(\*?)\s*([A-Za-z_$][\w$]*)\s*\(`), (_all, trivia, star, name) => {
+    liveExportDeclarations.push(liveExportStatement("default", name));
+    return `${trivia}function ${star}${name}(`;
+  });
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`default\s+class\s+([A-Za-z_$][\w$]*)\s*`), (_all, trivia, name) => {
+    liveExportDeclarations.push(liveExportStatement("default", name));
+    return `${trivia}class ${name} `;
+  });
   output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`default\b`), (_all, trivia) => {
     return `${trivia}${ESM_EXPORTS_BINDING}.default =`;
   });
@@ -3859,8 +3973,9 @@ function detachModuleChild(parent, child) {
 
 function circularRequireExports(module) {
   const exports = module.exports;
-  if (exports === null || typeof exports !== "object" || utilTypes.isProxy?.(exports)) return exports;
+  if (exports === null || typeof exports !== "object") return exports;
   if (Object.getPrototypeOf(exports) !== Object.prototype || Object.hasOwn(exports, "__esModule")) return exports;
+  if (globalThis.__cottontailProxyRegistry?.has(exports)) return exports;
   return new Proxy(exports, {
     get(target, property, receiver) {
       if (property !== "__esModule" && !Reflect.has(target, property)) {
@@ -3876,6 +3991,10 @@ function circularRequireExports(module) {
 
 function loadCommonJsModule(resolved, parent = null, isMain = false) {
   const { bare: resolvedPath, suffix } = splitSpecifierSuffix(resolved);
+  const embeddedRelativePath = embeddedRuntimeRelativePath(resolvedPath);
+  if (embeddedRelativePath != null && embeddedRuntimePreloadedModules.has(embeddedRelativePath)) {
+    return embeddedRuntimePreloadedModules.get(embeddedRelativePath);
+  }
   const pendingImport = globalThis.Loader?.registry?.get(resolved);
   if (pendingImport && typeof pendingImport.catch === "function") {
     pendingImport.catch(() => {});
@@ -3982,7 +4101,7 @@ function configureRequireProperties(require, normalizedBasePath, resolutionParen
   return require;
 }
 
-export function createRequire(basePath, parentModule = null) {
+function createRequireImpl(basePath, parentModule, resolveBundledCallerAtCallTime) {
   let normalizedBasePath;
   if (typeof basePath === "string") {
     if (/^file:/i.test(basePath)) {
@@ -4009,11 +4128,12 @@ export function createRequire(basePath, parentModule = null) {
   } else {
     throw invalidCreateRequireFilename(basePath);
   }
-  // A generated entry wrapper installs one shared global require for bundled
-  // source modules. Resolve that require from its call site; explicit
-  // createRequire() instances and CommonJS module-local requires keep their
-  // fixed parent and avoid stack inspection entirely.
-  const resolveBundledCallerAtCallTime = parentModule == null && isBundledImportMetaBase(normalizedBasePath);
+  // Public createRequire(import.meta.url) may receive the synthetic bundle
+  // URL. Recover its source caller once; only the generated shared require
+  // needs a fresh caller for every invocation.
+  if (!resolveBundledCallerAtCallTime && parentModule == null && isBundledImportMetaBase(normalizedBasePath)) {
+    normalizedBasePath = bundledCallerPathFromStack() ?? normalizedBasePath;
+  }
   const resolutionParent = parentModule ?? { filename: normalizedBasePath };
   const resolutionParentForCall = () => {
     if (!resolveBundledCallerAtCallTime) return resolutionParent;
@@ -4047,6 +4167,14 @@ export function createRequire(basePath, parentModule = null) {
     return loadCommonJsModule(resolved, parentModule);
   };
   return configureRequireProperties(require, normalizedBasePath, resolutionParentForCall);
+}
+
+export function createRequire(basePath, parentModule = null) {
+  return createRequireImpl(basePath, parentModule, false);
+}
+
+export function __createBundledRequire(basePath) {
+  return createRequireImpl(basePath, null, true);
 }
 
 const blockedExtensionMutationPattern = /(?:^|[\\/])node_modules[\\/](?:next[\\/]dist[\\/]build[\\/]next-config-ts[\\/]index\.js|@meteorjs[\\/]babel[\\/]index\.js)$/;
@@ -4120,7 +4248,7 @@ const commonJsCacheObject = new Proxy(commonJsCacheTarget, {
 });
 
 function isBundledImportMetaBase(path) {
-  const mainPath = globalThis.process?.argv?.[1] ?? processModule.argv?.[1];
+  const mainPath = currentProcessBuiltin().argv?.[1];
   if (typeof mainPath !== "string" || mainPath.length === 0) return false;
   const resolvedMainPath = isAbsolute(mainPath) ? mainPath : resolve(cottontail.cwd(), mainPath);
   return path === resolvedMainPath;
@@ -4506,7 +4634,7 @@ function readSourceMapPayload(filename, source) {
     const meta = sourceMapUrl.slice(5, comma);
     const body = sourceMapUrl.slice(comma + 1);
     const text = meta.includes(";base64")
-      ? buffer.Buffer.from(body, "base64").toString("utf8")
+      ? unwrapBuiltin(buffer).Buffer.from(body, "base64").toString("utf8")
       : decodeURIComponent(body);
     return JSON.parse(text);
   }
@@ -4680,7 +4808,7 @@ const compileCacheEntries = new Map();
 let sourceMapsSupport = { enabled: false, nodeModules: false, generatedCode: false };
 
 function compileCacheKey(filename, source) {
-  return crypto.createHash("sha256").update(`${filename}\0${source}`).digest("hex");
+  return unwrapBuiltin(crypto).createHash("sha256").update(`${filename}\0${source}`).digest("hex");
 }
 
 function recordCompileCache(filename, source) {
@@ -4720,7 +4848,7 @@ const moduleExtensionsTarget = {
     return executeDefaultExtension(module, filename, "ts");
   },
   ".node"(module, filename) {
-    processModule.dlopen(module, filename);
+    unwrapBuiltin(processModule).dlopen(module, filename);
     module.loaded = true;
   },
   ".json"(module, filename) {
@@ -4741,6 +4869,7 @@ const moduleExtensionsTarget = {
 };
 
 function clearModulePathCache() {
+  nativeModuleResolveCacheClear();
   for (const key of Object.keys(modulePathCache)) delete modulePathCache[key];
 }
 
@@ -5449,6 +5578,7 @@ Object.defineProperty(Module, "_pathCache", {
   enumerable: true,
   get() { return modulePathCache; },
   set(value) {
+    nativeModuleResolveCacheClear();
     modulePathCache = value && typeof value === "object" ? value : Object.create(null);
     _pathCache = modulePathCache;
   },
@@ -5508,57 +5638,83 @@ const moduleBuiltin = {
   wrap,
   wrapper,
 };
-const assertBuiltin = assert.default ?? assert;
-const assertStrictBuiltin = assertStrict.default ?? assertStrict;
-const consoleBuiltin = consoleModule.default ?? consoleModule;
-const eventsBuiltin = events.default ?? events;
+const lazyDefault = moduleValue => lazyBuiltin(() => {
+  const namespace = unwrapBuiltin(moduleValue);
+  return namespace.default ?? namespace;
+});
+const assertBuiltin = lazyDefault(assert);
+const assertStrictBuiltin = lazyDefault(assertStrict);
+const consoleBuiltin = lazyDefault(consoleModule);
+const eventsBuiltin = lazyDefault(events);
 function currentProcessBuiltin() {
-  return globalThis.process ?? processModule.default ?? processModule;
+  if (globalThis.process != null) return globalThis.process;
+  const namespace = unwrapBuiltin(processModule);
+  return namespace.default ?? namespace;
 }
 const processBuiltin = lazyBuiltin(currentProcessBuiltin);
-const streamBuiltin = stream.default ?? stream;
-const sysBuiltin = sys.default ?? sys;
+const streamBuiltin = lazyDefault(stream);
+const sysBuiltin = lazyDefault(sys);
 const pathBuiltin = path.default ?? path;
-const internalTestBindingBuiltin = {
-  ...internalTestBinding,
-  internalBinding(name) {
-    if (String(name) === "http_parser") return currentProcessBuiltin().binding("http_parser");
-    return internalTestBinding.internalBinding(name);
-  },
-};
+const internalTestBindingBuiltin = lazyBuiltin(() => {
+  const namespace = unwrapBuiltin(internalTestBinding);
+  return {
+    ...namespace,
+    internalBinding(name) {
+      if (String(name) === "http_parser") return currentProcessBuiltin().binding("http_parser");
+      return namespace.internalBinding(name);
+    },
+  };
+});
 // require("path/posix") must be the same object as require("path").posix.
-const pathPosixBuiltin = pathBuiltin.posix ?? (pathPosix.default ?? pathPosix);
-const pathWin32Builtin = pathBuiltin.win32 ?? (pathWin32.default ?? pathWin32);
+const pathPosixBuiltin = pathBuiltin.posix;
+const pathWin32Builtin = pathBuiltin.win32;
 // require("fs/promises") must be the same object as require("fs").promises
 // (Node exposes fs.promises as the exact fs/promises module object).
-const fsBuiltin = fs.default ?? fs;
-const fsPromisesBuiltin = fsBuiltin.promises ?? (fsPromises.default ?? fsPromises);
-const constantsBuiltin = nodeConstants.default ?? nodeConstants;
+const fsBuiltin = lazyDefault(fs);
+const fsPromisesBuiltin = lazyBuiltin(() => {
+  const fsValue = unwrapBuiltin(fsBuiltin);
+  const namespace = unwrapBuiltin(fsPromises);
+  return fsValue.promises ?? namespace.default ?? namespace;
+});
+const constantsBuiltin = lazyDefault(nodeConstants);
 // CommonJS exposes a mutable object for node:buffer. Some Node APIs, including
 // zlib's global output limit, intentionally observe mutations to that object.
-const bufferBuiltin = buffer.default ?? buffer;
-installMutableBufferMaxLength(bufferBuiltin);
-const httpAgentBuiltin = { Agent: http.Agent, globalAgent: http.globalAgent };
-const httpClientBuiltin = { ClientRequest: http.ClientRequest };
-const httpIncomingBuiltin = {
-  IncomingMessage: http.IncomingMessage,
+const bufferBuiltin = lazyBuiltin(() => {
+  const namespace = unwrapBuiltin(buffer);
+  const value = namespace.default ?? namespace;
+  installMutableBufferMaxLength(value);
+  return value;
+});
+const httpAgentBuiltin = lazyBuiltin(() => {
+  const namespace = unwrapBuiltin(http);
+  return { Agent: namespace.Agent, globalAgent: namespace.globalAgent };
+});
+const httpClientBuiltin = lazyBuiltin(() => ({ ClientRequest: unwrapBuiltin(http).ClientRequest }));
+const httpIncomingBuiltin = lazyBuiltin(() => ({
+  IncomingMessage: unwrapBuiltin(http).IncomingMessage,
   readStart(socket) { if (socket?.readable && !socket._paused) socket.resume?.(); },
   readStop(socket) { socket?.pause?.(); },
-};
-const httpOutgoingBuiltin = {
-  OutgoingMessage: http.OutgoingMessage,
-  validateHeaderName: http.validateHeaderName,
-  validateHeaderValue: http.validateHeaderValue,
-};
-const httpServerBuiltin = {
-  STATUS_CODES: http.STATUS_CODES,
-  Server: http.Server,
-  ServerResponse: http.ServerResponse,
-  _connectionListener: http._connectionListener,
-};
-const httpCommonBuiltin = lazyBuiltin(() => createHttpCommonBuiltin({
-  http,
-  incoming: httpIncomingBuiltin,
+}));
+const httpOutgoingBuiltin = lazyBuiltin(() => {
+  const namespace = unwrapBuiltin(http);
+  return {
+    OutgoingMessage: namespace.OutgoingMessage,
+    validateHeaderName: namespace.validateHeaderName,
+    validateHeaderValue: namespace.validateHeaderValue,
+  };
+});
+const httpServerBuiltin = lazyBuiltin(() => {
+  const namespace = unwrapBuiltin(http);
+  return {
+    STATUS_CODES: namespace.STATUS_CODES,
+    Server: namespace.Server,
+    ServerResponse: namespace.ServerResponse,
+    _connectionListener: namespace._connectionListener,
+  };
+});
+const httpCommonBuiltin = lazyBuiltin(() => unwrapBuiltin(httpCommon).createHttpCommonBuiltin({
+  http: unwrapBuiltin(http),
+  incoming: unwrapBuiltin(httpIncomingBuiltin),
   processObject: currentProcessBuiltin(),
 }));
 function translatePeerCertificate(certificate) {
@@ -5579,17 +5735,28 @@ function translatePeerCertificate(certificate) {
   }
   return certificate;
 }
-const tlsCommonBuiltin = {
-  SecureContext: tls.SecureContext,
-  createSecureContext: tls.createSecureContext,
-  translatePeerCertificate,
-};
-const tlsWrapBuiltin = {
-  TLSSocket: tls.TLSSocket,
-  Server: tls.Server,
-  createServer: tls.createServer,
-  connect: tls.connect,
-};
+const tlsCommonBuiltin = lazyBuiltin(() => {
+  const namespace = unwrapBuiltin(tls);
+  return {
+    SecureContext: namespace.SecureContext,
+    createSecureContext: namespace.createSecureContext,
+    translatePeerCertificate,
+  };
+});
+const tlsWrapBuiltin = lazyBuiltin(() => {
+  const namespace = unwrapBuiltin(tls);
+  return {
+    TLSSocket: namespace.TLSSocket,
+    Server: namespace.Server,
+    createServer: namespace.createServer,
+    connect: namespace.connect,
+  };
+});
+const streamDuplexBuiltin = lazyBuiltin(() => unwrapBuiltin(stream).Duplex);
+const streamPassThroughBuiltin = lazyBuiltin(() => unwrapBuiltin(stream).PassThrough);
+const streamReadableBuiltin = lazyBuiltin(() => unwrapBuiltin(stream).Readable);
+const streamTransformBuiltin = lazyBuiltin(() => unwrapBuiltin(stream).Transform);
+const streamWritableBuiltin = lazyBuiltin(() => unwrapBuiltin(stream).Writable);
 
 __setBuiltinModules({
   _http_agent: httpAgentBuiltin,
@@ -5604,18 +5771,18 @@ __setBuiltinModules({
   "node:_http_outgoing": httpOutgoingBuiltin,
   _http_server: httpServerBuiltin,
   "node:_http_server": httpServerBuiltin,
-  _stream_duplex: stream.Duplex,
-  "node:_stream_duplex": stream.Duplex,
-  _stream_passthrough: stream.PassThrough,
-  "node:_stream_passthrough": stream.PassThrough,
-  _stream_readable: stream.Readable,
-  "node:_stream_readable": stream.Readable,
-  _stream_transform: stream.Transform,
-  "node:_stream_transform": stream.Transform,
+  _stream_duplex: streamDuplexBuiltin,
+  "node:_stream_duplex": streamDuplexBuiltin,
+  _stream_passthrough: streamPassThroughBuiltin,
+  "node:_stream_passthrough": streamPassThroughBuiltin,
+  _stream_readable: streamReadableBuiltin,
+  "node:_stream_readable": streamReadableBuiltin,
+  _stream_transform: streamTransformBuiltin,
+  "node:_stream_transform": streamTransformBuiltin,
   _stream_wrap: streamBuiltin,
   "node:_stream_wrap": streamBuiltin,
-  _stream_writable: stream.Writable,
-  "node:_stream_writable": stream.Writable,
+  _stream_writable: streamWritableBuiltin,
+  "node:_stream_writable": streamWritableBuiltin,
   _tls_common: tlsCommonBuiltin,
   "node:_tls_common": tlsCommonBuiltin,
   _tls_wrap: tlsWrapBuiltin,
@@ -5737,6 +5904,7 @@ __setBuiltinModules({
   "node:worker_threads": workerThreads,
   zlib,
   "node:zlib": zlib,
+  "bun:wrap": bunWrap,
 });
 
 // Node's `module` builtin IS the Module class (module.exports = Module), so

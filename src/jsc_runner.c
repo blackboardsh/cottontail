@@ -11,6 +11,7 @@
 #include "url_bridge.h"
 
 #include <JavaScriptCore/JavaScript.h>
+#include <cottontail-jsc-embedder.h>
 
 #ifndef COTTONTAIL_VERSION
 #define COTTONTAIL_VERSION "0.0.0-cottontail"
@@ -46,7 +47,7 @@ extern size_t ct_jsc_heap_footprint(JSContextRef context);
 extern bool ct_jsc_value_is_rope(JSContextRef context, JSValueRef value);
 extern bool ct_jsc_set_time_zone(JSContextRef context, const char *time_zone);
 extern size_t ct_jsc_copy_protected_objects(JSContextRef context, JSValueRef *values, size_t capacity);
-extern int ct_jsc_bytecode_generate(
+extern int ct_jsc_embedder_bytecode_generate(
     JSContextGroupRef group,
     JSStringRef source,
     JSStringRef source_url,
@@ -54,7 +55,7 @@ extern int ct_jsc_bytecode_generate(
     size_t *output_length,
     JSStringRef *error_message
 );
-extern int ct_jsc_bytecode_evaluate(
+extern int ct_jsc_embedder_bytecode_evaluate(
     JSContextRef context,
     JSStringRef source,
     JSStringRef source_url,
@@ -294,6 +295,37 @@ int ct_paths_are_same_file(const char *source, const char *destination) {
     uv_fs_req_cleanup(&source_request);
     uv_fs_req_cleanup(&destination_request);
     return same;
+}
+
+int ct_native_copy_file(const char *source, const char *destination, int exclusive) {
+#if defined(__APPLE__) || defined(__MACH__)
+    if (clonefile(source, destination, 0) == 0) {
+        return 0;
+    }
+    if (!exclusive && errno == EEXIST && !ct_paths_are_same_file(source, destination)) {
+        if (unlink(destination) == 0 && clonefile(source, destination, 0) == 0) {
+            return 0;
+        }
+    }
+#endif
+    uv_fs_t request;
+    int flags = UV_FS_COPYFILE_FICLONE;
+    if (exclusive) {
+        flags |= UV_FS_COPYFILE_EXCL;
+    }
+    int status = uv_fs_copyfile(NULL, &request, source, destination, flags, NULL);
+    uv_fs_req_cleanup(&request);
+    return status;
+}
+
+int ct_native_clone_tree(const char *source, const char *destination) {
+#if defined(__APPLE__) || defined(__MACH__)
+    return clonefile(source, destination, 0);
+#else
+    (void)source;
+    (void)destination;
+    return -1;
+#endif
 }
 
 #if !defined(_WIN32)
@@ -2840,9 +2872,12 @@ typedef struct CtReloadWatcher {
     struct CtReloadWatcher *next;
 } CtReloadWatcher;
 
+typedef struct CtModuleResolveCacheEntry CtModuleResolveCacheEntry;
+
 struct CtJscRuntime {
     JSGlobalContextRef context;
     JSObjectRef host_object;
+    uint64_t native_binding_materialized[8];
     CtJscInspector *inspector;
     pthread_mutex_t inspector_mutex;
     void *inspector_run_loop;
@@ -2910,6 +2945,9 @@ struct CtJscRuntime {
     bool fatal_out_of_memory;
     bool reload_requested;
     uint32_t standalone_bytecode_module_count;
+    CtModuleResolveCacheEntry **module_resolve_cache_buckets;
+    size_t module_resolve_cache_capacity;
+    size_t module_resolve_cache_count;
     CtReloadWatcher *reload_watchers;
     FILE *reload_trace_file;
     bool sampling_profiler_enabled;
@@ -21194,6 +21232,24 @@ typedef struct CtNativeLibrary {
     struct CtNativeLibrary *next;
 } CtNativeLibrary;
 
+typedef enum CtPreparedFfiFastPath {
+    CT_PREPARED_FFI_FAST_PATH_NONE,
+    CT_PREPARED_FFI_FAST_PATH_I32_TO_I32,
+} CtPreparedFfiFastPath;
+
+static CtJscEncodedValue ct_prepared_ffi_i32_call(
+    CtJscInvocation *invocation,
+    void *user_data
+) {
+    const CtJscEncodedValue value = ct_jsc_invocation_argument(invocation, 0);
+    const int32_t argument = ct_jsc_value_to_int32(invocation, value);
+    if (ct_jsc_invocation_has_exception(invocation)) {
+        return ct_jsc_make_undefined(invocation);
+    }
+    int32_t (*native_call)(int32_t) = (int32_t (*)(int32_t))user_data;
+    return ct_jsc_make_int32(invocation, native_call(argument));
+}
+
 typedef struct CtPreparedFfiCall {
     void *function_pointer;
     CtFfiType returns;
@@ -21206,6 +21262,7 @@ typedef struct CtPreparedFfiCall {
     CtNapiEnv *napi_env;
     JSObjectRef callback_constructor;
     JSObjectRef cstring_constructor;
+    CtPreparedFfiFastPath fast_path;
 } CtPreparedFfiCall;
 
 static pthread_mutex_t ct_native_libraries_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -23445,6 +23502,20 @@ static JSValueRef ct_prepared_ffi_call_as_function(
         return JSValueMakeUndefined(ctx);
     }
 
+    if (call->fast_path == CT_PREPARED_FFI_FAST_PATH_I32_TO_I32) {
+        JSValueRef value = argc > 0 ? argv[0] : JSValueMakeUndefined(ctx);
+        double number = 0;
+        if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) {
+            return JSValueMakeUndefined(ctx);
+        }
+
+        int32_t argument = number >= INT32_MIN && number <= INT32_MAX
+            ? (int32_t)number
+            : (int32_t)ct_ffi_to_uint32(number);
+        int32_t (*native_call)(int32_t) = (int32_t (*)(int32_t))call->function_pointer;
+        return JSValueMakeNumber(ctx, native_call(argument));
+    }
+
     CtFfiValue arg_values[CT_FFI_MAX_ARGS];
     void *arg_value_ptrs[CT_FFI_MAX_ARGS];
     CtFfiValue result;
@@ -23546,6 +23617,12 @@ static JSValueRef ct_prepare_native_call(
         return JSValueMakeUndefined(ctx);
     }
 
+    if (call->returns == CT_FFI_TYPE_I32 &&
+        call->argc == 1 &&
+        call->arg_types[0] == CT_FFI_TYPE_I32) {
+        call->fast_path = CT_PREPARED_FFI_FAST_PATH_I32_TO_I32;
+    }
+
     bool needs_pointer_constructors = false;
     for (size_t index = 0; index < call->argc && !needs_pointer_constructors; index += 1) {
         needs_pointer_constructors = call->arg_type_ids[index] == 12 ||
@@ -23620,6 +23697,27 @@ static JSValueRef ct_prepare_native_call(
         ct_prepared_ffi_call_destroy(call);
         ct_throw_message(ctx, exception, "failed to create prepared FFI function");
         return JSValueMakeUndefined(ctx);
+    }
+    if (call->fast_path == CT_PREPARED_FFI_FAST_PATH_I32_TO_I32) {
+        JSObjectRef fast_call = ct_jsc_embedder_create_function(
+            ctx,
+            "ffi",
+            1,
+            ct_prepared_ffi_i32_call,
+            (void *)pointer
+        );
+        if (fast_call != NULL &&
+            !ct_set_property(
+                ctx,
+                prepared,
+                "__cottontailFastCall",
+                fast_call,
+                exception
+            )) {
+            JSObjectSetPrivate(prepared, NULL);
+            ct_prepared_ffi_call_destroy(call);
+            return JSValueMakeUndefined(ctx);
+        }
     }
     /* Root pointer constructors through the callable; JSC finalizers may run on any thread. */
     if (needs_pointer_constructors &&
@@ -35547,7 +35645,251 @@ static JSValueRef ct_unhandled_rejection(
 #include "native_bindings/websocket_frame_jsc.inc" /* Native WebSocket frame bytes. */
 #include "native_bindings/string_width_jsc.inc"
 #include "native_bindings/crypto_hasher_jsc.inc"
+#include "native_bindings/direct_jsc.inc"
 #include "native_bindings/callbacks.h"
+
+_Static_assert(
+    CT_HOST_NATIVE_BINDING_COUNT + CT_DIRECT_NATIVE_BINDING_COUNT <= 512,
+    "native binding materialization bitmap is too small"
+);
+
+static bool ct_host_has_legacy_native_binding(const char *name) {
+    for (size_t index = 0; index < CT_HOST_NATIVE_BINDING_COUNT; index += 1) {
+        if (strcmp(name, ct_host_native_binding_definitions[index].name) == 0) return true;
+    }
+    return false;
+}
+
+#define CT_NATIVE_BINDING_LOOKUP_CAPACITY 1024
+#define CT_NATIVE_BINDING_NAME_CAPACITY 128
+
+_Static_assert(
+    CT_HOST_NATIVE_BINDING_COUNT + CT_DIRECT_NATIVE_BINDING_COUNT <
+        CT_NATIVE_BINDING_LOOKUP_CAPACITY / 2,
+    "native binding lookup table must stay below 50% load"
+);
+
+static uv_once_t ct_native_binding_lookup_once = UV_ONCE_INIT;
+static uint16_t ct_native_binding_lookup[CT_NATIVE_BINDING_LOOKUP_CAPACITY];
+static size_t ct_native_binding_max_name_length = 0;
+
+static const char *ct_native_binding_name(size_t index) {
+    if (index < CT_HOST_NATIVE_BINDING_COUNT) {
+        return ct_host_native_binding_definitions[index].name;
+    }
+    return ct_direct_native_binding_definitions[
+        index - CT_HOST_NATIVE_BINDING_COUNT
+    ].name;
+}
+
+static uint64_t ct_native_binding_name_hash(const char *name, size_t length) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t index = 0; index < length; index += 1) {
+        hash ^= (uint8_t)name[index];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static void ct_native_binding_lookup_insert(const char *name, size_t index) {
+    const size_t name_length = strlen(name);
+    if (name_length > ct_native_binding_max_name_length) {
+        ct_native_binding_max_name_length = name_length;
+    }
+    const uint64_t hash = ct_native_binding_name_hash(name, name_length);
+    size_t slot = (size_t)hash & (CT_NATIVE_BINDING_LOOKUP_CAPACITY - 1);
+    for (;;) {
+        const uint16_t stored = ct_native_binding_lookup[slot];
+        if (stored == UINT16_MAX) {
+            ct_native_binding_lookup[slot] = (uint16_t)index;
+            return;
+        }
+        if (strcmp(ct_native_binding_name(stored), name) == 0) {
+            return;
+        }
+        slot = (slot + 1) & (CT_NATIVE_BINDING_LOOKUP_CAPACITY - 1);
+    }
+}
+
+static void ct_native_binding_lookup_initialize(void) {
+    for (size_t index = 0; index < CT_NATIVE_BINDING_LOOKUP_CAPACITY; index += 1) {
+        ct_native_binding_lookup[index] = UINT16_MAX;
+    }
+    for (size_t index = 0; index < CT_HOST_NATIVE_BINDING_COUNT; index += 1) {
+        ct_native_binding_lookup_insert(
+            ct_host_native_binding_definitions[index].name,
+            index
+        );
+    }
+    for (size_t index = 0; index < CT_DIRECT_NATIVE_BINDING_COUNT; index += 1) {
+        ct_native_binding_lookup_insert(
+            ct_direct_native_binding_definitions[index].name,
+            CT_HOST_NATIVE_BINDING_COUNT + index
+        );
+    }
+}
+
+static bool ct_host_native_binding_index(JSStringRef property_name, size_t *index_out) {
+    if (property_name == NULL || index_out == NULL) return false;
+    uv_once(&ct_native_binding_lookup_once, ct_native_binding_lookup_initialize);
+    const size_t utf16_length = JSStringGetLength(property_name);
+    if (utf16_length > ct_native_binding_max_name_length) return false;
+
+    char name[CT_NATIVE_BINDING_NAME_CAPACITY];
+    const size_t utf8_length = JSStringGetUTF8CString(
+        property_name,
+        name,
+        sizeof(name)
+    );
+    if (utf8_length == 0) return false;
+
+    const uint64_t hash = ct_native_binding_name_hash(name, utf8_length - 1);
+    size_t slot = (size_t)hash & (CT_NATIVE_BINDING_LOOKUP_CAPACITY - 1);
+    for (;;) {
+        const uint16_t stored = ct_native_binding_lookup[slot];
+        if (stored == UINT16_MAX) return false;
+        if (strcmp(ct_native_binding_name(stored), name) == 0) {
+            *index_out = stored;
+            return true;
+        }
+        slot = (slot + 1) & (CT_NATIVE_BINDING_LOOKUP_CAPACITY - 1);
+    }
+}
+
+static bool ct_host_native_binding_is_materialized(CtJscRuntime *runtime, size_t index) {
+    if (runtime == NULL || index >= 512) return false;
+    return (runtime->native_binding_materialized[index / 64] & (UINT64_C(1) << (index % 64))) != 0;
+}
+
+static void ct_host_native_binding_mark_materialized(CtJscRuntime *runtime, size_t index) {
+    if (runtime == NULL || index >= 512) return;
+    runtime->native_binding_materialized[index / 64] |= UINT64_C(1) << (index % 64);
+}
+
+static bool ct_host_has_property(
+    JSContextRef ctx,
+    JSObjectRef object,
+    JSStringRef property_name
+) {
+    (void)ctx;
+    size_t index = 0;
+    if (!ct_host_native_binding_index(property_name, &index)) return false;
+    return !ct_host_native_binding_is_materialized(
+        (CtJscRuntime *)JSObjectGetPrivate(object),
+        index
+    );
+}
+
+static JSValueRef ct_host_get_property(
+    JSContextRef ctx,
+    JSObjectRef object,
+    JSStringRef property_name,
+    JSValueRef *exception
+) {
+    size_t index = 0;
+    if (!ct_host_native_binding_index(property_name, &index)) return NULL;
+
+    CtJscRuntime *runtime = (CtJscRuntime *)JSObjectGetPrivate(object);
+    if (runtime == NULL || ct_host_native_binding_is_materialized(runtime, index)) return NULL;
+
+    const CtNativeBindingDefinition *binding = index < CT_HOST_NATIVE_BINDING_COUNT
+        ? &ct_host_native_binding_definitions[index]
+        : NULL;
+    JSValueRef function = NULL;
+    const CtDirectNativeBindingDefinition *direct = binding != NULL
+        ? ct_direct_native_binding_for_name(binding->name)
+        : &ct_direct_native_binding_definitions[index - CT_HOST_NATIVE_BINDING_COUNT];
+    if (direct != NULL) {
+        function = ct_jsc_embedder_create_function(
+            ctx,
+            direct->name,
+            direct->arity,
+            direct->callback,
+            runtime
+        );
+    }
+    if (function == NULL && binding != NULL) {
+        function = ct_jsc_embedder_create_legacy_function(
+            ctx,
+            binding->name,
+            0,
+            binding->callback,
+            object
+        );
+    }
+    if (function == NULL && binding != NULL) {
+        function = ct_make_function(ctx, binding->name, binding->callback, runtime);
+    }
+    if (function == NULL) return NULL;
+    ct_host_native_binding_mark_materialized(runtime, index);
+    JSObjectSetProperty(
+        ctx,
+        object,
+        property_name,
+        function,
+        kJSPropertyAttributeNone,
+        exception
+    );
+    return exception != NULL && *exception != NULL ? NULL : function;
+}
+
+static bool ct_host_set_property(
+    JSContextRef ctx,
+    JSObjectRef object,
+    JSStringRef property_name,
+    JSValueRef value,
+    JSValueRef *exception
+) {
+    (void)ctx;
+    (void)value;
+    (void)exception;
+    size_t index = 0;
+    if (ct_host_native_binding_index(property_name, &index)) {
+        ct_host_native_binding_mark_materialized(
+            (CtJscRuntime *)JSObjectGetPrivate(object),
+            index
+        );
+    }
+    return false;
+}
+
+static void ct_host_get_property_names(
+    JSContextRef ctx,
+    JSObjectRef object,
+    JSPropertyNameAccumulatorRef property_names
+) {
+    (void)ctx;
+    CtJscRuntime *runtime = (CtJscRuntime *)JSObjectGetPrivate(object);
+    for (size_t index = 0; index < CT_HOST_NATIVE_BINDING_COUNT; index += 1) {
+        if (ct_host_native_binding_is_materialized(runtime, index)) continue;
+        JSStringRef name = ct_js_string(ct_host_native_binding_definitions[index].name);
+        JSPropertyNameAccumulatorAddName(property_names, name);
+        JSStringRelease(name);
+    }
+    for (size_t index = 0; index < CT_DIRECT_NATIVE_BINDING_COUNT; index += 1) {
+        const CtDirectNativeBindingDefinition *binding =
+            &ct_direct_native_binding_definitions[index];
+        if (ct_host_has_legacy_native_binding(binding->name)) continue;
+        const size_t materialized_index = CT_HOST_NATIVE_BINDING_COUNT + index;
+        if (ct_host_native_binding_is_materialized(runtime, materialized_index)) continue;
+        JSStringRef name = ct_js_string(binding->name);
+        JSPropertyNameAccumulatorAddName(property_names, name);
+        JSStringRelease(name);
+    }
+}
+
+static JSObjectRef ct_make_host_object(JSContextRef ctx, CtJscRuntime *runtime) {
+    JSClassDefinition definition = kJSClassDefinitionEmpty;
+    definition.className = "CottontailHost";
+    definition.hasProperty = ct_host_has_property;
+    definition.getProperty = ct_host_get_property;
+    definition.setProperty = ct_host_set_property;
+    definition.getPropertyNames = ct_host_get_property_names;
+    JSClassRef cls = JSClassCreate(&definition);
+    JSObjectRef host = JSObjectMake(ctx, cls, runtime);
+    JSClassRelease(cls);
+    return host;
+}
 
 static int ct_install_host_api(CtJscRuntime *runtime) {
     JSContextRef ctx = runtime->context;
@@ -35568,11 +35910,10 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_set_property(ctx, console, "warn", ct_make_plain_function(ctx, "warn", ct_console_error), &exception);
     ct_set_property(ctx, global, "console", console, &exception);
 
-    JSObjectRef host = ct_make_object(ctx);
+    JSObjectRef host = ct_make_host_object(ctx, runtime);
     runtime->host_object = host;
     JSValueProtect(ctx, host);
 
-    ct_register_host_native_bindings(ctx, host, runtime);
     JSObjectRef coverage_collector = ct_jsc_create_test_coverage_collector(ctx);
     if (coverage_collector != NULL) {
         ct_set_property(ctx, host, "collectTestCoverage", coverage_collector, &exception);
@@ -36006,6 +36347,7 @@ int ct_jsc_runtime_prepare_hot_reload(CtJscRuntime *runtime, char **error_out) {
     ct_timer_destroy_all(runtime);
     ct_brotli_encoder_destroy_all(runtime);
     ct_vm_context_destroy_all(runtime);
+    ct_module_resolve_cache_clear(runtime);
     ct_active_requests_destroy(runtime);
     runtime->fatal_exception_routed = false;
     ct_process_set_exit_code(ctx, 0);
@@ -36068,6 +36410,7 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
         ct_timer_destroy_all(runtime);
         ct_brotli_encoder_destroy_all(runtime);
         ct_vm_context_destroy_all(runtime);
+        ct_module_resolve_cache_clear(runtime);
         ct_active_requests_destroy(runtime);
         if (runtime->spawn_event_handler != NULL) JSValueUnprotect(ctx, runtime->spawn_event_handler);
         if (runtime->fd_event_handler != NULL) JSValueUnprotect(ctx, runtime->fd_event_handler);
@@ -37416,7 +37759,7 @@ static int ct_jsc_runtime_eval_internal(
     }
     int bytecode_status = 1;
     if (exception == NULL && bytecode != NULL && bytecode_len > 0) {
-        bytecode_status = ct_jsc_bytecode_evaluate(
+        bytecode_status = ct_jsc_embedder_bytecode_evaluate(
             ctx,
             script,
             source_url,
@@ -37618,7 +37961,7 @@ int ct_jsc_generate_bytecode(
     JSStringRef source_url = ct_js_string(source_url_text);
     free(source_url_text);
     JSStringRef generation_error = NULL;
-    const int status = ct_jsc_bytecode_generate(
+    const int status = ct_jsc_embedder_bytecode_generate(
         JSContextGetGroup(context),
         script,
         source_url,

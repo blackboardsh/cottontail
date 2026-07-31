@@ -4,6 +4,7 @@ const iterations = 200_000;
 const rounds = 5;
 const requestedFixture = process.argv[2];
 let checksum = 0;
+const nanotime = globalThis.cottontail?.nanotime ?? process.hrtime.bigint;
 
 const fixtures = {
   posix: {
@@ -24,9 +25,9 @@ function measure(label, callback) {
   for (let index = 0; index < 5_000; index++) consume(callback());
   const samples = [];
   for (let round = 0; round < rounds; round++) {
-    const startedAt = cottontail.nanotime();
+    const startedAt = nanotime();
     for (let index = 0; index < iterations; index++) consume(callback());
-    samples.push(cottontail.nanotime() - startedAt);
+    samples.push(nanotime() - startedAt);
   }
   samples.sort((left, right) => left - right);
   console.log(`${label}.median_ns=${samples[Math.floor(samples.length / 2)]}`);

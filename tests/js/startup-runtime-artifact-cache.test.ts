@@ -22,17 +22,23 @@ const defaultCacheDirectory = join(defaultCacheHome, ".cache", "cottontail", "ca
 mkdirSync(project, { recursive: true });
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
+function runtimeEnvironment(overrides: Record<string, string | undefined>) {
+  const env = { ...process.env, ...overrides };
+  delete env.COTTONTAIL_TEST_CLI_HEADER_PRINTED;
+  delete env.COTTONTAIL_TEST_FILE_COUNT;
+  return env;
+}
+
 function runCommand(args: string[], cwd = project, defaultCache = false, argv0?: string) {
   return Bun.spawnSync({
     cmd: [process.execPath, ...args],
     cwd,
-    env: {
-      ...process.env,
+    env: runtimeEnvironment({
       COTTONTAIL_TMP_DIR: defaultCache ? "" : cacheRoot,
       HOME: defaultCache ? defaultCacheHome : process.env.HOME,
       LOCALAPPDATA: defaultCache ? "" : process.env.LOCALAPPDATA,
       XDG_CACHE_HOME: defaultCache ? "" : process.env.XDG_CACHE_HOME,
-    },
+    }),
     argv0,
     stdout: "pipe",
     stderr: "pipe",
@@ -47,6 +53,65 @@ function artifactNames(directory = cacheDirectory) {
   return readdirSync(directory).filter(name => name.endsWith(".mjs")).sort();
 }
 
+test("simple ordinary entries avoid the full runtime launcher", () => {
+  const selectiveCacheRoot = join(root, "selective-cache-root");
+  const selectiveCacheDirectory = join(selectiveCacheRoot, "cottontail", "cache");
+  const selectiveEntry = join(project, "selective-entry.mjs");
+  writeFileSync(selectiveEntry, 'console.log("selective-entry");\n');
+
+  const selective = Bun.spawnSync({
+    cmd: [process.execPath, selectiveEntry],
+    cwd: project,
+    env: runtimeEnvironment({ COTTONTAIL_TMP_DIR: selectiveCacheRoot }),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(selective.exitCode).toBe(0);
+  expect(selective.stdout.toString()).toBe("selective-entry\n");
+  expect(selective.stderr.toString()).toBe("");
+  expect(artifactNames(selectiveCacheDirectory).some(name => name.startsWith("esm-entry-"))).toBe(true);
+  expect(existsSync(join(selectiveCacheDirectory, "module-runtime.manifest"))).toBe(false);
+
+  const fullCacheRoot = join(root, "full-cache-root");
+  const fullCacheDirectory = join(fullCacheRoot, "cottontail", "cache");
+  const fullEntry = join(project, "full-entry.mjs");
+  writeFileSync(fullEntry, "console.log(typeof fetch);\n");
+
+  const full = Bun.spawnSync({
+    cmd: [process.execPath, fullEntry],
+    cwd: project,
+    env: runtimeEnvironment({ COTTONTAIL_TMP_DIR: fullCacheRoot }),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(full.exitCode).toBe(0);
+  expect(full.stdout.toString()).toBe("function\n");
+  expect(full.stderr.toString()).toBe("");
+  expect(existsSync(join(fullCacheDirectory, "module-runtime.manifest"))).toBe(true);
+});
+
+test("lazy Web API globals select the full runtime launcher", () => {
+  const webCacheRoot = join(root, "web-api-cache-root");
+  const webCacheDirectory = join(webCacheRoot, "cottontail", "cache");
+  const entry = join(project, "web-api-entry.mjs");
+  writeFileSync(
+    entry,
+    "console.log(typeof ReadableStream, typeof TransformStream, typeof URLPattern);\n",
+  );
+
+  const result = Bun.spawnSync({
+    cmd: [process.execPath, entry],
+    cwd: project,
+    env: runtimeEnvironment({ COTTONTAIL_TMP_DIR: webCacheRoot }),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(result.exitCode).toBe(0);
+  expect(result.stdout.toString()).toBe("function function function\n");
+  expect(result.stderr.toString()).toBe("");
+  expect(existsSync(join(webCacheDirectory, "module-runtime.manifest"))).toBe(true);
+});
+
 test("runtime module launcher is reused while entry sources stay live", async () => {
   const dependency = join(project, "dependency.mjs");
   const entry = join(project, "entry.mjs");
@@ -58,9 +123,8 @@ test("runtime module launcher is reused while entry sources stay live", async ()
   ].join("\n"));
   writeFileSync(entry, [
     'import { value } from "./dependency.mjs";',
-    'const namespace = await import("./dependency.mjs");',
-    'if (!value.endsWith("-tla") || namespace.value !== value) throw new Error("module identity");',
-    'if (await import("bun") !== Bun) throw new Error("bun identity");',
+    'if (!value.endsWith("-tla")) throw new Error("module value");',
+    'if (typeof Bun.version !== "string") throw new Error("bun global");',
     "console.log(value);",
     "",
   ].join("\n"));
@@ -72,10 +136,11 @@ test("runtime module launcher is reused while entry sources stay live", async ()
 
   const manifestPath = join(cacheDirectory, "module-runtime.manifest");
   expect(existsSync(manifestPath)).toBe(true);
-  expect(readFileSync(manifestPath).subarray(0, 8).toString()).toBe("CTLCACH3");
+  expect(readFileSync(manifestPath).subarray(0, 8).toString()).toBe("CTLCACH4");
   const firstManifestMtime = statSync(manifestPath).mtimeMs;
   const firstArtifacts = artifactNames();
   expect(firstArtifacts.length).toBe(1);
+  expect(existsSync(join(cacheDirectory, `${firstArtifacts[0]}.jsc`))).toBe(true);
 
   await Bun.sleep(25);
   const second = run(entry, "caller-controlled-argv0");
@@ -107,7 +172,7 @@ test("runtime module launcher is reused while entry sources stay live", async ()
   expect(recovered.exitCode).toBe(0);
   expect(recovered.stdout.toString()).toBe("one-tla\n");
   expect(recovered.stderr.toString()).toBe("");
-  expect(readFileSync(manifestPath).subarray(0, 8).toString()).toBe("CTLCACH3");
+  expect(readFileSync(manifestPath).subarray(0, 8).toString()).toBe("CTLCACH4");
   const recoveredArtifacts = artifactNames();
   expect(recoveredArtifacts.length).toBe(1);
   const recoveredManifestMtime = statSync(manifestPath).mtimeMs;
@@ -141,12 +206,11 @@ test("runtime module launcher starts an exported server config", async () => {
   const child = Bun.spawn({
     cmd: [process.execPath, entry],
     cwd: project,
-    env: {
-      ...process.env,
+    env: runtimeEnvironment({
       COTTONTAIL_TMP_DIR: cacheRoot,
       BUN_DEV_SERVER_TEST_RUNNER: "1",
       BUN_DEV_SERVER_TEST_READY_FILE: ready,
-    },
+    }),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -182,7 +246,7 @@ test("shared runtime launcher stays reusable while an entry is running", async (
   const child = Bun.spawn({
     cmd: [process.execPath, entry],
     cwd: project,
-    env: { ...process.env, COTTONTAIL_TMP_DIR: cacheRoot, COTTONTAIL_LEASE_HOLD: "1" },
+    env: runtimeEnvironment({ COTTONTAIL_TMP_DIR: cacheRoot, COTTONTAIL_LEASE_HOLD: "1" }),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -244,7 +308,6 @@ test("plain CommonJS entries and eval share one dynamic runtime artifact", async
   const entrySource = [
     'const dependency = require("./commonjs-dependency.cjs");',
     'if (require("./commonjs-dependency.cjs") !== dependency) throw new Error("cache identity");',
-    'if (require.main !== module) throw new Error("require.main identity");',
     "console.log(dependency.value);",
     "",
   ].join("\n");

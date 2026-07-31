@@ -30,6 +30,7 @@ const validatorPath = join(rootDir, 'scripts', 'validate-release-binary.js');
 const macosExportListPath = join(rootDir, 'src', 'compiler', 'src', 'symbols.txt');
 const linuxVersionScriptPath = join(rootDir, 'src', 'compiler', 'src', 'symbols.dyn');
 const windowsModuleDefinitionPath = join(rootDir, 'src', 'compiler', 'src', 'symbols.def');
+const nativeBindingsGenerator = join(rootDir, 'scripts', 'generate-native-bindings.js');
 
 if (!existsSync(zigPath)) {
   console.error(`Vendored Zig compiler not found at ${zigPath}. Run the cottontail setup first.`);
@@ -55,6 +56,7 @@ const stagingRoot = mkdtempSync(join(tmpdir(), 'cottontail-release-'));
 const stagedExecutable = join(stagingRoot, 'bin', executableName);
 
 try {
+  run(process.execPath, [nativeBindingsGenerator], 'Native binding generation');
   const args = ['build', '-Doptimize=ReleaseSmall'];
   if (process.platform === 'win32') {
     args.push('-Dtarget=x86_64-windows-msvc');

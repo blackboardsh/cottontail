@@ -3,16 +3,18 @@
 // implementation (see bun's src/js/thirdparty/*). This module ports those
 // shims on top of cottontail's fetch/Response/Request/Headers classes.
 //
-// The classes are imported from ./index.js (not read off globalThis) because
-// user code may override globalThis.Response/Request/Headers/fetch before
-// requiring "node-fetch"; the shim must keep using the originals.
-import {
-  fetch as bunFetch,
-  FormData as BunFormData,
-  Headers as WebHeaders,
-  Request as WebRequest,
-  Response as WebResponse,
-} from "./index.js";
+// Capture the core constructors through the private runtime bridge because
+// user code may replace their public global aliases before requiring this
+// lazy module. Importing index.js here would instantiate a second Bun runtime.
+const bunRuntime = globalThis[Symbol.for("cottontail.internal.bunRuntimeBridge")];
+if (bunRuntime?.abiVersion !== 1) throw new Error("Cottontail Bun runtime bridge ABI mismatch");
+const {
+  fetch: bunFetch,
+  FormData: BunFormData,
+  Headers: WebHeaders,
+  Request: WebRequest,
+  Response: WebResponse,
+} = bunRuntime;
 
 // Blob/File are installed on globalThis during startup (before any user code
 // runs is not guaranteed for this lazily-required module, so capture the

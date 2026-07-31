@@ -68,6 +68,7 @@ pub const Runtime = struct {
     allocator: std.mem.Allocator,
     handle: *c.CtJscRuntime,
     max_script_size: usize = 64 * 1024 * 1024,
+    max_bytecode_size: usize = 128 * 1024 * 1024,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator) !Runtime {
         return initWithStackSize(io, allocator, 0);
@@ -279,7 +280,18 @@ pub const Runtime = struct {
         };
         defer self.allocator.free(source);
 
-        return self.runSource(source, script_path);
+        const bytecode_path = std.mem.concat(self.allocator, u8, &.{ script_path, ".jsc" }) catch
+            return self.runSource(source, script_path);
+        defer self.allocator.free(bytecode_path);
+        const bytecode = std.Io.Dir.cwd().readFileAlloc(
+            self.io,
+            bytecode_path,
+            self.allocator,
+            .limited(self.max_bytecode_size),
+        ) catch return self.runSource(source, script_path);
+        defer self.allocator.free(bytecode);
+
+        return self.runSourceWithBytecode(source, script_path, bytecode);
     }
 
     pub fn evalImmediate(self: *Runtime, source: []const u8, filename: [:0]const u8) !void {

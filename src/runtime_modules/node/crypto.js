@@ -5048,7 +5048,13 @@ class Crypto {
 }
 Object.defineProperty(Crypto, "name", { value: "Crypto", configurable: true });
 
-export const webcrypto = globalThis.crypto ?? Object.create(Crypto.prototype);
+// The Bun surface may install crypto as a lazy global backed by this module.
+// Read only an existing data property to avoid invoking that accessor while
+// node:crypto itself is initializing.
+const globalCryptoDescriptor = Object.getOwnPropertyDescriptor(globalThis, "crypto");
+export const webcrypto = globalCryptoDescriptor && "value" in globalCryptoDescriptor
+  ? globalCryptoDescriptor.value ?? Object.create(Crypto.prototype)
+  : Object.create(Crypto.prototype);
 if (!(webcrypto instanceof Crypto)) Object.setPrototypeOf(webcrypto, Crypto.prototype);
 export const subtle = webcrypto.subtle;
 export let fips = 0;

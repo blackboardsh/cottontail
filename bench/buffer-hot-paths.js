@@ -3,13 +3,14 @@ import { Buffer } from "node:buffer";
 const targetSampleNs = 40_000_000n;
 const sampleCount = 7;
 let checksum = 0;
+const nanotime = globalThis.cottontail?.nanotime ?? process.hrtime.bigint;
 
 function elapsed(iterations, operation) {
-  const start = cottontail.nanotime();
+  const start = nanotime();
   for (let index = 0; index < iterations; index += 1) {
     checksum ^= Number(operation(index)) | 0;
   }
-  return cottontail.nanotime() - start;
+  return nanotime() - start;
 }
 
 function benchmark(name, operation) {

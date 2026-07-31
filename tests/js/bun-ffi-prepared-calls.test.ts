@@ -53,6 +53,8 @@ describe("bun:ffi prepared native calls", () => {
     try {
       expect(abs(-41)).toBe(41);
       expect(abs.native(-42)).toBe(42);
+      expect(abs("-44" as any)).toBe(44);
+      expect(abs(45n as any)).toBe(45);
       expect(abs.native).not.toBe(abs);
       library.close();
       expect(abs(-43)).toBe(43);

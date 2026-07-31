@@ -21,6 +21,8 @@ const ROOT = process.cwd();
 const MANIFEST_PATH = join(dirname(fileURLToPath(import.meta.url)), 'jsc-manifest.json');
 const MANIFEST = JSON.parse(readFileSync(MANIFEST_PATH, 'utf8'));
 const JSC_ROOT = join(ROOT, 'vendors', 'jsc');
+const EMBEDDER_ABI_VERSION = 2;
+const EMBEDDER_ABI = `CT_JSC_EMBEDDER_ABI_VERSION=${EMBEDDER_ABI_VERSION}`;
 
 function fail(message, error) {
   console.error(message);
@@ -205,6 +207,41 @@ function verifyJscIcuContract(vendorDir) {
   }
 }
 
+function verifyJscEmbedderContract(vendorDir, platformKey) {
+  const library = platformKey.startsWith('windows-')
+    ? 'CottontailJSCEmbedder.lib'
+    : 'libCottontailJSCEmbedder.a';
+  const required = [
+    join(vendorDir, 'lib', library),
+    join(vendorDir, 'include', 'cottontail', 'cottontail-jsc-embedder.h'),
+    join(vendorDir, 'share', 'cottontail-jsc', 'EMBEDDER_ABI'),
+    join(vendorDir, 'share', 'cottontail-jsc', 'embedder-manifest.json'),
+  ];
+  for (const path of required) {
+    if (!existsSync(path) || !statSync(path).isFile() || statSync(path).size === 0) {
+      fail(`The pinned JSC artifact is missing its Cottontail embedder contract: ${path}`);
+    }
+  }
+  const actual = readFileSync(required[2], 'utf8').trim();
+  if (actual !== EMBEDDER_ABI) {
+    fail(`Cottontail requires ${EMBEDDER_ABI}, but the JSC artifact provides ${actual}.`);
+  }
+  const manifest = JSON.parse(readFileSync(required[3], 'utf8'));
+  const headerSha256 = sha256File(required[1]);
+  const webkitRevisionPath = join(vendorDir, 'WEBKIT_REVISION');
+  const webkitRevision = existsSync(webkitRevisionPath)
+    ? readFileSync(webkitRevisionPath, 'utf8').trim()
+    : null;
+  if (
+    manifest.schema !== 1 ||
+    manifest.abiVersion !== EMBEDDER_ABI_VERSION ||
+    manifest.headerSha256 !== headerSha256 ||
+    (webkitRevision && manifest.webkitSha !== webkitRevision)
+  ) {
+    fail('The pinned JSC embedder manifest does not match its header or WebKit build.');
+  }
+}
+
 function verifyPublishedFallbackMetadata(fallbackDir, platformKey) {
   const metadataPath = join(fallbackDir, 'ICU_FALLBACK.json');
   if (!existsSync(metadataPath)) return;
@@ -385,6 +422,7 @@ function vendorLocalJsc(platformKey, archiveValue) {
     ` data-${localIcuDataSha256 ?? 'external'}`;
 
   if (isCurrentJscVendored(vendorDir, stampPath, expectedStamp)) {
+    verifyJscEmbedderContract(vendorDir, platformKey);
     ensureIcuHeaders(vendorDir);
     ensureIcuFallback(vendorDir, platformKey);
     console.log(`✓ Local JavaScriptCore SDK already vendored from ${archivePath}`);
@@ -404,6 +442,8 @@ function vendorLocalJsc(platformKey, archiveValue) {
     if (!existsSync(libDir) || !existsSync(includeDir)) {
       fail(`Local JavaScriptCore SDK layout is incomplete in ${archivePath}`);
     }
+
+    verifyJscEmbedderContract(stagingDir, platformKey);
 
     if (localIcuData) {
       const fallbackDir = join(stagingDir, 'lib', 'cottontail-icu');
@@ -452,6 +492,7 @@ function vendorJsc() {
     : `${MANIFEST.tag} ${asset.sha256}`;
 
   if (isCurrentJscVendored(vendorDir, stampPath, expectedStamp)) {
+    verifyJscEmbedderContract(vendorDir, platformKey);
     ensureIcuHeaders(vendorDir);
     ensureIcuFallback(vendorDir, platformKey);
     console.log(`✓ JavaScriptCore ${MANIFEST.tag} (${platformKey}) already vendored`);
@@ -489,6 +530,8 @@ function vendorJsc() {
     if (!existsSync(libDir) || !existsSync(includeDir)) {
       fail(`Vendored JavaScriptCore layout is incomplete under ${vendorDir}`);
     }
+
+    verifyJscEmbedderContract(stagingDir, platformKey);
 
     ensureIcuHeaders(stagingDir);
     ensureIcuFallback(stagingDir, platformKey);

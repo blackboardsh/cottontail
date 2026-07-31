@@ -145,6 +145,45 @@ static void ct_register_host_native_bindings(
     CT_REGISTER_NATIVE_BINDINGS(uuid);
 }
 
+typedef struct CtNativeBindingDefinition {
+    const char *name;
+    JSObjectCallAsFunctionCallback callback;
+} CtNativeBindingDefinition;
+
+#undef CT_NATIVE_BINDING
+#define CT_NATIVE_BINDING(name, callback) { name, callback },
+
+static const CtNativeBindingDefinition ct_host_native_binding_definitions[] = {
+#include "runtime.inc"
+#include "inspector.inc"
+#include "buffer.inc"
+#include "filesystem.inc"
+#include "glob.inc"
+#include "process.inc"
+#include "http.inc"
+#include "tooling.inc"
+#include "memory_ffi.inc"
+#include "worker.inc"
+#include "system.inc"
+#include "compression.inc"
+#include "crypto.inc"
+#include "data_parser.inc"
+#include "dns.inc"
+#include "sockets.inc"
+#include "tls.inc"
+#include "sqlite.inc"
+#include "sql_wire.inc"
+#include "string_width.inc"
+#include "url.inc"
+#include "platform.inc"
+#include "path.inc"
+#include "uuid.inc"
+};
+
+#define CT_HOST_NATIVE_BINDING_COUNT \
+    (sizeof(ct_host_native_binding_definitions) / sizeof(ct_host_native_binding_definitions[0]))
+
+#undef CT_NATIVE_BINDING
 #undef CT_REGISTER_NATIVE_BINDINGS
 #undef CT_NATIVE_CALLBACK_COUNT
 

@@ -1019,7 +1019,19 @@ class SocketImpl extends Duplex {
       if (!this.readableEnded && !this._readEndSignaled) {
         this._readEndSignaled = true;
         this.push(null);
-        if (this.readableLength === 0) this.read(0);
+        const hasUnreadData = this.readableLength > 0;
+        if (!hasUnreadData) this.read(0);
+        if (!this.allowHalfOpen && this.writable && !this.destroyed) {
+          // Native peer EOF closes a Node socket even when its readable side
+          // remains paused with buffered bytes. readable-stream otherwise
+          // waits indefinitely for `end` to be consumed before auto-destroy.
+          if (hasUnreadData) {
+            this.once("finish", () => {
+              if (!this.destroyed && !this.readableEnded) this.destroy();
+            });
+          }
+          this.end();
+        }
       }
       return;
     }

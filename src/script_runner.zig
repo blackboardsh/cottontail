@@ -4150,13 +4150,18 @@ fn fullRuntimeGlobal(name: []const u8) bool {
     for ([_][]const u8{
         "AbortController",
         "AbortSignal",
+        "BuildError",
+        "BuildMessage",
         "BroadcastChannel",
+        "ByteLengthQueuingStrategy",
         "CloseEvent",
         "CompressionStream",
+        "CountQueuingStrategy",
         "Crypto",
         "CryptoKey",
         "CustomEvent",
         "DecompressionStream",
+        "DOMException",
         "ErrorEvent",
         "Event",
         "EventTarget",
@@ -4171,10 +4176,32 @@ fn fullRuntimeGlobal(name: []const u8) bool {
         "PerformanceMark",
         "PerformanceMeasure",
         "PerformanceObserver",
+        "PerformanceObserverEntryList",
+        "PerformanceResourceTiming",
+        "PerformanceServerTiming",
+        "PerformanceTiming",
+        "ReadableByteStreamController",
+        "ReadableStream",
+        "ReadableStreamBYOBReader",
+        "ReadableStreamBYOBRequest",
+        "ReadableStreamDefaultController",
+        "ReadableStreamDefaultReader",
         "Request",
+        "ResolveError",
+        "ResolveMessage",
         "Response",
+        "ShadowRealm",
         "SubtleCrypto",
+        "SuppressedError",
+        "TextDecoderStream",
+        "TextEncoderStream",
+        "TransformStream",
+        "TransformStreamDefaultController",
+        "URLPattern",
         "WebSocket",
+        "WritableStream",
+        "WritableStreamDefaultController",
+        "WritableStreamDefaultWriter",
         "afterAll",
         "afterEach",
         "beforeAll",
@@ -4211,12 +4238,13 @@ fn runtimeMemberProperty(tokens: []const JavaScriptModuleToken, index: usize) ?[
 
 const RuntimeBootstrapMode = enum {
     full,
+    bare,
     minimal,
     process,
 };
 
 const ReloadRuntimeBootstrapAnalysis = struct {
-    mode: RuntimeBootstrapMode = .minimal,
+    mode: RuntimeBootstrapMode = .bare,
     needs_runtime_module_sources: bool = false,
 };
 
@@ -4236,7 +4264,7 @@ fn sourceRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBoo
     ) catch return .full;
     const tokens = try tokenizeJavaScriptModuleSyntax(ctx.allocator, source);
 
-    var mode: RuntimeBootstrapMode = .minimal;
+    var mode: RuntimeBootstrapMode = .bare;
     var index: usize = 0;
     while (index < tokens.len) : (index += 1) {
         const token = tokens[index];
@@ -4247,16 +4275,30 @@ fn sourceRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBoo
         if (std.mem.eql(u8, token.text, "Bun")) {
             const property = runtimeMemberProperty(tokens, index) orelse return .full;
             if (!minimalRuntimeBunProperty(property)) return .full;
+            if (mode == .bare) mode = .minimal;
         } else if (std.mem.eql(u8, token.text, "process")) {
             const property = runtimeMemberProperty(tokens, index) orelse return .full;
             if (std.mem.eql(u8, property, "mainModule")) return .full;
-            if (!minimalRuntimeProcessProperty(property)) mode = .process;
+            if (!minimalRuntimeProcessProperty(property))
+                mode = .process
+            else if (mode == .bare)
+                mode = .minimal;
         } else if (std.mem.eql(u8, token.text, "Error")) {
             if (runtimeMemberProperty(tokens, index)) |property| {
                 if (std.mem.eql(u8, property, "captureStackTrace") or
                     std.mem.eql(u8, property, "prepareStackTrace") or
                     std.mem.eql(u8, property, "stackTraceLimit")) return .full;
             }
+        } else if (std.mem.eql(u8, token.text, "globalThis") or
+            std.mem.eql(u8, token.text, "global") or
+            std.mem.eql(u8, token.text, "eval") or
+            std.mem.eql(u8, token.text, "Function") or
+            std.mem.eql(u8, token.text, "Promise") or
+            std.mem.eql(u8, token.text, "async") or
+            std.mem.eql(u8, token.text, "await") or
+            std.mem.eql(u8, token.text, "throw"))
+        {
+            if (mode == .bare) mode = .minimal;
         } else if (fullRuntimeGlobal(token.text)) {
             return .full;
         }
@@ -4315,7 +4357,8 @@ fn resolveReloadRuntimeImport(
 fn mergeRuntimeBootstrapMode(left: RuntimeBootstrapMode, right: RuntimeBootstrapMode) RuntimeBootstrapMode {
     if (left == .full or right == .full) return .full;
     if (left == .process or right == .process) return .process;
-    return .minimal;
+    if (left == .minimal or right == .minimal) return .minimal;
+    return .bare;
 }
 
 fn reloadRuntimeBootstrapModeVisit(
@@ -4590,9 +4633,20 @@ fn bundleScriptNative(
         false;
     const runtime_entrypoint_needs_main_transform = runtime_module_launcher_candidate and
         try entrypointNeedsMainMetadataTransform(ctx, script_abs);
+    const selective_runtime_entrypoint_mode: ?RuntimeBootstrapMode = if (runtime_module_launcher_candidate and
+        !runtime_candidate_is_common_js and
+        !runtime_entrypoint_needs_main_transform)
+    mode: {
+        const bootstrap_mode = try entrypointRuntimeBootstrapMode(ctx, script_abs);
+        break :mode if (bootstrap_mode == .full) null else bootstrap_mode;
+    } else null;
+    // The reusable module launcher installs the complete on-demand module
+    // system. Entries proven to need only the selective bootstrap are smaller
+    // and faster through the regular bundled-entry path.
     const runtime_module_entrypoint = runtime_module_launcher_candidate and
         !runtime_candidate_is_common_js and
-        !runtime_entrypoint_needs_main_transform;
+        !runtime_entrypoint_needs_main_transform and
+        selective_runtime_entrypoint_mode == null;
     const script_entry_abs = if (is_wasm_entrypoint or runtime_module_entrypoint)
         script_abs
     else
@@ -4649,7 +4703,9 @@ fn bundleScriptNative(
         build_options == null and
         !requires_full_runtime_preloads and
         !is_wasm_entrypoint)
-        if (reload_dependencies_out != null) mode: {
+        if (selective_runtime_entrypoint_mode) |mode|
+            mode
+        else if (reload_dependencies_out != null) mode: {
             const analysis = try reloadRuntimeBootstrapAnalysis(ctx, script_entry_abs);
             reload_needs_runtime_module_sources = analysis.needs_runtime_module_sources;
             break :mode analysis.mode;
@@ -4660,7 +4716,7 @@ fn bundleScriptNative(
     // COTTONTAIL-COMPAT: Hot mode keeps one JSC runtime alive. Once its minimal
     // bootstrap has run, later generations only need to evaluate the entry.
     const reuse_minimal_reload_runtime = reuse_reload_runtime and
-        runtime_bootstrap_mode == .minimal and
+        (runtime_bootstrap_mode == .minimal or runtime_bootstrap_mode == .bare) and
         !is_common_js_entrypoint and
         !is_wasm_entrypoint;
     const has_custom_conditions = hasCustomConditions(exec_args) or hasCustomConditions(script_args);
@@ -4786,6 +4842,15 @@ fn bundleScriptNative(
     options.runtime_virtual_root = runtime_virtual_root;
     options.preserve_external_require_name = true;
     options.rewrite_jest_for_tests = is_test_cli_execution;
+    if (build_options == null and use_runtime_module_launcher_cache) {
+        // The shared launcher is immutable and always accompanied by a source
+        // map. Compacting it substantially reduces JSC bytecode decode and
+        // retained-heap cost without changing user entry source or stacks.
+        options.minify_whitespace = true;
+        options.minify_identifiers = true;
+        options.minify_syntax = true;
+        options.keep_names = true;
+    }
     if (build_options == null) {
         options.code_coverage = testCoverageRequestedFromArgs(
             ctx.io,
@@ -4955,7 +5020,7 @@ const LauncherCache = struct {
     lock_file: std.Io.File,
 };
 
-const launcher_cache_magic = "CTLCACH3";
+const launcher_cache_magic = "CTLCACH4";
 const launcher_cache_manifest_limit = 16 * 1024 * 1024;
 const launcher_cache_stale_limit = 64;
 const launcher_cache_cleanup_scan_limit = 256;
@@ -4976,6 +5041,14 @@ const LauncherCacheDependency = struct {
 
 const LauncherCacheManifest = struct {
     bytes: []u8,
+    artifact_id: [64]u8,
+    code_digest: [32]u8,
+    source_map_digest: [32]u8,
+    bytecode_digest: [32]u8,
+};
+
+const LauncherCacheManifestCore = struct {
+    payload: []u8,
     artifact_id: [64]u8,
     code_digest: [32]u8,
     source_map_digest: [32]u8,
@@ -5097,6 +5170,10 @@ fn launcherCacheSourceMapPath(ctx: *const Context, bundle_path: []const u8) ![]c
     return try std.mem.concat(ctx.allocator, u8, &.{ bundle_path, ".map" });
 }
 
+fn launcherCacheBytecodePath(ctx: *const Context, bundle_path: []const u8) ![]const u8 {
+    return try std.mem.concat(ctx.allocator, u8, &.{ bundle_path, ".jsc" });
+}
+
 fn launcherCacheLeasePath(ctx: *const Context, bundle_path: []const u8) ![]const u8 {
     return try std.mem.concat(ctx.allocator, u8, &.{ bundle_path, ".lease" });
 }
@@ -5173,6 +5250,7 @@ fn removeLauncherCacheArtifact(
 ) LauncherCacheRemoval {
     const bundle_path = launcherCacheArtifactPath(ctx, cache, artifact_id) catch return .unmanaged;
     const source_map_path = launcherCacheSourceMapPath(ctx, bundle_path) catch return .unmanaged;
+    const bytecode_path = launcherCacheBytecodePath(ctx, bundle_path) catch return .unmanaged;
     const lease_path = launcherCacheLeasePath(ctx, bundle_path) catch return .unmanaged;
     const lease_file = std.Io.Dir.cwd().openFile(ctx.io, lease_path, .{ .mode = .read_write }) catch
         return .unmanaged;
@@ -5184,6 +5262,7 @@ fn removeLauncherCacheArtifact(
     }
     std.Io.Dir.cwd().deleteFile(ctx.io, bundle_path) catch {};
     std.Io.Dir.cwd().deleteFile(ctx.io, source_map_path) catch {};
+    std.Io.Dir.cwd().deleteFile(ctx.io, bytecode_path) catch {};
     lease_file.close(ctx.io);
     std.Io.Dir.cwd().deleteFile(ctx.io, lease_path) catch {};
     return .removed;
@@ -5532,13 +5611,13 @@ fn readLauncherCacheInt(
     return value;
 }
 
-fn buildLauncherCacheManifest(
+fn buildLauncherCacheManifestCore(
     ctx: *const Context,
     cache: *const LauncherCache,
     dependencies: []LauncherCacheDependency,
     code: []const u8,
     source_map: []const u8,
-) !LauncherCacheManifest {
+) !LauncherCacheManifestCore {
     std.mem.sort(LauncherCacheDependency, dependencies, {}, launcherCacheDependencyLessThan);
 
     const code_digest = hashLauncherCacheBytes(code);
@@ -5565,16 +5644,34 @@ fn buildLauncherCacheManifest(
     hasher.final(&digest);
     const artifact_id = std.fmt.bytesToHex(digest, .lower);
 
-    var manifest: std.ArrayList(u8) = .empty;
-    try manifest.appendSlice(ctx.allocator, launcher_cache_magic);
-    try manifest.appendSlice(ctx.allocator, &cache.key);
-    try manifest.appendSlice(ctx.allocator, &artifact_id);
-    try manifest.appendSlice(ctx.allocator, payload.items);
     return .{
-        .bytes = try manifest.toOwnedSlice(ctx.allocator),
+        .payload = try payload.toOwnedSlice(ctx.allocator),
         .artifact_id = artifact_id,
         .code_digest = code_digest,
         .source_map_digest = source_map_digest,
+    };
+}
+
+fn buildLauncherCacheManifest(
+    ctx: *const Context,
+    cache: *const LauncherCache,
+    core: LauncherCacheManifestCore,
+    bytecode: []const u8,
+) !LauncherCacheManifest {
+    const bytecode_digest = hashLauncherCacheBytes(bytecode);
+    var manifest: std.ArrayList(u8) = .empty;
+    try manifest.appendSlice(ctx.allocator, launcher_cache_magic);
+    try manifest.appendSlice(ctx.allocator, &cache.key);
+    try manifest.appendSlice(ctx.allocator, &core.artifact_id);
+    try manifest.appendSlice(ctx.allocator, core.payload);
+    try appendLauncherCacheInt(&manifest, ctx.allocator, u64, @intCast(bytecode.len));
+    try manifest.appendSlice(ctx.allocator, &bytecode_digest);
+    return .{
+        .bytes = try manifest.toOwnedSlice(ctx.allocator),
+        .artifact_id = core.artifact_id,
+        .code_digest = core.code_digest,
+        .source_map_digest = core.source_map_digest,
+        .bytecode_digest = bytecode_digest,
     };
 }
 
@@ -5618,7 +5715,7 @@ fn validateLauncherCacheManifest(
     cache: *const LauncherCache,
     manifest: []const u8,
 ) !?RuntimeArtifact {
-    const fixed_metadata_len = @sizeOf(u64) + 32 + @sizeOf(u64) + 32;
+    const fixed_metadata_len = @sizeOf(u64) + 32 + @sizeOf(u64) + 32 + @sizeOf(u64) + 32;
     const header_len = launcher_cache_magic.len + cache.key.len + 64;
     if (manifest.len < header_len + fixed_metadata_len + @sizeOf(u32) or
         !std.mem.eql(u8, manifest[0..launcher_cache_magic.len], launcher_cache_magic) or
@@ -5628,14 +5725,6 @@ fn validateLauncherCacheManifest(
     }
     const artifact_id = manifest[launcher_cache_magic.len + cache.key.len .. header_len];
     if (!launcherCacheHexIdValid(artifact_id)) return null;
-
-    var artifact_hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    artifact_hasher.update(&cache.key);
-    artifact_hasher.update(manifest[header_len..]);
-    var artifact_digest: [32]u8 = undefined;
-    artifact_hasher.final(&artifact_digest);
-    const expected_artifact_id = std.fmt.bytesToHex(artifact_digest, .lower);
-    if (!std.mem.eql(u8, artifact_id, &expected_artifact_id)) return null;
 
     var cursor = header_len;
     const code_size = readLauncherCacheInt(u64, manifest, &cursor) orelse return null;
@@ -5673,12 +5762,28 @@ fn validateLauncherCacheManifest(
         cursor = path_end;
         if (!validateLauncherCacheDependency(ctx, kind, path, size, stamp, digest)) return null;
     }
-    if (cursor != manifest.len) return null;
+    const core_end = cursor;
+    var artifact_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    artifact_hasher.update(&cache.key);
+    artifact_hasher.update(manifest[header_len..core_end]);
+    var artifact_digest: [32]u8 = undefined;
+    artifact_hasher.final(&artifact_digest);
+    const expected_artifact_id = std.fmt.bytesToHex(artifact_digest, .lower);
+    if (!std.mem.eql(u8, artifact_id, &expected_artifact_id)) return null;
+
+    const bytecode_size = readLauncherCacheInt(u64, manifest, &cursor) orelse return null;
+    const bytecode_digest_end = std.math.add(usize, cursor, 32) catch return null;
+    if (bytecode_digest_end > manifest.len) return null;
+    const bytecode_digest: *const [32]u8 = @ptrCast(manifest[cursor..bytecode_digest_end].ptr);
+    cursor = bytecode_digest_end;
+    if (bytecode_size == 0 or cursor != manifest.len) return null;
 
     const bundle_path = try launcherCacheArtifactPath(ctx, cache, artifact_id);
     if (!launcherCacheFileMatches(ctx, bundle_path, code_size, code_digest)) return null;
     const source_map_path = try launcherCacheSourceMapPath(ctx, bundle_path);
     if (!launcherCacheFileMatches(ctx, source_map_path, source_map_size, source_map_digest)) return null;
+    const bytecode_path = try launcherCacheBytecodePath(ctx, bundle_path);
+    if (!launcherCacheFileMatches(ctx, bytecode_path, bytecode_size, bytecode_digest)) return null;
     const lease_file = (try acquireLauncherCacheArtifactLease(ctx, bundle_path)) orelse return null;
     return .{ .path = bundle_path, .lease_file = lease_file };
 }
@@ -5714,9 +5819,17 @@ fn installLauncherCache(
         original_entry,
         input_files,
     );
-    const manifest = try buildLauncherCacheManifest(ctx, cache, dependencies, code, map);
-    const bundle_path = try launcherCacheArtifactPath(ctx, cache, &manifest.artifact_id);
+    const core = try buildLauncherCacheManifestCore(ctx, cache, dependencies, code, map);
+    const bundle_path = try launcherCacheArtifactPath(ctx, cache, &core.artifact_id);
     const source_map_path = try launcherCacheSourceMapPath(ctx, bundle_path);
+    const bytecode_path = try launcherCacheBytecodePath(ctx, bundle_path);
+    try icu_bootstrap.ensureWithEnvironment(ctx.io, ctx.environ_map);
+    const bytecode = try runtime.generateCachedBytecode(
+        ctx.allocator,
+        code,
+        try ctx.allocator.dupeZ(u8, bundle_path),
+    );
+    const manifest = try buildLauncherCacheManifest(ctx, cache, core, bytecode);
 
     if (!launcherCacheFileMatches(ctx, bundle_path, @intCast(code.len), &manifest.code_digest)) {
         try writeLauncherCacheFileAtomic(ctx, bundle_path, code);
@@ -5724,11 +5837,14 @@ fn installLauncherCache(
     if (!launcherCacheFileMatches(ctx, source_map_path, @intCast(map.len), &manifest.source_map_digest)) {
         try writeLauncherCacheFileAtomic(ctx, source_map_path, map);
     }
+    if (!launcherCacheFileMatches(ctx, bytecode_path, @intCast(bytecode.len), &manifest.bytecode_digest)) {
+        try writeLauncherCacheFileAtomic(ctx, bytecode_path, bytecode);
+    }
     const lease_file = (try acquireLauncherCacheArtifactLease(ctx, bundle_path)) orelse
         return error.LauncherArtifactBusy;
     errdefer lease_file.close(ctx.io);
 
-    // The fixed manifest is the generation index. Publish it only after both
+    // The fixed manifest is the generation index. Publish it only after all
     // immutable artifact files are complete.
     try writeLauncherCacheFileAtomic(ctx, cache.manifest_path, manifest.bytes);
     cleanupLauncherCacheArtifacts(ctx, cache, &manifest.artifact_id);
@@ -6546,6 +6662,60 @@ fn writeReusedReloadEntryWrapper(
     return wrapper_path;
 }
 
+fn writeBareRuntimeEntryWrapper(
+    ctx: *const Context,
+    tmp_dir: []const u8,
+    script_import_abs: []const u8,
+    script_abs: []const u8,
+    test_cli_execution: bool,
+    stable_source_map_path: bool,
+) ![]const u8 {
+    const wrapper_name = try std.fmt.allocPrint(
+        ctx.allocator,
+        "script-entry-bare-{x}.mjs",
+        .{std.hash.Wyhash.hash(0, script_abs)},
+    );
+    const wrapper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, wrapper_name });
+    const bundle_map_literal = if (stable_source_map_path)
+        "\"\""
+    else blk: {
+        const bundle_map_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs.map" });
+        break :blk try jsonStringLiteral(ctx, bundle_map_path);
+    };
+    const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
+    const test_header_signal = if (test_cli_execution)
+        "globalThis.__cottontailBunTestHeaderPrinted = true;"
+    else
+        "";
+    const source = try std.fmt.allocPrint(ctx.allocator,
+        \\globalThis.__cottontailBundleSourceMap ??= {s};
+        \\globalThis.__cottontailBundleSourceRoot ??= {s};
+        \\globalThis.__filename ??= {s};
+        \\globalThis.__dirname ??= {s};
+        \\globalThis.Loader ??= {{ registry: new Map() }};
+        \\{s}
+        \\globalThis.__cottontailLoadingTestModules = true;
+        \\try {{
+        \\{s}  globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
+        \\  await import({s});
+        \\}} finally {{
+        \\  globalThis.__cottontailLoadingTestModules = false;
+        \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
+        \\}}
+        \\
+    , .{
+        bundle_map_literal,
+        try jsonStringLiteral(ctx, ctx.project_root),
+        try jsonStringLiteral(ctx, script_abs),
+        try jsonStringLiteral(ctx, script_dir),
+        cpu_profiler_start_statement,
+        test_header_signal,
+        try jsonStringLiteral(ctx, script_import_abs),
+    });
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
+    return wrapper_path;
+}
+
 fn writeMinimalRuntimeEntryWrapper(
     ctx: *const Context,
     tmp_dir: []const u8,
@@ -6558,6 +6728,14 @@ fn writeMinimalRuntimeEntryWrapper(
     bootstrap_mode: RuntimeBootstrapMode,
 ) ![]const u8 {
     std.debug.assert(bootstrap_mode != .full);
+    if (bootstrap_mode == .bare) return writeBareRuntimeEntryWrapper(
+        ctx,
+        tmp_dir,
+        script_import_abs,
+        script_abs,
+        test_cli_execution,
+        stable_source_map_path,
+    );
     const process_bootstrap_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "internal", "runtime-process-bootstrap.js" });
     const bootstrap_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "internal", "runtime-bootstrap.js" });
     const url_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "url.js" });
@@ -6668,7 +6846,7 @@ fn writeCottontailEntryWrapper(
         bootstrap_mode,
     );
     const bun_module = try runtimeModulePath(ctx, &.{ "bun", "index.js" });
-    const bake_dev_server_module = try runtimeModulePath(ctx, &.{ "bun", "bake-dev-server.js" });
+    const default_app_module = try runtimeModulePath(ctx, &.{ "bun", "default-app.js" });
     const wrapper_name = try std.fmt.allocPrint(
         ctx.allocator,
         "script-entry-{x}.mjs",
@@ -6676,7 +6854,7 @@ fn writeCottontailEntryWrapper(
     );
     const wrapper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, wrapper_name });
     const bun_literal = try jsonStringLiteral(ctx, bun_module);
-    const bake_dev_server_literal = try jsonStringLiteral(ctx, bake_dev_server_module);
+    const default_app_literal = try jsonStringLiteral(ctx, default_app_module);
     const script_import_literal = try jsonStringLiteral(ctx, script_import_abs);
     const script_literal = try jsonStringLiteral(ctx, script_abs);
     const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
@@ -6698,7 +6876,7 @@ fn writeCottontailEntryWrapper(
         ctx.allocator,
         \\import __ctBunModule from {s};
         \\import {{ startDefaultApp as __ctStartDefaultApp }} from {s};
-        \\import {{ createRequire as __ctCreateRequire }} from "node:module";
+        \\import {{ __createBundledRequire as __ctCreateBundledRequire }} from "node:module";
         \\import {{ existsSync as __ctExistsSync }} from "node:fs";
         \\import {{ dirname as __ctPathDirname, resolve as __ctPathResolve }} from "node:path";
         \\globalThis.__cottontailBundleSourceMap ??= {s};
@@ -6745,7 +6923,7 @@ fn writeCottontailEntryWrapper(
         \\  const resolved = __ctBunModule.resolveSync(text, __ctImportMetaParentDir(parent));
         \\  return resolved.startsWith("/") ? __ctBunModule.pathToFileURL(resolved).href : resolved;
         \\}};
-        \\globalThis.__ctMetaRequire ??= __ctCreateRequire(__ctImportMetaBase);
+        \\globalThis.__ctMetaRequire ??= __ctCreateBundledRequire(__ctImportMetaBase);
         \\globalThis.require = globalThis.__ctMetaRequire;
         \\globalThis.__ctMetaResolveSync = (specifier, parent = __ctImportMetaBase) => globalThis.__cottontailImportMetaResolveSync(specifier, parent);
         \\globalThis.__ctMetaResolve = (specifier, parent = __ctImportMetaBase) => globalThis.__cottontailImportMetaResolve(specifier, parent);
@@ -6768,7 +6946,7 @@ fn writeCottontailEntryWrapper(
     ,
         .{
             bun_literal,
-            bake_dev_server_literal,
+            default_app_literal,
             bundle_map_literal,
             bundle_source_root_literal,
             script_literal,
@@ -8985,6 +9163,166 @@ fn rewriteNamespaceEsModuleAssignments(allocator: std.mem.Allocator, source: []c
     return try output.toOwnedSlice(allocator);
 }
 
+fn writeLazyRuntimeEntryWrapper(
+    ctx: *const Context,
+    tmp_dir: []const u8,
+    script_abs: []const u8,
+    preload_imports: []const u8,
+    test_cli_execution: bool,
+    stable_source_map_path: bool,
+    runtime_virtual_root: []const u8,
+) ![]const u8 {
+    const wrapper_name = try std.fmt.allocPrint(
+        ctx.allocator,
+        "script-entry-runtime-{x}.mjs",
+        .{std.hash.Wyhash.hash(0, script_abs)},
+    );
+    const wrapper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, wrapper_name });
+    const bun_literal = try jsonStringLiteral(
+        ctx,
+        try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "bun", "index.js" }),
+    );
+    const default_app_literal = try jsonStringLiteral(
+        ctx,
+        try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "bun", "default-app.js" }),
+    );
+    const bundle_map_literal = if (stable_source_map_path)
+        "\"\""
+    else blk: {
+        const bundle_map_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs.map" });
+        break :blk try jsonStringLiteral(ctx, bundle_map_path);
+    };
+    const bundle_source_root_literal = try jsonStringLiteral(
+        ctx,
+        if (stable_source_map_path) runtime_virtual_root else ctx.project_root,
+    );
+    const test_header_signal = if (test_cli_execution)
+        "globalThis.__cottontailBunTestHeaderPrinted = true;"
+    else
+        "";
+    const source = try std.fmt.allocPrint(ctx.allocator,
+        \\import {s};
+        \\import {{ startDefaultApp as __ctStartDefaultApp }} from {s};
+        \\globalThis.__cottontailBundleSourceMap ??= {s};
+        \\globalThis.__cottontailBundleSourceRoot ??= {s};
+        \\globalThis.Loader ??= {{ registry: new Map() }};
+        \\globalThis.__cottontailLoadDotenv?.();
+        \\await globalThis.__cottontailLoadStandaloneBunfig?.();
+        \\await globalThis.__cottontailLoadStandaloneExecPreloads?.();
+        \\{s}
+        \\globalThis.__cottontailLoadingTestModules = true;
+        \\try {{
+        \\{s}
+        \\{s}  globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
+        \\  const __ctEntryPath = globalThis.process?.argv?.[1];
+        \\  if (!__ctEntryPath) throw new Error("Missing runtime entrypoint");
+        \\  const __ctPluginEntry = await globalThis.__cottontailResolvePluginEntrypoint?.(__ctEntryPath, __ctEntryPath);
+        \\  const __ctEntryNamespace = __ctPluginEntry?.matched
+        \\    ? await __ctPluginEntry.value
+        \\    : await globalThis.__cottontailImportModule(__ctEntryPath, __ctEntryPath, undefined, true);
+        \\  await __ctStartDefaultApp(__ctEntryNamespace);
+        \\}} finally {{
+        \\  globalThis.__cottontailLoadingTestModules = false;
+        \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
+        \\}}
+        \\
+    , .{
+        bun_literal,
+        default_app_literal,
+        bundle_map_literal,
+        bundle_source_root_literal,
+        test_header_signal,
+        cpu_profiler_start_statement,
+        preload_imports,
+    });
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
+    return wrapper_path;
+}
+
+fn writeLazyCommonJsEntryWrapper(
+    ctx: *const Context,
+    tmp_dir: []const u8,
+    script_abs: []const u8,
+    preload_imports: []const u8,
+    test_cli_execution: bool,
+    stable_source_map_path: bool,
+    runtime_virtual_root: []const u8,
+) ![]const u8 {
+    const wrapper_name = try std.fmt.allocPrint(
+        ctx.allocator,
+        "script-entry-commonjs-{x}.mjs",
+        .{std.hash.Wyhash.hash(0, script_abs)},
+    );
+    const wrapper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, wrapper_name });
+    const bun_literal = try jsonStringLiteral(
+        ctx,
+        try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "bun", "index.js" }),
+    );
+    const module_literal = try jsonStringLiteral(
+        ctx,
+        try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "module.js" }),
+    );
+    const script_literal = try jsonStringLiteral(ctx, script_abs);
+    const bundle_map_literal = if (stable_source_map_path)
+        "\"\""
+    else blk: {
+        const bundle_map_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs.map" });
+        break :blk try jsonStringLiteral(ctx, bundle_map_path);
+    };
+    const bundle_source_root_literal = try jsonStringLiteral(
+        ctx,
+        if (stable_source_map_path) runtime_virtual_root else ctx.project_root,
+    );
+    const test_header_signal = if (test_cli_execution)
+        "globalThis.__cottontailBunTestHeaderPrinted = true;"
+    else
+        "";
+    const main_action = if (stable_source_map_path)
+        \\const __ctEntryPath = globalThis.process?.argv?.[1];
+        \\if (!__ctEntryPath) throw new Error("Missing runtime entrypoint");
+        \\const __ctPluginEntry = await globalThis.__cottontailResolvePluginEntrypoint?.(__ctEntryPath, __ctEntryPath);
+        \\if (__ctPluginEntry?.matched) await __ctPluginEntry.value;
+        \\else (moduleModule.default ?? moduleModule.Module).runMain();
+    else
+        try std.fmt.allocPrint(ctx.allocator,
+            \\const __ctPluginEntry = await globalThis.__cottontailResolvePluginEntrypoint?.({s}, {s});
+            \\if (__ctPluginEntry?.matched) await __ctPluginEntry.value;
+            \\else (moduleModule.default ?? moduleModule.Module).runMain();
+        , .{ script_literal, script_literal });
+    const source = try std.fmt.allocPrint(ctx.allocator,
+        \\import {s};
+        \\import * as moduleModule from {s};
+        \\globalThis.__cottontailBundleSourceMap ??= {s};
+        \\globalThis.__cottontailBundleSourceRoot ??= {s};
+        \\globalThis.Loader ??= {{ registry: new Map() }};
+        \\globalThis.__cottontailLoadDotenv?.();
+        \\await globalThis.__cottontailLoadStandaloneBunfig?.();
+        \\await globalThis.__cottontailLoadStandaloneExecPreloads?.();
+        \\{s}
+        \\globalThis.__cottontailLoadingTestModules = true;
+        \\try {{
+        \\{s}
+        \\{s}  globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
+        \\{s}
+        \\}} finally {{
+        \\  globalThis.__cottontailLoadingTestModules = false;
+        \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
+        \\}}
+        \\
+    , .{
+        bun_literal,
+        module_literal,
+        bundle_map_literal,
+        bundle_source_root_literal,
+        test_header_signal,
+        cpu_profiler_start_statement,
+        preload_imports,
+        main_action,
+    });
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
+    return wrapper_path;
+}
+
 fn writeRuntimeEntryWrapper(
     ctx: *const Context,
     tmp_dir: []const u8,
@@ -9008,6 +9346,24 @@ fn writeRuntimeEntryWrapper(
         stable_source_map_path,
         runtime_virtual_root,
         bootstrap_mode,
+    );
+    if (runtime_module_entrypoint) return writeLazyRuntimeEntryWrapper(
+        ctx,
+        tmp_dir,
+        script_abs,
+        preload_imports,
+        test_cli_execution,
+        stable_source_map_path,
+        runtime_virtual_root,
+    );
+    if (!bundle_entry) return writeLazyCommonJsEntryWrapper(
+        ctx,
+        tmp_dir,
+        script_abs,
+        preload_imports,
+        test_cli_execution,
+        stable_source_map_path,
+        runtime_virtual_root,
     );
     const wrapper_name = try std.fmt.allocPrint(
         ctx.allocator,
@@ -9081,7 +9437,7 @@ fn writeRuntimeEntryWrapper(
         try std.fmt.allocPrint(
             ctx.allocator,
             "import {{ startDefaultApp as __ctStartDefaultApp }} from {s};",
-            .{try jsonStringLiteral(ctx, try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "bun", "bake-dev-server.js" }))},
+            .{try jsonStringLiteral(ctx, try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "bun", "default-app.js" }))},
         )
     else
         "";
@@ -9261,6 +9617,12 @@ fn writeRuntimeEntryWrapper(
             \\if (__ctPluginEntry?.matched) await __ctPluginEntry.value;
             \\else await import({s});
         , .{ script_literal, script_literal, script_import_literal })
+    else if (stable_source_map_path)
+        \\const __ctEntryPath = globalThis.process?.argv?.[1];
+        \\if (!__ctEntryPath) throw new Error("Missing runtime entrypoint");
+        \\const __ctPluginEntry = await globalThis.__cottontailResolvePluginEntrypoint?.(__ctEntryPath, __ctEntryPath);
+        \\if (__ctPluginEntry?.matched) await __ctPluginEntry.value;
+        \\else (moduleModule.default ?? moduleModule.Module).runMain();
     else
         try std.fmt.allocPrint(ctx.allocator,
             \\const __ctPluginEntry = await globalThis.__cottontailResolvePluginEntrypoint?.({s}, {s});
@@ -9537,6 +9899,17 @@ test "runtime module launcher is limited to ordinary file execution" {
     try std.testing.expect(!canUseRuntimeModuleLauncher(.{ .test_cli_execution = true }));
     try std.testing.expect(!canUseRuntimeModuleLauncher(.{ .wasm_entrypoint = true }));
     try std.testing.expect(!canUseRuntimeModuleLauncher(.{ .uses_module_mock = true }));
+}
+
+test "full runtime globals include lazy Web APIs" {
+    for ([_][]const u8{
+        "ReadableStream",
+        "TransformStream",
+        "URLPattern",
+        "WritableStream",
+    }) |name| {
+        try std.testing.expect(fullRuntimeGlobal(name));
+    }
 }
 
 test "eval source maps use Bun's virtual source identity" {

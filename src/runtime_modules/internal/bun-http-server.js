@@ -180,12 +180,13 @@ export function createNativeServeRequestState(item, options) {
     bodyStateSymbol,
     unreadBodyAbortReason,
     connectionClosedError,
+    createAbortController,
   } = options;
   const requestId = item.id;
   const hasBody = Boolean(item.hasBody);
   let bodyController = null;
   let nativeFinished = false;
-  let abortController = new globalThis.AbortController();
+  let abortController = createAbortController();
 
   const state = {
     abortController,

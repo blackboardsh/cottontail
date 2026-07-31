@@ -1,10 +1,11 @@
 let accumulator = 0;
 
-const start = cottontail.nanotime();
+const nanotime = globalThis.cottontail?.nanotime ?? process.hrtime.bigint;
+const start = nanotime();
 for (let i = 0; i < 200_000; i += 1) {
   accumulator += i;
 }
-const elapsedNs = cottontail.nanotime() - start;
+const elapsedNs = nanotime() - start;
 
 if (accumulator <= 0) {
   throw new Error("loop benchmark accumulator failed");

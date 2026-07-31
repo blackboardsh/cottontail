@@ -59,6 +59,8 @@ const PackageManagerBunLockfile = @import("package_manager_bun_lockfile.zig");
 
 extern "c" fn _get_osfhandle(fd: c_int) isize;
 extern "c" fn ct_paths_are_same_file(source: [*:0]const u8, destination: [*:0]const u8) c_int;
+extern "c" fn ct_native_copy_file(source: [*:0]const u8, destination: [*:0]const u8, exclusive: c_int) c_int;
+extern "c" fn ct_native_clone_tree(source: [*:0]const u8, destination: [*:0]const u8) c_int;
 
 pub const CtHostEnvEntry = extern struct {
     name: [*:0]const u8,
@@ -1512,6 +1514,14 @@ const NativeCopyContext = struct {
         destination: []const u8,
         exclusive: bool,
     ) !void {
+        const source_z = self.allocator.dupeZ(u8, source) catch |err|
+            return self.fail(source, destination, "copyfile", err);
+        const destination_z = self.allocator.dupeZ(u8, destination) catch |err|
+            return self.fail(source, destination, "copyfile", err);
+        if (ct_native_copy_file(source_z.ptr, destination_z.ptr, @intFromBool(exclusive)) == 0) {
+            return;
+        }
+
         const cwd = std.Io.Dir.cwd();
         const source_file = cwd.openFile(self.io, source, .{}) catch |err|
             return self.fail(source, destination, "open", err);
@@ -1552,10 +1562,11 @@ const NativeCopyContext = struct {
         source: []const u8,
         destination: []const u8,
         destination_stat: ?std.Io.File.Stat,
+        replace_cloned: bool,
     ) !void {
         const cwd = std.Io.Dir.cwd();
         if (destination_stat) |existing| {
-            if (!self.force) {
+            if (!replace_cloned and !self.force) {
                 if (self.error_on_exist) {
                     return self.fail(source, destination, "symlink", error.PathAlreadyExists);
                 }
@@ -1618,6 +1629,42 @@ const NativeCopyContext = struct {
         }) catch |err| return self.fail(source, destination, "symlink", err);
     }
 
+    fn normalizeClonedSymlinks(
+        self: *NativeCopyContext,
+        source: [:0]const u8,
+        destination: [:0]const u8,
+    ) !void {
+        const cwd = std.Io.Dir.cwd();
+        var directory = cwd.openDir(self.io, source, .{ .iterate = true }) catch |err|
+            return self.fail(source, destination, "scandir", err);
+        defer directory.close(self.io);
+        var iterator = directory.iterate();
+        while (iterator.next(self.io) catch |err|
+            return self.fail(source, destination, "scandir", err)) |entry|
+        {
+            const child_source = std.fs.path.joinZ(self.allocator, &.{ source, entry.name }) catch |err|
+                return self.fail(source, destination, "cp", err);
+            const child_destination = std.fs.path.joinZ(self.allocator, &.{ destination, entry.name }) catch |err|
+                return self.fail(source, destination, "cp", err);
+            const child_stat = cwd.statFile(self.io, child_source, .{
+                .follow_symlinks = false,
+            }) catch |err| return self.fail(child_source, child_destination, "lstat", err);
+            switch (child_stat.kind) {
+                .directory => try self.normalizeClonedSymlinks(child_source, child_destination),
+                .sym_link => {
+                    const destination_stat = try self.statIfPresent(
+                        child_destination,
+                        false,
+                        child_source,
+                        child_destination,
+                    );
+                    try self.copySymlink(child_source, child_destination, destination_stat, true);
+                },
+                else => {},
+            }
+        }
+    }
+
     fn copyEntry(self: *NativeCopyContext, source: [:0]const u8, destination: [:0]const u8) !void {
         const cwd = std.Io.Dir.cwd();
         const source_stat = cwd.statFile(self.io, source, .{
@@ -1645,6 +1692,10 @@ const NativeCopyContext = struct {
                     return self.fail(source, destination, "cp", error.IsDir);
                 }
                 const created = destination_stat == null;
+                if (created and ct_native_clone_tree(source.ptr, destination.ptr) == 0) {
+                    try self.normalizeClonedSymlinks(source, destination);
+                    return;
+                }
                 if (created) {
                     cwd.createDir(self.io, destination, .default_dir) catch |err|
                         return self.fail(source, destination, "mkdir", err);
@@ -1686,7 +1737,7 @@ const NativeCopyContext = struct {
                 }
                 try self.copyFileBytes(source, destination, false);
             },
-            .sym_link => try self.copySymlink(source, destination, destination_stat),
+            .sym_link => try self.copySymlink(source, destination, destination_stat, false),
             .named_pipe, .unix_domain_socket, .whiteout, .door, .event_port, .unknown => {
                 return self.fail(source, destination, "cp", error.InvalidArgument);
             },

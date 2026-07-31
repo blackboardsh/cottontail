@@ -1,5 +1,3 @@
-import { KeyObject } from "../crypto.js";
-
 // util.types: brand checks that survive prototype swaps (matching Node's
 // native checks as closely as pure JS allows). Each helper probes an internal
 // slot via a builtin prototype accessor/method rather than instanceof.
@@ -405,6 +403,7 @@ export function isInt8Array(value) {
 }
 
 export function isKeyObject(value) {
+  const { KeyObject } = require("../crypto.js");
   return value instanceof KeyObject;
 }
 

@@ -2141,6 +2141,7 @@ class Expectation {
     if (this._promiseMode) {
       const mode = this._promiseMode;
       const promise = promiseFromActual(this.actual, mode);
+      promise.catch?.(() => {});
       const runCheck = (actual) => check.call(
         new Expectation(actual, this._negate, null, this._label, mode === "rejects", this._testToken),
         actual,
@@ -2159,8 +2160,10 @@ class Expectation {
       // Attach a rejection handler in the same turn, then let the test
       // runner's pending-promise queue await asynchronous I/O. A nested
       // blocking wait here prevents fd events from completing network bodies.
+      result.catch(() => {});
+      if (globalThis.__cottontailRegisterTestPendingPromise?.(result)) return undefined;
+
       if (promise instanceof Promise) {
-        result.catch(() => {});
         let state = nativePromiseState(result);
         if (state?.status === 0 && typeof globalThis.cottontail?.waitForPromise === "function") {
           globalThis.cottontail.waitForPromise(result);
@@ -2171,8 +2174,6 @@ class Expectation {
         }
         if (state?.status === 1) return undefined;
       }
-
-      globalThis.__cottontailRegisterTestPendingPromise?.(result);
       return undefined;
     }
     return check.call(this, this.actual);

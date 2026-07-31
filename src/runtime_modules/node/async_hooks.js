@@ -774,7 +774,12 @@ function wrapAsyncContextCallbacks(value, callbackNames) {
 }
 
 function patchAsyncContextConstructor(global, name, callbackGroups) {
-  const nativeConstructor = global[name];
+  const descriptor = Object.getOwnPropertyDescriptor(global, name);
+  // Reading a lazy stream global here would initialize the complete streams
+  // graph while async_hooks itself is still bootstrapping. Its materializer
+  // calls this function again after replacing the accessor with a value.
+  if (descriptor && typeof descriptor.get === "function" && !("value" in descriptor)) return;
+  const nativeConstructor = descriptor && "value" in descriptor ? descriptor.value : global[name];
   if (typeof nativeConstructor !== "function" || nativeConstructor.__cottontailAsyncHooksPatched) return;
   let wrappedConstructor;
   wrappedConstructor = new Proxy(nativeConstructor, {

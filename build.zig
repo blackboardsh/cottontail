@@ -362,6 +362,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
         };
     }
     step.root_module.addIncludePath(b.path(b.fmt("{s}/include", .{vendor_dir})));
+    step.root_module.addIncludePath(b.path(b.fmt("{s}/include/cottontail", .{vendor_dir})));
     const icu_bridge_flags: []const []const u8 = if (has_icu_fallback)
         if (resolved_target.os.tag == .windows)
             &.{
@@ -470,7 +471,6 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
     });
     if (resolved_target.os.tag == .linux) {
         inline for (&.{
-            .{ "src/jsc_bytecode_bridge.cpp", "jsc_bytecode_bridge.o" },
             .{ "src/jsc_private_bridge.cpp", "jsc_private_bridge.o" },
             .{ "src/inspector_bridge.cpp", "inspector_bridge.o" },
             .{ "src/jsc_stock_bridge.cpp", "jsc_stock_bridge.o" },
@@ -504,7 +504,6 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
                 "src/libuv_internal_symbols.h",
             };
         inline for (&.{
-            "src/jsc_bytecode_bridge.cpp",
             "src/jsc_private_bridge.cpp",
             "src/inspector_bridge.cpp",
             "src/jsc_stock_bridge.cpp",
@@ -546,11 +545,13 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
     switch (resolved_target.os.tag) {
         .macos => {
             requireJscLibrary(b, vendor_dir, "libJavaScriptCore.a");
+            requireJscLibrary(b, vendor_dir, "libCottontailJSCEmbedder.a");
             // The vendored build is a JSCOnly static build: link the archives
             // directly plus the platform pieces the jsc binary itself depends
             // on. ICU calls are supplied by Cottontail's dispatch bridge.
             step.root_module.addIncludePath(b.path(b.fmt("{s}/include", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libJavaScriptCore.a", .{vendor_dir})));
+            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libCottontailJSCEmbedder.a", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libWTF.a", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libbmalloc.a", .{vendor_dir})));
             step.root_module.link_libcpp = true;
@@ -574,9 +575,11 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
         },
         .linux => {
             requireJscLibrary(b, vendor_dir, "libJavaScriptCore.a");
+            requireJscLibrary(b, vendor_dir, "libCottontailJSCEmbedder.a");
             if (!has_icu_fallback)
                 @panic("Linux JSC setup did not provide the static ICU fallback");
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libJavaScriptCore.a", .{vendor_dir})));
+            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libCottontailJSCEmbedder.a", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libWTF.a", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libbmalloc.a", .{vendor_dir})));
             for (fallback_libraries) |library|
@@ -604,9 +607,11 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
         .windows => {
             const dependency_dir = "vendors/windows-deps/x64-windows-static";
             requireJscLibrary(b, vendor_dir, "JavaScriptCore.lib");
+            requireJscLibrary(b, vendor_dir, "CottontailJSCEmbedder.lib");
             step.root_module.addIncludePath(b.path(b.fmt("{s}/include", .{dependency_dir})));
             step.root_module.addLibraryPath(b.path(b.fmt("{s}/lib", .{dependency_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/JavaScriptCore.lib", .{vendor_dir})));
+            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/CottontailJSCEmbedder.lib", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/WTF.lib", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/bmalloc.lib", .{vendor_dir})));
             if (!has_icu_fallback)
