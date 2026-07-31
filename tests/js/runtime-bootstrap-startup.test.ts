@@ -200,7 +200,7 @@ test("compiled bytecode is embedded and invalidates when source identity changes
   expect(bytecodeLength).toBeGreaterThan(56);
   const payloadOffset = trailerOffset - sourceLength - mapLength - filesLength - execArgvLength - bytecodeLength;
   const bytecodeOffset = payloadOffset + sourceLength + mapLength + filesLength + execArgvLength;
-  expect(bytes.subarray(bytecodeOffset, bytecodeOffset + 8).toString()).toBe("CTJSCB01");
+  expect(bytes.subarray(bytecodeOffset, bytecodeOffset + 8).toString()).toBe("CTJSCB02");
 
   const sourceBytes = bytes.subarray(payloadOffset, payloadOffset + sourceLength);
   const markerOffset = sourceBytes.indexOf("bytecode-one");

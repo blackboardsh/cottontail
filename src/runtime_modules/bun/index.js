@@ -1,4 +1,5 @@
 import "../internal/v8-date-parser.js";
+import { processObject as earlyProcessObject } from "../internal/runtime-process-bootstrap.js";
 import * as FFI from "./ffi.js";
 import * as NodeBufferNamespace from "../node/buffer.js";
 import * as NodeAsyncHooksNamespace from "../node/async_hooks.js";
@@ -245,6 +246,7 @@ export { write };
 const estimatedMemoryCostSymbol = Symbol.for("cottontail.estimatedMemoryCost");
 const stackFunctionRegistrySymbol = Symbol.for("cottontail.stackFunctionRegistry");
 
+globalThis.process ??= earlyProcessObject;
 installStandaloneRuntimeLoaders(globalThis.process);
 
 if (globalThis.process && Object.prototype.toString.call(globalThis.process) !== "[object process]") {
