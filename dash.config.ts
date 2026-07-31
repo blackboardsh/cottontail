@@ -1,4 +1,4 @@
-// @dash cli=0.2.1 cottontail=0.2.1
+// @dash cli=0.2.1 cottontail=0.2.2
 export default {
   scripts: {
     "push:canary": "node scripts/tag-release.js canary",
