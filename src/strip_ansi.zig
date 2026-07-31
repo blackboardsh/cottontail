@@ -150,14 +150,14 @@ pub export fn ct_strip_ansi_free_utf16(pointer: ?[*]u16, capacity: usize) void {
 
 test "strip ANSI handles CSI, OSC, and unterminated controls" {
     const csi = try strip(u8, "before\x1b[31mred\x1b[0mafter");
-    defer allocator.free(csi.?.ptr[0.."before\x1b[31mred\x1b[0mafter".len]);
+    defer ct_strip_ansi_free_latin1(csi.?.ptr, "before\x1b[31mred\x1b[0mafter".len);
     try std.testing.expectEqualStrings("beforeredafter", csi.?);
 
     const osc = try strip(u8, "before\x1b]0;title\x07after");
-    defer allocator.free(osc.?.ptr[0.."before\x1b]0;title\x07after".len]);
+    defer ct_strip_ansi_free_latin1(osc.?.ptr, "before\x1b]0;title\x07after".len);
     try std.testing.expectEqualStrings("beforeafter", osc.?);
 
     const unterminated = try strip(u8, "before\x1b[31");
-    defer allocator.free(unterminated.?.ptr[0.."before\x1b[31".len]);
+    defer ct_strip_ansi_free_latin1(unterminated.?.ptr, "before\x1b[31".len);
     try std.testing.expectEqualStrings("before", unterminated.?);
 }
