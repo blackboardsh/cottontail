@@ -61,6 +61,7 @@ extern "c" fn _get_osfhandle(fd: c_int) isize;
 extern "c" fn ct_paths_are_same_file(source: [*:0]const u8, destination: [*:0]const u8) c_int;
 extern "c" fn ct_native_copy_file(source: [*:0]const u8, destination: [*:0]const u8, exclusive: c_int) c_int;
 extern "c" fn ct_native_clone_tree(source: [*:0]const u8, destination: [*:0]const u8) c_int;
+extern "c" fn ct_native_chmod(path: [*:0]const u8, mode: c_uint) c_int;
 
 pub const CtHostEnvEntry = extern struct {
     name: [*:0]const u8,
@@ -1508,6 +1509,23 @@ const NativeCopyContext = struct {
         };
     }
 
+    fn setCopiedPermissions(
+        self: *NativeCopyContext,
+        source: []const u8,
+        destination: [:0]const u8,
+        permissions: std.Io.File.Permissions,
+        is_directory: bool,
+    ) !void {
+        if (comptime builtin.os.tag == .windows) {
+            const mode = windowsCopiedMode(permissions, is_directory);
+            const code = ct_native_chmod(destination.ptr, mode);
+            if (code != 0) return self.fail(source, destination, "chmod", nativeChmodError(code));
+            return;
+        }
+        std.Io.Dir.cwd().setFilePermissions(self.io, destination, permissions, .{}) catch |err|
+            return self.fail(source, destination, "chmod", err);
+    }
+
     fn copyFileBytes(
         self: *NativeCopyContext,
         source: []const u8,
@@ -1553,8 +1571,7 @@ const NativeCopyContext = struct {
         };
         destination_writer.flush() catch |err|
             return self.fail(source, destination, "write", err);
-        destination_file.setPermissions(self.io, source_stat.permissions) catch |err|
-            return self.fail(source, destination, "chmod", err);
+        try self.setCopiedPermissions(source, destination_z, source_stat.permissions, false);
     }
 
     fn copySymlink(
@@ -1715,14 +1732,12 @@ const NativeCopyContext = struct {
                     try self.copyEntry(child_source, child_destination);
                 }
 
-                if (created) {
-                    cwd.setFilePermissions(
-                        self.io,
-                        destination,
-                        source_stat.permissions,
-                        .{},
-                    ) catch |err| return self.fail(source, destination, "chmod", err);
-                }
+                if (created) try self.setCopiedPermissions(
+                    source,
+                    destination,
+                    source_stat.permissions,
+                    true,
+                );
             },
             .file, .block_device, .character_device => {
                 if (destination_stat != null) {
@@ -1744,6 +1759,25 @@ const NativeCopyContext = struct {
         }
     }
 };
+
+fn windowsCopiedMode(permissions: std.Io.File.Permissions, is_directory: bool) c_uint {
+    const read_only = permissions.toAttributes().READONLY;
+    return if (read_only)
+        (if (is_directory) 0o555 else 0o444)
+    else
+        (if (is_directory) 0o777 else 0o666);
+}
+
+test "Windows copied permissions preserve the read-only attribute" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const writable: std.Io.File.Permissions = @enumFromInt(0);
+    const read_only: std.Io.File.Permissions = @enumFromInt(1);
+    try std.testing.expectEqual(@as(c_uint, 0o666), windowsCopiedMode(writable, false));
+    try std.testing.expectEqual(@as(c_uint, 0o444), windowsCopiedMode(read_only, false));
+    try std.testing.expectEqual(@as(c_uint, 0o777), windowsCopiedMode(writable, true));
+    try std.testing.expectEqual(@as(c_uint, 0o555), windowsCopiedMode(read_only, true));
+}
 
 fn setNativeCopyError(
     error_out: *?[*:0]u8,
@@ -1955,6 +1989,15 @@ pub export fn ct_host_unlink(path: [*:0]const u8, error_out: *?[*:0]u8) c_int {
 pub export fn ct_host_chmod(path: [*:0]const u8, mode: c_uint, error_out: *?[*:0]u8) c_int {
     error_out.* = null;
 
+    if (comptime builtin.os.tag == .windows) {
+        const code = ct_native_chmod(path, mode);
+        if (code != 0) {
+            setErrorOut(error_out, @errorName(nativeChmodError(code)));
+            return -1;
+        }
+        return 0;
+    }
+
     const permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode"))
         std.Io.File.Permissions.fromMode(@intCast(mode))
     else
@@ -1966,6 +2009,16 @@ pub export fn ct_host_chmod(path: [*:0]const u8, mode: c_uint, error_out: *?[*:0
     };
 
     return 0;
+}
+
+fn nativeChmodError(code: c_int) anyerror {
+    return switch (code) {
+        c.ENOENT => error.FileNotFound,
+        c.EACCES => error.AccessDenied,
+        c.EPERM => error.PermissionDenied,
+        c.ENOTDIR => error.NotDir,
+        else => error.Unexpected,
+    };
 }
 
 pub export fn ct_host_spawn_sync(

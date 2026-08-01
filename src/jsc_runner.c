@@ -906,6 +906,11 @@ static int ct_windows_chmod(const char *path, mode_t mode) {
     return status;
 }
 
+int ct_native_chmod(const char *path, unsigned int mode) {
+    if (ct_windows_chmod(path, (mode_t)mode) == 0) return 0;
+    return errno != 0 ? errno : EIO;
+}
+
 static int ct_fchmod(int fd, mode_t mode) {
     HANDLE handle = (HANDLE)_get_osfhandle(fd);
     if (handle == INVALID_HANDLE_VALUE) {

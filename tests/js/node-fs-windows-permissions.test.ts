@@ -129,6 +129,33 @@ windowsTest("fchmod updates wide-path files and preserves EBADF validation", asy
   await expect(handle.chmod(0o600)).rejects.toMatchObject({ code: "EBADF", syscall: "fchmod" });
 });
 
+windowsTest("recursive copies restore Windows permissions without using Zig's unsupported path", () => {
+  const source = path.join(root, "copy-permissions-source");
+  const sourceFile = path.join(source, "nested", wideName);
+  const destinations = [
+    path.join(root, "copy-permissions-native"),
+    path.join(root, "copy-permissions-timestamps"),
+  ];
+  fs.mkdirSync(path.dirname(sourceFile), { recursive: true });
+  fs.writeFileSync(sourceFile, "content");
+  fs.chmodSync(sourceFile, 0o400);
+
+  try {
+    fs.cpSync(source, destinations[0], { recursive: true });
+    fs.cpSync(source, destinations[1], { recursive: true, preserveTimestamps: true });
+    for (const destination of destinations) {
+      const copied = path.join(destination, "nested", wideName);
+      expect(fs.readFileSync(copied, "utf8")).toBe("content");
+      expect(fs.statSync(copied).mode & 0o200).toBe(0);
+    }
+  } finally {
+    fs.chmodSync(sourceFile, 0o600);
+    for (const destination of destinations) {
+      try { fs.chmodSync(path.join(destination, "nested", wideName), 0o600); } catch {}
+    }
+  }
+});
+
 windowsTest("chown APIs are validated no-ops while closed FileHandles still reject", async () => {
   const missing = path.join(root, `missing-owner-${wideName}`);
   expect(() => fs.chownSync(missing, false as any, 456)).toThrow(expect.objectContaining({
