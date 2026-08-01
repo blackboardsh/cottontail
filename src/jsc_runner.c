@@ -625,6 +625,87 @@ static WCHAR *ct_windows_utf8_to_wide(const char *value) {
     return wide;
 }
 
+static ssize_t ct_windows_write_console_utf8(HANDLE handle, const void *buffer, size_t length) {
+    if (length == 0) return 0;
+    if (handle == NULL || handle == INVALID_HANDLE_VALUE || buffer == NULL) {
+        errno = EBADF;
+        return -1;
+    }
+
+    const unsigned char *bytes = (const unsigned char *)buffer;
+    size_t offset = 0;
+    while (offset < length) {
+        size_t byte_count = length - offset;
+        if (byte_count > 32768) byte_count = 32768;
+
+        /* Keep a UTF-8 sequence together when a large write is chunked. */
+        if (offset + byte_count < length) {
+            size_t boundary = byte_count;
+            while (boundary > 0 && (bytes[offset + boundary] & 0xc0) == 0x80) {
+                boundary -= 1;
+            }
+            if (boundary > 0) byte_count = boundary;
+        }
+
+        int wide_length = MultiByteToWideChar(
+            CP_UTF8,
+            0,
+            (const char *)bytes + offset,
+            (int)byte_count,
+            NULL,
+            0
+        );
+        if (wide_length <= 0) {
+            ct_windows_set_errno(GetLastError());
+            return -1;
+        }
+        WCHAR *wide = (WCHAR *)malloc(sizeof(WCHAR) * (size_t)wide_length);
+        if (wide == NULL) {
+            errno = ENOMEM;
+            return -1;
+        }
+        int converted = MultiByteToWideChar(
+            CP_UTF8,
+            0,
+            (const char *)bytes + offset,
+            (int)byte_count,
+            wide,
+            wide_length
+        );
+        if (converted != wide_length) {
+            DWORD error = GetLastError();
+            free(wide);
+            ct_windows_set_errno(error);
+            return -1;
+        }
+
+        size_t wide_offset = 0;
+        while (wide_offset < (size_t)wide_length) {
+            DWORD wide_count = (DWORD)((size_t)wide_length - wide_offset);
+            if (wide_count > 32767) wide_count = 32767;
+            if (wide_offset + wide_count < (size_t)wide_length &&
+                wide[wide_offset + wide_count - 1] >= 0xd800 &&
+                wide[wide_offset + wide_count - 1] <= 0xdbff)
+            {
+                wide_count -= 1;
+            }
+
+            DWORD written = 0;
+            if (!WriteConsoleW(handle, wide + wide_offset, wide_count, &written, NULL) || written == 0) {
+                DWORD error = GetLastError();
+                free(wide);
+                ct_windows_set_errno(error != ERROR_SUCCESS ? error : ERROR_WRITE_FAULT);
+                return -1;
+            }
+            wide_offset += written;
+        }
+
+        free(wide);
+        offset += byte_count;
+    }
+    return (ssize_t)length;
+}
+
 static char *ct_windows_wide_to_utf8(const WCHAR *value, size_t value_len, size_t *length_out) {
     if (length_out != NULL) *length_out = 0;
     if (value == NULL || value_len > INT_MAX) {
@@ -1605,6 +1686,10 @@ static ssize_t ct_windows_write(int fd, const void *buffer, size_t length) {
             return -1;
         }
         HANDLE handle = (HANDLE)raw_handle;
+        DWORD console_mode = 0;
+        if (GetConsoleMode(handle, &console_mode)) {
+            return ct_windows_write_console_utf8(handle, buffer, length);
+        }
         if (GetFileType(handle) != FILE_TYPE_PIPE ||
             !ct_windows_pipe_is_overlapped(handle)) {
             return _write(fd, buffer, length > UINT_MAX ? UINT_MAX : (unsigned int)length);
@@ -10831,32 +10916,9 @@ static bool ct_console_write_windows_utf8(FILE *stream, const char *text) {
 
     /* Keep buffered ASCII separators ordered with direct console writes. */
     (void)fflush(stream);
-    WCHAR *wide = ct_windows_utf8_to_wide(text != NULL ? text : "");
-    if (wide == NULL) return false;
-
-    size_t length = 0;
-    while (wide[length] != L'\0') length += 1;
-
-    size_t offset = 0;
-    while (offset < length) {
-        DWORD chunk = (DWORD)((length - offset) > 32767 ? 32767 : (length - offset));
-        if (offset + chunk < length &&
-            wide[offset + chunk - 1] >= 0xd800 &&
-            wide[offset + chunk - 1] <= 0xdbff)
-        {
-            chunk -= 1;
-        }
-
-        DWORD written = 0;
-        if (!WriteConsoleW(handle, wide + offset, chunk, &written, NULL) || written == 0) {
-            free(wide);
-            return offset != 0;
-        }
-        offset += written;
-    }
-
-    free(wide);
-    return true;
+    const char *value = text != NULL ? text : "";
+    size_t length = strlen(value);
+    return ct_windows_write_console_utf8(handle, value, length) == (ssize_t)length;
 }
 #endif
 

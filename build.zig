@@ -758,6 +758,7 @@ pub fn build(b: *std.Build) void {
         });
         const run_windows_console_test = b.addRunArtifact(windows_console_test);
         run_windows_console_test.addArg(b.getInstallPath(.bin, "cottontail.exe"));
+        run_windows_console_test.step.dependOn(b.getInstallStep());
         const windows_console_test_step = b.step(
             "test-windows-console",
             "Test Unicode output in a legacy Windows console",

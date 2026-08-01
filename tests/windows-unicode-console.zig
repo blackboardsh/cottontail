@@ -159,6 +159,32 @@ fn containsSequence(haystack: []const windows.WCHAR, needle: []const windows.WCH
     return false;
 }
 
+fn containsAscii(haystack: []const windows.WCHAR, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    outer: for (0..haystack.len - needle.len + 1) |start| {
+        for (needle, 0..) |character, offset| {
+            if (haystack[start + offset] != @as(windows.WCHAR, character)) continue :outer;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn countCodeUnit(haystack: []const windows.WCHAR, needle: windows.WCHAR) usize {
+    var count: usize = 0;
+    for (haystack) |character| {
+        if (character == needle) count += 1;
+    }
+    return count;
+}
+
+fn successfulExit(term: std.process.Child.Term) bool {
+    return switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
 fn writeFailure(io: std.Io, comptime format: []const u8, args: anytype) void {
     var stderr_buffer: [2048]u8 = undefined;
     var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
@@ -183,18 +209,40 @@ pub fn main(init: std.process.Init) !void {
     try std.Io.Dir.cwd().writeFile(init.io, .{
         .sub_path = script_path,
         .data =
-        \\console.log("\u2713", "stdout");
-        \\console.error("\u2713", "stderr");
+        \\import { spawnSync } from "node:child_process";
+        \\console.log("\u2713", "console stdout");
+        \\console.error("\u2713", "console stderr");
+        \\process.stdout.write("\u2713 stream stdout\n");
+        \\process.stderr.write("\u2713 stream stderr\n");
+        \\if (process.argv.includes("--inherit-child")) {
+        \\  const child = spawnSync("cmd.exe", ["/D", "/C", "echo inherited child stdout & echo inherited child stderr 1>&2"], { stdio: "inherit" });
+        \\  if (child.status !== 0) throw new Error(`inherited child exited ${child.status}`);
+        \\}
         ,
     });
     defer std.Io.Dir.deleteFileAbsolute(init.io, script_path) catch {};
+
+    const piped = try std.process.run(allocator, init.io, .{
+        .argv = &.{ args[1], script_path },
+    });
+    defer allocator.free(piped.stdout);
+    defer allocator.free(piped.stderr);
+    if (!successfulExit(piped.term) or
+        std.mem.indexOf(u8, piped.stdout, "\xe2\x9c\x93 console stdout") == null or
+        std.mem.indexOf(u8, piped.stdout, "\xe2\x9c\x93 stream stdout") == null or
+        std.mem.indexOf(u8, piped.stderr, "\xe2\x9c\x93 console stderr") == null or
+        std.mem.indexOf(u8, piped.stderr, "\xe2\x9c\x93 stream stderr") == null)
+    {
+        writeFailure(init.io, "Cottontail did not preserve redirected UTF-8 or inherited child output\n", .{});
+        return error.RedirectedOutputMismatch;
+    }
 
     var capture = try ConsoleCapture.init();
     var capture_active = true;
     defer if (capture_active) capture.deinit();
 
     var child = try std.process.spawn(init.io, .{
-        .argv = &.{ args[1], script_path },
+        .argv = &.{ args[1], script_path, "--inherit-child" },
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
@@ -222,13 +270,19 @@ pub fn main(init: std.process.Init) !void {
         return error.UnexpectedChildExitCode;
     }
 
-    const expected_stdout = [_]windows.WCHAR{ 0x2713, ' ', 's', 't', 'd', 'o', 'u', 't' };
-    const expected_stderr = [_]windows.WCHAR{ 0x2713, ' ', 's', 't', 'd', 'e', 'r', 'r' };
     const mojibake = [_]windows.WCHAR{ 0x0393, 0x00a3, 0x00f4 };
     const stdout = stdout_buffer[0..stdout_length];
     const stderr = stderr_buffer[0..stderr_length];
-    if (!containsSequence(stdout, &expected_stdout) or !containsSequence(stderr, &expected_stderr)) {
-        writeFailure(init.io, "Cottontail did not write Unicode console output through the wide Windows API\n", .{});
+    if (countCodeUnit(stdout, 0x2713) < 2 or
+        countCodeUnit(stderr, 0x2713) < 2 or
+        !containsAscii(stdout, "console stdout") or
+        !containsAscii(stdout, "stream stdout") or
+        !containsAscii(stdout, "inherited child stdout") or
+        !containsAscii(stderr, "console stderr") or
+        !containsAscii(stderr, "stream stderr") or
+        !containsAscii(stderr, "inherited child stderr"))
+    {
+        writeFailure(init.io, "Cottontail did not forward its console or inherited child output\n", .{});
         return error.UnicodeConsoleOutputMissing;
     }
     if (containsSequence(stdout, &mojibake) or containsSequence(stderr, &mojibake)) {
