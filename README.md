@@ -85,6 +85,7 @@ exposed by Cottontail itself.
 - `bun run run -- test.js` builds and runs a JavaScript file through `cottontail`.
 - `bun run dev` vendors, builds, and runs the smoke test in `test.js`.
 - `bun run bench` builds a release binary and runs dedicated startup / loop / JSON / async benchmarks.
+- `node scripts/compare-releases.js --cottontail 0.2.3 --bun 1.3.10` downloads and checksum-verifies those exact releases, compares executable sizes across the release matrix, and benchmarks both host binaries.
 - `bun run test:zig` runs the Zig unit tests.
 - `bun run test:js` runs the JavaScript runtime behavior suite.
 - `bun run test:electrobun` runs the local Electrobun bridge smoke test against a sibling `../electrobun/package/dist`.
@@ -92,6 +93,13 @@ exposed by Cottontail itself.
 - `bun run electrobun:window` opens a native window through the local Electrobun core.
 - `bun run test` runs both the Zig and JavaScript tests.
 - `bun run check-zig-version` prints the vendored Zig version through the local wrapper script.
+
+The release comparison command caches immutable artifacts under
+`.cottontail-tmp/release-benchmarks/` and writes JSON plus Markdown results
+there by default. Runtime order alternates for every paired sample, and the
+tables use medians. `--quick` validates the harness with reduced samples;
+`--skip-performance` or `--skip-sizes` runs only one half of the comparison.
+Run `node scripts/compare-releases.js --help` for all options.
 
 ## Release builds
 
