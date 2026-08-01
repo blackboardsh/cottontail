@@ -137,6 +137,13 @@ jobs:
       - name: Build and strip release binary
         run: node scripts/build-release.js
 
+      - name: Test Unicode output in a legacy Windows console
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          node scripts/zig.js build test-windows-console -Doptimize=ReleaseSmall -Dcpu=baseline
+          if ($LASTEXITCODE -ne 0) { throw "Windows Unicode console test failed" }
+
       - name: Validate stripped release binary
         run: node scripts/validate-release-binary.js
 

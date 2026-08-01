@@ -746,4 +746,22 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    if (target.result.os.tag == .windows) {
+        const windows_console_test = b.addExecutable(.{
+            .name = "windows-unicode-console-test",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/windows-unicode-console.zig"),
+                .target = target,
+                .optimize = .ReleaseSafe,
+            }),
+        });
+        const run_windows_console_test = b.addRunArtifact(windows_console_test);
+        run_windows_console_test.addArg(b.getInstallPath(.bin, "cottontail.exe"));
+        const windows_console_test_step = b.step(
+            "test-windows-console",
+            "Test Unicode output in a legacy Windows console",
+        );
+        windows_console_test_step.dependOn(&run_windows_console_test.step);
+    }
 }

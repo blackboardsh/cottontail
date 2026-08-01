@@ -10818,11 +10818,58 @@ static JSValueRef ct_array_buffer_view_has_buffer(JSContextRef ctx, JSObjectRef 
     return JSValueMakeBoolean(ctx, ct_jsc_array_buffer_view_has_buffer(argv[0]));
 }
 
+#if defined(_WIN32)
+static bool ct_console_write_windows_utf8(FILE *stream, const char *text) {
+    int fd = _fileno(stream);
+    if (fd < 0) return false;
+
+    intptr_t raw_handle = _get_osfhandle(fd);
+    if (raw_handle == -1) return false;
+    HANDLE handle = (HANDLE)raw_handle;
+    DWORD mode = 0;
+    if (!GetConsoleMode(handle, &mode)) return false;
+
+    /* Keep buffered ASCII separators ordered with direct console writes. */
+    (void)fflush(stream);
+    WCHAR *wide = ct_windows_utf8_to_wide(text != NULL ? text : "");
+    if (wide == NULL) return false;
+
+    size_t length = 0;
+    while (wide[length] != L'\0') length += 1;
+
+    size_t offset = 0;
+    while (offset < length) {
+        DWORD chunk = (DWORD)((length - offset) > 32767 ? 32767 : (length - offset));
+        if (offset + chunk < length &&
+            wide[offset + chunk - 1] >= 0xd800 &&
+            wide[offset + chunk - 1] <= 0xdbff)
+        {
+            chunk -= 1;
+        }
+
+        DWORD written = 0;
+        if (!WriteConsoleW(handle, wide + offset, chunk, &written, NULL) || written == 0) {
+            free(wide);
+            return offset != 0;
+        }
+        offset += written;
+    }
+
+    free(wide);
+    return true;
+}
+#endif
+
 static JSValueRef ct_console_log_impl(JSContextRef ctx, size_t argc, const JSValueRef argv[], FILE *stream) {
     for (size_t index = 0; index < argc; index += 1) {
         char *text = ct_value_to_string_copy(ctx, argv[index]);
         if (index > 0) fputc(' ', stream);
-        fputs(text != NULL ? text : "", stream);
+#if defined(_WIN32)
+        if (!ct_console_write_windows_utf8(stream, text))
+#endif
+        {
+            fputs(text != NULL ? text : "", stream);
+        }
         free(text);
     }
     fputc('\n', stream);
