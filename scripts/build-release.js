@@ -20,6 +20,7 @@ import {
   restrictElfDynamicExports,
   restrictPortableExecutableExports,
 } from './release-binary-contract.js';
+import { releaseTargetArgs } from './release-target.js';
 
 const rootDir = process.cwd();
 const zigName = process.platform === 'win32' ? 'zig.exe' : 'zig';
@@ -57,11 +58,13 @@ const stagedExecutable = join(stagingRoot, 'bin', executableName);
 
 try {
   run(process.execPath, [nativeBindingsGenerator], 'Native binding generation');
-  const args = ['build', '-Doptimize=ReleaseSmall'];
-  if (process.platform === 'win32') {
-    args.push('-Dtarget=x86_64-windows-msvc');
-  }
-  args.push('-Dcpu=baseline', '--prefix', stagingRoot);
+  const args = [
+    'build',
+    '-Doptimize=ReleaseSmall',
+    ...releaseTargetArgs(process.platform),
+    '--prefix',
+    stagingRoot,
+  ];
 
   run(zigPath, args, 'Cottontail release build');
   if (process.platform === 'darwin') {

@@ -49,7 +49,7 @@ jobs:
       - name: Validate release tag
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          node --test scripts/release-binary-contract.test.js scripts/release-contract.test.js scripts/release-version.test.js
+          node --test scripts/release-binary-contract.test.js scripts/release-contract.test.js scripts/release-version.test.js scripts/x64-baseline-release.test.js
           node scripts/validate-release-tag.js
 
       - name: Restore vendored toolchains

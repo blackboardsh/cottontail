@@ -654,6 +654,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{
         .default_target = if (builtin.os.tag == .windows) .{
             .cpu_arch = .x86_64,
+            .cpu_model = .baseline,
             .os_tag = .windows,
             .abi = .msvc,
         } else .{},

@@ -4,6 +4,8 @@ import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { releaseTargetArgs } from './release-target.js';
+
 const rootDir = process.cwd();
 const executableName = process.platform === 'win32' ? 'cottontail.exe' : 'cottontail';
 const zigName = process.platform === 'win32' ? 'zig.exe' : 'zig';
@@ -26,11 +28,12 @@ if (!existsSync(executablePath)) {
   throw new Error(`Release executable is missing: ${executablePath}`);
 }
 
-const buildArgs = ['build', 'build-native-plugin', '-Doptimize=ReleaseSmall'];
-if (process.platform === 'win32') {
-  buildArgs.push('-Dtarget=x86_64-windows-msvc');
-}
-buildArgs.push('-Dcpu=baseline');
+const buildArgs = [
+  'build',
+  'build-native-plugin',
+  '-Doptimize=ReleaseSmall',
+  ...releaseTargetArgs(process.platform),
+];
 run(zigPath, buildArgs, 'Native plugin fixture build');
 
 if (!existsSync(pluginPath)) {
