@@ -34,44 +34,49 @@ test("BodyInit snapshots mutable buffer sources and Blob-part arrays", async () 
 });
 
 test("Blob and File bodies retain metadata without retaining wrapper identity", async () => {
-  const source = new Blob(["contents"], { type: "text/example" });
-  const response = new Response(source);
-  const clone = response.clone();
-  const first = await response.blob();
-  const second = await clone.blob();
+  for (const make of [
+    (body: unknown) => new Response(body as any),
+    (body: unknown) => postRequest(body),
+  ]) {
+    const source = new Blob(["contents"], { type: "text/example" });
+    const body = make(source);
+    const clone = body.clone();
+    const first = await body.blob();
+    const second = await clone.blob();
 
-  expect(first).not.toBe(source);
-  expect(second).not.toBe(source);
-  expect(second).not.toBe(first);
-  expect(first.type).toBe("text/example");
-  expect(await first.text()).toBe("contents");
-  expect(await second.text()).toBe("contents");
+    expect(first).not.toBe(source);
+    expect(second).not.toBe(source);
+    expect(second).not.toBe(first);
+    expect(first.type).toBe("text/example");
+    expect(await first.text()).toBe("contents");
+    expect(await second.text()).toBe("contents");
 
-  const file = new File(["file contents"], "input.txt", {
-    type: "text/plain",
-    lastModified: 123,
-  });
-  const output = await new Response(file).blob();
-  expect(output).not.toBe(file);
-  expect(output).toBeInstanceOf(File);
-  expect((output as File).name).toBe("input.txt");
-  expect((output as File).lastModified).toBe(123);
+    const file = new File(["file contents"], "input.txt", {
+      type: "text/plain",
+      lastModified: 123,
+    });
+    const output = await make(file).blob();
+    expect(output).not.toBe(file);
+    expect(output).toBeInstanceOf(File);
+    expect((output as File).name).toBe("input.txt");
+    expect((output as File).lastModified).toBe(123);
 
-  const form = new FormData();
-  form.append("file", new Blob(["wrapped contents"]), "wrapped.txt");
-  const wrapped = form.get("file") as File;
-  const wrappedOutput = await new Response(wrapped).blob();
-  expect(wrappedOutput).not.toBe(wrapped);
-  expect(wrappedOutput).toBeInstanceOf(File);
-  expect((wrappedOutput as File).name).toBe("wrapped.txt");
-  expect(await wrappedOutput.text()).toBe("wrapped contents");
+    const form = new FormData();
+    form.append("file", new Blob(["wrapped contents"]), "wrapped.txt");
+    const wrapped = form.get("file") as File;
+    const wrappedOutput = await make(wrapped).blob();
+    expect(wrappedOutput).not.toBe(wrapped);
+    expect(wrappedOutput).toBeInstanceOf(File);
+    expect((wrappedOutput as File).name).toBe("wrapped.txt");
+    expect(await wrappedOutput.text()).toBe("wrapped contents");
 
-  const bunFile = Bun.file("package.json");
-  const bunFileOutput = await new Response(bunFile).blob();
-  expect(bunFileOutput).not.toBe(bunFile);
-  expect((bunFileOutput as any).name).toBe("package.json");
-  expect(typeof (bunFileOutput as any).exists).toBe("function");
-  expect(await bunFileOutput.text()).toContain('"name": "cottontail"');
+    const bunFile = Bun.file("package.json");
+    const bunFileOutput = await make(bunFile).blob();
+    expect(bunFileOutput).not.toBe(bunFile);
+    expect((bunFileOutput as any).name).toBe("package.json");
+    expect(typeof (bunFileOutput as any).exists).toBe("function");
+    expect(await bunFileOutput.text()).toContain('"name": "cottontail"');
+  }
 });
 
 test("FormData is captured when attached and reparsed per body consumer", async () => {

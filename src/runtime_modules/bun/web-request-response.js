@@ -1057,8 +1057,6 @@ export function createRequestResponseRuntime({
     return new BodyBlobViewClass(source);
   }
   
-  const plainBlobBodySnapshots = new WeakMap();
-
   function snapshotBlobBody(blob) {
     const source = blob?.[bodyBlobSourceSymbol] ?? blob;
     if (source?._source != null) {
@@ -1070,15 +1068,6 @@ export function createRequestResponseRuntime({
         type: source.type,
         lastModified: source.lastModified,
       });
-    }
-    if (Object.getPrototypeOf(source) === Blob.prototype) {
-      let snapshot = plainBlobBodySnapshots.get(source);
-      if (snapshot == null) {
-        snapshot = bodyBlobSlice.call(source, 0, source.size, source.type);
-        plainBlobBodySnapshots.set(source, snapshot);
-        plainBlobBodySnapshots.set(snapshot, snapshot);
-      }
-      return snapshot;
     }
     return bodyBlobSlice.call(source, 0, source.size, source.type);
   }
