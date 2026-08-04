@@ -1922,8 +1922,8 @@
       "reason": "Bun.color uses the vendored Zig CSS parser, color-space conversions, printer, structured formats, ANSI conversion, snapshots, and full ansi256 fuzz coverage; all 917 upstream cases pass."
     },
     "test/js/bun/css/css-fuzz.test.ts": {
-      "status": "expected-failure",
-      "reason": "Long-running CSS fuzz coverage currently exceeds the direct upstream runner timeout under Cottontail."
+      "status": "enabled",
+      "reason": "All five unchanged CSS fuzz cases complete within their upstream deadlines after pooling compiler allocations, preserving deep parser stacks, and making printer indentation wrapping explicit."
     },
     "test/js/bun/css/css.test.ts": {
       "status": "enabled",

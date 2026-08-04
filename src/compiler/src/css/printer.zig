@@ -513,12 +513,15 @@ pub const Printer = struct {
 
     /// Increases the current indent level.
     pub fn indent(this: *This) void {
-        this.indent_amt += 2;
+        // Bun's optimized printer wraps this byte counter for extremely deep
+        // nesting. Spell that behavior explicitly so safety-enabled builds do
+        // not trap where Bun continues serializing.
+        this.indent_amt +%= 2;
     }
 
     /// Decreases the current indent level.
     pub fn dedent(this: *This) void {
-        this.indent_amt -= 2;
+        this.indent_amt -%= 2;
     }
 
     const INDENTS: []const []const u8 = indents: {
@@ -558,6 +561,17 @@ pub const Printer = struct {
         }
     }
 };
+
+test "CSS printer indentation supports deeply nested rules" {
+    var printer: Printer = undefined;
+    printer.indent_amt = 0;
+
+    for (0..300) |_| printer.indent();
+    try std.testing.expectEqual(@as(u8, @truncate(600)), printer.indent_amt);
+
+    for (0..300) |_| printer.dedent();
+    try std.testing.expectEqual(@as(u8, 0), printer.indent_amt);
+}
 
 const bun = @import("bun");
 

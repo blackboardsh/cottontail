@@ -468,6 +468,12 @@ try {
       stdoutIncludes: ['bun build native passed'],
     },
     {
+      name: 'bun-build-css-stress',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-build-css-stress.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['2 pass', '0 fail'],
+    },
+    {
       name: 'bun-typescript-compiler-parity',
       argv: ['test', join(rootDir, 'tests', 'js', 'bun-typescript-compiler-parity.test.ts')],
       expectExitCode: 0,
