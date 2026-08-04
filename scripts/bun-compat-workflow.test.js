@@ -29,6 +29,10 @@ test('runs only for compat branches and manual dispatch', () => {
 test('runs the strict complete Cottontail-owned Bun tier without publishing', () => {
   assert.match(
     workflow,
+    /run: node scripts\/zig\.js build -Doptimize=ReleaseSmall -Dcpu=baseline/,
+  );
+  assert.match(
+    workflow,
     /run: node scripts\/run-upstream-tests\.js bun --include-expected-failures/,
   );
   assert.doesNotMatch(workflow, /continue-on-error:|upload-release-r2|publish|secrets\./i);

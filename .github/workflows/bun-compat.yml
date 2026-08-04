@@ -82,7 +82,7 @@ jobs:
           node scripts/setup-jsc.js
 
       - name: Build Cottontail
-        run: node scripts/zig.js build
+        run: node scripts/zig.js build -Doptimize=ReleaseSmall -Dcpu=baseline
 
       - name: Run complete Cottontail-owned Bun compatibility tier
         run: node scripts/run-upstream-tests.js bun --include-expected-failures
