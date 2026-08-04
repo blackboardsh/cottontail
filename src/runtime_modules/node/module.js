@@ -2570,6 +2570,14 @@ function hasBunTranspiledPragma(source) {
   return /^\/\/\s*@bun(?:\s|$)/.test(firstLine);
 }
 
+function bunCommonJsArtifactFactory(source) {
+  const text = String(source);
+  const lineEnd = text.indexOf("\n");
+  if (lineEnd < 0 || !/^\/\/\s*@bun\b.*@bun-cjs\b/.test(text.slice(0, lineEnd).trimEnd())) return null;
+  const factorySource = text.slice(lineEnd + 1).trim();
+  return factorySource.startsWith("(function") ? factorySource : null;
+}
+
 function maybeStripTypeScript(filename, source) {
   if (!typeScriptExtensionPattern.test(String(filename))) return source;
   // `// @bun` declares already-transpiled output. Parsing TypeScript below it
@@ -3024,6 +3032,16 @@ function executeRuntimeEsmSourceModule(module, filename, originalSource, loader)
 
 function executeDefaultExtension(module, filename, loader) {
   const originalSource = readModuleFile(filename).replace(/^#![^\n]*(\n|$)/, "");
+  const bundledCommonJsFactory = bunCommonJsArtifactFactory(originalSource);
+  if (bundledCommonJsFactory != null) {
+    // COTTONTAIL-COMPAT: Bun-targeted CJS build output is already a complete
+    // module factory. Invoking it directly avoids wrapping the factory expression
+    // as inert source when it is launched or loaded through node:module.
+    const factory = cottontail.compileFunction(bundledCommonJsFactory, filename);
+    factory(module.exports, module.require, module, filename, dirname(filename));
+    module.loaded = true;
+    return module.exports;
+  }
   const originalIsEsm = hasEsmSyntax(originalSource);
   const isEmbeddedRuntimeSource = embeddedRuntimeSourceEntry(filename).found;
   if (originalIsEsm && (runtimeEsmSourceExecutionDepth > 0 || isEmbeddedRuntimeSource)) {

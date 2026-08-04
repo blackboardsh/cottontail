@@ -7494,8 +7494,12 @@ fn hasBunTranspiledPragma(source: []const u8) bool {
 }
 
 fn bunCjsFactorySource(source: []const u8) ?[]const u8 {
-    const line_end = std.mem.indexOfScalar(u8, source, '\n') orelse return null;
-    const first_line = std.mem.trim(u8, source[0..line_end], " \t\r");
+    var line_start: usize = 0;
+    if (std.mem.startsWith(u8, source, "#!")) {
+        line_start = if (std.mem.indexOfScalar(u8, source, '\n')) |newline| newline + 1 else return null;
+    }
+    const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse return null;
+    const first_line = std.mem.trim(u8, source[line_start..line_end], " \t\r");
     if (!std.mem.startsWith(u8, first_line, "//") or std.mem.indexOf(u8, first_line, "@bun-cjs") == null) {
         return null;
     }

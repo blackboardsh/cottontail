@@ -1354,6 +1354,8 @@ fn nativeBuildGeneration(
     var compile_autoload_package_json: ?bool = null;
     var app = false;
     var watch = false;
+    var format_was_explicit = false;
+    var target_was_explicit = false;
     var index: usize = 2;
     while (index < args.len) : (index += 1) {
         const arg: []const u8 = args[index];
@@ -1593,12 +1595,14 @@ fn nativeBuildGeneration(
             index += 1;
             try entries.append(allocator, args[index]);
         } else if (std.mem.startsWith(u8, arg, "--format=")) {
+            format_was_explicit = true;
             options.output_format = cottontail_compiler.options.Format.fromString(arg["--format=".len..]) orelse {
                 try stderr.print("error: invalid build format \"{s}\"\n", .{arg["--format=".len..]});
                 try stderr.flush();
                 return 1;
             };
         } else if (std.mem.startsWith(u8, arg, "--target=") or std.mem.eql(u8, arg, "--target")) {
+            target_was_explicit = true;
             const target = if (std.mem.eql(u8, arg, "--target")) target: {
                 if (index + 1 >= args.len) {
                     try stderr.writeAll("error: --target requires a value\n");
@@ -1672,6 +1676,20 @@ fn nativeBuildGeneration(
         try stderr.flush();
         return 1;
     }
+    if (options.bytecode and !compile) {
+        if (target_was_explicit and options.target != .bun) {
+            try stderr.writeAll("error: target must be 'bun' when bytecode is true\n");
+            try stderr.flush();
+            return 1;
+        }
+        if (format_was_explicit and options.output_format != .cjs) {
+            try stderr.writeAll("error: format must be 'cjs' for bytecode without compile\n");
+            try stderr.flush();
+            return 1;
+        }
+        options.target = .bun;
+        options.output_format = .cjs;
+    }
     if (options.server_components and options.target == .browser) {
         try stderr.writeAll("error: Cannot use client-side --target=browser with --server-components\n");
         try stderr.flush();
@@ -1709,11 +1727,6 @@ fn nativeBuildGeneration(
         }
         options.compile_to_standalone_html = true;
         compile = false;
-    }
-    if (options.bytecode and !compile) {
-        try stderr.writeAll("error: bytecode is currently supported only with --compile\n");
-        try stderr.flush();
-        return 1;
     }
     if (compile) {
         options.target = .bun;
@@ -1845,6 +1858,10 @@ fn nativeBuildGeneration(
             }
         else
             null,
+        .__cottontailBytecodeOutputDirectory = if (outfile) |path|
+            (std.fs.path.dirname(path) orelse ".")
+        else
+            outdir,
     };
     const request_json = try std.json.Stringify.valueAlloc(allocator, request, .{});
     var error_message: ?[*:0]u8 = null;

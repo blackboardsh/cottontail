@@ -37590,6 +37590,17 @@ static char *ct_prepare_source_with_wrappers(
         const char *line_end = memchr(start, '\n', (size_t)(end - start));
         if (line_end == NULL) line_end = end;
         size_t line_len = (size_t)(line_end - start);
+        if (start == (const char *)source && line_len >= 2 && start[0] == '#' && start[1] == '!') {
+            if (!ct_sb_append_cstr(&builder, "//") ||
+                !ct_sb_append_bytes(&builder, start + 2, line_len - 2) ||
+                (line_end < end && !ct_sb_append_cstr(&builder, "\n"))) {
+                free(meta_builder.data);
+                free(builder.data);
+                return NULL;
+            }
+            start = line_end < end ? line_end + 1 : end;
+            continue;
+        }
         const CtJsScanState line_state = scan_state;
         ct_js_scan_advance_line(&scan_state, start, line_len);
         const char *trim = start;

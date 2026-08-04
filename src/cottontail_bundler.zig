@@ -2,6 +2,7 @@ const std = @import("std");
 const compiler = @import("cottontail_compiler");
 const bun_color = @import("bun_color.zig");
 const embedded_runtime_modules = @import("embedded_runtime_modules.zig");
+const js_runtime = @import("runtime.zig");
 
 const c_allocator = std.heap.c_allocator;
 
@@ -1573,6 +1574,49 @@ const BuildResultJson = struct {
     metafileMarkdown: ?[]const u8 = null,
 };
 
+fn bytecodeMarkedSource(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    var pragma_offset: usize = 0;
+    if (std.mem.startsWith(u8, source, "#!")) {
+        pragma_offset = (std.mem.indexOfScalar(u8, source, '\n') orelse return error.MissingBytecodePragma) + 1;
+    }
+
+    const pragma = "// @bun @bun-cjs";
+    if (!std.mem.startsWith(u8, source[pragma_offset..], pragma)) return error.MissingBytecodePragma;
+    return try std.mem.concat(allocator, u8, &.{
+        source[0..pragma_offset],
+        "// @bun @bytecode @bun-cjs",
+        source[pragma_offset + pragma.len ..],
+    });
+}
+
+fn bytecodeSourceFilename(
+    allocator: std.mem.Allocator,
+    request_object: std.json.ObjectMap,
+    working_dir: []const u8,
+    output_path: []const u8,
+) ![:0]const u8 {
+    const requested_output_dir = directory: {
+        if (request_object.get("__cottontailBytecodeOutputDirectory")) |value| {
+            if (value == .string and value.string.len > 0) break :directory value.string;
+        }
+        if (request_object.get("outdir")) |value| {
+            if (value == .string and value.string.len > 0) break :directory value.string;
+        }
+        break :directory working_dir;
+    };
+    const output_dir = if (std.fs.path.isAbsolute(requested_output_dir))
+        requested_output_dir
+    else
+        try std.fs.path.resolve(allocator, &.{ working_dir, requested_output_dir });
+    var relative_path = output_path;
+    while (std.mem.startsWith(u8, relative_path, "./")) relative_path = relative_path[2..];
+    const filename = if (std.fs.path.isAbsolute(relative_path))
+        relative_path
+    else
+        try std.fs.path.resolve(allocator, &.{ output_dir, relative_path });
+    return try allocator.dupeZ(u8, filename);
+}
+
 const BakeSourceMapFragmentJson = struct {
     inputStartLine: i32,
     inputStartColumn: i32,
@@ -2149,16 +2193,27 @@ pub fn buildEntryPointsJson(
         setError(error_out, "Invalid Bun.build options: {s}", .{@errorName(err)});
         return err;
     };
-    // COTTONTAIL-COMPAT: Bun build bytecode - see the runtime-bundle guard
-    // above. This remains an explicit unsupported result until portable JSC
-    // exposes a cache serializer Cottontail can also consume at runtime.
+    // COTTONTAIL-COMPAT: Non-standalone bytecode is a Bun-targeted CommonJS
+    // sidecar. Generate it after linking through the stock-JSC embedder bridge
+    // instead of entering Bun's patched SourceProvider bytecode path.
     if (options.bytecode) {
-        setError(error_out, "Bun.build bytecode requires a JavaScriptCore cached-bytecode API", .{});
-        return error.UnsupportedBytecode;
+        if (request_object.get("target") == null) {
+            options.target = .bun;
+        } else if (options.target != .bun) {
+            setError(error_out, "target must be 'bun' when bytecode is true", .{});
+            return error.InvalidOptions;
+        }
+        if (request_object.get("format") == null) {
+            options.output_format = .cjs;
+        } else if (options.output_format != .cjs) {
+            setError(error_out, "format must be 'cjs' for bytecode without compile", .{});
+            return error.InvalidOptions;
+        }
+    } else if (request_object.get("target") == null) {
+        // Bun.build defaults to target "browser" (the runtime bundler defaults
+        // to "bun"); an explicit target was already applied above.
+        options.target = .browser;
     }
-    // Bun.build defaults to target "browser" (the runtime bundler defaults to
-    // "bun"); an explicit target was already applied by parseBuildOptions.
-    if (request_object.get("target") == null) options.target = .browser;
 
     const allocator = compiler.default_allocator;
     compiler.cli.start_time = compiler.nanoTimestamp();
@@ -2253,7 +2308,7 @@ pub fn buildEntryPointsJson(
     transpiler.options.compile_to_standalone_html = options.compile_to_standalone_html;
     transpiler.options.env.behavior = options.env_behavior;
     transpiler.options.env.prefix = options.env_prefix;
-    transpiler.options.bytecode = options.bytecode;
+    transpiler.options.bytecode = false;
     transpiler.options.inline_import_meta_properties = options.inline_import_meta_properties;
     transpiler.options.minify_whitespace = options.minify_whitespace;
     transpiler.options.minify_identifiers = options.minify_identifiers;
@@ -2397,13 +2452,25 @@ pub fn buildEntryPointsJson(
     defer result.deinit();
 
     var outputs: std.ArrayList(BuildOutputJson) = .empty;
+    var bytecode_outputs: std.ArrayList(BuildOutputJson) = .empty;
     const base64 = std.base64.standard.Encoder;
     for (result.output_files.items) |output_file| {
-        const bytes = output_file.value.asSlice();
+        const original_bytes = output_file.value.asSlice();
+        const emits_bytecode = options.bytecode and
+            output_file.loader.isJavaScriptLike() and
+            (output_file.output_kind == .@"entry-point" or output_file.output_kind == .chunk);
+        const bytes = if (emits_bytecode)
+            bytecodeMarkedSource(arena_allocator, original_bytes) catch |err| {
+                setError(error_out, "Failed to prepare bytecode source for {s}: {s}", .{ output_file.dest_path, @errorName(err) });
+                return err;
+            }
+        else
+            original_bytes;
         const encoded = try arena_allocator.alloc(u8, base64.calcSize(bytes.len));
         _ = base64.encode(encoded, bytes);
-        const hash = try std.fmt.allocPrint(arena_allocator, "{f}", .{compiler.fmt.truncatedHash32(output_file.hash)});
-        const content_hash = try std.fmt.allocPrint(arena_allocator, "{f}", .{compiler.fmt.hexIntLower(output_file.hash)});
+        const artifact_hash = if (emits_bytecode) compiler.hash(bytes) else output_file.hash;
+        const hash = try std.fmt.allocPrint(arena_allocator, "{f}", .{compiler.fmt.truncatedHash32(artifact_hash)});
+        const content_hash = try std.fmt.allocPrint(arena_allocator, "{f}", .{compiler.fmt.hexIntLower(artifact_hash)});
         // HTML entries produce associated JavaScript and CSS artifacts. Bun
         // reports those artifacts' generated loaders while preserving the
         // input loader for ordinary JS-family entry points (for example JSX).
@@ -2423,7 +2490,32 @@ pub fn buildEntryPointsJson(
                 null,
             .b64 = encoded,
         });
+
+        if (emits_bytecode) {
+            const filename = try bytecodeSourceFilename(
+                arena_allocator,
+                request_object,
+                working_dir,
+                output_file.dest_path,
+            );
+            const bytecode = js_runtime.generateCachedBytecode(arena_allocator, bytes, filename) catch |err| {
+                setError(error_out, "Failed to generate bytecode for {s}: {s}", .{ output_file.dest_path, @errorName(err) });
+                return err;
+            };
+            const bytecode_encoded = try arena_allocator.alloc(u8, base64.calcSize(bytecode.len));
+            _ = base64.encode(bytecode_encoded, bytecode);
+            const bytecode_hash = compiler.hash(bytecode);
+            try bytecode_outputs.append(arena_allocator, .{
+                .path = try std.fmt.allocPrint(arena_allocator, "{s}.jsc", .{output_file.dest_path}),
+                .kind = "bytecode",
+                .loader = "file",
+                .hash = try std.fmt.allocPrint(arena_allocator, "{f}", .{compiler.fmt.truncatedHash32(bytecode_hash)}),
+                .contentHash = try std.fmt.allocPrint(arena_allocator, "{f}", .{compiler.fmt.hexIntLower(bytecode_hash)}),
+                .b64 = bytecode_encoded,
+            });
+        }
     }
+    try outputs.appendSlice(arena_allocator, bytecode_outputs.items);
 
     const metafile_markdown = result.metafile_markdown orelse if (options.metafile_markdown_path.len > 0 and result.metafile != null)
         try compiler.bundle_v2.LinkerContext.MetafileBuilder.generateMarkdown(arena_allocator, result.metafile.?)

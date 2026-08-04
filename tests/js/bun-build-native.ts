@@ -1,3 +1,7 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 function assert(value: unknown, message: string): asserts value {
   if (!value) throw new Error(message);
 }
@@ -14,6 +18,128 @@ assert(result.outputs[0] instanceof Blob, "native Bun.build should return BuildA
 const source = await result.outputs[0].text();
 assert(source.includes("var rexported = 42"), "native Bun.build should include imported modules");
 assert(source.includes("var doubled = rexported * 2"), "native Bun.build should transpile TypeScript");
+
+const bytecodeRoot = mkdtempSync(join(tmpdir(), "cottontail-build-bytecode-"));
+try {
+  const bytecodeResult = await Bun.build({
+    entrypoints: ["tests/js/fixtures/bun-build-entry.ts"],
+    outdir: bytecodeRoot,
+    target: "bun",
+    format: "cjs",
+    bytecode: true,
+    banner: "// cottontail bytecode banner",
+  });
+  assert(bytecodeResult.success, "native Bun.build bytecode should succeed");
+  assert(
+    bytecodeResult.outputs.map(output => output.kind).join(",") === "entry-point,bytecode",
+    "native Bun.build bytecode should return source and bytecode artifacts",
+  );
+  const bytecodeSource = await bytecodeResult.outputs[0].text();
+  assert(
+    bytecodeSource.startsWith(
+      "// @bun @bytecode @bun-cjs\n(function(exports, require, module, __filename, __dirname) {// cottontail bytecode banner",
+    ),
+    "native Bun.build bytecode should preserve Bun's pragma, wrapper, and banner order",
+  );
+  assert(
+    bytecodeResult.outputs[1].path === `${bytecodeResult.outputs[0].path}.jsc`,
+    "native Bun.build bytecode should use an adjacent .jsc path",
+  );
+  const bytecodeBytes = new Uint8Array(await bytecodeResult.outputs[1].arrayBuffer());
+  assert(
+    new TextDecoder().decode(bytecodeBytes.subarray(0, 8)) === "CTJSCB02",
+    "native Bun.build should serialize bytecode through the stock-JSC embedder bridge",
+  );
+  const bytecodeRun = Bun.spawnSync({
+    cmd: [process.execPath, bytecodeResult.outputs[0].path],
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  assert(bytecodeRun.exitCode === 0, `native Bun.build bytecode output should run: ${bytecodeRun.stderr}`);
+  assert(String(bytecodeRun.stdout) === "84\n", "native Bun.build bytecode output should execute its module body");
+
+  const hashbangBannerResult = await Bun.build({
+    entrypoints: ["entry.js"],
+    files: {
+      "entry.js": "module.exports = 1;",
+    },
+    outdir: join(bytecodeRoot, "hashbang-banner"),
+    target: "bun",
+    format: "cjs",
+    bytecode: true,
+    minify: { whitespace: true },
+    banner: "#!/usr/bin/env bun\n// Production build",
+  });
+  const hashbangBannerSource = await hashbangBannerResult.outputs[0].text();
+  assert(
+    hashbangBannerSource.startsWith(
+      "#!/usr/bin/env bun\n// @bun @bytecode @bun-cjs\n(function(exports, require, module, __filename, __dirname) {// Production build",
+    ),
+    "bytecode builds should put a banner hashbang before the Bun pragma and CommonJS wrapper",
+  );
+
+  const sourceHashbangResult = await Bun.build({
+    entrypoints: ["entry.js"],
+    files: {
+      "entry.js": '#!/usr/bin/env bun\nmodule.exports = 1;\nconsole.log("bun!");',
+    },
+    outdir: join(bytecodeRoot, "source-hashbang"),
+    target: "bun",
+    format: "cjs",
+    bytecode: true,
+    minify: { whitespace: true },
+    banner: "// Copyright 2024 Example Corp",
+  });
+  const sourceHashbangSource = await sourceHashbangResult.outputs[0].text();
+  assert(
+    sourceHashbangSource.startsWith(
+      "#!/usr/bin/env bun\n// @bun @bytecode @bun-cjs\n(function(exports, require, module, __filename, __dirname) {// Copyright 2024 Example Corp",
+    ),
+    "bytecode builds should preserve a source hashbang before the Bun pragma",
+  );
+  const sourceHashbangRun = Bun.spawnSync({
+    cmd: [process.execPath, sourceHashbangResult.outputs[0].path],
+    env: { ...process.env, BUN_JSC_verboseDiskCache: "1" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  assert(sourceHashbangRun.exitCode === 0, `source-hashbang bytecode output should run: ${sourceHashbangRun.stderr}`);
+  assert(String(sourceHashbangRun.stdout) === "bun!\n", "source-hashbang bytecode output should execute");
+  assert(
+    String(sourceHashbangRun.stderr).includes("[Disk Cache] Cache hit for sourceCode"),
+    "source-hashbang bytecode output should evaluate the generated JSC sidecar",
+  );
+
+  const bunImportResult = await Bun.build({
+    entrypoints: ["entry.ts"],
+    files: {
+      "entry.ts": `
+        import { RedisClient } from "bun";
+        import * as BunStar from "bun";
+        const bunRequire = require("bun");
+        console.log(RedisClient.name);
+        console.log(BunStar.RedisClient.name);
+        console.log(bunRequire.RedisClient.name);
+      `,
+    },
+    outdir: join(bytecodeRoot, "bun-import"),
+    target: "bun",
+    format: "cjs",
+    bytecode: true,
+  });
+  const bunImportRun = Bun.spawnSync({
+    cmd: [process.execPath, bunImportResult.outputs[0].path],
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  assert(bunImportRun.exitCode === 0, `bytecode output importing bun should run: ${bunImportRun.stderr}`);
+  assert(
+    String(bunImportRun.stdout) === "RedisClient\nRedisClient\nRedisClient\n",
+    "bytecode output should preserve Bun namespace imports and require calls",
+  );
+} finally {
+  rmSync(bytecodeRoot, { recursive: true, force: true });
+}
 
 const aliasTarget = `${import.meta.dir}/fixtures/bun-build-alias-target.ts`;
 const aliasResult = await Bun.build({
