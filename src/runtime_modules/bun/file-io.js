@@ -1,5 +1,8 @@
 import { fileURLToPath as nodeFileURLToPath } from "../node/url.js";
 import { bunFileMimeType } from "./mime-types.js";
+import { bunFileLikeBrand, isBunFileLike } from "./file-like.js";
+
+export { isBunFileLike };
 
 // Source parity reference: oven-sh/bun@bun-v1.3.10
 // - src/bun.js/webcore/Blob.zig
@@ -799,6 +802,7 @@ function createBunFile(state) {
   };
 
   bunFileStates.set(result, state);
+  Object.defineProperty(result, bunFileLikeBrand, { value: true });
   if (state.descriptor.kind === "path") {
     Object.defineProperty(result, "_bunFilePath", { value: state.descriptor.path, configurable: true });
     if (state.isSlice) {
@@ -824,15 +828,6 @@ export function file(path, options = undefined) {
     type,
     cachedStream: null,
   });
-}
-
-export function isBunFileLike(value) {
-  if (!value || typeof value !== "object") return false;
-  if (bunFileStates.has(value)) return true;
-  return typeof value.arrayBuffer === "function" &&
-    typeof value.text === "function" &&
-    typeof value.exists === "function" &&
-    (typeof value.writer === "function" || typeof value.write === "function");
 }
 
 function normalizeWriteOptions(options) {

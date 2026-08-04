@@ -2264,6 +2264,17 @@ fn maxOldSpaceSizeValue(arg: []const u8) ?[]const u8 {
 }
 
 fn applyRuntimeEnvFlags(io: std.Io, allocator: std.mem.Allocator, exec_args: []const [:0]const u8) bool {
+    for (exec_args) |arg| {
+        if (!std.mem.eql(u8, arg, "--smol")) continue;
+        // COTTONTAIL-COMPAT: Bun's --smol selects JSC's low-memory VM
+        // policy. Stock JSC exposes the equivalent collection, sweeping,
+        // and code-jettisoning behavior through forceMiniVMMode. Bound each
+        // allocation cycle as well; an explicit max-old-space flag below
+        // remains authoritative regardless of argument order.
+        if (setenv("JSC_forceMiniVMMode", "true", 1) != 0) return false;
+        if (setenv("JSC_gcMaxHeapSize", "33554432", 1) != 0) return false;
+        break;
+    }
     for (exec_args, 0..) |arg, index| {
         if (maxOldSpaceSizeValue(arg)) |size_text| {
             const size_mib = std.fmt.parseUnsigned(usize, size_text, 10) catch {
@@ -4241,6 +4252,7 @@ const RuntimeBootstrapMode = enum {
     bare,
     minimal,
     process,
+    http_server,
     eval_fast_fs,
     eval_common_js,
 };
@@ -4260,6 +4272,147 @@ fn entrypointRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !Runtim
     return source_mode;
 }
 
+fn httpRuntimeBunProperty(name: []const u8) bool {
+    return minimalRuntimeBunProperty(name) or std.mem.eql(u8, name, "serve");
+}
+
+fn httpRuntimeProcessProperty(name: []const u8) bool {
+    return minimalRuntimeProcessProperty(name) or
+        std.mem.eql(u8, name, "channel") or
+        std.mem.eql(u8, name, "connected") or
+        std.mem.eql(u8, name, "send");
+}
+
+fn httpRuntimeGlobal(name: []const u8) bool {
+    for ([_][]const u8{
+        "AbortController",
+        "AbortSignal",
+        "ByteLengthQueuingStrategy",
+        "CloseEvent",
+        "CountQueuingStrategy",
+        "CustomEvent",
+        "DOMException",
+        "ErrorEvent",
+        "Event",
+        "EventTarget",
+        "FormData",
+        "Headers",
+        "ReadableByteStreamController",
+        "ReadableStream",
+        "ReadableStreamBYOBReader",
+        "ReadableStreamBYOBRequest",
+        "ReadableStreamDefaultController",
+        "ReadableStreamDefaultReader",
+        "Request",
+        "Response",
+        "TransformStream",
+        "TransformStreamDefaultController",
+        "WritableStream",
+        "WritableStreamDefaultController",
+        "WritableStreamDefaultWriter",
+    }) |global_name| {
+        if (std.mem.eql(u8, name, global_name)) return true;
+    }
+    return false;
+}
+
+fn httpRuntimeServeOption(name: []const u8) bool {
+    return std.mem.eql(u8, name, "development") or
+        std.mem.eql(u8, name, "error") or
+        std.mem.eql(u8, name, "fetch") or
+        std.mem.eql(u8, name, "id") or
+        std.mem.eql(u8, name, "idleTimeout") or
+        std.mem.eql(u8, name, "maxRequestBodySize") or
+        std.mem.eql(u8, name, "port");
+}
+
+fn httpRuntimeServeOptionsSupported(tokens: []const JavaScriptModuleToken, bun_index: usize) bool {
+    var index = bun_index + 1;
+    if (index < tokens.len and tokenIs(tokens[index], .punct, "?")) index += 1;
+    if (index + 3 >= tokens.len or
+        !tokenIs(tokens[index], .punct, ".") or
+        !tokenIs(tokens[index + 1], .identifier, "serve") or
+        !tokenIs(tokens[index + 2], .punct, "(") or
+        !tokenIs(tokens[index + 3], .punct, "{")) return false;
+    index += 4;
+
+    while (index < tokens.len) {
+        while (index < tokens.len and tokenIs(tokens[index], .punct, ",")) index += 1;
+        if (index >= tokens.len) return false;
+        if (tokenIs(tokens[index], .punct, "}")) return true;
+        if (tokenIs(tokens[index], .identifier, "async")) index += 1;
+        if (index >= tokens.len or tokens[index].kind != .identifier or
+            !httpRuntimeServeOption(tokens[index].text)) return false;
+        index += 1;
+
+        if (index < tokens.len and tokenIs(tokens[index], .punct, ":")) {
+            index += 1;
+        } else if (index < tokens.len and tokenIs(tokens[index], .punct, "(")) {
+            // Object method syntax; the value scan below consumes parameters
+            // and the function body as nested clauses.
+        } else if (index < tokens.len and
+            (tokenIs(tokens[index], .punct, ",") or tokenIs(tokens[index], .punct, "}")))
+        {
+            // Shorthand property.
+            continue;
+        } else {
+            return false;
+        }
+
+        var braces: usize = 0;
+        var brackets: usize = 0;
+        var parens: usize = 0;
+        while (index < tokens.len) : (index += 1) {
+            const token = tokens[index];
+            if (tokenIs(token, .punct, "{")) {
+                braces += 1;
+            } else if (tokenIs(token, .punct, "}")) {
+                if (braces == 0 and brackets == 0 and parens == 0) return true;
+                if (braces == 0) return false;
+                braces -= 1;
+            } else if (tokenIs(token, .punct, "[")) {
+                brackets += 1;
+            } else if (tokenIs(token, .punct, "]")) {
+                if (brackets == 0) return false;
+                brackets -= 1;
+            } else if (tokenIs(token, .punct, "(")) {
+                parens += 1;
+            } else if (tokenIs(token, .punct, ")")) {
+                if (parens == 0) return false;
+                parens -= 1;
+            } else if (tokenIs(token, .punct, ",") and braces == 0 and brackets == 0 and parens == 0) {
+                index += 1;
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+fn httpRuntimeRequireSupported(tokens: []const JavaScriptModuleToken, index: usize) bool {
+    return index + 5 < tokens.len and
+        tokenIs(tokens[index + 1], .punct, "(") and
+        tokens[index + 2].kind == .string and
+        (std.mem.eql(u8, tokens[index + 2].text, "v8") or
+            std.mem.eql(u8, tokens[index + 2].text, "node:v8")) and
+        tokenIs(tokens[index + 3], .punct, ")") and
+        tokenIs(tokens[index + 4], .punct, ".") and
+        tokenIs(tokens[index + 5], .identifier, "writeHeapSnapshot");
+}
+
+fn httpRuntimeFetchIsServeOption(tokens: []const JavaScriptModuleToken, index: usize) bool {
+    if (index + 1 >= tokens.len) return false;
+    const next_is_option = tokenIs(tokens[index + 1], .punct, ":") or
+        tokenIs(tokens[index + 1], .punct, "(") or
+        tokenIs(tokens[index + 1], .punct, ",") or
+        tokenIs(tokens[index + 1], .punct, "}");
+    if (!next_is_option or index == 0) return false;
+    const previous = tokens[index - 1];
+    if (tokenIs(previous, .identifier, "async")) return index >= 2 and
+        (tokenIs(tokens[index - 2], .punct, "{") or tokenIs(tokens[index - 2], .punct, ","));
+    return tokenIs(previous, .punct, "{") or tokenIs(previous, .punct, ",");
+}
+
 fn sourceRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBootstrapMode {
     const loader = transpilerLoaderForPath(path) orelse return .full;
     _ = loader;
@@ -4277,7 +4430,16 @@ fn sourceRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBoo
     }
     const tokens = try tokenizeJavaScriptModuleSyntax(ctx.allocator, source);
 
-    var mode: RuntimeBootstrapMode = .bare;
+    var has_http_server = false;
+    for (tokens, 0..) |token, token_index| {
+        if (!tokenIs(token, .identifier, "Bun")) continue;
+        const property = runtimeMemberProperty(tokens, token_index) orelse continue;
+        if (!std.mem.eql(u8, property, "serve")) continue;
+        if (!httpRuntimeServeOptionsSupported(tokens, token_index)) return .full;
+        has_http_server = true;
+    }
+
+    var mode: RuntimeBootstrapMode = if (has_http_server) .http_server else .bare;
     var index: usize = 0;
     while (index < tokens.len) : (index += 1) {
         const token = tokens[index];
@@ -4287,15 +4449,24 @@ fn sourceRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBoo
         if (token.kind != .identifier) continue;
         if (std.mem.eql(u8, token.text, "Bun")) {
             const property = runtimeMemberProperty(tokens, index) orelse return .full;
-            if (!minimalRuntimeBunProperty(property)) return .full;
-            if (mode == .bare) mode = .minimal;
+            if (has_http_server) {
+                if (!httpRuntimeBunProperty(property)) return .full;
+            } else {
+                if (!minimalRuntimeBunProperty(property)) return .full;
+                if (mode == .bare) mode = .minimal;
+            }
         } else if (std.mem.eql(u8, token.text, "process")) {
             const property = runtimeMemberProperty(tokens, index) orelse return .full;
             if (std.mem.eql(u8, property, "mainModule")) return .full;
-            if (!minimalRuntimeProcessProperty(property))
+            if (has_http_server and !httpRuntimeProcessProperty(property)) return .full;
+            if (!has_http_server and !minimalRuntimeProcessProperty(property))
                 mode = .process
-            else if (mode == .bare)
+            else if (!has_http_server and mode == .bare)
                 mode = .minimal;
+        } else if (std.mem.eql(u8, token.text, "require")) {
+            if (!has_http_server or !httpRuntimeRequireSupported(tokens, index)) return .full;
+        } else if (std.mem.eql(u8, token.text, "fetch")) {
+            if (!has_http_server or !httpRuntimeFetchIsServeOption(tokens, index)) return .full;
         } else if (std.mem.eql(u8, token.text, "Error")) {
             if (runtimeMemberProperty(tokens, index)) |property| {
                 if (std.mem.eql(u8, property, "captureStackTrace") or
@@ -4305,14 +4476,18 @@ fn sourceRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBoo
         } else if (std.mem.eql(u8, token.text, "globalThis") or
             std.mem.eql(u8, token.text, "global") or
             std.mem.eql(u8, token.text, "eval") or
-            std.mem.eql(u8, token.text, "Function") or
-            std.mem.eql(u8, token.text, "Promise") or
+            std.mem.eql(u8, token.text, "Function"))
+        {
+            if (has_http_server) return .full;
+            if (mode == .bare) mode = .minimal;
+        } else if (std.mem.eql(u8, token.text, "Promise") or
             std.mem.eql(u8, token.text, "async") or
             std.mem.eql(u8, token.text, "await") or
             std.mem.eql(u8, token.text, "throw"))
         {
             if (mode == .bare) mode = .minimal;
         } else if (fullRuntimeGlobal(token.text)) {
+            if (has_http_server and httpRuntimeGlobal(token.text)) continue;
             return .full;
         }
     }
@@ -4371,6 +4546,10 @@ fn mergeRuntimeBootstrapMode(left: RuntimeBootstrapMode, right: RuntimeBootstrap
     if (left == .full or right == .full) return .full;
     if (left == .eval_common_js or right == .eval_common_js) return .eval_common_js;
     if (left == .eval_fast_fs or right == .eval_fast_fs) return .eval_fast_fs;
+    if (left == .http_server or right == .http_server) {
+        const other = if (left == .http_server) right else left;
+        return if (other == .bare or other == .minimal or other == .http_server) .http_server else .full;
+    }
     if (left == .process or right == .process) return .process;
     if (left == .minimal or right == .minimal) return .minimal;
     return .bare;
@@ -6859,8 +7038,30 @@ fn writeMinimalRuntimeEntryWrapper(
         stable_source_map_path,
     );
     const process_bootstrap_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "internal", "runtime-process-bootstrap.js" });
-    const bootstrap_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "internal", "runtime-bootstrap.js" });
-    const url_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "url.js" });
+    const bootstrap_module = try runtimeModulePathAtRoot(
+        ctx,
+        runtime_virtual_root,
+        if (bootstrap_mode == .http_server)
+            &.{ "internal", "runtime-bootstrap-core.js" }
+        else
+            &.{ "internal", "runtime-bootstrap.js" },
+    );
+    const url_module = try runtimeModulePathAtRoot(
+        ctx,
+        runtime_virtual_root,
+        if (bootstrap_mode == .http_server)
+            &.{ "internal", "file-url.js" }
+        else
+            &.{ "node", "url.js" },
+    );
+    const http_server_import = if (bootstrap_mode == .http_server) blk: {
+        const http_server_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "bun", "http-server-runtime.js" });
+        break :blk try std.fmt.allocPrint(
+            ctx.allocator,
+            "import {s};\n",
+            .{try jsonStringLiteral(ctx, http_server_module)},
+        );
+    } else "";
     const process_import = if (bootstrap_mode == .process) blk: {
         const process_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "process.js" });
         break :blk try std.fmt.allocPrint(
@@ -6870,7 +7071,7 @@ fn writeMinimalRuntimeEntryWrapper(
         );
     } else "";
     const ipc_bootstrap_import = if (ctx.environ_map.get("COTTONTAIL_IPC_BOOTSTRAP")) |mode| blk: {
-        if (!std.mem.eql(u8, mode, "node")) break :blk "";
+        if (bootstrap_mode == .http_server or !std.mem.eql(u8, mode, "node")) break :blk "";
         const child_process_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "child_process.js" });
         break :blk try std.fmt.allocPrint(
             ctx.allocator,
@@ -6905,6 +7106,7 @@ fn writeMinimalRuntimeEntryWrapper(
         \\import {{ fileURLToPath as __ctFileURLToPath, pathToFileURL as __ctPathToFileURL }} from {s};
         \\{s}
         \\{s}
+        \\{s}
         \\__ctInstallRuntimeBootstrap({{ fileURLToPath: __ctFileURLToPath, pathToFileURL: __ctPathToFileURL }});
         \\{s}
         \\globalThis.__cottontailBundleSourceMap ??= {s};
@@ -6930,6 +7132,7 @@ fn writeMinimalRuntimeEntryWrapper(
         try jsonStringLiteral(ctx, process_bootstrap_module),
         try jsonStringLiteral(ctx, bootstrap_module),
         try jsonStringLiteral(ctx, url_module),
+        http_server_import,
         process_import,
         ipc_bootstrap_import,
         process_install,

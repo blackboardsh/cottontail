@@ -1,5 +1,10 @@
 [
   {
+    "name": "concatHttpBodyChunks",
+    "arity": 1,
+    "callback": "ct_direct_concat_http_body_chunks"
+  },
+  {
     "name": "bufferCompare",
     "arity": 6,
     "callback": "ct_direct_buffer_compare"

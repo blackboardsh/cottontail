@@ -1,14 +1,14 @@
-import { resolve as pathResolve, win32 as pathWin32 } from "./path.js";
 import { Buffer } from "./buffer.js";
 import { toASCII, toUnicode } from "./punycode.js";
 import { parse as querystringParse, stringify as querystringStringify } from "./querystring.js";
+import { fileURLToPath, pathToFileURL } from "../internal/file-url.js";
 
 // Import the vendor implementation directly: globalThis.URL is only assigned
 // by bun/index.js after this module has already been evaluated, so grabbing
 // the global here would capture the weaker ffi.js bootstrap shim instead.
-import { URL, URLSearchParams, createFileURLFromPath } from "../vendor/whatwg-url.js";
+import { URL, URLSearchParams } from "../vendor/whatwg-url.js";
 
-export { URL, URLSearchParams };
+export { URL, URLSearchParams, fileURLToPath, pathToFileURL };
 
 function normalizePatternComponent(name, value) {
   if (value == null) return "*";
@@ -999,169 +999,6 @@ export { resolveUrl as resolve };
 export function resolveObject(source, relative) {
   if (!source) return relative;
   return parse(source, false, true).resolveObject(relative);
-}
-
-// ---------------------------------------------------------------------------
-// path <-> file: URL conversion (Node's lib/internal/url.js semantics)
-// ---------------------------------------------------------------------------
-
-const backslashRegEx = /\\/g;
-const hashRegEx = /#/g;
-const questionMarkRegEx = /\?/g;
-const tildeRegEx = /~/g;
-const pathNeedsEscapingRegEx = /[\u0000-\u0020"#%<>?\[\\\]\^`{|}~\u007F-\uFFFF]/;
-
-function encodePathChars(filepath) {
-  if (!pathNeedsEscapingRegEx.test(filepath)) return filepath;
-  const wellFormed = typeof filepath.toWellFormed === "function" ? filepath.toWellFormed() : filepath;
-  return encodeURI(wellFormed)
-    .replace(hashRegEx, "%23")
-    .replace(questionMarkRegEx, "%3F")
-    .replace(tildeRegEx, "%7E");
-}
-
-// Avoid rebuilding the same large absolute string in repeated pathToFileURL calls.
-let lastFilePathInput;
-let lastFilePathCwd;
-let lastResolvedFilePath;
-
-function resolvePathForFileURL(filepath) {
-  if (filepath.length > 0 && filepath !== "." && filepath !== ".." && filepath.indexOf("/") === -1) {
-    const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
-    if (filepath === lastFilePathInput && cwd === lastFilePathCwd) return lastResolvedFilePath;
-
-    const resolved = cwd.endsWith("/") ? `${cwd}${filepath}` : `${cwd}/${filepath}`;
-    lastFilePathInput = filepath;
-    lastFilePathCwd = cwd;
-    lastResolvedFilePath = resolved;
-    return resolved;
-  }
-  return pathResolve(filepath);
-}
-
-export function pathToFileURL(filepath, options = undefined) {
-  validateString(filepath, "path");
-  const windows = options?.windows ?? globalThis.process?.platform === "win32";
-  let sourcePath = String(filepath);
-  if (windows && /^\\\\\?\\[A-Za-z]:[\\/]/.test(sourcePath)) {
-    // A namespaced local drive path is still a local file URL, not a UNC URL.
-    sourcePath = sourcePath.slice(4);
-  } else if (windows && sourcePath.toUpperCase().startsWith("\\\\?\\UNC\\")) {
-    // Normalize an extended UNC path as an ordinary UNC path. This both strips
-    // the namespace marker and preserves a trailing share-root separator after
-    // resolving `..` components.
-    sourcePath = `\\\\${sourcePath.slice(8)}`;
-  }
-  const isUNC = windows && sourcePath.startsWith("\\\\");
-  let resolved = windows
-    ? pathWin32.resolve(sourcePath)
-    : resolvePathForFileURL(sourcePath);
-  if (isUNC && /^\\\\[^\\]+\\[^\\]+$/.test(sourcePath) && resolved.endsWith("\\")) {
-    // win32.resolve adds a separator to a bare UNC share root, while
-    // pathToFileURL preserves whether that separator was present in the input.
-    resolved = resolved.slice(0, -1);
-  }
-  if (isUNC || (windows && resolved.startsWith("\\\\"))) {
-    // UNC path format: \\server\share\resource
-    // The \\?\UNC\ long-path prefix is not part of the hostname.
-    const extended = resolved.toUpperCase().startsWith("\\\\?\\UNC\\");
-    const prefixLength = extended ? 8 : 2;
-    const hostnameEndIndex = resolved.indexOf("\\", prefixLength);
-    if (hostnameEndIndex === -1 || hostnameEndIndex === prefixLength) {
-      const err = new TypeError(`The argument 'path' must be an absolute path. Received ${JSON.stringify(filepath)}`);
-      err.code = "ERR_INVALID_ARG_VALUE";
-      throw err;
-    }
-    const hostname = toASCII(resolved.slice(prefixLength, hostnameEndIndex));
-    const pathname = encodePathChars(resolved.slice(hostnameEndIndex).replace(backslashRegEx, "/"));
-    return createFileURLFromPath(pathname, hostname);
-  }
-  if (windows) {
-    resolved = resolved.replace(backslashRegEx, "/");
-    if (/^[A-Za-z]:\//.test(resolved)) resolved = `/${resolved}`;
-    const filePathLast = filepath.charCodeAt(filepath.length - 1);
-    if ((filePathLast === CHAR_FORWARD_SLASH || filePathLast === 92) && resolved[resolved.length - 1] !== "/") {
-      resolved += "/";
-    }
-  } else {
-    // path.resolve strips trailing slashes so we must add them back
-    const filePathLast = filepath.charCodeAt(filepath.length - 1);
-    if (filePathLast === CHAR_FORWARD_SLASH && resolved[resolved.length - 1] !== "/") {
-      resolved += "/";
-    }
-  }
-  return createFileURLFromPath(encodePathChars(resolved));
-}
-
-function invalidFileUrlPathError(suffix) {
-  const err = new TypeError(`File URL path ${suffix}`);
-  err.code = "ERR_INVALID_FILE_URL_PATH";
-  return err;
-}
-
-function getPathFromURLPosix(url) {
-  if (url.hostname !== "") {
-    const err = new TypeError(`File URL host must be "localhost" or empty on ${globalThis.process?.platform ?? "darwin"}`);
-    err.code = "ERR_INVALID_FILE_URL_HOST";
-    throw err;
-  }
-  const pathname = url.pathname;
-  for (let n = 0; n < pathname.length; n++) {
-    if (pathname[n] === "%") {
-      const third = pathname.codePointAt(n + 2) | 0x20;
-      if (pathname[n + 1] === "2" && third === 102) {
-        throw invalidFileUrlPathError("must not include encoded / characters");
-      }
-    }
-  }
-  return decodeURIComponent(pathname);
-}
-
-function getPathFromURLWin32(url) {
-  const hostname = url.hostname;
-  let pathname = url.pathname;
-  for (let n = 0; n < pathname.length; n++) {
-    if (pathname[n] === "%") {
-      const third = pathname.codePointAt(n + 2) | 0x20;
-      if (
-        (pathname[n + 1] === "2" && third === 102) || // 2f => /
-        (pathname[n + 1] === "5" && third === 99) // 5c => \
-      ) {
-        throw invalidFileUrlPathError("must not include encoded \\ or / characters");
-      }
-    }
-  }
-  pathname = pathname.replace(/\//g, "\\");
-  pathname = decodeURIComponent(pathname);
-  if (hostname !== "") {
-    // If hostname is set, then we have a UNC path
-    return `\\\\${toUnicode(hostname)}${pathname}`;
-  }
-  // Otherwise, it's a local path that requires a drive letter
-  const letter = pathname.codePointAt(1) | 0x20;
-  const sep = pathname[2];
-  if (letter < 0x61 || letter > 0x7a || sep !== ":") {
-    throw invalidFileUrlPathError("must be absolute");
-  }
-  return pathname.slice(1);
-}
-
-export function fileURLToPath(path, options = undefined) {
-  const windows = options?.windows ?? globalThis.process?.platform === "win32";
-  if (typeof path === "string") {
-    if (/^file:\/\/[A-Za-z]:[\\/]/.test(path)) path = `file:///${path.slice("file://".length)}`;
-    path = new URL(path);
-  } else if (path === null || typeof path !== "object" || typeof path.href !== "string" || typeof path.protocol !== "string") {
-    throw invalidArgTypeError("path", "string or an instance of URL", path);
-  } else if (!(path instanceof URL)) {
-    path = new URL(path.href);
-  }
-  if (path.protocol !== "file:") {
-    const err = new TypeError("The URL must be of scheme file");
-    err.code = "ERR_INVALID_URL_SCHEME";
-    throw err;
-  }
-  return windows ? getPathFromURLWin32(path) : getPathFromURLPosix(path);
 }
 
 export function fileURLToPathBuffer(url) {

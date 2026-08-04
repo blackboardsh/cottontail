@@ -10,6 +10,7 @@
 #include <JavaScriptCore/JSStringRef.h>
 #include <JavaScriptCore/JSTypedArray.h>
 #include <JavaScriptCore/JSValueRef.h>
+#include <bmalloc/bmalloc.h>
 #include <bmalloc/pas_scavenger.h>
 #if defined(__APPLE__)
 #include <malloc/malloc.h>
@@ -419,6 +420,7 @@ public:
     void drainMicrotasks();
     bool enableControlFlowProfiler();
     void clearSourceProviderCaches();
+    void shrinkFootprintWhenIdle();
     Exception* cottontailThrowException(JSGlobalObject* global_object, JSObject* exception)
     {
         return throwException(global_object, exception);
@@ -551,11 +553,14 @@ extern "C" void ct_jsc_collect_full(JSContextRef context)
         vm->clearSourceProviderCaches();
         heap->deleteAllUnlinkedCodeBlocks(JSC::PreventCollectionAndDeleteAllCode);
         heap->collectNow(JSC::Sync, JSC::GCRequest(JSC::CollectionScope::Full));
+        vm->shrinkFootprintWhenIdle();
     }
 
     // A full JSC collection frees cells but libpas retains their committed
     // pages. Bun.gc(true) is also an explicit memory-pressure boundary, so
     // synchronously decommit those pages after releasing the VM lock.
+    bmalloc::api::scavengeThisThread();
+    bmalloc::api::scavenge();
     pas_scavenger_run_synchronously_now();
 #if defined(__APPLE__)
     malloc_zone_pressure_relief(nullptr, 0);
