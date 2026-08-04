@@ -79,8 +79,14 @@ static CtJscEncodedValue ct_direct_concat_http_body_chunks(
         total += length;
     }
 
+    if (total == 0) {
+        JSValueRef result = ct_array_buffer_from_copy(context, NULL, 0, &exception);
+        if (exception != NULL) return ct_jsc_throw_value_ref(invocation, exception);
+        return ct_jsc_value_from_ref(invocation, result);
+    }
+
     char *output = ct_http_body_chunk_alloc(total);
-    if (total > 0 && output == NULL) return ct_jsc_throw_error(invocation, "Out of memory");
+    if (output == NULL) return ct_jsc_throw_error(invocation, "Out of memory");
     size_t offset = 0;
     for (uint32_t index = 0; index < count; index += 1) {
         JSValueRef value = JSObjectGetPropertyAtIndex(context, chunks, index, &exception);

@@ -10,7 +10,9 @@ describe("native text encoding fast paths", () => {
     ]);
     expect(result).toBeInstanceOf(ArrayBuffer);
     expect(Array.from(new Uint8Array(result))).toEqual([0, 1, 2, 4, 5]);
-    expect(globalThis.cottontail.concatHttpBodyChunks([]).byteLength).toBe(0);
+    const empty = globalThis.cottontail.concatHttpBodyChunks([]);
+    expect(empty.byteLength).toBe(0);
+    expect(Array.from(new Uint8Array(empty))).toEqual([]);
     expect(() => globalThis.cottontail.concatHttpBodyChunks(["invalid"])).toThrow(TypeError);
   });
 
