@@ -37,7 +37,7 @@ test('runs the strict complete Cottontail-owned Bun tier without publishing', ()
   );
   assert.match(
     workflow,
-    /run: node scripts\/run-upstream-tests\.js bun --include-expected-failures/,
+    /run: node scripts\/run-upstream-tests\.js bun --hutch "\$HUTCH_ENGINE" --include-expected-failures/,
   );
   assert.doesNotMatch(workflow, /continue-on-error:|upload-release-r2|publish|secrets\./i);
 
@@ -73,7 +73,11 @@ test('builds and passes the pinned Hutch engine to split package fixtures', () =
   assert.doesNotMatch(hutchSetup, /command -v|which\(|["']PATH["']/);
 
   assert.match(workflow, /hutch_engine="\$\(node scripts\/setup-upstream-hutch\.js\)"/);
-  assert.match(workflow, /HUTCH_ENGINE: \$\{\{ steps\.hutch-engine\.outputs\.binary \}\}/);
+  assert.equal(
+    workflow.match(/HUTCH_ENGINE: \$\{\{ steps\.hutch-engine\.outputs\.binary \}\}/g)?.length,
+    2,
+    'both the complete tier and focused package cases must use the pinned Hutch engine',
+  );
   assert.match(
     workflow,
     /--hutch "\$HUTCH_ENGINE" --test test\/bundler\/bundler_defer\.test\.ts --case '\^\\\$file\$' --expect-pass --jobs 1/,

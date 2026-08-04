@@ -92,7 +92,9 @@ jobs:
           echo "binary=$hutch_engine" >> "$GITHUB_OUTPUT"
 
       - name: Run complete Cottontail-owned Bun compatibility tier
-        run: node scripts/run-upstream-tests.js bun --include-expected-failures
+        env:
+          HUTCH_ENGINE: ${{ steps.hutch-engine.outputs.binary }}
+        run: node scripts/run-upstream-tests.js bun --hutch "$HUTCH_ENGINE" --include-expected-failures
 
       - name: Run Hutch-backed split bundler cases
         env:
