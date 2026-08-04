@@ -12925,51 +12925,6 @@ if (typeof globalThis.WebAssembly === "object" && typeof globalThis.WebAssembly.
   };
 }
 
-// Blocking terminal prompts (alert/confirm/prompt), reading stdin one byte at
-// a time until newline/EOF like Bun's native implementations.
-{
-  const writeOut = (text) => {
-    const bytes = new TextEncoder().encode(text);
-    try {
-      cottontail.fdWriteAt(1, bytes, 0, bytes.byteLength, null);
-    } catch {}
-  };
-  const readLine = () => {
-    const chunk = new Uint8Array(1);
-    let line = "";
-    let sawAny = false;
-    for (;;) {
-      let read = 0;
-      try {
-        read = Number(cottontail.fdReadAt(0, chunk, 0, 1, null));
-      } catch {
-        break;
-      }
-      if (!(read > 0)) break;
-      sawAny = true;
-      if (chunk[0] === 10) return line.endsWith("\r") ? line.slice(0, -1) : line;
-      line += String.fromCharCode(chunk[0]);
-    }
-    if (!sawAny) return null;
-    return line.endsWith("\r") ? line.slice(0, -1) : line;
-  };
-  globalThis.alert ??= function alert(message = undefined) {
-    writeOut(message === undefined ? "Alert [Enter] " : `${message} [Enter] `);
-    readLine();
-  };
-  globalThis.confirm ??= function confirm(message = undefined) {
-    writeOut(message === undefined ? "Confirm [y/N] " : `${message} [y/N] `);
-    const line = readLine();
-    return line !== null && (line[0] === "y" || line[0] === "Y");
-  };
-  globalThis.prompt ??= function prompt(message = undefined, defaultValue = undefined) {
-    writeOut(`${message === undefined ? "Prompt" : message} `);
-    const line = readLine();
-    if (line === null || line === "") return defaultValue !== undefined ? String(defaultValue) : null;
-    return line;
-  };
-}
-
 if (globalThis.navigator == null) {
   const navigatorPlatform = cottontail.platform?.() === "darwin" ? "MacIntel" :
     cottontail.platform?.() === "win32" ? "Win32" :

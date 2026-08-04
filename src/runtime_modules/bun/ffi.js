@@ -803,7 +803,10 @@ const formatConsoleValue = (value, seen, objectDepth, indent, options) => {
         value.length > 10 || complex || tokens.some((token) => token.text.includes("\n")),
       );
     }
-    if (typeof Buffer !== "undefined" && Buffer.isBuffer?.(value)) {
+    // Buffer is always an ArrayBuffer view. Check that brand first so a
+    // userland Proxy is never passed to host Buffer.isBuffer(), which may
+    // probe observable properties such as `_isBuffer`.
+    if (ArrayBuffer.isView(value) && typeof Buffer !== "undefined" && Buffer.isBuffer?.(value)) {
       const shown = Array.from(value.subarray(0, 50), (byte) => byte.toString(16).padStart(2, "0"));
       const suffix = value.length > 50 ? ` ... ${value.length - 50} more bytes` : "";
       return `<Buffer ${shown.join(" ")}${suffix}>`;
@@ -1038,7 +1041,7 @@ const formatConsoleError = (error, level, separate = true) => {
   );
   if (level === "warn") {
     const heading = source.plainError ? `warn: ${message}` : `${name}: ${message}`;
-    return `${consoleGroupIndent}${heading}\n${stack}${properties}\n`;
+    return `${consoleGroupIndent}${heading}\n${stack}${properties}\n${separate ? "\n" : ""}`;
   }
 
   const firstLine = Math.max(0, source.lineIndex - 5);
@@ -1050,7 +1053,7 @@ const formatConsoleError = (error, level, separate = true) => {
   excerpt.push(" ".repeat(String(lineNumber).length + 3 + source.column - 1) + "^");
   excerpt.push(`${source.plainError ? "error" : name}: ${message}`);
   excerpt.push(`${stack}${properties}`);
-  if (separate) excerpt.push("");
+  if (separate) excerpt.push("", "");
   return excerpt.join("\n");
 };
 
@@ -1152,6 +1155,53 @@ console.debug = console.log;
   console.timeLog = (label = "default", ...data) => logTime(label, data, false);
   console.timeEnd = (label = "default") => logTime(label, [], true);
 }
+
+// Blocking terminal prompts read stdin one byte at a time until newline/EOF.
+// Keep these in the shared FFI bootstrap so selective and full runtimes expose
+// the same Bun globals.
+{
+  const writePrompt = (text) => {
+    const bytes = new TextEncoder().encode(text);
+    try {
+      cottontail.fdWriteAt(1, bytes, 0, bytes.byteLength, null);
+    } catch {}
+  };
+  const readPromptLine = () => {
+    const chunk = new Uint8Array(1);
+    let line = "";
+    let sawAny = false;
+    for (;;) {
+      let read = 0;
+      try {
+        read = Number(cottontail.fdReadAt(0, chunk, 0, 1, null));
+      } catch {
+        break;
+      }
+      if (!(read > 0)) break;
+      sawAny = true;
+      if (chunk[0] === 10) return line.endsWith("\r") ? line.slice(0, -1) : line;
+      line += String.fromCharCode(chunk[0]);
+    }
+    if (!sawAny) return null;
+    return line.endsWith("\r") ? line.slice(0, -1) : line;
+  };
+  g.alert ??= function alert(message = undefined) {
+    writePrompt(message === undefined ? "Alert [Enter] " : `${message} [Enter] `);
+    readPromptLine();
+  };
+  g.confirm ??= function confirm(message = undefined) {
+    writePrompt(message === undefined ? "Confirm [y/N] " : `${message} [y/N] `);
+    const line = readPromptLine();
+    return line !== null && (line[0] === "y" || line[0] === "Y");
+  };
+  g.prompt ??= function prompt(message = undefined, defaultValue = undefined) {
+    writePrompt(`${message === undefined ? "Prompt" : message} `);
+    const line = readPromptLine();
+    if (line === null || line === "") return defaultValue !== undefined ? String(defaultValue) : null;
+    return line;
+  };
+}
+
 g.global ??= g;
 g.self ??= g;
 g.performance ??= {};

@@ -165,7 +165,7 @@ try {
       name: 'runtime-bootstrap-startup-regressions',
       argv: ['test', join(rootDir, 'tests', 'js', 'runtime-bootstrap-startup.test.ts')],
       expectExitCode: 0,
-      stderrIncludes: ['14 pass', '0 fail'],
+      stderrIncludes: ['16 pass', '0 fail'],
     },
     {
       name: 'web-worker-module-loading',

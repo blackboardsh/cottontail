@@ -4238,6 +4238,19 @@ fn fullRuntimeGlobal(name: []const u8) bool {
     return false;
 }
 
+fn bareRuntimeConsoleProperty(name: []const u8) bool {
+    for ([_][]const u8{
+        "debug",
+        "error",
+        "info",
+        "log",
+        "warn",
+    }) |property| {
+        if (std.mem.eql(u8, name, property)) return true;
+    }
+    return false;
+}
+
 fn runtimeMemberProperty(tokens: []const JavaScriptModuleToken, index: usize) ?[]const u8 {
     var property_index = index + 1;
     if (property_index < tokens.len and tokenIs(tokens[property_index], .punct, "?")) property_index += 1;
@@ -4467,6 +4480,19 @@ fn sourceRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBoo
             if (!has_http_server or !httpRuntimeRequireSupported(tokens, index)) return .full;
         } else if (std.mem.eql(u8, token.text, "fetch")) {
             if (!has_http_server or !httpRuntimeFetchIsServeOption(tokens, index)) return .full;
+        } else if (std.mem.eql(u8, token.text, "console")) {
+            const property = runtimeMemberProperty(tokens, index) orelse return .full;
+            if (!bareRuntimeConsoleProperty(property)) {
+                if (has_http_server) return .full;
+                if (mode == .bare) mode = .minimal;
+            }
+        } else if (std.mem.eql(u8, token.text, "alert") or
+            std.mem.eql(u8, token.text, "confirm") or
+            std.mem.eql(u8, token.text, "prompt") or
+            std.mem.eql(u8, token.text, "Proxy"))
+        {
+            if (has_http_server) return .full;
+            if (mode == .bare) mode = .minimal;
         } else if (std.mem.eql(u8, token.text, "Error")) {
             if (runtimeMemberProperty(tokens, index)) |property| {
                 if (std.mem.eql(u8, property, "captureStackTrace") or
@@ -10460,6 +10486,15 @@ test "CommonJS eval bootstrap rejects advanced process APIs" {
         allocator,
         "require('node:fs'); process.permission.has('fs');",
     ));
+}
+
+test "bare console methods are limited to JSC's compatible surface" {
+    for ([_][]const u8{ "debug", "error", "info", "log", "warn" }) |name| {
+        try std.testing.expect(bareRuntimeConsoleProperty(name));
+    }
+    for ([_][]const u8{ "dir", "group", "groupEnd", "time", "timeEnd", "timeLog" }) |name| {
+        try std.testing.expect(!bareRuntimeConsoleProperty(name));
+    }
 }
 
 test "eval source maps use Bun's virtual source identity" {
