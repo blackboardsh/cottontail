@@ -28306,11 +28306,24 @@ static void *ct_async_process_thread(void *opaque) {
                     }
                     continue;
                 }
+                size_t buffered = 0;
                 for (;;) {
-                    ssize_t n = read(fds[index].fd, pipe_read_buffer, pipe_read_buffer_capacity);
+                    ssize_t n = read(
+                        fds[index].fd,
+                        pipe_read_buffer + buffered,
+                        pipe_read_buffer_capacity - buffered
+                    );
                     if (n > 0) {
-                        ct_async_process_queue_text(process, types[index], pipe_read_buffer, (size_t)n);
+                        buffered += (size_t)n;
+                        if (buffered == pipe_read_buffer_capacity) {
+                            ct_async_process_queue_text(process, types[index], pipe_read_buffer, buffered);
+                            buffered = 0;
+                        }
                         continue;
+                    }
+                    if (buffered > 0) {
+                        ct_async_process_queue_text(process, types[index], pipe_read_buffer, buffered);
+                        buffered = 0;
                     }
                     if (n == 0) {
                         if (fds[index].fd == process->stdout_fd) {

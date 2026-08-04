@@ -4241,7 +4241,12 @@ const RuntimeBootstrapMode = enum {
     bare,
     minimal,
     process,
+    eval_fast_fs,
+    eval_common_js,
 };
+
+const eval_fast_fs_bootstrap_marker = "/*@cottontail-eval-fast-fs-bootstrap*/";
+const eval_common_js_bootstrap_marker = "/*@cottontail-eval-commonjs-bootstrap*/";
 
 const ReloadRuntimeBootstrapAnalysis = struct {
     mode: RuntimeBootstrapMode = .bare,
@@ -4249,8 +4254,10 @@ const ReloadRuntimeBootstrapAnalysis = struct {
 };
 
 fn entrypointRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBootstrapMode {
+    const source_mode = try sourceRuntimeBootstrapMode(ctx, path);
+    if (source_mode == .eval_fast_fs or source_mode == .eval_common_js) return source_mode;
     if (!try entrypointImportsOnlyRuntimeAliases(ctx, path)) return .full;
-    return sourceRuntimeBootstrapMode(ctx, path);
+    return source_mode;
 }
 
 fn sourceRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBootstrapMode {
@@ -4262,6 +4269,12 @@ fn sourceRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBoo
         ctx.allocator,
         .limited(16 * 1024 * 1024),
     ) catch return .full;
+    if (std.mem.indexOf(u8, source, eval_fast_fs_bootstrap_marker) != null) {
+        return .eval_fast_fs;
+    }
+    if (std.mem.indexOf(u8, source, eval_common_js_bootstrap_marker) != null) {
+        return .eval_common_js;
+    }
     const tokens = try tokenizeJavaScriptModuleSyntax(ctx.allocator, source);
 
     var mode: RuntimeBootstrapMode = .bare;
@@ -4356,6 +4369,8 @@ fn resolveReloadRuntimeImport(
 
 fn mergeRuntimeBootstrapMode(left: RuntimeBootstrapMode, right: RuntimeBootstrapMode) RuntimeBootstrapMode {
     if (left == .full or right == .full) return .full;
+    if (left == .eval_common_js or right == .eval_common_js) return .eval_common_js;
+    if (left == .eval_fast_fs or right == .eval_fast_fs) return .eval_fast_fs;
     if (left == .process or right == .process) return .process;
     if (left == .minimal or right == .minimal) return .minimal;
     return .bare;
@@ -4596,7 +4611,11 @@ fn bundleScriptNative(
 
     const script_abs = try resolvePathForCwd(ctx.io, ctx.allocator, script_path);
     const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
-    const is_test_cli_execution = ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null;
+    const is_eval_entrypoint = std.mem.startsWith(u8, std.fs.path.basename(script_abs), ".cottontail-eval-");
+    // A nested `cottontail -e` is a new runtime invocation. Parent test-runner
+    // bookkeeping must not turn its launcher into another test harness.
+    const is_test_cli_execution = !is_eval_entrypoint and
+        ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null;
     const is_test_runtime_execution = is_test_cli_execution or
         ctx.environ_map.get("COTTONTAIL_TEST_FILE_COUNT") != null or
         isTestEntrypointPath(script_abs);
@@ -4684,7 +4703,8 @@ fn bundleScriptNative(
         test_preload_imports.len > 0 or
         startup_options.requiresFullRuntime();
     const runtime_transpiler_cache_enabled = cli_run_execution.runtimeTranspilerCacheEnabled(ctx.environ_map);
-    const runtime_cache_common_js_entrypoint = if (!runtime_module_entrypoint and
+    const runtime_cache_common_js_entrypoint = if (!is_eval_entrypoint and
+        !runtime_module_entrypoint and
         runtime_transpiler_cache_enabled and
         !is_wasm_entrypoint)
         try runtimeCacheCanUseCommonJsLoader(ctx, script_abs)
@@ -4697,7 +4717,17 @@ fn bundleScriptNative(
     const is_common_js_entrypoint = detected_common_js_entrypoint or runtime_cache_common_js_entrypoint;
     if (is_common_js_entrypoint) try validateCommonJsTestSyntax(ctx, script_entry_abs);
     var reload_needs_runtime_module_sources = true;
-    const runtime_bootstrap_mode: RuntimeBootstrapMode = if (!runtime_module_entrypoint and
+    const eval_bootstrap_mode: ?RuntimeBootstrapMode = if (is_eval_entrypoint and
+        !standalone_compile and
+        build_options == null and
+        !requires_full_runtime_preloads and
+        !is_wasm_entrypoint)
+        try entrypointRuntimeBootstrapMode(ctx, script_abs)
+    else
+        null;
+    const runtime_bootstrap_mode: RuntimeBootstrapMode = if (eval_bootstrap_mode) |mode|
+        mode
+    else if (!runtime_module_entrypoint and
         !runtime_cache_common_js_entrypoint and
         !standalone_compile and
         build_options == null and
@@ -4745,7 +4775,11 @@ fn bundleScriptNative(
     // graph edge whenever build options are present so its source and
     // transitive dependencies are embedded in the generated bundle.
     const bundle_common_js_entrypoint = is_common_js_entrypoint and
-        (has_custom_conditions or build_options != null or use_selective_runtime or reload_dependencies_out != null);
+        (has_custom_conditions or build_options != null or
+            (use_selective_runtime and
+                runtime_bootstrap_mode != .eval_fast_fs and
+                runtime_bootstrap_mode != .eval_common_js) or
+            reload_dependencies_out != null);
     const use_runtime_module_launcher_cache = runtime_module_entrypoint and plain_launcher_cacheable;
     const use_esm_bundle_cache = !runtime_module_entrypoint and
         !is_wasm_entrypoint and
@@ -5112,14 +5146,13 @@ fn acquireLauncherCache(
         .truncate = false,
     }) catch return null;
     errdefer lock_file.close(ctx.io);
-    const locked = lock_file.tryLock(ctx.io, .exclusive) catch {
+    // Shared launchers are expensive enough that racing processes should wait
+    // for the first producer and consume its artifact instead of compiling the
+    // same graph in parallel.
+    lock_file.lock(ctx.io, .exclusive) catch {
         lock_file.close(ctx.io);
         return null;
     };
-    if (!locked) {
-        lock_file.close(ctx.io);
-        return null;
-    }
 
     return .{
         .cache_root = cache_root,
@@ -6225,6 +6258,80 @@ fn sourceNeedsEvalModuleGlobals(allocator: std.mem.Allocator, source: []const u8
     return false;
 }
 
+fn evalSourceCanUseCommonJsBootstrap(allocator: std.mem.Allocator, source: []const u8) !bool {
+    const tokens = try tokenizeJavaScriptModuleSyntax(allocator, source);
+    var uses_common_js_runtime = false;
+    for (tokens, 0..) |token, index| {
+        if (token.kind != .identifier) continue;
+        if (std.mem.eql(u8, token.text, "Bun")) {
+            const property = runtimeMemberProperty(tokens, index) orelse return false;
+            if (!minimalRuntimeBunProperty(property)) return false;
+            continue;
+        }
+        if (std.mem.eql(u8, token.text, "process")) {
+            const property = runtimeMemberProperty(tokens, index) orelse return false;
+            if (std.mem.eql(u8, property, "mainModule")) return false;
+            continue;
+        }
+        if (std.mem.eql(u8, token.text, "Error")) {
+            if (runtimeMemberProperty(tokens, index)) |property| {
+                if (std.mem.eql(u8, property, "captureStackTrace") or
+                    std.mem.eql(u8, property, "prepareStackTrace") or
+                    std.mem.eql(u8, property, "stackTraceLimit")) return false;
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, token.text, "require") or
+            std.mem.eql(u8, token.text, "module") or
+            std.mem.eql(u8, token.text, "exports") or
+            std.mem.eql(u8, token.text, "__filename") or
+            std.mem.eql(u8, token.text, "__dirname") or
+            std.mem.eql(u8, token.text, "Buffer"))
+        {
+            uses_common_js_runtime = true;
+            continue;
+        }
+        if (fullRuntimeGlobal(token.text)) return false;
+    }
+    return uses_common_js_runtime;
+}
+
+fn evalSourceCanUseFastFsBootstrap(allocator: std.mem.Allocator, source: []const u8) !bool {
+    const imports_json = native_transpiler.scanImportsJson(source, "js") catch return false;
+    defer std.heap.c_allocator.free(imports_json);
+    const tokens = try tokenizeJavaScriptModuleSyntax(allocator, source);
+    var uses_fast_fs = false;
+    for (tokens, 0..) |token, index| {
+        if (token.kind != .identifier) continue;
+        if (std.mem.eql(u8, token.text, "require")) {
+            if (index + 5 >= tokens.len or
+                !tokenIs(tokens[index + 1], .punct, "(") or
+                tokens[index + 2].kind != .string or
+                (!std.mem.eql(u8, tokens[index + 2].text, "fs") and
+                    !std.mem.eql(u8, tokens[index + 2].text, "node:fs")) or
+                !tokenIs(tokens[index + 3], .punct, ")") or
+                !tokenIs(tokens[index + 4], .punct, ".") or
+                !tokenIs(tokens[index + 5], .identifier, "writeSync")) return false;
+            uses_fast_fs = true;
+            continue;
+        }
+        if (std.mem.eql(u8, token.text, "Buffer")) continue;
+        if (std.mem.eql(u8, token.text, "process")) {
+            const property = runtimeMemberProperty(tokens, index) orelse return false;
+            if (!minimalRuntimeProcessProperty(property)) return false;
+            continue;
+        }
+        if (std.mem.eql(u8, token.text, "Bun") or
+            std.mem.eql(u8, token.text, "module") or
+            std.mem.eql(u8, token.text, "exports") or
+            std.mem.eql(u8, token.text, "__filename") or
+            std.mem.eql(u8, token.text, "__dirname") or
+            std.mem.eql(u8, token.text, "fs") or
+            fullRuntimeGlobal(token.text)) return false;
+    }
+    return uses_fast_fs;
+}
+
 const EvalArgvMode = enum { unchanged, omit_entrypoint, stdin };
 
 const EvalEntrypoint = struct {
@@ -6359,10 +6466,20 @@ fn writeEvalEntrypoint(
         bun_eval_globals_bootstrap
     else
         "";
+    const selective_common_js_marker = if (!module_input)
+        if (try evalSourceCanUseFastFsBootstrap(ctx.allocator, source))
+            eval_fast_fs_bootstrap_marker
+        else if (try evalSourceCanUseCommonJsBootstrap(ctx.allocator, source))
+            eval_common_js_bootstrap_marker
+        else
+            ""
+    else
+        "";
     // COTTONTAIL-COMPAT: Keep eval on disk for stock JSC and concurrent
     // invocations while exposing Bun's virtual cwd/[eval] identity to
     // import.meta through the compiler's generated-source marker.
     const preamble = try std.mem.concat(ctx.allocator, u8, &.{
+        selective_common_js_marker,
         eval_globals_source,
         process_eval_source,
         argv_source,
@@ -9243,6 +9360,161 @@ fn writeLazyRuntimeEntryWrapper(
     return wrapper_path;
 }
 
+fn writeFastEvalFsEntryWrapper(
+    ctx: *const Context,
+    tmp_dir: []const u8,
+    runtime_virtual_root: []const u8,
+) ![]const u8 {
+    const wrapper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script-entry-eval-fast-fs.mjs" });
+    const process_literal = try jsonStringLiteral(
+        ctx,
+        try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "internal", "runtime-process-bootstrap.js" }),
+    );
+    const buffer_literal = try jsonStringLiteral(
+        ctx,
+        try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "internal", "buffer-polyfill.js" }),
+    );
+    const source = try std.fmt.allocPrint(ctx.allocator,
+        \\import {{ processObject as __ctProcess }} from {s};
+        \\import {{ Buffer as __ctBuffer }} from {s};
+        \\globalThis.process = __ctProcess;
+        \\globalThis.Buffer = __ctBuffer;
+        \\const __ctWriteSync = (fd, data, offset = undefined, length = undefined, position = null) => {{
+        \\  if (!Number.isInteger(fd) || fd < 0) throw new TypeError("fd must be a non-negative integer");
+        \\  let view;
+        \\  if (typeof data === "string") {{
+        \\    if (typeof offset === "string") {{ length = offset; offset = null; }}
+        \\    const encoding = typeof length === "string" ? length : "utf8";
+        \\    position = offset ?? null;
+        \\    view = __ctBuffer.from(data, encoding);
+        \\    offset = 0;
+        \\    length = view.byteLength;
+        \\  }} else {{
+        \\    view = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+        \\    if (!ArrayBuffer.isView(view)) throw new TypeError("data must be a string, ArrayBuffer, or ArrayBufferView");
+        \\    if (offset && typeof offset === "object") {{
+        \\      const options = offset;
+        \\      offset = options.offset ?? 0;
+        \\      length = options.length ?? view.byteLength - offset;
+        \\      position = options.position ?? null;
+        \\    }} else {{
+        \\      offset ??= 0;
+        \\      length ??= view.byteLength - offset;
+        \\    }}
+        \\  }}
+        \\  if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(length) || length < 0 || offset + length > view.byteLength) {{
+        \\    throw new RangeError("write range is outside the buffer");
+        \\  }}
+        \\  if (length === 0) return 0;
+        \\  return Number(cottontail.fdWriteAt(fd, view, offset, length, position));
+        \\}};
+        \\const __ctFs = Object.freeze({{ writeSync: __ctWriteSync }});
+        \\const __ctRequire = specifier => {{
+        \\  if (specifier === "fs" || specifier === "node:fs") return __ctFs;
+        \\  const error = new Error(`Cannot find module '${{specifier}}'`);
+        \\  error.code = "MODULE_NOT_FOUND";
+        \\  throw error;
+        \\}};
+        \\globalThis.require = __ctRequire;
+        \\globalThis.__ctMetaRequire = __ctRequire;
+        \\const __ctEntryPath = __ctProcess.argv?.[1];
+        \\if (!__ctEntryPath) throw new Error("Missing eval entrypoint");
+        \\const __ctSource = String(cottontail.readFile(__ctEntryPath));
+        \\(0, eval)(`${{__ctSource}}\n//# sourceURL=${{__ctEntryPath}}`);
+        \\
+    , .{ process_literal, buffer_literal });
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
+    return wrapper_path;
+}
+
+fn writeSelectiveEvalCommonJsEntryWrapper(
+    ctx: *const Context,
+    tmp_dir: []const u8,
+    preload_imports: []const u8,
+    test_cli_execution: bool,
+    stable_source_map_path: bool,
+    runtime_virtual_root: []const u8,
+) ![]const u8 {
+    const wrapper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script-entry-eval-commonjs.mjs" });
+    const ffi_literal = try jsonStringLiteral(
+        ctx,
+        try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "bun", "ffi.js" }),
+    );
+    const bootstrap_literal = try jsonStringLiteral(
+        ctx,
+        try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "internal", "runtime-bootstrap.js" }),
+    );
+    const url_literal = try jsonStringLiteral(
+        ctx,
+        try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "url.js" }),
+    );
+    const module_literal = try jsonStringLiteral(
+        ctx,
+        try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "module.js" }),
+    );
+    const fast_common_js_literal = try jsonStringLiteral(
+        ctx,
+        try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "internal", "eval-commonjs-fast.js" }),
+    );
+    const bundle_map_literal = if (stable_source_map_path)
+        "\"\""
+    else blk: {
+        const bundle_map_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs.map" });
+        break :blk try jsonStringLiteral(ctx, bundle_map_path);
+    };
+    const bundle_source_root_literal = try jsonStringLiteral(
+        ctx,
+        if (stable_source_map_path) runtime_virtual_root else ctx.project_root,
+    );
+    const test_header_signal = if (test_cli_execution)
+        "globalThis.__cottontailBunTestHeaderPrinted = true;"
+    else
+        "";
+    const source = try std.fmt.allocPrint(ctx.allocator,
+        \\import {s};
+        \\import {{ installRuntimeBootstrap as __ctInstallRuntimeBootstrap }} from {s};
+        \\import {{ fileURLToPath as __ctFileURLToPath, pathToFileURL as __ctPathToFileURL }} from {s};
+        \\import * as moduleModule from {s};
+        \\import {{ installFastEvalCommonJsBuiltins as __ctInstallFastEvalCommonJsBuiltins }} from {s};
+        \\__ctInstallRuntimeBootstrap({{ fileURLToPath: __ctFileURLToPath, pathToFileURL: __ctPathToFileURL }});
+        \\__ctInstallFastEvalCommonJsBuiltins(moduleModule);
+        \\const __ctEntryPath = globalThis.process?.argv?.[1];
+        \\if (!__ctEntryPath) throw new Error("Missing eval entrypoint");
+        \\globalThis.require ??= moduleModule.createRequire(__ctEntryPath);
+        \\globalThis.__ctMetaRequire ??= globalThis.require;
+        \\globalThis.__cottontailBundleSourceMap ??= {s};
+        \\globalThis.__cottontailBundleSourceRoot ??= {s};
+        \\globalThis.Loader ??= {{ registry: new Map() }};
+        \\globalThis.__cottontailLoadDotenv?.();
+        \\await globalThis.__cottontailLoadStandaloneBunfig?.();
+        \\await globalThis.__cottontailLoadStandaloneExecPreloads?.();
+        \\{s}
+        \\globalThis.__cottontailLoadingTestModules = true;
+        \\try {{
+        \\{s}
+        \\{s}  globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
+        \\  (moduleModule.default ?? moduleModule.Module).runMain();
+        \\}} finally {{
+        \\  globalThis.__cottontailLoadingTestModules = false;
+        \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
+        \\}}
+        \\
+    , .{
+        ffi_literal,
+        bootstrap_literal,
+        url_literal,
+        module_literal,
+        fast_common_js_literal,
+        bundle_map_literal,
+        bundle_source_root_literal,
+        test_header_signal,
+        cpu_profiler_start_statement,
+        preload_imports,
+    });
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
+    return wrapper_path;
+}
+
 fn writeLazyCommonJsEntryWrapper(
     ctx: *const Context,
     tmp_dir: []const u8,
@@ -9340,6 +9612,19 @@ fn writeRuntimeEntryWrapper(
     bootstrap_mode: RuntimeBootstrapMode,
     runtime_module_entrypoint: bool,
 ) ![]const u8 {
+    if (bootstrap_mode == .eval_fast_fs) return writeFastEvalFsEntryWrapper(
+        ctx,
+        tmp_dir,
+        runtime_virtual_root,
+    );
+    if (bootstrap_mode == .eval_common_js) return writeSelectiveEvalCommonJsEntryWrapper(
+        ctx,
+        tmp_dir,
+        preload_imports,
+        test_cli_execution,
+        stable_source_map_path,
+        runtime_virtual_root,
+    );
     if (bootstrap_mode != .full) return writeMinimalRuntimeEntryWrapper(
         ctx,
         tmp_dir,

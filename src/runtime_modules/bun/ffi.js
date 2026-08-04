@@ -1386,6 +1386,15 @@ function installBlobGlobals() {
         return this._size;
       }
 
+      static _fromOwnedChunks(chunks, type = "") {
+        const blob = Object.create(CottontailBlob.prototype);
+        blob._blobChunks = chunks;
+        blob._size = chunks.reduce((size, chunk) => size + chunk.byteLength, 0);
+        blob._bytes = null;
+        blob.type = normalizeBlobType(type);
+        return blob;
+      }
+
       _getBytes() {
         return concatBlobChunks(this._blobChunks, this._size);
       }
@@ -1455,7 +1464,13 @@ function installBlobGlobals() {
       writable: true,
       value: CottontailBlob,
     });
+    Object.defineProperty(g, "__cottontailBlobFromOwnedChunks", {
+      configurable: true,
+      value: chunks => CottontailBlob._fromOwnedChunks(chunks),
+    });
   }
+
+  g.__cottontailBlobFromOwnedChunks ??= chunks => new g.Blob(chunks);
 
   if (typeof g.File !== "function") {
     class CottontailFile extends g.Blob {

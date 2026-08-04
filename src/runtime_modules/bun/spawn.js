@@ -162,7 +162,25 @@ class ProcessReadable {
     return this._concatChunks(chunks);
   }
 
-  async blob() { return new Blob([await this.bytes()]); }
+  async blob() {
+    if (this._locked && this._ended && this._chunks.length === 0 && !this._emptyReadClaimed) {
+      this._emptyReadClaimed = true;
+      return new Blob([]);
+    }
+    const reader = this.getReader();
+    const chunks = [];
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+    } finally {
+      if (chunks.length === 0 && this._ended) this._emptyReadClaimed = true;
+      else reader.releaseLock();
+    }
+    return globalThis.__cottontailBlobFromOwnedChunks?.(chunks) ?? new Blob(chunks);
+  }
   async text() { return new TextDecoder().decode(await this.bytes()); }
 
   async json() {
