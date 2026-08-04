@@ -8181,10 +8181,15 @@ function bunInspectEvent(value, objectTag, ctx, indent, seen, depth) {
     ], ctx, indent, seen, depth);
   }
   if (objectTag === "[object ErrorEvent]") {
+    const errorDiagnostic = bunInspectErrorDiagnostic(value.error);
     return bunInspectEventEntries("ErrorEvent", [
       ["type", value.type],
       ["message", value.message],
-      ["error", value.error, bunInspectErrorDiagnostic(value.error) ?? undefined],
+      ["error", value.error, errorDiagnostic ?? (
+        value.error instanceof Error
+          ? `error: ${String(value.error.message ?? "")}\n`
+          : undefined
+      )],
     ], ctx, indent, seen, depth);
   }
   const commonEntries = [

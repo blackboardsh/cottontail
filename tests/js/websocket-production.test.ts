@@ -387,3 +387,84 @@ test("ws client and server negotiate permessage-deflate and close cleanly", asyn
     await deadline(new Promise<void>((resolve) => wss.close(() => resolve())), "ws server close");
   }
 });
+
+test("Bun WebSocket binaryType and Blob payloads", async () => {
+  await using server = Bun.serve({
+    port: 0,
+    fetch(request, instance) {
+      if (instance.upgrade(request)) return;
+      return new Response("Upgrade required", { status: 426 });
+    },
+    websocket: {
+      open(socket) {
+        socket.send(new Uint8Array([1, 2, 3]));
+      },
+      message(socket, message) {
+        socket.send(message);
+      },
+    },
+  });
+
+  const client = new WebSocket(`ws://127.0.0.1:${server.port}`);
+  expect(client.binaryType).toBe("nodebuffer");
+  expect(() => { client.binaryType = "invalid"; }).toThrow(TypeError);
+  client.binaryType = "blob";
+
+  const firstMessage = new Promise<Blob>((resolve, reject) => {
+    client.onerror = reject;
+    client.onmessage = (event) => resolve(event.data);
+  });
+  const first = await deadline(firstMessage, "initial Blob WebSocket message");
+  expect(first).toBeInstanceOf(Blob);
+  expect(new Uint8Array(await first.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]));
+
+  const echoedMessage = new Promise<Blob>((resolve, reject) => {
+    client.onerror = reject;
+    client.onmessage = (event) => resolve(event.data);
+  });
+  client.send(new Blob([new Uint8Array([4, 5, 6])]));
+  const echoed = await deadline(echoedMessage, "echoed Blob WebSocket message");
+  expect(echoed).toBeInstanceOf(Blob);
+  expect(new Uint8Array(await echoed.arrayBuffer())).toEqual(new Uint8Array([4, 5, 6]));
+  client.close();
+});
+
+test("ws compatibility client preserves a locally initiated clean close", async () => {
+  const server = createNetServer((socket) => {
+    let upgraded = false;
+    let buffer = Buffer.alloc(0);
+    socket.on("data", (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (!upgraded) {
+        const text = buffer.toString("latin1");
+        const headerEnd = text.indexOf("\r\n\r\n");
+        if (headerEnd < 0) return;
+        upgraded = true;
+        const key = text.match(/Sec-WebSocket-Key:\s*([^\r\n]+)/i)?.[1]?.trim();
+        if (!key) throw new Error("missing WebSocket key");
+        socket.write([
+          "HTTP/1.1 101 Switching Protocols",
+          "Upgrade: websocket",
+          "Connection: Upgrade",
+          `Sec-WebSocket-Accept: ${websocketAccept(key)}`,
+          "",
+          "",
+        ].join("\r\n"));
+        buffer = buffer.subarray(headerEnd + 4);
+      }
+      if (upgraded && buffer.byteLength > 0) socket.end();
+    });
+  });
+  const port = await deadline(listen(server), "clean-close WebSocket listener");
+  try {
+    const close = await deadline(new Promise<{ code: number; wasClean: boolean }>((resolve, reject) => {
+      const client = new WsClient(`ws://127.0.0.1:${port}/socket`);
+      client.once("error", reject);
+      client.once("open", () => client.close(1000));
+      client.once("close", (code, _reason, wasClean) => resolve({ code, wasClean }));
+    }), "locally initiated WebSocket close");
+    expect(close).toEqual({ code: 1000, wasClean: true });
+  } finally {
+    await deadline(closeNetServer(server), "clean-close WebSocket listener close");
+  }
+});

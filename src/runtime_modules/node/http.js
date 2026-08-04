@@ -445,6 +445,14 @@ function bytesFromBody(body) {
   if (typeof body === "string") return Buffer.from(body);
   if (body instanceof ArrayBuffer) return new Uint8Array(body);
   if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+  if (typeof globalThis.Blob === "function" && body instanceof globalThis.Blob) {
+    if (body._bytes instanceof Uint8Array) return body._bytes;
+    if (typeof body._getBytes === "function") {
+      const bytes = body._getBytes();
+      if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
+      if (ArrayBuffer.isView(bytes)) return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    }
+  }
   return Buffer.from(String(body));
 }
 
@@ -4017,7 +4025,7 @@ export const WebSocket = typeof existingWebSocket === "function" ? existingWebSo
     this.url = parsed.href;
     this.extensions = "";
     this.protocol = "";
-    this.binaryType = "blob";
+    this._binaryType = "nodebuffer";
     this.onopen = null;
     this.onerror = null;
     this.onclose = null;
@@ -4031,6 +4039,7 @@ export const WebSocket = typeof existingWebSocket === "function" ? existingWebSo
     this._pendingWriteFrames = [];
     this._pendingWriteBytes = 0;
     this._writeFlushScheduled = false;
+    this._postOpenDispatchPending = false;
     // Bun accepts an options object ({ headers, protocols, protocol, proxy,
     // tls, perMessageDeflate }) in place of the protocols argument.
     let options = null;
@@ -4059,7 +4068,21 @@ export const WebSocket = typeof existingWebSocket === "function" ? existingWebSo
     this._tlsOptions = options?.tls != null && typeof options.tls === "object" ? options.tls : null;
     this._deflateOffered = !(options != null && "perMessageDeflate" in options && !options.perMessageDeflate);
     this._proxy = normalizeWebSocketProxyOption(options?.proxy);
-    this._connect(parsed);
+    queueMicrotask(() => {
+      if (!this._aborted && this.readyState === WebSocket.CONNECTING) this._connect(parsed);
+    });
+  }
+
+  get binaryType() {
+    return this._binaryType;
+  }
+
+  set binaryType(value) {
+    const type = String(value);
+    if (type !== "nodebuffer" && type !== "arraybuffer" && type !== "blob") {
+      throw new TypeError('WebSocket.binaryType must be "nodebuffer", "arraybuffer", or "blob"');
+    }
+    this._binaryType = type;
   }
 
   addEventListener(name, handler) {
@@ -4291,6 +4314,7 @@ export const WebSocket = typeof existingWebSocket === "function" ? existingWebSo
 
   _handleData(chunk) {
     this._buffer = Buffer.concat([this._buffer, chunk]);
+    if (this._postOpenDispatchPending) return;
     if (this.readyState === WebSocket.CONNECTING) {
       const text = this._buffer.toString("latin1");
       const headerEnd = text.indexOf("\r\n\r\n");
@@ -4389,7 +4413,16 @@ export const WebSocket = typeof existingWebSocket === "function" ? existingWebSo
 
       this.readyState = WebSocket.OPEN;
       this._buffer = this._buffer.subarray(headerEnd + 4);
+      this._postOpenDispatchPending = true;
       this.dispatchEvent({ type: "open", target: this });
+      queueMicrotask(() => {
+        this._postOpenDispatchPending = false;
+        if (this.readyState === WebSocket.CLOSED || this._buffer.byteLength === 0) return;
+        const pending = this._buffer;
+        this._buffer = Buffer.alloc(0);
+        this._handleData(pending);
+      });
+      return;
     }
 
     if (this.readyState === WebSocket.CLOSED) return;
@@ -4477,16 +4510,12 @@ export const WebSocket = typeof existingWebSocket === "function" ? existingWebSo
           this._flushWriteFrames();
           this._socket?.write?.(websocketFrame(0xA, frame.payload));
         }
-        const data = this.binaryType === "arraybuffer"
-          ? frame.payload.buffer.slice(frame.payload.byteOffset, frame.payload.byteOffset + frame.payload.byteLength)
-          : frame.payload;
+        const data = this._binaryPayload(frame.payload);
         this.dispatchEvent(new MessageEvent("ping", { data, origin: this.url, source: this }));
         return;
       }
       if (frame.opcode === 0xA) {
-        const data = this.binaryType === "arraybuffer"
-          ? frame.payload.buffer.slice(frame.payload.byteOffset, frame.payload.byteOffset + frame.payload.byteLength)
-          : frame.payload;
+        const data = this._binaryPayload(frame.payload);
         this.dispatchEvent(new MessageEvent("pong", { data, origin: this.url, source: this }));
         return;
       }
@@ -4527,10 +4556,19 @@ export const WebSocket = typeof existingWebSocket === "function" ? existingWebSo
   _deliverMessage(opcode, payload) {
     const data = opcode === 0x1
       ? decodeWebSocketText(payload)
-      : this.binaryType === "arraybuffer"
-        ? payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength)
-        : payload;
+      : this._binaryPayload(payload);
     this.dispatchEvent(new MessageEvent("message", { data, origin: this.url, source: this }));
+  }
+
+  _binaryPayload(payload) {
+    if (this.binaryType === "arraybuffer") {
+      return payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength);
+    }
+    if (this.binaryType === "blob") {
+      const bytes = payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength);
+      return new globalThis.Blob([bytes]);
+    }
+    return payload;
   }
 
   _fail(error) {
@@ -4647,6 +4685,7 @@ export const WebSocket = typeof existingWebSocket === "function" ? existingWebSo
     const closeCode = Number(code) || 1000;
     const payload = createWebSocketClosePayload(closeCode, reason);
     this.readyState = WebSocket.CLOSING;
+    this._pendingClose = { code: closeCode, reason: String(reason), wasClean: true };
     this._flushWriteFrames();
     this._socket?.write?.(websocketFrame(0x8, payload));
     this._closeTimer = setTimeout(() => this._close(1006, "", false), 30_000);
