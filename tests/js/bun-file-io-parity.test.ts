@@ -47,6 +47,12 @@ test("file slices stay lazy, compose offsets, and stream in bounded chunks", asy
   expect(new TextDecoder().decode(Bun.concatArrayBuffers(chunks))).toBe("234567");
 });
 
+test("path-backed streams report open errors before returning a reader", () => {
+  expect(() => Bun.file(fixture("missing-stream.txt")).stream().getReader()).toThrow(
+    expect.objectContaining({ code: "ENOENT", syscall: "open" }),
+  );
+});
+
 test("descriptor-backed files consume the fd cursor without taking ownership", async () => {
   const path = fixture("descriptor.txt");
   cottontail.writeFile(path, "descriptor-data");

@@ -77,9 +77,13 @@ const selectedRecords = new Set();
 
 const testCliArgs = Array.from(globalThis.process?.argv ?? []).slice(2);
 const testRuntimeOptions = bunTestRuntimeOptions(testCliArgs);
-function testCliModeEnabled() {
+function testHeaderPrinted() {
   return globalThis.process?.env?.COTTONTAIL_TEST_CLI_HEADER_PRINTED === "1" ||
     globalThis.__cottontailBunTestHeaderPrinted === true;
+}
+
+function testCliModeEnabled() {
+  return globalThis.__cottontailBunTestRuntime === true || testHeaderPrinted();
 }
 const forceConcurrent = testRuntimeOptions.concurrent;
 const runTodoTests = testRuntimeOptions.runTodo;
@@ -1748,7 +1752,7 @@ function scheduleRun() {
     try {
       do {
         runAgain = false;
-        if (globalThis.__cottontailBunTestUsed && !testCliModeEnabled()) {
+        if (globalThis.__cottontailBunTestUsed && !testHeaderPrinted()) {
           globalThis.__cottontailBunTestHeaderPrinted = true;
           console.log(`bun test ${globalThis.Bun?.version_with_sha ?? "0.0.0-cottontail (cottontail)"}`);
         }

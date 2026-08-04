@@ -494,13 +494,12 @@ function streamFile(state, chunkSize) {
   const reader = createFileReader(state, normalizedChunkSize);
   const finalizerToken = { reader, fd: null, owned: false };
   if (state.descriptor.kind === "path") {
-    try {
-      if (statIsFIFO(currentStat(state))) {
-        reader.open();
-        finalizerToken.fd = reader.fd;
-        finalizerToken.owned = reader.owned;
-      }
-    } catch {}
+    // Bun opens path-backed streams before returning the reader. Besides
+    // preserving synchronous ENOENT/open errors, this keeps FIFO mode
+    // selection and descriptor ownership in one path.
+    reader.open();
+    finalizerToken.fd = reader.fd;
+    finalizerToken.owned = reader.owned;
   }
   let finalized = false;
   let stream;

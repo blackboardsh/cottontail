@@ -149,6 +149,13 @@ pub const Runtime = struct {
         }
     }
 
+    pub fn setTestRuntimeExecution(self: *Runtime) !void {
+        try self.evalImmediate(
+            "globalThis.__cottontailBunTestRuntime = true;",
+            "cottontail:test-runtime-bootstrap",
+        );
+    }
+
     pub fn setEmbeddedSourceMap(
         self: *Runtime,
         source_map: []const u8,

@@ -2669,7 +2669,8 @@ fn runPrepared(
         .embedded_source_map = embedded_source_map,
         .embedded_files = embedded_files,
         .embedded_bytecode = embedded_bytecode,
-        .test_cli_execution = ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null,
+        .test_cli_execution = ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null or
+            (process_args.len > 0 and isTestEntrypointPath(process_args[0])),
         .standalone_flags = standalone_flags,
         .exit_cleanup_path = if (runnableDirectoryForCleanup(ctx, runnable_path_z)) |path|
             try allocator.dupeZ(u8, path)
@@ -2775,6 +2776,8 @@ fn runReloadPrepared(
         .process_user_arg_offset = 1,
         .exec_args = exec_args,
         .inspector = inspector,
+        .test_cli_execution = ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null or
+            (process_args.len > 0 and isTestEntrypointPath(process_args[0])),
         .reload = .{
             .ctx = ctx.*,
             .entrypoint_path = entrypoint_path,
@@ -3063,6 +3066,7 @@ fn initReloadRuntime(execution: *ScriptExecution) !runtime.Runtime {
         execution.process_user_arg_offset,
         execution.exec_args,
     );
+    if (execution.test_cli_execution) try js_runtime.setTestRuntimeExecution();
     if (!configureRuntimeInspector(execution, &js_runtime)) return error.InspectorSetupFailed;
     return js_runtime;
 }
@@ -3323,6 +3327,13 @@ fn runScriptExecution(execution: *ScriptExecution) void {
         execution.exit_code = 1;
         return;
     };
+    if (execution.test_cli_execution) {
+        js_runtime.setTestRuntimeExecution() catch {
+            writeStderr(execution.io, "cottontail: failed to initialize bun:test runtime state\n", .{});
+            execution.exit_code = 1;
+            return;
+        };
+    }
 
     if (!configureRuntimeInspector(execution, &js_runtime)) {
         execution.exit_code = 1;
