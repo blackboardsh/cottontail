@@ -2689,16 +2689,30 @@ fn writeGithubEscaped(writer: *std.Io.Writer, value: []const u8, property: bool)
     };
 }
 
+fn isGithubCodeFrameLine(line: []const u8) bool {
+    // Code-frame excerpt: "<line> | <source>".
+    var index: usize = 0;
+    while (index < line.len and std.ascii.isDigit(line[index])) index += 1;
+    if (index > 0 and index + 1 < line.len and line[index] == ' ' and line[index + 1] == '|') return true;
+    // Caret/tilde underline beneath the excerpt.
+    for (line) |byte| {
+        if (byte != '^' and byte != '~' and byte != '-' and byte != ' ') return false;
+    }
+    return true;
+}
+
 fn writeGithubExceptionAnnotation(writer: *std.Io.Writer, output: []const u8) !bool {
     const location = githubStackLocation(output) orelse return false;
     var lines = std.mem.splitScalar(u8, output, '\n');
     var headline: []const u8 = "Error";
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len > 0) {
-            headline = trimmed;
-            break;
-        }
+        if (trimmed.len == 0) continue;
+        // Uncaught-error output prints the code frame before the "error:"
+        // headline; skip it so the title carries the error, not the excerpt.
+        if (isGithubCodeFrameLine(trimmed)) continue;
+        headline = trimmed;
+        break;
     }
 
     try writer.writeAll("::error file=");
