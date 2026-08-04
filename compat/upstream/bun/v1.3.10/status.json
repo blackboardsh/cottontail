@@ -4,15 +4,8 @@
   "tests": {
     "test/bundler/bun-build-api.test.ts": {
       "status": "enabled",
-      "reason": "Thirty-five Bun.build cases, seven snapshots, and one upstream todo pass across exact BuildArtifact output/hashes, options, errors, plugins, HTML loading, sourcemaps, tsconfig resolution, DCE annotations, macros, NODE_PATH, and callbacks. The remaining bytecode case requires a cached-bytecode serializer unavailable in stock JSC.",
-      "args": ["--test-name-pattern=^(?!.*bytecode works).*$"],
-      "timeoutMs": 120000,
-      "testNameExclusion": {
-        "pattern": "^(?!.*bytecode works).*$",
-        "classification": "runtime-gap",
-        "testNames": ["bytecode works"],
-        "reason": "Bun.build bytecode output still requires cached-bytecode serialization support."
-      }
+      "reason": "The complete Bun.build API file passes across BuildArtifact output and hashes, options, errors, plugins, HTML loading, sourcemaps, tsconfig resolution, DCE annotations, macros, NODE_PATH, callbacks, and stock-JSC cached-bytecode sidecars.",
+      "timeoutMs": 120000
     },
     "test/bundler/bundler_edgecase.test.ts": {
       "status": "enabled",
@@ -214,18 +207,7 @@
     },
     "test/bundler/bundler_banner.test.ts": {
       "status": "enabled",
-      "reason": "Banner placement passes across browser/Bun targets, ESM/CJS formats, minification, and source/banner hashbangs (8 bun:test cases, 11 assertions). Three bytecode-only cases are excluded because stock JSCOnly exposes no cached-bytecode serializer; Cottontail rejects bytecode builds explicitly instead of emitting unusable artifacts.",
-      "args": ["--test-name-pattern=^(?!.*Bytecode).*"],
-      "testNameExclusion": {
-        "pattern": "^(?!.*Bytecode).*",
-        "classification": "runtime-gap",
-        "testNames": [
-          "banner/BannerWithBytecodeAndCJSTargetBun",
-          "banner/HashbangBannerWithBytecodeAndCJSTargetBun",
-          "banner/SourceHashbangWithBytecodeAndCJSTargetBun"
-        ],
-        "reason": "The three generated banner cases require Bun-compatible CJS bytecode output."
-      }
+      "reason": "All 11 generated banner cases pass across browser and Bun targets, ESM and CJS formats, minification, source and banner hashbangs, and the three stock-JSC bytecode-sidecar variants."
     },
     "test/bundler/bundler_barrel.test.ts": {
       "status": "enabled",
@@ -238,14 +220,8 @@
     },
     "test/bundler/bundler_bun.test.ts": {
       "status": "enabled",
-      "reason": "Nine Bun-target cases pass with 13 assertions, including sqlite assets, source-map diagnostics, package conditions, and CLI defines. The owned runner isolates the generated matrix to bound retained fixture memory.",
-      "splitBundlerTests": true,
-      "expectedFailureBundlerTests": {
-        "bun/import-bun-format-cjs": "Bun's --bytecode format requires private JavaScriptCore cached-bytecode APIs that stock JSC does not expose; Cottontail intentionally uses unmodified JSC."
-      },
-      "expectedFailureBundlerTestClassifications": {
-        "bun/import-bun-format-cjs": "runtime-gap"
-      }
+      "reason": "All 10 Bun-target cases pass, including CJS bytecode output, sqlite assets, source-map diagnostics, package conditions, and CLI defines. The owned runner isolates the generated matrix to bound retained fixture memory.",
+      "splitBundlerTests": true
     },
     "test/bundler/bundler_cjs.test.ts": {
       "status": "enabled",
@@ -347,15 +323,9 @@
     },
     "test/bundler/bundler_defer.test.ts": {
       "status": "enabled",
-      "reason": "All eight generated plugin-defer cases pass with 17 assertions across concurrent onStart setup, deferred graph scheduling, CSS diagnostics, post-defer plugin errors, and double-defer validation. The ordinary package-manager-dependent integration case remains a strict subcase xfail.",
+      "reason": "All eight generated plugin-defer cases and the package-backed file case pass across concurrent onStart setup, deferred graph scheduling, CSS diagnostics, post-defer plugin errors, double-defer validation, and pinned Hutch dependency setup.",
       "splitBundlerTests": true,
-      "includeBundlerFileTests": true,
-      "expectedFailureBundlerTests": {
-        "$file": "The ordinary integration case invokes `cottontail install`; its empty dependency manifest still reaches the not-yet-integrated package-manager command before plugin finalization is exercised."
-      },
-      "expectedFailureBundlerTestClassifications": {
-        "$file": "delegated"
-      }
+      "includeBundlerFileTests": true
     },
     "test/bundler/bundler_drop.test.ts": {
       "status": "enabled",
@@ -422,16 +392,8 @@
     },
     "test/bundler/bundler_npm.test.ts": {
       "status": "enabled",
-      "reason": "The owned runner exposes both npm-backed bundler cases; each remains a strict expected failure at the package-install prerequisite instead of being hidden by the old zero-test result.",
-      "splitBundlerTests": true,
-      "expectedFailureBundlerTests": {
-        "npm/ReactSSR": "Requires a functional `cottontail install` package-manager path to materialize React before the bundler behavior can run.",
-        "npm/LodashES": "Requires a functional `cottontail install` package-manager path to materialize lodash-es before the bundler behavior can run."
-      },
-      "expectedFailureBundlerTestClassifications": {
-        "npm/ReactSSR": "delegated",
-        "npm/LodashES": "delegated"
-      }
+      "reason": "Both npm-backed bundler cases pass unchanged through the pinned Hutch engine, including React SSR output, exact source-map accounting, generated execution, and the lodash-es bundle.",
+      "splitBundlerTests": true
     },
     "test/bundler/bundler_plugin.test.ts": {
       "status": "enabled",
@@ -2011,9 +1973,8 @@
       "reason": "Bun.spawn PATH resolution smoke test passes under Cottontail's current spawn wrapper."
     },
     "test/js/bun/spawn/spawn-pipe-leak.test.ts": {
-      "status": "expected-failure",
-      "reason": "Performance-only expected failure: the exact unchanged aggregate launches 2,250 nested Cottontail processes and was stopped after 32 minutes while bounded batches continued making progress; reduced read-after-exit, unread, and read-before-exit probes pass with stable forced-GC RSS.",
-      "classification": "performance"
+      "status": "enabled",
+      "reason": "All three unchanged pipe lifecycle and forced-GC RSS cases pass across read-after-exit, unread, and read-before-exit workloads; the full 2,250-process aggregate completes within its upstream 30-second deadline."
     },
     "test/js/bun/spawn/spawn-signal.test.ts": {
       "status": "enabled",
@@ -6461,8 +6422,8 @@
   },
   "expectedCounts": {
     "runnableFiles": 1445,
-    "enabled": 1338,
-    "expectedFailure": 5,
+    "enabled": 1340,
+    "expectedFailure": 3,
     "skip": 102,
     "cottontailOwned": 1343,
     "hutchOwned": 102,
