@@ -78,6 +78,10 @@ function initializeRuntimeProcess() {
   target.nextTick ??= (callback, ...args) => queueMicrotask(() => callback(...args));
   target.exit ??= function exit(code = this.exitCode ?? 0) {
     this.exitCode = Number(code) || 0;
+    if (!this._exiting) {
+      this._exiting = true;
+      this.emit?.("exit", this.exitCode);
+    }
     cottontail.exit(this.exitCode);
   };
   target.reallyExit ??= target.exit;

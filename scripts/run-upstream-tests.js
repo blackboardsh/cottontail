@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'fs';
+import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
 import { spawn, spawnSync } from 'child_process';
 import os from 'os';
 import { delimiter, join, relative, resolve, sep } from 'path';
@@ -34,6 +34,15 @@ const activeChildren = new Set();
 const snapshotArtifactRoots = new Map();
 const externallyManagedSnapshotRoots = new Set();
 const nodeHarnessInventoryCache = new Map();
+const snapshotFileBaselines = new Map();
+const bunMutableSnapshotFiles = [
+  'packages/bun-plugin-svelte/bun.lock',
+  'test/napi/napi-app/bun.lock',
+];
+const bunGeneratedSnapshotPaths = [
+  'test/js/third_party/astro/fixtures/.astro',
+  'test/js/third_party/astro/fixtures/dist',
+];
 const bunSnapshotSourceNames = new Set([
   'LICENSE.md',
   'manifest.json',
@@ -56,8 +65,35 @@ function removeTemp(path) {
   try { rmSync(path, { recursive: true, force: true }); } catch {}
 }
 
+function captureSnapshotFileBaselines(snapshotRoot, runtime) {
+  if (runtime !== 'bun' || snapshotFileBaselines.has(snapshotRoot)) return;
+  const baselines = new Map();
+  for (const relativePath of bunMutableSnapshotFiles) {
+    const path = join(snapshotRoot, relativePath);
+    baselines.set(relativePath, existsSync(path) ? readFileSync(path) : null);
+  }
+  snapshotFileBaselines.set(snapshotRoot, baselines);
+}
+
+function restoreSnapshotFileBaselines(snapshotRoot, runtime) {
+  if (runtime !== 'bun') return;
+  const baselines = snapshotFileBaselines.get(snapshotRoot);
+  if (!baselines) return;
+  for (const [relativePath, contents] of baselines) {
+    const path = join(snapshotRoot, relativePath);
+    if (contents == null) rmSync(path, { force: true });
+    else writeFileSync(path, contents);
+  }
+}
+
 function removeSnapshotArtifacts(snapshotRoot, runtime) {
   if (externallyManagedSnapshotRoots.has(snapshotRoot)) return;
+  restoreSnapshotFileBaselines(snapshotRoot, runtime);
+  if (runtime === 'bun') {
+    for (const relativePath of bunGeneratedSnapshotPaths) {
+      try { rmSync(join(snapshotRoot, relativePath), { recursive: true, force: true }); } catch {}
+    }
+  }
   const testRoot = join(snapshotRoot, 'test');
   const installedDependencies = join(snapshotRoot, 'test', 'node_modules');
   const stack = [snapshotRoot];
@@ -1348,6 +1384,7 @@ for (const name of runtimeTargets(runtime, targets)) {
   if (!target) fail(`Missing upstream target: ${name}`);
   const snapshotRoot = targetSnapshotRoot(name, target);
   snapshotArtifactRoots.set(snapshotRoot, name);
+  captureSnapshotFileBaselines(snapshotRoot, name);
   removeSnapshotArtifacts(snapshotRoot, name);
   const statusPath = join(snapshotRoot, 'status.json');
   const status = readJson(statusPath);

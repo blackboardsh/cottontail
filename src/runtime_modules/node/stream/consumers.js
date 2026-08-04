@@ -1,3 +1,5 @@
+import { __setBuiltinModules } from "../module.js";
+
 async function chunksFrom(stream) {
   const chunks = [];
   if (stream == null) {
@@ -89,4 +91,10 @@ export async function blob(stream) {
   return new BlobCtor(await chunksFrom(stream));
 }
 
-export default { arrayBuffer, blob, buffer, json, text };
+const consumers = { arrayBuffer, blob, buffer, json, text };
+__setBuiltinModules({
+  "stream/consumers": consumers,
+  "node:stream/consumers": consumers,
+});
+
+export default consumers;

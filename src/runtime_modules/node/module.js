@@ -142,7 +142,7 @@ function loadRuntimePackageReplacement(name) {
 
 function loadBuiltinOrReplacement(name) {
   const text = String(name);
-  if (text === "process" || text === "node:process") return currentProcessBuiltin();
+  if (text === "process" || text === "node:process") return loadFullProcessBuiltin();
   if (hasRuntimePackageReplacement(text)) return loadRuntimePackageReplacement(text);
   return unwrapBuiltin(builtinModuleMap.get(text) ?? builtinModuleMap.get(text.replace(/^node:/, "")));
 }
@@ -233,6 +233,7 @@ const runtimeEsmWrapperCache = new Map();
 const nodeModulePathsCache = new Map();
 const nodeModulePathsCacheLimit = 256;
 const smolModuleCacheGcInterval = 16;
+const smolDynamicModuleCacheGcInterval = 1024;
 const bundledAsyncEsmGraphCache = new Map();
 const nativeObjectDefineProperty = Object.defineProperty;
 const builtinModuleMap = new Map();
@@ -245,6 +246,7 @@ const moduleHookIdKey = Symbol("cottontail.moduleHooksId");
 const moduleParentKey = Symbol("cottontail.moduleParent");
 const modulePathsBaseKey = Symbol("cottontail.modulePathsBase");
 const runtimeEsmSourceModuleKey = Symbol("cottontail.runtimeEsmSourceModule");
+const dynamicImportModuleKey = Symbol("cottontail.dynamicImportModule");
 const mainModuleStateKey = Symbol.for("cottontail.node.mainModuleState");
 const mainModuleState = globalThis[mainModuleStateKey] ??= {
   current: null,
@@ -264,6 +266,7 @@ let stripTypesWarningEmitted = false;
 let runtimeEsmSourceExecutionDepth = 0;
 let smolModuleCacheMode;
 let smolModuleCacheEvictions = 0;
+let smolDynamicModuleCacheEvictions = 0;
 
 const runtimePluginOnResolve = [];
 const runtimePluginOnLoad = [];
@@ -299,6 +302,7 @@ hotReloadHooks.add(() => {
   mainModuleState.hasOverride = false;
   mainModuleState.override = undefined;
   smolModuleCacheEvictions = 0;
+  smolDynamicModuleCacheEvictions = 0;
 });
 
 function runtimePluginFilterMatches(filter, path) {
@@ -1013,7 +1017,19 @@ export function __setBuiltinModules(modules) {
     configurable: true,
   });
   for (let [name, value] of Object.entries(modules || {})) {
-    const isLazy = typeof value === "function" && value[kLazyBuiltin] === true;
+    let isLazy = typeof value === "function" && value[kLazyBuiltin] === true;
+    if (isLazy && kUnwrapDefaultBuiltins.has(name)) {
+      const lazyNamespace = value;
+      value = lazyBuiltin(() => {
+        const namespace = unwrapBuiltin(lazyNamespace);
+        return namespace != null &&
+          (typeof namespace === "object" || typeof namespace === "function") &&
+          namespace.default != null
+          ? namespace.default
+          : namespace;
+      });
+      isLazy = true;
+    }
     if (!isLazy && name.replace(/^node:/, "") === "buffer") installMutableBufferMaxLength(value);
     let isNamespace = value != null &&
       (typeof value === "object" || typeof value === "function") &&
@@ -3920,7 +3936,10 @@ function importResolvedRuntimeModule(resolved, options = undefined, forceAsync =
     if (forceAsync && source !== undefined && sourceRequiresAsyncModuleExecution(resolvedPath, source)) {
       return executeDynamicImportSource(resolved, source, "module", true, asyncAncestors);
     }
-    return namespaceFromCommonJs(loadCommonJsModule(resolved), packageTypeIsModule(resolvedPath));
+    const value = loadCommonJsModule(resolved);
+    const loadedModule = commonJsCache.get(resolved);
+    if (loadedModule) loadedModule[dynamicImportModuleKey] = true;
+    return namespaceFromCommonJs(value, packageTypeIsModule(resolvedPath));
   }
   return executeDynamicImportSource(
     resolved,
@@ -4007,7 +4026,17 @@ export function __importModule(
   const registry = globalThis.Loader?.registry;
   if (registry?.has?.(cacheKey)) return registry.get(cacheKey);
 
-  const promise = Promise.resolve(importResolvedRuntimeModule(resolved, options, false, asyncAncestors));
+  const result = importResolvedRuntimeModule(resolved, options, false, asyncAncestors);
+  if (!isPromiseLike(result)) {
+    // Rewritten import() call sites are async functions already. Preserve the
+    // evaluated namespace directly so synchronous modules do not allocate two
+    // additional Promise reactions for every cache reload.
+    const loadedModule = commonJsCache.get(resolved);
+    if (loadedModule) loadedModule[dynamicImportModuleKey] = true;
+    registry?.set?.(cacheKey, result);
+    return result;
+  }
+  const promise = Promise.resolve(result);
   registry?.set?.(cacheKey, promise);
   promise.catch(() => {
     if (registry?.get?.(cacheKey) === promise) registry.delete(cacheKey);
@@ -4371,11 +4400,14 @@ const commonJsCacheObject = new Proxy(commonJsCacheTarget, {
   deleteProperty(target, property) {
     if (typeof property !== "string") return Reflect.deleteProperty(target, property);
     const cached = commonJsCache.get(property);
+    const registry = globalThis.Loader?.registry;
+    const dynamicImport = cached?.[dynamicImportModuleKey] === true ||
+      asyncEsmModuleCache.has(property) || registry?.has?.(property) === true;
     if (cached) detachModuleChild(cached[moduleParentKey], cached);
     commonJsCache.delete(property);
     asyncEsmModuleCache.delete(property);
-    globalThis.Loader?.registry?.delete?.(property);
-    if (cached) maybeCollectSmolModuleCacheChurn();
+    registry?.delete?.(property);
+    if (cached) maybeCollectSmolModuleCacheChurn(dynamicImport);
     return true;
   },
   ownKeys(target) {
@@ -4393,10 +4425,15 @@ function isSmolModuleCacheMode() {
   return smolModuleCacheMode;
 }
 
-function maybeCollectSmolModuleCacheChurn() {
+function maybeCollectSmolModuleCacheChurn(dynamicImport = false) {
   if (!isSmolModuleCacheMode()) return;
-  smolModuleCacheEvictions += 1;
-  if (smolModuleCacheEvictions % smolModuleCacheGcInterval !== 0) return;
+  if (dynamicImport) {
+    smolDynamicModuleCacheEvictions += 1;
+    if (smolDynamicModuleCacheEvictions % smolDynamicModuleCacheGcInterval !== 0) return;
+  } else {
+    smolModuleCacheEvictions += 1;
+    if (smolModuleCacheEvictions % smolModuleCacheGcInterval !== 0) return;
+  }
   // Cache deletion happens after module evaluation has returned. Collect at
   // that boundary so a synchronous require() churn loop cannot defer every
   // queued collection until after it has retained hundreds of dead modules.
@@ -5864,11 +5901,20 @@ const assertStrictBuiltin = lazyDefault(assertStrict);
 const consoleBuiltin = lazyDefault(consoleModule);
 const eventsBuiltin = lazyDefault(events);
 function currentProcessBuiltin() {
-  if (globalThis.process != null) return globalThis.process;
-  const namespace = unwrapBuiltin(processModule);
-  return namespace.default ?? namespace;
+  return globalThis.process ?? loadFullProcessBuiltin();
 }
-const processBuiltin = lazyBuiltin(currentProcessBuiltin);
+function loadFullProcessBuiltin() {
+  const current = globalThis.process;
+  if (current != null && typeof current.binding === "function") return current;
+  const namespace = unwrapBuiltin(processModule);
+  const process = namespace.default ?? namespace;
+  if (process != null) {
+    globalThis.process = process;
+    globalThis.__cottontailProcessObject = process;
+  }
+  return process ?? current;
+}
+const processBuiltin = lazyBuiltin(loadFullProcessBuiltin);
 const streamBuiltin = lazyDefault(stream);
 const sysBuiltin = lazyDefault(sys);
 const pathBuiltin = path.default ?? path;
@@ -5877,7 +5923,7 @@ const internalTestBindingBuiltin = lazyBuiltin(() => {
   return {
     ...namespace,
     internalBinding(name) {
-      if (String(name) === "http_parser") return currentProcessBuiltin().binding("http_parser");
+      if (String(name) === "http_parser") return loadFullProcessBuiltin().binding("http_parser");
       return namespace.internalBinding(name);
     },
   };

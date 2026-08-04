@@ -3233,7 +3233,8 @@ export class Verify extends Writable {
   }
 }
 
-const x509CertificateBrand = new WeakSet();
+const x509CertificateBrandKey = Symbol.for("cottontail.internal.crypto.x509CertificateBrand");
+const x509CertificateBrand = globalThis[x509CertificateBrandKey] ??= new WeakSet();
 const kX509CertificatePredicate = Symbol.for("cottontail.internal.crypto.isX509Certificate");
 
 export class X509Certificate {

@@ -165,7 +165,7 @@ try {
       name: 'runtime-bootstrap-startup-regressions',
       argv: ['test', join(rootDir, 'tests', 'js', 'runtime-bootstrap-startup.test.ts')],
       expectExitCode: 0,
-      stderrIncludes: ['13 pass', '0 fail'],
+      stderrIncludes: ['14 pass', '0 fail'],
     },
     {
       name: 'web-worker-module-loading',
@@ -196,7 +196,7 @@ try {
       executablePath: process.execPath,
       argv: ['--test-reporter=tap', '--test', join(rootDir, 'tests', 'upstream-runner.test.mjs')],
       expectExitCode: 0,
-      stdoutIncludes: ['# tests 13', '# pass 13', '# fail 0'],
+      stdoutIncludes: ['# tests 15', '# pass 15', '# fail 0'],
     },
     {
       name: 'internal-runtime-bindings',
@@ -534,7 +534,7 @@ try {
       name: 'text-encoding-native-fast-path',
       argv: ['test', join(rootDir, 'tests', 'js', 'text-encoding-native-fast-path.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: ['6 pass', '0 fail'],
+      stdoutIncludes: ['8 pass', '0 fail'],
     },
     ...(process.platform === 'win32'
       ? [

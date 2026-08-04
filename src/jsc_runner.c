@@ -5207,7 +5207,9 @@ static char *ct_copy_exception(JSContextRef ctx, JSValueRef exception) {
         "if(e&&e.__cottontailFormattedStack&&e.stack)return String(e.stack);"
         "if(e&&e.name==='ResolveMessage'&&e.message)return 'error: '+String(e.message);"
         "var head='';"
-        "if(e&&e.message)head=(e.name?String(e.name):'Error')+': '+String(e.message);"
+        "if(e&&e.message){var name=e.name?String(e.name):'Error';"
+        "if(name==='AssertionError'&&e.code==='ERR_ASSERTION')name+=' [ERR_ASSERTION]';"
+        "head=name+': '+String(e.message);}"
         "if(e&&e.stack){var stack=String(e.stack);return head&&stack.indexOf(head)<0?head+'\\n'+stack:stack;}"
         "if(head){"
         "var source=e&&(e.sourceURL||e.fileName);"
@@ -11777,9 +11779,25 @@ static void ct_normalize_uncaught_exception(JSContextRef ctx, JSValueRef thrown)
     JSObjectRef global = JSContextGetGlobalObject(ctx);
     JSValueRef exception = NULL;
     JSValueRef normalizer = ct_get_property(ctx, global, "__cottontailNormalizeUncaughtException", &exception);
-    if (exception != NULL || normalizer == NULL || !JSValueIsObject(ctx, normalizer) ||
-        !JSObjectIsFunction(ctx, (JSObjectRef)normalizer)) return;
-    JSObjectCallAsFunction(ctx, (JSObjectRef)normalizer, global, 1, &thrown, &exception);
+    if (exception == NULL && normalizer != NULL && JSValueIsObject(ctx, normalizer) &&
+        JSObjectIsFunction(ctx, (JSObjectRef)normalizer)) {
+        JSObjectCallAsFunction(ctx, (JSObjectRef)normalizer, global, 1, &thrown, &exception);
+        return;
+    }
+
+    exception = NULL;
+    JSStringRef source = ct_js_string(
+        "(function(e){if(e&&e.name==='ReferenceError'&&typeof e.message==='string'&&"
+        "e.message.startsWith(\"Can't find variable: \")){var old='ReferenceError: '+e.message;"
+        "var message=e.message.slice(21)+' is not defined';try{e.message=message;}catch(_){}"
+        "if(typeof e.stack==='string'){try{e.stack=e.stack.replace(old,'ReferenceError: '+message);}catch(_){}}}})"
+    );
+    JSValueRef fallback = JSEvaluateScript(ctx, source, NULL, NULL, 1, &exception);
+    JSStringRelease(source);
+    if (exception == NULL && fallback != NULL && JSValueIsObject(ctx, fallback) &&
+        JSObjectIsFunction(ctx, (JSObjectRef)fallback)) {
+        JSObjectCallAsFunction(ctx, (JSObjectRef)fallback, global, 1, &thrown, &exception);
+    }
 }
 
 static void ct_format_uncaught_exception(JSContextRef ctx, JSValueRef thrown) {
@@ -36478,8 +36496,8 @@ static JSValueRef ct_unhandled_rejection(
     const JSValueRef argv[],
     JSValueRef *exception
 ) {
-    (void)function;
     (void)this_object;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     if (argc >= 2) {
         JSObjectRef global = JSContextGetGlobalObject(ctx);
         JSValueRef handler_value = ct_get_property(ctx, global, "__cottontailHandleUnhandledRejection", exception);
@@ -36494,6 +36512,11 @@ static JSValueRef ct_unhandled_rejection(
                 ct_set_property(ctx, global, "__ctUnhandledRejection", result, exception);
             }
         } else {
+            ct_normalize_uncaught_exception(ctx, argv[1]);
+            if (runtime != NULL) {
+                runtime->fatal_exception_routed = true;
+                ct_process_set_exit_code(ctx, 1);
+            }
             ct_set_property(ctx, global, "__ctUnhandledRejection", argv[1], exception);
         }
     }
@@ -36762,10 +36785,11 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     JSValueRef exception = NULL;
     JSObjectRef global = JSContextGetGlobalObject(ctx);
 
-    JSObjectRef unhandled_rejection_callback = (JSObjectRef)ct_make_plain_function(
+    JSObjectRef unhandled_rejection_callback = (JSObjectRef)ct_make_function(
         ctx,
         "onUnhandledRejection",
-        ct_unhandled_rejection
+        ct_unhandled_rejection,
+        runtime
     );
     JSGlobalContextSetUnhandledRejectionCallback(runtime->context, unhandled_rejection_callback, &exception);
     if (exception != NULL) return -1;
@@ -38916,17 +38940,20 @@ int ct_jsc_runtime_wait_for_reload(CtJscRuntime *runtime, char **error_out) {
 int ct_jsc_runtime_exit_code(CtJscRuntime *runtime) {
     if (runtime != NULL && runtime->fatal_out_of_memory) return 134;
     if (runtime == NULL || runtime->context == NULL) return 0;
+    const int fatal_default = runtime->fatal_exception_routed ? 1 : 0;
 
     JSContextRef ctx = runtime->context;
     JSObjectRef process = ct_process_object(ctx);
-    if (process == NULL) return 0;
+    if (process == NULL) return fatal_default;
 
     JSValueRef exception = NULL;
     JSValueRef value = ct_get_property(ctx, process, "exitCode", &exception);
-    if (exception != NULL || value == NULL || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value)) return 0;
+    if (exception != NULL || value == NULL || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value)) {
+        return fatal_default;
+    }
 
     double number = JSValueToNumber(ctx, value, &exception);
-    if (exception != NULL || !isfinite(number)) return 0;
+    if (exception != NULL || !isfinite(number)) return fatal_default;
 
     double normalized = fmod(trunc(number), 256.0);
     if (normalized < 0) normalized += 256.0;

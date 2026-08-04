@@ -22,6 +22,7 @@ import * as fsModule from "../../fs.js";
 import * as timersModule from "../../timers.js";
 import * as streamModule from "../../stream.js";
 import { uvErrorMap as platformUvErrorMap } from "../../internal/uv-errors.js";
+import { createWebPrimitives } from "../../../bun/web-primitives.js";
 
 // Pre-seed entries that Node v24's per-context primordials script does not
 // define but the vendored modules can reach (e.g. reconstructing a
@@ -500,6 +501,11 @@ function addAbortListener(signal, listener) {
 
 function makeAbortControllerModule() {
   const { codes } = internalRequire("internal/errors");
+  if (typeof globalThis.AbortController !== "function" || typeof globalThis.AbortSignal !== "function") {
+    const primitives = createWebPrimitives((...args) => internalRequire("internal/util/inspect").inspect(...args));
+    globalThis.AbortController ??= primitives.CottontailAbortController;
+    globalThis.AbortSignal ??= primitives.CottontailAbortSignal;
+  }
   function validateAbortSignal(signal) {
     if (signal === null || typeof signal !== "object" || !("aborted" in signal)) {
       throw new codes.ERR_INVALID_ARG_TYPE("signal", "AbortSignal", signal);
@@ -510,7 +516,7 @@ function makeAbortControllerModule() {
     AbortSignal: globalThis.AbortSignal,
     kAborted: Symbol("kAborted"),
     transferableAbortController() {
-      return new AbortController();
+      return new globalThis.AbortController();
     },
     transferableAbortSignal(signal) {
       validateAbortSignal(signal);

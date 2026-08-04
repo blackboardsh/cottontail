@@ -1,4 +1,8 @@
+const webPrimitivesKey = Symbol.for("cottontail.internal.webPrimitives");
+
 export function createWebPrimitives(nodeInspect) {
+  const existing = globalThis[webPrimitivesKey];
+  if (existing !== undefined) return existing;
   const inspectCustomSymbol = Symbol.for("nodejs.util.inspect.custom");
   const domExceptionCodes = {
     IndexSizeError: 1,
@@ -815,7 +819,7 @@ export function createWebPrimitives(nodeInspect) {
     }
   }
   
-    return {
+  const primitives = {
     BunFile,
     CottontailAbortController,
     CottontailAbortSignal,
@@ -834,5 +838,9 @@ export function createWebPrimitives(nodeInspect) {
     nodeTypeError,
     setEventHandlerAttributeOrder,
   };
+  Object.defineProperty(globalThis, webPrimitivesKey, {
+    value: primitives,
+    configurable: true,
+  });
+  return primitives;
 }
-

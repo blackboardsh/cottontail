@@ -7,6 +7,7 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
 } from 'fs';
 import { dirname, join, relative, resolve } from 'path';
 import { fileURLToPath } from 'url';
@@ -59,7 +60,8 @@ function ensureDirectoryLink(link, target) {
       if (linkedTarget === resolve(target)) return link;
     } catch {}
   }
-  if (existing) rmSync(link, { recursive: true, force: true });
+  if (existing?.isSymbolicLink()) unlinkSync(link);
+  else if (existing) rmSync(link, { recursive: true, force: true });
   mkdirSync(dirname(link), { recursive: true });
   const linkTarget = process.platform === 'win32' ? target : relative(dirname(link), target);
   symlinkSync(linkTarget, link, process.platform === 'win32' ? 'junction' : 'dir');

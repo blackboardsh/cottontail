@@ -6454,7 +6454,7 @@ fn evalSourceCanUseCommonJsBootstrap(allocator: std.mem.Allocator, source: []con
         }
         if (std.mem.eql(u8, token.text, "process")) {
             const property = runtimeMemberProperty(tokens, index) orelse return false;
-            if (std.mem.eql(u8, property, "mainModule")) return false;
+            if (!minimalRuntimeProcessProperty(property)) return false;
             continue;
         }
         if (std.mem.eql(u8, token.text, "Error")) {
@@ -7172,6 +7172,7 @@ fn writeCottontailEntryWrapper(
     );
     const bun_module = try runtimeModulePath(ctx, &.{ "bun", "index.js" });
     const default_app_module = try runtimeModulePath(ctx, &.{ "bun", "default-app.js" });
+    const process_module = try runtimeModulePath(ctx, &.{ "node", "process.js" });
     const wrapper_name = try std.fmt.allocPrint(
         ctx.allocator,
         "script-entry-{x}.mjs",
@@ -7180,6 +7181,7 @@ fn writeCottontailEntryWrapper(
     const wrapper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, wrapper_name });
     const bun_literal = try jsonStringLiteral(ctx, bun_module);
     const default_app_literal = try jsonStringLiteral(ctx, default_app_module);
+    const process_literal = try jsonStringLiteral(ctx, process_module);
     const script_import_literal = try jsonStringLiteral(ctx, script_import_abs);
     const script_literal = try jsonStringLiteral(ctx, script_abs);
     const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
@@ -7201,6 +7203,7 @@ fn writeCottontailEntryWrapper(
         ctx.allocator,
         \\import __ctBunModule from {s};
         \\import {{ startDefaultApp as __ctStartDefaultApp }} from {s};
+        \\import __ctFullProcess from {s};
         \\import {{ __createBundledRequire as __ctCreateBundledRequire }} from "node:module";
         \\import {{ existsSync as __ctExistsSync }} from "node:fs";
         \\import {{ dirname as __ctPathDirname, resolve as __ctPathResolve }} from "node:path";
@@ -7209,6 +7212,8 @@ fn writeCottontailEntryWrapper(
         \\globalThis.__filename ??= {s};
         \\globalThis.__dirname ??= {s};
         \\globalThis.Loader ??= {{ registry: new Map() }};
+        \\globalThis.process = __ctFullProcess;
+        \\globalThis.__cottontailProcessObject = __ctFullProcess;
         \\const __ctImportMetaBase = globalThis.__cottontailStandaloneFiles == null ? {s} : import.meta.path;
         \\const __ctImportMetaParentDir = (parent) => {{
         \\  let text = String(parent);
@@ -7272,6 +7277,7 @@ fn writeCottontailEntryWrapper(
         .{
             bun_literal,
             default_app_literal,
+            process_literal,
             bundle_map_literal,
             bundle_source_root_literal,
             script_literal,
@@ -8945,11 +8951,21 @@ fn appendDynamicTargetFactory(
     }
     try output.appendSlice(ctx.allocator, "};\n    const __ctFactorySource = __ctType == null || (__ctType === __ctInferredType && __ctJavaScriptFactories[__ctType] == null) ? __ctDefaultFactorySource : __ctJavaScriptFactories[__ctType];\n    if (__ctFactorySource == null) ");
     try output.appendSlice(ctx.allocator, factory_error);
+    try output.appendSlice(ctx.allocator, "\n    const __ctCompiledFactories = __ctLoad");
+    try output.appendSlice(ctx.allocator, try std.fmt.allocPrint(ctx.allocator, "{d}", .{index}));
+    try output.appendSlice(ctx.allocator, ".__ctCompiledFactories ??= new Map();\n" ++
+        "    let __ctCompiledFactory = __ctCompiledFactories.get(__ctFactorySource);\n" ++
+        "    if (__ctCompiledFactory == null) {\n" ++
+        "      __ctCompiledFactory = ");
     if (builtin.os.tag == .windows) {
-        try output.appendSlice(ctx.allocator, "\n    globalThis.cottontail.compileFunction(\"(function anonymous(module, exports, require, __ctImportMeta, __ctDynamicImport\\n) {\\n\" + __ctFactorySource + \"\\n})\", __ctImportMeta.url)(module, exports, __ctCreateRequire(__ctPath");
+        try output.appendSlice(ctx.allocator, "globalThis.cottontail.compileFunction(\"(function anonymous(module, exports, require, __ctImportMeta, __ctDynamicImport\\n) {\\n\" + __ctFactorySource + \"\\n})\", __ctImportMeta.url)");
     } else {
-        try output.appendSlice(ctx.allocator, "\n    new Function(\"module\", \"exports\", \"require\", \"__ctImportMeta\", \"__ctDynamicImport\", __ctFactorySource)(module, exports, __ctCreateRequire(__ctPath");
+        try output.appendSlice(ctx.allocator, "new Function(\"module\", \"exports\", \"require\", \"__ctImportMeta\", \"__ctDynamicImport\", __ctFactorySource)");
     }
+    try output.appendSlice(ctx.allocator, ";\n" ++
+        "      __ctCompiledFactories.set(__ctFactorySource, __ctCompiledFactory);\n" ++
+        "    }\n" ++
+        "    __ctCompiledFactory(module, exports, __ctCreateRequire(__ctPath");
     try output.appendSlice(ctx.allocator, try std.fmt.allocPrint(ctx.allocator, "{d}", .{index}));
     // The target promise's normalization catch adds one reaction of its own.
     // Two empty reactions keep nested evaluation behind both that propagation
@@ -9522,6 +9538,10 @@ fn writeLazyRuntimeEntryWrapper(
         ctx,
         try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "bun", "default-app.js" }),
     );
+    const process_literal = try jsonStringLiteral(
+        ctx,
+        try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "process.js" }),
+    );
     const bundle_map_literal = if (stable_source_map_path)
         "\"\""
     else blk: {
@@ -9539,6 +9559,9 @@ fn writeLazyRuntimeEntryWrapper(
     const source = try std.fmt.allocPrint(ctx.allocator,
         \\import {s};
         \\import {{ startDefaultApp as __ctStartDefaultApp }} from {s};
+        \\import __ctFullProcess from {s};
+        \\globalThis.process = __ctFullProcess;
+        \\globalThis.__cottontailProcessObject = __ctFullProcess;
         \\globalThis.__cottontailBundleSourceMap ??= {s};
         \\globalThis.__cottontailBundleSourceRoot ??= {s};
         \\globalThis.Loader ??= {{ registry: new Map() }};
@@ -9565,6 +9588,7 @@ fn writeLazyRuntimeEntryWrapper(
     , .{
         bun_literal,
         default_app_literal,
+        process_literal,
         bundle_map_literal,
         bundle_source_root_literal,
         test_header_signal,
@@ -9753,6 +9777,10 @@ fn writeLazyCommonJsEntryWrapper(
         ctx,
         try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "module.js" }),
     );
+    const process_literal = try jsonStringLiteral(
+        ctx,
+        try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "process.js" }),
+    );
     const script_literal = try jsonStringLiteral(ctx, script_abs);
     const bundle_map_literal = if (stable_source_map_path)
         "\"\""
@@ -9783,6 +9811,9 @@ fn writeLazyCommonJsEntryWrapper(
     const source = try std.fmt.allocPrint(ctx.allocator,
         \\import {s};
         \\import * as moduleModule from {s};
+        \\import __ctFullProcess from {s};
+        \\globalThis.process = __ctFullProcess;
+        \\globalThis.__cottontailProcessObject = __ctFullProcess;
         \\globalThis.__cottontailBundleSourceMap ??= {s};
         \\globalThis.__cottontailBundleSourceRoot ??= {s};
         \\globalThis.Loader ??= {{ registry: new Map() }};
@@ -9803,6 +9834,7 @@ fn writeLazyCommonJsEntryWrapper(
     , .{
         bun_literal,
         module_literal,
+        process_literal,
         bundle_map_literal,
         bundle_source_root_literal,
         test_header_signal,
@@ -9954,7 +9986,7 @@ fn writeRuntimeEntryWrapper(
         \\import * as fsPromises from {s};
         \\import * as os from {s};
         \\import * as path from {s};
-        \\import * as processModule from {s};
+        \\import processBuiltin from {s};
         \\import * as readline from {s};
         \\import * as readlinePromises from {s};
         \\import * as util from {s};
@@ -10148,8 +10180,6 @@ fn writeRuntimeEntryWrapper(
         \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
         \\}}
     , .{ test_header_signal, cpu_profiler_start_statement, preload_imports, main_action });
-    // process.js initializes through a runtime cycle, so its bundled namespace
-    // can expose an uninitialized default even after the global is ready.
     const bootstrap = try std.fmt.allocPrint(
         ctx.allocator,
         \\globalThis.__cottontailBundleSourceMap ??= {s};
@@ -10161,7 +10191,8 @@ fn writeRuntimeEntryWrapper(
         \\const nodeTestBuiltin = nodeTest.default ?? nodeTest;
         \\const streamBuiltin = stream.default ?? stream;
         \\const pathBuiltin = path.default ?? path;
-        \\const processBuiltin = globalThis.process ?? processModule.default ?? processModule;
+        \\globalThis.process = processBuiltin;
+        \\globalThis.__cottontailProcessObject = processBuiltin;
         \\const pathPosixBuiltin = pathBuiltin.posix ?? pathPosix.default ?? pathPosix;
         \\const pathWin32Builtin = pathBuiltin.win32 ?? pathWin32.default ?? pathWin32;
         \\moduleModule.__setBuiltinModules({{
@@ -10414,6 +10445,21 @@ test "full runtime globals include lazy Web APIs" {
     }) |name| {
         try std.testing.expect(fullRuntimeGlobal(name));
     }
+}
+
+test "CommonJS eval bootstrap rejects advanced process APIs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    try std.testing.expect(try evalSourceCanUseCommonJsBootstrap(
+        allocator,
+        "require('node:fs'); process.cwd();",
+    ));
+    try std.testing.expect(!try evalSourceCanUseCommonJsBootstrap(
+        allocator,
+        "require('node:fs'); process.permission.has('fs');",
+    ));
 }
 
 test "eval source maps use Bun's virtual source identity" {

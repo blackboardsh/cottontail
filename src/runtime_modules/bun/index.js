@@ -133,10 +133,9 @@ function lazyModuleObject(loadModule) {
 }
 
 function initializeNodeHttp() {
-  const runtimeRequire = globalThis.require ?? globalThis.__ctMetaRequire;
-  const namespace = typeof runtimeRequire === "function"
-    ? runtimeRequire("node:http")
-    : loadEmbeddedRuntimeModule("node/http.js");
+  // Public require("node:http") returns the CommonJS default object. Bun's
+  // WebSocket implementation also needs Cottontail's internal named helpers.
+  const namespace = loadEmbeddedRuntimeModule("node/http.js");
   const incomingPrototype = namespace.IncomingMessage?.prototype;
   if (incomingPrototype && !Object.prototype.hasOwnProperty.call(incomingPrototype, "_read")) {
     Object.defineProperty(incomingPrototype, "_read", {

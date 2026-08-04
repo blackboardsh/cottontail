@@ -12,7 +12,11 @@ test("a direct CommonJS entry owns process.mainModule", () => {
   writeFileSync(target, [
     "if (require.main !== module) throw new Error('require.main identity');",
     "if (process.mainModule !== module) throw new Error('process.mainModule identity');",
-    "if (require('node:process').mainModule !== module) throw new Error('node:process identity');",
+    "const nodeProcess = require('node:process');",
+    "if (nodeProcess !== process) throw new Error('node:process singleton identity');",
+    "if (nodeProcess.mainModule !== module) throw new Error('node:process mainModule identity');",
+    "if (typeof nodeProcess.binding !== 'function') throw new Error('node:process binding');",
+    "if (typeof nodeProcess.report !== 'object') throw new Error('node:process report');",
     "if (module.parent !== null) throw new Error('main module parent');",
     "console.log('main-module-pass');",
     "",
@@ -161,3 +165,34 @@ test("smol mode bounds CommonJS cache-churn RSS", () => {
   expect(child.stdout.toString()).toContain("cache-churn-pass");
   expect(child.stderr.toString()).toBe("");
 }, 20_000);
+
+test("smol mode batches dynamic-import cache collection", () => {
+  const target = join(root, "dynamic-cache-churn-target.cjs");
+  const entry = join(root, "dynamic-cache-churn.mjs");
+  writeFileSync(target, [
+    "globalThis.__dynamicCacheEvaluation = (globalThis.__dynamicCacheEvaluation ?? 0) + 1;",
+    "module.exports = { evaluation: globalThis.__dynamicCacheEvaluation };",
+    "",
+  ].join("\n"));
+  writeFileSync(entry, [
+    'import { createRequire } from "node:module";',
+    "const require = createRequire(import.meta.url);",
+    `const target = ${JSON.stringify(target)};`,
+    "let collections = 0;",
+    "const collect = cottontail.gc;",
+    "cottontail.gc = (...args) => { collections += 1; return collect(...args); };",
+    "for (let index = 0; index < 2048; index += 1) {",
+    "  delete require.cache[target];",
+    "  await import(target);",
+    "}",
+    "if (globalThis.__dynamicCacheEvaluation !== 2048) throw new Error('module was not re-evaluated');",
+    "if (collections > 4) throw new Error(`dynamic cache churn forced ${collections} collections`);",
+    "console.log('dynamic-cache-churn-pass');",
+    "",
+  ].join("\n"));
+
+  const child = Bun.spawnSync({ cmd: [process.execPath, "--smol", "run", entry] });
+  expect(child.exitCode).toBe(0);
+  expect(child.stdout.toString()).toContain("dynamic-cache-churn-pass");
+  expect(child.stderr.toString()).toBe("");
+}, 10_000);

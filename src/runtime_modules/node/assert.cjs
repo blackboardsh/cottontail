@@ -3,7 +3,7 @@
 class AssertionError extends Error {
   constructor(options = {}) {
     super(options.message === undefined ? "Assertion failed" : options.message);
-    this.name = "AssertionError";
+    this.name = "AssertionError [ERR_ASSERTION]";
     this.actual = options.actual;
     this.expected = options.expected;
     this.operator = options.operator;
@@ -21,6 +21,14 @@ class AssertionError extends Error {
         if (!this.stack.includes(name)) this.stack += `\n    at ${name}`;
       }
     }
+    // JSC creates Error.stack lazily. Capture it with Node's coded display
+    // name, then retain the public AssertionError name on the instance.
+    void this.stack;
+    this.name = "AssertionError";
+  }
+
+  toString() {
+    return `${this.name} [${this.code}]: ${this.message}`;
   }
 }
 

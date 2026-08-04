@@ -1,4 +1,5 @@
 import { _wrapAsyncCallback } from "./async_hooks.js";
+import { __setBuiltinModules } from "./module.js";
 
 const nativeSetTimeout = globalThis.setTimeout.bind(globalThis);
 const nativeClearTimeout = globalThis.clearTimeout.bind(globalThis);
@@ -80,7 +81,7 @@ Object.defineProperty(setInterval, promisifyCustom, {
   configurable: true,
 });
 
-export default {
+const timers = {
   clearImmediate,
   clearInterval,
   clearTimeout,
@@ -89,3 +90,7 @@ export default {
   setInterval,
   setTimeout,
 };
+
+__setBuiltinModules({ timers, "node:timers": timers });
+
+export default timers;

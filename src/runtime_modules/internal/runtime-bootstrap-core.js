@@ -44,6 +44,9 @@ globalThis.__cottontailFormatUncaughtException ??= (error) => {
     try {
       header = Error.prototype.toString.call(error);
     } catch {}
+    if (error?.name === "AssertionError" && error?.code === "ERR_ASSERTION") {
+      header = `AssertionError [ERR_ASSERTION]: ${error.message}`;
+    }
     if (referenceErrorHeaders) header = referenceErrorHeaders[1];
     return header && !stack.includes(header) ? `${header}\n${stack}` : stack;
   }

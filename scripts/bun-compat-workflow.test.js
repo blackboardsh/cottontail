@@ -31,13 +31,27 @@ test('runs only for compat branches and manual dispatch', () => {
 });
 
 test('runs the strict complete Cottontail-owned Bun tier without publishing', () => {
+  for (const platform of ['macos-arm64', 'linux-x64', 'linux-arm64', 'windows-x64']) {
+    assert.match(workflow, new RegExp(`platform: ${platform}`));
+  }
+  assert.match(workflow, /runner: macos-26/);
+  assert.match(workflow, /runner: ubuntu-24\.04/);
+  assert.match(workflow, /runner: ubuntu-24\.04-arm/);
+  assert.match(workflow, /runner: windows-2025/);
+  assert.match(workflow, /fail-fast: false/);
   assert.match(
     workflow,
-    /run: node scripts\/zig\.js build -Doptimize=ReleaseSmall -Dcpu=baseline/,
+    /node scripts\/zig\.js build -Doptimize=ReleaseSmall -Dcpu=baseline/,
   );
   assert.match(
     workflow,
-    /run: node scripts\/run-upstream-tests\.js bun --hutch "\$HUTCH_ENGINE" --include-expected-failures/,
+    /node scripts\/zig\.js build -Doptimize=ReleaseSmall -Dtarget=x86_64-windows-msvc -Dcpu=baseline/,
+  );
+  assert.match(workflow, /run: node scripts\/zig\.js build test/);
+  assert.match(workflow, /run: node scripts\/test-js\.js/);
+  assert.match(
+    workflow,
+    /run: node scripts\/run-upstream-tests\.js bun --hutch "\$HUTCH_ENGINE"/,
   );
   assert.doesNotMatch(workflow, /continue-on-error:|upload-release-r2|publish|secrets\./i);
 
@@ -72,6 +86,7 @@ test('builds and passes the pinned Hutch engine to split package fixtures', () =
   assert.match(hutchSetup, /process\.platform === 'win32' \? 'hutch-engine\.exe' : 'hutch-engine'/);
   assert.doesNotMatch(hutchSetup, /command -v|which\(|["']PATH["']/);
 
+  assert.match(workflow, /shell: bash\s+run: \|\s+hutch_engine="\$\(node scripts\/setup-upstream-hutch\.js\)"/);
   assert.match(workflow, /hutch_engine="\$\(node scripts\/setup-upstream-hutch\.js\)"/);
   assert.equal(
     workflow.match(/HUTCH_ENGINE: \$\{\{ steps\.hutch-engine\.outputs\.binary \}\}/g)?.length,

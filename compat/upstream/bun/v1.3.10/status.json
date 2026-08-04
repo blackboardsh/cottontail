@@ -1008,9 +1008,8 @@
       "reason": "Optional peer resolution across multiple instances of the same package passes the copied hoisting regression (7 assertions)."
     },
     "test/cli/install/semver.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Bun.semver order and satisfies use the vendored Bun Zig parser and pass all 22 copied upstream cases (1,762 assertions), including loose versions, ranges, prereleases, buffers, and error behavior."
+      "status": "enabled",
+      "reason": "Bun.semver order and satisfies pass all 22 copied upstream runtime cases (1,762 assertions), including loose versions, ranges, prereleases, buffers, and error behavior."
     },
     "test/cli/install/shebang-normalize.test.ts": {
       "status": "skip",
@@ -1130,9 +1129,8 @@
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 6 assertions)."
     },
     "test/cli/run/shell-keepalive.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
+      "status": "enabled",
+      "reason": "Bun.$ keeps the runtime alive for both builtin and external shell commands (2 copied bun:test cases, 2 assertions)."
     },
     "test/cli/run/syntax.test.ts": {
       "status": "enabled",
@@ -1499,18 +1497,16 @@
       "timeoutMs": 120000
     },
     "test/js/bun/http/req-url-leak.test.ts": {
-      "status": "expected-failure",
-      "reason": "Performance-only quarantine: inherited Bun IPC exposes the transport-backed process.channel control contract, and a bounded 130-request probe with 15 KB targets plateaued from 844 MB at its midpoint to 845 MB at completion, confirming functional URL release. The stock-JSC baseline already exceeds Bun's absolute 150 MB ceiling.",
-      "classification": "performance"
+      "status": "enabled",
+      "reason": "Native request-target reuse and lazy URL caching pass the exact copied 10,000-request memory lifecycle test within Bun's growth and absolute RSS limits."
     },
     "test/js/bun/http/request-smuggling.test.ts": {
       "status": "enabled",
       "reason": "Passes under Cottontail after the resolver/runtime-bundling fixes (verified twice: 14 bun:test cases, 24 assertions)."
     },
     "test/js/bun/http/serve-body-leak.test.ts": {
-      "status": "expected-failure",
-      "reason": "Performance-only quarantine: bounded probes pass ignore, text, JSON, body-getter, complete-stream, incomplete-stream, and streaming-echo behavior across 56 half-megabyte requests. The stock-JSC child starts around 761 MB RSS, already above the copied absolute 512 MB ceiling, and the exact stress workload also exceeds its copied 40-second deadline.",
-      "classification": "performance"
+      "status": "enabled",
+      "reason": "Native request buffering, body getter access, streaming, incomplete reads, ignored bodies, JSON decoding, and identity echo pass all seven copied 10,000-request memory lifecycle cases (70,021 assertions)."
     },
     "test/js/bun/http/serve-direct-readable-stream.test.ts": {
       "status": "enabled",
@@ -3871,7 +3867,7 @@
     },
     "test/js/web/fetch/body.test.ts": {
       "status": "enabled",
-      "reason": "The file remains classified enabled with two external-DNS cases accounted as environmental exclusions. An unfiltered audit exposed two empty-File FormData type regressions; the assigned HTTP fix and focused rerun must land before this entry supports a full-parity claim.",
+      "reason": "All locally runnable cases pass, including empty-File FormData type and identity behavior; two external-DNS cases remain accounted as environmental exclusions.",
       "args": ["--test-name-pattern=^(?!.*fetch[(][)] stream).*$"],
       "testNameExclusion": {
         "pattern": "^(?!.*fetch[(][)] stream).*$",
@@ -6422,11 +6418,11 @@
   },
   "expectedCounts": {
     "runnableFiles": 1445,
-    "enabled": 1341,
-    "expectedFailure": 2,
-    "skip": 102,
-    "cottontailOwned": 1343,
-    "hutchOwned": 102,
+    "enabled": 1345,
+    "expectedFailure": 0,
+    "skip": 100,
+    "cottontailOwned": 1345,
+    "hutchOwned": 100,
     "upstreamTodoSkipSyntaxSites": 711,
     "upstreamTodoSkipSyntaxFiles": 258
   }
