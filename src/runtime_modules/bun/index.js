@@ -168,10 +168,7 @@ const loadNodeStreamModule = createLazyModule("node:stream", () => loadEmbeddedR
 const loadNodeStreamWebModule = createLazyModule("node:stream/web", () => loadEmbeddedRuntimeModule("node/stream/web.js"));
 const loadNodeTlsModule = createLazyModule("node:tls", () => loadEmbeddedRuntimeModule("node/tls.js"));
 const loadNodeZlibModule = createLazyModule("node:zlib", () => loadEmbeddedRuntimeModule("node/zlib.js"));
-const loadNodeCryptoModule = createLazyModule("node:crypto", () => {
-  const namespace = loadEmbeddedRuntimeModule("node/crypto.js");
-  return namespace.default ?? namespace;
-});
+const loadNodeCryptoModule = createLazyModule("node:crypto", () => loadEmbeddedRuntimeModule("node/crypto.js"));
 const nodeHttp = lazyModuleObject(loadNodeHttpModule);
 const nodeHttps = lazyModuleObject(loadNodeHttpsModule);
 const nodeNet = lazyModuleObject(loadNodeNetModule);
@@ -12987,7 +12984,7 @@ const initialCryptoObject = globalThis.crypto;
 let initializedCryptoObject;
 function initializeCryptoGlobals() {
   if (initializedCryptoObject !== undefined) return initializedCryptoObject;
-  const cryptoObject = initialCryptoObject ?? {};
+  let cryptoObject = initialCryptoObject ?? {};
   // node:crypto adopts an existing global crypto object while it initializes.
   // Publish the placeholder first to avoid re-entering this lazy accessor.
   if (initialCryptoObject == null) {
@@ -12999,6 +12996,15 @@ function initializeCryptoGlobals() {
     });
   }
   const nodeCrypto = loadNodeCryptoModule();
+  if (nodeCrypto.webcrypto !== cryptoObject) {
+    cryptoObject = nodeCrypto.webcrypto;
+    Object.defineProperty(globalThis, "crypto", {
+      configurable: true,
+      enumerable: true,
+      value: cryptoObject,
+      writable: true,
+    });
+  }
   cryptoObject.randomUUID ??= nodeCrypto.randomUUID;
   // Bun accepts ArrayBuffer/SharedArrayBuffer and does not impose WebCrypto's
   // 65536-byte quota on this convenience API.
