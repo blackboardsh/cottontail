@@ -2157,12 +2157,10 @@ class Expectation {
         },
       );
 
-      // Attach a rejection handler in the same turn, then let the test
-      // runner's pending-promise queue await asynchronous I/O. A nested
-      // blocking wait here prevents fd events from completing network bodies.
+      // Bun's promise matchers settle before returning to the test body, even
+      // when callers omit `await`. Drive Cottontail's event loop here so later
+      // assertions observe subprocess and filesystem side effects in order.
       result.catch(() => {});
-      if (globalThis.__cottontailRegisterTestPendingPromise?.(result)) return undefined;
-
       if (promise instanceof Promise) {
         let state = nativePromiseState(result);
         if (state?.status === 0 && typeof globalThis.cottontail?.waitForPromise === "function") {
@@ -2174,6 +2172,7 @@ class Expectation {
         }
         if (state?.status === 1) return undefined;
       }
+      if (globalThis.__cottontailRegisterTestPendingPromise?.(result)) return undefined;
       return undefined;
     }
     return check.call(this, this.actual);

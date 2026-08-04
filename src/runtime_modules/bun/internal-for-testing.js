@@ -1001,7 +1001,13 @@ export function getEventLoopStats() {
 }
 export const install_test_helpers = {
   parseLockfile(cwd) {
-    return JSON.parse(cottontail.packageManagerParseLockfile(String(cwd)));
+    const lockfile = JSON.parse(cottontail.packageManagerParseLockfile(String(cwd)));
+    for (const dependency of lockfile?.dependencies ?? []) {
+      if (dependency?.literal === "workspace:" && "workspace" in dependency) {
+        dependency.workspace = "";
+      }
+    }
+    return lockfile;
   },
 };
 export const npm_manifest_test_helpers = {

@@ -450,6 +450,12 @@ try {
       stdoutIncludes: ['bun test module passed'],
     },
     {
+      name: 'bun-test-unawaited-promise-matchers',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-test-unawaited-promise-matchers.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['2 pass', '0 fail'],
+    },
+    {
       name: 'bun-test-module-explicit-cli',
       argv: ['test', join(rootDir, 'tests', 'js', 'bun-test-module.ts')],
       expectExitCode: 0,
