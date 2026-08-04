@@ -50,20 +50,42 @@ Each snapshot has:
 - `status.json` for Cottontail's current enabled/skipped/expected-failure state
 - the copied upstream test files and upstream license notice
 
-`status.json` may set `defaultStatus` to `enabled` to run the copied corpus by
-default, then use per-test `disabled` or `skip` entries to quarantine failures
-as they are discovered. Explicit `--test <relative-path>` runs the selected
-test even if it is currently disabled, which keeps reproduction easy.
-Per-test `args` are appended to the Cottontail invocation. A `serial: true`
-entry runs outside the Bun harness's parallel file workers for load-sensitive
-tests. A `splitBundlerTests: true` entry runs every discovered `itBundled` case
-in its own process through Bun's `BUN_BUNDLER_TEST_FILTER`, bounding retained
-fixture memory. The owned `expectBundled.ts` helper provides a registration-only
-discovery pass, so generated case IDs are included and skipped/commented cases
-are not. These adaptations must include their rationale in the entry's `reason`.
-An enabled split entry may use `expectedFailureBundlerTests` to map individual
-case IDs to documented reasons. Those cases remain in every run as strict
-expected failures, so a newly passing case is reported as an XPASS.
+The Bun `status.json` uses `defaultStatus: "not-enabled"`. Every currently
+copied runnable file has an exact-path entry in `tests`. Regex status patterns
+are forbidden: after an upstream refresh, a newly copied test is therefore
+reported as unclassified instead of silently inheriting an expected failure.
+Run the accounting check before changing the compatibility headline:
+
+```sh
+bun run compat:upstream:check
+```
+
+The check rejects stale paths, missing exact entries, count drift, unaccounted
+`--test-name-pattern` arguments, and delegated files that are not marked
+`owner: "hutch-package-manager"` plus `status: "skip"`. It also reports every
+whole-file expected failure, structured test-name exclusion, split bundler
+expected failure, and source-level upstream todo/skip marker.
+
+Per-test `args` are appended to the Cottontail invocation. Every
+`--test-name-pattern` argument must have matching `testNameExclusion` metadata,
+which records the exact omitted names, classification, and reason. A
+`serial: true` entry runs outside the Bun harness's parallel file workers for
+load-sensitive tests. A `splitBundlerTests: true` entry runs every discovered
+`itBundled` case in its own process through Bun's
+`BUN_BUNDLER_TEST_FILTER`, bounding retained fixture memory. The owned
+`expectBundled.ts` helper provides a registration-only discovery pass, so
+generated case IDs are included and skipped/commented cases are not. These
+adaptations must include their rationale in the entry's `reason`. An enabled
+split entry may use `expectedFailureBundlerTests` to map individual case IDs to
+reasons, with matching classifications in
+`expectedFailureBundlerTestClassifications`. Those cases remain in every run as
+strict expected failures, so a newly passing case is reported as an XPASS.
+
+The source-marker count is an audit inventory, not a parity score. Upstream
+todo/skip syntax includes platform guards, tests of `bun:test` skip behavior,
+and fixture source embedded in strings. Runtime execution summaries determine
+which cases actually skipped on a platform. Bun's copied `expectations.txt` is
+retained for provenance but is not applied by Cottontail's direct Bun runner.
 
 The Bun runner uses up to four workers by default. Independent failures from
 the parallel phase are retried serially before being reported. Use `--jobs 1`

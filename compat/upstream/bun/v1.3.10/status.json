@@ -1,588 +1,18 @@
 {
-  "schema": 1,
+  "schema": 2,
   "defaultStatus": "not-enabled",
-  "patterns": [
-    {
-      "pattern": "^test/regression/",
-      "status": "expected-failure",
-      "reason": "Measured unclassified baseline: the remaining 64 regression files fail under Cottontail across package-manager, transpiler-diagnostic, process, networking, module, and error-format behavior; eight hit either the harness or file timeout. More specific passing regression patterns below override this strict-xfail fallback."
-    },
-    {
-      "pattern": "^test/bundler/",
-      "status": "expected-failure",
-      "reason": "Measured unclassified baseline: the remaining 11 bundler files fail in compile/defer/feature-flag, native-plugin, standalone, CLI, or runtime-transpiler coverage. Explicit passing bundler entries below override this strict-xfail fallback."
-    },
-    {
-      "pattern": "^test/cli/",
-      "status": "expected-failure",
-      "reason": "Measured unclassified baseline: 34 of the remaining 35 CLI files fail in package-manager, nested run/test, coverage, watch, profile, workspace, or lifecycle behavior; run-unicode is enabled by an exact override below."
-    },
-    {
-      "pattern": "^test/config/",
-      "status": "expected-failure",
-      "reason": "Measured unclassified baseline: the remaining bunfig preload coverage fails under Cottontail. Explicit passing config entries override this strict-xfail fallback."
-    },
-    {
-      "pattern": "^test/internal/",
-      "status": "expected-failure",
-      "reason": "Measured unclassified baseline: Bun's remaining repository-policy and bindgen-internal files fail because their Bun source/build infrastructure is not present in Cottontail."
-    },
-    {
-      "pattern": "^test/integration/",
-      "status": "expected-failure",
-      "reason": "Measured unclassified baseline: all nine remaining framework/tool integration files fail in dependency installation, native-addon, dev-server, or package-manager setup before completing their application assertions."
-    },
-    {
-      "pattern": "^test/v8/",
-      "status": "expected-failure",
-      "reason": "Measured unclassified baseline: Bun's remaining V8-compatibility aggregate fails under Cottontail's stock JavaScriptCore runtime."
-    },
-    {
-      "pattern": "^test/js/node/",
-      "status": "expected-failure",
-      "reason": "Measured unclassified baseline: 46 of the remaining 48 Node files fail across full/stress suites for child_process, crypto, DNS, fs, HTTP/2, inspector, net, process, TLS, streams, workers, watch, and zlib; seven time out. Existing passing entries and two exact pass overrides below take precedence."
-    },
-    {
-      "pattern": "^test/js/(?:first_party|junit-reporter|web|workerd)/",
-      "status": "expected-failure",
-      "reason": "Measured unclassified baseline: all 29 remaining first-party/web files fail across Undici/ws, fetch and streaming stress, WebSocket, worker, leak, JUnit, and workerd HTMLRewriter coverage; twelve hit the 12-second discovery timeout."
-    },
-    {
-      "pattern": "^test/js/third_party/",
-      "status": "expected-failure",
-      "reason": "Measured unclassified baseline: 35 of the remaining 38 third-party files fail through native-addon, package-manager, framework, protocol, or runtime behavior; three grpc-js files are enabled by an exact override below. Existing passing package entries also take precedence."
-    },
-    {
-      "pattern": "^test/js/sql/",
-      "status": "expected-failure",
-      "reason": "The two remaining Bun.SQL files require either the not-yet-integrated MySQL/MariaDB adapters or additional adapter-specific configuration behavior. Passing SQLite and adapter-override files are enabled explicitly."
-    },
-    {
-      "pattern": "^test/cli/run/run-unicode\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Serially confirmed after unclassified discovery: Unicode script names and arguments pass both copied upstream cases with two assertions."
-    },
-    {
-      "pattern": "^test/cli/run/run-eval\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "All 29 copied eval and print cases pass across argument placement, TypeScript and JSX transforms, top-level await, source URLs, inspect formatting, and syntax failures (58 assertions).",
-      "args": ["--timeout=50000"],
-      "timeoutMs": 600000
-    },
-    {
-      "pattern": "^test/cli/run/transpiler-cache\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "All eight copied runtime transpiler-cache cases pass across enablement, version invalidation, content addressing, permissions, concurrent writers, and non-inlined environment values (116 assertions).",
-      "args": ["--timeout=180000"],
-      "timeoutMs": 600000
-    },
-    {
-      "pattern": "^test/cli/update_interactive_formatting\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "All 31 copied interactive update cases pass across selection and navigation, dry-run and cancellation, recursive and filtered workspaces, catalog layouts, semver prefix preservation, package installation, and lockfile persistence (163 assertions).",
-      "timeoutMs": 30000
-    },
-    {
-      "pattern": "^test/cli/update_interactive_install\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Both copied interactive update installation cases pass, updating package.json and the installed node_modules package for compatible and latest-version selections (14 assertions).",
-      "timeoutMs": 30000
-    },
-    {
-      "pattern": "^test/cli/run/sql-preconnect\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied SQL preconnect fixture passes both local-loopback cases: startup connects when DATABASE_URL and --sql-preconnect are present and does not connect without the flag (4 assertions).",
-      "args": ["--timeout=10000"],
-      "timeoutMs": 30000
-    },
-    {
-      "pattern": "^test/cli/run/env\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied environment corpus passes 62 active cases covering precedence, parsing, expansion, --env-file, NODE_ENV, large files, and environment APIs.",
-      "args": ["--timeout=30000"],
-      "timeoutMs": 240000
-    },
-    {
-      "pattern": "^test/cli/user-agent\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Both copied user-agent cases pass: the final duplicate option wins and explicit fetch headers override the configured default.",
-      "args": ["--timeout=30000"],
-      "timeoutMs": 90000
-    },
-    {
-      "pattern": "^test/config/bunfig/preload\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "All 18 active copied preload cases pass with early process bootstrap and Bun-compatible preload ordering; two upstream skips and one todo remain.",
-      "args": ["--timeout=30000"],
-      "timeoutMs": 180000
-    },
-    {
-      "pattern": "^test/cli/bunfig-test-options\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Bunfig test randomization, seeded ordering, invalid seed combinations, rerunEach, and combined test options pass all five copied cases; subprocess-heavy stock-JSC startup requires a larger per-case budget.",
-      "args": ["--timeout=30000"],
-      "timeoutMs": 150000
-    },
-    {
-      "pattern": "^test/cli/init/init\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied Bun init corpus passes with interactive and noninteractive defaults, JavaScript/TypeScript choices, deterministic package metadata, overwrite handling, and generated file contents (10 cases, 76 assertions)."
-    },
-    {
-      "pattern": "^test/cli/heap-prof\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "All seven copied profiling cases pass with Bun-compatible option validation, naming, directories, lifecycle flushing, and truthful stock-JSC sampling-profiler failure handling (55 assertions).",
-      "args": ["--timeout=20000"],
-      "timeoutMs": 180000
-    },
-    {
-      "pattern": "^test/js/node/(?:cluster\\.test\\.ts|util/node-inspect-tests/parallel/util-inspect-getters-accessing-this\\.test\\.js)$",
-      "status": "enabled",
-      "reason": "Serially confirmed after unclassified discovery: Node cluster compatibility and util.inspect getter receiver behavior pass four copied upstream cases."
-    },
-    {
-      "pattern": "^test/js/third_party/grpc-js/test-(?:call-propagation|deadline|server-deadlines)\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Serially confirmed after unclassified discovery: grpc-js propagation and client/server deadline behavior pass 13 copied upstream cases."
-    },
-    {
-      "pattern": "^test/js/third_party/(?:hono/hello-world-fixture\\.test\\.ts|pino/pino\\.test\\.js)$",
-      "status": "enabled",
-      "reason": "The copied Hono and Pino fixtures pass against the integrated Node HTTP, stream, filesystem, and logging compatibility runtime (two cases, seven assertions)."
-    },
-    {
-      "pattern": "^test/js/third_party/msw/msw\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied MSW fixture intercepts Axios through the mutable Node HTTP module, returns its synthetic JSON response, and passes the upstream output assertion."
-    },
-    {
-      "pattern": "^test/js/third_party/st/st\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied st fixture starts a Node-compatible HTTP static server, fetches its TypeScript source, and exits cleanly; stock-JSC child startup requires a larger per-case budget.",
-      "args": ["--timeout=20000"],
-      "timeoutMs": 30000
-    },
-    {
-      "pattern": "^test/js/third_party/pg-gateway/pglite\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied PGlite fixture loads through the integrated PostgreSQL/Node compatibility runtime and completes a real embedded SQL query (one case, 16 assertions); initialization requires a larger stock-JSC budget.",
-      "args": ["--timeout=30000"],
-      "timeoutMs": 60000
-    },
-    {
-      "pattern": "^test/js/third_party/(?:grpc-js/test-(?:channel-credentials|server)|pnpm/pnpm)\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied gRPC credentials/server and pnpm fixtures pass with HTTP/2 TLS controls, package binary resolution, symlinked .bin entries, and native process behavior (60 cases)."
-    },
-    {
-      "pattern": "^test/js/third_party/remix/remix\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied Remix fixture starts the real server, serves the application root, and validates its response; stock-JSC child startup slightly exceeds Bun's default case budget.",
-      "args": ["--timeout=30000"],
-      "timeoutMs": 45000
-    },
-    {
-      "pattern": "^test/js/third_party/rollup-v4/rollup-v4\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied Rollup v4 fixture loads the native parseAst package entry and matches Bun's AST snapshot (one case, one assertion)."
-    },
-    {
-      "pattern": "^test/js/third_party/comlink/comlink\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied Comlink fixture starts a real Web Worker through the native transport and resolves its first remote property within Bun's 100ms bound (one case, one assertion)."
-    },
-    {
-      "pattern": "^test/js/bun/.*\\.test\\.(?:js|mjs|cjs|ts|tsx|mts|cts)$",
-      "status": "enabled",
-      "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
-    },
-    {
-      "pattern": "^test/js/bun/shell/.*\\.test\\.(?:js|mjs|cjs|ts|tsx|mts|cts)$",
-      "status": "expected-failure",
-      "reason": "Bun shell parser/runtime conformance needs a dedicated implementation pass; individual smoke tests are re-enabled explicitly."
-    },
-    {
-      "pattern": "^test/js/bun/spawn/.*\\.test\\.(?:js|mjs|cjs|ts|tsx|mts|cts)$",
-      "status": "expected-failure",
-      "reason": "Bun.spawn conformance needs a dedicated implementation pass; individual smoke tests are re-enabled explicitly."
-    },
-    {
-      "pattern": "^test/js/bun/sqlite/.*\\.test\\.(?:js|mjs|cjs|ts|tsx|mts|cts)$",
-      "status": "enabled",
-      "reason": "The complete copied Bun SQLite snapshot passes: database and statement behavior, metadata, datetime binding, serialization, transactions, disposal, and cross-process access (81 cases, 842 assertions)."
-    },
-    {
-      "pattern": "^test/js/bun/test/.*\\.test\\.(?:js|mjs|cjs|ts|tsx|mts|cts)$",
-      "status": "expected-failure",
-      "reason": "Bun test-runner conformance needs a dedicated implementation pass; individual smoke tests are re-enabled explicitly."
-    },
-    {
-      "pattern": "^test/js/bun/util/.*\\.test\\.(?:js|mjs|cjs|ts|tsx|mts|cts)$",
-      "status": "expected-failure",
-      "reason": "Bun utility API conformance needs a dedicated implementation pass; individual smoke tests are re-enabled explicitly."
-    },
-    {
-      "pattern": "^test/js/bun/util/fuzzy-wuzzy\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Bun's copied fuzzy-wuzzy utility corpus passes with finite cached test/describe modifier graphs, conditional modifiers, conflict validation, prototypes, and .each behavior (153 cases, 330 assertions)."
-    },
-    {
-      "pattern": "^test/js/third_party/jsonwebtoken/.*\\.test\\.js$",
-      "status": "enabled",
-      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
-    },
-    {
-      "pattern": "^test/js/third_party/express/.*\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied Express corpus passes with Node-compatible HTTP, streams, body parsing, redirects, legacy URL parsing, file responses, ranges, and filesystem error behavior."
-    },
-    {
-      "pattern": "^test/napi/",
-      "status": "expected-failure",
-      "reason": "The aggregate native-addon corpus still includes unsupported Node-API cases and platform-specific build orchestration. Cottontail's bridge now passes focused addon loading, shared libuv loop, async work, cleanup-hook, thread-pool, and thread-safe-function teardown coverage."
-    },
-    {
-      "pattern": "^test/napi/node-napi-tests/test/(?:js-native-api|node-api)/.+/do\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
-      "args": ["--timeout=120000"],
-      "timeoutMs": 180000
-    },
-    {
-      "pattern": "^test/cli/install/",
-      "status": "expected-failure",
-      "reason": "Strict fallback for newly copied package-manager files; every currently vendored install file has a measured exact enabled override."
-    },
-    {
-      "pattern": "^test/bake/",
-      "status": "expected-failure",
-      "reason": "Requires Bun's bake dev-server/framework pipeline, which Cottontail does not implement yet."
-    },
-    {
-      "pattern": "^test/cli/hot/",
-      "status": "expected-failure",
-      "reason": "Cottontail now reloads tracked dependency graphs, preserves hot VM state, restarts --watch processes, and supports build --watch. The exact hot files remain unpromoted because fixed-deadline reload cycles can time out and the source-map stress loops do not yet complete within Bun's deadlines."
-    },
-    {
-      "pattern": "^test/cli/hot/watch-many-dirs\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied 129-directory hot-reload stress case passes all three simultaneous update cycles and exits cleanly (1 case, 6 assertions)."
-    },
-    {
-      "pattern": "^test/cli/create/create-jsx\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The exact Bun CI contract passes: four deterministic React/Tailwind create-and-build workflows complete with 12 assertions, while the eight dev-server snapshot and live shadcn@canary cases remain upstream-authored CI todos.",
-      "env": {
-        "CI": "1"
-      },
-      "timeoutMs": 240000
-    },
-    {
-      "pattern": "^test/cli/inspect/",
-      "status": "expected-failure",
-      "reason": "Requires Bun's WebKit inspector protocol server, which Cottontail does not expose yet."
-    },
-    {
-      "pattern": "^test/cli/inspect/inspect\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied inspector CLI and protocol coverage passes all 29 cases and 73 assertions across TCP, Unix, IPv4, IPv6, inspect-wait, inspect-brk, WebSocket, node:inspector, lifecycle, and error-stack behavior.",
-      "timeoutMs": 120000
-    },
-    {
-      "pattern": "^test/cli/inspect/BunFrontendDevServer\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied frontend dev-server inspector coverage passes all 5 active cases, 36 assertions, and 2 snapshots; 2 upstream cases remain authored as todos.",
-      "args": ["--timeout=20000"],
-      "timeoutMs": 120000
-    },
-    {
-      "pattern": "^test/cli/inspect/test-reporter\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied TestReporter inspector case passes its retroactive discovery, parent relationships, execution lifecycle, and clean child exit checks (1 case, 7 assertions).",
-      "args": ["--timeout=30000"],
-      "env": {
-        "COTTONTAIL_TMP_DIR": "/tmp",
-        "TMPDIR": "/tmp",
-        "TMP": "/tmp",
-        "TEMP": "/tmp"
-      },
-      "timeoutMs": 60000
-    },
-    {
-      "pattern": "^test/cli/inspect/HTTPServerAgent\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied HTTPServer inspector case passes initial and hot-reloaded route reporting, stable server identity, and close lifecycle coverage (1 case, 5 assertions, 3 snapshots).",
-      "args": ["--timeout=30000"],
-      "env": {
-        "COTTONTAIL_TMP_DIR": "/tmp",
-        "TMPDIR": "/tmp",
-        "TMP": "/tmp",
-        "TEMP": "/tmp"
-      },
-      "timeoutMs": 60000
-    },
-    {
-      "pattern": "^test/regression/issue/(?:10380/spy-matchers-diff|14709|16474|19661|20100|20546|23183|24234|24399|25231|25750|25794|27117)\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Copied upstream regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
-    },
-    {
-      "pattern": "^test/regression/issue/26298\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "All three copied standalone bytecode regressions pass with stock JSC, including multi-module execution and the real verbose disk-cache hit diagnostic (15 assertions).",
-      "args": ["--timeout=30000"],
-      "timeoutMs": 120000
-    },
-    {
-      "pattern": "^test/regression/issue/(?:04298/04298|09041|14624)\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Copied runtime regressions pass directly under Cottontail in the grouped unclassified discovery run."
-    },
-    {
-      "pattern": "^test/regression/issue/(?:invalid-escape-sequences|jsx-template-string-crash)\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied parser regressions pass on the integrated compiler: malformed escapes produce diagnostics without crashing, and JSX template strings compile and execute correctly."
-    },
-    {
-      "pattern": "^test/regression/issue/24387\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "A failed synchronous require of top-level-await code clears the module cache so a subsequent dynamic import succeeds; stock-JSC startup requires a larger per-case budget.",
-      "args": ["--timeout=20000"],
-      "timeoutMs": 30000
-    },
-    {
-      "pattern": "^test/regression/issue/25648\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Explicit --bundle builds correctly rename shadowing function and class expressions and execute without recursive symbol capture; stock-JSC startup requires a larger per-case budget.",
-      "args": ["--timeout=20000"],
-      "timeoutMs": 30000
-    },
-    {
-      "pattern": "^test/regression/issue/(?:19652|20321|21677|21792)\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Copied build production mode, runtime API, raw Date header, and SNI TLS-array regressions pass under Cottontail."
-    },
-    {
-      "pattern": "^test/regression/issue/(?:24593|26125|26225|5344)\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Exact copied regressions pass under the integrated runtime: compressed WebSocket publish, mTLS client-certificate switching, node-fetch form-data streams, and split re-export linking (11 cases, 52 assertions)."
-    },
-    {
-      "pattern": "^test/regression/issue/(?:27428|3613)\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Exact copied regressions pass with deterministic HTTP parser shutdown, async-context-safe responses, and ws handleProtocols selection and fallback behavior (4 cases).",
-      "args": ["--timeout=10000"],
-      "timeoutMs": 45000
-    },
-    {
-      "pattern": "^test/regression/issue/24385\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "All 14 copied Redis and Valkey environment URL variants load and duplicate the lazy client without protocol errors (42 assertions); stock-JSC subprocess startup requires a larger file budget.",
-      "args": ["--timeout=30000"],
-      "timeoutMs": 240000
-    },
-    {
-      "pattern": "^test/regression/issue/26286\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Bun.Terminal delivers PTY data callbacks and preserves AsyncLocalStorage state in both copied regression cases (4 assertions)."
-    },
-    {
-      "pattern": "^test/regression/issue/20753\\.test\\.js$",
-      "status": "enabled",
-      "reason": "Node child_process execFile reports normalized asynchronous ENOENT/EACCES errors and preserves encoded stdout/stderr for callbacks and promisification."
-    },
-    {
-      "pattern": "^test/regression/issue/(?:19219|21274)\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "HTMLRewriter propagates synchronous and settled async handler errors, and X509Certificate parses authority information access and extended key usage metadata."
-    },
-    {
-      "pattern": "^test/regression/issue/09739\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The abort-controller package replacement preserves the native AbortController constructor through mixed CommonJS and ESM imports."
-    },
-    {
-      "pattern": "^test/regression/issue/08794\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Ordinary Error stacks are lazily source-mapped and formatted with Node/Bun-compatible V8-style frames, including mocked function names."
-    },
-    {
-      "pattern": "^test/regression/issue/10170\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Promisified child_process.execFile returns Cottontail's canonical Bun-compatible version output with an empty stderr stream."
-    },
-    {
-      "pattern": "^test/regression/issue/(?:08964/08964\\.test\\.ts|12034/12034\\.test\\.js)$",
-      "status": "enabled",
-      "reason": "Bun.spawnSync exposes an undefined signalCode after normal exit, and extension-suffixed TypeScript fixtures execute with shared test globals and custom matchers."
-    },
-    {
-      "pattern": "^test/regression/issue/08757\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Symlinked entrypoints canonicalize process.argv[1] and Bun.main while preserving entry-only import.meta.main semantics and canonical import.meta paths."
-    },
-    {
-      "pattern": "^test/regression/issue/(?:14135\\.test\\.ts|17405\\.test\\.ts|18159/18159\\.test\\.ts)$",
-      "status": "enabled",
-      "reason": "Bun test .only selection gates suite hooks correctly, shell echo implements Bun's n/E/e flag and escape semantics, and NaN timer delays emit TimeoutNaNWarning."
-    },
-    {
-      "pattern": "^test/regression/issue/1632\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Destroyed child stdout pipes propagate a real EPIPE to the child, and natural process shutdown honors process.exitCode after lifecycle handlers."
-    },
-    {
-      "pattern": "^test/regression/issue/18595\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "AsyncLocalStorage context survives HTTP request callbacks, an awaited timer, and fetch response completion."
-    },
-    {
-      "pattern": "^test/regression/issue/23077/23077\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "A nested bun test invocation aggregates multiple explicit test files and exits successfully."
-    },
-    {
-      "pattern": "^test/js/node/util/node-inspect-tests/(?:internal-inspect|parallel/util-format)\\.test\\.js$",
-      "status": "enabled",
-      "reason": "Copied Node util.inspect and util.format compatibility fixtures complete without assertion failures."
-    },
-    {
-      "pattern": "^test/js/web/fetch/abort-signal-leak\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Fetch Request instances always expose an AbortSignal, and in-process Bun.serve request signals survive abort handling without retained-signal growth."
-    },
-    {
-      "pattern": "^test/regression/issue/(?:014865\\.test\\.ts|04947\\.test\\.js)$",
-      "status": "enabled",
-      "reason": "The built-in node-fetch compatibility class accepts and preserves relative URL inputs while retaining native Request behavior."
-    },
-    {
-      "pattern": "^test/js/node/http/node-fetch(?:-cjs|-primordials)?\\.test\\.(?:js|ts)$",
-      "status": "enabled",
-      "reason": "Bun's hardcoded node-fetch package replacements resolve from ESM and CommonJS with compatible exports, primordials, headers, and fetch behavior."
-    },
-    {
-      "pattern": "^test/regression/issue/(?:bundler-plugin-onresolve-entrypoint|fuzzer-ENG-22942|postgres-null-byte-injection|postgres-stringbuilder-assertion-aggressive|prepare-stack-trace-crash|s3-header-injection|s3-signature-order|s3-signature-performance|test-process-stdout-async-iterator|tty-reopen-after-stdin-eof|tui-app-tty-pattern)\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Copied upstream runtime regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
-    },
-    {
-      "pattern": "^test/js/node/crypto/(?:crypto-hmac-algorithm|crypto-oneshot|crypto\\.hmac)\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Node-compatible HMAC and one-shot crypto behavior passes the copied Bun corpus at the normal test timeout."
-    },
-    {
-      "pattern": "^test/js/node/(?:fs/promises\\.test\\.js|process/stdin/stdin-fixtures\\.test\\.ts|util/bun-inspect\\.test\\.ts|vm/vm\\.test\\.ts)$",
-      "status": "enabled",
-      "reason": "Copied Node filesystem, stdin, inspect, and VM behavior passes directly under Cottontail at the normal test timeout."
-    },
-    {
-      "pattern": "^test/js/web/fetch/headers\\.undici\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Undici-derived Web Headers behavior passes the copied Bun corpus at the normal test timeout."
-    },
-    {
-      "pattern": "^test/js/web/(?:nationalized|request/request-subclass)\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Bun's abort-controller replacement and Web Request subclass getter/validation behavior pass the copied upstream coverage."
-    },
-    {
-      "pattern": "^test/js/web/websocket/(?:websocket-custom-headers|websocket-permessage-deflate-simple|websocket-permessage-deflate|websocket-subprotocol-strict)\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "WebSocket custom-header, compression, and subprotocol behavior passes the copied Bun corpus at the normal test timeout."
-    },
-    {
-      "pattern": "^test/js/third_party/body-parser/express-bun-build-compile\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied body-parser Express build/compile integration passes directly under Cottontail at the normal test timeout."
-    },
-    {
-      "pattern": "^test/regression/issue/(?:11793\\.test\\.ts|12782\\.test\\.ts|14029\\.test\\.ts|19850/19850\\.test\\.ts|20980\\.test\\.ts)$",
-      "status": "enabled",
-      "reason": "Focused batch validation confirms Bun test-runner preload, hook, snapshot, timing, primitive-error, and test.each lifecycle behavior."
-    },
-    {
-      "pattern": "^test/regression/issue/(?:00631\\.test\\.ts|026039\\.test\\.ts|02977\\.test\\.ts|07740\\.test\\.ts|09559\\.test\\.ts|10132\\.test\\.ts|11806\\.test\\.ts|12117\\.test\\.ts|1365\\.test\\.ts|21177\\.test\\.ts|24502/bun-pm-ls-all-invalid-package-id\\.test\\.ts|25589-frame-size-(?:connect|grpc)\\.test\\.ts|26460\\.test\\.ts|malformed-integrity-base64\\.test\\.ts)$",
-      "status": "enabled",
-      "reason": "Focused batch validation confirms package-manager, CLI diagnostics, completion, package-script ancestry, test alias, socket lifecycle, and HTTP/2 frame-size regressions."
-    },
-    {
-      "pattern": "^test/regression/issue/17766\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied Unicode property escape and Acorn parser regression passes both deterministic cases with its inline snapshot."
-    },
-    {
-      "pattern": "^test/js/third_party/grpc-js/test-(?:channelz|global-subchannel-pool|idle-timer|local-subchannel-pool|outlier-detection|pick-first|retry|server-errors|server-interceptors)\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Focused batch validation confirms deterministic gRPC channel, resolver-pool, retry, server, interceptor, and HTTP/2 stream lifecycle behavior."
-    },
-    {
-      "pattern": "^test/js/third_party/grpc-js/test-tonic\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "The copied tonic interoperability case passes with its external fixture setup under the owned extended test deadline.",
-      "args": [
-        "--timeout=30000"
-      ],
-      "timeoutMs": 60000
-    },
-    {
-      "pattern": "^test/js/node/tls/(?:fetch-tls-cert|node-tls-cert|node-tls-server)\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Focused batch validation confirms deterministic Node TLS certificate, server, session, and connection semantics."
-    },
-    {
-      "pattern": "^test/js/(?:first_party/(?:undici/undici-primordials|ws/ws-proxy)|third_party/(?:http2-wrapper/http2-wrapper|socket\\.io/socket\\.io-connection-state-recovery))\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Focused batch validation confirms Undici primordials, WebSocket proxying, HTTP/2 wrapper, and Socket.IO recovery behavior."
-    },
-    {
-      "pattern": "^test/js/third_party/(?:@duckdb/node-api/duckdb\\.test\\.ts|@napi-rs/canvas/napi-rs-canvas\\.test\\.ts|duckdb/duckdb-basic-usage\\.test\\.ts|resvg/bbox\\.test\\.js)$",
-      "status": "enabled",
-      "reason": "Focused batch validation confirms native addon loading and compatibility for DuckDB, napi-rs canvas, and resvg."
-    },
-    {
-      "pattern": "^test/js/(?:bun/(?:jsc/shadow\\.test\\.js|util/(?:heap-snapshot\\.test\\.ts|inspect-error\\.test\\.js))|node/(?:inspector/(?:inspector-profiler|inspector)\\.test\\.ts|v8/capture-stack-trace\\.test\\.js))$",
-      "status": "enabled",
-      "reason": "Focused batch validation confirms Bun/JSC heap and error introspection plus Node inspector, profiler, and structured stack behavior on stock JSC."
-    },
-    {
-      "pattern": "^test/cli/run/(?:env|esm-defineProperty|filter-workspace|garbage-env|run-autoinstall|run-shell|tsconfig-override|workspaces)\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Focused batch validation confirms Bun CLI environment loading, workspace selection, module descriptors, auto-install, shell, and tsconfig behavior."
-    },
-    {
-      "pattern": "^test/(?:bundler/standalone\\.test\\.ts|bake/dev/(?:plugins|vfile|incremental-graph-edge-deletion|import-meta-inline)\\.test\\.ts)$",
-      "status": "enabled",
-      "reason": "Focused batch validation confirms standalone compiler output and Bake plugin, virtual-file, graph invalidation, and import.meta behavior."
-    },
-    {
-      "pattern": "^test/js/(?:bun/http/bun-serve-html(?:-entry|-manifest)?\\.test\\.ts|node/http/node-http-with-ws\\.test\\.ts)$",
-      "status": "enabled",
-      "reason": "Focused batch validation confirms Bun HTML serving, generated manifests/assets, CLI HTML entrypoints, and Node HTTP/WebSocket interoperability."
-    },
-    {
-      "pattern": "^test/regression/issue/(?:08093|21907|22003|23474|23649)\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Exact copied regressions pass package hardlink installation, large CSS-number parsing, sourcemap filename escaping, WebSocket upgrade cookies, and malformed async-function diagnostics (7 cases, 40 assertions)."
-    },
-    {
-      "pattern": "^test/regression/issue/12548\\.test\\.ts$",
-      "status": "enabled",
-      "reason": "Both copied BunPlugin TypeScript loader and type-import regressions pass; stock-JSC compilation requires a larger per-file budget (2 cases, 6 assertions).",
-      "args": [
-        "--timeout=30000"
-      ],
-      "timeoutMs": 45000
-    }
-  ],
   "tests": {
     "test/bundler/bun-build-api.test.ts": {
       "status": "enabled",
       "reason": "Thirty-five Bun.build cases, seven snapshots, and one upstream todo pass across exact BuildArtifact output/hashes, options, errors, plugins, HTML loading, sourcemaps, tsconfig resolution, DCE annotations, macros, NODE_PATH, and callbacks. The remaining bytecode case requires a cached-bytecode serializer unavailable in stock JSC.",
-      "args": [
-        "--test-name-pattern=^(?!.*bytecode works).*$"
-      ],
-      "timeoutMs": 120000
+      "args": ["--test-name-pattern=^(?!.*bytecode works).*$"],
+      "timeoutMs": 120000,
+      "testNameExclusion": {
+        "pattern": "^(?!.*bytecode works).*$",
+        "classification": "runtime-gap",
+        "testNames": ["bytecode works"],
+        "reason": "Bun.build bytecode output still requires cached-bytecode serialization support."
+      }
     },
     "test/bundler/bundler_edgecase.test.ts": {
       "status": "enabled",
@@ -775,9 +205,7 @@
     "test/bundler/bun-build-compile-sourcemap.test.ts": {
       "status": "enabled",
       "reason": "Standalone source maps pass inline, external, linked, nested-outfile, multi-source, and real split-module graph coverage. Split chunks and their unique maps are embedded, resolved from memory, materialized when requested, and execute successfully. The owned runner allows 30 seconds per case because assembling a self-contained executable can exceed Bun's 5-second default (9 bun:test cases, 84 assertions).",
-      "args": [
-        "--timeout=30000"
-      ],
+      "args": ["--timeout=30000"],
       "timeoutMs": 180000
     },
     "test/bundler/bun-build-compile.test.ts": {
@@ -787,9 +215,17 @@
     "test/bundler/bundler_banner.test.ts": {
       "status": "enabled",
       "reason": "Banner placement passes across browser/Bun targets, ESM/CJS formats, minification, and source/banner hashbangs (8 bun:test cases, 11 assertions). Three bytecode-only cases are excluded because stock JSCOnly exposes no cached-bytecode serializer; Cottontail rejects bytecode builds explicitly instead of emitting unusable artifacts.",
-      "args": [
-        "--test-name-pattern=^(?!.*Bytecode).*"
-      ]
+      "args": ["--test-name-pattern=^(?!.*Bytecode).*"],
+      "testNameExclusion": {
+        "pattern": "^(?!.*Bytecode).*",
+        "classification": "runtime-gap",
+        "testNames": [
+          "banner/BannerWithBytecodeAndCJSTargetBun",
+          "banner/HashbangBannerWithBytecodeAndCJSTargetBun",
+          "banner/SourceHashbangWithBytecodeAndCJSTargetBun"
+        ],
+        "reason": "The three generated banner cases require Bun-compatible CJS bytecode output."
+      }
     },
     "test/bundler/bundler_barrel.test.ts": {
       "status": "enabled",
@@ -806,6 +242,9 @@
       "splitBundlerTests": true,
       "expectedFailureBundlerTests": {
         "bun/import-bun-format-cjs": "Bun's --bytecode format requires private JavaScriptCore cached-bytecode APIs that stock JSC does not expose; Cottontail intentionally uses unmodified JSC."
+      },
+      "expectedFailureBundlerTestClassifications": {
+        "bun/import-bun-format-cjs": "runtime-gap"
       }
     },
     "test/bundler/bundler_cjs.test.ts": {
@@ -913,6 +352,9 @@
       "includeBundlerFileTests": true,
       "expectedFailureBundlerTests": {
         "$file": "The ordinary integration case invokes `cottontail install`; its empty dependency manifest still reaches the not-yet-integrated package-manager command before plugin finalization is exercised."
+      },
+      "expectedFailureBundlerTestClassifications": {
+        "$file": "delegated"
       }
     },
     "test/bundler/bundler_drop.test.ts": {
@@ -952,6 +394,12 @@
         "jsx/AutomaticFragmentProd": "Upstream marks this case todo and expects only the final fragment even though its fixture prints two preceding JSX values.",
         "jsx/ImportSourceProd": "Upstream marks production todo but expects the development fragment symbol from the production custom JSX runtime.",
         "jsx/PragmaMultipleProd": "Upstream marks this case todo and expects React production element semantics that its copied local react/jsx-runtime fixture does not implement."
+      },
+      "expectedFailureBundlerTestClassifications": {
+        "jsx/AutomaticFragmentDev": "upstream",
+        "jsx/AutomaticFragmentProd": "upstream",
+        "jsx/ImportSourceProd": "upstream",
+        "jsx/PragmaMultipleProd": "upstream"
       }
     },
     "test/bundler/bundler_loader.test.ts": {
@@ -979,6 +427,10 @@
       "expectedFailureBundlerTests": {
         "npm/ReactSSR": "Requires a functional `cottontail install` package-manager path to materialize React before the bundler behavior can run.",
         "npm/LodashES": "Requires a functional `cottontail install` package-manager path to materialize lodash-es before the bundler behavior can run."
+      },
+      "expectedFailureBundlerTestClassifications": {
+        "npm/ReactSSR": "delegated",
+        "npm/LodashES": "delegated"
       }
     },
     "test/bundler/bundler_plugin.test.ts": {
@@ -1218,12 +670,14 @@
       "status": "skip",
       "owner": "hutch-package-manager",
       "reason": "All 26 stable bunx cases pass with 115 assertions and one platform skip. The live @angular/cli@latest case is excluded as non-hermetic registry drift because current Angular requires a newer Node patch release and official Bun 1.3.10 fails it identically.",
-      "args": [
-        "--timeout",
-        "300000",
-        "--test-name-pattern=^(?!should handle package that requires node 24$).*"
-      ],
-      "timeoutMs": 360000
+      "args": ["--timeout", "300000", "--test-name-pattern=^(?!should handle package that requires node 24$).*"],
+      "timeoutMs": 360000,
+      "testNameExclusion": {
+        "pattern": "^(?!should handle package that requires node 24$).*",
+        "classification": "environment",
+        "testNames": ["should handle package that requires node 24"],
+        "reason": "The live @angular/cli registry case has drifted beyond the pinned runtime and fails under Bun 1.3.10 too."
+      }
     },
     "test/cli/install/bun-audit.test.ts": {
       "status": "skip",
@@ -1617,9 +1071,7 @@
       "status": "enabled",
       "reason": "Vanilla JSC sampling data is emitted as Chrome CPU profiles and relationship-aware markdown with names, paths, timings, custom output names, and directories. The copied stress file runs alone at four-way concurrency because every profiled child parses Cottontail's full JavaScript runtime launcher; the public Bun-compatible default remains 20.",
       "serial": true,
-      "args": [
-        "--max-concurrency=4"
-      ]
+      "args": ["--max-concurrency=4"]
     },
     "test/cli/run/empty-file.test.ts": {
       "status": "enabled",
@@ -1675,7 +1127,8 @@
     },
     "test/cli/run/require-cache.test.ts": {
       "status": "expected-failure",
-      "reason": "Performance-only quarantine: CommonJS cache deletion and fresh evaluation, wrapper mutation and factory reuse, dynamic import, basic cache behavior, and long-export modules pass. The remaining unchanged await-import memory case peaks around 96 MB against Bun's 64 MB ceiling."
+      "reason": "Performance-only quarantine: CommonJS cache deletion and fresh evaluation, wrapper mutation and factory reuse, dynamic import, basic cache behavior, and long-export modules pass. The remaining unchanged await-import memory case peaks around 96 MB against Bun's 64 MB ceiling.",
+      "classification": "performance"
     },
     "test/cli/run/run-cjs.test.ts": {
       "status": "enabled",
@@ -2039,9 +1492,7 @@
       "status": "enabled",
       "reason": "Bun.serve TLS coverage passes with the streaming node:http/https/tls stack (16 bun:test cases, 32 assertions). The three-handshake SNI fixture runs serially with a 15-second per-case budget because Cottontail performs each handshake through its JS HTTP/TLS stack.",
       "serial": true,
-      "args": [
-        "--timeout=15000"
-      ]
+      "args": ["--timeout=15000"]
     },
     "test/js/bun/http/bun-serve-static.test.ts": {
       "status": "enabled",
@@ -2087,7 +1538,8 @@
     },
     "test/js/bun/http/req-url-leak.test.ts": {
       "status": "expected-failure",
-      "reason": "Performance-only quarantine: inherited Bun IPC exposes the transport-backed process.channel control contract, and a bounded 130-request probe with 15 KB targets plateaued from 844 MB at its midpoint to 845 MB at completion, confirming functional URL release. The stock-JSC baseline already exceeds Bun's absolute 150 MB ceiling."
+      "reason": "Performance-only quarantine: inherited Bun IPC exposes the transport-backed process.channel control contract, and a bounded 130-request probe with 15 KB targets plateaued from 844 MB at its midpoint to 845 MB at completion, confirming functional URL release. The stock-JSC baseline already exceeds Bun's absolute 150 MB ceiling.",
+      "classification": "performance"
     },
     "test/js/bun/http/request-smuggling.test.ts": {
       "status": "enabled",
@@ -2095,7 +1547,8 @@
     },
     "test/js/bun/http/serve-body-leak.test.ts": {
       "status": "expected-failure",
-      "reason": "Performance-only quarantine: bounded probes pass ignore, text, JSON, body-getter, complete-stream, incomplete-stream, and streaming-echo behavior across 56 half-megabyte requests. The stock-JSC child starts around 761 MB RSS, already above the copied absolute 512 MB ceiling, and the exact stress workload also exceeds its copied 40-second deadline."
+      "reason": "Performance-only quarantine: bounded probes pass ignore, text, JSON, body-getter, complete-stream, incomplete-stream, and streaming-echo behavior across 56 half-megabyte requests. The stock-JSC child starts around 761 MB RSS, already above the copied absolute 512 MB ceiling, and the exact stress workload also exceeds its copied 40-second deadline.",
+      "classification": "performance"
     },
     "test/js/bun/http/serve-direct-readable-stream.test.ts": {
       "status": "enabled",
@@ -2559,7 +2012,8 @@
     },
     "test/js/bun/spawn/spawn-pipe-leak.test.ts": {
       "status": "expected-failure",
-      "reason": "Performance-only expected failure: the exact unchanged aggregate launches 2,250 nested Cottontail processes and was stopped after 32 minutes while bounded batches continued making progress; reduced read-after-exit, unread, and read-before-exit probes pass with stable forced-GC RSS."
+      "reason": "Performance-only expected failure: the exact unchanged aggregate launches 2,250 nested Cottontail processes and was stopped after 32 minutes while bounded batches continued making progress; reduced read-after-exit, unread, and read-before-exit probes pass with stable forced-GC RSS.",
+      "classification": "performance"
     },
     "test/js/bun/spawn/spawn-signal.test.ts": {
       "status": "enabled",
@@ -2676,10 +2130,6 @@
     "test/js/bun/test/concurrent.test.ts": {
       "status": "enabled",
       "reason": "bun:test concurrent test scheduling, max-concurrency, and serial override coverage passes under Cottontail."
-    },
-    "test/js/bun/test/concurrent-test-glob.test.ts": {
-      "status": "enabled",
-      "reason": "Bun test.concurrent file-glob selection and execution behavior passes the copied upstream file (4 bun:test cases, 11 assertions)."
     },
     "test/js/bun/test/concurrent_immediate.test.ts": {
       "status": "enabled",
@@ -3239,9 +2689,7 @@
       "status": "enabled",
       "reason": "The copied upstream async-context tracking matrix passes across events, streams, timers, networking, HTTP, TLS, child processes, filesystem, DNS, crypto, workers, and Web APIs (74 active cases plus 1 upstream todo). Every active case launches both Cottontail and Node, so the file runs outside the outer parallel pool with four concurrent cases.",
       "serial": true,
-      "args": [
-        "--max-concurrency=4"
-      ]
+      "args": ["--max-concurrency=4"]
     },
     "test/js/node/async_hooks/async-local-storage-thenable.test.ts": {
       "status": "enabled",
@@ -3475,9 +2923,7 @@
     "test/js/node/http/node-http-uaf.test.ts": {
       "status": "enabled",
       "reason": "Both copied abort-heavy HTTP fixtures complete without crashes, duplicate request errors, or late rejected body work (2 cases, 8 assertions); their 22-second average runtime needs a functional-parity timeout budget.",
-      "args": [
-        "--timeout=30000"
-      ],
+      "args": ["--timeout=30000"],
       "timeoutMs": 90000
     },
     "test/js/node/http/node-http-with-ws.test.ts": {
@@ -4002,50 +3448,6 @@
       "status": "enabled",
       "reason": "The complete copied zlib behavior corpus passes with callable constructors, validation, dictionaries, truncated streams, concatenated frames, Brotli params, and incremental Brotli/Zstd output (378 bun:test cases, 425 assertions)."
     },
-    "test/js/node/test/parallel/test-child-process-execfilesync-maxbuf.js": {
-      "status": "enabled",
-      "reason": "Node execFileSync routes through the native spawnSync limit contract and reports maxBuffer failures with captured output."
-    },
-    "test/js/node/test/parallel/test-child-process-execsync-maxbuf.js": {
-      "status": "enabled",
-      "reason": "Node execSync routes through the native spawnSync limit contract and reports maxBuffer failures with captured output."
-    },
-    "test/js/node/test/parallel/test-child-process-spawnsync-args.js": {
-      "status": "enabled",
-      "reason": "Node spawnSync argument normalization and child argv behavior pass the copied upstream file."
-    },
-    "test/js/node/test/parallel/test-child-process-spawnsync-env.js": {
-      "status": "enabled",
-      "reason": "Node spawnSync environment inheritance, replacement, and value coercion pass the copied upstream file."
-    },
-    "test/js/node/test/parallel/test-child-process-spawnsync-input.js": {
-      "status": "enabled",
-      "reason": "Node spawnSync supports string, Buffer, TypedArray, and DataView input plus pipe and inherited output semantics."
-    },
-    "test/js/node/test/parallel/test-child-process-spawnsync-kill-signal.js": {
-      "status": "enabled",
-      "reason": "Node spawnSync timeout termination honors default, named, and numeric kill signals with ETIMEDOUT metadata."
-    },
-    "test/js/node/test/parallel/test-child-process-spawnsync-maxbuf.js": {
-      "status": "enabled",
-      "reason": "Node spawnSync enforces explicit, infinite, and default maxBuffer limits with ENOBUFS metadata and partial output."
-    },
-    "test/js/node/test/parallel/test-child-process-spawnsync-shell.js": {
-      "status": "enabled",
-      "reason": "Node spawnSync shell command construction and output behavior pass the copied upstream file."
-    },
-    "test/js/node/test/parallel/test-child-process-spawnsync-timeout.js": {
-      "status": "enabled",
-      "reason": "Node spawnSync terminates timed-out children natively and returns ETIMEDOUT system-error metadata."
-    },
-    "test/js/node/test/parallel/test-child-process-spawnsync-validation-errors.js": {
-      "status": "enabled",
-      "reason": "Node spawnSync validates cwd, process flags, credentials, shell, argv0, timeout, maxBuffer, and killSignal options."
-    },
-    "test/js/node/test/parallel/test-child-process-spawnsync.js": {
-      "status": "enabled",
-      "reason": "Node spawnSync process status, ENOENT metadata, cwd, and Buffer/string output encodings pass the copied upstream file."
-    },
     "test/js/sql/adapter-env-var-precedence.test.ts": {
       "status": "enabled",
       "reason": "Bun.SQL adapter precedence, URL and environment parsing, aliases, TLS, timeouts, and MySQL/MariaDB configuration pass all 38 copied upstream cases with 123 assertions."
@@ -4105,9 +3507,7 @@
     "test/js/third_party/astro/astro-post.test.js": {
       "status": "enabled",
       "reason": "All four copied Astro action cases pass through real production builds and preview servers, covering POST actions and multipart form data under both Bun and Node adapters (6 assertions).",
-      "args": [
-        "--timeout=300000"
-      ],
+      "args": ["--timeout=300000"],
       "timeoutMs": 120000
     },
     "test/js/third_party/duckdb/duckdb-basic-usage.test.ts": {
@@ -4117,25 +3517,19 @@
     "test/js/third_party/es-module-lexer/es-module-lexer.test.ts": {
       "status": "enabled",
       "reason": "The copied event-loop regression completes ten real es-module-lexer child launches and validates every parse and exit result; stock-JSC child startup requires a larger per-case budget (1 case, 20 assertions).",
-      "args": [
-        "--timeout=300000"
-      ],
+      "args": ["--timeout=300000"],
       "timeoutMs": 360000
     },
     "test/js/third_party/esbuild/esbuild-child_process.test.ts": {
       "status": "enabled",
       "reason": "The copied fixture runs esbuild 0.17.11's real service process across asynchronous and synchronous transform/build operations; nested stock-JSC startup requires a larger per-case budget (1 case, 1 assertion).",
-      "args": [
-        "--timeout=120000"
-      ],
+      "args": ["--timeout=120000"],
       "timeoutMs": 180000
     },
     "test/js/third_party/prisma/prisma.test.ts": {
       "status": "enabled",
       "reason": "The copied Bun CI path runs real Prisma 5.1.1 SQLite/Postgres client generation and native-engine dependency loading before its upstream-authored CI skips; database and leak cases remain skipped exactly as under Bun CI.",
-      "args": [
-        "--timeout=120000"
-      ],
+      "args": ["--timeout=120000"],
       "timeoutMs": 240000,
       "env": {
         "CI": "1",
@@ -4516,10 +3910,17 @@
     },
     "test/js/web/fetch/body.test.ts": {
       "status": "enabled",
-      "reason": "All 340 runnable local body cases pass, including SharedArrayBuffer, FormData, ReadableStream, Bun.spawn output, cloning, and every body-consumption method. Four cases are skipped upstream; the two example.com fetch fixtures are filtered because this test environment has no external DNS.",
-      "args": [
-        "--test-name-pattern=^(?!.*fetch[(][)] stream).*$"
-      ]
+      "reason": "The file remains classified enabled with two external-DNS cases accounted as environmental exclusions. An unfiltered audit exposed two empty-File FormData type regressions; the assigned HTTP fix and focused rerun must land before this entry supports a full-parity claim.",
+      "args": ["--test-name-pattern=^(?!.*fetch[(][)] stream).*$"],
+      "testNameExclusion": {
+        "pattern": "^(?!.*fetch[(][)] stream).*$",
+        "classification": "environment",
+        "testNames": [
+          "Request > constructor > ReadableStream > fetch() stream",
+          "Response > constructor > ReadableStream > fetch() stream"
+        ],
+        "reason": "Both cases require external example.com DNS; curl and Node fail the same lookup in this environment."
+      }
     },
     "test/js/web/fetch/chunked-trailing.test.js": {
       "status": "enabled",
@@ -4759,9 +4160,7 @@
     "test/js/web/websocket/websocket.test.js": {
       "status": "enabled",
       "reason": "Bun WebSocket client/server lifecycle, TLS verification, encrypted keys, handshake failures, binary and large messages, subprocess cleanup, stress cancellation, and GC coverage pass the copied upstream file (24 bun:test cases, 78 assertions).",
-      "args": [
-        "--timeout=120000"
-      ],
+      "args": ["--timeout=120000"],
       "timeoutMs": 120000
     },
     "test/js/workerd/html-rewriter.test.js": {
@@ -5009,9 +4408,7 @@
     "test/regression/issue/12042.test.ts": {
       "status": "enabled",
       "reason": "Verbose fetch logs the form-urlencoded request body without recursion or a crash (1 case, 1 assertion); stock-JSC subprocess startup requires a larger case budget.",
-      "args": [
-        "--timeout=30000"
-      ],
+      "args": ["--timeout=30000"],
       "timeoutMs": 60000
     },
     "test/regression/issue/12250.test.ts": {
@@ -5196,17 +4593,13 @@
     "test/regression/issue/22157.test.ts": {
       "status": "enabled",
       "reason": "Both compiled-executable argv cases pass all 8 assertions; the extended case deadline accommodates Cottontail's compile startup cost without changing assertions.",
-      "args": [
-        "--timeout=15000"
-      ],
+      "args": ["--timeout=15000"],
       "timeoutMs": 60000
     },
     "test/regression/issue/22199.test.ts": {
       "status": "enabled",
       "reason": "Plugin onResolve callbacks handle async undefined, async null, sync undefined, and rejected promises without crashing (4 cases, 8 assertions).",
-      "args": [
-        "--timeout=15000"
-      ],
+      "args": ["--timeout=15000"],
       "timeoutMs": 90000
     },
     "test/regression/issue/22243.test.ts": {
@@ -5510,9 +4903,7 @@
     "test/regression/issue/26460.test.ts": {
       "status": "enabled",
       "reason": "All four shell cwd forms pass 12 assertions; the extended case and file deadlines accommodate Cottontail startup while preserving the copied checks.",
-      "args": [
-        "--timeout=30000"
-      ],
+      "args": ["--timeout=30000"],
       "timeoutMs": 120000
     },
     "test/regression/issue/26631.test.ts": {
@@ -5526,9 +4917,7 @@
     "test/regression/issue/26851.test.ts": {
       "status": "enabled",
       "reason": "Both --bail JUnit reporter regressions write the requested output file and preserve their copied assertions (2 cases, 13 assertions); subprocess startup requires a larger case budget.",
-      "args": [
-        "--timeout=30000"
-      ],
+      "args": ["--timeout=30000"],
       "timeoutMs": 120000
     },
     "test/regression/issue/27014.test.ts": {
@@ -5748,6 +5137,10 @@
       "timeoutMs": 900000
     },
     "test/cli/create/create-jsx.test.ts": {
+      "env": {
+        "CI": "1"
+      },
+      "timeoutMs": 240000,
       "status": "skip",
       "owner": "hutch-package-manager",
       "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
@@ -5778,11 +5171,13 @@
       "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
     },
     "test/cli/update_interactive_formatting.test.ts": {
+      "timeoutMs": 30000,
       "status": "skip",
       "owner": "hutch-package-manager",
       "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
     },
     "test/cli/update_interactive_install.test.ts": {
+      "timeoutMs": 30000,
       "status": "skip",
       "owner": "hutch-package-manager",
       "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
@@ -5821,6 +5216,1257 @@
       "status": "skip",
       "owner": "hutch-package-manager",
       "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
+    },
+    "test/bake/dev/plugins.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms standalone compiler output and Bake plugin, virtual-file, graph invalidation, and import.meta behavior."
+    },
+    "test/bake/dev/vfile.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms standalone compiler output and Bake plugin, virtual-file, graph invalidation, and import.meta behavior."
+    },
+    "test/bundler/standalone.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms standalone compiler output and Bake plugin, virtual-file, graph invalidation, and import.meta behavior."
+    },
+    "test/cli/bunfig-test-options.test.ts": {
+      "status": "enabled",
+      "reason": "Bunfig test randomization, seeded ordering, invalid seed combinations, rerunEach, and combined test options pass all five copied cases; subprocess-heavy stock-JSC startup requires a larger per-case budget.",
+      "args": ["--timeout=30000"],
+      "timeoutMs": 150000
+    },
+    "test/cli/heap-prof.test.ts": {
+      "status": "enabled",
+      "reason": "All seven copied profiling cases pass with Bun-compatible option validation, naming, directories, lifecycle flushing, and truthful stock-JSC sampling-profiler failure handling (55 assertions).",
+      "args": ["--timeout=20000"],
+      "timeoutMs": 180000
+    },
+    "test/cli/hot/watch-many-dirs.test.ts": {
+      "status": "enabled",
+      "reason": "The copied 129-directory hot-reload stress case passes all three simultaneous update cycles and exits cleanly (1 case, 6 assertions)."
+    },
+    "test/cli/inspect/BunFrontendDevServer.test.ts": {
+      "status": "enabled",
+      "reason": "The copied frontend dev-server inspector coverage passes all 5 active cases, 36 assertions, and 2 snapshots; 2 upstream cases remain authored as todos.",
+      "args": ["--timeout=20000"],
+      "timeoutMs": 120000
+    },
+    "test/cli/inspect/HTTPServerAgent.test.ts": {
+      "status": "enabled",
+      "reason": "The copied HTTPServer inspector case passes initial and hot-reloaded route reporting, stable server identity, and close lifecycle coverage (1 case, 5 assertions, 3 snapshots).",
+      "args": ["--timeout=30000"],
+      "env": {
+        "COTTONTAIL_TMP_DIR": "/tmp",
+        "TMPDIR": "/tmp",
+        "TMP": "/tmp",
+        "TEMP": "/tmp"
+      },
+      "timeoutMs": 60000
+    },
+    "test/cli/inspect/inspect.test.ts": {
+      "status": "enabled",
+      "reason": "The copied inspector CLI and protocol coverage passes all 29 cases and 73 assertions across TCP, Unix, IPv4, IPv6, inspect-wait, inspect-brk, WebSocket, node:inspector, lifecycle, and error-stack behavior.",
+      "timeoutMs": 120000
+    },
+    "test/cli/inspect/test-reporter.test.ts": {
+      "status": "enabled",
+      "reason": "The copied TestReporter inspector case passes its retroactive discovery, parent relationships, execution lifecycle, and clean child exit checks (1 case, 7 assertions).",
+      "args": ["--timeout=30000"],
+      "env": {
+        "COTTONTAIL_TMP_DIR": "/tmp",
+        "TMPDIR": "/tmp",
+        "TMP": "/tmp",
+        "TEMP": "/tmp"
+      },
+      "timeoutMs": 60000
+    },
+    "test/cli/run/esm-defineProperty.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms Bun CLI environment loading, workspace selection, module descriptors, auto-install, shell, and tsconfig behavior."
+    },
+    "test/cli/run/garbage-env.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms Bun CLI environment loading, workspace selection, module descriptors, auto-install, shell, and tsconfig behavior."
+    },
+    "test/cli/run/run-eval.test.ts": {
+      "status": "enabled",
+      "reason": "All 29 copied eval and print cases pass across argument placement, TypeScript and JSX transforms, top-level await, source URLs, inspect formatting, and syntax failures (58 assertions).",
+      "args": ["--timeout=50000"],
+      "timeoutMs": 600000
+    },
+    "test/cli/run/run-unicode.test.ts": {
+      "status": "enabled",
+      "reason": "Serially confirmed after unclassified discovery: Unicode script names and arguments pass both copied upstream cases with two assertions."
+    },
+    "test/cli/run/sql-preconnect.test.ts": {
+      "status": "enabled",
+      "reason": "The copied SQL preconnect fixture passes both local-loopback cases: startup connects when DATABASE_URL and --sql-preconnect are present and does not connect without the flag (4 assertions).",
+      "args": ["--timeout=10000"],
+      "timeoutMs": 30000
+    },
+    "test/cli/run/transpiler-cache.test.ts": {
+      "status": "enabled",
+      "reason": "All eight copied runtime transpiler-cache cases pass across enablement, version invalidation, content addressing, permissions, concurrent writers, and non-inlined environment values (116 assertions).",
+      "args": ["--timeout=180000"],
+      "timeoutMs": 600000
+    },
+    "test/cli/run/tsconfig-override.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms Bun CLI environment loading, workspace selection, module descriptors, auto-install, shell, and tsconfig behavior."
+    },
+    "test/cli/user-agent.test.ts": {
+      "status": "enabled",
+      "reason": "Both copied user-agent cases pass: the final duplicate option wins and explicit fetch headers override the configured default.",
+      "args": ["--timeout=30000"],
+      "timeoutMs": 90000
+    },
+    "test/config/bunfig/preload.test.ts": {
+      "status": "enabled",
+      "reason": "All 18 active copied preload cases pass with early process bootstrap and Bun-compatible preload ordering; two upstream skips and one todo remain.",
+      "args": ["--timeout=30000"],
+      "timeoutMs": 180000
+    },
+    "test/js/bun/bundler/yaml-bundler.test.js": {
+      "status": "enabled",
+      "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
+    },
+    "test/js/bun/console/bun-inspect-table.test.ts": {
+      "status": "enabled",
+      "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
+    },
+    "test/js/bun/crypto/cipheriv-decipheriv.test.ts": {
+      "status": "enabled",
+      "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
+    },
+    "test/js/bun/fetch/node-use-system-ca.test.ts": {
+      "status": "enabled",
+      "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
+    },
+    "test/js/bun/ffi/addr32.test.ts": {
+      "status": "enabled",
+      "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
+    },
+    "test/js/bun/glob/stress.test.ts": {
+      "status": "enabled",
+      "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
+    },
+    "test/js/bun/http/form-data-set-append.test.js": {
+      "status": "enabled",
+      "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
+    },
+    "test/js/bun/http/getIfPropertyExists.test.ts": {
+      "status": "enabled",
+      "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
+    },
+    "test/js/bun/http/leaks-test.test.ts": {
+      "status": "enabled",
+      "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
+    },
+    "test/js/bun/jsc/string-noAtomize.test.ts": {
+      "status": "enabled",
+      "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
+    },
+    "test/js/bun/resolve/import-meta-resolve.test.mjs": {
+      "status": "enabled",
+      "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
+    },
+    "test/js/bun/resolve/resolve-bad-parent.test.mjs": {
+      "status": "enabled",
+      "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
+    },
+    "test/js/bun/resolve/toml/crash/toml-crash.test.ts": {
+      "status": "enabled",
+      "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
+    },
+    "test/js/bun/s3/s3.leak.test.ts": {
+      "status": "enabled",
+      "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
+    },
+    "test/js/bun/s3/s3.test.ts": {
+      "status": "enabled",
+      "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
+    },
+    "test/js/bun/symbols.test.ts": {
+      "status": "enabled",
+      "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
+    },
+    "test/js/bun/udp/dgram.test.ts": {
+      "status": "enabled",
+      "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
+    },
+    "test/js/bun/util/fuzzy-wuzzy.test.ts": {
+      "status": "enabled",
+      "reason": "Bun's copied fuzzy-wuzzy utility corpus passes with finite cached test/describe modifier graphs, conditional modifiers, conflict validation, prototypes, and .each behavior (153 cases, 330 assertions)."
+    },
+    "test/js/bun/util/inspect-error.test.js": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms Bun/JSC heap and error introspection plus Node inspector, profiler, and structured stack behavior on stock JSC."
+    },
+    "test/js/first_party/undici/undici-primordials.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms Undici primordials, WebSocket proxying, HTTP/2 wrapper, and Socket.IO recovery behavior."
+    },
+    "test/js/first_party/ws/ws-proxy.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms Undici primordials, WebSocket proxying, HTTP/2 wrapper, and Socket.IO recovery behavior."
+    },
+    "test/js/node/cluster.test.ts": {
+      "status": "enabled",
+      "reason": "Serially confirmed after unclassified discovery: Node cluster compatibility and util.inspect getter receiver behavior pass four copied upstream cases."
+    },
+    "test/js/node/crypto/crypto-hmac-algorithm.test.ts": {
+      "status": "enabled",
+      "reason": "Node-compatible HMAC and one-shot crypto behavior passes the copied Bun corpus at the normal test timeout."
+    },
+    "test/js/node/crypto/crypto-oneshot.test.ts": {
+      "status": "enabled",
+      "reason": "Node-compatible HMAC and one-shot crypto behavior passes the copied Bun corpus at the normal test timeout."
+    },
+    "test/js/node/crypto/crypto.hmac.test.ts": {
+      "status": "enabled",
+      "reason": "Node-compatible HMAC and one-shot crypto behavior passes the copied Bun corpus at the normal test timeout."
+    },
+    "test/js/node/fs/promises.test.js": {
+      "status": "enabled",
+      "reason": "Copied Node filesystem, stdin, inspect, and VM behavior passes directly under Cottontail at the normal test timeout."
+    },
+    "test/js/node/http/node-fetch-cjs.test.js": {
+      "status": "enabled",
+      "reason": "Bun's hardcoded node-fetch package replacements resolve from ESM and CommonJS with compatible exports, primordials, headers, and fetch behavior."
+    },
+    "test/js/node/http/node-fetch-primordials.test.ts": {
+      "status": "enabled",
+      "reason": "Bun's hardcoded node-fetch package replacements resolve from ESM and CommonJS with compatible exports, primordials, headers, and fetch behavior."
+    },
+    "test/js/node/http/node-fetch.test.js": {
+      "status": "enabled",
+      "reason": "Bun's hardcoded node-fetch package replacements resolve from ESM and CommonJS with compatible exports, primordials, headers, and fetch behavior."
+    },
+    "test/js/node/inspector/inspector-profiler.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms Bun/JSC heap and error introspection plus Node inspector, profiler, and structured stack behavior on stock JSC."
+    },
+    "test/js/node/inspector/inspector.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms Bun/JSC heap and error introspection plus Node inspector, profiler, and structured stack behavior on stock JSC."
+    },
+    "test/js/node/process/stdin/stdin-fixtures.test.ts": {
+      "status": "enabled",
+      "reason": "Copied Node filesystem, stdin, inspect, and VM behavior passes directly under Cottontail at the normal test timeout."
+    },
+    "test/js/node/tls/fetch-tls-cert.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms deterministic Node TLS certificate, server, session, and connection semantics."
+    },
+    "test/js/node/tls/node-tls-cert.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms deterministic Node TLS certificate, server, session, and connection semantics."
+    },
+    "test/js/node/tls/node-tls-server.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms deterministic Node TLS certificate, server, session, and connection semantics."
+    },
+    "test/js/node/util/bun-inspect.test.ts": {
+      "status": "enabled",
+      "reason": "Copied Node filesystem, stdin, inspect, and VM behavior passes directly under Cottontail at the normal test timeout."
+    },
+    "test/js/node/util/node-inspect-tests/internal-inspect.test.js": {
+      "status": "enabled",
+      "reason": "Copied Node util.inspect and util.format compatibility fixtures complete without assertion failures."
+    },
+    "test/js/node/util/node-inspect-tests/parallel/util-format.test.js": {
+      "status": "enabled",
+      "reason": "Copied Node util.inspect and util.format compatibility fixtures complete without assertion failures."
+    },
+    "test/js/node/util/node-inspect-tests/parallel/util-inspect-getters-accessing-this.test.js": {
+      "status": "enabled",
+      "reason": "Serially confirmed after unclassified discovery: Node cluster compatibility and util.inspect getter receiver behavior pass four copied upstream cases."
+    },
+    "test/js/node/v8/capture-stack-trace.test.js": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms Bun/JSC heap and error introspection plus Node inspector, profiler, and structured stack behavior on stock JSC."
+    },
+    "test/js/third_party/@duckdb/node-api/duckdb.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms native addon loading and compatibility for DuckDB, napi-rs canvas, and resvg."
+    },
+    "test/js/third_party/@napi-rs/canvas/napi-rs-canvas.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms native addon loading and compatibility for DuckDB, napi-rs canvas, and resvg."
+    },
+    "test/js/third_party/body-parser/express-bun-build-compile.test.ts": {
+      "status": "enabled",
+      "reason": "The copied body-parser Express build/compile integration passes directly under Cottontail at the normal test timeout."
+    },
+    "test/js/third_party/comlink/comlink.test.ts": {
+      "status": "enabled",
+      "reason": "The copied Comlink fixture starts a real Web Worker through the native transport and resolves its first remote property within Bun's 100ms bound (one case, one assertion)."
+    },
+    "test/js/third_party/express/app.router.test.ts": {
+      "status": "enabled",
+      "reason": "The copied Express corpus passes with Node-compatible HTTP, streams, body parsing, redirects, legacy URL parsing, file responses, ranges, and filesystem error behavior."
+    },
+    "test/js/third_party/express/express.json.test.ts": {
+      "status": "enabled",
+      "reason": "The copied Express corpus passes with Node-compatible HTTP, streams, body parsing, redirects, legacy URL parsing, file responses, ranges, and filesystem error behavior."
+    },
+    "test/js/third_party/express/express.test.ts": {
+      "status": "enabled",
+      "reason": "The copied Express corpus passes with Node-compatible HTTP, streams, body parsing, redirects, legacy URL parsing, file responses, ranges, and filesystem error behavior."
+    },
+    "test/js/third_party/express/express.text.test.ts": {
+      "status": "enabled",
+      "reason": "The copied Express corpus passes with Node-compatible HTTP, streams, body parsing, redirects, legacy URL parsing, file responses, ranges, and filesystem error behavior."
+    },
+    "test/js/third_party/express/res.json.test.ts": {
+      "status": "enabled",
+      "reason": "The copied Express corpus passes with Node-compatible HTTP, streams, body parsing, redirects, legacy URL parsing, file responses, ranges, and filesystem error behavior."
+    },
+    "test/js/third_party/express/res.location.test.ts": {
+      "status": "enabled",
+      "reason": "The copied Express corpus passes with Node-compatible HTTP, streams, body parsing, redirects, legacy URL parsing, file responses, ranges, and filesystem error behavior."
+    },
+    "test/js/third_party/express/res.redirect.test.ts": {
+      "status": "enabled",
+      "reason": "The copied Express corpus passes with Node-compatible HTTP, streams, body parsing, redirects, legacy URL parsing, file responses, ranges, and filesystem error behavior."
+    },
+    "test/js/third_party/express/res.send.test.ts": {
+      "status": "enabled",
+      "reason": "The copied Express corpus passes with Node-compatible HTTP, streams, body parsing, redirects, legacy URL parsing, file responses, ranges, and filesystem error behavior."
+    },
+    "test/js/third_party/express/res.sendFile.test.ts": {
+      "status": "enabled",
+      "reason": "The copied Express corpus passes with Node-compatible HTTP, streams, body parsing, redirects, legacy URL parsing, file responses, ranges, and filesystem error behavior."
+    },
+    "test/js/third_party/grpc-js/test-call-propagation.test.ts": {
+      "status": "enabled",
+      "reason": "Serially confirmed after unclassified discovery: grpc-js propagation and client/server deadline behavior pass 13 copied upstream cases."
+    },
+    "test/js/third_party/grpc-js/test-channel-credentials.test.ts": {
+      "status": "enabled",
+      "reason": "The copied gRPC credentials/server and pnpm fixtures pass with HTTP/2 TLS controls, package binary resolution, symlinked .bin entries, and native process behavior (60 cases)."
+    },
+    "test/js/third_party/grpc-js/test-channelz.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms deterministic gRPC channel, resolver-pool, retry, server, interceptor, and HTTP/2 stream lifecycle behavior."
+    },
+    "test/js/third_party/grpc-js/test-deadline.test.ts": {
+      "status": "enabled",
+      "reason": "Serially confirmed after unclassified discovery: grpc-js propagation and client/server deadline behavior pass 13 copied upstream cases."
+    },
+    "test/js/third_party/grpc-js/test-global-subchannel-pool.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms deterministic gRPC channel, resolver-pool, retry, server, interceptor, and HTTP/2 stream lifecycle behavior."
+    },
+    "test/js/third_party/grpc-js/test-idle-timer.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms deterministic gRPC channel, resolver-pool, retry, server, interceptor, and HTTP/2 stream lifecycle behavior."
+    },
+    "test/js/third_party/grpc-js/test-local-subchannel-pool.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms deterministic gRPC channel, resolver-pool, retry, server, interceptor, and HTTP/2 stream lifecycle behavior."
+    },
+    "test/js/third_party/grpc-js/test-outlier-detection.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms deterministic gRPC channel, resolver-pool, retry, server, interceptor, and HTTP/2 stream lifecycle behavior."
+    },
+    "test/js/third_party/grpc-js/test-pick-first.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms deterministic gRPC channel, resolver-pool, retry, server, interceptor, and HTTP/2 stream lifecycle behavior."
+    },
+    "test/js/third_party/grpc-js/test-retry.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms deterministic gRPC channel, resolver-pool, retry, server, interceptor, and HTTP/2 stream lifecycle behavior."
+    },
+    "test/js/third_party/grpc-js/test-server-deadlines.test.ts": {
+      "status": "enabled",
+      "reason": "Serially confirmed after unclassified discovery: grpc-js propagation and client/server deadline behavior pass 13 copied upstream cases."
+    },
+    "test/js/third_party/grpc-js/test-server-errors.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms deterministic gRPC channel, resolver-pool, retry, server, interceptor, and HTTP/2 stream lifecycle behavior."
+    },
+    "test/js/third_party/grpc-js/test-server-interceptors.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms deterministic gRPC channel, resolver-pool, retry, server, interceptor, and HTTP/2 stream lifecycle behavior."
+    },
+    "test/js/third_party/grpc-js/test-server.test.ts": {
+      "status": "enabled",
+      "reason": "The copied gRPC credentials/server and pnpm fixtures pass with HTTP/2 TLS controls, package binary resolution, symlinked .bin entries, and native process behavior (60 cases)."
+    },
+    "test/js/third_party/grpc-js/test-tonic.test.ts": {
+      "status": "enabled",
+      "reason": "The copied tonic interoperability case passes with its external fixture setup under the owned extended test deadline.",
+      "args": ["--timeout=30000"],
+      "timeoutMs": 60000
+    },
+    "test/js/third_party/hono/hello-world-fixture.test.ts": {
+      "status": "enabled",
+      "reason": "The copied Hono and Pino fixtures pass against the integrated Node HTTP, stream, filesystem, and logging compatibility runtime (two cases, seven assertions)."
+    },
+    "test/js/third_party/http2-wrapper/http2-wrapper.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms Undici primordials, WebSocket proxying, HTTP/2 wrapper, and Socket.IO recovery behavior."
+    },
+    "test/js/third_party/jsonwebtoken/async_sign.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/buffer.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/claim-aud.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/claim-exp.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/claim-iat.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/claim-iss.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/claim-jti.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/claim-nbf.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/claim-private.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/claim-sub.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/decoding.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/encoding.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/expires_format.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/header-kid.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/invalid_exp.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/issue_147.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/issue_304.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/issue_70.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/jwt.asymmetric_signing.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/jwt.hs.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/jwt.malicious.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/noTimestamp.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/non_object_values.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/option-complete.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/option-maxAge.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/option-nonce.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/rsa-public-key.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/schema.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/set_headers.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/undefined_secretOrPublickey.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/validateAsymmetricKey.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/verify.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/jsonwebtoken/wrong_alg.test.js": {
+      "status": "enabled",
+      "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
+    },
+    "test/js/third_party/msw/msw.test.ts": {
+      "status": "enabled",
+      "reason": "The copied MSW fixture intercepts Axios through the mutable Node HTTP module, returns its synthetic JSON response, and passes the upstream output assertion."
+    },
+    "test/js/third_party/pg-gateway/pglite.test.ts": {
+      "status": "enabled",
+      "reason": "The copied PGlite fixture loads through the integrated PostgreSQL/Node compatibility runtime and completes a real embedded SQL query (one case, 16 assertions); initialization requires a larger stock-JSC budget.",
+      "args": ["--timeout=30000"],
+      "timeoutMs": 60000
+    },
+    "test/js/third_party/pino/pino.test.js": {
+      "status": "enabled",
+      "reason": "The copied Hono and Pino fixtures pass against the integrated Node HTTP, stream, filesystem, and logging compatibility runtime (two cases, seven assertions)."
+    },
+    "test/js/third_party/remix/remix.test.ts": {
+      "status": "enabled",
+      "reason": "The copied Remix fixture starts the real server, serves the application root, and validates its response; stock-JSC child startup slightly exceeds Bun's default case budget.",
+      "args": ["--timeout=30000"],
+      "timeoutMs": 45000
+    },
+    "test/js/third_party/resvg/bbox.test.js": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms native addon loading and compatibility for DuckDB, napi-rs canvas, and resvg."
+    },
+    "test/js/third_party/rollup-v4/rollup-v4.test.ts": {
+      "status": "enabled",
+      "reason": "The copied Rollup v4 fixture loads the native parseAst package entry and matches Bun's AST snapshot (one case, one assertion)."
+    },
+    "test/js/third_party/socket.io/socket.io-connection-state-recovery.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms Undici primordials, WebSocket proxying, HTTP/2 wrapper, and Socket.IO recovery behavior."
+    },
+    "test/js/third_party/st/st.test.ts": {
+      "status": "enabled",
+      "reason": "The copied st fixture starts a Node-compatible HTTP static server, fetches its TypeScript source, and exits cleanly; stock-JSC child startup requires a larger per-case budget.",
+      "args": ["--timeout=20000"],
+      "timeoutMs": 30000
+    },
+    "test/js/web/fetch/abort-signal-leak.test.ts": {
+      "status": "enabled",
+      "reason": "Fetch Request instances always expose an AbortSignal, and in-process Bun.serve request signals survive abort handling without retained-signal growth."
+    },
+    "test/js/web/fetch/headers.undici.test.ts": {
+      "status": "enabled",
+      "reason": "Undici-derived Web Headers behavior passes the copied Bun corpus at the normal test timeout."
+    },
+    "test/js/web/nationalized.test.ts": {
+      "status": "enabled",
+      "reason": "Bun's abort-controller replacement and Web Request subclass getter/validation behavior pass the copied upstream coverage."
+    },
+    "test/js/web/request/request-subclass.test.ts": {
+      "status": "enabled",
+      "reason": "Bun's abort-controller replacement and Web Request subclass getter/validation behavior pass the copied upstream coverage."
+    },
+    "test/js/web/websocket/websocket-custom-headers.test.ts": {
+      "status": "enabled",
+      "reason": "WebSocket custom-header, compression, and subprotocol behavior passes the copied Bun corpus at the normal test timeout."
+    },
+    "test/js/web/websocket/websocket-permessage-deflate-simple.test.ts": {
+      "status": "enabled",
+      "reason": "WebSocket custom-header, compression, and subprotocol behavior passes the copied Bun corpus at the normal test timeout."
+    },
+    "test/js/web/websocket/websocket-permessage-deflate.test.ts": {
+      "status": "enabled",
+      "reason": "WebSocket custom-header, compression, and subprotocol behavior passes the copied Bun corpus at the normal test timeout."
+    },
+    "test/js/web/websocket/websocket-subprotocol-strict.test.ts": {
+      "status": "enabled",
+      "reason": "WebSocket custom-header, compression, and subprotocol behavior passes the copied Bun corpus at the normal test timeout."
+    },
+    "test/napi/node-napi-tests/test/js-native-api/2_function_arguments/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/3_callbacks/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/4_object_factory/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/5_function_factory/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/6_object_wrap/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/7_factory_wrap/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/8_passing_wrapped/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_array/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_bigint/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_cannot_run_js/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_constructor/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_conversions/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_dataview/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_date/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_error/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_exception/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_finalizer/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_function/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_general/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_handle_scope/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_instance_data/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_new_target/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_number/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_object/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_promise/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_properties/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_reference/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_reference_double_free/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_string/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_symbol/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/js-native-api/test_typedarray/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/1_hello_world/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_async/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_async_cleanup_hook/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_async_context/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_buffer/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_callback_scope/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_cleanup_hook/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_env_teardown_gc/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_exception/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_fatal/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_fatal_exception/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_general/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_init_order/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_instance_data/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_make_callback/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_make_callback_recurse/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_null_init/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_reference_by_node_api_version/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_threadsafe_function/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_uv_loop/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_uv_threadpool_size/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_worker_buffer_callback/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_worker_terminate/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/napi/node-napi-tests/test/node-api/test_worker_terminate_finalization/do.test.ts": {
+      "status": "enabled",
+      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "args": ["--timeout=120000"],
+      "timeoutMs": 180000
+    },
+    "test/regression/issue/014865.test.ts": {
+      "status": "enabled",
+      "reason": "The built-in node-fetch compatibility class accepts and preserves relative URL inputs while retaining native Request behavior."
+    },
+    "test/regression/issue/02977.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms package-manager, CLI diagnostics, completion, package-script ancestry, test alias, socket lifecycle, and HTTP/2 frame-size regressions."
+    },
+    "test/regression/issue/04298/04298.test.ts": {
+      "status": "enabled",
+      "reason": "Copied runtime regressions pass directly under Cottontail in the grouped unclassified discovery run."
+    },
+    "test/regression/issue/04947.test.js": {
+      "status": "enabled",
+      "reason": "The built-in node-fetch compatibility class accepts and preserves relative URL inputs while retaining native Request behavior."
+    },
+    "test/regression/issue/08757.test.ts": {
+      "status": "enabled",
+      "reason": "Symlinked entrypoints canonicalize process.argv[1] and Bun.main while preserving entry-only import.meta.main semantics and canonical import.meta paths."
+    },
+    "test/regression/issue/08794.test.ts": {
+      "status": "enabled",
+      "reason": "Ordinary Error stacks are lazily source-mapped and formatted with Node/Bun-compatible V8-style frames, including mocked function names."
+    },
+    "test/regression/issue/08964/08964.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.spawnSync exposes an undefined signalCode after normal exit, and extension-suffixed TypeScript fixtures execute with shared test globals and custom matchers."
+    },
+    "test/regression/issue/09041.test.ts": {
+      "status": "enabled",
+      "reason": "Copied runtime regressions pass directly under Cottontail in the grouped unclassified discovery run."
+    },
+    "test/regression/issue/09559.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms package-manager, CLI diagnostics, completion, package-script ancestry, test alias, socket lifecycle, and HTTP/2 frame-size regressions."
+    },
+    "test/regression/issue/09739.test.ts": {
+      "status": "enabled",
+      "reason": "The abort-controller package replacement preserves the native AbortController constructor through mixed CommonJS and ESM imports."
+    },
+    "test/regression/issue/10132.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms package-manager, CLI diagnostics, completion, package-script ancestry, test alias, socket lifecycle, and HTTP/2 frame-size regressions."
+    },
+    "test/regression/issue/10170.test.ts": {
+      "status": "enabled",
+      "reason": "Promisified child_process.execFile returns Cottontail's canonical Bun-compatible version output with an empty stderr stream."
+    },
+    "test/regression/issue/10380/spy-matchers-diff.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/11793.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms Bun test-runner preload, hook, snapshot, timing, primitive-error, and test.each lifecycle behavior."
+    },
+    "test/regression/issue/12034/12034.test.js": {
+      "status": "enabled",
+      "reason": "Bun.spawnSync exposes an undefined signalCode after normal exit, and extension-suffixed TypeScript fixtures execute with shared test globals and custom matchers."
+    },
+    "test/regression/issue/12117.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms package-manager, CLI diagnostics, completion, package-script ancestry, test alias, socket lifecycle, and HTTP/2 frame-size regressions."
+    },
+    "test/regression/issue/12548.test.ts": {
+      "status": "enabled",
+      "reason": "Both copied BunPlugin TypeScript loader and type-import regressions pass; stock-JSC compilation requires a larger per-file budget (2 cases, 6 assertions).",
+      "args": ["--timeout=30000"],
+      "timeoutMs": 45000
+    },
+    "test/regression/issue/12782.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms Bun test-runner preload, hook, snapshot, timing, primitive-error, and test.each lifecycle behavior."
+    },
+    "test/regression/issue/1365.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms package-manager, CLI diagnostics, completion, package-script ancestry, test alias, socket lifecycle, and HTTP/2 frame-size regressions."
+    },
+    "test/regression/issue/14029.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms Bun test-runner preload, hook, snapshot, timing, primitive-error, and test.each lifecycle behavior."
+    },
+    "test/regression/issue/14135.test.ts": {
+      "status": "enabled",
+      "reason": "Bun test .only selection gates suite hooks correctly, shell echo implements Bun's n/E/e flag and escape semantics, and NaN timer delays emit TimeoutNaNWarning."
+    },
+    "test/regression/issue/14624.test.ts": {
+      "status": "enabled",
+      "reason": "Copied runtime regressions pass directly under Cottontail in the grouped unclassified discovery run."
+    },
+    "test/regression/issue/14709.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/1632.test.ts": {
+      "status": "enabled",
+      "reason": "Destroyed child stdout pipes propagate a real EPIPE to the child, and natural process shutdown honors process.exitCode after lifecycle handlers."
+    },
+    "test/regression/issue/16474.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/17405.test.ts": {
+      "status": "enabled",
+      "reason": "Bun test .only selection gates suite hooks correctly, shell echo implements Bun's n/E/e flag and escape semantics, and NaN timer delays emit TimeoutNaNWarning."
+    },
+    "test/regression/issue/17766.test.ts": {
+      "status": "enabled",
+      "reason": "The copied Unicode property escape and Acorn parser regression passes both deterministic cases with its inline snapshot."
+    },
+    "test/regression/issue/18159/18159.test.ts": {
+      "status": "enabled",
+      "reason": "Bun test .only selection gates suite hooks correctly, shell echo implements Bun's n/E/e flag and escape semantics, and NaN timer delays emit TimeoutNaNWarning."
+    },
+    "test/regression/issue/18595.test.ts": {
+      "status": "enabled",
+      "reason": "AsyncLocalStorage context survives HTTP request callbacks, an awaited timer, and fetch response completion."
+    },
+    "test/regression/issue/19219.test.ts": {
+      "status": "enabled",
+      "reason": "HTMLRewriter propagates synchronous and settled async handler errors, and X509Certificate parses authority information access and extended key usage metadata."
+    },
+    "test/regression/issue/19652.test.ts": {
+      "status": "enabled",
+      "reason": "Copied build production mode, runtime API, raw Date header, and SNI TLS-array regressions pass under Cottontail."
+    },
+    "test/regression/issue/19661.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/19850/19850.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms Bun test-runner preload, hook, snapshot, timing, primitive-error, and test.each lifecycle behavior."
+    },
+    "test/regression/issue/20100.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/20321.test.ts": {
+      "status": "enabled",
+      "reason": "Copied build production mode, runtime API, raw Date header, and SNI TLS-array regressions pass under Cottontail."
+    },
+    "test/regression/issue/20546.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/20753.test.js": {
+      "status": "enabled",
+      "reason": "Node child_process execFile reports normalized asynchronous ENOENT/EACCES errors and preserves encoded stdout/stderr for callbacks and promisification."
+    },
+    "test/regression/issue/20980.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms Bun test-runner preload, hook, snapshot, timing, primitive-error, and test.each lifecycle behavior."
+    },
+    "test/regression/issue/21177.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms package-manager, CLI diagnostics, completion, package-script ancestry, test alias, socket lifecycle, and HTTP/2 frame-size regressions."
+    },
+    "test/regression/issue/21274.test.ts": {
+      "status": "enabled",
+      "reason": "HTMLRewriter propagates synchronous and settled async handler errors, and X509Certificate parses authority information access and extended key usage metadata."
+    },
+    "test/regression/issue/21677.test.ts": {
+      "status": "enabled",
+      "reason": "Copied build production mode, runtime API, raw Date header, and SNI TLS-array regressions pass under Cottontail."
+    },
+    "test/regression/issue/21792.test.ts": {
+      "status": "enabled",
+      "reason": "Copied build production mode, runtime API, raw Date header, and SNI TLS-array regressions pass under Cottontail."
+    },
+    "test/regression/issue/23077/23077.test.ts": {
+      "status": "enabled",
+      "reason": "A nested bun test invocation aggregates multiple explicit test files and exits successfully."
+    },
+    "test/regression/issue/23183.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/24234.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/24385.test.ts": {
+      "status": "enabled",
+      "reason": "All 14 copied Redis and Valkey environment URL variants load and duplicate the lazy client without protocol errors (42 assertions); stock-JSC subprocess startup requires a larger file budget.",
+      "args": ["--timeout=30000"],
+      "timeoutMs": 240000
+    },
+    "test/regression/issue/24387.test.ts": {
+      "status": "enabled",
+      "reason": "A failed synchronous require of top-level-await code clears the module cache so a subsequent dynamic import succeeds; stock-JSC startup requires a larger per-case budget.",
+      "args": ["--timeout=20000"],
+      "timeoutMs": 30000
+    },
+    "test/regression/issue/24399.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/24593.test.ts": {
+      "status": "enabled",
+      "reason": "Exact copied regressions pass under the integrated runtime: compressed WebSocket publish, mTLS client-certificate switching, node-fetch form-data streams, and split re-export linking (11 cases, 52 assertions)."
+    },
+    "test/regression/issue/25231.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/25589-frame-size-connect.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms package-manager, CLI diagnostics, completion, package-script ancestry, test alias, socket lifecycle, and HTTP/2 frame-size regressions."
+    },
+    "test/regression/issue/25589-frame-size-grpc.test.ts": {
+      "status": "enabled",
+      "reason": "Focused batch validation confirms package-manager, CLI diagnostics, completion, package-script ancestry, test alias, socket lifecycle, and HTTP/2 frame-size regressions."
+    },
+    "test/regression/issue/25648.test.ts": {
+      "status": "enabled",
+      "reason": "Explicit --bundle builds correctly rename shadowing function and class expressions and execute without recursive symbol capture; stock-JSC startup requires a larger per-case budget.",
+      "args": ["--timeout=20000"],
+      "timeoutMs": 30000
+    },
+    "test/regression/issue/25750.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/25794.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/26125.test.ts": {
+      "status": "enabled",
+      "reason": "Exact copied regressions pass under the integrated runtime: compressed WebSocket publish, mTLS client-certificate switching, node-fetch form-data streams, and split re-export linking (11 cases, 52 assertions)."
+    },
+    "test/regression/issue/26225.test.ts": {
+      "status": "enabled",
+      "reason": "Exact copied regressions pass under the integrated runtime: compressed WebSocket publish, mTLS client-certificate switching, node-fetch form-data streams, and split re-export linking (11 cases, 52 assertions)."
+    },
+    "test/regression/issue/26286.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.Terminal delivers PTY data callbacks and preserves AsyncLocalStorage state in both copied regression cases (4 assertions)."
+    },
+    "test/regression/issue/26298.test.ts": {
+      "status": "enabled",
+      "reason": "All three copied standalone bytecode regressions pass with stock JSC, including multi-module execution and the real verbose disk-cache hit diagnostic (15 assertions).",
+      "args": ["--timeout=30000"],
+      "timeoutMs": 120000
+    },
+    "test/regression/issue/27117.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/27428.test.ts": {
+      "status": "enabled",
+      "reason": "Exact copied regressions pass with deterministic HTTP parser shutdown, async-context-safe responses, and ws handleProtocols selection and fallback behavior (4 cases).",
+      "args": ["--timeout=10000"],
+      "timeoutMs": 45000
+    },
+    "test/regression/issue/3613.test.ts": {
+      "status": "enabled",
+      "reason": "Exact copied regressions pass with deterministic HTTP parser shutdown, async-context-safe responses, and ws handleProtocols selection and fallback behavior (4 cases).",
+      "args": ["--timeout=10000"],
+      "timeoutMs": 45000
+    },
+    "test/regression/issue/5344.test.ts": {
+      "status": "enabled",
+      "reason": "Exact copied regressions pass under the integrated runtime: compressed WebSocket publish, mTLS client-certificate switching, node-fetch form-data streams, and split re-export linking (11 cases, 52 assertions)."
+    },
+    "test/regression/issue/bundler-plugin-onresolve-entrypoint.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream runtime regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/fuzzer-ENG-22942.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream runtime regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/invalid-escape-sequences.test.ts": {
+      "status": "enabled",
+      "reason": "The copied parser regressions pass on the integrated compiler: malformed escapes produce diagnostics without crashing, and JSX template strings compile and execute correctly."
+    },
+    "test/regression/issue/jsx-template-string-crash.test.ts": {
+      "status": "enabled",
+      "reason": "The copied parser regressions pass on the integrated compiler: malformed escapes produce diagnostics without crashing, and JSX template strings compile and execute correctly."
+    },
+    "test/regression/issue/postgres-null-byte-injection.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream runtime regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/postgres-stringbuilder-assertion-aggressive.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream runtime regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/prepare-stack-trace-crash.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream runtime regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/s3-header-injection.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream runtime regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/s3-signature-order.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream runtime regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/s3-signature-performance.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream runtime regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/test-process-stdout-async-iterator.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream runtime regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/tty-reopen-after-stdin-eof.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream runtime regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    "test/regression/issue/tui-app-tty-pattern.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream runtime regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
     }
+  },
+  "expectedCounts": {
+    "runnableFiles": 1445,
+    "enabled": 1338,
+    "expectedFailure": 5,
+    "skip": 102,
+    "cottontailOwned": 1343,
+    "hutchOwned": 102,
+    "upstreamTodoSkipSyntaxSites": 711,
+    "upstreamTodoSkipSyntaxFiles": 258
   }
 }

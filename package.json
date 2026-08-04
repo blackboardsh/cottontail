@@ -32,6 +32,7 @@
     "compat:surface:all": "bun run compat:surface && bun run compat:surface:view",
     "compat:upstream": "bun run build && node scripts/run-upstream-tests.js all",
     "compat:upstream:bun:ci": "node --test scripts/bun-compat-workflow.test.js && node scripts/run-upstream-tests.js bun --include-expected-failures",
+    "compat:upstream:check": "node scripts/check-bun-status.js",
     "compat:upstream:list": "node scripts/run-upstream-tests.js all --list",
     "compat:upstream:xfail": "bun run build && node scripts/run-upstream-tests.js all --include-expected-failures",
     "compat:upstream:import": "node scripts/import-upstream-tests.js all",
