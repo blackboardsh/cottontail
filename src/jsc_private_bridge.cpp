@@ -10,6 +10,10 @@
 #include <JavaScriptCore/JSStringRef.h>
 #include <JavaScriptCore/JSTypedArray.h>
 #include <JavaScriptCore/JSValueRef.h>
+#include <bmalloc/pas_scavenger.h>
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -36,6 +40,10 @@
 #include <wtf/text/ExternalStringImpl.h>
 #include <wtf/text/StringImpl.h>
 #include <wtf/text/UniquedStringImpl.h>
+
+namespace JSC {
+JSValueRef setNeverOptimize(JSContextRef, JSValueRef);
+}
 
 namespace WTF {
 
@@ -138,6 +146,13 @@ private:
 extern "C" bool ct_jsc_string_is_8_bit(JSStringRef string)
 {
     return string != nullptr && string->is8Bit();
+}
+
+extern "C" JSValueRef ct_jsc_set_never_optimize(
+    JSContextRef context,
+    JSValueRef function)
+{
+    return JSC::setNeverOptimize(context, function);
 }
 
 extern "C" bool ct_jsc_value_is_out_of_memory_error(
@@ -302,8 +317,8 @@ class Exception;
 class FunctionHasExecutedCache;
 class JSCell;
 class JSGlobalObject;
-class JSObject;
 class VM;
+class JSObject;
 
 using SourceID = unsigned;
 
@@ -526,15 +541,25 @@ extern "C" void ct_jsc_collect_full(JSContextRef context)
     if (context == nullptr)
         return;
 
-    auto* vm = ct_jsc_vm(context);
-    JSC::JSLockHolder lock(*vm);
-    auto* heap = ct_jsc_heap(vm);
+    {
+        auto* vm = ct_jsc_vm(context);
+        JSC::JSLockHolder lock(*vm);
+        auto* heap = ct_jsc_heap(vm);
 
-    // Match Bun's synchronous GC path: source-provider and unlinked-code
-    // caches otherwise keep evicted modules' source and filenames alive.
-    vm->clearSourceProviderCaches();
-    heap->deleteAllUnlinkedCodeBlocks(JSC::PreventCollectionAndDeleteAllCode);
-    heap->collectNow(JSC::Sync, JSC::GCRequest(JSC::CollectionScope::Full));
+        // Match Bun's synchronous GC path: source-provider and unlinked-code
+        // caches otherwise keep evicted modules' source and filenames alive.
+        vm->clearSourceProviderCaches();
+        heap->deleteAllUnlinkedCodeBlocks(JSC::PreventCollectionAndDeleteAllCode);
+        heap->collectNow(JSC::Sync, JSC::GCRequest(JSC::CollectionScope::Full));
+    }
+
+    // A full JSC collection frees cells but libpas retains their committed
+    // pages. Bun.gc(true) is also an explicit memory-pressure boundary, so
+    // synchronously decommit those pages after releasing the VM lock.
+    pas_scavenger_run_synchronously_now();
+#if defined(__APPLE__)
+    malloc_zone_pressure_relief(nullptr, 0);
+#endif
 }
 
 static std::atomic<ptrdiff_t> ct_jsc_control_flow_profiler_offset { -1 };

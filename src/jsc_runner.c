@@ -18,6 +18,14 @@
 #endif
 
 extern bool ct_jsc_string_is_8_bit(JSStringRef string);
+typedef void (*CtExternalStringFinalize)(void *, void *, size_t);
+extern JSStringRef ct_jsc_string_create_external_latin1(
+    const uint8_t *characters,
+    size_t length,
+    CtExternalStringFinalize finalize,
+    void *context
+);
+extern JSValueRef ct_jsc_set_never_optimize(JSContextRef context, JSValueRef function);
 extern bool ct_jsc_value_is_out_of_memory_error(JSContextRef context, JSValueRef value);
 #if defined(_WIN32) || defined(__linux__)
 extern void ct_jsc_initialize_main_thread(void);
@@ -20976,6 +20984,11 @@ static JSValueRef ct_process_info(JSContextRef ctx, JSObjectRef function, JSObje
         free(kind);
         return JSValueMakeNumber(ctx, (double)old);
     }
+    if (strcmp(kind, "rss") == 0) {
+        double rss = ct_current_rss_bytes();
+        free(kind);
+        return JSValueMakeNumber(ctx, rss);
+    }
     if (strcmp(kind, "memoryUsage") == 0) {
         JSObjectRef result = ct_make_object(ctx);
         double rss = ct_current_rss_bytes();
@@ -23953,6 +23966,12 @@ static JSValueRef ct_close_callback(JSContextRef ctx, JSObjectRef function, JSOb
     return JSValueMakeBoolean(ctx, closed);
 }
 
+static void ct_external_string_free(void *context, void *buffer, size_t buffer_size) {
+    (void)context;
+    (void)buffer_size;
+    free(buffer);
+}
+
 static JSValueRef ct_read_file_common(JSContextRef ctx, size_t argc, const JSValueRef argv[], JSValueRef *exception, bool as_buffer) {
     if (argc < 1) {
         ct_throw_message(ctx, exception, "readFile(path) requires a path");
@@ -23988,7 +24007,34 @@ static JSValueRef ct_read_file_common(JSContextRef ctx, size_t argc, const JSVal
     buffer[read_len] = 0;
     fclose(file);
     free(path);
-    JSValueRef result = as_buffer ? ct_array_buffer_from_copy(ctx, buffer, read_len, exception) : ct_make_string_len(ctx, buffer, read_len);
+    JSValueRef result = NULL;
+    if (!as_buffer) {
+        bool is_ascii = true;
+        for (size_t index = 0; index < read_len; index++) {
+            if (((const uint8_t *)buffer)[index] >= 0x80) {
+                is_ascii = false;
+                break;
+            }
+        }
+        if (is_ascii) {
+            JSStringRef string = ct_jsc_string_create_external_latin1(
+                (const uint8_t *)buffer,
+                read_len,
+                ct_external_string_free,
+                NULL
+            );
+            if (string != NULL) {
+                result = JSValueMakeString(ctx, string);
+                JSStringRelease(string);
+                buffer = NULL;
+            }
+        }
+    }
+    if (result == NULL) {
+        result = as_buffer
+            ? ct_array_buffer_from_copy(ctx, buffer, read_len, exception)
+            : ct_make_string_len(ctx, buffer, read_len);
+    }
     free(buffer);
     return result;
 }
@@ -30227,6 +30273,16 @@ static JSValueRef ct_jsc_string_is_8_bit_host(JSContextRef ctx, JSObjectRef func
     bool is_8_bit = ct_jsc_string_is_8_bit(string);
     JSStringRelease(string);
     return JSValueMakeBoolean(ctx, is_8_bit);
+}
+
+static JSValueRef ct_jsc_set_never_optimize_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1 || !JSValueIsObject(ctx, argv[0]) || !JSObjectIsFunction(ctx, (JSObjectRef)argv[0])) {
+        ct_throw_type_error(ctx, exception, "cottontail.jscSetNeverOptimize(function) requires a function");
+        return JSValueMakeUndefined(ctx);
+    }
+    return ct_jsc_set_never_optimize(ctx, argv[0]);
 }
 
 static JSValueRef ct_jsc_value_is_rope_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {

@@ -67,7 +67,7 @@ function initializeRuntimeProcess() {
   target.memoryUsage ??= function memoryUsage() {
     return cottontail.processInfo("memoryUsage");
   };
-  target.memoryUsage.rss ??= () => Number(cottontail.processInfo("memoryUsage").rss) || 0;
+  target.memoryUsage.rss ??= () => Number(cottontail.processInfo("rss")) || 0;
   target.uptime ??= () => Number(BigInt(Math.floor(cottontail.nanotime?.() ?? Date.now() * 1_000_000)) - processStartNs) / 1e9;
   target.hrtime ??= function hrtime(previous) {
     let value = BigInt(Math.floor(cottontail.nanotime?.() ?? Date.now() * 1_000_000));

@@ -4647,7 +4647,7 @@ fn bundleScriptNative(
     // ordinary ESM through the same on-demand module system without changing
     // the compatibility transforms used by CommonJS and test entry points.
     const runtime_candidate_is_common_js = if (runtime_module_launcher_candidate)
-        try shouldBundleCommonJsEntrypoint(ctx, script_abs)
+        try sourceLooksCommonJs(ctx, script_abs) or try shouldBundleCommonJsEntrypoint(ctx, script_abs)
     else
         false;
     const runtime_entrypoint_needs_main_transform = runtime_module_launcher_candidate and
@@ -4713,7 +4713,7 @@ fn bundleScriptNative(
     const detected_common_js_entrypoint = if (is_wasm_entrypoint or runtime_module_entrypoint)
         false
     else
-        try shouldBundleCommonJsEntrypoint(ctx, script_entry_abs);
+        runtime_candidate_is_common_js or try shouldBundleCommonJsEntrypoint(ctx, script_entry_abs);
     const is_common_js_entrypoint = detected_common_js_entrypoint or runtime_cache_common_js_entrypoint;
     if (is_common_js_entrypoint) try validateCommonJsTestSyntax(ctx, script_entry_abs);
     var reload_needs_runtime_module_sources = true;
@@ -4727,6 +4727,11 @@ fn bundleScriptNative(
         null;
     const runtime_bootstrap_mode: RuntimeBootstrapMode = if (eval_bootstrap_mode) |mode|
         mode
+    else if (is_common_js_entrypoint)
+        // CommonJS requires one stable Module instance and a filename-bound
+        // require function. The selective bundle's stack-derived require is
+        // observably different and retains caller paths during cache churn.
+        .full
     else if (!runtime_module_entrypoint and
         !runtime_cache_common_js_entrypoint and
         !standalone_compile and
@@ -5096,7 +5101,7 @@ fn acquireLauncherCache(
     key_material_path: ?[]const u8,
 ) !?LauncherCache {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("cottontail-launcher-v4\x00");
+    hasher.update("cottontail-launcher-v5\x00");
     hasher.update(cache_name);
     hasher.update("\x00");
     hasher.update(ctx.executable_stamp);
@@ -7471,15 +7476,22 @@ fn writeBunCompatTransformedSource(
         transformed_source = transformed;
         changed = true;
     }
-    if (try rewriteQueryImports(
-        ctx,
-        transformed_source,
-        resolution_dir,
-        transpilerLoaderForPath(script_abs),
-        preserve_static_html_imports,
-    )) |transformed| {
-        transformed_source = transformed;
-        changed = true;
+    const plain_common_js = !sourceLooksEsm(transformed_source) and
+        (std.mem.indexOf(u8, transformed_source, "require(") != null or
+            std.mem.indexOf(u8, transformed_source, "require.resolve") != null or
+            std.mem.indexOf(u8, transformed_source, "module.exports") != null or
+            std.mem.indexOf(u8, transformed_source, "exports.") != null);
+    if (!plain_common_js) {
+        if (try rewriteQueryImports(
+            ctx,
+            transformed_source,
+            resolution_dir,
+            transpilerLoaderForPath(script_abs),
+            preserve_static_html_imports,
+        )) |transformed| {
+            transformed_source = transformed;
+            changed = true;
+        }
     }
     // Bun treats extensionless entrypoints as TypeScript, so rewrite them into
     // a generated .ts file before invoking the compiler.
