@@ -218,6 +218,37 @@ function installProcessApi(processObject) {
     return [...(listeners.get(String(name)) ?? [])];
   };
 
+  const captureStateKey = Symbol.for("cottontail.process.uncaughtExceptionCaptureState");
+  const captureState = processObject[captureStateKey] ?? { callback: null };
+  Object.defineProperty(processObject, captureStateKey, {
+    configurable: true,
+    value: captureState,
+  });
+  processObject.setUncaughtExceptionCaptureCallback ??= function setUncaughtExceptionCaptureCallback(callback) {
+    if (callback !== null && callback !== undefined && typeof callback !== "function") {
+      const error = new TypeError('The "fn" argument must be of type function or null');
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
+    }
+    if (typeof callback === "function" && typeof captureState.callback === "function") {
+      const error = new Error("setupUncaughtExceptionCapture() was called while a capture callback was already active");
+      error.code = "ERR_UNCAUGHT_EXCEPTION_CAPTURE_ALREADY_SET";
+      throw error;
+    }
+    captureState.callback = callback ?? null;
+  };
+  processObject.hasUncaughtExceptionCaptureCallback ??= () => typeof captureState.callback === "function";
+  processObject._fatalException ??= function _fatalException(error, fromPromise = false) {
+    if (arguments.length === 0) return undefined;
+    const origin = fromPromise ? "unhandledRejection" : "uncaughtException";
+    processObject.emit("uncaughtExceptionMonitor", error, origin);
+    if (typeof captureState.callback === "function") {
+      captureState.callback(error);
+      return true;
+    }
+    return processObject.emit("uncaughtException", error, origin);
+  };
+
   processObject.emit = function emit(name, ...args) {
     const handlers = [...(listeners.get(String(name)) ?? [])];
     for (const handler of handlers) {
@@ -314,6 +345,22 @@ const processObject = g.process ?? {
 g.process = processObject;
 installWindowsProcessEnvironment(g.process);
 installProcessApi(g.process);
+if (cottontail.isWorker?.() === true && typeof g.__cottontailWorkerEvalSource === "string") {
+  try {
+    const descriptor = JSON.parse(g.__cottontailWorkerEvalSource);
+    if (descriptor?.bootstrap && descriptor?.input && Array.isArray(descriptor.argv)) {
+      g.__cottontailPreparedWorkerDescriptor = descriptor;
+      g.__cottontailWorkerBootstrap = descriptor.bootstrap;
+      g.__cottontailWorkerRuntimeCacheId = descriptor.runtimeCacheId;
+      g.process.argv = descriptor.argv;
+      g.process.execArgv = descriptor.execArgv;
+      const environment = g.process.env ?? {};
+      for (const key of Object.keys(environment)) delete environment[key];
+      Object.assign(environment, descriptor.workerEnvironment);
+      g.process.env = environment;
+    }
+  } catch {}
+}
 if (g.process.env?.COTTONTAIL_TEST_CLI_HEADER_PRINTED === "1") {
   globalThis.__cottontailBunTestHeaderPrinted = true;
   delete g.process.env.COTTONTAIL_TEST_CLI_HEADER_PRINTED;
@@ -1410,6 +1457,19 @@ function relativeBlobIndex(value, size, fallback) {
   return Math.min(number, size);
 }
 
+function initializeBlobState(blob, chunks, type = "") {
+  Object.defineProperties(blob, {
+    _blobChunks: { configurable: true, writable: true, value: chunks },
+    _size: {
+      configurable: true,
+      writable: true,
+      value: chunks.reduce((size, chunk) => size + chunk.byteLength, 0),
+    },
+    _bytes: { configurable: true, writable: true, value: null },
+    type: { configurable: true, value: normalizeBlobType(type) },
+  });
+}
+
 function installBlobGlobals() {
   if (typeof g.Blob !== "function") {
     class CottontailBlob {
@@ -1420,16 +1480,13 @@ function installBlobGlobals() {
         // COTTONTAIL-COMPAT: Blob snapshots each backing store once and keeps
         // repeated parts shared until a contiguous representation is requested.
         const snapshots = new WeakMap();
-        this._blobChunks = [];
-        this._size = 0;
+        const chunks = [];
         for (const part of sourceParts) {
           for (const chunk of snapshotBlobPart(part, snapshots)) {
-            this._blobChunks.push(chunk);
-            this._size += chunk.byteLength;
+            chunks.push(chunk);
           }
         }
-        this._bytes = null;
-        this.type = normalizeBlobType(options?.type);
+        initializeBlobState(this, chunks, options?.type);
       }
 
       get size() {
@@ -1438,10 +1495,7 @@ function installBlobGlobals() {
 
       static _fromOwnedChunks(chunks, type = "") {
         const blob = Object.create(CottontailBlob.prototype);
-        blob._blobChunks = chunks;
-        blob._size = chunks.reduce((size, chunk) => size + chunk.byteLength, 0);
-        blob._bytes = null;
-        blob.type = normalizeBlobType(type);
+        initializeBlobState(blob, chunks, type);
         return blob;
       }
 
@@ -1509,6 +1563,10 @@ function installBlobGlobals() {
         };
       }
     }
+    Object.defineProperty(CottontailBlob.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: "Blob",
+    });
     Object.defineProperty(g, "Blob", {
       configurable: true,
       writable: true,
@@ -1528,11 +1586,17 @@ function installBlobGlobals() {
         if (arguments.length < 2) throw new TypeError("File constructor requires file bits and name");
         if (typeof parts === "string" || parts == null) throw new TypeError("File bits must be an iterable object");
         super(parts, options);
-        this.name = String(name);
-        this.lastModified = Number(options?.lastModified ?? Date.now());
+        Object.defineProperties(this, {
+          name: { configurable: true, value: String(name) },
+          lastModified: { configurable: true, value: Number(options?.lastModified ?? Date.now()) },
+        });
       }
     }
     Object.defineProperty(CottontailFile, "name", { value: "File", configurable: true });
+    Object.defineProperty(CottontailFile.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: "File",
+    });
     Object.defineProperty(g, "File", {
       configurable: true,
       writable: true,
@@ -2429,6 +2493,7 @@ function installWorkerNativeEventHandler() {
     const worker = workerInstances.get(Number(event?.id));
     if (!worker) return;
     if (event?.type === "exit") {
+      try { worker._poll(); } catch {}
       const code = Number(event?.code ?? 0) || 0;
       worker._refed = false;
       worker._terminated = true;
@@ -2583,6 +2648,7 @@ function rewriteWorkerNamedImports(spec) {
 
 const workerBundleCache = new Map();
 const preparedWorkerScript = Symbol.for("cottontail.worker.prepared-script");
+const reusablePreparedWorkerScript = Symbol.for("cottontail.worker.reusable-prepared-script");
 const workerEvalSource = Symbol.for("cottontail.worker.eval-source");
 const workerThreadName = Symbol.for("cottontail.worker.thread-name");
 const workerStackSize = Symbol.for("cottontail.worker.stack-size");
@@ -2824,17 +2890,22 @@ function prepareWorkerScriptPath(scriptPath, options = undefined) {
     return target;
   }
   const wrapperPath = `${tempDir}/bun-worker-entry-${nonce}.mjs`;
-  const bundledPath = `${tempDir}/bun-worker-${nonce}.js`;
+  const reusableBundleName = cacheKey
+    .replace(/^.*[\\/]/, "")
+    .replace(/\.[^.]+$/, "")
+    .replace(/[^A-Za-z0-9_.-]/g, "_");
+  const bundledPath = options?.[reusablePreparedWorkerScript] === true
+    ? `${tempDir}/${reusableBundleName}.bundle.js`
+    : `${tempDir}/bun-worker-${nonce}.js`;
   const slashTarget = String(target).replace(/\\/g, "/");
   const runtimeRoot = workerRuntimeRoot();
-  // Workers are independent Bun runtimes, not FFI-only isolates. Boot the full
-  // runtime so worker code sees the same Bun and Node APIs as the main thread.
   const runtimeEntry = workerRuntimePath(runtimeRoot, "bun/index.js");
   if (options?.[preparedWorkerScript] === true) {
-    const moduleEntry = workerRuntimePath(runtimeRoot, "node/module.js");
+    if (options?.[reusablePreparedWorkerScript] === true && cottontail.existsSync?.(bundledPath)) {
+      workerBundleCache.set(cacheKey, bundledPath);
+      return bundledPath;
+    }
     cottontail.writeFile(wrapperPath, [
-      `import ${JSON.stringify(runtimeEntry)};`,
-      `import ${JSON.stringify(moduleEntry)};`,
       `import ${JSON.stringify(slashTarget)};`,
     ].join("\n"));
     try {
@@ -2844,13 +2915,19 @@ function prepareWorkerScriptPath(scriptPath, options = undefined) {
         includeRuntimeModules: true,
         inlineImportMetaProperties: true,
         alias: workerRuntimeAliases(runtimeRoot),
+        minify: { whitespace: true, identifiers: true, syntax: true, keepNames: true },
       }));
       cottontail.writeFile(bundledPath, bundled);
+      if (options?.[reusablePreparedWorkerScript] === true) {
+        workerBundleCache.set(cacheKey, bundledPath);
+      }
       return bundledPath;
     } finally {
       try { cottontail.unlinkSync?.(wrapperPath); } catch {}
     }
   }
+  // Ordinary Web Workers are independent Bun runtimes, not FFI-only isolates.
+  // Boot the full runtime so they see the same Bun and Node APIs as the parent.
   try {
     const imports = [`import ${JSON.stringify(runtimeEntry)};`];
     if (hasWorkerOptions || !options?.[preparedWorkerScript]) {
@@ -2986,7 +3063,8 @@ g.Worker ??= class Worker {
   _startWorker(scriptPath, options) {
     if (this._terminated) return;
     this.scriptPath = prepareWorkerScriptPath(scriptPath, options);
-    const disposePreparedScript = options?.[preparedWorkerScript] === true;
+    const disposePreparedScript = options?.[preparedWorkerScript] === true &&
+      options?.[reusablePreparedWorkerScript] !== true;
     try {
       this.handle = cottontail.spawnWorker(
         this.scriptPath,

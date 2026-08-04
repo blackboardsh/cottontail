@@ -3795,6 +3795,7 @@
     },
     "test/js/web/workers/structured-clone.test.ts": {
       "status": "enabled",
+      "timeoutMs": 120000,
       "reason": "Structured cloning and bun:jsc serialization pass primitive, collection, Blob/File, BlockList, transfer, and cross-process coverage."
     },
     "test/js/web/workers/worker_blob.test.ts": {

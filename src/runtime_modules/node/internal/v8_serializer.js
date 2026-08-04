@@ -154,20 +154,11 @@ function bunFileBytes(value) {
 
 function storageBunFile(bytes, mime, name, lastModified) {
   const type = String(mime ?? "");
-  const blob = {};
+  const blob = new globalThis.Blob([bytes], { type });
   Object.defineProperties(blob, {
     [storageBunFileBrand]: { value: true },
-    [Symbol.toStringTag]: { value: "Blob" },
-    _bytes: { value: bytes },
-    name: { value: String(name ?? "") },
-    type: { value: type },
-    size: { value: bytes.byteLength },
+    name: { value: name === "" ? undefined : String(name) },
     lastModified: { value: Number(lastModified ?? 0) },
-    arrayBuffer: { value: async () => bytes.slice().buffer },
-    bytes: { value: async () => bytes.slice() },
-    text: { value: async () => new TextDecoder().decode(bytes) },
-    slice: { value: (...args) => new globalThis.Blob([bytes], { type }).slice(...args) },
-    stream: { value: () => new globalThis.Blob([bytes], { type }).stream() },
   });
   return blob;
 }

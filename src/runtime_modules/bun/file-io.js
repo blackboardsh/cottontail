@@ -463,6 +463,39 @@ async function readFileBytes(state) {
   return concatBytes(chunks, length);
 }
 
+function readFileBytesSync(state) {
+  assertSyntheticAllocationLimit(state);
+  if (state.descriptor.kind === "path") {
+    const embedded = standaloneFileBytes(state.descriptor.path);
+    const source = embedded ?? bytesFromBufferSource(cottontail.readFileBuffer(state.descriptor.path));
+    const start = Math.min(state.start, source.byteLength);
+    const end = state.length == null
+      ? source.byteLength
+      : Math.min(source.byteLength, start + state.length);
+    return source.slice(start, end);
+  }
+
+  const size = fileSize(state);
+  if (!Number.isFinite(size)) throw invalidArgumentType("Cannot synchronously snapshot a non-regular file");
+  const length = state.length == null
+    ? Math.max(0, size - state.start)
+    : Math.max(0, Math.min(state.length, size - state.start));
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  while (offset < bytes.byteLength) {
+    const count = Number(cottontail.fdReadAt(
+      state.descriptor.fd,
+      bytes,
+      offset,
+      bytes.byteLength - offset,
+      state.start + offset,
+    ));
+    if (!(count > 0)) break;
+    offset += count;
+  }
+  return offset === bytes.byteLength ? bytes : bytes.slice(0, offset);
+}
+
 function streamFile(state, chunkSize) {
   if (chunkSize != null && typeof chunkSize !== "number") {
     throw invalidArgumentType("chunkSize must be a number");
@@ -800,8 +833,17 @@ function createBunFile(state) {
     writer(options = undefined) { return createFileSink(state, options); },
   };
 
+  for (const key of Reflect.ownKeys(result)) {
+    const descriptor = Object.getOwnPropertyDescriptor(result, key);
+    if (descriptor) Object.defineProperty(result, key, { ...descriptor, enumerable: false });
+  }
+
   bunFileStates.set(result, state);
   Object.defineProperty(result, bunFileLikeBrand, { value: true });
+  Object.defineProperty(result, "_getBytes", {
+    value: () => readFileBytesSync(state),
+    configurable: true,
+  });
   if (state.descriptor.kind === "path") {
     Object.defineProperty(result, "_bunFilePath", { value: state.descriptor.path, configurable: true });
     if (state.isSlice) {

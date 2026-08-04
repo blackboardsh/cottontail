@@ -716,8 +716,10 @@ export function createBunSpawnRuntime(deps) {
     }
     const rawSignalCode = Number(result.signalCode ?? result.signal ?? 0);
     const exitCode = rawSignalCode > 0 ? null : Number(result.status ?? result.exitCode ?? 0);
-    const rawStdout = asBuffer(result.stdout ?? "");
-    let rawStderr = asBuffer(result.stderr ?? "");
+    const stdoutValue = result.stdoutBytes ?? result.stdout ?? "";
+    const stderrValue = result.stderrBytes ?? result.stderr ?? "";
+    const rawStdout = globalThis.Buffer?.from ? globalThis.Buffer.from(stdoutValue) : asBuffer(stdoutValue);
+    let rawStderr = globalThis.Buffer?.from ? globalThis.Buffer.from(stderrValue) : asBuffer(stderrValue);
     if (nativeOptions.stdoutFilePath != null) {
       try { host.writeFile(nativeOptions.stdoutFilePath, rawStdout); } catch {}
     }

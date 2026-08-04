@@ -232,7 +232,7 @@ function wrapBunFileSlices(value) {
       return sliced;
     },
     writable: true,
-    enumerable: true,
+    enumerable: false,
     configurable: true,
   });
   return value;
@@ -1497,10 +1497,11 @@ function normalizeStdio(value, fallback, index, details) {
     return "inherit";
   }
 
+  const isSharedBuffer = typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer;
   if (index === 0) {
-    if ((value instanceof ArrayBuffer || ArrayBuffer.isView(value)) && value.byteLength === 0) return "ignore";
+    if ((value instanceof ArrayBuffer || isSharedBuffer || ArrayBuffer.isView(value)) && value.byteLength === 0) return "ignore";
     if (typeof globalThis.Blob === "function" && value instanceof globalThis.Blob && value.size === 0) return "ignore";
-    if (isBunFileLike(value) || isReadableStreamLike(value) || value instanceof ArrayBuffer ||
+    if (isBunFileLike(value) || isReadableStreamLike(value) || value instanceof ArrayBuffer || isSharedBuffer ||
         ArrayBuffer.isView(value) || (typeof globalThis.Blob === "function" && value instanceof globalThis.Blob) ||
         typeof value?.arrayBuffer === "function" || typeof value?.bytes === "function") {
       details.input = value;
@@ -1569,6 +1570,9 @@ function normalizeSpawnOptions(options = {}, defaults = {}, sync = false) {
   }
 
   let input = options.input ?? details.input;
+  if (typeof SharedArrayBuffer === "function" && input instanceof SharedArrayBuffer) {
+    input = sharedArrayBufferBytes(input);
+  }
   const stdinFileBacked = input != null && isBunFileLike(input) && typeof input._bunFilePath === "string";
   // Bun.file(...) as stdin: read the file contents and feed them as input,
   // matching bun's behavior of wiring the file to the child's stdin.
@@ -7654,12 +7658,60 @@ if (globalThis.process) {
 // Bun.stdin is a BunFile-like object (upstream: a lazy Blob over fd 0) with
 // stream()/text()/json()/bytes()/arrayBuffer(). process.stdin is a real node
 // Readable now, so wrap it rather than exposing it directly.
+async function* iterateStdinChunks(source) {
+  if (!source) return;
+  if (typeof source[Symbol.asyncIterator] === "function") {
+    for await (const chunk of source) yield asBuffer(chunk);
+    return;
+  }
+
+  const chunks = [];
+  let ended = source.readableEnded === true;
+  let failure;
+  let wake;
+  const notify = () => {
+    const resolve = wake;
+    wake = undefined;
+    resolve?.();
+  };
+  const onData = (chunk) => {
+    chunks.push(asBuffer(chunk));
+    notify();
+  };
+  const onEnd = () => {
+    ended = true;
+    notify();
+  };
+  const onError = (error) => {
+    failure = error;
+    ended = true;
+    notify();
+  };
+  source.on?.("data", onData);
+  source.once?.("end", onEnd);
+  source.once?.("error", onError);
+  try {
+    while (!ended || chunks.length > 0) {
+      if (chunks.length > 0) {
+        yield chunks.shift();
+        continue;
+      }
+      await new Promise((resolve) => { wake = resolve; });
+    }
+    if (failure) throw failure;
+  } finally {
+    source.off?.("data", onData);
+    source.off?.("end", onEnd);
+    source.off?.("error", onError);
+  }
+}
+
 function collectStdinBytes() {
   const source = globalThis.process?.stdin;
   if (!source) return Promise.resolve(new Uint8Array(0));
   return (async () => {
     const chunks = [];
-    for await (const chunk of source) chunks.push(asBuffer(chunk));
+    for await (const chunk of iterateStdinChunks(source)) chunks.push(chunk);
     return concatManyBuffers(chunks);
   })();
 }
@@ -7679,8 +7731,7 @@ export const stdin = {
   stream() {
     const source = globalThis.process?.stdin;
     return bodyReadableStream((async function* () {
-      if (!source) return;
-      for await (const chunk of source) yield asBuffer(chunk);
+      yield* iterateStdinChunks(source);
     })());
   },
   async text() {

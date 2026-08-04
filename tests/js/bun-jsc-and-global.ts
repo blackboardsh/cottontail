@@ -28,6 +28,9 @@ import {
   startSamplingProfiler,
 } from "bun:jsc";
 import vm from "node:vm";
+import { closeSync, openSync } from "node:fs";
+import { BlockList } from "node:net";
+import { structuredCloneAdvanced } from "bun:internal-for-testing";
 
 function assert(value: unknown, message: string): asserts value {
   if (!value) throw new Error(message);
@@ -37,6 +40,44 @@ const payload = { name: "cottontail", values: [1, 2, 3] };
 const encoded = serialize(payload);
 assert(encoded instanceof SharedArrayBuffer, "bun:jsc serialize should return shared bytes");
 assert(JSON.stringify(deserialize(encoded)) === JSON.stringify(payload), "bun:jsc deserialize mismatch");
+
+const sourceFile = Bun.file(import.meta.filename);
+assert(Object.keys(sourceFile).length === 0, "BunFile internals should not be enumerable");
+const clonedSourceFile = deserialize(serialize(sourceFile));
+assert(clonedSourceFile instanceof Blob, "bun:jsc path BunFile clone type mismatch");
+assert(await clonedSourceFile.text() === await sourceFile.text(), "bun:jsc path BunFile clone bytes mismatch");
+assert(clonedSourceFile.name === sourceFile.name, "bun:jsc path BunFile clone name mismatch");
+const storedSourceFile = structuredCloneAdvanced(sourceFile, [], false, true, "worker");
+assert(storedSourceFile instanceof Blob, "advanced stored BunFile clone type mismatch");
+assert(Object.keys(storedSourceFile).length === 0, "advanced stored BunFile internals should not be enumerable");
+assert(await storedSourceFile.text() === await sourceFile.text(), "advanced stored BunFile clone bytes mismatch");
+const sourceFd = openSync(import.meta.filename, "r");
+try {
+  const fdFile = Bun.file(sourceFd);
+  const clonedFdFile = deserialize(serialize(fdFile));
+  assert(clonedFdFile instanceof Blob, "bun:jsc fd BunFile clone type mismatch");
+  assert(await clonedFdFile.text() === await fdFile.text(), "bun:jsc fd BunFile clone bytes mismatch");
+  assert(clonedFdFile.name === undefined, "bun:jsc fd BunFile clone name mismatch");
+} finally {
+  closeSync(sourceFd);
+}
+
+const blockList = new BlockList();
+blockList.addAddress("123.123.123.123");
+const clonedBlockList = structuredCloneAdvanced(blockList, [], false, false, "worker");
+assert(clonedBlockList.check("123.123.123.123"), "advanced BlockList clone lost state");
+const storedBlockList = structuredCloneAdvanced(blockList, [], false, true, "worker");
+assert(Object.keys(storedBlockList).length === 0, "stored BlockList should lose platform state");
+let blockListTransferError: unknown;
+try {
+  structuredCloneAdvanced(blockList, [blockList], true, false, "worker");
+} catch (error) {
+  blockListTransferError = error;
+}
+assert(
+  (blockListTransferError as Error)?.message === "The object can not be cloned.",
+  "advanced BlockList transfer error mismatch",
+);
 assert(heapSize() > 0, "bun:jsc heapSize mismatch");
 assert(heapStats().heapCapacity > 0 && heapStats().objectCount > 0, "bun:jsc heapStats mismatch");
 assert(memoryUsage().current > 0 && memoryUsage().peak > 0, "bun:jsc memoryUsage mismatch");

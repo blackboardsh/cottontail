@@ -16,6 +16,32 @@ const objectForm = (spawnSync as any)(
 );
 assert(objectForm.stdout?.toString() === "object", "object-form options were overridden by a second argument");
 
+const sharedInput = new SharedArrayBuffer(4);
+new Uint8Array(sharedInput).set([1, 2, 3, 4]);
+const sharedInputResult = spawnSync(
+  [process.execPath, "-e", "process.stdin.pipe(process.stdout)"],
+  { stdin: sharedInput, stdout: "pipe", stderr: "pipe" },
+);
+assert(sharedInputResult.success, "SharedArrayBuffer stdin child failed");
+assert(
+  sharedInputResult.stdout?.equals(Buffer.from([1, 2, 3, 4])),
+  "SharedArrayBuffer stdin bytes mismatch",
+);
+
+const sharedOutputResult = spawnSync(
+  [
+    process.execPath,
+    "-e",
+    "const output = new SharedArrayBuffer(8); new Uint8Array(output).set([0, 127, 128, 255, 1, 254, 13, 10]); process.stdout.write(output);",
+  ],
+  { stdout: "pipe", stderr: "pipe" },
+);
+assert(sharedOutputResult.success, "SharedArrayBuffer stdout child failed");
+assert(
+  sharedOutputResult.stdout?.equals(Buffer.from([0, 127, 128, 255, 1, 254, 13, 10])),
+  "SharedArrayBuffer stdout bytes mismatch",
+);
+
 for (const stdio of [null, []] as const) {
   const result = spawnSync(["sh", "-c", "printf default"], { stdio: stdio as any, stdout: "ignore" });
   assert(result.stdout?.toString() === "default", "stdio presence did not take precedence over stdout");

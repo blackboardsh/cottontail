@@ -66,6 +66,32 @@ test("ordinary worker environments remain isolated", async () => {
   expect(process.env[key]).toBeUndefined();
 });
 
+test("workers lazily retain the full Bun runtime", async () => {
+  const worker = new Worker(
+    `const { parentPort } = require("node:worker_threads");
+     Bun.sleep(1).then(() => parentPort.postMessage(Bun.deepEquals({ value: 1 }, { value: 1 })));`,
+    { eval: true },
+  );
+  expect((await once(worker, "message"))[0]).toBe(true);
+  await once(worker, "exit");
+});
+
+test("workers inherit execArgv and retain an explicit exit code through terminate", async () => {
+  const inheritedExecArgv = new Worker(
+    `const { parentPort } = require("node:worker_threads");
+     parentPort.postMessage({ argv: process.argv, execArgv: process.execArgv });`,
+    { eval: true },
+  );
+  const inherited = (await once(inheritedExecArgv, "message"))[0];
+  expect(inherited.execArgv).toEqual(process.execArgv);
+  expect(inherited.argv.slice(2)).toEqual(process.argv.slice(2));
+  await once(inheritedExecArgv, "exit");
+
+  const explicitExit = new Worker(`setTimeout(() => process.exit(2), 10);`, { eval: true });
+  expect((await once(explicitExit, "exit"))[0]).toBe(2);
+  expect(await explicitExit.terminate()).toBe(2);
+});
+
 test("worker options expose argv, execArgv, name, resource limits, and stdio", async () => {
   const worker = new Worker(
     `const { parentPort, resourceLimits, threadName } = require("node:worker_threads");

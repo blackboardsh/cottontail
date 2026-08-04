@@ -791,38 +791,49 @@ function unregisterSharedEnvironmentWorker(groupId, workerThreadId) {
   }
 }
 
-function workerRunSource(input) {
-  if (input.kind === "eval") {
-    return [
-      `const __ctModuleNamespace = await globalThis.__cottontailImportModule("node:module");`,
-      `const __ctModule = __ctModuleNamespace.Module ?? __ctModuleNamespace.default;`,
-      `const __ctEvalModule = new __ctModule(${JSON.stringify(input.filename)}, null);`,
-      `__ctEvalModule.filename = ${JSON.stringify(input.filename)};`,
-      `__ctEvalModule.paths = __ctModule._nodeModulePaths?.(${JSON.stringify(cottontail.cwd())}) ?? [];`,
-      `let __ctEvalSource = globalThis.__cottontailWorkerEvalSource;`,
-      `try {`,
-      `  try {`,
-      `    __ctEvalModule._compile(__ctEvalSource, ${JSON.stringify(input.filename)});`,
-      `  } catch (__ctEvalError) {`,
-      `    throw globalThis.__cottontailNormalizeWorkerEvalError?.(__ctEvalError) ?? __ctEvalError;`,
-      `  }`,
-      `} finally {`,
-      `  __ctEvalSource = undefined;`,
-      `  try { delete globalThis.__cottontailWorkerEvalSource; } catch { globalThis.__cottontailWorkerEvalSource = undefined; }`,
-      `}`,
-    ].join("\n");
-  }
-  if (input.kind === "commonjs") {
-    return [
-      `const __ctModuleNamespace = await globalThis.__cottontailImportModule("node:module");`,
-      `const __ctRunMain = __ctModuleNamespace.runMain ?? __ctModuleNamespace.default?.runMain;`,
-      `__ctRunMain(${JSON.stringify(input.filename)});`,
-    ].join("\n");
-  }
+function workerRunSource() {
   return [
-    `await import(${JSON.stringify(input.specifier)});`,
+    `const __ctWorkerInput = __ctWorkerDescriptor.input;`,
+    `if (__ctWorkerInput.kind === "eval") {`,
+    `  const __ctModuleNamespace = await globalThis.__cottontailImportModule("node:module");`,
+    `  const __ctModule = __ctModuleNamespace.Module ?? __ctModuleNamespace.default;`,
+    `  const __ctEvalModule = new __ctModule(__ctWorkerInput.filename, null);`,
+    `  __ctEvalModule.filename = __ctWorkerInput.filename;`,
+    `  __ctEvalModule.paths = __ctModule._nodeModulePaths?.(__ctWorkerDescriptor.cwd) ?? [];`,
+    `  let __ctEvalSource = globalThis.__cottontailWorkerEvalSource;`,
+    `  try {`,
+    `    try {`,
+    `      __ctEvalModule._compile(__ctEvalSource, __ctWorkerInput.filename);`,
+    `    } catch (__ctEvalError) {`,
+    `      throw globalThis.__cottontailNormalizeWorkerEvalError?.(__ctEvalError) ?? __ctEvalError;`,
+    `    }`,
+    `  } finally {`,
+    `    __ctEvalSource = undefined;`,
+    `    try { delete globalThis.__cottontailWorkerEvalSource; } catch { globalThis.__cottontailWorkerEvalSource = undefined; }`,
+    `  }`,
+    `} else if (__ctWorkerInput.kind === "commonjs") {`,
+    `  const __ctModuleNamespace = await globalThis.__cottontailImportModule("node:module");`,
+    `  const __ctRunMain = __ctModuleNamespace.runMain ?? __ctModuleNamespace.default?.runMain;`,
+    `  __ctRunMain(__ctWorkerInput.filename);`,
+    `} else {`,
+    `  await globalThis.__cottontailImportModule(__ctWorkerInput.specifier);`,
+    `}`,
   ].join("\n");
 }
+
+function canUseLeanWorkerWrapper(input, options) {
+  if (input.kind === "eval" || String(input.filename).startsWith("data:")) return false;
+  if (options.stdin === true || options.stdout === true || options.stderr === true) return false;
+  try {
+    const source = String(cottontail.readFile(input.filename));
+    return !/(?:^|\n)\s*(?:import|export)\b|import\.meta|\b(?:Bun|require|module|exports|__filename|__dirname|throw)\b/.test(source);
+  } catch {
+    return false;
+  }
+}
+
+const reusableWorkerWrapperPaths = new Map();
+let nextWorkerWrapperId = 1;
 
 function makeWorkerWrapper(input, options = {}, sharedEnvironmentGroupId = null) {
   const workerDataWire = encodeWireMessage(
@@ -831,13 +842,14 @@ function makeWorkerWrapper(input, options = {}, sharedEnvironmentGroupId = null)
   );
   const environmentDataWire = encodeWireMessage([...environmentData]);
   const resourceLimitsWire = encodeWireMessage(options.resourceLimits ?? {});
-  const execArgv = options.execArgv
+  const execArgv = Array.isArray(options.execArgv)
     ? Array.from(options.execArgv, String)
     : Array.from(globalThis.process?.execArgv ?? [], String);
+  const parentArgv = Array.from(globalThis.process?.argv ?? [], String);
   const argv = [
-    String(globalThis.process?.argv?.[0] ?? globalThis.process?.execPath ?? "cottontail"),
+    String(parentArgv[0] ?? globalThis.process?.execPath ?? "cottontail"),
     input.filename,
-    ...Array.from(options.argv ?? [], String),
+    ...Array.from(Array.isArray(options.argv) ? options.argv : parentArgv.slice(2), String),
   ];
   const shareEnvironment = options.env === SHARE_ENV;
   const workerEnvironment = stringEnvironment(
@@ -856,35 +868,88 @@ function makeWorkerWrapper(input, options = {}, sharedEnvironmentGroupId = null)
     shareEnvironment,
     sharedEnvironmentGroupId,
   };
+  const descriptor = {
+    argv,
+    bootstrap,
+    cwd: String(cottontail.cwd()),
+    evalSource: input.kind === "eval" ? input.source : undefined,
+    execArgv,
+    input: {
+      filename: input.filename,
+      kind: input.kind,
+      specifier: input.specifier,
+    },
+    runtimeCacheId: workerRuntimeCacheId,
+    workerEnvironment,
+  };
   const dir = workerTempDir();
   cottontail.mkdirSync?.(dir, true);
-  const nonce = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
-  const wrapperPath = `${dir}/worker-thread-${nonce}.mjs`;
-  const source = [
+  const leanWrapper = canUseLeanWorkerWrapper(input, options);
+  const wrapperKey = leanWrapper ? `lean:${input.specifier}` : "runtime";
+  let wrapperPath = reusableWorkerWrapperPaths.get(wrapperKey);
+  if (wrapperPath == null) {
+    wrapperPath = `${dir}/worker-thread-runtime-${workerRuntimeCacheId}-${nextWorkerWrapperId++}.mjs`;
+    reusableWorkerWrapperPaths.set(wrapperKey, wrapperPath);
+  }
+  const source = leanWrapper ? [
+    `import "bun:ffi";`,
+    `import "node:worker_threads";`,
+    `import ${JSON.stringify(input.specifier)};`,
+  ].join("\n") : [
+    `import "bun:ffi";`,
+    `import { loadEmbeddedRuntimeModule as __ctLoadEmbeddedRuntimeModule } from "node:module";`,
+    `const __ctWorkerDescriptor = JSON.parse(String(globalThis.__cottontailWorkerEvalSource ?? "{}"));`,
     `globalThis.__cottontailWorkerRuntimeCacheId = ${JSON.stringify(workerRuntimeCacheId)};`,
-    `globalThis.__cottontailWorkerBootstrap = ${JSON.stringify(bootstrap)};`,
+    `globalThis.__cottontailWorkerBootstrap = __ctWorkerDescriptor.bootstrap;`,
+    `globalThis.__cottontailWorkerEvalSource = __ctWorkerDescriptor.evalSource;`,
     `if (globalThis.process) {`,
-    `  globalThis.process.argv = ${JSON.stringify(argv)};`,
-    `  globalThis.process.execArgv = ${JSON.stringify(execArgv)};`,
+    `  globalThis.process.argv = __ctWorkerDescriptor.argv;`,
+    `  globalThis.process.execArgv = __ctWorkerDescriptor.execArgv;`,
     `}`,
-    `if (globalThis.Bun) globalThis.Bun.argv = ${JSON.stringify(argv)};`,
+    `if (globalThis.Bun) globalThis.Bun.argv = __ctWorkerDescriptor.argv;`,
     `if (globalThis.process) {`,
     `  const __ctWorkerEnv = globalThis.process.env ?? {};`,
     `  for (const __ctKey of Object.keys(__ctWorkerEnv)) delete __ctWorkerEnv[__ctKey];`,
-    `  Object.assign(__ctWorkerEnv, ${JSON.stringify(workerEnvironment)});`,
+    `  Object.assign(__ctWorkerEnv, __ctWorkerDescriptor.workerEnvironment);`,
     `  globalThis.process.env = __ctWorkerEnv;`,
     `}`,
     `await globalThis.__cottontailImportModule("node:worker_threads");`,
+    `const __ctMinimalBun = globalThis.Bun ?? {};`,
+    `let __ctLoadingFullBun = false;`,
+    `let __ctLoadedFullBun = null;`,
+    `const __ctLoadFullBun = () => {`,
+    `  if (__ctLoadedFullBun) return __ctLoadedFullBun;`,
+    `  if (__ctLoadingFullBun) return __ctMinimalBun;`,
+    `  __ctLoadingFullBun = true;`,
+    `  try {`,
+    `    const __ctBunNamespace = __ctLoadEmbeddedRuntimeModule("bun/index.js");`,
+    `    __ctLoadedFullBun = __ctBunNamespace?.default ?? __ctBunNamespace?.Bun ?? globalThis.Bun ?? __ctMinimalBun;`,
+    `    return __ctLoadedFullBun;`,
+    `  } finally {`,
+    `    __ctLoadingFullBun = false;`,
+    `  }`,
+    `};`,
+    `const __ctLazyBun = new Proxy(__ctMinimalBun, {`,
+    `  get(target, property, receiver) {`,
+    `    if (Reflect.has(target, property)) return Reflect.get(target, property, receiver);`,
+    `    const loaded = __ctLoadFullBun();`,
+    `    return Reflect.get(loaded, property, loaded);`,
+    `  },`,
+    `  has(target, property) {`,
+    `    return Reflect.has(target, property) || Reflect.has(__ctLoadFullBun(), property);`,
+    `  },`,
+    `});`,
+    `globalThis.Bun = __ctLazyBun;`,
     `globalThis.__cottontailConfigureWorkerStdio?.();`,
     `globalThis.__cottontailWorkerThreadsNotifyReady?.();`,
     `try {`,
-    workerRunSource(input),
+    workerRunSource(),
     `} catch (__ctWorkerError) {`,
     `  globalThis.__cottontailWorkerThreadsReportError?.(__ctWorkerError);`,
     `}`,
   ].join("\n");
-  cottontail.writeFile(wrapperPath, source);
-  return wrapperPath;
+  if (!cottontail.existsSync?.(wrapperPath)) cottontail.writeFile(wrapperPath, source);
+  return { descriptor: JSON.stringify(descriptor), path: wrapperPath };
 }
 
 function bytesViewForStdio(chunk, encoding = undefined) {
@@ -1197,7 +1262,7 @@ export class Worker extends EventEmitter {
     const input = normalizeWorkerInput(filename, options);
     const emptyEvalSource = input.kind === "eval" && !/\S/.test(input.source);
     const sharedEnvironmentGroupId = options.env === SHARE_ENV ? ensureSharedEnvironmentGroup() : null;
-    const wrapper = makeWorkerWrapper(input, options, sharedEnvironmentGroupId);
+    const preparedWorker = makeWorkerWrapper(input, options, sharedEnvironmentGroupId);
 
     this.threadId = 0;
     this.threadName = String(options.name ?? "");
@@ -1218,9 +1283,10 @@ export class Worker extends EventEmitter {
     this._terminationResolve = null;
     this._sharedEnvironmentGroupId = sharedEnvironmentGroupId;
 
-    this._worker = new globalThis.Worker(wrapper, {
+    this._worker = new globalThis.Worker(preparedWorker.path, {
       [Symbol.for("cottontail.worker.prepared-script")]: true,
-      [Symbol.for("cottontail.worker.eval-source")]: input.kind === "eval" ? input.source : undefined,
+      [Symbol.for("cottontail.worker.reusable-prepared-script")]: true,
+      [Symbol.for("cottontail.worker.eval-source")]: preparedWorker.descriptor,
       [Symbol.for("cottontail.worker.thread-name")]: this.threadName,
       [Symbol.for("cottontail.worker.stack-size")]: workerStackSizeBytes(options.resourceLimits),
       [Symbol.for("cottontail.worker.native-options")]: {
@@ -1302,6 +1368,12 @@ export class Worker extends EventEmitter {
     if (this._input?.kind !== "eval" && /Cannot find module|ModuleNotFound/.test(String(error?.message ?? error))) {
       return new Error(`BuildMessage: ModuleNotFound resolving ${JSON.stringify(this._input.filename)} (entry point)`);
     }
+    if (workerHeapLimitBytes(this.resourceLimits) != null &&
+        error?.name === "RangeError" && error?.message === "Out of memory") {
+      const memoryError = new Error("Worker terminated due to reaching memory limit: JS heap out of memory");
+      memoryError.code = "ERR_WORKER_OUT_OF_MEMORY";
+      return memoryError;
+    }
     return error;
   }
 
@@ -1327,7 +1399,7 @@ export class Worker extends EventEmitter {
       return;
     }
     if (control.type === "exitCode") {
-      if (!this._terminationPromise) this._reportedExitCode = Number(control.code) || 0;
+      this._reportedExitCode = Number(control.code) || 0;
       return;
     }
     if (control.type === "ready") {
@@ -1357,7 +1429,9 @@ export class Worker extends EventEmitter {
     this._running = false;
     this._refed = false;
     const nativeExitCode = Number(code) || 0;
-    this._exitCode = this._terminationPromise ? nativeExitCode : (this._reportedExitCode ?? nativeExitCode);
+    this._exitCode = this._terminationPromise && this._reportedExitCode === 0
+      ? nativeExitCode
+      : (this._reportedExitCode ?? nativeExitCode);
     workerInstances.delete(this._nativeThreadId);
     unregisterSharedEnvironmentWorker(this._sharedEnvironmentGroupId, this._nativeThreadId);
     if (isMainThread) {
@@ -2093,8 +2167,7 @@ function acknowledgeThreadMessage(control, status, code = undefined, message = u
 function dispatchThreadMessage(control) {
   try {
     const emit = globalThis.process?.emit;
-    const listenerCount = Number(globalThis.process?.listenerCount?.("workerMessage") ?? 0);
-    if (typeof emit !== "function" || listenerCount === 0) {
+    if (typeof emit !== "function") {
       acknowledgeThreadMessage(
         control,
         "error",
@@ -2103,7 +2176,16 @@ function dispatchThreadMessage(control) {
       );
       return;
     }
-    emit.call(globalThis.process, "workerMessage", control.value, Number(control.sourceThreadId));
+    const delivered = emit.call(globalThis.process, "workerMessage", control.value, Number(control.sourceThreadId));
+    if (!delivered) {
+      acknowledgeThreadMessage(
+        control,
+        "error",
+        "ERR_WORKER_MESSAGING_FAILED",
+        "Cannot find the destination thread or listener",
+      );
+      return;
+    }
     acknowledgeThreadMessage(control, "ok");
   } catch (error) {
     acknowledgeThreadMessage(
@@ -2449,8 +2531,8 @@ if (!isMainThread) {
     const processExit = globalThis.process.exit;
     globalThis.process.exit = function exit(code = this?.exitCode ?? 0) {
       const exitCode = Number(code) || 0;
+      this.exitCode = exitCode;
       sendParentControl({ type: "exitCode", code: exitCode });
-      globalThis.__cottontailWorkerThreadsFatalCleanup?.();
       return processExit.call(this, exitCode);
     };
   }

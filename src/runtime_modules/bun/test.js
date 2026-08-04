@@ -1053,8 +1053,6 @@ function isEmptyObjectValue(value) {
   if (Array.isArray(value)) return value.length === 0;
   if (!value || typeof value !== "object") return false;
   if (isMapValue(value) || isSetValue(value) || isDateValue(value) || isRegExpValue(value)) return false;
-  const proto = Object.getPrototypeOf(value);
-  if (proto !== Object.prototype && proto !== null) return false;
   return Object.keys(value).length === 0;
 }
 
