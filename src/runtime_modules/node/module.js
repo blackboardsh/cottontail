@@ -2736,7 +2736,7 @@ function compiledRuntimeEsmWrapper(source, filename, diagnosticSource) {
   const cached = runtimeEsmWrapperCache.get(cacheKey);
   if (cached?.source === source && cached.inputSource === diagnosticSource) return cached.run;
   const run = compileModuleWrapper(
-    [ESM_EXPORTS_BINDING, "require", "module", "__ctImportMeta"],
+    [ESM_EXPORTS_BINDING, "require", "module", "__filename", "__dirname", "__ctImportMeta"],
     source,
     filename,
     diagnosticSource,
@@ -2775,7 +2775,14 @@ function executeCommonJsSource(module, filename, source, requireOverride = undef
       run = compiledRuntimeEsmWrapper(transformed, filename, source);
     }
     try {
-      run(module.exports, requireOverride ?? module.require, module, importMetaForModule(filename));
+      run(
+        module.exports,
+        requireOverride ?? module.require,
+        module,
+        filename,
+        dirname(filename),
+        importMetaForModule(filename),
+      );
     } catch (error) {
       throw remapThrownModuleError(error, filename, FUNCTION_WRAPPER_LINE_OFFSET);
     }
@@ -2873,7 +2880,15 @@ function sourceRequiresAsyncModuleExecution(filename, source) {
   } catch {
     return false;
   }
-  const parameters = [ESM_EXPORTS_BINDING, "require", "module", "__ctImportMeta", "Error"];
+  const parameters = [
+    ESM_EXPORTS_BINDING,
+    "require",
+    "module",
+    "__filename",
+    "__dirname",
+    "__ctImportMeta",
+    "Error",
+  ];
   try {
     new Function(...parameters, transformed);
     return false;
@@ -3720,7 +3735,7 @@ function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, origina
     recordCompileCache(resolvedPath, transformed);
     try {
       run = compileAsyncModuleWrapper(
-        [ESM_EXPORTS_BINDING, "__ctImportMeta", "__ctModuleAncestors", "Error"],
+        [ESM_EXPORTS_BINDING, "__filename", "__dirname", "__ctImportMeta", "__ctModuleAncestors", "Error"],
         transformed,
         sourceName,
         originalSource,
@@ -3733,6 +3748,8 @@ function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, origina
   }
   record.promise = run(
     namespace,
+    resolvedPath,
+    dirname(resolvedPath),
     importMetaForHookModule(resolvedPath, suffix),
     moduleAncestors,
     dynamicModuleErrorConstructor(sourceName, originalSource),
@@ -3813,7 +3830,15 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
     recordCompileCache(resolvedPath, transformed);
     try {
       run = compileModuleWrapper(
-        [ESM_EXPORTS_BINDING, "require", "__ctModuleRecord", "__ctImportMeta", "Error"],
+        [
+          ESM_EXPORTS_BINDING,
+          "require",
+          "__ctModuleRecord",
+          "__filename",
+          "__dirname",
+          "__ctImportMeta",
+          "Error",
+        ],
         transformed,
         sourceName,
         originalSource,
@@ -3833,6 +3858,8 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
       namespace,
       createEsmRequire(hookRequireBase(resolvedPath), moduleRecord),
       moduleRecord,
+      resolvedPath,
+      dirname(resolvedPath),
       importMetaForHookModule(resolvedPath, suffix),
       dynamicModuleErrorConstructor(sourceName, originalSource),
     );

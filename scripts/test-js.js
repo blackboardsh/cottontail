@@ -150,6 +150,12 @@ try {
       stdoutIncludes: ['builtin dynamic import identity passed'],
     },
     {
+      name: 'esm-lexical-paths',
+      argv: ['test', join(rootDir, 'tests', 'js', 'esm-lexical-paths.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['2 pass', '0 fail'],
+    },
+    {
       name: 'bundled-dynamic-import-default-identity',
       argv: ['test', join(rootDir, 'tests', 'js', 'builtin-dynamic-import-default-identity.test.ts')],
       expectExitCode: 0,
