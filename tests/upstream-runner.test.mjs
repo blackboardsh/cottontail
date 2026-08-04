@@ -21,6 +21,7 @@ function createFixture(t) {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "cottontail-upstream-runner-"));
   const snapshotRoot = join(fixtureRoot, "node-snapshot");
   const capturePath = join(fixtureRoot, "harness-invocations.jsonl");
+  const environmentCapturePath = join(fixtureRoot, "harness-environment.jsonl");
   const targetsPath = join(fixtureRoot, "targets.json");
   const preflightShimPath = join(fixtureRoot, "preflight-shim.cjs");
   t.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
@@ -100,6 +101,15 @@ function createFixture(t) {
       "    capture_path = os.environ['COTTONTAIL_RUNNER_TEST_CAPTURE']",
       "    with open(capture_path, 'a', encoding='utf-8') as capture:",
       "        capture.write(json.dumps(sys.argv[1:]) + '\\n')",
+      "    environment_capture_path = os.environ.get('COTTONTAIL_RUNNER_TEST_ENV_CAPTURE')",
+      "    if environment_capture_path:",
+      "        with open(environment_capture_path, 'a', encoding='utf-8') as capture:",
+      "            capture.write(json.dumps({",
+      "                'spawnExecPath': os.environ.get('COTTONTAIL_SPAWN_EXEC_PATH'),",
+      "                'spawnArgv0': os.environ.get('COTTONTAIL_SPAWN_ARGV0'),",
+      "                'cottontailBinary': os.environ.get('COTTONTAIL_BINARY'),",
+      "                'dashCottontail': os.environ.get('DASH_COTTONTAIL'),",
+      "            }) + '\\n')",
       "",
       "    args = sys.argv[1:]",
       "    selectors = []",
@@ -188,6 +198,7 @@ function createFixture(t) {
 
   return {
     capturePath,
+    environmentCapturePath,
     preflightShimPath,
     snapshotRoot,
     targetsPath,
@@ -311,6 +322,42 @@ test("Node default runs use explicit selectors and isolate expected failures", (
     ],
   );
   assert.match(result.stdout, /1 expected failure/);
+});
+
+test("Hutch is exposed as the CLI while Cottontail remains the test runtime", (t) => {
+  const fixture = createFixture(t);
+  const result = runRunner(
+    fixture,
+    ["--hutch", process.execPath, "--match", "^test/parallel/test-alpha\\.js$"],
+    {
+      environment: {
+        COTTONTAIL_RUNNER_TEST_ENV_CAPTURE: fixture.environmentCapturePath,
+      },
+    },
+  );
+  assertSucceeded(result);
+  assert.deepEqual(readInvocations(fixture.environmentCapturePath), [
+    {
+      spawnExecPath: process.execPath,
+      spawnArgv0: process.execPath,
+      cottontailBinary: process.execPath,
+      dashCottontail: process.execPath,
+    },
+  ]);
+});
+
+test("--expect-pass validates a focused recorded failure without editing status", (t) => {
+  const fixture = createFixture(t);
+  const result = runRunner(fixture, [
+    "--only-status",
+    "expected-failure",
+    "--expect-pass",
+  ]);
+  assertSucceeded(result);
+  assert.deepEqual(
+    readInvocations(fixture.capturePath),
+    [harnessArgs("parallel/test-beta")],
+  );
 });
 
 test("Node selectors are split into bounded command-line chunks", (t) => {

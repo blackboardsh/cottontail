@@ -4,8 +4,12 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 const workflowPath = new URL('../.github/workflows/bun-compat.yml', import.meta.url);
+const hutchManifestPath = new URL('../compat/upstream/hutch.json', import.meta.url);
+const hutchSetupPath = new URL('./setup-upstream-hutch.js', import.meta.url);
 const statusPath = new URL('../compat/upstream/bun/v1.3.10/status.json', import.meta.url);
 const workflow = readFileSync(workflowPath, 'utf8');
+const hutchManifest = JSON.parse(readFileSync(hutchManifestPath, 'utf8'));
+const hutchSetup = readFileSync(hutchSetupPath, 'utf8');
 const status = JSON.parse(readFileSync(statusPath, 'utf8'));
 
 function workflowTriggers(source) {
@@ -60,4 +64,26 @@ test('runs the strict complete Cottontail-owned Bun tier without publishing', ()
   assert.equal(disabled, hutchOwned.length);
   assert.equal(notEnabled, 0);
   assert.equal(discovered - disabled, enabled + expectedFailures);
+});
+
+test('builds and passes the pinned Hutch engine to split package fixtures', () => {
+  assert.match(hutchManifest.repository, /^https:\/\/github\.com\/[^/]+\/hutch\.git$/);
+  assert.match(hutchManifest.commit, /^[0-9a-f]{40}$/);
+  assert.match(hutchSetup, /process\.platform === 'win32' \? 'hutch-engine\.exe' : 'hutch-engine'/);
+  assert.doesNotMatch(hutchSetup, /command -v|which\(|["']PATH["']/);
+
+  assert.match(workflow, /hutch_engine="\$\(node scripts\/setup-upstream-hutch\.js\)"/);
+  assert.match(workflow, /HUTCH_ENGINE: \$\{\{ steps\.hutch-engine\.outputs\.binary \}\}/);
+  assert.match(
+    workflow,
+    /--hutch "\$HUTCH_ENGINE" --test test\/bundler\/bundler_defer\.test\.ts --case '\^\\\$file\$' --expect-pass --jobs 1/,
+  );
+  assert.match(
+    workflow,
+    /--hutch "\$HUTCH_ENGINE" --test test\/bundler\/bundler_npm\.test\.ts --case '\^npm\/ReactSSR\$' --expect-pass --jobs 1/,
+  );
+  assert.match(
+    workflow,
+    /--hutch "\$HUTCH_ENGINE" --test test\/bundler\/bundler_npm\.test\.ts --case '\^npm\/LodashES\$' --expect-pass --jobs 1/,
+  );
 });

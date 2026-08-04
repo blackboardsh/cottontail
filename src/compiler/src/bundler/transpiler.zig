@@ -339,6 +339,11 @@ pub const Transpiler = struct {
         defer js_ast.Stmt.Data.Store.reset();
 
         try this.options.loadDefines(this.allocator, this.env, &this.options.env);
+        try this.options.define.insert(
+            this.allocator,
+            "__COTTONTAIL_INTERNAL_NULL_SAFE_TO_ESM__",
+            options.Define.Data.initBoolean(this.options.target != .browser),
+        );
 
         var is_development = false;
         if (this.options.define.dots.get("NODE_ENV")) |NODE_ENV| {

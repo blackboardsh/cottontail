@@ -60,7 +60,10 @@ function initializeRuntimeProcess() {
   target.browser ??= false;
   target.exitCode ??= undefined;
   target.cwd ??= () => cottontail.cwd();
-  target.chdir ??= directory => cottontail.chdir(directory);
+  target.chdir ??= directory => {
+    if (typeof cottontail.chdir === "function") return cottontail.chdir(directory);
+    return cottontail.processInfo("chdir", String(directory));
+  };
   target.memoryUsage ??= function memoryUsage() {
     return cottontail.processInfo("memoryUsage");
   };

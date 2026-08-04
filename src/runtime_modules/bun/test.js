@@ -4009,6 +4009,11 @@ const defaultExport = {
   xtest,
 };
 
+// `bun:test` and Bun.jest(file) must share registration and reporter state.
+// They can arrive through different embedded-module aliases, so retain the
+// module interface independently of the loader cache key.
+globalThis[Symbol.for("cottontail.internal.bunTestModule")] = defaultExport;
+
 function installShellConstructor() {
   const shell = globalThis.Bun?.$;
   if (typeof shell !== "function" || typeof shell.Shell === "function") return;

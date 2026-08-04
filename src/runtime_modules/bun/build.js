@@ -87,6 +87,18 @@ export function createBunBuildFacade(dependencies) {
         const relative = String(output.path ?? "").replace(/^\.\//, "");
         if (outdir) {
           const absolute = nodePathResolve(outdir, relative);
+          if (output.kind === "sourcemap") {
+            const sourceMap = JSON.parse(globalThis.Buffer.from(output.b64 ?? "", "base64").toString("utf8"));
+            if (Array.isArray(sourceMap.sources)) {
+              const mapDirectory = pathDirname(absolute);
+              sourceMap.sources = sourceMap.sources.map((source) => {
+                source = String(source);
+                if (!nodePathIsAbsolute(source) && /^[A-Za-z][A-Za-z0-9+.-]*:/.test(source)) return source;
+                return nodePathRelative(mapDirectory, nodePathResolve(cwd, source));
+              });
+              output.b64 = globalThis.Buffer.from(JSON.stringify(sourceMap)).toString("base64");
+            }
+          }
           const parent = pathDirname(absolute);
           if (parent && parent !== ".") cottontail.mkdirSync(parent, true);
           cottontail.writeFile(absolute, globalThis.Buffer.from(output.b64 ?? "", "base64"));

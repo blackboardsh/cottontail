@@ -42,6 +42,18 @@ test("selective bootstrap retains representative builtin behavior", () => {
   expect(String(result.stdout)).toContain("runtime-bootstrap-builtins-ok");
 });
 
+test("selective bootstrap supports process.chdir", () => {
+  const destination = join(temporaryDirectory, "selective-chdir");
+  mkdirSync(destination, { recursive: true });
+  const result = run([
+    "-e",
+    `process.chdir(${JSON.stringify(destination)}); console.log(process.cwd())`,
+  ]);
+  expect(String(result.stderr)).toBe("");
+  expect(result.exitCode).toBe(0);
+  expect(String(result.stdout).trim()).toBe(realpathSync(destination));
+});
+
 test("full-runtime globals select the complete bootstrap", () => {
   const result = run(["-e", "console.log(typeof fetch, typeof Response, typeof process.stdout?.write)"]);
   expect(String(result.stderr)).toBe("");

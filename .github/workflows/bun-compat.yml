@@ -84,5 +84,20 @@ jobs:
       - name: Build Cottontail
         run: node scripts/zig.js build -Doptimize=ReleaseSmall -Dcpu=baseline
 
+      - name: Build pinned Hutch compatibility engine
+        id: hutch-engine
+        run: |
+          hutch_engine="$(node scripts/setup-upstream-hutch.js)"
+          test -x "$hutch_engine"
+          echo "binary=$hutch_engine" >> "$GITHUB_OUTPUT"
+
       - name: Run complete Cottontail-owned Bun compatibility tier
         run: node scripts/run-upstream-tests.js bun --include-expected-failures
+
+      - name: Run Hutch-backed split bundler cases
+        env:
+          HUTCH_ENGINE: ${{ steps.hutch-engine.outputs.binary }}
+        run: |
+          node scripts/run-upstream-tests.js bun --hutch "$HUTCH_ENGINE" --test test/bundler/bundler_defer.test.ts --case '^\$file$' --expect-pass --jobs 1
+          node scripts/run-upstream-tests.js bun --hutch "$HUTCH_ENGINE" --test test/bundler/bundler_npm.test.ts --case '^npm/ReactSSR$' --expect-pass --jobs 1
+          node scripts/run-upstream-tests.js bun --hutch "$HUTCH_ENGINE" --test test/bundler/bundler_npm.test.ts --case '^npm/LodashES$' --expect-pass --jobs 1

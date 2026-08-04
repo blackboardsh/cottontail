@@ -8,6 +8,32 @@ repository runner, it gives every child an owned temp root through `BUN_TMPDIR`,
 Direct Cottontail runs of the Bun snapshot get the same containment from the snapshot's
 Cottontail-only preload.
 
+## Hutch-backed CLI fixtures
+
+Cottontail owns the runtime and bundler behavior exercised by the Bun corpus, while
+Hutch owns package management. CI and clean checkouts can fetch and build the audited
+Hutch revision in `compat/upstream/hutch.json` with Cottontail's vendored Zig.
+The setup command returns Hutch's command engine, not its user-facing
+version/pragma launcher:
+
+```sh
+HUTCH_BINARY="$(node scripts/setup-upstream-hutch.js)"
+node scripts/run-upstream-tests.js bun \
+  --hutch "$HUTCH_BINARY" \
+  --test test/bundler/bundler_npm.test.ts \
+  --case '^npm/ReactSSR$' \
+  --expect-pass \
+  --jobs 1
+```
+
+The test process remains the Cottontail binary selected by `--binary`. Its CLI child
+identity points at Hutch's engine, and that engine is pinned back to the same Cottontail
+binary for runtime commands. Bypassing Hutch's outer launcher also keeps generated
+one-line bundles out of its `// @dash` pragma parser. A local sibling engine build can
+be passed explicitly instead; the runner never searches for or silently selects a
+global Hutch. `COTTONTAIL_UPSTREAM_HUTCH_BINARY` can provide an already pinned engine
+path in CI.
+
 Set `COTTONTAIL_UPSTREAM_KEEP_TEMP=1`, `COTTONTAIL_KEEP_TEMP`, or `DEBUG=1` to preserve
 the run's root for inspection. Cleanup never scans for `bun.test.*` names; it can
 only remove the exact root created for that run.

@@ -69,7 +69,7 @@ export var __toESM = (mod, isNodeMode, target) => {
   // file that has been converted to a CommonJS file using a Babel-
   // compatible transform (i.e. "__esModule" has not been set), then set
   // "default" to the CommonJS "module.exports" for node compatibility.
-  if (mod != null)
+  if (__COTTONTAIL_INTERNAL_NULL_SAFE_TO_ESM__ ? mod != null : true)
     for (let key of __getOwnPropNames(mod))
       if (!__hasOwnProp.call(to, key))
         __defProp(to, key, {

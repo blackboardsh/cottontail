@@ -10195,6 +10195,8 @@ export function jest(_source = undefined) {
   if (inTestRunner && typeof _source !== "string") {
     throw new Error("Bun.jest() expects a string filename");
   }
+  const sharedModule = globalThis[Symbol.for("cottontail.internal.bunTestModule")];
+  if (sharedModule != null) return sharedModule;
   const module = loadBunTestModule();
   return module.default ?? module;
 }
