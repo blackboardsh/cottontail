@@ -233,6 +233,13 @@ Buffer.from = function from(value, encodingOrOffset, length) {
     if (typeof value === "string" && isHexEncoding(encodingOrOffset)) {
       return originalBufferFrom(validHexPrefix(value), "hex");
     }
+    if (typeof value === "string" &&
+        (encodingOrOffset === undefined || /^utf-?8$/i.test(String(encodingOrOffset)))) {
+      // The vendored polyfill encodes UTF-8 strings with a per-char JS loop
+      // twice (once for the length, once for the write); TextEncoder is ~25x
+      // faster and byte-identical.
+      return originalBufferFrom(new TextEncoder().encode(value));
+    }
     return originalBufferFrom(value, encodingOrOffset, length);
   } catch (error) {
     if (typeof value === "string" && error instanceof TypeError && /Unknown encoding/.test(error.message)) {

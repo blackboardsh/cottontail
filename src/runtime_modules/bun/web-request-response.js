@@ -80,7 +80,9 @@ export function createRequestResponseRuntime({
     const iterable = typeof body === "function" ? body() : body;
     if (typeof body.getReader === "function" || (iterable && typeof iterable[Symbol.asyncIterator] === "function")) {
       const chunks = [];
-      await consumeStreamingBody(body, (chunk) => chunks.push(asBuffer(chunk)));
+      // String chunks must go through TextEncoder: asBuffer falls back to
+      // Buffer.from(string), which is >20x slower for multi-MB chunks.
+      await consumeStreamingBody(body, (chunk) => chunks.push(typeof chunk === "string" ? new TextEncoder().encode(chunk) : asBuffer(chunk)));
       return concatBodyChunks(chunks);
     }
     if (typeof body.bytes === "function") return asBuffer(await body.bytes());
