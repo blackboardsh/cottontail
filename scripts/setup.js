@@ -105,6 +105,7 @@ function vendorZig() {
 
     if (archive === 'tar.xz') {
       execFileSync('tar', [
+        '--force-local',
         '-xJf',
         archivePath,
         '--strip-components=1',

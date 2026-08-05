@@ -162,6 +162,7 @@ function ensureIcuHeaders(vendorDir) {
       );
     }
     exec('tar', [
+      '--force-local',
       '-xzf',
       archivePath,
       '-C',

@@ -74,6 +74,9 @@ function setup() {
     }
 
     execFileSync('tar', [
+      // --force-local: on Windows an absolute archive path (D:\...) would
+      // otherwise be parsed as a remote host:file spec.
+      '--force-local',
       '-xzf',
       archivePath,
       '--strip-components=1',
