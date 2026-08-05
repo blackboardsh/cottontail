@@ -3983,6 +3983,8 @@
       "args": ["--timeout=10000", "--test-name-pattern=^(?!.*#3545).*$"],
       "testNameExclusion": {
         "pattern": "^(?!.*#3545).*$",
+        "classification": "environment",
+        "testNames": ["#3545"],
         "reason": "The #3545 case fetches http://example.com; external DNS is not available on every compatibility host."
       },
       "timeoutMs": 300000
@@ -6082,8 +6084,9 @@
       "timeoutMs": 180000
     },
     "test/napi/node-napi-tests/test/node-api/test_uv_threadpool_size/do.test.ts": {
-      "status": "enabled",
-      "reason": "All 55 copied Node-API fixture files pass their 124 active cases (136 assertions); 24 additional cases remain upstream-authored todos.",
+      "status": "expected-failure",
+      "classification": "upstream",
+      "reason": "The fixture calls uv_sleep, which real Bun 1.3.10 crashes on identically (verified against the real binary: 'panic: unsupported uv function: uv_sleep', oven-sh/bun#18546). No Bun-parity runtime can pass it.",
       "args": ["--timeout=120000"],
       "timeoutMs": 180000
     },
@@ -6426,8 +6429,8 @@
   },
   "expectedCounts": {
     "runnableFiles": 1445,
-    "enabled": 1345,
-    "expectedFailure": 0,
+    "enabled": 1344,
+    "expectedFailure": 1,
     "skip": 100,
     "cottontailOwned": 1345,
     "hutchOwned": 100,
