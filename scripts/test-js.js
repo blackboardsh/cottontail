@@ -1062,7 +1062,7 @@ try {
       name: 'websocket-production',
       argv: ['test', join(rootDir, 'tests', 'js', 'websocket-production.test.ts')],
       expectExitCode: 0,
-      stderrIncludes: ['6 pass', '0 fail'],
+      stderrIncludes: ['8 pass', '0 fail'],
     },
     {
       name: 'websocket-native-frame',
