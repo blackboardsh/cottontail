@@ -3864,7 +3864,8 @@
     },
     "test/js/web/fetch/body-stream.test.ts": {
       "status": "enabled",
-      "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (0 bun:test cases, 0 assertions)."
+      "reason": "Passes all copied cases with Bun.serve websocket/TLS support and the streaming fetch client (4,883 bun:test cases, 72,293 assertions, ~25s; the 120s harness budget covers serial-mode contention).",
+      "timeoutMs": 120000
     },
     "test/js/web/fetch/body.test.ts": {
       "status": "enabled",
@@ -3977,8 +3978,9 @@
     },
     "test/js/web/fetch/fetch.test.ts": {
       "status": "enabled",
-      "reason": "Fetch, Request, Response, Headers, Blob, Bun.file, redirects, framing, duplex uploads, aborts, and response lifecycle ownership pass all 341 copied cases with 7,390 assertions. A 10-second test timeout covers cold native compilation of the two --smol lifecycle child fixtures.",
-      "args": ["--timeout=10000"]
+      "reason": "Fetch, Request, Response, Headers, Blob, Bun.file, redirects, framing, duplex uploads, aborts, and response lifecycle ownership pass all 341 copied cases with 7,390 assertions. A 10-second test timeout covers cold native compilation of the two --smol lifecycle child fixtures; the 300s harness budget covers the ~115s suite wall time.",
+      "args": ["--timeout=10000"],
+      "timeoutMs": 300000
     },
     "test/js/web/fetch/fetch.stream.test.ts": {
       "status": "enabled",
