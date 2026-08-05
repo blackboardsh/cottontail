@@ -576,6 +576,10 @@ export function createBunBuildFacade(dependencies) {
         }
         if (!path) continue;
         if (!userNamespace) userNamespace = importerNamespace;
+        // Entry points are resolved in the empty namespace, but a resolved
+        // entry module itself lives in the default "file" namespace unless
+        // the plugin explicitly redirects it elsewhere.
+        if (!userNamespace) userNamespace = "file";
         if (typeof external !== "boolean" && external != null) {
           throw new TypeError('onResolve plugins "external" field must be boolean or unspecified');
         }
