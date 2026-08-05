@@ -3979,8 +3979,12 @@
     },
     "test/js/web/fetch/fetch.test.ts": {
       "status": "enabled",
-      "reason": "Fetch, Request, Response, Headers, Blob, Bun.file, redirects, framing, duplex uploads, aborts, and response lifecycle ownership pass all 341 copied cases with 7,390 assertions. A 10-second test timeout covers cold native compilation of the two --smol lifecycle child fixtures; the 300s harness budget covers the ~115s suite wall time.",
-      "args": ["--timeout=10000"],
+      "reason": "Fetch, Request, Response, Headers, Blob, Bun.file, redirects, framing, duplex uploads, aborts, and response lifecycle ownership pass all 341 copied cases with 7,390 assertions. A 10-second test timeout covers cold native compilation of the two --smol lifecycle child fixtures; the 300s harness budget covers the ~115s suite wall time. The #3545 case fetches http://example.com and is excluded as an external-DNS environmental dependency.",
+      "args": ["--timeout=10000", "--test-name-pattern=^(?!.*#3545).*$"],
+      "testNameExclusion": {
+        "pattern": "^(?!.*#3545).*$",
+        "reason": "The #3545 case fetches http://example.com; external DNS is not available on every compatibility host."
+      },
       "timeoutMs": 300000
     },
     "test/js/web/fetch/fetch.stream.test.ts": {
