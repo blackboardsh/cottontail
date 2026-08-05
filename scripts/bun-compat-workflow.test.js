@@ -7,10 +7,13 @@ const workflowPath = new URL('../.github/workflows/bun-compat.yml', import.meta.
 const hutchManifestPath = new URL('../compat/upstream/hutch.json', import.meta.url);
 const hutchSetupPath = new URL('./setup-upstream-hutch.js', import.meta.url);
 const statusPath = new URL('../compat/upstream/bun/v1.3.10/status.json', import.meta.url);
-const workflow = readFileSync(workflowPath, 'utf8');
-const hutchManifest = JSON.parse(readFileSync(hutchManifestPath, 'utf8'));
-const hutchSetup = readFileSync(hutchSetupPath, 'utf8');
-const status = JSON.parse(readFileSync(statusPath, 'utf8'));
+// Windows runners may check the repository out with CRLF line endings;
+// normalize so the contract regexes match regardless of checkout config.
+const readText = (path) => readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
+const workflow = readText(workflowPath);
+const hutchManifest = JSON.parse(readText(hutchManifestPath));
+const hutchSetup = readText(hutchSetupPath);
+const status = JSON.parse(readText(statusPath));
 
 function workflowTriggers(source) {
   const end = source.indexOf('\npermissions:');

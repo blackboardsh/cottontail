@@ -74,6 +74,13 @@ jobs:
         with:
           bun-version: 1.3.10
 
+      - name: Provision linked react package
+        if: steps.bun-compat-dependencies.outputs.cache-hit != 'true'
+        # test/package.json links react from file:../node_modules/react,
+        # mirroring Bun's repo where a root install provides it. On a fresh
+        # checkout that target does not exist, so provision it first.
+        run: bun add react@18.3.1 --cwd=compat/upstream/bun/v1.3.10 --ignore-scripts
+
       - name: Restore frozen Bun test dependencies
         if: steps.bun-compat-dependencies.outputs.cache-hit != 'true'
         run: bun install --cwd=compat/upstream/bun/v1.3.10/test --frozen-lockfile --ignore-scripts
