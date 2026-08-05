@@ -161,12 +161,14 @@ function ensureIcuHeaders(vendorDir) {
           `Actual:   ${actualSha256}`
       );
     }
+    // MSYS tar cannot chdir into drive-letter backslash paths on Windows.
+    const tarPath = (p) => (process.platform === 'win32' ? p.replace(/\\/g, '/') : p);
     exec('tar', [
       '--force-local',
       '-xzf',
-      archivePath,
+      tarPath(archivePath),
       '-C',
-      includeDir,
+      tarPath(includeDir),
       '--strip-components=3',
       'icu/source/common/unicode',
       'icu/source/i18n/unicode',
