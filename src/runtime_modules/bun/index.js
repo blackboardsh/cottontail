@@ -1664,11 +1664,18 @@ function withoutElectrobunHostEnv(env) {
 
 function isCurrentCottontailExecutable(file) {
   const execPath = String(cottontail.execPath?.() ?? globalThis.process?.execPath ?? "");
-  if (execPath.length > 0 && String(file) === execPath) return true;
-  // Facade mode: process.execPath shows the wrapper (hutch) path while the
-  // native execPath is the real runtime; both must count as "current".
+  return execPath.length > 0 && String(file) === execPath;
+}
+
+// Facade mode: process.execPath displays the wrapper (hutch) path while the
+// native execPath is the real runtime. Spawning the facade path must NOT be
+// treated as spawning the runtime itself — the deferred-start spawn gate
+// would inject a --cottontail-spawn-gate argv the wrapper cannot parse — but
+// the child still needs the facade routing vars to find the runtime.
+function isFacadeDisplayExecutable(file) {
   const display = String(globalThis.process?.execPath ?? "");
-  return display.length > 0 && String(file) === display;
+  const native = String(cottontail.execPath?.() ?? "");
+  return display.length > 0 && display !== native && String(file) === display;
 }
 
 function prepareNativeSpawnOptions(file, nativeOptions, args = []) {
@@ -1682,8 +1689,18 @@ function prepareNativeSpawnOptions(file, nativeOptions, args = []) {
     env.COTTONTAIL_SPAWN_EXEC_PATH = nodePathResolve(String(file));
     if (nativeOptions.argv0 !== undefined) env.COTTONTAIL_SPAWN_ARGV0 = nativeOptions.argv0;
     if (nativeOptions.stdinFileBacked) env.COTTONTAIL_SPAWN_STDIN_FILE = "1";
+    return {
+      ...nativeOptions,
+      env,
+      clearEnv: true,
+    };
+  }
+  if (isFacadeDisplayExecutable(file)) {
     // Facade routing must survive an explicit spawn env (e.g. `env: {}`):
     // without it the child wrapper cannot locate the runtime at all.
+    const env = nativeOptions.env === undefined
+      ? withoutElectrobunHostEnv(currentProcessEnv())
+      : { ...nativeOptions.env };
     for (const key of ["DASH_COTTONTAIL", "COTTONTAIL_BINARY"]) {
       if (env[key] === undefined) {
         const inherited = currentProcessEnv()[key];
