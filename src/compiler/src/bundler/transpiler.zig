@@ -172,6 +172,11 @@ pub const Transpiler = struct {
         js_ast.Stmt.Data.Store.create();
 
         const fs = try Fs.FileSystem.init(opts.absolute_working_dir);
+        // The DirInfo cache is a process-global singleton (BSSMap.instance)
+        // shared with earlier in-process bundling passes. Honor the override.
+        if (opts.tsconfig_override != null) {
+            _resolver.DirInfo.HashMap.resetInstance();
+        }
         const bundle_options = try options.BundleOptions.fromApi(
             allocator,
             fs,
@@ -339,6 +344,11 @@ pub const Transpiler = struct {
         defer js_ast.Stmt.Data.Store.reset();
 
         try this.options.loadDefines(this.allocator, this.env, &this.options.env);
+        try this.options.define.insert(
+            this.allocator,
+            "__COTTONTAIL_INTERNAL_NULL_SAFE_TO_ESM__",
+            options.Define.Data.initBoolean(this.options.target != .browser),
+        );
 
         var is_development = false;
         if (this.options.define.dots.get("NODE_ENV")) |NODE_ENV| {

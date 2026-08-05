@@ -162,7 +162,25 @@ class ProcessReadable {
     return this._concatChunks(chunks);
   }
 
-  async blob() { return new Blob([await this.bytes()]); }
+  async blob() {
+    if (this._locked && this._ended && this._chunks.length === 0 && !this._emptyReadClaimed) {
+      this._emptyReadClaimed = true;
+      return new Blob([]);
+    }
+    const reader = this.getReader();
+    const chunks = [];
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+    } finally {
+      if (chunks.length === 0 && this._ended) this._emptyReadClaimed = true;
+      else reader.releaseLock();
+    }
+    return globalThis.__cottontailBlobFromOwnedChunks?.(chunks) ?? new Blob(chunks);
+  }
   async text() { return new TextDecoder().decode(await this.bytes()); }
 
   async json() {
@@ -698,8 +716,10 @@ export function createBunSpawnRuntime(deps) {
     }
     const rawSignalCode = Number(result.signalCode ?? result.signal ?? 0);
     const exitCode = rawSignalCode > 0 ? null : Number(result.status ?? result.exitCode ?? 0);
-    const rawStdout = asBuffer(result.stdout ?? "");
-    let rawStderr = asBuffer(result.stderr ?? "");
+    const stdoutValue = result.stdoutBytes ?? result.stdout ?? "";
+    const stderrValue = result.stderrBytes ?? result.stderr ?? "";
+    const rawStdout = globalThis.Buffer?.from ? globalThis.Buffer.from(stdoutValue) : asBuffer(stdoutValue);
+    let rawStderr = globalThis.Buffer?.from ? globalThis.Buffer.from(stderrValue) : asBuffer(stderrValue);
     if (nativeOptions.stdoutFilePath != null) {
       try { host.writeFile(nativeOptions.stdoutFilePath, rawStdout); } catch {}
     }
@@ -744,13 +764,23 @@ export function createBunSpawnRuntime(deps) {
     return {
       get finished() { return finished; },
       async pump(write) {
+        // Keep one read request pending at all times. Otherwise the stream's
+        // eager `pull` refills can run while we await a write, and a pull that
+        // enqueues a chunk and then throws would error the stream with the
+        // chunk still queued — spec error handling resets the queue and the
+        // data is lost. Bun still delivers data enqueued before the throw.
+        let pendingRead = reader.read();
         try {
           for (;;) {
-            const { done, value } = await reader.read();
+            const { done, value } = await pendingRead;
             if (done) {
               finished = true;
               return null;
             }
+            pendingRead = reader.read();
+            // The read-ahead may reject while we are awaiting a write below;
+            // it is awaited (or abandoned) on the next loop turn.
+            pendingRead.catch(() => {});
             const bytes = asBuffer(value);
             for (let offset = 0; offset < bytes.byteLength; offset += 16 * 1024) {
               const chunk = bytes.subarray(offset, Math.min(offset + 16 * 1024, bytes.byteLength));

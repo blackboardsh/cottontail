@@ -7,7 +7,8 @@ let cachedConfig;
 let cachedRuntimeOptions;
 
 function testCliModeEnabled() {
-  return globalThis.__cottontailBunTestHeaderPrinted === true ||
+  return globalThis.__cottontailBunTestRuntime === true ||
+    globalThis.__cottontailBunTestHeaderPrinted === true ||
     globalThis.process?.env?.COTTONTAIL_TEST_CLI_HEADER_PRINTED === "1";
 }
 

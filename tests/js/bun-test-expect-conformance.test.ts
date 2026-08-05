@@ -45,6 +45,15 @@ test("negative matcher includes Bun's half-unit boundary", () => {
   expect(-0.499999).not.toBeNegative();
 });
 
+test("toBeEmptyObject uses enumerable properties for host objects", () => {
+  expect(new Blob(["payload"])).toBeEmptyObject();
+  expect(Object.create({ inherited: true })).toBeEmptyObject();
+  expect(new Map()).not.toBeEmptyObject();
+  expect(new Set()).not.toBeEmptyObject();
+  expect(new Date()).not.toBeEmptyObject();
+  expect(/value/).not.toBeEmptyObject();
+});
+
 test("expectation metadata and unsupported serializer match Bun", () => {
   const expectation = expect(1);
   expect(Object.prototype.toString.call(expectation)).toBe("[object Expect]");

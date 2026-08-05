@@ -203,7 +203,10 @@ assert(cachedDataVersionTag() === cachedDataTag, "cachedDataVersionTag stability
 const heapStats = getHeapStatistics();
 assert(typeof heapStats.total_heap_size === "number" && heapStats.total_heap_size >= heapStats.used_heap_size,
   "getHeapStatistics mismatch");
-assert(heapStats.total_heap_size_executable === 0, "JSC executable heap accounting should be explicit");
+// Bun parity: JSC exposes no executable/data split, and Bun reports half the
+// used heap as executable (verified against Bun 1.3.10), so we do the same.
+assert(heapStats.total_heap_size_executable === (heapStats.used_heap_size >> 1),
+  "getHeapStatistics executable share mismatch (Bun parity: used >> 1)");
 const heapSpaces = getHeapSpaceStatistics();
 assert(heapSpaces.length === 1 && heapSpaces[0].space_name === "jsc_heap", "getHeapSpaceStatistics mismatch");
 assert(heapSpaces[0].space_used_size >= 0 && heapSpaces[0].space_used_size <= heapSpaces[0].space_size,

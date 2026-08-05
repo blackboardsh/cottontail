@@ -9,12 +9,20 @@ function expectCode(callback: () => unknown, code: string) {
   expect(callback).toThrow(expect.objectContaining({ code }));
 }
 
-test("Web Crypto exposes a coherent global constructor", () => {
+test("Web Crypto exposes coherent global constructors", async () => {
   expect(typeof globalThis.Crypto).toBe("function");
+  expect(typeof globalThis.CryptoKey).toBe("function");
+  expect(typeof globalThis.SubtleCrypto).toBe("function");
   expect(globalThis.crypto).toBe(webcrypto);
   expect(globalThis.crypto).toBeInstanceOf(globalThis.Crypto);
   expect(globalThis.crypto.constructor).toBe(globalThis.Crypto);
   expect(globalThis.crypto.subtle).toBeInstanceOf(globalThis.SubtleCrypto);
+  const key = await globalThis.crypto.subtle.generateKey(
+    { name: "AES-GCM", length: 128 },
+    true,
+    ["encrypt", "decrypt"],
+  );
+  expect(key).toBeInstanceOf(globalThis.CryptoKey);
   expect(Object.prototype.toString.call(globalThis.crypto)).toBe("[object Crypto]");
   expect(() => new globalThis.Crypto()).toThrow(expect.objectContaining({ code: "ERR_ILLEGAL_CONSTRUCTOR" }));
 });

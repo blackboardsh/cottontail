@@ -501,7 +501,8 @@ class TextEncoder {
   }
 
   encodeInto(source, destination) {
-    if (!(destination instanceof Uint8Array)) {
+    // Accept Uint8Array from any realm (e.g. vm contexts), not just this one.
+    if (!(destination instanceof Uint8Array) && destination?.[Symbol.toStringTag] !== "Uint8Array") {
       const error = new TypeError('The "destination" argument must be an instance of Uint8Array');
       error.code = "ERR_INVALID_ARG_TYPE";
       throw error;

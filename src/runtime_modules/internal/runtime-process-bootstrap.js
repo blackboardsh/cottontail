@@ -60,11 +60,14 @@ function initializeRuntimeProcess() {
   target.browser ??= false;
   target.exitCode ??= undefined;
   target.cwd ??= () => cottontail.cwd();
-  target.chdir ??= directory => cottontail.chdir(directory);
+  target.chdir ??= directory => {
+    if (typeof cottontail.chdir === "function") return cottontail.chdir(directory);
+    return cottontail.processInfo("chdir", String(directory));
+  };
   target.memoryUsage ??= function memoryUsage() {
     return cottontail.processInfo("memoryUsage");
   };
-  target.memoryUsage.rss ??= () => Number(cottontail.processInfo("memoryUsage").rss) || 0;
+  target.memoryUsage.rss ??= () => Number(cottontail.processInfo("rss")) || 0;
   target.uptime ??= () => Number(BigInt(Math.floor(cottontail.nanotime?.() ?? Date.now() * 1_000_000)) - processStartNs) / 1e9;
   target.hrtime ??= function hrtime(previous) {
     let value = BigInt(Math.floor(cottontail.nanotime?.() ?? Date.now() * 1_000_000));
@@ -75,6 +78,10 @@ function initializeRuntimeProcess() {
   target.nextTick ??= (callback, ...args) => queueMicrotask(() => callback(...args));
   target.exit ??= function exit(code = this.exitCode ?? 0) {
     this.exitCode = Number(code) || 0;
+    if (!this._exiting) {
+      this._exiting = true;
+      this.emit?.("exit", this.exitCode);
+    }
     cottontail.exit(this.exitCode);
   };
   target.reallyExit ??= target.exit;

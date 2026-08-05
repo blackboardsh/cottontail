@@ -42,11 +42,61 @@ test("selective bootstrap retains representative builtin behavior", () => {
   expect(String(result.stdout)).toContain("runtime-bootstrap-builtins-ok");
 });
 
+test("selective bootstrap supports process.chdir", () => {
+  const destination = join(temporaryDirectory, "selective-chdir");
+  mkdirSync(destination, { recursive: true });
+  const result = run([
+    "-e",
+    `process.chdir(${JSON.stringify(destination)}); console.log(process.cwd())`,
+  ]);
+  expect(String(result.stderr)).toBe("");
+  expect(result.exitCode).toBe(0);
+  expect(String(result.stdout).trim()).toBe(realpathSync(destination));
+});
+
 test("full-runtime globals select the complete bootstrap", () => {
   const result = run(["-e", "console.log(typeof fetch, typeof Response, typeof process.stdout?.write)"]);
   expect(String(result.stderr)).toBe("");
   expect(result.exitCode).toBe(0);
   expect(String(result.stdout).trim()).toBe("function function function");
+});
+
+test("advanced console methods select the compatible formatter", () => {
+  const fixture = join(temporaryDirectory, "selective-console.js");
+  writeFileSync(fixture, `
+const value = new Proxy({ answer: 42 }, {
+  get(target, property, receiver) {
+    process.stdout.write(\`unexpected proxy get: \${String(property)}\\n\`);
+    return Reflect.get(target, property, receiver);
+  },
+});
+console.group("group");
+console.log(value);
+console.groupEnd();
+console.time("clock");
+console.timeLog("clock", "tick");
+console.timeEnd("clock");
+`);
+
+  const result = run([fixture]);
+  expect(result.exitCode).toBe(0);
+  expect(String(result.stdout)).toBe("group\n  {\n    answer: 42,\n  }\n");
+  expect(String(result.stderr).replace(/^\[.+?ms\] /gm, "")).toBe("clock tick\nclock\n");
+});
+
+test("confirm is available in the selective runtime", () => {
+  const fixture = join(temporaryDirectory, "selective-confirm.js");
+  writeFileSync(fixture, 'console.error(confirm("Proceed?") ? "Yes" : "No");\n');
+  const result = Bun.spawnSync({
+    cmd: [process.execPath, fixture],
+    env: process.env,
+    stdin: Buffer.from("Y\r\n"),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(result.exitCode).toBe(0);
+  expect(String(result.stdout)).toBe("Proceed? [y/N] ");
+  expect(String(result.stderr)).toBe("Yes\n");
 });
 
 test("selective bootstrap consumes internal spawn identity variables", () => {

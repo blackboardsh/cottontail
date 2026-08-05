@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'fs';
+import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
 import { spawn, spawnSync } from 'child_process';
 import os from 'os';
 import { delimiter, join, relative, resolve, sep } from 'path';
@@ -15,6 +15,7 @@ let binaryPath = resolve(
   process.env.COTTONTAIL_UPSTREAM_BINARY ??
     join('zig-out', 'bin', process.platform === 'win32' ? 'cottontail.exe' : 'cottontail'),
 );
+let hutchPath = null;
 const pythonPath = process.env.PYTHON ?? (process.platform === 'win32' ? 'python' : 'python3');
 const tempBase = process.env.COTTONTAIL_UPSTREAM_TMPDIR ?? (process.platform === 'darwin' ? '/tmp' : os.tmpdir());
 const tempRoot = mkdtempSync(join(tempBase, 'cottontail-upstream-tests-'));
@@ -33,6 +34,15 @@ const activeChildren = new Set();
 const snapshotArtifactRoots = new Map();
 const externallyManagedSnapshotRoots = new Set();
 const nodeHarnessInventoryCache = new Map();
+const snapshotFileBaselines = new Map();
+const bunMutableSnapshotFiles = [
+  'packages/bun-plugin-svelte/bun.lock',
+  'test/napi/napi-app/bun.lock',
+];
+const bunGeneratedSnapshotPaths = [
+  'test/js/third_party/astro/fixtures/.astro',
+  'test/js/third_party/astro/fixtures/dist',
+];
 const bunSnapshotSourceNames = new Set([
   'LICENSE.md',
   'manifest.json',
@@ -55,8 +65,35 @@ function removeTemp(path) {
   try { rmSync(path, { recursive: true, force: true }); } catch {}
 }
 
+function captureSnapshotFileBaselines(snapshotRoot, runtime) {
+  if (runtime !== 'bun' || snapshotFileBaselines.has(snapshotRoot)) return;
+  const baselines = new Map();
+  for (const relativePath of bunMutableSnapshotFiles) {
+    const path = join(snapshotRoot, relativePath);
+    baselines.set(relativePath, existsSync(path) ? readFileSync(path) : null);
+  }
+  snapshotFileBaselines.set(snapshotRoot, baselines);
+}
+
+function restoreSnapshotFileBaselines(snapshotRoot, runtime) {
+  if (runtime !== 'bun') return;
+  const baselines = snapshotFileBaselines.get(snapshotRoot);
+  if (!baselines) return;
+  for (const [relativePath, contents] of baselines) {
+    const path = join(snapshotRoot, relativePath);
+    if (contents == null) rmSync(path, { force: true });
+    else writeFileSync(path, contents);
+  }
+}
+
 function removeSnapshotArtifacts(snapshotRoot, runtime) {
   if (externallyManagedSnapshotRoots.has(snapshotRoot)) return;
+  restoreSnapshotFileBaselines(snapshotRoot, runtime);
+  if (runtime === 'bun') {
+    for (const relativePath of bunGeneratedSnapshotPaths) {
+      try { rmSync(join(snapshotRoot, relativePath), { recursive: true, force: true }); } catch {}
+    }
+  }
   const testRoot = join(snapshotRoot, 'test');
   const installedDependencies = join(snapshotRoot, 'test', 'node_modules');
   const stack = [snapshotRoot];
@@ -251,6 +288,8 @@ function usage() {
     '',
     'Options:',
     '  --binary <path>              Use an immutable Cottontail executable for this run.',
+    '  --expect-pass                Require a focused selection to pass, including recorded xfails.',
+    '  --hutch <path>               Route Bun CLI fixture calls through a pinned Hutch engine.',
     '  --include-expected-failures  Run tests marked expected-failure and require them to fail.',
     '  --case <regexp>              Select generated itBundled case IDs within a split file.',
     '  --jobs <n>                   Bound Bun file, split-case, and in-file test concurrency (default: up to 4).',
@@ -266,6 +305,7 @@ function usage() {
     'Snapshot overrides:',
     '  COTTONTAIL_UPSTREAM_TARGETS_PATH   Read target metadata from this JSON file.',
     '  COTTONTAIL_UPSTREAM_BUN_SNAPSHOT   Run against an externally managed Bun snapshot.',
+    '  COTTONTAIL_UPSTREAM_HUTCH_BINARY   Pinned Hutch engine used by the compatibility harness.',
     '  COTTONTAIL_UPSTREAM_NODE_SNAPSHOT  Run against an externally managed Node snapshot.',
   ].join('\n'));
 }
@@ -278,6 +318,8 @@ function parseArgs(argv) {
   }
   const options = {
     includeExpectedFailures: false,
+    expectPass: false,
+    hutch: null,
     list: false,
     maxFailures: Infinity,
     jobs: defaultBunJobs,
@@ -295,6 +337,10 @@ function parseArgs(argv) {
     const arg = args.shift();
     if (arg === '--include-expected-failures') {
       options.includeExpectedFailures = true;
+    } else if (arg === '--expect-pass') {
+      options.expectPass = true;
+    } else if (arg === '--hutch') {
+      options.hutch = args.shift() ?? fail('--hutch requires a path');
     } else if (arg === '--binary') {
       options.binary = args.shift() ?? fail('--binary requires a path');
     } else if (arg === '--case') {
@@ -349,6 +395,16 @@ function parseArgs(argv) {
     }
   }
   if (!['node', 'bun', 'all'].includes(runtime)) fail(`Unknown upstream runtime: ${runtime}`);
+  if (
+    options.expectPass &&
+    !options.test &&
+    !options.match &&
+    !options.caseMatch &&
+    !options.onlyStatus &&
+    !Number.isFinite(options.maxTests)
+  ) {
+    fail('--expect-pass requires a focused test selection');
+  }
   return { runtime, options };
 }
 
@@ -682,7 +738,26 @@ function makeEnv(runtime, target, runTemp = tempRoot, overrides = undefined) {
     COTTONTAIL_UPSTREAM_VERSION: target.version,
     COTTONTAIL_REPO_ROOT: rootDir,
     ...(overrides ?? {}),
+    ...(hutchPath ? {
+      // The test itself remains a direct Cottontail process. Present Hutch's
+      // command engine as Bun's CLI executable so package setup stays on the
+      // build-tool side while runtime children route back to Cottontail. The
+      // outer Hutch version/pragma launcher is deliberately not involved.
+      COTTONTAIL_SPAWN_EXEC_PATH: hutchPath,
+      COTTONTAIL_SPAWN_ARGV0: hutchPath,
+      COTTONTAIL_BINARY: binaryPath,
+      DASH_COTTONTAIL: binaryPath,
+    } : {}),
   };
+}
+
+function expectPassEntries(entries, options) {
+  if (!options.expectPass) return entries;
+  return entries.map((entry) => ({
+    ...entry,
+    status: 'enabled',
+    reason: 'focused run requires this selection to pass',
+  }));
 }
 
 function prepareBunTestDependencies(entries, snapshotRoot) {
@@ -820,7 +895,7 @@ function expandBunEntries(entries, snapshotRoot, target, options) {
   if (options.caseMatch && expanded.length === 0) {
     fail(`No generated itBundled case IDs matched ${options.caseMatch}`);
   }
-  return expanded;
+  return expectPassEntries(expanded, options);
 }
 
 function normalizeNodeEntryPath(entryPath) {
@@ -1289,6 +1364,12 @@ function runtimeTargets(runtime, targets) {
 
 const { runtime, options } = parseArgs(process.argv.slice(2));
 if (options.binary != null) binaryPath = resolve(rootDir, options.binary);
+const configuredHutchPath = options.hutch ?? process.env.COTTONTAIL_UPSTREAM_HUTCH_BINARY;
+if (configuredHutchPath != null) {
+  hutchPath = resolve(rootDir, configuredHutchPath);
+  if (!existsSync(hutchPath)) fail(`Hutch binary not found at ${hutchPath}.`);
+  if (!statSync(hutchPath).isFile()) fail(`Hutch binary is not a file: ${hutchPath}.`);
+}
 if (!existsSync(targetsPath)) fail(`Missing ${targetsPath}`);
 if (!options.list) {
   if (!existsSync(binaryPath)) fail(`Built cottontail binary not found at ${binaryPath}. Run "bun run build" first.`);
@@ -1303,6 +1384,7 @@ for (const name of runtimeTargets(runtime, targets)) {
   if (!target) fail(`Missing upstream target: ${name}`);
   const snapshotRoot = targetSnapshotRoot(name, target);
   snapshotArtifactRoots.set(snapshotRoot, name);
+  captureSnapshotFileBaselines(snapshotRoot, name);
   removeSnapshotArtifacts(snapshotRoot, name);
   const statusPath = join(snapshotRoot, 'status.json');
   const status = readJson(statusPath);
@@ -1327,10 +1409,11 @@ for (const name of runtimeTargets(runtime, targets)) {
     continue;
   }
 
-  const entries = selectedTests(status, options, snapshotRoot, name).slice(0, options.maxTests);
+  let entries = selectedTests(status, options, snapshotRoot, name).slice(0, options.maxTests);
   if (entries.length === 0) {
     fail(`No ${name} upstream tests matched the requested selection.`);
   }
+  if (name === 'node') entries = expectPassEntries(entries, options);
   if (name === 'bun') prepareBunTestDependencies(entries, snapshotRoot);
   const results = name === 'node'
     ? runNode(name, target, entries, snapshotRoot, options)

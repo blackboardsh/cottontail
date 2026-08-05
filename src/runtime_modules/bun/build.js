@@ -87,6 +87,18 @@ export function createBunBuildFacade(dependencies) {
         const relative = String(output.path ?? "").replace(/^\.\//, "");
         if (outdir) {
           const absolute = nodePathResolve(outdir, relative);
+          if (output.kind === "sourcemap") {
+            const sourceMap = JSON.parse(globalThis.Buffer.from(output.b64 ?? "", "base64").toString("utf8"));
+            if (Array.isArray(sourceMap.sources)) {
+              const mapDirectory = pathDirname(absolute);
+              sourceMap.sources = sourceMap.sources.map((source) => {
+                source = String(source);
+                if (!nodePathIsAbsolute(source) && /^[A-Za-z][A-Za-z0-9+.-]*:/.test(source)) return source;
+                return nodePathRelative(mapDirectory, nodePathResolve(cwd, source));
+              });
+              output.b64 = globalThis.Buffer.from(JSON.stringify(sourceMap)).toString("base64");
+            }
+          }
           const parent = pathDirname(absolute);
           if (parent && parent !== ".") cottontail.mkdirSync(parent, true);
           cottontail.writeFile(absolute, globalThis.Buffer.from(output.b64 ?? "", "base64"));
@@ -349,14 +361,11 @@ export function createBunBuildFacade(dependencies) {
     return dot > 0 ? base.slice(dot) : "";
   }
 
-  // Runs Bun.build plugins in-process, materializes the
-  // resolved module graph into a shadow directory, and delegates the actual
-  // bundling of the materialized files to the plugin-free build pipeline.
-  async function buildWithPlugins(options, plugins) {
-    options = await ctNormalizeBuildFiles(options, true);
-    const pluginGraphHook = typeof options?.__cottontailPluginGraph === "function"
-      ? options.__cottontailPluginGraph
-      : null;
+  // Validates build plugins and runs their setup() functions synchronously.
+  // Bun.build surfaces synchronous setup errors (including calling missing
+  // builder methods such as `module()`) as synchronous throws, so this phase
+  // must not be deferred into a promise.
+  function prepareBuildPlugins(options, plugins) {
     const onResolveRules = [];
     const onLoadRules = [];
     const onBeforeParseRules = [];
@@ -428,10 +437,38 @@ export function createBunBuildFacade(dependencies) {
         throw error;
       }
     }
+    const setupPromises = [];
     for (const plugin of plugins) {
       const setupResult = Reflect.apply(plugin.setup, undefined, [builder]);
-      if (cottontail.promiseStatus?.(setupResult) >= 0) await setupResult;
+      if (cottontail.promiseStatus?.(setupResult) >= 0) setupPromises.push(setupResult);
     }
+    return {
+      onResolveRules,
+      onLoadRules,
+      onBeforeParseRules,
+      onStartPromises,
+      onEndCallbacks,
+      setupPromises,
+    };
+  }
+
+  // Runs Bun.build plugins in-process, materializes the
+  // resolved module graph into a shadow directory, and delegates the actual
+  // bundling of the materialized files to the plugin-free build pipeline.
+  async function buildWithPlugins(options, plugins, prepared = null) {
+    options = await ctNormalizeBuildFiles(options, true);
+    const pluginGraphHook = typeof options?.__cottontailPluginGraph === "function"
+      ? options.__cottontailPluginGraph
+      : null;
+    const {
+      onResolveRules,
+      onLoadRules,
+      onBeforeParseRules,
+      onStartPromises,
+      onEndCallbacks,
+      setupPromises,
+    } = prepared ?? prepareBuildPlugins(options, plugins);
+    for (const setupPromise of setupPromises) await setupPromise;
     if (onStartPromises.length > 0) await Promise.all(onStartPromises);
 
     if (onResolveRules.length === 0 && onLoadRules.length === 0 && onBeforeParseRules.length === 0) {
@@ -455,6 +492,7 @@ export function createBunBuildFacade(dependencies) {
     const pluginWarnings = [];
     const pluginResolveFailures = [];
     const moduleRecords = new Map();
+    const resolveCache = new Map();
     const packageMetadata = new Map();
     const materializedLoaders = {};
     const usedShadowNames = new Set();
@@ -515,7 +553,11 @@ export function createBunBuildFacade(dependencies) {
 
     const resolveWithPlugins = async (specifier, importer, importerNamespace, resolveDir, kind) => {
       for (const rule of onResolveRules) {
-        if (rule.namespace !== importerNamespace) continue;
+        // Bun invokes onResolve callbacks registered for the default "file"
+        // namespace for imports from every namespace (including entry points,
+        // whose importer namespace is ""), while callbacks registered for a
+        // custom namespace only fire for importers inside that namespace.
+        if (rule.namespace !== importerNamespace && rule.namespace !== "file") continue;
         if (!rule.filter.test(specifier)) continue;
         const result = await Reflect.apply(rule.callback, undefined, [{
           path: specifier,
@@ -534,6 +576,10 @@ export function createBunBuildFacade(dependencies) {
         }
         if (!path) continue;
         if (!userNamespace) userNamespace = importerNamespace;
+        // Entry points are resolved in the empty namespace, but a resolved
+        // entry module itself lives in the default "file" namespace unless
+        // the plugin explicitly redirects it elsewhere.
+        if (!userNamespace) userNamespace = "file";
         if (typeof external !== "boolean" && external != null) {
           throw new TypeError('onResolve plugins "external" field must be boolean or unspecified');
         }
@@ -683,7 +729,11 @@ export function createBunBuildFacade(dependencies) {
           side: options?.target === "browser" ? "client" : "server",
         });
         if (result == null || typeof result !== "object") continue;
-        let { contents, loader = defaultLoader } = result;
+        let { contents, loader } = result;
+        // When an onLoad plugin omits the loader, Bun falls back to the
+        // extension's loader, but extensions that would otherwise use the
+        // "file" loader are parsed as JavaScript instead.
+        loader ??= defaultLoader === "file" ? "js" : defaultLoader;
         if (loader === "object") {
           if (!("exports" in result)) {
             throw new TypeError('onLoad plugin returning loader: "object" must have "exports" property');
@@ -878,9 +928,36 @@ export function createBunBuildFacade(dependencies) {
         ? `${location.relativePath.slice(0, location.relativePath.length - base.length)}${stem}${ext}`
         : sourceRelativeIsLocal
           ? `${sourceRelativeDir === "." ? "" : `${sourceRelativeDir}/`}${stem}${ext}`
-          : namespace !== "file"
+          : namespace !== "file" && entryName == null
             ? `deps/${namespaceName}-${stem}-${namespaceHash}${ext}`
           : `${entryName == null ? `deps/dep-${depCounter++}-` : ""}${stem}${ext}`;
+      // A plugin may resolve a module to a path nested beneath another
+      // module's own path (e.g. onResolve returning path.resolve(importer,
+      // specifier)). The shadow directory cannot represent a file as a
+      // directory, so fall back to a flat deps name when any path component
+      // collides with an already-materialized module.
+      {
+        const parts = name.split("/");
+        let prefix = "";
+        let collides = false;
+        for (let index = 0; index < parts.length - 1; index++) {
+          prefix = prefix === "" ? parts[index] : `${prefix}/${parts[index]}`;
+          if (usedShadowNames.has(prefix)) {
+            collides = true;
+            break;
+          }
+        }
+        if (!collides) {
+          const prefixWithSlash = `${name}/`;
+          for (const used of usedShadowNames) {
+            if (used.startsWith(prefixWithSlash)) {
+              collides = true;
+              break;
+            }
+          }
+        }
+        if (collides) name = `deps/dep-${depCounter++}-${stem}${ext}`;
+      }
       let counter = 1;
       const originalName = name;
       while (usedShadowNames.has(name)) {
@@ -898,11 +975,27 @@ export function createBunBuildFacade(dependencies) {
       record.contents = ctBuildContentsText(record.contents);
       const edges = await Promise.all(scanBundleImportsForLoader(record.contents, loader).map(async ({ specifier, kind }) => {
         const resolveDir = record.namespace === "file" ? pathDirname(record.path) : cottontail.cwd();
-        let target;
-        try {
-          target = await resolveWithPlugins(specifier, record.path, record.namespace, resolveDir, kind)
-            ?? defaultResolveImport(specifier, record);
-        } catch (error) {
+        // Bun resolves a given specifier from a given importer only once, so
+        // duplicate imports within one file must not re-run onResolve hooks.
+        // The in-flight attempt is cached so concurrent duplicate imports
+        // share a single resolution.
+        const cacheKey = `${record.namespace}\0${record.path}\0${kind}\0${specifier}`;
+        let attempt = resolveCache.get(cacheKey);
+        if (attempt === undefined) {
+          attempt = (async () => {
+            try {
+              return {
+                target: await resolveWithPlugins(specifier, record.path, record.namespace, resolveDir, kind)
+                  ?? defaultResolveImport(specifier, record),
+              };
+            } catch (error) {
+              return { error };
+            }
+          })();
+          resolveCache.set(cacheKey, attempt);
+        }
+        const { target, error } = await attempt;
+        if (error !== undefined) {
           errors.push(ctPluginBuildMessage(error, record.path, record.namespace));
           pluginResolveFailures.push({ importer: record.path, specifier });
           return null;
@@ -963,7 +1056,7 @@ export function createBunBuildFacade(dependencies) {
     for (const entry of (options?.entrypoints ?? []).map(String)) {
       let resolved;
       try {
-        resolved = await resolveWithPlugins(entry, "", "file", ".", "entry-point-build");
+        resolved = await resolveWithPlugins(entry, "", "", ".", "entry-point-build");
       } catch (error) {
         errors.push(ctPluginBuildMessage(error, entry.startsWith("/") ? entry : nodePathResolve(entry), "file"));
         continue;
@@ -1537,7 +1630,9 @@ export function createBunBuildFacade(dependencies) {
           throw new TypeError("Expected plugin to be an object");
         }
       }
-      return buildWithPlugins(options, options.plugins);
+      // Plugin setup runs synchronously so that configuration errors throw
+      // from Bun.build itself instead of rejecting the returned promise.
+      return buildWithPlugins(options, options.plugins, prepareBuildPlugins(options, options.plugins));
     }
 
     const state = {

@@ -1,5 +1,8 @@
 import { fileURLToPath as nodeFileURLToPath } from "../node/url.js";
 import { bunFileMimeType } from "./mime-types.js";
+import { bunFileLikeBrand, isBunFileLike } from "./file-like.js";
+
+export { isBunFileLike };
 
 // Source parity reference: oven-sh/bun@bun-v1.3.10
 // - src/bun.js/webcore/Blob.zig
@@ -460,6 +463,39 @@ async function readFileBytes(state) {
   return concatBytes(chunks, length);
 }
 
+function readFileBytesSync(state) {
+  assertSyntheticAllocationLimit(state);
+  if (state.descriptor.kind === "path") {
+    const embedded = standaloneFileBytes(state.descriptor.path);
+    const source = embedded ?? bytesFromBufferSource(cottontail.readFileBuffer(state.descriptor.path));
+    const start = Math.min(state.start, source.byteLength);
+    const end = state.length == null
+      ? source.byteLength
+      : Math.min(source.byteLength, start + state.length);
+    return source.slice(start, end);
+  }
+
+  const size = fileSize(state);
+  if (!Number.isFinite(size)) throw invalidArgumentType("Cannot synchronously snapshot a non-regular file");
+  const length = state.length == null
+    ? Math.max(0, size - state.start)
+    : Math.max(0, Math.min(state.length, size - state.start));
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  while (offset < bytes.byteLength) {
+    const count = Number(cottontail.fdReadAt(
+      state.descriptor.fd,
+      bytes,
+      offset,
+      bytes.byteLength - offset,
+      state.start + offset,
+    ));
+    if (!(count > 0)) break;
+    offset += count;
+  }
+  return offset === bytes.byteLength ? bytes : bytes.slice(0, offset);
+}
+
 function streamFile(state, chunkSize) {
   if (chunkSize != null && typeof chunkSize !== "number") {
     throw invalidArgumentType("chunkSize must be a number");
@@ -491,13 +527,12 @@ function streamFile(state, chunkSize) {
   const reader = createFileReader(state, normalizedChunkSize);
   const finalizerToken = { reader, fd: null, owned: false };
   if (state.descriptor.kind === "path") {
-    try {
-      if (statIsFIFO(currentStat(state))) {
-        reader.open();
-        finalizerToken.fd = reader.fd;
-        finalizerToken.owned = reader.owned;
-      }
-    } catch {}
+    // Bun opens path-backed streams before returning the reader. Besides
+    // preserving synchronous ENOENT/open errors, this keeps FIFO mode
+    // selection and descriptor ownership in one path.
+    reader.open();
+    finalizerToken.fd = reader.fd;
+    finalizerToken.owned = reader.owned;
   }
   let finalized = false;
   let stream;
@@ -798,7 +833,17 @@ function createBunFile(state) {
     writer(options = undefined) { return createFileSink(state, options); },
   };
 
+  for (const key of Reflect.ownKeys(result)) {
+    const descriptor = Object.getOwnPropertyDescriptor(result, key);
+    if (descriptor) Object.defineProperty(result, key, { ...descriptor, enumerable: false });
+  }
+
   bunFileStates.set(result, state);
+  Object.defineProperty(result, bunFileLikeBrand, { value: true });
+  Object.defineProperty(result, "_getBytes", {
+    value: () => readFileBytesSync(state),
+    configurable: true,
+  });
   if (state.descriptor.kind === "path") {
     Object.defineProperty(result, "_bunFilePath", { value: state.descriptor.path, configurable: true });
     if (state.isSlice) {
@@ -824,15 +869,6 @@ export function file(path, options = undefined) {
     type,
     cachedStream: null,
   });
-}
-
-export function isBunFileLike(value) {
-  if (!value || typeof value !== "object") return false;
-  if (bunFileStates.has(value)) return true;
-  return typeof value.arrayBuffer === "function" &&
-    typeof value.text === "function" &&
-    typeof value.exists === "function" &&
-    (typeof value.writer === "function" || typeof value.write === "function");
 }
 
 function normalizeWriteOptions(options) {
@@ -899,13 +935,31 @@ function normalizeWriteDestination(destination, options) {
   return { kind: descriptor.kind, state: null, ...descriptor };
 }
 
+// Bun's write_file.zig keeps bytes-backed Blob inputs in memory and starts
+// the write task eagerly, so a read issued immediately after observes the new
+// contents. Mirror that by taking the synchronous write path when the Blob's
+// bytes are already available (host Blobs expose them through _bytes /
+// _getBytes); file-backed and opaque Blobs keep the async streaming path.
+function immediateBlobBytes(data) {
+  try {
+    if (data._bytes instanceof Uint8Array) return data._bytes;
+    if (typeof data._getBytes === "function") {
+      const bytes = data._getBytes();
+      if (isBufferSource(bytes)) return bytesFromBufferSource(bytes);
+    }
+  } catch {
+    // Fall back to the asynchronous streaming source.
+  }
+  return null;
+}
+
 function immediateSource(data) {
   if (typeof data === "string" || data instanceof String) return String(data);
   if (isBufferSource(data)) return bytesFromBufferSource(data);
   if (typeof data === "symbol") throw invalidArgumentType("Bun.write expects a Blob-y thing to write");
   if (data == null) return null;
   if (bunFileStates.has(data) || isBunFileLike(data)) return undefined;
-  if (typeof Blob === "function" && data instanceof Blob) return undefined;
+  if (typeof Blob === "function" && data instanceof Blob) return immediateBlobBytes(data) ?? undefined;
   if (typeof Response === "function" && data instanceof Response) return undefined;
   if (typeof Request === "function" && data instanceof Request) return undefined;
   if (data?.constructor?.name === "Archive" && typeof data.bytes === "function") return undefined;

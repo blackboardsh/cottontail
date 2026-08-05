@@ -2,7 +2,7 @@ import path from "../node/path.js";
 import { readFileSync, readdirSync, statSync, writeFileSync } from "../node/fs.js";
 import { pathToFileURL } from "../node/url.js";
 import { __setBuiltinModules } from "../node/module.js";
-import bundledReactRefreshSource from "./bake-react-refresh.txt";
+import bundledReactRefreshModule from "./bake-react-refresh.txt";
 import {
   bakeGraphAttributeFiles,
   contentTypeForStaticFile,
@@ -19,6 +19,7 @@ import {
   serverBoundaryFiles,
   ssrGraphBridgePrefix,
   staticRouterFile,
+  textModuleSource,
 } from "./bake-framework.js";
 import { FrameworkRouter } from "./bake-framework-router.js";
 import { handleBakeErrorReport } from "./bake-error-report.js";
@@ -644,7 +645,7 @@ function reactRefreshBuildOptions(entryPath, buildConfig) {
   if (refreshPath === null && resolveBakeImport(entryPath, "react", { alias }) !== null) {
     refreshPath = path.join(projectRoot, ".cottontail-bake-react-refresh.js");
     alias = { ...(alias ?? {}), "react-refresh/runtime": refreshPath };
-    files = { [refreshPath]: bundledReactRefreshSource };
+    files = { [refreshPath]: textModuleSource(bundledReactRefreshModule) };
   }
   return { alias, files, refreshPath, usesBundledFallback: files !== undefined };
 }

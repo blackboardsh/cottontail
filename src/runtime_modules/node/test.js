@@ -77,9 +77,13 @@ const selectedRecords = new Set();
 
 const testCliArgs = Array.from(globalThis.process?.argv ?? []).slice(2);
 const testRuntimeOptions = bunTestRuntimeOptions(testCliArgs);
-function testCliModeEnabled() {
+function testHeaderPrinted() {
   return globalThis.process?.env?.COTTONTAIL_TEST_CLI_HEADER_PRINTED === "1" ||
     globalThis.__cottontailBunTestHeaderPrinted === true;
+}
+
+function testCliModeEnabled() {
+  return globalThis.__cottontailBunTestRuntime === true || testHeaderPrinted();
 }
 const forceConcurrent = testRuntimeOptions.concurrent;
 const runTodoTests = testRuntimeOptions.runTodo;
@@ -225,10 +229,23 @@ function promiseThen(value, onFulfilled, onRejected) {
   return runnerPromiseThen.call(promise, onFulfilled, onRejected);
 }
 
+// The process-wide uncaught-exception capture is a singleton, but this module
+// can be evaluated more than once in a single process: the bunfig preload
+// graph imports "bun:test" through the native ESM loader, while test files
+// that rely on the lazy `describe`/`test`/`expect` globals reach a second
+// instance through the embedded CommonJS module cache. Install the real
+// process callback once per process and route errors to the most recently
+// evaluated instance, which owns the registrations for the executing file.
+const uncaughtCaptureProcessKey = Symbol.for("cottontail.bunTest.uncaughtCaptureInstalled");
+const uncaughtCaptureHandlerKey = Symbol.for("cottontail.bunTest.uncaughtCaptureHandler");
+const unhandledRejectionProcessKey = Symbol.for("cottontail.bunTest.unhandledRejectionInstalled");
+const unhandledRejectionHandlerKey = Symbol.for("cottontail.bunTest.unhandledRejectionHandler");
+
 function installUncaughtCapture() {
-  if (uncaughtCaptureInstalled || typeof globalThis.process?.setUncaughtExceptionCaptureCallback !== "function") return;
+  if (typeof globalThis.process?.setUncaughtExceptionCaptureCallback !== "function") return;
+  const processGlobal = globalThis.process;
   uncaughtCaptureInstalled = true;
-  globalThis.process.setUncaughtExceptionCaptureCallback((error) => {
+  processGlobal[uncaughtCaptureHandlerKey] = (error) => {
     const execution = executionStorage.getStore();
     if (execution?.failExternal) {
       execution.failExternal(error);
@@ -239,19 +256,47 @@ function installUncaughtCapture() {
       scheduleAfterHooks();
       return;
     }
-    globalThis.process.setUncaughtExceptionCaptureCallback(null);
+    processGlobal[uncaughtCaptureProcessKey] = false;
+    processGlobal[uncaughtCaptureHandlerKey] = undefined;
+    processGlobal.setUncaughtExceptionCaptureCallback(null);
     uncaughtCaptureInstalled = false;
+    runnerSetTimeout(() => { throw error; }, 0);
+  };
+  if (processGlobal[uncaughtCaptureProcessKey]) return;
+  processGlobal[uncaughtCaptureProcessKey] = true;
+  processGlobal.setUncaughtExceptionCaptureCallback((error) => {
+    const active = processGlobal[uncaughtCaptureHandlerKey];
+    if (typeof active === "function") {
+      active(error);
+      return;
+    }
     runnerSetTimeout(() => { throw error; }, 0);
   });
 }
 
 function installUnhandledRejectionCapture() {
-  if (unhandledRejectionCaptureInstalled || typeof globalThis.process?.on !== "function") return;
+  if (typeof globalThis.process?.on !== "function") return;
+  const processGlobal = globalThis.process;
   unhandledRejectionCaptureInstalled = true;
-  globalThis.process.on("unhandledRejection", (reason, promise) => {
+  processGlobal[unhandledRejectionHandlerKey] = (reason, promise) => {
     const error = reason instanceof Error ? reason : new Error(String(reason));
+    // bun/test.js's throw matchers block in waitForPromise; while blocked, a
+    // sibling promise of the one under assertion can reject before its own
+    // matcher attaches a handler. Bun quietly captures that rejection instead
+    // of failing the test (Expect.getValueAsToThrow's unhandledRejectionScope).
+    const quietCapture = globalThis.__cottontailQuietUnhandledRejectionCapture;
+    if (quietCapture) {
+      if (!quietCapture.didCapture) {
+        quietCapture.didCapture = true;
+        quietCapture.value = reason;
+      }
+      return;
+    }
     const owner = promise && typeof promise === "object" ? promiseOwners.get(promise) : null;
-    if (owner?.kind === "test" && owner.active && typeof owner.failExternal === "function") {
+    if (owner?.kind === "test" && typeof owner.failExternal === "function") {
+      // Late rejections owned by an already-finished test stay with that
+      // test (failExternal is a no-op once the attempt settled) instead of
+      // falling through to whichever unrelated test is currently running.
       owner.failExternal(error);
       return;
     }
@@ -265,6 +310,11 @@ function installUnhandledRejectionCapture() {
       return;
     }
     recordUnhandledError(error);
+  };
+  if (processGlobal[unhandledRejectionProcessKey]) return;
+  processGlobal[unhandledRejectionProcessKey] = true;
+  processGlobal.on("unhandledRejection", (reason, promise) => {
+    processGlobal[unhandledRejectionHandlerKey]?.(reason, promise);
   });
 }
 
@@ -275,9 +325,12 @@ function guardAsyncCallback(callback, captureReturnedPromise = true, externalOnT
     capturedExecution.needsPostBodyDrain = true;
   }
   return function guardedTestCallback(...args) {
-    const execution = capturedExecution.kind === "test" && !capturedExecution.active
-      ? currentExecution()
-      : capturedExecution;
+    // A callback scheduled by a test that has since completed still belongs
+    // to that test: re-attributing its errors to whichever test is currently
+    // running would fail an unrelated victim (bun absorbs late throws from a
+    // finished test's stray timers). The captured execution's failExternal is
+    // a no-op once the attempt has settled.
+    const execution = capturedExecution;
     try {
       const result = callback.apply(this, args);
       if (captureReturnedPromise && result && typeof result.then === "function" && execution) {
@@ -794,6 +847,14 @@ function suiteHasLifecycleWork(suite) {
   return suite.children.some((child) => child.kind === "suite" && suiteHasLifecycleWork(child));
 }
 
+function suiteHasTestRecords(suite) {
+  return suite.children.some((child) => child.kind === "suite" ? suiteHasTestRecords(child) : true);
+}
+
+function suiteHasSelectedTest(suite) {
+  return suite.children.some((child) => child.kind === "suite" ? suiteHasSelectedTest(child) : selectedByOnly(child));
+}
+
 function suiteBeforeError(suite) {
   for (const item of suiteChain(suite)) {
     if (item.beforeError) return item.beforeError;
@@ -1099,7 +1160,11 @@ async function executeSuite(suite, concurrentGroup) {
   }
 
   const hasRunnableWork = suiteHasRunnableWork(suite);
-  const runnable = hasRunnableWork || suiteHasLifecycleWork(suite);
+  // Bun still runs hooks for suites that are empty or whose tests are all
+  // skipped, but not for suites whose tests were deselected by `.only`
+  // (issue #14135).
+  const runnable = hasRunnableWork ||
+    (suiteHasLifecycleWork(suite) && (!suiteHasTestRecords(suite) || suiteHasSelectedTest(suite)));
   const shouldRunBefore = runnable && !suite.beforeRan && (suite !== rootSuite || hasRunnableWork);
   if (shouldRunBefore) {
     if (suite.beforeHooks.length > 0) await flushConcurrent(concurrentGroup);
@@ -1182,7 +1247,7 @@ function parseStackFrame(line) {
   let match = /^(.*?)@(.+):(\d+):(\d+)$/.exec(text);
   if (match) {
     return {
-      functionName: match[1] || "<anonymous>",
+      functionName: match[1] && match[1] !== "unknown" ? match[1] : "<anonymous>",
       filePath: normalizeDiagnosticPath(match[2]),
       line: Number(match[3]),
       column: Number(match[4]),
@@ -1191,7 +1256,7 @@ function parseStackFrame(line) {
   match = /^\s*at\s+(?:(.*?)\s+\()?(.+):(\d+):(\d+)\)?$/.exec(text);
   if (!match) return null;
   return {
-    functionName: match[1] || "<anonymous>",
+    functionName: match[1] && match[1] !== "unknown" ? match[1] : "<anonymous>",
     filePath: normalizeDiagnosticPath(match[2]),
     line: Number(match[3]),
     column: Number(match[4]),
@@ -1214,7 +1279,9 @@ function failureStackFrames(error) {
     const frame = parseStackFrame(line);
     if (!frame) continue;
     const path = frame.filePath;
-    if (!path || path.includes("/.cottontail-embedded-runtime/") ||
+    // Bun never shows its own internals in test failure stacks: drop frames
+    // from builtin modules ("node:test", "node:async_hooks", ...).
+    if (!path || path.startsWith("node:") || path.includes("/.cottontail-embedded-runtime/") ||
         path.includes("/.cottontail-tmp/") || path.endsWith("/script.bundle.mjs")) continue;
     frames.push(frame);
   }
@@ -1748,7 +1815,7 @@ function scheduleRun() {
     try {
       do {
         runAgain = false;
-        if (globalThis.__cottontailBunTestUsed && !testCliModeEnabled()) {
+        if (globalThis.__cottontailBunTestUsed && !testHeaderPrinted()) {
           globalThis.__cottontailBunTestHeaderPrinted = true;
           console.log(`bun test ${globalThis.Bun?.version_with_sha ?? "0.0.0-cottontail (cottontail)"}`);
         }

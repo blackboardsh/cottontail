@@ -4,6 +4,7 @@
 // compression transform streams.
 import * as whatwg from "./whatwg.js";
 import { Buffer } from "../buffer.js";
+import { __setBuiltinModules } from "../module.js";
 import {
   brotliCompressSync,
   brotliDecompressSync,
@@ -626,7 +627,7 @@ export class DecompressionStream extends TransformStream {
   }
 }
 
-export default {
+const streamWeb = {
   ByteLengthQueuingStrategy,
   CompressionStream,
   CountQueuingStrategy,
@@ -645,3 +646,10 @@ export default {
   WritableStreamDefaultController,
   WritableStreamDefaultWriter,
 };
+
+__setBuiltinModules({
+  "stream/web": streamWeb,
+  "node:stream/web": streamWeb,
+});
+
+export default streamWeb;

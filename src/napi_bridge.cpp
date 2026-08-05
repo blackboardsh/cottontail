@@ -817,6 +817,9 @@ struct ModuleRegistrationSession {
     std::vector<RegisteredModule> registrations;
     bool attempted { false };
     bool invalid { false };
+    // Legacy node_module_register attempts report Node's module-naming
+    // message; napi_module_register attempts report Bun's nameless one.
+    bool invalid_legacy { false };
     bool allocation_failed { false };
 };
 
@@ -3400,6 +3403,7 @@ extern "C" void node_module_register(void* opaque_module)
     auto* module = static_cast<node::node_module*>(opaque_module);
     if (!module || (!module->nm_register_func && !module->nm_context_register_func)) {
         session->invalid = true;
+        session->invalid_legacy = true;
         return;
     }
     try {
@@ -3497,7 +3501,9 @@ static JSValueRef invoke_legacy_module(NapiEnv* env, node::node_module* module, 
         return nullptr;
     }
     if (!module->nm_context_register_func && !module->nm_register_func) {
-        *exception = make_loader_error(env, std::string("The module '") + module_name + "' has no declared entry point.");
+        // Bun's napi loader message (nameless), unlike the require()-of-.node
+        // path which names the module (see addon_no_entrypoint_message).
+        *exception = make_loader_error(env, "Module has no declared entry point.");
         return nullptr;
     }
     if (!exports)
@@ -3616,7 +3622,11 @@ extern "C" JSValueRef ct_napi_load_addon(
     }
 
     if (registered_during_load && registration_session.invalid) {
-        *exception = make_loader_error(env, addon_no_entrypoint_message(path));
+        *exception = make_loader_error(
+            env,
+            registration_session.invalid_legacy
+                ? addon_no_entrypoint_message(path)
+                : std::string("Module has no declared entry point."));
         destroy_single_env(env);
         return nullptr;
     }
@@ -3694,7 +3704,11 @@ extern "C" JSValueRef ct_napi_load_addon(
                 return nullptr;
             }
             if (registration_session.invalid) {
-                *exception = make_loader_error(module_env, addon_no_entrypoint_message(path));
+                *exception = make_loader_error(
+                    module_env,
+                    registration_session.invalid_legacy
+                        ? addon_no_entrypoint_message(path)
+                        : std::string("Module has no declared entry point."));
                 return nullptr;
             }
         }

@@ -100,8 +100,14 @@ import {
   registerFetchBodyFinalizer,
   takeBody as lifecycleTakeBody,
 } from "./web-body-lifecycle.js";
+import { createRequestResponseRuntime } from "./web-request-response.js";
+import { startNativeServe } from "./native-serve.js";
+import { createCookieRuntime } from "./cookie.js";
+import { asBuffer, concatBuffers, concatManyBuffers } from "./web-buffer-utils.js";
+import { createWebPrimitives } from "./web-primitives.js";
 import { installStandaloneRuntimeLoaders } from "../internal/standalone-runtime.js";
 import { runtimeDefaultUserAgent } from "../internal/runtime-options.js";
+import { renderTable } from "../internal/console-table.js";
 import {
   file as createBunFile,
   guessMimeType,
@@ -128,10 +134,9 @@ function lazyModuleObject(loadModule) {
 }
 
 function initializeNodeHttp() {
-  const runtimeRequire = globalThis.require ?? globalThis.__ctMetaRequire;
-  const namespace = typeof runtimeRequire === "function"
-    ? runtimeRequire("node:http")
-    : loadEmbeddedRuntimeModule("node/http.js");
+  // Public require("node:http") returns the CommonJS default object. Bun's
+  // WebSocket implementation also needs Cottontail's internal named helpers.
+  const namespace = loadEmbeddedRuntimeModule("node/http.js");
   const incomingPrototype = namespace.IncomingMessage?.prototype;
   if (incomingPrototype && !Object.prototype.hasOwnProperty.call(incomingPrototype, "_read")) {
     Object.defineProperty(incomingPrototype, "_read", {
@@ -164,10 +169,7 @@ const loadNodeStreamModule = createLazyModule("node:stream", () => loadEmbeddedR
 const loadNodeStreamWebModule = createLazyModule("node:stream/web", () => loadEmbeddedRuntimeModule("node/stream/web.js"));
 const loadNodeTlsModule = createLazyModule("node:tls", () => loadEmbeddedRuntimeModule("node/tls.js"));
 const loadNodeZlibModule = createLazyModule("node:zlib", () => loadEmbeddedRuntimeModule("node/zlib.js"));
-const loadNodeCryptoModule = createLazyModule("node:crypto", () => {
-  const namespace = loadEmbeddedRuntimeModule("node/crypto.js");
-  return namespace.default ?? namespace;
-});
+const loadNodeCryptoModule = createLazyModule("node:crypto", () => loadEmbeddedRuntimeModule("node/crypto.js"));
 const nodeHttp = lazyModuleObject(loadNodeHttpModule);
 const nodeHttps = lazyModuleObject(loadNodeHttpsModule);
 const nodeNet = lazyModuleObject(loadNodeNetModule);
@@ -231,7 +233,7 @@ function wrapBunFileSlices(value) {
       return sliced;
     },
     writable: true,
-    enumerable: true,
+    enumerable: false,
     configurable: true,
   });
   return value;
@@ -691,6 +693,10 @@ const parseCallSites = (stack, fallbackSourceURL = undefined) => {
     const location = separator < 0 ? "" : line.slice(separator + 1);
     const locationMatch = /^(.*):(\d+):(\d+)$/.exec(location);
     let fileName = locationMatch?.[1] || location || null;
+    // Bun reports plain filesystem paths in stack frames, not file: URLs.
+    if (typeof fileName === "string" && fileName.startsWith("file://")) {
+      try { fileName = nodeFileURLToPath(fileName); } catch {}
+    }
     const lineNumber = locationMatch ? Number(locationMatch[2]) : null;
     const columnNumber = locationMatch ? Number(locationMatch[3]) : null;
     functionName ||= null;
@@ -1004,29 +1010,18 @@ function validateSpawnInput(file, args = [], options = {}) {
 }
 
 if (globalThis.console) {
-  const nativeConsoleTable = typeof globalThis.console.table === "function" ? globalThis.console.table.bind(globalThis.console) : null;
   const renderConsoleTable = (value, properties = undefined) => {
     if (properties !== undefined && !Array.isArray(properties)) {
       throw new TypeError("console.table properties must be an array");
     }
-    if (Array.isArray(value) && value.every((item) => item && typeof item === "object" && !Array.isArray(item))) {
-      const keys = properties?.length ? properties.map(String) : [...new Set(value.flatMap((item) => Object.keys(item)))];
-      const rows = value.map((item, index) => [String(index), ...keys.map((key) => String(item[key] ?? ""))]);
-      const headers = ["", ...keys];
-      const widths = headers.map((header, index) => Math.max(String(header).length, ...rows.map((row) => row[index].length)));
-      const border = (left, mid, right) => `${left}${widths.map((width) => "─".repeat(width + 2)).join(mid)}${right}`;
-      const rowLine = (row) => `│${row.map((cell, index) => ` ${String(cell).padEnd(widths[index])} `).join("│")}│`;
-      globalThis.console.log([
-        border("┌", "┬", "┐"),
-        rowLine(headers),
-        border("├", "┼", "┤"),
-        ...rows.map(rowLine),
-        border("└", "┴", "┘"),
-      ].join("\n"));
-      return;
+    if (value !== null && typeof value === "object") {
+      const rendered = renderTable(value, properties, { colors: false });
+      if (rendered) {
+        earlyProcessObject.stdout?.write?.(rendered);
+        return;
+      }
     }
-    if (nativeConsoleTable) return nativeConsoleTable(value, properties);
-    globalThis.console.log(nodeInspect(value, { colors: false }));
+    globalThis.console.log(value);
   };
   globalThis.console.table = renderConsoleTable;
 }
@@ -1137,7 +1132,7 @@ if (!Object.__cottontailGlobalPrototypePatched) {
   Object.defineProperty(Object, "__cottontailGlobalPrototypePatched", { value: true });
 }
 
-const internalPromiseThen = Promise.prototype.then;
+const internalPromiseThen = globalThis[Symbol.for("cottontail.nativePromiseThen")] ?? Promise.prototype.then;
 
 function internalThen(promise, onFulfilled, onRejected) {
   return internalPromiseThen.call(promise, onFulfilled, onRejected);
@@ -1496,10 +1491,11 @@ function normalizeStdio(value, fallback, index, details) {
     return "inherit";
   }
 
+  const isSharedBuffer = typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer;
   if (index === 0) {
-    if ((value instanceof ArrayBuffer || ArrayBuffer.isView(value)) && value.byteLength === 0) return "ignore";
+    if ((value instanceof ArrayBuffer || isSharedBuffer || ArrayBuffer.isView(value)) && value.byteLength === 0) return "ignore";
     if (typeof globalThis.Blob === "function" && value instanceof globalThis.Blob && value.size === 0) return "ignore";
-    if (isBunFileLike(value) || isReadableStreamLike(value) || value instanceof ArrayBuffer ||
+    if (isBunFileLike(value) || isReadableStreamLike(value) || value instanceof ArrayBuffer || isSharedBuffer ||
         ArrayBuffer.isView(value) || (typeof globalThis.Blob === "function" && value instanceof globalThis.Blob) ||
         typeof value?.arrayBuffer === "function" || typeof value?.bytes === "function") {
       details.input = value;
@@ -1568,6 +1564,9 @@ function normalizeSpawnOptions(options = {}, defaults = {}, sync = false) {
   }
 
   let input = options.input ?? details.input;
+  if (typeof SharedArrayBuffer === "function" && input instanceof SharedArrayBuffer) {
+    input = sharedArrayBufferBytes(input);
+  }
   const stdinFileBacked = input != null && isBunFileLike(input) && typeof input._bunFilePath === "string";
   // Bun.file(...) as stdin: read the file contents and feed them as input,
   // matching bun's behavior of wiring the file to the child's stdin.
@@ -1668,6 +1667,17 @@ function isCurrentCottontailExecutable(file) {
   return execPath.length > 0 && String(file) === execPath;
 }
 
+// Facade mode: process.execPath displays the wrapper (hutch) path while the
+// native execPath is the real runtime. Spawning the facade path must NOT be
+// treated as spawning the runtime itself — the deferred-start spawn gate
+// would inject a --cottontail-spawn-gate argv the wrapper cannot parse — but
+// the child still needs the facade routing vars to find the runtime.
+function isFacadeDisplayExecutable(file) {
+  const display = String(globalThis.process?.execPath ?? "");
+  const native = String(cottontail.execPath?.() ?? "");
+  return display.length > 0 && display !== native && String(file) === display;
+}
+
 function prepareNativeSpawnOptions(file, nativeOptions, args = []) {
   if (isCurrentCottontailExecutable(file)) {
     // COTTONTAIL-COMPAT: spawn argv0 - Cottontail children use this internal
@@ -1677,10 +1687,26 @@ function prepareNativeSpawnOptions(file, nativeOptions, args = []) {
       ? withoutElectrobunHostEnv(currentProcessEnv())
       : { ...nativeOptions.env };
     env.COTTONTAIL_SPAWN_EXEC_PATH = nodePathResolve(String(file));
-    // JSC reads heap sizing before Cottontail's CLI can inspect --smol.
-    if (args.some(arg => String(arg) === "--smol")) env.JSC_largeHeapSize = "1048576";
     if (nativeOptions.argv0 !== undefined) env.COTTONTAIL_SPAWN_ARGV0 = nativeOptions.argv0;
     if (nativeOptions.stdinFileBacked) env.COTTONTAIL_SPAWN_STDIN_FILE = "1";
+    return {
+      ...nativeOptions,
+      env,
+      clearEnv: true,
+    };
+  }
+  if (isFacadeDisplayExecutable(file)) {
+    // Facade routing must survive an explicit spawn env (e.g. `env: {}`):
+    // without it the child wrapper cannot locate the runtime at all.
+    const env = nativeOptions.env === undefined
+      ? withoutElectrobunHostEnv(currentProcessEnv())
+      : { ...nativeOptions.env };
+    for (const key of ["DASH_COTTONTAIL", "COTTONTAIL_BINARY"]) {
+      if (env[key] === undefined) {
+        const inherited = currentProcessEnv()[key];
+        if (inherited !== undefined) env[key] = String(inherited);
+      }
+    }
     return {
       ...nativeOptions,
       env,
@@ -1695,99 +1721,6 @@ function prepareNativeSpawnOptions(file, nativeOptions, args = []) {
   }
   return nativeOptions;
 }
-
-function asBuffer(value) {
-  if (value instanceof Uint8Array) return value;
-  if (value instanceof ArrayBuffer) return new Uint8Array(value);
-  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-  if (globalThis.Buffer?.from) return globalThis.Buffer.from(value ?? "");
-  return new TextEncoder().encode(String(value ?? ""));
-}
-
-// The host Blob lacks Bun's json()/formData() helpers and does not strip a
-// UTF-8 BOM in text(); patch the prototype to match Bun.
-(function patchBlobPrototype() {
-  const proto = globalThis.Blob?.prototype;
-  if (!proto) return;
-  const blobNames = new WeakMap();
-  if (!Object.getOwnPropertyDescriptor(proto, "name")) {
-    Object.defineProperty(proto, "name", {
-      get() { return blobNames.get(this); },
-      set(value) { if (typeof value === "string") blobNames.set(this, value); },
-      configurable: true,
-    });
-  }
-  if (typeof proto.slice === "function" && !proto.slice.__cottontailBunSlice) {
-    const originalSlice = proto.slice;
-    const slice = function slice(start = undefined, end = undefined, type = "") {
-      if (typeof start === "string") {
-        type = start;
-        start = 0;
-        end = this.size;
-      } else if (typeof end === "string") {
-        type = end;
-        end = this.size;
-      }
-      if (typeof start !== "number" || Number.isNaN(start)) start = 0;
-      if (typeof end !== "number") end = this.size;
-      else if (Number.isNaN(end)) end = 0;
-      return originalSlice.call(this, start, end, type);
-    };
-    slice.__cottontailBunSlice = true;
-    Object.defineProperty(proto, "slice", { value: slice, writable: true, configurable: true });
-  }
-  if (typeof proto.text === "function" && !proto.text.__cottontailBOM) {
-    const originalText = proto.text;
-    const wrapped = async function text() {
-      return stripUtf8BOMText(String(await originalText.call(this)));
-    };
-    wrapped.__cottontailBOM = true;
-    Object.defineProperty(proto, "text", { value: wrapped, writable: true, configurable: true });
-  }
-  if (typeof proto.json !== "function" || !proto.json.__cottontailBunJson) {
-    const json = async function json() {
-      try {
-        return JSON.parse(await this.text());
-      } catch {
-        throw new SyntaxError("Failed to parse JSON");
-      }
-    };
-    json.__cottontailBunJson = true;
-    Object.defineProperty(proto, "json", {
-      value: json,
-      writable: true,
-      configurable: true,
-    });
-  }
-  if (typeof proto.formData !== "function") {
-    Object.defineProperty(proto, "formData", {
-      value: async function formData() {
-        return parseMultipartFormData(this, this.type);
-      },
-      writable: true,
-      configurable: true,
-    });
-  }
-  const readOnlyBlob = function readOnlyBlob() {
-    throw new TypeError("Cannot write to a Blob backed by bytes, which are always read-only");
-  };
-  for (const name of ["write", "unlink", "delete", "writer"]) {
-    if (typeof proto[name] !== "function") {
-      Object.defineProperty(proto, name, {
-        value: readOnlyBlob,
-        writable: true,
-        configurable: true,
-      });
-    }
-  }
-  if (typeof proto.stat !== "function") {
-    Object.defineProperty(proto, "stat", {
-      value: async function stat() {},
-      writable: true,
-      configurable: true,
-    });
-  }
-})();
 
 // ---------------------------------------------------------------------------
 // The host-provided Buffer lacks the numeric read/write API (readUInt16BE,
@@ -2005,31 +1938,6 @@ function asBuffer(value) {
   });
 })();
 
-function concatBuffers(left, right) {
-  const lhs = asBuffer(left);
-  const rhs = asBuffer(right);
-  if (globalThis.Buffer?.concat) return globalThis.Buffer.concat([lhs, rhs]);
-  const out = new Uint8Array(lhs.length + rhs.length);
-  out.set(lhs, 0);
-  out.set(rhs, lhs.length);
-  return out;
-}
-
-function concatManyBuffers(chunks) {
-  if (chunks.length === 1) return asBuffer(chunks[0]);
-  if (globalThis.Buffer?.concat) return globalThis.Buffer.concat(chunks.map(asBuffer));
-  let length = 0;
-  for (const chunk of chunks) length += asBuffer(chunk).length;
-  const out = new Uint8Array(length);
-  let offset = 0;
-  for (const chunk of chunks) {
-    const bytes = asBuffer(chunk);
-    out.set(bytes, offset);
-    offset += bytes.length;
-  }
-  return out;
-}
-
 let bunSpawnRuntime;
 
 function getBunSpawnRuntime() {
@@ -2057,2067 +1965,39 @@ export function spawnSync(...args) {
 export function spawn(...args) {
   return getBunSpawnRuntime().spawn(...args);
 }
-function sharedArrayBufferBytes(data) {
-  if (typeof SharedArrayBuffer !== "function" || !(data instanceof SharedArrayBuffer)) return null;
-  // Creating a view over an empty SharedArrayBuffer trips a host bug
-  // ("Buffer is already detached"); avoid touching it.
-  if (data.byteLength === 0) return new Uint8Array(0);
-  const copy = new Uint8Array(data.byteLength);
-  copy.set(new Uint8Array(data));
-  return copy;
-}
-
-function bytesFromData(data) {
-  if (data == null) return new Uint8Array(0);
-  const sharedCopy = sharedArrayBufferBytes(data);
-  if (sharedCopy) return sharedCopy;
-  if (data instanceof ArrayBuffer) return new Uint8Array(data);
-  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-  return new TextEncoder().encode(String(data));
-}
-
-function snapshotBufferSource(data) {
-  const sharedCopy = sharedArrayBufferBytes(data);
-  if (sharedCopy) return new Blob([sharedCopy]);
-  const source = data instanceof ArrayBuffer
-    ? new Uint8Array(data)
-    : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-  return new Blob([source]);
-}
-
-const fetchBodyStartSymbol = Symbol("cottontail.fetchBodyStart");
-
-async function bytesFromBody(body) {
-  if (body == null) return new Uint8Array(0);
-  body?.[fetchBodyStartSymbol]?.();
-  const sharedCopy = sharedArrayBufferBytes(body);
-  if (sharedCopy) return sharedCopy;
-  if (body instanceof Uint8Array) return body;
-  if (body instanceof ArrayBuffer) return new Uint8Array(body);
-  if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
-  if (body instanceof FormData) return (await encodeMultipartFormData(body)).bytes;
-  // Streams must be consumed through their reader (before the .bytes()
-  // shortcut below) so the fetch-spec lock is acquired and retained: after a
-  // body is consumed, stream.locked must remain true.
-  const iterable = typeof body === "function" ? body() : body;
-  if (typeof body.getReader === "function" || (iterable && typeof iterable[Symbol.asyncIterator] === "function")) {
-    const chunks = [];
-    await consumeStreamingBody(body, (chunk) => chunks.push(asBuffer(chunk)));
-    return concatManyBuffers(chunks);
-  }
-  if (typeof body.bytes === "function") return asBuffer(await body.bytes());
-  if (typeof body.arrayBuffer === "function") return new Uint8Array(await body.arrayBuffer());
-  if (typeof body.text === "function") return new TextEncoder().encode(await body.text());
-  return bytesFromData(body);
-}
-
-let nextBodySinkId = 1;
-
-async function consumeStreamingBody(body, onChunk) {
-  if (body && typeof body.getReader === "function") {
-    // Per the fetch spec, consuming a body keeps the stream locked: the
-    // reader is intentionally never released (stream.locked stays true).
-    const reader = body.getReader();
-    for (;;) {
-      const settled = await reader.read().then(
-        (item) => ({ item, error: null }),
-        (error) => ({ item: null, error }),
-      );
-      if (settled.error != null) throw settled.error;
-      const item = settled.item;
-      if (item.done) return;
-      await onChunk(item.value);
-    }
-  }
-
-  const iterable = typeof body === "function" ? body() : body;
-  if (!iterable || typeof iterable[Symbol.asyncIterator] !== "function") {
-    throw new TypeError("Expected a streaming response body");
-  }
-  const iterator = iterable[Symbol.asyncIterator]();
-  const controller = {
-    sinkId: nextBodySinkId++,
-    async write(chunk) {
-      await onChunk(chunk);
-      return chunk?.byteLength ?? chunk?.length ?? String(chunk ?? "").length;
-    },
-    flush() {
-      return 0;
-    },
-    async end(chunk = undefined) {
-      if (chunk !== undefined) await onChunk(chunk);
-    },
-  };
-  for (;;) {
-    const item = await iterator.next(controller);
-    if (item.value !== undefined && item.value !== null) await onChunk(item.value);
-    if (item.done) return;
-  }
-}
-
-function bodyReadableStream(body) {
-  if (body == null) return null;
-  if (typeof body.getReader === "function") return body;
-  const iterable = typeof body === "function" ? body() : body;
-  if (iterable && typeof iterable[Symbol.asyncIterator] === "function") {
-    const iterator = iterable[Symbol.asyncIterator]();
-    let pending = null;
-    let closed = false;
-    let activeChunks = null;
-    const queuedChunks = [];
-    const sink = {
-      sinkId: nextBodySinkId++,
-      write(chunk) {
-        const target = activeChunks ?? queuedChunks;
-        target.push(chunk);
-        return chunk?.byteLength ?? chunk?.length ?? String(chunk ?? "").length;
-      },
-      flush() {
-        return 0;
-      },
-      end(chunk = undefined) {
-        if (chunk !== undefined) this.write(chunk);
-        closed = true;
-        return Promise.resolve();
-      },
-    };
-
-    const nextItem = async (wait) => {
-      if (!pending) pending = iterator.next(sink);
-      if (wait) {
-        const item = await pending;
-        pending = null;
-        return { settled: true, item };
-      }
-      let settled = false;
-      let item;
-      let error;
-      pending.then(
-        (value) => {
-          settled = true;
-          item = value;
-        },
-        (reason) => {
-          settled = true;
-          error = reason;
-        },
-      );
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      if (!settled) return { settled: false };
-      pending = null;
-      if (error) throw error;
-      return { settled: true, item };
-    };
-
-    return new globalThis.ReadableStream({
-      async pull(controller) {
-        if (closed) {
-          controller.close();
-          return;
-        }
-        const chunks = queuedChunks.splice(0);
-        activeChunks = chunks;
-        try {
-          for (;;) {
-            const result = await nextItem(chunks.length === 0);
-            if (!result.settled) break;
-            const item = result.item;
-            if (item.value !== undefined && item.value !== null) chunks.push(item.value);
-            if (item.done) {
-              closed = true;
-              break;
-            }
-          }
-        } finally {
-          activeChunks = null;
-        }
-        if (chunks.length > 0) controller.enqueue(concatManyBuffers(chunks));
-        if (closed) controller.close();
-      },
-      cancel(reason = undefined) {
-        closed = true;
-        return iterator.return?.(reason);
-      },
-    });
-  }
-  return new globalThis.ReadableStream({
-    async start(controller) {
-      try {
-        const bytes = await bytesFromBody(body);
-        if (bytes.byteLength > 0) controller.enqueue(bytes);
-        controller.close();
-      } catch (error) {
-        controller.error(error);
-      }
-    },
-  });
-}
-
-function bodyValueForConsumption(owner) {
-  return lifecycleBodyValueForConsumption(owner, isStreamingBody);
-}
-
-function bodyStreamFor(owner) {
-  return lifecycleBodyStreamFor(
-    owner,
-    bodyReadableStream,
-    isStreamingBody,
-    sourceBody => sourceBody?.[fetchBodyStartSymbol]?.(),
-  );
-}
-
-function arrayBufferFromBytes(bytes) {
-  if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) return bytes.buffer;
-  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-}
-
-const blobBodyCache = new WeakMap();
-const textBodyCache = new WeakMap();
-
-function cachedBlobForBytes(bytes, type = "") {
-  let typedCache = blobBodyCache.get(bytes);
-  if (!typedCache) {
-    typedCache = new Map();
-    blobBodyCache.set(bytes, typedCache);
-  }
-  const key = String(type || "");
-  let blob = typedCache.get(key);
-  if (!blob) {
-    blob = new Blob([arrayBufferFromBytes(bytes)], { type: key });
-    typedCache.set(key, blob);
-  }
-  return blob;
-}
-
-function cachedTextForBytes(bytes) {
-  let text = textBodyCache.get(bytes);
-  if (text === undefined) {
-    text = new TextDecoder().decode(bytes);
-    textBodyCache.set(bytes, text);
-  }
-  return text;
-}
-
-// Bun exposes URLSearchParams.prototype.size as configurable + enumerable.
-if (URLSearchParams?.prototype) {
-  const sizeDescriptor = Object.getOwnPropertyDescriptor(URLSearchParams.prototype, "size");
-  if (!sizeDescriptor || !sizeDescriptor.configurable || !sizeDescriptor.enumerable) {
-    Object.defineProperty(URLSearchParams.prototype, "size", {
-      get: sizeDescriptor?.get ?? function size() {
-        let count = 0;
-        for (const _ of this) count += 1;
-        return count;
-      },
-      enumerable: true,
-      configurable: true,
-    });
-  }
-}
-
-// Bun's non-standard URLSearchParams extensions.
-if (URLSearchParams?.prototype && typeof URLSearchParams.prototype.toJSON !== "function") {
-  Object.defineProperties(URLSearchParams.prototype, {
-    toJSON: {
-      value: function toJSON() {
-        const result = {};
-        for (const [key, value] of this) {
-          if (Object.prototype.hasOwnProperty.call(result, key)) {
-            if (Array.isArray(result[key])) result[key].push(value);
-            else result[key] = [result[key], value];
-          } else {
-            result[key] = value;
-          }
-        }
-        return result;
-      },
-      writable: true,
-      configurable: true,
-    },
-    length: {
-      get() {
-        let count = 0;
-        for (const _ of this) count += 1;
-        return count;
-      },
-      configurable: true,
-    },
-    [Symbol.for("nodejs.util.inspect.custom")]: {
-      value: function inspect() {
-        const entries = Object.entries(this.toJSON());
-        if (entries.length === 0) return "URLSearchParams {}";
-        const lines = entries.map(([key, value]) => {
-          const rendered = Array.isArray(value)
-            ? `[ ${value.map((item) => JSON.stringify(item)).join(", ")} ]`
-            : JSON.stringify(value);
-          return `  ${JSON.stringify(key)}: ${rendered},`;
-        });
-        return `URLSearchParams {\n${lines.join("\n")}\n}`;
-      },
-      writable: true,
-      configurable: true,
-    },
-  });
-}
-
-// Bun prints URL objects as an expanded property list (see url.test.ts).
-if (URL?.prototype && !URL.prototype[Symbol.for("nodejs.util.inspect.custom")]) {
-  Object.defineProperty(URL.prototype, Symbol.for("nodejs.util.inspect.custom"), {
-    value: function inspect() {
-      const searchParamsText = String(
-        this.searchParams?.[Symbol.for("nodejs.util.inspect.custom")]?.() ?? this.searchParams,
-      ).replace(/\n/g, "\n  ");
-      return [
-        "URL {",
-        `  href: ${JSON.stringify(this.href)},`,
-        `  origin: ${JSON.stringify(this.origin)},`,
-        `  protocol: ${JSON.stringify(this.protocol)},`,
-        `  username: ${JSON.stringify(this.username)},`,
-        `  password: ${JSON.stringify(this.password)},`,
-        `  host: ${JSON.stringify(this.host)},`,
-        `  hostname: ${JSON.stringify(this.hostname)},`,
-        `  port: ${JSON.stringify(this.port)},`,
-        `  pathname: ${JSON.stringify(this.pathname)},`,
-        `  hash: ${JSON.stringify(this.hash)},`,
-        `  search: ${JSON.stringify(this.search)},`,
-        `  searchParams: ${searchParamsText},`,
-        "  toJSON: [Function: toJSON],",
-        "  toString: [Function: toString],",
-        "}",
-      ].join("\n");
-    },
-    writable: true,
-    configurable: true,
-  });
-}
-
-if (URL?.prototype && !Object.getOwnPropertyDescriptor(URL.prototype, estimatedMemoryCostSymbol)) {
-  Object.defineProperty(URL.prototype, estimatedMemoryCostSymbol, {
-    configurable: true,
-    get() {
-      return 128 + String(this.href ?? "").length;
-    },
-  });
-}
-
-if (URLSearchParams?.prototype &&
-    !Object.getOwnPropertyDescriptor(URLSearchParams.prototype, estimatedMemoryCostSymbol)) {
-  Object.defineProperty(URLSearchParams.prototype, estimatedMemoryCostSymbol, {
-    configurable: true,
-    get() {
-      return 128 + String(this).length;
-    },
-  });
-}
-
-export { URL, URLSearchParams };
-
-export class Headers {
-  constructor(init = undefined) {
-    this._values = new Map();
-    this._allValues = new Map();
-    if (init === undefined) return;
-    // WebIDL HeadersInit: primitives (including null and strings) throw.
-    if (init === null || (typeof init !== "object" && typeof init !== "function")) {
-      throw new TypeError("Headers can only be constructed from an object or an iterable of [name, value] pairs");
-    }
-    if (init instanceof Headers) {
-      // Copy from the internal map to preserve original header casing.
-      for (const [normalized, entry] of init._values) {
-        if (normalized === "set-cookie") {
-          for (const value of init._allValues.get(normalized) ?? []) this.append(entry.key, value);
-        } else {
-          this.append(entry.key, entry.value);
-        }
-      }
-      return;
-    }
-    // Per WebIDL, Symbol.iterator is read exactly once: a defined but
-    // non-callable iterator is a TypeError, undefined selects the record path.
-    const iteratorMethod = init[Symbol.iterator];
-    if (iteratorMethod !== undefined) {
-      if (typeof iteratorMethod !== "function") {
-        throw new TypeError("Headers init is not iterable");
-      }
-      const iterator = iteratorMethod.call(init);
-      for (;;) {
-        const step = iterator.next();
-        if (step.done) break;
-        const entry = step.value;
-        if (entry === null || (typeof entry !== "object" && typeof entry !== "function")) {
-          throw new TypeError("Headers sequence must contain [name, value] pairs");
-        }
-        const pair = Array.isArray(entry) ? entry : Array.from(entry);
-        if (pair.length !== 2) {
-          throw new TypeError("Headers sequence must contain [name, value] pairs");
-        }
-        this.append(pair[0], pair[1]);
-      }
-      return;
-    }
-    // record<ByteString, ByteString>: own enumerable properties; symbol keys
-    // cannot convert to ByteString and throw.
-    for (const key of Reflect.ownKeys(init)) {
-      const descriptor = Object.getOwnPropertyDescriptor(init, key);
-      if (!descriptor || !descriptor.enumerable) continue;
-      if (typeof key === "symbol") {
-        throw new TypeError("Header name must be a string");
-      }
-      this.append(key, init[key]);
-    }
-  }
-  getSetCookie() {
-    return [...(this._allValues.get("set-cookie") ?? [])];
-  }
-  append(key, value) {
-    if (arguments.length < 2) {
-      throw new TypeError(`Headers.append requires 2 arguments, received ${arguments.length}`);
-    }
-    const name = headerNameToString(key);
-    validateHeaderName(name);
-    const stringValue = normalizeHeaderValueText(headerValueToString(value, name));
-    validateHeaderValue(stringValue, name);
-    const normalized = name.toLowerCase();
-    const existing = this._values.get(normalized);
-    const allValues = this._allValues.get(normalized) ?? [];
-    allValues.push(stringValue);
-    this._allValues.set(normalized, allValues);
-    // Per the fetch spec, cookie is the only header whose values combine with
-    // "; " instead of ", " when appended.
-    const separator = normalized === "cookie" ? "; " : ", ";
-    this._values.set(normalized, {
-      key: existing?.key ?? name,
-      value: existing ? `${existing.value}${separator}${stringValue}` : stringValue,
-    });
-  }
-  set(key, value) {
-    if (arguments.length < 2) {
-      throw new TypeError(`Headers.set requires 2 arguments, received ${arguments.length}`);
-    }
-    const name = headerNameToString(key);
-    validateHeaderName(name);
-    const stringValue = normalizeHeaderValueText(headerValueToString(value, name));
-    validateHeaderValue(stringValue, name);
-    const normalized = name.toLowerCase();
-    this._allValues.set(normalized, [stringValue]);
-    this._values.set(normalized, { key: name, value: stringValue });
-  }
-  get(key) {
-    if (arguments.length < 1) {
-      throw new TypeError("Headers.get requires 1 argument, received 0");
-    }
-    const name = headerNameToString(key);
-    validateHeaderName(name);
-    return this._values.get(name.toLowerCase())?.value ?? null;
-  }
-  getAll(key) {
-    if (arguments.length < 1) {
-      throw new TypeError("Headers.getAll requires 1 argument, received 0");
-    }
-    const normalized = headerNameToString(key).toLowerCase();
-    if (normalized !== "set-cookie") {
-      throw new TypeError('getAll() can only be used with the "Set-Cookie" header');
-    }
-    return [...(this._allValues.get(normalized) ?? [])];
-  }
-  has(key) {
-    if (arguments.length < 1) {
-      throw new TypeError("Headers.has requires 1 argument, received 0");
-    }
-    const name = headerNameToString(key);
-    validateHeaderName(name);
-    return this._values.has(name.toLowerCase());
-  }
-  delete(key) {
-    if (arguments.length < 1) {
-      throw new TypeError("Headers.delete requires 1 argument, received 0");
-    }
-    const name = headerNameToString(key);
-    validateHeaderName(name);
-    const normalized = name.toLowerCase();
-    this._allValues.delete(normalized);
-    this._values.delete(normalized);
-  }
-  _sortedEntries() {
-    const entries = [];
-    const setCookies = [];
-    for (const [normalized, entry] of this._values) {
-      if (normalized === "set-cookie") {
-        for (const value of this._allValues.get(normalized) ?? []) setCookies.push([normalized, value]);
-      } else {
-        entries.push([normalized, entry.value]);
-      }
-    }
-    entries.sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
-    // Bun (WebCore FetchHeaders) iterates set-cookie entries after all other
-    // headers, in insertion order.
-    entries.push(...setCookies);
-    return entries;
-  }
-  forEach(callback, thisArg = undefined) {
-    if (typeof callback !== "function") {
-      throw new TypeError("Headers.forEach requires the callback to be a function");
-    }
-    for (const [key, value] of this.entries()) callback.call(thisArg, value, key, this);
-  }
-  toJSON() {
-    const result = {};
-    const entries = [...this._values.entries()]
-      .map(([normalized, { value }]) => [
-        normalized,
-        normalized === "set-cookie" ? [...(this._allValues.get(normalized) ?? [])] : value,
-      ])
-      .sort(([left], [right]) => left.localeCompare(right));
-    for (const [key, value] of entries) result[key] = value;
-    return result;
-  }
-  // Iteration is live per the fetch spec: each step re-reads the sorted and
-  // combined header list rather than iterating over a snapshot.
-  *entries() {
-    for (let index = 0; ; index += 1) {
-      const snapshot = this._sortedEntries();
-      if (index >= snapshot.length) return;
-      yield snapshot[index];
-    }
-  }
-  *keys() {
-    for (const [key] of this.entries()) yield key;
-  }
-  *values() {
-    for (const [, value] of this.entries()) yield value;
-  }
-  get count() {
-    const setCookies = this._allValues.get("set-cookie")?.length ?? 0;
-    return this._values.size + Math.max(0, setCookies - 1);
-  }
-  [Symbol.iterator]() {
-    return this.entries();
-  }
-  get [estimatedMemoryCostSymbol]() {
-    let size = 128;
-    for (const [key, value] of this.entries()) size += key.length + value.length + 32;
-    return size;
-  }
-  [Symbol.for("nodejs.util.inspect.custom")]() {
-    const entries = [];
-    for (const [normalized, entry] of this._values) {
-      if (normalized === "set-cookie") {
-        for (const value of this._allValues.get(normalized) ?? []) entries.push([normalized, value]);
-      } else {
-        entries.push([normalized, entry.value]);
-      }
-    }
-    if (entries.length === 0) return "Headers {}";
-    // Bun lists well-known header names before custom ones, each entry with a
-    // trailing comma.
-    const known = entries.filter(([key]) => wellKnownHeaderNames.has(key));
-    const custom = entries.filter(([key]) => !wellKnownHeaderNames.has(key));
-    const lines = [...known, ...custom].map(([key, value]) => `  ${JSON.stringify(key)}: ${JSON.stringify(value)},`);
-    return `Headers {\n${lines.join("\n")}\n}`;
-  }
-}
-
-Object.defineProperty(Headers.prototype, Symbol.toStringTag, {
-  value: "Headers",
-  writable: false,
-  enumerable: false,
-  configurable: true,
-});
-
-const wellKnownHeaderNames = new Set([
-  "accept", "accept-charset", "accept-encoding", "accept-language", "accept-ranges",
-  "access-control-allow-credentials", "access-control-allow-headers", "access-control-allow-methods",
-  "access-control-allow-origin", "access-control-expose-headers", "access-control-max-age",
-  "access-control-request-headers", "access-control-request-method", "age", "allow", "authorization",
-  "cache-control", "connection", "content-disposition", "content-encoding", "content-language",
-  "content-length", "content-location", "content-range", "content-security-policy", "content-type",
-  "cookie", "date", "etag", "expect", "expires", "forwarded", "from", "host", "if-match",
-  "if-modified-since", "if-none-match", "if-range", "if-unmodified-since", "last-modified", "link",
-  "location", "max-forwards", "origin", "pragma", "proxy-authenticate", "proxy-authorization",
-  "range", "referer", "referrer-policy", "refresh", "retry-after", "sec-websocket-accept",
-  "sec-websocket-extensions", "sec-websocket-key", "sec-websocket-protocol", "sec-websocket-version",
-  "server", "set-cookie", "strict-transport-security", "te", "trailer", "transfer-encoding",
-  "upgrade", "upgrade-insecure-requests", "user-agent", "vary", "via", "warning", "www-authenticate",
-  "x-content-type-options", "x-frame-options", "x-requested-with", "x-xss-protection",
-]);
-
-// Header validation is deliberately regex-free: user code can sabotage
-// RegExp.prototype.exec (which `.test()` consults) and Headers must still work.
-const invalidHeaderErrorSymbol = Symbol("cottontail.invalidHeader");
-
-function invalidHeaderError(message) {
-  const error = new TypeError(message);
-  Object.defineProperty(error, invalidHeaderErrorSymbol, { value: true });
-  return error;
-}
-
-function headerNameToString(name) {
-  if (typeof name === "symbol") throw new TypeError("Header name must be a string");
-  return String(name);
-}
-
-function headerValueToString(value, name) {
-  if (typeof value === "symbol") throw new TypeError(`Header "${name}" value must be a string`);
-  return String(value);
-}
-
-// HTTP token code points per RFC 9110.
-function isHeaderTokenCode(code) {
-  if (code >= 0x30 && code <= 0x39) return true; // 0-9
-  if (code >= 0x41 && code <= 0x5a) return true; // A-Z
-  if (code >= 0x61 && code <= 0x7a) return true; // a-z
-  switch (code) {
-    case 0x21: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27:
-    case 0x2a: case 0x2b: case 0x2d: case 0x2e: case 0x5e: case 0x5f:
-    case 0x60: case 0x7c: case 0x7e:
-      return true;
-    default:
-      return false;
-  }
-}
-
-function validateHeaderName(nameText) {
-  if (nameText.length === 0) {
-    throw invalidHeaderError(`Invalid header name: '${nameText}'`);
-  }
-  for (let index = 0; index < nameText.length; index += 1) {
-    if (!isHeaderTokenCode(nameText.charCodeAt(index))) {
-      throw invalidHeaderError(`Invalid header name: '${nameText}'`);
-    }
-  }
-}
-
-function isHeaderWhitespaceCode(code) {
-  return code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d;
-}
-
-// Strip leading/trailing HTTP whitespace per the fetch spec value normalize.
-function normalizeHeaderValueText(valueText) {
-  let start = 0;
-  let end = valueText.length;
-  while (start < end && isHeaderWhitespaceCode(valueText.charCodeAt(start))) start += 1;
-  while (end > start && isHeaderWhitespaceCode(valueText.charCodeAt(end - 1))) end -= 1;
-  return start === 0 && end === valueText.length ? valueText : valueText.slice(start, end);
-}
-
-function validateHeaderValue(valueText, nameText) {
-  for (let index = 0; index < valueText.length; index += 1) {
-    const code = valueText.charCodeAt(index);
-    if (code === 0x00 || code === 0x0a || code === 0x0d || code > 0xff) {
-      throw invalidHeaderError(`Header value is not valid. Header '${nameText}' has invalid value: '${valueText}'`);
-    }
-  }
-}
-
-function headersGetAll(name) {
-  const normalized = String(name).toLowerCase();
-  if (normalized === "set-cookie" && typeof this.getSetCookie === "function") return this.getSetCookie();
-  const value = this.get?.(name);
-  return value == null ? [] : [String(value)];
-}
-
-export class FormData {
-  constructor() {
-    this._entries = [];
-  }
-  append(name, value, filename = undefined) {
-    if (arguments.length < 2) {
-      throw new TypeError(`FormData.append requires at least 2 arguments, received ${arguments.length}`);
-    }
-    this._entries.push(makeFormDataEntry(name, value, filename));
-  }
-  set(name, value, filename = undefined) {
-    if (arguments.length < 2) {
-      throw new TypeError(`FormData.set requires at least 2 arguments, received ${arguments.length}`);
-    }
-    const entry = makeFormDataEntry(name, value, filename);
-    this.delete(entry[0]);
-    this._entries.push(entry);
-  }
-  get length() {
-    return this._entries.length;
-  }
-  get(name) {
-    const key = String(name);
-    const found = this._entries.find((entry) => entry[0] === key);
-    return found ? found[1] : null;
-  }
-  getAll(name) {
-    const key = String(name);
-    return this._entries.filter((entry) => entry[0] === key).map((entry) => entry[1]);
-  }
-  has(name) {
-    const key = String(name);
-    return this._entries.some((entry) => entry[0] === key);
-  }
-  delete(name) {
-    const key = String(name);
-    this._entries = this._entries.filter((entry) => entry[0] !== key);
-  }
-  *entries() {
-    for (const [key, value] of this._entries) yield [key, value];
-  }
-  *keys() {
-    for (const [key] of this._entries) yield key;
-  }
-  *values() {
-    for (const [, value] of this._entries) yield value;
-  }
-  forEach(callback, thisArg = undefined) {
-    if (typeof callback !== "function") {
-      throw new TypeError("FormData.forEach requires the callback to be a function");
-    }
-    for (const [key, value] of this._entries) callback.call(thisArg, value, key, this);
-  }
-  [Symbol.iterator]() {
-    return this.entries();
-  }
-  get [estimatedMemoryCostSymbol]() {
-    let size = 128;
-    for (const [key, value] of this._entries) {
-      size += key.length + 64;
-      if (typeof value === "string") size += value.length;
-      else if (typeof value?.size === "number" && Number.isFinite(value.size)) size += Math.max(0, value.size);
-    }
-    return size;
-  }
-  toJSON() {
-    const result = {};
-    for (const [key, value] of this._entries) {
-      const serialized = typeof value === "string"
-        ? value
-        : { name: typeof value?.name === "string" ? value.name : "", size: value?.size ?? 0 };
-      if (Object.hasOwn(result, key)) {
-        if (!Array.isArray(result[key])) result[key] = [result[key]];
-        result[key].push(serialized);
-      } else {
-        result[key] = serialized;
-      }
-    }
-    return result;
-  }
-  static from(data, boundary = undefined) {
-    let text;
-    let blobBytes = data?._bytes instanceof Uint8Array ? data._bytes : null;
-    if (blobBytes === null && data instanceof Blob && typeof data._getBytes === "function") {
-      const bytes = data._getBytes();
-      if (bytes instanceof Uint8Array) blobBytes = bytes;
-      else if (ArrayBuffer.isView(bytes)) {
-        blobBytes = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-      }
-    }
-    const byteLength = data instanceof ArrayBuffer
-      ? data.byteLength
-      : ArrayBuffer.isView(data)
-        ? data.byteLength
-        : blobBytes !== null
-          ? blobBytes.byteLength
-          : typeof data === "string" ? data.length : 0;
-    const allocationLimit = globalThis.__cottontailSyntheticAllocationLimit ?? 0x7fffffff;
-    if (byteLength > allocationLimit) {
-      throw new RangeError(`Cannot create a string longer than ${allocationLimit} characters`);
-    }
-    if (typeof data === "string") text = data;
-    else if (data instanceof ArrayBuffer) text = stringLatin1FromBytes(new Uint8Array(data));
-    else if (ArrayBuffer.isView(data)) text = stringLatin1FromBytes(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
-    else if (blobBytes !== null) text = stringLatin1FromBytes(blobBytes);
-    else text = String(data);
-    if (boundary != null) return parseMultipartFormDataText(text, String(boundary));
-    const result = new FormData();
-    for (const [key, value] of new URLSearchParams(text)) result.append(key, value);
-    return result;
-  }
-}
-
-Object.defineProperty(FormData.prototype, Symbol.toStringTag, {
-  value: "FormData",
-  writable: false,
-  enumerable: false,
-  configurable: true,
-});
-
-function stringLatin1FromBytes(bytes) {
-  let output = "";
-  for (const byte of bytes) output += String.fromCharCode(byte);
-  return output;
-}
-
-function isBlobLikeFormValue(value) {
-  return value != null && typeof value === "object" &&
-    typeof value.arrayBuffer === "function" &&
-    (value instanceof Blob || typeof value.stream === "function" || typeof value.text === "function");
-}
-
-function makeFormDataEntry(name, value, filename) {
-  if (typeof name === "symbol") throw new TypeError("FormData field name must be a string");
-  const key = String(name);
-  if (!isBlobLikeFormValue(value)) {
-    if (filename !== undefined) {
-      throw new TypeError("The filename argument can only be used when the value is a Blob or File");
-    }
-    if (typeof value === "symbol") throw new TypeError("FormData field value cannot be a symbol");
-    return [key, String(value)];
-  }
-  if (filename !== undefined) {
-    return [key, formDataFileView(value, String(filename))];
-  }
-  // A Blob keeps its identity (Bun does not wrap it into a File named
-  // "blob"); lazy file refs (Bun.file) become Blob-compatible views.
-  if (value instanceof Blob) return [key, value];
-  return [key, formDataFileView(value, undefined)];
-}
-
-function snapshotFormDataBody(formData) {
-  const snapshot = new FormData();
-  snapshot._entries = formData._entries.map(([name, value]) => {
-    if (typeof value === "string") return [name, value];
-    const filename = typeof value?.name === "string" && value.name !== "" ? value.name : "blob";
-    let source = value;
-    const seen = new Set();
-    while (source != null && typeof source === "object" && !seen.has(source)) {
-      const nested = source._source ?? source[bodyBlobSourceSymbol];
-      if (nested == null) break;
-      seen.add(source);
-      source = nested;
-    }
-    if (typeof source?._bunFilePath === "string" &&
-        !Array.isArray(source._blobChunks) && cottontail.existsSync(source._bunFilePath)) {
-      let bytes = asBuffer(cottontail.readFileBuffer(source._bunFilePath));
-      const start = Number(source._bunFileStart);
-      const end = Number(source._bunFileEnd);
-      if (Number.isFinite(start) && Number.isFinite(end)) {
-        bytes = bytes.subarray(
-          Math.max(0, Math.min(bytes.byteLength, start)),
-          Math.max(0, Math.min(bytes.byteLength, end)),
-        );
-      }
-      source = new Blob([bytes], { type: typeof value?.type === "string" ? value.type : "" });
-    }
-    return [name, formDataFileView(source, filename)];
-  });
-  if (formData._boundary != null) snapshot._boundary = formData._boundary;
-  return snapshot;
-}
-
-const bodyBlobSourceSymbol = Symbol("cottontail.bodyBlobSource");
-const bodyBlobSlice = Blob.prototype.slice;
-let BodyBlobViewClass = null;
-
-function lazyBlobBodyView(source) {
-  BodyBlobViewClass ??= class Blob extends globalThis.Blob {
-    constructor(value) {
-      super([], { type: typeof value?.type === "string" ? value.type : "" });
-      Object.defineProperty(this, bodyBlobSourceSymbol, { value });
-    }
-    get size() {
-      return Number(this[bodyBlobSourceSymbol]?.size ?? 0);
-    }
-    get name() {
-      return this[bodyBlobSourceSymbol]?.name;
-    }
-    get lastModified() {
-      return this[bodyBlobSourceSymbol]?.lastModified;
-    }
-    get fd() {
-      return this[bodyBlobSourceSymbol]?.fd;
-    }
-    get _bunFilePath() {
-      return this[bodyBlobSourceSymbol]?._bunFilePath;
-    }
-    get _bunFileStart() {
-      return this[bodyBlobSourceSymbol]?._bunFileStart;
-    }
-    get _bunFileEnd() {
-      return this[bodyBlobSourceSymbol]?._bunFileEnd;
-    }
-    async arrayBuffer() {
-      return await this[bodyBlobSourceSymbol].arrayBuffer();
-    }
-    async bytes() {
-      const source = this[bodyBlobSourceSymbol];
-      if (typeof source.bytes === "function") return asBuffer(await source.bytes());
-      return asBuffer(new Uint8Array(await source.arrayBuffer()));
-    }
-    async text() {
-      return await this[bodyBlobSourceSymbol].text();
-    }
-    stream() {
-      const source = this[bodyBlobSourceSymbol];
-      return typeof source.stream === "function" ? source.stream() : super.stream();
-    }
-    slice(...args) {
-      const source = this[bodyBlobSourceSymbol];
-      return typeof source.slice === "function" ? source.slice(...args) : super.slice(...args);
-    }
-    exists(...args) {
-      return this[bodyBlobSourceSymbol].exists(...args);
-    }
-    writer(...args) {
-      return this[bodyBlobSourceSymbol].writer(...args);
-    }
-    stat(...args) {
-      return this[bodyBlobSourceSymbol].stat(...args);
-    }
-    write(...args) {
-      return this[bodyBlobSourceSymbol].write(...args);
-    }
-    delete(...args) {
-      return this[bodyBlobSourceSymbol].delete(...args);
-    }
-    unlink(...args) {
-      return this[bodyBlobSourceSymbol].unlink(...args);
-    }
-  };
-  return new BodyBlobViewClass(source);
-}
-
-function snapshotBlobBody(blob) {
-  const source = blob?.[bodyBlobSourceSymbol] ?? blob;
-  if (source?._source != null) {
-    return formDataFileView(source._source, typeof source.name === "string" ? source.name : undefined);
-  }
-  if (isBunFileLike(source)) return lazyBlobBodyView(source);
-  if (typeof globalThis.File === "function" && source instanceof globalThis.File) {
-    return new globalThis.File([source], source.name, {
-      type: source.type,
-      lastModified: source.lastModified,
-    });
-  }
-  return bodyBlobSlice.call(source, 0, source.size, source.type);
-}
-
-function snapshotBodyValue(body) {
-  if (body == null) return null;
-  if (typeof body === "symbol") throw new TypeError("Cannot convert a symbol to a string");
-  if (typeof body === "string") return body;
-  if (isURLSearchParamsLike(body)) return serializeURLSearchParamsBody(body);
-  if (body instanceof FormData) return snapshotFormDataBody(body);
-  if (body instanceof Blob) return snapshotBlobBody(body);
-  const isSharedBuffer = typeof SharedArrayBuffer === "function" && body instanceof SharedArrayBuffer;
-  if (isSharedBuffer || body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
-    return snapshotBufferSource(body);
-  }
-  if (isBunFileLike(body) || isStreamingBody(body)) return body;
-  if (Array.isArray(body)) {
-    for (const part of body) {
-      if (typeof part === "symbol") throw new TypeError("Cannot convert a symbol to a string");
-    }
-    return new Blob(body);
-  }
-  return String(body);
-}
-
-function formDataBoundary(formData) {
-  // Lowercase so the boundary survives Blob type normalization (which
-  // lowercases MIME types) when a multipart body round-trips through blob().
-  return formData._boundary ??= `----cottontailformboundary${randomBytes(12).toString("hex")}`;
-}
-
-function isURLSearchParamsLike(value) {
-  if (value == null || typeof value !== "object") return false;
-  if (value instanceof URLSearchParams) return true;
-  const GlobalURLSearchParams = globalThis.URLSearchParams;
-  return typeof GlobalURLSearchParams === "function" && value instanceof GlobalURLSearchParams;
-}
-
-const urlSearchParamsEntries = URLSearchParams.prototype.entries;
-
-function serializeURLSearchParamsBody(searchParams) {
-  let output = "";
-  for (const [name, value] of urlSearchParamsEntries.call(searchParams)) {
-    if (output !== "") output += "&";
-    output += `${formUrlEncodeComponent(name)}=${formUrlEncodeComponent(value)}`;
-  }
-  return output;
-}
-
-function toWellFormedBodyString(input) {
-  const value = String(input);
-  let output = null;
-  let segmentStart = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length) {
-      const next = value.charCodeAt(index + 1);
-      if (next >= 0xdc00 && next <= 0xdfff) {
-        index += 1;
-        continue;
-      }
-    }
-    if (code < 0xd800 || code > 0xdfff) continue;
-    output ??= "";
-    output += `${value.slice(segmentStart, index)}\ufffd`;
-    segmentStart = index + 1;
-  }
-  return output == null ? value : output + value.slice(segmentStart);
-}
-
-function formUrlEncodeComponent(value) {
-  const text = String(value);
-  // COTTONTAIL-COMPAT: Avoid copying large ASCII form fields when every byte is
-  // already in the application/x-www-form-urlencoded percent-encode set.
-  if (/^[A-Za-z0-9*._-]*$/.test(text)) return text;
-  let encoded = encodeURIComponent(toWellFormedBodyString(text)).replaceAll("%20", "+");
-  if (/[!'()~]/.test(encoded)) {
-    encoded = encoded.replace(/[!'()~]/g, (character) =>
-      `%${character.charCodeAt(0).toString(16).toUpperCase()}`
-    );
-  }
-  return encoded;
-}
-
-(function patchURLSearchParamsSerialization() {
-  const proto = URLSearchParams?.prototype;
-  const entries = proto?.entries;
-  if (!proto || typeof entries !== "function" || proto.toString?.__cottontailFastFormEncoding) return;
-  const toString = function toString() {
-    let output = "";
-    for (const [name, value] of entries.call(this)) {
-      if (output !== "") output += "&";
-      output += `${formUrlEncodeComponent(name)}=${formUrlEncodeComponent(value)}`;
-    }
-    return output;
-  };
-  toString.__cottontailFastFormEncoding = true;
-  Object.defineProperty(proto, "toString", { value: toString, writable: true, configurable: true });
-})();
-
-function parseBodyJson(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new SyntaxError("Failed to parse JSON");
-  }
-}
-
-// Fill in the fetch-spec default Content-Type for bodies that imply one.
-function setDefaultBodyContentType(headers, body) {
-  if (body == null || headers.has("content-type")) return;
-  if (body instanceof FormData) {
-    headers.set("Content-Type", `multipart/form-data; boundary=${formDataBoundary(body)}`);
-  } else if (isURLSearchParamsLike(body)) {
-    headers.set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8");
-  } else if (body instanceof Blob && typeof body.type === "string" && body.type !== "") {
-    headers.set("Content-Type", body.type);
-  }
-}
-
-// Bun surfaces missing Bun.file() FormData parts as a synchronous ENOENT when
-// the body is attached to a Response/Request.
-function assertFormDataFilesExist(formData) {
-  for (const [, value] of formData._entries) {
-    let source = value;
-    const seen = new Set();
-    while (source != null && typeof source === "object" && !seen.has(source)) {
-      const nested = source._source ?? source[bodyBlobSourceSymbol];
-      if (nested == null) break;
-      seen.add(source);
-      source = nested;
-    }
-    if (source != null && typeof source === "object" && typeof source._bunFilePath === "string" &&
-        !cottontail.existsSync(source._bunFilePath)) {
-      const error = new Error(`ENOENT: no such file or directory, open '${source._bunFilePath}'`);
-      error.code = "ENOENT";
-      error.errno = -2;
-      error.syscall = "open";
-      error.path = source._bunFilePath;
-      throw error;
-    }
-  }
-}
-
-function escapeMultipartHeader(value) {
-  return String(value).replace(/\r|\n/g, " ").replace(/"/g, "%22");
-}
-
-async function encodeMultipartFormData(formData) {
-  const boundary = formDataBoundary(formData);
-  const chunks = [];
-  for (const [name, value] of formData._entries) {
-    const isFilePart = typeof value !== "string";
-    let header = `--${boundary}\r\nContent-Disposition: form-data; name="${escapeMultipartHeader(name)}"`;
-    if (isFilePart) {
-      const filename = typeof value?.name === "string" && value.name !== "" ? value.name : "blob";
-      header += `; filename="${escapeMultipartHeader(filename)}"`;
-    }
-    header += "\r\n";
-    if (isFilePart && value?.type) header += `Content-Type: ${value.type}\r\n`;
-    chunks.push(new TextEncoder().encode(`${header}\r\n`));
-    chunks.push(await bytesFromBody(value));
-    chunks.push(new TextEncoder().encode("\r\n"));
-  }
-  chunks.push(new TextEncoder().encode(`--${boundary}--\r\n`));
-  return { boundary, bytes: concatManyBuffers(chunks) };
-}
-
-function stripUtf8BOMText(text) {
-  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
-}
-
-function blobTypeFromBodyHeaders(headers) {
-  const type = headers.get("content-type") ?? "";
-  if (/^(?:text\/|application\/json(?:;|$))/i.test(type)) {
-    return `${type.split(";", 1)[0]};charset=utf-8`;
-  }
-  if (/^application\/(?:xml|javascript|x-www-form-urlencoded)$/i.test(type)) {
-    return `${type};charset=utf-8`;
-  }
-  return type;
-}
-
-// Reinterpret latin1-decoded bytes as UTF-8 when that produces valid text.
-function utf8FromLatin1Text(text) {
-  const value = String(text ?? "");
-  if (!/[\x80-\xff]/.test(value)) return value;
-  const bytes = Buffer.from(value, "latin1");
-  const decoded = bytes.toString("utf8");
-  return Buffer.from(decoded, "utf8").equals(bytes) ? decoded : value;
-}
-
-async function parseMultipartFormData(body, contentType) {
-  const contentTypeText = String(contentType ?? "");
-  const parsedContentType = parseParameterizedHeader(contentTypeText);
-  if (parsedContentType.value === "application/x-www-form-urlencoded") {
-    const text = stripUtf8BOMText(new TextDecoder().decode(await bytesFromBody(body)));
-    const result = new FormData();
-    for (const [name, value] of new URLSearchParams(text)) result.append(name, value);
-    return result;
-  }
-  if (parsedContentType.value !== "multipart/form-data") {
-    throw new TypeError("Body cannot be decoded as form data");
-  }
-  const boundary = parsedContentType.parameters.get("boundary");
-  if (!boundary || /[\r\n]/.test(boundary)) {
-    throw new TypeError("Missing multipart boundary");
-  }
-  // WHATWG aliases "latin1" to windows-1252, so TextDecoder remaps bytes in
-  // the 0x80-0x9f range. Multipart parsing needs a lossless byte string.
-  const source = stringLatin1FromBytes(await bytesFromBody(body));
-  return parseMultipartFormDataText(source, boundary);
-}
-
-function splitHeaderParameters(value) {
-  const segments = [];
-  let segment = "";
-  let quoted = false;
-  let escaped = false;
-  for (const character of String(value)) {
-    if (escaped) {
-      segment += character;
-      escaped = false;
-      continue;
-    }
-    if (quoted && character === "\\") {
-      segment += character;
-      escaped = true;
-      continue;
-    }
-    if (character === '"') {
-      quoted = !quoted;
-      segment += character;
-      continue;
-    }
-    if (character === ";" && !quoted) {
-      segments.push(segment);
-      segment = "";
-      continue;
-    }
-    segment += character;
-  }
-  segments.push(segment);
-  return segments;
-}
-
-function unquoteHeaderParameter(value) {
-  const text = String(value).trim();
-  if (!text.startsWith('"')) return text;
-  if (text.length < 2 || !text.endsWith('"')) return undefined;
-  let result = "";
-  let escaped = false;
-  for (const character of text.slice(1, -1)) {
-    if (escaped) {
-      result += character;
-      escaped = false;
-    } else if (character === "\\") {
-      escaped = true;
-    } else {
-      result += character;
-    }
-  }
-  if (escaped) result += "\\";
-  return result;
-}
-
-function parseParameterizedHeader(value, allowBunExtendedFilename = false) {
-  const [rawValue = "", ...rawParameters] = splitHeaderParameters(value);
-  const parameters = new Map();
-  for (const rawParameter of rawParameters) {
-    const parameter = rawParameter.trim();
-    let equals = parameter.indexOf("=");
-    let name;
-    let rawParameterValue;
-    if (equals >= 0) {
-      name = parameter.slice(0, equals).trim().toLowerCase();
-      rawParameterValue = parameter.slice(equals + 1);
-    } else if (allowBunExtendedFilename && parameter.toLowerCase().startsWith("filename*")) {
-      // Bun's copied fixture accepts `filename*UTF-8''...` without the RFC
-      // 5987 equals sign, so preserve that production parser behavior.
-      name = "filename*";
-      rawParameterValue = parameter.slice("filename*".length);
-    } else {
-      continue;
-    }
-    const parsedValue = unquoteHeaderParameter(rawParameterValue);
-    if (name && parsedValue !== undefined && !parameters.has(name)) parameters.set(name, parsedValue);
-  }
-  return { value: rawValue.trim().toLowerCase(), parameters };
-}
-
-function percentDecodedHeaderBytes(value) {
-  const bytes = [];
-  for (let index = 0; index < value.length;) {
-    if (value[index] === "%") {
-      const pair = value.slice(index + 1, index + 3);
-      if (!/^[0-9A-Fa-f]{2}$/.test(pair)) return null;
-      bytes.push(parseInt(pair, 16));
-      index += 3;
-      continue;
-    }
-    const code = value.charCodeAt(index);
-    if (code > 0x7f) return null;
-    bytes.push(code);
-    index += 1;
-  }
-  return Uint8Array.from(bytes);
-}
-
-function decodeExtendedHeaderValue(value) {
-  const match = /^([^']*)'[^']*'(.*)$/.exec(value);
-  if (!match) return undefined;
-  const bytes = percentDecodedHeaderBytes(match[2]);
-  if (!bytes) return undefined;
-  const charset = match[1].trim().toLowerCase();
-  try {
-    if (charset === "utf-8" || charset === "utf8") {
-      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    }
-    if (charset === "iso-8859-1" || charset === "latin1") {
-      return Array.from(bytes, byte => String.fromCharCode(byte)).join("");
-    }
-  } catch {}
-  return undefined;
-}
-
-function parseMultipartPartHeaders(source) {
-  const headers = new Map();
-  for (const line of source.split("\r\n")) {
-    const colon = line.indexOf(":");
-    if (colon <= 0) throw new TypeError("FormData parse error: expected a part header");
-    const name = line.slice(0, colon).trim().toLowerCase();
-    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) {
-      throw new TypeError("FormData parse error: expected a part header");
-    }
-    if (!headers.has(name)) headers.set(name, line.slice(colon + 1).trim());
-  }
-  return headers;
-}
-
-function parseMultipartFormDataText(source, boundary) {
-  const result = new FormData();
-  const delimiter = `--${boundary}`;
-  if (!source.includes(`${delimiter}--`)) {
-    throw new TypeError("FormData parse error missing final boundary");
-  }
-  if (!source.startsWith(delimiter)) {
-    throw new TypeError("FormData parse error: missing initial boundary");
-  }
-  let cursor = delimiter.length;
-  if (source.startsWith("--", cursor)) return result;
-  if (!source.startsWith("\r\n", cursor)) {
-    throw new TypeError("FormData parse error: invalid boundary");
-  }
-  cursor += 2;
-
-  for (;;) {
-    const separator = source.indexOf("\r\n\r\n", cursor);
-    if (separator < 0) throw new TypeError("FormData parse error: expected a part header");
-    const headers = parseMultipartPartHeaders(source.slice(cursor, separator));
-    const valueStart = separator + 4;
-    const nextBoundary = source.indexOf(`\r\n${delimiter}`, valueStart);
-    if (nextBoundary < 0) throw new TypeError("FormData parse error missing final boundary");
-    const value = source.slice(valueStart, nextBoundary);
-
-    const disposition = parseParameterizedHeader(headers.get("content-disposition") ?? "", true);
-    const rawFieldName = disposition.value === "form-data" ? disposition.parameters.get("name") : undefined;
-    if (rawFieldName === undefined) {
-      throw new TypeError("FormData parse error: invalid Content-Disposition header");
-    }
-    const fieldName = utf8FromLatin1Text(rawFieldName);
-    const extendedFilename = disposition.parameters.get("filename*");
-    let filename = extendedFilename === undefined ? undefined : decodeExtendedHeaderValue(extendedFilename);
-    if (filename === undefined && disposition.parameters.has("filename")) {
-      filename = utf8FromLatin1Text(disposition.parameters.get("filename"));
-    }
-    if (filename !== undefined) {
-      const type = headers.get("content-type") ?? "application/octet-stream";
-      result.append(fieldName, new Blob([Buffer.from(value, "latin1")], { type }), filename);
-    } else {
-      result.append(fieldName, utf8FromLatin1Text(value));
-    }
-
-    cursor = nextBoundary + 2 + delimiter.length;
-    if (source.startsWith("--", cursor)) return result;
-    if (!source.startsWith("\r\n", cursor)) {
-      throw new TypeError("FormData parse error: invalid boundary");
-    }
-    cursor += 2;
-  }
-}
-
-const requestState = new WeakMap();
-const lazyRequestURLToken = {};
-
-const bunHttpMethods = new Map([
-  "ACL", "BIND", "CHECKOUT", "CONNECT", "COPY", "DELETE", "GET", "HEAD", "LINK", "LOCK",
-  "M-SEARCH", "MERGE", "MKACTIVITY", "MKCALENDAR", "MKCOL", "MOVE", "NOTIFY", "OPTIONS",
-  "PATCH", "POST", "PROPFIND", "PROPPATCH", "PURGE", "PUT", "QUERY", "REBIND", "REPORT",
-  "SEARCH", "SOURCE", "SUBSCRIBE", "TRACE", "UNBIND", "UNLINK", "UNLOCK", "UNSUBSCRIBE",
-].flatMap(method => [[method, method], [method.toLowerCase(), method]]));
-
-function isObjectLike(value) {
-  return value !== null && (typeof value === "object" || typeof value === "function");
-}
-
-function bunString(value) {
-  if (typeof value === "symbol") throw new TypeError("Cannot convert a symbol to a string");
-  return String(value);
-}
-
-function bunHttpMethod(value) {
-  if (value === undefined || value === null || value === "") return "GET";
-  const text = bunString(value);
-  return bunHttpMethods.get(text) ?? "GET";
-}
-
-function coerceBunStatus(value) {
-  if (typeof value === "bigint") {
-    const integer = BigInt.asIntN(64, value);
-    return { number: Number(integer), display: integer.toString() };
-  }
-  if (typeof value === "number") {
-    if (Number.isNaN(value)) return { number: 0, display: "0" };
-    if (value >= 2 ** 63) {
-      return { number: Number.MAX_SAFE_INTEGER, display: "9223372036854775807" };
-    }
-    if (value <= -(2 ** 63)) {
-      return { number: Number.MIN_SAFE_INTEGER, display: "-9223372036854775808" };
-    }
-    const integer = BigInt(Math.trunc(value));
-    return { number: Number(integer), display: integer.toString() };
-  }
-
-  // Bun's generic JSValue path uses JSC's ToInt32 conversion, while primitive
-  // doubles and BigInts take the paths above. This intentionally wraps large
-  // numeric strings before status validation.
-  const number = value >> 0;
-  return { number, display: String(number) };
-}
-
-function readBunResponseInit(init, rejectPrimitive = true) {
-  if (init === null || init === undefined) {
-    return {
-      headers: new Headers(),
-      headersValue: undefined,
-      method: "GET",
-      methodValue: undefined,
-      status: 200,
-      statusText: "",
-    };
-  }
-  if (!isObjectLike(init)) {
-    if (!rejectPrimitive) return null;
-    throw new TypeError("Failed to construct 'Response': The provided body value is not of type 'ResponseInit'");
-  }
-
-  // Response.Init.init() reads these in this order. Keep each value so Request
-  // can distinguish an omitted overlay field from one coercing to a default.
-  const headersValue = init.headers;
-  const headers = headersValue === undefined ? new Headers() : new Headers(headersValue);
-
-  let status = 200;
-  const statusValue = init.status;
-  if (statusValue !== undefined) {
-    const coerced = coerceBunStatus(statusValue);
-    if (coerced.number !== 101 && (coerced.number < 200 || coerced.number >= 600)) {
-      throw new RangeError(
-        `The status provided (${coerced.display}) must be 101 or in the range of [200, 599]`,
-      );
-    }
-    status = coerced.number;
-  }
-
-  const statusTextValue = init.statusText;
-  const statusText = statusTextValue === undefined || statusTextValue === null || statusTextValue === ""
-    ? ""
-    : bunString(statusTextValue);
-
-  const methodValue = init.method;
-  const method = bunHttpMethod(methodValue);
-  return { headers, headersValue, method, methodValue, status, statusText };
-}
-
-function requestInitEnum(value, name, allowed) {
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== "string") throw new TypeError(`${name} must be a string`);
-  if (!allowed.includes(value)) {
-    const choices = allowed.map(choice => `'${choice}'`).join(", ").replace(/, ([^,]+)$/, " or $1");
-    throw new TypeError(`${name} must be one of ${choices}`);
-  }
-  return value;
-}
-
-function requestInitSignal(value) {
-  if (value === undefined || value === null || value === "") return undefined;
-  if (!isAbortSignal(value)) {
-    throw new Error("Failed to construct 'Request': signal is not of type AbortSignal.");
-  }
-  return value;
-}
-
-function externallyOwnedBodyBytes(body) {
-  if (body == null) return 0;
-  if (typeof body === "string") return Buffer.byteLength(body);
-  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return body.byteLength;
-  if (typeof body?.size === "number" && Number.isFinite(body.size)) return Math.max(0, body.size);
-  if (body instanceof FormData) return Number(body[estimatedMemoryCostSymbol]) || 0;
-  return 0;
-}
-
-function canonicalFetchUrl(value) {
-  const text = bunString(value);
-  try {
-    return new URL(text).href;
-  } catch (cause) {
-    const error = new TypeError(`Failed to construct 'Request': Invalid URL "${text}"`);
-    error.cause = cause;
-    throw error;
-  }
-}
-
-function isJSCFinalObject(value) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
-  if (globalThis.__cottontailProxyRegistry?.has(value)) return false;
-  if (value instanceof Request || value instanceof Response) return false;
-  try {
-    return Object.prototype.toString.call(value) === "[object Object]";
-  } catch {
-    return false;
-  }
-}
-
-function requestInputImplementsToString(value) {
-  if (typeof value === "function") return true;
-  if (!isObjectLike(value)) return false;
-  const primitive = value[Symbol.toPrimitive];
-  if (typeof primitive === "function") return true;
-  const toString = value.toString;
-  return typeof toString === "function" && toString !== Object.prototype.toString;
-}
-
-export class Request {
-  constructor(input, init = undefined, internalToken = null, internalURLFactory = null) {
-    const urlFactory = internalToken === lazyRequestURLToken && typeof internalURLFactory === "function"
-      ? internalURLFactory
-      : null;
-    if (urlFactory === null && (arguments.length === 0 || input === null || input === undefined)) {
-      throw new TypeError("Failed to construct 'Request': expected non-empty string or object, got undefined");
-    }
-    const inputIsUrl = typeof input === "string" || input instanceof URL;
-    if (urlFactory === null && !inputIsUrl && !isObjectLike(input)) {
-      throw new TypeError("Failed to construct 'Request': expected non-empty string or object");
-    }
-
-    const initObject = isObjectLike(init) ? init : null;
-    const inputRequestState = input instanceof Request ? requestState.get(input) : null;
-    const inputResponse = input instanceof Response ? input : null;
-    const inputObject = isObjectLike(input) ? input : null;
-    let urlText = inputIsUrl ? bunString(input) : undefined;
-    let urlOverlayText;
-
-    let bodySet = false;
-    let rawBody = null;
-    let bodyOwner = null;
-    let bodyFromInit = false;
-    let signal;
-    let signalExplicit = false;
-    let method;
-    let headers;
-    let redirect;
-    let cache;
-    let mode;
-
-    const readCandidate = (candidate, explicitRequestOverlay = false, inputFallback = false) => {
-      if (!candidate) return;
-
-      if (!bodySet) {
-        const value = candidate.body;
-        if (value !== undefined) {
-          bodySet = true;
-          rawBody = value;
-          bodyOwner = candidate instanceof Request || candidate instanceof Response ? candidate : null;
-          bodyFromInit = candidate === initObject;
-        }
-      }
-      const acceptsURLOverlay = candidate === initObject && !inputIsUrl && urlFactory === null;
-      if (urlText === undefined || acceptsURLOverlay) {
-        const value = candidate.url;
-        if (value !== undefined) {
-          const candidateUrl = bunString(value);
-          if (candidateUrl !== "") {
-            urlText = candidateUrl;
-            if (acceptsURLOverlay) urlOverlayText = candidateUrl;
-          }
-        } else if (inputFallback && requestInputImplementsToString(candidate)) {
-          const candidateUrl = bunString(candidate);
-          if (candidateUrl !== "") urlText = candidateUrl;
-        }
-      }
-      if (signal === undefined) {
-        const value = requestInitSignal(candidate.signal);
-        if (value !== undefined) {
-          signal = value;
-          signalExplicit = true;
-        }
-      }
-
-      if (method === undefined || headers === undefined) {
-        const responseInit = readBunResponseInit(candidate);
-        const emptyHeaders = responseInit.headers._values?.size === 0;
-        let hasExplicitHeaders = responseInit.headersValue !== undefined;
-        let hasExplicitMethod = responseInit.methodValue !== undefined;
-        if (explicitRequestOverlay) {
-          // Bun repeats these fastGet() calls for a FinalObject overlay on a
-          // Request/Response input before deciding whether defaults override.
-          hasExplicitHeaders = candidate.headers !== undefined;
-          hasExplicitMethod = candidate.method !== undefined;
-        }
-        const emptyOverlayOnWrapper = candidate === initObject &&
-          (inputRequestState !== null || inputResponse !== null) && emptyHeaders;
-        if (headers === undefined && hasExplicitHeaders && !emptyOverlayOnWrapper) {
-          headers = responseInit.headers;
-        }
-        if (method === undefined && (!explicitRequestOverlay || hasExplicitMethod)) {
-          method = responseInit.method;
-        }
-      }
-
-      if (redirect === undefined) {
-        redirect = requestInitEnum(candidate.redirect, "redirect", ["follow", "manual", "error"]);
-      }
-      if (cache === undefined) {
-        cache = requestInitEnum(candidate.cache, "cache", [
-          "default", "no-store", "reload", "no-cache", "force-cache", "only-if-cached",
-        ]);
-      }
-      if (mode === undefined) {
-        mode = requestInitEnum(candidate.mode, "mode", ["same-origin", "no-cors", "cors", "navigate"]);
-      }
-    };
-
-    if (initObject) {
-      const explicitRequestOverlay = (inputRequestState !== null || inputResponse !== null) &&
-        isJSCFinalObject(initObject);
-      readCandidate(initObject, explicitRequestOverlay);
-    }
-
-    if (inputRequestState) {
-      if (!bodySet && input._body != null) {
-        bodySet = true;
-        rawBody = input._body;
-        bodyOwner = input;
-      }
-      signal ??= inputRequestState.signal;
-      signalExplicit ||= inputRequestState.signalExplicit === true;
-      method ??= inputRequestState.method;
-      if (headers === undefined) headers = new Headers(inputRequestState.headers);
-      redirect ??= inputRequestState.redirect;
-      cache ??= inputRequestState.cache;
-      mode ??= inputRequestState.mode;
-      if (urlText === undefined) urlText = input.url;
-    } else if (inputResponse) {
-      if (!bodySet && input._body != null) {
-        bodySet = true;
-        rawBody = input._body;
-        bodyOwner = input;
-      }
-      method ??= input._method ?? "GET";
-      if (headers === undefined) headers = new Headers(input.headers);
-      if (urlText === undefined && input.url !== "") urlText = input.url;
-    } else if (inputObject && typeof input !== "string" && !(input instanceof URL)) {
-      readCandidate(inputObject, false, true);
-    }
-
-    if (urlOverlayText !== undefined) urlText = urlOverlayText;
-
-    let url = "";
-    if (urlFactory === null) {
-      if (urlText === undefined || urlText === "") {
-        throw new Error("Failed to construct 'Request': url is required.");
-      }
-      url = canonicalFetchUrl(urlText);
-    }
-
-    headers ??= new Headers();
-    method ??= "GET";
-    signal ??= new AbortController().signal;
-    redirect ??= "follow";
-    cache ??= "default";
-    mode ??= "cors";
-
-    const params = initObject?.params ?? inputRequestState?.params ?? inputObject?.params ?? {};
-    const initKeepalive = initObject?.keepalive;
-    const keepaliveValue = initKeepalive ?? inputRequestState?.keepalive ?? inputObject?.keepalive ?? false;
-    const keepalive = Boolean(keepaliveValue);
-    const keepaliveExplicit = initObject != null && initKeepalive !== undefined ||
-      inputRequestState?.keepaliveExplicit === true;
-    requestState.set(this, {
-      url,
-      urlFactory,
-      method,
-      headers,
-      params,
-      signal,
-      signalExplicit,
-      redirect,
-      cache,
-      mode,
-      credentials: "include",
-      keepalive,
-      keepaliveExplicit,
-      serveIdleTimeout: undefined,
-    });
-    this._body = bodyOwner instanceof Request && bodyOwner === input && bodySet && !bodyFromInit
-      ? bodyForRequestCopy(bodyOwner)
-      : bodyOwner instanceof Response && bodyOwner === input && bodySet && !bodyFromInit
-        ? teeClonedBody(bodyOwner)
-        : snapshotBodyValue(rawBody);
-    setDefaultBodyContentType(headers, this._body instanceof FormData ? this._body : rawBody);
-    if (this._body instanceof FormData) assertFormDataFilesExist(this._body);
-    if (this._body?.locked) throw new TypeError(keepalive ? "keepalive" : "ReadableStream is locked");
-    if (bodyStreamIsDisturbed(this._body)) throw new TypeError("ReadableStream has already been used");
-    if (keepalive && typeof this._body?.getReader === "function") {
-      throw new TypeError("keepalive");
-    }
-    this._bodyStream = undefined;
-    this._bodyUsed = false;
-  }
-  get url() {
-    const state = requestState.get(this);
-    if (typeof state?.urlFactory === "function") {
-      const url = canonicalFetchUrl(state.urlFactory());
-      state.url = url;
-      state.urlFactory = null;
-    }
-    return state?.url;
-  }
-  get method() { return requestState.get(this)?.method; }
-  get headers() { return requestState.get(this)?.headers; }
-  get params() { return requestState.get(this)?.params; }
-  set params(value) {
-    const state = requestState.get(this);
-    if (state) state.params = value;
-  }
-  get signal() { return requestState.get(this)?.signal; }
-  get redirect() { return requestState.get(this)?.redirect; }
-  get cache() { return requestState.get(this)?.cache; }
-  get mode() { return requestState.get(this)?.mode; }
-  get credentials() { return requestState.get(this)?.credentials; }
-  get keepalive() { return requestState.get(this)?.keepalive === true; }
-  get body() {
-    return bodyStreamFor(this);
-  }
-  get cookies() {
-    return this._cookies ??= new CookieMap(this.headers.get("cookie") ?? "", { preserveFirst: true });
-  }
-  set cookies(_) {
-    throw new TypeError("Request.cookies is readonly");
-  }
-  get bodyUsed() {
-    return bodyWasUsed(this);
-  }
-  get [estimatedMemoryCostSymbol]() {
-    const state = requestState.get(this);
-    const headersCost = Number(state?.headers?.[estimatedMemoryCostSymbol]) || 0;
-    const upgradeContext = serveUpgradeContexts.get(this);
-    return 512 + externallyOwnedBodyBytes(this._body) + headersCost +
-      (upgradeContext && !upgradeContext.used ? 4096 : 0);
-  }
-  clone() {
-    if (this._bodyStream?.locked) throw new TypeError("ReadableStream is locked");
-    if (bodyWasUsed(this)) throw new TypeError("Body already used");
-    const cloned = new Request(this.url, {
-      method: this.method,
-      headers: new Headers(this.headers),
-      params: this.params,
-      signal: this.signal,
-      redirect: this.redirect,
-      cache: this.cache,
-      mode: this.mode,
-      credentials: this.credentials,
-      keepalive: this.keepalive,
-    });
-    const clonedState = requestState.get(cloned);
-    if (clonedState) clonedState.signalExplicit = requestState.get(this)?.signalExplicit === true;
-    cloned._body = teeClonedBody(this);
-    if (this._cookies) cloned._cookies = cloneCookieMap(this._cookies);
-    return cloned;
-  }
-  _takeBody() {
-    return lifecycleTakeBody(this, isStreamingBody);
-  }
-  async arrayBuffer() {
-    const body = this._takeBody();
-    if (body instanceof Blob) return body.arrayBuffer();
-    return arrayBufferFromBytes(await bytesFromBody(body));
-  }
-  async bytes() {
-    const body = this._takeBody();
-    if (body instanceof Blob && typeof body.bytes === "function") return asBuffer(await body.bytes());
-    return asBuffer(await bytesFromBody(body));
-  }
-  async blob() {
-    const type = blobTypeFromBodyHeaders(this.headers);
-    const body = this._takeBody();
-    // Bun keeps a Blob body's own MIME type. Response headers only supply a
-    // type when the consumed body did not already carry one.
-    if (body instanceof Blob && (body.type || !type)) return body;
-    return cachedBlobForBytes(await bytesFromBody(body), type);
-  }
-  text() {
-    if (this._bodyStream?.locked) return handledRejectedPromise(new TypeError("ReadableStream is locked"));
-    if (bodyWasUsed(this)) return handledRejectedPromise(new TypeError("Body already used"));
-    const body = bodyValueForConsumption(this);
-    if (body != null) this._bodyUsed = true;
-    if (body == null) return Promise.resolve("");
-    if (typeof body === "string") return Promise.resolve(stripUtf8BOMText(body));
-    if (body instanceof Blob) return body.text().then(stripUtf8BOMText);
-    return bytesFromBody(body).then((bytes) => stripUtf8BOMText(cachedTextForBytes(bytes)));
-  }
-  async json() {
-    if (this._body instanceof Blob && typeof this._body.json === "function") {
-      try {
-        return await this._takeBody().json();
-      } catch (error) {
-        if (error instanceof SyntaxError) throw new SyntaxError("Failed to parse JSON");
-        throw error;
-      }
-    }
-    return parseBodyJson(await this.text());
-  }
-  formData() {
-    if (!(this instanceof Request)) {
-      let message = "Expected this to be instanceof Request";
-      if (this === null) message += ", but received null";
-      else if (this !== undefined && typeof this === "object") message += `, but received an instance of ${this.constructor?.name ?? "Object"}`;
-      else if (typeof this === "string") message += `, but received type string ('${this}')`;
-      else if (this !== undefined) message += `, but received type ${typeof this} (${nodeInspect(this)})`;
-      const error = new TypeError(message);
-      error.code = "ERR_INVALID_THIS";
-      throw error;
-    }
-    if (this._bodyStream?.locked) return handledRejectedPromise(new TypeError("ReadableStream is locked"));
-    if (bodyWasUsed(this)) return handledRejectedPromise(new TypeError("Body already used"));
-    this._bodyUsed = true;
-    return parseMultipartFormData(bodyValueForConsumption(this), this.headers.get("content-type"));
-  }
-  [ctInspectSymbol]() {
-    const headerInspector = bunInspectPropertyDescriptor(this.headers, ctInspectSymbol)?.value;
-    const renderedHeaders = typeof headerInspector === "function"
-      ? headerInspector.call(this.headers)
-      : nodeInspect(this.headers);
-    const size = inspectBodyByteSize(this._body) ?? "0 KB";
-    return `Request (${size}) {\n  method: ${JSON.stringify(this.method)},\n  url: ${JSON.stringify(normalizeRequestUrl(this.url))},\n  headers: ${renderedHeaders}\n}`;
-  }
-}
-
-function requestWithLazyURL(urlFactory, init) {
-  return new Request(undefined, init, lazyRequestURLToken, urlFactory);
-}
-
-function cloneCookieMap(map) {
-  const cloned = new CookieMap();
-  for (const [name, value] of Map.prototype.entries.call(map)) {
-    Map.prototype.set.call(cloned, name, value);
-  }
-  cloned._changes = map._changes.map((change) => ({ ...change }));
-  cloned._initialKeys = [...map._initialKeys];
-  cloned._dynamicKeys = [...map._dynamicKeys];
-  return cloned;
-}
-
-function bodyForRequestCopy(source) {
-  if (source._bodyStream?.locked || source._body?.locked) {
-    throw new TypeError("ReadableStream is locked");
-  }
-  if (bodyWasUsed(source)) {
-    // A consumed native body has become Bun's Empty value and remains
-    // cloneable. An exposed or user-provided stream remains disturbed.
-    if (source._bodyStream != null || isStreamingBody(source._body)) {
-      throw new TypeError("Body already used");
-    }
-    return new Blob([]);
-  }
-  return teeClonedBody(source);
-}
-
-function teeClonedBody(source) {
-  const body = source._body;
-  if (!isStreamingBody(body)) {
-    if (source._bodyStream != null) source._bodyLocksUse = false;
-    return snapshotBodyValue(body);
-  }
-
-  const stream = source._bodyStream ?? bodyReadableStream(body);
-  if (!stream || typeof stream.tee !== "function") return body;
-  if (stream.locked) throw new TypeError("ReadableStream is locked");
-  if (bodyStreamIsDisturbed(stream)) throw new TypeError("Body already used");
-
-  const [original, cloned] = stream.tee();
-  source._body = original;
-  source._bodyStream = undefined;
-  source._bodyLocksUse = undefined;
-  source._bodyUsed = false;
-  return cloned;
-}
-
-function normalizeRequestUrl(value) {
-  const text = String(value);
-  try {
-    const url = new URL(text);
-    const pathname = String(url.pathname || "/") || "/";
-    return `${url.origin}${pathname}${url.search}${url.hash}`;
-  } catch {
-    return text;
-  }
-}
-
-function normalizeServeDispatchUrl(value) {
-  const normalized = normalizeRequestUrl(value);
-  try {
-    const url = new URL(normalized);
-    const pathname = String(url.pathname || "/").replace(/^\/+/, "/") || "/";
-    return `${url.origin}${pathname}${url.search}${url.hash}`;
-  } catch {
-    return normalized;
-  }
-}
-
-export class Response {
-  constructor(body = null, init = {}) {
-    const responseInit = readBunResponseInit(init);
-    const rawBody = body;
-    this.status = responseInit.status;
-    this.statusText = responseInit.statusText;
-    this.headers = responseInit.headers;
-    this._method = responseInit.method;
-    body = snapshotBodyValue(rawBody);
-    if (body?.locked) throw new TypeError("ReadableStream is locked");
-    if (bodyStreamIsDisturbed(body)) throw new TypeError("ReadableStream has already been used");
-    setDefaultBodyContentType(this.headers, body instanceof FormData ? body : rawBody);
-    if (body instanceof FormData) assertFormDataFilesExist(body);
-    this._body = body;
-    this._bodyStream = undefined;
-    this._bodyUsed = false;
-    this._bodyConsumedBytes = 0;
-    this.url = "";
-    this.redirected = false;
-    this._type = "default";
-  }
-  get bodyUsed() {
-    return bodyWasUsed(this);
-  }
-  get [estimatedMemoryCostSymbol]() {
-    return 512 + externallyOwnedBodyBytes(this._body) +
-      (Number(this.headers?.[estimatedMemoryCostSymbol]) || 0);
-  }
-  static json(value, init = {}) {
-    const omitted = arguments.length === 0;
-    if (typeof init === "number") init = { status: init };
-    let body;
-    if (omitted) {
-      body = "";
-    } else {
-      try {
-        body = JSON.stringify(value);
-      } catch (error) {
-        // Match Node's JSON.stringify BigInt message (Bun does the same).
-        if (typeof value === "bigint") throw new TypeError("Do not know how to serialize a BigInt");
-        throw error;
-      }
-      // Top-level undefined/function/symbol serialize to undefined; Bun throws.
-      if (body === undefined) throw new TypeError("Value is not JSON serializable");
-    }
-    const headers = new Headers(init.headers);
-    if (!headers.has("content-type")) headers.set("content-type", "application/json;charset=utf-8");
-    return new Response(body, { ...init, headers });
-  }
-  static error() {
-    const response = new Response(null);
-    response.status = 0;
-    response.statusText = "";
-    response._type = "error";
-    return response;
-  }
-  static redirect(url, status = 302) {
-    let init = {};
-    let statusCode = 302;
-    if (status !== null && typeof status === "object") {
-      init = status;
-      statusCode = init.status === undefined ? 302 : Number(init.status);
-    } else if (typeof status === "number") {
-      statusCode = status;
-    }
-    if (statusCode !== 301 && statusCode !== 302 && statusCode !== 303 && statusCode !== 307 && statusCode !== 308) {
-      throw new RangeError("Invalid status code");
-    }
-    const headers = new Headers(init.headers);
-    headers.set("location", String(url));
-    return new Response(null, { ...init, status: statusCode, headers });
-  }
-  clone() {
-    if (this._bodyStream?.locked) throw new TypeError("ReadableStream is locked");
-    if (bodyWasUsed(this)) throw new TypeError("Body already used");
-    const cloned = responseWithMetadata(null, {
-      status: this.status === 0 || this.status === 101 ? 200 : this.status,
-      statusText: this.statusText,
-      headers: new Headers(this.headers),
-      method: this._method,
-    }, {
-      url: this.url,
-      redirected: this.redirected,
-      type: this._type,
-    });
-    cloned.status = this.status;
-    cloned._body = teeClonedBody(this);
-    return cloned;
-  }
-  _takeBody() {
-    return lifecycleTakeBody(this, isStreamingBody);
-  }
-  async arrayBuffer() {
-    const body = this._takeBody();
-    if (body instanceof Blob) return body.arrayBuffer();
-    return arrayBufferFromBytes(await bytesFromBody(body));
-  }
-  async bytes() {
-    const body = this._takeBody();
-    if (body instanceof Blob && typeof body.bytes === "function") return asBuffer(await body.bytes());
-    return asBuffer(await bytesFromBody(body));
-  }
-  async blob() {
-    const type = blobTypeFromBodyHeaders(this.headers);
-    const body = this._takeBody();
-    // Bun keeps a Blob body's own MIME type. Response headers only supply a
-    // type when the consumed body did not already carry one.
-    if (body instanceof Blob && (body.type || !type)) return body;
-    return cachedBlobForBytes(await bytesFromBody(body), type);
-  }
-  text() {
-    if (this._bodyStream?.locked) return handledRejectedPromise(new TypeError("ReadableStream is locked"));
-    if (bodyWasUsed(this)) return handledRejectedPromise(new TypeError("Body already used"));
-    const body = bodyValueForConsumption(this);
-    if (body != null) this._bodyUsed = true;
-    if (body == null) return Promise.resolve("");
-    if (typeof body === "string") return Promise.resolve(stripUtf8BOMText(body));
-    if (body instanceof Blob) return body.text().then(stripUtf8BOMText);
-    return bytesFromBody(body).then((bytes) => stripUtf8BOMText(cachedTextForBytes(bytes)));
-  }
-  async json() {
-    if (this._body instanceof Blob && typeof this._body.json === "function") {
-      try {
-        return await this._takeBody().json();
-      } catch (error) {
-        if (error instanceof SyntaxError) throw new SyntaxError("Failed to parse JSON");
-        throw error;
-      }
-    }
-    return parseBodyJson(await this.text());
-  }
-  formData() {
-    if (this._bodyStream?.locked) return handledRejectedPromise(new TypeError("ReadableStream is locked"));
-    if (bodyWasUsed(this)) return handledRejectedPromise(new TypeError("Body already used"));
-    if (this._body != null) this._bodyUsed = true;
-    return parseMultipartFormData(bodyValueForConsumption(this), this.headers.get("content-type"));
-  }
-  get body() {
-    return bodyStreamFor(this);
-  }
-  get ok() {
-    return this.status >= 200 && this.status < 300;
-  }
-  get type() {
-    return this._type;
-  }
-  [Symbol.for("nodejs.util.inspect.custom")]() {
-    const indentTail = (text) => String(text).split("\n").map((line, index) => (index === 0 ? line : `  ${line}`)).join("\n");
-    const lines = [
-      `ok: ${this.ok}`,
-      `url: ${JSON.stringify(this.url)}`,
-      `status: ${this.status}`,
-      `statusText: ${JSON.stringify(this.statusText)}`,
-      `headers: ${indentTail(this.headers[Symbol.for("nodejs.util.inspect.custom")]())}`,
-      `redirected: ${this.redirected}`,
-      `bodyUsed: ${this.bodyUsed}`,
-    ];
-    const body = this._body;
-    const sizeText = typeof body?.getReader === "function"
-      ? formatInspectBodyByteSize(this._bodyConsumedBytes, false)
-      : inspectBodyByteSize(body);
-    const prefix = sizeText == null ? "Response" : `Response (${sizeText})`;
-    const bodyInspector = body == null ? undefined : bunInspectPropertyDescriptor(body, ctInspectSymbol)?.value;
-    if (typeof bodyInspector === "function") {
-      lines.push(indentTail(bodyInspector.call(body)));
-    } else if (sizeText != null) {
-      lines.push(sizeText === "0 KB" ? "[Blob detached]" : `Blob (${sizeText})`);
-    }
-    return `${prefix} {\n${lines.map((line, index) => `  ${line}${index === lines.length - 1 ? "" : ","}`).join("\n")}\n}`;
-  }
-}
-
-function responseWithMetadata(body, init, metadata = undefined) {
-  const response = new Response(body, init);
-  if (metadata) {
-    response.url = String(metadata.url ?? "");
-    response.redirected = Boolean(metadata.redirected);
-    response._type = String(metadata.type ?? "default");
-  }
-  return response;
-}
-
-// Bun renders body sizes as "N bytes" below 1 KB and with two decimals in
-// decimal units above it.
-function inspectBodyByteSize(body) {
-  let size = null;
-  if (body == null) return null;
-  if (typeof body === "string") size = new TextEncoder().encode(body).byteLength;
-  else if (body instanceof ArrayBuffer) size = body.byteLength;
-  else if (ArrayBuffer.isView(body)) size = body.byteLength;
-  else if (typeof body === "object" && typeof body.size === "number" && Number.isFinite(body.size)) size = body.size;
-  if (size == null) return null;
-  return formatInspectBodyByteSize(size, true);
-}
-
-function formatInspectBodyByteSize(size, emptyAsKilobytes) {
-  if (size === 0) return emptyAsKilobytes ? "0 KB" : "0 bytes";
-  if (size < 1000) return `${size} bytes`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let value = size;
-  let unit = -1;
-  do {
-    value /= 1000;
-    unit += 1;
-  } while (value >= 1000 && unit < units.length - 1);
-  return `${value.toFixed(2)} ${units[unit]}`;
-}
+let arrayBufferFromBytes;
+let bodyBlobSourceSymbol;
+let bodyReadableStream;
+let bodyValueForConsumption;
+let bunString;
+let bytesFromBody;
+let bytesFromData;
+let consumeStreamingBody;
+let encodeMultipartFormData;
+let externallyOwnedBodyBytes;
+let fetchBodyStartSymbol;
+let FormData;
+let formDataBoundary;
+let Headers;
+let headersGetAll;
+let inspectBodyByteSize;
+let invalidHeaderErrorSymbol;
+let isObjectLike;
+let isURLSearchParamsLike;
+let normalizeRequestUrl;
+let normalizeServeDispatchUrl;
+let parseMultipartFormData;
+let parseMultipartFormDataText;
+let Request;
+let requestState;
+let requestWithLazyURL;
+let Response;
+let responseWithMetadata;
+let sharedArrayBufferBytes;
+let stringLatin1FromBytes;
+let stripUtf8BOMText;
+
+export { FormData, Headers, Request, Response, URL, URLSearchParams };
 
 const activeServeOrigins = globalThis.__cottontailActiveServeOrigins ??= new Map();
 const activeServeDispatches = globalThis.__cottontailActiveServeDispatches ??= new WeakMap();
@@ -4159,6 +2039,7 @@ function abortActiveServeRequests(server) {
 }
 
 function activeServerForFetchUrl(urlText) {
+  if (activeServeOrigins.size === 0) return null;
   try {
     const url = new URL(urlText);
     const rawHostname = String(url.hostname).slice(String(url.hostname).lastIndexOf("@") + 1);
@@ -4175,7 +2056,7 @@ function activeServerForFetchUrl(urlText) {
   return null;
 }
 
-function fetchProxyConfiguration(urlText, init = {}) {
+function fetchProxyConfiguration(urlText, init = {}, parsedUrl = null) {
   const explicit = init?.proxy;
   if (explicit != null) {
     const rawValue = typeof explicit === "object" && !Array.isArray(explicit)
@@ -4215,8 +2096,10 @@ function fetchProxyConfiguration(urlText, init = {}) {
     };
   }
 
-  let protocol = "http:";
-  try { protocol = new URL(urlText).protocol; } catch {}
+  let protocol = parsedUrl?.protocol ?? "http:";
+  if (parsedUrl == null) {
+    try { protocol = new URL(urlText).protocol; } catch {}
+  }
   const env = globalThis.process?.env ?? {};
   const names = protocol === "https:"
     ? ["https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"]
@@ -4402,7 +2285,7 @@ function fetchUsesKeepalive(request) {
   return state?.keepaliveExplicit === true ? request.keepalive : true;
 }
 
-function applyDefaultFetchHeaders(request, keepalive = fetchUsesKeepalive(request)) {
+function applyDefaultFetchHeaders(request, keepalive = fetchUsesKeepalive(request), parsedUrl = null) {
   const headers = request.headers;
   if (!headers.has("user-agent")) {
     headers.set(
@@ -4415,7 +2298,7 @@ function applyDefaultFetchHeaders(request, keepalive = fetchUsesKeepalive(reques
   if (!headers.has("accept-encoding")) headers.set("Accept-Encoding", "gzip, deflate, br, zstd");
   if (!headers.has("host")) {
     try {
-      const url = new URL(request.url);
+      const url = parsedUrl ?? new URL(request.url);
       headers.set("Host", `${url.hostname}${url.port ? `:${url.port}` : ""}`);
     } catch {}
   }
@@ -4440,7 +2323,20 @@ function fetchPoolKey(urlText, tlsConfig = undefined) {
     (tlsConfig ? `|tls:${fetchTlsSessionKey(tlsConfig)}` : "");
 }
 
+let lastParsedFetchUrlText = null;
+let lastParsedFetchUrl = null;
+
+function parsedFetchUrl(urlText) {
+  const text = String(urlText);
+  if (text === lastParsedFetchUrlText) return lastParsedFetchUrl;
+  const parsed = new URL(text);
+  lastParsedFetchUrlText = text;
+  lastParsedFetchUrl = parsed;
+  return parsed;
+}
+
 function hasPreconnectedFetchSocket(urlText, tlsConfig = undefined) {
+  if (preconnectedFetchSockets.size === 0) return false;
   try {
     const list = preconnectedFetchSockets.get(fetchPoolKey(urlText, tlsConfig));
     return list?.some(socket => !socket.destroyed && socket.writable !== false) === true;
@@ -4523,6 +2419,9 @@ async function fetchFromNodeHttp(request, redirectMode = "follow", depth = 0, re
 // fires on already-correct text.
 function redirectLocationText(location) {
   let text = String(location);
+  // Bun's redirect resolver treats a leading "://" as scheme-relative
+  // ("//host/path"); the WHATWG parser would keep it as a path segment.
+  if (text.startsWith("://")) text = text.slice(1);
   for (let pass = 0; pass < 3; pass += 1) {
     if (!/[\x80-\xff]/.test(text) || /[Ā-￿]/.test(text)) return text;
     const bytes = Buffer.from(text, "latin1");
@@ -4752,6 +2651,20 @@ function incomingMessageBodyStream(message, signal) {
   return stream;
 }
 
+const preparedNodeFetchBlobBodies = new WeakMap();
+
+function prepareImmutableBlobFetchBody(body) {
+  let prepared = preparedNodeFetchBlobBodies.get(body);
+  if (prepared == null) {
+    prepared = Promise.resolve(body.arrayBuffer()).then(arrayBuffer => {
+      const bytes = Buffer.from(arrayBuffer);
+      return { bytes, stream: null, length: bytes.byteLength };
+    });
+    preparedNodeFetchBlobBodies.set(body, prepared);
+  }
+  return prepared;
+}
+
 function prepareNodeFetchBody(request) {
   const body = request._body;
   if (body == null || request.method === "GET" || request.method === "HEAD") return { bytes: null, stream: null, length: null };
@@ -4770,6 +2683,12 @@ function prepareNodeFetchBody(request) {
   }
   const shared = sharedArrayBufferBytes(body);
   if (shared) return { bytes: Buffer.from(shared), stream: null, length: shared.byteLength };
+  // Native Blob snapshots are immutable. Reusing their prepared bytes avoids
+  // rebuilding an identical ReadableStream for every request while retaining
+  // live reads for Bun.file and other Blob-like objects.
+  if (body instanceof Blob && Object.getPrototypeOf(body) === Blob.prototype) {
+    return prepareImmutableBlobFetchBody(body);
+  }
   if (typeof body?.stream === "function" && typeof body?.size === "number") {
     return { bytes: null, stream: body.stream(), length: Number(body.size) };
   }
@@ -4955,31 +2874,32 @@ function destroyOneShotProxyTunnelAgent(agent) {
   for (const socket of sockets) socket?._destroyImmediately?.();
 }
 
-function fetchOnceUsingNodeClient(request, redirected = false, transport = {}, onResponse = null) {
-  // COTTONTAIL-COMPAT: A pending fetch remains referenced while body
-  // preparation and node:net address fallback have no active socket handle.
-  const livenessTimer = setTimeout(() => {}, 0x7fffffff);
+function fetchOnceUsingNodeClient(request, redirected = false, transport = {}, onResponse = null, parsedUrl = null) {
+  // COTTONTAIL-COMPAT: Async body preparation can precede creation of the
+  // request socket, so keep only that interval referenced. Once dispatched,
+  // node:net owns a live handle and no synthetic timer is needed.
+  let livenessTimer = null;
   const release = value => {
-    clearTimeout(livenessTimer);
+    if (livenessTimer != null) clearTimeout(livenessTimer);
     return value;
   };
   try {
-    const url = new URL(request.url);
+    const url = parsedUrl ?? new URL(request.url);
     const keepalive = fetchUsesKeepalive(request);
-    applyDefaultFetchHeaders(request, keepalive);
+    applyDefaultFetchHeaders(request, keepalive, url);
     const preparedBody = prepareNodeFetchBody(request);
-    const pending = preparedBody && typeof preparedBody.then === "function"
-      ? preparedBody.then(body => dispatchNodeFetchRequest(request, redirected, transport, onResponse, url, keepalive, body))
-      : dispatchNodeFetchRequest(request, redirected, transport, onResponse, url, keepalive, preparedBody);
-    return Promise.resolve(pending).then(
-      release,
-      error => {
-        clearTimeout(livenessTimer);
-        throw error;
-      },
-    );
+    if (preparedBody && typeof preparedBody.then === "function") {
+      livenessTimer = setTimeout(() => {}, 0x7fffffff);
+      return preparedBody
+        .then(body => dispatchNodeFetchRequest(request, redirected, transport, onResponse, url, keepalive, body))
+        .then(release, error => {
+          clearTimeout(livenessTimer);
+          throw error;
+        });
+    }
+    return dispatchNodeFetchRequest(request, redirected, transport, onResponse, url, keepalive, preparedBody);
   } catch (error) {
-    clearTimeout(livenessTimer);
+    if (livenessTimer != null) clearTimeout(livenessTimer);
     throw error;
   }
 }
@@ -4993,13 +2913,14 @@ function dispatchNodeFetchRequest(request, redirected, transport, onResponse, ur
   let hostname = String(url.hostname).replace(/^\[|\]$/g, "");
   let port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
   let path = `${url.pathname || "/"}${url.search || ""}`;
-  const tlsOptions = fetchTlsOptions(url, transport.tlsConfig);
+  let tlsOptions = null;
+  const getTlsOptions = () => tlsOptions ??= fetchTlsOptions(url, transport.tlsConfig);
   let agent = keepalive ? defaultFetchHttpAgent() : false;
   const proxyValue = transport.proxy?.explicit ?? transport.proxy?.environment;
   if (proxyValue) {
     const proxy = normalizedProxyUrl(proxyValue);
     if (url.protocol === "https:") {
-      agent = httpsProxyTunnelAgent(url, proxy, transport.proxy.headers, tlsOptions, false);
+      agent = httpsProxyTunnelAgent(url, proxy, transport.proxy.headers, getTlsOptions(), false);
     } else {
       client = proxy.protocol === "https:" ? nodeHttps : nodeHttp;
       hostname = proxy.hostname;
@@ -5013,8 +2934,8 @@ function dispatchNodeFetchRequest(request, redirected, transport, onResponse, ur
     }
   } else if (url.protocol === "https:") {
     agent = transport.tlsConfig
-      ? customFetchHttpsAgent(tlsOptions, transport.tlsConfig, keepalive)
-      : defaultFetchHttpsAgent(tlsOptions, keepalive);
+      ? customFetchHttpsAgent(getTlsOptions(), transport.tlsConfig, keepalive)
+      : defaultFetchHttpsAgent(getTlsOptions(), keepalive);
   }
 
   return new Promise((resolve, reject) => {
@@ -5046,7 +2967,7 @@ function dispatchNodeFetchRequest(request, redirected, transport, onResponse, ur
         headers: nodeFetchHeaders(request.headers),
         agent,
         socketPath: transport.socketPath,
-        ...((client === nodeHttps || url.protocol === "https:") ? tlsOptions : {}),
+        ...((client === nodeHttps || url.protocol === "https:") ? getTlsOptions() : {}),
       }, incoming => {
         responseReceived = true;
         const resolveResponse = resolve;
@@ -5137,7 +3058,7 @@ function settleNodeFetchResponse(request, response, redirectMode, depth, transpo
   });
 }
 
-function fetchFromNodeClient(request, redirectMode = "follow", depth = 0, redirected = false, transport = {}) {
+function fetchFromNodeClient(request, redirectMode = "follow", depth = 0, redirected = false, transport = {}, parsedUrl = null) {
   throwIfAborted(request.signal);
   if (depth > 20) throw new TypeError("redirect count exceeded");
   return fetchOnceUsingNodeClient(
@@ -5145,6 +3066,7 @@ function fetchFromNodeClient(request, redirectMode = "follow", depth = 0, redire
     redirected,
     transport,
     response => settleNodeFetchResponse(request, response, redirectMode, depth, transport),
+    parsedUrl,
   );
 }
 
@@ -5172,7 +3094,8 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
     ? Buffer.alloc(0)
     : Buffer.from(await bytesFromBody(request._body));
   return new Promise((resolve, reject) => {
-    const url = new URL(request.url);
+    const suppliedUrl = transport.parsedUrl;
+    const url = suppliedUrl?.href === request.url ? suppliedUrl : parsedFetchUrl(request.url);
     const isHttps = url.protocol === "https:";
     let hostname = String(url.hostname).replace(/^\[|\]$/g, "");
     if (hostname === "0.0.0.0") hostname = "127.0.0.1";
@@ -5189,6 +3112,10 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
         settled = true;
         cleanup();
         reject(error);
+        // Same retain-cycle break as the success path: once settled, the
+        // settler bindings must not keep transport closures alive.
+        resolve = null;
+        reject = null;
         return;
       }
       if (!streamDone && streamController) {
@@ -5330,6 +3257,14 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
     let bodyRemaining = 0;
     let chunkState = null;
 
+    // COTTONTAIL-COMPAT: the body stream below uses a zero highWaterMark so
+    // desiredSize stays <= 0, which keeps ReadableStreamDefaultController's
+    // post-enqueue callPullIfNeeded from invoking the pull algorithm (and
+    // allocating its promise bookkeeping) while nobody reads. Pulls still
+    // fire for pending read requests, so consumers drive delivery normally.
+    // desiredSize therefore cannot provide backpressure; track buffered
+    // bytes ourselves and pause the socket past the same 4 MiB budget.
+    let bufferedBodyBytes = 0;
     const enqueueBody = (chunk) => {
       if (chunk.byteLength === 0) return;
       if (streamDone || !streamController) return;
@@ -5337,7 +3272,8 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
         streamController.enqueue(Buffer.from(chunk));
         // Backpressure: stop reading from the socket once the consumer's
         // queue is full; pull() resumes it.
-        if (streamController.desiredSize <= 0 && !socket.destroyed) socket.pause?.();
+        bufferedBodyBytes += chunk.byteLength;
+        if (bufferedBodyBytes > 4 * 1024 * 1024 && !socket.destroyed) socket.pause?.();
       } catch {}
     };
 
@@ -5386,13 +3322,15 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
           }
         },
         pull() {
+          // A reader is draining the queue; reopen the delivery budget.
+          bufferedBodyBytes = 0;
           if (!finished && !socket.destroyed) socket.resume?.();
         },
         cancel() {
           streamDone = true;
           cleanup();
         },
-      }, new ByteLengthQueuingStrategy({ highWaterMark: 4 * 1024 * 1024 }));
+      }, new ByteLengthQueuingStrategy({ highWaterMark: 0 }));
       Object.defineProperty(stream, abandonedFetchBodyCleanupSymbol, {
         value() {
           if (streamDone) return;
@@ -5417,6 +3355,12 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
       const decodedResponse = decodeFetchResponse(response, transport.decompress !== false);
       settled = true;
       resolve(decodedResponse);
+      // Break the retain cycle: the fetch-body FinalizationRegistry pins the
+      // transport closures (unregister token + held cleanup value) until the
+      // response is collected, and a settled promise pins its result — a
+      // reachable `resolve` binding would pin the response forever.
+      resolve = null;
+      reject = null;
       if (bodyMode === "none" || (bodyMode === "length" && bodyRemaining === 0)) {
         if (initialChunk.byteLength > 0) {
           // Ignore pipelined data.
@@ -5585,7 +3529,7 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
   });
 }
 
-function prepareFetchRequest(input, init = {}) {
+function prepareFetchRequest(input, init = {}, initWasProvided = true) {
   let requestInit = init;
   if (!(input instanceof Request) && init?.body === "") {
     const method = String(init.method ?? "GET").toUpperCase();
@@ -5602,7 +3546,9 @@ function prepareFetchRequest(input, init = {}) {
     }
   }
   const hasOverrides = requestInit != null && typeof requestInit === "object" && Object.keys(requestInit).length > 0;
-  const request = input instanceof Request && !hasOverrides ? input : new Request(input, requestInit);
+  const request = input instanceof Request && !hasOverrides
+    ? input
+    : new Request(input, initWasProvided ? requestInit : undefined);
   return { request, upgradeStreamBody };
 }
 
@@ -5711,14 +3657,14 @@ function fetchImpl(request, init = {}, upgradeStreamBody = null) {
       url: request.url,
     }));
   }
-  const parsedUrl = new URL(request.url);
+  const parsedUrl = parsedFetchUrl(request.url);
   if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
     throw new TypeError(`Unsupported URL scheme: ${parsedUrl.protocol}`);
   }
   const unixSocketPath = init?.unix != null && init.unix !== false ? String(init.unix) : null;
   const unixTransportPath = unixSocketPath == null ? null : windowsUnixTransportPath(unixSocketPath);
   const customTlsConfig = init?.tls != null && typeof init.tls === "object" && !Array.isArray(init.tls) ? init.tls : null;
-  const proxy = fetchProxyConfiguration(request.url, init);
+  const proxy = fetchProxyConfiguration(request.url, init, parsedUrl);
   if (unixSocketPath && proxy.active) throw new TypeError("fetch() proxy and unix options cannot be used together");
   if (customTlsConfig) {
     for (const name of ["ca", "cert", "key", "pfx", "crl"]) {
@@ -5756,7 +3702,7 @@ function fetchImpl(request, init = {}, upgradeStreamBody = null) {
   const localHttpPath = activeServer != null && parsedUrl.protocol === "http:" &&
     !proxy.active && !wantsUpgrade && !customTlsSocketPath;
   if (localHttpPath || localTlsKeepalivePath) {
-    applyDefaultFetchHeaders(request, usesKeepalive);
+    applyDefaultFetchHeaders(request, usesKeepalive, parsedUrl);
     const peerKey = localTlsKeepalivePath ? `tls:${fetchTlsSessionKey(customTlsConfig)}` : "http";
     return fetchFromActiveServer(activeServer, request, redirectMode, 0, false, decompress, peerKey, {
       tlsConfig: customTlsConfig ?? undefined,
@@ -5768,6 +3714,12 @@ function fetchImpl(request, init = {}, upgradeStreamBody = null) {
     return fetchFromNodeHttp(request, redirectMode, 0, false, {
       streamBody: upgradeStreamBody,
       rejectUnauthorized: customTlsConfig?.rejectUnauthorized,
+      tlsConfig: customTlsConfig ?? undefined,
+    });
+  }
+  if (!proxy.active && unixSocketPath == null && parsedUrl.protocol === "http:" && isLoopbackHostname(parsedUrl.hostname)) {
+    return fetchFromNodeHttp(request, redirectMode, 0, false, {
+      pooled: usesKeepalive,
       tlsConfig: customTlsConfig ?? undefined,
     });
   }
@@ -5783,11 +3735,12 @@ function fetchImpl(request, init = {}, upgradeStreamBody = null) {
     tlsConfig: customTlsConfig ?? undefined,
     proxy,
     decompress,
-  });
+  }, parsedUrl);
 }
 
 export function fetch(input, init = {}) {
   try {
+    const initWasProvided = arguments.length > 1;
     let preparedInput = input;
     let preparedInit = init;
     if (!(input instanceof Request) && !(input instanceof URL) && isObjectLike(input) && !("url" in input)) {
@@ -5801,7 +3754,7 @@ export function fetch(input, init = {}) {
       preparedInput = new Request(input, init);
       preparedInit = {};
     }
-    const prepared = prepareFetchRequest(preparedInput, preparedInit);
+    const prepared = prepareFetchRequest(preparedInput, preparedInit, initWasProvided);
     const body = prepared.request._body;
     if (isBunFileLike(body) && body._bunFilePath && !cottontail.existsSync(body._bunFilePath)) {
       const error = new Error(`ENOENT: no such file or directory, open '${body._bunFilePath}'`);
@@ -6067,6 +4020,10 @@ function finishActiveServeRequestBody(request, response) {
   const body = request?._body;
   const state = body?.[activeServeRequestBodyStateSymbol];
   if (!state || state.settled || response?._body === body) return;
+  // The handler may have attached a reader intending to consume the body
+  // while the response streams back; only abort a body never exposed for
+  // reading. Anything left unread is still force-aborted on disposal.
+  if (body != null && (body.locked === true || bodyStreamIsDisturbed(body))) return;
   state.abort(activeServeUnreadBodyAbortError);
 }
 
@@ -6475,7 +4432,12 @@ async function prepareServeResponse(value, request, options = {}) {
     : null;
   const sourceResponse = cached
     ? cached.response.clone()
-    : normalizeResponse(value instanceof Response ? value : new Response(value));
+    : normalizeResponse(value instanceof Response
+      // Static routes share one Response object across requests; take the body
+      // from a clone so the original is never consumed, even on paths that do
+      // not populate the response cache (HEAD, missing files).
+      ? (options.cacheKey != null ? value.clone() : value)
+      : new Response(value));
   const headers = new Headers(sourceResponse.headers);
   const body = cached ? cached.body : sourceResponse._takeBody();
   const method = String(request.method || "GET").toUpperCase();
@@ -6818,6 +4780,9 @@ function runServeHandler(options, request, server) {
       allowFileFallback: true,
       preserveFileSliceStatus: typeof route !== "function",
       staticTextContentType: typeof route !== "function",
+      // A static route Response object is shared by every request; serve each
+      // one from a cached snapshot instead of consuming the original body.
+      cacheKey: typeof route !== "function" && route && typeof route === "object" ? route : null,
     });
     return isPromiseLike(prepared)
       ? prepared.then((resolved) => resolved ?? runFetchFallback(options, request, server))
@@ -7813,7 +5778,11 @@ function beginServerWebSocketClose(state, code, reason, payload) {
   if (socket && !socket.destroyed && socket.writable) {
     flushServerWebSocketFrames(state);
     try {
-      socket.end(encodeServerWebSocketFrame(0x8, payload));
+      socket.end(encodeServerWebSocketFrame(0x8, payload), () => {
+        // uWS/Bun invoke the close handler once the close echo is flushed,
+        // not when the peer finishes the TCP close handshake.
+        finalizeServerWebSocket(state, code, String(reason ?? ""));
+      });
       state.closeTimer = setTimeout(() => terminateServerWebSocket(state), 30_000);
       state.closeTimer?.unref?.();
       return;
@@ -9066,428 +7035,50 @@ export function serve(options) {
     return serveNodeBacked(options, { hostname, unixPath, tlsConfigs, inspectorReload });
   }
 
-  let native;
-  try {
-    const preboundKey = Symbol.for("cottontail.preboundHttpServer");
-    const prebound = globalThis[preboundKey];
-    const requestedPort = defaultServePort(options);
-    if (
-      prebound?.native != null &&
-      !unixPath &&
-      hostname === "localhost" &&
-      Number(prebound.requestedPort) === requestedPort
-    ) {
-      native = prebound.native;
-      delete globalThis[preboundKey];
-    } else {
-      const preboundFd = Number(prebound?.fd);
-      if (Number.isInteger(preboundFd) && preboundFd >= 0) {
-        try { cottontail.closeFd(preboundFd); } catch {}
-      }
-      if (prebound?.native != null) {
-        try { cottontail.httpServerStop(prebound.native.id, true); } catch {}
-      }
-      if (prebound != null) delete globalThis[preboundKey];
-      native = cottontail.httpServerStart(
-        hostname,
-        requestedPort,
-        unixPath || undefined,
-        configuredMaxRequestBodySize,
-      );
-    }
-  } catch (rawError) {
-    const reason = rawError instanceof Error ? rawError.message : String(rawError);
-    const error = rawError instanceof Error
-      ? rawError
-      : new Error(
-          unixPath
-            ? `Failed to listen on unix socket ${unixPath}: ${reason}`
-            : `Failed to start server. ${reason}`,
-        );
-    throw normalizeServeListenErrorCode(error, reason);
-  }
-  const isUnix = unixPath.length > 0;
-  const nativeDisplayHostname = String(native.hostname ?? hostname).includes(":") && !String(native.hostname ?? hostname).startsWith("[")
-    ? `[${native.hostname}]`
-    : native.hostname;
-  const requestOrigin = isUnix ? "http://localhost" : `http://${nativeDisplayHostname}:${native.port}`;
-  let activeOptions = options;
-  let nativeClosed = false;
-  let pumping = false;
-  let interval = null;
-  let publicUrl = null;
-  const maxConcurrentNativeRequests = 256;
-  const originKeys = isUnix ? [] : [
-    requestOrigin,
-    ...(native.hostname === "0.0.0.0" ? [`http://127.0.0.1:${native.port}`, `http://localhost:${native.port}`] : []),
-  ];
-
-  const nativeRequests = new Map();
-  let server;
-  const lifecycle = createServeLifecycle(() => 0);
-  server = {
-    id: options.id ?? native.id,
-    hostname: isUnix ? undefined : native.hostname,
-    port: isUnix ? undefined : native.port,
-    address: isUnix ? native.address : {
-      address: native.hostname,
-      family: "IPv4",
-      port: native.port,
-    },
-    development: activeOptions.development ?? false,
-    get pendingRequests() {
-      return lifecycle.pendingRequests;
-    },
-    pendingWebSockets: 0,
-    protocol: "http",
-    get url() {
-      publicUrl ??= new globalThis.URL(isUnix ? serveUnixUrlText(unixPath) : `${requestOrigin}/`);
-      return publicUrl;
-    },
-    stop(force = false) {
-      return lifecycle.stop(force);
-    },
-    [Symbol.dispose]() {
-      server.stop(true);
-    },
-    [Symbol.asyncDispose]() {
-      return server.stop(true);
-    },
-    reload(nextOptions = {}) {
-      registerServeHtmlOptions(activeOptions[serveHtmlStateSymbol], nextOptions);
-      activeOptions = { ...activeOptions, ...nextOptions };
-      server.development = activeOptions.development ?? false;
-      return server;
-    },
-    async fetch(input, init = {}) {
-      if (typeof activeOptions.fetch !== "function") {
-        throw new Error("fetch() requires the server to have a fetch handler");
-      }
-      return dispatchServeFetch(activeOptions, server, input, init);
-    },
-    ref() {
-      interval?.ref?.();
-      return server;
-    },
-    unref() {
-      interval?.unref?.();
-      return server;
-    },
-    requestIP(request) {
-      const peer = serveRequestPeers.get(request);
-      return peer ? { ...peer } : null;
-    },
-    closeIdleConnections() {
-      if (!nativeClosed) cottontail.httpServerCloseIdle(native.id);
-    },
-    timeout(request, seconds) {
-      return setServeRequestIdleTimeout(request, seconds, isUnix, arguments.length);
-    },
-    upgrade() {
-      return false;
-    },
-    publish() {
-      return 0;
-    },
-    subscriberCount() {
-      return 0;
-    },
-  };
-
-  activeServeDispatches.set(server, (input, init) => dispatchServeFetch(activeOptions, server, input, init));
-  activeServeLifecycles.set(server, lifecycle);
-  for (const origin of originKeys) activeServeOrigins.set(origin, server);
-
-  const respond = (item, status, headersText, body) => {
-    if (nativeClosed) return;
-    try {
-      cottontail.httpServerRespond(native.id, item.id, status, headersText, body);
-    } catch (error) {
-      if (nativeClosed && String(error).includes("HTTP server not found")) return;
-      throw error;
-    }
-  };
-
-  const nativeConnectionClosedError = () => {
-    const error = new Error("The socket connection was closed unexpectedly.");
-    error.code = "ECONNRESET";
-    return error;
-  };
-
-  const createNativeRequestState = (item) => createNativeServeRequestState(item, {
+  return startNativeServe(options, {
+    CottontailAbortController,
+    Response,
+    abortActiveServeRequests,
+    activeServeDispatches,
+    activeServeLifecycles,
+    activeServeOrigins,
+    activeServeRequestBodyStateSymbol,
+    activeServeUnreadBodyAbortError,
+    arrayBufferFromBytes,
     binding: cottontail,
-    serverId: native.id,
-    isServerClosed: () => nativeClosed,
-    bodyStateSymbol: activeServeRequestBodyStateSymbol,
-    unreadBodyAbortReason: () => activeServeUnreadBodyAbortError,
-    connectionClosedError: nativeConnectionClosedError,
-    createAbortController: () => new CottontailAbortController(),
+    bytesFromBody,
+    bytesFromData,
+    configuredMaxRequestBodySize,
+    consumeStreamingBody,
+    createNativeServeRequestOperation,
+    createNativeServeRequestState,
+    createServeLifecycle,
+    defaultServePort,
+    dispatchServeFetch,
+    finalizeServeInspector,
+    finishActiveServeRequestBody,
+    headersToText,
+    hostname,
+    incomingRequestURLFactory,
+    inspectorReload,
+    isPromiseLike,
+    isStreamingBody,
+    normalizeRequestUrl,
+    normalizeResponseResult,
+    normalizeServeDateHeader,
+    normalizeServeListenErrorCode,
+    parseHeadersText,
+    registerServeHtmlOptions,
+    requestIdleTimeout,
+    requestWithLazyURL,
+    runServeHandler,
+    serveHtmlStateSymbol,
+    serveRequestPeers,
+    serveResponseWithIdleTimeout,
+    serveUnixUrlText,
+    setServeRequestIdleTimeout,
+    unixPath,
   });
-
-  const responseBody = (response) => {
-    if (response instanceof Response) {
-      const body = response._takeBody();
-      if (body == null || typeof body === "string" || body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
-        return arrayBufferFromBytes(bytesFromData(body));
-      }
-      return bytesFromBody(body).then(arrayBufferFromBytes);
-    }
-    return response.arrayBuffer();
-  };
-
-  const sendStreamingResponse = async (item, response, status, headers) => {
-    if (nativeClosed) return;
-    const body = response._takeBody();
-    let responseStarted = false;
-    const startResponse = () => {
-      if (responseStarted) return;
-      cottontail.httpServerResponseStart(native.id, item.id, status, headers);
-      responseStarted = true;
-    };
-    const writeChunk = (chunk) => {
-      const bytes = bytesFromData(chunk);
-      if (bytes.byteLength > 0) cottontail.httpServerResponseWrite(native.id, item.id, bytes);
-    };
-    try {
-      if (body && typeof body.getReader === "function") {
-        const reader = body.getReader();
-        const read = () => reader.read().then(
-          (readResult) => ({ readResult, error: null }),
-          (error) => ({ readResult: null, error }),
-        );
-        const pendingRead = read();
-        const checkpoint = {};
-        let checkpointTimer;
-        let settled = await Promise.race([
-          pendingRead,
-          new Promise((resolve) => {
-            checkpointTimer = setTimeout(() => resolve(checkpoint), 0);
-          }),
-        ]);
-        if (settled === checkpoint) {
-          startResponse();
-          settled = await pendingRead;
-        } else {
-          clearTimeout(checkpointTimer);
-        }
-
-        for (;;) {
-          if (settled.error != null) throw settled.error;
-          if (settled.readResult.done) break;
-          startResponse();
-          writeChunk(settled.readResult.value);
-          settled = await read();
-        }
-        startResponse();
-      } else {
-        startResponse();
-        await consumeStreamingBody(body, writeChunk);
-      }
-      cottontail.httpServerResponseEnd(native.id, item.id);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!nativeClosed) console.error(`error: ${message}`);
-      try {
-        startResponse();
-        cottontail.httpServerResponseEnd(native.id, item.id);
-      } catch {
-        try {
-          cottontail.httpServerResponseAbort(native.id, item.id);
-        } catch {}
-      }
-    }
-  };
-
-  const sendResponse = (item, response, statusOverride = undefined) => {
-    normalizeServeDateHeader(response.headers);
-    const status = statusOverride ?? response.status;
-    const headers = headersToText(response.headers, String(item.method).toUpperCase() === "HEAD");
-    if (isStreamingBody(response._body)) {
-      return sendStreamingResponse(item, response, status, headers);
-    }
-    const body = responseBody(response);
-    if (isPromiseLike(body)) {
-      return body.then(
-        (resolvedBody) => respond(item, status, headers, resolvedBody),
-        (error) => {
-          const message = error instanceof Error ? error.message : String(error);
-          console.error(`error: ${message}`);
-          respond(item, status, headers, arrayBufferFromBytes(new Uint8Array(0)));
-        },
-      );
-    }
-    respond(item, status, headers, body);
-    return undefined;
-  };
-
-  const handleError = (item, error) => {
-    const fallbackResponse = (cause) => new Response(
-      cause instanceof Error ? cause.stack || cause.message : String(cause),
-      {
-        status: 500,
-        headers: { "content-type": "text/plain; charset=utf-8" },
-      },
-    );
-    let response;
-    if (typeof activeOptions.error === "function") {
-      try {
-        response = normalizeResponseResult(activeOptions.error(error));
-      } catch (nextError) {
-        response = fallbackResponse(nextError);
-      }
-    } else {
-      response = fallbackResponse(error);
-    }
-
-    if (isPromiseLike(response)) {
-      return response.then(
-        (resolvedResponse) => sendResponse(item, resolvedResponse),
-        (nextError) => sendResponse(item, fallbackResponse(nextError)),
-      );
-    }
-    return sendResponse(item, response);
-  };
-
-  const handle = (operation) => {
-    const item = operation.item;
-    const state = operation.state;
-    const requestHeaders = parseHeadersText(item.headersText);
-    const requestInit = {
-      method: item.method,
-      headers: requestHeaders,
-      signal: state.abortController.signal,
-    };
-    if (String(item.method).toUpperCase() !== "GET" && String(item.method).toUpperCase() !== "HEAD") {
-      requestInit.body = state.body;
-    }
-    const request = requestWithLazyURL(
-      incomingRequestURLFactory("http:", requestHeaders.get("host"), item.url, requestOrigin, normalizeRequestUrl),
-      requestInit,
-    );
-    operation.attachRequest(request);
-    if (item.remote) serveRequestPeers.set(request, item.remote);
-    const sendHandledResponse = (response) => {
-      const item = operation.item;
-      const request = operation.request;
-      if (item == null || request == null || nativeClosed) return undefined;
-      finishActiveServeRequestBody(request, response);
-      return sendResponse(item, serveResponseWithIdleTimeout(
-        response,
-        requestIdleTimeout(request, activeOptions.idleTimeout),
-      ));
-    };
-    const sendHandledError = (error) => {
-      const item = operation.item;
-      const request = operation.request;
-      if (item == null || request == null || nativeClosed) return undefined;
-      finishActiveServeRequestBody(request, null);
-      return handleError(item, error);
-    };
-    try {
-      const response = runServeHandler(activeOptions, request, server);
-      if (isPromiseLike(response)) {
-        return response
-          .then(sendHandledResponse)
-          .catch(sendHandledError);
-      }
-      return sendHandledResponse(response);
-    } catch (error) {
-      return sendHandledError(error);
-    }
-  };
-
-  const finishNativeRequest = (operation) => {
-    const state = operation.state;
-    if (state == null) return;
-    state.finishResponse();
-    nativeRequests.delete(operation.id);
-    lifecycle.finishRequest(state.lifecycleRequest);
-    operation.dispose();
-  };
-
-  const maybeFinishNativeStop = () => {
-    if (!lifecycle.stopRequested || lifecycle.forceRequested || nativeClosed || nativeRequests.size !== 0) return;
-    const status = cottontail.httpServerStatus(native.id);
-    if (status == null || Number(status.activeClients) !== 0) return;
-    nativeClosed = true;
-    if (interval != null) {
-      clearInterval(interval);
-      interval = null;
-    }
-    cottontail.httpServerStop(native.id, false);
-    lifecycle.markTransportDrained();
-  };
-
-  const stopNativeTransport = (force) => {
-    for (const origin of originKeys) activeServeOrigins.delete(origin);
-    if (force) {
-      abortActiveServeRequests(server);
-      for (const operation of nativeRequests.values()) {
-        operation.forceAbort();
-        operation.dispose();
-      }
-      nativeClosed = true;
-      if (interval != null) {
-        clearInterval(interval);
-        interval = null;
-      }
-      nativeRequests.clear();
-      cottontail.httpServerStop(native.id, true);
-      lifecycle.markTransportDrained();
-      return;
-    }
-    cottontail.httpServerStopListening(native.id);
-    maybeFinishNativeStop();
-  };
-  lifecycle.configure(stopNativeTransport, () => stopNativeTransport(true));
-
-  const pollNativeRequestEvents = () => {
-    for (const operation of nativeRequests.values()) operation.poll();
-  };
-
-  const pump = () => {
-    if (nativeClosed || pumping) return;
-    if (globalThis.__cottontailProcessIpcPending === true) return;
-    pumping = true;
-    pollNativeRequestEvents();
-    if ((globalThis.__cottontailPollProcessIpc?.() ?? 0) > 0) {
-      cottontail.drainJobs?.();
-      pumping = false;
-      maybeFinishNativeStop();
-      return;
-    }
-    while (!nativeClosed && server.pendingRequests < maxConcurrentNativeRequests) {
-      const item = cottontail.httpServerPoll(native.id);
-      if (!item) break;
-      const state = createNativeRequestState(item);
-      const operation = createNativeServeRequestOperation(item, state);
-      state.lifecycleRequest = lifecycle.beginRequest(() => operation.forceAbort());
-      nativeRequests.set(operation.id, operation);
-      const handled = handle(operation);
-      if (isPromiseLike(handled)) {
-        Promise.resolve(handled).then(
-          () => {
-            finishNativeRequest(operation);
-            pump();
-          },
-          (error) => {
-            console.error(error instanceof Error ? error.stack || error.message : error);
-            finishNativeRequest(operation);
-            pump();
-          },
-        );
-      } else {
-        finishNativeRequest(operation);
-      }
-    }
-    pollNativeRequestEvents();
-    pumping = false;
-    maybeFinishNativeStop();
-  };
-
-  interval = setInterval(pump, 1);
-  pump();
-  return finalizeServeInspector(server, activeOptions, inspectorReload);
 }
 
 function tarString(bytes, offset, length) {
@@ -10130,12 +7721,60 @@ if (globalThis.process) {
 // Bun.stdin is a BunFile-like object (upstream: a lazy Blob over fd 0) with
 // stream()/text()/json()/bytes()/arrayBuffer(). process.stdin is a real node
 // Readable now, so wrap it rather than exposing it directly.
+async function* iterateStdinChunks(source) {
+  if (!source) return;
+  if (typeof source[Symbol.asyncIterator] === "function") {
+    for await (const chunk of source) yield asBuffer(chunk);
+    return;
+  }
+
+  const chunks = [];
+  let ended = source.readableEnded === true;
+  let failure;
+  let wake;
+  const notify = () => {
+    const resolve = wake;
+    wake = undefined;
+    resolve?.();
+  };
+  const onData = (chunk) => {
+    chunks.push(asBuffer(chunk));
+    notify();
+  };
+  const onEnd = () => {
+    ended = true;
+    notify();
+  };
+  const onError = (error) => {
+    failure = error;
+    ended = true;
+    notify();
+  };
+  source.on?.("data", onData);
+  source.once?.("end", onEnd);
+  source.once?.("error", onError);
+  try {
+    while (!ended || chunks.length > 0) {
+      if (chunks.length > 0) {
+        yield chunks.shift();
+        continue;
+      }
+      await new Promise((resolve) => { wake = resolve; });
+    }
+    if (failure) throw failure;
+  } finally {
+    source.off?.("data", onData);
+    source.off?.("end", onEnd);
+    source.off?.("error", onError);
+  }
+}
+
 function collectStdinBytes() {
   const source = globalThis.process?.stdin;
   if (!source) return Promise.resolve(new Uint8Array(0));
   return (async () => {
     const chunks = [];
-    for await (const chunk of source) chunks.push(asBuffer(chunk));
+    for await (const chunk of iterateStdinChunks(source)) chunks.push(chunk);
     return concatManyBuffers(chunks);
   })();
 }
@@ -10155,8 +7794,7 @@ export const stdin = {
   stream() {
     const source = globalThis.process?.stdin;
     return bodyReadableStream((async function* () {
-      if (!source) return;
-      for await (const chunk of source) yield asBuffer(chunk);
+      yield* iterateStdinChunks(source);
     })());
   },
   async text() {
@@ -10195,6 +7833,8 @@ export function jest(_source = undefined) {
   if (inTestRunner && typeof _source !== "string") {
     throw new Error("Bun.jest() expects a string filename");
   }
+  const sharedModule = globalThis[Symbol.for("cottontail.internal.bunTestModule")];
+  if (sharedModule != null) return sharedModule;
   const module = loadBunTestModule();
   return module.default ?? module;
 }
@@ -10224,8 +7864,12 @@ export function nanoseconds() {
   return bigintNs != null ? Number(bigintNs) : Math.floor((performance?.now?.() ?? Date.now()) * 1_000_000);
 }
 
-function bunForceGc(force = false) {
-  cottontail.gc?.(Boolean(force));
+function bunForceGc(force = undefined) {
+  // Bun.gc() with no argument must collect fully and synchronously: the
+  // non-force path (JSGarbageCollect) neither shrinks heap capacity nor
+  // returns pages, so tight alloc/gc loops balloon the RSS high-water mark
+  // (~100 MB per 1M small objects) and request-clone-leak tests fail.
+  cottontail.gc?.(force === undefined ? true : Boolean(force));
   cottontail.drainJobs?.();
 }
 export { bunForceGc as gc };
@@ -10655,10 +8299,15 @@ function bunInspectEvent(value, objectTag, ctx, indent, seen, depth) {
     ], ctx, indent, seen, depth);
   }
   if (objectTag === "[object ErrorEvent]") {
+    const errorDiagnostic = bunInspectErrorDiagnostic(value.error);
     return bunInspectEventEntries("ErrorEvent", [
       ["type", value.type],
       ["message", value.message],
-      ["error", value.error, bunInspectErrorDiagnostic(value.error) ?? undefined],
+      ["error", value.error, errorDiagnostic ?? (
+        value.error instanceof Error
+          ? `error: ${String(value.error.message ?? "")}\n`
+          : undefined
+      )],
     ], ctx, indent, seen, depth);
   }
   const commonEntries = [
@@ -10742,7 +8391,8 @@ function bunStyleInspect(value, ctx, indent, seen, depth) {
   const custom = customDescriptor && "value" in customDescriptor ? customDescriptor.value : undefined;
   if (typeof custom === "function" && custom !== nodeInspect) {
     const remaining = ctx.maxDepth === Infinity ? Infinity : ctx.maxDepth - depth;
-    const result = custom.call(value, remaining, bunInspectCustomOptions(ctx), nodeInspect);
+    // Bun passes util.inspect itself as the inspect argument, not a wrapper.
+    const result = custom.call(value, remaining, bunInspectCustomOptions(ctx), loadNodeUtilModule().inspect);
     if (result !== value) {
       return typeof result === "string" ? result : bunStyleInspect(result, ctx, indent, seen, depth);
     }
@@ -10944,11 +8594,9 @@ export function inspect(value, options = undefined, colorsArg = undefined) {
 inspect.table = function table(value, properties = undefined, options = undefined) {
   if (arguments.length === 0 || value == null) return "";
   if (typeof value !== "object" && typeof value !== "function") return "";
-  const selected = Array.isArray(properties)
-    ? Object.fromEntries(Array.from(properties).map((key) => [key, value?.[key]]))
-    : value;
-  const tableOptions = Array.isArray(properties) ? options : properties;
-  return nodeInspect(selected, tableOptions);
+  const selectedProperties = Array.isArray(properties) ? properties : undefined;
+  const tableOptions = (Array.isArray(properties) ? options : properties) ?? undefined;
+  return renderTable(value, selectedProperties, tableOptions);
 };
 
 export function deepEquals(left, right) {
@@ -12605,367 +10253,10 @@ export const JSONL = {
   },
 };
 
-function normalizeCookieText(value) {
-  const text = String(value ?? "");
-  let output = "";
-  for (let index = 0; index < text.length; index += 1) {
-    const code = text.charCodeAt(index);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = text.charCodeAt(index + 1);
-      if (next >= 0xdc00 && next <= 0xdfff) {
-        output += text[index] + text[index + 1];
-        index += 1;
-      } else {
-        output += "\ufffd";
-      }
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      output += "\ufffd";
-    } else {
-      output += text[index];
-    }
-  }
-  return output;
-}
-
-function encodeCookieText(value) {
-  return encodeURIComponent(normalizeCookieText(value));
-}
-
-function decodeCookieText(value) {
-  try {
-    return decodeURIComponent(String(value));
-  } catch {
-    return String(value).replace(/%(?![0-9a-fA-F]{2})/g, "\ufffd");
-  }
-}
-
-function isInvalidCookieName(value) {
-  const text = String(value);
-  return text.length === 0 || /[\x00-\x20\x7f;=]/.test(text) || /[^\x00-\x7f]/.test(text);
-}
-
-// Set-Cookie values must be ASCII and must not contain characters that would
-// allow header splitting / cookie injection (NUL, CR, LF).
-function isInvalidCookieValue(value) {
-  return /[\x00\r\n]|[^\x00-\x7f]/.test(String(value));
-}
-
-// Attribute names in a Set-Cookie string must be ASCII without control
-// characters; unknown-but-well-formed attributes are ignored by the parser.
-function isInvalidCookieAttributeName(value) {
-  return /[\x00-\x08\x0a-\x1f\x7f]|[^\x00-\x7f]/.test(String(value));
-}
-
-function isInvalidCookieDomain(value) {
-  return /[^A-Za-z0-9.-]/.test(String(value));
-}
-
-function isInvalidCookiePath(value) {
-  return /[\x00-\x1f\x7f;]/.test(String(value));
-}
-
-export class Cookie {
-  constructor(name, value = undefined, options = {}) {
-    if (name && typeof name === "object" && !(name instanceof String)) {
-      options = name;
-      name = options.name;
-      value = options.value;
-    }
-    // `new Bun.Cookie("a=b; Path=/")` parses the cookie string form.
-    if (value === undefined && typeof name === "string" && name.includes("=")) {
-      return Cookie.parse(name);
-    }
-    const initialName = String(name);
-    if (isInvalidCookieName(initialName)) throw new TypeError("Invalid cookie name: contains invalid characters");
-    this._name = initialName;
-    this._value = "";
-    this.value = value ?? "";
-    this._path = "/";
-    this._domain = null;
-    this.path = options.path == null ? "/" : String(options.path);
-    this.domain = options.domain == null || options.domain === "" ? null : String(options.domain);
-    this.secure = Boolean(options.secure);
-    this.httpOnly = Boolean(options.httpOnly);
-    this.partitioned = Boolean(options.partitioned);
-    this.sameSite = String(options.sameSite ?? "lax");
-    if (!["strict", "lax", "none"].includes(this.sameSite)) {
-      throw new TypeError("Invalid sameSite value. Must be 'strict', 'lax', or 'none'");
-    }
-    if (options.maxAge != null) this.maxAge = Number(options.maxAge);
-    const expires = normalizeCookieExpires(options.expires);
-    if (expires !== undefined) this.expires = expires;
-  }
-  static parse(text) {
-    const parts = String(text).split(";");
-    const first = parts.shift() ?? "";
-    const eq = first.indexOf("=");
-    const name = eq >= 0 ? first.slice(0, eq) : first;
-    const value = eq >= 0 ? first.slice(eq + 1) : "";
-    if (isInvalidCookieValue(value)) {
-      throw new TypeError("Invalid cookie value: contains invalid characters");
-    }
-    const options = {};
-    for (const raw of parts) {
-      const part = raw.trim();
-      if (!part) continue;
-      const attrEq = part.indexOf("=");
-      const key = (attrEq >= 0 ? part.slice(0, attrEq) : part).trim().toLowerCase();
-      if (isInvalidCookieAttributeName(key)) {
-        throw new TypeError("Invalid cookie attribute name: contains invalid characters");
-      }
-      const attrValue = attrEq >= 0 ? part.slice(attrEq + 1).trim().replace(/^"|"$/g, "") : "";
-      if (key === "domain") options.domain = attrValue;
-      else if (key === "path") options.path = attrValue;
-      else if (key === "max-age") options.maxAge = Number(attrValue);
-      else if (key === "expires") options.expires = new Date(attrValue);
-      else if (key === "secure") options.secure = true;
-      else if (key === "httponly") options.httpOnly = true;
-      else if (key === "partitioned") options.partitioned = true;
-      else if (key === "samesite") options.sameSite = attrValue.toLowerCase();
-    }
-    return new Cookie(name.trim(), decodeCookieText(value.trim()), options);
-  }
-  static from(name, value = undefined, options = {}) {
-    if (name instanceof Cookie) return name;
-    if (value === undefined && typeof name === "string" && String(name).includes("=")) return Cookie.parse(name);
-    return new Cookie(name, value, options);
-  }
-  isExpired() {
-    if (this.maxAge != null) return Number(this.maxAge) <= 0;
-    return this.expires instanceof Date && this.expires.getTime() <= Date.now();
-  }
-  serialize() {
-    const parts = [`${this.name}=${encodeCookieText(this.value)}`];
-    if (this.domain) parts.push(`Domain=${this.domain}`);
-    if (this.path != null) parts.push(`Path=${this.path}`);
-    if (this.expires instanceof Date) parts.push(`Expires=${formatCookieDate(this.expires)}`);
-    if (this.maxAge != null) parts.push(`Max-Age=${Math.trunc(Number(this.maxAge))}`);
-    if (this.secure) parts.push("Secure");
-    if (this.httpOnly) parts.push("HttpOnly");
-    if (this.partitioned) parts.push("Partitioned");
-    if (this.sameSite) parts.push(`SameSite=${this.sameSite[0].toUpperCase()}${this.sameSite.slice(1).toLowerCase()}`);
-    return parts.join("; ");
-  }
-  toString() {
-    return this.serialize();
-  }
-  get value() {
-    return this._value;
-  }
-  set value(next) {
-    this._value = normalizeCookieText(next);
-  }
-  get name() {
-    return this._name;
-  }
-  set name(_next) {
-  }
-  get domain() {
-    return this._domain;
-  }
-  set domain(next) {
-    if (next == null || next === "") {
-      this._domain = null;
-      return;
-    }
-    const value = String(next);
-    if (isInvalidCookieDomain(value)) throw new TypeError("Invalid cookie domain: contains invalid characters");
-    this._domain = value;
-  }
-  get path() {
-    return this._path;
-  }
-  set path(next) {
-    if (next === "") {
-      this._path = null;
-      return;
-    }
-    const value = next == null ? "/" : String(next);
-    if (isInvalidCookiePath(value)) throw new TypeError("Invalid cookie path: contains invalid characters");
-    this._path = value;
-  }
-  toJSON() {
-    const result = {
-      name: this.name,
-      value: this.value,
-      domain: this.domain,
-      path: this.path,
-      secure: this.secure,
-      sameSite: this.sameSite,
-      httpOnly: this.httpOnly,
-      partitioned: this.partitioned,
-    };
-    if (this.expires !== undefined) result.expires = this.expires;
-    if (this.maxAge !== undefined) result.maxAge = this.maxAge;
-    return result;
-  }
-}
-
-function normalizeCookieExpires(value) {
-  if (value == null) return undefined;
-  if (value instanceof Date) {
-    if (Number.isNaN(value.getTime())) throw new TypeError("expires must be a valid Date (or Number)");
-    return value;
-  }
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new TypeError("expires must be a valid Number");
-    return new Date(value * 1000);
-  }
-  if (typeof value === "string") {
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime())) throw new TypeError("Invalid cookie expiration date");
-    return date;
-  }
-  throw new TypeError(`The argument 'expires' Invalid expires value. Must be a Date or a number. Received ${nodeInspect(value)}`);
-}
-
-function formatCookieDate(date) {
-  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-  const day = days[(date.getUTCDay() + 1) % 7];
-  const dd = String(date.getUTCDate());
-  const hh = String(date.getUTCHours()).padStart(2, "0");
-  const mm = String(date.getUTCMinutes()).padStart(2, "0");
-  const ss = String(date.getUTCSeconds()).padStart(2, "0");
-  return `${day}, ${dd} ${months[date.getUTCMonth()]} ${date.getUTCFullYear()} ${hh}:${mm}:${ss} -0000`;
-}
-
-export class CookieMap extends Map {
-  constructor(init = undefined, options = undefined) {
-    super();
-    this._changes = [];
-    this._initialKeys = [];
-    this._dynamicKeys = [];
-    const preserveFirst = Boolean(options?.preserveFirst);
-    if (typeof init === "string") {
-      const parts = init.split(";");
-      for (let index = 0; index < parts.length; index += 1) {
-        const raw = index === 0 ? parts[index].trimEnd() : parts[index].trim();
-        const eq = raw.indexOf("=");
-        if (eq < 0) continue;
-        const name = eq >= 0 ? raw.slice(0, eq).trimEnd() : raw.trimEnd();
-        const value = eq >= 0 ? raw.slice(eq + 1).trim() : "";
-        if (!name) continue;
-        if (preserveFirst && Map.prototype.has.call(this, name)) continue;
-        if (!Map.prototype.has.call(this, name)) this._initialKeys.push(name);
-        Map.prototype.set.call(this, name, decodeCookieText(value));
-      }
-    } else if (Array.isArray(init) || (init && typeof init[Symbol.iterator] === "function")) {
-      for (const pair of init) {
-        if (!Array.isArray(pair) || pair.length !== 2) {
-          throw new TypeError("Expected arrays of exactly two strings");
-        }
-        const [key, value] = pair;
-        const name = String(key);
-        if (!Map.prototype.has.call(this, name)) this._initialKeys.push(name);
-        if (!preserveFirst || !Map.prototype.has.call(this, name)) {
-          Map.prototype.set.call(this, name, String(value));
-        }
-      }
-    } else if (init && typeof init === "object") {
-      for (const [key, value] of Object.entries(init)) {
-        Map.prototype.set.call(this, key, String(value));
-        this._initialKeys.push(key);
-      }
-    }
-  }
-  set(name, value = undefined, options = {}) {
-    const cookie = name instanceof Cookie ? name : new Cookie(name, value, options);
-    if (!this._dynamicKeys.includes(cookie.name)) this._dynamicKeys.push(cookie.name);
-    Map.prototype.set.call(this, cookie.name, cookie);
-    this._changes = this._changes.filter((item) =>
-      item.name !== cookie.name ||
-      item.domain !== cookie.domain ||
-      item.path !== cookie.path
-    );
-    this._changes.push(cookie);
-    return this;
-  }
-  get(name) {
-    if (!super.has(name)) return null;
-    const value = super.get(name);
-    return value instanceof Cookie ? value.value : value;
-  }
-  delete(name, options = {}) {
-    let cookie;
-    if (name instanceof Cookie) {
-      cookie = new Cookie(name.name, "", {
-        domain: name.domain,
-        path: name.path,
-        secure: name.secure,
-        httpOnly: name.httpOnly,
-        partitioned: name.partitioned,
-        sameSite: name.sameSite,
-        expires: 0,
-      });
-    } else if (name && typeof name === "object") {
-      if (name.name == null) throw new TypeError("Cookie name is required");
-      cookie = new Cookie({
-        ...name,
-        value: "",
-        expires: 0,
-      });
-    } else {
-      cookie = new Cookie(name, "", { ...options, expires: 0 });
-    }
-    const existed = super.delete(cookie.name);
-    const dynamicIndex = this._dynamicKeys.indexOf(cookie.name);
-    if (dynamicIndex >= 0) this._dynamicKeys.splice(dynamicIndex, 1);
-    this._changes = this._changes.filter((item) =>
-      item.name !== cookie.name ||
-      item.domain !== cookie.domain ||
-      item.path !== cookie.path
-    );
-    this._changes.push(cookie);
-    return existed;
-  }
-  toSetCookieHeaders() {
-    return this._changes.map((cookie) => cookie.serialize());
-  }
-  toString() {
-    return [...this].map(([key, value]) => `${key}=${value}`).join("; ");
-  }
-  toJSON() {
-    return Object.fromEntries(this);
-  }
-  *keys() {
-    const yielded = new Set();
-    if (this._dynamicKeys.length > 0) {
-      for (let index = 0; index < this._dynamicKeys.length; index += 1) {
-        const key = this._dynamicKeys[index];
-        if (!super.has(key)) continue;
-        yielded.add(key);
-        yield key;
-      }
-      const initialKeys = [...this._initialKeys].reverse();
-      for (const key of initialKeys) {
-        if (yielded.has(key) || !super.has(key)) continue;
-        yield key;
-      }
-      return;
-    }
-    const initialKeys = [...this._initialKeys];
-    for (const key of initialKeys) {
-      if (!super.has(key)) continue;
-      yield key;
-    }
-  }
-  *entries() {
-    for (const key of this.keys()) {
-      const value = Map.prototype.get.call(this, key);
-      yield [key, value instanceof Cookie ? value.value : value];
-    }
-  }
-  *values() {
-    for (const [, value] of this.entries()) yield value;
-  }
-  [Symbol.iterator]() {
-    return this.entries();
-  }
-  forEach(callback, thisArg = undefined) {
-    for (const [key, value] of this.entries()) callback.call(thisArg, value, key, this);
-  }
-}
+let Cookie;
+let CookieMap;
+({ Cookie, CookieMap } = createCookieRuntime(nodeInspect));
+export { Cookie, CookieMap };
 
 export class Glob {
   constructor(pattern) {
@@ -14877,7 +12168,7 @@ function passwordHashSync(value, algorithm = undefined) {
   const bytes = passwordBytes(value, "password");
   if (bytes.byteLength === 0) throw new TypeError("password must not be empty");
   const options = passwordAlgorithm(algorithm);
-  return cottontail.passwordHashSync(options.id, bytes, options.timeCost, options.memoryCost, options.cost);
+  return passwordNativeCall(() => cottontail.passwordHashSync(options.id, bytes, options.timeCost, options.memoryCost, options.cost));
 }
 
 function passwordHash(value, algorithm = undefined) {
@@ -14885,7 +12176,7 @@ function passwordHash(value, algorithm = undefined) {
   const bytes = passwordBytes(value, "password");
   if (bytes.byteLength === 0) throw new TypeError("password must not be empty");
   const options = passwordAlgorithm(algorithm);
-  return Promise.resolve().then(() => cottontail.passwordHashSync(options.id, bytes, options.timeCost, options.memoryCost, options.cost));
+  return Promise.resolve().then(() => passwordNativeCall(() => cottontail.passwordHashSync(options.id, bytes, options.timeCost, options.memoryCost, options.cost)));
 }
 
 function inferPasswordAlgorithm(hash) {
@@ -14896,6 +12187,28 @@ function inferPasswordAlgorithm(hash) {
   throw new TypeError("Unsupported password algorithm");
 }
 
+const passwordHashPatterns = {
+  argon2id: /^\$argon2id\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+$/,
+  argon2i: /^\$argon2i\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+$/,
+  argon2d: /^\$argon2d\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+$/,
+  bcrypt: /^\$2[aby]?\$\d{2}\$[./A-Za-z0-9]{53}$/,
+};
+
+function passwordNativeCall(operation) {
+  try {
+    return operation();
+  } catch (thrown) {
+    if (thrown instanceof Error) throw thrown;
+    throw new Error(typeof thrown === "string" ? thrown : "Password operation failed");
+  }
+}
+
+function assertPasswordHashFormat(label, hash) {
+  if (!passwordHashPatterns[label].test(hash)) {
+    throw new Error("Password operation failed: InvalidEncoding");
+  }
+}
+
 function passwordVerifySync(value, hashValue, algorithm = undefined) {
   if (arguments.length < 2) throw new TypeError("password and hash are required");
   const bytes = passwordBytes(value, "password");
@@ -14903,7 +12216,8 @@ function passwordVerifySync(value, hashValue, algorithm = undefined) {
   if (bytes.byteLength === 0 || hashBytes.byteLength === 0) return false;
   const hash = new TextDecoder().decode(hashBytes);
   const options = passwordAlgorithm(algorithm === undefined ? inferPasswordAlgorithm(hash) : algorithm);
-  return cottontail.passwordVerifySync(options.id, bytes, hashBytes);
+  assertPasswordHashFormat(options.label, hash);
+  return passwordNativeCall(() => cottontail.passwordVerifySync(options.id, bytes, hashBytes));
 }
 
 function passwordVerify(value, hashValue, algorithm = undefined) {
@@ -14913,7 +12227,8 @@ function passwordVerify(value, hashValue, algorithm = undefined) {
   if (bytes.byteLength === 0 || hashBytes.byteLength === 0) return Promise.resolve(false);
   const hash = new TextDecoder().decode(hashBytes);
   const options = passwordAlgorithm(algorithm === undefined ? inferPasswordAlgorithm(hash) : algorithm);
-  return Promise.resolve().then(() => cottontail.passwordVerifySync(options.id, bytes, hashBytes));
+  assertPasswordHashFormat(options.label, hash);
+  return Promise.resolve().then(() => passwordNativeCall(() => cottontail.passwordVerifySync(options.id, bytes, hashBytes)));
 }
 
 export const password = {
@@ -15324,864 +12639,43 @@ export const CSRF = {
   },
 };
 
-const inspectCustomSymbol = Symbol.for("nodejs.util.inspect.custom");
-const domExceptionCodes = {
-  IndexSizeError: 1,
-  DOMStringSizeError: 2,
-  HierarchyRequestError: 3,
-  WrongDocumentError: 4,
-  InvalidCharacterError: 5,
-  NoDataAllowedError: 6,
-  NoModificationAllowedError: 7,
-  NotFoundError: 8,
-  NotSupportedError: 9,
-  InUseAttributeError: 10,
-  InvalidStateError: 11,
-  SyntaxError: 12,
-  InvalidModificationError: 13,
-  NamespaceError: 14,
-  InvalidAccessError: 15,
-  ValidationError: 16,
-  TypeMismatchError: 17,
-  SecurityError: 18,
-  NetworkError: 19,
-  AbortError: 20,
-  URLMismatchError: 21,
-  QuotaExceededError: 22,
-  TimeoutError: 23,
-  InvalidNodeTypeError: 24,
-  DataCloneError: 25,
-};
-
-class CottontailDOMException extends Error {
-  constructor(message = "", nameOrOptions = "Error") {
-    let name = "Error";
-    let hasCause = false;
-    let cause;
-    if (typeof nameOrOptions === "object" && nameOrOptions !== null) {
-      if (nameOrOptions.name !== undefined) name = String(nameOrOptions.name);
-      if ("cause" in nameOrOptions) {
-        hasCause = true;
-        cause = nameOrOptions.cause;
-      }
-    } else if (nameOrOptions !== undefined) {
-      name = String(nameOrOptions);
-    }
-    super(String(message));
-    this.name = name;
-    if (hasCause) {
-      Object.defineProperty(this, "cause", {
-        value: cause,
-        writable: true,
-        enumerable: false,
-        configurable: true,
-      });
-    }
-    // Match WebKit/Bun: DOMException instances do not carry a stack trace.
-    this.stack = undefined;
-  }
-
-  get code() {
-    return domExceptionCodes[this.name] ?? 0;
-  }
-
-  get [Symbol.toStringTag]() {
-    return "DOMException";
-  }
-}
-
-Object.defineProperty(CottontailDOMException, "name", {
-  value: "DOMException",
-  configurable: true,
-});
-
-{
-  const domExceptionLegacyConstants = {
-    INDEX_SIZE_ERR: 1,
-    DOMSTRING_SIZE_ERR: 2,
-    HIERARCHY_REQUEST_ERR: 3,
-    WRONG_DOCUMENT_ERR: 4,
-    INVALID_CHARACTER_ERR: 5,
-    NO_DATA_ALLOWED_ERR: 6,
-    NO_MODIFICATION_ALLOWED_ERR: 7,
-    NOT_FOUND_ERR: 8,
-    NOT_SUPPORTED_ERR: 9,
-    INUSE_ATTRIBUTE_ERR: 10,
-    INVALID_STATE_ERR: 11,
-    SYNTAX_ERR: 12,
-    INVALID_MODIFICATION_ERR: 13,
-    NAMESPACE_ERR: 14,
-    INVALID_ACCESS_ERR: 15,
-    VALIDATION_ERR: 16,
-    TYPE_MISMATCH_ERR: 17,
-    SECURITY_ERR: 18,
-    NETWORK_ERR: 19,
-    ABORT_ERR: 20,
-    URL_MISMATCH_ERR: 21,
-    QUOTA_EXCEEDED_ERR: 22,
-    TIMEOUT_ERR: 23,
-    INVALID_NODE_TYPE_ERR: 24,
-    DATA_CLONE_ERR: 25,
-  };
-  for (const [constantName, constantValue] of Object.entries(domExceptionLegacyConstants)) {
-    const descriptor = {
-      value: constantValue,
-      writable: false,
-      enumerable: true,
-      configurable: false,
-    };
-    Object.defineProperty(CottontailDOMException, constantName, descriptor);
-    Object.defineProperty(CottontailDOMException.prototype, constantName, descriptor);
-  }
-}
-
-const eventState = new WeakMap();
-const eventTargetWeakHandler = Symbol.for("nodejs.internal.event_target.kWeakHandler");
-const eventTargetResistStopPropagation = Symbol.for("nodejs.internal.event_target.kResistStopPropagation");
-const NativeWeakRef = globalThis.WeakRef;
-
-function internalWeakRef(target) {
-  return new NativeWeakRef(target);
-}
-
-function eventStateFor(event) {
-  const state = eventState.get(event);
-  if (!state) throw new TypeError("Illegal invocation");
-  return state;
-}
-
-function setEventTarget(event, target, currentTarget) {
-  const state = eventState.get(event);
-  if (state) {
-    if (state.target == null) state.target = target;
-    state.currentTarget = currentTarget;
-    return true;
-  }
-  return false;
-}
-
-function markEventTrusted(event) {
-  const state = eventState.get(event);
-  if (state) {
-    state.isTrusted = true;
-    return;
-  }
-  try {
-    Object.defineProperty(event, "isTrusted", { value: true, configurable: true });
-  } catch {}
-}
-
-// Shared unforgeable-style isTrusted getter: the WHATWG spec installs
-// isTrusted as an own accessor on every event instance, with the same getter
-// function shared between instances (observable via getOwnPropertyDescriptor).
-function sharedIsTrustedGetter() {
-  return eventStateFor(this).isTrusted;
-}
-Object.defineProperty(sharedIsTrustedGetter, "name", { value: "isTrusted", configurable: true });
-
-class CottontailEvent {
-  constructor(type, init = undefined) {
-    const options = init != null && typeof init === "object" ? init : {};
-    eventState.set(this, {
-      type: String(type),
-      bubbles: Boolean(options.bubbles),
-      cancelable: Boolean(options.cancelable),
-      composed: Boolean(options.composed),
-      defaultPrevented: false,
-      target: null,
-      currentTarget: null,
-      isTrusted: false,
-      cancelBubble: false,
-      stopImmediate: false,
-      eventPhase: 0,
-      returnValue: true,
-      timeStamp: typeof globalThis.performance?.now === "function" ? globalThis.performance.now() : Date.now(),
-    });
-    Object.defineProperty(this, "isTrusted", {
-      get: sharedIsTrustedGetter,
-      enumerable: true,
-      configurable: false,
-    });
-  }
-
-  get type() {
-    return eventStateFor(this).type;
-  }
-
-  get bubbles() {
-    return eventStateFor(this).bubbles;
-  }
-
-  get cancelable() {
-    return eventStateFor(this).cancelable;
-  }
-
-  get composed() {
-    return eventStateFor(this).composed;
-  }
-
-  get defaultPrevented() {
-    return eventStateFor(this).defaultPrevented;
-  }
-
-  get target() {
-    return eventStateFor(this).target;
-  }
-
-  get srcElement() {
-    return eventStateFor(this).target;
-  }
-
-  get currentTarget() {
-    return eventStateFor(this).currentTarget;
-  }
-
-  get eventPhase() {
-    return eventStateFor(this).eventPhase;
-  }
-
-  get timeStamp() {
-    return eventStateFor(this).timeStamp;
-  }
-
-  get cancelBubble() {
-    return eventStateFor(this).cancelBubble;
-  }
-
-  set cancelBubble(value) {
-    if (value) eventStateFor(this).cancelBubble = true;
-  }
-
-  get returnValue() {
-    return !eventStateFor(this).defaultPrevented;
-  }
-
-  set returnValue(value) {
-    const state = eventStateFor(this);
-    if (!value && state.cancelable) state.defaultPrevented = true;
-  }
-
-  composedPath() {
-    const state = eventStateFor(this);
-    return state.currentTarget == null ? [] : [state.currentTarget];
-  }
-
-  stopPropagation() {
-    eventStateFor(this).cancelBubble = true;
-  }
-
-  stopImmediatePropagation() {
-    const state = eventStateFor(this);
-    state.cancelBubble = true;
-    state.stopImmediate = true;
-  }
-
-  preventDefault() {
-    const state = eventStateFor(this);
-    if (state.cancelable) state.defaultPrevented = true;
-  }
-
-  initEvent(type, bubbles = false, cancelable = false) {
-    const state = eventStateFor(this);
-    if (state.eventPhase !== 0) return;
-    state.type = String(type);
-    state.bubbles = Boolean(bubbles);
-    state.cancelable = Boolean(cancelable);
-  }
-
-  get [Symbol.toStringTag]() {
-    return "Event";
-  }
-}
-
-Object.defineProperty(CottontailEvent.prototype, "isTrusted", {
-  get: sharedIsTrustedGetter,
-  enumerable: true,
-  configurable: true,
-});
-
-for (const [name, value] of [["NONE", 0], ["CAPTURING_PHASE", 1], ["AT_TARGET", 2], ["BUBBLING_PHASE", 3]]) {
-  Object.defineProperty(CottontailEvent, name, { value, enumerable: true });
-  Object.defineProperty(CottontailEvent.prototype, name, { value, enumerable: true });
-}
-
-class CottontailCustomEvent extends CottontailEvent {
-  constructor(type, init = {}) {
-    super(type, init);
-    this.detail = init.detail ?? null;
-  }
-
-  initCustomEvent(type, bubbles = false, cancelable = false, detail = null) {
-    this.initEvent(type, bubbles, cancelable);
-    this.detail = detail;
-  }
-}
-
-class CottontailErrorEvent extends CottontailEvent {
-  constructor(type = "error", init = {}) {
-    super(type, init);
-    this.message = String(init.message ?? "");
-    this.filename = String(init.filename ?? "");
-    this.lineno = Number(init.lineno ?? 0);
-    this.colno = Number(init.colno ?? 0);
-    this.error = init.error ?? null;
-  }
-
-  [inspectCustomSymbol]() {
-    let errorText;
-    if (this.error == null) {
-      errorText = this.error === undefined ? "undefined" : "null";
-    } else if (this.error instanceof globalThis.Error) {
-      errorText = `error: ${String(this.error.message ?? "")}\n`;
-    } else {
-      errorText = nodeInspect(this.error);
-    }
-    return `ErrorEvent {\n  type: ${JSON.stringify(String(this.type))},\n  message: ${JSON.stringify(String(this.message))},\n  error: ${errorText},\n}`;
-  }
-}
-
-class CottontailCloseEvent extends CottontailEvent {
-  constructor(type = "close", init = {}) {
-    super(type, init);
-    this.wasClean = Boolean(init.wasClean);
-    this.code = Number(init.code ?? 0);
-    this.reason = String(init.reason ?? "");
-  }
-}
-
-class CottontailFile extends Blob {
-  constructor(parts, name, options = {}) {
-    if (arguments.length < 2) throw new TypeError("File constructor requires file bits and name");
-    if (parts == null || typeof parts[Symbol.iterator] !== "function") throw new TypeError("File bits must be iterable");
-    super(parts, options);
-    this.name = String(name);
-    this.lastModified = Number(options.lastModified ?? Date.now());
-  }
-}
-
-function BunFile(parts, name, options = {}) {
-  if (!new.target) throw new TypeError("Class constructor File cannot be invoked without 'new'");
-  return Reflect.construct(CottontailFile, [parts, name, options], new.target);
-}
-BunFile.prototype = CottontailFile.prototype;
-
-// A File whose contents delegate to an underlying blob-like source (an
-// in-memory Blob or a lazy Bun.file ref) without copying it eagerly. Used by
-// FormData for entries that carry an explicit filename.
-let CottontailFormDataFileClass = null;
-function formDataFileView(source, filename) {
-  CottontailFormDataFileClass ??= class File extends globalThis.File {
-    constructor(src, name) {
-      super([], name, {
-        type: typeof src?.type === "string" ? src.type : "",
-        // Deterministic default so structural equality between separately
-        // created views holds (Bun reports 0 for wrapped blobs too).
-        lastModified: Number(src?.lastModified ?? 0) || 0,
-      });
-      this._source = src;
-    }
-    get size() {
-      return Number(this._source?.size ?? 0);
-    }
-    async arrayBuffer() {
-      return await this._source.arrayBuffer();
-    }
-    async bytes() {
-      if (typeof this._source.bytes === "function") return asBuffer(await this._source.bytes());
-      return asBuffer(new Uint8Array(await this._source.arrayBuffer()));
-    }
-    async text() {
-      return await this._source.text();
-    }
-    stream() {
-      if (typeof this._source.stream === "function") return this._source.stream();
-      return super.stream();
-    }
-    slice(...args) {
-      if (typeof this._source.slice === "function") return this._source.slice(...args);
-      return super.slice(...args);
-    }
-  };
-  const name = filename !== undefined
-    ? filename
-    : (typeof source?.name === "string" && source.name !== "" ? source.name : "blob");
-  return new CottontailFormDataFileClass(source, name);
-}
-
-Object.defineProperty(CottontailCustomEvent, "name", { value: "CustomEvent", configurable: true });
-Object.defineProperty(CottontailErrorEvent, "name", { value: "ErrorEvent", configurable: true });
-Object.defineProperty(CottontailCloseEvent, "name", { value: "CloseEvent", configurable: true });
-Object.defineProperty(CottontailFile, "name", { value: "File", configurable: true });
-Object.defineProperty(BunFile, "name", { value: "File", configurable: true });
-Object.defineProperty(CottontailCustomEvent.prototype, Symbol.toStringTag, { value: "CustomEvent", configurable: true });
-Object.defineProperty(CottontailErrorEvent.prototype, Symbol.toStringTag, { value: "ErrorEvent", configurable: true });
-Object.defineProperty(CottontailCloseEvent.prototype, Symbol.toStringTag, { value: "CloseEvent", configurable: true });
-
-const eventTargetListenerMaps = new WeakMap();
-const eventHandlerAttributeOrders = new WeakMap();
-let eventListenerOrder = 0;
-
-function setEventHandlerAttributeOrder(target, type, handler) {
-  let orders = eventHandlerAttributeOrders.get(target);
-  if (!orders) {
-    orders = new Map();
-    eventHandlerAttributeOrders.set(target, orders);
-  }
-  if (typeof handler === "function") {
-    if (!orders.has(type)) orders.set(type, ++eventListenerOrder);
-  } else {
-    orders.delete(type);
-  }
-}
-
-function eventTargetListenersFor(target) {
-  const listeners = eventTargetListenerMaps.get(target);
-  if (!listeners) throw new TypeError("Can only call this method on instances of EventTarget");
-  return listeners;
-}
-
-class CottontailEventTarget {
-  constructor() {
-    const listeners = new Map();
-    eventTargetListenerMaps.set(this, listeners);
-    Object.defineProperty(this, "__ctEventListeners", {
-      value: listeners,
-      enumerable: false,
-      configurable: true,
-      writable: true,
-    });
-  }
-
-  addEventListener(type, listener, options = undefined) {
-    const listeners = eventTargetListenersFor(this);
-    if (listener == null) return;
-    const name = String(type);
-    const opts = options && typeof options === "object" ? options : {};
-    const capture = options === true || Boolean(opts.capture);
-    const signal = opts.signal;
-    if (signal != null && signal.aborted) return;
-    const list = listeners.get(name) ?? [];
-    if (!list.some((entry) => entry.listener === listener && entry.capture === capture)) {
-      list.push({
-        listener,
-        capture,
-        once: Boolean(opts.once),
-        weak: Boolean(opts[eventTargetWeakHandler]),
-        resistStopPropagation: Boolean(opts[eventTargetResistStopPropagation]),
-        order: ++eventListenerOrder,
-      });
-      if (signal != null && typeof signal.addEventListener === "function") {
-        signal.addEventListener("abort", () => {
-          this.removeEventListener(name, listener, { capture });
-        }, { once: true, [eventTargetWeakHandler]: true });
-      }
-    }
-    listeners.set(name, list);
-  }
-
-  removeEventListener(type, listener, options = undefined) {
-    const listeners = eventTargetListenersFor(this);
-    const name = String(type);
-    const capture = options === true || Boolean(options && typeof options === "object" && options.capture);
-    const list = listeners.get(name);
-    if (list) {
-      listeners.set(name, list.filter((entry) => !(entry.listener === listener && entry.capture === capture)));
-    }
-    refreshAbortSignalRetention(this);
-  }
-
-  dispatchEvent(event) {
-    const listeners = eventTargetListenersFor(this);
-    const state = eventState.get(event);
-    if (state) {
-      state.target = this;
-      state.currentTarget = this;
-      state.eventPhase = 2;
-      state.stopImmediate = false;
-      state.cancelBubble = false;
-      const list = [...(listeners.get(state.type) ?? [])];
-      const handler = this[`on${state.type}`];
-      if (typeof handler === "function") {
-        list.push({ listener: handler, capture: false, once: false, order: eventHandlerAttributeOrders.get(this)?.get(state.type) ?? Infinity });
-      }
-      list.sort((a, b) => a.order - b.order);
-      for (const entry of list) {
-        if (state.stopImmediate && !entry.resistStopPropagation) continue;
-        const listener = entry.listener;
-        if (entry.once) this.removeEventListener(state.type, listener, { capture: entry.capture });
-        if (typeof listener === "function") listener.call(this, event);
-        else if (listener && typeof listener.handleEvent === "function") listener.handleEvent(event);
-      }
-      state.eventPhase = 0;
-      state.currentTarget = null;
-      return !state.defaultPrevented;
-    }
-    // Legacy path: internal call sites dispatch plain objects that carry a
-    // type/target shape but are not real Event instances.
-    const dispatched = event && typeof event === "object" ? event : new CottontailEvent(String(event));
-    if (!setEventTarget(dispatched, this, this)) {
-      try {
-        if (!dispatched.target) dispatched.target = this;
-        dispatched.currentTarget = this;
-      } catch {}
-    }
-    const dispatchedType = String(dispatched.type);
-    const list = [...(listeners.get(dispatchedType) ?? [])];
-    const handler = this[`on${dispatchedType}`];
-    if (typeof handler === "function") {
-      list.push({ listener: handler, capture: false, once: false, order: eventHandlerAttributeOrders.get(this)?.get(dispatchedType) ?? Infinity });
-    }
-    list.sort((a, b) => a.order - b.order);
-    for (const entry of list) {
-      const listener = entry.listener;
-      if (entry.once) this.removeEventListener(dispatched.type, listener, { capture: entry.capture });
-      if (typeof listener === "function") listener.call(this, dispatched);
-      else if (listener && typeof listener.handleEvent === "function") listener.handleEvent(dispatched);
-    }
-    return !dispatched.defaultPrevented;
-  }
-
-  get [Symbol.toStringTag]() {
-    return "EventTarget";
-  }
-}
-Object.defineProperty(CottontailEventTarget, "name", { value: "EventTarget", configurable: true });
-
-function makeAbortError() {
-  const DOMExceptionClass = globalThis.DOMException ?? CottontailDOMException;
-  return new DOMExceptionClass("The operation was aborted.", "AbortError");
-}
-
-function makeTimeoutError() {
-  const DOMExceptionClass = globalThis.DOMException ?? CottontailDOMException;
-  return new DOMExceptionClass("The operation timed out.", "TimeoutError");
-}
-
-function nodeTypeError(code, message) {
-  const error = new TypeError(message);
-  error.code = code;
-  return error;
-}
-
-function invalidAbortSignalArgument(name, value) {
-  const received = value === null ? "null" : value === undefined ? "undefined" : typeof value;
-  return nodeTypeError(
-    "ERR_INVALID_ARG_TYPE",
-    `The "${name}" argument must be an instance of AbortSignal. Received ${received}`,
-  );
-}
-
-const abortSignalConstructToken = Symbol("CottontailAbortSignalConstruct");
-const abortSignalState = new WeakMap();
-const abortControllerState = new WeakMap();
-const abortDependantSignals = Symbol("kDependantSignals");
-const activeAbortSignals = new Set();
-const abortQueue = [];
-let drainingAbortQueue = false;
-
-const abortTimeoutFinalizer = typeof FinalizationRegistry === "function"
-  ? new FinalizationRegistry(timer => {
-      try { clearTimeout(timer); } catch {}
-    })
-  : null;
-
-class WeakDependantSignalSet {
-  constructor() {
-    this.refs = new Set();
-  }
-
-  add(ref) {
-    this.refs.add(ref);
-    return this;
-  }
-
-  delete(ref) {
-    return this.refs.delete(ref);
-  }
-
-  prune() {
-    for (const ref of [...this.refs]) {
-      if (!ref.deref()) this.refs.delete(ref);
-    }
-  }
-
-  get size() {
-    this.prune();
-    return this.refs.size;
-  }
-
-  [Symbol.iterator]() {
-    this.prune();
-    return this.refs[Symbol.iterator]();
-  }
-}
-
-const dependantFinalizer = typeof FinalizationRegistry === "function"
-  ? new FinalizationRegistry((held) => {
-      const source = held?.source?.deref?.();
-      if (!source) return;
-      const state = abortSignalState.get(source);
-      state?.dependants?.delete(held.ref);
-      refreshAbortSignalRetention(source);
-    })
-  : null;
-
-const sourceFinalizer = typeof FinalizationRegistry === "function"
-  ? new FinalizationRegistry((held) => {
-      const dependantRef = held?.dependant;
-      setImmediate(() => {
-        const dependant = dependantRef?.deref?.();
-        if (!dependant) return;
-        const state = abortSignalState.get(dependant);
-        state?.sourceSignals?.delete(held.sourceRef);
-        refreshAbortSignalRetention(dependant);
-      });
-    })
-  : null;
-
-function abortSignalStateFor(signal) {
-  const state = abortSignalState.get(signal);
-  if (!state) throw new TypeError("Value is not an AbortSignal");
-  return state;
-}
-
-function abortControllerStateFor(controller) {
-  const state = abortControllerState.get(controller);
-  if (!state) throw new TypeError("Value is not an AbortController");
-  return state;
-}
-
-function isAbortSignal(value) {
-  return abortSignalState.has(value);
-}
-
-function cleanupDependants(state) {
-  state.dependants.prune();
-}
-
-function addDependantSignal(source, dependant, dependantRef, sourceRef) {
-  const state = abortSignalStateFor(source);
-  state.dependants.add(dependantRef);
-  dependantFinalizer?.register(dependant, { source: sourceRef, ref: dependantRef });
-  refreshAbortSignalRetention(source);
-}
-
-function enqueueDependants(state) {
-  cleanupDependants(state);
-  for (const ref of state.dependants) {
-    const dependant = ref.deref();
-    if (dependant) abortQueue.push([dependant, state.reason]);
-  }
-}
-
-function drainAbortQueue() {
-  if (drainingAbortQueue) return;
-  drainingAbortQueue = true;
-  try {
-    while (abortQueue.length > 0) {
-      const [signal, reason] = abortQueue.shift();
-      abortSignal(signal, reason);
-    }
-  } finally {
-    drainingAbortQueue = false;
-  }
-}
-
-function abortSignal(signal, reason) {
-  const state = abortSignalStateFor(signal);
-  if (state.aborted) return;
-  state.aborted = true;
-  state.reason = reason;
-  if (state.timeoutTimer != null) {
-    clearTimeout(state.timeoutTimer);
-    abortTimeoutFinalizer?.unregister(state.timeoutTimer);
-    state.timeoutTimer = null;
-  }
-  activeAbortSignals.delete(signal);
-  const EventClass = globalThis.Event ?? CottontailEvent;
-  const event = new EventClass("abort");
-  markEventTrusted(event);
-  signal.dispatchEvent(event);
-  enqueueDependants(state);
-  drainAbortQueue();
-}
-
-function refreshAbortSignalRetention(target) {
-  const state = abortSignalState.get(target);
-  if (!state || state.aborted) {
-    activeAbortSignals.delete(target);
-    return;
-  }
-  const listeners = (target.__ctEventListeners?.get?.("abort") ?? []).filter((entry) => !entry.weak);
-  const hasListener = listeners.length > 0 || typeof state.onabort === "function";
-  state.dependants.prune();
-  const retainTimeout = state.timeoutTimer != null && (hasListener || state.dependants.size > 0);
-  const retainComposite = state.composite && state.sourceSignals?.size > 0 && hasListener;
-  if (retainTimeout || retainComposite) {
-    activeAbortSignals.add(target);
-  } else {
-    activeAbortSignals.delete(target);
-  }
-}
-
-class CottontailAbortSignal extends CottontailEventTarget {
-  constructor(token) {
-    if (token !== abortSignalConstructToken) {
-      throw nodeTypeError("ERR_ILLEGAL_CONSTRUCTOR", "Illegal constructor");
-    }
-    super();
-    const dependants = new WeakDependantSignalSet();
-    abortSignalState.set(this, {
-      aborted: false,
-      reason: undefined,
-      onabort: null,
-      timeoutTimer: null,
-      timeoutDeadline: null,
-      dependants,
-      composite: false,
-      sourceSignals: null,
-    });
-    Object.defineProperty(this, abortDependantSignals, {
-      value: dependants,
-      enumerable: false,
-      configurable: true,
-    });
-  }
-
-  get aborted() {
-    return abortSignalStateFor(this).aborted;
-  }
-
-  get reason() {
-    return abortSignalStateFor(this).reason;
-  }
-
-  get onabort() {
-    return abortSignalStateFor(this).onabort;
-  }
-
-  set onabort(handler) {
-    const state = abortSignalStateFor(this);
-    state.onabort = typeof handler === "function" ? handler : null;
-    refreshAbortSignalRetention(this);
-  }
-
-  addEventListener(type, listener, options = undefined) {
-    super.addEventListener(type, listener, options);
-    refreshAbortSignalRetention(this);
-  }
-
-  throwIfAborted() {
-    const state = abortSignalStateFor(this);
-    if (state.aborted) throw state.reason;
-  }
-
-  static abort(reason = makeAbortError()) {
-    const signal = new CottontailAbortSignal(abortSignalConstructToken);
-    abortSignal(signal, reason);
-    return signal;
-  }
-
-  static timeout(delay) {
-    let normalizedDelay;
-    try {
-      normalizedDelay = Math.trunc(+delay);
-    } catch (error) {
-      throw new TypeError(error?.message ?? "AbortSignal.timeout delay must be a number");
-    }
-    if (!Number.isFinite(normalizedDelay) || normalizedDelay < 0 || normalizedDelay > Number.MAX_SAFE_INTEGER) {
-      throw new TypeError(`AbortSignal.timeout delay must be between 0 and ${Number.MAX_SAFE_INTEGER}`);
-    }
-    const controller = new CottontailAbortController();
-    const signal = controller.signal;
-    const signalRef = internalWeakRef(signal);
-    const timer = setTimeout(() => {
-      abortTimeoutFinalizer?.unregister(timer);
-      const liveSignal = signalRef.deref();
-      if (liveSignal) abortSignal(liveSignal, makeTimeoutError());
-    }, normalizedDelay);
-    timer?.unref?.();
-    const state = abortSignalStateFor(signal);
-    state.timeoutTimer = timer;
-    state.timeoutDeadline = Date.now() + normalizedDelay;
-    abortTimeoutFinalizer?.register(signal, timer, timer);
-    return signal;
-  }
-
-  static any(signals) {
-    if (signals == null || typeof signals[Symbol.iterator] !== "function") {
-      throw nodeTypeError("ERR_INVALID_ARG_TYPE", "The \"signals\" argument must be an iterable of AbortSignal instances");
-    }
-    const list = Array.from(signals);
-    for (let index = 0; index < list.length; index += 1) {
-      if (!isAbortSignal(list[index])) throw invalidAbortSignalArgument(`signals[${index}]`, list[index]);
-    }
-    const controller = new CottontailAbortController();
-    const result = controller.signal;
-    const resultState = abortSignalStateFor(result);
-    resultState.composite = true;
-    resultState.sourceSignals = new Set();
-    for (const signal of list) {
-      if (signal.aborted) {
-        controller.abort(signal.reason);
-        return result;
-      }
-    }
-    const resultRef = internalWeakRef(result);
-    for (const signal of list) {
-      const sourceState = abortSignalStateFor(signal);
-      if (sourceState.composite) {
-        for (const sourceRef of sourceState.sourceSignals ?? []) {
-          const source = sourceRef.deref();
-          if (!source || resultState.sourceSignals.has(sourceRef)) continue;
-          resultState.sourceSignals.add(sourceRef);
-          addDependantSignal(source, result, resultRef, sourceRef);
-          sourceFinalizer?.register(signal, { sourceRef, dependant: resultRef });
-        }
-        continue;
-      }
-      const sourceRef = internalWeakRef(signal);
-      resultState.sourceSignals.add(sourceRef);
-      addDependantSignal(signal, result, resultRef, sourceRef);
-      sourceFinalizer?.register(signal, { sourceRef, dependant: resultRef });
-    }
-    return result;
-  }
-
-  [inspectCustomSymbol]() {
-    return `AbortSignal { aborted: ${this.aborted ? "true" : "false"} }`;
-  }
-
-  get [Symbol.toStringTag]() {
-    return "AbortSignal";
-  }
-}
-
-class CottontailAbortController {
-  constructor() {
-    abortControllerState.set(this, {
-      signal: new CottontailAbortSignal(abortSignalConstructToken),
-    });
-  }
-
-  get signal() {
-    return abortControllerStateFor(this).signal;
-  }
-
-  abort(reason = makeAbortError()) {
-    abortSignal(abortControllerStateFor(this).signal, reason);
-  }
-
-  [inspectCustomSymbol](_depth, options) {
-    return options?.depth === null
-      ? `AbortController { signal: ${this.signal[inspectCustomSymbol]()} }`
-      : "AbortController { signal: [AbortSignal] }";
-  }
-
-  get [Symbol.toStringTag]() {
-    return "AbortController";
-  }
-}
+let BunFile;
+let CottontailAbortController;
+let CottontailAbortSignal;
+let CottontailCloseEvent;
+let CottontailCustomEvent;
+let CottontailDOMException;
+let CottontailErrorEvent;
+let CottontailEvent;
+let CottontailEventTarget;
+let abortSignalState;
+let eventState;
+let eventStateFor;
+let inspectCustomSymbol;
+let isAbortSignal;
+let markEventTrusted;
+let nodeTypeError;
+let setEventHandlerAttributeOrder;
+
+({
+  BunFile,
+  CottontailAbortController,
+  CottontailAbortSignal,
+  CottontailCloseEvent,
+  CottontailCustomEvent,
+  CottontailDOMException,
+  CottontailErrorEvent,
+  CottontailEvent,
+  CottontailEventTarget,
+  abortSignalState,
+  eventState,
+  eventStateFor,
+  inspectCustomSymbol,
+  isAbortSignal,
+  markEventTrusted,
+  nodeTypeError,
+  setEventHandlerAttributeOrder,
+} = createWebPrimitives(nodeInspect));
 
 function makeDataCloneError(message) {
   const DOMExceptionClass = globalThis.DOMException ?? CottontailDOMException;
@@ -16285,6 +12779,62 @@ function structuredCloneValue(value, seen) {
   for (const key of Object.keys(value)) result[key] = structuredCloneValue(value[key], seen);
   return result;
 }
+
+({
+  arrayBufferFromBytes,
+  bodyBlobSourceSymbol,
+  bodyReadableStream,
+  bodyValueForConsumption,
+  bunString,
+  bytesFromBody,
+  bytesFromData,
+  consumeStreamingBody,
+  encodeMultipartFormData,
+  externallyOwnedBodyBytes,
+  fetchBodyStartSymbol,
+  FormData,
+  formDataBoundary,
+  Headers,
+  headersGetAll,
+  inspectBodyByteSize,
+  invalidHeaderErrorSymbol,
+  isObjectLike,
+  isURLSearchParamsLike,
+  normalizeRequestUrl,
+  normalizeServeDispatchUrl,
+  parseMultipartFormData,
+  parseMultipartFormDataText,
+  Request,
+  requestState,
+  requestWithLazyURL,
+  Response,
+  responseWithMetadata,
+  sharedArrayBufferBytes,
+  stringLatin1FromBytes,
+  stripUtf8BOMText,
+} = createRequestResponseRuntime({
+  activeServeRequestBodyStateSymbol,
+  asBuffer,
+  bodyStreamIsDisturbed,
+  bodyWasUsed,
+  bunInspectPropertyDescriptor,
+  concatManyBuffers,
+  CookieMap,
+  ctInspectSymbol,
+  estimatedMemoryCostSymbol,
+  handledRejectedPromise,
+  isAbortSignal,
+  isBunFileLike,
+  isStreamingBody,
+  lifecycleBodyStreamFor,
+  lifecycleBodyValueForConsumption,
+  lifecycleTakeBody,
+  nodeInspect,
+  randomBytes,
+  serveUpgradeContexts,
+  URL,
+  URLSearchParams,
+}));
 
 const BunObjectTarget = globalThis.Bun ?? {};
 let bunObjectReified = Boolean(globalThis.__cottontailBunReified);
@@ -16521,51 +13071,6 @@ if (typeof globalThis.WebAssembly === "object" && typeof globalThis.WebAssembly.
   };
 }
 
-// Blocking terminal prompts (alert/confirm/prompt), reading stdin one byte at
-// a time until newline/EOF like Bun's native implementations.
-{
-  const writeOut = (text) => {
-    const bytes = new TextEncoder().encode(text);
-    try {
-      cottontail.fdWriteAt(1, bytes, 0, bytes.byteLength, null);
-    } catch {}
-  };
-  const readLine = () => {
-    const chunk = new Uint8Array(1);
-    let line = "";
-    let sawAny = false;
-    for (;;) {
-      let read = 0;
-      try {
-        read = Number(cottontail.fdReadAt(0, chunk, 0, 1, null));
-      } catch {
-        break;
-      }
-      if (!(read > 0)) break;
-      sawAny = true;
-      if (chunk[0] === 10) return line.endsWith("\r") ? line.slice(0, -1) : line;
-      line += String.fromCharCode(chunk[0]);
-    }
-    if (!sawAny) return null;
-    return line.endsWith("\r") ? line.slice(0, -1) : line;
-  };
-  globalThis.alert ??= function alert(message = undefined) {
-    writeOut(message === undefined ? "Alert [Enter] " : `${message} [Enter] `);
-    readLine();
-  };
-  globalThis.confirm ??= function confirm(message = undefined) {
-    writeOut(message === undefined ? "Confirm [y/N] " : `${message} [y/N] `);
-    const line = readLine();
-    return line !== null && (line[0] === "y" || line[0] === "Y");
-  };
-  globalThis.prompt ??= function prompt(message = undefined, defaultValue = undefined) {
-    writeOut(`${message === undefined ? "Prompt" : message} `);
-    const line = readLine();
-    if (line === null || line === "") return defaultValue !== undefined ? String(defaultValue) : null;
-    return line;
-  };
-}
-
 if (globalThis.navigator == null) {
   const navigatorPlatform = cottontail.platform?.() === "darwin" ? "MacIntel" :
     cottontail.platform?.() === "win32" ? "Win32" :
@@ -16580,7 +13085,7 @@ const initialCryptoObject = globalThis.crypto;
 let initializedCryptoObject;
 function initializeCryptoGlobals() {
   if (initializedCryptoObject !== undefined) return initializedCryptoObject;
-  const cryptoObject = initialCryptoObject ?? {};
+  let cryptoObject = initialCryptoObject ?? {};
   // node:crypto adopts an existing global crypto object while it initializes.
   // Publish the placeholder first to avoid re-entering this lazy accessor.
   if (initialCryptoObject == null) {
@@ -16592,6 +13097,15 @@ function initializeCryptoGlobals() {
     });
   }
   const nodeCrypto = loadNodeCryptoModule();
+  if (nodeCrypto.webcrypto !== cryptoObject) {
+    cryptoObject = nodeCrypto.webcrypto;
+    Object.defineProperty(globalThis, "crypto", {
+      configurable: true,
+      enumerable: true,
+      value: cryptoObject,
+      writable: true,
+    });
+  }
   cryptoObject.randomUUID ??= nodeCrypto.randomUUID;
   // Bun accepts ArrayBuffer/SharedArrayBuffer and does not impose WebCrypto's
   // 65536-byte quota on this convenience API.
@@ -17809,7 +14323,7 @@ globalThis.Bun = BunObject;
 if (typeof globalThis.TextEncoder === "function" && typeof globalThis.TextEncoder.prototype.encodeInto !== "function") {
   Object.defineProperty(globalThis.TextEncoder.prototype, "encodeInto", {
     value(source = "", destination) {
-      if (!(destination instanceof Uint8Array)) throw new TypeError("TextEncoder.encodeInto requires a Uint8Array destination");
+      if (!(destination instanceof Uint8Array) && destination?.[Symbol.toStringTag] !== "Uint8Array") throw new TypeError("TextEncoder.encodeInto requires a Uint8Array destination");
       const input = String(source);
       let read = 0;
       let written = 0;

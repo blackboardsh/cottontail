@@ -11,13 +11,11 @@ pub const deprecated = @import("bun_core/deprecated.zig");
 pub const OOM = std.mem.Allocator.Error;
 pub const JSError = error{ JSError, OutOfMemory, JSTerminated };
 pub const Maybe = jsc.Node.Maybe;
-// NOTE: page_allocator (mmap-backed) rather than the libc allocator on
-// purpose: upstream tests run cottontail children under libgmalloc
-// (harness.forceGuardMalloc), and routing the compiler's allocation firehose
-// through guarded malloc makes process startup exceed test timeouts. Bulk
-// allocations flow through arenas, so per-allocation page rounding is mostly
-// amortized.
-pub const default_allocator = std.heap.page_allocator;
+// Keep the compiler allocation firehose away from libc so Bun's Guard Malloc
+// tests do not turn every allocation into a guarded mapping. Unlike
+// page_allocator, the pooled allocator also amortizes the many non-arena
+// allocations owned by Bun.build configs, diagnostics, and output artifacts.
+pub const default_allocator = std.heap.smp_allocator;
 /// The retained install sources support compiler data types and Hutch's narrow
 /// lockfile services. Hutch owns package management; runtime auto-install is off.
 pub const enable_package_manager = false;
@@ -1036,6 +1034,17 @@ pub const allocators = struct {
                 loaded = false;
             }
 
+            /// Drops every cached entry while keeping the instance alive.
+            /// A tsconfig override changes path resolution for every
+            /// directory, so entries cached by an earlier in-process bundling
+            /// pass (for example the script runner bundling the entrypoint
+            /// script) are invalid and must not be reused.
+            pub fn resetInstance() void {
+                if (!loaded) return;
+                instance.indexes.clearRetainingCapacity();
+                instance.values_list.clearRetainingCapacity();
+            }
+
             pub fn isOverflowing() bool {
                 return false;
             }
@@ -1182,7 +1191,12 @@ pub const allocators = struct {
         };
 
         pub fn init() @This() {
-            return .{ .arena = std.heap.ArenaAllocator.init(default_allocator) };
+            // Bun gives every bundle its own mimalloc heap. Cottontail keeps
+            // the same bulk-release lifetime but uses Zig's pooled allocator
+            // underneath it. Backing this arena with page_allocator turns
+            // every Bun.build() into a large mmap/munmap cycle, which is
+            // especially costly for repeated small CSS builds.
+            return .{ .arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator) };
         }
 
         pub fn allocator(self: *@This()) std.mem.Allocator {

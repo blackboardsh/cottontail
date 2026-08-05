@@ -23,6 +23,10 @@ export const Buffer = new Proxy(RuntimeBuffer, {
     return invokeBufferConstructor(target, thisArgument, argumentsList);
   },
   construct(target, argumentsList, newTarget) {
+    // Zero-argument construction (e.g. `new (class extends Buffer {})()`)
+    // yields an empty buffer; forwarding undefined to from() would throw the
+    // arity TypeError (globals.test.js "extendable").
+    if (argumentsList.length === 0) argumentsList = [0];
     return invokeBufferConstructor(target, undefined, argumentsList, newTarget);
   },
 });
@@ -232,6 +236,13 @@ Buffer.from = function from(value, encodingOrOffset, length) {
     }
     if (typeof value === "string" && isHexEncoding(encodingOrOffset)) {
       return originalBufferFrom(validHexPrefix(value), "hex");
+    }
+    if (typeof value === "string" &&
+        (encodingOrOffset === undefined || /^utf-?8$/i.test(String(encodingOrOffset)))) {
+      // The vendored polyfill encodes UTF-8 strings with a per-char JS loop
+      // twice (once for the length, once for the write); TextEncoder is ~25x
+      // faster and byte-identical.
+      return originalBufferFrom(new TextEncoder().encode(value));
     }
     return originalBufferFrom(value, encodingOrOffset, length);
   } catch (error) {

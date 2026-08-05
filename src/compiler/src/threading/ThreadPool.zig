@@ -309,8 +309,10 @@ inline fn notify(self: *ThreadPool, is_waking: bool) void {
 }
 
 pub const default_thread_stack_size = brk: {
-    // 4mb
-    const default = 4 * 1024 * 1024;
+    // The recursive CSS rule parser needs roughly 4 MiB for 300 nested
+    // at-rules in safety-enabled builds. Leave headroom for diagnostics and
+    // allocator frames around the parser.
+    const default = 16 * 1024 * 1024;
     if (!Environment.isMac) break :brk default;
 
     const size = default - (default % std.heap.page_size_max);

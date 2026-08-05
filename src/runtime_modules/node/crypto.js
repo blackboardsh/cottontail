@@ -2410,12 +2410,17 @@ export function Hmac(algorithm, key, options = undefined) {
 Hmac.prototype = HmacImpl.prototype;
 
 const keyObjectConstructionToken = Symbol("cottontail.crypto.KeyObject");
+// Brand used by util/types.isKeyObject: the same realm may hold duplicate
+// module records (e.g. ESM default import vs require) with distinct KeyObject
+// classes, so identity cannot rely on instanceof alone.
+const keyObjectBrand = Symbol.for("cottontail.crypto.KeyObject");
 
 export class KeyObject {
   constructor(type, data, options = {}, constructionToken = undefined) {
     if (constructionToken !== keyObjectConstructionToken) {
       throw new TypeError("KeyObject cannot be constructed directly");
     }
+    Object.defineProperty(this, keyObjectBrand, { value: true });
     const normalizedType = String(type);
     if (normalizedType !== "secret" && normalizedType !== "public" && normalizedType !== "private") {
       throw new TypeError("KeyObject type must be secret, public, or private");
@@ -3233,7 +3238,8 @@ export class Verify extends Writable {
   }
 }
 
-const x509CertificateBrand = new WeakSet();
+const x509CertificateBrandKey = Symbol.for("cottontail.internal.crypto.x509CertificateBrand");
+const x509CertificateBrand = globalThis[x509CertificateBrandKey] ??= new WeakSet();
 const kX509CertificatePredicate = Symbol.for("cottontail.internal.crypto.isX509Certificate");
 
 export class X509Certificate {
@@ -4259,7 +4265,9 @@ function webcryptoUsageList(usages = []) {
   return [...new Set(Array.from(usages ?? [], (usage) => String(usage)))];
 }
 
-export class CryptoKey {
+// Static bundles and embedded lazy loads can instantiate this module separately.
+// Keep WebCrypto brands and instances canonical within each JSC global.
+class CryptoKeyImplementation {
   constructor(type, algorithm, extractable, usages, material) {
     this.type = type;
     this.extractable = Boolean(extractable);
@@ -4272,6 +4280,9 @@ export class CryptoKey {
     return "CryptoKey";
   }
 }
+Object.defineProperty(CryptoKeyImplementation, "name", { value: "CryptoKey", configurable: true });
+const cryptoKeyConstructorKey = Symbol.for("cottontail.internal.crypto.CryptoKey");
+export const CryptoKey = globalThis[cryptoKeyConstructorKey] ??= CryptoKeyImplementation;
 
 function assertCryptoKey(key, usage = undefined) {
   if (!(key instanceof CryptoKey)) throw new TypeError("Expected a CryptoKey");
@@ -4695,7 +4706,8 @@ function webcryptoDecryptOperation(algorithm, key, data, usage) {
   throw new TypeError(`Invalid WebCrypto decrypt algorithm: ${name}`);
 }
 
-const subtleCrypto = {
+const subtleCryptoInstanceKey = Symbol.for("cottontail.internal.crypto.subtleCrypto");
+const subtleCrypto = globalThis[subtleCryptoInstanceKey] ??= {
   async digest(algorithm, data) {
     const name = typeof algorithm === "string" ? algorithm : algorithm?.name;
     const bytes = digestBytes(name, bytesFromData(data), hashOutputLengths[normalizeAlgorithm(name)]);
@@ -5006,7 +5018,7 @@ const subtleCrypto = {
 export const constants = constantsObject;
 // Web-facing SubtleCrypto class: crypto.subtle must be an instance of a class
 // named "SubtleCrypto" (exposed as a global by bun/index.js).
-export class SubtleCrypto {
+class SubtleCryptoImplementation {
   constructor() {
     throw new TypeError("Illegal constructor");
   }
@@ -5014,6 +5026,8 @@ export class SubtleCrypto {
     return "SubtleCrypto";
   }
 }
+const subtleCryptoConstructorKey = Symbol.for("cottontail.internal.crypto.SubtleCrypto");
+export const SubtleCrypto = globalThis[subtleCryptoConstructorKey] ??= SubtleCryptoImplementation;
 Object.defineProperty(SubtleCrypto, "name", { value: "SubtleCrypto", configurable: true });
 for (const method of Object.keys(subtleCrypto)) {
   Object.defineProperty(SubtleCrypto.prototype, method, {
@@ -5025,7 +5039,7 @@ for (const method of Object.keys(subtleCrypto)) {
 }
 Object.setPrototypeOf(subtleCrypto, SubtleCrypto.prototype);
 
-class Crypto {
+class CryptoImplementation {
   constructor() {
     throw nodeCryptoError(TypeError, "ERR_ILLEGAL_CONSTRUCTOR", "Illegal constructor");
   }
@@ -5046,15 +5060,20 @@ class Crypto {
     return "Crypto";
   }
 }
+const cryptoConstructorKey = Symbol.for("cottontail.internal.crypto.Crypto");
+const Crypto = globalThis[cryptoConstructorKey] ??= CryptoImplementation;
 Object.defineProperty(Crypto, "name", { value: "Crypto", configurable: true });
 
 // The Bun surface may install crypto as a lazy global backed by this module.
 // Read only an existing data property to avoid invoking that accessor while
 // node:crypto itself is initializing.
 const globalCryptoDescriptor = Object.getOwnPropertyDescriptor(globalThis, "crypto");
-export const webcrypto = globalCryptoDescriptor && "value" in globalCryptoDescriptor
-  ? globalCryptoDescriptor.value ?? Object.create(Crypto.prototype)
-  : Object.create(Crypto.prototype);
+const webcryptoInstanceKey = Symbol.for("cottontail.internal.crypto.webcrypto");
+export const webcrypto = globalThis[webcryptoInstanceKey] ??= (
+  globalCryptoDescriptor && "value" in globalCryptoDescriptor
+    ? globalCryptoDescriptor.value ?? Object.create(Crypto.prototype)
+    : Object.create(Crypto.prototype)
+);
 if (!(webcrypto instanceof Crypto)) Object.setPrototypeOf(webcrypto, Crypto.prototype);
 export const subtle = webcrypto.subtle;
 export let fips = 0;

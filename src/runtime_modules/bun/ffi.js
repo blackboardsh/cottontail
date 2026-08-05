@@ -218,6 +218,37 @@ function installProcessApi(processObject) {
     return [...(listeners.get(String(name)) ?? [])];
   };
 
+  const captureStateKey = Symbol.for("cottontail.process.uncaughtExceptionCaptureState");
+  const captureState = processObject[captureStateKey] ?? { callback: null };
+  Object.defineProperty(processObject, captureStateKey, {
+    configurable: true,
+    value: captureState,
+  });
+  processObject.setUncaughtExceptionCaptureCallback ??= function setUncaughtExceptionCaptureCallback(callback) {
+    if (callback !== null && callback !== undefined && typeof callback !== "function") {
+      const error = new TypeError('The "fn" argument must be of type function or null');
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
+    }
+    if (typeof callback === "function" && typeof captureState.callback === "function") {
+      const error = new Error("setupUncaughtExceptionCapture() was called while a capture callback was already active");
+      error.code = "ERR_UNCAUGHT_EXCEPTION_CAPTURE_ALREADY_SET";
+      throw error;
+    }
+    captureState.callback = callback ?? null;
+  };
+  processObject.hasUncaughtExceptionCaptureCallback ??= () => typeof captureState.callback === "function";
+  processObject._fatalException ??= function _fatalException(error, fromPromise = false) {
+    if (arguments.length === 0) return undefined;
+    const origin = fromPromise ? "unhandledRejection" : "uncaughtException";
+    processObject.emit("uncaughtExceptionMonitor", error, origin);
+    if (typeof captureState.callback === "function") {
+      captureState.callback(error);
+      return true;
+    }
+    return processObject.emit("uncaughtException", error, origin);
+  };
+
   processObject.emit = function emit(name, ...args) {
     const handlers = [...(listeners.get(String(name)) ?? [])];
     for (const handler of handlers) {
@@ -314,6 +345,22 @@ const processObject = g.process ?? {
 g.process = processObject;
 installWindowsProcessEnvironment(g.process);
 installProcessApi(g.process);
+if (cottontail.isWorker?.() === true && typeof g.__cottontailWorkerEvalSource === "string") {
+  try {
+    const descriptor = JSON.parse(g.__cottontailWorkerEvalSource);
+    if (descriptor?.bootstrap && descriptor?.input && Array.isArray(descriptor.argv)) {
+      g.__cottontailPreparedWorkerDescriptor = descriptor;
+      g.__cottontailWorkerBootstrap = descriptor.bootstrap;
+      g.__cottontailWorkerRuntimeCacheId = descriptor.runtimeCacheId;
+      g.process.argv = descriptor.argv;
+      g.process.execArgv = descriptor.execArgv;
+      const environment = g.process.env ?? {};
+      for (const key of Object.keys(environment)) delete environment[key];
+      Object.assign(environment, descriptor.workerEnvironment);
+      g.process.env = environment;
+    }
+  } catch {}
+}
 if (g.process.env?.COTTONTAIL_TEST_CLI_HEADER_PRINTED === "1") {
   globalThis.__cottontailBunTestHeaderPrinted = true;
   delete g.process.env.COTTONTAIL_TEST_CLI_HEADER_PRINTED;
@@ -803,7 +850,10 @@ const formatConsoleValue = (value, seen, objectDepth, indent, options) => {
         value.length > 10 || complex || tokens.some((token) => token.text.includes("\n")),
       );
     }
-    if (typeof Buffer !== "undefined" && Buffer.isBuffer?.(value)) {
+    // Buffer is always an ArrayBuffer view. Check that brand first so a
+    // userland Proxy is never passed to host Buffer.isBuffer(), which may
+    // probe observable properties such as `_isBuffer`.
+    if (ArrayBuffer.isView(value) && typeof Buffer !== "undefined" && Buffer.isBuffer?.(value)) {
       const shown = Array.from(value.subarray(0, 50), (byte) => byte.toString(16).padStart(2, "0"));
       const suffix = value.length > 50 ? ` ... ${value.length - 50} more bytes` : "";
       return `<Buffer ${shown.join(" ")}${suffix}>`;
@@ -1038,7 +1088,7 @@ const formatConsoleError = (error, level, separate = true) => {
   );
   if (level === "warn") {
     const heading = source.plainError ? `warn: ${message}` : `${name}: ${message}`;
-    return `${consoleGroupIndent}${heading}\n${stack}${properties}\n`;
+    return `${consoleGroupIndent}${heading}\n${stack}${properties}\n${separate ? "\n" : ""}`;
   }
 
   const firstLine = Math.max(0, source.lineIndex - 5);
@@ -1050,7 +1100,7 @@ const formatConsoleError = (error, level, separate = true) => {
   excerpt.push(" ".repeat(String(lineNumber).length + 3 + source.column - 1) + "^");
   excerpt.push(`${source.plainError ? "error" : name}: ${message}`);
   excerpt.push(`${stack}${properties}`);
-  if (separate) excerpt.push("");
+  if (separate) excerpt.push("", "");
   return excerpt.join("\n");
 };
 
@@ -1152,6 +1202,53 @@ console.debug = console.log;
   console.timeLog = (label = "default", ...data) => logTime(label, data, false);
   console.timeEnd = (label = "default") => logTime(label, [], true);
 }
+
+// Blocking terminal prompts read stdin one byte at a time until newline/EOF.
+// Keep these in the shared FFI bootstrap so selective and full runtimes expose
+// the same Bun globals.
+{
+  const writePrompt = (text) => {
+    const bytes = new TextEncoder().encode(text);
+    try {
+      cottontail.fdWriteAt(1, bytes, 0, bytes.byteLength, null);
+    } catch {}
+  };
+  const readPromptLine = () => {
+    const chunk = new Uint8Array(1);
+    let line = "";
+    let sawAny = false;
+    for (;;) {
+      let read = 0;
+      try {
+        read = Number(cottontail.fdReadAt(0, chunk, 0, 1, null));
+      } catch {
+        break;
+      }
+      if (!(read > 0)) break;
+      sawAny = true;
+      if (chunk[0] === 10) return line.endsWith("\r") ? line.slice(0, -1) : line;
+      line += String.fromCharCode(chunk[0]);
+    }
+    if (!sawAny) return null;
+    return line.endsWith("\r") ? line.slice(0, -1) : line;
+  };
+  g.alert ??= function alert(message = undefined) {
+    writePrompt(message === undefined ? "Alert [Enter] " : `${message} [Enter] `);
+    readPromptLine();
+  };
+  g.confirm ??= function confirm(message = undefined) {
+    writePrompt(message === undefined ? "Confirm [y/N] " : `${message} [y/N] `);
+    const line = readPromptLine();
+    return line !== null && (line[0] === "y" || line[0] === "Y");
+  };
+  g.prompt ??= function prompt(message = undefined, defaultValue = undefined) {
+    writePrompt(`${message === undefined ? "Prompt" : message} `);
+    const line = readPromptLine();
+    if (line === null || line === "") return defaultValue !== undefined ? String(defaultValue) : null;
+    return line;
+  };
+}
+
 g.global ??= g;
 g.self ??= g;
 g.performance ??= {};
@@ -1360,6 +1457,19 @@ function relativeBlobIndex(value, size, fallback) {
   return Math.min(number, size);
 }
 
+function initializeBlobState(blob, chunks, type = "") {
+  Object.defineProperties(blob, {
+    _blobChunks: { configurable: true, writable: true, value: chunks },
+    _size: {
+      configurable: true,
+      writable: true,
+      value: chunks.reduce((size, chunk) => size + chunk.byteLength, 0),
+    },
+    _bytes: { configurable: true, writable: true, value: null },
+    type: { configurable: true, value: normalizeBlobType(type) },
+  });
+}
+
 function installBlobGlobals() {
   if (typeof g.Blob !== "function") {
     class CottontailBlob {
@@ -1370,20 +1480,23 @@ function installBlobGlobals() {
         // COTTONTAIL-COMPAT: Blob snapshots each backing store once and keeps
         // repeated parts shared until a contiguous representation is requested.
         const snapshots = new WeakMap();
-        this._blobChunks = [];
-        this._size = 0;
+        const chunks = [];
         for (const part of sourceParts) {
           for (const chunk of snapshotBlobPart(part, snapshots)) {
-            this._blobChunks.push(chunk);
-            this._size += chunk.byteLength;
+            chunks.push(chunk);
           }
         }
-        this._bytes = null;
-        this.type = normalizeBlobType(options?.type);
+        initializeBlobState(this, chunks, options?.type);
       }
 
       get size() {
         return this._size;
+      }
+
+      static _fromOwnedChunks(chunks, type = "") {
+        const blob = Object.create(CottontailBlob.prototype);
+        initializeBlobState(blob, chunks, type);
+        return blob;
       }
 
       _getBytes() {
@@ -1450,12 +1563,22 @@ function installBlobGlobals() {
         };
       }
     }
+    Object.defineProperty(CottontailBlob.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: "Blob",
+    });
     Object.defineProperty(g, "Blob", {
       configurable: true,
       writable: true,
       value: CottontailBlob,
     });
+    Object.defineProperty(g, "__cottontailBlobFromOwnedChunks", {
+      configurable: true,
+      value: chunks => CottontailBlob._fromOwnedChunks(chunks),
+    });
   }
+
+  g.__cottontailBlobFromOwnedChunks ??= chunks => new g.Blob(chunks);
 
   if (typeof g.File !== "function") {
     class CottontailFile extends g.Blob {
@@ -1463,15 +1586,29 @@ function installBlobGlobals() {
         if (arguments.length < 2) throw new TypeError("File constructor requires file bits and name");
         if (typeof parts === "string" || parts == null) throw new TypeError("File bits must be an iterable object");
         super(parts, options);
-        this.name = String(name);
-        this.lastModified = Number(options?.lastModified ?? Date.now());
+        Object.defineProperties(this, {
+          name: { configurable: true, value: String(name) },
+          lastModified: { configurable: true, value: Number(options?.lastModified ?? Date.now()) },
+        });
       }
     }
+    // Match Bun/WebKit: calling File() without `new` throws a TypeError naming
+    // "File", not the internal class name.
+    function CallableFile(parts, name, options = {}) {
+      if (!new.target) throw new TypeError("Class constructor File cannot be invoked without 'new'");
+      return Reflect.construct(CottontailFile, [parts, name, options], new.target);
+    }
+    CallableFile.prototype = CottontailFile.prototype;
     Object.defineProperty(CottontailFile, "name", { value: "File", configurable: true });
+    Object.defineProperty(CallableFile, "name", { value: "File", configurable: true });
+    Object.defineProperty(CottontailFile.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: "File",
+    });
     Object.defineProperty(g, "File", {
       configurable: true,
       writable: true,
-      value: CottontailFile,
+      value: CallableFile,
     });
   }
 }
@@ -2364,6 +2501,7 @@ function installWorkerNativeEventHandler() {
     const worker = workerInstances.get(Number(event?.id));
     if (!worker) return;
     if (event?.type === "exit") {
+      try { worker._poll(); } catch {}
       const code = Number(event?.code ?? 0) || 0;
       worker._refed = false;
       worker._terminated = true;
@@ -2518,6 +2656,7 @@ function rewriteWorkerNamedImports(spec) {
 
 const workerBundleCache = new Map();
 const preparedWorkerScript = Symbol.for("cottontail.worker.prepared-script");
+const reusablePreparedWorkerScript = Symbol.for("cottontail.worker.reusable-prepared-script");
 const workerEvalSource = Symbol.for("cottontail.worker.eval-source");
 const workerThreadName = Symbol.for("cottontail.worker.thread-name");
 const workerStackSize = Symbol.for("cottontail.worker.stack-size");
@@ -2759,17 +2898,22 @@ function prepareWorkerScriptPath(scriptPath, options = undefined) {
     return target;
   }
   const wrapperPath = `${tempDir}/bun-worker-entry-${nonce}.mjs`;
-  const bundledPath = `${tempDir}/bun-worker-${nonce}.js`;
+  const reusableBundleName = cacheKey
+    .replace(/^.*[\\/]/, "")
+    .replace(/\.[^.]+$/, "")
+    .replace(/[^A-Za-z0-9_.-]/g, "_");
+  const bundledPath = options?.[reusablePreparedWorkerScript] === true
+    ? `${tempDir}/${reusableBundleName}.bundle.js`
+    : `${tempDir}/bun-worker-${nonce}.js`;
   const slashTarget = String(target).replace(/\\/g, "/");
   const runtimeRoot = workerRuntimeRoot();
-  // Workers are independent Bun runtimes, not FFI-only isolates. Boot the full
-  // runtime so worker code sees the same Bun and Node APIs as the main thread.
   const runtimeEntry = workerRuntimePath(runtimeRoot, "bun/index.js");
   if (options?.[preparedWorkerScript] === true) {
-    const moduleEntry = workerRuntimePath(runtimeRoot, "node/module.js");
+    if (options?.[reusablePreparedWorkerScript] === true && cottontail.existsSync?.(bundledPath)) {
+      workerBundleCache.set(cacheKey, bundledPath);
+      return bundledPath;
+    }
     cottontail.writeFile(wrapperPath, [
-      `import ${JSON.stringify(runtimeEntry)};`,
-      `import ${JSON.stringify(moduleEntry)};`,
       `import ${JSON.stringify(slashTarget)};`,
     ].join("\n"));
     try {
@@ -2779,13 +2923,19 @@ function prepareWorkerScriptPath(scriptPath, options = undefined) {
         includeRuntimeModules: true,
         inlineImportMetaProperties: true,
         alias: workerRuntimeAliases(runtimeRoot),
+        minify: { whitespace: true, identifiers: true, syntax: true, keepNames: true },
       }));
       cottontail.writeFile(bundledPath, bundled);
+      if (options?.[reusablePreparedWorkerScript] === true) {
+        workerBundleCache.set(cacheKey, bundledPath);
+      }
       return bundledPath;
     } finally {
       try { cottontail.unlinkSync?.(wrapperPath); } catch {}
     }
   }
+  // Ordinary Web Workers are independent Bun runtimes, not FFI-only isolates.
+  // Boot the full runtime so they see the same Bun and Node APIs as the parent.
   try {
     const imports = [`import ${JSON.stringify(runtimeEntry)};`];
     if (hasWorkerOptions || !options?.[preparedWorkerScript]) {
@@ -2921,7 +3071,8 @@ g.Worker ??= class Worker {
   _startWorker(scriptPath, options) {
     if (this._terminated) return;
     this.scriptPath = prepareWorkerScriptPath(scriptPath, options);
-    const disposePreparedScript = options?.[preparedWorkerScript] === true;
+    const disposePreparedScript = options?.[preparedWorkerScript] === true &&
+      options?.[reusablePreparedWorkerScript] !== true;
     try {
       this.handle = cottontail.spawnWorker(
         this.scriptPath,
@@ -3336,7 +3487,7 @@ function readCString(pointer) {
 
 const cstringArrayBuffers = new WeakMap();
 
-export class CString extends String {
+class CStringImpl extends String {
   constructor(value, byteOffset, byteLength) {
     const pointer = value == null ? 0 : value;
     let text = "";
@@ -3366,6 +3517,14 @@ export class CString extends String {
     return arrayBuffer;
   }
 }
+
+// Called without `new`, Bun.FFI.CString returns the decoded string as a
+// primitive instead of throwing a class-constructor error (issue #25231).
+export const CString = new Proxy(CStringImpl, {
+  apply(target, thisArg, args) {
+    return String(Reflect.construct(target, args));
+  },
+});
 
 const callbackState = new WeakMap();
 

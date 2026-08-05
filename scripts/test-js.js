@@ -150,6 +150,12 @@ try {
       stdoutIncludes: ['builtin dynamic import identity passed'],
     },
     {
+      name: 'esm-lexical-paths',
+      argv: ['test', join(rootDir, 'tests', 'js', 'esm-lexical-paths.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['2 pass', '0 fail'],
+    },
+    {
       name: 'bundled-dynamic-import-default-identity',
       argv: ['test', join(rootDir, 'tests', 'js', 'builtin-dynamic-import-default-identity.test.ts')],
       expectExitCode: 0,
@@ -159,7 +165,7 @@ try {
       name: 'runtime-bootstrap-startup-regressions',
       argv: ['test', join(rootDir, 'tests', 'js', 'runtime-bootstrap-startup.test.ts')],
       expectExitCode: 0,
-      stderrIncludes: ['13 pass', '0 fail'],
+      stderrIncludes: ['16 pass', '0 fail'],
     },
     {
       name: 'web-worker-module-loading',
@@ -190,7 +196,7 @@ try {
       executablePath: process.execPath,
       argv: ['--test-reporter=tap', '--test', join(rootDir, 'tests', 'upstream-runner.test.mjs')],
       expectExitCode: 0,
-      stdoutIncludes: ['# tests 13', '# pass 13', '# fail 0'],
+      stdoutIncludes: ['# tests 15', '# pass 15', '# fail 0'],
     },
     {
       name: 'internal-runtime-bindings',
@@ -450,6 +456,12 @@ try {
       stdoutIncludes: ['bun test module passed'],
     },
     {
+      name: 'bun-test-unawaited-promise-matchers',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-test-unawaited-promise-matchers.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['2 pass', '0 fail'],
+    },
+    {
       name: 'bun-test-module-explicit-cli',
       argv: ['test', join(rootDir, 'tests', 'js', 'bun-test-module.ts')],
       expectExitCode: 0,
@@ -466,6 +478,12 @@ try {
       scriptPath: join(rootDir, 'tests', 'js', 'bun-build-native.ts'),
       expectExitCode: 0,
       stdoutIncludes: ['bun build native passed'],
+    },
+    {
+      name: 'bun-build-css-stress',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-build-css-stress.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['2 pass', '0 fail'],
     },
     {
       name: 'bun-typescript-compiler-parity',
@@ -516,7 +534,7 @@ try {
       name: 'text-encoding-native-fast-path',
       argv: ['test', join(rootDir, 'tests', 'js', 'text-encoding-native-fast-path.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: ['6 pass', '0 fail'],
+      stdoutIncludes: ['8 pass', '0 fail'],
     },
     ...(process.platform === 'win32'
       ? [
@@ -1044,7 +1062,7 @@ try {
       name: 'websocket-production',
       argv: ['test', join(rootDir, 'tests', 'js', 'websocket-production.test.ts')],
       expectExitCode: 0,
-      stderrIncludes: ['6 pass', '0 fail'],
+      stderrIncludes: ['8 pass', '0 fail'],
     },
     {
       name: 'websocket-native-frame',

@@ -62,7 +62,10 @@ const streamWeb = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/stream/web.j
 const stringDecoder = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/string_decoder.js"));
 const sys = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/sys.js"));
 const timers = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/timers.js"));
-const timersPromises = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/timers/promises.js"));
+const timersPromises = lazyBuiltin(() => {
+  const namespace = loadEmbeddedRuntimeModule("node/timers/promises.js");
+  return namespace.default ?? namespace;
+});
 const tls = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/tls.js"));
 const tty = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/tty.js"));
 const util = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/util.js"));
@@ -142,7 +145,7 @@ function loadRuntimePackageReplacement(name) {
 
 function loadBuiltinOrReplacement(name) {
   const text = String(name);
-  if (text === "process" || text === "node:process") return currentProcessBuiltin();
+  if (text === "process" || text === "node:process") return loadFullProcessBuiltin();
   if (hasRuntimePackageReplacement(text)) return loadRuntimePackageReplacement(text);
   return unwrapBuiltin(builtinModuleMap.get(text) ?? builtinModuleMap.get(text.replace(/^node:/, "")));
 }
@@ -228,6 +231,12 @@ export const builtinModules = [
 
 const commonJsCache = new Map();
 const commonJsWrapperFactoryCache = new Map();
+const bundledCommonJsFactoryCache = new Map();
+const runtimeEsmWrapperCache = new Map();
+const nodeModulePathsCache = new Map();
+const nodeModulePathsCacheLimit = 256;
+const smolModuleCacheGcInterval = 16;
+const smolDynamicModuleCacheGcInterval = 1024;
 const bundledAsyncEsmGraphCache = new Map();
 const nativeObjectDefineProperty = Object.defineProperty;
 const builtinModuleMap = new Map();
@@ -238,7 +247,15 @@ let modulePathCache = Object.create(null);
 const moduleHooks = [];
 const moduleHookIdKey = Symbol("cottontail.moduleHooksId");
 const moduleParentKey = Symbol("cottontail.moduleParent");
+const modulePathsBaseKey = Symbol("cottontail.modulePathsBase");
 const runtimeEsmSourceModuleKey = Symbol("cottontail.runtimeEsmSourceModule");
+const dynamicImportModuleKey = Symbol("cottontail.dynamicImportModule");
+const mainModuleStateKey = Symbol.for("cottontail.node.mainModuleState");
+const mainModuleState = globalThis[mainModuleStateKey] ??= {
+  current: null,
+  hasOverride: false,
+  override: undefined,
+};
 const hookResolvedFormats = new Map();
 const sourceMapCache = new Map();
 const nativeModuleResolveCacheGet = cottontail.moduleResolveCacheGet;
@@ -250,6 +267,9 @@ let moduleParentWarningEmitted = false;
 let activeResolverConditions = null;
 let stripTypesWarningEmitted = false;
 let runtimeEsmSourceExecutionDepth = 0;
+let smolModuleCacheMode;
+let smolModuleCacheEvictions = 0;
+let smolDynamicModuleCacheEvictions = 0;
 
 const runtimePluginOnResolve = [];
 const runtimePluginOnLoad = [];
@@ -268,6 +288,9 @@ if (globalThis.__cottontailHotReloadHooks == null) {
 hotReloadHooks.add(() => {
   commonJsCache.clear();
   commonJsWrapperFactoryCache.clear();
+  bundledCommonJsFactoryCache.clear();
+  runtimeEsmWrapperCache.clear();
+  nodeModulePathsCache.clear();
   bundledAsyncEsmGraphCache.clear();
   builtinModuleMap.clear();
   builtinNamespaceEntries.clear();
@@ -278,6 +301,11 @@ hotReloadHooks.add(() => {
   sourceMapCache.clear();
   clearRuntimePlugins();
   mainModule = null;
+  mainModuleState.current = null;
+  mainModuleState.hasOverride = false;
+  mainModuleState.override = undefined;
+  smolModuleCacheEvictions = 0;
+  smolDynamicModuleCacheEvictions = 0;
 });
 
 function runtimePluginFilterMatches(filter, path) {
@@ -992,7 +1020,19 @@ export function __setBuiltinModules(modules) {
     configurable: true,
   });
   for (let [name, value] of Object.entries(modules || {})) {
-    const isLazy = typeof value === "function" && value[kLazyBuiltin] === true;
+    let isLazy = typeof value === "function" && value[kLazyBuiltin] === true;
+    if (isLazy && kUnwrapDefaultBuiltins.has(name)) {
+      const lazyNamespace = value;
+      value = lazyBuiltin(() => {
+        const namespace = unwrapBuiltin(lazyNamespace);
+        return namespace != null &&
+          (typeof namespace === "object" || typeof namespace === "function") &&
+          namespace.default != null
+          ? namespace.default
+          : namespace;
+      });
+      isLazy = true;
+    }
     if (!isLazy && name.replace(/^node:/, "") === "buffer") installMutableBufferMaxLength(value);
     let isNamespace = value != null &&
       (typeof value === "object" || typeof value === "function") &&
@@ -1913,17 +1953,23 @@ function withSpecifierSuffix(path, suffix) {
 }
 
 function moduleNotFoundError(request, resolveMessage = false, basePath = undefined) {
-  let message = `Cannot find module '${request}'`;
-  if (!resolveMessage && basePath != null) {
+  void resolveMessage;
+  // Bun surfaces module resolution failures as ResolveMessage instances and
+  // words them as "Cannot find package '<bare specifier>'" vs
+  // "Cannot find module '<relative/absolute path>'".
+  const isPathSpecifier =
+    request.startsWith(".") || request.startsWith("/") || request.startsWith("file:");
+  let message = `Cannot find ${isPathSpecifier ? "module" : "package"} '${request}'`;
+  if (basePath != null) {
     let referrer = String(basePath);
     if (referrer.startsWith("file:")) {
       try { referrer = fileURLToPath(referrer); } catch {}
     }
-    message += `\nRequire stack:\n- ${referrer}`;
+    message += ` from '${referrer}'`;
   }
-  const error = new Error(message);
+  const error = new ResolveMessage(message);
+  error.name = "ResolveMessage";
   error.code = "MODULE_NOT_FOUND";
-  if (resolveMessage) error.name = "ResolveMessage";
   return error;
 }
 
@@ -2570,6 +2616,14 @@ function hasBunTranspiledPragma(source) {
   return /^\/\/\s*@bun(?:\s|$)/.test(firstLine);
 }
 
+function bunCommonJsArtifactFactory(source) {
+  const text = String(source);
+  const lineEnd = text.indexOf("\n");
+  if (lineEnd < 0 || !/^\/\/\s*@bun\b.*@bun-cjs\b/.test(text.slice(0, lineEnd).trimEnd())) return null;
+  const factorySource = text.slice(lineEnd + 1).trim();
+  return factorySource.startsWith("(function") ? factorySource : null;
+}
+
 function maybeStripTypeScript(filename, source) {
   if (!typeScriptExtensionPattern.test(String(filename))) return source;
   // `// @bun` declares already-transpiled output. Parsing TypeScript below it
@@ -2654,44 +2708,106 @@ function compilePublicCommonJsWrapper(source, filename) {
   const internalArgs = [CJS_FILENAME_BINDING, CJS_DIRNAME_BINDING, CJS_DYNAMIC_IMPORT_BINDING];
   const cacheKey = String(filename);
   const cached = commonJsWrapperFactoryCache.get(cacheKey);
+  let createWrapper;
+  let moduleDirname;
+  let dynamicImport;
   if (cached?.source === source
     && cached.moduleWrapper === activeWrapper
     && cached.prefix === prefix
     && cached.suffix === suffix) {
-    return cached.wrapper;
+    createWrapper = cached.createWrapper;
+    moduleDirname = cached.moduleDirname;
+    dynamicImport = cached.dynamicImport;
+  } else {
+    const factorySource = `(function(${internalArgs.join(",")}) { return ${prefix}${source}${suffix}\n})`;
+    try {
+      createWrapper = typeof cottontail.compileFunction === "function"
+        ? cottontail.compileFunction(factorySource, filename)
+        : new Function(...internalArgs, `return ${prefix}${source}${suffix}`);
+    } catch (error) {
+      throw markModuleCompileError(error, filename, source, 1);
+    }
+    moduleDirname = dirname(filename);
+    dynamicImport = async (specifier, options) => globalThis.__cottontailImportModule(String(specifier), filename, options);
   }
-  const factorySource = `(function(${internalArgs.join(",")}) { return ${prefix}${source}${suffix}\n})`;
-  let createWrapper;
-  try {
-    createWrapper = typeof cottontail.compileFunction === "function"
-      ? cottontail.compileFunction(factorySource, filename)
-      : new Function(...internalArgs, `return ${prefix}${source}${suffix}`);
-  } catch (error) {
-    throw markModuleCompileError(error, filename, source, 1);
-  }
-  const compiledWrapper = createWrapper(
-    filename,
-    dirname(filename),
-    async (specifier, options) => globalThis.__cottontailImportModule(String(specifier), filename, options),
-  );
+  const compiledWrapper = createWrapper(filename, moduleDirname, dynamicImport);
+  if (isSmolModuleCacheMode()) cottontail.jscSetNeverOptimize?.(compiledWrapper);
   commonJsWrapperFactoryCache.set(cacheKey, {
     source,
     moduleWrapper: activeWrapper,
     prefix,
     suffix,
-    wrapper: compiledWrapper,
+    createWrapper,
+    moduleDirname,
+    dynamicImport,
   });
   return compiledWrapper;
 }
 
+function cachedPublicCommonJsWrapper(source, filename) {
+  const activeWrapper = Module.wrapper ?? wrapper;
+  const cached = commonJsWrapperFactoryCache.get(String(filename));
+  if (cached?.source !== source
+    || cached.moduleWrapper !== activeWrapper
+    || cached.prefix !== String(activeWrapper?.[0])
+    || cached.suffix !== String(activeWrapper?.[1])) {
+    return null;
+  }
+  return cached.createWrapper(filename, cached.moduleDirname, cached.dynamicImport);
+}
+
+function compiledRuntimeEsmWrapper(source, filename, diagnosticSource) {
+  const cacheKey = String(filename);
+  const cached = runtimeEsmWrapperCache.get(cacheKey);
+  if (cached?.source === source && cached.inputSource === diagnosticSource) return cached.run;
+  const run = compileModuleWrapper(
+    [ESM_EXPORTS_BINDING, "require", "module", "__filename", "__dirname", "__ctImportMeta"],
+    source,
+    filename,
+    diagnosticSource,
+  );
+  runtimeEsmWrapperCache.set(cacheKey, { inputSource: diagnosticSource, source, run });
+  return run;
+}
+
+function runPublicCommonJsWrapper(module, filename, compiledWrapper) {
+  try {
+    compiledWrapper.call(
+      module.exports,
+      module.exports,
+      module.require,
+      module,
+      filename,
+      dirname(filename),
+    );
+  } catch (error) {
+    throw remapThrownModuleError(error, filename, FUNCTION_WRAPPER_LINE_OFFSET);
+  }
+  module.loaded = true;
+  return module.exports;
+}
+
 function executeCommonJsSource(module, filename, source, requireOverride = undefined, sourceIsEsm = undefined) {
   if (sourceIsEsm ?? hasEsmSyntax(source)) {
-    const transformed = transformEsmSourceForDynamicImport(source);
-    maybeRegisterSourceMap(filename, transformed);
-    recordCompileCache(filename, transformed);
-    const run = compileModuleWrapper([ESM_EXPORTS_BINDING, "require", "module", "__ctImportMeta"], transformed, filename);
+    const cached = runtimeEsmWrapperCache.get(String(filename));
+    let run;
+    if (cached?.inputSource === source) {
+      run = cached.run;
+    } else {
+      const transformed = transformEsmSourceForDynamicImport(source);
+      maybeRegisterSourceMap(filename, transformed);
+      recordCompileCache(filename, transformed);
+      run = compiledRuntimeEsmWrapper(transformed, filename, source);
+    }
     try {
-      run(module.exports, requireOverride ?? module.require, module, importMetaForModule(filename));
+      run(
+        module.exports,
+        requireOverride ?? module.require,
+        module,
+        filename,
+        dirname(filename),
+        importMetaForModule(filename),
+      );
     } catch (error) {
       throw remapThrownModuleError(error, filename, FUNCTION_WRAPPER_LINE_OFFSET);
     }
@@ -2718,22 +2834,11 @@ function executeCommonJsSource(module, filename, source, requireOverride = undef
   }
   maybeRegisterSourceMap(filename, effectiveSource);
   recordCompileCache(filename, effectiveSource);
-  const wrapper = compilePublicCommonJsWrapper(effectiveSource, filename);
-  const moduleDirname = dirname(filename);
-  try {
-    wrapper.call(
-      module.exports,
-      module.exports,
-      module.require,
-      module,
-      filename,
-      moduleDirname,
-    );
-  } catch (error) {
-    throw remapThrownModuleError(error, filename, FUNCTION_WRAPPER_LINE_OFFSET);
-  }
-  module.loaded = true;
-  return module.exports;
+  return runPublicCommonJsWrapper(
+    module,
+    filename,
+    compilePublicCommonJsWrapper(effectiveSource, filename),
+  );
 }
 
 function transpileExtensionSource(filename, loader, forceTransform = false, inputSource = undefined) {
@@ -2800,7 +2905,15 @@ function sourceRequiresAsyncModuleExecution(filename, source) {
   } catch {
     return false;
   }
-  const parameters = [ESM_EXPORTS_BINDING, "require", "module", "__ctImportMeta", "Error"];
+  const parameters = [
+    ESM_EXPORTS_BINDING,
+    "require",
+    "module",
+    "__filename",
+    "__dirname",
+    "__ctImportMeta",
+    "Error",
+  ];
   try {
     new Function(...parameters, transformed);
     return false;
@@ -2882,6 +2995,20 @@ function runtimeEsmRootHasBarePackageEdges(entryPath, entrySource) {
   }
 }
 
+function runtimeEsmRootHasStaticImportEdges(entryPath, entrySource) {
+  if (typeof cottontail.transpilerScanImports !== "function") return true;
+  try {
+    const imports = JSON.parse(cottontail.transpilerScanImports(
+      String(entrySource),
+      "{}",
+      runtimeEsmGraphLoader(entryPath),
+    ));
+    return !Array.isArray(imports) || imports.some(item => item?.kind === "import-statement");
+  } catch {
+    return true;
+  }
+}
+
 function runtimeAsyncEsmGraph(entryPath, entrySource) {
   if (typeof cottontail.bundleNative !== "function" ||
       !runtimeEsmRootHasBarePackageEdges(entryPath, entrySource)) {
@@ -2928,42 +3055,50 @@ function rewriteBundledEsmDynamicImports(source) {
 }
 
 function executeBundledCommonJsModule(module, filename, source, loader) {
-  let bundled;
-  try {
-    bundled = String(cottontail.bundleNative(
-      filename,
-      dirname(filename),
-      JSON.stringify({
-        format: "cjs",
-        target: "bun",
-        preserveExternalRequireName: true,
-        runtimeFileLoaderPaths: true,
-        ignoreDCEAnnotations: true,
-        treeShaking: false,
-        // Keep packages and JavaScript dependencies in createRequire()'s
-        // shared module cache. Inlining a package while externalizing its
-        // relative files also moves those require() calls under the entry's
-        // directory and gives them the wrong referrer.
-        packages: "external",
-        external: runtimeEsmGraphExternalPatterns,
-        define: {
-          "import.meta": "__ctImportMeta",
-        },
-      }),
-    ));
-  } catch (error) {
-    if (isAsyncModuleBundleFailure(error, filename, source)) {
-      throw new TypeError(`require() async module "${filename}" is unsupported. use "await import()" instead.`);
+  const cacheKey = String(filename);
+  let buildFactory;
+  const cached = bundledCommonJsFactoryCache.get(cacheKey);
+  if (cached?.source === source) {
+    buildFactory = cached.buildFactory;
+  } else {
+    let bundled;
+    try {
+      bundled = String(cottontail.bundleNative(
+        filename,
+        dirname(filename),
+        JSON.stringify({
+          format: "cjs",
+          target: "bun",
+          preserveExternalRequireName: true,
+          runtimeFileLoaderPaths: true,
+          ignoreDCEAnnotations: true,
+          treeShaking: false,
+          // Keep packages and JavaScript dependencies in createRequire()'s
+          // shared module cache. Inlining a package while externalizing its
+          // relative files also moves those require() calls under the entry's
+          // directory and gives them the wrong referrer.
+          packages: "external",
+          external: runtimeEsmGraphExternalPatterns,
+          define: {
+            "import.meta": "__ctImportMeta",
+          },
+        }),
+      ));
+    } catch (error) {
+      if (isAsyncModuleBundleFailure(error, filename, source)) {
+        throw new TypeError(`require() async module "${filename}" is unsupported. use "await import()" instead.`);
+      }
+      throw error;
     }
-    throw error;
+    bundled = rewriteBundledEsmDynamicImports(bundled);
+    maybeRegisterSourceMap(filename, bundled);
+    recordCompileCache(filename, bundled);
+    buildFactory = cottontail.compileFunction(
+      `(function(__ctImportMeta, ${CJS_DYNAMIC_IMPORT_BINDING}) { return (\n${bundled}\n); })`,
+      filename,
+    );
+    bundledCommonJsFactoryCache.set(cacheKey, { source, buildFactory });
   }
-  bundled = rewriteBundledEsmDynamicImports(bundled);
-  maybeRegisterSourceMap(filename, bundled);
-  recordCompileCache(filename, bundled);
-  const buildFactory = cottontail.compileFunction(
-    `(function(__ctImportMeta, ${CJS_DYNAMIC_IMPORT_BINDING}) { return (\n${bundled}\n); })`,
-    filename,
-  );
   const factory = buildFactory(
     importMetaForModule(filename),
     async (specifier, options) => globalThis.__cottontailImportModule(String(specifier), filename, options),
@@ -2971,6 +3106,7 @@ function executeBundledCommonJsModule(module, filename, source, loader) {
   if (typeof factory !== "function") {
     throw new TypeError(`Runtime bundle for '${filename}' did not produce a CommonJS wrapper`);
   }
+  if (isSmolModuleCacheMode()) cottontail.jscSetNeverOptimize?.(factory);
   // The bundler lowers this ESM file's static imports to require() calls. They
   // still resolve with ESM conditions: using the module's ordinary CommonJS
   // require here can select a package's `require` export (or reject an
@@ -3024,9 +3160,27 @@ function executeRuntimeEsmSourceModule(module, filename, originalSource, loader)
 
 function executeDefaultExtension(module, filename, loader) {
   const originalSource = readModuleFile(filename).replace(/^#![^\n]*(\n|$)/, "");
+  const bundledCommonJsFactory = bunCommonJsArtifactFactory(originalSource);
+  if (bundledCommonJsFactory != null) {
+    // COTTONTAIL-COMPAT: Bun-targeted CJS build output is already a complete
+    // module factory. Invoking it directly avoids wrapping the factory expression
+    // as inert source when it is launched or loaded through node:module.
+    const factory = cottontail.compileFunction(bundledCommonJsFactory, filename);
+    factory(module.exports, module.require, module, filename, dirname(filename));
+    module.loaded = true;
+    return module.exports;
+  }
+  const compileOverridden = module._compile !== defaultModuleCompile;
+  if (!compileOverridden) {
+    const cachedWrapper = cachedPublicCommonJsWrapper(originalSource, filename);
+    if (cachedWrapper !== null) return runPublicCommonJsWrapper(module, filename, cachedWrapper);
+  }
   const originalIsEsm = hasEsmSyntax(originalSource);
   const isEmbeddedRuntimeSource = embeddedRuntimeSourceEntry(filename).found;
-  if (originalIsEsm && (runtimeEsmSourceExecutionDepth > 0 || isEmbeddedRuntimeSource)) {
+  const useRuntimeEsmSource = isEmbeddedRuntimeSource ||
+    (runtimeEsmSourceExecutionDepth > 0 &&
+      (originalSource.length < 256 * 1024 || runtimeEsmRootHasStaticImportEdges(filename, originalSource)));
+  if (originalIsEsm && useRuntimeEsmSource) {
     return executeRuntimeEsmSourceModule(module, filename, originalSource, loader);
   }
   if (originalIsEsm &&
@@ -3034,7 +3188,6 @@ function executeDefaultExtension(module, filename, loader) {
       typeof cottontail.bundleNative === "function") {
     return executeBundledCommonJsModule(module, filename, originalSource, loader);
   }
-  const compileOverridden = module._compile !== defaultModuleCompile;
   const source = transpileExtensionSource(filename, loader, compileOverridden, originalSource);
   // Bun's synchronous ESM path does not call an overridden module._compile.
   const sourceIsEsm = source === originalSource ? originalIsEsm : hasEsmSyntax(source);
@@ -3607,7 +3760,7 @@ function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, origina
     recordCompileCache(resolvedPath, transformed);
     try {
       run = compileAsyncModuleWrapper(
-        [ESM_EXPORTS_BINDING, "__ctImportMeta", "__ctModuleAncestors", "Error"],
+        [ESM_EXPORTS_BINDING, "__filename", "__dirname", "__ctImportMeta", "__ctModuleAncestors", "Error"],
         transformed,
         sourceName,
         originalSource,
@@ -3620,6 +3773,8 @@ function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, origina
   }
   record.promise = run(
     namespace,
+    resolvedPath,
+    dirname(resolvedPath),
     importMetaForHookModule(resolvedPath, suffix),
     moduleAncestors,
     dynamicModuleErrorConstructor(sourceName, originalSource),
@@ -3700,7 +3855,15 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
     recordCompileCache(resolvedPath, transformed);
     try {
       run = compileModuleWrapper(
-        [ESM_EXPORTS_BINDING, "require", "__ctModuleRecord", "__ctImportMeta", "Error"],
+        [
+          ESM_EXPORTS_BINDING,
+          "require",
+          "__ctModuleRecord",
+          "__filename",
+          "__dirname",
+          "__ctImportMeta",
+          "Error",
+        ],
         transformed,
         sourceName,
         originalSource,
@@ -3720,6 +3883,8 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
       namespace,
       createEsmRequire(hookRequireBase(resolvedPath), moduleRecord),
       moduleRecord,
+      resolvedPath,
+      dirname(resolvedPath),
       importMetaForHookModule(resolvedPath, suffix),
       dynamicModuleErrorConstructor(sourceName, originalSource),
     );
@@ -3780,7 +3945,10 @@ function importResolvedRuntimeModule(resolved, options = undefined, forceAsync =
     if (forceAsync && source !== undefined && sourceRequiresAsyncModuleExecution(resolvedPath, source)) {
       return executeDynamicImportSource(resolved, source, "module", true, asyncAncestors);
     }
-    return namespaceFromCommonJs(loadCommonJsModule(resolved), packageTypeIsModule(resolvedPath));
+    const value = loadCommonJsModule(resolved);
+    const loadedModule = commonJsCache.get(resolved);
+    if (loadedModule) loadedModule[dynamicImportModuleKey] = true;
+    return namespaceFromCommonJs(value, packageTypeIsModule(resolvedPath));
   }
   return executeDynamicImportSource(
     resolved,
@@ -3867,7 +4035,17 @@ export function __importModule(
   const registry = globalThis.Loader?.registry;
   if (registry?.has?.(cacheKey)) return registry.get(cacheKey);
 
-  const promise = Promise.resolve(importResolvedRuntimeModule(resolved, options, false, asyncAncestors));
+  const result = importResolvedRuntimeModule(resolved, options, false, asyncAncestors);
+  if (!isPromiseLike(result)) {
+    // Rewritten import() call sites are async functions already. Preserve the
+    // evaluated namespace directly so synchronous modules do not allocate two
+    // additional Promise reactions for every cache reload.
+    const loadedModule = commonJsCache.get(resolved);
+    if (loadedModule) loadedModule[dynamicImportModuleKey] = true;
+    registry?.set?.(cacheKey, result);
+    return result;
+  }
+  const promise = Promise.resolve(result);
   registry?.set?.(cacheKey, promise);
   promise.catch(() => {
     if (registry?.get?.(cacheKey) === promise) registry.delete(cacheKey);
@@ -4231,10 +4409,14 @@ const commonJsCacheObject = new Proxy(commonJsCacheTarget, {
   deleteProperty(target, property) {
     if (typeof property !== "string") return Reflect.deleteProperty(target, property);
     const cached = commonJsCache.get(property);
+    const registry = globalThis.Loader?.registry;
+    const dynamicImport = cached?.[dynamicImportModuleKey] === true ||
+      asyncEsmModuleCache.has(property) || registry?.has?.(property) === true;
     if (cached) detachModuleChild(cached[moduleParentKey], cached);
     commonJsCache.delete(property);
     asyncEsmModuleCache.delete(property);
-    globalThis.Loader?.registry?.delete?.(property);
+    registry?.delete?.(property);
+    if (cached) maybeCollectSmolModuleCacheChurn(dynamicImport);
     return true;
   },
   ownKeys(target) {
@@ -4246,6 +4428,26 @@ const commonJsCacheObject = new Proxy(commonJsCacheTarget, {
     return { value: commonJsCache.get(property), writable: true, enumerable: true, configurable: true };
   },
 });
+
+function isSmolModuleCacheMode() {
+  smolModuleCacheMode ??= (currentProcessBuiltin().execArgv ?? []).includes("--smol");
+  return smolModuleCacheMode;
+}
+
+function maybeCollectSmolModuleCacheChurn(dynamicImport = false) {
+  if (!isSmolModuleCacheMode()) return;
+  if (dynamicImport) {
+    smolDynamicModuleCacheEvictions += 1;
+    if (smolDynamicModuleCacheEvictions % smolDynamicModuleCacheGcInterval !== 0) return;
+  } else {
+    smolModuleCacheEvictions += 1;
+    if (smolModuleCacheEvictions % smolModuleCacheGcInterval !== 0) return;
+  }
+  // Cache deletion happens after module evaluation has returned. Collect at
+  // that boundary so a synchronous require() churn loop cannot defer every
+  // queued collection until after it has retained hundreds of dead modules.
+  cottontail.gc?.(true);
+}
 
 function isBundledImportMetaBase(path) {
   const mainPath = currentProcessBuiltin().argv?.[1];
@@ -4316,8 +4518,24 @@ export function __runMain(filename) {
   }
   const module = makeModule(resolved, null, true);
   mainModule = module;
+  mainModuleState.current = module;
   refreshModuleRequire(module);
   commonJsCache.set(resolved, module);
+  const processObject = currentProcessBuiltin();
+  if (!Object.hasOwn(processObject, "mainModule")) {
+    Object.defineProperty(processObject, "mainModule", {
+      get() {
+        return mainModuleState.hasOverride ? mainModuleState.override : mainModuleState.current;
+      },
+      set(value) {
+        if (!mainModuleState.hasOverride && value === mainModuleState.current) return;
+        mainModuleState.hasOverride = true;
+        mainModuleState.override = value;
+      },
+      enumerable: true,
+      configurable: true,
+    });
+  }
   const require = createRequire(resolved, module);
   require.main = module;
   try {
@@ -4351,6 +4569,42 @@ const moduleParentDescriptor = {
   set: setModuleParent,
 };
 
+function getModulePaths() {
+  const base = this[modulePathsBaseKey];
+  const paths = base == null ? [] : _nodeModulePaths(base);
+  nativeObjectDefineProperty(this, "paths", {
+    configurable: true,
+    enumerable: true,
+    writable: true,
+    value: paths,
+  });
+  return paths;
+}
+
+function setModulePaths(value) {
+  nativeObjectDefineProperty(this, "paths", {
+    configurable: true,
+    enumerable: true,
+    writable: true,
+    value,
+  });
+}
+
+const modulePathsDescriptor = {
+  configurable: true,
+  enumerable: true,
+  get: getModulePaths,
+  set: setModulePaths,
+};
+
+function setModulePathsBase(module, base) {
+  module[modulePathsBaseKey] = base;
+  const descriptor = Object.getOwnPropertyDescriptor(module, "paths");
+  if (descriptor && Object.hasOwn(descriptor, "value")) {
+    module.paths = base == null ? [] : _nodeModulePaths(base);
+  }
+}
+
 export class Module {
   constructor(id = "", parent = null) {
     this.id = id;
@@ -4359,7 +4613,8 @@ export class Module {
     this.filename = null;
     this.loaded = false;
     this.children = [];
-    this.paths = id ? _nodeModulePaths(this.path) : [];
+    this[modulePathsBaseKey] = id ? this.path : null;
+    nativeObjectDefineProperty(this, "paths", modulePathsDescriptor);
     this[moduleParentKey] = parent;
     nativeObjectDefineProperty(this, "parent", moduleParentDescriptor);
     refreshModuleRequire(this);
@@ -4368,7 +4623,7 @@ export class Module {
   load(filename) {
     this.filename = String(filename);
     this.path = dirname(this.filename);
-    this.paths = _nodeModulePaths(this.path);
+    setModulePathsBase(this, this.path);
     refreshModuleRequire(this);
     return executeCommonJsModule(this, this.filename);
   }
@@ -4382,7 +4637,7 @@ export class Module {
   _compile(source, filename) {
     this.filename = String(filename);
     this.path = dirname(this.filename);
-    this.paths = _nodeModulePaths(this.path);
+    setModulePathsBase(this, this.path);
     refreshModuleRequire(this);
     executeCommonJsSource(this, this.filename, String(source));
     return undefined;
@@ -4905,8 +5160,12 @@ export function isBuiltin(name) {
 
 export function _nodeModulePaths(from) {
   if (arguments.length === 0) throw new TypeError('The "from" argument must be a string');
+  const normalizedFrom = resolve(String(from || "."));
+  const cached = nodeModulePathsCache.get(normalizedFrom);
+  if (cached !== undefined) return cached.slice();
+
   const paths = [];
-  let current = resolve(String(from || "."));
+  let current = normalizedFrom;
   while (true) {
     if (basename(current).toLowerCase() !== "node_modules") {
       paths.push(join(current, "node_modules"));
@@ -4915,7 +5174,11 @@ export function _nodeModulePaths(from) {
     if (parent === current) break;
     current = parent;
   }
-  return paths;
+  if (nodeModulePathsCache.size >= nodeModulePathsCacheLimit) {
+    nodeModulePathsCache.delete(nodeModulePathsCache.keys().next().value);
+  }
+  nodeModulePathsCache.set(normalizedFrom, paths);
+  return paths.slice();
 }
 
 export function _resolveLookupPaths(request, parent = undefined) {
@@ -5647,11 +5910,20 @@ const assertStrictBuiltin = lazyDefault(assertStrict);
 const consoleBuiltin = lazyDefault(consoleModule);
 const eventsBuiltin = lazyDefault(events);
 function currentProcessBuiltin() {
-  if (globalThis.process != null) return globalThis.process;
-  const namespace = unwrapBuiltin(processModule);
-  return namespace.default ?? namespace;
+  return globalThis.process ?? loadFullProcessBuiltin();
 }
-const processBuiltin = lazyBuiltin(currentProcessBuiltin);
+function loadFullProcessBuiltin() {
+  const current = globalThis.process;
+  if (current != null && typeof current.binding === "function") return current;
+  const namespace = unwrapBuiltin(processModule);
+  const process = namespace.default ?? namespace;
+  if (process != null) {
+    globalThis.process = process;
+    globalThis.__cottontailProcessObject = process;
+  }
+  return process ?? current;
+}
+const processBuiltin = lazyBuiltin(loadFullProcessBuiltin);
 const streamBuiltin = lazyDefault(stream);
 const sysBuiltin = lazyDefault(sys);
 const pathBuiltin = path.default ?? path;
@@ -5660,7 +5932,7 @@ const internalTestBindingBuiltin = lazyBuiltin(() => {
   return {
     ...namespace,
     internalBinding(name) {
-      if (String(name) === "http_parser") return currentProcessBuiltin().binding("http_parser");
+      if (String(name) === "http_parser") return loadFullProcessBuiltin().binding("http_parser");
       return namespace.internalBinding(name);
     },
   };

@@ -1,5 +1,4 @@
 import Module, { _resolveFilename } from "../node/module.js";
-import { BlockList } from "../node/net.js";
 import fsDefault, { readFileSync } from "../node/fs.js";
 import { createHash } from "../node/crypto.js";
 import { gunzipSync } from "../node/zlib.js";
@@ -938,13 +937,20 @@ function isBunFile(value) {
     typeof value.writer === "function";
 }
 
-function isCloneOnlyPlatformObject(value) {
-  return isBunFile(value) || value instanceof BlockList;
+function isBlockList(value) {
+  return value?.constructor?.name === "BlockList" &&
+    typeof value.addAddress === "function" &&
+    typeof value.check === "function" &&
+    typeof value[Symbol.for("cottontail.structuredClone")] === "function";
 }
 
-function replaceCloneOnlyPlatformObjects(value, seen = new WeakMap()) {
+function isCloneOnlyPlatformObject(value) {
+  return isBunFile(value) || isBlockList(value);
+}
+
+function replaceIncompatiblePlatformObjects(value, incompatible, seen = new WeakMap()) {
   if (value === null || typeof value !== "object") return value;
-  if (isCloneOnlyPlatformObject(value)) return {};
+  if (incompatible(value)) return {};
   if (seen.has(value)) return seen.get(value);
   seen.set(value, value);
 
@@ -953,8 +959,8 @@ function replaceCloneOnlyPlatformObjects(value, seen = new WeakMap()) {
     value.clear();
     for (const [key, entryValue] of entries) {
       value.set(
-        replaceCloneOnlyPlatformObjects(key, seen),
-        replaceCloneOnlyPlatformObjects(entryValue, seen),
+        replaceIncompatiblePlatformObjects(key, incompatible, seen),
+        replaceIncompatiblePlatformObjects(entryValue, incompatible, seen),
       );
     }
     return value;
@@ -963,12 +969,12 @@ function replaceCloneOnlyPlatformObjects(value, seen = new WeakMap()) {
   if (value instanceof Set) {
     const entries = [...value];
     value.clear();
-    for (const entry of entries) value.add(replaceCloneOnlyPlatformObjects(entry, seen));
+    for (const entry of entries) value.add(replaceIncompatiblePlatformObjects(entry, incompatible, seen));
     return value;
   }
 
   for (const key of Object.keys(value)) {
-    value[key] = replaceCloneOnlyPlatformObjects(value[key], seen);
+    value[key] = replaceIncompatiblePlatformObjects(value[key], incompatible, seen);
   }
   return value;
 }
@@ -990,9 +996,9 @@ export function structuredCloneAdvanced(
     value,
     transfers.length > 0 ? { transfer: transfers } : undefined,
   );
-  return isForTransfer || isForStorage
-    ? replaceCloneOnlyPlatformObjects(cloned)
-    : cloned;
+  if (isForTransfer) return replaceIncompatiblePlatformObjects(cloned, isCloneOnlyPlatformObject);
+  if (isForStorage) return replaceIncompatiblePlatformObjects(cloned, isBlockList);
+  return cloned;
 }
 
 export function getEventLoopStats() {
@@ -1001,7 +1007,13 @@ export function getEventLoopStats() {
 }
 export const install_test_helpers = {
   parseLockfile(cwd) {
-    return JSON.parse(cottontail.packageManagerParseLockfile(String(cwd)));
+    const lockfile = JSON.parse(cottontail.packageManagerParseLockfile(String(cwd)));
+    for (const dependency of lockfile?.dependencies ?? []) {
+      if (dependency?.literal === "workspace:" && "workspace" in dependency) {
+        dependency.workspace = "";
+      }
+    }
+    return lockfile;
   },
 };
 export const npm_manifest_test_helpers = {

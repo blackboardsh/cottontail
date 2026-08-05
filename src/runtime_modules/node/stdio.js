@@ -40,9 +40,18 @@ function bytesToChunk(bytes, encoding) {
   return globalThis.Buffer?.from ? globalThis.Buffer.from(view) : view;
 }
 
+function sharedArrayBufferBytes(value) {
+  if (typeof SharedArrayBuffer !== "function" || !(value instanceof SharedArrayBuffer)) return null;
+  const bytes = new Uint8Array(value.byteLength);
+  bytes.set(new Uint8Array(value));
+  return bytes;
+}
+
 function chunkByteLength(chunk) {
   if (chunk == null) return 0;
   if (typeof chunk === "string") return new TextEncoder().encode(chunk).byteLength;
+  const sharedBytes = sharedArrayBufferBytes(chunk);
+  if (sharedBytes) return sharedBytes.byteLength;
   if (chunk instanceof ArrayBuffer) return chunk.byteLength;
   if (ArrayBuffer.isView(chunk)) return chunk.byteLength;
   return new TextEncoder().encode(String(chunk)).byteLength;
@@ -272,9 +281,15 @@ export function createWritableStdio(fd = 1) {
       callback = encoding;
       encoding = undefined;
     }
+    // Node replaces unpaired UTF-16 surrogates with U+FFFD when writing
+    // strings; the native fdWrite path drops them instead, so sanitize here.
+    if (typeof chunk === "string" && typeof chunk.isWellFormed === "function" && !chunk.isWellFormed()) {
+      chunk = chunk.toWellFormed();
+    }
+    const nativeChunk = sharedArrayBufferBytes(chunk) ?? chunk;
     const status = typeof cottontail.fdWriteStatus === "function"
-      ? Number(cottontail.fdWriteStatus(fd, chunk))
-      : cottontail.fdWrite?.(fd, chunk) === true ? 0 : 32;
+      ? Number(cottontail.fdWriteStatus(fd, nativeChunk))
+      : cottontail.fdWrite?.(fd, nativeChunk) === true ? 0 : 32;
     if (status === 0) {
       if (typeof callback === "function") callback(undefined);
       return true;

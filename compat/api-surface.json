@@ -7677,12 +7677,33 @@
         ],
         "hasDefaultExport": true
       },
+      "bun/build": {
+        "file": "src/runtime_modules/bun/build.js",
+        "exports": [
+          "createBunBuildFacade"
+        ],
+        "hasDefaultExport": false
+      },
       "bun/color": {
         "file": "src/runtime_modules/bun/color.js",
         "exports": [
           "color"
         ],
         "hasDefaultExport": true
+      },
+      "bun/cookie": {
+        "file": "src/runtime_modules/bun/cookie.js",
+        "exports": [
+          "createCookieRuntime"
+        ],
+        "hasDefaultExport": false
+      },
+      "bun/default-app": {
+        "file": "src/runtime_modules/bun/default-app.js",
+        "exports": [
+          "startDefaultApp"
+        ],
+        "hasDefaultExport": false
       },
       "bun/dns": {
         "file": "src/runtime_modules/bun/dns.js",
@@ -7728,6 +7749,29 @@
           "makeBunFileError",
           "pathDirname",
           "write"
+        ],
+        "hasDefaultExport": false
+      },
+      "bun/file-like": {
+        "file": "src/runtime_modules/bun/file-like.js",
+        "exports": [
+          "bunFileLikeBrand",
+          "isBunFileLike"
+        ],
+        "hasDefaultExport": false
+      },
+      "bun/http-server-runtime": {
+        "file": "src/runtime_modules/bun/http-server-runtime.js",
+        "exports": [
+          "Cookie",
+          "CookieMap",
+          "FormData",
+          "Headers",
+          "Request",
+          "Response",
+          "serve",
+          "URL",
+          "URLSearchParams"
         ],
         "hasDefaultExport": false
       },
@@ -7839,6 +7883,7 @@
           "stdout",
           "stringWidth",
           "stripANSI",
+          "stripVTControlCharacters",
           "Terminal",
           "TOML",
           "Transpiler",
@@ -7959,10 +8004,65 @@
         ],
         "hasDefaultExport": true
       },
+      "bun/lazy-runtime": {
+        "file": "src/runtime_modules/bun/lazy-runtime.js",
+        "exports": [
+          "createLazyBuiltin",
+          "createLazyFunction",
+          "createLazyModule",
+          "createLazyObject",
+          "installLazyGlobal"
+        ],
+        "hasDefaultExport": false
+      },
+      "bun/lazy-subsystems": {
+        "file": "src/runtime_modules/bun/lazy-subsystems.js",
+        "exports": [
+          "bunJSCBuiltin",
+          "bunSQLiteBuiltin",
+          "bunTestBuiltin",
+          "color",
+          "connect",
+          "dns",
+          "JSON5",
+          "listen",
+          "loadBunJSCModule",
+          "loadBunSQLiteModule",
+          "loadBunTestModule",
+          "loadColorModule",
+          "loadDNSModule",
+          "loadJSON5Module",
+          "loadRedisModule",
+          "loadS3Module",
+          "loadSocketModule",
+          "loadSQLModule",
+          "loadTOMLModule",
+          "loadWebSocketModule",
+          "loadYAMLModule",
+          "postgres",
+          "redis",
+          "RedisClient",
+          "s3",
+          "S3Client",
+          "sql",
+          "SQL",
+          "TOML",
+          "webSocketBuiltin",
+          "YAML"
+        ],
+        "hasDefaultExport": false
+      },
       "bun/mime-types": {
         "file": "src/runtime_modules/bun/mime-types.js",
         "exports": [
           "bunFileMimeType"
+        ],
+        "hasDefaultExport": false
+      },
+      "bun/native-serve": {
+        "file": "src/runtime_modules/bun/native-serve.js",
+        "exports": [
+          "startNativeServe"
         ],
         "hasDefaultExport": false
       },
@@ -8010,6 +8110,13 @@
           "s3",
           "S3Client",
           "s3File"
+        ],
+        "hasDefaultExport": false
+      },
+      "bun/shell": {
+        "file": "src/runtime_modules/bun/shell.js",
+        "exports": [
+          "createBunShellFacade"
         ],
         "hasDefaultExport": false
       },
@@ -8114,6 +8221,29 @@
           "markFetchBodyConsumed",
           "registerFetchBodyFinalizer",
           "takeBody"
+        ],
+        "hasDefaultExport": false
+      },
+      "bun/web-buffer-utils": {
+        "file": "src/runtime_modules/bun/web-buffer-utils.js",
+        "exports": [
+          "asBuffer",
+          "concatBuffers",
+          "concatManyBuffers"
+        ],
+        "hasDefaultExport": false
+      },
+      "bun/web-primitives": {
+        "file": "src/runtime_modules/bun/web-primitives.js",
+        "exports": [
+          "createWebPrimitives"
+        ],
+        "hasDefaultExport": false
+      },
+      "bun/web-request-response": {
+        "file": "src/runtime_modules/bun/web-request-response.js",
+        "exports": [
+          "createRequestResponseRuntime"
         ],
         "hasDefaultExport": false
       },
@@ -8284,6 +8414,21 @@
         ],
         "hasDefaultExport": false
       },
+      "internal/eval-commonjs-fast": {
+        "file": "src/runtime_modules/internal/eval-commonjs-fast.js",
+        "exports": [
+          "installFastEvalCommonJsBuiltins"
+        ],
+        "hasDefaultExport": false
+      },
+      "internal/file-url": {
+        "file": "src/runtime_modules/internal/file-url.js",
+        "exports": [
+          "fileURLToPath",
+          "pathToFileURL"
+        ],
+        "hasDefaultExport": false
+      },
       "internal/jsc-value-serialization": {
         "file": "src/runtime_modules/internal/jsc-value-serialization.js",
         "exports": [
@@ -8303,6 +8448,15 @@
           "methods"
         ],
         "hasDefaultExport": false
+      },
+      "internal/runtime-bootstrap-core": {
+        "file": "src/runtime_modules/internal/runtime-bootstrap-core.js",
+        "exports": [
+          "Bun",
+          "installRuntimeBootstrap",
+          "process"
+        ],
+        "hasDefaultExport": true
       },
       "internal/runtime-bootstrap": {
         "file": "src/runtime_modules/internal/runtime-bootstrap.js",
@@ -8328,6 +8482,11 @@
           "processObject"
         ],
         "hasDefaultExport": true
+      },
+      "internal/runtime-stack-remap": {
+        "file": "src/runtime_modules/internal/runtime-stack-remap.js",
+        "exports": [],
+        "hasDefaultExport": false
       },
       "internal/runtime-transpiler-cache": {
         "file": "src/runtime_modules/internal/runtime-transpiler-cache.js",
@@ -9664,6 +9823,7 @@
         "exports": [
           "cpPromiseImpl",
           "cpSyncImpl",
+          "nativeCopyError",
           "normalizeCopyPath"
         ],
         "hasDefaultExport": false
@@ -9673,6 +9833,7 @@
         "exports": [
           "cpPromiseImpl",
           "cpSyncImpl",
+          "nativeCopyError",
           "normalizeCopyPath"
         ],
         "hasDefaultExport": false
@@ -9871,6 +10032,8 @@
           "lstatSync",
           "lutimes",
           "lutimesSync",
+          "makeCopyFileError",
+          "makeFsError",
           "mkdir",
           "mkdirSync",
           "mkdtemp",
@@ -9881,6 +10044,9 @@
           "opendir",
           "opendirSync",
           "openSync",
+          "parseRmOptions",
+          "prepareCopyFile",
+          "prepareRm",
           "promises",
           "R_OK",
           "read",
@@ -9985,6 +10151,8 @@
           "lstatSync",
           "lutimes",
           "lutimesSync",
+          "makeCopyFileError",
+          "makeFsError",
           "mkdir",
           "mkdirSync",
           "mkdtemp",
@@ -9995,6 +10163,9 @@
           "opendir",
           "opendirSync",
           "openSync",
+          "parseRmOptions",
+          "prepareCopyFile",
+          "prepareRm",
           "promises",
           "R_OK",
           "read",
@@ -10486,6 +10657,7 @@
       "module": {
         "file": "src/runtime_modules/node/module.js",
         "exports": [
+          "__createBundledRequire",
           "__importModule",
           "__runMain",
           "__setBuiltinModules",
@@ -10517,9 +10689,11 @@
           "getSourceMapsSupport",
           "globalPaths",
           "isBuiltin",
+          "loadEmbeddedRuntimeModule",
           "Module",
           "ns",
           "register",
+          "registerEmbeddedRuntimeModules",
           "registerHooks",
           "runMain",
           "setSourceMapsSupport",
@@ -10534,6 +10708,7 @@
       "node:module": {
         "file": "src/runtime_modules/node/module.js",
         "exports": [
+          "__createBundledRequire",
           "__importModule",
           "__runMain",
           "__setBuiltinModules",
@@ -10565,9 +10740,11 @@
           "getSourceMapsSupport",
           "globalPaths",
           "isBuiltin",
+          "loadEmbeddedRuntimeModule",
           "Module",
           "ns",
           "register",
+          "registerEmbeddedRuntimeModules",
           "registerHooks",
           "runMain",
           "setSourceMapsSupport",
@@ -13652,11 +13829,43 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
+      "src/runtime_modules/bun/build.js": {
+        "file": "src/runtime_modules/bun/build.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "createBunBuildFacade"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": [
+          "BuildError",
+          "BuildMessage",
+          "ResolveError",
+          "ResolveMessage"
+        ]
+      },
       "src/runtime_modules/bun/color.js": {
         "file": "src/runtime_modules/bun/color.js",
         "hasDefaultExport": true,
         "namedExports": [
           "color"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/bun/cookie.js": {
+        "file": "src/runtime_modules/bun/cookie.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "createCookieRuntime"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/bun/default-app.js": {
+        "file": "src/runtime_modules/bun/default-app.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "startDefaultApp"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -13718,6 +13927,56 @@
         ],
         "bunObjectProperties": [],
         "globalProperties": []
+      },
+      "src/runtime_modules/bun/file-like.js": {
+        "file": "src/runtime_modules/bun/file-like.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "bunFileLikeBrand",
+          "isBunFileLike"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/bun/http-server-runtime.js": {
+        "file": "src/runtime_modules/bun/http-server-runtime.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "Cookie",
+          "CookieMap",
+          "FormData",
+          "Headers",
+          "Request",
+          "Response",
+          "serve",
+          "URL",
+          "URLSearchParams"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": [
+          "__cottontailActiveServeAbortControllers",
+          "__cottontailActiveServeDispatches",
+          "__cottontailActiveServeLifecycles",
+          "__cottontailActiveServeOrigins",
+          "__cottontailHttpServerRuntime",
+          "AbortController",
+          "AbortSignal",
+          "Bun",
+          "CloseEvent",
+          "CustomEvent",
+          "DOMException",
+          "ErrorEvent",
+          "Event",
+          "EventTarget",
+          "File",
+          "FormData",
+          "Headers",
+          "Request",
+          "require",
+          "Response",
+          "URL",
+          "URLSearchParams"
+        ]
       },
       "src/runtime_modules/bun/index.js": {
         "file": "src/runtime_modules/bun/index.js",
@@ -13828,6 +14087,7 @@
           "stdout",
           "stringWidth",
           "stripANSI",
+          "stripVTControlCharacters",
           "Terminal",
           "TOML",
           "Transpiler",
@@ -13975,7 +14235,6 @@
           "__cottontailImportMetaResolveSync",
           "__cottontailInspectBunExpectationError",
           "__cottontailMakeMessageEvent",
-          "__cottontailProcessIpcPending",
           "__cottontailPromisePeekStates",
           "__cottontailRemapPosition",
           "__cottontailRemapStackString",
@@ -13990,11 +14249,7 @@
           "AbortController",
           "AbortSignal",
           "addEventListener",
-          "afterAll",
-          "afterEach",
           "alert",
-          "beforeAll",
-          "beforeEach",
           "Blob",
           "BroadcastChannel",
           "Buffer",
@@ -14004,23 +14259,17 @@
           "CloseEvent",
           "confirm",
           "crypto",
-          "Crypto",
-          "CryptoKey",
           "CustomEvent",
-          "describe",
           "dispatchEvent",
           "DOMException",
           "ErrorEvent",
           "Event",
           "EventTarget",
-          "expect",
-          "expectTypeOf",
           "fetch",
           "File",
           "FormData",
           "Headers",
           "HTMLRewriter",
-          "it",
           "MessageChannel",
           "MessageEvent",
           "MessagePort",
@@ -14036,6 +14285,7 @@
           "PerformanceServerTiming",
           "PerformanceTiming",
           "postMessage",
+          "process",
           "prompt",
           "removeEventListener",
           "reportError",
@@ -14048,18 +14298,12 @@
           "ShadowRealm",
           "SharedArrayBuffer",
           "structuredClone",
-          "SubtleCrypto",
           "SuppressedError",
-          "test",
           "TextEncoder",
           "URL",
-          "URLPattern",
           "URLSearchParams",
           "WebAssembly",
-          "Worker",
-          "xdescribe",
-          "xit",
-          "xtest"
+          "Worker"
         ]
       },
       "src/runtime_modules/bun/internal-for-testing.js": {
@@ -14171,6 +14415,58 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
+      "src/runtime_modules/bun/lazy-runtime.js": {
+        "file": "src/runtime_modules/bun/lazy-runtime.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "createLazyBuiltin",
+          "createLazyFunction",
+          "createLazyModule",
+          "createLazyObject",
+          "installLazyGlobal"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/bun/lazy-subsystems.js": {
+        "file": "src/runtime_modules/bun/lazy-subsystems.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "bunJSCBuiltin",
+          "bunSQLiteBuiltin",
+          "bunTestBuiltin",
+          "color",
+          "connect",
+          "dns",
+          "JSON5",
+          "listen",
+          "loadBunJSCModule",
+          "loadBunSQLiteModule",
+          "loadBunTestModule",
+          "loadColorModule",
+          "loadDNSModule",
+          "loadJSON5Module",
+          "loadRedisModule",
+          "loadS3Module",
+          "loadSocketModule",
+          "loadSQLModule",
+          "loadTOMLModule",
+          "loadWebSocketModule",
+          "loadYAMLModule",
+          "postgres",
+          "redis",
+          "RedisClient",
+          "s3",
+          "S3Client",
+          "sql",
+          "SQL",
+          "TOML",
+          "webSocketBuiltin",
+          "YAML"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/bun/mime-types.js": {
         "file": "src/runtime_modules/bun/mime-types.js",
         "hasDefaultExport": false,
@@ -14179,6 +14475,18 @@
         ],
         "bunObjectProperties": [],
         "globalProperties": []
+      },
+      "src/runtime_modules/bun/native-serve.js": {
+        "file": "src/runtime_modules/bun/native-serve.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "startNativeServe"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": [
+          "__cottontailProcessIpcPending",
+          "__cottontailRemapStackString"
+        ]
       },
       "src/runtime_modules/bun/node-fetch.js": {
         "file": "src/runtime_modules/bun/node-fetch.js",
@@ -14231,6 +14539,15 @@
           "s3",
           "S3Client",
           "s3File"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/bun/shell.js": {
+        "file": "src/runtime_modules/bun/shell.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "createBunShellFacade"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -14389,6 +14706,37 @@
         ],
         "bunObjectProperties": [],
         "globalProperties": []
+      },
+      "src/runtime_modules/bun/web-buffer-utils.js": {
+        "file": "src/runtime_modules/bun/web-buffer-utils.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "asBuffer",
+          "concatBuffers",
+          "concatManyBuffers"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/bun/web-primitives.js": {
+        "file": "src/runtime_modules/bun/web-primitives.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "createWebPrimitives"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/bun/web-request-response.js": {
+        "file": "src/runtime_modules/bun/web-request-response.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "createRequestResponseRuntime"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": [
+          "File"
+        ]
       },
       "src/runtime_modules/bun/yaml.js": {
         "file": "src/runtime_modules/bun/yaml.js",
@@ -14606,6 +14954,25 @@
           "__cottontailLoadDotenv"
         ]
       },
+      "src/runtime_modules/internal/eval-commonjs-fast.js": {
+        "file": "src/runtime_modules/internal/eval-commonjs-fast.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "installFastEvalCommonJsBuiltins"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/internal/file-url.js": {
+        "file": "src/runtime_modules/internal/file-url.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "fileURLToPath",
+          "pathToFileURL"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/internal/jsc-value-serialization.js": {
         "file": "src/runtime_modules/internal/jsc-value-serialization.js",
         "hasDefaultExport": false,
@@ -14633,8 +15000,8 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
-      "src/runtime_modules/internal/runtime-bootstrap.js": {
-        "file": "src/runtime_modules/internal/runtime-bootstrap.js",
+      "src/runtime_modules/internal/runtime-bootstrap-core.js": {
+        "file": "src/runtime_modules/internal/runtime-bootstrap-core.js",
         "hasDefaultExport": true,
         "namedExports": [
           "Bun",
@@ -14645,10 +15012,19 @@
         "globalProperties": [
           "__cottontailFormatUncaughtException",
           "__cottontailNormalizeUncaughtException",
-          "__cottontailRemapStackString",
-          "__cottontailSourceContextForLocation",
           "Bun"
         ]
+      },
+      "src/runtime_modules/internal/runtime-bootstrap.js": {
+        "file": "src/runtime_modules/internal/runtime-bootstrap.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "Bun",
+          "installRuntimeBootstrap",
+          "process"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
       },
       "src/runtime_modules/internal/runtime-options.js": {
         "file": "src/runtime_modules/internal/runtime-options.js",
@@ -14671,6 +15047,16 @@
         "globalProperties": [
           "__cottontailStandaloneFlags",
           "process"
+        ]
+      },
+      "src/runtime_modules/internal/runtime-stack-remap.js": {
+        "file": "src/runtime_modules/internal/runtime-stack-remap.js",
+        "hasDefaultExport": false,
+        "namedExports": [],
+        "bunObjectProperties": [],
+        "globalProperties": [
+          "__cottontailRemapStackString",
+          "__cottontailSourceContextForLocation"
         ]
       },
       "src/runtime_modules/internal/runtime-transpiler-cache.js": {
@@ -15423,6 +15809,7 @@
         "namedExports": [
           "cpPromiseImpl",
           "cpSyncImpl",
+          "nativeCopyError",
           "normalizeCopyPath"
         ],
         "bunObjectProperties": [],
@@ -15561,6 +15948,8 @@
           "lstatSync",
           "lutimes",
           "lutimesSync",
+          "makeCopyFileError",
+          "makeFsError",
           "mkdir",
           "mkdirSync",
           "mkdtemp",
@@ -15571,6 +15960,9 @@
           "opendir",
           "opendirSync",
           "openSync",
+          "parseRmOptions",
+          "prepareCopyFile",
+          "prepareRm",
           "promises",
           "R_OK",
           "read",
@@ -15891,6 +16283,7 @@
         "file": "src/runtime_modules/node/module.js",
         "hasDefaultExport": true,
         "namedExports": [
+          "__createBundledRequire",
           "__importModule",
           "__runMain",
           "__setBuiltinModules",
@@ -15922,9 +16315,11 @@
           "getSourceMapsSupport",
           "globalPaths",
           "isBuiltin",
+          "loadEmbeddedRuntimeModule",
           "Module",
           "ns",
           "register",
+          "registerEmbeddedRuntimeModules",
           "registerHooks",
           "runMain",
           "setSourceMapsSupport",
@@ -15942,8 +16337,10 @@
           "__cottontailHotReloadHooks",
           "__cottontailImportModule",
           "__cottontailImportPluginModule",
+          "__cottontailProcessObject",
           "__cottontailRemapModuleStackString",
           "__cottontailResolvePluginEntrypoint",
+          "process",
           "ResolveMessage"
         ]
       },
@@ -17936,6 +18333,7 @@
       "__cottontailHeapObjectFinalizer",
       "__cottontailHeapObjectRefs",
       "__cottontailHotReloadHooks",
+      "__cottontailHttpServerRuntime",
       "__cottontailImportMetaResolve",
       "__cottontailImportMetaResolveSync",
       "__cottontailImportModule",
@@ -17957,6 +18355,7 @@
       "__cottontailPermissionFdPaths",
       "__cottontailProcessIpcGeneration",
       "__cottontailProcessIpcPending",
+      "__cottontailProcessObject",
       "__cottontailPromisePeekStates",
       "__cottontailProxyDetails",
       "__cottontailProxyRegistry",
@@ -18002,12 +18401,8 @@
       "AbortController",
       "AbortSignal",
       "addEventListener",
-      "afterAll",
-      "afterEach",
       "AggregateError",
       "alert",
-      "beforeAll",
-      "beforeEach",
       "Blob",
       "BroadcastChannel",
       "Buffer",
@@ -18021,18 +18416,13 @@
       "CloseEvent",
       "confirm",
       "crypto",
-      "Crypto",
-      "CryptoKey",
       "CustomEvent",
       "Date",
-      "describe",
       "dispatchEvent",
       "DOMException",
       "ErrorEvent",
       "Event",
       "EventTarget",
-      "expect",
-      "expectTypeOf",
       "exports",
       "fetch",
       "File",
@@ -18041,7 +18431,6 @@
       "fs",
       "Headers",
       "HTMLRewriter",
-      "it",
       "jest",
       "MessageChannel",
       "MessageEvent",
@@ -18080,21 +18469,15 @@
       "ShadowRealm",
       "SharedArrayBuffer",
       "structuredClone",
-      "SubtleCrypto",
       "SuppressedError",
-      "test",
       "TextEncoder",
       "URL",
-      "URLPattern",
       "URLSearchParams",
       "vi",
       "WebAssembly",
       "WebSocket",
       "Worker",
-      "workerData",
-      "xdescribe",
-      "xit",
-      "xtest"
+      "workerData"
     ]
   },
   "coverage": {
@@ -18885,7 +19268,13 @@
           "writevSync"
         ],
         "missing": [],
-        "extra": []
+        "extra": [
+          "makeCopyFileError",
+          "makeFsError",
+          "parseRmOptions",
+          "prepareCopyFile",
+          "prepareRm"
+        ]
       },
       "fs/promises": {
         "module": "present",
@@ -19101,13 +19490,16 @@
         "missing": [],
         "extra": [
           "$",
+          "__createBundledRequire",
           "__importModule",
           "__runMain",
           "__setBuiltinModules",
           "_clearBunPlugins",
           "_registerBunPlugin",
           "_resolveForImport",
-          "ns"
+          "loadEmbeddedRuntimeModule",
+          "ns",
+          "registerEmbeddedRuntimeModules"
         ]
       },
       "net": {
@@ -20370,6 +20762,7 @@
             "jest",
             "origin",
             "registerMacro",
+            "stripVTControlCharacters",
             "version_with_sha"
           ]
         },
@@ -20490,14 +20883,14 @@
       "commit": "18aefb2d2b36938316d27b5cb53089e97632f0c3",
       "snapshot": "compat/upstream/node/v24.11.1",
       "copiedFiles": 9615,
-      "discoveredRunnableFiles": 7015,
-      "enabled": 7015,
+      "discoveredRunnableFiles": 7021,
+      "enabled": 7021,
       "delegated": 0,
       "expectedFailure": 0,
       "disabled": 0,
       "notEnabled": 0,
-      "classifiedTests": 7015,
-      "trackedTests": 7015
+      "classifiedTests": 7021,
+      "trackedTests": 7021
     },
     "bun": {
       "version": "1.3.10",
@@ -20505,9 +20898,9 @@
       "snapshot": "compat/upstream/bun/v1.3.10",
       "copiedFiles": 8078,
       "discoveredRunnableFiles": 1445,
-      "enabled": 1338,
-      "delegated": 102,
-      "expectedFailure": 5,
+      "enabled": 1345,
+      "delegated": 100,
+      "expectedFailure": 0,
       "disabled": 0,
       "notEnabled": 0,
       "classifiedTests": 1445,
@@ -20518,17 +20911,17 @@
     "node": {
       "note": "Heuristic behavioral-readiness signal from inline COTTONTAIL-COMPAT comments, explicit unsupported/native markers, and Node-focused test files. This is not a conformance result.",
       "estimate": {
-        "implementedPercentLower": 75,
-        "implementedPercentUpper": 85,
-        "gapPercentLower": 15,
-        "gapPercentUpper": 25
+        "implementedPercentLower": 73,
+        "implementedPercentUpper": 83,
+        "gapPercentLower": 17,
+        "gapPercentUpper": 27
       },
       "signals": {
         "publicNodeModules": 58,
-        "nodeTestFiles": 108,
-        "compatMarkers": 20,
-        "modulesWithCompatMarkers": 14,
-        "explicitUnsupportedMarkers": 35,
+        "nodeTestFiles": 115,
+        "compatMarkers": 21,
+        "modulesWithCompatMarkers": 15,
+        "explicitUnsupportedMarkers": 37,
         "nativeAvailabilityGuards": 0,
         "modulesWithUnsupportedMarkers": 11
       },
@@ -20546,10 +20939,19 @@
           "name": "crypto",
           "file": "src/runtime_modules/node/crypto.js",
           "compatMarkers": 0,
-          "unsupportedMarkers": 10,
+          "unsupportedMarkers": 12,
           "nativeAvailabilityGuards": 0,
-          "tests": 4,
-          "gapScore": 20
+          "tests": 5,
+          "gapScore": 24
+        },
+        {
+          "name": "module",
+          "file": "src/runtime_modules/node/module.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 5,
+          "nativeAvailabilityGuards": 0,
+          "tests": 6,
+          "gapScore": 13
         },
         {
           "name": "process",
@@ -20559,15 +20961,6 @@
           "nativeAvailabilityGuards": 0,
           "tests": 18,
           "gapScore": 12
-        },
-        {
-          "name": "module",
-          "file": "src/runtime_modules/node/module.js",
-          "compatMarkers": 0,
-          "unsupportedMarkers": 5,
-          "nativeAvailabilityGuards": 0,
-          "tests": 5,
-          "gapScore": 10
         },
         {
           "name": "http2",
@@ -20584,7 +20977,7 @@
           "compatMarkers": 2,
           "unsupportedMarkers": 0,
           "nativeAvailabilityGuards": 0,
-          "tests": 11,
+          "tests": 13,
           "gapScore": 6
         },
         {
@@ -20620,7 +21013,7 @@
           "compatMarkers": 1,
           "unsupportedMarkers": 0,
           "nativeAvailabilityGuards": 0,
-          "tests": 11,
+          "tests": 13,
           "gapScore": 3
         },
         {
@@ -20749,43 +21142,51 @@
           "compatMarkers": [],
           "unsupportedMarkers": [
             {
-              "line": 1437,
+              "line": 1447,
               "text": "throw new TypeError(`Unsupported asymmetric key type: ${keyObject.asymmetricKeyType}`);"
             },
             {
-              "line": 1528,
+              "line": 1538,
               "text": "throw new Error(\"Unsupported encrypted PKCS#8 key\");"
             },
             {
-              "line": 1532,
+              "line": 1542,
               "text": "if (asn1Oid(kdfOid) !== pkcs8EncryptionOids.pbkdf2) throw new Error(\"Unsupported encrypted PKCS#8 key derivation function\");"
             },
             {
-              "line": 1545,
+              "line": 1555,
               "text": "if (!prf) throw new Error(\"Unsupported encrypted PKCS#8 PBKDF2 digest\");"
             },
             {
-              "line": 1550,
+              "line": 1560,
               "text": "if (!info || cipherParameters?.tag !== 0x04) throw new Error(\"Unsupported encrypted PKCS#8 cipher\");"
             },
             {
-              "line": 4493,
+              "line": 2622,
+              "text": "if (!supportedNativeEcCurves.includes(namedCurve)) throw new TypeError(`Unsupported EC JWK curve: ${jwk.crv}`);"
+            },
+            {
+              "line": 2635,
+              "text": "throw new TypeError(\"Unsupported JWK key type\");"
+            },
+            {
+              "line": 4420,
               "text": "throw webcryptoDomException(`Unsupported WebCrypto hash: ${name}`, \"NotSupportedError\");"
             },
             {
-              "line": 4562,
+              "line": 4489,
               "text": "if (!nodeCurve) throw webcryptoDomException(`Unsupported namedCurve: ${namedCurve}`, \"NotSupportedError\");"
             },
             {
-              "line": 4568,
+              "line": 4495,
               "text": "throw webcryptoDomException(`Unsupported WebCrypto generateKey algorithm: ${rawName}`, \"NotSupportedError\");"
             },
             {
-              "line": 4574,
+              "line": 4501,
               "text": "throw webcryptoDomException(`Unsupported key usage for ${algorithmName}`, \"SyntaxError\");"
             },
             {
-              "line": 4923,
+              "line": 4850,
               "text": "throw webcryptoDomException(\"unsupported algorithm\", \"NotSupportedError\");"
             }
           ],
@@ -20794,6 +21195,7 @@
             "tests/js/node-constants-zlib-crypto.ts",
             "tests/js/node-crypto-kdf-dh-surface.ts",
             "tests/js/node-crypto-keyobject-encryption.ts",
+            "tests/js/node-crypto-native-backend.ts",
             "tests/js/node-crypto-webcrypto-conformance.ts"
           ]
         },
@@ -20808,6 +21210,8 @@
           "tests": [
             "tests/js/node-fs-binary-io.ts",
             "tests/js/node-fs-focused-regressions.test.ts",
+            "tests/js/node-fs-native-bulk.test.ts",
+            "tests/js/node-fs-native-walk.test.ts",
             "tests/js/node-fs-source-conformance.ts",
             "tests/js/node-fs-surface.ts",
             "tests/js/node-fs-unlink-directory-link.ts",
@@ -20829,6 +21233,8 @@
           "tests": [
             "tests/js/node-fs-binary-io.ts",
             "tests/js/node-fs-focused-regressions.test.ts",
+            "tests/js/node-fs-native-bulk.test.ts",
+            "tests/js/node-fs-native-walk.test.ts",
             "tests/js/node-fs-source-conformance.ts",
             "tests/js/node-fs-surface.ts",
             "tests/js/node-fs-unlink-directory-link.ts",
@@ -20847,7 +21253,7 @@
           ],
           "unsupportedMarkers": [
             {
-              "line": 3908,
+              "line": 3927,
               "text": "throw new SyntaxError(`Unsupported proxy protocol: ${parsed.protocol}`);"
             }
           ],
@@ -20921,32 +21327,35 @@
         },
         "module": {
           "file": "src/runtime_modules/node/module.js",
-          "compatMarkers": [],
+          "compatMarkers": [
+            "Bun-targeted CJS build output is already a complete"
+          ],
           "unsupportedMarkers": [
             {
-              "line": 734,
+              "line": 763,
               "text": "throw new TypeError(`require() async module \"${descriptor.key}\" is unsupported. use \"await import()\" instead.`);"
             },
             {
-              "line": 739,
+              "line": 768,
               "text": "throw new TypeError(`require() async module \"${descriptor.key}\" is unsupported. use \"await import()\" instead.`);"
             },
             {
-              "line": 2855,
+              "line": 3068,
               "text": "throw new TypeError(`require() async module \"${filename}\" is unsupported. use \"await import()\" instead.`);"
             },
             {
-              "line": 2916,
+              "line": 3132,
               "text": "throw new TypeError(`require() async module \"${filename}\" is unsupported. use \"await import()\" instead.`);"
             },
             {
-              "line": 3814,
+              "line": 4085,
               "text": "throw new TypeError(`require() async module \"${filename}\" is unsupported. use \"await import()\" instead.`);"
             }
           ],
           "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-misc-modules-surface.ts",
+            "tests/js/node-module-cache-lifecycle.test.ts",
             "tests/js/node-module-direct-package-root.ts",
             "tests/js/node-module-loader-compat.test.ts",
             "tests/js/node-module-sourcemap-test426.test.ts",
@@ -21207,10 +21616,10 @@
       "note": "Source caveat and local test-inventory signals only. These are not conformance results and do not support a Bun compatibility percentage.",
       "signals": {
         "publicBunModules": 5,
-        "bunTestFiles": 72,
+        "bunTestFiles": 86,
         "compatMarkers": 19,
-        "modulesWithCompatMarkers": 7,
-        "explicitUnsupportedMarkers": 18,
+        "modulesWithCompatMarkers": 9,
+        "explicitUnsupportedMarkers": 19,
         "nativeAvailabilityGuards": 0,
         "modulesWithUnsupportedMarkers": 9
       },
@@ -21218,11 +21627,11 @@
         {
           "name": "bun",
           "file": "src/runtime_modules/bun/index.js",
-          "compatMarkers": 9,
+          "compatMarkers": 7,
           "unsupportedMarkers": 6,
           "nativeAvailabilityGuards": 0,
-          "tests": 72,
-          "gapScore": 39
+          "tests": 86,
+          "gapScore": 33
         },
         {
           "name": "bake-dev-server",
@@ -21257,7 +21666,7 @@
           "compatMarkers": 1,
           "unsupportedMarkers": 1,
           "nativeAvailabilityGuards": 0,
-          "tests": 3,
+          "tests": 4,
           "gapScore": 5
         },
         {
@@ -21267,6 +21676,15 @@
           "unsupportedMarkers": 1,
           "nativeAvailabilityGuards": 0,
           "tests": 17,
+          "gapScore": 5
+        },
+        {
+          "name": "encoding",
+          "file": "src/runtime_modules/bun/encoding.js",
+          "compatMarkers": 0,
+          "unsupportedMarkers": 2,
+          "nativeAvailabilityGuards": 0,
+          "tests": 0,
           "gapScore": 5
         },
         {
@@ -21288,13 +21706,13 @@
           "gapScore": 4
         },
         {
-          "name": "encoding",
-          "file": "src/runtime_modules/bun/encoding.js",
-          "compatMarkers": 0,
-          "unsupportedMarkers": 1,
+          "name": "web-request-response",
+          "file": "src/runtime_modules/bun/web-request-response.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
           "nativeAvailabilityGuards": 0,
           "tests": 0,
-          "gapScore": 3
+          "gapScore": 4
         },
         {
           "name": "internal-for-testing",
@@ -21303,6 +21721,15 @@
           "unsupportedMarkers": 1,
           "nativeAvailabilityGuards": 0,
           "tests": 0,
+          "gapScore": 3
+        },
+        {
+          "name": "shell",
+          "file": "src/runtime_modules/bun/shell.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
+          "tests": 5,
           "gapScore": 3
         },
         {
@@ -21366,7 +21793,11 @@
           "compatMarkers": [],
           "unsupportedMarkers": [
             {
-              "line": 563,
+              "line": 219,
+              "text": "throw new Error(`TextDecoder: the \"${this.encoding}\" encoding requires native converter support, which is unavailable in this build`);"
+            },
+            {
+              "line": 421,
               "text": "throw new Error(`TextDecoder: the \"${this.encoding}\" encoding requires ICU converter support, which is unavailable in this build`);"
             }
           ],
@@ -21380,7 +21811,7 @@
           ],
           "unsupportedMarkers": [
             {
-              "line": 3170,
+              "line": 3195,
               "text": "throw new TypeError(`Unsupported type ${String(type)}. Must be one of: ${supportedFFITypes}`);"
             }
           ],
@@ -21388,17 +21819,16 @@
           "tests": [
             "tests/js/bun-ffi-compat.test.ts",
             "tests/js/bun-ffi-int64-returns.test.ts",
+            "tests/js/bun-ffi-prepared-calls.test.ts",
             "tests/js/bun-ffi-surface.ts"
           ]
         },
         "bun": {
           "file": "src/runtime_modules/bun/index.js",
           "compatMarkers": [
-            "Bun.$ native interpreter - the production parser,",
             "spawn argv0 - Cottontail children use this internal",
-            "Avoid copying large ASCII form fields when every byte is",
             "A completed response can outlive its agent lease.",
-            "A pending fetch remains referenced while body",
+            "Async body preparation can precede creation of the",
             "Fetch uses Node Transform decoder output and propagates",
             "The in-process fetch fast path has no OS client fd;",
             "Bun.serve drains an unread upload after the handler",
@@ -21406,27 +21836,27 @@
           ],
           "unsupportedMarkers": [
             {
-              "line": 8486,
+              "line": 3615,
               "text": "throw new TypeError(`Unsupported URL scheme: ${parsedUrl.protocol}`);"
             },
             {
-              "line": 17327,
+              "line": 12038,
               "text": "if (!(label in passwordAlgorithmIds)) throw new TypeError(\"Unsupported password algorithm\");"
             },
             {
-              "line": 17358,
+              "line": 12069,
               "text": "throw new TypeError(\"Unsupported password algorithm\");"
             },
             {
-              "line": 17731,
+              "line": 12442,
               "text": "throw new TypeError(`Unsupported CSRF token encoding: ${encoding}`);"
             },
             {
-              "line": 17747,
+              "line": 12458,
               "text": "throw new TypeError(`Unsupported CSRF token encoding: ${encoding}`);"
             },
             {
-              "line": 18936,
+              "line": 12903,
               "text": "throw new TypeError(`WebAssembly response has unsupported MIME type '${type}'`);"
             }
           ],
@@ -21434,6 +21864,7 @@
           "tests": [
             "tests/js/bun-apis.js",
             "tests/js/bun-build-compile-native.test.ts",
+            "tests/js/bun-build-css-stress.test.ts",
             "tests/js/bun-build-error.ts",
             "tests/js/bun-build-html-no-bundle.test.ts",
             "tests/js/bun-build-native.ts",
@@ -21441,6 +21872,8 @@
             "tests/js/bun-build-windows-metadata.test.ts",
             "tests/js/bun-cjs-interop.ts",
             "tests/js/bun-color-source-conformance.test.ts",
+            "tests/js/bun-cryptohasher-native.test.ts",
+            "tests/js/bun-data-parser-native.test.ts",
             "tests/js/bun-direct-readable-stream.test.ts",
             "tests/js/bun-dns-cache.ts",
             "tests/js/bun-dns-rejects-matcher.test.ts",
@@ -21448,15 +21881,22 @@
             "tests/js/bun-fetch-verbose.test.ts",
             "tests/js/bun-ffi-compat.test.ts",
             "tests/js/bun-ffi-int64-returns.test.ts",
+            "tests/js/bun-ffi-prepared-calls.test.ts",
             "tests/js/bun-ffi-surface.ts",
             "tests/js/bun-file-io-parity.test.ts",
+            "tests/js/bun-file-mime-native.test.ts",
+            "tests/js/bun-glob-native.test.ts",
             "tests/js/bun-global.ts",
             "tests/js/bun-http-focused.test.ts",
+            "tests/js/bun-index-of-line-native.test.ts",
+            "tests/js/bun-jest-module-identity.test.ts",
             "tests/js/bun-jsc-and-global.ts",
+            "tests/js/bun-lazy-runtime.test.ts",
             "tests/js/bun-native-plugin.ts",
             "tests/js/bun-net-socket-compat.test.ts",
             "tests/js/bun-package-manager-internals.ts",
             "tests/js/bun-plugin-lifecycle.test.ts",
+            "tests/js/bun-random-uuid-native.test.ts",
             "tests/js/bun-redis-client.test.ts",
             "tests/js/bun-repl.ts",
             "tests/js/bun-resolver-source-port.test.ts",
@@ -21477,12 +21917,15 @@
             "tests/js/bun-spawn-execpath-env.ts",
             "tests/js/bun-spawn-ipc-contract.test.ts",
             "tests/js/bun-spawn-native-routing.test.ts",
+            "tests/js/bun-spawn-pipe-lifecycle.test.ts",
             "tests/js/bun-spawn-readable-stream.test.ts",
             "tests/js/bun-spawn-streaming.ts",
             "tests/js/bun-spawn-sync-native.test.ts",
             "tests/js/bun-sql-mysql-adapter.test.ts",
             "tests/js/bun-sql-postgres-adapter.test.ts",
             "tests/js/bun-sqlite.ts",
+            "tests/js/bun-string-width-native.test.ts",
+            "tests/js/bun-strip-ansi.test.ts",
             "tests/js/bun-test-asymmetric.ts",
             "tests/js/bun-test-ci-snapshot-diagnostics.test.ts",
             "tests/js/bun-test-cjs-top-level-await.test.ts",
@@ -21503,6 +21946,7 @@
             "tests/js/bun-transpiled-dynamic-import.js",
             "tests/js/bun-transpiler-repeat.test.ts",
             "tests/js/bun-typescript-compiler-parity.test.ts",
+            "tests/js/bun-which-native.test.ts",
             "tests/js/bun-which-windows-extension.ts"
           ]
         },
@@ -21511,12 +21955,27 @@
           "compatMarkers": [],
           "unsupportedMarkers": [
             {
-              "line": 681,
+              "line": 704,
               "text": "throw new Error(\"socketpair is unavailable in this Cottontail build\");"
             }
           ],
           "nativeAvailabilityGuards": [],
           "tests": []
+        },
+        "shell": {
+          "file": "src/runtime_modules/bun/shell.js",
+          "compatMarkers": [
+            "Bun.$ native interpreter - the production parser,"
+          ],
+          "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
+          "tests": [
+            "tests/js/bun-shell-long-top-level-await.ts",
+            "tests/js/bun-shell-positional-seq-regressions.test.ts",
+            "tests/js/bun-shell-runtime.test.ts",
+            "tests/js/bun-shell-source-port.test.ts",
+            "tests/js/bun-shell-subshell-background-regressions.test.ts"
+          ]
         },
         "socket": {
           "file": "src/runtime_modules/bun/socket.js",
@@ -21537,23 +21996,23 @@
           "compatMarkers": [],
           "unsupportedMarkers": [
             {
-              "line": 549,
+              "line": 508,
               "text": "if (text[offset++] !== \"{\") throw postgresProtocolError(\"Unsupported PostgreSQL array format\");"
             },
             {
-              "line": 654,
+              "line": 613,
               "text": "throw postgresProtocolError(`Unsupported PostgreSQL binary result for type ${column.typeOID}`);"
             },
             {
-              "line": 1917,
+              "line": 1847,
               "text": "if (payload[0] !== 10) throw mysqlProtocolError(`Unsupported MySQL protocol version: ${payload[0]}`);"
             },
             {
-              "line": 2010,
+              "line": 1940,
               "text": "throw mysqlProtocolError(`Unsupported MySQL authentication plugin: ${plugin}`, \"ERR_MYSQL_UNSUPPORTED_AUTH_PLUGIN\");"
             },
             {
-              "line": 2476,
+              "line": 2362,
               "text": "throw mysqlProtocolError(`Unsupported MySQL authentication continuation: ${status}`);"
             }
           ],
@@ -21614,6 +22073,15 @@
           "file": "src/runtime_modules/bun/utf-8-validate.js",
           "compatMarkers": [
             "Bun replaces the optional utf-8-validate native addon"
+          ],
+          "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
+          "tests": []
+        },
+        "web-request-response": {
+          "file": "src/runtime_modules/bun/web-request-response.js",
+          "compatMarkers": [
+            "Avoid copying large ASCII form fields when every byte is"
           ],
           "unsupportedMarkers": [],
           "nativeAvailabilityGuards": [],

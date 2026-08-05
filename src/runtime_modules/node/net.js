@@ -222,6 +222,44 @@ function installFdWatchDispatcher() {
   return listeners;
 }
 
+// fd watch events must never run socket/user code synchronously from the
+// native fd-event dispatch. The native dispatcher holds a reentrancy guard
+// (dispatching_fd_events) for the whole drain, and JSC drains microtasks on
+// each JSLock release inside that window — a microtask that synchronously
+// blocks on cottontail.waitForPromise (bun:test promise matchers do this)
+// then spins a nested event-loop tick whose fd dispatch early-returns on the
+// guard, so any event still queued natively (e.g. the peer EOF the promise
+// is waiting for) is never delivered and the loop deadlocks. Timer
+// callbacks have no such guard and are dispatched by every (including
+// nested) tick, so queue the event and flush it from a 0ms timer instead.
+// (process.nextTick was tried here: the JS-side nextTick drain is not
+// reentrant and deadlocks the same way.) FIFO order across sockets is
+// preserved; per-socket ordering is preserved by the queue.
+const fdEventPumpQueue = [];
+let fdEventPumpTimer = null;
+function armFdEventPump() {
+  if (fdEventPumpTimer != null) return;
+  fdEventPumpTimer = globalThis.setTimeout(flushFdEventPump, 0);
+}
+function flushFdEventPump() {
+  fdEventPumpTimer = null;
+  try {
+    while (fdEventPumpQueue.length > 0) {
+      const entry = fdEventPumpQueue.shift();
+      entry.handler(entry.event);
+    }
+  } finally {
+    if (fdEventPumpQueue.length > 0) armFdEventPump();
+  }
+}
+function enqueueFdEventForPump(handler, event) {
+  fdEventPumpQueue.push({ handler, event });
+  armFdEventPump();
+}
+function pumpFdEventHandler(handler) {
+  return (event) => enqueueFdEventForPump(handler, event);
+}
+
 function pendingConnectIdForAcceptedSocket(socket) {
   const localPort = Number(socket?.localPort);
   const localAddress = socket?.localAddress;
@@ -258,7 +296,7 @@ function startAcceptWatch(target, fd, referenced, onReadable, onError = (error) 
   if (!watchId) return false;
 
   target._acceptWatchId = watchId;
-  listeners.set(watchId, _wrapAsyncCallback((event) => {
+  listeners.set(watchId, pumpFdEventHandler(_wrapAsyncCallback((event) => {
     if (target._acceptWatchId !== watchId) return;
     if (event.type === "readable") {
       try {
@@ -277,7 +315,7 @@ function startAcceptWatch(target, fd, referenced, onReadable, onError = (error) 
       if (event.errno != null) error.errno = Number(event.errno);
       onError(error);
     }
-  }));
+  })));
   target._unregisterAcceptWatch = () => listeners.delete(watchId);
   return true;
 }
@@ -692,6 +730,14 @@ class SocketImpl extends Duplex {
     this.fd = Number(fd);
     this._nativeShutdownSent = false;
     this._nativeReadPaused = false;
+    // A destroy from a previous life on this socket object schedules
+    // readable-stream's deferred close bookkeeping (emitCloseNT), which can
+    // land after _undestroy() already reset the state. Attaching a fresh fd
+    // means a new life has begun; stale close flags must not leak into it —
+    // writableState.closeEmitted would make needFinish() false forever and
+    // hang a following end().
+    if (this._writableState) this._writableState.closeEmitted = false;
+    if (this._readableState) this._readableState.closeEmitted = false;
     if (this._adoptedRawHandle && "fd" in this._adoptedRawHandle) {
       try { this._adoptedRawHandle.fd = this.fd; } catch {}
     }
@@ -726,7 +772,7 @@ class SocketImpl extends Duplex {
     if (!watchId) return false;
     this._watchId = watchId;
     this._watchWriteOnly = true;
-    fdWatchListeners.set(watchId, _wrapAsyncCallback((event) => {
+    fdWatchListeners.set(watchId, pumpFdEventHandler(_wrapAsyncCallback((event) => {
       if (this._watchId !== watchId || this.destroyed) return;
       if (event.type === "writable") {
         this._flushOutboundWrites();
@@ -738,7 +784,7 @@ class SocketImpl extends Duplex {
         if (event.errno != null) error.errno = Number(event.errno);
         this._failOutboundWrites(error);
       }
-    }));
+    })));
     this._unregisterWatch = () => fdWatchListeners.delete(watchId);
     return true;
   }
@@ -911,6 +957,14 @@ class SocketImpl extends Duplex {
   }
 
   _failOutboundWrites(error) {
+    if (error != null && !(error instanceof Error)) {
+      // Native fd-write bindings throw bare strerror strings; stream error
+      // paths and fetch's pooled-retry flagging require an Error.
+      const message = String(error);
+      error = new Error(message);
+      if (/broken pipe/i.test(message)) error.code = "EPIPE";
+      else if (/connection reset/i.test(message)) error.code = "ECONNRESET";
+    }
     const pending = this._outboundWrites.splice(0);
     for (const entry of pending) {
       if (typeof entry.callback === "function") queueMicrotask(() => entry.callback(error));
@@ -1109,13 +1163,16 @@ class SocketImpl extends Duplex {
     this._watchId = Number(watch?.id || 0);
     if (!this._watchId) return this;
     const watchId = this._watchId;
-    fdWatchListeners.set(watchId, _wrapAsyncCallback((event) => {
+    fdWatchListeners.set(watchId, pumpFdEventHandler(_wrapAsyncCallback((event) => {
       if (this.destroyed) {
         if (this._destroyFinalize != null && event.type !== "data" && event.type !== "writable") {
           this._finishDeferredDestroy();
         }
         return;
       }
+      // The pump widens the window between native queueing and delivery; drop
+      // events from a watch this socket has since replaced (e.g. reconnect).
+      if (this._watchId !== watchId) return;
       if (event.type === "writable") {
         this._flushOutboundWrites();
         this.__cottontailBunWritable?.();
@@ -1152,7 +1209,7 @@ class SocketImpl extends Duplex {
         if (event.errno != null) error.errno = Number(event.errno);
         this.destroy(error);
       }
-    }));
+    })));
     this._unregisterWatch = () => {
       fdWatchListeners.delete(watchId);
     };
@@ -1193,6 +1250,9 @@ class SocketImpl extends Duplex {
     if (!this.destroyed && (this.fd != null || this._watchId)) this._destroyImmediately();
     this._finishDeferredDestroy();
 
+    // Anything deferred from the old connection (e.g. the close event timer)
+    // checks this generation before touching the new life's state.
+    this._lifeGeneration = (this._lifeGeneration ?? 0) + 1;
     this._undestroy();
     this.connecting = false;
     this.fd = null;
@@ -1814,7 +1874,14 @@ class SocketImpl extends Duplex {
       this._nativeHandleTransferred = false;
       if (!this._closeEmitted) {
         this._closeEmitted = true;
-        const closeTimer = setTimeout(() => this.emit("close", Boolean(error)), 0);
+        // The emission is deferred; if the socket is reconnected before the
+        // timer fires, the stale close must not land in the new life (it
+        // would set closeEmitted on the fresh stream state, which
+        // needFinish() requires to be false, and mislead user listeners).
+        const closeLifeGeneration = this._lifeGeneration ?? 0;
+        const closeTimer = setTimeout(() => {
+          if ((this._lifeGeneration ?? 0) === closeLifeGeneration) this.emit("close", Boolean(error));
+        }, 0);
         if (!this._refed) closeTimer.unref?.();
       }
     };

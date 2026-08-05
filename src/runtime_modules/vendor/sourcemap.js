@@ -944,7 +944,9 @@ export function formatUncaughtBundleError(error) {
           /^\s*at\s+.*?\s+\((.+):(\d+):(\d+)\)$/.exec(frameLine) ??
           /^\s*at\s+(.+):(\d+):(\d+)$/.exec(frameLine);
         if (!frame) continue;
-        const header = Error.prototype.toString.call(error);
+        const header = error?.name === "AssertionError" && error?.code === "ERR_ASSERTION"
+          ? `AssertionError [ERR_ASSERTION]: ${error.message}`
+          : Error.prototype.toString.call(error);
         error.stack = `${header}\n    at ${frame[1]}:${frame[2]}:${frame[3]}`;
         Object.defineProperty(error, "__cottontailFormattedStack", { value: true, configurable: true });
         return true;
@@ -966,7 +968,12 @@ export function formatUncaughtBundleError(error) {
         codeFrame.push(`${sourceLine} | ${context.lines[sourceLine - 1]}`);
       }
       codeFrame.push(`${" ".repeat(String(line).length + 3 + Math.max(0, column - 1))}^`);
-      const label = String(error?.name ?? "Error") === "Error" ? "error" : String(error.name);
+      const errorName = String(error?.name ?? "Error");
+      const label = errorName === "Error"
+        ? "error"
+        : errorName === "AssertionError" && error?.code === "ERR_ASSERTION"
+          ? "AssertionError [ERR_ASSERTION]"
+          : errorName;
       codeFrame.push(`${label}: ${String(error?.message ?? "")}`);
       codeFrame.push(`    at ${context.source}:${line}:${column}`);
       error.stack = codeFrame.join("\n");

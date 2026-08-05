@@ -6,9 +6,17 @@ import {
   statSync,
   writeFileSync,
 } from "../node/fs.js";
-import reactClientSource from "./bake-react-client.txt";
-import reactServerSource from "./bake-react-server.txt";
-import reactSsrSource from "./bake-react-ssr.txt";
+import reactClientModule from "./bake-react-client.txt";
+import reactServerModule from "./bake-react-server.txt";
+import reactSsrModule from "./bake-react-ssr.txt";
+
+// COTTONTAIL-COMPAT: When this module is loaded through the runtime CJS
+// pipeline (loadEmbeddedRuntimeModule), a .txt import arrives as the module
+// namespace ({ default: text }) instead of the text itself.
+export const textModuleSource = (value) => (typeof value === "string" ? value : value?.default);
+const reactClientSource = textModuleSource(reactClientModule);
+const reactServerSource = textModuleSource(reactServerModule);
+const reactSsrSource = textModuleSource(reactSsrModule);
 
 const javascriptExtensions = [".tsx", ".ts", ".jsx", ".js", ".mts", ".mjs", ".cts", ".cjs"];
 const transpilers = new Map();

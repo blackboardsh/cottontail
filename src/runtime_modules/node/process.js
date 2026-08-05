@@ -465,7 +465,7 @@ function makeMemoryUsage() {
   return processInfo("memoryUsage");
 }
 
-makeMemoryUsage.rss = () => Number(processInfo("memoryUsage").rss) || 0;
+makeMemoryUsage.rss = () => Number(processInfo("rss")) || 0;
 
 function pickConstants(predicate) {
   const out = {};
@@ -1590,17 +1590,25 @@ processObject.domain ??= null;
 processObject._exiting ??= false;
 processObject.exitCode ??= undefined;
 
-let mainModuleOverride;
-let hasMainModuleOverride = false;
+const mainModuleStateKey = Symbol.for("cottontail.node.mainModuleState");
+const mainModuleState = globalThis[mainModuleStateKey] ??= {
+  current: null,
+  hasOverride: false,
+  override: undefined,
+};
 
 function findMainModule() {
+  if (mainModuleState.current != null) return mainModuleState.current;
   try {
     const moduleBuiltin = processObject.getBuiltinModule?.("module");
     const cache = moduleBuiltin?._cache ?? moduleBuiltin?.default?._cache;
     if (cache == null || typeof cache !== "object") return undefined;
     for (const filename of Reflect.ownKeys(cache)) {
       const candidate = cache[filename];
-      if (candidate?.id === ".") return candidate;
+      if (candidate?.id === ".") {
+        mainModuleState.current = candidate;
+        return candidate;
+      }
     }
   } catch {}
   return undefined;
@@ -1609,13 +1617,13 @@ function findMainModule() {
 if (!Object.hasOwn(processObject, "mainModule")) {
   Object.defineProperty(processObject, "mainModule", {
     get() {
-      return hasMainModuleOverride ? mainModuleOverride : findMainModule();
+      return mainModuleState.hasOverride ? mainModuleState.override : findMainModule();
     },
     set(value) {
       const detected = findMainModule();
-      if (!hasMainModuleOverride && value === detected) return;
-      hasMainModuleOverride = true;
-      mainModuleOverride = value;
+      if (!mainModuleState.hasOverride && value === detected) return;
+      mainModuleState.hasOverride = true;
+      mainModuleState.override = value;
     },
     enumerable: true,
     configurable: true,

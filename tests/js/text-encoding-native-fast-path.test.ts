@@ -1,6 +1,21 @@
 import { describe, expect, test } from "bun:test";
 
 describe("native text encoding fast paths", () => {
+  test("concatenates transient HTTP body chunks without changing their bytes", () => {
+    const result = globalThis.cottontail.concatHttpBodyChunks([
+      Uint8Array.of(0, 1, 2),
+      new Uint8Array([3, 4]).subarray(1),
+      new ArrayBuffer(0),
+      Uint8Array.of(5),
+    ]);
+    expect(result).toBeInstanceOf(ArrayBuffer);
+    expect(Array.from(new Uint8Array(result))).toEqual([0, 1, 2, 4, 5]);
+    const empty = globalThis.cottontail.concatHttpBodyChunks([]);
+    expect(empty.byteLength).toBe(0);
+    expect(Array.from(new Uint8Array(empty))).toEqual([]);
+    expect(() => globalThis.cottontail.concatHttpBodyChunks(["invalid"])).toThrow(TypeError);
+  });
+
   test("does not take the one-shot path after streaming state exists", () => {
     const decoder = new TextDecoder();
     expect(decoder.decode(Uint8Array.of(0xe2), { stream: true })).toBe("");

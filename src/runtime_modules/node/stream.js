@@ -3,6 +3,7 @@
 // See ./stream/readable-stream.js (generated bundle; MIT licensed).
 import Stream from "./stream/readable-stream.js";
 import { _wrapAsyncCallback } from "./async_hooks.js";
+import { __setBuiltinModules } from "./module.js";
 
 export const Readable = Stream.Readable;
 export const Writable = Stream.Writable;
@@ -705,6 +706,8 @@ Duplex.fromWeb = function fromWeb(pair, options) {
 Duplex.toWeb = function toWeb(duplex) {
   return newReadableWritablePairFromDuplex(duplex);
 };
+
+__setBuiltinModules({ stream: Stream, "node:stream": Stream });
 
 export { Stream };
 export default Stream;

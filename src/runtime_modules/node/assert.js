@@ -1,4 +1,9 @@
-import { internalRequire } from "./util/internal/loader.js";
+let internalRequireImplementation;
+
+function internalRequire(id) {
+  internalRequireImplementation ??= require("./util/internal/loader.js").internalRequire;
+  return internalRequireImplementation(id);
+}
 
 const kAssertOptions = Symbol("assert options");
 

@@ -24,6 +24,21 @@ function run(directory: string, args: string[], env: Record<string, string | und
   return { ...result, stderrText: String(result.stderr ?? "") };
 }
 
+function runDirect(directory: string, args: string[]) {
+  const result = Bun.spawnSync([process.execPath, join(directory, "sample.test.ts"), ...args], {
+    cwd: directory,
+    env: { ...process.env, AGENT: "0" },
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  return {
+    ...result,
+    stdoutText: String(result.stdout ?? ""),
+    stderrText: String(result.stderr ?? ""),
+  };
+}
+
 test("Bun CLI validates bail and timeout before discovery", () => {
   const directory = fixture({ "sample.test.ts": `import { test } from "bun:test"; test("ok", () => {});` });
   try {
@@ -37,6 +52,31 @@ test("Bun CLI validates bail and timeout before discovery", () => {
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("Bun CLI applies timeout flags to test bodies", () => {
+  const directory = fixture({
+    "sample.test.ts": `
+      import { test } from "bun:test";
+      test("wait", async () => { await Bun.sleep(40); });
+    `,
+  });
+  try {
+    const short = run(directory, ["--timeout=5"]);
+    expect(short.exitCode).toBe(1);
+    expect(short.stderrText).toContain("timed out after 5ms");
+
+    const long = run(directory, ["--timeout", "100"]);
+    expect(long.exitCode).toBe(0);
+    expect(long.stderrText).toContain("(pass) wait");
+
+    const direct = runDirect(directory, ["--timeout=100"]);
+    expect(direct.exitCode).toBe(0);
+    expect(direct.stdoutText.match(/bun test v/g)).toHaveLength(1);
+    expect(direct.stderrText).toContain("(pass) wait");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}, { timeout: 30_000 });
 
 test("Bun CLI validates retry and rerun-each options", () => {
   const directory = fixture({ "sample.test.ts": `import { test } from "bun:test"; test("ok", () => {});` });

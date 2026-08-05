@@ -31,6 +31,100 @@ static bool ct_direct_buffer_index(
     return true;
 }
 
+static CtJscEncodedValue ct_direct_concat_http_body_chunks(
+    CtJscInvocation *invocation,
+    void *user_data
+) {
+    (void)user_data;
+    if (ct_jsc_invocation_argument_count(invocation) < 1) {
+        return ct_jsc_throw_type_error(invocation, "concatHttpBodyChunks requires an array");
+    }
+
+    JSContextRef context = ct_jsc_invocation_context_ref(invocation);
+    JSValueRef chunks_value = ct_jsc_value_get_ref(
+        invocation,
+        ct_jsc_invocation_argument(invocation, 0)
+    );
+    if (!JSValueIsObject(context, chunks_value)) {
+        return ct_jsc_throw_type_error(invocation, "concatHttpBodyChunks requires an array");
+    }
+
+    JSObjectRef chunks = (JSObjectRef)chunks_value;
+    JSValueRef exception = NULL;
+    JSValueRef length_value = ct_get_property(context, chunks, "length", &exception);
+    if (exception != NULL) return ct_jsc_throw_value_ref(invocation, exception);
+    const double length_number = JSValueToNumber(context, length_value, &exception);
+    if (exception != NULL) return ct_jsc_throw_value_ref(invocation, exception);
+    if (!isfinite(length_number) || length_number < 0 ||
+        floor(length_number) != length_number || length_number > UINT32_MAX) {
+        return ct_jsc_throw_type_error(invocation, "concatHttpBodyChunks received an invalid array length");
+    }
+
+    const uint32_t count = (uint32_t)length_number;
+    size_t total = 0;
+    for (uint32_t index = 0; index < count; index += 1) {
+        JSValueRef value = JSObjectGetPropertyAtIndex(context, chunks, index, &exception);
+        if (exception != NULL) return ct_jsc_throw_value_ref(invocation, exception);
+        uint8_t *data = NULL;
+        size_t length = 0;
+        if (ct_get_bytes(context, value, &data, &length) != 0) {
+            return ct_jsc_throw_type_error(
+                invocation,
+                "concatHttpBodyChunks entries must be ArrayBuffers or typed arrays"
+            );
+        }
+        if (length > SIZE_MAX - total) {
+            return ct_jsc_throw_error(invocation, "concatHttpBodyChunks result is too large");
+        }
+        total += length;
+    }
+
+    if (total == 0) {
+        JSValueRef result = ct_array_buffer_from_copy(context, NULL, 0, &exception);
+        if (exception != NULL) return ct_jsc_throw_value_ref(invocation, exception);
+        return ct_jsc_value_from_ref(invocation, result);
+    }
+
+    char *output = ct_http_body_chunk_alloc(total);
+    if (output == NULL) return ct_jsc_throw_error(invocation, "Out of memory");
+    size_t offset = 0;
+    for (uint32_t index = 0; index < count; index += 1) {
+        JSValueRef value = JSObjectGetPropertyAtIndex(context, chunks, index, &exception);
+        if (exception != NULL) {
+            ct_http_body_chunk_free(output, total);
+            return ct_jsc_throw_value_ref(invocation, exception);
+        }
+        uint8_t *data = NULL;
+        size_t length = 0;
+        if (ct_get_bytes(context, value, &data, &length) != 0 || length > total - offset) {
+            ct_http_body_chunk_free(output, total);
+            return ct_jsc_throw_type_error(
+                invocation,
+                "concatHttpBodyChunks entries changed while being read"
+            );
+        }
+        if (length > 0) memcpy(output + offset, data, length);
+        offset += length;
+    }
+    if (offset != total) {
+        ct_http_body_chunk_free(output, total);
+        return ct_jsc_throw_type_error(
+            invocation,
+            "concatHttpBodyChunks entries changed while being read"
+        );
+    }
+
+    JSValueRef result = ct_array_buffer_take_http_body_chunk(
+        context,
+        &output,
+        total,
+        &exception
+    );
+    ct_http_body_chunk_free(output, total);
+    if (exception != NULL) return ct_jsc_throw_value_ref(invocation, exception);
+    return ct_jsc_value_from_ref(invocation, result);
+}
+
 static CtJscEncodedValue ct_direct_buffer_compare(
     CtJscInvocation *invocation,
     void *user_data
@@ -577,6 +671,18 @@ static CtJscEncodedValue ct_direct_text_decode(
         ct_jsc_invocation_argument(invocation, 3)
     );
     const CtTextEncoding encoding = (CtTextEncoding)(int)encoding_number;
+    if (encoding == CT_TEXT_ENCODING_UTF8) {
+        bool is_ascii = true;
+        for (size_t index = 0; index < bytes.length; index += 1) {
+            if (bytes.data[index] > 0x7f) {
+                is_ascii = false;
+                break;
+            }
+        }
+        if (is_ascii) {
+            return ct_jsc_make_latin1_string(invocation, bytes.data, bytes.length);
+        }
+    }
     JSContextRef context = ct_jsc_invocation_context_ref(invocation);
     JSValueRef exception = NULL;
     JSValueRef result = NULL;

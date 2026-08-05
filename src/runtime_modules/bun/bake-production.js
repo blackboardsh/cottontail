@@ -356,8 +356,9 @@ async function writeStandardESM(result, filename) {
   const artifact = result.outputs.find(output => output.kind === "entry-point") ?? result.outputs[0];
   if (!artifact) throw new Error(`Bake build did not emit ${filename}`);
   mkdirSync(path.dirname(filename), { recursive: true });
-  writeFileSync(filename, await artifact.text());
-  return filename;
+  const source = await artifact.text();
+  writeFileSync(filename, source);
+  return { filename, source };
 }
 
 function inlineSourceMap(source) {
@@ -580,7 +581,7 @@ async function loadServerRoute(context, route) {
     if (isCssArtifact(output)) serverStyles.push(url);
   }
   const filename = path.join(context.tempRoot, `route-${route.index}.mjs`);
-  await writeStandardESM(result, filename);
+  const written = await writeStandardESM(result, filename);
   const exports = await import(pathToFileURL(filename).href);
   if (exports.framework === null || typeof exports.framework !== "object") {
     throw new TypeError(`Bake server entrypoint for ${route.page} did not produce a module namespace`);
@@ -590,6 +591,10 @@ async function loadServerRoute(context, route) {
     layouts: exports.layouts ?? [],
     pageModule: exports.pageModule,
     styles: [...new Set([...serverStyles, ...route.client.styles])],
+    // The route bundle is loaded through a native dynamic import, so errors
+    // it throws never pick up the dynamic-module source metadata that
+    // formatBakeProductionError needs to map them back to original sources.
+    errorSource: { filename: written.filename, source: written.source },
   };
 }
 
@@ -711,6 +716,12 @@ async function prerenderRoute(context, initialRoute, params) {
       );
     } catch (error) {
       if (!(error instanceof Response)) {
+        if (error != null && error[dynamicErrorSourceSymbol] == null && route.server.errorSource != null) {
+          Object.defineProperty(error, dynamicErrorSourceSymbol, {
+            configurable: true,
+            value: route.server.errorSource,
+          });
+        }
         formatBakeProductionError(error, context.projectRoot);
         throw error;
       }

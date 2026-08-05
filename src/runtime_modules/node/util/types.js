@@ -402,7 +402,12 @@ export function isInt8Array(value) {
   return typedArrayTag(value) === "Int8Array";
 }
 
+const keyObjectBrand = Symbol.for("cottontail.crypto.KeyObject");
+
 export function isKeyObject(value) {
+  // The brand survives duplicate module records (distinct KeyObject classes
+  // for the same realm); fall back to instanceof for unbranded instances.
+  if (value != null && value[keyObjectBrand] === true) return true;
   const { KeyObject } = require("../crypto.js");
   return value instanceof KeyObject;
 }

@@ -66,8 +66,34 @@ function readRawHttpResponse(socket) {
       const headerEnd = buffered.indexOf("\r\n\r\n");
       if (headerEnd < 0) return;
       const head = buffered.subarray(0, headerEnd).toString();
-      const contentLength = Number(/\r\ncontent-length:\s*(\d+)/i.exec(`\r\n${head}`)?.[1] ?? 0);
+      const transferEncoding = /\r\ntransfer-encoding:\s*([^\r\n]+)/i.exec(`\r\n${head}`)?.[1]?.toLowerCase();
       const bodyStart = headerEnd + 4;
+      if (transferEncoding?.split(",").some(value => value.trim() === "chunked")) {
+        const chunks = [];
+        let cursor = bodyStart;
+        for (;;) {
+          const sizeEnd = buffered.indexOf("\r\n", cursor);
+          if (sizeEnd < 0) return;
+          const sizeText = buffered.subarray(cursor, sizeEnd).toString().split(";", 1)[0].trim();
+          if (!/^[0-9a-f]+$/i.test(sizeText)) return onError(new Error("invalid chunked HTTP response"));
+          const size = Number.parseInt(sizeText, 16);
+          cursor = sizeEnd + 2;
+          if (size === 0) {
+            if (buffered.byteLength < cursor + 2) return;
+            if (buffered.subarray(cursor, cursor + 2).toString() !== "\r\n" &&
+                buffered.indexOf("\r\n\r\n", cursor) < 0) return;
+            return finish({ head, body: Buffer.concat(chunks).toString() });
+          }
+          if (buffered.byteLength < cursor + size + 2) return;
+          chunks.push(buffered.subarray(cursor, cursor + size));
+          cursor += size;
+          if (buffered.subarray(cursor, cursor + 2).toString() !== "\r\n") {
+            return onError(new Error("invalid chunk terminator in HTTP response"));
+          }
+          cursor += 2;
+        }
+      }
+      const contentLength = Number(/\r\ncontent-length:\s*(\d+)/i.exec(`\r\n${head}`)?.[1] ?? 0);
       if (buffered.byteLength - bodyStart < contentLength) return;
       finish({ head, body: buffered.subarray(bodyStart, bodyStart + contentLength).toString() });
     };
@@ -83,6 +109,39 @@ function readRawHttpResponse(socket) {
       cleanup();
       reject(new Error("raw HTTP response timed out"));
     }, 3000);
+    socket.on("data", onData);
+    socket.once("error", onError);
+    socket.once("close", onClose);
+  });
+}
+
+function waitForSocketText(socket, expected, timeout = 3000) {
+  return new Promise((resolve, reject) => {
+    let buffered = "";
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.off("data", onData);
+      socket.off("error", onError);
+      socket.off("close", onClose);
+    };
+    const onData = chunk => {
+      buffered += Buffer.from(chunk).toString();
+      if (!buffered.includes(expected)) return;
+      cleanup();
+      resolve(buffered);
+    };
+    const onError = error => {
+      cleanup();
+      reject(error);
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new Error(`socket closed before receiving ${JSON.stringify(expected)}`));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`timed out waiting for ${JSON.stringify(expected)}`));
+    }, timeout);
     socket.on("data", onData);
     socket.once("error", onError);
     socket.once("close", onClose);
@@ -163,6 +222,25 @@ test("Request and Response JSON errors use Bun's stable message", async () => {
     }
     expect(error).toBeInstanceOf(SyntaxError);
     expect(error.message).toBe("Failed to parse JSON");
+  }
+});
+
+test("Request and Response preserve an empty multipart File type", async () => {
+  for (const createBody of [
+    form => new Request("http://localhost", { method: "POST", body: form }),
+    form => new Response(form),
+  ]) {
+    const form = new FormData();
+    const empty = new Blob([]);
+    const json = new Blob(["[]"], { type: "application/json" });
+    form.set("empty", empty, "empty.txt");
+    form.set("json", json, "data.json");
+
+    const parsed = await createBody(form).formData();
+    expect(parsed.get("empty")).toBeInstanceOf(File);
+    expect(parsed.get("empty").name).toBe("empty.txt");
+    expect(parsed.get("empty").type).toBe(empty.type);
+    expect(parsed.get("json").type).toBe(json.type);
   }
 });
 
@@ -430,6 +508,230 @@ test("native Bun.serve streams partial Content-Length and chunked request bodies
   }
 });
 
+test("native Bun.serve buffers pristine text and JSON bodies without changing stream semantics", async () => {
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const body = request.body;
+      const pathname = new URL(request.url).pathname;
+      const value = pathname === "/json" ? JSON.stringify(await request.json()) : await request.text();
+      expect(body.locked).toBe(true);
+      return new Response(value);
+    },
+  });
+  try {
+    expect(await requestNativeHttpText(`${server.url.origin}/text`, Buffer.from("plain ASCII"))).toBe("plain ASCII");
+    expect(await requestNativeHttpText(`${server.url.origin}/text`, Buffer.from("snowman: ☃"))).toBe("snowman: ☃");
+    const json = Buffer.from(JSON.stringify({ value: "native" }));
+    expect(await requestNativeHttpText(`${server.url.origin}/json`, json)).toBe(json.toString());
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("native request body reads outlive a synchronous handler response", async () => {
+  const observed = Promise.withResolvers();
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      request.text().then(observed.resolve, observed.reject);
+      return new Response("accepted");
+    },
+  });
+  try {
+    expect(await requestNativeHttpText(server.url, Buffer.from("read after response"))).toBe("accepted");
+    expect(await withTimeout(observed.promise, "detached native body read did not settle")).toBe("read after response");
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("native Bun.serve forwards an untouched request body with fixed and chunked framing", async () => {
+  for (const framing of ["content-length", "chunked"]) {
+    const dispatched = Promise.withResolvers();
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request) {
+        dispatched.resolve();
+        return new Response(request.body, {
+          status: 201,
+          headers: { "x-cottontail-echo": framing },
+        });
+      },
+    });
+    const socket = net.connect(server.port, server.hostname);
+    socket.on("error", () => {});
+    try {
+      await once(socket, "connect");
+      const response = readRawHttpResponse(socket);
+      const firstEcho = waitForSocketText(socket, "hello");
+      if (framing === "content-length") {
+        socket.write("POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 11\r\n\r\nhello");
+      } else {
+        socket.write("POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n");
+      }
+
+      await withTimeout(dispatched.promise, `${framing} identity request was not dispatched`);
+      await firstEcho;
+      socket.write(framing === "content-length" ? " world" : "6\r\n world\r\n0\r\n\r\n");
+
+      const result = await response;
+      expect(result.head).toStartWith("HTTP/1.1 201");
+      expect(result.head).toContain(`x-cottontail-echo: ${framing}`);
+      if (framing === "content-length") {
+        expect(result.head.toLowerCase()).toContain("content-length: 11");
+        expect(result.head.toLowerCase()).not.toContain("transfer-encoding:");
+      } else {
+        expect(result.head.toLowerCase()).toContain("transfer-encoding: chunked");
+      }
+      expect(result.body).toBe("hello world");
+    } finally {
+      socket.destroy();
+      await server.stop(true);
+    }
+  }
+});
+
+test("native request-body forwarding cannot deadlock when the uploader waits before reading", async () => {
+  const payload = Buffer.alloc(8 * 1024 * 1024, 0x61);
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: request => new Response(request.body),
+  });
+  const socket = net.connect(server.port, server.hostname);
+  socket.on("error", () => {});
+  try {
+    await once(socket, "connect");
+    socket.write(
+      `POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: ${payload.byteLength}\r\n\r\n`,
+    );
+    await withTimeout(
+      new Promise((resolve, reject) => socket.write(payload, error => error ? reject(error) : resolve())),
+      "identity upload remained blocked while its response was unread",
+      10_000,
+    );
+
+    const chunks = [];
+    socket.on("data", chunk => chunks.push(Buffer.from(chunk)));
+    await withTimeout(once(socket, "close"), "identity response did not complete", 10_000);
+    const response = Buffer.concat(chunks);
+    const headerEnd = response.indexOf("\r\n\r\n");
+    expect(response.subarray(0, headerEnd).toString()).toStartWith("HTTP/1.1 200");
+    expect(response.subarray(headerEnd + 4)).toEqual(payload);
+  } finally {
+    socket.destroy();
+    await server.stop(true);
+  }
+});
+
+test("chunked identity forwarding matches Bun past maxRequestBodySize", async () => {
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    maxRequestBodySize: 32,
+    fetch: request => new Response(request.body),
+  });
+  const socket = net.connect(server.port, server.hostname);
+  socket.on("error", () => {});
+  try {
+    await once(socket, "connect");
+    const response = readRawHttpResponse(socket);
+    socket.write(
+      "POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n" +
+      "8\r\nabcdefgh\r\n10\r\nijklmnopqrstuvwx\r\n10\r\nyzABCDEFGHIJKLMN\r\n0\r\n\r\n",
+    );
+    const result = await response;
+    expect(result.head).toStartWith("HTTP/1.1 200");
+    expect(result.body).toBe("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN");
+  } finally {
+    socket.destroy();
+    await server.stop(true);
+  }
+});
+
+test("native request-body forwarding preserves keep-alive reuse and upload aborts", async () => {
+  const peers = [];
+  const aborted = Promise.withResolvers();
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request, activeServer) {
+      peers.push(activeServer.requestIP(request)?.port);
+      if (new URL(request.url).pathname === "/abort") {
+        request.signal.addEventListener("abort", () => aborted.resolve(request.signal.reason), { once: true });
+      }
+      return new Response(request.body);
+    },
+  });
+  const socket = net.connect(server.port, server.hostname);
+  socket.on("error", () => {});
+  try {
+    await once(socket, "connect");
+    for (const [index, body] of ["first", "second"].entries()) {
+      const response = readRawHttpResponse(socket);
+      socket.write(
+        `POST / HTTP/1.1\r\nHost: localhost\r\n${index === 1 ? "Connection: close\r\n" : ""}` +
+        `Content-Length: ${body.length}\r\n\r\n${body}`,
+      );
+      expect((await response).body).toBe(body);
+    }
+    expect(peers).toHaveLength(2);
+    expect(peers[1]).toBe(peers[0]);
+
+    const abortSocket = net.connect(server.port, server.hostname);
+    abortSocket.on("error", () => {});
+    try {
+      await once(abortSocket, "connect");
+      const firstEcho = waitForSocketText(abortSocket, "aaaa");
+      abortSocket.write("POST /abort HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048576\r\n\r\n");
+      abortSocket.write(Buffer.alloc(32 * 1024, 0x61));
+      await firstEcho;
+      abortSocket.destroy();
+      expect((await withTimeout(aborted.promise, "identity upload abort was not propagated")).code).toBe("ECONNRESET");
+    } finally {
+      abortSocket.destroy();
+    }
+  } finally {
+    socket.destroy();
+    await server.stop(true);
+  }
+});
+
+test("native Bun.serve falls back after request body cloning or reading", async () => {
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const pathname = new URL(request.url).pathname;
+      if (pathname === "/clone") {
+        request.clone();
+        return new Response(request.body, { headers: { "x-body-path": "clone" } });
+      }
+
+      const consumed = await request.bytes();
+      const replay = new ReadableStream({
+        start(controller) {
+          controller.enqueue(consumed);
+          controller.close();
+        },
+      });
+      return new Response(replay, { headers: { "x-body-path": "read" } });
+    },
+  });
+  try {
+    const body = Buffer.from("fallback body");
+    for (const route of ["clone", "read"]) {
+      expect(await requestNativeHttpText(`${server.url.origin}/${route}`, body)).toBe(body.toString());
+    }
+  } finally {
+    await server.stop(true);
+  }
+});
+
 test("native Bun.serve aborts the request body and signal when an upload disconnects", async () => {
   const firstChunk = Promise.withResolvers();
   const observed = Promise.withResolvers();
@@ -515,6 +817,54 @@ test("native Bun.serve retains a lazy request URL after request finalization", a
     expect(await getNativeHttpText(`${server.url.origin}${longPath}`)).toBe("ok");
     const request = await captured.promise;
     expect(request.url).toBe(`${server.url.origin}${longPath}`);
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("native Bun.serve target reuse preserves every lazy Request URL", async () => {
+  const captured = [];
+  const repeatedPath = `/${"repeat/".repeat(512)}same?value=1`;
+  const distinctPath = "/distinct?value=2";
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      captured.push(request);
+      return new Response("ok");
+    },
+  });
+  try {
+    for (const path of [repeatedPath, repeatedPath, distinctPath, repeatedPath]) {
+      expect(await getNativeHttpText(`${server.url.origin}${path}`)).toBe("ok");
+    }
+    expect(captured.map(request => request.url)).toEqual([
+      repeatedPath,
+      repeatedPath,
+      distinctPath,
+      repeatedPath,
+    ].map(path => `${server.url.origin}${path}`));
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("native Bun.serve handlers can sample resident memory without heap statistics", async () => {
+  const samples = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch() {
+      const rss = process.memoryUsage.rss();
+      samples.push(rss);
+      return new Response(String(rss));
+    },
+  });
+  try {
+    for (let index = 0; index < 4; index += 1) {
+      expect(Number(await getNativeHttpText(server.url))).toBeGreaterThan(0);
+    }
+    expect(samples.every(Number.isFinite)).toBe(true);
   } finally {
     await server.stop(true);
   }
