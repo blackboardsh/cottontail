@@ -285,6 +285,9 @@ if (inheritedSpawnExecPath != null) {
 }
 const inheritedFileBackedStdin = globalThis.process?.env?.COTTONTAIL_SPAWN_STDIN_FILE === "1";
 if (inheritedFileBackedStdin) {
+  // Recorded for whenever the stdin stream is actually constructed — at this
+  // point process.stdin may not exist yet.
+  globalThis.__cottontailFileBackedStdin = true;
   const stream = globalThis.process?.stdin;
   for (const method of ["ref", "unref"]) {
     try {
