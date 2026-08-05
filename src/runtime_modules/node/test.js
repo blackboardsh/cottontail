@@ -281,7 +281,10 @@ function installUnhandledRejectionCapture() {
   processGlobal[unhandledRejectionHandlerKey] = (reason, promise) => {
     const error = reason instanceof Error ? reason : new Error(String(reason));
     const owner = promise && typeof promise === "object" ? promiseOwners.get(promise) : null;
-    if (owner?.kind === "test" && owner.active && typeof owner.failExternal === "function") {
+    if (owner?.kind === "test" && typeof owner.failExternal === "function") {
+      // Late rejections owned by an already-finished test stay with that
+      // test (failExternal is a no-op once the attempt settled) instead of
+      // falling through to whichever unrelated test is currently running.
       owner.failExternal(error);
       return;
     }
@@ -310,9 +313,12 @@ function guardAsyncCallback(callback, captureReturnedPromise = true, externalOnT
     capturedExecution.needsPostBodyDrain = true;
   }
   return function guardedTestCallback(...args) {
-    const execution = capturedExecution.kind === "test" && !capturedExecution.active
-      ? currentExecution()
-      : capturedExecution;
+    // A callback scheduled by a test that has since completed still belongs
+    // to that test: re-attributing its errors to whichever test is currently
+    // running would fail an unrelated victim (bun absorbs late throws from a
+    // finished test's stray timers). The captured execution's failExternal is
+    // a no-op once the attempt has settled.
+    const execution = capturedExecution;
     try {
       const result = callback.apply(this, args);
       if (captureReturnedPromise && result && typeof result.then === "function" && execution) {
