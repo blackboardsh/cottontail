@@ -888,6 +888,25 @@ export class TLSSocket extends Socket {
     this._tlsId = Number(native.id);
     this.fd = Number(native.fd ?? -1);
     this._tlsInfo = native;
+    // Expose the connection fd through _handle (Bun parity): when this socket
+    // wraps a parent socket, the fd was detached during the TLS upgrade, so
+    // the parent's fd stays null (issue #24575).
+    if (this._handle != null && typeof this._handle === "object" && this._handle.fd == null) {
+      const owner = this;
+      const inner = this._handle;
+      this._handle = {
+        _owner: owner,
+        get fd() { return owner.fd ?? -1; },
+        get owner() { return owner; },
+        set owner(value) { /* facade owner is fixed */ },
+        setNoDelay(value = true) { inner.setNoDelay?.(value); return 0; },
+        setKeepAlive(value = false, delay = 0) { inner.setKeepAlive?.(value, Number(delay) * 1000); return 0; },
+        close(callback) { owner.destroy(); if (typeof callback === "function") queueMicrotask(callback); },
+        ref() { owner.ref?.(); },
+        unref() { owner.unref?.(); },
+        hasRef() { return owner._refed !== false; },
+      };
+    }
     this.destroyed = false;
     this.readable = true;
     this.writable = !this._ending;
