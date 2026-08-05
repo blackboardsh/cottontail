@@ -348,7 +348,14 @@ NativeHTTPParserState.prototype._dispatchNative = function _dispatchNative(event
       completeConnection(this._connectionsList, this.owner);
       this._lastMessageStart = 0;
       const callback = this.owner[kOnMessageComplete];
-      if (typeof callback === "function") callback.call(this.owner);
+      if (typeof callback === "function") {
+        this._inMessageComplete = true;
+        try {
+          callback.call(this.owner);
+        } finally {
+          this._inMessageComplete = false;
+        }
+      }
       return 0;
     }
     default:
@@ -839,7 +846,15 @@ function execute() {
           result.reason,
           Math.max(0, Number(result.bytesParsed) - pendingLength),
         );
-        parser._latchedError = error;
+        // Bun surfaces a parse error once and recovers: the parser is
+        // re-initialized so a following finish() returns undefined and a new
+        // execute() starts a fresh parse, rather than latching the error.
+        nativeHttpParser.httpParserInitialize(
+          parser._token,
+          parser._type,
+          parser._maxHeaderSize,
+          parser._lenientFlags,
+        );
         return error;
       }
 
@@ -882,6 +897,13 @@ function finish() {
   if (parser._latchedError) return parser._latchedError;
   parser._currentBuffer = EMPTY_BUFFER;
   if (parser._native) {
+    if (parser._executing) {
+      // finish() from inside a parse callback: report the EOF-state error
+      // without touching the native parser — llhttp_finish mid-dispatch
+      // would poison the error state of the in-flight execute.
+      if (parser._inMessageComplete) return undefined;
+      return parserError("HPE_INVALID_EOF_STATE", "Invalid EOF state", 0);
+    }
     if (parser._pending.length > 0 && !parser._paused) {
       const pendingResult = execute.call(parser.owner, EMPTY_BUFFER);
       if (pendingResult && typeof pendingResult === "object") return pendingResult;
