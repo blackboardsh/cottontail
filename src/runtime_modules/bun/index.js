@@ -3234,6 +3234,14 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
     let bodyRemaining = 0;
     let chunkState = null;
 
+    // COTTONTAIL-COMPAT: the body stream below uses a zero highWaterMark so
+    // desiredSize stays <= 0, which keeps ReadableStreamDefaultController's
+    // post-enqueue callPullIfNeeded from invoking the pull algorithm (and
+    // allocating its promise bookkeeping) while nobody reads. Pulls still
+    // fire for pending read requests, so consumers drive delivery normally.
+    // desiredSize therefore cannot provide backpressure; track buffered
+    // bytes ourselves and pause the socket past the same 4 MiB budget.
+    let bufferedBodyBytes = 0;
     const enqueueBody = (chunk) => {
       if (chunk.byteLength === 0) return;
       if (streamDone || !streamController) return;
@@ -3241,7 +3249,8 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
         streamController.enqueue(Buffer.from(chunk));
         // Backpressure: stop reading from the socket once the consumer's
         // queue is full; pull() resumes it.
-        if (streamController.desiredSize <= 0 && !socket.destroyed) socket.pause?.();
+        bufferedBodyBytes += chunk.byteLength;
+        if (bufferedBodyBytes > 4 * 1024 * 1024 && !socket.destroyed) socket.pause?.();
       } catch {}
     };
 
@@ -3290,13 +3299,15 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
           }
         },
         pull() {
+          // A reader is draining the queue; reopen the delivery budget.
+          bufferedBodyBytes = 0;
           if (!finished && !socket.destroyed) socket.resume?.();
         },
         cancel() {
           streamDone = true;
           cleanup();
         },
-      }, new ByteLengthQueuingStrategy({ highWaterMark: 4 * 1024 * 1024 }));
+      }, new ByteLengthQueuingStrategy({ highWaterMark: 0 }));
       Object.defineProperty(stream, abandonedFetchBodyCleanupSymbol, {
         value() {
           if (streamDone) return;
