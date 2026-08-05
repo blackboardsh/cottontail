@@ -1,6 +1,8 @@
 export function internalBinding(name) {
   const key = String(name);
-  const binding = globalThis.process?.binding;
+  // Bun's internal/test/binding reaches bindings that process.binding()
+  // refuses to expose publicly (signal_wrap, os, spawn_sync, zlib, ...).
+  const binding = globalThis.process?.__cottontailBindingInternal ?? globalThis.process?.binding;
   if (typeof binding !== "function") {
     throw new Error("process.binding is unavailable");
   }

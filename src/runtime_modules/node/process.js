@@ -1140,10 +1140,14 @@ function makeProcessBinding(name) {
         bits: processObject.arch === "x64" || processObject.arch === "arm64" ? 64 : 32,
         getDefaultLocale: () => Intl.DateTimeFormat().resolvedOptions().locale,
       });
-    // Bun 1.3.10 throws for these (and everything else unlisted above):
-    // async_wrap, cares_wrap, contextify, crypto, fs_event_wrap, icu,
-    // inspector, js_stream, os, pipe_wrap, process_wrap, signal_wrap,
-    // spawn_sync, stream_wrap, tcp_wrap, tls_wrap, udp_wrap, url, v8, zlib.
+    case "os":
+      return makeOsBinding();
+    case "spawn_sync":
+      return makeSpawnSyncBinding();
+    case "zlib":
+      return makeZlibBinding();
+    case "signal_wrap":
+      return signalWrapBinding;
     default:
       throwNoSuchBinding(name);
   }
@@ -3026,12 +3030,32 @@ export const _debugProcess = processObject._debugProcess = (targetPid) =>
 export const _startProfilerIdleNotifier = processObject._startProfilerIdleNotifier = () => {};
 export const _stopProfilerIdleNotifier = processObject._stopProfilerIdleNotifier = () => {};
 
+// Bun 1.3.10's process.binding() throws for these, even where an internal
+// implementation exists (internal/test/binding bypasses via bindingInternal).
+const processBindingThrowsFor = new Set([
+  "async_wrap", "cares_wrap", "contextify", "crypto", "fs_event_wrap", "icu",
+  "inspector", "js_stream", "os", "pipe_wrap", "process_wrap", "signal_wrap",
+  "spawn_sync", "stream_wrap", "tcp_wrap", "tls_wrap", "udp_wrap", "url",
+  "v8", "zlib",
+]);
+
+function bindingByName(key) {
+  if (!processBindingCache.has(key)) processBindingCache.set(key, makeProcessBinding(key));
+  return processBindingCache.get(key);
+}
+
+export const bindingInternal = processObject.__cottontailBindingInternal = (name) => {
+  const key = String(name);
+  if (key.length === 0) throwNoSuchBinding(key);
+  return bindingByName(key);
+};
+
 export const binding = processObject.binding = (name) => {
   if (typeof name !== "string") throw invalidArgType("module", "string", name);
   const key = name;
   if (key.length === 0) throwNoSuchBinding(key);
-  if (!processBindingCache.has(key)) processBindingCache.set(key, makeProcessBinding(key));
-  return processBindingCache.get(key);
+  if (processBindingThrowsFor.has(key)) throwNoSuchBinding(key);
+  return bindingByName(key);
 };
 
 export const _linkedBinding = processObject._linkedBinding = (name) => {

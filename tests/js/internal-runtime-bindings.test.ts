@@ -55,7 +55,9 @@ describe("internal runtime bindings", () => {
     const detachedStart = signal.start;
     const detachedStop = signal.stop;
 
-    expect(binding).toBe(process.binding("signal_wrap"));
+    // Bun 1.3.10's public process.binding("signal_wrap") throws; the internal
+    // surface keeps it. Assert cache identity through internalBinding instead.
+    expect(binding).toBe(internalBinding("signal_wrap"));
     expect(Object.keys(binding)).toEqual(["Signal"]);
     expect(Object.keys(Signal.prototype)).toEqual(["start", "stop"]);
     for (const invoke of [() => detachedStart(9), () => detachedStop()]) {
