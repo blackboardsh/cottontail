@@ -935,13 +935,31 @@ function normalizeWriteDestination(destination, options) {
   return { kind: descriptor.kind, state: null, ...descriptor };
 }
 
+// Bun's write_file.zig keeps bytes-backed Blob inputs in memory and starts
+// the write task eagerly, so a read issued immediately after observes the new
+// contents. Mirror that by taking the synchronous write path when the Blob's
+// bytes are already available (host Blobs expose them through _bytes /
+// _getBytes); file-backed and opaque Blobs keep the async streaming path.
+function immediateBlobBytes(data) {
+  try {
+    if (data._bytes instanceof Uint8Array) return data._bytes;
+    if (typeof data._getBytes === "function") {
+      const bytes = data._getBytes();
+      if (isBufferSource(bytes)) return bytesFromBufferSource(bytes);
+    }
+  } catch {
+    // Fall back to the asynchronous streaming source.
+  }
+  return null;
+}
+
 function immediateSource(data) {
   if (typeof data === "string" || data instanceof String) return String(data);
   if (isBufferSource(data)) return bytesFromBufferSource(data);
   if (typeof data === "symbol") throw invalidArgumentType("Bun.write expects a Blob-y thing to write");
   if (data == null) return null;
   if (bunFileStates.has(data) || isBunFileLike(data)) return undefined;
-  if (typeof Blob === "function" && data instanceof Blob) return undefined;
+  if (typeof Blob === "function" && data instanceof Blob) return immediateBlobBytes(data) ?? undefined;
   if (typeof Response === "function" && data instanceof Response) return undefined;
   if (typeof Request === "function" && data instanceof Request) return undefined;
   if (data?.constructor?.name === "Archive" && typeof data.bytes === "function") return undefined;

@@ -1901,7 +1901,9 @@ export class ServerResponse extends OutgoingMessage {
     if (this._pendingHeadBlock != null) {
       const block = this._pendingHeadBlock;
       this._pendingHeadBlock = null;
-      if (!socket.destroyed && socket.writable) socket.write(block);
+      // Header values are validated to latin1 code points; write them as
+      // latin1 bytes like Node so non-ASCII values survive the wire exactly.
+      if (!socket.destroyed && socket.writable) socket.write(Buffer.from(block, "latin1"));
     }
     this.emit("socket", socket);
     return this;
@@ -2107,7 +2109,9 @@ export class ServerResponse extends OutgoingMessage {
     const block = lines.join("\r\n");
     this._header = block;
     const socket = this.socket;
-    if (socket && !socket.destroyed && socket.writable) socket.write(block);
+    // Header values are validated to latin1 code points; write them as latin1
+    // bytes like Node so non-ASCII values survive the wire exactly.
+    if (socket && !socket.destroyed && socket.writable) socket.write(Buffer.from(block, "latin1"));
     else this._pendingHeadBlock = block;
   }
 
@@ -3200,7 +3204,9 @@ export class ClientRequest extends OutgoingMessage {
       this._headerSent = true;
       this.headersSent = true;
       this._header = lines.join("\r\n");
-      socket.write(Buffer.from(this._header));
+      // Header values are validated to latin1 code points; write them as
+      // latin1 bytes like Node so non-ASCII values survive the wire exactly.
+      socket.write(Buffer.from(this._header, "latin1"));
       this._waitingForContinue = String(this.getHeader("expect") ?? "").toLowerCase() === "100-continue" && this._requestPendingBytes > 0;
       if (this._waitingForContinue) {
         this._continueTimer = setTimeout(sendContinueBody, 1000);

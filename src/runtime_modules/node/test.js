@@ -229,10 +229,23 @@ function promiseThen(value, onFulfilled, onRejected) {
   return runnerPromiseThen.call(promise, onFulfilled, onRejected);
 }
 
+// The process-wide uncaught-exception capture is a singleton, but this module
+// can be evaluated more than once in a single process: the bunfig preload
+// graph imports "bun:test" through the native ESM loader, while test files
+// that rely on the lazy `describe`/`test`/`expect` globals reach a second
+// instance through the embedded CommonJS module cache. Install the real
+// process callback once per process and route errors to the most recently
+// evaluated instance, which owns the registrations for the executing file.
+const uncaughtCaptureProcessKey = Symbol.for("cottontail.bunTest.uncaughtCaptureInstalled");
+const uncaughtCaptureHandlerKey = Symbol.for("cottontail.bunTest.uncaughtCaptureHandler");
+const unhandledRejectionProcessKey = Symbol.for("cottontail.bunTest.unhandledRejectionInstalled");
+const unhandledRejectionHandlerKey = Symbol.for("cottontail.bunTest.unhandledRejectionHandler");
+
 function installUncaughtCapture() {
-  if (uncaughtCaptureInstalled || typeof globalThis.process?.setUncaughtExceptionCaptureCallback !== "function") return;
+  if (typeof globalThis.process?.setUncaughtExceptionCaptureCallback !== "function") return;
+  const processGlobal = globalThis.process;
   uncaughtCaptureInstalled = true;
-  globalThis.process.setUncaughtExceptionCaptureCallback((error) => {
+  processGlobal[uncaughtCaptureHandlerKey] = (error) => {
     const execution = executionStorage.getStore();
     if (execution?.failExternal) {
       execution.failExternal(error);
@@ -243,16 +256,29 @@ function installUncaughtCapture() {
       scheduleAfterHooks();
       return;
     }
-    globalThis.process.setUncaughtExceptionCaptureCallback(null);
+    processGlobal[uncaughtCaptureProcessKey] = false;
+    processGlobal[uncaughtCaptureHandlerKey] = undefined;
+    processGlobal.setUncaughtExceptionCaptureCallback(null);
     uncaughtCaptureInstalled = false;
+    runnerSetTimeout(() => { throw error; }, 0);
+  };
+  if (processGlobal[uncaughtCaptureProcessKey]) return;
+  processGlobal[uncaughtCaptureProcessKey] = true;
+  processGlobal.setUncaughtExceptionCaptureCallback((error) => {
+    const active = processGlobal[uncaughtCaptureHandlerKey];
+    if (typeof active === "function") {
+      active(error);
+      return;
+    }
     runnerSetTimeout(() => { throw error; }, 0);
   });
 }
 
 function installUnhandledRejectionCapture() {
-  if (unhandledRejectionCaptureInstalled || typeof globalThis.process?.on !== "function") return;
+  if (typeof globalThis.process?.on !== "function") return;
+  const processGlobal = globalThis.process;
   unhandledRejectionCaptureInstalled = true;
-  globalThis.process.on("unhandledRejection", (reason, promise) => {
+  processGlobal[unhandledRejectionHandlerKey] = (reason, promise) => {
     const error = reason instanceof Error ? reason : new Error(String(reason));
     const owner = promise && typeof promise === "object" ? promiseOwners.get(promise) : null;
     if (owner?.kind === "test" && owner.active && typeof owner.failExternal === "function") {
@@ -269,6 +295,11 @@ function installUnhandledRejectionCapture() {
       return;
     }
     recordUnhandledError(error);
+  };
+  if (processGlobal[unhandledRejectionProcessKey]) return;
+  processGlobal[unhandledRejectionProcessKey] = true;
+  processGlobal.on("unhandledRejection", (reason, promise) => {
+    processGlobal[unhandledRejectionHandlerKey]?.(reason, promise);
   });
 }
 

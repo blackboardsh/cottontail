@@ -190,7 +190,12 @@ function abortActiveServeRequests(server) {
 function finishActiveServeRequestBody(request, response) {
   const body = request?._body;
   const state = body?.[activeServeRequestBodyStateSymbol];
-  if (!state || state.settled || response?._body === body) return;
+  if (!state || state.bodySettled || response?._body === body) return;
+  // The handler may have attached a reader (or otherwise started consuming
+  // the body) intending to read it while the response streams back. Only
+  // abort a body that was never exposed for reading; anything left unread is
+  // still force-aborted when the request is disposed after the response ends.
+  if (body != null && (body.locked === true || bodyStreamIsDisturbed(body))) return;
   state.abort(activeServeUnreadBodyAbortError);
 }
 

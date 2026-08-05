@@ -2396,6 +2396,9 @@ async function fetchFromNodeHttp(request, redirectMode = "follow", depth = 0, re
 // fires on already-correct text.
 function redirectLocationText(location) {
   let text = String(location);
+  // Bun's redirect resolver treats a leading "://" as scheme-relative
+  // ("//host/path"); the WHATWG parser would keep it as a path segment.
+  if (text.startsWith("://")) text = text.slice(1);
   for (let pass = 0; pass < 3; pass += 1) {
     if (!/[\x80-\xff]/.test(text) || /[Ā-￿]/.test(text)) return text;
     const bytes = Buffer.from(text, "latin1");
@@ -3086,6 +3089,10 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
         settled = true;
         cleanup();
         reject(error);
+        // Same retain-cycle break as the success path: once settled, the
+        // settler bindings must not keep transport closures alive.
+        resolve = null;
+        reject = null;
         return;
       }
       if (!streamDone && streamController) {
@@ -3314,6 +3321,12 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
       const decodedResponse = decodeFetchResponse(response, transport.decompress !== false);
       settled = true;
       resolve(decodedResponse);
+      // Break the retain cycle: the fetch-body FinalizationRegistry pins the
+      // transport closures (unregister token + held cleanup value) until the
+      // response is collected, and a settled promise pins its result — a
+      // reachable `resolve` binding would pin the response forever.
+      resolve = null;
+      reject = null;
       if (bodyMode === "none" || (bodyMode === "length" && bodyRemaining === 0)) {
         if (initialChunk.byteLength > 0) {
           // Ignore pipelined data.
@@ -3670,7 +3683,7 @@ function fetchImpl(request, init = {}, upgradeStreamBody = null) {
       tlsConfig: customTlsConfig ?? undefined,
     });
   }
-  if (!proxy.active && parsedUrl.protocol === "http:" && isLoopbackHostname(parsedUrl.hostname)) {
+  if (!proxy.active && unixSocketPath == null && parsedUrl.protocol === "http:" && isLoopbackHostname(parsedUrl.hostname)) {
     return fetchFromNodeHttp(request, redirectMode, 0, false, {
       pooled: usesKeepalive,
       tlsConfig: customTlsConfig ?? undefined,
@@ -3973,6 +3986,10 @@ function finishActiveServeRequestBody(request, response) {
   const body = request?._body;
   const state = body?.[activeServeRequestBodyStateSymbol];
   if (!state || state.settled || response?._body === body) return;
+  // The handler may have attached a reader intending to consume the body
+  // while the response streams back; only abort a body never exposed for
+  // reading. Anything left unread is still force-aborted on disposal.
+  if (body != null && (body.locked === true || bodyStreamIsDisturbed(body))) return;
   state.abort(activeServeUnreadBodyAbortError);
 }
 
@@ -5719,7 +5736,11 @@ function beginServerWebSocketClose(state, code, reason, payload) {
   if (socket && !socket.destroyed && socket.writable) {
     flushServerWebSocketFrames(state);
     try {
-      socket.end(encodeServerWebSocketFrame(0x8, payload));
+      socket.end(encodeServerWebSocketFrame(0x8, payload), () => {
+        // uWS/Bun invoke the close handler once the close echo is flushed,
+        // not when the peer finishes the TCP close handshake.
+        finalizeServerWebSocket(state, code, String(reason ?? ""));
+      });
       state.closeTimer = setTimeout(() => terminateServerWebSocket(state), 30_000);
       state.closeTimer?.unref?.();
       return;
@@ -7801,8 +7822,12 @@ export function nanoseconds() {
   return bigintNs != null ? Number(bigintNs) : Math.floor((performance?.now?.() ?? Date.now()) * 1_000_000);
 }
 
-function bunForceGc(force = false) {
-  cottontail.gc?.(Boolean(force));
+function bunForceGc(force = undefined) {
+  // Bun.gc() with no argument must collect fully and synchronously: the
+  // non-force path (JSGarbageCollect) neither shrinks heap capacity nor
+  // returns pages, so tight alloc/gc loops balloon the RSS high-water mark
+  // (~100 MB per 1M small objects) and request-clone-leak tests fail.
+  cottontail.gc?.(force === undefined ? true : Boolean(force));
   cottontail.drainJobs?.();
 }
 export { bunForceGc as gc };

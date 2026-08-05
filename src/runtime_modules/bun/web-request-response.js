@@ -186,7 +186,13 @@ export function createRequestResponseRuntime({
     if (owner._bodyStream?.locked) return handledRejectedPromise(new TypeError("ReadableStream is locked"));
     if (bodyWasUsed(owner)) return handledRejectedPromise(new TypeError("Body already used"));
     const body = bodyValueForConsumption(owner);
-    if (body != null) owner._bodyUsed = true;
+    // Keep the trivial paths free of async function frames: when the call
+    // happens at the edge of stack exhaustion, entering an async function
+    // converts the RangeError into an unhandled rejection instead of the
+    // synchronous throw Bun's native text() produces.
+    if (body == null) return Promise.resolve("");
+    owner._bodyUsed = true;
+    if (typeof body === "string") return Promise.resolve(stripUtf8BOMText(body));
     return withBufferedServeBody(body, () => textFromBody(body));
   }
   
@@ -1078,12 +1084,14 @@ export function createRequestResponseRuntime({
     if (typeof body === "string") return body;
     if (isURLSearchParamsLike(body)) return serializeURLSearchParamsBody(body);
     if (body instanceof FormData) return snapshotFormDataBody(body);
+    // Bun.file()-style bodies keep their identity (Bun exposes the FileRef
+    // itself as the body); streaming bodies are passed through untouched.
+    if (isBunFileLike(body) || isStreamingBody(body)) return body;
     if (body instanceof Blob) return snapshotBlobBody(body);
     const isSharedBuffer = typeof SharedArrayBuffer === "function" && body instanceof SharedArrayBuffer;
     if (isSharedBuffer || body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
       return snapshotBufferSource(body);
     }
-    if (isBunFileLike(body) || isStreamingBody(body)) return body;
     if (Array.isArray(body)) {
       for (const part of body) {
         if (typeof part === "symbol") throw new TypeError("Cannot convert a symbol to a string");
@@ -1183,6 +1191,10 @@ export function createRequestResponseRuntime({
       headers.set("Content-Type", `multipart/form-data; boundary=${formDataBoundary(body)}`);
     } else if (isURLSearchParamsLike(body)) {
       headers.set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8");
+    } else if (typeof body === "string") {
+      // BodyInit extraction for a string defaults to text/plain (fetch spec);
+      // response.blob() re-encodes it as "text/plain;charset=utf-8".
+      headers.set("Content-Type", "text/plain;charset=UTF-8");
     } else if (body instanceof Blob && typeof body.type === "string" && body.type !== "") {
       headers.set("Content-Type", body.type);
     }
@@ -1754,8 +1766,14 @@ export function createRequestResponseRuntime({
         }
         signal ??= inputRequestState.signal;
         signalExplicit ||= inputRequestState.signalExplicit === true;
-        method ??= inputRequestState.method;
-        if (headers === undefined) headers = new Headers(inputRequestState.headers);
+        // Read method/headers through the input's own getters (like Bun's
+        // fastGet) so Request subclasses overriding them are honored; for a
+        // plain Request the getters return these same state values.
+        if (method === undefined) {
+          const inputMethod = input.method;
+          if (inputMethod !== undefined) method = bunHttpMethod(inputMethod);
+        }
+        if (headers === undefined) headers = new Headers(input.headers);
         redirect ??= inputRequestState.redirect;
         cache ??= inputRequestState.cache;
         mode ??= inputRequestState.mode;

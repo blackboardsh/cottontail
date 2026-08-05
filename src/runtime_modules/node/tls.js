@@ -2099,7 +2099,12 @@ class ServerImpl extends NetServer {
       clearInterval(this._tlsAcceptTimer);
       this._tlsAcceptTimer = null;
     }
-    try { cottontail.tlsServerClose(this._tlsServerId); } catch {}
+    // Defer the blocking native close: ct_tls_server_free joins the accept
+    // thread, which can be parked in a blocking SSL_accept waiting for a
+    // ClientHello that never arrives (aborted fetches leave half-open TLS
+    // connections); joining synchronously here deadlocks the script thread.
+    const tlsServerId = this._tlsServerId;
+    setTimeout(() => { try { cottontail.tlsServerClose(tlsServerId); } catch {} }, 0);
     this._tlsServerId = null;
     this._tlsAddress = null;
     this.listening = false;

@@ -375,7 +375,10 @@ export function startNativeServe(options, runtime) {
         const item = operation.item;
         const request = operation.request;
         if (item == null || request == null || nativeClosed) return undefined;
-        finishActiveServeRequestBody(request, response);
+        // A locked body stream means the handler attached a reader and may
+        // still consume the request body while the response streams back;
+        // only an untouched body may be aborted as unread here.
+        if (request._body?.locked !== true) finishActiveServeRequestBody(request, response);
         const sent = sendResponse(item, serveResponseWithIdleTimeout(
           response,
           requestIdleTimeout(request, activeOptions.idleTimeout),
@@ -388,7 +391,7 @@ export function startNativeServe(options, runtime) {
         const item = operation.item;
         const request = operation.request;
         if (item == null || request == null || nativeClosed) return undefined;
-        finishActiveServeRequestBody(request, null);
+        if (request._body?.locked !== true) finishActiveServeRequestBody(request, null);
         return handleError(item, error);
       };
       try {

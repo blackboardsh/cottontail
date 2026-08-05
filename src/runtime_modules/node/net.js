@@ -911,6 +911,14 @@ class SocketImpl extends Duplex {
   }
 
   _failOutboundWrites(error) {
+    if (error != null && !(error instanceof Error)) {
+      // Native fd-write bindings throw bare strerror strings; stream error
+      // paths and fetch's pooled-retry flagging require an Error.
+      const message = String(error);
+      error = new Error(message);
+      if (/broken pipe/i.test(message)) error.code = "EPIPE";
+      else if (/connection reset/i.test(message)) error.code = "ECONNRESET";
+    }
     const pending = this._outboundWrites.splice(0);
     for (const entry of pending) {
       if (typeof entry.callback === "function") queueMicrotask(() => entry.callback(error));

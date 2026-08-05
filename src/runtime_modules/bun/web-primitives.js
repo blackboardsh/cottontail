@@ -819,6 +819,40 @@ export function createWebPrimitives(nodeInspect) {
     }
   }
   
+  // Bun 1.3.10 parses Blob.json() through BunString.toJSON, which rejects an
+  // over-limit string with ERR_STRING_TOO_LONG before JSON parsing begins
+  // (src/bun.js/bindings/bindings.cpp BunString__toJSON). Blob.prototype.text()
+  // already throws the matching string-length RangeError, so translate exactly
+  // that failure and keep genuine parse failures as Bun's "Failed to parse
+  // JSON" SyntaxError. The __cottontailBunJson marker tells the
+  // Request/Response runtime's patchBlobPrototype to keep this version.
+  (function patchBlobJson() {
+    const proto = globalThis.Blob?.prototype;
+    if (!proto) return;
+    const json = async function json() {
+      let text;
+      try {
+        text = await this.text();
+      } catch (error) {
+        if (error instanceof RangeError &&
+            typeof error.message === "string" &&
+            error.message.startsWith("Cannot create a string longer than")) {
+          const tooLong = new RangeError("Cannot parse a JSON string longer than 2^32-1 characters");
+          tooLong.code = "ERR_STRING_TOO_LONG";
+          throw tooLong;
+        }
+        throw error;
+      }
+      try {
+        return JSON.parse(text);
+      } catch {
+        throw new SyntaxError("Failed to parse JSON");
+      }
+    };
+    json.__cottontailBunJson = true;
+    Object.defineProperty(proto, "json", { value: json, writable: true, configurable: true });
+  })();
+
   const primitives = {
     BunFile,
     CottontailAbortController,
