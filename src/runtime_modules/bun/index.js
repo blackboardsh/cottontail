@@ -3967,6 +3967,8 @@ function decodeFetchResponse(response, decompress = true) {
 
 function activeServeRequestBody(body) {
   let controller;
+  let bodyReader = null;
+  let bodyIterator = null;
   const state = {
     byteSize: requestBodyByteSize(body),
     settled: false,
@@ -3982,11 +3984,43 @@ function activeServeRequestBody(body) {
       }
     },
   };
+  // Open-ended bodies (streams, async iterables, node Readables) must feed
+  // the handler incrementally: one chunk per pull, so a server reading the
+  // request body sees data as the client produces it (node-fetch "request
+  // body streams properly"). Buffered bodies keep the single-shot path.
+  const isOpenEndedBody = body != null && typeof body !== "string" &&
+    !(body instanceof ArrayBuffer) && !ArrayBuffer.isView(body) &&
+    !(typeof globalThis.Blob === "function" && body instanceof globalThis.Blob) &&
+    (typeof body?.getReader === "function" || typeof body?.[Symbol.asyncIterator] === "function" ||
+     typeof body?.pipe === "function" || typeof body?.read === "function");
   const stream = new globalThis.ReadableStream({
     start(value) {
       controller = value;
     },
     pull() {
+      if (state.settled) return state.pending;
+      if (isOpenEndedBody) {
+        state.pending = (async () => {
+          if (!bodyReader && !bodyIterator) {
+            if (typeof body.getReader === "function") bodyReader = body.getReader();
+            else if (typeof body[Symbol.asyncIterator] === "function") bodyIterator = body[Symbol.asyncIterator]();
+          }
+          if (!bodyReader && !bodyIterator) throw new TypeError("Expected a streaming request body");
+          const { done, value } = bodyReader ? await bodyReader.read() : await bodyIterator.next();
+          if (state.settled) return;
+          if (done) {
+            state.settled = true;
+            controller.close();
+            return;
+          }
+          controller.enqueue(typeof value === "string" ? new TextEncoder().encode(value) : asBuffer(value));
+        })().catch((error) => {
+          if (state.settled) return;
+          state.settled = true;
+          try { controller.error(error); } catch {}
+        });
+        return state.pending;
+      }
       if (state.started) return state.pending;
       state.started = true;
       state.pending = new Promise((resolve) => setTimeout(resolve, 0))
