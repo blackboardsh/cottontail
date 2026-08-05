@@ -17,6 +17,9 @@ import { cpus } from 'os';
 import { join, dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
+// MSYS tar cannot chdir into drive-letter backslash paths on Windows.
+const tarPath = (p) => (process.platform === 'win32' ? p.replace(/\\/g, '/') : p);
+
 const ROOT = process.cwd();
 const MANIFEST_PATH = join(dirname(fileURLToPath(import.meta.url)), 'jsc-manifest.json');
 const MANIFEST = JSON.parse(readFileSync(MANIFEST_PATH, 'utf8'));
@@ -161,8 +164,6 @@ function ensureIcuHeaders(vendorDir) {
           `Actual:   ${actualSha256}`
       );
     }
-    // MSYS tar cannot chdir into drive-letter backslash paths on Windows.
-    const tarPath = (p) => (process.platform === 'win32' ? p.replace(/\\/g, '/') : p);
     exec('tar', [
       '--force-local',
       '-xzf',
@@ -331,7 +332,7 @@ function buildPinnedIcuFallback(vendorDir, platformKey) {
       );
     }
 
-    exec('tar', ['-xzf', archivePath, '-C', sourceDir, '--strip-components=1']);
+    exec('tar', ['--force-local', '-xzf', tarPath(archivePath), '-C', tarPath(sourceDir), '--strip-components=1']);
     const configurePlatform = platformKey.startsWith('macos-') ? 'MacOSX' : 'Linux';
     exec(
       join(sourceDir, 'source', 'runConfigureICU'),
@@ -438,7 +439,7 @@ function vendorLocalJsc(platformKey, archiveValue) {
   mkdirSync(stagingDir, { recursive: true });
 
   try {
-    exec('tar', ['-xzf', archivePath, '--strip-components=1', '-C', stagingDir]);
+    exec('tar', ['--force-local', '-xzf', tarPath(archivePath), '--strip-components=1', '-C', tarPath(stagingDir)]);
 
     const libDir = join(stagingDir, 'lib');
     const includeDir = join(stagingDir, 'include', 'JavaScriptCore');
@@ -525,7 +526,7 @@ function vendorJsc() {
       );
     }
 
-    exec('tar', ['-xzf', archivePath, '--strip-components=1', '-C', stagingDir]);
+    exec('tar', ['--force-local', '-xzf', tarPath(archivePath), '--strip-components=1', '-C', tarPath(stagingDir)]);
     unlinkSync(archivePath);
 
     const libDir = join(stagingDir, 'lib');
