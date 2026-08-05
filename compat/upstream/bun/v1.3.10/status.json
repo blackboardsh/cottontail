@@ -104,7 +104,8 @@
     },
     "test/bake/dev-and-prod.test.ts": {
       "status": "enabled",
-      "reason": "Bake development and production compilation pass all 12 copied cases with 27 assertions."
+      "reason": "Bake development and production compilation pass all 12 copied cases with 27 assertions (~21s of dev-server startups; the 90s harness budget covers parallel-load scheduling).",
+      "timeoutMs": 90000
     },
     "test/bake/dev/bundle.test.ts": {
       "status": "enabled",

@@ -835,6 +835,14 @@ function suiteHasLifecycleWork(suite) {
   return suite.children.some((child) => child.kind === "suite" && suiteHasLifecycleWork(child));
 }
 
+function suiteHasTestRecords(suite) {
+  return suite.children.some((child) => child.kind === "suite" ? suiteHasTestRecords(child) : true);
+}
+
+function suiteHasSelectedTest(suite) {
+  return suite.children.some((child) => child.kind === "suite" ? suiteHasSelectedTest(child) : selectedByOnly(child));
+}
+
 function suiteBeforeError(suite) {
   for (const item of suiteChain(suite)) {
     if (item.beforeError) return item.beforeError;
@@ -1140,7 +1148,11 @@ async function executeSuite(suite, concurrentGroup) {
   }
 
   const hasRunnableWork = suiteHasRunnableWork(suite);
-  const runnable = hasRunnableWork || suiteHasLifecycleWork(suite);
+  // Bun still runs hooks for suites that are empty or whose tests are all
+  // skipped, but not for suites whose tests were deselected by `.only`
+  // (issue #14135).
+  const runnable = hasRunnableWork ||
+    (suiteHasLifecycleWork(suite) && (!suiteHasTestRecords(suite) || suiteHasSelectedTest(suite)));
   const shouldRunBefore = runnable && !suite.beforeRan && (suite !== rootSuite || hasRunnableWork);
   if (shouldRunBefore) {
     if (suite.beforeHooks.length > 0) await flushConcurrent(concurrentGroup);
@@ -1223,7 +1235,7 @@ function parseStackFrame(line) {
   let match = /^(.*?)@(.+):(\d+):(\d+)$/.exec(text);
   if (match) {
     return {
-      functionName: match[1] || "<anonymous>",
+      functionName: match[1] && match[1] !== "unknown" ? match[1] : "<anonymous>",
       filePath: normalizeDiagnosticPath(match[2]),
       line: Number(match[3]),
       column: Number(match[4]),
@@ -1232,7 +1244,7 @@ function parseStackFrame(line) {
   match = /^\s*at\s+(?:(.*?)\s+\()?(.+):(\d+):(\d+)\)?$/.exec(text);
   if (!match) return null;
   return {
-    functionName: match[1] || "<anonymous>",
+    functionName: match[1] && match[1] !== "unknown" ? match[1] : "<anonymous>",
     filePath: normalizeDiagnosticPath(match[2]),
     line: Number(match[3]),
     column: Number(match[4]),
@@ -1255,7 +1267,9 @@ function failureStackFrames(error) {
     const frame = parseStackFrame(line);
     if (!frame) continue;
     const path = frame.filePath;
-    if (!path || path.includes("/.cottontail-embedded-runtime/") ||
+    // Bun never shows its own internals in test failure stacks: drop frames
+    // from builtin modules ("node:test", "node:async_hooks", ...).
+    if (!path || path.startsWith("node:") || path.includes("/.cottontail-embedded-runtime/") ||
         path.includes("/.cottontail-tmp/") || path.endsWith("/script.bundle.mjs")) continue;
     frames.push(frame);
   }

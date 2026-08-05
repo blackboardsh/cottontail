@@ -35,6 +35,11 @@ import {
 const Promise = globalThis.Promise;
 const queueMicrotask = globalThis.queueMicrotask.bind(globalThis);
 
+// Materialize the web-streams globals now, before any test file can replace
+// Promise.prototype.then: the underlying polyfill captures Promise statics at
+// load time and must never see a user-overridden `then`.
+try { void globalThis.ReadableStream; } catch {}
+
 restoreBunTestFilterArgument();
 
 function safeUncaughtDescriptorValue(object, name) {
@@ -1796,8 +1801,9 @@ function parseExpectationStackFrame(line) {
   if (!match) return null;
   let filePath = String(match[2]).replace(/^file:\/\//, "").replaceAll("\\", "/");
   try { filePath = decodeURIComponent(filePath); } catch {}
+  const rawName = match[1];
   return {
-    functionName: match[1] || "<anonymous>",
+    functionName: rawName && rawName !== "unknown" ? rawName : "<anonymous>",
     filePath,
     line: Number(match[3]),
     column: Number(match[4]),
@@ -2481,11 +2487,9 @@ class Expectation {
       }
       if (didThrow) return checkThrown(true, thrown);
       if (isPromiseLike(result)) {
-        const isAsyncFunction = Object.prototype.toString.call(actual) === "[object AsyncFunction]";
-        if (!isAsyncFunction) {
-          result.catch?.(() => {});
-          return checkThrown(false, undefined);
-        }
+        // Bun treats a rejected promise returned from any function — not just
+        // async functions — as a throw for toThrow (verified against Bun
+        // 1.3.10), so drive every promise result to settlement.
         const settled = result.then(
           () => this._check(false, "Expected function to throw"),
           (error) => checkThrown(true, error),
@@ -2496,6 +2500,14 @@ class Expectation {
         // Bun.serve(...)` disposing via stop(true) — races a still-pending
         // matcher and aborts the in-flight in-process fetch dispatch.
         settled.catch(() => {});
+        // Bun counts the expect() call as soon as the matcher runs — the
+        // test may time out while waitForPromise below is still blocked
+        // (issue #23865), so the assertion must be recorded up front. The
+        // skip flag keeps the eventual _check from counting it twice.
+        if (!this._promiseMode) {
+          countAssertion();
+          this._skipAssertionCount = true;
+        }
         if (!this._promiseMode && typeof globalThis.cottontail?.waitForPromise === "function") {
           let state = nativePromiseState(settled);
           if (state?.status === 0) {
@@ -2506,11 +2518,9 @@ class Expectation {
           if (state?.status === 1) return undefined;
         }
         // Bun keeps the running test alive until this promise settles
-        // (issue #23865) and counts the expect() call immediately — the
-        // test may time out before the promise resolves.
-        if (!this._promiseMode && globalThis.__cottontailRegisterTestPendingPromise?.(settled)) {
-          countAssertion();
-          this._skipAssertionCount = true;
+        // (issue #23865); the assertion was already counted above.
+        if (!this._promiseMode) {
+          globalThis.__cottontailRegisterTestPendingPromise?.(settled);
         }
         return settled;
       }
@@ -2652,7 +2662,7 @@ class Expectation {
       throw new Error("Snapshot matchers cannot be used outside of a test");
     }
     if (globalThis.__cottontailCurrentTestIsConcurrent?.() &&
-        !globalThis.__cottontailCurrentTestHasOwnConcurrency?.()) {
+        bunCurrentFileConcurrentTestCount() > 1) {
       throw new Error("Snapshot matchers are not supported in concurrent tests");
     }
     const snapshotContext = captureSnapshotContext(currentTest);
@@ -3680,6 +3690,27 @@ const bunRootSuite = {
 };
 let nextInspectorTestId = 1;
 
+// Bun only rejects snapshot matchers in concurrent tests when the file
+// contains more than one concurrent test (verified against Bun 1.3.10 — a
+// lone concurrent test, whether via test.concurrent or inherited from
+// describe.concurrent, may use snapshots). Tracked per test file.
+const bunConcurrentTestsByFile = new Map();
+
+function bunConcurrentTestFileKey() {
+  const file = globalThis.__cottontailCurrentTestFile?.() ||
+    globalThis.__cottontailRegisteringTestFile || globalThis.__filename || "";
+  return file ? normalizeInlineSnapshotPath(file) : "";
+}
+
+function noteBunConcurrentTest() {
+  const key = bunConcurrentTestFileKey();
+  bunConcurrentTestsByFile.set(key, (bunConcurrentTestsByFile.get(key) ?? 0) + 1);
+}
+
+function bunCurrentFileConcurrentTestCount() {
+  return bunConcurrentTestsByFile.get(bunConcurrentTestFileKey()) ?? 0;
+}
+
 function reportInspectorTestFound(id, name, type, parent, line) {
   const params = {
     id,
@@ -3803,6 +3834,10 @@ function makeBunTestFunction(base) {
     const inspectorId = nextInspectorTestId++;
     reportInspectorTestFound(inspectorId, name, "test", registrationSuite, registrationLine);
     noteBunTestSelection(name, registrationSuite);
+    const concurrencyOptions = applyBunFileConcurrency(options);
+    if (!concurrencyOptions.serial && (concurrencyOptions.concurrent || registrationSuite.concurrent)) {
+      noteBunConcurrentTest();
+    }
     return enqueueBunTestEntry(registrationSuite.orderScope, () => base(
       name,
       applyBunFileConcurrency({
@@ -3853,6 +3888,7 @@ function makeBunDescribe(base) {
       inspectorId,
       matchingTestCount: 0,
       totalTestCount: 0,
+      concurrent: options.serial ? false : Boolean(options.concurrent || registrationSuite.concurrent),
       orderScope: createBunTestOrderScope(registrationSuite.orderScope),
     };
     return enqueueBunTestEntry(registrationSuite.orderScope, () => base(
@@ -3888,8 +3924,13 @@ function isTruthyEnvValue(value) {
   return text !== "" && text !== "0" && text !== "false";
 }
 
+// Snapshot the environment at module evaluation: Bun decides CI-ness from
+// the process startup environment, and user preloads (test/preload.ts
+// rewrites process.env from bunEnv) must not flip it later.
+const testRunnerStartupEnv = { ...(globalThis.process?.env ?? {}) };
+
 function isCIEnvironment() {
-  const env = globalThis.process?.env ?? {};
+  const env = testRunnerStartupEnv;
   if (env.CI != null) return isTruthyEnvValue(env.CI);
   if (env.JENKINS_URL != null || env.BUILD_ID != null) return true;
   return ["GITHUB_ACTIONS", "GITLAB_CI", "CIRCLECI", "TRAVIS", "BUILDKITE", "APPVEYOR", "TEAMCITY_VERSION"]

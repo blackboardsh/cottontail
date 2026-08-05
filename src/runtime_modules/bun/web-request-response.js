@@ -1194,9 +1194,9 @@ export function createRequestResponseRuntime({
     } else if (isURLSearchParamsLike(body)) {
       headers.set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8");
     } else if (typeof body === "string") {
-      // BodyInit extraction for a string defaults to text/plain (fetch spec);
-      // response.blob() re-encodes it as "text/plain;charset=utf-8".
-      headers.set("Content-Type", "text/plain;charset=UTF-8");
+      // Bun does not put a Content-Type on the Response/Request headers for
+      // string bodies (issue #24817); blob() derives the type from the body
+      // itself and the serve layer defaults it on the wire.
     } else if (body instanceof Blob && typeof body.type === "string" && body.type !== "") {
       headers.set("Content-Type", body.type);
     }
@@ -1922,8 +1922,11 @@ export function createRequestResponseRuntime({
       return asBuffer(await bytesFromBody(body));
     }
     async blob() {
-      const type = blobTypeFromBodyHeaders(this.headers);
+      let type = blobTypeFromBodyHeaders(this.headers);
       const body = this._takeBody();
+      // Bun sets no Content-Type header for string bodies, but the extracted
+      // body still carries its text/plain type into blob().
+      if (!type && typeof body === "string") type = "text/plain;charset=utf-8";
       // Bun keeps a Blob body's own MIME type. Response headers only supply a
       // type when the consumed body did not already carry one.
       if (body instanceof Blob && (body.type || !type)) return body;
@@ -2144,8 +2147,11 @@ export function createRequestResponseRuntime({
       return asBuffer(await bytesFromBody(body));
     }
     async blob() {
-      const type = blobTypeFromBodyHeaders(this.headers);
+      let type = blobTypeFromBodyHeaders(this.headers);
       const body = this._takeBody();
+      // Bun sets no Content-Type header for string bodies, but the extracted
+      // body still carries its text/plain type into blob().
+      if (!type && typeof body === "string") type = "text/plain;charset=utf-8";
       // Bun keeps a Blob body's own MIME type. Response headers only supply a
       // type when the consumed body did not already carry one.
       if (body instanceof Blob && (body.type || !type)) return body;
