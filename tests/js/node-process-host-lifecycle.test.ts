@@ -161,7 +161,8 @@ test.skipIf(process.platform === "win32")("OS signals emit their name", async ()
   `);
 
   expect(result.exitCode).toBe(0);
-  expect(result.stdout).toBe('["SIGUSR1"]\n');
+  // Bun 1.3.10 delivers (name, number) to signal listeners.
+  expect(result.stdout).toBe('["SIGUSR1",30]\n');
 });
 
 for (const signal of ["SIGALRM", "SIGPROF", "SIGVTALRM", "SIGPWR"] as const) {

@@ -38564,7 +38564,19 @@ static bool ct_runtime_has_pending_native_events(CtJscRuntime *runtime) {
                 break;
             }
         }
-        if (has_active_signal_watcher) (void)ct_runtime_uv_run(runtime, UV_RUN_NOWAIT);
+        if (has_active_signal_watcher) {
+            /* The watchers stay unref'd so listeners alone never keep the
+             * process alive — but that also means a NOWAIT uv_run returns
+             * without polling. Ref them for this one sweep so a signal
+             * raised just before termination is delivered into pending. */
+            for (size_t index = 0; index < runtime->signal_watcher_count; index += 1) {
+                if (runtime->signal_watchers[index].active) uv_ref((uv_handle_t *)&runtime->signal_watchers[index].handle);
+            }
+            (void)ct_runtime_uv_run(runtime, UV_RUN_NOWAIT);
+            for (size_t index = 0; index < runtime->signal_watcher_count; index += 1) {
+                if (runtime->signal_watchers[index].active) uv_unref((uv_handle_t *)&runtime->signal_watchers[index].handle);
+            }
+        }
     }
 
     if (runtime->next_tick_pending) return true;
