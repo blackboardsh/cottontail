@@ -22,6 +22,17 @@ import { finalizeTestReporters } from "../internal/bun-test-reporters.js";
 
 const tests = [];
 const events = [];
+
+// This module can be evaluated more than once in a single process: the lazy
+// `describe`/`test`/`expect` globals reach one loader-cache key while
+// `bun:test` (and `Bun.jest(file)`) reaches another. Both instances must
+// share a single registration/reporter state — otherwise the first runner to
+// drain prints a partial summary and process.exit()s while the other
+// instance's tests are still in flight. The first instance to evaluate
+// becomes the primary; later instances re-export its interface and skip all
+// process-global side effects. Mirrors bun/test.js's bunTestModule handling.
+const primaryTestModuleKey = Symbol.for("cottontail.internal.nodeTestModule");
+const primaryTestModule = globalThis[primaryTestModuleKey] ?? null;
 const Promise = globalThis.Promise;
 const queueMicrotask = globalThis.queueMicrotask.bind(globalThis);
 const runnerSetTimeout = globalThis.setTimeout;
@@ -195,7 +206,7 @@ function installDotsConsoleHooks() {
   }
 }
 
-installDotsConsoleHooks();
+if (!primaryTestModule) installDotsConsoleHooks();
 
 function isTruthyEnvValue(value) {
   if (value == null) return false;
@@ -986,7 +997,7 @@ async function executeAttempt(record) {
   });
 }
 
-globalThis.__cottontailRecordTestAssertionCount = (count) => {
+if (!primaryTestModule) globalThis.__cottontailRecordTestAssertionCount = (count) => {
   const execution = executionStorage.getStore?.() ?? activeExecution;
   if (!execution?.record) return;
   (execution.record.attemptAssertionCounts ??= []).push(Math.max(0, Number(count) || 0));
@@ -1126,7 +1137,9 @@ function recordUnhandledError(error) {
 
 // Bun installs its test-runner rejection handlers before loading each test
 // entrypoint, so module-scope failures use the same reporter as test failures.
-if (testCliModeEnabled()) {
+// Only the primary instance's handlers are live; a delegating instance's
+// handlers would route errors into state nothing registers into.
+if (!primaryTestModule && testCliModeEnabled()) {
   installUncaughtCapture();
   installUnhandledRejectionCapture();
 }
@@ -1385,6 +1398,9 @@ function fullTestName(record) {
   return names.join(" > ") || record.name || "test runner";
 }
 
+// These introspection hooks must read the primary instance's execution state;
+// a delegating instance's execution storage never runs any test.
+if (!primaryTestModule) {
 globalThis.__cottontailCurrentTestName = () => {
   const execution = executionStorage.getStore?.();
   return execution?.record ? fullTestName(execution.record) : "";
@@ -1448,6 +1464,7 @@ globalThis.__cottontailCurrentTestRemainingMs = () => {
   if (!execution || execution.deadline == null) return null;
   return Math.max(0, execution.deadline - runnerDateNow());
 };
+}
 
 function appendFailure(lines, record, error) {
   if (record.unhandledBetweenTests) {
@@ -1845,7 +1862,7 @@ function scheduleRun() {
   });
 }
 
-globalThis[Symbol.for("cottontail.internal.startTestRun")] = scheduleRun;
+if (!primaryTestModule) globalThis[Symbol.for("cottontail.internal.startTestRun")] = scheduleRun;
 
 function normalizeCountOption(value, name) {
   const count = Number(value);
@@ -1895,8 +1912,8 @@ function makeTestFunction(defaultOptions = {}) {
   return fn;
 }
 
-export const test = makeTestFunction();
-export const it = test;
+export const test = primaryTestModule?.test ?? makeTestFunction();
+export const it = primaryTestModule?.it ?? test;
 
 function suiteFunction(name, options, callback, defaultOptions = {}) {
   if (currentExecution()) throw nestedTestNotImplemented("describe");
@@ -1938,18 +1955,18 @@ function suiteFunction(name, options, callback, defaultOptions = {}) {
   }
 }
 
-export const describe = Object.assign(suiteFunction, {
+export const describe = primaryTestModule?.describe ?? Object.assign(suiteFunction, {
   only: (...args) => suiteFunction(args[0], args[1], args[2], { only: true }),
   skip: (...args) => suiteFunction(args[0], args[1], args[2], { skip: true }),
   todo: (...args) => suiteFunction(args[0], args[1], args[2], { todo: true }),
 });
 
-export const suite = describe;
-export const only = makeTestFunction({ only: true });
-export const skip = makeTestFunction({ skip: true });
-export const todo = makeTestFunction({ todo: true });
+export const suite = primaryTestModule?.suite ?? describe;
+export const only = primaryTestModule?.only ?? makeTestFunction({ only: true });
+export const skip = primaryTestModule?.skip ?? makeTestFunction({ skip: true });
+export const todo = primaryTestModule?.todo ?? makeTestFunction({ todo: true });
 
-export function before(fn, options = {}) {
+function beforeImpl(fn, options = {}) {
   const execution = currentExecution();
   if (execution) execution.afterBodyHooks.unshift({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
   else {
@@ -1964,7 +1981,9 @@ export function before(fn, options = {}) {
   }
 }
 
-export function after(fn, options = {}) {
+export const before = primaryTestModule?.before ?? beforeImpl;
+
+function afterImpl(fn, options = {}) {
   const execution = currentExecution();
   if (execution) execution.afterBodyHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
   else {
@@ -1974,7 +1993,9 @@ export function after(fn, options = {}) {
   }
 }
 
-export function beforeEach(fn, options = {}) {
+export const after = primaryTestModule?.after ?? afterImpl;
+
+function beforeEachImpl(fn, options = {}) {
   if (currentExecution()) {
     throw new Error("Cannot call beforeEach() inside a test. Call it inside describe() instead.");
   }
@@ -1982,14 +2003,18 @@ export function beforeEach(fn, options = {}) {
   scheduleRun();
 }
 
-export function afterEach(fn, options = {}) {
+export const beforeEach = primaryTestModule?.beforeEach ?? beforeEachImpl;
+
+function afterEachImpl(fn, options = {}) {
   const execution = currentExecution();
   if (execution) execution.afterEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
   else currentSuite.afterEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
   scheduleRun();
 }
 
-export function onTestFinished(fn, options = {}) {
+export const afterEach = primaryTestModule?.afterEach ?? afterEachImpl;
+
+function onTestFinishedImpl(fn, options = {}) {
   if (typeof fn !== "function") throw new TypeError("onTestFinished requires a callback");
   const execution = currentExecution();
   if (!execution) throw new Error("Cannot call onTestFinished() outside of a test");
@@ -1999,11 +2024,15 @@ export function onTestFinished(fn, options = {}) {
   execution.finishHooks.push({ fn, options });
 }
 
-export function setDefaultTimeout(timeout) {
+export const onTestFinished = primaryTestModule?.onTestFinished ?? onTestFinishedImpl;
+
+function setDefaultTimeoutImpl(timeout) {
   const value = Number(timeout);
   if (!Number.isFinite(value) || value < 0) throw new TypeError("timeout must be a non-negative number");
   defaultTimeout = value;
 }
+
+export const setDefaultTimeout = primaryTestModule?.setDefaultTimeout ?? setDefaultTimeoutImpl;
 
 class MockTracker {
   constructor() {
@@ -2070,16 +2099,16 @@ class MockTracker {
   }
 }
 
-export const mock = new MockTracker();
+export const mock = primaryTestModule?.mock ?? new MockTracker();
 
-export const assert = {
+export const assert = primaryTestModule?.assert ?? {
   ...nodeAssert,
   register(name, fn) {
     this[name] = fn;
   },
 };
 
-export const snapshot = {
+export const snapshot = primaryTestModule?.snapshot ?? {
   _serializers: [],
   _resolveSnapshotPath: null,
   setDefaultSnapshotSerializers(serializers = []) {
@@ -2101,28 +2130,54 @@ async function *runEvents(options = {}) {
   yield *events;
 }
 
-export function run(options = {}) {
+function runImpl(options = {}) {
   return Readable.from(runEvents(options));
 }
 
-Object.assign(test, {
-  after,
-  afterEach,
-  assert,
-  before,
-  beforeEach,
-  describe,
-  it,
-  mock,
-  onTestFinished,
-  only,
-  run,
-  setDefaultTimeout,
-  skip,
-  snapshot,
-  suite,
-  test,
-  todo,
-});
+export const run = primaryTestModule?.run ?? runImpl;
+
+// The primary instance publishes its interface so later evaluations of this
+// module (a different loader-cache key for the same file) delegate to it
+// instead of building a second, divergent runner state.
+if (!primaryTestModule) {
+  Object.assign(test, {
+    after,
+    afterEach,
+    assert,
+    before,
+    beforeEach,
+    describe,
+    it,
+    mock,
+    onTestFinished,
+    only,
+    run,
+    setDefaultTimeout,
+    skip,
+    snapshot,
+    suite,
+    test,
+    todo,
+  });
+  globalThis[primaryTestModuleKey] = {
+    test,
+    it,
+    describe,
+    suite,
+    only,
+    skip,
+    todo,
+    before,
+    after,
+    beforeEach,
+    afterEach,
+    onTestFinished,
+    setDefaultTimeout,
+    mock,
+    assert,
+    snapshot,
+    run,
+  };
+}
 
 export default test;

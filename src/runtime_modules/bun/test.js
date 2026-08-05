@@ -596,14 +596,71 @@ function enumerableOwnKeys(value, symbolsOnly = false) {
     Object.prototype.propertyIsEnumerable.call(value, key));
 }
 
+// An own "__proto__" data property (e.g. JSON.parse('{"__proto__":…}'))
+// disqualifies an object's structure from JSC's fast property enumeration
+// (hasUnderscoreProtoPropertyExcludingOriginalProto), so Bun's deep equality
+// (Bun__deepEquals in bindings.cpp) falls back to its generic path there:
+// property names are collected across the whole prototype chain and values
+// are read with prototype-chain lookups (reading "__proto__" on an object
+// without an own "__proto__" yields its prototype). That is why Bun
+// considers JSON.parse('{"__proto__":x}') equal to the literal
+// `{ __proto__: x }`, but not the reverse.
+function hasOwnProtoDataProperty(value) {
+  const descriptor = Object.getOwnPropertyDescriptor(value, "__proto__");
+  return descriptor !== undefined && "value" in descriptor;
+}
+
+function protoChainEnumerableKeys(value) {
+  const keys = [];
+  const seen = new Set();
+  for (let cursor = value; cursor != null; cursor = Object.getPrototypeOf(cursor)) {
+    for (const key of Reflect.ownKeys(cursor)) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (Object.prototype.propertyIsEnumerable.call(cursor, key)) keys.push(key);
+    }
+  }
+  return keys;
+}
+
+function matchesProtoChainProperties(actual, expected, state, strict) {
+  const actualKeys = protoChainEnumerableKeys(actual);
+  const expectedKeys = protoChainEnumerableKeys(expected);
+  if (strict && actualKeys.length !== expectedKeys.length) return false;
+  const body = matchEverySequential(actualKeys, (key) => {
+    const rightHas = Reflect.has(expected, key);
+    if (!strict && actual[key] === undefined && !rightHas) return true;
+    if (!rightHas) return false;
+    return matchesExpected(actual[key], expected[key], state, strict);
+  });
+  return mapMatchResult(body, (matched) => {
+    if (!matched) return false;
+    for (let index = actualKeys.length; index < expectedKeys.length; index++) {
+      if (expected[expectedKeys[index]] !== undefined) return false;
+    }
+    return true;
+  });
+}
+
 function arrayDataValue(value, index) {
   const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
   return descriptor && "value" in descriptor ? descriptor.value : missingArrayValue;
 }
 
 function calculatedClassName(value) {
+  // Mirrors JSC's JSObject::calculatedClassName (used by Bun's strict deep
+  // equality): the own constructor's display name, else the prototype
+  // chain's constructor name, else Symbol.toStringTag, else "Object" — so a
+  // null-prototype object still classes as "Object" like a plain literal.
   try {
-    return value?.constructor?.name ?? Object.prototype.toString.call(value);
+    let name = Object.getOwnPropertyDescriptor(value, "constructor")?.value?.name;
+    if (name == null) name = Object.getPrototypeOf(value)?.constructor?.name;
+    if (name == null || name === "Object") {
+      const tag = value[Symbol.toStringTag];
+      if (typeof tag === "string") return tag;
+      if (name == null) return "Object";
+    }
+    return name;
   } catch {
     return Object.prototype.toString.call(value);
   }
@@ -655,6 +712,9 @@ function finishExpectedPair(state, result) {
 
 function matchesEnumerableProperties(actual, expected, state, strict) {
   if (strict && calculatedClassName(actual) !== calculatedClassName(expected)) return false;
+  if (hasOwnProtoDataProperty(actual) || hasOwnProtoDataProperty(expected)) {
+    return matchesProtoChainProperties(actual, expected, state, strict);
+  }
   const actualKeys = enumerableOwnKeys(actual);
   const expectedKeys = enumerableOwnKeys(expected);
   if (strict && actualKeys.length !== expectedKeys.length) return false;

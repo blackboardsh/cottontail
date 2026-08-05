@@ -1077,7 +1077,21 @@ function callbackifySync(fn) {
 export function deflateSync(data, options = undefined) { return transformSync("deflate", data, options); }
 export function deflateRawSync(data, options = undefined) { return transformSync("deflateRaw", data, options); }
 export function gzipSync(data, options = undefined) { return transformSync("gzip", data, options); }
-export function inflateSync(data, options = undefined) { return transformSync("inflate", data, options); }
+export function inflateSync(data, options = undefined) {
+  // Bun.inflateSync aliases this one-shot and inflates raw deflate by
+  // default (BunObject.zig runs it with windowBits -15): when the zlib
+  // wrapper fails the header check, retry as a raw deflate stream and report
+  // the raw stream's error if that fails too (e.g. "invalid stored block
+  // lengths" instead of "incorrect header check").
+  try {
+    return transformSync("inflate", data, options);
+  } catch (error) {
+    // Only data errors fall through to the raw attempt; option-validation
+    // and output-limit failures are not format mismatches.
+    if (error instanceof Error) throw error;
+    return transformSync("inflateRaw", data, options);
+  }
+}
 export function inflateRawSync(data, options = undefined) { return transformSync("inflateRaw", data, options); }
 export function gunzipSync(data, options = undefined) { return decompressMembersSync("gunzip", data, options); }
 export function unzipSync(data, options = undefined) { return decompressMembersSync("unzip", data, options); }
