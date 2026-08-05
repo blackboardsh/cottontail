@@ -2490,6 +2490,21 @@ class Expectation {
           () => this._check(false, "Expected function to throw"),
           (error) => checkThrown(true, error),
         );
+        // Bun drives async-function throw matchers to settlement before
+        // expect() returns (verified against Bun 1.3.10). Without this,
+        // teardown that runs when the test body exits — e.g. `using server =
+        // Bun.serve(...)` disposing via stop(true) — races a still-pending
+        // matcher and aborts the in-flight in-process fetch dispatch.
+        settled.catch(() => {});
+        if (!this._promiseMode && typeof globalThis.cottontail?.waitForPromise === "function") {
+          let state = nativePromiseState(settled);
+          if (state?.status === 0) {
+            globalThis.cottontail.waitForPromise(settled);
+            state = nativePromiseState(settled);
+          }
+          if (state?.status === 2) throw state.value;
+          if (state?.status === 1) return undefined;
+        }
         // Bun keeps the running test alive until this promise settles
         // (issue #23865) and counts the expect() call immediately — the
         // test may time out before the promise resolves.
