@@ -32378,11 +32378,17 @@ static JSValueRef ct_close_fd(JSContextRef ctx, JSObjectRef function, JSObjectRe
     return JSValueMakeUndefined(ctx);
 }
 
+/* macOS (and POSIX generally) rejects a single write/pwrite whose count
+   exceeds INT_MAX with EINVAL; clamp each syscall and loop instead. */
+#define CT_MAX_WRITE_CHUNK ((size_t)INT_MAX)
+
 static int ct_fd_write_bytes(int fd, const uint8_t *bytes, size_t len) {
     if (fd < 0) return EBADF;
     size_t written_total = 0;
     while (written_total < len) {
-        ssize_t written = write(fd, bytes + written_total, len - written_total);
+        size_t chunk = len - written_total;
+        if (chunk > CT_MAX_WRITE_CHUNK) chunk = CT_MAX_WRITE_CHUNK;
+        ssize_t written = write(fd, bytes + written_total, chunk);
         if (written < 0) {
             if (errno == EINTR) continue;
             return errno;
@@ -32768,8 +32774,9 @@ static JSValueRef ct_fd_write_some(JSContextRef ctx, JSObjectRef function, JSObj
     }
 
     ssize_t written;
+    size_t chunk = len > CT_MAX_WRITE_CHUNK ? CT_MAX_WRITE_CHUNK : len;
     do {
-        written = write(fd, bytes, len);
+        written = write(fd, bytes, chunk);
     } while (written < 0 && errno == EINTR);
     free(text);
     if (written < 0) {
@@ -33025,9 +33032,11 @@ static JSValueRef ct_fd_write_at(JSContextRef ctx, JSObjectRef function, JSObjec
     bool has_position = argc >= 5 && !JSValueIsUndefined(ctx, argv[4]) && !JSValueIsNull(ctx, argv[4]);
     size_t written_total = 0;
     while (written_total < length) {
+        size_t chunk = length - written_total;
+        if (chunk > CT_MAX_WRITE_CHUNK) chunk = CT_MAX_WRITE_CHUNK;
         ssize_t count = has_position
-            ? pwrite(fd, bytes + offset + written_total, length - written_total, (off_t)ct_value_to_number(ctx, argv[4]) + (off_t)written_total)
-            : write(fd, bytes + offset + written_total, length - written_total);
+            ? pwrite(fd, bytes + offset + written_total, chunk, (off_t)ct_value_to_number(ctx, argv[4]) + (off_t)written_total)
+            : write(fd, bytes + offset + written_total, chunk);
         if (count < 0) {
             if (errno == EINTR) continue;
             free(text);

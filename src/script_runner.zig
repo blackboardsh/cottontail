@@ -3672,7 +3672,7 @@ fn buildCpuProfile(
             .columnNumber = -1,
         },
     });
-    var node_ids: std.StringHashMapUnmanaged(u32) = .empty;
+    var node_ids: compiler.StringHashMapUnmanaged(u32) = .empty;
     var samples: std.ArrayList(u32) = .empty;
     var time_deltas: std.ArrayList(u64) = .empty;
 
@@ -3814,7 +3814,7 @@ fn cpuProfileMarkdown(allocator: std.mem.Allocator, profile: BuiltCpuProfile) ![
     }
 
     try output.appendSlice("## Files\n\n");
-    var files: std.StringHashMapUnmanaged(void) = .empty;
+    var files: compiler.StringHashMapUnmanaged(void) = .empty;
     for (profile.mutable_nodes[1..]) |node| {
         const url = node.call_frame.url;
         if (url.len == 0 or files.contains(url)) continue;
@@ -4511,12 +4511,18 @@ fn sourceRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBoo
                     std.mem.eql(u8, property, "stackTraceLimit")) return .full;
             }
         } else if (std.mem.eql(u8, token.text, "globalThis") or
-            std.mem.eql(u8, token.text, "global") or
-            std.mem.eql(u8, token.text, "eval") or
-            std.mem.eql(u8, token.text, "Function"))
+            std.mem.eql(u8, token.text, "global"))
         {
             if (has_http_server) return .full;
             if (mode == .bare) mode = .minimal;
+        } else if (std.mem.eql(u8, token.text, "eval") or
+            std.mem.eql(u8, token.text, "Function"))
+        {
+            // eval'd or Function-constructed code is compiled against the
+            // real global at runtime and can reference any global
+            // dynamically; a reduced bootstrap would hide them (e.g.
+            // eval("typeof Headers") must observe the full global set).
+            return .full;
         } else if (std.mem.eql(u8, token.text, "Promise") or
             std.mem.eql(u8, token.text, "async") or
             std.mem.eql(u8, token.text, "await") or
@@ -4595,7 +4601,7 @@ fn mergeRuntimeBootstrapMode(left: RuntimeBootstrapMode, right: RuntimeBootstrap
 fn reloadRuntimeBootstrapModeVisit(
     ctx: *const Context,
     path: []const u8,
-    visited: *std.StringHashMapUnmanaged(void),
+    visited: *compiler.StringHashMapUnmanaged(void),
 ) !ReloadRuntimeBootstrapAnalysis {
     const canonical = resolvePathForCwd(ctx.io, ctx.allocator, path) catch path;
     if (visited.contains(canonical)) return .{};
@@ -4649,7 +4655,7 @@ fn reloadRuntimeBootstrapModeVisit(
 }
 
 fn reloadRuntimeBootstrapAnalysis(ctx: *const Context, path: []const u8) !ReloadRuntimeBootstrapAnalysis {
-    var visited: std.StringHashMapUnmanaged(void) = .empty;
+    var visited: compiler.StringHashMapUnmanaged(void) = .empty;
     return reloadRuntimeBootstrapModeVisit(ctx, path, &visited);
 }
 
@@ -5676,7 +5682,7 @@ fn hashLauncherCacheDirectory(ctx: *const Context, path: []const u8) ![32]u8 {
 fn appendLauncherCacheDependency(
     ctx: *const Context,
     dependencies: *std.ArrayList(LauncherCacheDependency),
-    seen: *std.StringHashMapUnmanaged(void),
+    seen: *compiler.StringHashMapUnmanaged(void),
     path: []const u8,
     include_missing: bool,
 ) !bool {
@@ -5703,7 +5709,7 @@ fn appendLauncherCacheDependency(
 fn appendLauncherCacheDirectory(
     ctx: *const Context,
     dependencies: *std.ArrayList(LauncherCacheDependency),
-    seen: *std.StringHashMapUnmanaged(void),
+    seen: *compiler.StringHashMapUnmanaged(void),
     path: []const u8,
 ) !void {
     if (path.len == 0 or seen.contains(path)) return;
@@ -5720,7 +5726,7 @@ fn appendLauncherCacheDirectory(
 fn appendLauncherCacheConfigChain(
     ctx: *const Context,
     dependencies: *std.ArrayList(LauncherCacheDependency),
-    seen: *std.StringHashMapUnmanaged(void),
+    seen: *compiler.StringHashMapUnmanaged(void),
     start_dir: []const u8,
 ) !void {
     var current = start_dir;
@@ -5750,7 +5756,7 @@ fn collectLauncherCacheDependencies(
     input_files: []const native_bundler.GraphInputFile,
 ) ![]LauncherCacheDependency {
     var dependencies: std.ArrayList(LauncherCacheDependency) = .empty;
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var seen: compiler.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(ctx.allocator);
 
     const wrapped_entry_real = std.Io.Dir.cwd().realPathFileAlloc(

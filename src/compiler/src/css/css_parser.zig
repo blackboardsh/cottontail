@@ -122,7 +122,7 @@ pub const PrintErr = error{
 
 pub fn OOM(e: anyerror) noreturn {
     if (comptime bun.Environment.isDebug) {
-        std.debug.assert(e == std.mem.Allocator.Error.OutOfMemory);
+        bun.assert(e == std.mem.Allocator.Error.OutOfMemory);
     }
     bun.outOfMemory();
 }
@@ -5397,7 +5397,7 @@ const Tokenizer = struct {
     pub fn consumeNewline(this: *Tokenizer) void {
         const byte = this.nextByteUnchecked();
         if (bun.Environment.allow_assert) {
-            std.debug.assert(byte == '\r' or byte == '\n' or byte == FORM_FEED_BYTE);
+            bun.assert(byte == '\r' or byte == '\n' or byte == FORM_FEED_BYTE);
         }
         this.position += 1;
         if (byte == '\r' and this.nextByte() == '\n') {
@@ -5417,7 +5417,7 @@ const Tokenizer = struct {
     /// 11110xxx  0xF0..0xF7   First byte of a 4-byte character encoding
     /// 10xxxxxx  0x80..0xBF   Continuation byte: one of 1-3 bytes following the first <--
     pub fn consumeContinuationByte(this: *Tokenizer) void {
-        if (bun.Environment.allow_assert) std.debug.assert(this.nextByteUnchecked() & 0xC0 == 0x80);
+        if (bun.Environment.allow_assert) bun.assert(this.nextByteUnchecked() & 0xC0 == 0x80);
         // Continuation bytes contribute to column overcount. Note
         // that due to the special case for the 4-byte sequence intro,
         // we must use wrapping add here.
@@ -5435,7 +5435,7 @@ const Tokenizer = struct {
     /// 11110xxx  0xF0..0xF7   First byte of a 4-byte character encoding <--
     /// 10xxxxxx  0x80..0xBF   Continuation byte: one of 1-3 bytes following the first
     pub fn consume4byteIntro(this: *Tokenizer) void {
-        if (bun.Environment.allow_assert) std.debug.assert(this.nextByteUnchecked() & 0xF0 == 0xF0);
+        if (bun.Environment.allow_assert) bun.assert(this.nextByteUnchecked() & 0xF0 == 0xF0);
         // This takes two UTF-16 characters to represent, so we
         // actually have an undercount.
         // this.current_line_start_position = self.current_line_start_position.wrapping_sub(1);
@@ -5487,8 +5487,8 @@ const Tokenizer = struct {
             // rejected.
             for (0..n) |i| {
                 const b = this.byteAt(i);
-                std.debug.assert(std.ascii.isAscii(b) or (b & 0xF0 != 0xF0 and b & 0xC0 != 0x80));
-                std.debug.assert(b != '\r' and b != '\n' and b != '\x0C');
+                bun.assert(std.ascii.isAscii(b) or (b & 0xF0 != 0xF0 and b & 0xC0 != 0x80));
+                bun.assert(b != '\r' and b != '\n' and b != '\x0C');
             }
         }
         this.position += n;
@@ -5496,7 +5496,7 @@ const Tokenizer = struct {
 
     /// Advance over any kind of byte, excluding newlines.
     pub fn consumeKnownByte(this: *Tokenizer, byte: u8) void {
-        if (bun.Environment.allow_assert) std.debug.assert(byte != '\r' and byte != '\n' and byte != FORM_FEED_BYTE);
+        if (bun.Environment.allow_assert) bun.assert(byte != '\r' and byte != '\n' and byte != FORM_FEED_BYTE);
         this.position += 1;
         // Continuation bytes contribute to column overcount.
         if (byte & 0xF0 == 0xF0) {

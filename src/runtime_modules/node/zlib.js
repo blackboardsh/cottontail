@@ -767,6 +767,15 @@ class Zlib extends Transform {
     if (this._mode === "zstdDecompress") {
       completed = decodeCompletedInput(this._mode, input, this._transformOptions());
     }
+    // zlib-wrapped/raw inflate stream transforms run with Z_SYNC_FLUSH, which
+    // decodes a truncated stream without complaint; at end-of-input Node
+    // (and Bun) require the stream to actually terminate, so re-run a strict
+    // Z_FINISH decode purely for its error (brotli/zstd already fail
+    // natively). Corrupt data throws the native zlib error as before.
+    if (this._mode === "inflate" || this._mode === "inflateRaw" ||
+      this._mode === "gunzip" || this._mode === "unzip") {
+      transformSync(this._mode, input, { ...this._transformOptions(), finishFlush: constants.Z_FINISH });
+    }
     const output = completed === null ? transformSync(this._mode, input, this._transformOptions()) : completed.bytes;
     let bytes = output instanceof Uint8Array ? output : new Uint8Array(output);
     if (this._isDecompress) {

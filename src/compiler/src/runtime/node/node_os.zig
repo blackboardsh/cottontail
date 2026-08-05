@@ -65,7 +65,7 @@ fn cpusImplLinux(globalThis: *jsc.JSGlobalObject) !jsc.JSValue {
 
     // Read /proc/stat to get number of CPUs and times
     {
-        const file = std.fs.cwd().openFile("/proc/stat", .{}) catch {
+        const file = bun.FD.stdFile(bun.sys.open("/proc/stat", bun.O.RDONLY, 0).unwrap() catch {
             // hidepid mounts (common on Android) deny /proc/stat. lazyCpus in os.ts
             // pre-creates hostCpuCount lazy proxies, so return that many stub
             // entries (zeroed times / unknown model / speed 0) — matches Node.

@@ -2173,6 +2173,10 @@ fn writeMultiTestEntrypoint(
         try appendJavaScriptStringLiteral(allocator, &marker_source, test_directory);
         try marker_source.appendSlice(allocator, ";\nglobalThis.__cottontailRegisteringTestFile = ");
         try appendJavaScriptStringLiteral(allocator, &marker_source, absolute);
+        // Each test file observes Bun.main as its own path; assigning it in
+        // the per-file marker also resets any override a previous file set.
+        try marker_source.appendSlice(allocator, ";\nglobalThis.Bun.main = ");
+        try appendJavaScriptStringLiteral(allocator, &marker_source, absolute);
         try marker_source.appendSlice(allocator, ";\n");
         try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = marker_path, .data = marker_source.items });
 

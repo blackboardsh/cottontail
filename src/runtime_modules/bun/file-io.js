@@ -872,7 +872,7 @@ export function file(path, options = undefined) {
 }
 
 function normalizeWriteOptions(options) {
-  if (options == null) return { createPath: true, createPathWasSet: false, mode: 0o664 };
+  if (options == null) return { createPath: true, createPathWasSet: false, mode: 0o664, modeWasSet: false };
   if (typeof options !== "object") throw invalidArgumentType("Expected options to be an object for 'write'.");
   let createPath = true;
   let createPathWasSet = false;
@@ -884,7 +884,9 @@ function normalizeWriteOptions(options) {
     createPath = options.createPath;
   }
   let mode = 0o664;
+  let modeWasSet = false;
   if (options.mode != null) {
+    modeWasSet = true;
     if (typeof options.mode !== "number" || !Number.isFinite(options.mode)) {
       throw invalidArgumentType("Expected options.mode to be a number for 'write'.");
     }
@@ -897,7 +899,7 @@ function normalizeWriteOptions(options) {
   }
   // Bun 1.3.10 only parses createPath and mode for local files. In particular,
   // an AbortSignal in this object is intentionally ignored.
-  return { createPath, createPathWasSet, mode };
+  return { createPath, createPathWasSet, mode, modeWasSet };
 }
 
 function normalizeWriteDestination(destination, options) {
@@ -980,11 +982,24 @@ function openWriteDestination(destination, options) {
   if (destination.kind === "stream") return { fd: null, owned: false, stream: destination.stream };
   if (destination.kind === "fd") return { fd: destination.fd, owned: false, stream: null };
   ensureDestinationParent(destination, options);
+  let fd;
   try {
-    return { fd: cottontail.openFd(destination.path, "wnt", options.mode), owned: true, stream: null };
+    fd = cottontail.openFd(destination.path, "wnt", options.mode);
   } catch (error) {
     throw makeBunFileError(error, destination.path, "open");
   }
+  if (options.modeWasSet) {
+    // open(2) only applies the mode when it creates the file; an explicit
+    // mode must also replace the permissions of an existing destination
+    // (and bypass umask for newly created ones), matching Bun's write_file.
+    try {
+      cottontail.fchmodSync(fd, options.mode);
+    } catch (error) {
+      try { cottontail.closeFd(fd); } catch {}
+      throw makeBunFileError(error, destination.path, "chmod");
+    }
+  }
+  return { fd, owned: true, stream: null };
 }
 
 function closeWriteDestination(opened) {
