@@ -43,13 +43,10 @@ pub const Linker = struct {
         file_path: Fs.Path,
         fd: ?FileDescriptorType,
     ) !Fs.FileSystem.RealFS.ModKey {
-        var file: std.fs.File = if (fd) |_fd| _fd.stdFile() else try std.fs.cwd().openFile(file_path.text, .{ .mode = .read_only });
-        Fs.FileSystem.setMaxFd(file.handle);
-        const modkey = try Fs.FileSystem.RealFS.ModKey.generate(&this.fs.fs, file_path.text, file);
-
-        if (fd == null)
-            file.close();
-        return modkey;
+        // cottontail: std.fs.File is unavailable; ModKey.generate stats the
+        // path through std.Io, so the open-file shortcut is dropped.
+        _ = fd;
+        return Fs.FileSystem.RealFS.ModKey.generate(&this.fs.fs, file_path.text);
     }
 
     pub fn getHashedFilename(

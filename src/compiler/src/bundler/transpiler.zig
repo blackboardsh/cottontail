@@ -395,6 +395,10 @@ pub const Transpiler = struct {
         comptime Outstream: type,
         outstream: Outstream,
         client_entry_point_: ?*EntryPoints.ClientEntryPoint,
+        // cottontail: the old linker pulls in the unported JSC plugin host and
+        // mod-key cache, so transform-only callers instantiate this with
+        // allow_link=false to keep that dead code unreferenced.
+        comptime allow_link: bool,
     ) !?options.OutputFile {
         _ = outstream;
 
@@ -446,25 +450,27 @@ pub const Transpiler = struct {
                 ) orelse {
                     return null;
                 };
-                if (!transpiler.options.transform_only) {
-                    if (!transpiler.options.target.isBun())
-                        try transpiler.linker.link(
-                            file_path,
-                            &result,
-                            transpiler.options.origin,
-                            import_path_format,
-                            false,
-                            false,
-                        )
-                    else
-                        try transpiler.linker.link(
-                            file_path,
-                            &result,
-                            transpiler.options.origin,
-                            import_path_format,
-                            false,
-                            true,
-                        );
+                if (comptime allow_link) {
+                    if (!transpiler.options.transform_only) {
+                        if (!transpiler.options.target.isBun())
+                            try transpiler.linker.link(
+                                file_path,
+                                &result,
+                                transpiler.options.origin,
+                                import_path_format,
+                                false,
+                                false,
+                            )
+                        else
+                            try transpiler.linker.link(
+                                file_path,
+                                &result,
+                                transpiler.options.origin,
+                                import_path_format,
+                                false,
+                                true,
+                            );
+                    }
                 }
 
                 const buffer_writer = js_printer.BufferWriter.init(transpiler.allocator);
@@ -983,18 +989,10 @@ pub const Transpiler = struct {
                             .bun => .source_code,
                             .bun_cjs => .source_code_cjs,
                             .bytecode_cjs, .bytecode => brk: {
-                                const default_value: ParseResult.AlreadyBundled = if (already_bundled == .bytecode_cjs) .source_code_cjs else .source_code;
-                                if (this_parse.virtual_source == null and this_parse.allow_bytecode_cache) {
-                                    var path_buf2: bun.PathBuffer = undefined;
-                                    @memcpy(path_buf2[0..path.text.len], path.text);
-                                    path_buf2[path.text.len..][0..bun.bytecode_extension.len].* = bun.bytecode_extension.*;
-                                    const bytecode = bun.sys.File.toSourceAt(dirname_fd.unwrapValid() orelse bun.FD.cwd(), path_buf2[0 .. path.text.len + bun.bytecode_extension.len], bun.default_allocator, .{}).asValue() orelse break :brk default_value;
-                                    if (bytecode.contents.len == 0) {
-                                        break :brk default_value;
-                                    }
-                                    break :brk if (already_bundled == .bytecode_cjs) .{ .bytecode_cjs = @constCast(bytecode.contents) } else .{ .bytecode = @constCast(bytecode.contents) };
-                                }
-                                break :brk default_value;
+                                // cottontail: no on-disk bytecode cache is attached to
+                                // this parse path; pre-bundled bytecode inputs always
+                                // fall back to their original source.
+                                break :brk if (already_bundled == .bytecode_cjs) .source_code_cjs else .source_code;
                             },
                         },
                         .source = source.*,
@@ -1237,7 +1235,8 @@ pub const Transpiler = struct {
         var paths = [_]string{_entry};
         var entry = transpiler.fs.abs(&paths);
 
-        std.fs.accessAbsolute(entry, .{}) catch
+        // cottontail: std.fs.cwd().access is unavailable; stat through std.Io.
+        _ = std.Io.Dir.cwd().statFile(std.Io.Threaded.global_single_threaded.io(), entry, .{}) catch
             return _entry;
 
         entry = transpiler.fs.relativeTo(entry);
@@ -1381,6 +1380,7 @@ pub const Transpiler = struct {
                         Outstream,
                         outstream,
                         client_entry_point,
+                        true,
                     ) catch continue orelse continue;
                     transpiler.output_files.append(entry_point_output_file) catch unreachable;
 
@@ -1397,6 +1397,7 @@ pub const Transpiler = struct {
                         Outstream,
                         outstream,
                         null,
+                        true,
                     ) catch continue orelse continue;
                     transpiler.output_files.append(original_output_file) catch unreachable;
 
@@ -1410,9 +1411,47 @@ pub const Transpiler = struct {
                 Outstream,
                 outstream,
                 null,
+                true,
             ) catch continue orelse continue;
             transpiler.output_files.append(output_file) catch unreachable;
         }
+    }
+
+    /// cottontail: transform-only (--no-bundle) driver. Mirrors the upstream
+    /// `transform()` + `processResolveQueue()` flow, but instantiates
+    /// `buildWithResolveResultEager` with `allow_link=false` so the unported
+    /// old-linker machinery (JSC plugin host, mod-key cache) stays dead code.
+    pub fn transformEntries(
+        transpiler: *Transpiler,
+        allocator: std.mem.Allocator,
+        log: *logger.Log,
+    ) !options.TransformResult {
+        var entry_points = try allocator.alloc(_resolver.Result, transpiler.options.entry_points.len);
+        entry_points = entry_points[0..transpiler.enqueueEntryPoints(entry_points, true)];
+        transpiler.options.transform_only = true;
+
+        const DummyOutstream = struct {};
+        while (transpiler.resolve_queue.readItem()) |item| {
+            js_ast.Expr.Data.Store.reset();
+            js_ast.Stmt.Data.Store.reset();
+
+            const output_file = transpiler.buildWithResolveResultEager(
+                item,
+                .relative,
+                DummyOutstream,
+                .{},
+                null,
+                false,
+            ) catch continue orelse continue;
+            transpiler.output_files.append(output_file) catch unreachable;
+        }
+
+        return options.TransformResult.init(
+            try allocator.dupe(u8, transpiler.result.outbase),
+            try transpiler.output_files.toOwnedSlice(),
+            log,
+            allocator,
+        );
     }
 };
 

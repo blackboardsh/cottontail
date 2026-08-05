@@ -2412,6 +2412,57 @@ pub fn buildEntryPointsJson(
     transpiler.resolver.opts = transpiler.options;
     transpiler.resolver.env_loader = transpiler.env;
 
+    // --no-bundle (Bun.build({ bundle: false })): transform each entry point
+    // in isolation without linking, mirroring upstream build_command.zig's
+    // transform_only branch (src/cli/build_command.zig:309-325).
+    if (options.transform_only) {
+        transpiler.options.import_path_format = .relative;
+        transpiler.options.allow_runtime = false;
+        transpiler.resolver.opts.allow_runtime = false;
+
+        const transform_result = transpiler.transformEntries(allocator, &log) catch |err| {
+            return try buildFailureJson(arena_allocator, &log, err);
+        };
+        if (log.hasErrors()) {
+            return try buildFailureJson(arena_allocator, &log, error.TransformFailed);
+        }
+
+        var transform_outputs: std.ArrayList(BuildOutputJson) = .empty;
+        const transform_base64 = std.base64.standard.Encoder;
+        for (transform_result.output_files) |output_file| {
+            const bytes = output_file.value.asSlice();
+            const encoded = try arena_allocator.alloc(u8, transform_base64.calcSize(bytes.len));
+            _ = transform_base64.encode(encoded, bytes);
+            const artifact_hash = compiler.hash(bytes);
+            // The transform path does not assign destination paths; name the
+            // artifact after the input file, mapping JS-family extensions to
+            // ".js" like upstream's transform output naming does.
+            const basename = std.fs.path.basename(output_file.src_path.text);
+            const extension = std.fs.path.extension(basename);
+            const dest_name = if (std.mem.eql(u8, extension, ".js") or
+                std.mem.eql(u8, extension, ".jsx") or
+                std.mem.eql(u8, extension, ".ts") or
+                std.mem.eql(u8, extension, ".tsx"))
+                try std.fmt.allocPrint(arena_allocator, "{s}.js", .{basename[0 .. basename.len - extension.len]})
+            else
+                try arena_allocator.dupe(u8, basename);
+            try transform_outputs.append(arena_allocator, .{
+                .path = dest_name,
+                .kind = "entry-point",
+                .loader = @tagName(output_file.loader),
+                .hash = try std.fmt.allocPrint(arena_allocator, "{f}", .{compiler.fmt.truncatedHash32(artifact_hash)}),
+                .contentHash = try std.fmt.allocPrint(arena_allocator, "{f}", .{compiler.fmt.hexIntLower(artifact_hash)}),
+                .b64 = encoded,
+            });
+        }
+        const transform_json = BuildResultJson{
+            .success = true,
+            .logs = try buildLogsFromLogger(arena_allocator, &log, false),
+            .outputs = transform_outputs.items,
+        };
+        return try c_allocator.dupe(u8, try std.json.Stringify.valueAlloc(arena_allocator, transform_json, .{}));
+    }
+
     var input_file_map: compiler.jsc.API.JSBundler.FileMap = .{};
     if (request_object.get("files")) |files_value| {
         if (files_value == .object) {
