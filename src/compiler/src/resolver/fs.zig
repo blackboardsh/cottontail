@@ -882,7 +882,8 @@ pub const FileSystem = struct {
                 }
 
                 return ModKey{
-                    .inode = stat.inode,
+                    // std.Io stat inodes are i64 on Windows, u64 elsewhere.
+                    .inode = @intCast(stat.inode),
                     .size = stat.size,
                     .mtime = mtime,
                     .mode = 0,
