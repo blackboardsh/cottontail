@@ -158,7 +158,7 @@ pub fn decode(
             continue;
         }
         const mapped = table[byte - 0x80];
-        if (mapped == undefined_code_point) {
+        if (undefined_code_point == mapped) {
             if (fatal) return .invalid;
             code_unit.* = 0xfffd;
         } else {

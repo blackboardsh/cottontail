@@ -2410,12 +2410,17 @@ export function Hmac(algorithm, key, options = undefined) {
 Hmac.prototype = HmacImpl.prototype;
 
 const keyObjectConstructionToken = Symbol("cottontail.crypto.KeyObject");
+// Brand used by util/types.isKeyObject: the same realm may hold duplicate
+// module records (e.g. ESM default import vs require) with distinct KeyObject
+// classes, so identity cannot rely on instanceof alone.
+const keyObjectBrand = Symbol.for("cottontail.crypto.KeyObject");
 
 export class KeyObject {
   constructor(type, data, options = {}, constructionToken = undefined) {
     if (constructionToken !== keyObjectConstructionToken) {
       throw new TypeError("KeyObject cannot be constructed directly");
     }
+    Object.defineProperty(this, keyObjectBrand, { value: true });
     const normalizedType = String(type);
     if (normalizedType !== "secret" && normalizedType !== "public" && normalizedType !== "private") {
       throw new TypeError("KeyObject type must be secret, public, or private");

@@ -1034,6 +1034,17 @@ pub const allocators = struct {
                 loaded = false;
             }
 
+            /// Drops every cached entry while keeping the instance alive.
+            /// A tsconfig override changes path resolution for every
+            /// directory, so entries cached by an earlier in-process bundling
+            /// pass (for example the script runner bundling the entrypoint
+            /// script) are invalid and must not be reused.
+            pub fn resetInstance() void {
+                if (!loaded) return;
+                instance.indexes.clearRetainingCapacity();
+                instance.values_list.clearRetainingCapacity();
+            }
+
             pub fn isOverflowing() bool {
                 return false;
             }

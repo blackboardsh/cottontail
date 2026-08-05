@@ -62,7 +62,10 @@ const streamWeb = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/stream/web.j
 const stringDecoder = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/string_decoder.js"));
 const sys = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/sys.js"));
 const timers = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/timers.js"));
-const timersPromises = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/timers/promises.js"));
+const timersPromises = lazyBuiltin(() => {
+  const namespace = loadEmbeddedRuntimeModule("node/timers/promises.js");
+  return namespace.default ?? namespace;
+});
 const tls = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/tls.js"));
 const tty = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/tty.js"));
 const util = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/util.js"));
@@ -1950,17 +1953,23 @@ function withSpecifierSuffix(path, suffix) {
 }
 
 function moduleNotFoundError(request, resolveMessage = false, basePath = undefined) {
-  let message = `Cannot find module '${request}'`;
-  if (!resolveMessage && basePath != null) {
+  void resolveMessage;
+  // Bun surfaces module resolution failures as ResolveMessage instances and
+  // words them as "Cannot find package '<bare specifier>'" vs
+  // "Cannot find module '<relative/absolute path>'".
+  const isPathSpecifier =
+    request.startsWith(".") || request.startsWith("/") || request.startsWith("file:");
+  let message = `Cannot find ${isPathSpecifier ? "module" : "package"} '${request}'`;
+  if (basePath != null) {
     let referrer = String(basePath);
     if (referrer.startsWith("file:")) {
       try { referrer = fileURLToPath(referrer); } catch {}
     }
-    message += `\nRequire stack:\n- ${referrer}`;
+    message += ` from '${referrer}'`;
   }
-  const error = new Error(message);
+  const error = new ResolveMessage(message);
+  error.name = "ResolveMessage";
   error.code = "MODULE_NOT_FOUND";
-  if (resolveMessage) error.name = "ResolveMessage";
   return error;
 }
 

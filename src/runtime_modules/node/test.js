@@ -280,6 +280,18 @@ function installUnhandledRejectionCapture() {
   unhandledRejectionCaptureInstalled = true;
   processGlobal[unhandledRejectionHandlerKey] = (reason, promise) => {
     const error = reason instanceof Error ? reason : new Error(String(reason));
+    // bun/test.js's throw matchers block in waitForPromise; while blocked, a
+    // sibling promise of the one under assertion can reject before its own
+    // matcher attaches a handler. Bun quietly captures that rejection instead
+    // of failing the test (Expect.getValueAsToThrow's unhandledRejectionScope).
+    const quietCapture = globalThis.__cottontailQuietUnhandledRejectionCapture;
+    if (quietCapture) {
+      if (!quietCapture.didCapture) {
+        quietCapture.didCapture = true;
+        quietCapture.value = reason;
+      }
+      return;
+    }
     const owner = promise && typeof promise === "object" ? promiseOwners.get(promise) : null;
     if (owner?.kind === "test" && typeof owner.failExternal === "function") {
       // Late rejections owned by an already-finished test stay with that

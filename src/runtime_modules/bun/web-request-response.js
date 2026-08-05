@@ -1957,7 +1957,7 @@ export function createRequestResponseRuntime({
         error.code = "ERR_INVALID_THIS";
         throw error;
       }
-      if (this._bodyStream?.locked) return handledRejectedPromise(new TypeError("ReadableStream is locked"));
+      if (this._bodyStream?.locked || this._body?.locked === true) return handledRejectedPromise(new TypeError("Body already used"));
       if (bodyWasUsed(this)) return handledRejectedPromise(new TypeError("Body already used"));
       this._bodyUsed = true;
       return parseMultipartFormData(bodyValueForConsumption(this), this.headers.get("content-type"));

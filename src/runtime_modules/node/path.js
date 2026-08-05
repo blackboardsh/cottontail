@@ -615,6 +615,18 @@ export const win32 = {
                   // We matched a device root such as \\.\PHYSICALDRIVE0.
                   device = `\\\\${firstPart}`;
                   rootEnd = 4;
+                  // Bun behavior: when the device path consists solely of the
+                  // namespace prefix and a single component (e.g. \\?\foo or
+                  // \\?\C:), the whole thing is the root and keeps a trailing
+                  // separator (\\?\foo\), like a UNC share root.
+                  let k = j;
+                  while (k < len && isPathSeparator(path.charCodeAt(k))) {
+                    k++;
+                  }
+                  if (k === len) {
+                    device = `\\\\${firstPart}\\${path.slice(last, j)}`;
+                    rootEnd = len;
+                  }
                 }
               }
             }

@@ -23,6 +23,10 @@ export const Buffer = new Proxy(RuntimeBuffer, {
     return invokeBufferConstructor(target, thisArgument, argumentsList);
   },
   construct(target, argumentsList, newTarget) {
+    // Zero-argument construction (e.g. `new (class extends Buffer {})()`)
+    // yields an empty buffer; forwarding undefined to from() would throw the
+    // arity TypeError (globals.test.js "extendable").
+    if (argumentsList.length === 0) argumentsList = [0];
     return invokeBufferConstructor(target, undefined, argumentsList, newTarget);
   },
 });

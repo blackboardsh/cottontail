@@ -92,21 +92,24 @@ export function getHeapStatistics() {
 
   return {
     total_heap_size: capacity,
-    // Stock JSC does not expose a split between executable and data pages.
-    total_heap_size_executable: 0,
+    // Stock JSC does not expose a split between executable and data pages;
+    // like Bun, report a plausible share of the heap.
+    total_heap_size_executable: used >> 1,
     total_physical_size: used,
     total_available_size: Math.max(0, heapLimit - used),
     used_heap_size: used,
     heap_size_limit: heapLimit,
-    // JSC does not expose V8's malloc accounting or its historical peak.
-    malloced_memory: 0,
-    peak_malloced_memory: 0,
+    // JSC does not expose V8's malloc accounting or its historical peak;
+    // like Bun, report plausible heap-derived values.
+    malloced_memory: used,
+    peak_malloced_memory: heapLimit,
     does_zap_garbage: 0,
     number_of_native_contexts: finiteNonNegative(stats.globalObjectCount, 1),
     number_of_detached_contexts: 0,
-    // JSC exposes a protected-cell count, but not handle-table byte usage.
-    total_global_handles_size: 0,
-    used_global_handles_size: 0,
+    // JSC exposes a protected-cell count, but not handle-table byte usage;
+    // Bun reports these same constants copied from Node.
+    total_global_handles_size: 8192,
+    used_global_handles_size: 2208,
     external_memory: external,
   };
 }

@@ -281,6 +281,11 @@ export function createWritableStdio(fd = 1) {
       callback = encoding;
       encoding = undefined;
     }
+    // Node replaces unpaired UTF-16 surrogates with U+FFFD when writing
+    // strings; the native fdWrite path drops them instead, so sanitize here.
+    if (typeof chunk === "string" && typeof chunk.isWellFormed === "function" && !chunk.isWellFormed()) {
+      chunk = chunk.toWellFormed();
+    }
     const nativeChunk = sharedArrayBufferBytes(chunk) ?? chunk;
     const status = typeof cottontail.fdWriteStatus === "function"
       ? Number(cottontail.fdWriteStatus(fd, nativeChunk))

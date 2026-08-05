@@ -3497,7 +3497,7 @@ static JSValueRef invoke_legacy_module(NapiEnv* env, node::node_module* module, 
         return nullptr;
     }
     if (!module->nm_context_register_func && !module->nm_register_func) {
-        *exception = make_loader_error(env, std::string("The module '") + module_name + "' has no declared entry point.");
+        *exception = make_loader_error(env, "Module has no declared entry point.");
         return nullptr;
     }
     if (!exports)
@@ -3553,13 +3553,8 @@ static void* find_addon_symbol(void* handle, const char* symbol)
 
 static std::string addon_no_entrypoint_message(const char* path)
 {
-    std::string module_name = path ? path : "unknown";
-    const size_t separator = module_name.find_last_of("/\\");
-    if (separator != std::string::npos)
-        module_name.erase(0, separator + 1);
-    if (module_name.ends_with(".node"))
-        module_name.resize(module_name.size() - 5);
-    return std::string("The module '") + module_name + "' has no declared entry point.";
+    (void)path;
+    return "Module has no declared entry point.";
 }
 
 extern "C" JSValueRef ct_napi_load_addon(

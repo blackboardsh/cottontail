@@ -1630,6 +1630,7 @@ const NativeCopyContext = struct {
                 ) catch |err| return self.fail(source, destination, "symlink", err);
             if (target_is_directory) {
                 if (pathsEqual(target, destination_target)) {
+                    if (replace_cloned) return; // clone already produced the desired link
                     return self.fail(source, destination, "cp", error.CopyInvalid);
                 }
                 if (isSubdirectory(target, destination_target) or

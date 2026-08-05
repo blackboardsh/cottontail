@@ -2511,8 +2511,25 @@ class Expectation {
         if (!this._promiseMode && typeof globalThis.cottontail?.waitForPromise === "function") {
           let state = nativePromiseState(settled);
           if (state?.status === 0) {
-            globalThis.cottontail.waitForPromise(settled);
+            // While blocked here, sibling promises rejected by the code under
+            // test have no handler yet (their own matchers run after we
+            // return). Bun routes such rejections to a quiet capture instead
+            // of failing the test (VirtualMachine.unhandledRejectionScope in
+            // Expect.getValueAsToThrow); do the same via a hook the test
+            // runner's unhandledRejection capture consults.
+            const quietCapture = { didCapture: false, value: undefined };
+            const previousQuietCapture = globalThis.__cottontailQuietUnhandledRejectionCapture;
+            globalThis.__cottontailQuietUnhandledRejectionCapture = quietCapture;
+            try {
+              globalThis.cottontail.waitForPromise(settled);
+            } finally {
+              globalThis.__cottontailQuietUnhandledRejectionCapture = previousQuietCapture;
+            }
             state = nativePromiseState(settled);
+            if (state?.status === 1 && quietCapture.didCapture) {
+              checkThrown(true, quietCapture.value);
+              return undefined;
+            }
           }
           if (state?.status === 2) throw state.value;
           if (state?.status === 1) return undefined;
@@ -3827,10 +3844,10 @@ function makeBunTestFunction(base) {
     }
     const registrationSuite = bunRegistrationSuite();
     const name = normalizeTestName(parsed.name);
-    let registrationLine = captureTestRegistrationLine(
+    let registrationLine = Number(extraOptions.__bunRegistrationLine) || captureTestRegistrationLine(
       globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? "",
     );
-    if (options.todo && typeof parsed.callback !== "function") registrationLine = Math.max(0, registrationLine - 1);
+    if (options.todo && typeof parsed.callback !== "function" && !Number(extraOptions.__bunRegistrationLine)) registrationLine = Math.max(0, registrationLine - 1);
     const inspectorId = nextInspectorTestId++;
     reportInspectorTestFound(inspectorId, name, "test", registrationSuite, registrationLine);
     noteBunTestSelection(name, registrationSuite);
@@ -3856,10 +3873,14 @@ function makeBunTestFunction(base) {
     invoke(args, extraOptions, apiName, rows) {
       if (rows === undefined) return register(args, extraOptions, apiName);
       const parsed = parseCallbackArgs(args);
+      // Capture the .each() call-site line here: inside rows.forEach the user
+      // frame is attributed to the generated bundle, so captureTestRegistrationLine
+      // in register() finds nothing and the JUnit reporter loses the line.
+      const captured = captureTestRegistrationLine(globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? "");
       rows.forEach((row, index) => {
         const values = normalizeEachValues(row);
         const testCallback = parsed.callback?.bind(row, ...values);
-        register([formatBunEachLabel(parsed.name, values, index), parsed.options, testCallback], extraOptions, apiName);
+        register([formatBunEachLabel(parsed.name, values, index), parsed.options, testCallback], captured > 0 ? { ...extraOptions, __bunRegistrationLine: captured } : extraOptions, apiName);
       });
       return undefined;
     },
@@ -3877,7 +3898,7 @@ function makeBunDescribe(base) {
     }
     const registrationSuite = bunRegistrationSuite();
     const name = normalizeTestName(parsed.name);
-    const registrationLine = captureTestRegistrationLine(
+    const registrationLine = Number(extraOptions.__bunRegistrationLine) || captureTestRegistrationLine(
       globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? "",
     );
     const inspectorId = nextInspectorTestId++;
@@ -3904,10 +3925,14 @@ function makeBunDescribe(base) {
     invoke(args, extraOptions, apiName, rows) {
       if (rows === undefined) return register(args, extraOptions, apiName);
       const parsed = parseDescribeArgs(args);
+      // Capture the .each() call-site line here: inside rows.forEach the user
+      // frame is attributed to the generated bundle, so captureTestRegistrationLine
+      // in register() finds nothing and the JUnit reporter loses the line.
+      const captured = captureTestRegistrationLine(globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? "");
       rows.forEach((row, index) => {
         const values = normalizeEachValues(row);
         const describeCallback = parsed.callback?.bind(row, ...values);
-        register([formatBunEachLabel(parsed.name, values, index), parsed.options, describeCallback], extraOptions, apiName);
+        register([formatBunEachLabel(parsed.name, values, index), parsed.options, describeCallback], captured > 0 ? { ...extraOptions, __bunRegistrationLine: captured } : extraOptions, apiName);
       });
       return undefined;
     },

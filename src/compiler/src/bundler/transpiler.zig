@@ -172,6 +172,11 @@ pub const Transpiler = struct {
         js_ast.Stmt.Data.Store.create();
 
         const fs = try Fs.FileSystem.init(opts.absolute_working_dir);
+        // The DirInfo cache is a process-global singleton (BSSMap.instance)
+        // shared with earlier in-process bundling passes. Honor the override.
+        if (opts.tsconfig_override != null) {
+            _resolver.DirInfo.HashMap.resetInstance();
+        }
         const bundle_options = try options.BundleOptions.fromApi(
             allocator,
             fs,

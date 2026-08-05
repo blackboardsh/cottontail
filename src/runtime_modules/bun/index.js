@@ -107,6 +107,7 @@ import { asBuffer, concatBuffers, concatManyBuffers } from "./web-buffer-utils.j
 import { createWebPrimitives } from "./web-primitives.js";
 import { installStandaloneRuntimeLoaders } from "../internal/standalone-runtime.js";
 import { runtimeDefaultUserAgent } from "../internal/runtime-options.js";
+import { renderTable } from "../internal/console-table.js";
 import {
   file as createBunFile,
   guessMimeType,
@@ -692,6 +693,10 @@ const parseCallSites = (stack, fallbackSourceURL = undefined) => {
     const location = separator < 0 ? "" : line.slice(separator + 1);
     const locationMatch = /^(.*):(\d+):(\d+)$/.exec(location);
     let fileName = locationMatch?.[1] || location || null;
+    // Bun reports plain filesystem paths in stack frames, not file: URLs.
+    if (typeof fileName === "string" && fileName.startsWith("file://")) {
+      try { fileName = nodeFileURLToPath(fileName); } catch {}
+    }
     const lineNumber = locationMatch ? Number(locationMatch[2]) : null;
     const columnNumber = locationMatch ? Number(locationMatch[3]) : null;
     functionName ||= null;
@@ -1005,29 +1010,18 @@ function validateSpawnInput(file, args = [], options = {}) {
 }
 
 if (globalThis.console) {
-  const nativeConsoleTable = typeof globalThis.console.table === "function" ? globalThis.console.table.bind(globalThis.console) : null;
   const renderConsoleTable = (value, properties = undefined) => {
     if (properties !== undefined && !Array.isArray(properties)) {
       throw new TypeError("console.table properties must be an array");
     }
-    if (Array.isArray(value) && value.every((item) => item && typeof item === "object" && !Array.isArray(item))) {
-      const keys = properties?.length ? properties.map(String) : [...new Set(value.flatMap((item) => Object.keys(item)))];
-      const rows = value.map((item, index) => [String(index), ...keys.map((key) => String(item[key] ?? ""))]);
-      const headers = ["", ...keys];
-      const widths = headers.map((header, index) => Math.max(String(header).length, ...rows.map((row) => row[index].length)));
-      const border = (left, mid, right) => `${left}${widths.map((width) => "─".repeat(width + 2)).join(mid)}${right}`;
-      const rowLine = (row) => `│${row.map((cell, index) => ` ${String(cell).padEnd(widths[index])} `).join("│")}│`;
-      globalThis.console.log([
-        border("┌", "┬", "┐"),
-        rowLine(headers),
-        border("├", "┼", "┤"),
-        ...rows.map(rowLine),
-        border("└", "┴", "┘"),
-      ].join("\n"));
-      return;
+    if (value !== null && typeof value === "object") {
+      const rendered = renderTable(value, properties, { colors: false });
+      if (rendered) {
+        earlyProcessObject.stdout?.write?.(rendered);
+        return;
+      }
     }
-    if (nativeConsoleTable) return nativeConsoleTable(value, properties);
-    globalThis.console.log(nodeInspect(value, { colors: false }));
+    globalThis.console.log(value);
   };
   globalThis.console.table = renderConsoleTable;
 }
@@ -1138,7 +1132,7 @@ if (!Object.__cottontailGlobalPrototypePatched) {
   Object.defineProperty(Object, "__cottontailGlobalPrototypePatched", { value: true });
 }
 
-const internalPromiseThen = Promise.prototype.then;
+const internalPromiseThen = globalThis[Symbol.for("cottontail.nativePromiseThen")] ?? Promise.prototype.then;
 
 function internalThen(promise, onFulfilled, onRejected) {
   return internalPromiseThen.call(promise, onFulfilled, onRejected);
@@ -1670,7 +1664,11 @@ function withoutElectrobunHostEnv(env) {
 
 function isCurrentCottontailExecutable(file) {
   const execPath = String(cottontail.execPath?.() ?? globalThis.process?.execPath ?? "");
-  return execPath.length > 0 && String(file) === execPath;
+  if (execPath.length > 0 && String(file) === execPath) return true;
+  // Facade mode: process.execPath shows the wrapper (hutch) path while the
+  // native execPath is the real runtime; both must count as "current".
+  const display = String(globalThis.process?.execPath ?? "");
+  return display.length > 0 && String(file) === display;
 }
 
 function prepareNativeSpawnOptions(file, nativeOptions, args = []) {
@@ -1684,6 +1682,14 @@ function prepareNativeSpawnOptions(file, nativeOptions, args = []) {
     env.COTTONTAIL_SPAWN_EXEC_PATH = nodePathResolve(String(file));
     if (nativeOptions.argv0 !== undefined) env.COTTONTAIL_SPAWN_ARGV0 = nativeOptions.argv0;
     if (nativeOptions.stdinFileBacked) env.COTTONTAIL_SPAWN_STDIN_FILE = "1";
+    // Facade routing must survive an explicit spawn env (e.g. `env: {}`):
+    // without it the child wrapper cannot locate the runtime at all.
+    for (const key of ["DASH_COTTONTAIL", "COTTONTAIL_BINARY"]) {
+      if (env[key] === undefined) {
+        const inherited = currentProcessEnv()[key];
+        if (inherited !== undefined) env[key] = String(inherited);
+      }
+    }
     return {
       ...nativeOptions,
       env,
@@ -4409,7 +4415,12 @@ async function prepareServeResponse(value, request, options = {}) {
     : null;
   const sourceResponse = cached
     ? cached.response.clone()
-    : normalizeResponse(value instanceof Response ? value : new Response(value));
+    : normalizeResponse(value instanceof Response
+      // Static routes share one Response object across requests; take the body
+      // from a clone so the original is never consumed, even on paths that do
+      // not populate the response cache (HEAD, missing files).
+      ? (options.cacheKey != null ? value.clone() : value)
+      : new Response(value));
   const headers = new Headers(sourceResponse.headers);
   const body = cached ? cached.body : sourceResponse._takeBody();
   const method = String(request.method || "GET").toUpperCase();
@@ -4752,6 +4763,9 @@ function runServeHandler(options, request, server) {
       allowFileFallback: true,
       preserveFileSliceStatus: typeof route !== "function",
       staticTextContentType: typeof route !== "function",
+      // A static route Response object is shared by every request; serve each
+      // one from a cached snapshot instead of consuming the original body.
+      cacheKey: typeof route !== "function" && route && typeof route === "object" ? route : null,
     });
     return isPromiseLike(prepared)
       ? prepared.then((resolved) => resolved ?? runFetchFallback(options, request, server))
@@ -8360,7 +8374,8 @@ function bunStyleInspect(value, ctx, indent, seen, depth) {
   const custom = customDescriptor && "value" in customDescriptor ? customDescriptor.value : undefined;
   if (typeof custom === "function" && custom !== nodeInspect) {
     const remaining = ctx.maxDepth === Infinity ? Infinity : ctx.maxDepth - depth;
-    const result = custom.call(value, remaining, bunInspectCustomOptions(ctx), nodeInspect);
+    // Bun passes util.inspect itself as the inspect argument, not a wrapper.
+    const result = custom.call(value, remaining, bunInspectCustomOptions(ctx), loadNodeUtilModule().inspect);
     if (result !== value) {
       return typeof result === "string" ? result : bunStyleInspect(result, ctx, indent, seen, depth);
     }
@@ -8562,11 +8577,9 @@ export function inspect(value, options = undefined, colorsArg = undefined) {
 inspect.table = function table(value, properties = undefined, options = undefined) {
   if (arguments.length === 0 || value == null) return "";
   if (typeof value !== "object" && typeof value !== "function") return "";
-  const selected = Array.isArray(properties)
-    ? Object.fromEntries(Array.from(properties).map((key) => [key, value?.[key]]))
-    : value;
-  const tableOptions = Array.isArray(properties) ? options : properties;
-  return nodeInspect(selected, tableOptions);
+  const selectedProperties = Array.isArray(properties) ? properties : undefined;
+  const tableOptions = (Array.isArray(properties) ? options : properties) ?? undefined;
+  return renderTable(value, selectedProperties, tableOptions);
 };
 
 export function deepEquals(left, right) {
@@ -12138,7 +12151,7 @@ function passwordHashSync(value, algorithm = undefined) {
   const bytes = passwordBytes(value, "password");
   if (bytes.byteLength === 0) throw new TypeError("password must not be empty");
   const options = passwordAlgorithm(algorithm);
-  return cottontail.passwordHashSync(options.id, bytes, options.timeCost, options.memoryCost, options.cost);
+  return passwordNativeCall(() => cottontail.passwordHashSync(options.id, bytes, options.timeCost, options.memoryCost, options.cost));
 }
 
 function passwordHash(value, algorithm = undefined) {
@@ -12146,7 +12159,7 @@ function passwordHash(value, algorithm = undefined) {
   const bytes = passwordBytes(value, "password");
   if (bytes.byteLength === 0) throw new TypeError("password must not be empty");
   const options = passwordAlgorithm(algorithm);
-  return Promise.resolve().then(() => cottontail.passwordHashSync(options.id, bytes, options.timeCost, options.memoryCost, options.cost));
+  return Promise.resolve().then(() => passwordNativeCall(() => cottontail.passwordHashSync(options.id, bytes, options.timeCost, options.memoryCost, options.cost)));
 }
 
 function inferPasswordAlgorithm(hash) {
@@ -12157,6 +12170,28 @@ function inferPasswordAlgorithm(hash) {
   throw new TypeError("Unsupported password algorithm");
 }
 
+const passwordHashPatterns = {
+  argon2id: /^\$argon2id\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+$/,
+  argon2i: /^\$argon2i\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+$/,
+  argon2d: /^\$argon2d\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+$/,
+  bcrypt: /^\$2[aby]?\$\d{2}\$[./A-Za-z0-9]{53}$/,
+};
+
+function passwordNativeCall(operation) {
+  try {
+    return operation();
+  } catch (thrown) {
+    if (thrown instanceof Error) throw thrown;
+    throw new Error(typeof thrown === "string" ? thrown : "Password operation failed");
+  }
+}
+
+function assertPasswordHashFormat(label, hash) {
+  if (!passwordHashPatterns[label].test(hash)) {
+    throw new Error("Password operation failed: InvalidEncoding");
+  }
+}
+
 function passwordVerifySync(value, hashValue, algorithm = undefined) {
   if (arguments.length < 2) throw new TypeError("password and hash are required");
   const bytes = passwordBytes(value, "password");
@@ -12164,7 +12199,8 @@ function passwordVerifySync(value, hashValue, algorithm = undefined) {
   if (bytes.byteLength === 0 || hashBytes.byteLength === 0) return false;
   const hash = new TextDecoder().decode(hashBytes);
   const options = passwordAlgorithm(algorithm === undefined ? inferPasswordAlgorithm(hash) : algorithm);
-  return cottontail.passwordVerifySync(options.id, bytes, hashBytes);
+  assertPasswordHashFormat(options.label, hash);
+  return passwordNativeCall(() => cottontail.passwordVerifySync(options.id, bytes, hashBytes));
 }
 
 function passwordVerify(value, hashValue, algorithm = undefined) {
@@ -12174,7 +12210,8 @@ function passwordVerify(value, hashValue, algorithm = undefined) {
   if (bytes.byteLength === 0 || hashBytes.byteLength === 0) return Promise.resolve(false);
   const hash = new TextDecoder().decode(hashBytes);
   const options = passwordAlgorithm(algorithm === undefined ? inferPasswordAlgorithm(hash) : algorithm);
-  return Promise.resolve().then(() => cottontail.passwordVerifySync(options.id, bytes, hashBytes));
+  assertPasswordHashFormat(options.label, hash);
+  return Promise.resolve().then(() => passwordNativeCall(() => cottontail.passwordVerifySync(options.id, bytes, hashBytes)));
 }
 
 export const password = {
@@ -14269,7 +14306,7 @@ globalThis.Bun = BunObject;
 if (typeof globalThis.TextEncoder === "function" && typeof globalThis.TextEncoder.prototype.encodeInto !== "function") {
   Object.defineProperty(globalThis.TextEncoder.prototype, "encodeInto", {
     value(source = "", destination) {
-      if (!(destination instanceof Uint8Array)) throw new TypeError("TextEncoder.encodeInto requires a Uint8Array destination");
+      if (!(destination instanceof Uint8Array) && destination?.[Symbol.toStringTag] !== "Uint8Array") throw new TypeError("TextEncoder.encodeInto requires a Uint8Array destination");
       const input = String(source);
       let read = 0;
       let written = 0;

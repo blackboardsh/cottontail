@@ -31,6 +31,13 @@ const primordialsSeed = {};
 if (typeof globalThis.Float16Array === "function") {
   primordialsSeed.Float16Array = globalThis.Float16Array;
 }
+// The engine exposes Error.captureStackTrace through the prototype chain
+// rather than as an own static property of Error, so the vendored primordials
+// script's copyPropsRenamed(Error, ...) never picks it up. Vendored modules
+// (internal/errors, util) destructure ErrorCaptureStackTrace from primordials.
+if (typeof globalThis.Error?.captureStackTrace === "function") {
+  primordialsSeed.ErrorCaptureStackTrace = globalThis.Error.captureStackTrace;
+}
 export const primordials = buildPrimordials(primordialsSeed);
 
 // ---------------------------------------------------------------------------
@@ -522,7 +529,9 @@ function makeAbortControllerModule() {
       validateAbortSignal(signal);
       return signal;
     },
-    async aborted(signal, resource) {
+    // Validates synchronously (matching Bun's native util.aborted); only the
+    // abort wait itself is asynchronous.
+    aborted(signal, resource) {
       validateAbortSignal(signal);
       const { validateObject, kValidateObjectAllowObjects } = internalRequire("internal/validators");
       validateObject(resource, "resource", kValidateObjectAllowObjects ?? 0);

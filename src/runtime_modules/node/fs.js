@@ -713,9 +713,11 @@ export class Dir {
 }
 
 export function existsSync(path) {
-  const normalizedPath = normalizePath(path);
-  assertFsRead(normalizedPath);
+  // Node's existsSync never throws: invalid path types and permission/IO
+  // errors alike surface as `false`.
   try {
+    const normalizedPath = normalizePath(path);
+    assertFsRead(normalizedPath);
     // GetFileAttributesW succeeds for a dangling Windows reparse point, while
     // Node's existsSync follows links and returns false when the target is gone.
     if (isWindowsFs) {
@@ -2781,7 +2783,7 @@ export function watchFile(path, options = {}, listener = undefined) {
     options = {};
   }
   if (typeof listener !== "function") throw new TypeError("The \"listener\" argument must be of type function");
-  const filename = normalizePath(path);
+  const filename = normalizeWatchPath(path);
   assertFsRead(filename);
   const statOptions = options?.bigint ? { bigint: true } : undefined;
   let entry = fileWatchers.get(filename);
@@ -2825,7 +2827,7 @@ export function watchFile(path, options = {}, listener = undefined) {
 }
 
 export function unwatchFile(path, listener = undefined) {
-  const filename = normalizePath(path);
+  const filename = normalizeWatchPath(path);
   const entry = fileWatchers.get(filename);
   if (!entry) return;
   if (typeof listener === "function") entry.listeners.delete(listener);

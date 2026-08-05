@@ -104,7 +104,16 @@ function normalizePath(path, allowAboveRoot, separator, isSeparator) {
 }
 
 function runtimeCwd() {
-  return globalThis.process?.cwd?.() ?? globalThis.cottontail.cwd();
+  const cwd = globalThis.process?.cwd;
+  if (typeof cwd === "function") {
+    // Tests may monkey-patch process.cwd with a string-returning stub; honor
+    // it, falling back to the native cwd on any mismatch.
+    try {
+      const value = cwd.call(globalThis.process);
+      if (typeof value === "string" && value.length > 0) return value;
+    } catch {}
+  }
+  return globalThis.cottontail.cwd();
 }
 
 function resolvePosixPath(path) {

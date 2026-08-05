@@ -1592,7 +1592,15 @@ function installBlobGlobals() {
         });
       }
     }
+    // Match Bun/WebKit: calling File() without `new` throws a TypeError naming
+    // "File", not the internal class name.
+    function CallableFile(parts, name, options = {}) {
+      if (!new.target) throw new TypeError("Class constructor File cannot be invoked without 'new'");
+      return Reflect.construct(CottontailFile, [parts, name, options], new.target);
+    }
+    CallableFile.prototype = CottontailFile.prototype;
     Object.defineProperty(CottontailFile, "name", { value: "File", configurable: true });
+    Object.defineProperty(CallableFile, "name", { value: "File", configurable: true });
     Object.defineProperty(CottontailFile.prototype, Symbol.toStringTag, {
       configurable: true,
       value: "File",
@@ -1600,7 +1608,7 @@ function installBlobGlobals() {
     Object.defineProperty(g, "File", {
       configurable: true,
       writable: true,
-      value: CottontailFile,
+      value: CallableFile,
     });
   }
 }
@@ -3479,7 +3487,7 @@ function readCString(pointer) {
 
 const cstringArrayBuffers = new WeakMap();
 
-export class CString extends String {
+class CStringImpl extends String {
   constructor(value, byteOffset, byteLength) {
     const pointer = value == null ? 0 : value;
     let text = "";
@@ -3509,6 +3517,14 @@ export class CString extends String {
     return arrayBuffer;
   }
 }
+
+// Called without `new`, Bun.FFI.CString returns the decoded string as a
+// primitive instead of throwing a class-constructor error (issue #25231).
+export const CString = new Proxy(CStringImpl, {
+  apply(target, thisArg, args) {
+    return String(Reflect.construct(target, args));
+  },
+});
 
 const callbackState = new WeakMap();
 

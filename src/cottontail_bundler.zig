@@ -698,15 +698,27 @@ fn cloneGeneratedJavaScript(contents: []const u8, working_dir: []const u8) ![]u8
     // synchronously, before Bun's compact helper assigns its cached Promise.
     // Publish an already-resolved placeholder during that call so the linker-
     // generated namespace continuation can run, then cache the real result.
-    const patched = try std.mem.replaceOwned(
-        u8,
-        c_allocator,
-        generated,
-        generated_esm_initializer,
-        cottontail_esm_initializer,
-    );
+    //
+    // Only patch the actual top-level helper declaration: the compact helper
+    // text also appears verbatim inside user string literals (upstream test
+    // snapshots embed it), and replacing those corrupts them.
+    const declaration = "var __esm = " ++ generated_esm_initializer;
+    const replacement = "var __esm = " ++ cottontail_esm_initializer;
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(c_allocator);
+    var copied_until: usize = 0;
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, generated, search_from, declaration)) |found| {
+        search_from = found + declaration.len;
+        if (found != 0 and generated[found - 1] != '\n') continue;
+        try output.appendSlice(c_allocator, generated[copied_until..found]);
+        try output.appendSlice(c_allocator, replacement);
+        copied_until = search_from;
+    }
+    if (copied_until == 0) return generated;
+    try output.appendSlice(c_allocator, generated[copied_until..]);
     c_allocator.free(generated);
-    return patched;
+    return try output.toOwnedSlice(c_allocator);
 }
 
 fn cloneGraphOutputFile(

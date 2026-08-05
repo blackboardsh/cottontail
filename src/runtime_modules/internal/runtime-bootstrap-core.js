@@ -1,8 +1,14 @@
 import { bunCompatVersion, processObject as earlyProcessObject } from "./runtime-process-bootstrap.js";
 import { createWritableStdio } from "../node/stdio.js";
 import { installDotenvLoader } from "./dotenv.js";
+import { renderTable } from "./console-table.js";
 
 const bunSleepSetTimeout = globalThis.setTimeout.bind(globalThis);
+
+// Stash the pristine Promise.prototype.then before any module (async_hooks,
+// the test runner, or user code) can replace it. Internal machinery must
+// never flow through a user-overridden `then`.
+globalThis[Symbol.for("cottontail.nativePromiseThen")] ??= Promise.prototype.then;
 
 function remapStackString(value) {
   const remap = globalThis.__cottontailRemapStackString;
@@ -127,6 +133,21 @@ if (globalThis.console && typeof globalThis.console.write !== "function") {
     processObject.stdout?.write?.(String(chunk));
   };
 }
+if (globalThis.console && typeof globalThis.console.table !== "function") {
+  globalThis.console.table = (value, properties = undefined) => {
+    if (properties !== undefined && !Array.isArray(properties)) {
+      throw new TypeError("console.table properties must be an array");
+    }
+    if (value !== null && typeof value === "object") {
+      const rendered = renderTable(value, properties, { colors: false });
+      if (rendered) {
+        processObject.stdout?.write?.(rendered);
+        return;
+      }
+    }
+    globalThis.console.log(value);
+  };
+}
 const bunObject = globalThis.Bun ?? {};
 Object.defineProperty(bunObject, Symbol.toStringTag, { value: "Bun", configurable: true });
 bunObject.argv ??= processObject.argv;
@@ -143,7 +164,14 @@ bunObject.gc ??= function gc(force = false) {
 };
 bunObject.sleep ??= function sleep(value) {
   const delay = value instanceof Date ? value.getTime() - Date.now() : Number(value);
-  return new Promise(resolve => bunSleepSetTimeout(resolve, Math.max(0, Number.isFinite(delay) ? delay : 2 ** 31 - 1)));
+  // Bun saturates oversized timeouts to the maximum 32-bit timer value instead
+  // of clamping them to ~1ms the way DOM/Node timers do.
+  const saturated = Number.isNaN(delay)
+    ? 0
+    : !Number.isFinite(delay)
+      ? 2 ** 31 - 1
+      : Math.min(Math.max(0, delay), 2 ** 31 - 1);
+  return new Promise(resolve => bunSleepSetTimeout(resolve, saturated));
 };
 bunObject.sleepSync ??= function sleepSync(value) {
   const delay = Number(value);

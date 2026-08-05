@@ -19,7 +19,13 @@ function normalizePath(value) {
 export function captureTestRegistrationLine(filePath) {
   const target = normalizePath(filePath);
   if (!target) return 0;
-  for (const line of String(new Error().stack ?? "").split("\n")) {
+  let stack = String(new Error().stack ?? "");
+  try {
+    // .each() row registrations run through bound callbacks whose frames are
+    // attributed to the generated bundle; remap them back to source paths.
+    stack = globalThis.__cottontailRemapStackString?.(stack) ?? stack;
+  } catch {}
+  for (const line of stack.split("\n")) {
     const match = /(?:\(|@|\bat\s+)([^()@]+):(\d+):(\d+)\)?$/.exec(line.trim());
     if (!match) continue;
     const candidate = normalizePath(match[1]);
@@ -53,7 +59,13 @@ function relativeFileName(filePath) {
 
 function registrationSuites(record) {
   const suites = [];
-  for (let suite = record.suite; suite?.parent; suite = suite.parent) suites.push(suite);
+  for (let suite = record.suite; suite?.parent; suite = suite.parent) {
+    // bun/test.js wraps each test file in an anonymous suite (name "")
+    // (bunRegistrationSuite); it is not a user describe and must not become
+    // a testsuite element or appear in testcase classnames.
+    if (suite.name === "" && suite.options?.__bunTest) continue;
+    suites.push(suite);
+  }
   return suites.reverse();
 }
 
@@ -66,6 +78,13 @@ function buildReportTree(records, rootSuite) {
     const files = new Map();
     const appendChild = (parent, child) => {
       if (child?.kind === "suite") {
+        if (child.name === "" && child.options?.__bunTest) {
+          // Anonymous per-file wrapper suite from bun/test.js
+          // (bunRegistrationSuite): hoist its children instead of emitting a
+          // nameless testsuite element.
+          for (const nested of child.children ?? []) appendChild(parent, nested);
+          return;
+        }
         const suiteNode = createNode("suite", child);
         for (const nested of child.children ?? []) appendChild(suiteNode, nested);
         if (metricsForNode(suiteNode).tests > 0) parent.children.push(suiteNode);

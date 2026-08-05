@@ -764,13 +764,23 @@ export function createBunSpawnRuntime(deps) {
     return {
       get finished() { return finished; },
       async pump(write) {
+        // Keep one read request pending at all times. Otherwise the stream's
+        // eager `pull` refills can run while we await a write, and a pull that
+        // enqueues a chunk and then throws would error the stream with the
+        // chunk still queued — spec error handling resets the queue and the
+        // data is lost. Bun still delivers data enqueued before the throw.
+        let pendingRead = reader.read();
         try {
           for (;;) {
-            const { done, value } = await reader.read();
+            const { done, value } = await pendingRead;
             if (done) {
               finished = true;
               return null;
             }
+            pendingRead = reader.read();
+            // The read-ahead may reject while we are awaiting a write below;
+            // it is awaited (or abandoned) on the next loop turn.
+            pendingRead.catch(() => {});
             const bytes = asBuffer(value);
             for (let offset = 0; offset < bytes.byteLength; offset += 16 * 1024) {
               const chunk = bytes.subarray(offset, Math.min(offset + 16 * 1024, bytes.byteLength));
