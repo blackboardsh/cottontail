@@ -399,7 +399,41 @@ if (typeof cottontail.gc === "function" &&
 g.process.versions ??= { node: "24.0.0", cottontail: "0.0.0-dev" };
 g.process.versions.node ??= "24.0.0";
 g.process.release ??= { name: "cottontail" };
+// Node exposes the node-gyp build configuration on every process, including
+// worker threads that stay on this lean process object.
+g.process.config ??= Object.freeze({
+  target_defaults: Object.freeze({
+    cflags: Object.freeze([]),
+    default_configuration: "Release",
+    defines: Object.freeze([]),
+    include_dirs: Object.freeze([]),
+    libraries: Object.freeze([]),
+  }),
+  variables: Object.freeze({
+    clang: 1,
+    host_arch: g.process.arch,
+    target_arch: g.process.arch,
+    enable_lto: false,
+    node_target_type: "executable",
+    node_use_openssl: true,
+    node_shared_zlib: false,
+  }),
+});
 g.process.emitWarning ??= (message, type = "Warning") => console.warn(`${type}: ${message}`);
+g.process.features ??= Object.freeze({
+  inspector: false,
+  debug: false,
+  uv: true,
+  ipv6: true,
+  openssl_is_boringssl: false,
+  tls_alpn: false,
+  tls_sni: false,
+  tls_ocsp: false,
+  tls: false,
+  cached_builtins: false,
+  require_module: true,
+  typescript: "transform",
+});
 g.process.stdin ??= createReadableStdio(0);
 g.process.stdout ??= createWritableStdio(1);
 g.process.stderr ??= createWritableStdio(2);
@@ -1253,8 +1287,14 @@ g.global ??= g;
 g.self ??= g;
 g.performance ??= {};
 {
+  // Measure from process start (Bun parity: floor(process.uptime()) tracks
+  // floor(performance.now()/1000)), not from this module's eval time.
+  const uptimeNs = Number(cottontail?.processInfo?.("uptime")) * 1e9;
   const monotonicNow = typeof cottontail?.nanotime === "function"
-    ? (() => { const base = cottontail.nanotime(); return () => Number(cottontail.nanotime() - base) / 1e6; })()
+    ? (() => {
+        const base = cottontail.nanotime() - (Number.isFinite(uptimeNs) ? uptimeNs : 0);
+        return () => Number(cottontail.nanotime() - base) / 1e6;
+      })()
     : (() => { const base = Date.now(); return () => Date.now() - base; })();
   const timeOrigin = Date.now() - monotonicNow();
   if (g.performance.timeOrigin == null || !(g.performance.timeOrigin > 0)) {

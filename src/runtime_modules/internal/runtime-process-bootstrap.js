@@ -1,4 +1,4 @@
-export const nodeCompatVersion = "24.11.1";
+export const nodeCompatVersion = "24.3.0";
 export const bunCompatVersion = "1.3.10";
 
 const processStartNs = BigInt(Math.floor(cottontail.nanotime?.() ?? Date.now() * 1_000_000));
@@ -46,6 +46,41 @@ function initializeRuntimeProcess() {
 
   target.platform ??= cottontail.platform();
   target.arch ??= cottontail.arch();
+  // Node exposes the node-gyp build configuration on every process, including
+  // worker threads. Mirror the defaults node/process.js merges on top of so
+  // lean runtimes (workers, spawned wrappers) see the same shape.
+  target.config ??= Object.freeze({
+    target_defaults: Object.freeze({
+      cflags: Object.freeze([]),
+      default_configuration: "Release",
+      defines: Object.freeze([]),
+      include_dirs: Object.freeze([]),
+      libraries: Object.freeze([]),
+    }),
+    variables: Object.freeze({
+      clang: 1,
+      host_arch: target.arch,
+      target_arch: target.arch,
+      enable_lto: false,
+      node_target_type: "executable",
+      node_use_openssl: true,
+      node_shared_zlib: false,
+    }),
+  });
+  target.features ??= Object.freeze({
+    inspector: false,
+    debug: false,
+    uv: true,
+    ipv6: true,
+    openssl_is_boringssl: false,
+    tls_alpn: false,
+    tls_sni: false,
+    tls_ocsp: false,
+    tls: false,
+    cached_builtins: false,
+    require_module: true,
+    typescript: "transform",
+  });
   target.pid ??= Number(cottontail.pid?.() ?? 0);
   target.ppid ??= Number(cottontail.processInfo?.("ppid") ?? 0);
   target.version ??= `v${nodeCompatVersion}`;

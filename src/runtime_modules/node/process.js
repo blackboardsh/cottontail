@@ -23,7 +23,7 @@ import {
   permissionsEnabled,
 } from "./internal/permissions.js";
 
-const nodeCompatVersion = "24.11.1";
+const nodeCompatVersion = "24.3.0";
 let sourceMapsState = false;
 let uncaughtExceptionCaptureCallback = null;
 let lastClockNs = 0n;
@@ -1106,20 +1106,12 @@ function makeProcessBinding(name) {
       return makeFsBinding();
     case "buffer":
       return makeBufferBinding();
-    case "os":
-      return makeOsBinding();
-    case "spawn_sync":
-      return makeSpawnSyncBinding();
-    case "zlib":
-      return makeZlibBinding();
     case "uv":
       return uvBinding;
     case "util":
       return utilBinding;
     case "tty_wrap":
       return ttyWrapBinding;
-    case "signal_wrap":
-      return signalWrapBinding;
     case "http_parser":
       return makeHttpParserBinding();
     case "timers":
@@ -1148,6 +1140,10 @@ function makeProcessBinding(name) {
         bits: processObject.arch === "x64" || processObject.arch === "arm64" ? 64 : 32,
         getDefaultLocale: () => Intl.DateTimeFormat().resolvedOptions().locale,
       });
+    // Bun 1.3.10 throws for these (and everything else unlisted above):
+    // async_wrap, cares_wrap, contextify, crypto, fs_event_wrap, icu,
+    // inspector, js_stream, os, pipe_wrap, process_wrap, signal_wrap,
+    // spawn_sync, stream_wrap, tcp_wrap, tls_wrap, udp_wrap, url, v8, zlib.
     default:
       throwNoSuchBinding(name);
   }
@@ -2514,7 +2510,9 @@ const allowedNodeEnvironmentFlagValues = `
 -C
 -r
 `.trim().split(/\s+/);
-export const allowedNodeEnvironmentFlags = new ImmutableSet(allowedNodeEnvironmentFlagValues);
+// Bun 1.3.10 exposes an empty stub set here (verified against the real
+// binary); nothing in the runtime consumes the values.
+export const allowedNodeEnvironmentFlags = new ImmutableSet([]);
 processObject.allowedNodeEnvironmentFlags = allowedNodeEnvironmentFlags;
 const exitCodeDescriptor = Object.getOwnPropertyDescriptor(processObject, "exitCode");
 if (exitCodeDescriptor == null || exitCodeDescriptor.configurable) {
@@ -2644,7 +2642,7 @@ export const kill = processObject.kill = (targetPid, signal = "SIGTERM") => {
       : signalNamesByNumber.get(signalValue);
   if (pidNumber === processObject.pid && signalName && processObject.listenerCount(signalName) > 0) {
     _enqueueNextTick(() => {
-      if (!processObject.emit(signalName, signalName)) {
+      if (!processObject.emit(signalName, signalName, signalValue)) {
         processObject._kill(pidNumber, signalValue);
       }
     });

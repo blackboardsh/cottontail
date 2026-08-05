@@ -11909,11 +11909,12 @@ static int ct_dispatch_signals(CtJscRuntime *runtime, char **error_out) {
         CtSignalWatcher *watcher = &runtime->signal_watchers[index];
         while (watcher->active && watcher->pending > 0) {
             watcher->pending -= 1;
-            JSValueRef arguments[1] = {
+            JSValueRef arguments[2] = {
                 ct_make_string(ctx, watcher->name),
+                JSValueMakeNumber(ctx, watcher->number),
             };
             JSValueRef exception = NULL;
-            JSValueRef emitted = ct_process_emit_event(ctx, watcher->name, 1, arguments, &exception);
+            JSValueRef emitted = ct_process_emit_event(ctx, watcher->name, 2, arguments, &exception);
             if (exception != NULL) {
                 JSValueRef thrown = exception;
                 if (ct_handle_uncaught_exception(runtime, thrown, &exception)) continue;
@@ -32382,8 +32383,17 @@ static JSValueRef ct_close_fd(JSContextRef ctx, JSObjectRef function, JSObjectRe
    exceeds INT_MAX with EINVAL; clamp each syscall and loop instead. */
 #define CT_MAX_WRITE_CHUNK ((size_t)INT_MAX)
 
+/* Direct fd writes bypass the C stdio buffer. Flush it first so output
+   buffered by native addon printf() calls keeps program order relative to
+   console.log/process.stdout.write, matching Node and Bun. */
+static void ct_stdio_flush_for_fd(int fd) {
+    if (fd == 1) fflush(stdout);
+    else if (fd == 2) fflush(stderr);
+}
+
 static int ct_fd_write_bytes(int fd, const uint8_t *bytes, size_t len) {
     if (fd < 0) return EBADF;
+    ct_stdio_flush_for_fd(fd);
     size_t written_total = 0;
     while (written_total < len) {
         size_t chunk = len - written_total;
@@ -32773,6 +32783,7 @@ static JSValueRef ct_fd_write_some(JSContextRef ctx, JSObjectRef function, JSObj
         return JSValueMakeNumber(ctx, 0);
     }
 
+    ct_stdio_flush_for_fd(fd);
     ssize_t written;
     size_t chunk = len > CT_MAX_WRITE_CHUNK ? CT_MAX_WRITE_CHUNK : len;
     do {
@@ -33030,6 +33041,7 @@ static JSValueRef ct_fd_write_at(JSContextRef ctx, JSObjectRef function, JSObjec
     if (offset > bytes_len) offset = bytes_len;
     if (length > bytes_len - offset) length = bytes_len - offset;
     bool has_position = argc >= 5 && !JSValueIsUndefined(ctx, argv[4]) && !JSValueIsNull(ctx, argv[4]);
+    if (!has_position) ct_stdio_flush_for_fd(fd);
     size_t written_total = 0;
     while (written_total < length) {
         size_t chunk = length - written_total;
@@ -38539,6 +38551,21 @@ static int ct_route_global_uncaught_exception(CtJscRuntime *runtime, const char 
 
 static bool ct_runtime_has_pending_native_events(CtJscRuntime *runtime) {
     bool pending = false;
+
+    if (runtime->uv_loop_initialized) {
+        /* A signal raised during script evaluation sits in libuv's queue
+         * until a loop turn moves it into watcher->pending. If any watcher is
+         * active, run one NOWAIT sweep first so a just-raised signal is
+         * observed here instead of terminating before its dispatch. */
+        bool has_active_signal_watcher = false;
+        for (size_t index = 0; index < runtime->signal_watcher_count; index += 1) {
+            if (runtime->signal_watchers[index].active) {
+                has_active_signal_watcher = true;
+                break;
+            }
+        }
+        if (has_active_signal_watcher) (void)ct_runtime_uv_run(runtime, UV_RUN_NOWAIT);
+    }
 
     if (runtime->next_tick_pending) return true;
     if (runtime->referenced_timer_count > 0) return true;
