@@ -6693,7 +6693,9 @@ fn writeEvalEntrypoint(
         bun_eval_globals_bootstrap
     else
         "";
-    const selective_common_js_marker = if (!module_input)
+    // The print-result wrapper (-p/--print) calls Bun.inspect, which only
+    // the full runtime provides — never select a reduced bootstrap for it.
+    const selective_common_js_marker = if (!module_input and !print_result)
         if (try evalSourceCanUseFastFsBootstrap(ctx.allocator, source))
             eval_fast_fs_bootstrap_marker
         else if (try evalSourceCanUseCommonJsBootstrap(ctx.allocator, source))
