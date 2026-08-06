@@ -753,6 +753,9 @@ if (typeof nativeCaptureStackTrace === "function" && !Error.captureStackTrace.__
     try {
       const holder = {};
       nativeCaptureStackTrace(holder, constructorOpt);
+      if (globalThis.process?.env?.CT_DEBUG_STACK === "1") {
+        console.log("=== RAW HOLDER STACK ===\n" + holder.stack + "\n=== END RAW ===");
+      }
       const rawStack = ctRemapStackString(holder.stack);
       const callSites = limitedCallSites(rawStack, undefined, requestedLimit);
       Object.defineProperty(target, "stack", {
@@ -14379,26 +14382,30 @@ if (typeof globalThis.TextEncoder === "function" && typeof globalThis.TextEncode
     writable: true,
   });
 }
+// Capture the pristine web globals at runtime evaluation: Bun's undici
+// builtin binds the originals even if user code later replaces the globals
+// (undici-primordials test sets them all to 42 before requiring undici).
+const undiciPrimordialGlobals = {
+  fetch,
+  Response,
+  Request,
+  Headers,
+  FormData,
+  File: globalThis.File,
+  Blob: globalThis.Blob,
+  URL,
+  URLSearchParams,
+  AbortSignal: globalThis.AbortSignal,
+  AbortController: globalThis.AbortController,
+  WebSocket: globalThis.WebSocket,
+  CloseEvent: globalThis.CloseEvent,
+  ErrorEvent: globalThis.ErrorEvent,
+  MessageEvent: globalThis.MessageEvent,
+  EventTarget: globalThis.EventTarget,
+};
 const loadUndiciBuiltin = createLazyModule("node:undici", () => {
   const { createUndiciModule } = loadEmbeddedRuntimeModule("node/undici.js");
-  return createUndiciModule({
-    fetch,
-    Response,
-    Request,
-    Headers,
-    FormData,
-    File: globalThis.File,
-    Blob: globalThis.Blob,
-    URL,
-    URLSearchParams,
-    AbortSignal: globalThis.AbortSignal,
-    AbortController: globalThis.AbortController,
-    WebSocket: globalThis.WebSocket,
-    CloseEvent: globalThis.CloseEvent,
-    ErrorEvent: globalThis.ErrorEvent,
-    MessageEvent: globalThis.MessageEvent,
-    EventTarget: globalThis.EventTarget,
-  });
+  return createUndiciModule(undiciPrimordialGlobals);
 });
 const undiciBuiltin = createLazyBuiltin(loadUndiciBuiltin);
 nodeSetBuiltinModules({
