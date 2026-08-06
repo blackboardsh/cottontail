@@ -442,6 +442,10 @@ export class Socket extends EventEmitter {
   address() {
     this._healthCheck();
     if (this._bindState !== "bound") throw socketNotRunning();
+    // Bun reflects the connected peer in address() after connect().
+    if (this._connectState === "connected" && this.remote) {
+      return { ...this.remote, family: this.family === 6 ? "IPv6" : "IPv4" };
+    }
     return { ...(this._address ?? cottontail.udpSocketAddress(this.fd)) };
   }
 

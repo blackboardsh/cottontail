@@ -9836,12 +9836,30 @@ async function createUdpSocket(options) {
       socket.close();
       throw new TypeError("connect must be an object");
     }
-    try {
-      socket.connect(Number(options.connect.port), String(options.connect.hostname ?? (type === "udp6" ? "::1" : "127.0.0.1")));
-    } catch (error) {
-      socket.close();
-      throw error;
-    }
+    // dgram connect is asynchronous (DNS lookup): a failure arrives as an
+    // 'error' event, which must reject this promise instead of going
+    // unhandled (udp_socket "connect with invalid hostname rejects").
+    await new Promise((resolve, reject) => {
+      const onError = (error) => {
+        socket.removeListener("connect", onConnect);
+        socket.close();
+        reject(error);
+      };
+      const onConnect = () => {
+        socket.removeListener("error", onError);
+        resolve();
+      };
+      socket.once("error", onError);
+      socket.once("connect", onConnect);
+      try {
+        socket.connect(Number(options.connect.port), String(options.connect.hostname ?? (type === "udp6" ? "::1" : "127.0.0.1")));
+      } catch (error) {
+        socket.removeListener("error", onError);
+        socket.removeListener("connect", onConnect);
+        socket.close();
+        reject(error);
+      }
+    });
   }
 
   const nativeAddress = socket.address();
