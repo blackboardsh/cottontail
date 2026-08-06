@@ -771,10 +771,17 @@ class Zlib extends Transform {
     // decodes a truncated stream without complaint; at end-of-input Node
     // (and Bun) require the stream to actually terminate, so re-run a strict
     // Z_FINISH decode purely for its error (brotli/zstd already fail
-    // natively). Corrupt data throws the native zlib error as before.
+    // natively). The error is deferred until after the decoded output is
+    // pushed: consumers enforcing size limits (express body-parser's 413)
+    // must observe the data before the integrity error.
+    let strictError = null;
     if (this._mode === "inflate" || this._mode === "inflateRaw" ||
       this._mode === "gunzip" || this._mode === "unzip") {
-      transformSync(this._mode, input, { ...this._transformOptions(), finishFlush: constants.Z_FINISH });
+      try {
+        transformSync(this._mode, input, { ...this._transformOptions(), finishFlush: constants.Z_FINISH });
+      } catch (error) {
+        strictError = error;
+      }
     }
     const output = completed === null ? transformSync(this._mode, input, this._transformOptions()) : completed.bytes;
     let bytes = output instanceof Uint8Array ? output : new Uint8Array(output);
@@ -829,6 +836,7 @@ class Zlib extends Transform {
     }
     this._pushOutput(bytes);
     if (this._mode === "zstdCompress") this._emittedMember = true;
+    if (strictError) throw strictError;
     return true;
   }
 
