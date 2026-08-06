@@ -1170,9 +1170,11 @@ Object.defineProperty(globalThis, "__cottontailBufferTranscodeImplementation", {
   configurable: true,
 });
 
-export function transcode(source, fromEncoding, toEncoding) {
-  return transcodeImplementation(source, fromEncoding, toEncoding);
-}
+// COTTONTAIL-COMPAT: Bun 1.3.10 does not export `transcode` from node:buffer.
+// Keep the implementation internal for potential future use.
+// export function transcode(source, fromEncoding, toEncoding) {
+//   return transcodeImplementation(source, fromEncoding, toEncoding);
+// }
 
 export function resolveObjectURL(id) {
   if (typeof globalThis.resolveObjectURL === "function") return globalThis.resolveObjectURL(id);
@@ -1193,5 +1195,4 @@ export default {
   kMaxLength,
   kStringMaxLength,
   resolveObjectURL,
-  transcode,
 };

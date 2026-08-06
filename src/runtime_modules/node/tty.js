@@ -1,4 +1,3 @@
-import { EventEmitter } from "./events.js";
 import { Readable, Writable } from "./stream.js";
 
 function normalizeFd(fd) {
@@ -25,7 +24,7 @@ export function isatty(fd) {
 // intentionally callable without `new`.
 export function ReadStream(fd) {
   if (!(this instanceof ReadStream)) return new ReadStream(fd);
-  EventEmitter.call(this);
+  Readable.call(this);
   this.fd = normalizeFd(fd);
   this.isRaw = false;
   this.isTTY = isatty(this.fd);
@@ -46,7 +45,7 @@ ReadStream.prototype.unref = function unref() { return this; };
 
 export function WriteStream(fd) {
   if (!(this instanceof WriteStream)) return new WriteStream(fd);
-  EventEmitter.call(this);
+  Writable.call(this);
   this.fd = normalizeFd(fd);
   this.isTTY = isatty(this.fd);
   this.writable = true;

@@ -2,6 +2,7 @@ import { bunCompatVersion, processObject as earlyProcessObject } from "./runtime
 import { createWritableStdio } from "../node/stdio.js";
 import { installDotenvLoader } from "./dotenv.js";
 import { renderTable } from "./console-table.js";
+import { formatWithOptions } from "../node/util.js";
 
 const bunSleepSetTimeout = globalThis.setTimeout.bind(globalThis);
 
@@ -128,10 +129,42 @@ installDotenvLoader(processObject);
 try {
   __ctMetaEnv = processObject.env;
 } catch {}
-if (globalThis.console && typeof globalThis.console.write !== "function") {
-  globalThis.console.write = (chunk = "") => {
-    processObject.stdout?.write?.(String(chunk));
-  };
+if (globalThis.console) {
+  // Override native console methods to use util.inspect-based formatting.
+  // The native console.log just calls String() on objects, producing
+  // "[object Object]" instead of a proper inspect output like real Bun.
+  const nativeLog = globalThis.console.log;
+  const nativeError = globalThis.console.error;
+
+  const _inspectOpts = { colors: false, compact: false };
+  function patchedLog(...args) {
+    try {
+      const text = formatWithOptions(_inspectOpts, ...args);
+      processObject.stdout?.write?.(text + "\n");
+    } catch {
+      nativeLog?.apply(globalThis.console, args);
+    }
+  }
+  function patchedError(...args) {
+    try {
+      const text = formatWithOptions(_inspectOpts, ...args);
+      processObject.stderr?.write?.(text + "\n");
+    } catch {
+      nativeError?.apply(globalThis.console, args);
+    }
+  }
+
+  globalThis.console.log = patchedLog;
+  globalThis.console.info = patchedLog;
+  globalThis.console.debug = patchedLog;
+  globalThis.console.error = patchedError;
+  globalThis.console.warn = patchedError;
+
+  if (typeof globalThis.console.write !== "function") {
+    globalThis.console.write = (chunk = "") => {
+      processObject.stdout?.write?.(String(chunk));
+    };
+  }
 }
 if (globalThis.console && typeof globalThis.console.table !== "function") {
   globalThis.console.table = (value, properties = undefined) => {

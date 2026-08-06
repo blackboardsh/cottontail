@@ -59,6 +59,9 @@ function makeNodeError(ErrorType, message, code, details = undefined) {
   const error = new ErrorType(message);
   error.code = code;
   if (details) Object.assign(error, details);
+  if (typeof Error.captureStackTrace === "function") {
+    Error.captureStackTrace(error, makeNodeError);
+  }
   Object.defineProperty(error, "toString", {
     configurable: true,
     writable: true,

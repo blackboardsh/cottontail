@@ -3425,6 +3425,16 @@ function namespaceFromBuiltin(name, value) {
   // live value here would misclassify CommonJS-style builtins after user code
   // assigns an ordinary `.default` property to them.
   if (builtinNamespaceEntries.has(String(name))) return unwrapped;
+  // ESM runtime modules (e.g. node/tls.js) are loaded as real module
+  // namespaces whose property descriptors must be preserved (non-configurable
+  // getters, throwing setters, etc.).  Wrapping them in namespaceFromCommonJs
+  // would flatten every descriptor to a configurable getter, breaking
+  // immutability contracts like tls.rootCertificates.
+  if (unwrapped != null &&
+      (typeof unwrapped === "object" || typeof unwrapped === "function") &&
+      unwrapped[Symbol.toStringTag] === "Module") {
+    return unwrapped;
+  }
   const namespace = namespaceFromCommonJs(unwrapped);
   // bun/index.js exports the global Bun object both as its default and as the
   // named `Bun` binding. The builtin registry intentionally stores the plain

@@ -848,6 +848,7 @@ function limitedCallSites(stack, fallbackSourceURL = undefined, configuredLimit 
 }
 
 const bunAccessedErrorStacks = new WeakSet();
+let prepareStackTraceRecursionGuard = false;
 
 if (typeof nativeCaptureStackTrace === "function" && !Error.captureStackTrace.__cottontailStructuredCallSites) {
   const captureStackTrace = function(target, constructorOpt = undefined) {
@@ -868,7 +869,19 @@ if (typeof nativeCaptureStackTrace === "function" && !Error.captureStackTrace.__
         value: rawStack,
       });
       if (typeof prepare === "function") {
-        target.stack = prepare(target, callSites);
+        if (prepareStackTraceRecursionGuard) {
+          const name = String(target.name || target.constructor?.name || "Error");
+          const message = target.message == null || target.message === "" ? "" : `: ${String(target.message)}`;
+          const frames = callSites.map((site) => `    at ${site.toString()}`).join("\n");
+          target.stack = `${name}${message}${frames ? `\n${frames}` : ""}`;
+        } else {
+          prepareStackTraceRecursionGuard = true;
+          try {
+            target.stack = prepare(target, callSites);
+          } finally {
+            prepareStackTraceRecursionGuard = false;
+          }
+        }
       } else {
         const name = String(target.name || target.constructor?.name || "Error");
         const message = target.message == null || target.message === "" ? "" : `: ${String(target.message)}`;
@@ -967,7 +980,22 @@ function installNodeStyleErrorConstructor(name) {
             const callSites = limitedCallSites(remappedStack, generatedPosition.sourceURL);
             reanchorTopFrameOnConstructor(callSites[0], error.constructor?.name ?? name, error.message);
             if (typeof prepare === "function") {
-              cached = prepare(error, callSites);
+              if (prepareStackTraceRecursionGuard) {
+                const errorName = error.name === undefined ? name : String(error.name);
+                const errorMessage = error.message == null ? "" : String(error.message);
+                const header = errorName === ""
+                  ? errorMessage
+                  : errorMessage === "" ? errorName : `${errorName}: ${errorMessage}`;
+                const frames = callSites.map((site) => `    at ${site.toString()}`).join("\n");
+                cached = `${header}${frames ? `\n${frames}` : ""}`;
+              } else {
+                prepareStackTraceRecursionGuard = true;
+                try {
+                  cached = prepare(error, callSites);
+                } finally {
+                  prepareStackTraceRecursionGuard = false;
+                }
+              }
               return cached;
             }
             const errorName = error.name === undefined ? name : String(error.name);
