@@ -1220,6 +1220,7 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
   let exited = false;
   let exitEmitted = false;
   let closeEmitted = false;
+  let ipcEnded = false;
   let closeCodeOverride;
   let terminalTimer = null;
   const scheduleTerminalEvents = () => {
@@ -1227,6 +1228,12 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
     terminalTimer = setTimeout(() => {
       terminalTimer = null;
       if (exited && !exitEmitted) {
+        // If the IPC pipe closed before exit, finish IPC cleanup before
+        // emitting "exit" so that pending-send error microtasks are queued
+        // first, matching real Bun/Node event ordering.
+        if (ipcEnded && child.connected) {
+          finishIpc();
+        }
         exitEmitted = true;
         finishStdin();
         emitChild("exit", child.exitCode, child.signalCode);
@@ -1284,7 +1291,10 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
       return;
     }
     if (event.type === "ipc_end") {
-      finishIpc();
+      // Mark that the IPC pipe has closed. The actual cleanup is deferred
+      // to scheduleTerminalEvents so that the exit event fires first,
+      // matching real Bun/Node ordering.
+      ipcEnded = true;
       return;
     }
     if (event.type === "exit" && !exited) {
@@ -2312,7 +2322,8 @@ function installParentIpcChannel(child, serialization = undefined, nodeProtocol 
     if (!child.connected) {
       const error = makeChannelClosedError();
       if (sendCallback) queueMicrotask(() => sendCallback(error));
-      else emitChildProcessError(child, error);
+      // Without a callback, just return false (matching real Bun/Node:
+      // post-disconnect sends without a callback silently return false).
       return false;
     }
     if (!nativeIpcReady) {
@@ -2505,7 +2516,7 @@ function installWindowsPipeIpcChannel(child, ipcStream, nodeIpcProtocol = false,
     if (!child.connected) {
       const error = makeChannelClosedError();
       if (sendCallback) queueMicrotask(() => sendCallback(error));
-      else emitChildProcessError(child, error);
+      // Without a callback, just return false (matching real Bun/Node).
       return false;
     }
     if (!pipeIpcReady) {

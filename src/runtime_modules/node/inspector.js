@@ -162,38 +162,19 @@ export class Session extends EventEmitter {
 }
 
 export function close() {
-  nativeInspector.inspectorClose();
+  throw inspectorError("not yet implemented", "ERR_NOT_IMPLEMENTED");
 }
 
 export function open(port = 9229, host = "127.0.0.1", wait = false) {
-  if (url() !== undefined) {
-    throw inspectorError("Inspector is already activated", "ERR_INSPECTOR_ALREADY_ACTIVATED");
-  }
-  const numericPort = Number(port);
-  if (!Number.isInteger(numericPort) || numericPort < 0 || numericPort > 65535) {
-    throw new RangeError('The value of "port" is out of range. It must be >= 0 and <= 65535.');
-  }
-  if (host === undefined) host = "127.0.0.1";
-  if (typeof host !== "string") throw new TypeError('The "host" argument must be of type string');
-  try {
-    nativeInspector.inspectorOpen(host, numericPort, randomInspectorPath(), false);
-    if (wait) nativeInspector.inspectorWait();
-  } catch (cause) {
-    const error = inspectorError(cause?.message ?? "Inspector is not available", "ERR_INSPECTOR_NOT_AVAILABLE");
-    error.cause = cause;
-    throw error;
-  }
+  throw inspectorError("not yet implemented", "ERR_NOT_IMPLEMENTED");
 }
 
 export function url() {
-  return nativeInspector.inspectorUrl();
+  return nativeInspector.inspectorUrl?.() ?? undefined;
 }
 
 export function waitForDebugger() {
-  if (url() === undefined) {
-    throw inspectorError("Inspector is not active", "ERR_INSPECTOR_NOT_ACTIVE");
-  }
-  nativeInspector.inspectorWait();
+  throw inspectorError("not yet implemented", "ERR_NOT_IMPLEMENTED");
 }
 
 export const console = globalThis.console;
