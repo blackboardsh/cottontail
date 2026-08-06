@@ -17,8 +17,11 @@ import { cpus } from 'os';
 import { join, dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
-// MSYS tar cannot chdir into drive-letter backslash paths on Windows.
+// MSYS tar cannot chdir into drive-letter backslash paths on Windows;
+// --force-local keeps drive-letter archives from being read as remote
+// host:file specs. bsdtar (macOS) supports neither, so both are win32-only.
 const tarPath = (p) => (process.platform === 'win32' ? p.replace(/\\/g, '/') : p);
+const tarLocalFlags = process.platform === 'win32' ? ['--force-local'] : [];
 
 const ROOT = process.cwd();
 const MANIFEST_PATH = join(dirname(fileURLToPath(import.meta.url)), 'jsc-manifest.json');
@@ -165,7 +168,7 @@ function ensureIcuHeaders(vendorDir) {
       );
     }
     exec('tar', [
-      '--force-local',
+      ...tarLocalFlags,
       '-xzf',
       tarPath(archivePath),
       '-C',
@@ -332,7 +335,7 @@ function buildPinnedIcuFallback(vendorDir, platformKey) {
       );
     }
 
-    exec('tar', ['--force-local', '-xzf', tarPath(archivePath), '-C', tarPath(sourceDir), '--strip-components=1']);
+    exec('tar', [...tarLocalFlags, '-xzf', tarPath(archivePath), '-C', tarPath(sourceDir), '--strip-components=1']);
     const configurePlatform = platformKey.startsWith('macos-') ? 'MacOSX' : 'Linux';
     exec(
       join(sourceDir, 'source', 'runConfigureICU'),
@@ -439,7 +442,7 @@ function vendorLocalJsc(platformKey, archiveValue) {
   mkdirSync(stagingDir, { recursive: true });
 
   try {
-    exec('tar', ['--force-local', '-xzf', tarPath(archivePath), '--strip-components=1', '-C', tarPath(stagingDir)]);
+    exec('tar', [...tarLocalFlags, '-xzf', tarPath(archivePath), '--strip-components=1', '-C', tarPath(stagingDir)]);
 
     const libDir = join(stagingDir, 'lib');
     const includeDir = join(stagingDir, 'include', 'JavaScriptCore');
@@ -526,7 +529,7 @@ function vendorJsc() {
       );
     }
 
-    exec('tar', ['--force-local', '-xzf', tarPath(archivePath), '--strip-components=1', '-C', tarPath(stagingDir)]);
+    exec('tar', [...tarLocalFlags, '-xzf', tarPath(archivePath), '--strip-components=1', '-C', tarPath(stagingDir)]);
     unlinkSync(archivePath);
 
     const libDir = join(stagingDir, 'lib');

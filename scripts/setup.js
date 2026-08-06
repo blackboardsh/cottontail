@@ -84,6 +84,7 @@ function vendorZig() {
   const archivePath = join(ROOT, 'vendors', archive === 'zip' ? 'zig.zip' : 'zig.tar.xz');
   // MSYS tar cannot chdir into drive-letter backslash paths on Windows.
   const tarPath = (p) => (process.platform === 'win32' ? p.replace(/\\/g, '/') : p);
+        const tarLocalFlags = process.platform === 'win32' ? ['--force-local'] : [];
   const tempDir = join(ROOT, 'vendors', 'zig-temp');
   const url = `https://ziglang.org/download/${ZIG_VERSION}/${folder}.${archive}`;
 
@@ -107,7 +108,7 @@ function vendorZig() {
 
     if (archive === 'tar.xz') {
       execFileSync('tar', [
-        '--force-local',
+        ...tarLocalFlags,
         '-xJf',
         tarPath(archivePath),
         '--strip-components=1',
