@@ -196,7 +196,9 @@ assert(filled.toString() === "abab", "process.binding buffer fill mismatch");
 assert(bufferBinding.indexOfString(Buffer.from("abcabc"), "bc", 0, "utf8") === 1, "process.binding buffer indexOfString mismatch");
 assert(bufferBinding.indexOfNumber(Buffer.from([1, 2, 3]), 2, 0) === 1, "process.binding buffer indexOfNumber mismatch");
 
-const osBinding = (process as any).binding("os");
+// Bun 1.3.10's public process.binding() throws for os/spawn_sync/zlib;
+// the internal surface keeps them (see upstream process.test.js throw-set).
+const osBinding = (process as any).__cottontailBindingInternal("os");
 assert(typeof osBinding.getHostname() === "string", "process.binding os hostname mismatch");
 const loadAverage = new Float64Array(3);
 assert(osBinding.getLoadAvg(loadAverage) === undefined, "process.binding os getLoadAvg return mismatch");
@@ -240,7 +242,7 @@ if (process.platform === "linux") {
   assert(osBinding.getUptime() > 1, "process.binding os should report Linux system uptime");
 }
 
-const spawnSyncBinding = (process as any).binding("spawn_sync");
+const spawnSyncBinding = (process as any).__cottontailBindingInternal("spawn_sync");
 const bindingShell = process.platform === "win32" ? "cmd.exe" : "sh";
 const bindingShellArgs = process.platform === "win32"
   ? ["cmd.exe", "/d", "/s", "/c", "echo binding-spawn"]
@@ -256,7 +258,7 @@ assert(
   `process.binding spawn_sync stdout mismatch: ${JSON.stringify(privateSpawn.output[1].toString())}`,
 );
 
-const zlibBinding = (process as any).binding("zlib");
+const zlibBinding = (process as any).__cottontailBindingInternal("zlib");
 assert(zlibBinding.crc32("abc") === 0x352441c2, "process.binding zlib crc32 mismatch");
 
 try {
