@@ -10500,19 +10500,57 @@ export class Glob {
   scanSync(options = {}) {
     options = normalizeGlobScanOptions(options);
     const cwd = nodePathResolve(String(options.cwd ?? options.root ?? cottontail.cwd()));
-    const patternIsAbsolute = isAbsoluteGlobPath(normalizeGlobSeparators(this.pattern));
-    const compiledPattern = normalizeGlobSeparators(this.pattern);
-    const root = patternIsAbsolute ? absoluteGlobScanRoot(compiledPattern, cwd) : cwd;
+    const normalizedPattern = normalizeGlobSeparators(this.pattern);
+    const patternIsAbsolute = isAbsoluteGlobPath(normalizedPattern);
+    const compiledPattern = normalizedPattern;
+    // Detect leading dot-segments in the pattern (e.g. "./", "../", "../../")
+    // Bun preserves these in relative scan results and resolves them for the scan root.
+    let dotPrefix = "";
+    let scanRoot = cwd;
+    if (!patternIsAbsolute) {
+      const dotPrefixMatch = compiledPattern.match(/^((?:\.\.?\/)+)/);
+      if (dotPrefixMatch) {
+        dotPrefix = dotPrefixMatch[1];
+        // Resolve the scan root by applying the dot-segments to cwd
+        const prefixWithoutTrailingSlash = dotPrefix.endsWith("/") ? dotPrefix.slice(0, -1) : dotPrefix;
+        scanRoot = nodePathResolve(cwd, prefixWithoutTrailingSlash);
+      }
+    }
+    const root = patternIsAbsolute ? absoluteGlobScanRoot(compiledPattern, cwd) : scanRoot;
     if (patternIsAbsolute && root === "/" && absoluteRootGlobShouldNotScan(compiledPattern)) return [];
     const absolute = Boolean(options.absolute);
     const onlyFiles = options.onlyFiles !== false;
     const dot = Boolean(options.dot);
     const followSymlinks = Object.prototype.hasOwnProperty.call(options, "followSymlinks") && Boolean(options.followSymlinks);
+    // When the pattern has a dot-prefix, walkFiles generates paths relative to the
+    // resolved root (without the prefix). We need a matcher for the stripped pattern.
+    let strippedMatcher = null;
+    if (dotPrefix) {
+      const strippedPattern = compiledPattern.slice(dotPrefix.length);
+      if (strippedPattern) {
+        strippedMatcher = lazyPicomatch(strippedPattern, { dot: true });
+      }
+    }
     const results = [];
     for (const entry of walkFiles(root, { dot, onlyFiles, followSymlinks, throwErrorOnBrokenSymlink: Boolean(options.throwErrorOnBrokenSymlink) })) {
       const matchTarget = patternIsAbsolute ? entry.absolute : entry.relative;
-      if (!this.match(matchTarget) && !(entry.isDirectory && this.match(`${matchTarget}/`))) continue;
-      results.push(absolute || patternIsAbsolute ? entry.absolute : entry.relative);
+      let matches;
+      if (strippedMatcher) {
+        // Use the stripped pattern for matching against walkFiles' relative paths
+        matches = strippedMatcher(matchTarget) || (entry.isDirectory && strippedMatcher(`${matchTarget}/`));
+      } else {
+        matches = this.match(matchTarget) || (entry.isDirectory && this.match(`${matchTarget}/`));
+      }
+      if (!matches) continue;
+      if (absolute || patternIsAbsolute) {
+        results.push(entry.absolute);
+      } else if (dotPrefix) {
+        // Prepend the dot-prefix from the pattern to the relative path
+        const prefix = dotPrefix.endsWith("/") ? dotPrefix.slice(0, -1) : dotPrefix;
+        results.push(entry.relative ? `${prefix}/${entry.relative}` : prefix);
+      } else {
+        results.push(entry.relative);
+      }
     }
     return results;
   }
