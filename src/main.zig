@@ -2483,11 +2483,14 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
         try appendDiscoveredTestFiles(init, allocator, positionals.items, &test_files);
     } else {
         for (positionals.items) |path| {
-            if (openTestDirectory(init.io, path)) |directory| {
+            // Bun treats an empty positional as the current directory (shell
+            // templates like `bun test ${""} ./file.test.ts` produce one).
+            const effective: [:0]const u8 = if (path.len == 0) "." else path;
+            if (openTestDirectory(init.io, effective)) |directory| {
                 expanded_directory = true;
-                try appendTestDirectoryFiles(init, allocator, path, directory, &test_files);
+                try appendTestDirectoryFiles(init, allocator, effective, directory, &test_files);
             } else {
-                try test_files.append(allocator, path);
+                try test_files.append(allocator, effective);
             }
         }
     }

@@ -6972,6 +6972,18 @@ fn buildCliPreloadImports(ctx: *const Context, script_abs: []const u8, exec_args
     return try output.toOwnedSlice(ctx.allocator);
 }
 
+// In test CLI mode, an entry module that fails to parse or evaluate must be
+// reported through the test runner ("Unhandled error between tests", counting
+// 1 fail + 1 error) instead of surfacing as a fatal process error. Emits the
+// `catch` clause for the entry wrapper's `try`/`finally`; the JS side lives in
+// the runner (Symbol.for("cottontail.internal.testModuleLoadError")). The hook
+// is registered lazily with the runner module, so the catch loads "bun:test"
+// first when nothing claimed the error. Outside test mode this is empty.
+fn testModuleLoadErrorCatch(ctx: *const Context, test_cli_execution: bool, path_literal: []const u8) ![]const u8 {
+    if (!test_cli_execution) return "";
+    return std.fmt.allocPrint(ctx.allocator, " catch (error) {{ const __ctLoadErrorHook = () => globalThis[Symbol.for(\"cottontail.internal.testModuleLoadError\")]?.(error, {s}); if (!__ctLoadErrorHook()) {{ try {{ await import(\"bun:test\"); }} catch {{}} if (!__ctLoadErrorHook()) throw error; }} }}", .{path_literal});
+}
+
 fn writeReusedReloadEntryWrapper(
     ctx: *const Context,
     tmp_dir: []const u8,
@@ -6995,7 +7007,7 @@ fn writeReusedReloadEntryWrapper(
         \\  {s}
         \\  globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
         \\  await import({s});
-        \\}} finally {{
+        \\}}{s} finally {{
         \\  globalThis.__cottontailLoadingTestModules = false;
         \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
         \\}}
@@ -7003,6 +7015,7 @@ fn writeReusedReloadEntryWrapper(
     , .{
         test_header_signal,
         try jsonStringLiteral(ctx, script_import_abs),
+        try testModuleLoadErrorCatch(ctx, test_cli_execution, try jsonStringLiteral(ctx, script_abs)),
     });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
@@ -7044,7 +7057,7 @@ fn writeBareRuntimeEntryWrapper(
         \\try {{
         \\{s}  globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
         \\  await import({s});
-        \\}} finally {{
+        \\}}{s} finally {{
         \\  globalThis.__cottontailLoadingTestModules = false;
         \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
         \\}}
@@ -7057,6 +7070,7 @@ fn writeBareRuntimeEntryWrapper(
         cpu_profiler_start_statement,
         test_header_signal,
         try jsonStringLiteral(ctx, script_import_abs),
+        try testModuleLoadErrorCatch(ctx, test_cli_execution, try jsonStringLiteral(ctx, script_abs)),
     });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
@@ -7168,7 +7182,7 @@ fn writeMinimalRuntimeEntryWrapper(
         \\{s}
         \\{s}  globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
         \\  await import({s});
-        \\}} finally {{
+        \\}}{s} finally {{
         \\  globalThis.__cottontailLoadingTestModules = false;
         \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
         \\}}
@@ -7189,6 +7203,7 @@ fn writeMinimalRuntimeEntryWrapper(
         cpu_profiler_start_statement,
         preload_imports,
         try jsonStringLiteral(ctx, script_import_abs),
+        try testModuleLoadErrorCatch(ctx, test_cli_execution, try jsonStringLiteral(ctx, script_abs)),
     });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
@@ -7313,7 +7328,7 @@ fn writeCottontailEntryWrapper(
         \\  const __ctPluginEntry = await globalThis.__cottontailResolvePluginEntrypoint?.({s}, {s});
         \\  const __ctEntryNamespace = __ctPluginEntry?.matched ? await __ctPluginEntry.value : await import({s});
         \\  await __ctStartDefaultApp(__ctEntryNamespace);
-        \\}} finally {{
+        \\}}{s} finally {{
         \\  globalThis.__cottontailLoadingTestModules = false;
         \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
         \\}}
@@ -7334,6 +7349,7 @@ fn writeCottontailEntryWrapper(
             script_literal,
             script_literal,
             script_import_literal,
+            try testModuleLoadErrorCatch(ctx, test_cli_execution, script_literal),
         },
     );
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
@@ -9656,7 +9672,7 @@ fn writeLazyRuntimeEntryWrapper(
         \\    ? await __ctPluginEntry.value
         \\    : await globalThis.__cottontailImportModule(__ctEntryPath, __ctEntryPath, undefined, true);
         \\  await __ctStartDefaultApp(__ctEntryNamespace);
-        \\}} finally {{
+        \\}}{s} finally {{
         \\  globalThis.__cottontailLoadingTestModules = false;
         \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
         \\}}
@@ -9670,6 +9686,7 @@ fn writeLazyRuntimeEntryWrapper(
         test_header_signal,
         cpu_profiler_start_statement,
         preload_imports,
+        try testModuleLoadErrorCatch(ctx, test_cli_execution, try jsonStringLiteral(ctx, script_abs)),
     });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
@@ -9809,7 +9826,7 @@ fn writeSelectiveEvalCommonJsEntryWrapper(
         \\{s}
         \\{s}  globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
         \\  (moduleModule.default ?? moduleModule.Module).runMain();
-        \\}} finally {{
+        \\}}{s} finally {{
         \\  globalThis.__cottontailLoadingTestModules = false;
         \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
         \\}}
@@ -9825,6 +9842,7 @@ fn writeSelectiveEvalCommonJsEntryWrapper(
         test_header_signal,
         cpu_profiler_start_statement,
         preload_imports,
+        try testModuleLoadErrorCatch(ctx, test_cli_execution, "__ctEntryPath"),
     });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
@@ -9902,7 +9920,7 @@ fn writeLazyCommonJsEntryWrapper(
         \\{s}
         \\{s}  globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
         \\{s}
-        \\}} finally {{
+        \\}}{s} finally {{
         \\  globalThis.__cottontailLoadingTestModules = false;
         \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
         \\}}
@@ -9917,6 +9935,7 @@ fn writeLazyCommonJsEntryWrapper(
         cpu_profiler_start_statement,
         preload_imports,
         main_action,
+        try testModuleLoadErrorCatch(ctx, test_cli_execution, script_literal),
     });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
@@ -10251,11 +10270,11 @@ fn writeRuntimeEntryWrapper(
         \\{s}
         \\{s}globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
         \\{s}
-        \\}} finally {{
+        \\}}{s} finally {{
         \\  globalThis.__cottontailLoadingTestModules = false;
         \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
         \\}}
-    , .{ test_header_signal, cpu_profiler_start_statement, preload_imports, main_action });
+    , .{ test_header_signal, cpu_profiler_start_statement, preload_imports, main_action, try testModuleLoadErrorCatch(ctx, test_cli_execution, script_literal) });
     const bootstrap = try std.fmt.allocPrint(
         ctx.allocator,
         \\globalThis.__cottontailBundleSourceMap ??= {s};

@@ -841,7 +841,7 @@ function limitedCallSites(stack, fallbackSourceURL = undefined, configuredLimit 
   let sites = parseCallSites(stack, fallbackSourceURL);
   sites = sites.filter((site) => {
     const f = site.file ?? site.getFileName?.() ?? "";
-    return !(f.includes("runtime_modules/bun/index.js") || f.includes(".cottontail-embedded-runtime") || f.includes("/src/runtime_modules/") || f.includes(".cottontail-tmp"));
+    return !(f.includes("runtime_modules/bun/index.js") || f.includes(".cottontail-embedded-runtime") || f.includes("/src/runtime_modules/") || f.includes(".cottontail-tmp") || f.includes("cottontail:") || f.includes("cottontail-direct-entry"));
   });
   const limit = Number(configuredLimit);
   return Number.isFinite(limit) && limit >= 0 ? sites.slice(0, Math.floor(limit)) : sites;
