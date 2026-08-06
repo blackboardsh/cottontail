@@ -1627,8 +1627,8 @@ function installBlobGlobals() {
         if (typeof parts === "string" || parts == null) throw new TypeError("File bits must be an iterable object");
         super(parts, options);
         Object.defineProperties(this, {
-          name: { configurable: true, value: String(name) },
-          lastModified: { configurable: true, value: Number(options?.lastModified ?? Date.now()) },
+          name: { configurable: true, writable: true, value: String(name) },
+          lastModified: { configurable: true, writable: true, value: Number(options?.lastModified ?? Date.now()) },
         });
       }
     }

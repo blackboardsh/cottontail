@@ -617,7 +617,7 @@ class CottontailCallSite {
         : "<anonymous>";
       const name = this.functionName
         ? `${this.constructorFrame ? "new " : ""}${this.functionName}`
-        : "unknown";
+        : "<anonymous>";
       return `${name} (${location})`;
     }
     get [Symbol.toStringTag]() { return "CallSite"; }
@@ -689,6 +689,91 @@ function evalSourceURLFromCallSites(sites) {
   return null;
 }
 
+const frameSourceLinesCache = new Map();
+
+// Source lines for a stack frame's file, preferring the bundle source map's
+// embedded original sources and falling back to reading the file from disk.
+function frameSourceLines(fileName) {
+  if (typeof fileName !== "string" || fileName === "") return null;
+  if (frameSourceLinesCache.has(fileName)) return frameSourceLinesCache.get(fileName);
+  if (frameSourceLinesCache.size > 64) frameSourceLinesCache.clear();
+  let lines = null;
+  const context = bundleSourceContextForLocation(fileName, 1, 1);
+  if (Array.isArray(context?.lines)) {
+    lines = context.lines;
+  } else {
+    let path = fileName;
+    if (path.startsWith("file://")) {
+      try { path = nodeFileURLToPath(path); } catch {}
+    }
+    try { lines = String(cottontail.readFile(path)).split(/\r?\n/); } catch { lines = null; }
+  }
+  frameSourceLinesCache.set(fileName, lines);
+  return lines;
+}
+
+// JSC records the position of a frame suspended at a JS-level call as the
+// return address (the op after the call), so stacks captured through the
+// CottontailError/captureStackTrace wrappers attribute their top frame to the
+// statement after the error-originating call. Bun attributes it to the call
+// itself. Re-anchor the top frame on the originating expression by scanning
+// the source near the reported position.
+function reanchorTopFrame(site, pattern, columnOf, message = undefined) {
+  if (!site?.fileName || !Number.isFinite(site.lineNumber)) return;
+  const lines = frameSourceLines(site.fileName);
+  if (!Array.isArray(lines)) return;
+  // When the error message appears verbatim in the source it disambiguates
+  // which of several nearby `new Error(...)` expressions produced this error.
+  const hint = typeof message === "string" && message !== "" && !message.includes("\n") ? message : null;
+  const reportedLine = Math.min(site.lineNumber, lines.length);
+  for (const requireHint of hint === null ? [false] : [true, false]) {
+    for (let offset = 0; offset <= 4; offset += 1) {
+      for (const line of offset === 0 ? [reportedLine] : [reportedLine - offset, reportedLine + offset]) {
+        if (line < 1 || line > lines.length) continue;
+        const text = lines[line - 1];
+        if (requireHint && !text.includes(hint)) continue;
+        pattern.lastIndex = 0;
+        let match;
+        let found = null;
+        while ((match = pattern.exec(text)) !== null) {
+          const anchorColumn = match.index + match[0].length; // 1-based column just past the match
+          // On the reported line the originating call must end at or before the
+          // reported position.
+          if (line === reportedLine && Number.isFinite(site.columnNumber) && anchorColumn > site.columnNumber) continue;
+          found = match;
+        }
+        if (!found) continue;
+        site.lineNumber = line;
+        site.columnNumber = columnOf(found);
+        return;
+      }
+    }
+  }
+}
+
+// `new Error(...)` frames point at the constructor name (Bun: `at <anonymous>
+// (file:32:19)` for `  const err = new Error(...)`).
+function reanchorTopFrameOnConstructor(site, constructorName, message = undefined) {
+  if (typeof constructorName !== "string" || !/^[A-Za-z_$][\w$]*$/.test(constructorName)) return;
+  const escaped = constructorName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  reanchorTopFrame(
+    site,
+    new RegExp(`\\bnew\\s+${escaped}\\s*\\(`, "g"),
+    (match) => match.index + match[0].lastIndexOf("(") - constructorName.length + 1,
+    message,
+  );
+}
+
+// `Error.captureStackTrace(obj)` frames point at the call's open paren (Bun:
+// `at f (file:12:26)` for `  Error.captureStackTrace(err);`).
+function reanchorTopFrameOnCaptureStackTrace(site) {
+  reanchorTopFrame(
+    site,
+    /\.captureStackTrace\s*\(/g,
+    (match) => match.index + match[0].length,
+  );
+}
+
 const parseCallSites = (stack, fallbackSourceURL = undefined) => {
   const sites = String(stack ?? "").split("\n").filter(Boolean).map((line) => {
     const separator = line.indexOf("@");
@@ -733,7 +818,23 @@ const parseCallSites = (stack, fallbackSourceURL = undefined) => {
       }
     }
   }
-  return sites;
+  // Cottontail runs user entry points and test callbacks through its own JS
+  // machinery (node:module loader, node:async_hooks storage wrappers, the
+  // node:test runner). Bun's native driver never surfaces those frames, so
+  // stacks captured in user code hide the loader frames entirely and end at
+  // the outermost user frame.
+  const visible = sites.filter((site) => {
+    const fileName = site.fileName;
+    // Note: the location parser splits ":line:column" off, so the fileName of
+    // a "node:module:2783:19" frame is exactly "node:module".
+    return fileName !== "node:module";
+  });
+  while (visible.length > 0) {
+    const fileName = visible[visible.length - 1].fileName;
+    if (typeof fileName === "string" && /^(?:node|bun):/.test(fileName)) visible.pop();
+    else break;
+  }
+  return visible;
 };
 
 function limitedCallSites(stack, fallbackSourceURL = undefined, configuredLimit = Error.stackTraceLimit) {
@@ -753,11 +854,9 @@ if (typeof nativeCaptureStackTrace === "function" && !Error.captureStackTrace.__
     try {
       const holder = {};
       nativeCaptureStackTrace(holder, constructorOpt);
-      if (globalThis.process?.env?.CT_DEBUG_STACK === "1") {
-        console.log("=== RAW HOLDER STACK ===\n" + holder.stack + "\n=== END RAW ===");
-      }
       const rawStack = ctRemapStackString(holder.stack);
       const callSites = limitedCallSites(rawStack, undefined, requestedLimit);
+      if (constructorOpt === undefined) reanchorTopFrameOnCaptureStackTrace(callSites[0]);
       Object.defineProperty(target, "stack", {
         configurable: true,
         enumerable: false,
@@ -801,6 +900,12 @@ function installNodeStyleErrorConstructor(name) {
       NativeError.stackTraceLimit = requestedLimit;
       Reflect.set(NativeError, "prepareStackTrace", underlyingPrepare);
       if (StackError) Reflect.set(StackError, "prepareStackTrace", nativePrepare);
+    }
+    if (Number(requestedLimit) === 0) {
+      // Bun captures no stack while Error.stackTraceLimit is 0: the error has
+      // no own "stack" property and reading it yields undefined.
+      delete error.stack;
+      rawStack = undefined;
     }
     const generatedPosition = {
       line: Number(error.line),
@@ -856,6 +961,7 @@ function installNodeStyleErrorConstructor(name) {
             const prepare = Error.prepareStackTrace;
             const remappedStack = ctRemapStackString(rawStack);
             const callSites = limitedCallSites(remappedStack, generatedPosition.sourceURL);
+            reanchorTopFrameOnConstructor(callSites[0], error.constructor?.name ?? name, error.message);
             if (typeof prepare === "function") {
               cached = prepare(error, callSites);
               return cached;
@@ -8194,7 +8300,10 @@ function bunInspectDecodeOriginalPath(lines) {
 function bunInspectBuildMessageDiagnostic(error) {
   if (error?.name !== "BuildMessage") return null;
   const message = String(error.message ?? "");
-  const headline = message.split("\n", 1)[0];
+  // Module-load BuildMessages carry a pre-rendered diagnostic as their
+  // message ("<line> | <source>\n  ^\nerror: <headline>\n    at ..."); Bun's
+  // BuildMessage.message is the bare headline. Recover it when present.
+  const headline = /^error: (.+)$/m.exec(message)?.[1] ?? message.split("\n", 1)[0];
   const location = message.match(/(?:^|\n)\s*at\s+(.+):(\d+):(\d+)\s*$/m) ??
     String(error.stack ?? "").match(/(?:^|\n)\s*at\s+[^\n]*?\(?([^()\n]+):(\d+):(\d+)\)?/);
   if (!location) return null;
@@ -8226,6 +8335,9 @@ function bunInspectErrorDiagnostic(error, ctx = undefined) {
   const stackWasAccessed = bunAccessedErrorStacks.has(error);
   let stack;
   try { stack = error instanceof Error ? error.stack : null; } catch { return null; }
+  // A user-installed Error.prepareStackTrace may return the CallSite array
+  // itself; Bun still renders the diagnostic from the underlying frames.
+  if (Array.isArray(stack)) stack = stack.map((site) => `    at ${site}`).join("\n");
   if (typeof stack !== "string") return null;
   stack = ctRemapStackString(stack);
   const frame = stack.match(/(?:^|\n)\s*at [^\n]*?\(?([^()\n]+):(\d+):(\d+)\)?/);
@@ -8323,6 +8435,8 @@ function bunInspectErrorDiagnostic(error, ctx = undefined) {
         frame = stackWasAccessed
           ? `at ${frame.slice("at unknown (".length, -1)}`
           : `at <anonymous> (${frame.slice("at unknown (".length)}`;
+      } else if (stackWasAccessed && frame.startsWith("at <anonymous> (")) {
+        frame = `at ${frame.slice("at <anonymous> (".length, -1)}`;
       }
       return `      ${frame}`;
     })
@@ -8553,7 +8667,16 @@ function bunStyleInspect(value, ctx, indent, seen, depth) {
     if (value?.[dynamicErrorSourceSymbol]?.source != null) {
       return bunInspectDynamicErrorSource(value, nodeInspect(value, bunInspectNodeOptions(ctx, depth)));
     }
-    const diagnostic = bunInspectBuildMessageDiagnostic(value) ?? bunInspectErrorDiagnostic(value, ctx);
+    // Bun only renders the bare diagnostic (code frame + message + frames)
+    // for errors without own enumerable properties; extra properties are
+    // rendered by recursing, which is also what makes pathologically nested
+    // errors overflow the stack instead of collapsing to the diagnostic.
+    // BuildMessage always renders as a diagnostic (its enumerable "name" own
+    // property is an artifact of the JS-side class).
+    const errorKeys = Object.keys(value).filter((key) => key !== "stack" && key !== "message");
+    const diagnostic = errorKeys.length === 0 || value.name === "BuildMessage"
+      ? bunInspectBuildMessageDiagnostic(value) ?? bunInspectErrorDiagnostic(value, ctx)
+      : null;
     if (diagnostic !== null) {
       const causeDescriptor = Object.getOwnPropertyDescriptor(value, "cause");
       const cause = causeDescriptor && "value" in causeDescriptor ? causeDescriptor.value : undefined;
@@ -8564,7 +8687,6 @@ function bunStyleInspect(value, ctx, indent, seen, depth) {
         ? diagnostic
         : `${diagnostic.trimEnd()}\n\n${causeDiagnostic}`;
     }
-    const errorKeys = Object.keys(value).filter((key) => key !== "stack" && key !== "message");
     if (errorKeys.length === 0) {
       return bunInspectDynamicErrorSource(value, nodeInspect(value, bunInspectNodeOptions(ctx, depth)));
     }
@@ -14400,22 +14522,18 @@ if (typeof globalThis.TextEncoder === "function" && typeof globalThis.TextEncode
     writable: true,
   });
 }
-// Capture the pristine web globals at runtime evaluation: Bun's undici
-// builtin binds the originals even if user code later replaces the globals
-// (undici-primordials test sets them all to 42 before requiring undici).
+// Capture the bootstrap-installed globals eagerly: Bun's undici builtin
+// binds the originals even if user code later replaces them (the
+// undici-primordials test sets them all to 42 before requiring undici).
+// These are installed before this module evaluates, so no lazy module
+// evaluation is forced. The runtime's own fetch/Response/Request/... are
+// module-scope bindings — already immune to global replacement — so they
+// stay lazy to avoid pulling web modules forward in the load order.
 const undiciPrimordialGlobals = {
-  fetch,
-  Response,
-  Request,
-  Headers,
-  FormData,
   File: globalThis.File,
   Blob: globalThis.Blob,
-  URL,
-  URLSearchParams,
   AbortSignal: globalThis.AbortSignal,
   AbortController: globalThis.AbortController,
-  WebSocket: globalThis.WebSocket,
   CloseEvent: globalThis.CloseEvent,
   ErrorEvent: globalThis.ErrorEvent,
   MessageEvent: globalThis.MessageEvent,
@@ -14423,7 +14541,19 @@ const undiciPrimordialGlobals = {
 };
 const loadUndiciBuiltin = createLazyModule("node:undici", () => {
   const { createUndiciModule } = loadEmbeddedRuntimeModule("node/undici.js");
-  return createUndiciModule(undiciPrimordialGlobals);
+  return createUndiciModule({
+    fetch,
+    Response,
+    Request,
+    Headers,
+    FormData,
+    URL,
+    URLSearchParams,
+    // Read lazily: the WebSocket global is itself lazily installed, and
+    // forcing it here reorders module evaluation (node-module-surface).
+    WebSocket: globalThis.WebSocket,
+    ...undiciPrimordialGlobals,
+  });
 });
 const undiciBuiltin = createLazyBuiltin(loadUndiciBuiltin);
 nodeSetBuiltinModules({
