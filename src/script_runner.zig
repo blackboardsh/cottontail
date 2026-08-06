@@ -7726,6 +7726,16 @@ fn writeBunCompatTransformedSource(
     }
 
     const resolution_dir = source_base_dir orelse std.fs.path.dirname(script_abs) orelse ctx.project_root;
+    // The generated compat file embeds this path in its original-path marker,
+    // so it is also what import.meta.path reports inside the module — and
+    // therefore the key a dynamic self-import resolves to.
+    const script_name = std.fs.path.basename(script_abs);
+    const generated_input = std.mem.startsWith(u8, script_name, ".cottontail-eval-") or
+        std.mem.startsWith(u8, script_name, ".cottontail-compat-");
+    const original_path = if (generated_input)
+        (try originalPathFromSourceMarker(ctx.allocator, source)) orelse script_abs
+    else
+        script_abs;
     if (try rewriteSelfNamespaceImports(ctx, transformed_source, script_abs, resolution_dir)) |transformed| {
         transformed_source = transformed;
         changed = true;
@@ -7742,6 +7752,7 @@ fn writeBunCompatTransformedSource(
             resolution_dir,
             transpilerLoaderForPath(script_abs),
             preserve_static_html_imports,
+            original_path,
         )) |transformed| {
             transformed_source = transformed;
             changed = true;
@@ -7773,13 +7784,6 @@ fn writeBunCompatTransformedSource(
         .{ std.hash.Wyhash.hash(0, source), std.hash.Wyhash.hash(0, &invocation_bytes), ext },
     );
     const generated_path = try std.fs.path.join(ctx.allocator, &.{ script_dir, generated_name });
-    const script_name = std.fs.path.basename(script_abs);
-    const generated_input = std.mem.startsWith(u8, script_name, ".cottontail-eval-") or
-        std.mem.startsWith(u8, script_name, ".cottontail-compat-");
-    const original_path = if (generated_input)
-        (try originalPathFromSourceMarker(ctx.allocator, source)) orelse script_abs
-    else
-        script_abs;
     const encoder = std.base64.standard.Encoder;
     const encoded_path = try ctx.allocator.alloc(u8, encoder.calcSize(original_path.len));
     const encoded = encoder.encode(encoded_path, original_path);
@@ -9226,6 +9230,7 @@ fn rewriteQueryImports(
     resolution_dir: []const u8,
     source_loader: ?[]const u8,
     preserve_static_html_imports: bool,
+    self_alias_path: ?[]const u8,
 ) !?[]u8 {
     var occurrences: std.ArrayList(DynamicImportOccurrence) = .empty;
     var targets: std.ArrayList(DynamicImportTarget) = .empty;
@@ -9448,6 +9453,32 @@ fn rewriteQueryImports(
         try appendDynamicTargetFactory(ctx, &output, target, index);
     }
     try appendDynamicDispatcher(ctx, &output, targets.items, resolution_dir);
+
+    // This module evaluates under its generated .cottontail-compat-* path,
+    // but import.meta.path inside it reports the original source path. Alias
+    // the original path to a getter-backed namespace over this module's
+    // exports so a dynamic self-import (`await import(import.meta.path)`)
+    // returns the in-flight module instead of re-evaluating the source.
+    if (self_alias_path) |self_path| {
+        const self_exports = try collectSelfNamespaceExports(ctx.allocator, source);
+        defer ctx.allocator.free(self_exports);
+        try output.appendSlice(ctx.allocator,
+            \\{
+            \\  const __ctSelfNamespace = {};
+            \\  Object.defineProperty(__ctSelfNamespace, Symbol.toStringTag, { value: "Module" });
+            \\
+        );
+        for (self_exports) |item| {
+            try output.appendSlice(ctx.allocator, "  Object.defineProperty(__ctSelfNamespace, ");
+            try output.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, item.exported_name));
+            try output.appendSlice(ctx.allocator, ", { enumerable: true, get: () => ");
+            try output.appendSlice(ctx.allocator, item.local_name);
+            try output.appendSlice(ctx.allocator, " });\n");
+        }
+        try output.appendSlice(ctx.allocator, "  globalThis.__cottontailRegisterSelfModuleNamespace?.(");
+        try output.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, self_path));
+        try output.appendSlice(ctx.allocator, ", __ctSelfNamespace);\n}\n");
+    }
 
     var copied_until: usize = 0;
     for (occurrences.items) |occurrence| {

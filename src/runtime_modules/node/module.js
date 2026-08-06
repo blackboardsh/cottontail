@@ -3735,6 +3735,22 @@ const asyncEsmModuleCache = new Map();
 const dynamicEsmFactoryCache = new Map();
 const asyncDynamicEsmFactoryCache = new Map();
 
+// Entrypoints and test files execute from a generated .cottontail-compat-*
+// sibling whose import.meta still reports the original path (via the
+// base64 original-path marker). A dynamic self-import therefore resolves the
+// original path, which is not the cache key the module is evaluating under —
+// without this alias the self-import re-evaluates the module instead of
+// returning the in-flight namespace (ESM cyclic semantics). The generated
+// wrapper calls this once, at the top of its own evaluation, with a
+// getter-backed namespace over its exported bindings.
+globalThis.__cottontailRegisterSelfModuleNamespace ??= (resolvedPath, namespace) => {
+  const key = String(resolvedPath);
+  const promise = Promise.resolve(namespace);
+  if (!asyncEsmModuleCache.has(key)) asyncEsmModuleCache.set(key, { namespace, promise });
+  const registry = globalThis.Loader?.registry;
+  if (registry != null && !registry.has(key)) registry.set(key, promise);
+};
+
 function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, originalSource, ancestors = undefined) {
   const cacheKey = String(resolved);
   const sourceName = `${resolvedPath}${suffix}`;
