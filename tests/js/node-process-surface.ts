@@ -34,7 +34,7 @@ assert(processDefault === process, "default process should be global process");
 assert(processModule.pid === process.pid, "pid export mismatch");
 assert(processModule.ppid > 0, "ppid should be present");
 assert(typeof processModule.version === "string", "version missing");
-assert(processModule.allowedNodeEnvironmentFlags.has("--enable-source-maps"), "allowedNodeEnvironmentFlags missing expected flag");
+assert(processModule.allowedNodeEnvironmentFlags.size === 0, "allowedNodeEnvironmentFlags should be Bun's empty stub set");
 assert(processModule.config.variables.target_arch === process.arch, "config target_arch mismatch");
 assert(processModule.features.require_module === true, "features.require_module mismatch");
 
