@@ -6031,7 +6031,7 @@ extern "C" napi_status napi_get_version(napi_env opaque_env, uint32_t* result)
 extern "C" napi_status napi_get_node_version(napi_env opaque_env, const napi_node_version** result)
 {
     // COTTONTAIL-COMPAT: Keep this synchronized with nodeCompatVersion in node/process.js.
-    static const napi_node_version version { 24, 11, 1, "node" };
+    static const napi_node_version version { 24, 3, 0, "node" };
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
     if (!env || !result)
         return invalid(env);

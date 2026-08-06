@@ -636,7 +636,9 @@ function materializeIncomingHeaders(rawHeaders, joinDuplicateHeaders = false, ma
     ? Math.min(rawHeaders.length, count * 2)
     : rawHeaders.length;
   const raw = rawHeaders.slice(0, limit);
-  const headers = Object.create(null);
+  // Bun/Node expose req.headers as a plain object inheriting Object.prototype
+  // (upstream node-http "Headers should inherit from Object.prototype").
+  const headers = {};
 
   for (let index = 0; index + 1 < raw.length; index += 2) {
     const name = String(raw[index]).toLowerCase();
