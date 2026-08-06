@@ -109,6 +109,9 @@ pub const BundleOptions = struct {
     entry_naming: []const u8 = "[dir]/[name].[ext]",
     chunk_naming: []const u8 = "./chunk-[hash].[ext]",
     asset_naming: []const u8 = "./[name]-[hash].[ext]",
+    /// CLI mode: false when neither --outdir nor --outfile is given, so the
+    /// bundler errors if the graph would emit more than one output file.
+    supports_multiple_outputs: bool = true,
 };
 
 /// Process-wide worker pool shared by every bundle. Passing an external pool
@@ -1468,6 +1471,9 @@ pub fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator)
     if (object.get("splitting")) |value| {
         if (value == .bool) options.code_splitting = value.bool;
     }
+    if (object.get("__cottontailSupportsMultipleOutputs")) |value| {
+        if (value == .bool) options.supports_multiple_outputs = value.bool;
+    }
     if (object.get("includeRuntimeModules")) |value| {
         if (value == .bool) options.include_runtime_modules = value.bool;
     }
@@ -2202,6 +2208,22 @@ pub fn buildEntryPointsJson(
         return error.InvalidOptions;
     }
     var options = parseBuildOptions(request_json, arena_allocator) catch |err| {
+        if (err == error.InvalidLoader) {
+            // Extract the invalid loader name from the request for the error message
+            if (request_object.get("loader")) |value| {
+                if (value == .object) {
+                    var iterator = value.object.iterator();
+                    while (iterator.next()) |entry| {
+                        if (entry.value_ptr.* == .string) {
+                            if (compiler.options.Loader.fromString(entry.value_ptr.string) == null) {
+                                setError(error_out, "invalid loader \"{s}\", expected one of: js, jsx, ts, tsx, css, json, file, text, base64, dataurl, wasm, html, md, toml, yaml, jsonc, sqlite, sqlite_embedded, napi", .{entry.value_ptr.string});
+                                return err;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         setError(error_out, "Invalid Bun.build options: {s}", .{@errorName(err)});
         return err;
     };
@@ -2354,7 +2376,7 @@ pub fn buildEntryPointsJson(
     transpiler.options.metafile_json_path = options.metafile_json_path;
     transpiler.options.metafile_markdown_path = options.metafile_markdown_path;
     transpiler.options.code_splitting = options.code_splitting;
-    transpiler.options.supports_multiple_outputs = true;
+    transpiler.options.supports_multiple_outputs = options.supports_multiple_outputs;
     var optimize_imports = compiler.StringSet.init(arena_allocator);
     for (options.optimize_imports) |package_name| try optimize_imports.insert(package_name);
     if (!optimize_imports.isEmpty()) transpiler.options.optimize_imports = &optimize_imports;

@@ -1341,6 +1341,8 @@ fn nativeBuildGeneration(
     var conditions: std.ArrayList([]const u8) = .empty;
     var define_keys: std.ArrayList([]const u8) = .empty;
     var define_values: std.ArrayList([]const u8) = .empty;
+    var loader_extensions: std.ArrayList([]const u8) = .empty;
+    var loader_values: std.ArrayList([]const u8) = .empty;
     var outdir: ?[]const u8 = null;
     var outfile: ?[]const u8 = null;
     var metafile_json_path: ?[]const u8 = null;
@@ -1546,6 +1548,19 @@ fn nativeBuildGeneration(
         } else if (std.mem.eql(u8, arg, "--external") and index + 1 < args.len) {
             index += 1;
             try external.append(allocator, args[index]);
+        } else if (std.mem.startsWith(u8, arg, "--loader=")) {
+            const loader_arg = arg["--loader=".len..];
+            if (std.mem.indexOfScalar(u8, loader_arg, ':')) |colon_idx| {
+                try loader_extensions.append(allocator, loader_arg[0..colon_idx]);
+                try loader_values.append(allocator, loader_arg[colon_idx + 1 ..]);
+            }
+        } else if (std.mem.eql(u8, arg, "--loader") and index + 1 < args.len) {
+            index += 1;
+            const loader_arg = args[index];
+            if (std.mem.indexOfScalar(u8, loader_arg, ':')) |colon_idx| {
+                try loader_extensions.append(allocator, loader_arg[0..colon_idx]);
+                try loader_values.append(allocator, loader_arg[colon_idx + 1 ..]);
+            }
         } else if (std.mem.startsWith(u8, arg, "--outdir=")) {
             outdir = arg["--outdir=".len..];
         } else if (std.mem.eql(u8, arg, "--outdir") and index + 1 < args.len) {
@@ -1809,6 +1824,10 @@ fn nativeBuildGeneration(
     for (options.define_keys, options.define_values) |key, value| {
         try define_object.put(allocator, key, .{ .string = value });
     }
+    var loader_object: std.json.ObjectMap = .{};
+    for (loader_extensions.items, loader_values.items) |ext, loader_name| {
+        try loader_object.put(allocator, ext, .{ .string = loader_name });
+    }
     const request = .{
         .entrypoints = entries.items,
         .target = @tagName(options.target),
@@ -1830,6 +1849,7 @@ fn nativeBuildGeneration(
         },
         .conditions = options.conditions,
         .define = std.json.Value{ .object = define_object },
+        .loader = std.json.Value{ .object = loader_object },
         .splitting = options.code_splitting,
         .banner = options.banner,
         .footer = options.footer,
@@ -1862,6 +1882,7 @@ fn nativeBuildGeneration(
             (std.fs.path.dirname(path) orelse ".")
         else
             outdir,
+        .__cottontailSupportsMultipleOutputs = outdir != null,
     };
     const request_json = try std.json.Stringify.valueAlloc(allocator, request, .{});
     var error_message: ?[*:0]u8 = null;
