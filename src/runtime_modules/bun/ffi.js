@@ -1148,7 +1148,9 @@ const emitConsoleText = (writer, text) => {
     : globalThis.process?.stderr;
   if (processStream && typeof processStream.write === "function") {
     const output = String(text);
-    processStream.write(output.endsWith("\n") ? output : `${output}\n`);
+    // Bun and Node always append the newline, even when the formatted output
+    // already ends with one (console.log("abc\n") prints "abc\n\n").
+    processStream.write(`${output}\n`);
     return;
   }
   writer?.(text);
