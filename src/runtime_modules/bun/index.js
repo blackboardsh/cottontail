@@ -14439,7 +14439,11 @@ for (const name of [
   "xtest",
   "xdescribe",
 ]) {
-  installLazyGlobal(name, () => loadBunTestModule()[name]);
+  // Resolve to the already-shared bun:test instance when one exists: the
+  // bunfig preload path evaluates the module through the ESM loader, and a
+  // second lazy evaluation would swallow global hook registrations
+  // (beforeEach never firing in describe-scoped suites).
+  installLazyGlobal(name, () => (globalThis[Symbol.for("cottontail.internal.bunTestModule")] ?? loadBunTestModule())[name]);
 }
 if (globalThis.Headers?.prototype && typeof globalThis.Headers.prototype.getAll !== "function") {
   Object.defineProperty(globalThis.Headers.prototype, "getAll", {

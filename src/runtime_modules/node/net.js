@@ -2268,7 +2268,9 @@ class ServerImpl extends EventEmitter {
       if (result != null) {
         this._fd = Number(result.fd);
         this._isPipe = options.path != null;
-        this._ownsPipePath = this._isPipe;
+        // Node/Bun do not remove the socket file on server.close(); only
+        // Bun.listen's fd-adopted servers opt into unlinking (issue #6413).
+        this._ownsPipePath = false;
         this._path = this._isPipe ? String(result.path ?? options.path) : null;
         this._address = this._isPipe ? this._path : result.address ?? null;
       }

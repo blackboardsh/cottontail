@@ -3504,9 +3504,25 @@ export function _attachHttpConnection(server, socket) {
     clearKeepAliveTimer();
   };
 
-  const fail = (error, statusLine = error?.statusLine ?? (error?.code === "HPE_HEADER_OVERFLOW"
-    ? "431 Request Header Fields Too Large"
-    : error?.code === "HPE_INVALID_VERSION" ? "505 HTTP Version Not Supported" : "400 Bad Request")) => {
+  const fail = (error, statusLine = undefined) => {
+    // Bun's server surfaces most llhttp protocol violations as HPE_INTERNAL;
+    // only header-token and transfer-encoding errors keep their specific code.
+    if (error && typeof error.code === "string") {
+      if (error.code === "HPE_INVALID_VERSION") {
+        error.code = "HPE_INTERNAL";
+        if (error.statusLine == null) error.statusLine = "505 HTTP Version Not Supported";
+      } else if (
+        error.code === "HPE_LF_EXPECTED" ||
+        error.code === "HPE_CR_EXPECTED" ||
+        error.code === "HPE_STRICT" ||
+        error.code === "HPE_INVALID_CHUNK_SIZE"
+      ) {
+        error.code = "HPE_INTERNAL";
+      }
+    }
+    statusLine ??= error?.statusLine ?? (error?.code === "HPE_HEADER_OVERFLOW"
+      ? "431 Request Header Fields Too Large"
+      : error?.code === "HPE_INVALID_VERSION" ? "505 HTTP Version Not Supported" : "400 Bad Request");
     detachParser();
     // Parser failures must abort the request body without closing the
     // transport before a clientError listener or the fallback response runs.
