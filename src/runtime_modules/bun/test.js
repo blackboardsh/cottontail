@@ -3143,7 +3143,14 @@ expect.hasAssertions = () => {
 };
 expect.extend = installCustomMatchers;
 expect.addSnapshotSerializer = (_serializer) => { throw new Error("Not implemented"); };
-expect.unreachable = (message = "reached unreachable code") => { throw new nodeAssert.AssertionError({ message }); };
+expect.unreachable = (message = "reached unreachable code") => {
+  // Bun rethrows an Error argument as-is; otherwise it throws a plain Error
+  // named "UnreachableError" (verified against Bun 1.3.10).
+  if (message instanceof Error) throw message;
+  const error = new Error(String(message));
+  error.name = "UnreachableError";
+  throw error;
+};
 
 function normalizeMockImplementation(implementation, provided = true) {
   if (typeof implementation === "function") return implementation;
@@ -3496,6 +3503,41 @@ function doneContinuationFrame(error) {
   return null;
 }
 
+// Stacks captured synchronously inside a done-style callback come back with
+// the bundle's path but the original source coordinates (engine quirk); the
+// reporter drops those bundle frames and the failure prints without its
+// source excerpt. Re-point the top frame at the test file it actually came
+// from — the coordinates are already the original ones.
+function repairDoneErrorStackPath(error) {
+  if (!(error instanceof Error)) return;
+  const currentFile = normalizeDoneFramePath(globalThis.__cottontailCurrentTestFile?.());
+  if (!currentFile) return;
+  let stack;
+  try {
+    stack = error.stack;
+  } catch {
+    return;
+  }
+  if (typeof stack !== "string" || !stack.includes("script.bundle.mjs")) return;
+  const lines = stack.split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = /^(\s*at\s+(?:.*?\s+\()?|[^@\n]*@)([^\s()]*script\.bundle\.mjs):([0-9]+):([0-9]+)(\)?\s*)$/.exec(lines[index]);
+    if (!match) continue;
+    const lineNumber = Number(match[3]);
+    if (!Number.isFinite(lineNumber) || lineNumber < 1) continue;
+    let sourceLine = null;
+    try {
+      sourceLine = String(nodeReadFileSync(currentFile, "utf8")).split(/\r?\n/)[lineNumber - 1] ?? null;
+    } catch {}
+    if (sourceLine === null) continue;
+    lines[index] = `${match[1]}${currentFile}:${match[3]}:${match[4]}${match[5]}`;
+    try {
+      error.stack = lines.join("\n");
+    } catch {}
+    return;
+  }
+}
+
 function runDoneCallbackWithSchedulerTracking(callback, done) {
   const restorations = [];
   const replace = (owner, property, replacement) => {
@@ -3574,6 +3616,7 @@ function wrapDoneCallback(callback) {
     const done = (error) => {
       if (doneCalled || settled) return;
       doneCalled = true;
+      repairDoneErrorStackPath(error);
       const frame = doneContinuationFrame(error);
       const scheduler = doneSchedulerStorage.getStore();
       const previousFrame = frame && previousDoneFrames.get(frame.filePath);
@@ -3610,6 +3653,11 @@ function wrapDoneCallback(callback) {
     } catch (error) {
       callbackReturned = true;
       returnedPromiseSettled = true;
+      if (error instanceof Error && !error.__cottontailBunExpectation) {
+        try {
+          Object.defineProperty(error, "__cottontailBunThrowSite", { value: true, configurable: true });
+        } catch {}
+      }
       returnedPromiseError = error;
       finish();
     }
@@ -3657,9 +3705,31 @@ function wrapTestCallback(callback, inspectorId = 0) {
     resetAssertionState();
     let status = "pass";
     try {
-      await wrapped();
+      let result;
+      try {
+        result = wrapped();
+      } catch (syncError) {
+        // A synchronous throw propagates through Bun's native runner as an
+        // exception, and Bun reports its throw-site position (the closing
+        // paren for `throw new Error(...)`); errors delivered through a
+        // rejection report the construction site. Tag the sync throw so the
+        // reporter can tell them apart (verified against Bun 1.3.10).
+        if (syncError instanceof Error && !syncError.__cottontailBunExpectation) {
+          try {
+            Object.defineProperty(syncError, "__cottontailBunThrowSite", { value: true, configurable: true });
+          } catch {}
+        }
+        throw syncError;
+      }
+      await result;
       verifyAssertionState();
     } catch (error) {
+      // The engine computes error.stack lazily on first read; by report time
+      // the throwing context is gone and the captured frames drift. Reading it
+      // here — the closest runner frame to the throw — freezes the right one.
+      if (error instanceof Error) {
+        try { void error.stack; } catch {}
+      }
       status = error?.code === "ERR_TEST_FAILURE" && error?.failureType === "testTimeoutFailure" ? "timeout" : "fail";
       throw error;
     } finally {

@@ -83,6 +83,7 @@ let skippedTests = 0;
 let todoTests = 0;
 let runnerErrors = 0;
 let nextReportOrder = 0;
+let moduleLoadErrorAt = 0;
 const failures = [];
 const selectedRecords = new Set();
 
@@ -257,6 +258,7 @@ function installUncaughtCapture() {
   const processGlobal = globalThis.process;
   uncaughtCaptureInstalled = true;
   processGlobal[uncaughtCaptureHandlerKey] = (error) => {
+    tagThrowSiteError(error);
     const execution = executionStorage.getStore();
     if (execution?.failExternal) {
       execution.failExternal(error);
@@ -341,20 +343,36 @@ function guardAsyncCallback(callback, captureReturnedPromise = true, externalOnT
     // running would fail an unrelated victim (bun absorbs late throws from a
     // finished test's stray timers). The captured execution's failExternal is
     // a no-op once the attempt has settled.
-    const execution = capturedExecution;
+    let execution = capturedExecution;
     try {
       const result = callback.apply(this, args);
       if (captureReturnedPromise && result && typeof result.then === "function" && execution) {
-        promiseThen(result, undefined, execution.failExternal);
+        promiseThen(result, undefined, (error) => routeGuardedError(execution, error));
       }
       return result;
     } catch (error) {
       if (!externalOnThrow) throw error;
-      if (execution?.failExternal) execution.failExternal(error);
-      else recordUnhandledError(error);
+      routeGuardedError(execution, tagThrowSiteError(error));
       return undefined;
     }
   };
+}
+
+function routeGuardedError(execution, error) {
+  // Exception to the owner attribution above: an expect() assertion binds to
+  // the test that is running when the matcher executes, not to the test that
+  // scheduled the callback. bun_test.fixture's "misattributed error" relies on
+  // this — the stray timer's failing expect is caught by the currently-running
+  // `.failing` test, which then passes.
+  if (error?.__cottontailBunExpectation && execution?.kind === "test" && !execution.active) {
+    const current = currentExecution();
+    if (current?.kind === "test" && current.active && typeof current.failExternal === "function") {
+      current.failExternal(error);
+      return;
+    }
+  }
+  if (execution?.failExternal) execution.failExternal(error);
+  else recordUnhandledError(error);
 }
 
 function copyTimerMetadata(wrapper, original) {
@@ -615,7 +633,7 @@ function invokeDoneCallback(callback, thisValue, args) {
       const result = callback.apply(thisValue, [...args, done]);
       if (result && typeof result.then === "function") promiseThen(result, undefined, done);
     } catch (error) {
-      done(error);
+      done(tagThrowSiteError(error));
     }
   });
 }
@@ -630,7 +648,15 @@ function invokeTestCallback(record, context) {
     let value;
     if (typeof record.fn !== "function") value = undefined;
     else if (record.fn.length >= 2) value = await invokeDoneCallback(record.fn, undefined, [context]);
-    else value = await record.fn(context);
+    else {
+      let result;
+      try {
+        result = record.fn(context);
+      } catch (error) {
+        throw tagThrowSiteError(error);
+      }
+      value = await result;
+    }
     // Bun keeps a test alive until matcher-produced promises settle (e.g.
     // expect(asyncFn).toThrow() — issue #23865); they race the test timeout.
     while (execution?.pendingPromises?.length) {
@@ -650,7 +676,7 @@ function invokeHook(hook, context) {
         else if (hook.fn.length >= 2) result = invokeDoneCallback(hook.fn, undefined, [context]);
         else result = hook.fn(context);
       } catch (error) {
-        throw annotatePrimitiveError(error, context?.filePath ?? hook.filePath);
+        throw annotatePrimitiveError(tagThrowSiteError(error), context?.filePath ?? hook.filePath);
       }
       return promiseThen(
         runnerPromiseResolve(result),
@@ -671,7 +697,7 @@ async function runHookList(hooks, context, reverseLayers = false) {
     try {
       await invokeHook(hook, context);
     } catch (error) {
-      return error;
+      return materializeErrorStack(error);
     }
   }
   return null;
@@ -681,9 +707,13 @@ function tagPerTestHookError(error) {
   if (error === null) return null;
   if ((typeof error === "object" || typeof error === "function") &&
       Object.prototype.hasOwnProperty.call(error, "__cottontailBunPrimitiveError")) {
+    // annotatePrimitiveError already resolved a source location for this
+    // primitive throw; keep the annotated error for display (bun prints the
+    // source excerpt + stack for hook callbacks that throw primitives) instead
+    // of the raw value, which would print without any location.
     const wrapped = new Error(String(error.__cottontailBunPrimitiveError));
     wrapped.code = "ERR_BUN_TEST_CALLBACK_FAILURES";
-    wrapped.errors = [error.__cottontailBunPrimitiveError];
+    wrapped.errors = [error];
     return wrapped;
   }
   if (typeof error !== "object" && typeof error !== "function") {
@@ -801,10 +831,15 @@ async function defineDeferredSuite(suite) {
     let rejectExternal;
     const failure = new Promise((_, reject) => { rejectExternal = reject; });
     const target = { kind: "describe", failExternal: rejectExternal };
-    const result = failureStorage.run(
-      target,
-      () => typeof suite.definitionFn === "function" ? suite.definitionFn() : undefined,
-    );
+    let result;
+    try {
+      result = failureStorage.run(
+        target,
+        () => typeof suite.definitionFn === "function" ? suite.definitionFn() : undefined,
+      );
+    } catch (error) {
+      throw tagThrowSiteError(error);
+    }
     await runnerPromiseRace([runnerPromiseResolve(result), failure]);
     suite.definitionState = "defined";
   } catch (error) {
@@ -927,6 +962,17 @@ function reapDanglingProcesses(execution) {
   }
 }
 
+// The engine computes error.stack lazily on first read; by report time the
+// throwing context is gone and the captured frames can drift (bundle paths, or
+// positions from a later test's error). Reading .stack when the runner first
+// captures an error freezes the correct frames.
+function materializeErrorStack(error) {
+  if (error instanceof Error) {
+    try { void error.stack; } catch {}
+  }
+  return error;
+}
+
 async function executeAttempt(record) {
   const context = new TestContext(record);
   const execution = {
@@ -941,7 +987,7 @@ async function executeAttempt(record) {
     activeExecution = execution;
     const externalFailure = new Promise((_, reject) => {
       execution.failExternal = (error) => {
-        const normalized = bunAsyncCallbackFailure(record, error);
+        const normalized = bunAsyncCallbackFailure(record, materializeErrorStack(error));
         (execution.externalErrors ??= []).push(normalized);
         reject(normalized);
       };
@@ -966,7 +1012,7 @@ async function executeAttempt(record) {
           await drainPostBodyTurn(execution);
           if (execution.externalErrors?.length) throw execution.externalErrors[0];
         } catch (error) {
-          bodyError = annotatePrimitiveError(error, record.filePath);
+          bodyError = annotatePrimitiveError(materializeErrorStack(error), record.filePath);
         }
         // Like bun, a timed-out test kills subprocesses it left running.
         if (bodyError?.code === "ERR_TEST_TIMEOUT") reapDanglingProcesses(execution);
@@ -1107,6 +1153,7 @@ async function execute(record) {
 }
 
 function recordHookFailure(name, error, isRunnerError = false, filePath = undefined) {
+  materializeErrorStack(error);
   const record = {
     name,
     status: isRunnerError ? "error" : "fail",
@@ -1122,6 +1169,7 @@ function recordHookFailure(name, error, isRunnerError = false, filePath = undefi
 }
 
 function recordUnhandledError(error) {
+  materializeErrorStack(error);
   const record = {
     name: "Unhandled error between tests",
     status: "error",
@@ -1145,16 +1193,42 @@ if (!primaryTestModule && testCliModeEnabled()) {
 }
 
 async function runConcurrentRecords(records) {
-  const batchSize = Number.isFinite(maxConcurrency)
+  const limit = Number.isFinite(maxConcurrency)
     ? Math.max(1, maxConcurrency)
     : Math.max(1, records.length);
+  const inFlight = new Set();
   let cursor = 0;
+  // Bun's concurrent scheduler is a rolling window, not batches: a new test
+  // starts the moment a running one settles (max-concurrency 3 yields an
+  // execution pattern of 1,2,3,3,3,...). Between launches Bun drains the
+  // microtask queue, so a chain that settles without macrotask work (sync or
+  // immediately-resolved async bodies/hooks) completes fully — hooks
+  // included — before the next test starts, while a chain pending on real
+  // async work stays in flight and the next test launches right away. The
+  // drain must never yield to macrotasks (timers would interleave into the
+  // launch sequence); the round cap only bounds pathological chains that
+  // reschedule microtasks forever without settling.
   while (cursor < records.length && !bailReached()) {
-    const batch = [];
-    while (cursor < records.length && batch.length < batchSize) {
-      batch.push(execute(records[cursor++]));
+    while (inFlight.size >= limit) {
+      await runnerPromiseRace(Array.from(inFlight));
     }
-    await runnerPromiseAll(batch);
+    if (bailReached()) break;
+    let settled = false;
+    const promise = execute(records[cursor++]);
+    runnerPromiseThen.call(promise, () => {
+      settled = true;
+      inFlight.delete(promise);
+    }, () => {
+      settled = true;
+      inFlight.delete(promise);
+    });
+    inFlight.add(promise);
+    for (let round = 0; round < 4096 && !settled; round += 1) {
+      await runnerPromiseResolve();
+    }
+  }
+  while (inFlight.size > 0) {
+    await runnerPromiseRace(Array.from(inFlight));
   }
 }
 
@@ -1175,10 +1249,11 @@ async function executeSuite(suite, concurrentGroup) {
   const hasRunnableWork = suiteHasRunnableWork(suite);
   // Bun still runs hooks for suites that are empty or whose tests are all
   // skipped, but not for suites whose tests were deselected by `.only`
-  // (issue #14135).
+  // (issue #14135). The root suite is no exception: a file with only
+  // top-level beforeAll/afterAll hooks and no tests still runs them.
   const runnable = hasRunnableWork ||
     (suiteHasLifecycleWork(suite) && (!suiteHasTestRecords(suite) || suiteHasSelectedTest(suite)));
-  const shouldRunBefore = runnable && !suite.beforeRan && (suite !== rootSuite || hasRunnableWork);
+  const shouldRunBefore = runnable && !suite.beforeRan;
   if (shouldRunBefore) {
     if (suite.beforeHooks.length > 0) await flushConcurrent(concurrentGroup);
     suite.beforeRan = true;
@@ -1264,6 +1339,7 @@ function parseStackFrame(line) {
       filePath: normalizeDiagnosticPath(match[2]),
       line: Number(match[3]),
       column: Number(match[4]),
+      bare: false,
     };
   }
   match = /^\s*at\s+(?:(.*?)\s+\()?(.+):(\d+):(\d+)\)?$/.exec(text);
@@ -1273,6 +1349,9 @@ function parseStackFrame(line) {
     filePath: normalizeDiagnosticPath(match[2]),
     line: Number(match[3]),
     column: Number(match[4]),
+    // Top-level frames print bare in Bun ("at /path/file.js:1:3", no function
+    // name or parens) — preserve that instead of synthesizing "<anonymous>".
+    bare: match[1] === undefined && !text.includes("("),
   };
 }
 
@@ -1298,6 +1377,15 @@ function failureStackFrames(error) {
         path.includes("/.cottontail-tmp/") || path.endsWith("/script.bundle.mjs")) continue;
     frames.push(frame);
   }
+  for (const frame of frames) {
+    // A column past the end of the source line (e.g. the engine reports
+    // "Unexpected end of file" one past the last character) is never
+    // printable; Bun clamps the caret to the last character.
+    const sourceLine = sourceLinesFor(frame.filePath)?.[frame.line - 1];
+    if (sourceLine && frame.column > sourceLine.length) {
+      frame.column = Math.max(1, sourceLine.length);
+    }
+  }
   for (const frame of error?.__cottontailBunAsyncParentFrames ?? []) {
     if (!frame?.filePath || !Number.isFinite(frame.line) || !Number.isFinite(frame.column)) continue;
     if (frames.some((candidate) => candidate.filePath === frame.filePath &&
@@ -1309,7 +1397,35 @@ function failureStackFrames(error) {
       column: Number(frame.column),
     });
   }
-  return frames.map(normalizeConstructedErrorFrame);
+  // Errors that reached the reporter through the exception path (a synchronous
+  // throw, as opposed to a promise rejection) carry JSC's throw-site position:
+  // for `throw new Error(...)` that is the closing paren of the constructor
+  // call, not the constructor-name position the engine captures at
+  // construction. Verified against Bun 1.3.10 (sync body/hook/describe throws
+  // and timer-callback throws use the closing paren; async throws and
+  // rejections use the constructor name).
+  if (error?.__cottontailBunThrowSite && frames.length > 0) {
+    frames[0] = normalizeConstructedErrorFrame(frames[0]);
+  }
+  return frames;
+}
+
+function normalizeConstructedErrorFrame(frame) {
+  const sourceLine = sourceLinesFor(frame.filePath)?.[frame.line - 1];
+  if (!sourceLine || !/\bnew\s+(?:Error|[A-Za-z_$][\w$]*Error)\s*\(/.test(sourceLine)) return frame;
+  const closingParen = sourceLine.lastIndexOf(")");
+  return closingParen < 0 ? frame : { ...frame, column: closingParen + 1 };
+}
+
+// Marks an error that arrived through the exception path so its top frame is
+// printed with the throw-site column (see failureStackFrames).
+function tagThrowSiteError(error) {
+  if (error instanceof Error && !error.__cottontailBunExpectation) {
+    try {
+      Object.defineProperty(error, "__cottontailBunThrowSite", { value: true, configurable: true });
+    } catch {}
+  }
+  return error;
 }
 
 function sourceLinesFor(path) {
@@ -1327,13 +1443,6 @@ function sourceLinesFor(path) {
   return lines;
 }
 
-function normalizeConstructedErrorFrame(frame) {
-  const sourceLine = sourceLinesFor(frame.filePath)?.[frame.line - 1];
-  if (!sourceLine || !/\bnew\s+(?:Error|[A-Za-z_$][\w$]*Error)\s*\(/.test(sourceLine)) return frame;
-  const closingParen = sourceLine.lastIndexOf(")");
-  return closingParen < 0 ? frame : { ...frame, column: closingParen + 1 };
-}
-
 function durationSuffix(durationMs) {
   const duration = Number(durationMs);
   return Number.isFinite(duration) && duration >= 10 ? ` [${duration.toFixed(2)}ms]` : "";
@@ -1348,11 +1457,7 @@ function appendSourceFrame(lines, frame) {
     lines.push(`${String(lineNumber).padStart(width)} | ${sourceLines[lineNumber - 1]}`);
   }
   const sourceLine = sourceLines[frame.line - 1];
-  let column = Math.max(1, Math.min(Number(frame.column) || 1, sourceLine.length + 1));
-  if (/\bnew\s+(?:Error|[A-Za-z_$][\w$]*Error)\s*\(/.test(sourceLine)) {
-    const closingParen = sourceLine.lastIndexOf(")");
-    if (closingParen >= 0) column = closingParen + 1;
-  }
+  const column = Math.max(1, Math.min(Number(frame.column) || 1, sourceLine.length + 1));
   lines.push(`${" ".repeat(width + 3 + column - 1)}^`);
 }
 
@@ -1378,13 +1483,16 @@ function appendErrorDiagnostic(lines, error) {
   lines.push(`error: ${formatFailure(error)}`);
   for (const frame of frames.slice(0, 5)) {
     const functionName = frame.functionName === "@" ? "<anonymous>" : frame.functionName;
+    const location = frame.bare
+      ? `${frame.filePath}:${frame.line}:${frame.column}`
+      : `${functionName} (${frame.filePath}:${frame.line}:${frame.column})`;
     if (error?.__cottontailBunExpectation) {
       if (!formatFailure(error).endsWith("\n")) lines.push("");
-      lines.push(`      at ${functionName} (${frame.filePath}:${frame.line}:${frame.column})`);
+      lines.push(`      at ${location}`);
     } else if (error?.__cottontailBunPerTestHook) {
-      lines.push(`      at ${functionName} (${frame.filePath}:${frame.line}:${frame.column})`);
+      lines.push(`      at ${location}`);
     } else {
-      lines.push(`    at ${functionName} (${frame.filePath}:${frame.line}:${frame.column})`);
+      lines.push(`    at ${location}`);
     }
   }
 }
@@ -1731,7 +1839,12 @@ function reportResults() {
     lines.push(` ${assertionCount} expect() calls`);
   }
   const total = passedTests + skippedTests + todoTests + failedTests;
-  lines.push(`Ran ${total} ${total === 1 ? "test" : "tests"} across ${testFileCount} ${testFileCount === 1 ? "file" : "files"}.${durationSuffix(runDurationMs)}`);
+  // A run aborted by a module load error has no test durations to sum, but
+  // Bun still prints the elapsed wall time on the "Ran ..." line.
+  const ranSuffix = moduleLoadErrorAt > 0
+    ? ` [${Math.max(0, runnerDateNow() - moduleLoadErrorAt).toFixed(2)}ms]`
+    : durationSuffix(runDurationMs);
+  lines.push(`Ran ${total} ${total === 1 ? "test" : "tests"} across ${testFileCount} ${testFileCount === 1 ? "file" : "files"}.${ranSuffix}`);
   console.error(lines.join("\n"));
 }
 
@@ -1864,6 +1977,32 @@ function scheduleRun() {
 
 if (!primaryTestModule) globalThis[Symbol.for("cottontail.internal.startTestRun")] = scheduleRun;
 
+// A test entry module that fails to parse or evaluate never registers any
+// tests, but Bun still reports the load failure through the test reporter: an
+// "Unhandled error between tests" banner that counts as one failed test and
+// one error (0 pass / 1 fail / 1 error / Ran 1 test). The entry wrappers call
+// this hook from their `await import(...)` catch; it returns true when the
+// error was claimed so the wrapper can stop it from also surfacing as a fatal
+// process error.
+if (!primaryTestModule) {
+  globalThis[Symbol.for("cottontail.internal.testModuleLoadError")] = (error, filePath = undefined) => {
+    const record = {
+      name: "Unhandled error between tests",
+      status: "error",
+      suite: rootSuite,
+      filePath: String(filePath ?? globalThis.__cottontailRegisteringTestFile ?? ""),
+      unhandledBetweenTests: true,
+      reportOrder: nextReportOrder++,
+    };
+    runnerErrors += 1;
+    failedTests += 1;
+    moduleLoadErrorAt = runnerDateNow();
+    failures.push({ record, error });
+    emit("test:fail", { name: record.name, error });
+    return true;
+  };
+}
+
 function normalizeCountOption(value, name) {
   const count = Number(value);
   if (!Number.isInteger(count) || count < 0) throw new TypeError(`${name} must be a non-negative integer`);
@@ -1946,7 +2085,7 @@ function suiteFunction(name, options, callback, defaultOptions = {}) {
     emit("test:suite:finish", { name: parsed.name });
     return promiseThen(completion, undefined, () => {});
   } catch (error) {
-    child.definitionError = error;
+    child.definitionError = tagThrowSiteError(error);
     emit("test:suite:finish", { name: parsed.name });
     scheduleRun();
     return runnerPromiseResolve();
