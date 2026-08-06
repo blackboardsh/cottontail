@@ -4077,6 +4077,12 @@ fn isRuntimeAliasSpecifier(specifier: []const u8) bool {
 
 fn isMinimalRuntimeAliasSpecifier(specifier: []const u8) bool {
     const bare = if (std.mem.startsWith(u8, specifier, "node:")) specifier["node:".len..] else specifier;
+    // These modules internally depend on web globals (ReadableStream,
+    // AbortController, etc.) that are only available in full bootstrap mode.
+    if (std.mem.eql(u8, bare, "stream") or
+        std.mem.eql(u8, bare, "stream/consumers") or
+        std.mem.eql(u8, bare, "stream/promises") or
+        std.mem.eql(u8, bare, "stream/web")) return false;
     for (node_runtime_aliases) |alias| {
         if (std.mem.eql(u8, bare, alias.specifier)) return true;
     }
