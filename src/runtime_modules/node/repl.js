@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync } from "./fs.js";
 import { createRequire } from "./module.js";
 import { join } from "./path.js";
 import { inspect } from "./util.js";
+import "../bun/index.js";
 
 export const REPL_MODE_SLOPPY = Symbol("repl-sloppy");
 export const REPL_MODE_STRICT = Symbol("repl-strict");
