@@ -16,8 +16,6 @@ const {
 
 const {
   Interface: _Interface,
-} = require('readline');
-const {
   kQuestion,
   kQuestionCancel,
   kQuestionReject,
