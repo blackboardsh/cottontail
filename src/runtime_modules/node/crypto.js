@@ -2,6 +2,18 @@ import constantsObject from "./constants.js";
 import { Buffer } from "./buffer.js";
 import { Transform, Writable } from "./stream.js";
 
+// This module can be evaluated more than once in a single process: an ESM
+// `import "crypto"` and a CJS `require("crypto")` (through node:module's
+// embedded builtin table) produce distinct module records — notably under the
+// test runner — each with its own copies of the exported constructor classes.
+// Third-party packages mix the two records (e.g. jsonwebtoken checks
+// `key instanceof require("crypto").KeyObject` against a key built through
+// `import "crypto"`), so the exported constructors must be process-wide
+// singletons: the first record to evaluate wins and later records re-export
+// its classes. Mirrors the CryptoKey/SubtleCrypto/webcrypto sharing below and
+// the node:test singleton in test.js.
+const sharedCryptoConstructors = globalThis[Symbol.for("cottontail.internal.crypto.constructors")] ??= {};
+
 const supportedHashes = [
   "md4",
   "md5",
@@ -2330,10 +2342,10 @@ class HashImpl extends Transform {
 }
 
 // Node allows Hash/Hmac to be invoked without `new`.
-export function Hash(algorithm, options = undefined) {
+function HashImplementation(algorithm, options = undefined) {
   return new HashImpl(algorithm, options);
 }
-Hash.prototype = HashImpl.prototype;
+HashImplementation.prototype = HashImpl.prototype;
 
 function describeReceived(value) {
   if (value === null) return "null";
@@ -2404,18 +2416,21 @@ class HmacImpl extends Transform {
   }
 }
 
-export function Hmac(algorithm, key, options = undefined) {
+function HmacImplementation(algorithm, key, options = undefined) {
   return new HmacImpl(algorithm, key, options);
 }
-Hmac.prototype = HmacImpl.prototype;
+HmacImplementation.prototype = HmacImpl.prototype;
 
-const keyObjectConstructionToken = Symbol("cottontail.crypto.KeyObject");
+// Registered with Symbol.for so every duplicate module record (see
+// sharedCryptoConstructors above) accepts the same token: a later record's
+// internal `new KeyObject(...)` calls construct the first record's class.
+const keyObjectConstructionToken = Symbol.for("cottontail.internal.crypto.KeyObjectConstructionToken");
 // Brand used by util/types.isKeyObject: the same realm may hold duplicate
 // module records (e.g. ESM default import vs require) with distinct KeyObject
 // classes, so identity cannot rely on instanceof alone.
 const keyObjectBrand = Symbol.for("cottontail.crypto.KeyObject");
 
-export class KeyObject {
+class KeyObjectImplementation {
   constructor(type, data, options = {}, constructionToken = undefined) {
     if (constructionToken !== keyObjectConstructionToken) {
       throw new TypeError("KeyObject cannot be constructed directly");
@@ -2747,7 +2762,7 @@ function decapsulateSync(key, ciphertext) {
   throw new TypeError(`KEM key type is not available: ${privateKey.asymmetricKeyType}`);
 }
 
-export class DiffieHellman {
+class DiffieHellmanImplementation {
   constructor(primeOrLength, keyEncodingOrGenerator = undefined, generator = undefined, generatorEncoding = undefined) {
     const params = normalizeDhParameters(primeOrLength, keyEncodingOrGenerator, generator, generatorEncoding);
     if (params.prime <= 3n || !isProbablePrime(params.prime)) {
@@ -2806,7 +2821,7 @@ export class DiffieHellman {
   }
 }
 
-export class DiffieHellmanGroup extends DiffieHellman {
+class DiffieHellmanGroupImplementation extends DiffieHellmanImplementation {
   constructor(name) {
     const normalized = String(name).toLowerCase();
     const prime = dhGroupPrimes[normalized];
@@ -2819,7 +2834,7 @@ export class DiffieHellmanGroup extends DiffieHellman {
   }
 }
 
-export class Certificate {
+class CertificateImplementation {
   static verifySpkac(spkac, encoding = undefined) {
     return new Certificate().verifySpkac(spkac, encoding);
   }
@@ -2967,7 +2982,7 @@ class CipherBase extends Transform {
   }
 }
 
-export class Cipheriv extends CipherBase {
+class CipherivImplementation extends CipherBase {
   constructor(algorithm, key, iv, options = {}) {
     super(algorithm, key, iv, options, true);
   }
@@ -2981,7 +2996,7 @@ export class Cipheriv extends CipherBase {
   }
 }
 
-export class Decipheriv extends CipherBase {
+class DecipherivImplementation extends CipherBase {
   constructor(algorithm, key, iv, options = {}) {
     super(algorithm, key, iv, options, false);
   }
@@ -2996,7 +3011,7 @@ export class Decipheriv extends CipherBase {
   }
 }
 
-export class ECDH {
+class ECDHImplementation {
   constructor(curveName) {
     const normalized = ecCurveName(curveName);
     if (!supportedNativeEcCurves.includes(normalized)) cryptoFeatureError(`crypto.ECDH(${curveName})`);
@@ -3132,7 +3147,7 @@ function ecEncodePointGeneric(point, params, format) {
   return bufferFromBytes(new Uint8Array([4, ...x, ...y]));
 }
 
-ECDH.convertKey = function convertKey(key, curve, inputEncoding = undefined, outputEncoding = undefined, format = "uncompressed") {
+ECDHImplementation.convertKey = function convertKey(key, curve, inputEncoding = undefined, outputEncoding = undefined, format = "uncompressed") {
   const curveName = ecCurveName(curve);
   const params = ecConvertKeyCurves[curveName];
   if (params == null) {
@@ -3166,7 +3181,7 @@ ECDH.convertKey = function convertKey(key, curve, inputEncoding = undefined, out
   return encodeDigest(new Uint8Array(ecEncodePointGeneric(point, params, normalizedFormat)), outputEncoding ?? "buffer");
 };
 
-export class Sign extends Writable {
+class SignImplementation extends Writable {
   constructor(algorithm, options = undefined) {
     super(options && typeof options === "object" ? options : {});
     // The stream shim assigns instance `_write = null` when no write option is
@@ -3203,7 +3218,7 @@ export class Sign extends Writable {
   }
 }
 
-export class Verify extends Writable {
+class VerifyImplementation extends Writable {
   constructor(algorithm, options = undefined) {
     super(options && typeof options === "object" ? options : {});
     if (this._write === null) delete this._write;
@@ -3242,7 +3257,7 @@ const x509CertificateBrandKey = Symbol.for("cottontail.internal.crypto.x509Certi
 const x509CertificateBrand = globalThis[x509CertificateBrandKey] ??= new WeakSet();
 const kX509CertificatePredicate = Symbol.for("cottontail.internal.crypto.isX509Certificate");
 
-export class X509Certificate {
+class X509CertificateImplementation {
   constructor(buffer) {
     const parsed = parseX509Certificate(buffer);
     x509CertificateBrand.add(this);
@@ -3368,12 +3383,32 @@ export class X509Certificate {
   }
 }
 
-Object.defineProperty(X509Certificate, kX509CertificatePredicate, {
+Object.defineProperty(X509CertificateImplementation, kX509CertificatePredicate, {
   value: (value) => x509CertificateBrand.has(value),
   configurable: false,
   enumerable: false,
   writable: false,
 });
+
+// Process-wide constructor singletons (see sharedCryptoConstructors at the
+// top of this module): when this module is evaluated a second time in the
+// same process — e.g. require("crypto") alongside import "crypto" under the
+// test runner — the duplicate record re-exports the first record's classes so
+// `instanceof` identity holds across records. All declarations above this
+// point reference the *Implementation bindings; everything below (including
+// the default export and cross-module importers) sees the shared ones.
+export const Hash = (sharedCryptoConstructors.Hash ??= HashImplementation);
+export const Hmac = (sharedCryptoConstructors.Hmac ??= HmacImplementation);
+export const Sign = (sharedCryptoConstructors.Sign ??= SignImplementation);
+export const Verify = (sharedCryptoConstructors.Verify ??= VerifyImplementation);
+export const Cipheriv = (sharedCryptoConstructors.Cipheriv ??= CipherivImplementation);
+export const Decipheriv = (sharedCryptoConstructors.Decipheriv ??= DecipherivImplementation);
+export const DiffieHellman = (sharedCryptoConstructors.DiffieHellman ??= DiffieHellmanImplementation);
+export const DiffieHellmanGroup = (sharedCryptoConstructors.DiffieHellmanGroup ??= DiffieHellmanGroupImplementation);
+export const ECDH = (sharedCryptoConstructors.ECDH ??= ECDHImplementation);
+export const KeyObject = (sharedCryptoConstructors.KeyObject ??= KeyObjectImplementation);
+export const X509Certificate = (sharedCryptoConstructors.X509Certificate ??= X509CertificateImplementation);
+export const Certificate = (sharedCryptoConstructors.Certificate ??= CertificateImplementation);
 
 export function createHash(algorithm, options = undefined) {
   return new Hash(algorithm, options);
@@ -3438,6 +3473,15 @@ export function getHashes() {
 }
 
 export function createSecretKey(key, encoding = undefined) {
+  // Node rejects asymmetric KeyObjects here instead of re-wrapping them
+  // (ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE).
+  if (key instanceof KeyObject && key.type !== "secret") {
+    throw nodeCryptoError(
+      TypeError,
+      "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE",
+      `Invalid key object type ${key.type}, expected secret.`,
+    );
+  }
   return new KeyObject("secret", key, { encoding }, keyObjectConstructionToken);
 }
 
