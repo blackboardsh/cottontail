@@ -128,11 +128,378 @@ installDotenvLoader(processObject);
 try {
   __ctMetaEnv = processObject.env;
 } catch {}
-if (globalThis.console && typeof globalThis.console.write !== "function") {
-  globalThis.console.write = (chunk = "") => {
-    processObject.stdout?.write?.(String(chunk));
+// ── Console formatter (selective-bootstrap path) ──────────────────────────
+// The full runtime (ffi.js) ships a richer formatter, but scripts that stay on
+// the selective bootstrap never load ffi.js.  Without a replacement console,
+// JSC's native console.log renders objects as "[object Object]".  We replace
+// the entire console object here so that even the lightest bootstrap path
+// produces Bun-compatible inspect output.
+//
+// IMPORTANT: property values are read via Object.getOwnPropertyDescriptor so
+// that Proxy get-traps are never fired (matches Bun / ffi.js behavior).
+if (globalThis.console) {
+  const nativeLog = console.log?.bind(console);
+  const nativeError = console.error?.bind(console);
+  const nativeWarn = console.warn?.bind(console) ?? nativeError;
+  let groupIndent = "";
+  const consoleDepth = 2;
+  const identifierKeyRe = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+  const inspectCustom = Symbol.for("nodejs.util.inspect.custom");
+
+  const emitText = (stream, text) => {
+    if (stream && typeof stream.write === "function") {
+      stream.write(`${text}\n`);
+      return;
+    }
+    nativeLog?.(text);
   };
+
+  const indentText = (text, indentLines) => {
+    const rendered = String(text);
+    return groupIndent + (indentLines ? rendered.replace(/\n/g, `\n${groupIndent}`) : rendered);
+  };
+
+  const formatKey = (key) => {
+    if (typeof key === "symbol") return `[${String(key)}]`;
+    return identifierKeyRe.test(key) ? key : JSON.stringify(key);
+  };
+
+  const formatFunction = (value) => {
+    let kind = "Function";
+    try {
+      const text = Function.prototype.toString.call(value);
+      if (/^class[\s{]/.test(text)) return value.name ? `[class ${value.name}]` : "[class (anonymous)]";
+      if (value.constructor?.name === "AsyncFunction") kind = "AsyncFunction";
+      else if (value.constructor?.name === "GeneratorFunction") kind = "GeneratorFunction";
+      else if (value.constructor?.name === "AsyncGeneratorFunction") kind = "AsyncGeneratorFunction";
+    } catch {}
+    return value.name ? `[${kind}: ${value.name}]` : `[${kind}]`;
+  };
+
+  const protoValue = (value, key) => {
+    let cur = value;
+    for (let d = 0; cur != null && d < 8; d += 1) {
+      const desc = Object.getOwnPropertyDescriptor(cur, key);
+      if (desc) return "value" in desc ? desc.value : undefined;
+      cur = Object.getPrototypeOf(cur);
+    }
+    return undefined;
+  };
+
+  const formatValue = (value, seen, depth, indent, opts) => {
+    switch (typeof value) {
+      case "string": return JSON.stringify(value);
+      case "number": return Object.is(value, -0) ? "-0" : String(value);
+      case "bigint": return `${value}n`;
+      case "boolean":
+      case "undefined": return String(value);
+      case "symbol": return value.toString();
+      case "function": return formatFunction(value);
+    }
+    if (value === null) return "null";
+    if (seen.has(value)) return "[Circular]";
+
+    // Custom inspect
+    if (opts.customInspect) {
+      const custom = protoValue(value, inspectCustom);
+      if (typeof custom === "function") {
+        const remaining = opts.depth === Number.MAX_SAFE_INTEGER
+          ? opts.depth
+          : Math.max(opts.depth - depth, 0);
+        const result = custom.call(value, remaining, {
+          colors: false,
+          depth: opts.depth,
+          stylize: (t) => String(t),
+        });
+        if (result !== value) {
+          return typeof result === "string"
+            ? result
+            : formatValue(result, seen, depth, indent, opts);
+        }
+      }
+    }
+
+    // Boxed primitives
+    if (value instanceof String) return `[String: ${JSON.stringify(String.prototype.valueOf.call(value))}]`;
+    if (value instanceof Number) return `[Number: ${formatValue(Number.prototype.valueOf.call(value), seen, depth, indent, opts)}]`;
+    if (value instanceof Boolean) return `[Boolean: ${Boolean.prototype.valueOf.call(value)}]`;
+
+    if (value instanceof Error) {
+      let name = "Error", message = "", stack = "";
+      try { if (value.name != null) name = String(value.name); } catch {}
+      try { if (value.message != null) message = String(value.message); } catch {}
+      try { const s = value.stack; if (typeof s === "string" && s.length > 0) stack = s; } catch {}
+      const header = message ? `${name}: ${message}` : name;
+      // Extra own enumerable properties (excluding name/message/stack)
+      let extra = "";
+      try {
+        const keys = Reflect.ownKeys(value).filter(k => {
+          if (k === "name" || k === "message" || k === "stack") return false;
+          return Object.getOwnPropertyDescriptor(value, k)?.enumerable === true;
+        });
+        if (keys.length > 0) {
+          const pad = " ".repeat(indent + 2);
+          for (const key of keys) {
+            const desc = Object.getOwnPropertyDescriptor(value, key);
+            const rendered = formatValue(desc?.value, seen, depth + 1, indent + 2, opts);
+            extra += `\n${pad}${formatKey(key)}: ${rendered},`;
+          }
+        }
+      } catch {}
+      if (!stack) return `${header}${extra}`;
+      return `${stack.startsWith(name) ? stack : `${header}\n${stack.replace(/^/gm, "      ")}`}${extra}`;
+    }
+    if (value instanceof Date) return Number.isNaN(value.getTime()) ? "Invalid Date" : value.toISOString();
+    if (value instanceof RegExp) return String(value);
+    if (typeof Promise !== "undefined" && value instanceof Promise) return "Promise { <pending> }";
+
+    seen.add(value);
+    try {
+      if (Array.isArray(value)) {
+        if (value.length === 0) return "[]";
+        const pad = " ".repeat(indent + 2);
+        let out = "[\n";
+        let count = 0;
+        for (let i = 0; i < value.length; i++) {
+          if (!(i in value)) {
+            out += `${pad}empty item,\n`;
+          } else if (count >= 100) {
+            out += `${pad}... ${value.length - i} more items,\n`;
+            break;
+          } else {
+            out += `${pad}${formatValue(value[i], seen, depth + 1, indent + 2, opts)},\n`;
+          }
+          count++;
+        }
+        return `${out}${" ".repeat(indent)}]`;
+      }
+      if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
+        const name = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(value), "constructor")?.value?.name ?? "TypedArray";
+        if (value.length === 0) return `${name}(0) []`;
+        const pad = " ".repeat(indent + 2);
+        let out = `${name}(${value.length}) [\n`;
+        for (let i = 0; i < value.length; i++) {
+          out += `${pad}${formatValue(value[i], seen, depth + 1, indent + 2, opts)},\n`;
+        }
+        return `${out}${" ".repeat(indent)}]`;
+      }
+      if (value instanceof Map) {
+        if (value.size === 0) return "Map {}";
+        const pad = " ".repeat(indent + 2);
+        let out = `Map(${value.size}) {\n`;
+        for (const [k, v] of value) {
+          out += `${pad}${formatValue(k, seen, depth + 1, indent + 2, opts)}: ${formatValue(v, seen, depth + 1, indent + 2, opts)},\n`;
+        }
+        return `${out}${" ".repeat(indent)}}`;
+      }
+      if (value instanceof Set) {
+        if (value.size === 0) return "Set {}";
+        const pad = " ".repeat(indent + 2);
+        let out = `Set(${value.size}) {\n`;
+        for (const item of value) {
+          out += `${pad}${formatValue(item, seen, depth + 1, indent + 2, opts)},\n`;
+        }
+        return `${out}${" ".repeat(indent)}}`;
+      }
+      if (depth > opts.depth) return "[Object ...]";
+
+      // Prefix: constructor name or Symbol.toStringTag
+      let prefix = "";
+      const proto = Object.getPrototypeOf(value);
+      const tag = protoValue(value, Symbol.toStringTag);
+      if (typeof tag === "string") {
+        if (tag !== "Object") prefix = `${tag} `;
+      } else if (proto === null) {
+        prefix = "[Object: null prototype] ";
+      } else {
+        const ctor = Object.getOwnPropertyDescriptor(proto, "constructor")?.value;
+        if (ctor?.name && ctor.name !== "Object") prefix = `${ctor.name} `;
+      }
+
+      // Collect own enumerable keys via descriptors (avoids Proxy get traps)
+      const keys = Reflect.ownKeys(value).filter((key) => {
+        const desc = Object.getOwnPropertyDescriptor(value, key);
+        return desc?.enumerable === true;
+      });
+      // Include prototype methods (non-constructor functions)
+      if (proto && proto !== Object.prototype && proto !== null) {
+        for (const key of Reflect.ownKeys(proto)) {
+          if (key === "constructor" || keys.includes(key)) continue;
+          const desc = Object.getOwnPropertyDescriptor(proto, key);
+          if (typeof desc?.value === "function") keys.push(key);
+        }
+      }
+
+      if (keys.length === 0) return `${prefix}{}`;
+      const pad = " ".repeat(indent + 2);
+      let out = `${prefix}{\n`;
+      for (const key of keys) {
+        const desc = Object.getOwnPropertyDescriptor(value, key) ?? Object.getOwnPropertyDescriptor(proto, key);
+        let rendered;
+        if (desc && !("value" in desc)) {
+          rendered = desc.get && desc.set ? "[Getter/Setter]" : desc.get ? "[Getter]" : "[Setter]";
+        } else {
+          rendered = formatValue(desc?.value, seen, depth + 1, indent + 2, opts);
+        }
+        out += `${pad}${formatKey(key)}: ${rendered},\n`;
+      }
+      return `${out}${" ".repeat(indent)}}`;
+    } finally {
+      seen.delete(value);
+    }
+  };
+
+  const formatArg = (value, opts) => {
+    if (typeof value === "string") return value;
+    try {
+      return formatValue(value, new Set(), 0, 0, opts ?? { depth: consoleDepth, customInspect: true });
+    } catch (e) {
+      if (/revoked/i.test(String(e?.message))) return "<Revoked Proxy>";
+      try { return String(value); } catch { return "<Revoked Proxy>"; }
+    }
+  };
+
+  const formatPlaceholders = (fmt, values) => {
+    let vi = 0;
+    const text = fmt.replace(/%([sdifjoO%])/g, (match, spec) => {
+      if (spec === "%") return "%";
+      if (vi >= values.length) return match;
+      const v = values[vi++];
+      switch (spec) {
+        case "s": return String(v);
+        case "d": case "i": return parseInt(v, 10).toString();
+        case "f": return Number(v).toString();
+        case "j": try { return JSON.stringify(v); } catch { return "[Circular]"; }
+        case "o": case "O": return formatArg(v);
+        default: return match;
+      }
+    });
+    return { text, remaining: values.slice(vi) };
+  };
+
+  const formatArgs = (args, substitutions, opts) => {
+    if (args.length === 0) return "";
+    let text, remaining;
+    if (substitutions && typeof args[0] === "string" && args.length > 1) {
+      const result = formatPlaceholders(args[0], args.slice(1));
+      text = result.text;
+      remaining = result.remaining;
+    } else {
+      text = formatArg(args[0], opts);
+      remaining = args.slice(1);
+    }
+    for (const v of remaining) text += ` ${formatArg(v, opts)}`;
+    return text;
+  };
+
+  const writeConsole = (stream, args, substitutions, opts, separateError) => {
+    // Single Error argument → formatted stack
+    if (args.length === 1 && separateError) {
+      try {
+        if (args[0] instanceof Error) {
+          let name = "Error", message = "", stack = "";
+          try { if (args[0].name != null) name = String(args[0].name); } catch {}
+          try { if (args[0].message != null) message = String(args[0].message); } catch {}
+          try { const s = args[0].stack; if (typeof s === "string" && s.length > 0) stack = s; } catch {}
+          const header = message ? `${name}: ${message}` : name;
+          const rendered = !stack ? header : stack.startsWith(name) ? stack : `${header}\n${stack.replace(/^/gm, "      ")}`;
+          emitText(stream, rendered);
+          return;
+        }
+      } catch {}
+    }
+    const rendered = formatArgs(args, substitutions, opts);
+    const indentLines = typeof args[0] !== "string";
+    emitText(stream, indentText(rendered, indentLines));
+  };
+
+  const stdoutStream = processObject.stdout;
+  const stderrStream = processObject.stderr;
+
+  console.log = (...args) => writeConsole(stdoutStream, args, true, undefined, false);
+  console.info = console.log;
+  console.debug = console.log;
+  console.error = (...args) => writeConsole(stderrStream, args, true, undefined, true);
+  console.warn = (...args) => writeConsole(stderrStream, args, true, undefined, true);
+
+  console.write = (chunk = "") => {
+    stdoutStream?.write?.(String(chunk));
+  };
+
+  // Group / count / time / dir / assert
+  {
+    const counts = new Map();
+    const times = new Map();
+    const consoleNow = typeof cottontail?.nanotime === "function"
+      ? () => Number(cottontail.nanotime()) / 1e6
+      : () => Date.now();
+
+    console.group = (...args) => {
+      if (args.length > 0) console.log(...args);
+      groupIndent += "  ";
+    };
+    console.groupEnd = () => {
+      groupIndent = groupIndent.slice(0, Math.max(0, groupIndent.length - 2));
+    };
+    console.groupCollapsed = console.group;
+
+    console.count = (label = "default") => {
+      const key = String(label);
+      const next = (counts.get(key) ?? 0) + 1;
+      counts.set(key, next);
+      console.log(`${key}: ${next}`);
+    };
+    console.countReset = (label = "default") => { counts.delete(String(label)); };
+
+    console.time = (label = "default") => {
+      const key = String(label);
+      if (!times.has(key)) times.set(key, consoleNow());
+    };
+    const logTime = (label, data, remove) => {
+      const key = String(label);
+      const started = times.get(key);
+      if (started == null) return;
+      const elapsed = Math.max(0, consoleNow() - started).toFixed(2);
+      const suffix = data.length > 0 ? ` ${formatArgs(data, false)}` : "";
+      emitText(stderrStream, indentText(`[${elapsed}ms] ${key}${suffix}`, false));
+      if (remove) times.delete(key);
+    };
+    console.timeLog = (label = "default", ...data) => logTime(label, data, false);
+    console.timeEnd = (label = "default") => logTime(label, [], true);
+
+    console.dir = (value, dirOptions = undefined) => {
+      let depth = consoleDepth;
+      if (dirOptions && Object.prototype.hasOwnProperty.call(dirOptions, "depth")) {
+        const requested = Number(dirOptions.depth);
+        depth = requested === Infinity
+          ? Number.MAX_SAFE_INTEGER
+          : (Number.isFinite(requested) ? Math.max(0, Math.trunc(requested)) : 0);
+      }
+      writeConsole(stdoutStream, [value], false, { depth, customInspect: false }, false);
+    };
+
+    console.assert = (condition, ...args) => {
+      if (!condition) console.error("Assertion failed" + (args.length ? ":" : ""), ...args);
+    };
+
+    console.clear = () => {
+      // Best-effort: write ANSI clear-screen escape
+      stdoutStream?.write?.("\x1b[2J\x1b[H");
+    };
+
+    console.createTask = typeof cottontail?.createTask === "function"
+      ? cottontail.createTask.bind(cottontail)
+      : (target) => target;
+  }
+
+  // Mark the console so ffi.js can detect the bootstrap already installed the
+  // compatible formatter and skip its own console setup (avoids double-formatting).
+  Object.defineProperty(console, Symbol.for("cottontail.consoleBootstrapEnhanced"), {
+    value: true,
+    configurable: true,
+  });
 }
+
 if (globalThis.console && typeof globalThis.console.table !== "function") {
   globalThis.console.table = (value, properties = undefined) => {
     if (properties !== undefined && !Array.isArray(properties)) {
