@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const host = @import("host.zig");
 const standalone_executable = @import("standalone_executable.zig");
 
@@ -275,28 +276,61 @@ pub const Runtime = struct {
         }
     }
 
+    /// Map a file read-only. The event loop runs inside the eval call, so
+    /// buffers passed to it stay alive for the entire process; file-backed
+    /// clean pages stay out of phys_footprint while anonymous readFileAlloc
+    /// copies are dirty for the whole run. Mappings are intentionally left in
+    /// place until process exit (JSC may retain pointers into the cached
+    /// bytecode for lazy function decoding).
+    fn mapFileForRead(self: *Runtime, path: []const u8, max_size: usize) ?[]const u8 {
+        if (builtin.os.tag == .windows) return null;
+        const file = std.Io.Dir.cwd().openFile(self.io, path, .{}) catch return null;
+        defer file.close(self.io);
+        const stat = file.stat(self.io) catch return null;
+        if (stat.size == 0) return null;
+        const len = std.math.cast(usize, stat.size) orelse return null;
+        if (len > max_size) return null;
+        const mapped = std.posix.mmap(
+            null,
+            len,
+            .{ .READ = true },
+            .{ .TYPE = .PRIVATE },
+            file.handle,
+            0,
+        ) catch return null;
+        return mapped[0..len];
+    }
+
     pub fn runFile(self: *Runtime, script_path: [:0]const u8) u8 {
-        const source = std.Io.Dir.cwd().readFileAlloc(
-            self.io,
-            script_path,
-            self.allocator,
-            .limited(self.max_script_size),
-        ) catch |err| {
-            self.writeLoadError(script_path, err);
-            return 1;
+        var source_owned = false;
+        const source: []const u8 = self.mapFileForRead(script_path, self.max_script_size) orelse blk: {
+            source_owned = true;
+            break :blk std.Io.Dir.cwd().readFileAlloc(
+                self.io,
+                script_path,
+                self.allocator,
+                .limited(self.max_script_size),
+            ) catch |err| {
+                self.writeLoadError(script_path, err);
+                return 1;
+            };
         };
-        defer self.allocator.free(source);
+        defer if (source_owned) self.allocator.free(@constCast(source));
 
         const bytecode_path = std.mem.concat(self.allocator, u8, &.{ script_path, ".jsc" }) catch
             return self.runSource(source, script_path);
         defer self.allocator.free(bytecode_path);
-        const bytecode = std.Io.Dir.cwd().readFileAlloc(
-            self.io,
-            bytecode_path,
-            self.allocator,
-            .limited(self.max_bytecode_size),
-        ) catch return self.runSource(source, script_path);
-        defer self.allocator.free(bytecode);
+        var bytecode_owned = false;
+        const bytecode: []const u8 = self.mapFileForRead(bytecode_path, self.max_bytecode_size) orelse blk: {
+            bytecode_owned = true;
+            break :blk std.Io.Dir.cwd().readFileAlloc(
+                self.io,
+                bytecode_path,
+                self.allocator,
+                .limited(self.max_bytecode_size),
+            ) catch return self.runSource(source, script_path);
+        };
+        defer if (bytecode_owned) self.allocator.free(@constCast(bytecode));
 
         return self.runSourceWithBytecode(source, script_path, bytecode);
     }
