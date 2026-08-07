@@ -1138,6 +1138,11 @@ const formatConsoleError = (error, level, separate = true) => {
   return excerpt.join("\n");
 };
 
+// If the selective bootstrap (runtime-bootstrap-core.js) already installed a
+// compatible console formatter, skip the full-runtime replacement to avoid
+// double-formatting.  The bootstrap writes directly to process.stdout/stderr,
+// so its output is correct even without ffi.js re-wrapping the methods.
+if (!console[Symbol.for("cottontail.consoleBootstrapEnhanced")]) {
 const nativeConsoleLog = console.log?.bind(console);
 const nativeConsoleError = console.error?.bind(console);
 const nativeConsoleWarn = console.warn?.bind(console) ?? nativeConsoleError;
@@ -1237,6 +1242,16 @@ console.debug = console.log;
   };
   console.timeLog = (label = "default", ...data) => logTime(label, data, false);
   console.timeEnd = (label = "default") => logTime(label, [], true);
+}
+} else {
+  // Bootstrap already enhanced the console.  Ensure the internal error-report
+  // symbol is still wired up (the bootstrap does not know about writeConsole).
+  if (!Object.getOwnPropertyDescriptor(console, Symbol.for("cottontail.reportError.console"))) {
+    Object.defineProperty(console, Symbol.for("cottontail.reportError.console"), {
+      value: (error) => console.error(error),
+      configurable: true,
+    });
+  }
 }
 
 // Blocking terminal prompts read stdin one byte at a time until newline/EOF.

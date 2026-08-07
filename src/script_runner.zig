@@ -4503,9 +4503,14 @@ fn sourceRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBoo
             if (!has_http_server or !httpRuntimeFetchIsServeOption(tokens, index)) return .full;
         } else if (std.mem.eql(u8, token.text, "console")) {
             const property = runtimeMemberProperty(tokens, index) orelse return .full;
-            if (!bareRuntimeConsoleProperty(property)) {
-                if (has_http_server) return .full;
-                if (mode == .bare) mode = .minimal;
+            // Any console usage requires at least the minimal bootstrap so that
+            // the inspect-style console formatter in runtime-bootstrap-core.js
+            // is loaded.  Without it, JSC's native console.log renders objects
+            // as "[object Object]".
+            if (has_http_server) {
+                if (!bareRuntimeConsoleProperty(property)) return .full;
+            } else if (mode == .bare) {
+                mode = .minimal;
             }
         } else if (std.mem.eql(u8, token.text, "alert") or
             std.mem.eql(u8, token.text, "confirm") or
