@@ -3588,7 +3588,7 @@ function staticImportCall(specifier, asyncStaticImports, attributeKeyword, attri
 // Single line (no trailing newline) so prepending it does not shift line
 // numbers of the transformed module source.
 const staticImportHelperSource = `const __ctStaticImport = (spec) => { const value = require(spec); const builtinMap = globalThis.__cottontailBuiltinModules; const registeredNamespace = builtinMap?.[Symbol.for("cottontail.node.builtinImportNamespaces")]?.get(String(spec)); if (registeredNamespace !== undefined && builtinMap.get(String(spec)) === value) return registeredNamespace; if (value && (typeof value === "object" || typeof value === "function") && value[Symbol.toStringTag] === "Module") return value; const ns = { default: value }; if (value && (typeof value === "object" || typeof value === "function")) { for (const key of Object.keys(value)) { if (key !== "default") ns[key] = value[key]; } if (value.__esModule && Object.hasOwn(value, "default")) ns.default = value.default; } return ns; }; const __ctDynamicImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options); `;
-const asyncStaticImportHelperSource = `const __ctDynamicImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options, true); const __ctStaticImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options, true, __ctModuleAncestors); `;
+const asyncStaticImportHelperSource = `const __ctDynamicImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options, true, __ctModuleAncestors); const __ctStaticImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options, true, __ctModuleAncestors); `;
 const esmExportDeclarationTrivia = String.raw`((?:\s|\/\*(?:[^*]|\*(?!\/))*\*\/|\/\/[^\r\n]*(?:\r?\n|$))*)`;
 
 function esmExportDeclarationPattern(declaration) {
@@ -3910,7 +3910,15 @@ function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, origina
   const sourceName = `${resolvedPath}${suffix}`;
   const cached = asyncEsmModuleCache.get(cacheKey);
   if (cached !== undefined) {
-    return ancestors?.has(cacheKey) ? cached.namespace : cached.promise;
+    // A module in this import chain's ancestry (across static AND dynamic
+    // import edges — the transformed helpers thread __ctModuleAncestors
+    // through both) is still evaluating; awaiting its completion promise
+    // would deadlock, since it cannot finish until this import settles. Bun
+    // resolves such cycles with the in-flight namespace (live partial
+    // exports), so do the same. `cached.promise` is null while the module's
+    // synchronous prefix is still on the stack below us — that is the same
+    // cycle case arriving before the promise was even installed.
+    return ancestors?.has(cacheKey) ? cached.namespace : (cached.promise ?? cached.namespace);
   }
   const namespace = createModuleNamespace();
   const record = { namespace, promise: null };
