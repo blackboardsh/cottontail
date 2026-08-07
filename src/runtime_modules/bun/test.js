@@ -407,8 +407,8 @@ function bunDeepEqual(actual, expected, seen = new WeakMap()) {
   const expectedEntries = plainObjectEntries(expected);
   if (!actualEntries || !expectedEntries) return deepEqual(actual, expected);
   if (actualEntries.length !== expectedEntries.length) return false;
-  actualEntries.sort((left, right) => codePointCompare(String(left[0]), String(right[0])));
-  expectedEntries.sort((left, right) => codePointCompare(String(left[0]), String(right[0])));
+  actualEntries.sort((left, right) => String(left[0]).localeCompare(String(right[0])));
+  expectedEntries.sort((left, right) => String(left[0]).localeCompare(String(right[0])));
   for (let index = 0; index < actualEntries.length; index += 1) {
     if (actualEntries[index][0] !== expectedEntries[index][0]) return false;
     if (!bunDeepEqual(actualEntries[index][1], expectedEntries[index][1], seen)) return false;
@@ -962,22 +962,10 @@ function snapshotMatcherText(value) {
   }
 }
 
-function codePointCompare(a, b) {
-  const lenA = a.length;
-  const lenB = b.length;
-  const minLen = Math.min(lenA, lenB);
-  for (let i = 0; i < minLen; i++) {
-    const cpA = a.charCodeAt(i);
-    const cpB = b.charCodeAt(i);
-    if (cpA !== cpB) return cpA - cpB;
-  }
-  return lenA - lenB;
-}
-
 function snapshotObjectEntries(value) {
   return Reflect.ownKeys(value)
     .filter((key) => Object.prototype.propertyIsEnumerable.call(value, key))
-    .sort((left, right) => codePointCompare(String(left), String(right)));
+    .sort((left, right) => String(left).localeCompare(String(right)));
 }
 
 function snapshotObjectKey(key) {
