@@ -119,7 +119,11 @@ const testReporterFinalizers = [
     finalize: () => writeJunitReport(tests, rootSuite, junitOptions),
   },
 ];
-const testFileCount = Math.max(1, Number(globalThis.process?.env?.COTTONTAIL_TEST_FILE_COUNT ?? 1) || 1);
+const testFileCount = Math.max(1, Number(
+  globalThis.__cottontailBunTestFileCount ??
+    globalThis.process?.env?.COTTONTAIL_TEST_FILE_COUNT ??
+    1,
+) || 1);
 const configuredTimeoutScale = Number(globalThis.process?.env?.COTTONTAIL_TEST_TIMEOUT_SCALE ?? 1);
 const timeoutScale = Number.isFinite(configuredTimeoutScale) && configuredTimeoutScale >= 1
   ? configuredTimeoutScale

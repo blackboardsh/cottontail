@@ -361,9 +361,17 @@ if (cottontail.isWorker?.() === true && typeof g.__cottontailWorkerEvalSource ==
     }
   } catch {}
 }
+// The `bun test` CLI hands these markers to the runtime process it re-execs.
+// They are implementation details of that handoff: promote them to internal
+// globals and drop them from process.env so children spawned by tests (which
+// copy process.env) run exactly like a directly invoked runtime.
 if (g.process.env?.COTTONTAIL_TEST_CLI_HEADER_PRINTED === "1") {
   globalThis.__cottontailBunTestHeaderPrinted = true;
   delete g.process.env.COTTONTAIL_TEST_CLI_HEADER_PRINTED;
+}
+if (g.process.env?.COTTONTAIL_TEST_FILE_COUNT !== undefined) {
+  globalThis.__cottontailBunTestFileCount = g.process.env.COTTONTAIL_TEST_FILE_COUNT;
+  delete g.process.env.COTTONTAIL_TEST_FILE_COUNT;
 }
 g.process.execPath ??= cottontailExecPath;
 g.process.argv0 ??= g.process.execPath;

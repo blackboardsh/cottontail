@@ -2531,8 +2531,13 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
         (generated_entrypoint or !isGithubTestReporting(init.environ_map)))
     {
         if (!generated_entrypoint) {
+            // In-process bookkeeping only: the map is a private copy, so the
+            // marker never reaches this process' real environment. Calling
+            // setenv() here would leak it into every child the test spawns
+            // (`env: { ...process.env }`), and those children would then take
+            // the test-runtime module pipeline instead of behaving like a
+            // directly invoked runtime. Bun leaks no such marker.
             try init.environ_map.put("COTTONTAIL_TEST_FILE_COUNT", "1");
-            _ = setenv("COTTONTAIL_TEST_FILE_COUNT", "1", 1);
         }
         return null;
     }
