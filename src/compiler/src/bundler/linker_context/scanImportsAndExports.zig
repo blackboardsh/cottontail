@@ -647,6 +647,7 @@ pub fn scanImportsAndExports(this: *LinkerContext) ScanImportsAndExportsError!vo
                 var to_esm_uses: u32 = 0;
                 var to_common_js_uses: u32 = 0;
                 var runtime_require_uses: u32 = 0;
+                var esm_dyn_uses: u32 = 0;
 
                 // Imports of wrapped files must depend on the wrapper
                 for (part.import_record_indices.slice()) |import_record_index| {
@@ -758,6 +759,14 @@ pub fn scanImportsAndExports(this: *LinkerContext) ScanImportsAndExportsError!vo
                                 Index.source(other_source_index),
                             );
 
+                            // COTTONTAIL-COMPAT: runtime bundles print dynamic
+                            // imports of bundled ESM modules as `__esmDyn(...)`
+                            // (registry-aware; see js_printer), so include the
+                            // helper from the runtime.
+                            if (kind == .dynamic and this.options.runtime_dynamic_imports) {
+                                esm_dyn_uses += 1;
+                            }
+
                             // If this is a "require()" call, then we should add the
                             // "__esModule" marker to behave as if the module was converted
                             // from ESM to CommonJS. This is done via a wrapper instead of
@@ -868,6 +877,13 @@ pub fn scanImportsAndExports(this: *LinkerContext) ScanImportsAndExportsError!vo
                         Index.part(part_index),
                         "__reExport",
                         re_export_uses,
+                    );
+
+                    try this.graph.generateRuntimeSymbolImportAndUse(
+                        source_index,
+                        Index.part(part_index),
+                        "__esmDyn",
+                        esm_dyn_uses,
                     );
                 }
             }

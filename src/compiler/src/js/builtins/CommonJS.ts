@@ -391,6 +391,12 @@ export function createRequireCache() {
       $requireMap.$delete(key);
       $esmRegistryDelete(key);
       $evictIsolationSourceProviderCache(key);
+      // Also evict the JS-visible Loader.registry entry so a bundled dynamic
+      // import (__esmDyn) re-executes the module like Bun does after
+      // `delete require.cache[path]`. Deliberately calls the possibly-patched
+      // `delete` so the runtime's JS-side module caches cascade too.
+      const loaderRegistry = globalThis.Loader?.registry;
+      if (loaderRegistry != null) loaderRegistry.delete(key);
       return true;
     },
 

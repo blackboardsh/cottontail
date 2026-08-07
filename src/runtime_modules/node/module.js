@@ -3896,7 +3896,13 @@ globalThis.__cottontailRegisterSelfModuleNamespace ??= (resolvedPath, namespace)
   const promise = Promise.resolve(namespace);
   if (!asyncEsmModuleCache.has(key)) asyncEsmModuleCache.set(key, { namespace, promise });
   const registry = globalThis.Loader?.registry;
-  if (registry != null && !registry.has(key)) registry.set(key, promise);
+  // Overwrite, don't set-if-absent: the bundled dynamic-import helper
+  // (`__esmDyn` in the bundler runtime) registers the entry's key with a
+  // promise that only resolves once the entry finishes evaluating. A dynamic
+  // self-import during evaluation must get this in-flight namespace instead,
+  // or it deadlocks awaiting its own completion. This runs at the top of the
+  // module's own evaluation, so it is the authoritative entry for the key.
+  if (registry != null) registry.set(key, promise);
 };
 
 function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, originalSource, ancestors = undefined) {

@@ -418,8 +418,8 @@ fn cloneGraphSourceMap(output_file: *const compiler.options.OutputFile) !GraphSo
     return .{ .path = path, .contents = contents };
 }
 
-const generated_esm_initializer = "(fn, res) => () => (fn && (res = fn(fn = 0)), res)";
-const cottontail_esm_initializer = "(fn, res) => () => { if (!fn) return res; const init = fn; fn = 0; res = Promise.resolve(); try { return res = init(); } catch (error) { res = void 0; throw error; } }";
+const generated_esm_initializer = "(fn, res) => ((orig) => (force) => ((fn || force && (fn = orig)) && (res = fn(fn = 0)), res))(fn)";
+const cottontail_esm_initializer = "(fn, res) => { const orig = fn; return (force) => { if (!fn) { if (!force || !orig) return res; fn = orig; } const init = fn; fn = 0; res = Promise.resolve(); try { return res = init(); } catch (error) { res = void 0; throw error; } } }";
 
 const GeneratedReplacement = struct {
     start: usize,

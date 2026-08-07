@@ -20,6 +20,13 @@ Object.defineProperty(g, "__cottontailPrepareHotReload", { configurable: true, v
   for (const hook of hooks) {
     try { hook(); } catch (error) { console.error(error); }
   }
+  // The Loader.registry shim persists across hot generations (`??=` global)
+  // while each generation's bundle is a fresh evaluation. Registry-aware
+  // bundled dynamic imports (__esmDyn) consult it before executing, so stale
+  // entries from the previous generation would suppress re-execution of the
+  // reloaded entry graph. Bun's --hot likewise evicts registry entries so the
+  // next import re-runs the module.
+  g.Loader?.registry?.clear?.();
   g.process?.__cottontailListeners?.clear?.();
   if (g.process) g.process.exitCode = 0;
   g.__ctUnhandledRejection = undefined;

@@ -1378,6 +1378,10 @@ pub const LinkerContext = struct {
             .has_run_symbol_renamer = true,
             .source_path = source.path,
             .runtime_dynamic_imports = c.options.runtime_dynamic_imports,
+            .esm_dyn_ref = if (c.options.runtime_dynamic_imports)
+                c.runtimeFunction("__esmDyn")
+            else
+                Ref.None,
 
             .allocator = alloc,
             .source_map_allocator = if (c.dev_server != null and
@@ -1458,6 +1462,7 @@ pub const LinkerContext = struct {
             .wrapper_ref = c.graph.ast.items(.wrapper_ref)[source_index],
 
             .was_unwrapped_require = was_unwrapped_require and c.graph.ast.items(.flags)[source_index].force_cjs_to_esm,
+            .source_path_text = c.parse_graph.input_files.items(.source)[source_index].path.text,
         };
     }
 

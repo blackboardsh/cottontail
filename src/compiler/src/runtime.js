@@ -314,7 +314,65 @@ export var __decorateElement = (array, flags, name, decorators, target, extra) =
   );
 };
 
-export var __esm = (fn, res) => () => (fn && (res = fn((fn = 0))), res);
+// COTTONTAIL-COMPAT: the initializer keeps the original fn so a truthy
+// `force` argument can re-run an already-evaluated module body. Bundled
+// dynamic imports use this (via __esmDyn) to re-execute a module after its
+// Loader.registry entry was deleted, matching Bun's registry semantics.
+// Static init calls pass no argument and behave exactly like before.
+export var __esm = (fn, res) => (orig => force => ((fn || (force && (fn = orig))) && (res = fn((fn = 0))), res))(fn);
+
+// COTTONTAIL-COMPAT: registry-aware wrapper for `import()` of a bundled ESM
+// module. Bun resolves dynamic imports at runtime and caches them in the
+// JSC module loader registry (visible as `Loader.registry`), so user code can
+// evict a module with `Loader.registry.delete(path)` and the next `import()`
+// re-executes it. Cottontail pre-bundles statically-resolvable dynamic
+// imports as lazily-initialized `__esm` wrappers, which the registry never
+// saw. This helper registers the import promise under the resolved path (the
+// same key Bun uses) and force-re-runs the module initializer when a
+// previously-registered key has been deleted from the registry.
+export var __esmDyn = /* @__PURE__ */ ((seen, evaluating) => (key, init, ns) => {
+  // Re-entrant import while this module's initializer is still running (a
+  // dynamic self-import or dynamic-import cycle). Returning the registered
+  // promise would deadlock — it only settles once the initializer finishes —
+  // so call the (already-latched) initializer directly like the pre-registry
+  // emission did: it returns the in-flight placeholder promise.
+  if (evaluating.has(key)) {
+    var pending = init();
+    return pending && typeof pending.then === "function" ? pending.then(() => ns) : Promise.resolve(ns);
+  }
+  var reg = globalThis.Loader && globalThis.Loader.registry;
+  if (reg && reg.has(key)) return reg.get(key);
+  var force = !!reg && seen.has(key);
+  var promise = Promise.resolve().then(() => {
+    evaluating.add(key);
+    var res;
+    try {
+      res = init(force);
+    } catch (error) {
+      evaluating.delete(key);
+      throw error;
+    }
+    if (res && typeof res.then === "function") {
+      return res.then(
+        () => (evaluating.delete(key), ns),
+        error => {
+          evaluating.delete(key);
+          throw error;
+        },
+      );
+    }
+    evaluating.delete(key);
+    return ns;
+  });
+  if (reg) {
+    seen.add(key);
+    reg.set(key, promise);
+    promise.catch(() => {
+      if (reg.get(key) === promise) reg.delete(key);
+    });
+  }
+  return promise;
+})(new Set(), new Set());
 
 // This is used for JSX inlining with React.
 export var $$typeof = /* @__PURE__ */ Symbol.for("react.element");

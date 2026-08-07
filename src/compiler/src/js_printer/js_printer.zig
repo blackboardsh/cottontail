@@ -390,6 +390,9 @@ pub const Options = struct {
     /// Runtime execution bundles must resolve import() from the original source
     /// module instead of the generated bundle's directory.
     runtime_dynamic_imports: bool = false,
+    /// Runtime helper `__esmDyn` for registry-aware dynamic imports of bundled
+    /// ESM modules (only valid when runtime_dynamic_imports is set).
+    esm_dyn_ref: Ref = Ref.None,
     allocator: std.mem.Allocator = default_allocator,
     source_map_allocator: ?std.mem.Allocator = null,
     source_map_handler: ?SourceMapHandler = null,
@@ -462,6 +465,11 @@ pub const RequireOrImportMeta = struct {
     exports_ref: Ref = Ref.None,
     is_wrapper_async: bool = false,
     was_unwrapped_require: bool = false,
+    /// Absolute path of the target module's source. Used as the
+    /// `Loader.registry` key for registry-aware dynamic imports of bundled
+    /// modules (`__esmDyn`); import record paths can still hold the raw
+    /// relative specifier.
+    source_path_text: string = "",
 
     pub const Callback = struct {
         const Fn = fn (*anyopaque, u32, bool) RequireOrImportMeta;
@@ -1674,6 +1682,40 @@ fn NewPrinter(
                 }
 
                 var meta = p.options.requireOrImportMetaForSource(record.source_index.get(), was_unwrapped_require);
+
+                // COTTONTAIL-COMPAT: dynamic imports of bundled ESM modules in
+                // runtime bundles go through the `__esmDyn` helper so they are
+                // registered in `Loader.registry` under the resolved path (the
+                // key Bun would use) and `Loader.registry.delete(path)` makes
+                // the next `import()` genuinely re-execute the module. Keep
+                // the exports ref even when the result is unused: the cached
+                // registry promise must resolve to the namespace so any later
+                // import of the same key observes it. Dynamic SELF-imports are
+                // excluded: they keep the plain `init().then(...)` emission
+                // that the self-import machinery patches and aliases
+                // (placeholder promise, exports proxy,
+                // __cottontailRegisterSelfModuleNamespace).
+                if (record.kind == .dynamic and
+                    p.options.runtime_dynamic_imports and
+                    p.options.esm_dyn_ref.isValid() and
+                    meta.wrapper_ref.isValid() and
+                    meta.exports_ref.isValid() and
+                    meta.source_path_text.len > 0 and
+                    !meta.was_unwrapped_require and
+                    !record.flags.wrap_with_to_esm and
+                    !(if (p.options.source_path) |sp| strings.eql(sp.text, meta.source_path_text) else false))
+                {
+                    p.printSpaceBeforeIdentifier();
+                    p.printSymbol(p.options.esm_dyn_ref);
+                    p.print("(");
+                    p.printStringLiteralUTF8(meta.source_path_text, false);
+                    p.print(", ");
+                    p.printSymbol(meta.wrapper_ref);
+                    p.print(", ");
+                    p.printSymbol(meta.exports_ref);
+                    p.print(")");
+                    return;
+                }
 
                 // Don't need the namespace object if the result is unused anyway
                 if (flags.contains(.expr_result_is_unused)) {
