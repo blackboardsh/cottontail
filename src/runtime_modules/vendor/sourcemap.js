@@ -22,6 +22,7 @@ let cachedSourceRoot;
 let cachedState; // undefined = never attempted for cachedMapPath, null = load failed
 const adjacentBundleStates = new Map();
 const virtualSourceMappings = new WeakMap();
+const remapStackMemo = new WeakMap();
 
 function isWindowsAbsolutePath(path) {
   return /^[A-Za-z]:[\\/]/.test(String(path)) || /^[\\/]{2}[^\\/]/.test(String(path));
@@ -58,6 +59,25 @@ function normalizePath(path) {
     }
   }
   return root + out.join("/");
+}
+
+// `state.sources` never changes after buildState, but locating a frame's
+// source used to re-normalize every entry on every lookup — O(sources) string
+// work per stack frame, which dominates Error.prototype.stack.
+const normalizedSourcesCache = new WeakMap();
+
+function normalizedSources(state) {
+  let entry = normalizedSourcesCache.get(state);
+  if (entry === undefined) {
+    const list = state.sources.map(candidate => normalizePath(candidate));
+    const byPath = new Map();
+    for (let index = 0; index < list.length; index += 1) {
+      if (!byPath.has(list[index])) byPath.set(list[index], index);
+    }
+    entry = { list, byPath };
+    normalizedSourcesCache.set(state, entry);
+  }
+  return entry;
 }
 
 function resolveSource(mapDir, sourceRoot, source) {
@@ -413,6 +433,31 @@ function buildState(mapPath, mapData, configuredBundlePath, configuredSourceRoot
     const sourceBase = typeof configuredRoot === "string" && configuredRoot !== "" ? configuredRoot : mapDir;
     const sources = map.sources.map((source) => resolveSource(sourceBase, map.sourceRoot, source));
     const generatedSources = map.sources.map((source) => resolveSource(mapDir, map.sourceRoot, source));
+    // Only sources whose generated path differs from the resolved original
+    // path need rewriting in stack strings; scanning the stack once per source
+    // otherwise costs O(sources) substring searches per remap. Grouping those
+    // by directory lets one search per directory rule out every file under it,
+    // which is what happens for essentially every stack.
+    const rewritableGroups = new Map();
+    for (let index = 0; index < generatedSources.length; index += 1) {
+      const generated = generatedSources[index];
+      if (generated === sources[index]) continue;
+      const prefix = generated.slice(0, generated.lastIndexOf("/") + 1);
+      const basename = generated.slice(prefix.length);
+      let group = rewritableGroups.get(prefix);
+      if (group === undefined) {
+        group = { indices: [], byBasename: new Map(), lengths: new Set() };
+        rewritableGroups.set(prefix, group);
+      }
+      group.indices.push(index);
+      group.lengths.add(basename.length);
+      const bucket = group.byBasename.get(basename);
+      if (bucket) bucket.push(index);
+      else group.byBasename.set(basename, [index]);
+    }
+    for (const group of rewritableGroups.values()) {
+      group.lengths = [...group.lengths].sort((left, right) => right - left);
+    }
     const sourceLines = new Array(map.sources.length);
     const bundlePath = typeof configuredBundlePath === "string" && configuredBundlePath !== ""
       ? configuredBundlePath
@@ -423,6 +468,7 @@ function buildState(mapPath, mapData, configuredBundlePath, configuredSourceRoot
     return {
       sources,
       generatedSources,
+      rewritableGroups,
       sourceContentText: map.sourceContentSpans ? text : null,
       sourceContentSpans: map.sourceContentSpans,
       sourceLines,
@@ -671,10 +717,8 @@ function remapVirtualSourceFrame(state, file, line, column) {
     : null;
   const matchesEntry = entrySource &&
     (entrySource === relativeSource || entrySource.endsWith(`/${relativeSource}`));
-  const sourceIndex = state.sources.findIndex(candidate => {
-    const normalized = normalizePath(candidate);
-    return normalized === relativeSource || normalized.endsWith(`/${relativeSource}`);
-  });
+  const sourceIndex = normalizedSources(state).list.findIndex(normalized =>
+    normalized === relativeSource || normalized.endsWith(`/${relativeSource}`));
   const mapping = sourceIndex < 0 ? null : virtualSourceMapping(state, sourceIndex);
   if (!mapping || mapping.anchors.length === 0) {
     return matchesEntry
@@ -770,7 +814,8 @@ export function sourceContextForLocation(source, line, column) {
   const state = getState();
   if (!state || typeof source !== "string") return null;
   const normalized = normalizePath(source.startsWith("file://") ? source.slice("file://".length) : source);
-  let sourceIndex = state.sources.findIndex(candidate => normalizePath(candidate) === normalized);
+  const normalizedList = normalizedSources(state);
+  let sourceIndex = normalizedList.byPath.get(normalized) ?? -1;
   const entrySource = typeof globalThis.__filename === "string"
     ? normalizePath(globalThis.__filename)
     : null;
@@ -779,7 +824,7 @@ export function sourceContextForLocation(source, line, column) {
     let bestIndex = -1;
     let bestSuffix = 1;
     for (let index = 0; index < state.sources.length; index += 1) {
-      const candidateParts = normalizePath(state.sources[index]).split("/");
+      const candidateParts = normalizedList.list[index].split("/");
       let suffix = 0;
       while (suffix < entryParts.length && suffix < candidateParts.length &&
           entryParts[entryParts.length - suffix - 1] === candidateParts[candidateParts.length - suffix - 1]) {
@@ -862,6 +907,39 @@ function preferConstructedErrorCallSite(state, generatedLine, generatedColumn, m
   return previousMappedSource.trim() === "" ? mapped : previous;
 }
 
+const EMPTY_INDICES = [];
+
+// Indices of rewritable sources whose generated path could possibly occur in
+// `text`, in ascending order (matching the order a full scan would visit).
+function rewritableCandidates(state, text) {
+  const groups = state.rewritableGroups;
+  if (groups.size === 0) return EMPTY_INDICES;
+  let candidates = null;
+  const add = (indices) => {
+    if (candidates === null) candidates = new Set();
+    for (const index of indices) candidates.add(index);
+  };
+  for (const [prefix, group] of groups) {
+    if (prefix === "") {
+      add(group.indices);
+      continue;
+    }
+    // Every occurrence of a generated path starts with an occurrence of its
+    // directory prefix, so only the text right after each such occurrence can
+    // name one of the group's files.
+    for (let at = text.indexOf(prefix); at >= 0; at = text.indexOf(prefix, at + 1)) {
+      const start = at + prefix.length;
+      for (const length of group.lengths) {
+        if (start + length > text.length) continue;
+        const bucket = group.byBasename.get(text.slice(start, start + length));
+        if (bucket) add(bucket);
+      }
+    }
+  }
+  if (candidates === null) return EMPTY_INDICES;
+  return [...candidates].sort((left, right) => left - right);
+}
+
 export function remapStackString(stack) {
   if (typeof stack !== "string" || stack === "") return stack;
   const mapPath = globalThis.__cottontailBundleSourceMap;
@@ -871,6 +949,18 @@ export function remapStackString(stack) {
   if (!hasMapPath && !hasMapData) return remapAdjacentBundleFrames(stack);
   const state = getState();
   if (!state) return remapAdjacentBundleFrames(stack);
+  // Remapping is a pure function of the stack text, the (cached) map state and
+  // the entry filename, and identical stacks recur constantly — loops, retried
+  // assertions, repeated `new Error()` at one site.
+  const entryFilename = typeof globalThis.__filename === "string" ? globalThis.__filename : null;
+  let memo = remapStackMemo.get(state);
+  if (memo === undefined) remapStackMemo.set(state, memo = { entryFilename, entries: new Map() });
+  if (memo.entryFilename !== entryFilename) {
+    memo.entryFilename = entryFilename;
+    memo.entries.clear();
+  }
+  const memoized = memo.entries.get(stack);
+  if (memoized !== undefined) return memoized;
   let remapped = stack;
   if (state?.bundleRegExp) {
     state.bundleRegExp.lastIndex = 0;
@@ -892,10 +982,10 @@ export function remapStackString(stack) {
       },
     );
   }
-  for (let index = 0; index < state.generatedSources.length; index += 1) {
+  for (const index of rewritableCandidates(state, remapped)) {
     const generated = state.generatedSources[index];
     const original = state.sources[index];
-    if (generated === original || !remapped.includes(generated)) continue;
+    if (!remapped.includes(generated)) continue;
     const virtual = virtualSourceMapping(state, index);
     if (virtual) {
       const sourcePattern = escapeRegExp(generated);
@@ -912,7 +1002,7 @@ export function remapStackString(stack) {
   }
   remapped = remapAdjacentBundleFrames(remapped);
   const activeBundlePath = state?.bundlePath;
-  return remapped
+  const result = remapped
     .split("\n")
     .filter((line) => {
       if (!activeBundlePath) return true;
@@ -920,6 +1010,9 @@ export function remapStackString(stack) {
       return !(isFrame && line.includes(activeBundlePath));
     })
     .join("\n");
+  if (memo.entries.size >= 512) memo.entries.clear();
+  memo.entries.set(stack, result);
+  return result;
 }
 
 function remapAdjacentBundleFrames(stack) {

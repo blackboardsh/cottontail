@@ -258,6 +258,12 @@ const mainModuleState = globalThis[mainModuleStateKey] ??= {
 };
 const hookResolvedFormats = new Map();
 const sourceMapCache = new Map();
+// Files already probed and found to carry no source map. Without this, every
+// stack-string remap re-read every frame's file from disk.
+const sourceMapMisses = new Set();
+// Remapping a stack string is a pure function of the registered source maps,
+// and the same stack recurs constantly (loops, repeated assertions).
+const remappedStacks = new Map();
 const nativeModuleResolveCacheGet = cottontail.moduleResolveCacheGet;
 const nativeModuleResolveCachePut = cottontail.moduleResolveCachePut;
 const nativeModuleResolveCacheClear = cottontail.moduleResolveCacheClear;
@@ -299,6 +305,8 @@ hotReloadHooks.add(() => {
   moduleHooks.length = 0;
   hookResolvedFormats.clear();
   sourceMapCache.clear();
+  sourceMapMisses.clear();
+  remappedStacks.clear();
   clearRuntimePlugins();
   mainModule = null;
   mainModuleState.current = null;
@@ -5099,18 +5107,31 @@ function maybeRegisterSourceMap(filename, source) {
     if (payload) {
       const lineLengths = String(source).replace(/\n$/, "").split("\n").map((line) => line.length);
       sourceMapCache.set(String(filename), new SourceMap(payload, { lineLengths }));
+      sourceMapMisses.delete(String(filename));
+      remappedStacks.clear();
     }
   } catch {}
 }
 
 function remapRegisteredSourceMapStack(stack) {
+  const key = String(stack ?? "");
+  const memoized = remappedStacks.get(key);
+  if (memoized !== undefined) return memoized;
+  const result = remapRegisteredSourceMapStackUncached(key);
+  if (remappedStacks.size >= 512) remappedStacks.clear();
+  remappedStacks.set(key, result);
+  return result;
+}
+
+function remapRegisteredSourceMapStackUncached(stack) {
   return String(stack ?? "").replace(/(^|[\s(@])([^\s()@]+):(\d+):(\d+)/gm, (frame, prefix, file, lineText, columnText) => {
     let sourceMap = sourceMapCache.get(file);
-    if (!sourceMap) {
+    if (!sourceMap && !sourceMapMisses.has(file)) {
       try {
         maybeRegisterSourceMap(file, readModuleFile(file));
         sourceMap = sourceMapCache.get(file);
       } catch {}
+      if (!sourceMap) sourceMapMisses.add(file);
     }
     if (!sourceMap) return frame;
     const entry = sourceMap.findEntry(Number(lineText) - 1, Number(columnText) - 1);
