@@ -4696,7 +4696,23 @@ function isGeneratedBundlePath(path) {
 }
 
 function bundledCallerPathFromStack() {
-  const stack = String(new Error().stack || "");
+  // Errors constructed inside the runtime never reach the Bun-compatible
+  // `Error.prototype.stack` formatting, so in a bundled run every frame here
+  // still names the generated bundle. Remap through the bundle's source map
+  // to recover the module that actually called require(), and ignore whatever
+  // is left pointing at the bundle: those frames are the generated wrappers,
+  // not a caller, and resolving against them would send bare specifiers to the
+  // cache directory instead of the requiring module's node_modules.
+  let stack = String(new Error().stack || "");
+  const remap = globalThis.__cottontailRemapStackString;
+  if (typeof remap === "function") {
+    try {
+      stack = String(remap(stack) ?? stack);
+    } catch {}
+  }
+  const bundlePath = typeof globalThis.__cottontailBundlePath === "string"
+    ? globalThis.__cottontailBundlePath
+    : null;
   for (const line of stack.split("\n").slice(2)) {
     const trimmed = line.trim();
     const match = trimmed.match(/\((.*):\d+:\d+\)$/) ??

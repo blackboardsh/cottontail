@@ -997,7 +997,16 @@ export function remapStackString(stack) {
         },
       );
     } else {
-      remapped = remapped.replaceAll(generated, original);
+      // A generated path is only a frame when it starts at a path boundary and
+      // carries a position. Replacing it as a bare substring corrupts frames
+      // that already name the original file: for sources outside the bundle
+      // directory the generated path walks past the filesystem root, leaving a
+      // suffix of the original path that then gets the original prefixed onto
+      // it once per remap.
+      remapped = remapped.replace(
+        new RegExp(`(^|[\\s(@]|file:\\/\\/)${escapeRegExp(generated)}(?=:\\d+:\\d+)`, "gm"),
+        (match, prefix) => `${prefix}${original}`,
+      );
     }
   }
   remapped = remapAdjacentBundleFrames(remapped);

@@ -4,6 +4,8 @@
 const contexts = new WeakSet();
 const contextHandles = new WeakMap();
 const contextVmSnapshots = new WeakMap();
+const contextGlobals = new WeakMap();
+const contextGlobalProxies = new WeakMap();
 const vmHost = globalThis.cottontail;
 const intrinsicPromiseThen = Promise.prototype.then;
 const contextFinalizer = typeof FinalizationRegistry === "function" &&
@@ -253,6 +255,7 @@ export function createContext(context = {}, options = undefined) {
       );
       contextHandles.set(context, handle);
       contextFinalizer?.register(context, handle);
+      captureVmGlobal(handle, context);
     }
     contexts.add(context);
   }
@@ -408,6 +411,62 @@ function annotateVmError(error, sourceName, filename, apiName) {
   return error;
 }
 
+// The sibling realm's global is a distinct object from the contextified
+// sandbox, and property changes made on the sandbox after a run are only
+// imported at the next run. Node and Bun hand out a global proxy that reads
+// through to the sandbox at all times, which is what code like jsdom relies
+// on: it keeps `vm.runInContext("this", sandbox)` as `window._globalProxy`
+// and then installs `document` (and the rest of the Window) onto the sandbox.
+// Return a host-side proxy over the sandbox with the same read-through
+// behavior, falling back to the realm global for the vm-only intrinsics.
+function makeVmGlobalProxy(context, vmGlobal) {
+  const proxy = new Proxy(context, {
+    get(target, key, receiver) {
+      if (key === "globalThis") return proxy;
+      if (Reflect.has(target, key)) {
+        return Reflect.get(target, key, receiver === proxy ? target : receiver);
+      }
+      return Reflect.get(vmGlobal, key);
+    },
+    has(target, key) {
+      return Reflect.has(target, key) || Reflect.has(vmGlobal, key);
+    },
+    getOwnPropertyDescriptor(target, key) {
+      const own = Reflect.getOwnPropertyDescriptor(target, key);
+      if (own !== undefined) return own;
+      const inherited = Reflect.getOwnPropertyDescriptor(vmGlobal, key);
+      // Reporting a property the extensible target does not have is only a
+      // valid answer while it stays configurable.
+      return inherited !== undefined && inherited.configurable ? inherited : undefined;
+    },
+  });
+  return proxy;
+}
+
+function vmGlobalProxyFor(context, value) {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return value;
+  if (contextGlobals.get(context) !== value) return value;
+  let proxy = contextGlobalProxies.get(context);
+  if (proxy === undefined) {
+    proxy = makeVmGlobalProxy(context, value);
+    contextGlobalProxies.set(context, proxy);
+  }
+  return proxy;
+}
+
+function captureVmGlobal(handle, context) {
+  if (typeof vmHost?.vmRunInContext !== "function") return;
+  try {
+    const vmGlobal = vmHost.vmRunInContext(handle, context, "this", "evalmachine.<anonymous>");
+    if (vmGlobal !== null && (typeof vmGlobal === "object" || typeof vmGlobal === "function")) {
+      contextGlobals.set(context, vmGlobal);
+    }
+  } catch {}
+  try {
+    contextVmSnapshots.set(context, descriptorSnapshot(context));
+  } catch {}
+}
+
 function runCodeInContext(code, context, options = undefined, apiName = "runInContext") {
   const handle = contextHandles.get(context);
   if (handle !== undefined && typeof vmHost?.vmRunInContext === "function") {
@@ -445,7 +504,7 @@ function runCodeInContext(code, context, options = undefined, apiName = "runInCo
         intrinsicPromiseThen.call(observer, undefined, () => {});
       } catch {}
     }
-    return result;
+    return vmGlobalProxyFor(context, result);
   }
   return runCodeInContextFallback(code, context, options);
 }
