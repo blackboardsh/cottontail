@@ -57,6 +57,12 @@ function normalizeSpawnError(error, file, cwd = undefined) {
   return out;
 }
 
+// Bun hands a subprocess pipe reader everything that is already buffered in a
+// single read() result, capped at 256 KiB per delivery. Delivering one
+// underlying pipe read per result instead splits bursts apart: a child that
+// console.log()s twice and exits produces two reads here but one in Bun.
+const MAX_PIPE_READ_BYTES = 256 * 1024;
+
 class ProcessReadable {
   constructor(concatChunks, cancel = undefined) {
     this._concatChunks = concatChunks;
@@ -193,6 +199,26 @@ class ProcessReadable {
     }
   }
 
+  // Take as much of the already-buffered data as one read() may deliver.
+  // Only chunks that arrived before the consumer asked are merged, so a live
+  // producer that writes, pauses, then writes again still yields separate
+  // chunks with their original timing.
+  _takeBuffered() {
+    const chunks = this._chunks;
+    if (chunks.length === 1) return chunks.shift();
+    let total = 0;
+    let count = 0;
+    while (count < chunks.length) {
+      const size = chunks[count].length;
+      if (count > 0 && total + size > MAX_PIPE_READ_BYTES) break;
+      total += size;
+      count++;
+      if (total >= MAX_PIPE_READ_BYTES) break;
+    }
+    if (count <= 1) return chunks.shift();
+    return this._concatChunks(chunks.splice(0, count));
+  }
+
   getReader() {
     if (this._locked) throw new TypeError("ReadableStream is locked");
     this._locked = true;
@@ -203,7 +229,7 @@ class ProcessReadable {
       read() {
         if (cancelled || released) return Promise.resolve({ done: true, value: undefined });
         if (owner._chunks.length > 0) {
-          return Promise.resolve({ done: false, value: owner._chunks.shift() });
+          return Promise.resolve({ done: false, value: owner._takeBuffered() });
         }
         if (owner._ended) return Promise.resolve({ done: true, value: undefined });
         return new Promise(resolve => owner._readRequests.push(resolve));
