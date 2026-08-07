@@ -81,7 +81,7 @@ for (const [label, flags] of [
       expect(run.result.exitCode, run.stderr).toBe(0);
       const roots = readdirSync(run.managedBase);
       expect(roots.length, `${JSON.stringify(roots)}\n${run.stderr}`).toBe(1);
-      expect(roots[0].startsWith("cottontail-bun-tests-")).toBe(true);
+      expect(roots[0].startsWith("ct-tests-")).toBe(true);
       expect(readdirSync(join(run.managedBase, roots[0])).some(name => name.startsWith("bun.test."))).toBe(true);
       expect(existsSync(join(run.sentinel, "keep.txt"))).toBe(true);
       expect(run.stderr).toContain("kept upstream temp root:");
