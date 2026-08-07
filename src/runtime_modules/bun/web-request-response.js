@@ -50,6 +50,10 @@ export function createRequestResponseRuntime({
   }
   
   const fetchBodyStartSymbol = Symbol("cottontail.fetchBodyStart");
+  // Set on an in-process serve dispatch Request once its handler's response
+  // has settled: body reads that have not delivered by then reject with
+  // AbortError, mirroring Bun's request teardown over a real socket.
+  const serveDispatchFinishedSymbol = Symbol.for("cottontail.serveDispatchFinished");
 
   function concatBodyChunks(chunks) {
     if (chunks.length === 1) return asBuffer(chunks[0]);
@@ -206,7 +210,7 @@ export function createRequestResponseRuntime({
     return withBufferedServeBody(body, async () => parseBodyJson(await textFromBody(body)));
   }
   
-  function bodyReadableStream(body) {
+  function bodyReadableStream(body, requestFinished = undefined) {
     if (body == null) return null;
     if (typeof body.getReader === "function") return body;
     const iterable = typeof body === "function" ? body() : body;
@@ -295,6 +299,14 @@ export function createRequestResponseRuntime({
       async start(controller) {
         try {
           const bytes = await bytesFromBody(body);
+          // In-process serve dispatch (server.fetch / loopback fetch): the
+          // handler already returned its response, so reads left pending on
+          // the request body reject like a closed connection — matching
+          // Bun's behavior over a real socket.
+          if (requestFinished?.() === true) {
+            controller.error(new globalThis.DOMException("The connection was closed.", "AbortError"));
+            return;
+          }
           if (bytes.byteLength > 0) controller.enqueue(bytes);
           controller.close();
         } catch (error) {
@@ -316,7 +328,7 @@ export function createRequestResponseRuntime({
     }
     return lifecycleBodyStreamFor(
       owner,
-      bodyReadableStream,
+      (sourceBody) => bodyReadableStream(sourceBody, () => owner?.[serveDispatchFinishedSymbol] === true),
       isStreamingBody,
       sourceBody => sourceBody?.[fetchBodyStartSymbol]?.(),
     );
@@ -890,8 +902,15 @@ export function createRequestResponseRuntime({
   });
   
   function stringLatin1FromBytes(bytes) {
+    // Lossless byte->U+00xx decode (TextDecoder("latin1") would remap
+    // 0x80-0x9f via windows-1252). Chunked fromCharCode is ~3x faster than a
+    // per-byte rope concat and much faster than Buffer's latin1 slice on
+    // multi-MB multipart bodies.
     let output = "";
-    for (const byte of bytes) output += String.fromCharCode(byte);
+    const step = 8192;
+    for (let index = 0; index < bytes.length; index += step) {
+      output += String.fromCharCode.apply(null, bytes.subarray(index, index + step));
+    }
     return output;
   }
   

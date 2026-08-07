@@ -470,7 +470,12 @@ export function createNativeServeRequestState(item, options) {
         if (state.bodySettled) return undefined;
         jsBodyStarted = true;
         state.wantsData = true;
-        state.poll();
+        // Deliver on a microtask, never synchronously inside read(): Bun does
+        // not hand request-body data to a read() issued during the handler's
+        // synchronous execution, so a handler that returns a Response with a
+        // read still pending must see that read reject with AbortError when
+        // the request finishes, even if the bytes already arrived.
+        onProgress?.();
         return undefined;
       },
       cancel() {

@@ -411,16 +411,43 @@ function serveErrorResponse(options, error) {
   }
 }
 
+const serveDispatchFinishedSymbol = Symbol.for("cottontail.serveDispatchFinished");
+
+function markServeDispatchFinished(request, response) {
+  if (request == null) return;
+  const responseBody = response?._body;
+  if (responseBody != null && (responseBody === request._body || responseBody === request._bodyStream)) return;
+  request[serveDispatchFinishedSymbol] = true;
+}
+
+// In-process dispatch has no post-response disposal step like the native
+// transport; force-abort a request body left unread once the response is
+// complete so pending reads reject with AbortError as over a real socket.
+function disposeServeDispatchRequestBody(request, response) {
+  const body = request?._body;
+  const state = body?.[activeServeRequestBodyStateSymbol];
+  if (!state || state.settled || response?._body === body) return;
+  if (isStreamingBody(response?._body)) return;
+  state.abort(new globalThis.DOMException("The connection was closed.", "AbortError"));
+}
+
 async function dispatchServeFetch(options, server, input, init = {}) {
   const request = input instanceof Request ? input : new Request(String(input), init);
   const dispatchRequest = normalizedServeDispatchRequest(request);
   let response;
   try {
-    response = await runServeHandler(options, dispatchRequest, server);
+    const pending = runServeHandler(options, dispatchRequest, server);
+    // A synchronously returned response means the handler can never consume
+    // the request body afterwards; pending reads must reject with AbortError
+    // like they do over a real socket.
+    if (!isPromiseLike(pending)) markServeDispatchFinished(dispatchRequest, pending);
+    response = await pending;
   } catch (error) {
     response = await serveErrorResponse(options, error);
   }
+  markServeDispatchFinished(dispatchRequest, response);
   finishActiveServeRequestBody(dispatchRequest, response);
+  disposeServeDispatchRequestBody(dispatchRequest, response);
   response = serveResponseWithIdleTimeout(response, requestIdleTimeout(dispatchRequest, options.idleTimeout));
   response.url = request.url;
   return response;
