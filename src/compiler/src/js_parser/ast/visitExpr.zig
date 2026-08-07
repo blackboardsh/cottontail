@@ -761,7 +761,18 @@ pub fn VisitExpr(
                         }
                     },
                     .un_delete => {
+                        const original_operand_tag = e_.value.data;
                         e_.value = p.visitExprInOut(e_.value, .{});
+
+                        // When a non-reference operand (like a call expression) is replaced
+                        // with `e_undefined` due to `--drop`, the `delete` operator should
+                        // return `true` because the original expression was a non-reference.
+                        // Without this, `delete Bun.inspect()` with `drop: ["Bun"]` would
+                        // become `delete undefined` which incorrectly returns `false` since
+                        // the global `undefined` property is non-configurable.
+                        if (original_operand_tag == .e_call and e_.value.data == .e_undefined) {
+                            return p.newExpr(E.Boolean{ .value = true }, expr.loc);
+                        }
                     },
                     else => {
                         e_.value = p.visitExprInOut(e_.value, ExprIn{ .assign_target = e_.op.unaryAssignTarget() });
