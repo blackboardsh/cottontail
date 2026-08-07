@@ -4180,8 +4180,11 @@ static int ct_http_take_body_piece(
         }
 
         if (request->chunk_expect_crlf) {
+            /* Reject a bad terminator as soon as the first byte lands so a
+               fragmented read cannot defer the 400 until more data arrives. */
+            if (input->len >= 1 && input->data[0] != '\r') return -1;
             if (input->len < 2) return 1;
-            if (input->data[0] != '\r' || input->data[1] != '\n') return -1;
+            if (input->data[1] != '\n') return -1;
             ct_http_read_buffer_consume(input, 2);
             request->chunk_expect_crlf = false;
             continue;
@@ -4482,6 +4485,12 @@ static void ct_http_request_mark_aborted(CtHttpRequest *request) {
         ct_http_body_chunk_free(request->body_chunk, request->body_chunk_len);
         request->body_chunk = NULL;
         request->body_chunk_len = 0;
+        /* No further body events can reach JavaScript once the request is
+           aborted, so release the connection thread from waiting on their
+           delivery. Without this a request that was buffering its body when
+           the abort landed keeps the client socket open forever. */
+        request->body_forwarding_reported = true;
+        request->body_buffering_reported = true;
         pthread_cond_broadcast(&request->cond);
     }
     pthread_mutex_unlock(&request->mutex);
