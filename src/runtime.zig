@@ -140,7 +140,7 @@ pub const Runtime = struct {
             };
 
             if (eval_error != null) {
-                self.writeStderrLine(std.mem.span(eval_error));
+                self.writeStderrLine(errorSpan(eval_error));
             } else {
                 self.writeStderrLine("Failed to set cottontail.args");
             }
@@ -190,7 +190,7 @@ pub const Runtime = struct {
             &eval_error,
         ) != 0) {
             defer if (eval_error != null) c.ct_jsc_string_free(eval_error);
-            if (eval_error != null) self.writeStderrLine(std.mem.span(eval_error));
+            if (eval_error != null) self.writeStderrLine(errorSpan(eval_error));
             return error.SourceMapSetupFailed;
         }
     }
@@ -229,7 +229,7 @@ pub const Runtime = struct {
             &eval_error,
         ) != 0) {
             defer if (eval_error != null) c.ct_jsc_string_free(eval_error);
-            if (eval_error != null) self.writeStderrLine(std.mem.span(eval_error));
+            if (eval_error != null) self.writeStderrLine(errorSpan(eval_error));
             return error.SourceMapSetupFailed;
         }
     }
@@ -243,7 +243,7 @@ pub const Runtime = struct {
             &eval_error,
         ) != 0) {
             defer if (eval_error != null) c.ct_jsc_string_free(eval_error);
-            if (eval_error != null) self.writeStderrLine(std.mem.span(eval_error));
+            if (eval_error != null) self.writeStderrLine(errorSpan(eval_error));
             return error.StandaloneGraphSetupFailed;
         }
     }
@@ -270,7 +270,7 @@ pub const Runtime = struct {
             &eval_error,
         ) != 0) {
             defer if (eval_error != null) c.ct_jsc_string_free(eval_error);
-            if (eval_error != null) self.writeStderrLine(std.mem.span(eval_error));
+            if (eval_error != null) self.writeStderrLine(errorSpan(eval_error));
             return error.StandaloneFlagsSetupFailed;
         }
     }
@@ -311,7 +311,7 @@ pub const Runtime = struct {
             &eval_error,
         ) != 0) {
             defer if (eval_error != null) c.ct_jsc_string_free(eval_error);
-            if (eval_error != null) self.writeStderrLine(std.mem.span(eval_error));
+            if (eval_error != null) self.writeStderrLine(errorSpan(eval_error));
             return error.ImmediateEvalFailed;
         }
     }
@@ -364,7 +364,7 @@ pub const Runtime = struct {
 
             if (eval_status == -13) return 13;
             if (eval_error != null) {
-                self.writeStderrLine(std.mem.span(eval_error));
+                self.writeStderrLine(errorSpan(eval_error));
             } else {
                 self.writeStderrLine("Unknown JavaScript exception");
             }
@@ -398,7 +398,7 @@ pub const Runtime = struct {
             &watch_error,
         ) != 0) {
             defer if (watch_error != null) c.ct_jsc_string_free(watch_error);
-            if (watch_error != null) self.writeStderrLine(std.mem.span(watch_error));
+            if (watch_error != null) self.writeStderrLine(errorSpan(watch_error));
             return error.WatchSetupFailed;
         }
     }
@@ -407,7 +407,7 @@ pub const Runtime = struct {
         var wait_error: [*c]u8 = null;
         if (c.ct_jsc_runtime_wait_for_reload(self.handle, &wait_error) != 0) {
             defer if (wait_error != null) c.ct_jsc_string_free(wait_error);
-            if (wait_error != null) self.writeStderrLine(std.mem.span(wait_error));
+            if (wait_error != null) self.writeStderrLine(errorSpan(wait_error));
             return error.ReloadWaitFailed;
         }
         _ = c.ct_jsc_runtime_take_reload_request(self.handle);
@@ -417,7 +417,7 @@ pub const Runtime = struct {
         var cleanup_error: [*c]u8 = null;
         if (c.ct_jsc_runtime_prepare_hot_reload(self.handle, &cleanup_error) != 0) {
             defer if (cleanup_error != null) c.ct_jsc_string_free(cleanup_error);
-            if (cleanup_error != null) self.writeStderrLine(std.mem.span(cleanup_error));
+            if (cleanup_error != null) self.writeStderrLine(errorSpan(cleanup_error));
             return error.HotReloadCleanupFailed;
         }
     }
@@ -458,7 +458,7 @@ pub const Runtime = struct {
         }
         if (status != 0) {
             if (eval_error != null) {
-                self.writeReloadError(std.mem.span(eval_error));
+                self.writeReloadError(errorSpan(eval_error));
             } else if (status != -13) {
                 self.writeStderrLine("Unknown JavaScript exception");
             }
@@ -511,7 +511,7 @@ pub const Runtime = struct {
             };
 
             if (eval_error != null) {
-                self.writeStderrLine(std.mem.span(eval_error));
+                self.writeStderrLine(errorSpan(eval_error));
             } else {
                 self.writeStderrLine("Unknown JavaScript exception during process shutdown");
             }
@@ -530,7 +530,7 @@ pub const Runtime = struct {
         ) != 0) {
             defer if (lifecycle_error != null) c.ct_jsc_string_free(lifecycle_error);
             if (lifecycle_error != null) {
-                self.writeStderrLine(std.mem.span(lifecycle_error));
+                self.writeStderrLine(errorSpan(lifecycle_error));
             } else {
                 self.writeStderrLine("Unknown JavaScript exception during process shutdown");
             }
@@ -549,7 +549,7 @@ pub const Runtime = struct {
             };
 
             if (eval_error != null) {
-                self.writeStderrLine(std.mem.span(eval_error));
+                self.writeStderrLine(errorSpan(eval_error));
             } else {
                 self.writeStderrLine("Unknown JavaScript exception during Cottontail tick");
             }
@@ -608,7 +608,7 @@ pub const Runtime = struct {
         };
         if (status != 0) {
             defer if (inspector_error != null) c.ct_jsc_string_free(inspector_error);
-            if (inspector_error != null) self.writeStderrLine(std.mem.span(inspector_error));
+            if (inspector_error != null) self.writeStderrLine(errorSpan(inspector_error));
             return error.InspectorStartFailed;
         }
         if (url == null) return null;
@@ -678,6 +678,13 @@ pub const Runtime = struct {
             }
         }
         stderr.flush() catch {};
+    }
+
+    // COTTONTAIL-COMPAT: exception text may embed U+0000, so its byte length
+    // comes from the runtime instead of NUL-terminated span().
+    fn errorSpan(message: [*c]u8) []const u8 {
+        if (message == null) return "";
+        return message[0..c.ct_jsc_string_length(message)];
     }
 
     fn writeStderrLine(self: *Runtime, message: []const u8) void {

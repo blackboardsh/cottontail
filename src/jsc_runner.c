@@ -5196,6 +5196,27 @@ static char *ct_value_to_utf8_copy_checked(
     return buffer;
 }
 
+// COTTONTAIL-COMPAT: exception messages are user data and may embed U+0000, so
+// their true byte length cannot be recovered with strlen(). Record the length of
+// the most recently produced message alongside its address; ct_set_error_out
+// forwards it to the caller-visible record consulted by ct_jsc_string_length().
+// The pointer comparison is only ever made against a live allocation the caller
+// still owns, so an address can never be confused with a later one.
+static char *ct_exception_message_pointer = NULL;
+static size_t ct_exception_message_length = 0;
+
+static char *ct_track_exception_message(char *message, size_t length) {
+    ct_exception_message_pointer = message;
+    ct_exception_message_length = message != NULL ? length : 0;
+    return message;
+}
+
+static size_t ct_message_length(const char *message) {
+    if (message == NULL) return 0;
+    if (message == ct_exception_message_pointer) return ct_exception_message_length;
+    return strlen(message);
+}
+
 static char *ct_copy_exception(JSContextRef ctx, JSValueRef exception) {
     if (exception == NULL) return ct_duplicate_bytes("Unknown JavaScript exception", 28);
 
@@ -5230,16 +5251,24 @@ static char *ct_copy_exception(JSContextRef ctx, JSValueRef exception) {
         JSValueRef call_exception = NULL;
         JSValueRef formatted = JSObjectCallAsFunction(ctx, fn, NULL, 1, &arg, &call_exception);
         if (call_exception == NULL && formatted != NULL) {
-            char *copy = ct_value_to_string_copy(ctx, formatted);
-            if (copy != NULL) return copy;
+            size_t formatted_len = 0;
+            char *copy = ct_value_to_utf8_copy(ctx, formatted, &formatted_len);
+            if (copy != NULL) return ct_track_exception_message(copy, formatted_len);
         }
     }
-    return ct_value_to_string_copy(ctx, exception);
+    size_t fallback_len = 0;
+    char *fallback = ct_value_to_utf8_copy(ctx, exception, &fallback_len);
+    return ct_track_exception_message(fallback, fallback_len);
 }
+
+static char *ct_error_out_pointer = NULL;
+static size_t ct_error_out_length = 0;
 
 static void ct_set_error_out(char **error_out, char *message) {
     if (error_out != NULL) {
         *error_out = message;
+        ct_error_out_pointer = message;
+        ct_error_out_length = ct_message_length(message);
     } else {
         free(message);
     }
@@ -20121,9 +20150,11 @@ static JSValueRef ct_tls_connection_write(JSContextRef ctx, JSObjectRef function
     size_t len = 0;
     char *text = NULL;
     if (ct_get_bytes(ctx, argv[1], &bytes, &len) != 0) {
-        text = ct_value_to_string_copy(ctx, argv[1]);
+        // COTTONTAIL-COMPAT: strings may contain U+0000; carry the byte length
+        // explicitly instead of relying on NUL termination.
+        text = ct_value_to_utf8_copy(ctx, argv[1], &len);
         bytes = (uint8_t *)text;
-        len = text != NULL ? strlen(text) : 0;
+        if (text == NULL) len = 0;
     }
     size_t written_total = 0;
     char *write_error = NULL;
@@ -24648,9 +24679,9 @@ static JSValueRef ct_write_file(JSContextRef ctx, JSObjectRef function, JSObject
             offset += written;
         }
     } else {
-        char *text = ct_value_to_string_copy(ctx, argv[1]);
+        size_t text_len = 0;
+        char *text = ct_value_to_utf8_copy(ctx, argv[1], &text_len);
         if (text != NULL) {
-            size_t text_len = strlen(text);
             size_t offset = 0;
             while (offset < text_len) {
                 size_t written = fwrite(text + offset, 1, text_len - offset, file);
@@ -29917,9 +29948,11 @@ static JSValueRef ct_spawn_write(JSContextRef ctx, JSObjectRef function, JSObjec
     size_t len = 0;
     char *text = NULL;
     if (ct_get_bytes(ctx, argv[1], &bytes, &len) != 0) {
-        text = ct_value_to_string_copy(ctx, argv[1]);
+        // COTTONTAIL-COMPAT: strings may contain U+0000; carry the byte length
+        // explicitly instead of relying on NUL termination.
+        text = ct_value_to_utf8_copy(ctx, argv[1], &len);
         bytes = (uint8_t *)text;
-        len = text != NULL ? strlen(text) : 0;
+        if (text == NULL) len = 0;
     }
     bool ok = false;
     int stdin_fd = -1;
@@ -32736,9 +32769,11 @@ static JSValueRef ct_fd_write(JSContextRef ctx, JSObjectRef function, JSObjectRe
     size_t len = 0;
     char *text = NULL;
     if (ct_get_bytes(ctx, argv[1], &bytes, &len) != 0) {
-        text = ct_value_to_string_copy(ctx, argv[1]);
+        // COTTONTAIL-COMPAT: strings may contain U+0000; carry the byte length
+        // explicitly instead of relying on NUL termination.
+        text = ct_value_to_utf8_copy(ctx, argv[1], &len);
         bytes = (uint8_t *)text;
-        len = text != NULL ? strlen(text) : 0;
+        if (text == NULL) len = 0;
     }
 
     int write_error = ct_fd_write_bytes(fd, bytes, len);
@@ -32759,9 +32794,11 @@ static JSValueRef ct_fd_write_status(JSContextRef ctx, JSObjectRef function, JSO
     size_t len = 0;
     char *text = NULL;
     if (ct_get_bytes(ctx, argv[1], &bytes, &len) != 0) {
-        text = ct_value_to_string_copy(ctx, argv[1]);
+        // COTTONTAIL-COMPAT: strings may contain U+0000; carry the byte length
+        // explicitly instead of relying on NUL termination.
+        text = ct_value_to_utf8_copy(ctx, argv[1], &len);
         bytes = (uint8_t *)text;
-        len = text != NULL ? strlen(text) : 0;
+        if (text == NULL) len = 0;
     }
 
     int write_error = ct_fd_write_bytes(fd, bytes, len);
@@ -32782,9 +32819,11 @@ static JSValueRef ct_fd_write_some(JSContextRef ctx, JSObjectRef function, JSObj
     size_t len = 0;
     char *text = NULL;
     if (ct_get_bytes(ctx, argv[1], &bytes, &len) != 0) {
-        text = ct_value_to_string_copy(ctx, argv[1]);
+        // COTTONTAIL-COMPAT: strings may contain U+0000; carry the byte length
+        // explicitly instead of relying on NUL termination.
+        text = ct_value_to_utf8_copy(ctx, argv[1], &len);
         bytes = (uint8_t *)text;
-        len = text != NULL ? strlen(text) : 0;
+        if (text == NULL) len = 0;
     }
     if (fd < 0 || bytes == NULL) {
         free(text);
@@ -32830,9 +32869,11 @@ static JSValueRef ct_ipc_send(JSContextRef ctx, JSObjectRef function, JSObjectRe
     size_t len = 0;
     char *text = NULL;
     if (ct_get_bytes(ctx, argv[1], &bytes, &len) != 0) {
-        text = ct_value_to_string_copy(ctx, argv[1]);
+        // COTTONTAIL-COMPAT: strings may contain U+0000; carry the byte length
+        // explicitly instead of relying on NUL termination.
+        text = ct_value_to_utf8_copy(ctx, argv[1], &len);
         bytes = (uint8_t *)text;
-        len = text != NULL ? strlen(text) : 0;
+        if (text == NULL) len = 0;
     }
     if (fd < 0 || bytes == NULL) {
         free(text);
@@ -35853,7 +35894,15 @@ static JSValueRef ct_compile_function_native(JSContextRef ctx, JSObjectRef funct
         return JSValueMakeUndefined(ctx);
     }
 
-    JSStringRef source = ct_js_string(source_bytes);
+    // COTTONTAIL-COMPAT: sources may embed U+0000, so build the JSString from
+    // the explicit byte length rather than treating the copy as NUL-terminated.
+    JSStringRef source = ct_js_string_from_utf8_len(source_bytes, source_len);
+    if (source == NULL) {
+        free(source_bytes);
+        free(filename);
+        ct_throw_message(ctx, exception, "Out of memory compiling function");
+        return JSValueMakeUndefined(ctx);
+    }
     JSStringRef source_url = ct_js_string(filename);
     JSValueRef eval_exception = NULL;
     JSValueRef result = JSEvaluateScript(ctx, source, NULL, source_url, 1, &eval_exception);
@@ -39392,6 +39441,23 @@ char *ct_jsc_runtime_take_heap_snapshot(CtJscRuntime *runtime, bool gc_debugging
     return ct_jsc_heap_snapshot(runtime->context, gc_debugging ? 1 : 0);
 }
 
+// COTTONTAIL-COMPAT: error strings handed back through `error_out` are user
+// data and may embed U+0000. Callers must ask for the byte length instead of
+// measuring with strlen(), or output stops at the first NUL.
+size_t ct_jsc_string_length(const char *value) {
+    if (value == NULL) return 0;
+    if (value == ct_error_out_pointer) return ct_error_out_length;
+    return strlen(value);
+}
+
 void ct_jsc_string_free(char *value) {
+    if (value != NULL && value == ct_error_out_pointer) {
+        ct_error_out_pointer = NULL;
+        ct_error_out_length = 0;
+    }
+    if (value != NULL && value == ct_exception_message_pointer) {
+        ct_exception_message_pointer = NULL;
+        ct_exception_message_length = 0;
+    }
     free(value);
 }

@@ -117,6 +117,7 @@ int ct_jsc_runtime_wait_for_inspector(CtJscRuntime *runtime);
 bool ct_jsc_runtime_enable_sampling_profiler(CtJscRuntime *runtime);
 char *ct_jsc_runtime_take_sampling_profiler(CtJscRuntime *runtime);
 char *ct_jsc_runtime_take_heap_snapshot(CtJscRuntime *runtime, bool gc_debugging);
+size_t ct_jsc_string_length(const char *value);
 void ct_jsc_string_free(char *value);
 
 #endif
