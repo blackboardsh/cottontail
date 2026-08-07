@@ -1106,6 +1106,8 @@ const consoleErrorSource = (error) => {
   return { filename, lines, lineIndex: index, column: columnIndex + 1, plainError };
 };
 
+let consoleGroupIndent = "";
+
 const formatConsoleError = (error, level, separate = true) => {
   const source = consoleErrorSource(error);
   if (!source) return undefined;
@@ -1146,7 +1148,7 @@ if (!console[Symbol.for("cottontail.consoleBootstrapEnhanced")]) {
 const nativeConsoleLog = console.log?.bind(console);
 const nativeConsoleError = console.error?.bind(console);
 const nativeConsoleWarn = console.warn?.bind(console) ?? nativeConsoleError;
-let consoleGroupIndent = "";
+consoleGroupIndent = "";
 const emitConsoleText = (writer, text) => {
   const processStream = writer === nativeConsoleLog
     ? globalThis.process?.stdout
