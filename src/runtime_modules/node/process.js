@@ -2536,7 +2536,19 @@ Object.defineProperty(processObject, "sourceMapsEnabled", {
   configurable: true,
 });
 
-export const cwd = processObject.cwd = () => cottontail.cwd();
+let _cachedCwd = null;
+export const cwd = processObject.cwd = () => {
+  try {
+    _cachedCwd = cottontail.cwd();
+    return _cachedCwd;
+  } catch (e) {
+    // If getcwd() fails (e.g. current directory was deleted), return the cached value
+    if (_cachedCwd) return _cachedCwd;
+    throw e;
+  }
+};
+// Initialize the cache at module load time
+try { _cachedCwd = cottontail.cwd(); } catch {}
 
 export const chdir = processObject.chdir = (directory) => {
   if (typeof directory !== "string") throw invalidArgType("directory", "string", directory);
@@ -2544,6 +2556,8 @@ export const chdir = processObject.chdir = (directory) => {
   const source = processObject.cwd();
   try {
     processInfo("chdir", directory);
+    // Update the cached cwd on success
+    try { _cachedCwd = cottontail.cwd(); } catch { _cachedCwd = directory; }
   } catch (cause) {
     const detail = String(cause?.message ?? cause);
     const code = /no such file or directory/i.test(detail)
