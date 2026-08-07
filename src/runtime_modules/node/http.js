@@ -4059,6 +4059,7 @@ export const WebSocket = typeof existingWebSocket === "function" ? existingWebSo
     this._messageState = createWebSocketMessageState();
     this._deflate = null;
     this._aborted = false;
+    this._connectAborted = false;
     this._pendingClose = null;
     this._pendingWriteFrames = [];
     this._pendingWriteBytes = 0;
@@ -4505,6 +4506,23 @@ export const WebSocket = typeof existingWebSocket === "function" ? existingWebSo
     this._finishClosingTransport(code, reason, false, payload);
   }
 
+  // Bun parity: `close()` while CONNECTING moves to CLOSING, cancels the
+  // in-flight handshake, and fires *no* error/close events. The socket is
+  // abandoned and the WebSocket stays in CLOSING, matching Bun's native
+  // client (upstream `WebSocket::close()` -> cancel with no event dispatch).
+  _abortConnecting() {
+    this._aborted = true;
+    this._connectAborted = true;
+    this.readyState = WebSocket.CLOSING;
+    this._pendingClose = null;
+    resetWebSocketMessageState(this._messageState);
+    if (this._closeTimer != null) clearTimeout(this._closeTimer);
+    this._closeTimer = null;
+    const socket = this._socket;
+    this._socket = null;
+    try { socket?.destroy?.(); } catch {}
+  }
+
   _abortHandshake(code, reason) {
     if (this.readyState === WebSocket.CLOSED) return;
     this.readyState = WebSocket.CLOSED;
@@ -4605,6 +4623,7 @@ export const WebSocket = typeof existingWebSocket === "function" ? existingWebSo
   }
 
   _failWithClose(error, code, reason, wasClean = false) {
+    if (this._connectAborted) return;
     if (this.readyState === WebSocket.CLOSED) return;
     const connectFailure = this.readyState === WebSocket.CONNECTING;
     const cause = error?.message ?? String(error);
@@ -4702,8 +4721,7 @@ export const WebSocket = typeof existingWebSocket === "function" ? existingWebSo
   close(code = 1000, reason = "") {
     if (this.readyState === WebSocket.CLOSED || this.readyState === WebSocket.CLOSING) return;
     if (this.readyState === WebSocket.CONNECTING) {
-      this._aborted = true;
-      this._abortHandshake(1006, "");
+      this._abortConnecting();
       return;
     }
     const closeCode = Number(code) || 1000;
