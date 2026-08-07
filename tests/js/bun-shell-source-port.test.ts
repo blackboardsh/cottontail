@@ -14,6 +14,25 @@ const nestedRuntimeTimeout = 30_000;
 
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
+// COTTONTAIL-EXTENSION: Bun 1.3.10 rejects every `&` with `Background commands
+// "&" are not supported yet.`, so Cottontail's job queue is opt-in and the
+// default Bun.$ surface stays byte-for-byte compatible with Bun. These tests
+// exercise the extension explicitly.
+function testBackground(name: string, fn: () => unknown, options?: unknown) {
+  test(name, () => withBackgroundCommands(fn), options as any);
+}
+
+async function withBackgroundCommands<T>(run: () => T | Promise<T>): Promise<T> {
+  const previous = process.env.COTTONTAIL_SHELL_BACKGROUND;
+  process.env.COTTONTAIL_SHELL_BACKGROUND = "1";
+  try {
+    return await run();
+  } finally {
+    if (previous === undefined) delete process.env.COTTONTAIL_SHELL_BACKGROUND;
+    else process.env.COTTONTAIL_SHELL_BACKGROUND = previous;
+  }
+}
+
 test("ports list comments, negation, and multiline operators", async () => {
   const output = await shell(`
     echo before # the rest of this line is ignored
@@ -121,7 +140,7 @@ test("conditional expressions support logical and file operators", async () => {
   expect(output.stdout.toString()).toBe("accepted\n");
 });
 
-test("background lists execute concurrently and wait joins their output", async () => {
+testBackground("background lists execute concurrently and wait joins their output", async () => {
   const delayed = "await Bun.sleep(30); console.log('background')";
   const output = await $`
     ${process.execPath} -e ${delayed} &
@@ -150,7 +169,7 @@ test("production parsing materializes async redirected subshell nodes", () => {
   expect(() => parseProduction("& echo unreachable")).toThrow('Unexpected "&"');
 });
 
-test("background pipelines preserve list ordering and final shell joins", async () => {
+testBackground("background pipelines preserve list ordering and final shell joins", async () => {
   const delayed = "await Bun.sleep(30); console.log('pipeline')";
   const output = await $`
     ${process.execPath} -e ${delayed} | cat &
@@ -162,7 +181,7 @@ test("background pipelines preserve list ordering and final shell joins", async 
   expect(output.stderr.toString()).toBe("");
 });
 
-test("background commands compose with boolean lists and command substitution", async () => {
+testBackground("background commands compose with boolean lists and command substitution", async () => {
   const delayed = "await Bun.sleep(30); console.log('background')";
   const booleanList = await $`
     echo prefix && ${process.execPath} -e ${delayed} &
@@ -179,7 +198,7 @@ test("background commands compose with boolean lists and command substitution", 
   expect(substitution.stdout.toString()).toBe("foreground background\n");
 }, nestedRuntimeTimeout);
 
-test("background conditions and nested compounds share the shell job queue", async () => {
+testBackground("background conditions and nested compounds share the shell job queue", async () => {
   const delayed = "await Bun.sleep(30); console.log('condition')";
   const condition = await $`
     if ${process.execPath} -e ${delayed} & then echo consequent; fi
@@ -201,14 +220,14 @@ test("background conditions and nested compounds share the shell job queue", asy
   expect(compactCondition.stdout.toString()).toBe("foo\nfoo\nbar\n");
 });
 
-test("background operators retain quoting and reject invalid binary placement", async () => {
+testBackground("background operators retain quoting and reject invalid binary placement", async () => {
   expect(await shell("echo '&' \\&").then(output => output.stdout.toString())).toBe("& &\n");
   expect(() => shell("echo background & && echo unreachable")).toThrow(
     '"&" is not allowed on the left-hand side of "&&"',
   );
 });
 
-test("wait reports the last background status", async () => {
+testBackground("wait reports the last background status", async () => {
   const output = await shell("true & false & wait");
 
   expect(output.exitCode).toBe(1);
@@ -216,7 +235,7 @@ test("wait reports the last background status", async () => {
   expect(output.stderr.toString()).toBe("");
 });
 
-test("background redirections complete before the shell promise resolves", async () => {
+testBackground("background redirections complete before the shell promise resolves", async () => {
   const output = await shell("echo background > background.txt & echo foreground");
 
   expect(output.exitCode).toBe(0);

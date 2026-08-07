@@ -1,4 +1,18 @@
-import { closeSync, lstatSync, openSync, readFileSync, readdirSync, statSync, writeSync } from "../node/fs.js";
+// node/fs.js drags in node:stream, node:url and bun:ffi, which is ~290ms of
+// module evaluation on a cold process. Shell scripts that never touch the
+// filesystem (`echo`, `which`, pipelines into subprocesses) must not pay for
+// it, so the syscalls are bound on first use instead of at import time.
+let fsModule;
+function fs() {
+  return (fsModule ??= require("../node/fs.js"));
+}
+const closeSync = (...args) => fs().closeSync(...args);
+const lstatSync = (...args) => fs().lstatSync(...args);
+const openSync = (...args) => fs().openSync(...args);
+const readFileSync = (...args) => fs().readFileSync(...args);
+const readdirSync = (...args) => fs().readdirSync(...args);
+const statSync = (...args) => fs().statSync(...args);
+const writeSync = (...args) => fs().writeSync(...args);
 import { basename, dirname, isAbsolute, join, resolve } from "../node/path.js";
 import picomatch from "../vendor/picomatch.js";
 import { createShellBuiltins } from "./bun-shell-builtins.js";
@@ -113,26 +127,38 @@ function throwCachedShellParseError(cached) {
   throw error;
 }
 
+// Bun 1.3.10 parses the async/background grammar but refuses to run it: every
+// `&` reaches `Background commands "&" are not supported yet.` in the
+// production interpreter (Bun.$, `bun exec`, and subshells alike). Cottontail's
+// job-queue implementation stays available behind an explicit opt-in so the
+// default surface matches Bun exactly.
+function backgroundCommandsEnabled() {
+  const value = globalThis.process?.env?.COTTONTAIL_SHELL_BACKGROUND;
+  return value === "1" || value === "true";
+}
+
 export function parseBunShellSource(source) {
-  // Production execution enables AST forms whose state machines exist in Bun
-  // 1.3.10 while the testing serializer retains its public parser diagnostics.
   source = String(source);
-  const cached = shellParseCache.get(source);
+  const allowBackground = backgroundCommandsEnabled();
+  // The parse cache has to distinguish the two grammars, otherwise a source
+  // parsed under one setting would be replayed under the other.
+  const cacheKey = allowBackground ? `&${source}` : source;
+  const cached = shellParseCache.get(cacheKey);
   if (cached) {
-    shellParseCache.delete(source);
-    shellParseCache.set(source, cached);
+    shellParseCache.delete(cacheKey);
+    shellParseCache.set(cacheKey, cached);
     if (cached.error) throwCachedShellParseError(cached.error);
     return cached.value;
   }
   try {
     const value = parseShell(source, {
-      allowBackground: true,
+      allowBackground,
       allowSubshellRedirects: true,
     });
-    cacheShellParse(source, { value });
+    cacheShellParse(cacheKey, { value });
     return value;
   } catch (error) {
-    cacheShellParse(source, { error: cachedShellParseError(error) });
+    cacheShellParse(cacheKey, { error: cachedShellParseError(error) });
     throw error;
   }
 }

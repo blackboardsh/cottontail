@@ -330,6 +330,15 @@ export function lexShell(source) {
 
 const REDIRECTS = new Set(["<", "<<", "0<", "0<<", "0>", "0>>", ">", ">>", "1>", "1>>", "2>", "2>>", "&>", "&>>", "2>&1", "1>&2", ">&2", ">&1"]);
 
+// Bun reports operators found where a command was expected with the lexer tag
+// name, e.g. `expected a command or assignment but got: "DoubleAmpersand"`.
+const COMMAND_POSITION_TAGS = new Map([
+  ["&&", "DoubleAmpersand"],
+  ["||", "DoublePipe"],
+  ["|", "Pipe"],
+  ["&", "Ampersand"],
+]);
+
 function markRightmostAsync(node) {
   if (node?.type === "binary") return { ...node, right: markRightmostAsync(node.right) };
   return { type: "async", command: node };
@@ -516,6 +525,10 @@ class Parser {
     if (words.length === 0 && redirects.length === 0) {
       if (this.peek().type === "eof") throw syntax("Unexpected EOF", this.peek().position);
       if (this.isOp(")")) throw syntax("Unexpected ')'", this.peek().position);
+      const tag = COMMAND_POSITION_TAGS.get(this.peek().value);
+      if (this.peek().type === "op" && tag !== undefined) {
+        throw syntax(`expected a command or assignment but got: "${tag}"`, this.peek().position);
+      }
       throw syntax(`Unexpected token: \`${this.peek().raw ?? this.peek().value}\``, this.peek().position);
     }
     return { type: "command", words, redirects };

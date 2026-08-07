@@ -173,7 +173,9 @@ export function createBunShellFacade(dependencies) {
     const outputTargets = new Map();
     let inputBody = undefined;
     const state = { quote: null, escaped: false };
-    for (let index = 0; index < strings.length; index += 1) {
+    // Bun drives the loop off `strings.raw`, so a template-strings stand-in that
+    // only carries `raw` (no indexed `length`) still runs its command.
+    for (let index = 0; index < parts.length; index += 1) {
       let part = parts[index];
       const terminalTarget = index < values.length &&
         parts.slice(index + 1).every((item) => String(item).trim() === "");
