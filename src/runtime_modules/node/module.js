@@ -2192,27 +2192,6 @@ function resolveRequestCore(request, basePath, kind = "require", packageImportSe
     if (isBuiltinHiddenByCompatProfile(text)) throw unknownBuiltinError(text);
     return text;
   }
-  if (text.startsWith("bun:")) {
-    if (builtinModuleMap.has(text)) {
-      if (isBuiltinHiddenByCompatProfile(text)) throw unknownBuiltinError(text);
-      return text;
-    }
-    // Ensure lazy bun: modules are registered before resolution fails.
-    // bun/index.js registers most bun: modules, but it may not have loaded yet.
-    if (typeof globalThis.Bun !== "undefined" || text === "bun:wrap") {
-      // Known bun: modules that should be resolvable via require().
-      const knownBunModules = [
-        "bun:test", "bun:jsc", "bun:ffi", "bun:sqlite", "bun:yaml",
-        "bun:dns", "bun:json5", "bun:toml", "bun:s3", "bun:redis",
-        "bun:sql", "bun:color", "bun:socket", "bun:internal-for-testing",
-        "bun:wrap",
-      ];
-      if (knownBunModules.includes(text)) {
-        return text;
-      }
-    }
-    throw unknownBuiltinError(text);
-  }
   if (builtinModuleMap.has(text)) {
     if (isBuiltinHiddenByCompatProfile(text)) throw unknownBuiltinError(text);
     return text;
@@ -4251,36 +4230,6 @@ function loadCommonJsModule(resolved, parent = null, isMain = false) {
   if (hooked !== null) return hooked;
   if (builtinModuleMap.has(resolvedPath)) {
     return loadBuiltinOrReplacement(resolvedPath);
-  }
-  if (resolvedPath.startsWith("bun:")) {
-    // Map bun: specifiers to their embedded runtime module paths.
-    // This mirrors the Zig bundler's runtime aliases for the CJS require() path.
-    const bunModuleFileMap = {
-      "bun:ffi": "bun/ffi.js",
-      "bun:jsc": "bun/jsc.js",
-      "bun:sqlite": "bun/sqlite.js",
-      "bun:test": "bun/test.js",
-      "bun:internal-for-testing": "bun/internal-for-testing.js",
-      "bun:wrap": "bun/wrap.js",
-      "bun:yaml": "bun/yaml.js",
-      "bun:dns": "bun/dns.js",
-      "bun:json5": "bun/json5.js",
-      "bun:toml": "bun/toml.js",
-      "bun:s3": "bun/s3.js",
-      "bun:redis": "bun/redis.js",
-      "bun:sql": "bun/sql.js",
-      "bun:color": "bun/color.js",
-      "bun:socket": "bun/socket.js",
-    };
-    const embeddedPath = bunModuleFileMap[resolvedPath];
-    if (embeddedPath) {
-      const loaded = loadEmbeddedRuntimeModule(embeddedPath);
-      // For bun: modules that export a default, unwrap appropriately.
-      const exports = loaded?.default ?? loaded;
-      // Register in the map so subsequent require() calls find it.
-      builtinModuleMap.set(resolvedPath, loaded);
-      return exports;
-    }
   }
   if (hasRuntimePackageReplacement(resolvedPath)) {
     return loadRuntimePackageReplacement(resolvedPath);
