@@ -2154,7 +2154,7 @@ function isBuiltinHiddenByCompatProfile(id) {
 
 function resolveRequestCore(request, basePath, kind = "require", packageImportSeen = undefined) {
   const originalText = String(request);
-  if (originalText.includes("\0")) throw moduleNotFoundError(originalText);
+  if (originalText.includes("\0")) throw moduleNotFoundError(originalText, true, basePath);
   if (originalText.startsWith("#")) {
     return resolvePackageImports(originalText, basePath, kind, packageImportSeen ?? new Set());
   }
@@ -2926,6 +2926,20 @@ function sourceRequiresAsyncModuleExecution(filename, source) {
   } catch {
     return false;
   }
+  // JSC's Function constructors cannot parse `using` declarations (the native
+  // transpiler lowers them before evaluation), which would make both probes
+  // below throw and misreport an async module as sync-invalid. Rewrite them
+  // to `const` for the parse probe only; `await using` keeps its await so
+  // top-level-await detection still fires.
+  transformed = transformed
+    .replace(
+      /\bawait\s+using\s+([$_\p{ID_Start}][$_\u200C\u200D\p{ID_Continue}]*)\s*=/gu,
+      "const $1 = await ",
+    )
+    .replace(
+      /\busing\s+([$_\p{ID_Start}][$_\u200C\u200D\p{ID_Continue}]*)\s*=/gu,
+      "const $1 =",
+    );
   const parameters = [
     ESM_EXPORTS_BINDING,
     "require",
@@ -3196,7 +3210,16 @@ function executeDefaultExtension(module, filename, loader) {
     const cachedWrapper = cachedPublicCommonJsWrapper(originalSource, filename);
     if (cachedWrapper !== null) return runPublicCommonJsWrapper(module, filename, cachedWrapper);
   }
-  const originalIsEsm = hasEsmSyntax(originalSource);
+  // COTTONTAIL-COMPAT: Bun module-detects every source. Top-level await (and
+  // await using) without any import/export syntax must still take the ESM
+  // lane: the sync CJS wrapper cannot parse it. Entry points then execute
+  // through the async module graph and require() throws Bun's async-module
+  // TypeError. The bare-await regex is only a cheap gate; the compile probe in
+  // sourceRequiresAsyncModuleExecution is scope-aware and rejects await that
+  // is inside functions.
+  const originalIsEsm = hasEsmSyntax(originalSource) ||
+    (/(?<![.\w$])await\b/.test(originalSource) &&
+      sourceRequiresAsyncModuleExecution(filename, originalSource));
   const isEmbeddedRuntimeSource = embeddedRuntimeSourceEntry(filename).found;
   const useRuntimeEsmSource = isEmbeddedRuntimeSource ||
     (runtimeEsmSourceExecutionDepth > 0 &&
@@ -3541,14 +3564,28 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
   // Import declarations are hoisted to the top of the transformed output
   // (matching ESM semantics, where imports are initialized before any module
   // code runs, even when the import statement appears at the bottom).
+  // Entries are {offset, text}; offset is the match's position in the source
+  // string *as it stood when that entry's regex pass ran*. Each pass below
+  // handles a different import syntax shape (default+namespace, namespace,
+  // default+named, named, default, side-effect-only) and runs in that fixed
+  // order regardless of where those shapes actually appear in the source, so
+  // pushing plain strings here would order declarations by *syntax kind*
+  // instead of source position (e.g. a later `import {a} from "b"` would be
+  // hoisted ahead of an earlier `import "c"` side-effect import, running "b"
+  // before "c" even though ESM must evaluate them in source order). A pass
+  // only ever removes text it matches, which shifts later offsets down but
+  // never earlier ones, so comparing these offsets after every pass has run
+  // still recovers the true source order. Sorting by offset before emitting
+  // restores that order.
   const importDeclarations = [];
   const importedBindings = Object.create(null);
   let importNamespaceIndex = 0;
-  const importNamespace = (spec, attributeKeyword, attributes) => {
+  const importNamespace = (spec, attributeKeyword, attributes, offset) => {
     const name = `__cottontailImportNamespace${importNamespaceIndex++}`;
-    importDeclarations.push(
-      `const ${name} = ${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)};`,
-    );
+    importDeclarations.push({
+      offset,
+      text: `const ${name} = ${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)};`,
+    });
     return name;
   };
   const liveImportedBinding = (namespace, imported) => {
@@ -3562,8 +3599,8 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
   // node constructors and map_children module.
   output = replaceCodePattern(output,
     /\bimport\s+([A-Za-z_$][\w$]*)\s*,\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s+from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
-    (_all, def, name, spec, attributeKeyword, attributes) => {
-      const namespace = importNamespace(spec, attributeKeyword, attributes);
+    (_all, def, name, spec, attributeKeyword, attributes, offset) => {
+      const namespace = importNamespace(spec, attributeKeyword, attributes, offset);
       importedBindings[def] = liveImportedBinding(namespace, "default");
       importedBindings[name] = namespace;
       return ";";
@@ -3571,15 +3608,15 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
   );
   output = replaceCodePattern(output,
     /\bimport\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s+from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
-    (_all, name, spec, attributeKeyword, attributes) => {
-      importedBindings[name] = importNamespace(spec, attributeKeyword, attributes);
+    (_all, name, spec, attributeKeyword, attributes, offset) => {
+      importedBindings[name] = importNamespace(spec, attributeKeyword, attributes, offset);
       return ";";
     },
   );
   output = replaceCodePattern(output,
     /\bimport\s+([A-Za-z_$][\w$]*)\s*,\s*\{([^}]*)\}\s*from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
-    (_all, def, names, spec, attributeKeyword, attributes) => {
-      const namespace = importNamespace(spec, attributeKeyword, attributes);
+    (_all, def, names, spec, attributeKeyword, attributes, offset) => {
+      const namespace = importNamespace(spec, attributeKeyword, attributes, offset);
       importedBindings[def] = liveImportedBinding(namespace, "default");
       for (const binding of importedBindingEntries(names)) {
         importedBindings[binding.local] = liveImportedBinding(namespace, binding.imported);
@@ -3589,8 +3626,8 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
   );
   output = replaceCodePattern(output,
     /\bimport\s*\{([^}]*)\}\s*from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
-    (_all, names, spec, attributeKeyword, attributes) => {
-      const namespace = importNamespace(spec, attributeKeyword, attributes);
+    (_all, names, spec, attributeKeyword, attributes, offset) => {
+      const namespace = importNamespace(spec, attributeKeyword, attributes, offset);
       for (const binding of importedBindingEntries(names)) {
         importedBindings[binding.local] = liveImportedBinding(namespace, binding.imported);
       }
@@ -3599,14 +3636,17 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
   );
   output = replaceCodePattern(output,
     /\bimport\s+([A-Za-z_$][\w$]*)\s+from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
-    (_all, def, spec, attributeKeyword, attributes) => {
-      const namespace = importNamespace(spec, attributeKeyword, attributes);
+    (_all, def, spec, attributeKeyword, attributes, offset) => {
+      const namespace = importNamespace(spec, attributeKeyword, attributes, offset);
       importedBindings[def] = liveImportedBinding(namespace, "default");
       return ";";
     },
   );
-  output = replaceCodePattern(output, /\bimport\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g, (_all, spec, attributeKeyword, attributes) => {
-    importDeclarations.push(`${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)};`);
+  output = replaceCodePattern(output, /\bimport\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g, (_all, spec, attributeKeyword, attributes, offset) => {
+    importDeclarations.push({
+      offset,
+      text: `${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)};`,
+    });
     return ";";
   });
   output = rewriteImportedExportClauses(output, importedBindings);
@@ -3712,9 +3752,17 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
   });
   const helperSource = asyncStaticImports ? asyncStaticImportHelperSource : staticImportHelperSource;
   const exportDeclarations = liveExportDeclarations.join(" ");
+  // Restore true source order (see the comment on importDeclarations above)
+  // before emitting: each regex pass above records the offset it observed at
+  // the time it matched, and an earlier pass's offset is always <= a later
+  // pass's offset for content that was earlier in the original source.
+  const orderedImportDeclarations = importDeclarations
+    .slice()
+    .sort((a, b) => a.offset - b.offset)
+    .map((entry) => entry.text);
   const bindingEntries = Object.entries(importedBindings);
   if (bindingEntries.length === 0) {
-    return `${helperSource}${importDeclarations.join(" ")}${exportDeclarations}${output}`;
+    return `${helperSource}${orderedImportDeclarations.join(" ")}${exportDeclarations}${output}`;
   }
   const bindingScope = "__cottontailImportedBindings";
   const bindingDeclarations = bindingEntries.map(([local, expression]) =>
@@ -3727,7 +3775,7 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
   // inside the module remain inner scopes and therefore shadow imports exactly
   // where ordinary ESM bindings do.
   return `${helperSource}const ${bindingScope} = Object.create(null);` +
-    `${importDeclarations.join(" ")}${bindingDeclarations.join(" ")}` +
+    `${orderedImportDeclarations.join(" ")}${bindingDeclarations.join(" ")}` +
     `with (${bindingScope}) { ${exportDeclarations}${output} }`;
 }
 
@@ -3766,6 +3814,34 @@ const asyncEsmModuleCache = new Map();
 const dynamicEsmFactoryCache = new Map();
 const asyncDynamicEsmFactoryCache = new Map();
 
+// User code (bun:test fixtures in particular) can invalidate the dynamic
+// import() cache directly via `Loader.registry.delete(key)`. That native Map
+// is the source of truth for import() dedup, but this runtime also keeps its
+// own execution caches (commonJsCache, asyncEsmModuleCache,
+// dynamicEsmFactoryCache, asyncDynamicEsmFactoryCache) populated by the fast
+// paths in executeDynamicImportSource/loadCommonJsModule. Deleting only from
+// Loader.registry left those stale, so re-importing the same resolved path
+// (e.g. the bare specifier after previously importing it with a `?query`
+// suffix, or vice versa) served an already-evaluated module instead of
+// re-executing it. `globalThis.Loader` does not exist yet while this module
+// evaluates (it's installed later by the native bootstrap), so the patch is
+// applied lazily and idempotently the first time it's needed.
+let loaderRegistryPatched = false;
+function ensureLoaderRegistryPatched() {
+  if (loaderRegistryPatched) return;
+  const nativeRegistry = globalThis.Loader?.registry;
+  if (!nativeRegistry || typeof nativeRegistry.delete !== "function") return;
+  loaderRegistryPatched = true;
+  const nativeDelete = nativeRegistry.delete.bind(nativeRegistry);
+  nativeRegistry.delete = function cottontailLoaderRegistryDelete(key) {
+    commonJsCache.delete(key);
+    asyncEsmModuleCache.delete(key);
+    dynamicEsmFactoryCache.delete(key);
+    asyncDynamicEsmFactoryCache.delete(key);
+    return nativeDelete(key);
+  };
+}
+
 // Entrypoints and test files execute from a generated .cottontail-compat-*
 // sibling whose import.meta still reports the original path (via the
 // base64 original-path marker). A dynamic self-import therefore resolves the
@@ -3800,7 +3876,7 @@ function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, origina
     run = cachedFactory.run;
   } else {
     const transformed = transformEsmSourceForDynamicImport(
-      maybeStripTypeScript(resolvedPath, originalSource),
+      maybeTransformRuntimeSyntax(resolvedPath, maybeStripTypeScript(resolvedPath, originalSource)),
       true,
     );
     maybeRegisterSourceMap(resolvedPath, transformed);
@@ -4013,6 +4089,7 @@ export function __importModule(
   forceAsync = false,
   asyncAncestors = undefined,
 ) {
+  ensureLoaderRegistryPatched();
   const directMock = bunModuleMockFor(specifier);
   if (directMock.found) {
     if (directMock.value && typeof directMock.value.then === "function") {
