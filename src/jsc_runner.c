@@ -36289,28 +36289,69 @@ static JSValueRef ct_vm_context_create(
     static const char bridge_source[] =
         "(()=>{"
         "const g=globalThis;"
-        "const baseline=new Map(Reflect.ownKeys(g).map(key=>[key,Object.getOwnPropertyDescriptor(g,key)]));"
-        "let mirrored=new Set();"
+        /* Capture every intrinsic the bridge relies on: importSandbox mirrors
+         * sandbox properties onto the global, so a sandbox with an own
+         * `Map: undefined` (happy-dom's Window) would otherwise clobber the
+         * bridge's own machinery. */
+        "const NativeMap=Map;"
+        "const NativeSet=Set;"
+        "const ownKeys=Reflect.ownKeys;"
+        "const reflectSet=Reflect.set;"
+        "const getOwn=Object.getOwnPropertyDescriptor;"
+        "const defineProp=Object.defineProperty;"
+        /* Descriptor diffing alone cannot see assignments whose value equals the
+         * creation-time baseline (this.Set = globalThis.Set); Bun's contextify
+         * shares storage between sandbox and global, so every assignment lands
+         * on the sandbox regardless of value. Scripts therefore run with a
+         * transparent proxy of the global as `this` (and as `globalThis`) whose
+         * set trap records each write before forwarding it unchanged. */
+        "const assigned=new NativeMap();"
+        "const thisProxy=new Proxy(g,{"
+            "set(target,key,value){assigned.set(key,value);return reflectSet(target,key,value,target)}"
+        "});"
+        "defineProp(g,'globalThis',{value:thisProxy,writable:true,enumerable:false,configurable:true});"
+        "const drainAssigned=()=>{"
+            "const written=new NativeMap(assigned);"
+            "assigned.clear();"
+            "return written;"
+        "};"
+        "const baseline=new NativeMap(ownKeys(g).map(key=>[key,getOwn(g,key)]));"
+        "let mirrored=new NativeSet();"
+        "const sameVal=(x,y)=>x===y||(x!==x&&y!==y);"
         "const same=(a,b)=>a!==undefined&&b!==undefined&&a.configurable===b.configurable&&"
-            "a.enumerable===b.enumerable&&a.writable===b.writable&&a.value===b.value&&"
+            "a.enumerable===b.enumerable&&a.writable===b.writable&&sameVal(a.value,b.value)&&"
             "a.get===b.get&&a.set===b.set;"
-        "const define=(target,key,descriptor)=>{Object.defineProperty(target,key,descriptor)};"
+        "const define=(target,key,descriptor)=>{defineProp(target,key,descriptor)};"
         "function importSandbox(sandbox){"
-            "const next=new Set(Reflect.ownKeys(sandbox));"
+            "const next=new NativeSet(ownKeys(sandbox));"
             "for(const key of mirrored){if(!next.has(key)){"
                 "const descriptor=baseline.get(key);"
                 "if(descriptor===undefined)delete g[key];else define(g,key,descriptor);"
             "}}"
-            "for(const key of next)define(g,key,Object.getOwnPropertyDescriptor(sandbox,key));"
+            /* A sandbox key may collide with a non-configurable global
+             * (this.undefined = 5 exports `undefined` onto the sandbox); the
+             * definition fails where Bun's shared storage would simply shadow,
+             * so skip rather than throw. */
+            "for(const key of next){try{define(g,key,getOwn(sandbox,key))}catch{}}"
             "mirrored=next;"
+            "drainAssigned();"
         "}"
         "function exportSandbox(sandbox){"
-            "const next=new Set();"
-            "for(const key of Reflect.ownKeys(g)){"
-                "const descriptor=Object.getOwnPropertyDescriptor(g,key);"
+            "const written=drainAssigned();"
+            "const next=new NativeSet();"
+            "for(const key of ownKeys(g)){"
+                "const descriptor=getOwn(g,key);"
                 "const original=baseline.get(key);"
                 "if(mirrored.has(key)||original===undefined||!same(descriptor,original)){"
                     "define(sandbox,key,descriptor);next.add(key);"
+                "}else if(written.has(key)){"
+                    /* The assignment left the descriptor identical to baseline (e.g.
+                     * this.Set = globalThis.Set assigns the vm's own intrinsic back),
+                     * so descriptor diffing cannot see it. Bun's contextify shares
+                     * storage between sandbox and global, so the write lands on the
+                     * sandbox as a plain data property holding the written value. */
+                    "define(sandbox,key,{value:written.get(key),writable:true,enumerable:true,configurable:true});"
+                    "next.add(key);"
                 "}"
             "}"
             "for(const key of mirrored){if(!next.has(key))delete sandbox[key]}"
@@ -36326,7 +36367,7 @@ static JSValueRef ct_vm_context_create(
                 "error=>{exportSandbox(sandbox);throw error}"
             ");"
         "}"
-        "return{importSandbox,exportSandbox,settleResult};"
+        "return{importSandbox,exportSandbox,settleResult,thisProxy};"
         "})()";
     JSStringRef bridge_script = JSStringCreateWithUTF8CString(bridge_source);
     JSStringRef bridge_url = JSStringCreateWithUTF8CString("cottontail:vm-context-bootstrap");
@@ -36401,8 +36442,18 @@ static JSValueRef ct_vm_context_run(
         return JSValueMakeUndefined(ctx);
     }
 
+    /* Run with the bridge's tracking proxy as `this` so assignments to
+     * top-level `this` are recorded even when they do not change the global's
+     * descriptors. */
+    JSObjectRef script_this = NULL;
+    JSValueRef this_exception = NULL;
+    JSValueRef this_value = ct_get_property(entry->context, entry->bridge, "thisProxy", &this_exception);
+    if (this_exception == NULL && this_value != NULL && JSValueIsObject(entry->context, this_value)) {
+        script_this = (JSObjectRef)this_value;
+    }
+
     JSValueRef run_exception = NULL;
-    JSValueRef result = JSEvaluateScript(entry->context, script, NULL, source_url, 1, &run_exception);
+    JSValueRef result = JSEvaluateScript(entry->context, script, script_this, source_url, 1, &run_exception);
     JSStringRelease(script);
     if (source_url != NULL) JSStringRelease(source_url);
     if (result != NULL) JSValueProtect(entry->context, result);
