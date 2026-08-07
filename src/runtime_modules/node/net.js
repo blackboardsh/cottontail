@@ -7,6 +7,8 @@ const kConnectionCount = Symbol("connectionCount");
 // Allow a stock-JSC host-loop turn for bytes racing a graceful destroy to
 // be consumed before close(2), which otherwise converts the FIN into a reset.
 const gracefulDestroyDrainMilliseconds = 16;
+// Largest byte length a single Uint8Array can address, matching buffer.kMaxLength.
+const MAX_COALESCED_WRITEV_BYTES = 4294967296;
 // Windows named pipes cannot half-close. libuv keeps the readable side alive
 // briefly after writable shutdown, then closes the pipe and reports EOF.
 const windowsPipeEofTimeoutMilliseconds = 50;
@@ -1760,6 +1762,20 @@ class SocketImpl extends Duplex {
     }
     const parts = chunks.map(({ chunk, encoding }) => bytesFrom(chunk, encoding ?? this._defaultEncoding));
     const total = parts.reduce((length, part) => length + part.byteLength, 0);
+    // COTTONTAIL-COMPAT: a coalescing view cannot exceed the typed array limit,
+    // and node:http frames one chunked body write as head + payload + CRLF. A
+    // maximum-size payload therefore overflows the merge. Queue the parts
+    // individually instead; the outbound queue already preserves wire order.
+    if (total > MAX_COALESCED_WRITEV_BYTES) {
+      let remaining = parts.length;
+      let failure = null;
+      const done = (error) => {
+        if (error != null && failure == null) failure = error;
+        if (--remaining === 0) callback(failure);
+      };
+      for (const part of parts) this._write(part, "buffer", done);
+      return;
+    }
     const combined = new Uint8Array(total);
     let offset = 0;
     for (const part of parts) {
