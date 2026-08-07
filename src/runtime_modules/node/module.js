@@ -1494,8 +1494,33 @@ function bareModuleFileFor(request, startDir) {
   return null;
 }
 
+// Bun rewrites TypeScript-style output extensions back to their source
+// spellings when the literal file is missing: "./a.js" finds "./a.ts" or
+// "./a.tsx", and "./a.mjs" finds "./a.mts". ".cjs" is deliberately absent —
+// Bun does not map it to ".cts". Exports-map targets are excluded (they use
+// isFile directly), matching Bun.
+const typescriptExtensionRewrites = Object.freeze({
+  ".js": [".ts", ".tsx"],
+  ".jsx": [".ts", ".tsx"],
+  ".mjs": [".mts"],
+});
+
+function resolveTypeScriptExtensionRewrite(candidate) {
+  const dot = candidate.lastIndexOf(".");
+  if (dot <= 0) return null;
+  const rewrites = typescriptExtensionRewrites[candidate.slice(dot).toLowerCase()];
+  if (!rewrites) return null;
+  const stem = candidate.slice(0, dot);
+  for (const ext of rewrites) {
+    if (isFile(`${stem}${ext}`)) return `${stem}${ext}`;
+  }
+  return null;
+}
+
 function resolveAsFile(candidate) {
   if (isFile(candidate)) return candidate;
+  const rewritten = resolveTypeScriptExtensionRewrite(candidate);
+  if (rewritten) return rewritten;
   // Extensionless require() follows the live Module._extensions registry.
   // Keep JSX in the fallback list because Bun loads it without exposing a
   // public require.extensions entry.
@@ -2697,8 +2722,16 @@ function markModuleCompileError(error, filename, source, lineOffset = FUNCTION_W
   return error;
 }
 
+// cottontail.compileFunction marshals its source as a NUL-terminated string,
+// so an embedded U+0000 truncates the program and surfaces as a bogus
+// "Unexpected EOF". JSC's own Function constructor is UTF-16 clean, so route
+// those (rare) sources through it instead.
+function nativeCompilerUsable(source) {
+  return typeof cottontail.compileFunction === "function" && !String(source).includes("\0");
+}
+
 function compileModuleWrapper(args, source, filename, diagnosticSource = source) {
-  const useNativeCompiler = typeof cottontail.compileFunction === "function";
+  const useNativeCompiler = nativeCompilerUsable(source);
   try {
     if (useNativeCompiler) {
       return cottontail.compileFunction(`(function(${args.join(",")}) {\n${source}\n})`, filename);
@@ -2710,7 +2743,7 @@ function compileModuleWrapper(args, source, filename, diagnosticSource = source)
 }
 
 function compileAsyncModuleWrapper(args, source, filename, diagnosticSource = source) {
-  const useNativeCompiler = typeof cottontail.compileFunction === "function";
+  const useNativeCompiler = nativeCompilerUsable(source);
   try {
     if (useNativeCompiler) {
       return cottontail.compileFunction(`(async function(${args.join(",")}) {\n${source}\n})`, filename);
