@@ -1932,6 +1932,12 @@ function scheduleRun() {
   }
   installUncaughtCapture();
   installAsyncFailureGuards();
+  // COTTONTAIL-COMPAT: a test file with top-level await suspends mid-module,
+  // which drains the microtask queue. Starting the runner there would make any
+  // registration after the await look like it happened inside a running test.
+  // The loader clears this flag and re-enters through the startTestRun hook
+  // once every module finished evaluating.
+  if (globalThis.__cottontailLoadingTestModules === true) return;
   if (runnerActive) {
     runAgain = true;
     return;
