@@ -1029,10 +1029,28 @@ function kMaxLengthLimit() {
 class Brotli extends Zlib {}
 class Zstd extends Zlib {}
 
+// Node's zlib constructors are plain functions, so `zlib.Inflate.call(this,
+// opts)` from a `util.inherits` subclass (pngjs's sync inflate does exactly
+// this) initializes the caller's object in place. The engine classes here are
+// ES classes that cannot be `.call`ed, so build the state on a real instance
+// and transplant it onto the caller, re-pointing the binding handle at its new
+// owner so error reporting still reaches the object the caller listens on.
+function adoptZlibInstanceState(target, instance) {
+  for (const key of Reflect.ownKeys(instance)) {
+    const descriptor = Object.getOwnPropertyDescriptor(instance, key);
+    if (descriptor !== undefined) Object.defineProperty(target, key, descriptor);
+  }
+  if (target._handle?._stream === instance) target._handle._stream = target;
+  return target;
+}
+
 function makeCallableZlibConstructor(name, Parent, mode) {
   const Constructor = {
     [name]: function(options = {}) {
-      if (!new.target) return new Constructor(options);
+      if (!new.target) {
+        const instance = new Constructor(options);
+        return this instanceof Constructor ? adoptZlibInstanceState(this, instance) : instance;
+      }
       return Reflect.construct(Parent, [mode, options], new.target);
     },
   }[name];
