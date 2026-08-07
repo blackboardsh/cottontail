@@ -3349,10 +3349,59 @@ async function fetchOnceFromNodeHttp(request, redirected = false, transport = {}
 
 const EMPTY_BUFFER = new Uint8Array(0);
 
+// Bun caps simultaneous outbound HTTP requests (BUN_CONFIG_MAX_HTTP_REQUESTS,
+// default 256) and queues the rest. Without the cap, a burst of thousands of
+// concurrent fetches opens a socket (and a connect helper thread) apiece,
+// wedging both this process and any thread-per-connection peer.
+const maxSimultaneousFetchSockets = (() => {
+  const raw = Number(globalThis.process?.env?.BUN_CONFIG_MAX_HTTP_REQUESTS);
+  return Number.isFinite(raw) && raw >= 1 ? Math.min(Math.trunc(raw), 65336) : 256;
+})();
+let activeFetchSocketCount = 0;
+const pendingFetchSocketWaiters = [];
+
+function acquireFetchSocketSlot(signal) {
+  if (activeFetchSocketCount < maxSimultaneousFetchSockets) {
+    activeFetchSocketCount += 1;
+    return null;
+  }
+  return new Promise((resolve, reject) => {
+    const waiter = { resolve, reject, signal, onAbort: null };
+    if (signal && typeof signal.addEventListener === "function") {
+      waiter.onAbort = () => {
+        const index = pendingFetchSocketWaiters.indexOf(waiter);
+        if (index !== -1) pendingFetchSocketWaiters.splice(index, 1);
+        reject(normalizedFetchAbortReason(signal));
+      };
+      signal.addEventListener("abort", waiter.onAbort, { once: true });
+    }
+    pendingFetchSocketWaiters.push(waiter);
+  });
+}
+
+function releaseFetchSocketSlot() {
+  const waiter = pendingFetchSocketWaiters.shift();
+  if (waiter != null) {
+    waiter.signal?.removeEventListener?.("abort", waiter.onAbort);
+    // The slot transfers to the waiter; the active count stays constant.
+    waiter.resolve();
+    return;
+  }
+  if (activeFetchSocketCount > 0) activeFetchSocketCount -= 1;
+}
+
 async function fetchSocketAttempt(request, redirected, transport, usePool) {
   const body = request.method === "GET" || request.method === "HEAD"
     ? Buffer.alloc(0)
     : Buffer.from(await bytesFromBody(request._body));
+  const slotWait = acquireFetchSocketSlot(request.signal);
+  if (slotWait != null) await slotWait;
+  let fetchSocketSlotReleased = false;
+  const releaseFetchSlot = () => {
+    if (fetchSocketSlotReleased) return;
+    fetchSocketSlotReleased = true;
+    releaseFetchSocketSlot();
+  };
   return new Promise((resolve, reject) => {
     const suppliedUrl = transport.parsedUrl;
     const url = suppliedUrl?.href === request.url ? suppliedUrl : parsedFetchUrl(request.url);
@@ -3404,6 +3453,7 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
         : nodeNet.connect(port, hostname));
 
     const cleanup = () => {
+      releaseFetchSlot();
       try { socket.destroy?.(); } catch {}
     };
 
@@ -3412,6 +3462,7 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
     let socketGone = false;
     let responseConnectionClose = false;
     const repoolSocket = () => {
+      releaseFetchSlot();
       for (const name of ["data", "error", "end", "close", "connect", "secureConnect"]) {
         socket.removeAllListeners?.(name);
       }
@@ -4720,25 +4771,57 @@ function isMissingFileError(error) {
   return text.includes("ENOENT") || text.includes("No such file or directory") || text.includes("FileNotFound");
 }
 
+// Serve a previously cached static-route snapshot without touching the source
+// Response: no clone, no body snapshot, no byte copies. The cached bytes are
+// shared across requests; the native transport memcpy's them synchronously.
+function finishCachedServeResponse(cached, request) {
+  const method = String(request.method || "GET").toUpperCase();
+  const status = cached.status;
+  const headers = new Headers(cached.headers);
+  if ((method === "GET" || method === "HEAD") && status === 200 && (
+    ifModifiedSinceNotModified(request.headers.get("if-modified-since"), headers.get("last-modified")) ||
+    ifNoneMatchMatches(request.headers.get("if-none-match"), headers.get("etag"))
+  )) {
+    headers.delete("content-length");
+    return normalizeResponse(new Response(null, {
+      status: 304,
+      statusText: cached.statusText,
+      headers,
+    }), request);
+  }
+  const response = new Response(null, {
+    status,
+    statusText: cached.statusText,
+    headers,
+  });
+  if (method !== "HEAD" && statusAllowsBody(status)) response._body = cached.bytes;
+  return normalizeResponse(response, request);
+}
+
+function serveCachedResponse(cached, request, options) {
+  const body = cached.body;
+  if (options.allowFileFallback && isBunFileLike(body) && typeof body.exists === "function") {
+    return Promise.resolve(body.exists()).then(
+      (exists) => (exists ? finishCachedServeResponse(cached, request) : null),
+    );
+  }
+  return finishCachedServeResponse(cached, request);
+}
+
 async function prepareServeResponse(value, request, options = {}) {
-  const cached = options.cacheKey && typeof options.cacheKey === "object"
-    ? serveResponseCache.get(options.cacheKey)
-    : null;
-  const sourceResponse = cached
-    ? cached.response.clone()
-    : normalizeResponse(value instanceof Response
+  const sourceResponse = normalizeResponse(value instanceof Response
       // Static routes share one Response object across requests; take the body
       // from a clone so the original is never consumed, even on paths that do
       // not populate the response cache (HEAD, missing files).
       ? (options.cacheKey != null ? value.clone() : value)
       : new Response(value));
   const headers = new Headers(sourceResponse.headers);
-  const body = cached ? cached.body : sourceResponse._takeBody();
+  const body = sourceResponse._takeBody();
   const method = String(request.method || "GET").toUpperCase();
   const isFile = isBunFileLike(body);
   const fileSlice = bunFileSliceMetadata(body);
   const emptyFileSlice = isFile && bunFileServeSliceIsEmpty(body);
-  const sourceStreaming = !cached && isStreamingBody(body);
+  const sourceStreaming = isStreamingBody(body);
   if (sourceStreaming) trackServeReadableStream(body);
   const streaming = method !== "HEAD" && sourceStreaming;
 
@@ -4747,15 +4830,15 @@ async function prepareServeResponse(value, request, options = {}) {
   }
 
   let status = sourceResponse.status;
-  let bytes = cached?.bytes ?? new Uint8Array(0);
+  let bytes = new Uint8Array(0);
   if (statusAllowsBody(status)) {
-    if (!cached && method === "HEAD" && isFile && Number.isFinite(Number(body.size))) {
+    if (method === "HEAD" && isFile && Number.isFinite(Number(body.size))) {
       bytes = { byteLength: Number(body.size) };
-    } else if (!cached && method === "HEAD" && sourceStreaming) {
+    } else if (method === "HEAD" && sourceStreaming) {
       bytes = { byteLength: 0 };
-    } else if (!cached && !streaming && emptyFileSlice) {
+    } else if (!streaming && emptyFileSlice) {
       bytes = new Uint8Array(0);
-    } else if (!cached && !streaming) {
+    } else if (!streaming) {
       try {
         bytes = await bytesFromBody(body);
       } catch (error) {
@@ -4808,13 +4891,11 @@ async function prepareServeResponse(value, request, options = {}) {
     headers.set("ETag", entityTagForBytes(bytes));
   }
 
-  if (!streaming && !cached && options.cacheKey && typeof options.cacheKey === "object" && bytes instanceof Uint8Array) {
+  if (!streaming && options.cacheKey && typeof options.cacheKey === "object" && bytes instanceof Uint8Array) {
     serveResponseCache.set(options.cacheKey, {
-      response: new Response(bytes, {
-        status,
-        statusText: sourceResponse.statusText,
-        headers: new Headers(headers),
-      }),
+      status,
+      statusText: sourceResponse.statusText,
+      headers: new Headers(headers),
       body,
       bytes,
     });
@@ -4869,6 +4950,10 @@ function prepareServeResponseResult(value, request, options = {}) {
   if (isPromiseLike(value)) {
     return value.then((resolved) => prepareServeResponseResult(resolved, request, options));
   }
+  const cached = options.cacheKey && typeof options.cacheKey === "object"
+    ? serveResponseCache.get(options.cacheKey)
+    : null;
+  if (cached != null) return serveCachedResponse(cached, request, options);
   return prepareServeResponseSync(value, request, options) ?? prepareServeResponse(value, request, options);
 }
 
@@ -4979,12 +5064,43 @@ function serveResponseWithIdleTimeout(response, idleTimeoutSeconds) {
   return timedResponse;
 }
 
+const serveDispatchFinishedSymbol = Symbol.for("cottontail.serveDispatchFinished");
+
+function markServeDispatchFinished(request, response) {
+  if (request == null) return;
+  // The response may still stream from the request's own body (echo
+  // handlers); leave those alone.
+  const responseBody = response?._body;
+  if (responseBody != null && (responseBody === request._body || responseBody === request._bodyStream)) return;
+  request[serveDispatchFinishedSymbol] = true;
+}
+
+// The native transport force-aborts a request body left unread (even one with
+// a reader attached) when the request is disposed after its response ends.
+// In-process dispatch has no later disposal step, so do it here: pending
+// reads reject with AbortError exactly as they would over a real socket.
+function disposeServeDispatchRequestBody(request, response) {
+  const body = request?._body;
+  const state = body?.[activeServeRequestBodyStateSymbol];
+  if (!state || state.settled || response?._body === body) return;
+  // A streaming response may still be transforming the request body while
+  // the client consumes it; the request only ends with the response there.
+  if (isStreamingBody(response?._body)) return;
+  state.abort(new globalThis.DOMException("The connection was closed.", "AbortError"));
+}
+
 async function dispatchServeFetch(options, server, input, init = {}) {
   const request = input instanceof Request ? input : new Request(String(input), init);
   const dispatchRequest = normalizedServeDispatchRequest(request);
   let response;
   try {
-    response = await runServeHandler(options, dispatchRequest, server);
+    const pending = runServeHandler(options, dispatchRequest, server);
+    // A handler that returned synchronously can never consume the request
+    // body afterwards. Mark before any microtask runs so a body read issued
+    // during the handler rejects with AbortError (as over a real socket)
+    // instead of resolving with bytes the handler never waited for.
+    if (!isPromiseLike(pending)) markServeDispatchFinished(dispatchRequest, pending);
+    response = await pending;
   } catch (error) {
     if (typeof options.error !== "function") {
       finishActiveServeRequestBody(dispatchRequest, null);
@@ -4994,7 +5110,9 @@ async function dispatchServeFetch(options, server, input, init = {}) {
       response = await serveErrorResponse(options, error);
     }
   }
+  markServeDispatchFinished(dispatchRequest, response);
   finishActiveServeRequestBody(dispatchRequest, response);
+  disposeServeDispatchRequestBody(dispatchRequest, response);
   response = serveResponseWithIdleTimeout(response, requestIdleTimeout(dispatchRequest, options.idleTimeout));
   response.url = request.url;
   return response;
