@@ -2683,10 +2683,6 @@ fn runPrepared(
 fn configureRuntimeInspector(execution: *const ScriptExecution, js_runtime: *runtime.Runtime) bool {
     const inspector = execution.inspector orelse return true;
     const inspector_url = js_runtime.startInspector(inspector.options) catch {
-        // When the inspector was auto-configured (e.g. BUN_INSPECT_CONNECT_TO
-        // pointing at a non-existent socket), treat the failure as non-fatal
-        // so the script can still execute.
-        if (inspector.automatic) return true;
         writeStderr(execution.io, "cottontail: failed to start inspector\n", .{});
         return false;
     };
