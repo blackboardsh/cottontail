@@ -418,8 +418,31 @@ fn cloneGraphSourceMap(output_file: *const compiler.options.OutputFile) !GraphSo
     return .{ .path = path, .contents = contents };
 }
 
-const generated_esm_initializer = "(fn, res) => ((orig) => (force) => ((fn || force && (fn = orig)) && (res = fn(fn = 0)), res))(fn)";
-const cottontail_esm_initializer = "(fn, res) => { const orig = fn; return (force) => { if (!fn) { if (!force || !orig) return res; fn = orig; } const init = fn; fn = 0; res = Promise.resolve(); try { return res = init(); } catch (error) { res = void 0; throw error; } } }";
+/// Bun's original `__esm` helper, emitted for every non-runtime bundle.
+const generated_esm_initializer = "(fn, res) => () => (fn && (res = fn(fn = 0)), res)";
+const cottontail_esm_initializer = "(fn, res) => () => { if (!fn) return res; const init = fn; fn = 0; res = Promise.resolve(); try { return res = init(); } catch (error) { res = void 0; throw error; } }";
+
+/// Cottontail's force-capable `__esmForce` helper, selected by the linker only
+/// for runtime-launcher bundles (`runtime_dynamic_imports`). Keep in sync with
+/// `__esmForce` in src/compiler/src/runtime.js.
+const generated_esm_force_initializer = "(fn, res) => ((orig) => (force) => ((fn || force && (fn = orig)) && (res = fn(fn = 0)), res))(fn)";
+const cottontail_esm_force_initializer = "(fn, res) => { const orig = fn; return (force) => { if (!fn) { if (!force || !orig) return res; fn = orig; } const init = fn; fn = 0; res = Promise.resolve(); try { return res = init(); } catch (error) { res = void 0; throw error; } } }";
+
+const EsmInitializerVariant = struct {
+    declaration: []const u8,
+    replacement: []const u8,
+};
+
+const esm_initializer_variants = [_]EsmInitializerVariant{
+    .{
+        .declaration = "var __esm = " ++ generated_esm_initializer,
+        .replacement = "var __esm = " ++ cottontail_esm_initializer,
+    },
+    .{
+        .declaration = "var __esmForce = " ++ generated_esm_force_initializer,
+        .replacement = "var __esmForce = " ++ cottontail_esm_force_initializer,
+    },
+};
 
 const GeneratedReplacement = struct {
     start: usize,
@@ -619,7 +642,11 @@ fn patchGeneratedSelfImports(contents: []const u8, working_dir: []const u8) !?[]
         const name_end = generatedIdentifierEnd(contents, name_start);
         const init_name = contents[name_start..name_end];
         const assignment = std.mem.trimStart(u8, contents[name_end..], " \t");
-        if (!std.mem.startsWith(u8, assignment, "= __esm(")) {
+        // Runtime-launcher bundles wrap initializers with `__esmForce`; every
+        // other bundle uses Bun's `__esm`. Accept both spellings.
+        if (!std.mem.startsWith(u8, assignment, "= __esm(") and
+            !std.mem.startsWith(u8, assignment, "= __esmForce("))
+        {
             search_from = name_end;
             continue;
         }
@@ -694,33 +721,44 @@ fn cloneGeneratedJavaScript(contents: []const u8, working_dir: []const u8) ![]u8
         patched
     else
         try c_allocator.dupe(u8, contents);
-    if (std.mem.indexOf(u8, generated, generated_esm_initializer) == null) {
-        return generated;
-    }
     // A recursive dynamic self-import can enter an async ESM initializer
     // synchronously, before Bun's compact helper assigns its cached Promise.
     // Publish an already-resolved placeholder during that call so the linker-
     // generated namespace continuation can run, then cache the real result.
     //
-    // Only patch the actual top-level helper declaration: the compact helper
-    // text also appears verbatim inside user string literals (upstream test
-    // snapshots embed it), and replacing those corrupts them.
-    const declaration = "var __esm = " ++ generated_esm_initializer;
-    const replacement = "var __esm = " ++ cottontail_esm_initializer;
+    // Two helper spellings can appear: Bun's `__esm` (every ordinary bundle)
+    // and cottontail's force-capable `__esmForce` (runtime-launcher bundles,
+    // see LinkerContext.load). Patch whichever the bundle actually declared.
+    var current = generated;
+    for (esm_initializer_variants) |variant| {
+        current = try patchEsmInitializerDeclaration(current, variant);
+    }
+    return current;
+}
+
+/// Replaces top-level `var <name> = <compact helper>` declarations with the
+/// cottontail placeholder-publishing form. Only the actual declaration is
+/// patched: the compact helper text also appears verbatim inside user string
+/// literals (upstream test snapshots embed it), and replacing those corrupts
+/// them. Takes ownership of `contents` and returns an owned slice.
+fn patchEsmInitializerDeclaration(contents: []u8, variant: EsmInitializerVariant) ![]u8 {
+    if (std.mem.indexOf(u8, contents, variant.declaration) == null) {
+        return contents;
+    }
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(c_allocator);
     var copied_until: usize = 0;
     var search_from: usize = 0;
-    while (std.mem.indexOfPos(u8, generated, search_from, declaration)) |found| {
-        search_from = found + declaration.len;
-        if (found != 0 and generated[found - 1] != '\n') continue;
-        try output.appendSlice(c_allocator, generated[copied_until..found]);
-        try output.appendSlice(c_allocator, replacement);
+    while (std.mem.indexOfPos(u8, contents, search_from, variant.declaration)) |found| {
+        search_from = found + variant.declaration.len;
+        if (found != 0 and contents[found - 1] != '\n') continue;
+        try output.appendSlice(c_allocator, contents[copied_until..found]);
+        try output.appendSlice(c_allocator, variant.replacement);
         copied_until = search_from;
     }
-    if (copied_until == 0) return generated;
-    try output.appendSlice(c_allocator, generated[copied_until..]);
-    c_allocator.free(generated);
+    if (copied_until == 0) return contents;
+    try output.appendSlice(c_allocator, contents[copied_until..]);
+    c_allocator.free(contents);
     return try output.toOwnedSlice(c_allocator);
 }
 

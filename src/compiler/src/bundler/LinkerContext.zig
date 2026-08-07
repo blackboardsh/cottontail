@@ -238,7 +238,14 @@ pub const LinkerContext = struct {
 
         var runtime_named_exports = &this.graph.ast.items(.named_exports)[Index.runtime.get()];
 
-        this.esm_runtime_ref = runtime_named_exports.get("__esm").?.ref;
+        // COTTONTAIL-COMPAT: only cottontail's internal runtime-launcher
+        // bundles get the force-capable `__esmForce` wrapper (needed by the
+        // registry-aware `__esmDyn` dynamic-import helper). User-facing
+        // `bun build` output keeps Bun's original `__esm` helper text, which
+        // upstream inline snapshots golden-match byte-for-byte.
+        this.esm_runtime_ref = runtime_named_exports.get(
+            if (this.options.runtime_dynamic_imports) "__esmForce" else "__esm",
+        ).?.ref;
         this.cjs_runtime_ref = runtime_named_exports.get("__commonJS").?.ref;
         this.promise_all_runtime_ref = runtime_named_exports.get("__promiseAll").?.ref;
 
