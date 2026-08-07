@@ -4148,6 +4148,13 @@ globalThis.__cottontailImportModule = (
 };
 
 function executeQueriedModule(module, filename, suffix) {
+  // Handle ?raw query parameter - return file contents as raw text
+  if (suffix === "?raw") {
+    const rawContents = readModuleFile(filename);
+    module.exports = { default: rawContents };
+    module.loaded = true;
+    return module.exports;
+  }
   const originalSource = readModuleFile(filename).replace(/^#![^\n]*(\n|$)/, "");
   if (sourceRequiresAsyncModuleExecution(filename, originalSource)) {
     throw new TypeError(`require() async module "${filename}" is unsupported. use "await import()" instead.`);
