@@ -20536,6 +20536,17 @@ static double ct_current_rss_bytes(void) {
     mach_task_basic_info_data_t info;
     mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
     if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) == KERN_SUCCESS) {
+        // resident_size keeps counting pages the allocator already returned to
+        // the kernel via MADV_FREE_REUSABLE; our synchronous scavenge in
+        // ct_jsc_collect_full generates hundreds of MB of them. Subtract the
+        // reusable total so rss reports memory the process actually holds
+        // (matching phys_footprint's treatment of reusable pages).
+        task_vm_info_data_t vm_info;
+        mach_msg_type_number_t vm_count = TASK_VM_INFO_COUNT;
+        if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm_info, &vm_count) == KERN_SUCCESS &&
+            (double)vm_info.reusable < (double)info.resident_size) {
+            return (double)info.resident_size - (double)vm_info.reusable;
+        }
         return (double)info.resident_size;
     }
 #elif defined(__linux__)
@@ -30259,8 +30270,10 @@ static JSValueRef ct_gc(JSContextRef ctx, JSObjectRef function, JSObjectRef this
     bool force = argc > 0 && ct_value_to_bool(ctx, argv[0]);
 #if defined(__APPLE__)
     if (force) {
+        // ct_jsc_collect_full already runs malloc_zone_pressure_relief as part
+        // of its scavenge sequence; a second call here only manufactured more
+        // reusable pages.
         ct_jsc_collect_full(ctx);
-        malloc_zone_pressure_relief(NULL, 0);
     } else {
         JSGarbageCollect(ctx);
     }
