@@ -186,6 +186,93 @@ if (globalThis.console) {
     return undefined;
   };
 
+  const isBufferValue = (value) =>
+    typeof Buffer === "function" && typeof Buffer.isBuffer === "function" && Buffer.isBuffer(value);
+
+  const isArrayBufferValue = (value) => {
+    try {
+      if (value instanceof ArrayBuffer) return true;
+    } catch {}
+    try {
+      if (typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer) return true;
+    } catch {}
+    return false;
+  };
+
+  // Element views never wrap: Bun prints every element of a typed array,
+  // DataView or ArrayBuffer on the opening line.
+  const typedArrayBody = (elements) => {
+    let out = "";
+    for (let i = 0; i < elements.length; i++) {
+      const element = elements[i];
+      out += `${i > 0 ? ", " : ""}${typeof element === "bigint" ? `${element}n` : String(element)}`;
+    }
+    return out;
+  };
+
+  const isPrimitiveLike = (value) =>
+    value === null || (typeof value !== "object" && typeof value !== "function");
+
+  // Bun keeps a short array whose first element is primitive on one line and
+  // otherwise fills lines up to an 80 column budget, rather than emitting one
+  // element per line.
+  const formatArrayLike = (value, seen, depth, indent, opts) => {
+    const length = value.length;
+    const inner = indent + 2;
+    const pad = " ".repeat(inner);
+    const parts = [];
+    let truncated = null;
+    let count = 0;
+    let emptyStart = null;
+    for (let i = 0; i < length; i++) {
+      if (!(i in value)) {
+        if (emptyStart === null) emptyStart = i;
+        continue;
+      }
+      if (emptyStart !== null) {
+        const emptyCount = i - emptyStart;
+        parts.push(emptyCount === 1 ? "empty item" : `${emptyCount} x empty items`);
+        emptyStart = null;
+      }
+      if (count >= 100) {
+        truncated = length - i;
+        break;
+      }
+      count += 1;
+      parts.push(formatValue(value[i], seen, depth + 1, inner, opts));
+    }
+    if (truncated === null && emptyStart !== null) {
+      const emptyCount = length - emptyStart;
+      parts.push(emptyCount === 1 ? "empty item" : `${emptyCount} x empty items`);
+    }
+
+    const multiline = truncated !== null ||
+      length > 10 ||
+      !isPrimitiveLike(0 in value ? value[0] : undefined) ||
+      parts.some((part) => part.includes("\n"));
+    if (!multiline) return `[ ${parts.join(", ")} ]`;
+
+    let out = `[\n${pad}`;
+    let column = inner;
+    for (let i = 0; i < parts.length; i++) {
+      if (i > 0) {
+        out += ",";
+        column += 1;
+        if (column > 80) {
+          out += `\n${pad}`;
+          column = inner;
+        } else {
+          out += " ";
+          column += 1;
+        }
+      }
+      out += parts[i];
+      column += parts[i].length;
+    }
+    if (truncated !== null) out += `,\n${pad}... ${truncated} more items`;
+    return `${out}\n${" ".repeat(indent)}]`;
+  };
+
   const formatValue = (value, seen, depth, indent, opts) => {
     switch (typeof value) {
       case "string": return JSON.stringify(value);
@@ -257,31 +344,30 @@ if (globalThis.console) {
     try {
       if (Array.isArray(value)) {
         if (value.length === 0) return "[]";
-        const pad = " ".repeat(indent + 2);
-        let out = "[\n";
-        let count = 0;
-        for (let i = 0; i < value.length; i++) {
-          if (!(i in value)) {
-            out += `${pad}empty item,\n`;
-          } else if (count >= 100) {
-            out += `${pad}... ${value.length - i} more items,\n`;
-            break;
-          } else {
-            out += `${pad}${formatValue(value[i], seen, depth + 1, indent + 2, opts)},\n`;
-          }
-          count++;
-        }
-        return `${out}${" ".repeat(indent)}]`;
+        return formatArrayLike(value, seen, depth, indent, opts);
       }
-      if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
-        const name = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(value), "constructor")?.value?.name ?? "TypedArray";
-        if (value.length === 0) return `${name}(0) []`;
-        const pad = " ".repeat(indent + 2);
-        let out = `${name}(${value.length}) [\n`;
-        for (let i = 0; i < value.length; i++) {
-          out += `${pad}${formatValue(value[i], seen, depth + 1, indent + 2, opts)},\n`;
-        }
-        return `${out}${" ".repeat(indent)}]`;
+      if (isBufferValue(value)) {
+        const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        let hex = "";
+        for (let i = 0; i < bytes.length && i < 50; i++) hex += `${i > 0 ? " " : ""}${bytes[i].toString(16).padStart(2, "0")}`;
+        const rest = bytes.length > 50 ? ` ... ${bytes.length - 50} more bytes` : "";
+        return bytes.length === 0 ? "<Buffer >" : `<Buffer ${hex}${rest}>`;
+      }
+      if (ArrayBuffer.isView(value)) {
+        const isView = value instanceof DataView;
+        const name = isView
+          ? "DataView"
+          : Object.getOwnPropertyDescriptor(Object.getPrototypeOf(value), "constructor")?.value?.name ?? "TypedArray";
+        const elements = isView ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : value;
+        if (elements.length === 0) return `${name}(0) []`;
+        return `${name}(${elements.length}) [ ${typedArrayBody(elements)} ]`;
+      }
+      if (isArrayBufferValue(value)) {
+        const shared = typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer;
+        const name = shared ? "SharedArrayBuffer" : "ArrayBuffer";
+        const bytes = new Uint8Array(value);
+        if (bytes.length === 0) return `${name}(0) []`;
+        return `${name}(${bytes.length}) [ ${typedArrayBody(bytes)} ]`;
       }
       if (value instanceof Map) {
         if (value.size === 0) return "Map {}";
@@ -392,11 +478,61 @@ if (globalThis.console) {
     return text;
   };
 
-  const writeConsole = (stream, args, substitutions, opts, separateError) => {
+  // console.error/console.warn of an Error report the throw site from the
+  // entry source rather than the generated bundle's frames, matching the
+  // full-runtime console.
+  const consoleErrorSource = (error) => {
+    const filename = String(globalThis.__filename ?? processObject?.argv?.[1] ?? "");
+    if (!filename || !error?.message) return undefined;
+    let lines;
+    try {
+      lines = String(cottontail.readFile(filename)).split(/\r?\n/);
+    } catch {
+      return undefined;
+    }
+    const quotedMessage = JSON.stringify(String(error.message));
+    const lineIndex = lines.findIndex((line) => line.includes(quotedMessage));
+    if (lineIndex < 0) return undefined;
+    const line = lines[lineIndex];
+    const plainError = String(error.name ?? "Error") === "Error";
+    const columnIndex = plainError
+      ? Math.max(0, line.lastIndexOf("Error("))
+      : Math.max(0, line.indexOf("new "));
+    return { filename, lines, lineIndex, column: columnIndex + 1, plainError };
+  };
+
+  const formatConsoleError = (error, level) => {
+    const source = consoleErrorSource(error);
+    if (!source) return undefined;
+    const name = String(error.name ?? "Error");
+    const message = String(error.message ?? "");
+    const lineNumber = source.lineIndex + 1;
+    const stack = `      at ${source.filename}:${lineNumber}:${source.column}\n      at loadAndEvaluateModule (2:1)`;
+    if (level === "warn") {
+      const heading = source.plainError ? `warn: ${message}` : `${name}: ${message}`;
+      return `${groupIndent}${heading}\n${stack}\n\n`;
+    }
+    const firstLine = Math.max(0, source.lineIndex - 5);
+    const excerpt = [];
+    for (let index = firstLine; index <= source.lineIndex; index += 1) {
+      excerpt.push(`${index === firstLine ? groupIndent : ""}${index + 1} | ${source.lines[index]}`);
+    }
+    excerpt.push(" ".repeat(String(lineNumber).length + 3 + source.column - 1) + "^");
+    excerpt.push(`${source.plainError ? "error" : name}: ${message}`);
+    excerpt.push(stack, "", "");
+    return excerpt.join("\n");
+  };
+
+  const writeConsole = (stream, args, substitutions, opts, separateError, level) => {
     // Single Error argument → formatted stack
     if (args.length === 1 && separateError) {
       try {
         if (args[0] instanceof Error) {
+          const formatted = formatConsoleError(args[0], level);
+          if (formatted !== undefined) {
+            stream?.write?.(formatted);
+            return;
+          }
           let name = "Error", message = "", stack = "";
           try { if (args[0].name != null) name = String(args[0].name); } catch {}
           try { if (args[0].message != null) message = String(args[0].message); } catch {}
@@ -419,8 +555,8 @@ if (globalThis.console) {
   console.log = (...args) => writeConsole(stdoutStream, args, true, undefined, false);
   console.info = console.log;
   console.debug = console.log;
-  console.error = (...args) => writeConsole(stderrStream, args, true, undefined, true);
-  console.warn = (...args) => writeConsole(stderrStream, args, true, undefined, true);
+  console.error = (...args) => writeConsole(stderrStream, args, true, undefined, true, "error");
+  console.warn = (...args) => writeConsole(stderrStream, args, true, undefined, true, "warn");
 
   console.write = (chunk = "") => {
     stdoutStream?.write?.(String(chunk));

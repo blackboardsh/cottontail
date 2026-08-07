@@ -4672,6 +4672,29 @@ function isBundledImportMetaBase(path) {
   return path === resolvedMainPath;
 }
 
+let generatedBundlePathsKey;
+let generatedBundlePaths;
+
+// The generated entry bundle is a real file on disk, so a stack frame that
+// still carries its path (runtime-module frames and bundler helpers have no
+// mapping back to a source that exists) must never be mistaken for the
+// requiring module. Its own path is advertised directly or as the adjacent
+// external source map.
+function isGeneratedBundlePath(path) {
+  const bundlePath = globalThis.__cottontailBundlePath;
+  const mapPath = globalThis.__cottontailBundleSourceMap;
+  const key = `${typeof bundlePath === "string" ? bundlePath : ""} ${typeof mapPath === "string" ? mapPath : ""}`;
+  if (generatedBundlePathsKey !== key) {
+    generatedBundlePathsKey = key;
+    generatedBundlePaths = new Set();
+    if (typeof bundlePath === "string" && bundlePath !== "") generatedBundlePaths.add(bundlePath);
+    if (typeof mapPath === "string" && mapPath.endsWith(".map")) {
+      generatedBundlePaths.add(mapPath.slice(0, -".map".length));
+    }
+  }
+  return generatedBundlePaths.has(path);
+}
+
 function bundledCallerPathFromStack() {
   const stack = String(new Error().stack || "");
   for (const line of stack.split("\n").slice(2)) {
@@ -4690,6 +4713,7 @@ function bundledCallerPathFromStack() {
     }
     const candidate = isAbsolute(frame) ? frame : resolve(cottontail.cwd(), frame);
     if (/[\\/]node[\\/]module\.js$/.test(candidate)) continue;
+    if (isGeneratedBundlePath(candidate)) continue;
     if (isFile(candidate)) return candidate;
   }
   return null;
