@@ -485,6 +485,35 @@ function requestPath(url, options = undefined) {
   return `${url.pathname || "/"}${url.search || ""}`;
 }
 
+// COTTONTAIL-COMPAT: https-proxy-agent keeps the TLS settings it was
+// constructed with on `agent.connectOpts` and only forwards the per-request
+// options to the tunnelled `tls.connect`. Bun folds `agent.connectOpts` into
+// the request's TLS options at the lowest priority, so the same credentials
+// reach the target upgrade. Only TLS-shaped keys are copied; `connectOpts`
+// also carries the proxy's own host/port, which must never leak here.
+const AGENT_CONNECT_TLS_KEYS = [
+  "rejectUnauthorized",
+  "ca",
+  "cert",
+  "key",
+  "passphrase",
+  "ciphers",
+  "secureOptions",
+  "checkServerIdentity",
+];
+
+function agentConnectTlsOptions(agent) {
+  const connectOpts = agent?.connectOpts;
+  if (connectOpts == null || typeof connectOpts !== "object") return undefined;
+  let inherited;
+  for (const name of AGENT_CONNECT_TLS_KEYS) {
+    const value = connectOpts[name];
+    if (value === undefined) continue;
+    (inherited ??= {})[name] = value;
+  }
+  return inherited;
+}
+
 function normalizeListenArgs(args) {
   const list = Array.from(args);
   const callback = typeof list[list.length - 1] === "function" ? list.pop() : undefined;
@@ -3038,6 +3067,7 @@ export class ClientRequest extends OutgoingMessage {
     const secure = this.protocol === "https:";
     const defaultPort = secure ? 443 : 80;
     const requestOptions = {
+      ...agentConnectTlsOptions(this.agent),
       ...this._options,
       protocol: this.protocol,
       secureEndpoint: secure,
