@@ -658,13 +658,19 @@ function correctCallerLocations(sites) {
     const callee = sites[index - 1].functionName;
     const caller = sites[index];
     if (!callee || !caller.fileName || !Number.isFinite(caller.lineNumber)) continue;
+    // Dynamically evaluated sources have no source map, so Bun reports their
+    // frames at the raw JSC positions rather than at the call expression.
+    if (dynamicSources.has(caller.fileName)) continue;
     const context = bundleSourceContextForLocation(caller.fileName, caller.lineNumber, caller.columnNumber);
-    if (!Array.isArray(context?.lines)) continue;
-    const target = Math.max(0, Math.min(context.lines.length - 1, Number(context.line ?? caller.lineNumber) - 1));
+    // Frames whose file is not part of the bundle (dynamically evaluated
+    // sources, plain scripts) still have readable source lines.
+    const lines = Array.isArray(context?.lines) ? context.lines : frameSourceLines(caller.fileName);
+    if (!Array.isArray(lines)) continue;
+    const target = Math.max(0, Math.min(lines.length - 1, Number(context?.line ?? caller.lineNumber) - 1));
     const escaped = callee.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const invocation = new RegExp(`\\b${escaped}\\s*\\(`);
     for (let sourceIndex = target; sourceIndex >= Math.max(0, target - 12); sourceIndex -= 1) {
-      const sourceLine = context.lines[sourceIndex];
+      const sourceLine = lines[sourceIndex];
       const match = invocation.exec(sourceLine);
       if (!match || new RegExp(`\\b(?:function|class)\\s+${escaped}\\b`).test(sourceLine)) continue;
       caller.lineNumber = sourceIndex + 1;
@@ -689,12 +695,91 @@ function evalSourceURLFromCallSites(sites) {
   return null;
 }
 
+// Direct `eval` is a syntactic form, so there is no hook that could record the
+// evaluated text. JSC also drops the URL of eval'd frames entirely in this
+// embedding ("hello@" with no location at all), which leaves the source
+// literal in the calling file as the only place the text and the
+// `//# sourceURL` name can still be recovered from.
+function dynamicEvalSourceNearLine(fileName, lineNumber) {
+  const lines = frameSourceLines(fileName);
+  if (!Array.isArray(lines)) return null;
+  const text = lines.join("\n");
+  const anchor = Number.isFinite(lineNumber) ? lineNumber : 1;
+  const pattern = /(?:\/\/|\/\*)[#@]\s*sourceURL\s*=\s*([^\s*`'"}\r\n]+)/g;
+  let best = null;
+  for (let match; (match = pattern.exec(text)) !== null;) {
+    const open = text.lastIndexOf("`", match.index);
+    const close = text.indexOf("`", match.index);
+    if (open < 0 || close < 0) continue;
+    const source = text.slice(open + 1, close);
+    const startLine = text.slice(0, open).split("\n").length;
+    const distance = Math.abs(startLine - anchor);
+    if (best === null || distance < best.distance) best = { name: match[1], source, distance };
+  }
+  return best;
+}
+
+// Frames of directly eval'd code arrive with no file, line or column at all,
+// followed by the native `eval` frame and then the calling frame. Recover the
+// `//# sourceURL` name and the evaluated text from the caller's source so the
+// frames (and code frames rendered from them) name the eval'd script the way
+// Bun does.
+function resolveDynamicEvalFrames(sites, evalPosition) {
+  let boundary = 0;
+  while (boundary < sites.length && !sites[boundary].fileName) boundary += 1;
+  if (boundary === 0 || boundary >= sites.length) return;
+  const evalSite = sites[boundary];
+  if (!evalSite.nativeFrame || !evalSite.evalFrame) return;
+  const caller = sites[boundary + 1];
+  if (!caller?.fileName) return;
+  const found = dynamicEvalSourceNearLine(caller.fileName, caller.lineNumber);
+  if (!found) return;
+  globalThis.__cottontailRegisterDynamicSource(found.name, found.source);
+  const lines = found.source.split(/\r?\n/);
+  for (let index = 0; index < boundary; index += 1) sites[index].fileName = found.name;
+  const top = sites[0];
+  if (Number.isFinite(Number(evalPosition?.line))) {
+    top.lineNumber = Number(evalPosition.line);
+    top.columnNumber = Number(evalPosition.column);
+  }
+  // The remaining eval'd frames only have a function name; locate the call to
+  // the frame above them in the evaluated source, which is where JSC would
+  // have reported them (at the call's open paren).
+  for (let index = 1; index < boundary; index += 1) {
+    const callee = sites[index - 1].functionName;
+    if (!callee || !/^[A-Za-z_$][\w$]*$/.test(callee)) continue;
+    const invocation = new RegExp(`\\b${callee}\\s*\\(`);
+    for (let line = 0; line < lines.length; line += 1) {
+      if (new RegExp(`\\b(?:function|class)\\s+${callee}\\b`).test(lines[line])) continue;
+      const match = invocation.exec(lines[line]);
+      if (!match) continue;
+      sites[index].lineNumber = line + 1;
+      sites[index].columnNumber = match.index + match[0].length;
+      break;
+    }
+  }
+}
+
 const frameSourceLinesCache = new Map();
+
+// Source text of code that was evaluated rather than loaded from disk (vm
+// scripts, `//# sourceURL` eval), keyed by the name its stack frames use.
+// node:vm registers entries here so code frames can be rendered for them.
+const dynamicSources = new Map();
+const dynamicCallSitesSymbol = Symbol("cottontail.callSites");
+globalThis.__cottontailRegisterDynamicSource ??= (sourceName, source) => {
+  if (typeof sourceName !== "string" || sourceName === "" || typeof source !== "string") return;
+  if (dynamicSources.size > 64 && !dynamicSources.has(sourceName)) dynamicSources.clear();
+  dynamicSources.set(sourceName, source);
+  frameSourceLinesCache.delete(sourceName);
+};
 
 // Source lines for a stack frame's file, preferring the bundle source map's
 // embedded original sources and falling back to reading the file from disk.
 function frameSourceLines(fileName) {
   if (typeof fileName !== "string" || fileName === "") return null;
+  const dynamic = dynamicSources.get(fileName);
+  if (dynamic !== undefined) return dynamic.split(/\r?\n/);
   if (frameSourceLinesCache.has(fileName)) return frameSourceLinesCache.get(fileName);
   if (frameSourceLinesCache.size > 64) frameSourceLinesCache.clear();
   let lines = null;
@@ -720,6 +805,9 @@ function frameSourceLines(fileName) {
 // the source near the reported position.
 function reanchorTopFrame(site, pattern, columnOf, message = undefined) {
   if (!site?.fileName || !Number.isFinite(site.lineNumber)) return;
+  // Dynamically evaluated sources are not transpiled, so JSC's position is
+  // already the one Bun reports.
+  if (dynamicSources.has(site.fileName)) return;
   const lines = frameSourceLines(site.fileName);
   if (!Array.isArray(lines)) return;
   // When the error message appears verbatim in the source it disambiguates
@@ -774,7 +862,7 @@ function reanchorTopFrameOnCaptureStackTrace(site) {
   );
 }
 
-const parseCallSites = (stack, fallbackSourceURL = undefined) => {
+const parseCallSites = (stack, fallbackSourceURL = undefined, evalPosition = undefined) => {
   const sites = String(stack ?? "").split("\n").filter(Boolean).map((line) => {
     const separator = line.indexOf("@");
     let functionName = separator < 0 ? line : line.slice(0, separator);
@@ -806,6 +894,7 @@ const parseCallSites = (stack, fallbackSourceURL = undefined) => {
       constructorFrame: constructorName !== null,
     });
   });
+  resolveDynamicEvalFrames(sites, evalPosition);
   correctCallerLocations(sites);
   const hasEvalFrames = sites.slice(0, 3).some(site => site.evalFrame || site.nativeFrame);
   const evalSourceURL = evalSourceURLFromCallSites(sites);
@@ -837,8 +926,8 @@ const parseCallSites = (stack, fallbackSourceURL = undefined) => {
   return visible;
 };
 
-function limitedCallSites(stack, fallbackSourceURL = undefined, configuredLimit = Error.stackTraceLimit) {
-  let sites = parseCallSites(stack, fallbackSourceURL);
+function limitedCallSites(stack, fallbackSourceURL = undefined, configuredLimit = Error.stackTraceLimit, evalPosition = undefined) {
+  let sites = parseCallSites(stack, fallbackSourceURL, evalPosition);
   sites = sites.filter((site) => {
     const f = site.file ?? site.getFileName?.() ?? "";
     return !(f.includes("runtime_modules/bun/index.js") || f.includes(".cottontail-embedded-runtime") || f.includes("/src/runtime_modules/") || f.includes(".cottontail-tmp") || f.includes("cottontail:") || f.includes("cottontail-direct-entry"));
@@ -977,7 +1066,11 @@ function installNodeStyleErrorConstructor(name) {
             // caller file names).
             const prepare = Error.prepareStackTrace;
             const remappedStack = ctRemapStackString(rawStack);
-            const callSites = limitedCallSites(remappedStack, generatedPosition.sourceURL);
+            const callSites = limitedCallSites(
+              remappedStack, generatedPosition.sourceURL, Error.stackTraceLimit, generatedPosition);
+            try {
+              Object.defineProperty(error, dynamicCallSitesSymbol, { configurable: true, value: callSites });
+            } catch {}
             reanchorTopFrameOnConstructor(callSites[0], error.constructor?.name ?? name, error.message);
             if (typeof prepare === "function") {
               if (prepareStackTraceRecursionGuard) {
@@ -1081,8 +1174,31 @@ if (Error.prepareStackTrace === undefined) {
   Error.prepareStackTrace = defaultPrepareStackTrace;
 }
 
+// JSC names the top-level frame of a program "global code" (and of a direct
+// eval "eval code"); Bun renders the former with no function name at all and
+// the latter as "eval".
+function bunStackFrameText(site) {
+  const functionName = site.getFunctionName?.() ?? site.functionName ?? null;
+  if (functionName === "global code" || functionName === "module code") {
+    const fileName = site.getFileName?.() ?? site.fileName ?? null;
+    if (!fileName) return "at <anonymous> (unknown)";
+    const line = site.getLineNumber?.() ?? site.lineNumber;
+    const column = site.getColumnNumber?.() ?? site.columnNumber;
+    return `at ${fileName}${line == null ? "" : `:${line}${column == null ? "" : `:${column}`}`}`;
+  }
+  if (functionName === "eval code") {
+    const clone = new CottontailCallSite(site);
+    clone.functionName = "eval";
+    return `at ${clone.toString()}`;
+  }
+  return `at ${site.toString()}`;
+}
+
 // Shared hooks so other runtime modules (uncaught-error printing, test
 // reporters) can remap bundle stack positions without importing this module.
+globalThis.__cottontailBunStackFrames ??= (stack, fallbackSourceURL = undefined) =>
+  limitedCallSites(ctRemapStackString(stack), fallbackSourceURL, Infinity);
+globalThis.__cottontailBunStackFrameText ??= bunStackFrameText;
 globalThis.__cottontailRemapStackString ??= ctRemapStackString;
 globalThis.__cottontailRemapPosition ??= remapBundlePosition;
 globalThis.__cottontailSourceContextForLocation ??= bundleSourceContextForLocation;
@@ -8363,6 +8479,61 @@ function bunInspectBuildMessageDiagnostic(error) {
   return output;
 }
 
+// Errors raised inside a vm context come from a sibling JSC realm whose Error
+// intrinsic never passes through the host stack machinery, so their `.stack`
+// is still a raw JSC trace ("hello@hellohello.js:4:33"). Their frames point at
+// a dynamically evaluated source registered by node:vm rather than a file on
+// disk, which is where the code frame has to come from.
+function bunInspectDynamicSourceDiagnostic(error) {
+  if (error === null || typeof error !== "object") return null;
+  if (Object.prototype.toString.call(error) !== "[object Error]") return null;
+  let rawStack;
+  // Reading `.stack` marks the error as "stack was accessed", which changes how
+  // the ordinary diagnostic renders frames; probing here must stay invisible.
+  const stackWasAccessed = bunAccessedErrorStacks.has(error);
+  try { rawStack = error.stack; } catch { return null; } finally {
+    if (!stackWasAccessed) bunAccessedErrorStacks.delete(error);
+  }
+  let sites = error[dynamicCallSitesSymbol];
+  if (!Array.isArray(sites)) {
+    // Errors raised inside a vm context come from a sibling JSC realm whose
+    // Error intrinsic never passes through the host stack machinery, so their
+    // `.stack` is still a raw JSC trace ("hello@hellohello.js:4:33").
+    if (typeof rawStack !== "string" || rawStack === "" || /^\s*at /m.test(rawStack)) return null;
+    sites = limitedCallSites(ctRemapStackString(rawStack), undefined, Infinity);
+  }
+  sites = sites.filter(site => site.fileName !== "node:vm" && !site.nativeFrame);
+  const top = sites[0];
+  const source = top ? dynamicSources.get(top.fileName) : undefined;
+  if (source === undefined || !Number.isFinite(top.lineNumber)) return null;
+  const lines = source.split(/\r?\n/);
+  const sourceLine = lines[top.lineNumber - 1];
+  if (sourceLine == null) return null;
+  // JSC reports the position of the `(` in `new Error(...)`; Bun's diagnostic
+  // points at the start of the whole construction expression.
+  let column = Number.isFinite(top.columnNumber) ? top.columnNumber : 1;
+  const constructions = /\bnew\s+[A-Za-z_$][\w$.]*\s*\(/g;
+  for (let match; (match = constructions.exec(sourceLine)) !== null;) {
+    if (match.index + match[0].length === column) {
+      column = match.index + 1;
+      break;
+    }
+  }
+  const caret = " ".repeat(String(top.lineNumber).length + 3 + Math.max(0, column - 1)) + "^";
+  const name = error.name === undefined ? "Error" : String(error.name);
+  const label = name === "Error" ? "error" : name;
+  const message = error.message === undefined || error.message === null ? "" : String(error.message);
+  const frames = sites
+    .map((site, index) => {
+      if (index !== 0) return `      ${bunStackFrameText(site)}`;
+      const clone = new CottontailCallSite(site);
+      clone.columnNumber = column;
+      return `      ${bunStackFrameText(clone)}`;
+    })
+    .join("\n");
+  return `${top.lineNumber} | ${sourceLine}\n${caret}\n${label}: ${message}\n${frames}\n`;
+}
+
 function bunInspectErrorDiagnostic(error, ctx = undefined) {
   const stackWasAccessed = bunAccessedErrorStacks.has(error);
   let stack;
@@ -8691,11 +8862,19 @@ function bunStyleInspect(value, ctx, indent, seen, depth) {
       seen.delete(value);
     }
   }
+  if (!(value instanceof Error) && typeof custom !== "function") {
+    const realmDiagnostic = bunInspectDynamicSourceDiagnostic(value);
+    if (realmDiagnostic !== null) return realmDiagnostic;
+  }
   if (value instanceof Error && value.__cottontailBunExpectation &&
       typeof globalThis.__cottontailInspectBunExpectationError === "function") {
     return globalThis.__cottontailInspectBunExpectationError(value, ctx.colors);
   }
   if (value instanceof Error && typeof custom !== "function") {
+    // Frames in a `//# sourceURL` eval name a source that only exists in
+    // memory; its diagnostic has to come from the recovered text.
+    const evalDiagnostic = bunInspectDynamicSourceDiagnostic(value);
+    if (evalDiagnostic !== null) return evalDiagnostic;
     if (value?.[dynamicErrorSourceSymbol]?.source != null) {
       return bunInspectDynamicErrorSource(value, nodeInspect(value, bunInspectNodeOptions(ctx, depth)));
     }

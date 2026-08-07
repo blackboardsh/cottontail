@@ -346,15 +346,82 @@ function runCodeInContextFallback(code, context, options = undefined) {
   return runner.call(context, scope, context);
 }
 
-function runCodeInContext(code, context, options = undefined) {
+// Dynamically evaluated sources have no file on disk, so the diagnostics
+// machinery in bun/index.js (code frames, `frameSourceLines`) can only render
+// them when the runner hands over the text keyed by the name the frames use.
+function registerDynamicSource(sourceName, source) {
+  try {
+    globalThis.__cottontailRegisterDynamicSource?.(sourceName, source);
+  } catch {}
+}
+
+// Errors that escape a vm script carry a raw JSC stack ("global code@url:l:c")
+// captured in the sibling realm, whose Error intrinsic never goes through the
+// host's Bun-compatible stack formatting. Bun renders these as
+//
+//   <filename>:<line>
+//   Error: <message>
+//       at <vm frames>
+//       at <apiName> (unknown)
+//       at <host frames>
+//
+// where <filename> is the vm filename option (not the `//# sourceURL` name).
+function annotateVmError(error, sourceName, filename, apiName) {
+  if (error === null || typeof error !== "object") return error;
+  let rawStack;
+  try {
+    rawStack = error.stack;
+  } catch {
+    return error;
+  }
+  if (typeof rawStack !== "string" || rawStack === "" || /^\s*at /m.test(rawStack)) return error;
+  const allFrames = globalThis.__cottontailBunStackFrames?.(rawStack);
+  const frameText = globalThis.__cottontailBunStackFrameText;
+  if (!Array.isArray(allFrames) || typeof frameText !== "function") return error;
+  // This module's own frames stand in for Bun's native vm entry point.
+  const frames = allFrames.filter(site => site.getFileName?.() !== "node:vm");
+  const rendered = frames.map(site => `    ${frameText(site)}`);
+  // The host's native vm entry point sits between the vm frames and the host
+  // frames; Bun surfaces it with no location.
+  let boundary = 0;
+  while (boundary < frames.length && frames[boundary].getFileName?.() === sourceName) boundary += 1;
+  rendered.splice(boundary, 0, `    at ${apiName} (unknown)`);
+  let name;
+  let message;
+  try {
+    name = error.name === undefined ? "Error" : String(error.name);
+    message = error.message === undefined || error.message === null ? "" : String(error.message);
+  } catch {
+    return error;
+  }
+  const header = message === "" ? name : `${name}: ${message}`;
+  const line = Number(error.line);
+  const location = Number.isFinite(line) && line > 0 ? `${filename}:${line}\n` : "";
+  try {
+    Object.defineProperty(error, "stack", {
+      configurable: true,
+      enumerable: false,
+      writable: true,
+      value: `${location}${header}\n${rendered.join("\n")}`,
+    });
+  } catch {}
+  return error;
+}
+
+function runCodeInContext(code, context, options = undefined, apiName = "runInContext") {
   const handle = contextHandles.get(context);
   if (handle !== undefined && typeof vmHost?.vmRunInContext === "function") {
     const { filename } = normalizeRunOptions(options);
     const source = String(code);
     const sourceName = sourceURLFromCode(source) ?? filename ?? "evalmachine.<anonymous>";
+    registerDynamicSource(sourceName, source);
     let result;
     try {
-      result = vmHost.vmRunInContext(handle, context, source, sourceName);
+      try {
+        result = vmHost.vmRunInContext(handle, context, source, sourceName);
+      } catch (error) {
+        throw annotateVmError(error, sourceName, filename ?? "evalmachine.<anonymous>", apiName);
+      }
     } finally {
       // vmRunInContext imports the host sandbox and immediately exports the
       // resulting VM state. Keep that VM-side snapshot separate from later
@@ -402,7 +469,7 @@ export function runInContext(code, contextifiedObject, options = undefined) {
 
 export function runInNewContext(code, contextObject = {}, options = undefined) {
   const context = isContext(contextObject) ? contextObject : createContext(contextObject ?? {});
-  return runCodeInContext(code, context, options);
+  return runCodeInContext(code, context, options, "runInNewContext");
 }
 
 const kCachedDataPrefix = "cottontail-vm-bytecode-v1:";
