@@ -8496,7 +8496,7 @@ fn scanDynamicImports(
             }
         }
         if (!std.mem.startsWith(u8, source[cursor..], "import") or
-            (cursor > 0 and (isIdentifierPart(source[cursor - 1]) or source[cursor - 1] == '#' or source[cursor - 1] == '.')) or
+            (cursor > 0 and (isIdentifierPart(source[cursor - 1]) or source[cursor - 1] == '#' or source[cursor - 1] == '.' or source[cursor - 1] == '@')) or
             (cursor + "import".len < source.len and isIdentifierPart(source[cursor + "import".len])))
         {
             cursor += 1;
