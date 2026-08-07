@@ -60,6 +60,7 @@ let unhandledRejectionCaptureInstalled = false;
 let asyncFailureGuardsInstalled = false;
 let currentSuite;
 let activeExecution = null;
+let nodeTestStartRunHookInstalled = false;
 let runScheduled = false;
 let runnerActive = false;
 let runAgain = false;
@@ -1932,12 +1933,27 @@ function scheduleRun() {
   }
   installUncaughtCapture();
   installAsyncFailureGuards();
-  // COTTONTAIL-COMPAT: a test file with top-level await suspends mid-module,
-  // which drains the microtask queue. Starting the runner there would make any
-  // registration after the await look like it happened inside a running test.
-  // The loader clears this flag and re-enters through the startTestRun hook
-  // once every module finished evaluating.
-  if (globalThis.__cottontailLoadingTestModules === true) return;
+  // COTTONTAIL-COMPAT: under the bun-test CLI, a test file with top-level
+  // await suspends mid-module, which drains the microtask queue. Starting the
+  // runner there would make any registration after the await look like it
+  // happened inside a running test, so defer until the loader clears the flag
+  // and re-enters through the startTestRun hook. This MUST stay scoped to CLI
+  // mode: standalone node:test allows `await test(...)` at module top level,
+  // where the runner has to start while the module is still evaluating —
+  // gating there deadlocks the file (run waits on module end, module end
+  // waits on the run).
+  if (globalThis.__cottontailLoadingTestModules === true && testCliModeEnabled()) {
+    if (!nodeTestStartRunHookInstalled) {
+      nodeTestStartRunHookInstalled = true;
+      const hookKey = Symbol.for("cottontail.internal.startTestRun");
+      const prior = globalThis[hookKey];
+      globalThis[hookKey] = () => {
+        if (typeof prior === "function") prior();
+        scheduleRun();
+      };
+    }
+    return;
+  }
   if (runnerActive) {
     runAgain = true;
     return;
