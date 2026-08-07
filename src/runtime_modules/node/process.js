@@ -1337,7 +1337,7 @@ function makeReport() {
 }
 
 const cottontailExecPath = cottontail.execPath?.() ?? "cottontail";
-const cottontailArgv = Array.isArray(cottontail.argv) ? [...cottontail.argv] : [cottontailExecPath, ...(cottontail.args || [])];
+const cottontailArgv = Array.isArray(cottontail.argv) ? cottontail.argv : [cottontailExecPath, ...(cottontail.args || [])];
 if (cottontailArgv.length === 0) cottontailArgv.push(cottontailExecPath);
 if (cottontailArgv[0] === "cottontail") {
   cottontailArgv[0] = globalThis.__cottontailStandaloneFlags == null ? cottontailExecPath : "bun";
