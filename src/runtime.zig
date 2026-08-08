@@ -2,6 +2,28 @@ const std = @import("std");
 const builtin = @import("builtin");
 const host = @import("host.zig");
 const standalone_executable = @import("standalone_executable.zig");
+const cottontail_version = @import("version.zig").version;
+
+// Bun ends an uncaught run-mode error report with "\n\nBun v<v> (<os> <arch>)".
+// Cottontail prints its own product-identity analog. Platform names mirror
+// Bun's lowercase style (macos/linux/windows).
+const crash_footer_platform = switch (builtin.os.tag) {
+    .macos => "macos",
+    .linux => "linux",
+    .windows => "windows",
+    else => "unknown",
+};
+const crash_footer_arch = switch (builtin.cpu.arch) {
+    .aarch64 => "arm64",
+    .x86_64 => "x64",
+    .x86 => "x86",
+    else => "unknown",
+};
+// One leading newline here: writeStderrLine already terminated the message
+// with "\n", so this yields the "\n\n" blank-line separator Bun uses before
+// the footer, then the footer line, then a trailing newline.
+const crash_footer = "\nCottontail v" ++ cottontail_version ++
+    " (" ++ crash_footer_platform ++ " " ++ crash_footer_arch ++ ")\n";
 
 const c = @cImport({
     @cInclude("jsc_runner.h");
@@ -70,6 +92,9 @@ pub const Runtime = struct {
     handle: *c.CtJscRuntime,
     max_script_size: usize = 64 * 1024 * 1024,
     max_bytecode_size: usize = 128 * 1024 * 1024,
+    // Set for `cottontail test`: the bun:test reporter owns failure output, so
+    // the run-mode crash footer must be suppressed.
+    test_runtime: bool = false,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator) !Runtime {
         return initWithStackSize(io, allocator, 0);
@@ -151,6 +176,7 @@ pub const Runtime = struct {
     }
 
     pub fn setTestRuntimeExecution(self: *Runtime) !void {
+        self.test_runtime = true;
         try self.evalImmediate(
             "globalThis.__cottontailBunTestRuntime = true;",
             "cottontail:test-runtime-bootstrap",
@@ -397,11 +423,15 @@ pub const Runtime = struct {
             };
 
             if (eval_status == -13) return 13;
-            if (eval_error != null) {
-                self.writeStderrLine(errorSpan(eval_error));
-            } else {
-                self.writeStderrLine("Unknown JavaScript exception");
-            }
+            // Message and the product-identity crash footer (matching Bun's
+            // trailing "Bun v<v> (<os> <arch>)") share one writer: a second
+            // File.stderr().writer() would rewrite a regular-file stderr from
+            // offset 0 and corrupt the report. The footer is run-mode only;
+            // `cottontail test` surfaces failures through the bun:test reporter.
+            self.writeStderrCrash(
+                if (eval_error != null) errorSpan(eval_error) else "Unknown JavaScript exception",
+                !self.test_runtime,
+            );
 
             const routed_fatal = ct_jsc_runtime_had_fatal_exception(self.handle) != 0;
             const shutdown_status = self.emitProcessShutdown(false);
@@ -727,6 +757,16 @@ pub const Runtime = struct {
         const stderr = &stderr_writer.interface;
 
         stderr.print("{s}\n", .{message}) catch {};
+        stderr.flush() catch {};
+    }
+
+    fn writeStderrCrash(self: *Runtime, message: []const u8, with_footer: bool) void {
+        var stderr_buffer: [1024]u8 = undefined;
+        var stderr_writer = std.Io.File.stderr().writer(self.io, &stderr_buffer);
+        const stderr = &stderr_writer.interface;
+
+        stderr.print("{s}\n", .{message}) catch {};
+        if (with_footer) stderr.writeAll(crash_footer) catch {};
         stderr.flush() catch {};
     }
 };
