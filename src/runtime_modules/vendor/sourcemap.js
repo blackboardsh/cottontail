@@ -1037,6 +1037,126 @@ function remapAdjacentBundleFrames(stack) {
   });
 }
 
+const FRAME_KEYWORDS = new Set([
+  "abstract", "async", "await", "break", "case", "catch", "class", "const",
+  "continue", "debugger", "default", "delete", "do", "else", "enum", "export",
+  "extends", "false", "finally", "for", "from", "function", "get", "if",
+  "implements", "import", "in", "instanceof", "interface", "let", "new", "null",
+  "of", "package", "private", "protected", "public", "return", "set", "static",
+  "super", "switch", "this", "throw", "true", "try", "typeof", "undefined",
+  "var", "void", "while", "with", "yield",
+]);
+
+// Colorize a single source line for the uncaught-error code frame, mirroring
+// Bun's highlighted frame under FORCE_COLOR. This is best-effort: it never
+// throws and falls back to the raw text. Beyond cosmetics, inserting escapes
+// between tokens (e.g. `JSON` / `.stringify`) matches Bun's observable output,
+// which tools depend on when scanning highlighted frames.
+function highlightFrameLine(text) {
+  const RESET = "\x1b[0m";
+  const KEYWORD = "\x1b[35m";
+  const STRING = "\x1b[32m";
+  const NUMBER = "\x1b[33m";
+  const COMMENT = "\x1b[2m";
+  const PROPERTY = "\x1b[36m";
+  const isIdentStart = (c) => c === "_" || c === "$" || (c >= "a" && c <= "z") || (c >= "A" && c <= "Z");
+  const isIdentPart = (c) => isIdentStart(c) || (c >= "0" && c <= "9");
+  const isDigit = (c) => c >= "0" && c <= "9";
+  try {
+    let out = "";
+    let i = 0;
+    let lastSignificant = "";
+    const n = text.length;
+    while (i < n) {
+      const c = text[i];
+      // Comments
+      if (c === "/" && text[i + 1] === "/") {
+        out += COMMENT + text.slice(i) + RESET;
+        break;
+      }
+      if (c === "/" && text[i + 1] === "*") {
+        const end = text.indexOf("*/", i + 2);
+        const stop = end === -1 ? n : end + 2;
+        out += COMMENT + text.slice(i, stop) + RESET;
+        i = stop;
+        continue;
+      }
+      // Strings and template literals
+      if (c === '"' || c === "'" || c === "`") {
+        const quote = c;
+        let j = i + 1;
+        let segment = c;
+        while (j < n) {
+          const cj = text[j];
+          if (cj === "\\") { segment += cj + (text[j + 1] ?? ""); j += 2; continue; }
+          if (quote === "`" && cj === "$" && text[j + 1] === "{") {
+            // Close the string run, highlight the interpolated expression,
+            // then resume the template string after the matching brace.
+            out += STRING + segment + RESET;
+            let depth = 1;
+            let k = j + 2;
+            while (k < n && depth > 0) {
+              if (text[k] === "{") depth += 1;
+              else if (text[k] === "}") depth -= 1;
+              if (depth === 0) break;
+              k += 1;
+            }
+            out += "${" + highlightFrameLine(text.slice(j + 2, k)) + (k < n ? "}" : "");
+            j = k + 1;
+            segment = "";
+            continue;
+          }
+          segment += cj;
+          if (cj === quote) { j += 1; break; }
+          j += 1;
+        }
+        out += STRING + segment + RESET;
+        i = j;
+        lastSignificant = quote;
+        continue;
+      }
+      // Numbers
+      if (isDigit(c) || (c === "." && isDigit(text[i + 1]) && lastSignificant !== ")" && !isIdentPart(lastSignificant))) {
+        let j = i;
+        while (j < n && (isIdentPart(text[j]) || text[j] === "." )) j += 1;
+        out += NUMBER + text.slice(i, j) + RESET;
+        i = j;
+        lastSignificant = text[j - 1];
+        continue;
+      }
+      // Identifiers / keywords / properties
+      if (isIdentStart(c)) {
+        let j = i;
+        while (j < n && isIdentPart(text[j])) j += 1;
+        const word = text.slice(i, j);
+        if (FRAME_KEYWORDS.has(word)) {
+          out += KEYWORD + word + RESET;
+        } else if (lastSignificant === ".") {
+          out += PROPERTY + word + RESET;
+        } else {
+          out += word;
+        }
+        i = j;
+        lastSignificant = word[word.length - 1];
+        continue;
+      }
+      out += c;
+      if (c !== " " && c !== "\t") lastSignificant = c;
+      i += 1;
+    }
+    return out;
+  } catch {
+    return text;
+  }
+}
+
+function frameColorsEnabled() {
+  const env = globalThis.process?.env;
+  if (env?.FORCE_COLOR !== undefined) return env.FORCE_COLOR !== "0";
+  if (env?.NO_COLOR !== undefined || env?.NODE_DISABLE_COLORS !== undefined) return false;
+  return Boolean(globalThis.process?.stderr?.isTTY);
+}
+
 export function formatUncaughtBundleError(error) {
   try {
     const stack = remapStackString(String(error?.stack ?? ""));
@@ -1061,13 +1181,36 @@ export function formatUncaughtBundleError(error) {
       if (!frame) continue;
       const context = sourceContextForLocation(frame[1], Number(frame[2]), Number(frame[3]));
       if (!context || !Array.isArray(context.lines)) continue;
-      const line = Number(context.line);
-      const column = Number(context.column);
+      let line = Number(context.line);
+      let column = Number(context.column);
       if (!Number.isFinite(line) || !Number.isFinite(column)) continue;
+      // Anchor the code frame on the site where the Error was constructed, the
+      // way Bun does (its `error.stack[0]` is the `new Error(...)` call). When a
+      // multi-line construction spans several source lines, the frame position
+      // cottontail records can land on a later line (e.g. the following `throw`
+      // or a closing `)}`), producing a wide window that spills the tail of the
+      // construction. If the anchored line does not already name the
+      // construction but a nearby preceding line does, re-anchor to it.
+      const anchoredLine = context.lines[line - 1] ?? "";
+      const errorCtor = String(error?.name ?? "Error").replace(/[^A-Za-z0-9_$]/g, "");
+      const ctorPattern = new RegExp(`\\bnew\\s+(${errorCtor}|(?:Aggregate|Eval|Range|Reference|Syntax|Type|URI)?Error)\\b`);
+      if (errorCtor && !ctorPattern.test(anchoredLine)) {
+        for (let candidate = line; candidate >= Math.max(1, line - 6); candidate -= 1) {
+          const text = context.lines[candidate - 1] ?? "";
+          const match = ctorPattern.exec(text);
+          if (match) {
+            line = candidate;
+            column = match.index + match[0].lastIndexOf(match[1]) + 1;
+            break;
+          }
+        }
+      }
       const start = Math.max(1, line - 5);
       const codeFrame = [];
+      const colorize = frameColorsEnabled();
       for (let sourceLine = start; sourceLine <= line && sourceLine <= context.lines.length; sourceLine += 1) {
-        codeFrame.push(`${sourceLine} | ${context.lines[sourceLine - 1]}`);
+        const raw = context.lines[sourceLine - 1] ?? "";
+        codeFrame.push(`${sourceLine} | ${colorize ? highlightFrameLine(raw) : raw}`);
       }
       codeFrame.push(`${" ".repeat(String(line).length + 3 + Math.max(0, column - 1))}^`);
       const errorName = String(error?.name ?? "Error");
