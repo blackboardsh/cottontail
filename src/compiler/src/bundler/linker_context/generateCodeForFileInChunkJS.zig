@@ -456,10 +456,10 @@ pub fn generateCodeForFileInChunkJS(
                 // Each `var` declaration gets its own symbol (with a distinct
                 // ref) even when several redeclare the same name in one scope,
                 // so redeclarations are matched by the (shared) original name.
-                var redeclared_var_names: std.StringHashMapUnmanaged(void) = .empty;
+                var redeclared_var_names: bun.StringHashMapUnmanaged(void) = .empty;
                 defer redeclared_var_names.deinit(temp_allocator);
                 {
-                    var declared_once: std.StringHashMapUnmanaged(void) = .empty;
+                    var declared_once: bun.StringHashMapUnmanaged(void) = .empty;
                     defer declared_once.deinit(temp_allocator);
                     for (stmts.all_stmts.items) |scan_stmt| {
                         if (scan_stmt.data != .s_local) continue;
