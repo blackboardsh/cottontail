@@ -5387,22 +5387,29 @@ fn NewPrinter(
             // Special-case lazy-export AST
             if (ast.has_lazy_export) {
                 @branchHint(.unlikely);
-                const lazy_export = for (func.body.stmts) |stmt| {
+                // A module flagged `has_lazy_export` normally carries either an
+                // `s_lazy_export` or `s_export_default` statement in its wrapper.
+                // During incremental dev-server rebundles, a file can transiently
+                // become empty (e.g. edited to "" then rewritten), reaching this
+                // printer with the flag still set but no default-export statement.
+                // Treat a missing default as `undefined` (an empty module body)
+                // instead of crashing the dev server with a panic.
+                const lazy_export: ?Expr = for (func.body.stmts) |stmt| {
                     switch (stmt.data) {
                         .s_lazy_export => |expr| break Expr{ .data = expr.*, .loc = stmt.loc },
                         .s_export_default => |export_default| break export_default.value.toExpr(),
                         else => {},
                     }
-                } else @panic("Internal error: lazy export module is missing its default export");
+                } else null;
                 p.printFnArgs(func.open_parens_loc, func.args, func.flags.contains(.has_rest_arg), false);
                 p.printSpace();
                 p.print("{\n");
-                if (lazy_export.data != .e_undefined) {
+                if (lazy_export != null and lazy_export.?.data != .e_undefined) {
                     p.indent();
                     p.printIndent();
                     p.printSymbol(p.options.hmr_ref);
                     p.print(".cjs.exports = ");
-                    p.printExpr(lazy_export, .comma, .{});
+                    p.printExpr(lazy_export.?, .comma, .{});
                     p.print("; // bun .s_lazy_export\n");
                     p.unindent();
                 }
