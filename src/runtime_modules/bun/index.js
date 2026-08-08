@@ -3162,6 +3162,14 @@ function fetchOnceUsingNodeClient(request, redirected = false, transport = {}, o
   }
 }
 
+function fetchRequestTargetPath(url) {
+  // Collapse leading duplicate slashes ("//redirect" -> "/redirect") so the
+  // origin-form request-target isn't misread as an authority. Bun normalizes
+  // only leading slashes; internal ones ("/a//b") are preserved verbatim.
+  const pathname = (url.pathname || "/").replace(/^\/{2,}/, "/");
+  return `${pathname}${url.search || ""}`;
+}
+
 function dispatchNodeFetchRequest(request, redirected, transport, onResponse, url, keepalive, body) {
   if (body.length != null && !request.headers.has("content-length") && !request.headers.has("transfer-encoding")) {
     request.headers.set("Content-Length", String(body.length));
@@ -3170,7 +3178,7 @@ function dispatchNodeFetchRequest(request, redirected, transport, onResponse, ur
   let client = url.protocol === "https:" ? nodeHttps : nodeHttp;
   let hostname = String(url.hostname).replace(/^\[|\]$/g, "");
   let port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
-  let path = `${url.pathname || "/"}${url.search || ""}`;
+  let path = fetchRequestTargetPath(url);
   let tlsOptions = null;
   const getTlsOptions = () => tlsOptions ??= fetchTlsOptions(url, transport.tlsConfig);
   let agent = keepalive ? defaultFetchHttpAgent() : false;
@@ -3534,7 +3542,7 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
     ) {
       headerLines.push("Content-Length: 0");
     }
-    const path = `${url.pathname || "/"}${url.search || ""}`;
+    const path = fetchRequestTargetPath(url);
     const head = `${request.method} ${path} HTTP/1.1\r\n${headerLines.join("\r\n")}\r\n\r\n`;
 
     let requestSent = false;

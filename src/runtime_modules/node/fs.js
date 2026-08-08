@@ -1597,6 +1597,12 @@ export async function openAsBlob(path, options = {}) {
 // non-configurable accessors (closed, writableEnded, ...). Plain assignment to
 // those throws in strict mode, so instance state is installed as own data
 // properties which shadow the prototype accessors.
+// Marks objects actually built by ReadStreamImpl (with the fd-pump own state).
+// process.stdin is a plain Readable that gets FsReadStream.prototype grafted on
+// for public identity; it lacks this brand, so the fd-pump methods below must
+// fall back to the base Readable behavior instead of driving _pump().
+const kFdReadStreamState = Symbol("kFdReadStreamState");
+
 function defineOwnState(target, values) {
   for (const key of Object.keys(values)) {
     Object.defineProperty(target, key, {
@@ -1653,6 +1659,7 @@ class ReadStreamImpl extends Readable {
       : validateInteger(options.end, "end", 0, Number.MAX_SAFE_INTEGER);
     if (start != null && end != null && start > end) throw outOfRange("start", `<= ${end}`, start);
     if (fdHandle) fd = fdHandle._acquireStreamRef("createReadStream");
+    this[kFdReadStreamState] = true;
     defineOwnState(this, {
       path: hasFd ? path : normalizePath(path),
       flags: options?.flags || "r",
@@ -1756,6 +1763,9 @@ class ReadStreamImpl extends Readable {
   }
 
   _pump() {
+    // Defensive: never drive the fd pump on an object that lacks ReadStreamImpl's
+    // own state (e.g. FsReadStream.prototype grafted onto process.stdin).
+    if (!this[kFdReadStreamState]) return;
     if (this.destroyed || this.readableEnded || this._paused || this._reading) return;
     this._reading = true;
     let asyncRead = false;
@@ -1856,6 +1866,11 @@ class ReadStreamImpl extends Readable {
 
   resume() {
     if (typeof super.resume === "function") super.resume();
+    // When this prototype is grafted onto process.stdin (a plain Readable that
+    // never ran ReadStreamImpl's constructor), it has no fd-pump state. Driving
+    // _pump() there reads an undefined highWaterMark and throws; the base
+    // Readable.resume() already scheduled the object's own _read(), so stop here.
+    if (!this[kFdReadStreamState]) return this;
     if (!this._paused) return this;
     this._paused = false;
     queueMicrotask(() => this._pump());
