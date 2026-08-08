@@ -250,9 +250,17 @@ export function createReadableStdio(fd = 0) {
 
 export function createWritableStdio(fd = 1) {
   const listeners = new Map();
+  // A PTY slave (e.g. a child spawned with Bun's `terminal` option) is a
+  // character device, so process.stdout/stderr must report isTTY === true.
+  // node/process.js upgrades false -> true/undefined once node:process loads,
+  // but the full runtime `-e` path never loads it, so detect the tty here too.
+  let isTTY = false;
+  try {
+    if (cottontail.isatty?.(fd) === true) isTTY = true;
+  } catch {}
   const stream = {
     fd,
-    isTTY: false,
+    isTTY,
     writable: true,
     destroyed: false,
   };
