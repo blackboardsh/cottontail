@@ -3080,6 +3080,7 @@ function executeCommonJsSource(module, filename, source, requireOverride = undef
         Object.hasOwn(module.exports, "module.exports")) {
       module.exports = module.exports["module.exports"];
     }
+    finalizeEsmNamespaceOrder(module.exports);
     module.loaded = true;
     return module.exports;
   }
@@ -3402,6 +3403,7 @@ function executeBundledCommonJsModule(module, filename, source, loader) {
   } else {
     module.exports = requiredBundledEsmNamespace(module.exports, source, loader);
   }
+  finalizeEsmNamespaceOrder(module.exports);
   module.loaded = true;
   return module.exports;
 }
@@ -3651,6 +3653,36 @@ Object.defineProperty(moduleNamespacePrototype, "__esModule", {
 function createModuleNamespace() {
   const namespace = Object.create(moduleNamespacePrototype);
   Object.defineProperty(namespace, Symbol.toStringTag, { value: "Module" });
+  return namespace;
+}
+
+// An ES module namespace exposes its own string keys in ascending code-unit
+// order ([[OwnPropertyKeys]] sorts the exported names). Cottontail populates
+// the namespace as an ordinary object in source order, so once evaluation
+// (including any runtime `export *` population) has finished, reorder its own
+// enumerable string keys to match. The keys are re-inserted on the *same*
+// object so the namespace's identity survives — cyclic imports that already
+// captured the reference keep observing it, now in spec order.
+function finalizeEsmNamespaceOrder(namespace) {
+  if (namespace == null || (typeof namespace !== "object" && typeof namespace !== "function")) return namespace;
+  if (namespace[Symbol.toStringTag] !== "Module") return namespace;
+  const keys = Object.keys(namespace);
+  if (keys.length < 2) return namespace;
+  let ordered = true;
+  for (let i = 1; i < keys.length; i += 1) {
+    if (keys[i - 1] > keys[i]) { ordered = false; break; }
+  }
+  if (ordered) return namespace;
+  const descriptors = [];
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(namespace, key);
+    // Reordering means deleting and re-adding; bail if any key is locked down.
+    if (!descriptor || descriptor.configurable !== true) return namespace;
+    descriptors.push([key, descriptor]);
+  }
+  descriptors.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  for (const [key] of descriptors) delete namespace[key];
+  for (const [key, descriptor] of descriptors) Object.defineProperty(namespace, key, descriptor);
   return namespace;
 }
 
@@ -4261,7 +4293,7 @@ function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, origina
     moduleAncestors,
     dynamicModuleErrorConstructor(sourceName, originalSource),
   ).then(
-    () => namespace,
+    () => finalizeEsmNamespaceOrder(namespace),
     error => {
       if (asyncEsmModuleCache.get(cacheKey) === record) asyncEsmModuleCache.delete(cacheKey);
       throw error;
@@ -4374,7 +4406,7 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
     if (!isAsyncModuleRequireError(error)) throw error;
     return executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, originalSource);
   }
-  return namespace;
+  return finalizeEsmNamespaceOrder(namespace);
 }
 
 function importResolvedRuntimeModule(resolved, options = undefined, forceAsync = false, asyncAncestors = undefined) {
@@ -4623,6 +4655,7 @@ function executeQueriedModule(module, filename, suffix) {
     dirname(filename),
     importMetaForModule(filename, suffix),
   );
+  finalizeEsmNamespaceOrder(module.exports);
   module.loaded = true;
   return module.exports;
 }
