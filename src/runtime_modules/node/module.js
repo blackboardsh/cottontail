@@ -2362,6 +2362,13 @@ function isBuiltinHiddenByCompatProfile(id) {
 function resolveRequestCore(request, basePath, kind = "require", packageImportSeen = undefined) {
   const originalText = String(request);
   if (originalText.includes("\0")) throw moduleNotFoundError(originalText, true, basePath);
+  // Virtual modules registered through Bun.plugin's `build.module(id, ...)` are
+  // addressed by their bare id and have no on-disk path; resolve them to that id
+  // so the loader (loadCommonJsModule / the import path) dispatches to the
+  // registered factory instead of failing package resolution.
+  if (runtimePluginVirtualModules.has(originalText) || runtimePluginResolvedModules.has(originalText)) {
+    return originalText;
+  }
   if (originalText.startsWith("#")) {
     return resolvePackageImports(originalText, basePath, kind, packageImportSeen ?? new Set());
   }
