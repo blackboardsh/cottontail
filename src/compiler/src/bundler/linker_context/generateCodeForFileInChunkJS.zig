@@ -410,21 +410,30 @@ pub fn generateCodeForFileInChunkJS(
                 const ExportHoist = struct {
                     decls: std.ArrayListUnmanaged(G.Decl),
                     allocator: std.mem.Allocator,
+                    // Refs already emitted as a bare `var <ref>;` prefix
+                    // declaration. A redeclared binding reaches wrapIdentifier
+                    // more than once; emitting `var x, x;` is redundant, so the
+                    // duplicate declaration is suppressed while still returning
+                    // the identifier expression for the in-closure assignment.
+                    seen: std.AutoHashMapUnmanaged(Ref, void),
 
                     pub fn wrapIdentifier(w: *@This(), loc: Logger.Loc, ref: Ref) Expr {
-                        w.decls.append(
-                            w.allocator,
-                            .{
-                                .binding = Binding.alloc(
-                                    w.allocator,
-                                    B.Identifier{
-                                        .ref = ref,
-                                    },
-                                    loc,
-                                ),
-                                .value = null,
-                            },
-                        ) catch |err| bun.handleOom(err);
+                        const gop = w.seen.getOrPut(w.allocator, ref) catch |err| bun.handleOom(err);
+                        if (!gop.found_existing) {
+                            w.decls.append(
+                                w.allocator,
+                                .{
+                                    .binding = Binding.alloc(
+                                        w.allocator,
+                                        B.Identifier{
+                                            .ref = ref,
+                                        },
+                                        loc,
+                                    ),
+                                    .value = null,
+                                },
+                            ) catch |err| bun.handleOom(err);
+                        }
 
                         return Expr.initIdentifier(ref, loc);
                     }
@@ -433,7 +442,39 @@ pub fn generateCodeForFileInChunkJS(
                 var hoist = ExportHoist{
                     .decls = .empty,
                     .allocator = temp_allocator,
+                    .seen = .empty,
                 };
+
+                // A top-level `var` binding that is declared more than once
+                // cannot use the "move directly" hoist below: relocating each
+                // movable initializer to the eager module-scope prefix reorders
+                // the assignments relative to the statements that stay inside
+                // the `__esm` closure (e.g. `var x = 1; console.log(x); var x =
+                // 2` must still print 1). Detect redeclared identifiers up front
+                // so their initializers are emitted as in-closure assignments.
+                //
+                // Each `var` declaration gets its own symbol (with a distinct
+                // ref) even when several redeclare the same name in one scope,
+                // so redeclarations are matched by the (shared) original name.
+                var redeclared_var_names: std.StringHashMapUnmanaged(void) = .empty;
+                defer redeclared_var_names.deinit(temp_allocator);
+                {
+                    var declared_once: std.StringHashMapUnmanaged(void) = .empty;
+                    defer declared_once.deinit(temp_allocator);
+                    for (stmts.all_stmts.items) |scan_stmt| {
+                        if (scan_stmt.data != .s_local) continue;
+                        if (scan_stmt.data.s_local.kind.isUsing()) continue;
+                        for (scan_stmt.data.s_local.decls.slice()) |scan_decl| {
+                            if (scan_decl.binding.data != .b_identifier) continue;
+                            const symbol = c.graph.symbols.get(scan_decl.binding.data.b_identifier.ref) orelse continue;
+                            const name = symbol.original_name;
+                            const gop = declared_once.getOrPut(temp_allocator, name) catch continue;
+                            if (gop.found_existing) {
+                                redeclared_var_names.put(temp_allocator, name, {}) catch {};
+                            }
+                        }
+                    }
+                }
 
                 var inner_stmts = stmts.all_stmts.items;
 
@@ -455,7 +496,12 @@ pub fn generateCodeForFileInChunkJS(
                                 var value = Expr.empty;
                                 for (local.decls.slice()) |*decl| {
                                     if (decl.value) |initializer| {
-                                        const can_be_moved = initializer.canBeMoved();
+                                        const is_redeclared = decl.binding.data == .b_identifier and
+                                            if (c.graph.symbols.get(decl.binding.data.b_identifier.ref)) |sym|
+                                                redeclared_var_names.contains(sym.original_name)
+                                            else
+                                                false;
+                                        const can_be_moved = initializer.canBeMoved() and !is_redeclared;
                                         if (can_be_moved) {
                                             // if the value can be moved, move the decl directly to preserve destructuring
                                             // ie `const { main } = class { static main() {} }` => `var {main} = class { static main() {} }`
