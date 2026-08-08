@@ -2246,6 +2246,17 @@ fn runMultipleTestFilesWithBail(
     try stdout_writer.interface.print("bun test v{s} (cottontail)\n", .{testRunnerDisplayVersion(init)});
     try stdout_writer.interface.flush();
     try init.environ_map.put("COTTONTAIL_TEST_CLI_HEADER_PRINTED", "1");
+    // Bun's `bun test` defaults NODE_ENV to "test" as a real environment
+    // variable (visible to dynamic process.env reads and dotenv suffix
+    // selection) when the caller has not set it. Establish it before the
+    // runtime evaluates any user module.
+    if (init.environ_map.get("NODE_ENV") == null) {
+        try init.environ_map.put("NODE_ENV", "test");
+        // The in-process runtime builds process.env from the real environ
+        // (getenv), so mirror the default there too — not only in the map used
+        // to spawn child processes.
+        _ = setenv("NODE_ENV", "test", 1);
+    }
 
     var summary_id: [8]u8 = undefined;
     init.io.random(&summary_id);
@@ -2563,6 +2574,15 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
     try stdout_writer.interface.print("bun test v{s} (cottontail)\n", .{testRunnerDisplayVersion(init)});
     try stdout_writer.interface.flush();
     try init.environ_map.put("COTTONTAIL_TEST_CLI_HEADER_PRINTED", "1");
+    // See runSingleTestFile: `bun test` defaults NODE_ENV to "test" unless the
+    // caller already set it, before any user module is evaluated.
+    if (init.environ_map.get("NODE_ENV") == null) {
+        try init.environ_map.put("NODE_ENV", "test");
+        // The in-process runtime builds process.env from the real environ
+        // (getenv), so mirror the default there too — not only in the map used
+        // to spawn child processes.
+        _ = setenv("NODE_ENV", "test", 1);
+    }
     try init.environ_map.put(
         "COTTONTAIL_TEST_FILE_COUNT",
         try std.fmt.allocPrint(allocator, "{d}", .{entrypoint_count}),
@@ -3401,6 +3421,11 @@ pub fn main(init: std.process.Init) !void {
             try stdout.flush();
         }
         try init.environ_map.put("COTTONTAIL_TEST_CLI_HEADER_PRINTED", "1");
+        // `bun test` defaults NODE_ENV to "test" unless the caller set it.
+        if (init.environ_map.get("NODE_ENV") == null) {
+            try init.environ_map.put("NODE_ENV", "test");
+            _ = setenv("NODE_ENV", "test", 1);
+        }
     }
 
     const invocation = parseInvocation(init.io, init.arena.allocator(), args) catch |err| switch (err) {

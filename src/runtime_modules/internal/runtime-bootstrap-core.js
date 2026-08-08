@@ -182,7 +182,35 @@ if (globalThis.console) {
   const nativeError = console.error?.bind(console);
   const nativeWarn = console.warn?.bind(console) ?? nativeError;
   let groupIndent = "";
-  const consoleDepth = 2;
+  // console.log inspection depth: --console-depth CLI flag (surfaced by the
+  // launcher as COTTONTAIL_CONSOLE_DEPTH) takes precedence over the
+  // [console] depth key in bunfig.toml; both fall back to Bun's default of 2.
+  // A configured depth of 0 means "unlimited" (Bun semantics).
+  const bunfigConsoleDepth = () => {
+    try {
+      const source = String(cottontail.readFile("bunfig.toml"));
+      let inConsoleSection = false;
+      for (const rawLine of source.split(/\r?\n/)) {
+        const line = rawLine.replace(/\s+#.*$/, "").trim();
+        const section = line.match(/^\[([^\]]+)\]$/);
+        if (section) {
+          inConsoleSection = section[1].trim() === "console";
+          continue;
+        }
+        if (!inConsoleSection) continue;
+        const depth = line.match(/^depth\s*=\s*(\d+)\s*$/);
+        if (depth) return Number(depth[1]);
+      }
+    } catch {}
+    return undefined;
+  };
+  const consoleDepth = (() => {
+    const cliValue = globalThis.process?.env?.COTTONTAIL_CONSOLE_DEPTH;
+    const configured = cliValue !== undefined && /^\d+$/.test(cliValue)
+      ? Number(cliValue)
+      : bunfigConsoleDepth();
+    return configured === 0 ? Number.MAX_SAFE_INTEGER : (configured ?? 2);
+  })();
   const identifierKeyRe = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
   const inspectCustom = Symbol.for("nodejs.util.inspect.custom");
 
