@@ -44,7 +44,10 @@ assert(getEnvironmentData("key").value === 42, "environmentData mismatch");
 setEnvironmentData("shared", { token: "env", count: 7n });
 
 // Cold CI runners need a wider worker-startup budget than local dev machines.
-const workerResponseTimeoutMs = (process.env.CI === "true" || process.env.CI === "1") ? 15_000 : 1_500;
+// Worker startup is currently ~235ms/worker (see escalation item 34), so a
+// 1.5s budget flakes when the full test-js suite loads the machine. Keep a
+// generous local budget until worker VM-snapshot startup lands.
+const workerResponseTimeoutMs = (process.env.CI === "true" || process.env.CI === "1") ? 15_000 : 8_000;
 const marked = {};
 markAsUntransferable(marked);
 markAsUncloneable(marked);
