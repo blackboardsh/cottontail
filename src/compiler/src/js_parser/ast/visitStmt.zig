@@ -598,6 +598,13 @@ pub fn VisitStmt(
                 const name_ref = name.ref.?;
                 const original_name = p.symbols.items[name_ref.innerIndex()].original_name;
                 const original_is_dead = p.is_control_flow_dead;
+                // A decorated class is reassigned by its decorator lowering
+                // (`C = __decorateClass(...)` / `C = __legacyDecorateClassTS(...)`), and the
+                // decorator may freeze or replace the class binding. Emitting the keep-names
+                // `__name(C, "C")` afterwards would then attempt to redefine `name` on a frozen
+                // object and throw. esbuild/Bun do not emit keep-names for decorated classes, so
+                // match that and skip it below.
+                const class_had_decorators = data.class.has_decorators;
 
                 if (mark_as_dead) {
                     p.is_control_flow_dead = true;
@@ -639,7 +646,7 @@ pub fn VisitStmt(
                     }
                 }
 
-                if (!mark_as_dead and !has_static_name and p.options.features.minify_keep_names and !p.source.index.isRuntime()) {
+                if (!mark_as_dead and !has_static_name and !class_had_decorators and p.options.features.minify_keep_names and !p.source.index.isRuntime()) {
                     try stmts.append(p.keepStmtSymbolName(name.loc, name_ref, original_name));
                 }
 

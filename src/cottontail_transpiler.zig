@@ -577,7 +577,16 @@ fn process(
     // Vanilla JavaScriptCore does not parse TC39 decorators. Bun's parser
     // already contains the complete lowering pass, so transform JavaScript
     // decorators instead of relying on engine-specific syntax support.
-    parser_options.features.standard_decorators = !config.loader.isTypeScript();
+    //
+    // Scans (import/module-syntax analysis) never lower decorators — they only
+    // need the source to parse — so they must be permissive: TypeScript `accessor`
+    // auto-accessor fields are valid syntax only in standard-decorator mode, and
+    // hardcoding legacy mode for TS made the entry-point import scan reject valid
+    // `accessor` fields with a syntax error before the real transpile ever ran.
+    // Transforms keep the tsconfig-blind default (legacy for TS) because this
+    // standalone helper cannot see experimentalDecorators; entries whose
+    // decorators must be lowered are handled by the tsconfig-aware bundler path.
+    parser_options.features.standard_decorators = !config.loader.isTypeScript() or operation != .transform;
     parser_options.features.dead_code_elimination = config.dead_code_elimination;
     parser_options.features.trim_unused_imports = config.trim_unused_imports;
     parser_options.features.replace_exports = config.replace_exports;
