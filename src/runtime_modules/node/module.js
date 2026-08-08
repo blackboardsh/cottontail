@@ -1007,6 +1007,63 @@ const kBuiltinSharedSyntheticNamespaceExports = new Map([
 ]);
 const bufferMaxLengthStateKey = Symbol.for("cottontail.node.buffer.kMaxLength");
 
+// Node's `require('node:crypto')` exposes its exports as writable data
+// properties, so consumers may replace them. Next.js's `experimental.dynamicIO`
+// instrumentation relies on this: it runs `nodeCrypto.randomUUID = wrapped`
+// (and the same for randomBytes/randomFillSync/randomInt/generate*Sync) inside a
+// try/catch, logging "Failed to install `require('node:crypto').X` extension"
+// when the assignment throws. Our crypto module is authored in ESM and handed to
+// require() as a module namespace whose named exports are getter-only accessors,
+// so the assignment throws in strict mode and the warning fires. Give each
+// configurable getter-only export a self-redefining setter: reads stay lazy (we
+// never invoke the getter here) and the first assignment replaces the accessor
+// with the assigned value, matching Node's reassignable crypto exports.
+//
+// Scoped to crypto deliberately. Applying it to every builtin also makes
+// Next.js's node:fs-namespace patches take effect; those are silent no-ops
+// today, and once live they route webpack's PackFileCacheStrategy reads through
+// Next's io()-tracking fs wrappers, which surfaces a separate cache-restore
+// "buffer error". crypto is the only module whose failed patch is user-visible.
+function makeBuiltinExportsReassignable(moduleExports) {
+  if (moduleExports == null ||
+      (typeof moduleExports !== "object" && typeof moduleExports !== "function")) return;
+  for (const key of Object.keys(moduleExports)) {
+    const descriptor = Object.getOwnPropertyDescriptor(moduleExports, key);
+    if (descriptor === undefined || !descriptor.configurable) continue;
+    if (typeof descriptor.get !== "function" || descriptor.set !== undefined) continue;
+    const get = descriptor.get;
+    const enumerable = descriptor.enumerable;
+    Object.defineProperty(moduleExports, key, {
+      configurable: true,
+      enumerable,
+      get,
+      set(value) {
+        Object.defineProperty(this, key, {
+          value,
+          writable: true,
+          enumerable,
+          configurable: true,
+        });
+      },
+    });
+  }
+}
+
+// Wrap a builtin registry value so its getter-only exports become reassignable
+// on first materialization (see makeBuiltinExportsReassignable). Preserves the
+// lazy-thunk shape so registration stays deferred.
+function withReassignableExports(value) {
+  if (typeof value === "function" && value[kLazyBuiltin] === true) {
+    return lazyBuiltin(() => {
+      const resolved = unwrapBuiltin(value);
+      makeBuiltinExportsReassignable(resolved);
+      return resolved;
+    });
+  }
+  makeBuiltinExportsReassignable(value);
+  return value;
+}
+
 function installMutableBufferMaxLength(moduleExports) {
   if (moduleExports == null ||
       (typeof moduleExports !== "object" && typeof moduleExports !== "function")) return;
@@ -1069,6 +1126,9 @@ export function __setBuiltinModules(modules) {
     else builtinImportNamespaces.set(name, importNamespace);
     if (isNamespace) builtinNamespaceEntries.add(name);
     else builtinNamespaceEntries.delete(name);
+    // node:crypto's exports must be reassignable so Next.js's dynamicIO
+    // instrumentation can wrap them without erroring (see the helper above).
+    if (canonicalName === "crypto") value = withReassignableExports(value);
     builtinModuleMap.set(name, value);
     globalMap.set(name, value);
   }
@@ -3824,9 +3884,15 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
   // dependency a second time. Lexical declarations and function parameters
   // inside the module remain inner scopes and therefore shadow imports exactly
   // where ordinary ESM bindings do.
+  //
+  // The module body is followed by the `with` block's closing brace. Modules
+  // whose last line is a `//` line comment with no trailing newline (e.g. a
+  // `//# sourceMappingURL=` pragma) would otherwise swallow that brace into the
+  // comment, unbalancing the wrapper; a newline before the brace keeps it on
+  // its own line.
   return `${helperSource}const ${bindingScope} = Object.create(null);` +
     `${orderedImportDeclarations.join(" ")}${bindingDeclarations.join(" ")}` +
-    `with (${bindingScope}) { ${exportDeclarations}${output} }`;
+    `with (${bindingScope}) { ${exportDeclarations}${output}\n}`;
 }
 
 const dynamicErrorSourceSymbol = Symbol.for("cottontail.dynamicErrorSource");
