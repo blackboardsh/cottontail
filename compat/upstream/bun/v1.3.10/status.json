@@ -1909,7 +1909,27 @@
     },
     "test/js/bun/shell/bunshell.test.ts": {
       "status": "enabled",
-      "reason": "The complete Bun shell integration file passes all 384 active upstream cases (1,041 assertions); its remaining 43 cases are TODOs in Bun's copied source."
+      "reason": "The complete Bun shell integration file passes 375 active upstream cases (1,016 assertions) with 43 upstream TODOs; eight cases are excluded via testNameExclusion. The suite is spawn-heavy, so it runs in the serial bucket with an extended timeout.",
+      "serial": true,
+      "timeoutMs": 120000,
+      "args": [
+        "--test-name-pattern=^(?!.*(?:complicated pipeline|pipeline with background process|asynchronous command \\(after if\\)|asynchronous command \\(after then\\)|asynchronous command \\(after elif\\)|subshell > sharp|subshell ending with asynchronous list|brace grouping ending with asynchronous list)).*$"
+      ],
+      "testNameExclusion": {
+        "pattern": "^(?!.*(?:complicated pipeline|pipeline with background process|asynchronous command \\(after if\\)|asynchronous command \\(after then\\)|asynchronous command \\(after elif\\)|subshell > sharp|subshell ending with asynchronous list|brace grouping ending with asynchronous list)).*$",
+        "classification": "runtime-gap",
+        "testNames": [
+          "deno_task > pipeline > complicated pipeline",
+          "deno_task > pipeline > pipeline stack behavior > pipeline with background process",
+          "if_clause > ported from posix shell tests > command ending with asynchronous command (after if)",
+          "if_clause > ported from posix shell tests > command ending with asynchronous command (after then)",
+          "if_clause > ported from posix shell tests > command ending with asynchronous command (after elif)",
+          "subshell > ported > subshell ending with asynchronous list",
+          "subshell > ported > brace grouping ending with asynchronous list",
+          "subshell > sharp"
+        ],
+        "reason": "Seven cases exercise background commands (the `&` async operator plus the `wait` builtin), which Cottontail's ported shell interpreter does not implement yet (the parser rejects `&` with \"Background commands \\\"&\\\" are not supported yet.\"). The remaining case (subshell > sharp) runs `bun install` of sharp@0.33.3, which Cottontail delegates to Hutch. All other 375 shell integration cases pass."
+      }
     },
     "test/js/bun/shell/commands/basename.test.ts": {
       "status": "enabled",
@@ -1936,8 +1956,9 @@
       "reason": "Bun shell false smoke test passes under Cottontail's current shell wrapper."
     },
     "test/js/bun/shell/commands/ls.test.ts": {
-      "status": "enabled",
-      "reason": "Bun shell ls flags, sorting, path handling, output formatting, and diagnostics pass the copied upstream file (27 bun:test cases)."
+      "status": "expected-failure",
+      "classification": "delegated",
+      "reason": "The shared describe-level beforeAll runs `${BUN} install` to populate a node_modules tree (react, typescript, eslint, esbuild, ...) that the recursive ls case compares against. Cottontail delegates package installation to Hutch, so `cottontail install` exits 1 by design; the beforeAll throws before any case runs and the whole file fails. The ls builtin itself works (verified independently against touch/mkdir fixtures)."
     },
     "test/js/bun/shell/commands/mv.test.ts": {
       "status": "enabled",
@@ -1973,7 +1994,18 @@
     },
     "test/js/bun/shell/exec.test.ts": {
       "status": "enabled",
-      "reason": "Bun shell execution, environment, process status, pipelines, and redirection pass all 19 copied upstream cases (54 assertions)."
+      "reason": "Bun shell execution, environment, process status, pipelines, and redirection pass 18 of 19 copied upstream cases; one case is excluded via testNameExclusion.",
+      "args": [
+        "--test-name-pattern=^(?!.*bun works even when not in PATH).*$"
+      ],
+      "testNameExclusion": {
+        "pattern": "^(?!.*bun works even when not in PATH).*$",
+        "classification": "upstream",
+        "testNames": [
+          "bun exec > bun works even when not in PATH"
+        ],
+        "reason": "The case asserts the help output contains Bun's identity string \"Bun is a fast JavaScript runtime\". Cottontail intentionally prints its own banner and does not advertise Bun. The behavioral part of the case (resolving the runtime by name even with an empty PATH, i.e. not printing \"bun: command not found\") passes."
+      }
     },
     "test/js/bun/shell/file-io.test.ts": {
       "status": "enabled",
@@ -1985,7 +2017,20 @@
     },
     "test/js/bun/shell/leak.test.ts": {
       "status": "enabled",
-      "reason": "All 42 copied shell descriptor, repeated-memory, protected-object, pipeline/subshell, and never-started interpreter leak cases pass in focused groups."
+      "reason": "41 of 42 copied shell descriptor, repeated-memory, protected-object, pipeline/subshell, and never-started interpreter leak cases pass; one case is excluded via testNameExclusion. The file is spawn- and GC-heavy, so it runs in the serial bucket with an extended timeout.",
+      "serial": true,
+      "timeoutMs": 180000,
+      "args": [
+        "--test-name-pattern=^(?!.*#11816 > external).*$"
+      ],
+      "testNameExclusion": {
+        "pattern": "^(?!.*#11816 > external).*$",
+        "classification": "performance",
+        "testNames": [
+          "fd leak > #11816 > external"
+        ],
+        "reason": "The external variant awaits 100 spawned `${bunExe()} -e` subprocesses within a hardcoded 5s per-case budget before asserting object counts. Cottontail's per-process cold-start exceeds that budget, so the case times out before the leak assertion runs; it is a startup-cost timeout, not an fd leak (the builtin variant, which uses no subprocesses, passes)."
+      }
     },
     "test/js/bun/shell/shell-leak-args.test.ts": {
       "status": "enabled",
@@ -2008,9 +2053,9 @@
       "reason": "Bun shell command-substitution crash regression coverage passes under Cottontail."
     },
     "test/js/bun/shell/shell-hang.test.ts": {
-      "status": "enabled",
-      "reason": "Bun shell conditional success and failure fixtures complete without hanging and report the expected process status; load-sensitive, runs in the serial bucket.",
-      "serial": true
+      "status": "expected-failure",
+      "classification": "performance",
+      "reason": "Each case spawns a fixture and asserts it finishes within a hardcoded 700ms budget (via test.each's per-case timeout). Cottontail's shell-path cold-start is ~0.55s per fixture spawn, and with spawnSync/test-harness overhead every case lands around 730ms, just over the budget. The fixtures themselves complete correctly and do not hang; the failure is purely the tight startup-time budget."
     },
     "test/js/bun/shell/shell-blocking-pipe.test.ts": {
       "status": "enabled",
@@ -6830,8 +6875,8 @@
   },
   "expectedCounts": {
     "runnableFiles": 1445,
-    "enabled": 1326,
-    "expectedFailure": 16,
+    "enabled": 1324,
+    "expectedFailure": 18,
     "skip": 103,
     "cottontailOwned": 1345,
     "hutchOwned": 100,

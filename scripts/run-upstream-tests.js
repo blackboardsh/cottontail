@@ -1053,6 +1053,11 @@ function runDirectAsync(runtime, target, entry, snapshotRoot, options) {
     const child = spawn(binaryPath, [entry.path, ...entryArgs(entry, options)], {
       cwd: snapshotRoot,
       env: makeEnv(runtime, target, runTemp, {
+        // Spawning with `cwd` changes the child's working directory but not the
+        // inherited PWD env var. Keep PWD consistent with the launch directory
+        // so tests that snapshot `process.env` (e.g. shell variable expansion)
+        // do not observe a stale PWD from the runner's own shell.
+        PWD: snapshotRoot,
         ...(entry.env ?? {}),
         ...(options.timeoutScale !== 1
           ? { COTTONTAIL_TEST_TIMEOUT_SCALE: String(options.timeoutScale) }
