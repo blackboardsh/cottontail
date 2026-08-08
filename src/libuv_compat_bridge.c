@@ -5,11 +5,11 @@ _Noreturn void CrashHandler__unsupportedUVFunction(const char* function_name)
 {
     fprintf(
         stderr,
-        "Bun encountered a crash when running a NAPI module that tried to call\n"
+        "Cottontail encountered a crash when running a NAPI module that tried to call\n"
         "the %s libuv function.\n\n"
-        "Bun is actively working on supporting all libuv functions for POSIX\n"
-        "systems, please see this issue to track our progress:\n\n"
-        "https://github.com/oven-sh/bun/issues/18546\n",
+        "Cottontail is actively working on supporting all libuv functions for POSIX\n"
+        "systems, please report it here to track our progress:\n\n"
+        "https://github.com/blackboardsh/cottontail/issues\n",
         function_name ? function_name : "<unknown>"
     );
     fflush(stderr);

@@ -5019,7 +5019,7 @@ function runFetchFallback(options, request, server) {
     const prepare = (resolved) => prepareServeResponseResult(
       resolved instanceof Response
         ? resolved
-        : new Response("Welcome to Bun! To get started, return a Response object.", {
+        : new Response("Welcome to Cottontail! To get started, return a Response object.", {
           status: 200,
           headers: { "content-type": "text/plain; charset=utf-8" },
         }),

@@ -1295,7 +1295,7 @@ export function createBunShellRuntime(host) {
     if (commandResult == null && (name === "exec" || (invokesRuntime && args[0] === "exec"))) {
       if (name !== "exec") args = args.slice(1);
       if (args.length === 0) {
-        commandResult = result(0, 'Usage: bun exec <script>\n\nExecute a shell script directly from Bun.\n\nNote: If executing this from a shell, make sure to escape the string!\n\nExamples:\n  bun exec "echo hi"\n  bun exec "echo \\"hey friends\\"!"\n');
+        commandResult = result(0, 'Usage: cottontail exec <script>\n\nExecute a shell script directly from Cottontail.\n\nNote: If executing this from a shell, make sure to escape the string!\n\nExamples:\n  cottontail exec "echo hi"\n  cottontail exec "echo \\"hey friends\\"!"\n');
       } else {
         commandResult = await execute(parseBunShellSource(args.join(" ")), commandContext, input);
       }

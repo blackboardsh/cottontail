@@ -169,7 +169,7 @@ fn reportHutchScript(stderr: *std.Io.Writer, script_name: []const u8) !void {
 }
 
 const test_help_text =
-    \\Usage: bun test [flags] [<patterns>]
+    \\Usage: cottontail test [flags] [<patterns>]
     \\  Run all matching test files and print the results to stdout
     \\
     \\Flags:

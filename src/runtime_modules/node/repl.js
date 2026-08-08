@@ -744,7 +744,7 @@ class BuiltinReplSession {
     this.input.on("end", this.onEnd);
     this.input.on("error", this.onError);
     this.input.resume?.();
-    this.write(`Welcome to Bun v${Bun.version}\n`);
+    this.write(`Welcome to Cottontail v${process.versions.cottontail ?? Bun.version}\n`);
     this.write("Type .copy [code] to copy to clipboard. .help for more info.\n\n");
     this.prompt();
     await completed;

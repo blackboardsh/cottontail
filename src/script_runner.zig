@@ -2712,14 +2712,14 @@ fn configureRuntimeInspector(execution: *const ScriptExecution, js_runtime: *run
                     url;
                 writeStderr(
                     execution.io,
-                    "--------------------- Bun Inspector ---------------------\nListening:\n  {s}\nInspect in browser:\n  https://debug.bun.sh/#{s}\n--------------------- Bun Inspector ---------------------\n",
+                    "--------------------- Cottontail Inspector ---------------------\nListening:\n  {s}\nInspect in browser:\n  https://debug.bun.sh/#{s}\n--------------------- Cottontail Inspector ---------------------\n",
                     .{ url, browser_target },
                 );
             },
             .websocket_unix => {},
             else => writeStderr(
                 execution.io,
-                "--------------------- Bun Inspector ---------------------\nListening on {s}\n--------------------- Bun Inspector ---------------------\n",
+                "--------------------- Cottontail Inspector ---------------------\nListening on {s}\n--------------------- Cottontail Inspector ---------------------\n",
                 .{inspector.display_address},
             ),
         }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const script_runner = @import("script_runner.zig");
+const version = @import("version.zig");
 
 const interactive_bootstrap =
     \\import { runBuiltinCLI } from "node:repl";
@@ -8,7 +9,7 @@ const interactive_bootstrap =
 ;
 
 const interactive_banner =
-    "Welcome to Bun v1.3.10\n" ++
+    "Welcome to Cottontail v" ++ version.version ++ "\n" ++
     "Type .copy [code] to copy to clipboard. .help for more info.\n\n" ++
     "> ";
 

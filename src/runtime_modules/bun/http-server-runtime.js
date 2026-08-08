@@ -288,7 +288,7 @@ function requestBodyByteSize(body) {
 function prepareHandlerResponse(value, request) {
   const response = value instanceof Response
     ? value
-    : new Response("Welcome to Bun! To get started, return a Response object.", {
+    : new Response("Welcome to Cottontail! To get started, return a Response object.", {
       status: 200,
       headers: { "content-type": "text/plain; charset=utf-8" },
     });

@@ -16,7 +16,7 @@ import {
 const rootDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const packageJsonPath = join(rootDir, "package.json");
 const versionZigPath = join(rootDir, "src", "version.zig");
-const dashConfigPath = join(rootDir, "dash.config.ts");
+const hutchConfigPath = join(rootDir, "hutch.config.ts");
 
 function fail(message) {
   console.error(`cottontail release: ${message}`);
@@ -32,9 +32,9 @@ function git(args, options = {}) {
   return typeof output === "string" ? output.trim() : "";
 }
 
-function updateDashPin(path, field, version) {
+function updateHutchPin(path, field, version) {
   const source = readFileSync(path, "utf8");
-  const pattern = new RegExp(`^(// @dash .*\\b${field}=)[^\\s]+`, "m");
+  const pattern = new RegExp(`^(// @hutch .*\\b${field}=)[^\\s]+`, "m");
   const updated = source.replace(pattern, (_, prefix) => `${prefix}${version}`);
   if (updated === source) fail(`could not update ${field} in ${path}`);
   writeFileSync(path, updated);
@@ -128,10 +128,10 @@ const updatedVersionZig = versionZig.replace(
 );
 if (updatedVersionZig === versionZig) fail("could not update src/version.zig");
 writeFileSync(versionZigPath, updatedVersionZig);
-updateDashPin(dashConfigPath, "cottontail", answer);
+updateHutchPin(hutchConfigPath, "cottontail", answer);
 
 const tag = `v${answer}`;
-git(["add", "package.json", "src/version.zig", "dash.config.ts"], { inherit: true });
+git(["add", "package.json", "src/version.zig", "hutch.config.ts"], { inherit: true });
 git(["commit", "-m", tag], { inherit: true });
 git(["tag", "--annotate", tag, "--message", tag], { inherit: true });
 git(["push", "--atomic", "origin", "HEAD:main", `refs/tags/${tag}`], { inherit: true });
