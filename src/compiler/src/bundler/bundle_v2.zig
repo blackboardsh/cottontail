@@ -2887,7 +2887,14 @@ pub const BundleV2 = struct {
     /// optimize_imports. It must stay disabled when the caller explicitly
     /// disables tree shaking because it defers otherwise-executable imports.
     fn isBarrelOptimizationEnabled(this: *const BundleV2) bool {
-        return this.transpiler.options.tree_shaking;
+        // Barrel optimization only defers parsing of unused submodules from
+        // `sideEffects: false` barrels, so it is safe even when the linker's
+        // tree shaking is disabled to keep every export live. Bake's dev
+        // (`internal_bake_dev`) build forces `tree_shaking = false` for that
+        // reason, but must still skip unused barrel submodules to match Bun —
+        // otherwise a syntax error in an unimported submodule breaks the build.
+        return this.transpiler.options.tree_shaking or
+            this.transpiler.options.output_format == .internal_bake_dev;
     }
 
     // TODO: remove ResolveQueue
