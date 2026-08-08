@@ -2580,24 +2580,39 @@ class Expectation {
           countAssertion();
           this._skipAssertionCount = true;
         }
-        if (!this._promiseMode && typeof globalThis.cottontail?.waitForPromise === "function") {
+        if (!this._promiseMode && typeof globalThis.cottontail?.drainJobs === "function") {
           let state = nativePromiseState(settled);
           if (state?.status === 0) {
-            // While blocked here, sibling promises rejected by the code under
-            // test have no handler yet (their own matchers run after we
-            // return). Bun routes such rejections to a quiet capture instead
-            // of failing the test (VirtualMachine.unhandledRejectionScope in
+            // Settle microtask-only promises synchronously so teardown that
+            // runs when the test body exits (e.g. `using server =
+            // Bun.serve(...)` disposing via stop(true)) does not race a
+            // still-pending in-process matcher. We drain the microtask queue
+            // rather than block on cottontail.waitForPromise: promises backed
+            // by thread-pool async I/O (e.g. fs writes) are not delivered
+            // under a nested synchronous pump — after the first such request
+            // in a process, waitForPromise never observes the completion event
+            // and hangs (drives the test into a timeout). Those are left
+            // pending here and awaited by the runner's normal pendingPromises
+            // loop below, which pumps the real event loop.
+            //
+            // While draining, sibling promises rejected by the code under test
+            // have no handler yet (their own matchers run after we return).
+            // Bun routes such rejections to a quiet capture instead of failing
+            // the test (VirtualMachine.unhandledRejectionScope in
             // Expect.getValueAsToThrow); do the same via a hook the test
             // runner's unhandledRejection capture consults.
             const quietCapture = { didCapture: false, value: undefined };
             const previousQuietCapture = globalThis.__cottontailQuietUnhandledRejectionCapture;
             globalThis.__cottontailQuietUnhandledRejectionCapture = quietCapture;
             try {
-              globalThis.cottontail.waitForPromise(settled);
+              for (let attempt = 0; attempt < 64; attempt += 1) {
+                globalThis.cottontail.drainJobs();
+                state = nativePromiseState(settled);
+                if (!state || state.status !== 0) break;
+              }
             } finally {
               globalThis.__cottontailQuietUnhandledRejectionCapture = previousQuietCapture;
             }
-            state = nativePromiseState(settled);
             if (state?.status === 1 && quietCapture.didCapture) {
               checkThrown(true, quietCapture.value);
               return undefined;
