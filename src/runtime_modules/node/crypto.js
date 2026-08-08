@@ -3187,7 +3187,12 @@ class SignImplementation extends Writable {
     // The stream shim assigns instance `_write = null` when no write option is
     // given, shadowing the prototype method; remove the shadow.
     if (this._write === null) delete this._write;
-    this.algorithm = String(algorithm);
+    if (typeof algorithm !== "string") {
+      const err = new TypeError(`The "algorithm" argument must be of type string. Received ${describeReceived(algorithm)}`);
+      err.code = "ERR_INVALID_ARG_TYPE";
+      throw err;
+    }
+    this.algorithm = algorithm;
     this.chunks = [];
   }
 
@@ -3222,7 +3227,12 @@ class VerifyImplementation extends Writable {
   constructor(algorithm, options = undefined) {
     super(options && typeof options === "object" ? options : {});
     if (this._write === null) delete this._write;
-    this.algorithm = String(algorithm);
+    if (typeof algorithm !== "string") {
+      const err = new TypeError(`The "algorithm" argument must be of type string. Received ${describeReceived(algorithm)}`);
+      err.code = "ERR_INVALID_ARG_TYPE";
+      throw err;
+    }
+    this.algorithm = algorithm;
     this.chunks = [];
   }
 
