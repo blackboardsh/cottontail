@@ -1223,6 +1223,7 @@ function createHtmlDispatcher(config, development) {
         sourceText,
         hmrEntries,
         css,
+        hasFileAssets: !supportsInternalHmr,
         buildError: false,
         errors: [],
       };
@@ -1308,7 +1309,18 @@ function createHtmlDispatcher(config, development) {
       const htmlChanged = changedPaths.some(changedPath =>
         path.resolve(projectRoot, changedPath) === htmlPath
       );
-      if (!previousSuccessful || htmlChanged || previousSuccessful.sourceText !== next.sourceText) {
+      // Pages with linked file assets (e.g. <img src="image.png">) can't use the
+      // internal HMR graph and embed content-hashed asset URLs in the document.
+      // Editing such an asset leaves the raw HTML untouched but rewrites the
+      // built body, so compare the rendered body to force a reload. This is
+      // gated on hasFileAssets so CSS pages — whose bodies are stable across
+      // edits — keep flowing through the CSS hot-update path below.
+      const assetBodyChanged = next.hasFileAssets &&
+        typeof previousSuccessful.body === "string" &&
+        typeof next.body === "string" &&
+        previousSuccessful.body !== next.body;
+      if (!previousSuccessful || htmlChanged || previousSuccessful.sourceText !== next.sourceText ||
+          assetBodyChanged) {
         hardReload = true;
         successfulBundles.set(htmlPath, next);
         continue;
