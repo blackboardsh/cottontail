@@ -227,6 +227,10 @@ if (globalThis.console) {
   };
 
   const isBufferValue = (value) =>
+    // ArrayBuffer.isView is an internal-slot check that never reads a property,
+    // so it can't trip a Proxy trap (Buffer.isBuffer reads `._isBuffer` in the
+    // bootstrap polyfill). Gate the property-reading check behind it.
+    ArrayBuffer.isView(value) &&
     typeof Buffer === "function" && typeof Buffer.isBuffer === "function" && Buffer.isBuffer(value);
 
   const isArrayBufferValue = (value) => {
