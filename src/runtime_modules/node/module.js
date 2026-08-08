@@ -683,6 +683,9 @@ function runtimePluginTranspile(contents, loader, path, specifier) {
         target: "bun",
         deadCodeElimination: false,
         _cottontailStructuredErrors: true,
+        // Inject the automatic JSX runtime import + honor the project's tsconfig.
+        jsxAutoImport: true,
+        ...tsconfigTransformOverrides(path),
       }),
       loader,
     ));
@@ -1405,6 +1408,117 @@ function loadTsconfigPaths(dir) {
   }
   tsconfigPathsCache.set(dir, entry);
   return entry;
+}
+
+// Resolved tsconfig compilerOptions that steer the module-load transpile
+// (decorators + JSX). The standalone transpiler has no project resolver, so the
+// bundler-equivalent flags are read here and forwarded through the transform
+// options. `extends` chains are followed and results are cached per directory,
+// walking toward the filesystem root like TypeScript/Bun.
+const tsconfigCompilerOptionsCache = new Map();
+
+function readTsconfigCompilerOptions(file, seen) {
+  if (seen.has(file)) return {};
+  seen.add(file);
+  let parsed;
+  try {
+    if (!isFile(file)) return {};
+    parsed = parseJSONC(String(readModuleFile(file)));
+  } catch {
+    return {};
+  }
+  if (!parsed || typeof parsed !== "object") return {};
+  let base = {};
+  const extendsField = parsed.extends;
+  const extendsList = typeof extendsField === "string"
+    ? [extendsField]
+    : Array.isArray(extendsField) ? extendsField : [];
+  for (const specifier of extendsList) {
+    if (typeof specifier !== "string" || specifier.length === 0) continue;
+    // Only relative/absolute extends are resolved here; package extends would
+    // require the full resolver the bundler owns.
+    if (!specifier.startsWith(".") && !isAbsolute(specifier)) continue;
+    let extendsPath = resolve(dirname(file), specifier);
+    if (!/\.json$/i.test(extendsPath)) extendsPath += ".json";
+    base = { ...base, ...readTsconfigCompilerOptions(extendsPath, seen) };
+  }
+  const own = parsed.compilerOptions && typeof parsed.compilerOptions === "object"
+    ? parsed.compilerOptions
+    : {};
+  return { ...base, ...own };
+}
+
+function loadTsconfigCompilerOptions(dir) {
+  if (standaloneAutoloadDisabled("disableAutoloadTsconfig")) return null;
+  if (tsconfigCompilerOptionsCache.has(dir)) return tsconfigCompilerOptionsCache.get(dir);
+  let entry = null;
+  try {
+    const file = join(dir, "tsconfig.json");
+    if (isFile(file)) entry = readTsconfigCompilerOptions(file, new Set());
+  } catch {}
+  if (!entry) {
+    const parent = dirname(dir);
+    entry = parent && parent !== dir ? loadTsconfigCompilerOptions(parent) : null;
+  }
+  tsconfigCompilerOptionsCache.set(dir, entry);
+  return entry;
+}
+
+// Map resolved tsconfig compilerOptions to the standalone transpiler's option
+// keys. Returns only non-default overrides, or null when the project keeps the
+// transpiler defaults (TC39 standard decorators + automatic JSX runtime).
+function tsconfigTransformOverrides(filename) {
+  const dir = dirname(String(filename));
+  const compilerOptions = loadTsconfigCompilerOptions(dir);
+  const overrides = {};
+  let hasOverride = false;
+  if (compilerOptions) {
+    if (compilerOptions.experimentalDecorators === true) {
+      overrides.experimentalDecorators = true;
+      hasOverride = true;
+    }
+    if (compilerOptions.emitDecoratorMetadata === true) {
+      overrides.emitDecoratorMetadata = true;
+      hasOverride = true;
+    }
+    const jsx = typeof compilerOptions.jsx === "string" ? compilerOptions.jsx.toLowerCase() : null;
+    if (jsx === "react") {
+      overrides.jsxRuntime = "classic";
+      hasOverride = true;
+    } else if (jsx === "react-jsx") {
+      overrides.jsxRuntime = "automatic";
+      overrides.jsxDev = false;
+      hasOverride = true;
+    } else if (jsx === "react-jsxdev") {
+      overrides.jsxRuntime = "automatic";
+      overrides.jsxDev = true;
+      hasOverride = true;
+    }
+    if (typeof compilerOptions.jsxImportSource === "string" && compilerOptions.jsxImportSource.length > 0) {
+      overrides.jsxImportSource = compilerOptions.jsxImportSource;
+      hasOverride = true;
+    }
+    if (typeof compilerOptions.jsxFactory === "string" && compilerOptions.jsxFactory.length > 0) {
+      overrides.jsxFactory = compilerOptions.jsxFactory;
+      hasOverride = true;
+    }
+    if (typeof compilerOptions.jsxFragmentFactory === "string" && compilerOptions.jsxFragmentFactory.length > 0) {
+      overrides.jsxFragmentFactory = compilerOptions.jsxFragmentFactory;
+      hasOverride = true;
+    }
+  }
+  return hasOverride ? overrides : null;
+}
+
+// Loader for the standalone transpiler, keyed on the module's extension so JSX
+// in `.tsx`/`.jsx` is actually parsed instead of reaching the compiler as raw
+// `<` tokens.
+function transpilerLoaderForFilename(filename) {
+  const ext = String(filename).toLowerCase().match(/\.[^.]+$/)?.[0];
+  if (ext === ".tsx") return "tsx";
+  if (ext === ".ts" || ext === ".mts" || ext === ".cts") return "ts";
+  if (ext === ".jsx") return "jsx";
+  return "js";
 }
 
 function resolveTsconfigPathsMapping(request, startDir) {
@@ -2752,6 +2866,25 @@ function maybeStripTypeScript(filename, source) {
   // `// @bun` declares already-transpiled output. Parsing TypeScript below it
   // must fail instead of silently stripping types from an invalid artifact.
   if (hasBunTranspiledPragma(source)) return source;
+  const loader = transpilerLoaderForFilename(filename);
+  const overrides = tsconfigTransformOverrides(filename);
+  // `.tsx` sources carry JSX that the plain type-stripper (fixed to a "ts"
+  // loader) would leave as raw `<` tokens, and a project that opts into legacy
+  // (experimental) decorators or a specific JSX runtime must be honored. Route
+  // those through the full transform with the resolved loader + tsconfig
+  // options. Plain `.ts` with the default tsconfig keeps the cheaper strip,
+  // which already lowers TC39 standard decorators by default.
+  if ((loader === "tsx" || overrides !== null) && typeof cottontail.transpilerTransform === "function") {
+    try {
+      return String(cottontail.transpilerTransform(
+        String(source),
+        JSON.stringify({ jsxAutoImport: true, ...(overrides ?? {}) }),
+        loader,
+      ));
+    } catch (error) {
+      throw markModuleCompileError(error, filename, source, 0);
+    }
+  }
   if (typeof cottontail.stripTypeScriptTypes !== "function") return source;
   try {
     return String(cottontail.stripTypeScriptTypes(String(source), 1));
@@ -2771,7 +2904,7 @@ function maybeTransformRuntimeSyntax(filename, source) {
     : "js";
   return String(cottontail.transpilerTransform(
     String(source),
-    '{"target":"bun","deadCodeElimination":false}',
+    JSON.stringify({ target: "bun", deadCodeElimination: false, jsxAutoImport: true, ...tsconfigTransformOverrides(path) }),
     loader,
   ));
 }
@@ -3015,6 +3148,11 @@ function transpileExtensionSource(filename, loader, forceTransform = false, inpu
           __filename: CJS_FILENAME_BINDING,
           __dirname: CJS_DIRNAME_BINDING,
         },
+        // Inject the automatic JSX runtime import so the compiled module can
+        // execute standalone, and honor the project's tsconfig for decorator +
+        // JSX lowering.
+        jsxAutoImport: true,
+        ...tsconfigTransformOverrides(filename),
       }),
       loader,
     )));
