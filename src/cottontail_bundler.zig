@@ -902,6 +902,14 @@ pub fn bundleEntryPointGraphWithOptions(
         };
     }
 
+    // See buildEntryPointsJson: FileSystem.instance's top_level_dir is pinned on
+    // first init, so refresh it to this build's working directory before
+    // Transpiler.init so relative `external` paths normalize against the correct
+    // cwd rather than a previous in-process build's directory.
+    if (compiler.fs.FileSystem.instance_loaded) {
+        try compiler.fs.FileSystem.instance.setTopLevelDir(working_dir_z);
+    }
+
     var log = compiler.logger.Log.init(allocator);
     var transpiler = compiler.Transpiler.init(allocator, &log, transform_options, null) catch |err| {
         setBuildError(error_out, &log, err);
@@ -2349,6 +2357,17 @@ pub fn buildEntryPointsJson(
             .keys = options.define_keys,
             .values = options.define_values,
         };
+    }
+
+    // FileSystem is a process-global singleton: its top_level_dir is pinned on
+    // first init and later Transpiler.init calls ignore `absolute_working_dir`.
+    // Refresh it to THIS build's working directory *before* Transpiler.init so
+    // BundleOptions.fromApi (which builds ExternalModules) normalizes relative
+    // `external` paths against the correct cwd. Without this, a second in-process
+    // Bun.build with a different root resolves e.g. "./src/x.png" against the
+    // previous build's directory and fails to keep it external.
+    if (compiler.fs.FileSystem.instance_loaded) {
+        try compiler.fs.FileSystem.instance.setTopLevelDir(working_dir_z);
     }
 
     var log = compiler.logger.Log.init(allocator);
