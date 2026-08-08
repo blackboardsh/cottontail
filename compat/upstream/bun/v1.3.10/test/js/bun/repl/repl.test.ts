@@ -756,8 +756,8 @@ describe.concurrent("Bun REPL", () => {
     test("shows welcome message with version", async () => {
       const { stdout, exitCode } = await runRepl([".exit"]);
       const output = stripAnsi(stdout);
-      expect(output).toContain("Welcome to Bun");
-      expect(output).toMatch(/Bun v\d+\.\d+\.\d+/);
+      expect(output).toContain("Welcome to Cottontail");
+      expect(output).toMatch(/Cottontail v\d+\.\d+\.\d+/);
       expect(exitCode).toBe(0);
     });
   });
@@ -782,7 +782,7 @@ describe.concurrent("Bun REPL", () => {
 
     test("-e does not show welcome message", async () => {
       const { stdout, exitCode } = await runReplWith(["-e", "1 + 1"]);
-      expect(stdout).not.toContain("Welcome to Bun");
+      expect(stdout).not.toContain("Welcome to Cottontail");
       expect(exitCode).toBe(0);
     });
 
@@ -917,7 +917,7 @@ describe.todoIf(isWindows)("Bun REPL (Terminal)", () => {
   test("shows welcome message and prompt", async () => {
     await withTerminalRepl(async ({ allOutput }) => {
       const output = allOutput();
-      expect(output).toContain("Welcome to Bun");
+      expect(output).toContain("Welcome to Cottontail");
       expect(output).toMatch(/\u276f|> /);
     });
   });

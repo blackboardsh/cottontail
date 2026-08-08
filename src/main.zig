@@ -52,7 +52,7 @@ fn commandDisplayVersion(init: std.process.Init) []const u8 {
 }
 const help_text_template =
     \\cottontail {s}
-    \\Cottontail is a Bun-compatible JavaScript runtime built with Zig and JavaScriptCore.
+    \\Cottontail is a small, batteries included, and high performance JS runtime.
     \\
     \\Usage:
     \\  cottontail <entrypoint.js|entrypoint.ts> [args...]
@@ -3575,8 +3575,8 @@ pub fn main(init: std.process.Init) !void {
 
 test "help text mentions cottontail and script usage" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "cottontail") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "Bun-compatible JavaScript runtime") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "JavaScriptCore") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "batteries included") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "high performance JS runtime") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<entrypoint.js|entrypoint.ts>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "cottontail build") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "provided by Hutch") != null);

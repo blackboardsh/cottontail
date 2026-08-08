@@ -81,7 +81,7 @@ describe.if(!isWindows)("uv stubs", () => {
         .throws(false)
         .quiet();
       const stderrStr = stderr.toString();
-      expect(stderrStr).toContain("Bun encountered a crash when running a NAPI module that tried to call");
+      expect(stderrStr).toContain("Cottontail encountered a crash when running a NAPI module that tried to call");
       expect(stderrStr).toContain(symbol);
     });
   }

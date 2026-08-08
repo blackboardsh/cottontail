@@ -1994,18 +1994,7 @@
     },
     "test/js/bun/shell/exec.test.ts": {
       "status": "enabled",
-      "reason": "Bun shell execution, environment, process status, pipelines, and redirection pass 18 of 19 copied upstream cases; one case is excluded via testNameExclusion.",
-      "args": [
-        "--test-name-pattern=^(?!.*bun works even when not in PATH).*$"
-      ],
-      "testNameExclusion": {
-        "pattern": "^(?!.*bun works even when not in PATH).*$",
-        "classification": "upstream",
-        "testNames": [
-          "bun exec > bun works even when not in PATH"
-        ],
-        "reason": "The case asserts the help output contains Bun's identity string \"Bun is a fast JavaScript runtime\". Cottontail intentionally prints its own banner and does not advertise Bun. The behavioral part of the case (resolving the runtime by name even with an empty PATH, i.e. not printing \"bun: command not found\") passes."
-      }
+      "reason": "Bun shell execution, environment, process status, pipelines, and redirection pass all 19 copied upstream cases. The help-output assertions were updated to Cottontail's own branding (we own the suite), so no case is excluded."
     },
     "test/js/bun/shell/file-io.test.ts": {
       "status": "enabled",
