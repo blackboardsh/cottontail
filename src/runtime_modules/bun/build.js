@@ -739,7 +739,15 @@ export function createBunBuildFacade(dependencies) {
     };
 
     const loadWithPlugins = async (record) => {
-      const defaultLoader = record.namespace === "file" ? bundleLoaderForPath(record.path) : "js";
+      // The default loader is derived from the resolved path's extension for
+      // every namespace, matching Bun's `Path.loader()` which ignores the
+      // namespace. A path whose extension has no dedicated loader (the "file"
+      // fallback) is treated as JavaScript for non-"file" namespaces, mirroring
+      // Bun's `orelse .js` default for virtual/plugin-resolved modules.
+      const extensionLoader = bundleLoaderForPath(record.path);
+      const defaultLoader = record.namespace === "file"
+        ? extensionLoader
+        : extensionLoader === "file" ? "js" : extensionLoader;
       for (const rule of onLoadRules) {
         if (rule.namespace !== record.namespace) continue;
         if (!rule.filter.test(record.path)) continue;
