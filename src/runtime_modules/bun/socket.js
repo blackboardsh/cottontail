@@ -334,7 +334,11 @@ function attachBunSocketHandlers(socket, handlerState, data = undefined, connect
     const handlers = handlerState.current;
     const callback = handlers?.[name];
     if (typeof callback !== "function") {
-      if (name === "error") throw args[1];
+      // Bun's socket API treats the `error` handler as optional: a socket that
+      // faults (e.g. ECONNRESET on an abandoned connection) with no `error`
+      // handler is silently dropped, not escalated to an uncaught exception
+      // (verified against Bun 1.3.10). The `close` event still reports
+      // hadError via __cottontailBunCloseError.
       return undefined;
     }
     try {
