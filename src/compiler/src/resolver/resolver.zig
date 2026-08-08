@@ -591,6 +591,11 @@ pub const Resolver = struct {
     /// pattern. Does NOT consider `packages = external`; use
     /// `isExternalPattern` for the combined check.
     pub fn matchesUserExternalPattern(r: *ThisResolver, import_path: string) bool {
+        // Exact, cwd-independent match of a path-like external specifier as
+        // written in the source (e.g. `import "./foo"` with external ["./foo"]).
+        if (r.opts.external.exact.count() > 0 and r.opts.external.exact.contains(import_path)) {
+            return true;
+        }
         for (r.opts.external.patterns) |pattern| {
             if (import_path.len >= pattern.prefix.len + pattern.suffix.len and (strings.startsWith(
                 import_path,
