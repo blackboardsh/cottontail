@@ -1982,12 +1982,49 @@ fn nativeBuildGeneration(
     }
 
     if (result.get("logs")) |logs| {
+        var printed_warning = false;
         if (logs == .array) for (logs.array.items) |log| {
             if (log != .object) continue;
             const level = log.object.get("level") orelse continue;
             const message = log.object.get("message") orelse continue;
             if (level != .string or message != .string or !std.mem.eql(u8, level.string, "warning")) continue;
+            if (printed_warning) try stderr.writeAll("\n");
+            printed_warning = true;
+            if (log.object.get("position")) |position| {
+                if (position == .object) {
+                    const line_text = position.object.get("lineText");
+                    const line = position.object.get("line");
+                    const column = position.object.get("column");
+                    if (line_text != null and line_text.? == .string and
+                        line != null and line.? == .integer and line.?.integer > 0 and
+                        column != null and column.? == .integer and column.?.integer > 0)
+                    {
+                        try stderr.print("{} | {s}\n", .{ line.?.integer, line_text.?.string });
+                        const caret_padding = std.fmt.count("{} | ", .{line.?.integer}) +
+                            @as(usize, @intCast(column.?.integer - 1));
+                        try stderr.splatByteAll(' ', caret_padding);
+                        try stderr.writeAll("^\n");
+                    }
+                }
+            }
             try stderr.print("warn: {s}\n", .{message.string});
+            if (log.object.get("position")) |position| {
+                if (position == .object) {
+                    const file = position.object.get("file");
+                    const line = position.object.get("line");
+                    const column = position.object.get("column");
+                    if (file != null and file.? == .string and
+                        line != null and line.? == .integer and
+                        column != null and column.? == .integer)
+                    {
+                        try stderr.print("   at {s}:{}:{}\n", .{
+                            file.?.string,
+                            line.?.integer,
+                            column.?.integer,
+                        });
+                    }
+                }
+            }
         };
         try stderr.flush();
     }
