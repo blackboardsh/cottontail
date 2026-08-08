@@ -15,8 +15,22 @@ function remapStackString(value) {
   return typeof remap === "function" ? remap(value) : String(value);
 }
 
+// Set once the console formatter below is built; see its assignment.
+let bootstrapInspect;
+
+// A thrown value's own accessors are user code and may throw. Reading them
+// while formatting must never turn the report into "Unknown JavaScript
+// exception"; Bun keeps printing and marks the property as a getter.
+function safeRead(value, key) {
+  try {
+    return value == null ? undefined : value[key];
+  } catch {
+    return undefined;
+  }
+}
+
 function normalizeUncaughtReferenceError(error) {
-  if (error?.name !== "ReferenceError" ||
+  if (safeRead(error, "name") !== "ReferenceError" ||
       typeof error.message !== "string" ||
       !error.message.startsWith("Can't find variable: ")) {
     return undefined;
@@ -36,29 +50,55 @@ globalThis.__cottontailNormalizeUncaughtException ??= error => {
 };
 
 globalThis.__cottontailFormatUncaughtException ??= (error) => {
-  if (error?.__cottontailFormattedStack === true && typeof error.stack === "string") {
-    return error.stack;
+  const stackValue = safeRead(error, "stack");
+  if (safeRead(error, "__cottontailFormattedStack") === true && typeof stackValue === "string") {
+    return stackValue;
   }
-  if (error?.name === "ResolveMessage" && typeof error.message === "string") {
-    return `error: ${error.message}`;
+  const messageValue = safeRead(error, "message");
+  if (safeRead(error, "name") === "ResolveMessage" && typeof messageValue === "string") {
+    return `error: ${messageValue}`;
   }
   const referenceErrorHeaders = normalizeUncaughtReferenceError(error);
-  if (error && typeof error.stack === "string") {
-    let stack = remapStackString(error.stack);
+  if (error && typeof stackValue === "string") {
+    let stack = remapStackString(stackValue);
     if (referenceErrorHeaders) stack = stack.replace(referenceErrorHeaders[0], referenceErrorHeaders[1]);
     let header = "";
     try {
       header = Error.prototype.toString.call(error);
     } catch {}
-    if (error?.name === "AssertionError" && error?.code === "ERR_ASSERTION") {
-      header = `AssertionError [ERR_ASSERTION]: ${error.message}`;
+    if (safeRead(error, "name") === "AssertionError" && safeRead(error, "code") === "ERR_ASSERTION") {
+      header = `AssertionError [ERR_ASSERTION]: ${messageValue}`;
     }
     if (referenceErrorHeaders) header = referenceErrorHeaders[1];
     return header && !stack.includes(header) ? `${header}\n${stack}` : stack;
   }
   if (referenceErrorHeaders) return referenceErrorHeaders[1];
-  if (error?.message) return `${error.name || "Error"}: ${error.message}`;
-  return String(error);
+  if (typeof messageValue === "string" && error && typeof error === "object") {
+    // A thrown plain object: Bun reports the message, dumps the object, and
+    // points at whatever location the object claims.
+    const lines = [`error: ${messageValue}`];
+    try {
+      const inspect = globalThis.Bun?.inspect ?? bootstrapInspect;
+      const dump = inspect?.(error);
+      if (typeof dump === "string" && dump.length > 0) lines.push(dump);
+    } catch {}
+    const source = safeRead(error, "sourceURL") ?? safeRead(error, "fileName");
+    const line = safeRead(error, "line") ?? safeRead(error, "lineNumber");
+    const column = safeRead(error, "column") ?? safeRead(error, "columnNumber");
+    if (source != null || line != null) {
+      lines.push(
+        `      at ${source == null ? "<script>" : String(source)}` +
+          `${line == null ? "" : `:${String(line)}`}${column == null ? "" : `:${String(column)}`}`,
+      );
+    }
+    return lines.join("\n");
+  }
+  if (messageValue != null) return `${safeRead(error, "name") ?? "Error"}: ${messageValue}`;
+  try {
+    return String(error);
+  } catch {
+    return "Unknown JavaScript exception";
+  }
 };
 
 function installEmitter(target) {
@@ -444,6 +484,10 @@ if (globalThis.console) {
       try { return String(value); } catch { return "<Revoked Proxy>"; }
     }
   };
+
+  // The uncaught-exception formatter runs before this block and on the
+  // selective bootstrap has no Bun.inspect to reach for; share this one.
+  bootstrapInspect = value => formatArg(value, { depth: consoleDepth, customInspect: true });
 
   const formatPlaceholders = (fmt, values) => {
     let vi = 0;

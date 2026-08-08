@@ -571,8 +571,16 @@ function streamFile(state, chunkSize) {
   return stream;
 }
 
+// The native UTF-8 conversion stops at the first unpaired surrogate, which
+// would silently truncate the write. Bun encodes unpaired surrogates as U+FFFD
+// like every other string sink, so normalize before crossing the boundary.
+function wellFormedForUtf8(text) {
+  return typeof text.isWellFormed === "function" && !text.isWellFormed() ? text.toWellFormed() : text;
+}
+
 function writeAllToFd(fd, source, target) {
   const isString = typeof source === "string";
+  if (isString) source = wellFormedForUtf8(source);
   const requestedLength = isString ? source.length * 3 : source.byteLength;
   if (requestedLength === 0) return 0;
   let written;

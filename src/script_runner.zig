@@ -971,7 +971,14 @@ fn validateCommonJsTestSyntax(ctx: *const Context, script_abs: []const u8) !void
     const imports = native_transpiler.scanImportsJsonWithError(source, loader, &error_message) catch {
         if (error_message) |message| {
             defer native_transpiler.ct_transpiler_string_free(message);
-            writeTranspilerDiagnostic(ctx, std.mem.span(message), script_abs);
+            // `bun test` reports a file that fails to parse as an unhandled
+            // error between tests: file header, framed diagnostic, and one
+            // failing test so summaries and --bail accounting include it.
+            if (ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null) {
+                reportTestBundleError(ctx, script_abs, std.mem.span(message));
+            } else {
+                writeTranspilerDiagnostic(ctx, std.mem.span(message), script_abs);
+            }
         }
         return error.TestBundleFailed;
     };

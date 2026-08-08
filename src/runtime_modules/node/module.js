@@ -2391,7 +2391,16 @@ function refreshModuleRequire(module) {
   nativeObjectDefineProperty(require, "name", { value: "require", configurable: true });
   const moduleBase = module.filename || (isAbsolute(module.id) ? module.id : cottontail.cwd());
   configureRequireProperties(require, moduleBase, () => module, true);
-  module.require = require;
+  // Node reaches module.require through Module.prototype, so it is never an
+  // enumerable own property. Keeping it hidden matters for inspection: an
+  // enumerable require drags require.cache — the whole module graph — into
+  // every Bun.inspect() of a Module.
+  nativeObjectDefineProperty(module, "require", {
+    value: require,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
   return require;
 }
 
@@ -4770,6 +4779,8 @@ function reportMainCompileError(error, info) {
   cottontail.exit(1);
 }
 
+let implicitRunMainUsed = false;
+
 export function __runMain(filename) {
   let resolved = _resolveFilename(resolve(String(filename)), null, true);
   // --preserve-symlinks applies to dependencies, not the entry point. Node
@@ -5581,9 +5592,22 @@ export function _readPackage(requestPath) {
   };
 }
 
-export function runMain(main = globalThis.process?.argv?.[1]) {
-  if (!main) return undefined;
-  return __runMain(main);
+export function runMain(main) {
+  // Node loads the entry point through the CommonJS cache, so an implicit
+  // Module.runMain() after the entry already ran resolves from cache and never
+  // re-executes it; Bun likewise never re-runs the entry for a bare call. The
+  // process bootstrap performs the single implicit call that starts the entry,
+  // so every later implicit call is a no-op. Neither runtime returns exports.
+  if (main === undefined || main === null || main === "") {
+    if (implicitRunMainUsed) return undefined;
+    implicitRunMainUsed = true;
+    const entry = globalThis.process?.argv?.[1];
+    if (!entry) return undefined;
+    __runMain(entry);
+    return undefined;
+  }
+  __runMain(main);
+  return undefined;
 }
 
 export function syncBuiltinESMExports() {
