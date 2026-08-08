@@ -897,15 +897,16 @@ async function buildChangedHtmlHmrModules(projectRoot, changedPaths, previousBun
     if (!isJavaScriptArtifact({ loader: loaderForPath(entryPath) })) continue;
     if (![...loadedModuleIds].some(id => changedPathMatchesModule(projectRoot, [changedPath], id))) continue;
 
-    let artifact;
+    let internal;
     try {
-      artifact = await buildInternalBakeEntry(entryPath, outdir, buildConfig);
+      internal = await buildInternalBakeEntry(entryPath, outdir, buildConfig);
     } catch {
       return null;
     }
 
+    const { artifact, outputs } = internal;
     const source = await artifact.text();
-    const sourceMapRecord = await sourceMapRecordForArtifact(artifact, [artifact], source, projectRoot);
+    const sourceMapRecord = await sourceMapRecordForArtifact(artifact, outputs, source, projectRoot);
     for (const [id, definition] of Object.entries(bakeRegistryModules(source))) {
       if (!loadedModuleIds.has(id) || !changedPathMatchesModule(projectRoot, [changedPath], id)) continue;
       modules[id] = definition;
