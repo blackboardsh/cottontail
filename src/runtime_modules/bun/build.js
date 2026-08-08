@@ -40,13 +40,33 @@ export function createBunBuildFacade(dependencies) {
     const toAbsolute = (value) => (
       value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value) ? value : nodePathResolve(cwd, value)
     );
+    // A path-like entrypoint is anchored to the filesystem (absolute, or an
+    // explicit "./"/"../" relative path). Bare specifiers (e.g. "pkg",
+    // "@scope/pkg") are package entry points that the native resolver must
+    // look up in node_modules — applying the "exports"/"module"/"main" fields
+    // — so they are passed through unchanged rather than force-joined to cwd.
+    const isPathLike = (value) =>
+      value.startsWith("/") ||
+      value.startsWith("./") ||
+      value.startsWith("../") ||
+      value.startsWith(".\\") ||
+      value.startsWith("..\\") ||
+      value === "." ||
+      value === ".." ||
+      /^[A-Za-z]:[\\/]/.test(value);
     try {
       const entrypoints = [];
       const virtualFiles = spec.files && typeof spec.files === "object" ? spec.files : null;
       for (const entrypoint of spec.entrypoints ?? []) {
         const entry = String(entrypoint);
         const absoluteEntry = toAbsolute(entry);
-        if (!Object.prototype.hasOwnProperty.call(virtualFiles ?? {}, absoluteEntry) && !cottontail.existsSync(absoluteEntry)) {
+        // Resolve to a concrete file when the entry exists on disk (or in the
+        // virtual file map). Otherwise, defer bare package specifiers to the
+        // native resolver (node_modules lookup); only reject path-like entries
+        // that point at a non-existent file.
+        if (Object.prototype.hasOwnProperty.call(virtualFiles ?? {}, absoluteEntry) || cottontail.existsSync(absoluteEntry)) {
+          entrypoints.push(absoluteEntry);
+        } else if (isPathLike(entry)) {
           return {
             ok: false,
             name: "AggregateError",
@@ -58,8 +78,9 @@ export function createBunBuildFacade(dependencies) {
               position: null,
             }],
           };
+        } else {
+          entrypoints.push(entry);
         }
-        entrypoints.push(absoluteEntry);
       }
       const request = { ...spec, plugins: undefined, __cottontailWorkingDirectory: undefined, entrypoints };
       const parsed = JSON.parse(cottontail.buildNative(JSON.stringify(request), cwd));
