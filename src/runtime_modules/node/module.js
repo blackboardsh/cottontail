@@ -3648,7 +3648,7 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
   // compiler graph, for example, intentionally closes a cycle between its
   // node constructors and map_children module.
   output = replaceCodePattern(output,
-    /\bimport\s+([A-Za-z_$][\w$]*)\s*,\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s+from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
+    /\bimport\s+([A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*)\s*,\s*\*\s*as\s+([A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*)\s+from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
     (_all, def, name, spec, attributeKeyword, attributes, offset) => {
       const namespace = importNamespace(spec, attributeKeyword, attributes, offset);
       importedBindings[def] = liveImportedBinding(namespace, "default");
@@ -3657,14 +3657,14 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
     },
   );
   output = replaceCodePattern(output,
-    /\bimport\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s+from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
+    /\bimport\s*\*\s*as\s+([A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*)\s+from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
     (_all, name, spec, attributeKeyword, attributes, offset) => {
       importedBindings[name] = importNamespace(spec, attributeKeyword, attributes, offset);
       return ";";
     },
   );
   output = replaceCodePattern(output,
-    /\bimport\s+([A-Za-z_$][\w$]*)\s*,\s*\{([^}]*)\}\s*from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
+    /\bimport\s+([A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*)\s*,\s*\{([^}]*)\}\s*from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
     (_all, def, names, spec, attributeKeyword, attributes, offset) => {
       const namespace = importNamespace(spec, attributeKeyword, attributes, offset);
       importedBindings[def] = liveImportedBinding(namespace, "default");
@@ -3685,7 +3685,7 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
     },
   );
   output = replaceCodePattern(output,
-    /\bimport\s+([A-Za-z_$][\w$]*)\s+from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
+    /\bimport\s+([A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*)\s+from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
     (_all, def, spec, attributeKeyword, attributes, offset) => {
       const namespace = importNamespace(spec, attributeKeyword, attributes, offset);
       importedBindings[def] = liveImportedBinding(namespace, "default");
@@ -3725,7 +3725,7 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
     },
   );
   output = replaceCodePattern(output,
-    /\bexport\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s+from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
+    /\bexport\s*\*\s*as\s+([A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*)\s+from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
     (_all, name, spec, attributeKeyword, attributes) => {
       const namespace = `__cottontailReExportNamespace${importNamespaceIndex++}`;
       return `{ const ${namespace} = ${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)}; ${liveExportStatement(name, namespace)} }`;
@@ -3735,15 +3735,15 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
     /\bexport\s*\*\s*from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
     (_all, spec, attributeKeyword, attributes) => `{ const __ctNs = ${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)}; for (const __ctKey of Object.keys(__ctNs)) { if (__ctKey !== "default") Object.defineProperty(${ESM_EXPORTS_BINDING}, __ctKey, { configurable: true, enumerable: true, get: () => __ctNs[__ctKey] }); } }`,
   );
-  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`default\s+async\s+function\s*(\*?)\s*([A-Za-z_$][\w$]*)\s*\(`), (_all, trivia, star, name) => {
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`default\s+async\s+function\s*(\*?)\s*([A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*)\s*\(`), (_all, trivia, star, name) => {
     liveExportDeclarations.push(liveExportStatement("default", name));
     return `${trivia}async function ${star}${name}(`;
   });
-  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`default\s+function\s*(\*?)\s*([A-Za-z_$][\w$]*)\s*\(`), (_all, trivia, star, name) => {
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`default\s+function\s*(\*?)\s*([A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*)\s*\(`), (_all, trivia, star, name) => {
     liveExportDeclarations.push(liveExportStatement("default", name));
     return `${trivia}function ${star}${name}(`;
   });
-  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`default\s+class\s+([A-Za-z_$][\w$]*)\s*`), (_all, trivia, name) => {
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`default\s+class\s+([A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*)\s*`), (_all, trivia, name) => {
     liveExportDeclarations.push(liveExportStatement("default", name));
     return `${trivia}class ${name} `;
   });
@@ -3753,31 +3753,31 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
   output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`(const|let|var)\s+\{([^}]*)\}\s*=`), (_all, trivia, kind, bindings) => {
     for (const part of codeOnlyText(bindings).split(",")) {
       const name = part.trim().replace(/^\.\.\./, "").split(/\s*:\s*|\s*=\s*/, 2).at(-1)?.trim();
-      if (/^[A-Za-z_$][\w$]*$/.test(name ?? "")) {
+      if (/^[A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*$/.test(name ?? "")) {
         liveExportDeclarations.push(liveExportStatement(name, name));
       }
     }
     return `${trivia}${kind} {${bindings}} =`;
   });
-  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=`), (_all, trivia, kind, name) => {
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`(const|let|var)\s+([A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*)\s*=`), (_all, trivia, kind, name) => {
     liveExportDeclarations.push(liveExportStatement(name, name));
     return `${trivia}${kind} ${name} =`;
   });
   // Declarations without initializer (e.g. the `export var ns;` emitted for
   // TypeScript namespaces by the type stripper).
-  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`(let|var)\s+([A-Za-z_$][\w$]*)\s*;`), (_all, trivia, kind, name) => {
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`(let|var)\s+([A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*)\s*;`), (_all, trivia, kind, name) => {
     liveExportDeclarations.push(liveExportStatement(name, name));
     return `${trivia}${kind} ${name};`;
   });
-  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`async\s+function\s*(\*?)\s*([A-Za-z_$][\w$]*)\s*\(`), (_all, trivia, star, name) => {
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`async\s+function\s*(\*?)\s*([A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*)\s*\(`), (_all, trivia, star, name) => {
     liveExportDeclarations.push(liveExportStatement(name, name));
     return `${trivia}async function ${star}${name}(`;
   });
-  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`function\s*(\*?)\s*([A-Za-z_$][\w$]*)\s*\(`), (_all, trivia, star, name) => {
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`function\s*(\*?)\s*([A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*)\s*\(`), (_all, trivia, star, name) => {
     liveExportDeclarations.push(liveExportStatement(name, name));
     return `${trivia}function ${star}${name}(`;
   });
-  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`class\s+([A-Za-z_$][\w$]*)\s*`), (_all, trivia, name) => {
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`class\s+([A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*)\s*`), (_all, trivia, name) => {
     liveExportDeclarations.push(liveExportStatement(name, name));
     return `${trivia}class ${name} `;
   });
@@ -3789,12 +3789,12 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
       const local = pieces[0].trim();
       const exported = (pieces[1] ?? pieces[0]).trim();
       if (exported === '"module.exports"' || exported === "'module.exports'") {
-        if (/^[A-Za-z_$][\w$]*$/.test(local)) {
+        if (/^[A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*$/.test(local)) {
           liveExportDeclarations.push(liveExportStatement("module.exports", local));
         }
         continue;
       }
-      if (/^[A-Za-z_$][\w$]*$/.test(local) && /^[A-Za-z_$][\w$]*$/.test(exported)) {
+      if (/^[A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*$/.test(local) && /^[A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*$/.test(exported)) {
         liveExportDeclarations.push(liveExportStatement(exported, local));
       }
     }
@@ -5998,8 +5998,8 @@ function moduleBindingAliasPositions(source) {
   const positions = new Set();
   const code = codeOnlyText(source);
   const declarations = [
-    /\b(?:import|export)\s+(?:type\s+)?(?:[A-Za-z_$][\w$]*\s*,\s*)?\{[^{}]*\}/g,
-    /\b(?:import|export)\s+(?:type\s+)?(?:[A-Za-z_$][\w$]*\s*,\s*)?\*\s+as\s+[A-Za-z_$][\w$]*/g,
+    /\b(?:import|export)\s+(?:type\s+)?(?:[A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*\s*,\s*)?\{[^{}]*\}/g,
+    /\b(?:import|export)\s+(?:type\s+)?(?:[A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*\s*,\s*)?\*\s+as\s+[A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*/g,
   ];
   for (const declaration of declarations) {
     let match;
@@ -6081,7 +6081,7 @@ function stripTypeScriptTypesPreserveWhitespace(source) {
 
   source.replace(/import\s*\{([^}]*)\}\s*from/g, (match, names, offset) => {
     const namesStart = offset + match.indexOf("{") + 1;
-    const specifier = /(?:^|,)\s*type\s+[A-Za-z_$][\w$]*(?:\s+as\s+[A-Za-z_$][\w$]*)?\s*,?\s*/g;
+    const specifier = /(?:^|,)\s*type\s+[A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*(?:\s+as\s+[A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*)?\s*,?\s*/g;
     let item;
     while ((item = specifier.exec(names)) != null) {
       addMaskRange(ranges, namesStart + item.index, namesStart + item.index + item[0].length);
