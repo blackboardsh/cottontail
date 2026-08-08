@@ -4695,6 +4695,14 @@ function isGeneratedBundlePath(path) {
   return generatedBundlePaths.has(path);
 }
 
+// A generated bundle carries its own path in every frame it did not remap.
+// The runtime modules are bundled next to the entry unless
+// COTTONTAIL_RUNTIME_MODULES_DIR loads them from disk, so this helper's own
+// frames arrive as "<cache>/esm-entry-*.mjs" and would otherwise be taken for
+// the caller — resolving the caller's require() against the cache directory.
+const generatedBundleArtifactPattern =
+  /(?:^|[\\/])(?:script\.bundle\.mjs|(?:script|esm)-entry-[^\\/]*\.mjs|\.cottontail-compat-[0-9a-f]+(?:\.[A-Za-z0-9]+)?)$/;
+
 function bundledCallerPathFromStack() {
   // Errors constructed inside the runtime never reach the Bun-compatible
   // `Error.prototype.stack` formatting, so in a bundled run every frame here
@@ -4729,7 +4737,7 @@ function bundledCallerPathFromStack() {
     }
     const candidate = isAbsolute(frame) ? frame : resolve(cottontail.cwd(), frame);
     if (/[\\/]node[\\/]module\.js$/.test(candidate)) continue;
-    if (isGeneratedBundlePath(candidate)) continue;
+    if (isGeneratedBundlePath(candidate) || generatedBundleArtifactPattern.test(candidate)) continue;
     if (isFile(candidate)) return candidate;
   }
   return null;

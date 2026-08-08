@@ -113,10 +113,14 @@ class ProcessReadable {
     return this;
   }
 
-  listenerCount(name) { return (this._listeners.get(String(name)) ?? []).length; }
+  listenerCount(name) { return this._listeners.get(String(name))?.length ?? 0; }
 
+  // Every subprocess pipe chunk emits "data", so the no-listener case has to
+  // stay allocation-free: a 8 MiB stdout arrives as hundreds of chunks.
   emit(name, ...args) {
-    for (const handler of [...(this._listeners.get(String(name)) ?? [])]) handler(...args);
+    const handlers = this._listeners.get(String(name));
+    if (handlers === undefined || handlers.length === 0) return false;
+    for (const handler of [...handlers]) handler(...args);
     return this.listenerCount(name) > 0;
   }
 
@@ -148,15 +152,21 @@ class ProcessReadable {
     return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
   }
 
-  async bytes() {
-    if (this._locked && this._ended && this._chunks.length === 0 && !this._emptyReadClaimed) {
-      this._emptyReadClaimed = true;
-      return new Uint8Array(0);
-    }
+  // Drain every chunk into one array. Whole-body consumers join the pieces at
+  // the end anyway, so they bypass the per-read coalescing in _takeBuffered():
+  // merging buffered chunks into MAX_PIPE_READ_BYTES slices first would copy
+  // the entire payload an extra time before the final join.
+  async _drainChunks() {
     const reader = this.getReader();
     const chunks = [];
     try {
       for (;;) {
+        const buffered = this._chunks;
+        if (buffered.length > 0) {
+          for (let i = 0; i < buffered.length; i++) chunks.push(buffered[i]);
+          buffered.length = 0;
+          continue;
+        }
         const { done, value } = await reader.read();
         if (done) break;
         chunks.push(value);
@@ -165,7 +175,15 @@ class ProcessReadable {
       if (chunks.length === 0 && this._ended) this._emptyReadClaimed = true;
       else reader.releaseLock();
     }
-    return this._concatChunks(chunks);
+    return chunks;
+  }
+
+  async bytes() {
+    if (this._locked && this._ended && this._chunks.length === 0 && !this._emptyReadClaimed) {
+      this._emptyReadClaimed = true;
+      return new Uint8Array(0);
+    }
+    return this._concatChunks(await this._drainChunks());
   }
 
   async blob() {
@@ -173,18 +191,7 @@ class ProcessReadable {
       this._emptyReadClaimed = true;
       return new Blob([]);
     }
-    const reader = this.getReader();
-    const chunks = [];
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-      }
-    } finally {
-      if (chunks.length === 0 && this._ended) this._emptyReadClaimed = true;
-      else reader.releaseLock();
-    }
+    const chunks = await this._drainChunks();
     return globalThis.__cottontailBlobFromOwnedChunks?.(chunks) ?? new Blob(chunks);
   }
   async text() { return new TextDecoder().decode(await this.bytes()); }
