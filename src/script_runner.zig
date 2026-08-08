@@ -4863,6 +4863,20 @@ fn bundleScriptNative(
     const is_test_runtime_execution = is_test_cli_execution or
         ctx.environ_map.get("COTTONTAIL_TEST_FILE_COUNT") != null or
         isTestEntrypointPath(script_abs);
+    // `bun test <file>` runs the explicit file as a test regardless of its
+    // name (e.g. `index.fixture-test.ts`), so it must load the bunfig `[test]`
+    // preloads even though the name misses the `.test`/`_test`/`.spec` pattern.
+    // A single-file run is identified by COTTONTAIL_TEST_FILE_COUNT == "1"
+    // (multi-file runs go through the generated aggregate entrypoint, and set a
+    // higher count). Both markers live only in this process' private environ
+    // map and never reach spawned children, so `bun run` children of a test do
+    // not match here.
+    const is_single_file_test_entrypoint = !is_eval_entrypoint and
+        is_test_cli_execution and
+        if (ctx.environ_map.get("COTTONTAIL_TEST_FILE_COUNT")) |count|
+            std.mem.eql(u8, count, "1")
+        else
+            false;
     const is_wasm_entrypoint = std.mem.eql(u8, std.fs.path.extension(script_abs), ".wasm");
     var package_json_patch = try maybePatchEmptyPackageJsonForBundle(ctx, script_dir);
     defer restoreEmptyMetadataPatch(ctx, &package_json_patch);
@@ -4926,6 +4940,7 @@ fn bundleScriptNative(
             ctx,
             script_abs,
             is_test_cli_execution,
+            is_single_file_test_entrypoint,
             exec_args,
             script_args,
         );
@@ -6782,7 +6797,18 @@ fn isTestAggregateMarkerPath(path: []const u8) bool {
         std.mem.endsWith(u8, name, ".mjs");
 }
 
-fn shouldLoadBunfigTestPreloads(path: []const u8, test_cli_execution: bool) bool {
+fn shouldLoadBunfigTestPreloads(
+    path: []const u8,
+    test_cli_execution: bool,
+    single_file_test_entrypoint: bool,
+) bool {
+    // `bun test <file>` runs an explicit file as a test regardless of its
+    // name (e.g. `index.fixture-test.ts`), so the caller flags the single-file
+    // entrypoint and it loads the `[test]` preloads directly here. Otherwise
+    // only real test entrypoints (or the generated multi-file aggregate) under
+    // a test-CLI run qualify, which keeps `bun run` children spawned by tests
+    // on the universal preload rather than the `[test]` preload.
+    if (single_file_test_entrypoint) return true;
     return test_cli_execution and
         (isTestEntrypointPath(path) or isTestAggregateEntrypointPath(path));
 }
@@ -6849,10 +6875,15 @@ fn buildBunfigTestPreloadImports(
     ctx: *const Context,
     script_abs: []const u8,
     test_cli_execution: bool,
+    single_file_test_entrypoint: bool,
     exec_args: []const [:0]const u8,
     script_args: []const [:0]const u8,
 ) ![]const u8 {
-    const include_test_section = shouldLoadBunfigTestPreloads(script_abs, test_cli_execution);
+    const include_test_section = shouldLoadBunfigTestPreloads(
+        script_abs,
+        test_cli_execution,
+        single_file_test_entrypoint,
+    );
     const explicit_config = configPathFromArgs(exec_args) orelse configPathFromArgs(script_args);
     if (explicit_config) |configured| {
         const bunfig_path = if (std.fs.path.isAbsolute(configured))
@@ -10660,8 +10691,12 @@ test "isTestEntrypointPath matches bun test naming" {
     try std.testing.expect(!isTestAggregateMarkerPath("/a/tests/file-0.mjs"));
     try std.testing.expect(!isTestAggregateMarkerPath("/a/.cottontail-tmp/test-aggregate-1/example.ts"));
 
-    try std.testing.expect(shouldLoadBunfigTestPreloads("/a/b/example.test.ts", true));
-    try std.testing.expect(shouldLoadBunfigTestPreloads("/a/.cottontail-tmp/test-aggregate-1/entry.mjs", true));
-    try std.testing.expect(!shouldLoadBunfigTestPreloads("/a/b/example.test.ts", false));
-    try std.testing.expect(!shouldLoadBunfigTestPreloads("/a/b/example.ts", true));
+    try std.testing.expect(shouldLoadBunfigTestPreloads("/a/b/example.test.ts", true, false));
+    try std.testing.expect(shouldLoadBunfigTestPreloads("/a/.cottontail-tmp/test-aggregate-1/entry.mjs", true, false));
+    try std.testing.expect(!shouldLoadBunfigTestPreloads("/a/b/example.test.ts", false, false));
+    try std.testing.expect(!shouldLoadBunfigTestPreloads("/a/b/example.ts", true, false));
+    // Explicit single-file `bun test <file>` loads `[test]` preloads even when
+    // the entrypoint name does not match the test-file pattern.
+    try std.testing.expect(shouldLoadBunfigTestPreloads("/a/b/index.fixture-test.ts", false, true));
+    try std.testing.expect(shouldLoadBunfigTestPreloads("/a/b/example.ts", false, true));
 }
