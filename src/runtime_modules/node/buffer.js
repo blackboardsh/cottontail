@@ -1119,13 +1119,20 @@ export function SlowBuffer(size) {
   return Buffer.allocUnsafe(Number(size) || 0);
 }
 
-export function isAscii(input) {
+function isAsciiFallback(input) {
   const bytes = bufferSourceBytes(input);
   for (let index = 0; index < bytes.length; index += 1) {
     if ((bytes[index] & 0x80) !== 0) return false;
   }
   return true;
 }
+
+// Prefer the native isAscii so that construct-call semantics match Bun/Node
+// (`new isAscii(x)` returns the boolean result rather than a fresh object).
+export const isAscii =
+  typeof globalThis.cottontail?.createBufferIsAscii === "function"
+    ? globalThis.cottontail.createBufferIsAscii()
+    : isAsciiFallback;
 
 export function isUtf8(input) {
   const bytes = bufferSourceBytes(input);
@@ -1170,9 +1177,13 @@ Object.defineProperty(globalThis, "__cottontailBufferTranscodeImplementation", {
   configurable: true,
 });
 
-export function transcode(source, fromEncoding, toEncoding) {
-  return transcodeImplementation(source, fromEncoding, toEncoding);
-}
+// Bun reports `typeof buffer.transcode === "undefined"` while still keeping the
+// symbol callable. The native factory returns a function that masquerades as
+// undefined and dispatches to transcodeImplementation via the global above.
+export const transcode =
+  typeof globalThis.cottontail?.createBufferTranscode === "function"
+    ? globalThis.cottontail.createBufferTranscode()
+    : transcodeImplementation;
 
 export function resolveObjectURL(id) {
   if (typeof globalThis.resolveObjectURL === "function") return globalThis.resolveObjectURL(id);
