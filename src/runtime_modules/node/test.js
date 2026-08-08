@@ -446,6 +446,46 @@ function installAsyncFailureGuards() {
   Object.defineProperty(globalThis.Promise.reject, "name", { value: "reject", configurable: true });
 }
 
+// When several node:test files run together (`bun test a.js b.js`), Bun's
+// aggregate entry statically imports every transformed file, so the global
+// __filename / __cottontailRegisteringTestFile settle on the *last* file by the
+// time top-level test()/hook registrations run. Bun/Node attribute each
+// registration to the file where it lexically appears; recover that from the
+// call stack, which still carries the correct per-file frame. Returns null when
+// no user frame can be identified (single-file runs fall back to the globals).
+function deriveCallerTestFile() {
+  let stack = String(new Error().stack ?? "");
+  try {
+    stack = globalThis.__cottontailRemapStackString?.(stack) ?? stack;
+  } catch {}
+  for (const line of stack.split("\n")) {
+    const match = /(?:\(|@|\bat\s+)([^()@]+):(\d+):(\d+)\)?$/.exec(line.trim());
+    if (!match) continue;
+    const file = match[1];
+    if (!file || file.startsWith("node:") || file.startsWith("bun:")) continue;
+    // Skip the generated multi-file aggregate entry and per-file entry wrappers.
+    if (file.includes("test-aggregate-") || file.includes("script-entry-")) continue;
+    if (!file.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(file)) continue;
+    return file;
+  }
+  return null;
+}
+
+// Root-level beforeEach/afterEach registered while loading file A must only run
+// for file A's tests — Bun keeps each file's global hooks scoped to that file
+// even when multiple files run together. Non-root (describe) hooks already live
+// in a single file, so they are returned untouched. Hooks with no recorded
+// file (single-file fallback) always run, preserving prior behavior.
+function scopedEachHooks(suite, hooks, record) {
+  if (suite !== rootSuite || !hooks || hooks.length === 0) return hooks;
+  let needsFilter = false;
+  for (const hook of hooks) {
+    if (hook.registrationFile != null) { needsFilter = true; break; }
+  }
+  if (!needsFilter) return hooks;
+  return hooks.filter((hook) => hook.registrationFile == null || hook.registrationFile === record.filePath);
+}
+
 function createSuite(name, options = {}, parent = null) {
   const filePath = parent?.filePath || String(
     globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? "",
@@ -1006,7 +1046,7 @@ async function executeAttempt(record) {
     try {
       if (!setupError) {
         for (const suite of chain) {
-          const error = tagPerTestHookError(await runHookList(suite.beforeEachHooks, context));
+          const error = tagPerTestHookError(await runHookList(scopedEachHooks(suite, suite.beforeEachHooks, record), context));
           setupError ??= error;
           if (error) break;
         }
@@ -1029,7 +1069,7 @@ async function executeAttempt(record) {
         const dynamicAfterEachError = tagPerTestHookError(await runHookList(execution.afterEachHooks, context));
         cleanupError ??= dynamicAfterEachError;
         for (const suite of Array.from(chain).reverse()) {
-          const afterEachError = tagPerTestHookError(await runHookList(suite.afterEachHooks, context, true));
+          const afterEachError = tagPerTestHookError(await runHookList(scopedEachHooks(suite, suite.afterEachHooks, record), context, true));
           cleanupError ??= afterEachError;
         }
       }
@@ -2049,15 +2089,17 @@ function makeTestFunction(defaultOptions = {}) {
   const fn = function nodeTest(name, options, callback) {
     if (currentExecution()) throw nestedTestNotImplemented("test");
     const parsed = parseTestArgs(name, options, callback);
+    const derivedFile = deriveCallerTestFile();
+    const recordFilePath = String(
+      derivedFile ?? globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? globalThis.process?.argv?.[1] ?? "",
+    );
     const record = {
       name: parsed.name,
       options: validateTestOptions({ ...defaultOptions, ...parsed.options }),
       fn: parsed.fn,
       suite: currentSuite,
-      filePath: String(globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? globalThis.process?.argv?.[1] ?? ""),
-      registrationLine: Number(parsed.options.__bunRegistrationLine) || captureTestRegistrationLine(
-        String(globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? globalThis.process?.argv?.[1] ?? ""),
-      ),
+      filePath: recordFilePath,
+      registrationLine: Number(parsed.options.__bunRegistrationLine) || captureTestRegistrationLine(recordFilePath),
       ran: false,
       result: null,
     };
@@ -2164,7 +2206,7 @@ function beforeEachImpl(fn, options = {}) {
   if (currentExecution()) {
     throw new Error("Cannot call beforeEach() inside a test. Call it inside describe() instead.");
   }
-  currentSuite.beforeEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
+  currentSuite.beforeEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0, registrationFile: currentSuite === rootSuite ? deriveCallerTestFile() : undefined });
   scheduleRun();
 }
 
@@ -2173,7 +2215,7 @@ export const beforeEach = primaryTestModule?.beforeEach ?? beforeEachImpl;
 function afterEachImpl(fn, options = {}) {
   const execution = currentExecution();
   if (execution) execution.afterEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
-  else currentSuite.afterEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
+  else currentSuite.afterEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0, registrationFile: currentSuite === rootSuite ? deriveCallerTestFile() : undefined });
   scheduleRun();
 }
 
