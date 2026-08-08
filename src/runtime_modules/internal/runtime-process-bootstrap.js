@@ -44,6 +44,27 @@ function initializeRuntimeProcess() {
     try { delete target.env.COTTONTAIL_SPAWN_EXEC_PATH; } catch {}
   }
 
+  // Variables the spawning runtime injected so this process could be reached
+  // through its wrapper are part of that handoff, not of the environment the
+  // program asked for: keep their values for facade children of our own and
+  // drop them (and the marker) from process.env.
+  const injectedRouting = target.env.COTTONTAIL_SPAWN_ROUTING;
+  if (injectedRouting != null) {
+    const routing = {};
+    for (const key of String(injectedRouting).split(",")) {
+      if (key.length === 0) continue;
+      const value = target.env[key];
+      if (value != null) routing[key] = String(value);
+      try { delete target.env[key]; } catch {}
+    }
+    try { delete target.env.COTTONTAIL_SPAWN_ROUTING; } catch {}
+    Object.defineProperty(globalThis, "__cottontailFacadeRoutingEnv", {
+      value: routing,
+      writable: true,
+      configurable: true,
+    });
+  }
+
   target.platform ??= cottontail.platform();
   target.arch ??= cottontail.arch();
   // Node exposes the node-gyp build configuration on every process, including

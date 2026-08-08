@@ -436,20 +436,40 @@ function sanitizeEnvObject(env) {
   return sanitized;
 }
 
-function prepareNativeOptions(file, options = {}) {
-  if (options.env == null) {
-    // Node inherits the (possibly mutated) process.env object, not the raw environ.
-    return {
-      ...options,
-      env: sanitizeEnvObject(withoutElectrobunHostEnv(process.env)),
-      clearEnv: true,
-    };
+// Facade mode: process.execPath displays the wrapper path while the runtime
+// itself lives elsewhere. Spawning the wrapper hands it the routing variables
+// it needs to find the runtime, even when the caller replaced the whole
+// environment — the child scrubs them again on startup, so they stay invisible.
+function facadeRoutingEnv(file) {
+  const display = String(process.execPath ?? "");
+  const native = String(globalThis.cottontail?.execPath?.() ?? "");
+  if (display.length === 0 || display === native || String(file) !== display) return null;
+  const routing = {};
+  for (const key of ["DASH_COTTONTAIL", "COTTONTAIL_BINARY"]) {
+    const value = globalThis.__cottontailFacadeRoutingEnv?.[key] ?? process.env[key];
+    if (value != null) routing[key] = String(value);
   }
-  return {
-    ...options,
-    env: sanitizeEnvObject(options.env),
-    clearEnv: true,
-  };
+  return routing;
+}
+
+function prepareNativeOptions(file, options = {}) {
+  // Node inherits the (possibly mutated) process.env object, not the raw environ.
+  const env = options.env == null
+    ? sanitizeEnvObject(withoutElectrobunHostEnv(process.env))
+    : sanitizeEnvObject(options.env);
+  const routing = facadeRoutingEnv(file);
+  if (routing != null) {
+    const injected = [];
+    for (const [key, value] of Object.entries(routing)) {
+      if (env[key] !== undefined) continue;
+      env[key] = String(value);
+      injected.push(key);
+    }
+    // The wrapper's runtime drops exactly what we added here, so a child that
+    // was given an explicit environment still observes only that environment.
+    if (injected.length > 0) env.COTTONTAIL_SPAWN_ROUTING = injected.join(",");
+  }
+  return { ...options, env, clearEnv: true };
 }
 
 function normalizeCwdOption(cwd) {
@@ -787,8 +807,13 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
   const currentExecutable = command.file === String(
     globalThis.cottontail?.execPath?.() ?? globalThis.process?.execPath ?? "",
   );
+  // In facade mode the wrapper path launches this same runtime, so the child
+  // speaks the native IPC protocol. It still is not the current executable for
+  // the deferred-start gate: the wrapper cannot parse that argv.
+  const facadeDisplayExecutable = command.file === String(globalThis.process?.execPath ?? "") &&
+    String(globalThis.process?.execPath ?? "").length > 0;
   const nodeIpcProtocol = options.__nodeIpcProtocol === true ||
-    (options.__nodeIpcProtocol == null && ipcRequested && !currentExecutable);
+    (options.__nodeIpcProtocol == null && ipcRequested && !currentExecutable && !facadeDisplayExecutable);
   const useWindowsPipeIpc = isWindowsPlatform && ipcRequested;
   const publicStdioLength = Array.isArray(options.stdio) ? Math.max(3, options.stdio.length) : 3;
   const windowsPipeIpcTransportIndex = useWindowsPipeIpc
@@ -2171,7 +2196,15 @@ function emitChildProcessError(child, error) {
   // Node emits 'error' asynchronously; without a listener the EventEmitter
   // throws, surfacing as an uncaughtException.
   queueMicrotask(() => {
-    if (child.emit?.("error", error) === true) return;
+    // EventEmitter#emit("error") throws when nothing listens, so the listener
+    // count — not emit's return value — decides where the error goes.
+    const listening = typeof child.listenerCount === "function"
+      ? child.listenerCount("error") > 0
+      : false;
+    if (listening) {
+      child.emit("error", error);
+      return;
+    }
     const handled = globalThis.process?.emit?.("uncaughtException", error) === true;
     if (!handled) throw error;
   });
@@ -2199,8 +2232,11 @@ function installParentIpcChannel(child, serialization = undefined, nodeProtocol 
 
   const failPendingNativeIpcSends = (error) => {
     for (const pending of pendingNativeIpcSends.splice(0)) {
+      // Sends still waiting on our own readiness handshake were accepted by
+      // send() (it returned true). Node would already have written them to the
+      // channel, so a peer that closed without reading them is not an error the
+      // sender hears about — only an explicit callback learns the outcome.
       if (pending.callback) queueMicrotask(() => pending.callback(error));
-      else if (!child.killed) emitChildProcessError(child, error);
     }
   };
 
@@ -2321,9 +2357,11 @@ function installParentIpcChannel(child, serialization = undefined, nodeProtocol 
     const sendCallback = typeof normalizedSend.callback === "function" ? normalizedSend.callback : null;
     if (!child.connected) {
       const error = makeChannelClosedError();
+      // Node reports the failure asynchronously: through the callback when one
+      // is given, otherwise as an 'error' on the child (an uncaughtException
+      // when nothing listens). The call itself still returns false.
       if (sendCallback) queueMicrotask(() => sendCallback(error));
-      // Without a callback, just return false (matching real Bun/Node:
-      // post-disconnect sends without a callback silently return false).
+      else emitChildProcessError(child, error);
       return false;
     }
     if (!nativeIpcReady) {

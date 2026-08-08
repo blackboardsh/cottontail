@@ -746,6 +746,11 @@ export function createBunSpawnRuntime(deps) {
       });
     } catch (error) {
       throw normalizeSpawnError(error, file, nativeOptions.cwd);
+    } finally {
+      // A Bun.file(...) stdin descriptor is opened for the child alone.
+      if (nativeOptions.stdinFdOwned && nativeOptions.stdinFd != null) {
+        try { host.closeFd?.(nativeOptions.stdinFd); } catch {}
+      }
     }
     const rawSignalCode = Number(result.signalCode ?? result.signal ?? 0);
     const exitCode = rawSignalCode > 0 ? null : Number(result.status ?? result.exitCode ?? 0);
@@ -906,9 +911,10 @@ export function createBunSpawnRuntime(deps) {
 
     const child = {
       pid: 0,
-      stdin: terminal ? null : nativeOptions.stdinFd != null && nativeOptions.stdinFd !== 0
-        ? nativeOptions.stdinFd
-        : undefined,
+      stdin: terminal ? null
+        : nativeOptions.stdinFd != null && nativeOptions.stdinFd !== 0 && !nativeOptions.stdinFdOwned
+          ? nativeOptions.stdinFd
+          : undefined,
       get stdout() {
         if (terminal) return null;
         if (nativeOptions.stdoutFd != null && nativeOptions.stdoutFd !== 1) return nativeOptions.stdoutFd;
@@ -1190,6 +1196,8 @@ export function createBunSpawnRuntime(deps) {
     const redirectFds = [];
     let stdoutRedirectFd;
     let stderrRedirectFd;
+    // A Bun.file(...) stdin descriptor is opened for the child alone.
+    if (nativeOptions.stdinFdOwned && nativeOptions.stdinFd != null) redirectFds.push(nativeOptions.stdinFd);
     try {
       if (nativeOptions.stdoutFilePath != null) {
         stdoutRedirectFd = host.openFd(nativeOptions.stdoutFilePath, "w", 0o666);
@@ -1272,7 +1280,7 @@ export function createBunSpawnRuntime(deps) {
       : null;
     child.stdin = terminal
       ? null
-      : nativeOptions.stdinFd != null && nativeOptions.stdinFd !== 0
+      : nativeOptions.stdinFd != null && nativeOptions.stdinFd !== 0 && !nativeOptions.stdinFdOwned
         ? nativeOptions.stdinFd
         : readableInput != null
           ? nativeOptions.input

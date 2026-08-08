@@ -3947,7 +3947,7 @@ function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, origina
     recordCompileCache(resolvedPath, transformed);
     try {
       run = compileAsyncModuleWrapper(
-        [ESM_EXPORTS_BINDING, "__filename", "__dirname", "__ctImportMeta", "__ctModuleAncestors", "Error"],
+        [ESM_EXPORTS_BINDING, "require", "__filename", "__dirname", "__ctImportMeta", "__ctModuleAncestors", "Error"],
         transformed,
         sourceName,
         originalSource,
@@ -3960,6 +3960,10 @@ function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, origina
   }
   record.promise = run(
     namespace,
+    // An ES module's `require` resolves against its own path. Without this
+    // binding the module falls through to the global require installed by the
+    // generated launcher, whose base is the launcher artifact directory.
+    createEsmRequire(hookRequireBase(resolvedPath), { exports: namespace }),
     resolvedPath,
     dirname(resolvedPath),
     importMetaForHookModule(resolvedPath, suffix),
@@ -4534,12 +4538,18 @@ function createRequireImpl(basePath, parentModule, resolveBundledCallerAtCallTim
   // Public createRequire(import.meta.url) may receive the synthetic bundle
   // URL. Recover its source caller once; only the generated shared require
   // needs a fresh caller for every invocation.
+  let resolveCallerPerCall = resolveBundledCallerAtCallTime;
   if (!resolveBundledCallerAtCallTime && parentModule == null && isBundledImportMetaBase(normalizedBasePath)) {
-    normalizedBasePath = bundledCallerPathFromStack() ?? normalizedBasePath;
+    const callerPath = bundledCallerPathFromStack();
+    if (callerPath != null) normalizedBasePath = callerPath;
+    // A generated bundle is never a useful resolution base, so when the caller
+    // cannot be recovered here (this require is built while the bundle itself
+    // is still being set up), recover it on every call instead.
+    else if (isGeneratedRuntimeBundlePath(normalizedBasePath)) resolveCallerPerCall = true;
   }
   const resolutionParent = parentModule ?? { filename: normalizedBasePath };
   const resolutionParentForCall = () => {
-    if (!resolveBundledCallerAtCallTime) return resolutionParent;
+    if (!resolveCallerPerCall) return resolutionParent;
     const callerPath = bundledCallerPathFromStack();
     return callerPath == null ? resolutionParent : { filename: callerPath };
   };
@@ -4674,7 +4684,18 @@ function maybeCollectSmolModuleCacheChurn(dynamicImport = false) {
   cottontail.gc?.(true);
 }
 
+// Generated launcher artifacts (the cached entry bundles and the per-run
+// bundle) stand in for the entry the user actually ran. Resolving against one
+// of them would look for modules next to the cache directory.
+function isGeneratedRuntimeBundlePath(path) {
+  const normalized = String(path).replaceAll("\\", "/");
+  return /\/cottontail\/cache\/(?:esm-entry-|module-runtime-|commonjs-runtime-)/.test(normalized) ||
+    /\/cottontail\/run\/[^/]+\/script[.\-][^/]*\.mjs$/.test(normalized) ||
+    /\/script-entry-[^/]*\.mjs$/.test(normalized);
+}
+
 function isBundledImportMetaBase(path) {
+  if (isGeneratedRuntimeBundlePath(path)) return true;
   const mainPath = currentProcessBuiltin().argv?.[1];
   if (typeof mainPath !== "string" || mainPath.length === 0) return false;
   const resolvedMainPath = isAbsolute(mainPath) ? mainPath : resolve(cottontail.cwd(), mainPath);
@@ -4746,7 +4767,7 @@ function bundledCallerPathFromStack() {
     }
     const candidate = isAbsolute(frame) ? frame : resolve(cottontail.cwd(), frame);
     if (/[\\/]node[\\/]module\.js$/.test(candidate)) continue;
-    if (isGeneratedBundlePath(candidate) || generatedBundleArtifactPattern.test(candidate)) continue;
+    if (isGeneratedBundlePath(candidate) || generatedBundleArtifactPattern.test(candidate) || isGeneratedRuntimeBundlePath(candidate)) continue;
     if (isFile(candidate)) return candidate;
   }
   return null;

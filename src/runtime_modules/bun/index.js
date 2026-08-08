@@ -283,22 +283,6 @@ if (inheritedSpawnExecPath != null) {
   });
   try { delete globalThis.process.env.COTTONTAIL_SPAWN_EXEC_PATH; } catch {}
 }
-const inheritedFileBackedStdin = globalThis.process?.env?.COTTONTAIL_SPAWN_STDIN_FILE === "1";
-if (inheritedFileBackedStdin) {
-  // Recorded for whenever the stdin stream is actually constructed — at this
-  // point process.stdin may not exist yet.
-  globalThis.__cottontailFileBackedStdin = true;
-  const stream = globalThis.process?.stdin;
-  for (const method of ["ref", "unref"]) {
-    try {
-      delete stream?.[method];
-      if (typeof stream?.[method] === "function") {
-        Object.defineProperty(stream, method, { value: undefined, configurable: true });
-      }
-    } catch {}
-  }
-  try { delete globalThis.process.env.COTTONTAIL_SPAWN_STDIN_FILE; } catch {}
-}
 
 let ctEvalOffsetMap;
 let ctEvalLineOffset;
@@ -1828,12 +1812,22 @@ function normalizeSpawnOptions(options = {}, defaults = {}, sync = false) {
     input = sharedArrayBufferBytes(input);
   }
   const stdinFileBacked = input != null && isBunFileLike(input) && typeof input._bunFilePath === "string";
-  // Bun.file(...) as stdin: read the file contents and feed them as input,
-  // matching bun's behavior of wiring the file to the child's stdin.
+  // Bun.file(...) as stdin: hand the child the opened descriptor so it sees a
+  // real file (seekable, no ref/unref on process.stdin) instead of a pipe. An
+  // unopenable path leaves the child with empty stdin, which is what Bun does.
   if (stdinFileBacked) {
+    let fileFd = null;
     try {
-      input = asBuffer(cottontail.readFileBuffer ? cottontail.readFileBuffer(input._bunFilePath) : cottontail.readFile(input._bunFilePath));
+      fileFd = Number(cottontail.openFd(input._bunFilePath, "r", 0o666));
     } catch {
+      fileFd = null;
+    }
+    if (fileFd != null && Number.isInteger(fileFd) && fileFd >= 0) {
+      details.stdinFd = fileFd;
+      details.stdinFdOwned = true;
+      stdin = "inherit";
+      input = undefined;
+    } else {
       input = asBuffer("");
     }
   }
@@ -1877,7 +1871,7 @@ function normalizeSpawnOptions(options = {}, defaults = {}, sync = false) {
     stdoutFd: details.stdoutFd,
     stderrFd: details.stderrFd,
     extraStdio: details.extraStdio,
-    stdinFileBacked,
+    stdinFdOwned: details.stdinFdOwned === true,
     input: input != null && input !== "pipe" && input !== "inherit" && input !== "ignore" ? input : undefined,
     killSignal: killSignalNumber,
     maxBuffer,
@@ -1948,7 +1942,6 @@ function prepareNativeSpawnOptions(file, nativeOptions, args = []) {
       : { ...nativeOptions.env };
     env.COTTONTAIL_SPAWN_EXEC_PATH = nodePathResolve(String(file));
     if (nativeOptions.argv0 !== undefined) env.COTTONTAIL_SPAWN_ARGV0 = nativeOptions.argv0;
-    if (nativeOptions.stdinFileBacked) env.COTTONTAIL_SPAWN_STDIN_FILE = "1";
     return {
       ...nativeOptions,
       env,
@@ -1961,12 +1954,17 @@ function prepareNativeSpawnOptions(file, nativeOptions, args = []) {
     const env = nativeOptions.env === undefined
       ? withoutElectrobunHostEnv(currentProcessEnv())
       : { ...nativeOptions.env };
+    const injected = [];
     for (const key of ["DASH_COTTONTAIL", "COTTONTAIL_BINARY"]) {
-      if (env[key] === undefined) {
-        const inherited = currentProcessEnv()[key];
-        if (inherited !== undefined) env[key] = String(inherited);
-      }
+      if (env[key] !== undefined) continue;
+      const inherited = globalThis.__cottontailFacadeRoutingEnv?.[key] ?? currentProcessEnv()[key];
+      if (inherited === undefined) continue;
+      env[key] = String(inherited);
+      injected.push(key);
     }
+    // The wrapper's runtime drops exactly what we added here, so a child that
+    // was given an explicit environment still observes only that environment.
+    if (injected.length > 0) env.COTTONTAIL_SPAWN_ROUTING = injected.join(",");
     return {
       ...nativeOptions,
       env,
@@ -13395,7 +13393,21 @@ const BunObject = new Proxy(BunObjectTarget, {
 globalThis.__cottontailBunHasNonReifiedStatic = (value) => value === BunObject && !bunObjectReified;
 // String(Bun) must be "[object Bun]".
 Object.defineProperty(BunObjectTarget, Symbol.toStringTag, { value: "Bun", configurable: true });
-BunObject.argv = cottontail.argv || ["cottontail", ...(cottontail.args || [])];
+// Bun.argv and process.argv are the same array, so the executable rewrite
+// node/process.js applies to argv[0] has to be visible through both.
+let bunArgvOverride;
+Object.defineProperty(BunObject, "argv", {
+  configurable: true,
+  enumerable: true,
+  get() {
+    if (bunArgvOverride !== undefined) return bunArgvOverride;
+    const argv = globalThis.process?.argv;
+    return Array.isArray(argv) ? argv : cottontail.argv || ["cottontail", ...(cottontail.args || [])];
+  },
+  set(value) {
+    bunArgvOverride = value;
+  },
+});
 BunObject.env = globalThis.process?.env ?? cottontail.env();
 BunObject.$ = $;
 BunObject.ArrayBufferSink = ArrayBufferSink;

@@ -2046,17 +2046,6 @@ function createStdinStream() {
     stopWatching();
     return this;
   };
-  // A file-backed stdin (spawned via Bun.file(...)) reports no ref/unref
-  // handle in Bun, even though it reaches this process as a pipe. The env
-  // marker may still be present (bun/index.js deletes it later), and the
-  // global flag covers the case where it already ran.
-  if (globalThis.__cottontailFileBackedStdin ||
-      globalThis.process?.env?.COTTONTAIL_SPAWN_STDIN_FILE === "1" ||
-      (typeof cottontail.env === "function" && cottontail.env("COTTONTAIL_SPAWN_STDIN_FILE") === "1")) {
-    stream.ref = undefined;
-    stream.unref = undefined;
-  }
-
   return stream;
 }
 

@@ -701,6 +701,29 @@ function validateTlsMaterial(name, value, allowKeyObject = false) {
   throw invalidArgType(name, "of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer", value);
 }
 
+// Building a native context to validate the credentials parses the whole CA
+// bundle, which dominates the cost of every TLS connection. The result only
+// depends on the material below, so identical material is validated once.
+const secureContextValidationCache = new Map();
+const secureContextValidationCacheLimit = 64;
+
+function secureContextValidationKey(credentials, context, protocols, advanced) {
+  if (advanced != null && Object.keys(advanced).length > 0) return null;
+  for (const value of [credentials.cert, credentials.key, credentials.ca, credentials.passphrase, context.ciphers]) {
+    if (value !== undefined && value !== null && typeof value !== "string") return null;
+  }
+  return JSON.stringify([
+    credentials.cert ?? null,
+    credentials.key ?? null,
+    credentials.ca ?? null,
+    credentials.passphrase ?? null,
+    context.ciphers ?? null,
+    protocols.minVersion ?? null,
+    protocols.maxVersion ?? null,
+    protocols.secureOptions ?? null,
+  ]);
+}
+
 class SecureContextImpl {
   constructor(options = {}) {
     if (options == null) options = {};
@@ -724,25 +747,41 @@ class SecureContextImpl {
     const protocols = tlsProtocolOptions(context);
     const credentials = tlsCredentialOptions(context);
     const advanced = tlsAdvancedOptions(context);
-    try {
-      const contextInfo = cottontail.tlsValidateSecureContext?.(
-        credentials.cert,
-        credentials.key,
-        credentials.passphrase,
-        credentials.ca,
-        context.ciphers,
-        protocols.minVersion,
-        protocols.maxVersion,
-        protocols.secureOptions,
-        advanced,
-      );
-      this._certificate = bufferFromNativeBytes(contextInfo?.certificate);
-      this._issuer = bufferFromNativeBytes(contextInfo?.issuer);
-      if (contextInfo?.dhWarning) {
-        process.emitWarning("DH parameter is less than 2048 bits", "SecurityWarning");
+    const cacheKey = secureContextValidationKey(credentials, context, protocols, advanced);
+    let validated = cacheKey == null ? undefined : secureContextValidationCache.get(cacheKey);
+    if (validated === undefined) {
+      try {
+        const contextInfo = cottontail.tlsValidateSecureContext?.(
+          credentials.cert,
+          credentials.key,
+          credentials.passphrase,
+          credentials.ca,
+          context.ciphers,
+          protocols.minVersion,
+          protocols.maxVersion,
+          protocols.secureOptions,
+          advanced,
+        );
+        validated = {
+          certificate: bufferFromNativeBytes(contextInfo?.certificate),
+          issuer: bufferFromNativeBytes(contextInfo?.issuer),
+          dhWarning: contextInfo?.dhWarning === true,
+        };
+      } catch (error) {
+        throw normalizeTlsError(error, "Failed to initialize TLS context");
       }
-    } catch (error) {
-      throw normalizeTlsError(error, "Failed to initialize TLS context");
+      if (cacheKey != null) {
+        if (secureContextValidationCache.size >= secureContextValidationCacheLimit) {
+          secureContextValidationCache.delete(secureContextValidationCache.keys().next().value);
+        }
+        secureContextValidationCache.set(cacheKey, validated);
+      }
+    }
+    // Each context owns its copy: these are handed out as _certificate/_issuer.
+    this._certificate = validated.certificate == null ? validated.certificate : Buffer.from(validated.certificate);
+    this._issuer = validated.issuer == null ? validated.issuer : Buffer.from(validated.issuer);
+    if (validated.dhWarning) {
+      process.emitWarning("DH parameter is less than 2048 bits", "SecurityWarning");
     }
     this.context = context;
     this.servername = options.servername;

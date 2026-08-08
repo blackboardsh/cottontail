@@ -2175,7 +2175,23 @@ async function bunWrite(path, data) {
 }
 
 g.Bun ??= {};
-g.Bun.argv ??= cottontail.argv || ["cottontail", ...(cottontail.args || [])];
+if (!Object.prototype.hasOwnProperty.call(g.Bun, "argv")) {
+  // Bun.argv and process.argv are the same array, so the executable rewrite
+  // node/process.js applies to argv[0] has to be visible through both.
+  let argvOverride;
+  Object.defineProperty(g.Bun, "argv", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (argvOverride !== undefined) return argvOverride;
+      const argv = g.process?.argv;
+      return Array.isArray(argv) ? argv : cottontail.argv || ["cottontail", ...(cottontail.args || [])];
+    },
+    set(value) {
+      argvOverride = value;
+    },
+  });
+}
 g.Bun.env ??= processObject.env;
 g.Bun.file ??= bunFile;
 g.Bun.write ??= bunWrite;
