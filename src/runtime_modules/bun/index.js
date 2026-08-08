@@ -975,8 +975,14 @@ if (typeof nativeCaptureStackTrace === "function" && !Error.captureStackTrace.__
 }
 
 function installNodeStyleErrorConstructor(name) {
-  const NativeError = globalThis[name];
+  let NativeError = globalThis[name];
   if (typeof NativeError !== "function" || NativeError.__cottontailStackHeader) return;
+  // The always-loaded bootstrap installs a light position-remap wrapper (see
+  // internal/runtime-stack-remap.js). Unwrap it and wrap the original
+  // constructor so the rich layer here is the single wrapper — otherwise both
+  // layers would remap line/column and the second would remap already-mapped
+  // values.
+  if (NativeError.__cottontailLightError) NativeError = NativeError.__cottontailOriginalError;
   const CottontailError = function(...args) {
     const requestedLimit = NativeError.stackTraceLimit;
     if (Number.isFinite(Number(requestedLimit)) && Number(requestedLimit) < 100) NativeError.stackTraceLimit = 100;
@@ -1190,6 +1196,46 @@ globalThis.__cottontailBunStackFrameText ??= bunStackFrameText;
 globalThis.__cottontailRemapStackString ??= ctRemapStackString;
 globalThis.__cottontailRemapPosition ??= remapBundlePosition;
 globalThis.__cottontailSourceContextForLocation ??= bundleSourceContextForLocation;
+
+// Run-mode uncaught printer for the FULL runtime path (entries that use
+// `require`, etc.). The selective bootstrap (internal/runtime-bootstrap-core.js)
+// installs its own formatter, and bun:test installs a richer one — this only
+// fills the gap for full run mode, where neither is loaded. It renders coded
+// system errors (ENOENT, ...) the way Bun does — no "Error:" prefix and a
+// right-aligned path/syscall/errno/code block — and defers everything else to
+// the native fallback by returning undefined. Descriptor reads keep a
+// booby-trapped accessor (e.g. err-fd-fixture's throwing `fd`) from aborting
+// the report.
+if (globalThis.__cottontailFormatUncaughtException == null) {
+  const ownDescriptorValue = (object, key) => {
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(object, key);
+      return descriptor && "value" in descriptor ? descriptor.value : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  globalThis.__cottontailFormatUncaughtException = (error) => {
+    if (!error || typeof error !== "object") return undefined;
+    const code = ownDescriptorValue(error, "code");
+    const syscall = ownDescriptorValue(error, "syscall");
+    const errno = ownDescriptorValue(error, "errno");
+    const message = ownDescriptorValue(error, "message");
+    if (typeof code !== "string" || typeof syscall !== "string" ||
+        typeof errno !== "number" || typeof message !== "string") {
+      return undefined;
+    }
+    const path = ownDescriptorValue(error, "path");
+    const fields = [
+      ...(path === undefined ? [] : [["path", JSON.stringify(path)]]),
+      ["syscall", JSON.stringify(syscall)],
+      ["errno", String(errno)],
+      ["code", JSON.stringify(code)],
+    ];
+    return `${message}\n${fields.map(([key, field], index) =>
+      `${key.padStart(8)}: ${field}${index + 1 === fields.length ? "" : ","}`).join("\n")}`;
+  };
+}
 
 if (typeof JSON.parse === "function" && !JSON.parse.__cottontailStackHeader) {
   const nativeJSONParse = JSON.parse;

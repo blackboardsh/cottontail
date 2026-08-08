@@ -66,7 +66,10 @@ function uncaughtRuntimeTrailer() {
   return `\n\nBun v${version}`;
 }
 
-globalThis.__cottontailFormatUncaughtException ??= (value) => {
+// Force-assign (not `??=`): the full runtime module (bun/index.js) now also
+// installs a run-mode uncaught formatter, and bun:test must stay authoritative
+// in test mode regardless of load order.
+globalThis.__cottontailFormatUncaughtException = (value) => {
   if (!value || typeof value !== "object") return null;
   if (value.__cottontailFormattedStack === true && typeof value.stack === "string") {
     return value.stack;

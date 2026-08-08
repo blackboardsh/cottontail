@@ -29,6 +29,43 @@ function safeRead(value, key) {
   }
 }
 
+// Read an own property via its descriptor rather than a live get, so a
+// booby-trapped accessor (e.g. err-fd-fixture's throwing `fd` getter) can't
+// abort the report the way `safeRead` invoking the getter would.
+function ownDescriptorValue(object, key) {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(object, key);
+    return descriptor && "value" in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Coded system errors (ENOENT, EEXIST, ...) print with no "Error:" prefix and
+// a right-aligned path/syscall/errno/code block, matching Bun's SystemError
+// printer. Returns null for anything that isn't a coded system error so the
+// generic formatter below takes over.
+function formatUncaughtSystemError(error) {
+  if (!error || typeof error !== "object") return null;
+  const code = ownDescriptorValue(error, "code");
+  const syscall = ownDescriptorValue(error, "syscall");
+  const errno = ownDescriptorValue(error, "errno");
+  const message = ownDescriptorValue(error, "message");
+  if (typeof code !== "string" || typeof syscall !== "string" ||
+      typeof errno !== "number" || typeof message !== "string") {
+    return null;
+  }
+  const path = ownDescriptorValue(error, "path");
+  const fields = [
+    ...(path === undefined ? [] : [["path", JSON.stringify(path)]]),
+    ["syscall", JSON.stringify(syscall)],
+    ["errno", String(errno)],
+    ["code", JSON.stringify(code)],
+  ];
+  return `${message}\n${fields.map(([key, field], index) =>
+    `${key.padStart(8)}: ${field}${index + 1 === fields.length ? "" : ","}`).join("\n")}`;
+}
+
 function normalizeUncaughtReferenceError(error) {
   if (safeRead(error, "name") !== "ReferenceError" ||
       typeof error.message !== "string" ||
@@ -58,6 +95,8 @@ globalThis.__cottontailFormatUncaughtException ??= (error) => {
   if (safeRead(error, "name") === "ResolveMessage" && typeof messageValue === "string") {
     return `error: ${messageValue}`;
   }
+  const systemError = formatUncaughtSystemError(error);
+  if (systemError !== null) return systemError;
   const referenceErrorHeaders = normalizeUncaughtReferenceError(error);
   if (error && typeof stackValue === "string") {
     let stack = remapStackString(stackValue);
