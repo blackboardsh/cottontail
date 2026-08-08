@@ -1,5 +1,6 @@
 import "../bun/ffi.js";
 import picomatch from "../vendor/picomatch.js";
+import { _wrapAsyncCallback } from "./async_hooks.js";
 import constantsObject from "./constants.js";
 import { EventEmitter } from "./events.js";
 import { dirname, isAbsolute, join, relative, resolve, toNamespacedPath } from "./path.js";
@@ -2658,7 +2659,10 @@ class FSWatcher extends EventEmitter {
     this._abortQueued = false;
     this._id = null;
     this._listeners = installFsWatchDispatcher();
-    this._onNativeEvent = event => this._handleNativeEvent(event);
+    // Capture the AsyncLocalStorage context active at fs.watch() time so the
+    // watch callback (dispatched later from a native fd event) runs with it,
+    // matching Node/Bun. Without the wrap the callback sees an empty store.
+    this._onNativeEvent = _wrapAsyncCallback(event => this._handleNativeEvent(event));
     this._onAbort = () => this._abort();
     if (typeof listener === "function") this.on("change", listener);
 

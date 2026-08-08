@@ -1714,14 +1714,20 @@ class SocketImpl extends Duplex {
       // Connecting to a wildcard address targets the corresponding loopback.
       if (host === "0.0.0.0") host = "127.0.0.1";
       else if (host === "::") host = "::1";
-      this._resolveConnectAddresses(String(host), options, (error, addresses) => {
+      // Wrap the resolver continuation so the AsyncLocalStorage context active
+      // at connect() time survives the (possibly async) DNS lookup. Everything
+      // downstream — the connect-attempt listeners, _attachFd, the read watcher,
+      // write/end callbacks — captures its context from here, so an unwrapped
+      // hop loses context for every socket callback (only visible when the host
+      // needs resolving; literal IPs resolve synchronously).
+      this._resolveConnectAddresses(String(host), options, _wrapAsyncCallback((error, addresses) => {
         if (this.destroyed || !this.connecting) return;
         if (error) {
           failConnect(error);
           return;
         }
         this._attemptConnectAddresses(options, String(host), port, addresses);
-      });
+      }, { drainJobs: false }));
     } catch (rawError) {
       failConnect(rawError);
     }
