@@ -602,7 +602,11 @@ class CottontailCallSite {
       const name = this.functionName
         ? `${this.constructorFrame ? "new " : ""}${this.functionName}`
         : "<anonymous>";
-      return `${name} (${location})`;
+      // V8 prefixes frames resumed after an await with "async " (e.g.
+      // "at async foo (...)"); JSC carries the marker on the raw frame name,
+      // which limitedCallSites strips into asyncFrame.
+      const asyncPrefix = this.asyncFrame ? "async " : "";
+      return `${asyncPrefix}${name} (${location})`;
     }
     get [Symbol.toStringTag]() { return "CallSite"; }
   }
