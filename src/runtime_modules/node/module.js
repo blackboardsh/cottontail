@@ -3807,6 +3807,87 @@ function liveExportStatement(exported, expression) {
     `{ configurable: true, enumerable: true, get: () => ${expression} });`;
 }
 
+// The `export const/let/var` handlers below match a single declarator with a
+// regex, which only sees the first binding of a multi-declarator statement
+// (`export const a = 1, b = 2`). Given the index just past the first
+// declarator's `=`, scan the remaining comma-separated declarators and return
+// every additional bound name (simple identifiers and destructuring patterns).
+// The scan biases toward stopping (ASI at a top-level newline, or a top-level
+// `;`) so declarators that belong to a following statement are never captured.
+function collectTrailingExportBindingNames(text, start) {
+  const names = [];
+  const len = text.length;
+  const mask = codePositionMask(text);
+  const identStart = /[A-Za-z_$-￿]/;
+  const identPart = /[\w$-￿]/;
+  const identRe = /^[A-Za-z_$-￿][\w$-￿]*$/;
+  const isCode = (i) => mask[i] === 1;
+  const skipTrivia = (i) => {
+    while (i < len && (!isCode(i) || /\s/.test(text[i]))) i += 1;
+    return i;
+  };
+  const addPatternNames = (patternText) => {
+    for (const part of codeOnlyText(patternText).split(",")) {
+      const name = part.trim().replace(/^\.\.\./, "").split(/\s*:\s*|\s*=\s*/).at(-1)?.trim();
+      if (identRe.test(name ?? "")) names.push(name);
+    }
+  };
+  // Skip an initializer until the next top-level `,` (another declarator) or a
+  // statement boundary (`;`, an unbalanced closer, a top-level newline, EOF).
+  const skipInitializer = (i) => {
+    let depth = 0;
+    while (i < len) {
+      const c = text[i];
+      if (isCode(i)) {
+        if (c === "(" || c === "[" || c === "{") depth += 1;
+        else if (c === ")" || c === "]" || c === "}") { if (depth === 0) return { i, more: false }; depth -= 1; }
+        else if (depth === 0 && c === ",") return { i, more: true };
+        else if (depth === 0 && c === ";") return { i, more: false };
+        else if (depth === 0 && (c === "\n" || c === "\r")) return { i, more: false };
+      } else if (depth === 0 && (c === "\n" || c === "\r")) {
+        return { i, more: false };
+      }
+      i += 1;
+    }
+    return { i, more: false };
+  };
+  let i = start;
+  while (true) {
+    const boundary = skipInitializer(i);
+    if (!boundary.more) break;
+    i = skipTrivia(boundary.i + 1);
+    if (i >= len) break;
+    const ch = text[i];
+    if (isCode(i) && (ch === "{" || ch === "[")) {
+      let depth = 0;
+      let j = i;
+      for (; j < len; j += 1) {
+        if (!isCode(j)) continue;
+        const c = text[j];
+        if (c === "{" || c === "[" || c === "(") depth += 1;
+        else if (c === "}" || c === "]" || c === ")") { depth -= 1; if (depth === 0) { j += 1; break; } }
+      }
+      addPatternNames(text.slice(i + 1, j - 1));
+      i = skipTrivia(j);
+    } else if (isCode(i) && identStart.test(ch)) {
+      let j = i;
+      while (j < len && identPart.test(text[j])) j += 1;
+      names.push(text.slice(i, j));
+      i = skipTrivia(j);
+    } else {
+      break;
+    }
+    if (i < len && isCode(i) && text[i] === "=") {
+      i += 1; // consume `=`; the next iteration skips its initializer
+      continue;
+    }
+    // A declarator without an initializer: continue past the comma (if any).
+    if (i < len && isCode(i) && text[i] === ",") continue;
+    break;
+  }
+  return names;
+}
+
 function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) {
   const liveExportDeclarations = [];
   // Import declarations are hoisted to the top of the transformed output
@@ -3948,17 +4029,23 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
   output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`default\b`), (_all, trivia) => {
     return `${trivia}${ESM_EXPORTS_BINDING}.default =`;
   });
-  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`(const|let|var)\s+\{([^}]*)\}\s*=`), (_all, trivia, kind, bindings) => {
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`(const|let|var)\s+\{([^}]*)\}\s*=`), (_all, trivia, kind, bindings, offset, string) => {
     for (const part of codeOnlyText(bindings).split(",")) {
       const name = part.trim().replace(/^\.\.\./, "").split(/\s*:\s*|\s*=\s*/, 2).at(-1)?.trim();
       if (/^[A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*$/.test(name ?? "")) {
         liveExportDeclarations.push(liveExportStatement(name, name));
       }
     }
+    for (const name of collectTrailingExportBindingNames(string, offset + _all.length)) {
+      liveExportDeclarations.push(liveExportStatement(name, name));
+    }
     return `${trivia}${kind} {${bindings}} =`;
   });
-  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`(const|let|var)\s+([A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*)\s*=`), (_all, trivia, kind, name) => {
+  output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`(const|let|var)\s+([A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*)\s*=`), (_all, trivia, kind, name, offset, string) => {
     liveExportDeclarations.push(liveExportStatement(name, name));
+    for (const trailing of collectTrailingExportBindingNames(string, offset + _all.length)) {
+      liveExportDeclarations.push(liveExportStatement(trailing, trailing));
+    }
     return `${trivia}${kind} ${name} =`;
   });
   // Declarations without initializer (e.g. the `export var ns;` emitted for
