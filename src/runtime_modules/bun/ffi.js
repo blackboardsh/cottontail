@@ -4001,6 +4001,30 @@ function ccArguments(value) {
   return (Array.isArray(value) ? value : [value]).map(String);
 }
 
+// Match Bun's embedded TinyCC default include/library search paths so headers
+// like <node/node_api.h> installed under /usr/local or Homebrew are found when
+// compiling through the system compiler (zig cc / clang), which does not search
+// these directories by default.
+function systemCcSearchFlags() {
+  const flags = [];
+  const addInclude = dir => {
+    if (dir && cottontail.existsSync(dir)) flags.push(`-I${dir}`);
+  };
+  const addLibrary = dir => {
+    if (dir && cottontail.existsSync(dir)) flags.push(`-L${dir}`);
+  };
+  const platformName = platform();
+  if (platformName === "darwin" && cottontail.arch() === "arm64") {
+    addInclude("/opt/homebrew/include");
+    addLibrary("/opt/homebrew/lib");
+  }
+  if (platformName !== "win32") {
+    addInclude("/usr/local/include");
+    addLibrary("/usr/local/lib");
+  }
+  return flags;
+}
+
 function windowsNapiImportLibrary(compiler, sourcePaths, dir) {
   if (platform() !== "win32" || compiler.kind !== "zig") return null;
   const names = new Set();
@@ -4056,11 +4080,14 @@ export function cc(options) {
       ? ["-shared"]
       : ["-shared", "-fPIC"];
   const defines = Object.entries(options.define || {}).map(([name, value]) => `-D${name}=${value == null ? "1" : String(value)}`);
+  const includeDirs = ccArguments(options.include).map(dir => `-I${dir}`);
   const args = [
     ...compiler.prefix,
     ...sourcePaths,
     ...(napiImportLibrary ? [napiImportLibrary] : []),
     ...sharedArgs,
+    ...includeDirs,
+    ...systemCcSearchFlags(),
     ...defines,
     "-o",
     output,
