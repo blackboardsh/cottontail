@@ -360,8 +360,7 @@
     },
     "test/bundler/bundler_env.test.ts": {
       "status": "enabled",
-      "reason": "All seven API/CLI environment-injection variants pass with seven assertions, covering inline, disabled, prefix-filtered, nested literal references, and a runtime PATH intentionally replaced with an unusable value.",
-      "splitBundlerTests": true
+      "reason": "All seven API/CLI environment-injection variants pass together with seven assertions. The API and CLI describe scopes intentionally reuse two itBundled leaf IDs, so this light file stays in one process while covering inline, disabled, prefix-filtered, nested literal references, and a runtime PATH intentionally replaced with an unusable value."
     },
     "test/bundler/bundler_footer.test.ts": {
       "status": "enabled",

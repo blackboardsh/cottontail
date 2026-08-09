@@ -412,6 +412,7 @@ function installBundlerDiscoveryFixture(fixture, mode) {
     '  process.stdout.write(`${prefix}"case/one"\\n`);',
     '  const mode = process.env.COTTONTAIL_RUNNER_DISCOVERY_MODE;',
     '  if (mode === "nonzero") process.exit(2);',
+    '  if (mode === "duplicate") process.stdout.write(`${prefix}"case/one"\\n`);',
     '  if (mode === "partial") process.stdout.write(`${prefix}{`);',
     '  if (mode === "truncated") process.stdout.write("x".repeat(4096));',
     '  if (mode === "timeout") setInterval(() => {}, 1000);',
@@ -1138,6 +1139,14 @@ test("split bundler discovery fails closed on incomplete output", async (t) => {
       assert.match(result.stderr, expected);
     });
   }
+});
+
+test("split bundler discovery rejects duplicate case IDs", (t) => {
+  const fixture = createFixture(t);
+  const path = installBundlerDiscoveryFixture(fixture, "duplicate");
+  const result = runRunner(fixture, ["--test", path], { runtime: "bun" });
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  assert.match(result.stderr, /Duplicate itBundled discovery ID[^\n]*case\/one/);
 });
 
 test("resume skips matching passes, reruns failures, and rejects changed tests", (t) => {
