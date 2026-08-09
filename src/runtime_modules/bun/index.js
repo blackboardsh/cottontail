@@ -5797,6 +5797,15 @@ function serializeServeBuildErrors(owner, root, logs) {
   return globalThis.Buffer.from(new Uint8Array(bytes)).toString("base64");
 }
 
+function invalidateFailedServeHtmlBatch(state, development, batch) {
+  if (!development) return;
+  // A failed development rebuild must not leave the affected HTML routes
+  // serving their previous successful descriptors. Keep unrelated generated
+  // assets intact, but make the next route request observe (and report) the
+  // failed build instead of returning stale HTML with a 200 status.
+  for (const source of batch) state.htmlBySource.delete(nodePathResolve(source));
+}
+
 async function buildServeHtmlBatch(state, options, batch) {
   const generation = state.generation;
   const development = serveIsDevelopment(options);
@@ -5833,6 +5842,7 @@ async function buildServeHtmlBatch(state, options, batch) {
     result = await build(buildOptions);
   } catch (error) {
     if (generation !== state.generation) return;
+    invalidateFailedServeHtmlBatch(state, development, batch);
     const logs = error instanceof AggregateError ? error.errors : [error];
     if (inspectorState) {
       inspectorEmit("BunFrontendDevServer.bundleFailed", {
@@ -5844,6 +5854,7 @@ async function buildServeHtmlBatch(state, options, batch) {
   }
   if (generation !== state.generation) return;
   if (!result.success) {
+    invalidateFailedServeHtmlBatch(state, development, batch);
     if (inspectorState) {
       inspectorEmit("BunFrontendDevServer.bundleFailed", {
         serverId: inspectorState.id,
@@ -5940,7 +5951,7 @@ function ensureServeHtmlSource(state, options, source) {
   state.sources.add(absoluteSource);
   const ready = state.htmlBySource.get(absoluteSource);
   const development = serveIsDevelopment(options);
-  if (ready) return Promise.resolve(ready);
+  if (ready && !development) return Promise.resolve(ready);
   if (!state.buildPromise || state.buildGeneration !== generation) {
     const batch = development
       ? [...state.sources]
