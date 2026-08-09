@@ -65,6 +65,7 @@ compat/upstream/bun/*/nosourcemap_entry
 compat/upstream/bun/*/test*file.db
 compat/upstream/bun/*/*.db*
 compat/upstream/bun/*/sqlite:*
+compat/upstream/bun/*/test/js/third_party/prisma/prisma/sqlite/dev.db*
 
 # compile-mode diagnostics emitted at the repository root
 /chunk-*.js.map
