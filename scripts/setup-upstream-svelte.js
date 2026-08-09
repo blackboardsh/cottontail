@@ -9,6 +9,7 @@ import {
   symlinkSync,
   unlinkSync,
 } from 'fs';
+import { spawnSync } from 'child_process';
 import { dirname, join, relative, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -30,17 +31,22 @@ function defaultSnapshotRoot() {
 
 function parseArgs(argv) {
   let snapshotRoot = defaultSnapshotRoot();
+  let hutchPath = process.env.COTTONTAIL_UPSTREAM_HUTCH_BINARY ?? null;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === '--snapshot') {
       const value = argv[++index];
       if (!value) fail('--snapshot requires a path');
       snapshotRoot = resolve(rootDir, value);
+    } else if (arg === '--hutch') {
+      const value = argv[++index];
+      if (!value) fail('--hutch requires a path');
+      hutchPath = resolve(rootDir, value);
     } else {
       fail(`Unknown option: ${arg}`);
     }
   }
-  return { snapshotRoot };
+  return { snapshotRoot, hutchPath };
 }
 
 function statOrNull(path) {
@@ -68,7 +74,10 @@ function ensureDirectoryLink(link, target) {
   return link;
 }
 
-export function setupSvelteFixture(snapshotRoot = defaultSnapshotRoot()) {
+export function setupSvelteFixture(
+  snapshotRoot = defaultSnapshotRoot(),
+  hutchPath = process.env.COTTONTAIL_UPSTREAM_HUTCH_BINARY ?? null,
+) {
   const snapshot = resolve(snapshotRoot);
   const pluginRoot = join(snapshot, 'packages', 'bun-plugin-svelte');
   const bunTypesRoot = join(snapshot, 'packages', 'bun-types');
@@ -82,15 +91,34 @@ export function setupSvelteFixture(snapshotRoot = defaultSnapshotRoot()) {
   }
 
   // Every run must exercise the plugin's unchanged upstream install hook.
+  // Install during fixture preparation as well: the Bake ecosystem fixture
+  // consumes this dependency and can run before the integration test's
+  // beforeAll hook when upstream files execute in parallel.
   rmSync(join(pluginRoot, 'node_modules'), { recursive: true, force: true });
+
+  if (!hutchPath) {
+    fail('The Svelte upstream fixture requires the selected Hutch engine. Pass --hutch <path>.');
+  }
+  const install = spawnSync(hutchPath, ['install'], {
+    cwd: pluginRoot,
+    env: process.env,
+    stdio: 'inherit',
+  });
+  if (install.error) fail(`Failed to install the Svelte upstream fixture: ${install.error.message}`);
+  if (install.status !== 0) {
+    fail(`Svelte upstream fixture install exited ${install.status ?? 1}.`);
+  }
+  const compilerRoot = join(pluginRoot, 'node_modules', 'svelte', 'compiler');
+  if (!statOrNull(compilerRoot)?.isDirectory()) {
+    fail(`Svelte compiler was not installed at ${compilerRoot}.`);
+  }
 
   const testNodeModules = join(snapshot, 'test', 'node_modules');
   const pluginLink = join(testNodeModules, 'bun-plugin-svelte');
   ensureDirectoryLink(pluginLink, pluginRoot);
 
   // Bun's source checkout installs workspace dependencies at an ancestor of
-  // the test fixture. Mirror that resolution point without copying Svelte;
-  // the unchanged upstream beforeAll install populates this target.
+  // the test fixture. Mirror that resolution point without copying Svelte.
   const svelteLink = join(testNodeModules, 'svelte');
   ensureDirectoryLink(svelteLink, join(pluginRoot, 'node_modules', 'svelte'));
   console.log(`Prepared bun-plugin-svelte fixture at ${pluginLink}.`);
@@ -98,6 +126,6 @@ export function setupSvelteFixture(snapshotRoot = defaultSnapshotRoot()) {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const { snapshotRoot } = parseArgs(process.argv.slice(2));
-  setupSvelteFixture(snapshotRoot);
+  const { snapshotRoot, hutchPath } = parseArgs(process.argv.slice(2));
+  setupSvelteFixture(snapshotRoot, hutchPath);
 }

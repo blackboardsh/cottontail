@@ -61,6 +61,7 @@ const nodeHarnessInventoryPrefix = 'COTTONTAIL_NODE_HARNESS_INVENTORY:';
 const bundlerTestDiscoveryPrefix = 'COTTONTAIL_BUNDLER_TEST_ID:';
 const duckDBUpstreamTest = 'test/js/third_party/duckdb/duckdb-basic-usage.test.ts';
 const svelteUpstreamTest = 'test/integration/svelte/client-side.test.ts';
+const svelteBakeEcosystemTest = 'test/bake/dev/ecosystem.test.ts';
 const activeChildren = new Set();
 const snapshotArtifactRoots = new Map();
 const externallyManagedSnapshotRoots = new Set();
@@ -1819,11 +1820,12 @@ function expectPassEntries(entries, options) {
 function prepareBunTestDependencies(entries, snapshotRoot) {
   const selected = new Set(entries.map((entry) => entry.path));
   const fixtures = [
-    [duckDBUpstreamTest, 'DuckDB', 'setup-upstream-duckdb.js'],
-    [svelteUpstreamTest, 'Svelte', 'setup-upstream-svelte.js'],
+    [[duckDBUpstreamTest], 'DuckDB', 'setup-upstream-duckdb.js'],
+    [[svelteUpstreamTest, svelteBakeEcosystemTest], 'Svelte', 'setup-upstream-svelte.js'],
   ];
-  for (const [testPath, name, scriptName] of fixtures) {
-    if (!selected.has(testPath)) continue;
+  for (const [testPaths, name, scriptName] of fixtures) {
+    const testPath = testPaths.find((path) => selected.has(path));
+    if (!testPath) continue;
     if (externallyManagedSnapshotRoots.has(snapshotRoot)) {
       fail(
         `${name} fixture preparation mutates its Bun snapshot. ` +
@@ -1832,7 +1834,14 @@ function prepareBunTestDependencies(entries, snapshotRoot) {
       );
     }
     const setupScript = join(rootDir, 'scripts', scriptName);
-    const result = spawnSync(process.execPath, [setupScript, '--snapshot', snapshotRoot], {
+    const setupArgs = [setupScript, '--snapshot', snapshotRoot];
+    if (scriptName === 'setup-upstream-svelte.js') {
+      if (hutchPath == null) {
+        fail(`Svelte fixture preparation requires --hutch for ${testPath}.`);
+      }
+      setupArgs.push('--hutch', hutchPath);
+    }
+    const result = spawnSync(process.execPath, setupArgs, {
       cwd: rootDir,
       env: immutableBinaryEnvironment(),
       stdio: 'inherit',
