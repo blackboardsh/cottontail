@@ -3369,7 +3369,10 @@
     },
     "test/js/node/readline/readline.node.test.ts": {
       "status": "enabled",
-      "reason": "Passes on the vendored Node util/readline/vm/process stack (79 bun:test cases, 396 assertions)."
+      "reason": "Exercises the full terminal readline path under a capable terminal type instead of Node's intentionally limited TERM=dumb path (79 bun:test cases, 396 assertions).",
+      "env": {
+        "TERM": "xterm"
+      }
     },
     "test/js/node/readline/readline_never_unrefs.test.ts": {
       "status": "enabled",
