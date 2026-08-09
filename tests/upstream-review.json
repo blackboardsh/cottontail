@@ -5,6 +5,7 @@
   "comparisonPaths": [
     "test",
     "packages/bun-native-bundler-plugin-api/bundler_plugin.h",
+    "packages/bun-error/runtime-error.ts",
     "packages/bun-plugin-svelte/README.md",
     "packages/bun-plugin-svelte/bun.lock",
     "packages/bun-plugin-svelte/package.json",
@@ -78,6 +79,11 @@
         "reason": "Hand package-manager test changes to the Hutch repository."
       },
       {
+        "pathPrefix": "test/integration/next-pages/",
+        "destination": "hutch",
+        "reason": "Hand Next Pages dependency-install, lockfile/layout, and public development/build orchestration changes to the Hutch repository."
+      },
+      {
         "path": "test/bake/dev/react-response.test.ts",
         "destination": "out-of-scope",
         "reason": "Bun's React Server Components pipeline is outside the Electrobun 2.0 scope."
@@ -91,6 +97,11 @@
         "path": "test/js/node/inspector/inspector-profiler.test.ts",
         "destination": "out-of-scope",
         "reason": "Cottontail's JavaScriptCore build intentionally omits the sampling profiler."
+      },
+      {
+        "path": "test/js/bun/http/serve-body-leak.test.ts",
+        "destination": "out-of-scope",
+        "reason": "This long-running absolute-memory benchmark belongs in a post-2.0 performance lane after bootstrap-memory reduction."
       }
     ],
     "history": [
@@ -98,6 +109,22 @@
         "effectiveAt": "30e609e08073cf7114bfb278506962a5b19d0677",
         "reviewedAt": "2026-08-08",
         "reason": "Established the Bun 1.3.10 JavaScript test ownership baseline."
+      },
+      {
+        "effectiveAt": "30e609e08073cf7114bfb278506962a5b19d0677",
+        "reviewedAt": "2026-08-08",
+        "path": "test/js/bun/http/serve-body-leak.test.ts",
+        "from": "cottontail",
+        "to": "out-of-scope",
+        "reason": "Moved the zero-test filtered memory benchmark out of the correctness baseline and into a future performance lane."
+      },
+      {
+        "effectiveAt": "30e609e08073cf7114bfb278506962a5b19d0677",
+        "reviewedAt": "2026-08-08",
+        "pathPrefix": "test/integration/next-pages/",
+        "from": "cottontail",
+        "to": "hutch",
+        "reason": "Moved the three canonical Next Pages install, lockfile/layout, development-server, SSR, and production-build integration files to Hutch ownership without changing their upstream-relative paths."
       }
     ]
   },
@@ -106,7 +133,7 @@
     "licensePath": "compat/upstream/bun/v1.3.10/LICENSE.md"
   },
   "mappingPolicy": {
-    "implicit": "same-relative-path-at-baseline",
+    "implicit": "same-relative-path-at-baseline-and-recorded-same-path-handoffs",
     "relationships": [
       "adapted",
       "reimplemented",

@@ -26,11 +26,11 @@ bun run compat:surface:all
 `compat/upstream/` contains the Node snapshot and the frozen source baseline for
 the Bun-derived JavaScript tests. The Bun tree is no longer a live mirror:
 Cottontail and Hutch own their tests and may adapt them as the products diverge
-from Bun. The exact Bun v1.3.10 ownership index assigns 1,345 runnable files to
-Cottontail and 100 package-manager, project-mutation, and package-script files
-to Hutch. Cottontail currently enables 1,324 files, carries 18 whole-file
-expected failures, and deliberately leaves three files out of scope. Hutch's
-100 files run from its own repository. A `hutch` review route means handoff to
+from Bun. The exact Bun v1.3.10 ownership index assigns 1,342 runnable files to
+Cottontail and 103 package-manager, project-mutation, package-script, and public
+Next orchestration files to Hutch. Cottontail currently enables 1,318 files,
+carries 20 whole-file expected failures, and deliberately leaves four files out
+of scope. Hutch's 103 files run from its own repository. A `hutch` review route means handoff to
 that repository, not vendoring Hutch tests or creating a permanent Cottontail
 dependency on Hutch. The long-term dependency direction is Hutch to Cottontail.
 

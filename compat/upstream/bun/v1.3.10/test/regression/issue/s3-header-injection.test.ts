@@ -136,11 +136,16 @@ describe("S3 header injection prevention", () => {
     // Valid content-disposition values should not throw synchronously.
     // The write may eventually fail because the mock server doesn't speak S3 protocol,
     // but the option parsing should succeed and a request should be initiated.
-    expect(() =>
-      client.write("test-file.txt", "Hello", {
+    let writePromise: Promise<number> | undefined;
+    expect(() => {
+      writePromise = client.write("test-file.txt", "Hello", {
         contentDisposition: 'attachment; filename="report.pdf"',
-      }),
-    ).not.toThrow();
+      });
+    }).not.toThrow();
+    // This mock server intentionally does not implement the S3 response
+    // protocol. Consume the allowed asynchronous failure without making it
+    // part of the synchronous option-validation assertion above.
+    void writePromise?.catch(() => {});
 
     const receivedHeaders = await requestReceived;
     expect(receivedHeaders.get("content-disposition")).toBe('attachment; filename="report.pdf"');

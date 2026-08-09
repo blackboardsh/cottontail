@@ -273,6 +273,7 @@ let moduleParentWarningEmitted = false;
 let activeResolverConditions = null;
 let stripTypesWarningEmitted = false;
 let runtimeEsmSourceExecutionDepth = 0;
+let implicitDefaultExtensionContext = null;
 let smolModuleCacheMode;
 let smolModuleCacheEvictions = 0;
 let smolDynamicModuleCacheEvictions = 0;
@@ -3347,11 +3348,9 @@ function rewriteBundledEsmDynamicImports(source) {
 
 function executeBundledCommonJsModule(module, filename, source, loader) {
   const cacheKey = String(filename);
-  let buildFactory;
-  const cached = bundledCommonJsFactoryCache.get(cacheKey);
-  if (cached?.source === source) {
-    buildFactory = cached.buildFactory;
-  } else {
+  let factoryEntry = bundledCommonJsFactoryCache.get(cacheKey);
+  if (factoryEntry?.source !== source || factoryEntry.loader !== loader) {
+    let buildFactory;
     let bundled;
     try {
       bundled = String(cottontail.bundleNative(
@@ -3360,6 +3359,10 @@ function executeBundledCommonJsModule(module, filename, source, loader) {
         JSON.stringify({
           format: "cjs",
           target: "bun",
+          // The live Module._extensions function selects the grammar. Bun's
+          // native bundler otherwise treats a .js entry as JSX-capable, which
+          // lets wrapping the original `.js` loader silently widen its syntax.
+          loader,
           preserveExternalRequireName: true,
           runtimeFileLoaderPaths: true,
           ignoreDCEAnnotations: true,
@@ -3388,9 +3391,16 @@ function executeBundledCommonJsModule(module, filename, source, loader) {
       `(function(__ctImportMeta, ${CJS_DYNAMIC_IMPORT_BINDING}) { return (\n${bundled}\n); })`,
       filename,
     );
-    bundledCommonJsFactoryCache.set(cacheKey, { source, buildFactory });
+    factoryEntry = {
+      source,
+      loader,
+      buildFactory,
+      sourceExportsEsmMarker: undefined,
+      namespaceOrder: null,
+    };
+    bundledCommonJsFactoryCache.set(cacheKey, factoryEntry);
   }
-  const factory = buildFactory(
+  const factory = factoryEntry.buildFactory(
     importMetaForModule(filename),
     async (specifier, options) => globalThis.__cottontailImportModule(String(specifier), filename, options),
   );
@@ -3403,14 +3413,17 @@ function executeBundledCommonJsModule(module, filename, source, loader) {
   // require here can select a package's `require` export (or reject an
   // import-only package) even though the original edge was an import.
   factory(module.exports, createEsmRequire(filename, module), module, filename, dirname(filename));
+  let namespaceAlreadyOrdered = false;
   if (module.exports != null &&
       (typeof module.exports === "object" || typeof module.exports === "function") &&
       Object.hasOwn(module.exports, "module.exports")) {
     module.exports = module.exports["module.exports"];
   } else {
-    module.exports = requiredBundledEsmNamespace(module.exports, source, loader);
+    const required = requiredBundledEsmNamespace(module.exports, source, loader, factoryEntry);
+    module.exports = required.value;
+    namespaceAlreadyOrdered = required.ordered;
   }
-  finalizeEsmNamespaceOrder(module.exports);
+  if (!namespaceAlreadyOrdered) finalizeEsmNamespaceOrder(module.exports);
   module.loaded = true;
   return module.exports;
 }
@@ -3429,6 +3442,15 @@ function createEsmRequire(basePath, parentModule) {
   require.resolve = request => {
     if (typeof request !== "string") throw invalidRequestType(request);
     return resolveRequest(request, basePath, true, "import");
+  };
+  require.resolve.paths = request => {
+    if (typeof request !== "string") throw invalidRequestType(request);
+    const text = request;
+    if (isBuiltin(text)) return null;
+    if (text === "." || text === ".." || text.startsWith("./") || text.startsWith("../")) {
+      return [dirname(basePath)];
+    }
+    return _nodeModulePaths(dirname(basePath));
   };
   require.cache = commonJsCacheObject;
   require.extensions = extensionsForRequire(basePath);
@@ -3523,13 +3545,27 @@ function executeCommonJsModule(module, filename) {
     error.code = "ERR_REQUIRE_ESM";
     throw error;
   }
-  const loader = _extensions[extension] ?? _extensions[".js"];
+  const registeredLoader = _extensions[extension];
+  const usesDefaultFallback = registeredLoader == null;
+  const loader = registeredLoader ?? _extensions[".js"];
   if (typeof loader !== "function") {
     const error = new TypeError(`Module._extensions['${extension}'] is not a function`);
     error.code = "ERR_INVALID_ARG_TYPE";
     throw error;
   }
-  loader(module, filename);
+  // Bun accepts JSX/TSX without publishing those suffixes in
+  // Module._extensions. Preserve that implicit filename grammar even when a
+  // user wraps the original `.js` handler, while explicit/cross-assigned
+  // handlers keep the grammar selected by the handler itself.
+  const previousContext = implicitDefaultExtensionContext;
+  implicitDefaultExtensionContext = usesDefaultFallback && (extension === ".jsx" || extension === ".tsx")
+    ? { filename: String(filename), loader: extension.slice(1) }
+    : null;
+  try {
+    loader(module, filename);
+  } finally {
+    implicitDefaultExtensionContext = previousContext;
+  }
   return module.exports;
 }
 
@@ -3693,32 +3729,84 @@ function finalizeEsmNamespaceOrder(namespace) {
   return namespace;
 }
 
-function sourceExportsEsmMarker(source, loader) {
+function sourceExportsEsmMarker(source, loader, factoryEntry = undefined) {
+  if (factoryEntry?.sourceExportsEsmMarker !== undefined) {
+    return factoryEntry.sourceExportsEsmMarker;
+  }
+  let result = false;
   if (typeof cottontail.transpilerScan !== "function") return false;
   try {
     const scan = JSON.parse(cottontail.transpilerScan(String(source), "{}", loader));
-    return Array.isArray(scan?.exports) && scan.exports.includes("__esModule");
-  } catch {
-    return false;
-  }
+    result = Array.isArray(scan?.exports) && scan.exports.includes("__esModule");
+  } catch {}
+  if (factoryEntry) factoryEntry.sourceExportsEsmMarker = result;
+  return result;
 }
 
-function requiredBundledEsmNamespace(value, source, loader) {
-  if (value == null || (typeof value !== "object" && typeof value !== "function")) return value;
+function sameOwnKeyShape(left, right) {
+  if (!Array.isArray(left) || left.length !== right.length) return false;
+  for (let index = 0; index < right.length; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+function isArrayIndexString(key) {
+  const index = key >>> 0;
+  return index !== 0xffffffff && String(index) === key;
+}
+
+function requiredBundledEsmNamespace(value, source, loader, factoryEntry = undefined) {
+  if (value == null || (typeof value !== "object" && typeof value !== "function")) {
+    return { value, ordered: false };
+  }
   const marker = Object.getOwnPropertyDescriptor(value, "__esModule");
-  if (sourceExportsEsmMarker(source, loader) ||
-      marker?.value !== true || marker.enumerable || marker.configurable || marker.writable) {
-    return value;
+  if (marker?.value !== true || marker.enumerable || marker.configurable || marker.writable ||
+      sourceExportsEsmMarker(source, loader, factoryEntry)) {
+    return { value, ordered: false };
+  }
+
+  const inputKeys = Reflect.ownKeys(value);
+  const entries = [];
+  let canConstructInOrder = true;
+  for (const key of inputKeys) {
+    if (key === "__esModule" || key === Symbol.toStringTag) continue;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    entries.push([key, descriptor]);
+    if (!descriptor || descriptor.enumerable !== true || typeof key !== "string" || isArrayIndexString(key)) {
+      canConstructInOrder = false;
+    }
+  }
+
+  let order = null;
+  if (canConstructInOrder) {
+    const cachedOrder = factoryEntry?.namespaceOrder;
+    if (cachedOrder && sameOwnKeyShape(cachedOrder.inputKeys, inputKeys)) {
+      order = cachedOrder.order;
+    } else {
+      order = entries.map((_entry, index) => index);
+      order.sort((left, right) => {
+        const leftKey = entries[left][0];
+        const rightKey = entries[right][0];
+        return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+      });
+      if (factoryEntry) factoryEntry.namespaceOrder = { inputKeys, order };
+    }
+  } else if (factoryEntry) {
+    // Integer-index names need a true namespace exotic object (or a stable
+    // Proxy created before cycles can observe it). Preserve the existing
+    // finalization path for those and for other unusual generated surfaces.
+    factoryEntry.namespaceOrder = null;
   }
 
   const namespace = createModuleNamespace();
-  for (const key of Reflect.ownKeys(value)) {
-    if (key === "__esModule" || key === Symbol.toStringTag) continue;
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  const defineOrder = order ?? entries.map((_entry, index) => index);
+  for (const index of defineOrder) {
+    const [key, descriptor] = entries[index];
     if (descriptor) Object.defineProperty(namespace, key, descriptor);
   }
   moduleNamespaceEsmMarkers.set(namespace, true);
-  return namespace;
+  return { value: namespace, ordered: order !== null };
 }
 
 function namespaceFromCommonJs(value, packageTypeModule = false, additionalNames = []) {
@@ -5538,17 +5626,22 @@ function maybeRegisterSourceMap(filename, source) {
   } catch {}
 }
 
-function remapRegisteredSourceMapStack(stack) {
-  const key = String(stack ?? "");
+function remapRegisteredSourceMapStack(stack, wrappedFilename = undefined, wrapperLineOffset = 0) {
+  const stackText = String(stack ?? "");
+  const offset = Number(wrapperLineOffset) || 0;
+  const offsetFilename = offset && wrappedFilename != null ? String(wrappedFilename) : "";
+  const key = offsetFilename
+    ? `${offset}:${offsetFilename.length}:${offsetFilename}${stackText}`
+    : stackText;
   const memoized = remappedStacks.get(key);
   if (memoized !== undefined) return memoized;
-  const result = remapRegisteredSourceMapStackUncached(key);
+  const result = remapRegisteredSourceMapStackUncached(stackText, offsetFilename, offset);
   if (remappedStacks.size >= 512) remappedStacks.clear();
   remappedStacks.set(key, result);
   return result;
 }
 
-function remapRegisteredSourceMapStackUncached(stack) {
+function remapRegisteredSourceMapStackUncached(stack, wrappedFilename = "", wrapperLineOffset = 0) {
   return String(stack ?? "").replace(/(^|[\s(@])([^\s()@]+):(\d+):(\d+)/gm, (frame, prefix, file, lineText, columnText) => {
     let sourceMap = sourceMapCache.get(file);
     if (!sourceMap && !sourceMapMisses.has(file)) {
@@ -5559,7 +5652,9 @@ function remapRegisteredSourceMapStackUncached(stack) {
       if (!sourceMap) sourceMapMisses.add(file);
     }
     if (!sourceMap) return frame;
-    const entry = sourceMap.findEntry(Number(lineText) - 1, Number(columnText) - 1);
+    const generatedLine = Number(lineText) - (file === wrappedFilename ? wrapperLineOffset : 0);
+    if (!Number.isFinite(generatedLine) || generatedLine < 1) return frame;
+    const entry = sourceMap.findEntry(generatedLine - 1, Number(columnText) - 1);
     if (entry?.originalSource == null || entry.originalLine == null || entry.originalColumn == null) return frame;
     const source = String(entry.originalSource);
     const resolvedSource = isAbsolute(source) || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(source)
@@ -5585,7 +5680,7 @@ function remapThrownModuleError(error, fallbackFilename = undefined, wrapperLine
       });
     }
     if (error && typeof error.stack === "string") {
-      error.stack = remapRegisteredSourceMapStack(error.stack);
+      error.stack = remapRegisteredSourceMapStack(error.stack, filename, wrapperLineOffset);
     }
   } catch {}
   return error;
@@ -5611,10 +5706,13 @@ function originalErrorLocation(error, metadata) {
       source: metadata.generatedSource,
     };
   }
-  if (!Number.isFinite(generatedLine) || !Number.isFinite(generatedColumn)) return null;
+  // Source maps describe the generated file, not the function wrapper used to
+  // execute it. Normalize JSC's wrapped runtime line before looking it up.
+  const sourceMapLine = generatedLine - Number(metadata?.wrapperLineOffset || 0);
+  if (!Number.isFinite(sourceMapLine) || !Number.isFinite(generatedColumn)) return null;
 
   let mapColumn = Math.max(0, generatedColumn - 1);
-  const generatedLineText = String(metadata.generatedSource).split(/\r?\n/)[generatedLine - 1] ?? "";
+  const generatedLineText = String(metadata.generatedSource).split(/\r?\n/)[sourceMapLine - 1] ?? "";
   const constructorName = String(error?.name || "Error").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const constructorPattern = new RegExp(`\\bnew\\s+${constructorName}\\b`, "g");
   for (const match of generatedLineText.matchAll(constructorPattern)) {
@@ -5624,7 +5722,7 @@ function originalErrorLocation(error, metadata) {
     }
   }
 
-  const entry = sourceMap.findEntry(generatedLine - 1, mapColumn);
+  const entry = sourceMap.findEntry(sourceMapLine - 1, mapColumn);
   if (entry?.originalSource == null || entry.originalLine == null || entry.originalColumn == null) return null;
   const source = String(entry.originalSource);
   const filename = isAbsolute(source) || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(source)
@@ -5666,16 +5764,19 @@ globalThis.__cottontailFormatUncaughtModuleError = error => {
     if (error?.__cottontailSkipUncaughtModuleFormatting === true) return false;
     const metadata = error?.__ctModuleErrorMetadata;
     if (!metadata) return formatUncaughtBundleError(error);
+    const missingSourceMapNotes = !metadata.sourceMap && String(metadata.generatedSource).startsWith("// @bun")
+      ? `\nnote: missing sourcemaps for ${metadata.filename}\nnote: consider bundling with '--sourcemap' to get unminified traces`
+      : "";
     const location = originalErrorLocation(error, metadata);
     const codeFrame = bunUncaughtCodeFrame(location, error?.message);
     if (codeFrame && location) {
       const frames = String(error.stack ?? "").split(/\r?\n/).slice(1).join("\n");
-      error.stack = `${codeFrame}\n    at ${location.filename}:${location.line}:${location.column}${frames ? `\n${frames}` : ""}`;
+      error.stack = `${codeFrame}\n    at ${location.filename}:${location.line}:${location.column}${frames ? `\n${frames}` : ""}${missingSourceMapNotes}`;
       Object.defineProperty(error, "__cottontailFormattedStack", { value: true, configurable: true });
       return;
     }
-    if (!metadata.sourceMap && String(metadata.generatedSource).startsWith("// @bun")) {
-      error.stack = `${String(error.stack ?? error)}\nnote: missing sourcemaps for ${metadata.filename}\nnote: consider bundling with '--sourcemap' to get unminified traces`;
+    if (missingSourceMapNotes) {
+      error.stack = `${String(error.stack ?? error)}${missingSourceMapNotes}`;
       return;
     }
   } catch {}
@@ -5725,7 +5826,10 @@ function recordCompileCache(filename, source) {
 
 const moduleExtensionsTarget = {
   ".js"(module, filename) {
-    return executeDefaultExtension(module, filename, "js");
+    const implicitLoader = implicitDefaultExtensionContext?.filename === String(filename)
+      ? implicitDefaultExtensionContext.loader
+      : "js";
+    return executeDefaultExtension(module, filename, implicitLoader);
   },
   ".cjs"(module, filename) {
     return executeDefaultExtension(module, filename, "js");

@@ -434,7 +434,7 @@ function localHtmlModuleScripts(source, htmlPath) {
         ? path.resolve(globalThis.process?.cwd?.() ?? ".", `.${sourcePath}`)
         : path.resolve(path.dirname(htmlPath), sourcePath);
       scripts.push({
-        assetPath: parsed.pathname,
+        sourceUrl,
         entryPath,
       });
     },
@@ -469,6 +469,22 @@ function rewriteHtmlCssAssets(source, replacements) {
       }
       const replacement = replacements.get(pathname);
       if (replacement) element.setAttribute("href", replacement);
+    },
+  }).transform(source);
+}
+
+function rewriteHtmlModuleScriptAssets(source, replacements) {
+  if (replacements.size === 0) return source;
+  return new HTMLRewriter().on("script", {
+    element(element) {
+      const type = element.getAttribute("type");
+      const sourceUrl = element.getAttribute("src");
+      if (type?.toLowerCase() !== "module" || !sourceUrl) return;
+      // The scanner has already rejected external URLs. Preserve the exact
+      // decoded attribute here so root-relative and HTML-relative entries that
+      // normalize to the same URL pathname still map to their own artifacts.
+      const replacement = replacements.get(sourceUrl);
+      if (replacement) element.setAttribute("src", replacement);
     },
   }).transform(source);
 }
@@ -974,16 +990,26 @@ function createHtmlDispatcher(config, development) {
     if (scripts.length === 0) return null;
 
     const hmrEntries = [];
-    for (const { assetPath, entryPath } of scripts) {
+    const scriptAssetReplacements = new Map();
+    for (const [scriptIndex, { sourceUrl, entryPath }] of scripts.entries()) {
+      // Each standalone internal entry needs its own output namespace. Two
+      // distinct sources may share a basename (for example ./app.ts and
+      // /app.ts in nested HTML), and separate one-entry builds otherwise both
+      // emit app.js into the same directory.
+      const entryOutdir = scripts.length === 1
+        ? outdir
+        : path.join(outdir, `entry-${scriptIndex}`);
       let internal;
       try {
-        internal = await internalBakeEntry(entryPath, outdir, buildConfig, eagerBuilds);
+        internal = await internalBakeEntry(entryPath, entryOutdir, buildConfig, eagerBuilds);
       } catch {
         return null;
       }
       const { artifact, outputs, refreshId } = internal;
       if (requireStandalone && outputs.some(output => output !== artifact && output.kind !== "sourcemap")) return null;
 
+      const assetPath = outputAssetPath(outdir, artifact, buildConfig.publicPath);
+      scriptAssetReplacements.set(sourceUrl, assetPath);
       let source = await artifact.text();
       if (refreshId !== null) source = addBakeBundleConfig(source, "refresh", refreshId);
       const sourceMapRecord = await sourceMapRecordForArtifact(artifact, [artifact], source, projectRoot);
@@ -1015,9 +1041,17 @@ function createHtmlDispatcher(config, development) {
     }
 
     // COTTONTAIL-COMPAT: Bake's HMR linker defers require/TLA failures until
-    // module evaluation. Keep the original HTML while serving its scripts from
-    // the internal HMR graph so the runtime reports Bun's exact diagnostic.
-    return { body: sourceText, sourceText, hmrEntries, css: new Map(), buildError: false, errors: [] };
+    // module evaluation. Keep the raw HTML separately for invalidation while
+    // serving its scripts at the generated JavaScript URLs from the internal
+    // HMR graph so the runtime reports Bun's exact diagnostic.
+    return {
+      body: rewriteHtmlModuleScriptAssets(sourceText, scriptAssetReplacements),
+      sourceText,
+      hmrEntries,
+      css: new Map(),
+      buildError: false,
+      errors: [],
+    };
   }
 
   async function internalHtmlFailureLogs(sourceText, htmlPath, outdir, buildConfig) {

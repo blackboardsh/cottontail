@@ -22,6 +22,7 @@ async function postNodeAction(port) {
 }
 
 describe("astro", async () => {
+  let port;
   let previewServer;
   let origin;
 
@@ -33,10 +34,18 @@ describe("astro", async () => {
     });
     previewServer = await preview({
       root: fixtureDir,
-      port: 0,
+      server: {
+        host: "127.0.0.1",
+        port: 0,
+      },
       logLevel: "error",
     });
-    origin = `http://localhost:${previewServer.port}`;
+    const address = previewServer.server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Astro preview did not bind a TCP port");
+    }
+    port = address.port;
+    origin = `http://127.0.0.1:${port}`;
   });
   afterAll(async () => {
     await previewServer.stop();
@@ -66,7 +75,7 @@ describe("astro", async () => {
   });
 
   test("is able todo a POST request to an astro action using node", async () => {
-    await postNodeAction(previewServer.port);
+    await postNodeAction(port);
   });
 
   test("is able to post form data to an astro using bun", async () => {
@@ -89,6 +98,6 @@ describe("astro", async () => {
     });
   });
   test("is able to post form data to an astro using node", async () => {
-    await postNodeFormData(previewServer.port);
+    await postNodeFormData(port);
   });
 });

@@ -398,7 +398,15 @@ export function createBunBuildFacade(dependencies) {
       target: options?.target ?? "browser",
       onResolve(constraints, callback) {
         if (!callback || typeof callback !== "function") throw new TypeError("lmao callback must be a function");
-        onResolveRules.push({ ...ctValidatePluginConstraints(constraints), callback });
+        onResolveRules.push({
+          ...ctValidatePluginConstraints(constraints),
+          // Unlike onLoad, omitting the namespace on onResolve means that the
+          // filter applies to imports from every namespace. Keep that intent
+          // separate from the normalized default namespace so an explicitly
+          // requested "file" namespace can still be matched exactly.
+          allNamespaces: constraints.namespace === undefined,
+          callback,
+        });
         return this;
       },
       onLoad(constraints, callback) {
@@ -573,12 +581,11 @@ export function createBunBuildFacade(dependencies) {
     };
 
     const resolveWithPlugins = async (specifier, importer, importerNamespace, resolveDir, kind) => {
+      // Entry points report the empty namespace to callbacks, but participate
+      // in namespace-filter matching as files.
+      const namespaceForMatching = importerNamespace || "file";
       for (const rule of onResolveRules) {
-        // Bun invokes onResolve callbacks registered for the default "file"
-        // namespace for imports from every namespace (including entry points,
-        // whose importer namespace is ""), while callbacks registered for a
-        // custom namespace only fire for importers inside that namespace.
-        if (rule.namespace !== importerNamespace && rule.namespace !== "file") continue;
+        if (!rule.allNamespaces && rule.namespace !== namespaceForMatching) continue;
         if (!rule.filter.test(specifier)) continue;
         const result = await Reflect.apply(rule.callback, undefined, [{
           path: specifier,

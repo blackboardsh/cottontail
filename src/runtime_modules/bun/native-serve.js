@@ -32,6 +32,7 @@ export function startNativeServe(options, runtime) {
     normalizeServeDateHeader,
     normalizeServeListenErrorCode,
     parseHeadersText,
+    invalidateServeHtmlState,
     registerServeHtmlOptions,
     requestIdleTimeout,
     requestWithLazyURL,
@@ -132,8 +133,10 @@ export function startNativeServe(options, runtime) {
         return server.stop(true);
       },
       reload(nextOptions = {}) {
-        registerServeHtmlOptions(activeOptions[serveHtmlStateSymbol], nextOptions);
-        activeOptions = { ...activeOptions, ...nextOptions };
+        const reloadedOptions = { ...activeOptions, ...nextOptions };
+        invalidateServeHtmlState(activeOptions[serveHtmlStateSymbol], reloadedOptions);
+        registerServeHtmlOptions(activeOptions[serveHtmlStateSymbol], reloadedOptions);
+        activeOptions = reloadedOptions;
         server.development = activeOptions.development ?? false;
         return server;
       },

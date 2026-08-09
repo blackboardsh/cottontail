@@ -2,7 +2,7 @@
 
 The Bun-derived tests are separately owned Cottontail and Hutch JavaScript
 tests, not a live mirror of Bun's repository. Cottontail owns only its tests;
-the 100 Hutch paths are handed off to and run from the Hutch repository. Bun
+the 103 Hutch paths are handed off to and run from the Hutch repository. Bun
 compatibility established a useful starting line, not a permanent dependency
 or product boundary. Local tests may now diverge, move to another repository,
 or be retired when the corresponding subsystem changes.
@@ -25,12 +25,12 @@ The macOS baseline contains 1,445 runnable Bun-derived files:
 
 | Classification | Count |
 | --- | ---: |
-| Enabled Cottontail JavaScript baseline files | 1,324 |
-| Whole-file expected failures | 18 |
-| Hutch-owned JavaScript baseline files | 100 |
-| Deliberately out of scope | 3 |
+| Enabled Cottontail JavaScript baseline files | 1,318 |
+| Whole-file expected failures | 20 |
+| Hutch-owned JavaScript baseline files | 103 |
+| Deliberately out of scope | 4 |
 
-There are also 30 explicitly named test-case exclusions and four expected
+There are also 24 explicitly named test-case exclusions and four expected
 failures among individually split bundler cases. These remain visible
 exceptions; they are not part of the zero-unexpected-failure target. An
 unexpected pass is still a result that must be reviewed rather than silently
@@ -74,9 +74,18 @@ removing the transitional pin.
 | JavaScriptCore sampling profiler | Out of scope | The Cottontail JSC build intentionally omits it; reconsider only if profiling becomes a supported feature. |
 | Externalized subsystems | None yet | Name the destination repository here and in metadata when the first subsystem moves. |
 
-The three current exact out-of-scope files are
+The four current exact out-of-scope files are
 `test/bake/dev/react-response.test.ts`, `test/cli/run/cpu-prof.test.ts`, and
-`test/js/node/inspector/inspector-profiler.test.ts`.
+`test/js/node/inspector/inspector-profiler.test.ts`, plus the dedicated
+performance file `test/js/bun/http/serve-body-leak.test.ts`.
+
+The three canonical Next Pages files under
+`test/integration/next-pages/test/` are Hutch-owned because they install the
+fixture, assert package-manager lockfile/layout state, and drive Hutch's public
+development or build orchestration. Hutch copies all 28 tracked files in that
+fixture tree. The ignored `src/Counter.tsx` is the 29th working-tree file and is
+recreated from `src/Counter1.txt` by every runnable test; it is not provenance
+input and must not be force-tracked in either repository.
 
 ## Reviewing a newer Bun release
 
@@ -124,9 +133,12 @@ An `external` decision must name its destination repository. Keep rules loose:
 add exact-path mappings only for exceptions, renames, splits, combinations, or
 substantially rewritten tests.
 
-The pre-green mapping list is deliberately empty. Populate it after the green
-ownership checkpoint when tests first move or change identity; matching entries
-are attached to the comparison report. An exceptional mapping has this shape:
+The pre-green mapping list is deliberately empty. Same-relative-path handoffs
+to Hutch remain implicit: the routing history records the ownership change and
+Hutch's manifest records the identical local path. Populate mappings after the
+green ownership checkpoint when a test changes relative path or identity;
+matching entries are attached to the comparison report. An exceptional mapping
+has this shape:
 
 ```json
 {
@@ -153,10 +165,12 @@ Preserve Bun's MIT license at
 the source tag and commit in the snapshot manifest, and enough path history to
 identify a derived test's origin. Do not remove attribution when a test is
 adapted. Git history plus this baseline supplies provenance for same-path
-tests; record an explicit origin when a test is renamed, split, combined, or
-moved to another repository. An upstream path records the immediate comparison
-source, not exclusive authorship; preserve nested notices from Deno, Node,
-WebKit, WPT, test262, esbuild, and other original sources too.
+tests, including a handoff to Hutch that retains the upstream-relative path and
+is recorded in routing history and Hutch's manifest. Record an explicit mapping
+when a test is renamed, split, combined, or moved to another repository under a
+different path. An upstream path records the immediate comparison source, not
+exclusive authorship; preserve nested notices from Deno, Node, WebKit, WPT,
+test262, esbuild, and other original sources too.
 
 ## Review history
 

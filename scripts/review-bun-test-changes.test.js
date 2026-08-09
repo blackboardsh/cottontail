@@ -70,25 +70,31 @@ test('review metadata freezes the Bun baseline and all routing destinations', ()
     'utf8',
   ));
   assert.equal(status.expectedCounts.runnableFiles, 1445);
-  assert.equal(status.expectedCounts.enabled, 1324);
-  assert.equal(status.expectedCounts.expectedFailure, 18);
-  assert.equal(status.expectedCounts.skip, 103);
-  assert.equal(status.expectedCounts.cottontailOwned, 1345);
-  assert.equal(status.expectedCounts.hutchOwned, 100);
+  assert.equal(status.expectedCounts.enabled, 1318);
+  assert.equal(status.expectedCounts.expectedFailure, 20);
+  assert.equal(status.expectedCounts.skip, 107);
+  assert.equal(status.expectedCounts.cottontailOwned, 1342);
+  assert.equal(status.expectedCounts.hutchOwned, 103);
 
   const entries = Object.values(status.tests);
-  assert.equal(entries.filter((entry) => entry.owner === 'hutch-package-manager').length, 100);
+  assert.equal(entries.filter((entry) => entry.owner === 'hutch-package-manager').length, 103);
   assert.equal(entries.filter(
     (entry) => entry.status === 'skip' && entry.owner !== 'hutch-package-manager',
-  ).length, 3);
+  ).length, 4);
   assert.equal(entries.reduce(
     (count, entry) => count + (entry.testNameExclusion?.testNames.length ?? 0),
     0,
-  ), 30);
+  ), 24);
   assert.equal(entries.reduce(
     (count, entry) => count + Object.keys(entry.expectedFailureBundlerTests ?? {}).length,
     0,
   ), 4);
+
+  const [newNextPagesTest] = addRouting([
+    { status: 'A', path: 'test/integration/next-pages/test/new-upstream.test.ts' },
+  ], metadata, status);
+  assert.equal(newNextPagesTest.suggestedDestination, 'hutch');
+  assert.equal(newNextPagesTest.routingBasis, 'routing-rule');
 });
 
 test('name-status parsing preserves renames and unusual paths', () => {

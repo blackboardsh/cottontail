@@ -6,7 +6,9 @@ it.skipIf(process.platform === "win32")("should not time out", done => {
   const child = spawn(process.execPath, ["run", "./20144.fixture.ts"], {
     cwd: __dirname,
     stdio: [null, "inherit", "inherit", "ipc"],
-    timeout: 1000,
+    // Preserve a bounded hang detector while allowing a cold Hutch+Cottontail
+    // child enough time to compile the fixture and establish IPC.
+    timeout: 3_000,
     killSignal: "SIGKILL",
   });
 

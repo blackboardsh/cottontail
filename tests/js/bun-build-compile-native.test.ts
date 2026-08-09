@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 
 const root = mkdtempSync(join(tmpdir(), "cottontail-native-compile-"));
 
@@ -86,3 +86,61 @@ console.log(JSON.stringify({
     },
   });
 });
+
+test("compiled builds preserve an explicit root through direct and plugin-shadow graphs", async () => {
+  const project = join(root, "explicit-root");
+  const sourceDir = join(project, "src");
+  const assetDir = join(project, "assets");
+  const entry = join(sourceDir, "entry.ts");
+  mkdirSync(sourceDir, { recursive: true });
+  mkdirSync(assetDir, { recursive: true });
+  writeFileSync(join(assetDir, "payload.asset"), "embedded-asset");
+  writeFileSync(
+    entry,
+    'import payload from "../assets/payload.asset";\nconsole.log(payload.replaceAll("\\\\", "/"));\n',
+  );
+
+  const relativeRoot = relative(process.cwd(), project);
+  const virtualAsset = process.platform === "win32"
+    ? "B:/~BUN/root/assets/payload.asset"
+    : "/$bunfs/root/assets/payload.asset";
+
+  for (const usePlugin of [false, true]) {
+    const executable = join(
+      root,
+      process.platform === "win32"
+        ? `root-${usePlugin ? "plugin" : "direct"}.exe`
+        : `root-${usePlugin ? "plugin" : "direct"}`,
+    );
+    const result = await Bun.build({
+      entrypoints: [entry],
+      root: relativeRoot,
+      loader: { ".asset": "file" },
+      naming: { asset: "[dir]/[name].[ext]" },
+      compile: { outfile: executable },
+      plugins: usePlugin
+        ? [{
+            name: "compile-root-shadow",
+            setup(build) {
+              build.onLoad({ filter: /entry\.ts$/ }, args => ({
+                contents: readFileSync(args.path, "utf8"),
+                loader: "ts",
+              }));
+            },
+          }]
+        : undefined,
+    });
+
+    expect(result.success).toBe(true);
+    const run = Bun.spawnSync({
+      cmd: [executable],
+      cwd: project,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(run.exitCode).toBe(0);
+    expect(String(run.stderr)).toBe("");
+    expect(String(run.stdout).trim()).toBe(virtualAsset);
+  }
+}, { timeout: 120_000 });

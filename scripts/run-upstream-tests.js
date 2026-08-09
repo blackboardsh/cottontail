@@ -21,7 +21,7 @@ import {
 import { spawn, spawnSync } from 'child_process';
 import { createHash, randomUUID } from 'crypto';
 import os from 'os';
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path';
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from 'path';
 import { fileURLToPath } from 'url';
 
 const rootDir = process.cwd();
@@ -42,6 +42,7 @@ let hutchSourceHash = null;
 const pythonPath = process.env.PYTHON ?? (process.platform === 'win32' ? 'python' : 'python3');
 const tempBase = process.env.COTTONTAIL_UPSTREAM_TMPDIR ?? (process.platform === 'darwin' ? '/tmp' : os.tmpdir());
 const tempRoot = mkdtempSync(join(tempBase, 'cottontail-upstream-tests-'));
+let shortTempRoot = null;
 const baselineStateRoot = resolve(
   rootDir,
   process.env.COTTONTAIL_BASELINE_STATE_DIR ??
@@ -50,6 +51,7 @@ const baselineStateRoot = resolve(
 const disabledStatuses = new Set(['disabled', 'skip']);
 const directTestTimeoutMs = Number(process.env.COTTONTAIL_UPSTREAM_TEST_TIMEOUT_MS ?? 30000);
 const directTestMaxBuffer = Number(process.env.COTTONTAIL_UPSTREAM_TEST_MAX_BUFFER ?? 64 * 1024 * 1024);
+const processTerminationGraceMs = 5000;
 const defaultBunJobs = Math.max(1, Math.min(4, os.availableParallelism?.() ?? os.cpus().length));
 const binaryPreflightPrefix = 'COTTONTAIL_UPSTREAM_BINARY_PREFLIGHT:';
 const hutchPreflightPrefix = 'COTTONTAIL_HUTCH_ENGINE_PREFLIGHT:';
@@ -67,6 +69,7 @@ const snapshotFileBaselines = new Map();
 let exclusiveRunLock = null;
 let preserveRunLockOnExit = false;
 let skipSnapshotCleanupOnExit = false;
+let skipTempCleanupOnExit = false;
 let signalShutdownStarted = false;
 const bunMutableSnapshotFiles = [
   'packages/bun-plugin-svelte/bun.lock',
@@ -86,6 +89,27 @@ function shouldKeepTemp() {
 function removeTemp(path) {
   if (shouldKeepTemp()) return;
   try { rmSync(path, { recursive: true, force: true }); } catch {}
+}
+
+function createShortTempRoot() {
+  const bases = process.platform === 'win32'
+    ? [
+        process.env.SystemRoot && isAbsolute(process.env.SystemRoot)
+          ? join(process.env.SystemRoot, 'Temp')
+          : null,
+        join(parse(resolve(os.tmpdir())).root, 'Temp'),
+      ]
+    : ['/tmp'];
+  let lastError = null;
+  for (const base of [...new Set(bases.filter(Boolean))]) {
+    try {
+      mkdirSync(base, { recursive: true });
+      return mkdtempSync(join(base, 'ct-'));
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError ?? new Error('No short platform temporary directory is available.');
 }
 
 function captureSnapshotFileBaselines(snapshotRoot, runtime) {
@@ -210,6 +234,7 @@ process.on('exit', () => {
     .filter(processGroupIsRunning);
   if (liveChildren.length > 0) {
     skipSnapshotCleanupOnExit = true;
+    skipTempCleanupOnExit = true;
     preserveRunLockOnExit = true;
     console.error(
       `Test process group(s) ${liveChildren.join(', ')} were still live at runner exit; ` +
@@ -217,10 +242,14 @@ process.on('exit', () => {
     );
   }
   if (exclusiveRunLock != null && !skipSnapshotCleanupOnExit) removeAllSnapshotArtifacts();
-  if (shouldKeepTemp()) {
+  if (shouldKeepTemp() || skipTempCleanupOnExit) {
     console.error(`kept JavaScript baseline suite temp root: ${tempRoot}`);
+    if (shortTempRoot != null) {
+      console.error(`kept JavaScript baseline suite short temp root: ${shortTempRoot}`);
+    }
   } else {
     removeTemp(tempRoot);
+    if (shortTempRoot != null) removeTemp(shortTempRoot);
   }
   if (!preserveRunLockOnExit) releaseExclusiveRunLock();
 });
@@ -243,6 +272,7 @@ for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM']) {
       .filter(processGroupIsRunning);
     if (liveGroups.length > 0) {
       skipSnapshotCleanupOnExit = true;
+      skipTempCleanupOnExit = true;
       preserveRunLockOnExit = true;
       console.error(
         `Could not prove test process group(s) ${liveGroups.join(', ')} stopped; ` +
@@ -472,6 +502,23 @@ function processGroupIsRunning(pid) {
   } catch (error) {
     return error?.code === 'EPERM';
   }
+}
+
+async function terminateTrackedChild(child) {
+  killProcessTree(child);
+  const deadline = Date.now() + processTerminationGraceMs;
+  while (processGroupIsRunning(child.pid) && Date.now() < deadline) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+  }
+  if (processGroupIsRunning(child.pid)) {
+    skipSnapshotCleanupOnExit = true;
+    skipTempCleanupOnExit = true;
+    preserveRunLockOnExit = true;
+    return false;
+  }
+  activeChildren.delete(child);
+  updateExclusiveRunLockChildren();
+  return true;
 }
 
 function writeLockOwner(lockPath, token, owner) {
@@ -1654,22 +1701,48 @@ function statusCounts(snapshotRoot, status, runtime = 'node') {
 }
 
 function selectedTests(status, options, snapshotRoot, runtime = 'node') {
+  const focusedEntry = (path, selectedReason) => {
+    const entry = statusEntryForPath(status, path);
+    const owner = entry.owner ?? 'cottontail-runtime';
+    if (owner !== 'cottontail-runtime') {
+      fail(
+        `Focused JavaScript baseline path ${path} is owned by ${owner}, not Cottontail; ` +
+        'run it from its owning repository.'
+      );
+    }
+    if (disabledStatuses.has(entry.status)) {
+      fail(`Focused JavaScript baseline path ${path} is ${entry.status} and cannot be executed here.`);
+    }
+    if (entry.status === 'not-enabled' && options.onlyStatus !== 'not-enabled') {
+      fail(
+        `Focused JavaScript baseline path ${path} is not-enabled; ` +
+        'pass --only-status not-enabled to opt into that diagnostic tier.'
+      );
+    }
+    if (
+      options.onlyStatus != null &&
+      entry.status !== options.onlyStatus &&
+      !(options.onlyStatus === 'enabled' && hasEnabledBundlerCases(entry))
+    ) {
+      fail(
+        `Focused JavaScript baseline path ${path} has status ${entry.status}, ` +
+        `not ${options.onlyStatus}.`
+      );
+    }
+    return { ...entry, owner, reason: entry.reason ?? selectedReason };
+  };
+  const hasEnabledBundlerCases = (entry) =>
+    entry.splitBundlerTests === true && Object.keys(entry.enabledBundlerTests ?? {}).length > 0;
   if (options.test) {
-    return [{
-      ...statusEntryForPath(status, options.test, 'enabled'),
-      reason: status.tests?.[options.test]?.reason ?? 'selected from CLI',
-    }];
+    return [focusedEntry(options.test, 'selected from CLI')];
   }
   if (options.testList) {
-    return options.testList.paths.map((path) => ({
-      ...statusEntryForPath(status, path, 'enabled'),
-      reason: status.tests?.[path]?.reason ?? `selected from ${options.testList.path}`,
-    }));
+    return options.testList.paths.map((path) =>
+      focusedEntry(path, `selected from ${options.testList.path}`)
+    );
   }
   let entries;
   const includeExpectedFailures = options.includeExpectedFailures || options.onlyStatus === 'expected-failure';
-  const hasEnabledBundlerCases = (entry) =>
-    entry.splitBundlerTests === true && Object.keys(entry.enabledBundlerTests ?? {}).length > 0;
   if (status.defaultStatus === 'enabled' || patternEntries(status).length > 0) {
     entries = discoverRunnableFiles(snapshotRoot, runtime)
       .map((path) => statusEntryForPath(status, path, status.defaultStatus === 'enabled' ? 'enabled' : 'not-enabled'))
@@ -1785,6 +1858,7 @@ function entryPlanRecord(entry, snapshotRoot, options) {
     path: entry.path,
     variant: entry.variant ?? null,
     status: entry.status,
+    owner: entry.owner ?? 'cottontail-runtime',
     reason: entry.reason ?? null,
     args: entryArgs(entry, options),
     env: entry.env ?? null,
@@ -1803,6 +1877,7 @@ function makeRuntimePlan(runtime, target, statusPath, entries, snapshotRoot, opt
         unitId: entryUnitId(runtime, entry),
         path: entry.path,
         status: entry.status,
+        owner: entry.owner ?? 'cottontail-runtime',
         testHash: existsSync(join(snapshotRoot, entry.path))
           ? hashFile(join(snapshotRoot, entry.path))
           : 'missing',
@@ -1843,20 +1918,38 @@ function discoverBundlerTestIds(entry, snapshotRoot, target) {
     timeout,
     maxBuffer: directTestMaxBuffer,
   });
+  if (result.error || result.status !== 0 || result.signal != null) {
+    const details = [
+      result.error?.message,
+      result.signal ? `signal: ${result.signal}` : null,
+      result.status != null ? `exit status: ${result.status}` : null,
+      result.stderr,
+    ].filter(Boolean).join('\n');
+    fail(
+      `Incomplete itBundled discovery in ${entry.path}; discovery must exit cleanly` +
+      `${details ? `:\n${details}` : '.'}`
+    );
+  }
+  const stdout = String(result.stdout ?? '');
+  if (stdout.length > 0 && !/\r?\n$/.test(stdout)) {
+    fail(`Incomplete itBundled discovery output in ${entry.path}: final record was truncated.`);
+  }
   const ids = [];
-  for (const line of String(result.stdout ?? '').split(/\r?\n/)) {
+  const seen = new Set();
+  for (const line of stdout.split(/\r?\n/)) {
     if (!line.startsWith(bundlerTestDiscoveryPrefix)) continue;
     try {
       const id = JSON.parse(line.slice(bundlerTestDiscoveryPrefix.length));
-      if (typeof id === 'string' && !ids.includes(id)) ids.push(id);
+      if (typeof id !== 'string' || id.length === 0) {
+        fail(`Invalid itBundled discovery ID in ${entry.path}: ${line}`);
+      }
+      if (seen.has(id)) fail(`Duplicate itBundled discovery ID in ${entry.path}: ${id}`);
+      seen.add(id);
+      ids.push(id);
     } catch {
       fail(`Invalid itBundled discovery record in ${entry.path}: ${line}`);
     }
   }
-  // Mixed files can contain ordinary bun:test cases that fail while the
-  // lightweight registration pass still discovers every itBundled ID. Keep
-  // those ordinary cases as a separate owned variant instead of making their
-  // current result block generated-case isolation.
   if (ids.length === 0) {
     const details = [result.error?.message, result.stdout, result.stderr].filter(Boolean).join('\n');
     fail(`No itBundled cases discovered in ${entry.path}${details ? `:\n${details}` : ''}`);
@@ -2044,10 +2137,13 @@ function nodeHarnessChunks(target, entries, snapshotRoot, expectedFailure = fals
   });
 }
 
-function entryArgs(entry, options = null) {
+function entryArgs(entry, options = null, serialAttempt = false) {
   const args = Array.isArray(entry.args) ? entry.args.map(String) : [];
-  if (options != null && !args.some((arg) => arg === '--max-concurrency' || arg.startsWith('--max-concurrency='))) {
-    args.push('--max-concurrency', String(options.jobs));
+  if (
+    (options?.jobs === 1 || entry.serial === true || serialAttempt) &&
+    !args.some((arg) => arg === '--max-concurrency' || arg.startsWith('--max-concurrency='))
+  ) {
+    args.push('--max-concurrency', '1');
   }
   return args;
 }
@@ -2095,12 +2191,16 @@ function spawnCapturedAsync(command, args, spawnOptions, attemptOutput = null) {
       attemptOutput?.write('stderr', data);
       if (stderr.length < directTestMaxBuffer) stderr += data;
     });
-    const settle = (status, signal, error = undefined) => {
+    const settle = async (status, signal, error = undefined) => {
       if (settled) return;
       settled = true;
-      killProcessTree(child);
-      activeChildren.delete(child);
-      updateExclusiveRunLockChildren();
+      const stopped = await terminateTrackedChild(child);
+      if (!stopped) {
+        error = Object.assign(
+          new Error(`could not prove process group ${child.pid} stopped; owned temporary files were retained`),
+          { code: 'EPROCESSGROUP' },
+        );
+      }
       resolveResult({ status, signal, stdout, stderr, error });
     };
     child.on('exit', (status, signal) => setTimeout(() => settle(status, signal), 250));
@@ -2109,11 +2209,23 @@ function spawnCapturedAsync(command, args, spawnOptions, attemptOutput = null) {
   });
 }
 
-function runDirectAsync(runtime, target, entry, snapshotRoot, options, attemptOutput = null) {
+function runDirectAsync(runtime, target, entry, snapshotRoot, options, attemptOutput = null, serialAttempt = false) {
   const timeout = entryTimeout(entry, options);
-  const runTemp = mkdtempSync(join(tempRoot, 'run-'));
+  const useShortTemp = entry.env?.COTTONTAIL_UPSTREAM_SHORT_TEMP === '1';
+  // A few Unix-domain-socket fixtures must stay below macOS's 104-byte
+  // sockaddr_un limit. Keep those attempts isolated and runner-owned while
+  // placing their root under a genuinely short platform directory. This is
+  // deliberately independent of the launcher's containment override, which
+  // can itself be an absolute path deep inside an attested run directory.
+  if (useShortTemp && shortTempRoot == null) {
+    shortTempRoot = createShortTempRoot();
+  }
+  const runTemp = mkdtempSync(join(
+    useShortTemp ? shortTempRoot : tempRoot,
+    'run-',
+  ));
   return new Promise((resolveResult) => {
-    const child = spawn(binaryPath, [entry.path, ...entryArgs(entry, options)], {
+    const child = spawn(binaryPath, [entry.path, ...entryArgs(entry, options, serialAttempt)], {
       cwd: snapshotRoot,
       env: makeEnv(runtime, target, runTemp, {
         // Spawning with `cwd` changes the child's working directory but not the
@@ -2136,7 +2248,7 @@ function runDirectAsync(runtime, target, entry, snapshotRoot, options, attemptOu
     let settled = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      killProcessTree(child);
+      settle(null, null);
     }, timeout);
     child.stdout.on('data', (data) => {
       attemptOutput?.write('stdout', data);
@@ -2146,37 +2258,35 @@ function runDirectAsync(runtime, target, entry, snapshotRoot, options, attemptOu
       attemptOutput?.write('stderr', data);
       if (stderr.length < directTestMaxBuffer) stderr += data;
     });
-    const settle = (code, signal) => {
+    const settle = async (code, signal, spawnError = undefined) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       // A test owns its process group. Remove any grandchildren it left
       // behind after either a timeout or a normal/failed test exit.
-      killProcessTree(child);
-      activeChildren.delete(child);
-      updateExclusiveRunLockChildren();
-      removeTemp(runTemp);
+      const stopped = await terminateTrackedChild(child);
+      if (stopped) removeTemp(runTemp);
+      else {
+        spawnError = Object.assign(
+          new Error(`could not prove process group ${child.pid} stopped; ${runTemp} was retained`),
+          { code: 'EPROCESSGROUP' },
+        );
+      }
       resolveResult({
         status: code,
         signal,
         stdout,
         stderr,
-        error: timedOut ? Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }) : undefined,
+        error: spawnError ?? (timedOut
+          ? Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' })
+          : undefined),
       });
     };
     // 'exit' plus a grace beat: orphaned grandchildren can hold stdio pipes
     // open forever, so never wait solely on 'close'.
     child.on('exit', (code, signal) => setTimeout(() => settle(code, signal), 250));
     child.on('close', (code, signal) => settle(code, signal));
-    child.on('error', (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      activeChildren.delete(child);
-      updateExclusiveRunLockChildren();
-      removeTemp(runTemp);
-      resolveResult({ status: null, signal: null, stdout: '', stderr: '', error });
-    });
+    child.on('error', (error) => settle(null, null, error));
   });
 }
 
@@ -2199,15 +2309,20 @@ function classifyResult(runtime, entry, result, options) {
   }
   const exitCode = result.status ?? 1;
   const shouldFail = entry.status === 'expected-failure';
-  const ok = shouldFail ? exitCode !== 0 : exitCode === 0;
   const execution = runtime === 'bun' ? parseBunTestExecution(result.stderr) : null;
+  const allNotExecuted = exitCode === 0 && execution != null &&
+    execution.tests > 0 &&
+    execution.passed === 0 &&
+    execution.failed === 0 &&
+    execution.skipped + execution.todo === execution.tests;
+  const ok = allNotExecuted || (shouldFail ? exitCode !== 0 : exitCode === 0);
   const executionLabel = execution
     ? ` (${execution.tests} tests, ${execution.assertions} assertions)`
     : '';
   const message = ok
-      ? `${shouldFail ? 'xfail' : 'ok'} ${runtime} ${entryLabel(entry)}${executionLabel}`
+      ? `${allNotExecuted ? 'skip' : shouldFail ? 'xfail' : 'ok'} ${runtime} ${entryLabel(entry)}${executionLabel}`
       : `${shouldFail ? 'XPASS' : 'FAIL'} ${runtime} ${entryLabel(entry)} exited ${exitCode}`;
-  return { runtime, entry, ok, unexpected: !ok, message, execution, raw: result };
+  return { runtime, entry, ok, unexpected: !ok, message, execution, allNotExecuted, raw: result };
 }
 
 async function runBunEntries(
@@ -2241,7 +2356,15 @@ async function runBunEntries(
     const unitId = entryUnitId(runtime, entry);
     const label = `${runtime} ${entryLabel(entry)}`;
     const attemptOutput = reporter.attemptStarted(unitId, label, attempt, mode);
-    const result = await runOneAsync(runtime, target, entry, snapshotRoot, options, attemptOutput);
+    const result = await runOneAsync(
+      runtime,
+      target,
+      entry,
+      snapshotRoot,
+      options,
+      attemptOutput,
+      mode !== 'parallel',
+    );
     return { result, unitId, label, attempt, mode };
   };
 
@@ -2368,7 +2491,15 @@ async function runBunEntries(
   };
 }
 
-async function runOneAsync(runtime, target, entry, snapshotRoot, options, attemptOutput = null) {
+async function runOneAsync(
+  runtime,
+  target,
+  entry,
+  snapshotRoot,
+  options,
+  attemptOutput = null,
+  serialAttempt = false,
+) {
   const scriptPath = join(snapshotRoot, entry.path);
   if (!existsSync(scriptPath)) {
     return {
@@ -2384,7 +2515,15 @@ async function runOneAsync(runtime, target, entry, snapshotRoot, options, attemp
   if (!stat.isFile()) {
     return { runtime, entry, ok: false, unexpected: true, message: `not a file: ${entry.path}`, raw: {} };
   }
-  const result = await runDirectAsync(runtime, target, entry, snapshotRoot, options, attemptOutput);
+  const result = await runDirectAsync(
+    runtime,
+    target,
+    entry,
+    snapshotRoot,
+    options,
+    attemptOutput,
+    serialAttempt,
+  );
   return classifyResult(runtime, entry, result, options);
 }
 
@@ -2395,15 +2534,23 @@ function formatSpawnError(runtime, entry, result) {
 
 function parseBunTestExecution(stderr) {
   const text = String(stderr ?? '');
-  const pattern = /(?:^|\n)\s*(\d+) pass\s*\n(?:\s*\d+ (?:todo|skip)(?:ped)?\s*\n)*\s*(\d+) fail\s*\n(?:\s*\d+ error\s*\n)?(?:\s*(?:\d+ snapshots?, )?(\d+) expect\(\) calls\s*\n)?Ran (\d+) tests? across (\d+) file(?:s)?\./g;
+  const pattern = /(?:^|\n)\s*(\d+) pass\s*\n((?:\s*\d+ (?:todo|skip)(?:ped)?\s*\n)*)\s*(\d+) fail\s*\n(?:\s*\d+ error\s*\n)?(?:\s*(?:\d+ snapshots?, )?(\d+) expect\(\) calls\s*\n)?Ran (\d+) tests? across (\d+) file(?:s)?\./g;
   let execution = null;
   for (const match of text.matchAll(pattern)) {
+    let skipped = 0;
+    let todo = 0;
+    for (const count of match[2].matchAll(/(\d+) (todo|skip(?:ped)?)/g)) {
+      if (count[2] === 'todo') todo += Number(count[1]);
+      else skipped += Number(count[1]);
+    }
     execution = {
       passed: Number(match[1]),
-      failed: Number(match[2]),
-      assertions: Number(match[3] ?? 0),
-      tests: Number(match[4]),
-      files: Number(match[5]),
+      skipped,
+      todo,
+      failed: Number(match[3]),
+      assertions: Number(match[4] ?? 0),
+      tests: Number(match[5]),
+      files: Number(match[6]),
     };
   }
   return execution;
@@ -2481,13 +2628,7 @@ async function runNode(runtime, target, entries, snapshotRoot, options, reporter
     const allSkipped = report.total > 0 &&
       report.skipped === report.total &&
       /(?:^|\n)No tests to run\.\s*(?:\n|$)/.test(String(chunk.result.stdout ?? ''));
-    if (allSkipped && chunk.expectedFailure) {
-      unexpectedChunks.push({
-        ...chunk,
-        reportError: 'expected-failure selector was skipped by tools/test.py',
-      });
-      continue;
-    }
+    chunk.allSkipped = allSkipped;
     const chunkOk = allSkipped ||
       (chunk.expectedFailure ? exitCode !== 0 : exitCode === 0);
     if (!chunkOk) {
@@ -2509,6 +2650,7 @@ async function runNode(runtime, target, entries, snapshotRoot, options, reporter
       ? `${entries.length} selected harness path(s) in ${chunks.length} chunk(s)`
       : `${entries.length} enabled harness path(s) in ${chunks.length} chunk(s)`;
   const allExpectedFailure = expectedFailureEntries.length === entries.length;
+  const allExpectedFailureSkipped = allExpectedFailure && chunks.every((chunk) => chunk.allSkipped);
   const onlyXpass = unexpectedChunks.length > 0 &&
     unexpectedChunks.every((chunk) => chunk.xpass === true);
   const expectationLabel = expectedFailureEntries.length > 0 && !allExpectedFailure
@@ -2528,7 +2670,7 @@ async function runNode(runtime, target, entries, snapshotRoot, options, reporter
     ].filter(Boolean).join('\n');
   });
   const message = ok
-    ? `${allExpectedFailure ? 'xfail' : 'ok'} ${runtime} ${label}${expectationLabel}`
+    ? `${allExpectedFailureSkipped ? 'skip' : allExpectedFailure ? 'xfail' : 'ok'} ${runtime} ${label}${expectationLabel}`
     : [
         `${onlyXpass ? 'XPASS' : 'FAIL'} ${runtime} ${label}${expectationLabel}`,
         ...failureDetails,
@@ -2691,13 +2833,26 @@ for (const [runtimeIndex, name] of selectedRuntimeNames.entries()) {
 
 const sourceIntegrityErrors = [];
 if (reporter != null) {
-  removeAllSnapshotArtifacts();
-  for (const record of runtimePlanRecords) {
-    const current = snapshotSourceHash(record.snapshotRoot);
-    if (current.hash !== record.sourceIdentity.hash || current.files !== record.sourceIdentity.files) {
-      sourceIntegrityErrors.push(
-        `${record.name} snapshot source changed during the run: ${record.snapshotRoot}`
-      );
+  const liveGroups = [...activeChildren]
+    .map((child) => child.pid)
+    .filter(processGroupIsRunning);
+  if (liveGroups.length > 0) {
+    skipSnapshotCleanupOnExit = true;
+    skipTempCleanupOnExit = true;
+    preserveRunLockOnExit = true;
+    sourceIntegrityErrors.push(
+      `Could not prove test process group(s) ${liveGroups.join(', ')} stopped; ` +
+      'snapshot and temporary cleanup were skipped and the recoverable lock was retained.'
+    );
+  } else {
+    removeAllSnapshotArtifacts();
+    for (const record of runtimePlanRecords) {
+      const current = snapshotSourceHash(record.snapshotRoot);
+      if (current.hash !== record.sourceIdentity.hash || current.files !== record.sourceIdentity.files) {
+        sourceIntegrityErrors.push(
+          `${record.name} snapshot source changed during the run: ${record.snapshotRoot}`
+        );
+      }
     }
   }
   reporter.finish({ runtimeSummaries, stoppedEarly, sourceIntegrityErrors });

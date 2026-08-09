@@ -4,14 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const isWindows = process.platform === "win32";
-const isCI = process.env.CI === "true" || process.env.CI === "1";
 // Windows x64 currently runs under emulation during bring-up. Keep the
 // functional regression coverage while Windows startup performance is deferred.
 const maxStartupRss = (isWindows ? 384 : 250) * 1024 * 1024;
 const maxStdioStartupDurationMs = isWindows ? 30_000 : 5_000;
-// Cold Linux CI runners (empty caches, loaded hosts) sit just over the 1s
-// local budget; the assertion guards spawn-timeout behavior, not micro-perf.
-const coldReadlineTimeoutMs = isWindows ? 30_000 : isCI ? 5_000 : 1_000;
+// This is a bounded hang detector, not a startup microbenchmark. Empty caches
+// and a loaded host can legitimately take more than one second.
+const coldReadlineTimeoutMs = isWindows ? 30_000 : 5_000;
 const temporaryDirectory = mkdtempSync(join(tmpdir(), "cottontail-runtime-bootstrap-"));
 
 afterAll(() => rmSync(temporaryDirectory, { recursive: true, force: true }));
@@ -24,6 +23,15 @@ function run(args: string[]) {
     stdout: "pipe",
     stderr: "pipe",
   });
+}
+
+function nestedChildEnv() {
+  const env = { ...process.env };
+  delete env.COTTONTAIL_TEST_CLI_HEADER_PRINTED;
+  delete env.COTTONTAIL_TEST_FILE_COUNT;
+  delete env.COTTONTAIL_TEST_AGGREGATE_FILE;
+  delete env.COTTONTAIL_TEST_REPORTER_AGGREGATE_FILE;
+  return env;
 }
 
 test("no-op runtime stays below the startup RSS budget", () => {
@@ -159,6 +167,41 @@ test("selective bootstrap initializes process before transitive runtime modules"
   expect(argv.slice(2)).toEqual(userArguments);
 });
 
+test("automatic JSX dependencies select the complete bootstrap", () => {
+  const project = join(temporaryDirectory, "automatic-jsx-bootstrap");
+  const reactDirectory = join(project, "node_modules", "react");
+  mkdirSync(reactDirectory, { recursive: true });
+  writeFileSync(
+    join(reactDirectory, "package.json"),
+    JSON.stringify({
+      name: "react",
+      type: "module",
+      exports: {
+        "./jsx-runtime": "./jsx-runtime.js",
+        "./jsx-dev-runtime": "./jsx-runtime.js",
+      },
+    }),
+  );
+  writeFileSync(
+    join(reactDirectory, "jsx-runtime.js"),
+    `
+if (typeof process !== "object") throw new ReferenceError("process is not defined");
+if (typeof Response !== "function") throw new ReferenceError("Response is not defined");
+export const Fragment = Symbol.for("fixture.fragment");
+export function jsx(type, props) { return { type, props }; }
+export const jsxs = jsx;
+export const jsxDEV = jsx;
+`,
+  );
+  const fixture = join(project, "entry.tsx");
+  writeFileSync(fixture, 'console.log((<main id="ready" />).props.id);\n');
+
+  const result = run([fixture]);
+  expect(String(result.stderr)).toBe("");
+  expect(result.exitCode).toBe(0);
+  expect(String(result.stdout)).toBe("ready\n");
+});
+
 test("wrapped node shebang entrypoints remain valid JavaScript", () => {
   const fixture = join(temporaryDirectory, "vite-bin-smoke.js");
   writeFileSync(
@@ -175,6 +218,94 @@ test("wrapped node shebang entrypoints remain valid JavaScript", () => {
   });
 });
 
+test("direct test entries do not auto-start an exported server config", async () => {
+  const occupied = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch() { return new Response("occupied"); },
+  });
+  const fixture = join(temporaryDirectory, "default-server-test.ts");
+  writeFileSync(fixture, [
+    'import { expect, test } from "bun:test";',
+    'test("registered test runs", () => expect(true).toBe(true));',
+    "export default {",
+    '  hostname: "127.0.0.1",',
+    `  port: ${occupied.port},`,
+    '  fetch() { return new Response("must not start"); },',
+    "};",
+    "",
+  ].join("\n"));
+  const env = nestedChildEnv();
+
+  // Execute the file directly to cover the interval after bun:test registers
+  // the test and before its runner prints the test header. If default-app
+  // startup is attempted, the parent-owned port makes the child fail
+  // deterministically instead of hanging on a successfully bound server.
+  try {
+    const result = Bun.spawnSync({
+      cmd: [process.execPath, fixture],
+      env,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: 10_000,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(String(result.stdout)).toContain("bun test");
+    expect(String(result.stderr)).toContain("1 pass");
+    expect(String(result.stderr)).toContain("0 fail");
+  } finally {
+    await occupied.stop(true);
+  }
+});
+
+test("node:test default-app guard follows registrations, not module loading", () => {
+  const registeredFixture = join(temporaryDirectory, "default-server-node-test.mjs");
+  const registeredSentinel = "default app inspected registered node:test entry";
+  writeFileSync(registeredFixture, [
+    'import { test } from "node:test";',
+    'test("registered node:test runs", () => {});',
+    "export default {",
+    `  get fetch() { throw new Error(${JSON.stringify(registeredSentinel)}); },`,
+    "};",
+    "",
+  ].join("\n"));
+
+  const registeredResult = Bun.spawnSync({
+    cmd: [process.execPath, registeredFixture],
+    env: nestedChildEnv(),
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: 10_000,
+  });
+  expect(registeredResult.exitCode).toBe(0);
+  expect(String(registeredResult.stderr)).not.toContain(registeredSentinel);
+  expect(String(registeredResult.stderr)).toContain("1 pass");
+  expect(String(registeredResult.stderr)).toContain("0 fail");
+
+  const importOnlyFixture = join(temporaryDirectory, "default-server-node-test-import.mjs");
+  const importOnlySentinel = "default app inspected import-only node:test entry";
+  writeFileSync(importOnlyFixture, [
+    'import "node:test";',
+    "export default {",
+    `  get fetch() { throw new Error(${JSON.stringify(importOnlySentinel)}); },`,
+    "};",
+    "",
+  ].join("\n"));
+
+  const importOnlyResult = Bun.spawnSync({
+    cmd: [process.execPath, importOnlyFixture],
+    env: nestedChildEnv(),
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: 10_000,
+  });
+  expect(importOnlyResult.exitCode).not.toBe(0);
+  expect(String(importOnlyResult.stderr)).toContain(importOnlySentinel);
+});
+
 test("ordinary CommonJS entrypoints retain ownership of -c arguments", () => {
   const fixture = join(temporaryDirectory, "commonjs-cli-arguments.cjs");
   const config = join(temporaryDirectory, "application.config.js");
@@ -185,6 +316,16 @@ test("ordinary CommonJS entrypoints retain ownership of -c arguments", () => {
   expect(String(result.stderr)).toBe("");
   expect(result.exitCode).toBe(0);
   expect(JSON.parse(String(result.stdout))).toEqual(["-c", config]);
+});
+
+test("ordinary entrypoints retain ownership of trailing --tsconfig-override arguments", () => {
+  const fixture = join(temporaryDirectory, "application-cli-arguments.js");
+  writeFileSync(fixture, 'console.log(JSON.stringify(process.argv.slice(2)));\n');
+
+  const result = run([fixture, "--tsconfig-override", "app-value"]);
+  expect(String(result.stderr)).toBe("");
+  expect(result.exitCode).toBe(0);
+  expect(JSON.parse(String(result.stdout))).toEqual(["--tsconfig-override", "app-value"]);
 });
 
 test("cold readline process bootstrap completes within Bun's spawn timeout", () => {

@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -191,10 +191,13 @@ function createFixture(t) {
         "  hutchLauncherPath: process.env.HUTCH_LAUNCHER_PATH ?? null,",
         "  hutchLauncherVersion: process.env.HUTCH_LAUNCHER_VERSION ?? null,",
         "  hutchActiveChannel: process.env.HUTCH_ACTIVE_CHANNEL ?? null,",
+        "  temp: Object.fromEntries([",
+        "    'COTTONTAIL_TMP_DIR', 'BUN_TMPDIR', 'TEST_TMPDIR', 'TMPDIR', 'TMP', 'TEMP',",
+        "  ].map(key => [key, process.env[key] ?? null])),",
         "  argv: process.argv.slice(2),",
         "}) + '\\n');",
         "setTimeout(() => {",
-        "  process.stderr.write(`\\n 1 pass\\n 0 fail\\n 1 expect() calls\\nRan 1 test across 1 file.\\n`);",
+        "  process.stderr.write(process.env.COTTONTAIL_RUNNER_TEST_SUMMARY ?? `\\n 1 pass\\n 0 fail\\n 1 expect() calls\\nRan 1 test across 1 file.\\n`);",
         "  process.exit(record.exitCode);",
         "}, Number(process.env.COTTONTAIL_RUNNER_TEST_DELAY_MS ?? record.delayMs));",
         "",
@@ -399,6 +402,36 @@ function writeTestList(fixture, name, paths) {
   return path;
 }
 
+function installBundlerDiscoveryFixture(fixture, mode) {
+  const relativePath = "test/bundler/discovery.test.js";
+  const absolutePath = join(fixture.bunSnapshotRoot, relativePath);
+  mkdirSync(dirname(absolutePath), { recursive: true });
+  writeFileSync(absolutePath, [
+    'const prefix = "COTTONTAIL_BUNDLER_TEST_ID:";',
+    'if (process.env.COTTONTAIL_BUNDLER_TEST_DISCOVER === "1") {',
+    '  process.stdout.write(`${prefix}"case/one"\\n`);',
+    '  const mode = process.env.COTTONTAIL_RUNNER_DISCOVERY_MODE;',
+    '  if (mode === "nonzero") process.exit(2);',
+    '  if (mode === "partial") process.stdout.write(`${prefix}{`);',
+    '  if (mode === "truncated") process.stdout.write("x".repeat(4096));',
+    '  if (mode === "timeout") setInterval(() => {}, 1000);',
+    '} else {',
+    '  process.stderr.write("\\n 1 pass\\n 0 fail\\n 1 expect() calls\\nRan 1 test across 1 file.\\n");',
+    '}',
+    '',
+  ].join("\n"));
+  const statusPath = join(fixture.bunSnapshotRoot, "status.json");
+  const status = JSON.parse(readFileSync(statusPath, "utf8"));
+  status.tests[relativePath] = {
+    status: "enabled",
+    splitBundlerTests: true,
+    timeoutMs: mode === "timeout" ? 100 : 1000,
+    env: { COTTONTAIL_RUNNER_DISCOVERY_MODE: mode },
+  };
+  writeFileSync(statusPath, `${JSON.stringify(status, null, 2)}\n`);
+  return relativePath;
+}
+
 function reportEvents(reportDir) {
   return readJsonLines(join(reportDir, "events.jsonl"));
 }
@@ -565,6 +598,52 @@ test("test metadata cannot reintroduce loader variables", (t) => {
     /test metadata cannot override loader or runtime routing environment variable\(s\): dYlD_rOoT_pAtH/,
   );
   assert.deepEqual(readInvocations(fixture.bunCapturePath), []);
+});
+
+test("per-entry short temp mode bypasses a long ambient root and cleans its owned root", (t) => {
+  const fixture = createFixture(t);
+  const statusPath = join(fixture.bunSnapshotRoot, "status.json");
+  const status = JSON.parse(readFileSync(statusPath, "utf8"));
+  status.tests["test/js/pass-fast.test.js"] = {
+    env: { COTTONTAIL_UPSTREAM_SHORT_TEMP: "1" },
+  };
+  writeFileSync(statusPath, `${JSON.stringify(status, null, 2)}\n`);
+
+  const ambientTemp = join(
+    dirname(fixture.targetsPath),
+    "ambient-temp-that-is-deliberately-too-long-for-repeated-path-fixtures",
+  );
+  mkdirSync(ambientTemp, { recursive: true });
+  const result = runRunner(
+    fixture,
+    ["--test", "test/js/pass-fast.test.js"],
+    {
+      runtime: "bun",
+      environment: { COTTONTAIL_UPSTREAM_TMPDIR: ambientTemp },
+    },
+  );
+  assertSucceeded(result);
+
+  const [invocation] = readJsonLines(fixture.bunCapturePath);
+  const tempPaths = Object.values(invocation.temp);
+  assert.ok(tempPaths.every(Boolean));
+  assert.equal(new Set(tempPaths).size, 1, "all test temp variables must share one owned root");
+  const ownedRunTemp = tempPaths[0];
+  const ownedShortRoot = dirname(ownedRunTemp);
+  assert.match(basename(ownedRunTemp), /^run-/);
+  assert.match(basename(ownedShortRoot), /^ct-/);
+  assert.equal(
+    resolve(ownedRunTemp).startsWith(`${resolve(ambientTemp)}${sep}`),
+    false,
+    "short temp mode must ignore the ambient containment path",
+  );
+  if (process.platform !== "win32") {
+    assert.equal(dirname(ownedShortRoot), "/tmp");
+  }
+  assert.equal(existsSync(ownedRunTemp), false, "runner must remove the per-attempt root");
+  assert.equal(existsSync(ownedShortRoot), false, "runner must remove the short parent root");
+  assert.equal(existsSync(ambientTemp), true, "runner must not remove the caller-owned base");
+  assert.deepEqual(readdirSync(ambientTemp), []);
 });
 
 test("--expect-pass validates a focused recorded failure without editing status", (t) => {
@@ -737,8 +816,11 @@ test("Bun-derived tests report completion order, heartbeat, durable events, and 
     assert.equal(invocation.hutchLauncherPath, null);
     assert.equal(invocation.hutchLauncherVersion, null);
     assert.equal(invocation.hutchActiveChannel, null);
-    assert.deepEqual(invocation.argv, ["--max-concurrency", "2"]);
+    assert.deepEqual(invocation.argv, []);
   }
+  const plan = JSON.parse(readFileSync(join(reportDir, "plans", "bun.json"), "utf8"));
+  assert.ok(plan.tests.every((entry) => entry.args.length === 0));
+  assert.ok(plan.tests.every((entry) => entry.owner === "cottontail-runtime"));
   const events = reportEvents(reportDir);
   assert.equal(events.filter((event) => event.kind === "terminal").length, 2);
   assert.ok(events.some((event) => event.kind === "heartbeat"));
@@ -747,6 +829,48 @@ test("Bun-derived tests report completion order, heartbeat, durable events, and 
   assert.deepEqual(
     { planned: summary.planned, completed: summary.completed, unexpected: summary.unexpected },
     { planned: 2, completed: 2, unexpected: 0 },
+  );
+});
+
+test("--jobs=1 serializes bun:test unless metadata owns max-concurrency", (t) => {
+  const fixture = createFixture(t);
+  const statusPath = join(fixture.bunSnapshotRoot, "status.json");
+  const status = JSON.parse(readFileSync(statusPath, "utf8"));
+  status.tests["test/js/pass-after.test.js"] = {
+    args: ["--max-concurrency=7"],
+  };
+  writeFileSync(statusPath, `${JSON.stringify(status, null, 2)}\n`);
+  const reportDir = join(dirname(fixture.targetsPath), "serial-args-report");
+
+  const result = runRunner(
+    fixture,
+    [
+      "--match",
+      "^test/js/(?:pass-after|pass-fast)\\.test\\.js$",
+      "--jobs",
+      "1",
+      "--report-dir",
+      reportDir,
+    ],
+    { runtime: "bun" },
+  );
+  assertSucceeded(result);
+
+  const invocations = readJsonLines(fixture.bunCapturePath);
+  assert.deepEqual(
+    Object.fromEntries(invocations.map((invocation) => [invocation.path, invocation.argv])),
+    {
+      "test/js/pass-after.test.js": ["--max-concurrency=7"],
+      "test/js/pass-fast.test.js": ["--max-concurrency", "1"],
+    },
+  );
+  const plan = JSON.parse(readFileSync(join(reportDir, "plans", "bun.json"), "utf8"));
+  assert.deepEqual(
+    Object.fromEntries(plan.tests.map((entry) => [entry.path, entry.args])),
+    {
+      "test/js/pass-after.test.js": ["--max-concurrency=7"],
+      "test/js/pass-fast.test.js": ["--max-concurrency", "1"],
+    },
   );
 });
 
@@ -838,6 +962,11 @@ test("parallel fail-fast cancels in-flight attempts before releasing the lock", 
     event.unitId === "bun:test/js/pass-after.test.js" &&
     event.terminal === false
   ));
+  for (const invocation of readJsonLines(fixture.bunCapturePath)) {
+    for (const ownedTemp of Object.values(invocation.temp)) {
+      assert.equal(existsSync(ownedTemp), false, `canceled attempt retained ${ownedTemp}`);
+    }
+  }
   assert.equal(readdirSync(fixture.locksRoot).length, 0);
 });
 
@@ -861,10 +990,29 @@ test("serial confirmation attempts are visible and count one final failure", (t)
   assert.equal(result.status, 1, result.stdout + result.stderr);
   assert.match(result.stdout, /attempt 1 done.*awaiting serial confirmation/);
   assert.match(result.stdout, /attempt 2, serial confirmation/);
-  assert.equal(readJsonLines(fixture.bunCapturePath).length, 2);
+  assert.deepEqual(
+    readJsonLines(fixture.bunCapturePath).map((entry) => entry.argv),
+    [[], ["--max-concurrency", "1"]],
+  );
   const events = reportEvents(reportDir);
   assert.equal(events.filter((event) => event.kind === "attempt-end").length, 2);
   assert.equal(events.filter((event) => event.kind === "terminal").length, 1);
+});
+
+test("explicit serial metadata constrains only that file's in-file concurrency", (t) => {
+  const fixture = createFixture(t);
+  const statusPath = join(fixture.bunSnapshotRoot, "status.json");
+  const status = JSON.parse(readFileSync(statusPath, "utf8"));
+  status.tests["test/js/pass-fast.test.js"] = { serial: true };
+  writeFileSync(statusPath, `${JSON.stringify(status, null, 2)}\n`);
+  const result = runRunner(
+    fixture,
+    ["--test", "test/js/pass-fast.test.js", "--jobs", "2"],
+    { runtime: "bun" },
+  );
+  assertSucceeded(result);
+  assert.deepEqual(readJsonLines(fixture.bunCapturePath)[0].argv, ["--max-concurrency", "1"]);
+  assert.match(result.stdout, /explicit serial/);
 });
 
 test("focused selectors preserve xfail semantics unless --expect-pass opts in", (t) => {
@@ -902,6 +1050,94 @@ test("focused selectors preserve xfail semantics unless --expect-pass opts in", 
   );
   assertSucceeded(optedIn);
   assert.match(optedIn.stdout, /ok bun test\/js\/pass-fast\.test\.js/);
+});
+
+test("focused selectors cannot cross status or repository ownership boundaries", (t) => {
+  const fixture = createFixture(t);
+  const statusPath = join(fixture.bunSnapshotRoot, "status.json");
+  const status = JSON.parse(readFileSync(statusPath, "utf8"));
+  status.tests["test/js/pass-fast.test.js"] = {
+    status: "skip",
+    owner: "hutch-package-manager",
+    reason: "owned by Hutch",
+  };
+  status.tests["test/js/pass-after.test.js"] = {
+    status: "not-enabled",
+    reason: "diagnostic tier",
+  };
+  writeFileSync(statusPath, `${JSON.stringify(status, null, 2)}\n`);
+
+  const owned = runRunner(
+    fixture,
+    ["--test", "test/js/pass-fast.test.js"],
+    { runtime: "bun" },
+  );
+  assert.equal(owned.status, 1);
+  assert.match(owned.stderr, /owned by hutch-package-manager, not Cottontail/);
+  assert.deepEqual(readJsonLines(fixture.bunCapturePath), []);
+
+  const disabledByDefault = runRunner(
+    fixture,
+    ["--test", "test/js/pass-after.test.js"],
+    { runtime: "bun" },
+  );
+  assert.equal(disabledByDefault.status, 1);
+  assert.match(disabledByDefault.stderr, /is not-enabled/);
+
+  const diagnosticOptIn = runRunner(
+    fixture,
+    ["--test", "test/js/pass-after.test.js", "--only-status", "not-enabled"],
+    { runtime: "bun" },
+  );
+  assertSucceeded(diagnosticOptIn);
+});
+
+test("all-skipped and all-TODO expected failures are platform skips, not XPASS", async (t) => {
+  for (const [label, summary] of [
+    ["skipped", "\n 0 pass\n 1 skipped\n 0 fail\n 0 expect() calls\nRan 1 test across 1 file.\n"],
+    ["TODO", "\n 0 pass\n 4 todo\n 0 fail\n 0 expect() calls\nRan 4 tests across 1 file.\n"],
+  ]) {
+    await t.test(label, () => {
+      const fixture = createFixture(t);
+      const statusPath = join(fixture.bunSnapshotRoot, "status.json");
+      const status = JSON.parse(readFileSync(statusPath, "utf8"));
+      status.tests["test/js/pass-fast.test.js"] = {
+        status: "expected-failure",
+        reason: "platform gated",
+        env: { COTTONTAIL_RUNNER_TEST_SUMMARY: summary },
+      };
+      writeFileSync(statusPath, `${JSON.stringify(status, null, 2)}\n`);
+      const result = runRunner(
+        fixture,
+        ["--test", "test/js/pass-fast.test.js"],
+        { runtime: "bun" },
+      );
+      assertSucceeded(result);
+      assert.match(result.stdout, /skip bun test\/js\/pass-fast\.test\.js/);
+      assert.doesNotMatch(result.stdout, /XPASS/);
+    });
+  }
+});
+
+test("split bundler discovery fails closed on incomplete output", async (t) => {
+  for (const [mode, expected, environment] of [
+    ["nonzero", /discovery must exit cleanly/, {}],
+    ["timeout", /discovery must exit cleanly/, {}],
+    ["partial", /final record was truncated/, {}],
+    ["truncated", /discovery must exit cleanly/, { COTTONTAIL_UPSTREAM_TEST_MAX_BUFFER: "256" }],
+  ]) {
+    await t.test(mode, () => {
+      const fixture = createFixture(t);
+      const path = installBundlerDiscoveryFixture(fixture, mode);
+      const result = runRunner(
+        fixture,
+        ["--test", path],
+        { runtime: "bun", environment },
+      );
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.match(result.stderr, expected);
+    });
+  }
 });
 
 test("resume skips matching passes, reruns failures, and rejects changed tests", (t) => {

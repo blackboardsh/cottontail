@@ -450,6 +450,42 @@ test("Bun.serve graceful stop waits for upgraded WebSockets", async () => {
   }
 });
 
+test("ServerWebSocket applies positive backpressure limits to empty frames", async () => {
+  const sends = Promise.withResolvers<number[]>();
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request, activeServer) {
+      if (activeServer.upgrade(request)) return;
+      return new Response("upgrade required", { status: 426 });
+    },
+    websocket: {
+      backpressureLimit: 1,
+      open(socket) {
+        sends.resolve([
+          socket.send(""),
+          socket.send(""),
+          socket.send(""),
+        ]);
+      },
+      message() {},
+    },
+  });
+  const client = new WebSocket(server.url.href.replace(/^http/, "ws"));
+  try {
+    await new Promise((resolve, reject) => {
+      client.addEventListener("open", resolve, { once: true });
+      client.addEventListener("error", reject, { once: true });
+    });
+    // Empty payloads report zero bytes, but the second queued frame must still
+    // enter backpressure and later sends must be dropped until it drains.
+    expect(await sends.promise).toEqual([0, -1, 0]);
+  } finally {
+    client.close();
+    await server.stop(true);
+  }
+});
+
 test("native Bun.serve dispatches a nested request while its outer handler is pending", async () => {
   let server;
   server = Bun.serve({

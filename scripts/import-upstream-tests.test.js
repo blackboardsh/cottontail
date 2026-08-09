@@ -12,6 +12,7 @@ import {
   assertBunReplacementAllowed,
   assertCheckoutCommit,
   bunSnapshotLockPath,
+  copySpecs,
   parseImportArguments,
   withBunSnapshotMutationLock,
 } from './import-upstream-tests.js';
@@ -19,6 +20,28 @@ import {
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const rootDir = resolve(scriptsDir, '..');
 const importerPath = resolve(scriptsDir, 'import-upstream-tests.js');
+const bunRuntimeErrorFixture = 'packages/bun-error/runtime-error.ts';
+
+test('the Bun import preserves the RuntimeError fixture required by the owned test snapshot', () => {
+  const targets = JSON.parse(
+    readFileSync(join(rootDir, 'compat', 'upstream', 'targets.json'), 'utf8'),
+  );
+  const snapshotRoot = resolve(rootDir, targets.bun.snapshot);
+  const fixturePath = join(snapshotRoot, bunRuntimeErrorFixture);
+  assert.equal(copySpecs.bun.sparse.includes(bunRuntimeErrorFixture), true);
+  assert.equal(copySpecs.bun.paths.includes(bunRuntimeErrorFixture), true);
+  assert.equal(existsSync(fixturePath), true);
+  const ignored = spawnSync(
+    'git',
+    ['check-ignore', '--quiet', '--no-index', join(targets.bun.snapshot, bunRuntimeErrorFixture)],
+    { cwd: rootDir },
+  );
+  assert.equal(ignored.status, 1, ignored.stderr?.toString());
+  const manifest = JSON.parse(
+    readFileSync(join(snapshotRoot, 'manifest.json'), 'utf8'),
+  );
+  assert.equal(manifest.copiedPaths.includes(bunRuntimeErrorFixture), true);
+});
 
 test('the exceptional replacement flag applies only to Bun imports', () => {
   assert.deepEqual(parseImportArguments(['node']), {

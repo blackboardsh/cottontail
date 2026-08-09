@@ -171,7 +171,7 @@ try {
       name: 'runtime-bootstrap-startup-regressions',
       argv: ['test', join(rootDir, 'tests', 'js', 'runtime-bootstrap-startup.test.ts')],
       expectExitCode: 0,
-      stderrIncludes: ['16 pass', '0 fail'],
+      stderrIncludes: ['20 pass', '0 fail'],
     },
     {
       name: 'web-worker-module-loading',
@@ -465,7 +465,7 @@ try {
       name: 'bun-test-unawaited-promise-matchers',
       argv: ['test', join(rootDir, 'tests', 'js', 'bun-test-unawaited-promise-matchers.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: ['2 pass', '0 fail'],
+      stdoutIncludes: ['6 pass', '0 fail'],
     },
     {
       name: 'bun-test-module-explicit-cli',
@@ -484,6 +484,12 @@ try {
       scriptPath: join(rootDir, 'tests', 'js', 'bun-build-native.ts'),
       expectExitCode: 0,
       stdoutIncludes: ['bun build native passed'],
+    },
+    {
+      name: 'bun-build-compile-native',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-build-compile-native.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['2 pass', '0 fail'],
     },
     {
       name: 'bun-build-css-stress',

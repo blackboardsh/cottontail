@@ -239,7 +239,7 @@ export function withBunSnapshotMutationLock(snapshotRoot, operation, options = {
   }
 }
 
-const copySpecs = {
+export const copySpecs = {
   node: {
     sparse: ['test/**', 'tools/**', 'LICENSE'],
     paths: ['test', 'tools', 'LICENSE'],
@@ -248,6 +248,7 @@ const copySpecs = {
     sparse: [
       'test/**',
       'packages/bun-native-bundler-plugin-api/bundler_plugin.h',
+      'packages/bun-error/runtime-error.ts',
       'packages/bun-plugin-svelte/README.md',
       'packages/bun-plugin-svelte/bun.lock',
       'packages/bun-plugin-svelte/package.json',
@@ -268,6 +269,7 @@ const copySpecs = {
     paths: [
       'test',
       'packages/bun-native-bundler-plugin-api/bundler_plugin.h',
+      'packages/bun-error/runtime-error.ts',
       'packages/bun-plugin-svelte/README.md',
       'packages/bun-plugin-svelte/bun.lock',
       'packages/bun-plugin-svelte/package.json',

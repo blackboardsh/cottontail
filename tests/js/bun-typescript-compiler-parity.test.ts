@@ -121,8 +121,9 @@ test("accepts explicit export type chains without creating runtime exports", () 
   expect(result.stdout).toBe("ok");
 });
 
-// COTTONTAIL-KNOWN-GAP: the five test.todo cases below encode native-bundler
-// behaviors (TS diagnostics, tsconfig paths, import-attribute loader selection)
+// COTTONTAIL-KNOWN-GAP: the remaining test.todo cases below encode
+// runtime-module-launcher behaviors (TS diagnostics, automatic tsconfig paths,
+// import-attribute loader selection)
 // that the runtime-module-launcher pipeline does not implement yet. They only
 // ever passed because the pre-2026-08-07 test-marker env leak routed spawned
 // children onto the native bundler. See expert-escalation item 15.
@@ -155,7 +156,7 @@ test.todo("uses import attributes for static and dynamic loader selection", () =
   expect(JSON.parse(dynamicTextResult.stdout)).toBe("hello from dynamic text loader\n");
 });
 
-test.todo("resolves tsconfig paths automatically and through an override", () => {
+test.todo("resolves tsconfig paths automatically", () => {
   const compilerOptions = {
     baseUrl: ".",
     moduleResolution: "bundler",
@@ -169,7 +170,14 @@ test.todo("resolves tsconfig paths automatically and through an override", () =>
   const automaticResult = run(automatic);
   expectSuccess(automaticResult);
   expect(automaticResult.stdout).toBe("automatic");
+});
 
+test("resolves tsconfig paths through an explicit override", () => {
+  const compilerOptions = {
+    baseUrl: ".",
+    moduleResolution: "bundler",
+    paths: { "@lane/*": ["src/*"] },
+  };
   const override = fixture("override-tsconfig", {
     "tsconfig.json": JSON.stringify({ compilerOptions: { ...compilerOptions, paths: { "@lane/*": ["wrong/*"] } } }),
     "custom.json": JSON.stringify({ compilerOptions }),
@@ -197,6 +205,24 @@ test.todo("inherits tsconfig path resolution through extends", () => {
   const result = run(directory);
   expectSuccess(result);
   expect(result.stdout).toBe("inherited");
+});
+
+test("resolves inherited tsconfig paths through an explicit override", () => {
+  const directory = fixture("inherited-tsconfig-override", {
+    "base.json": JSON.stringify({
+      compilerOptions: {
+        baseUrl: ".",
+        moduleResolution: "bundler",
+        paths: { "@inherited/*": ["src/*"] },
+      },
+    }),
+    "custom.json": JSON.stringify({ extends: "./base.json" }),
+    "src/value.ts": `export const value = "inherited override";`,
+    "entry.ts": `import { value } from "@inherited/value"; console.log(value);`,
+  });
+  const result = run(directory, "entry.ts", ["--tsconfig-override", "custom.json"]);
+  expectSuccess(result);
+  expect(result.stdout).toBe("inherited override");
 });
 
 test.todo("reports precise missing type-value linkage diagnostics", () => {

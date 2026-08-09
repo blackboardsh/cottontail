@@ -1890,7 +1890,7 @@ fn compileBuild(
     const entry_path = entries_value.array.items[0].string;
     const entry_z = try allocator.dupeZ(u8, entry_path);
 
-    var build_options = try native_bundler.parseBuildOptions(request_json, allocator);
+    var build_options = try native_bundler.parseBuildOptions(request_json, working_dir, allocator);
     build_options.target = .bun;
     build_options.output_format = .esm;
 
@@ -4121,7 +4121,13 @@ fn entrypointImportsOnlyRuntimeAliases(ctx: *const Context, path: []const u8) !b
         ctx.allocator,
         .limited(4 * 1024 * 1024),
     ) catch return false;
-    const imports_json = native_transpiler.scanImportsJson(source, loader) catch return false;
+    // Runtime transpilation injects the automatic JSX runtime import. The
+    // public scanImports contract omits that synthetic edge, but bootstrap
+    // preflight must include it: the injected package can use globals (React's
+    // development runtime reads `process`) that a selective bootstrap has not
+    // installed yet. Source-level classic JSX pragmas and TS/TSX without JSX do
+    // not generate the edge and keep their existing selective path.
+    const imports_json = native_transpiler.scanRuntimeImportsJson(source, loader) catch return false;
     defer std.heap.c_allocator.free(imports_json);
 
     const ScannedImport = struct {
@@ -4641,7 +4647,10 @@ fn reloadRuntimeBootstrapModeVisit(
         ctx.allocator,
         .limited(4 * 1024 * 1024),
     ) catch return .{ .mode = .full, .needs_runtime_module_sources = true };
-    const imports_json = native_transpiler.scanImportsJson(source, loader) catch
+    // Follow the graph that runtime transpilation emits, including an
+    // automatic JSX runtime import. Otherwise hot/reload analysis can approve
+    // a reduced bootstrap without visiting the injected dependency.
+    const imports_json = native_transpiler.scanRuntimeImportsJson(source, loader) catch
         return .{ .mode = .full, .needs_runtime_module_sources = true };
     defer std.heap.c_allocator.free(imports_json);
     const ScannedImport = struct {
@@ -4856,6 +4865,9 @@ fn bundleScriptNative(
     const script_abs = try resolvePathForCwd(ctx.io, ctx.allocator, script_path);
     const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
     const is_eval_entrypoint = std.mem.startsWith(u8, std.fs.path.basename(script_abs), ".cottontail-eval-");
+    const is_internal_macro_eval = is_eval_entrypoint and for (exec_args) |arg| {
+        if (std.mem.eql(u8, arg, "--cottontail-macro-mode")) break true;
+    } else false;
     // A nested `cottontail -e` is a new runtime invocation. Parent test-runner
     // bookkeeping must not turn its launcher into another test harness.
     const is_test_cli_execution = !is_eval_entrypoint and
@@ -4891,6 +4903,14 @@ fn bundleScriptNative(
         false
     else
         entrypointUsesModuleMock(ctx, script_abs);
+    const tsconfig_override = (try tsconfigOverridePath(ctx, exec_args)) orelse
+        if (is_test_cli_execution)
+            // `cottontail test` keeps runner flags beside the selected test
+            // path in script_args. For an ordinary `cottontail app.js` run,
+            // everything after app.js belongs to the application instead.
+            try tsconfigOverridePath(ctx, script_args)
+        else
+            null;
     const runtime_module_launcher_candidate = canUseRuntimeModuleLauncher(.{
         .has_source_base_dir = source_base_dir != null,
         .has_build_options = build_options != null,
@@ -4900,7 +4920,12 @@ fn bundleScriptNative(
         .test_cli_execution = is_test_runtime_execution,
         .wasm_entrypoint = is_wasm_entrypoint,
         .uses_module_mock = entrypoint_uses_module_mock,
-    }) and !has_bun_compat_transform;
+    }) and !has_bun_compat_transform and
+        // The reusable launcher resolves the original entry from disk after
+        // its wrapper has been bundled, so compiler-only tsconfig path aliases
+        // cannot reach that graph. An explicit override must use the native
+        // bundler path that owns the entry and its dependency resolution.
+        tsconfig_override == null;
     // CommonJS already has a runtime-only Module.runMain() launcher. Route
     // ordinary ESM through the same on-demand module system without changing
     // the compatibility transforms used by CommonJS and test entry points.
@@ -5014,8 +5039,6 @@ fn bundleScriptNative(
         !is_common_js_entrypoint and
         !is_wasm_entrypoint;
     const has_custom_conditions = hasCustomConditions(exec_args) or hasCustomConditions(script_args);
-    const tsconfig_override = (try tsconfigOverridePath(ctx, exec_args)) orelse
-        try tsconfigOverridePath(ctx, script_args);
     var features: std.ArrayList([]const u8) = .empty;
     if (build_options) |provided| try features.appendSlice(ctx.allocator, provided.features);
     try collectFeatures(ctx.allocator, &features, exec_args);
@@ -5045,7 +5068,12 @@ fn bundleScriptNative(
                 runtime_bootstrap_mode != .eval_common_js) or
             reload_dependencies_out != null);
     const use_runtime_module_launcher_cache = runtime_module_entrypoint and plain_launcher_cacheable;
-    const use_esm_bundle_cache = !runtime_module_entrypoint and
+    // Macro arguments are embedded in a randomly named eval entrypoint. Its
+    // path-keyed ESM artifact can never be reused, so installing its bundle and
+    // source map in the durable cache and generating a JSC bytecode sidecar only
+    // adds latency and unbounded cache growth. Keep ordinary `-e` unchanged.
+    const use_esm_bundle_cache = !is_internal_macro_eval and
+        !runtime_module_entrypoint and
         !is_wasm_entrypoint and
         !is_common_js_entrypoint and
         plain_launcher_cacheable;
@@ -7037,6 +7065,21 @@ fn testModuleLoadErrorCatch(ctx: *const Context, test_cli_execution: bool, path_
     return std.fmt.allocPrint(ctx.allocator, " catch (error) {{ const __ctLoadErrorHook = () => globalThis[Symbol.for(\"cottontail.internal.testModuleLoadError\")]?.(error, {s}); if (!__ctLoadErrorHook()) {{ try {{ await import(\"bun:test\"); }} catch {{}} if (!__ctLoadErrorHook()) throw error; }} }}", .{path_literal});
 }
 
+// Finish a single-file test entry through the same node:test runner used by
+// files that import bun:test themselves. Explicit files without registrations
+// still need an empty coverage report, so load the runner on demand and mark
+// the entrypoint as complete before invoking its finalizer hook.
+fn testModuleFinalizeSource(test_cli_execution: bool) []const u8 {
+    if (!test_cli_execution) return "  globalThis.__cottontailLoadingTestModules = false;\n" ++
+        "  globalThis[Symbol.for(\"cottontail.internal.startTestRun\")]?.();";
+    return "  globalThis.__cottontailLoadingTestModules = false;\n" ++
+        "  globalThis.__cottontailTestEntrypointLoaded = true;\n" ++
+        "  if (typeof globalThis[Symbol.for(\"cottontail.internal.startTestRun\")] !== \"function\") {\n" ++
+        "    globalThis.__cottontailNodeTestRuntime = await import(\"node:test\");\n" ++
+        "  }\n" ++
+        "  globalThis[Symbol.for(\"cottontail.internal.startTestRun\")]?.();";
+}
+
 fn writeReusedReloadEntryWrapper(
     ctx: *const Context,
     tmp_dir: []const u8,
@@ -7061,14 +7104,14 @@ fn writeReusedReloadEntryWrapper(
         \\  globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
         \\  await import({s});
         \\}}{s} finally {{
-        \\  globalThis.__cottontailLoadingTestModules = false;
-        \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
+        \\{s}
         \\}}
         \\
     , .{
         test_header_signal,
         try jsonStringLiteral(ctx, script_import_abs),
         try testModuleLoadErrorCatch(ctx, test_cli_execution, try jsonStringLiteral(ctx, script_abs)),
+        testModuleFinalizeSource(test_cli_execution),
     });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
@@ -7111,8 +7154,7 @@ fn writeBareRuntimeEntryWrapper(
         \\{s}  globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
         \\  await import({s});
         \\}}{s} finally {{
-        \\  globalThis.__cottontailLoadingTestModules = false;
-        \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
+        \\{s}
         \\}}
         \\
     , .{
@@ -7124,6 +7166,7 @@ fn writeBareRuntimeEntryWrapper(
         test_header_signal,
         try jsonStringLiteral(ctx, script_import_abs),
         try testModuleLoadErrorCatch(ctx, test_cli_execution, try jsonStringLiteral(ctx, script_abs)),
+        testModuleFinalizeSource(test_cli_execution),
     });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
@@ -7236,8 +7279,7 @@ fn writeMinimalRuntimeEntryWrapper(
         \\{s}  globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
         \\  await import({s});
         \\}}{s} finally {{
-        \\  globalThis.__cottontailLoadingTestModules = false;
-        \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
+        \\{s}
         \\}}
         \\
     , .{
@@ -7257,6 +7299,7 @@ fn writeMinimalRuntimeEntryWrapper(
         preload_imports,
         try jsonStringLiteral(ctx, script_import_abs),
         try testModuleLoadErrorCatch(ctx, test_cli_execution, try jsonStringLiteral(ctx, script_abs)),
+        testModuleFinalizeSource(test_cli_execution),
     });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
@@ -7382,8 +7425,7 @@ fn writeCottontailEntryWrapper(
         \\  const __ctEntryNamespace = __ctPluginEntry?.matched ? await __ctPluginEntry.value : await import({s});
         \\  await __ctStartDefaultApp(__ctEntryNamespace);
         \\}}{s} finally {{
-        \\  globalThis.__cottontailLoadingTestModules = false;
-        \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
+        \\{s}
         \\}}
         \\
     ,
@@ -7403,6 +7445,7 @@ fn writeCottontailEntryWrapper(
             script_literal,
             script_import_literal,
             try testModuleLoadErrorCatch(ctx, test_cli_execution, script_literal),
+            testModuleFinalizeSource(test_cli_execution),
         },
     );
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
@@ -9726,8 +9769,7 @@ fn writeLazyRuntimeEntryWrapper(
         \\    : await globalThis.__cottontailImportModule(__ctEntryPath, __ctEntryPath, undefined, true);
         \\  await __ctStartDefaultApp(__ctEntryNamespace);
         \\}}{s} finally {{
-        \\  globalThis.__cottontailLoadingTestModules = false;
-        \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
+        \\{s}
         \\}}
         \\
     , .{
@@ -9740,6 +9782,7 @@ fn writeLazyRuntimeEntryWrapper(
         cpu_profiler_start_statement,
         preload_imports,
         try testModuleLoadErrorCatch(ctx, test_cli_execution, try jsonStringLiteral(ctx, script_abs)),
+        testModuleFinalizeSource(test_cli_execution),
     });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
@@ -9880,8 +9923,7 @@ fn writeSelectiveEvalCommonJsEntryWrapper(
         \\{s}  globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
         \\  (moduleModule.default ?? moduleModule.Module).runMain();
         \\}}{s} finally {{
-        \\  globalThis.__cottontailLoadingTestModules = false;
-        \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
+        \\{s}
         \\}}
         \\
     , .{
@@ -9896,6 +9938,7 @@ fn writeSelectiveEvalCommonJsEntryWrapper(
         cpu_profiler_start_statement,
         preload_imports,
         try testModuleLoadErrorCatch(ctx, test_cli_execution, "__ctEntryPath"),
+        testModuleFinalizeSource(test_cli_execution),
     });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
@@ -9974,8 +10017,7 @@ fn writeLazyCommonJsEntryWrapper(
         \\{s}  globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
         \\{s}
         \\}}{s} finally {{
-        \\  globalThis.__cottontailLoadingTestModules = false;
-        \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
+        \\{s}
         \\}}
         \\
     , .{
@@ -9989,6 +10031,7 @@ fn writeLazyCommonJsEntryWrapper(
         preload_imports,
         main_action,
         try testModuleLoadErrorCatch(ctx, test_cli_execution, script_literal),
+        testModuleFinalizeSource(test_cli_execution),
     });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
@@ -10324,10 +10367,9 @@ fn writeRuntimeEntryWrapper(
         \\{s}globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
         \\{s}
         \\}}{s} finally {{
-        \\  globalThis.__cottontailLoadingTestModules = false;
-        \\  globalThis[Symbol.for("cottontail.internal.startTestRun")]?.();
+        \\{s}
         \\}}
-    , .{ test_header_signal, cpu_profiler_start_statement, preload_imports, main_action, try testModuleLoadErrorCatch(ctx, test_cli_execution, script_literal) });
+    , .{ test_header_signal, cpu_profiler_start_statement, preload_imports, main_action, try testModuleLoadErrorCatch(ctx, test_cli_execution, script_literal), testModuleFinalizeSource(test_cli_execution) });
     const bootstrap = try std.fmt.allocPrint(
         ctx.allocator,
         \\globalThis.__cottontailBundleSourceMap ??= {s};

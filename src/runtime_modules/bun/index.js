@@ -5565,6 +5565,17 @@ function registerServeHtmlOptions(state, options) {
   visitServeHtmlRouteValues(state, options?.static);
 }
 
+function invalidateServeHtmlState(state, options = undefined) {
+  if (!state) return;
+  state.generation++;
+  if (options !== undefined) state.options = options;
+  state.assets.clear();
+  state.manifests = new WeakMap();
+  state.sources.clear();
+  state.htmlBySource.clear();
+  state.builtSources.clear();
+}
+
 function createServeHtmlState(options) {
   const state = {
     assets: new Map(),
@@ -5573,8 +5584,10 @@ function createServeHtmlState(options) {
     htmlBySource: new Map(),
     builtSources: new Set(),
     buildPromise: null,
+    buildGeneration: -1,
     configPromise: null,
-    preparedBuildReady: false,
+    generation: 0,
+    options,
   };
   registerServeHtmlOptions(state, options);
   return state;
@@ -5687,6 +5700,7 @@ function serializeServeBuildErrors(owner, root, logs) {
 }
 
 async function buildServeHtmlBatch(state, options, batch) {
+  const generation = state.generation;
   const development = serveIsDevelopment(options);
   const root = commonHtmlBuildRoot(batch);
   const inspectorState = state.inspectorState;
@@ -5698,6 +5712,7 @@ async function buildServeHtmlBatch(state, options, batch) {
     });
   }
   const config = await serveHtmlBuildConfig(state);
+  if (generation !== state.generation) return;
   const buildOptions = {
     entrypoints: batch,
     target: "browser",
@@ -5719,6 +5734,7 @@ async function buildServeHtmlBatch(state, options, batch) {
   try {
     result = await build(buildOptions);
   } catch (error) {
+    if (generation !== state.generation) return;
     const logs = error instanceof AggregateError ? error.errors : [error];
     if (inspectorState) {
       inspectorEmit("BunFrontendDevServer.bundleFailed", {
@@ -5728,6 +5744,7 @@ async function buildServeHtmlBatch(state, options, batch) {
     }
     throw error;
   }
+  if (generation !== state.generation) return;
   if (!result.success) {
     if (inspectorState) {
       inspectorEmit("BunFrontendDevServer.bundleFailed", {
@@ -5774,6 +5791,7 @@ async function buildServeHtmlBatch(state, options, batch) {
   for (const { descriptor } of outputDescriptors) {
     if (!new Set(["html", "css", "js"]).has(descriptor.loader)) continue;
     let contents = await descriptor.artifact.text();
+    if (generation !== state.generation) return;
     if (!contents.includes("/../")) continue;
     for (const { route } of outputDescriptors) {
       const basename = nodePathBasename(route);
@@ -5783,6 +5801,7 @@ async function buildServeHtmlBatch(state, options, batch) {
     descriptor.body = contents;
   }
 
+  if (generation !== state.generation) return;
   const unmatched = [...htmlOutputs];
   for (const source of batch) {
     const relative = nodePathRelative(root, source).replace(/\\/g, "/").replace(/^\.\//, "");
@@ -5804,29 +5823,43 @@ async function buildServeHtmlBatch(state, options, batch) {
   }
 }
 
+function startServeHtmlBuild(state, options, batch) {
+  const generation = state.generation;
+  let promise;
+  promise = buildServeHtmlBatch(state, options, batch).finally(() => {
+    if (state.buildPromise !== promise) return;
+    state.buildPromise = null;
+    state.buildGeneration = -1;
+  });
+  state.buildPromise = promise;
+  state.buildGeneration = generation;
+  return promise;
+}
+
 function ensureServeHtmlSource(state, options, source) {
   const absoluteSource = nodePathResolve(source);
+  const generation = state.generation;
   state.sources.add(absoluteSource);
   const ready = state.htmlBySource.get(absoluteSource);
   const development = serveIsDevelopment(options);
-  if (ready && (!development || state.preparedBuildReady)) {
-    state.preparedBuildReady = false;
-    return Promise.resolve(ready);
-  }
-  if (!state.buildPromise) {
-    if (development) {
-      state.assets.clear();
-      state.htmlBySource.clear();
-      state.builtSources.clear();
-    }
+  if (ready) return Promise.resolve(ready);
+  if (!state.buildPromise || state.buildGeneration !== generation) {
     const batch = development
       ? [...state.sources]
       : [...state.sources].filter(path => !state.builtSources.has(path));
-    state.buildPromise = buildServeHtmlBatch(state, options, batch).finally(() => {
-      state.buildPromise = null;
-    });
+    startServeHtmlBuild(state, options, batch);
   }
-  return state.buildPromise.then(() => {
+  const buildPromise = state.buildPromise;
+  return buildPromise.then(() => {
+    if (generation !== state.generation) {
+      // A reload owns the new source set. An older request may finish after the
+      // reload, but it must not add a removed source back or compile the new
+      // generation with its stale development/options object.
+      if (!state.sources.has(absoluteSource)) {
+        throw new Error(`HTML route was reloaded while bundling: ${absoluteSource}`);
+      }
+      return ensureServeHtmlSource(state, state.options, absoluteSource);
+    }
     const descriptor = state.htmlBySource.get(absoluteSource);
     if (descriptor) return descriptor;
     return ensureServeHtmlSource(state, options, absoluteSource);
@@ -5837,16 +5870,12 @@ async function prepareServeHtml(options, config) {
   if (options == null || typeof options !== "object") return;
   const state = options[serveHtmlStateSymbol] ?? createServeHtmlState(options);
   options[serveHtmlStateSymbol] = state;
+  state.options = options;
   state.configPromise = Promise.resolve(config);
   const batch = [...state.sources];
-  if (batch.length === 0 || state.buildPromise) return state.buildPromise;
-  state.buildPromise = buildServeHtmlBatch(state, options, batch);
-  try {
-    await state.buildPromise;
-    state.preparedBuildReady = true;
-  } finally {
-    state.buildPromise = null;
-  }
+  if (batch.length === 0) return;
+  if (state.buildPromise && state.buildGeneration === state.generation) return state.buildPromise;
+  await startServeHtmlBuild(state, options, batch);
 }
 
 Object.defineProperty(globalThis, prepareServeHtmlSymbol, {
@@ -6144,15 +6173,21 @@ function flushServerWebSocketFrames(state) {
   if (state.pendingFrames.length === 0) return;
   const frames = state.pendingFrames;
   const byteLength = state.pendingFrameBytes;
+  const payloadByteLength = state.pendingPayloadBytes;
   state.pendingFrames = [];
   state.pendingFrameBytes = 0;
+  state.pendingPayloadBytes = 0;
   const socket = state.socket;
-  if (!socket || socket.destroyed || !socket.writable || state.finalized) return;
+  if (!socket || socket.destroyed || !socket.writable || state.finalized) {
+    state.bufferedPayloadBytes = Math.max(0, state.bufferedPayloadBytes - payloadByteLength);
+    return;
+  }
   const output = frames.length === 1 ? frames[0] : Buffer.concat(frames, byteLength);
   const ok = socket.write(output, () => {
-    if (state.wantDrain && socket.writableLength === 0) scheduleServerWebSocketDrain(state);
+    state.bufferedPayloadBytes = Math.max(0, state.bufferedPayloadBytes - payloadByteLength);
+    if (state.wantDrain && state.bufferedPayloadBytes === 0) scheduleServerWebSocketDrain(state);
   });
-  if (!ok || socket.writableLength > state.config.backpressureLimit) {
+  if (!ok) {
     state.wantDrain = true;
     if (state.config.closeOnBackpressureLimit) terminateServerWebSocket(state);
   }
@@ -6174,19 +6209,23 @@ function sendServerWebSocketFrame(state, opcode, data, compress = false) {
   }
   const limit = state.config.backpressureLimit;
   if (state.wantDrain) return 0;
-  if (socket.writableLength + state.pendingFrameBytes > limit) {
-    state.wantDrain = true;
-    if (state.config.closeOnBackpressureLimit) terminateServerWebSocket(state);
-    return -1;
-  }
   const frame = encodeServerWebSocketFrame(opcode, payload, rsv1);
+  // Keep a positive byte ceiling effective for empty messages and control
+  // frames too. Their payload length is zero, but each queued frame still owns
+  // memory until the socket write completes.
+  const accountedPayloadByteLength = Math.max(1, payload.byteLength);
   state.pendingFrames.push(frame);
   state.pendingFrameBytes += frame.byteLength;
+  state.pendingPayloadBytes += accountedPayloadByteLength;
+  state.bufferedPayloadBytes += accountedPayloadByteLength;
   if (!state.frameFlushScheduled) {
     state.frameFlushScheduled = true;
     queueMicrotask(() => flushServerWebSocketFrames(state));
   }
-  if (socket.writableLength + state.pendingFrameBytes > limit) {
+  // Bun's backpressure limit is expressed in message payload bytes. The
+  // encoded RFC 6455 frame header is transport overhead: a one-byte message
+  // must still fit a one-byte limit and return 1. Zero disables the ceiling.
+  if (limit > 0 && state.bufferedPayloadBytes > limit) {
     state.wantDrain = true;
     if (state.config.closeOnBackpressureLimit) terminateServerWebSocket(state);
     return -1;
@@ -6277,6 +6316,8 @@ function terminateServerWebSocket(state) {
   state.pendingClose = { code: 1006, reason: "" };
   state.pendingFrames = [];
   state.pendingFrameBytes = 0;
+  state.pendingPayloadBytes = 0;
+  state.bufferedPayloadBytes = 0;
   try { state.socket?.destroy?.(); } catch {}
   queueMicrotask(() => {
     if (!state.finalized && state.socket?.destroyed) finalizeServerWebSocket(state, 1006, "");
@@ -6446,6 +6487,8 @@ function attachServerWebSocket(serverState, socket, head, data, deflate = null) 
     wantDrain: false,
     pendingFrames: [],
     pendingFrameBytes: 0,
+    pendingPayloadBytes: 0,
+    bufferedPayloadBytes: 0,
     frameFlushScheduled: false,
     finalized: false,
     opened: false,
@@ -7091,8 +7134,10 @@ function serveNodeBacked(options, context) {
       return server.stop(true);
     },
     reload(nextOptions = {}) {
-      registerServeHtmlOptions(activeOptions[serveHtmlStateSymbol], nextOptions);
-      activeOptions = { ...activeOptions, ...nextOptions };
+      const reloadedOptions = { ...activeOptions, ...nextOptions };
+      invalidateServeHtmlState(activeOptions[serveHtmlStateSymbol], reloadedOptions);
+      registerServeHtmlOptions(activeOptions[serveHtmlStateSymbol], reloadedOptions);
+      activeOptions = reloadedOptions;
       server.development = activeOptions.development ?? false;
       return server;
     },
@@ -7536,6 +7581,7 @@ export function serve(options) {
     normalizeServeDateHeader,
     normalizeServeListenErrorCode,
     parseHeadersText,
+    invalidateServeHtmlState,
     registerServeHtmlOptions,
     requestIdleTimeout,
     requestWithLazyURL,

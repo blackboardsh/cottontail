@@ -21816,9 +21816,21 @@ static JSValueRef ct_os_network_interfaces(JSContextRef ctx, JSObjectRef functio
 static JSValueRef ct_os_get_priority(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
+    int pid = 0;
+    if (argc >= 1) {
+        if (!JSValueIsNumber(ctx, argv[0])) {
+            ct_throw_type_error(ctx, exception, "osGetPriority pid must be a number");
+            return JSValueMakeUndefined(ctx);
+        }
+        double pid_number = JSValueToNumber(ctx, argv[0], NULL);
+        if (!isfinite(pid_number) || trunc(pid_number) != pid_number || pid_number < 0 || pid_number > INT_MAX) {
+            ct_throw_type_error(ctx, exception, "osGetPriority pid must be a finite non-negative 32-bit integer");
+            return JSValueMakeUndefined(ctx);
+        }
+        pid = (int)pid_number;
+    }
 #if defined(_WIN32)
-    DWORD pid = argc >= 1 ? (DWORD)ct_value_to_number(ctx, argv[0]) : 0;
-    HANDLE process = pid == 0 ? GetCurrentProcess() : OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    HANDLE process = pid == 0 ? GetCurrentProcess() : OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
     if (process == NULL) {
         ct_throw_message(ctx, exception, "Unable to open process");
         return JSValueMakeUndefined(ctx);
@@ -21836,9 +21848,8 @@ static JSValueRef ct_os_get_priority(JSContextRef ctx, JSObjectRef function, JSO
         : priority_class == IDLE_PRIORITY_CLASS ? 19
         : 0;
 #else
-    id_t pid = argc >= 1 ? (id_t)ct_value_to_number(ctx, argv[0]) : 0;
     errno = 0;
-    int priority = getpriority(PRIO_PROCESS, pid);
+    int priority = getpriority(PRIO_PROCESS, (id_t)pid);
     if (priority == -1 && errno != 0) {
         ct_throw_message(ctx, exception, strerror(errno));
         return JSValueMakeUndefined(ctx);
@@ -21851,11 +21862,31 @@ static JSValueRef ct_os_set_priority(JSContextRef ctx, JSObjectRef function, JSO
     (void)function;
     (void)thisObject;
     if (argc < 2) {
-        ct_throw_message(ctx, exception, "osSetPriority(pid, priority) requires pid and priority");
+        ct_throw_type_error(ctx, exception, "osSetPriority(pid, priority) requires pid and priority");
         return JSValueMakeUndefined(ctx);
     }
-    int pid = (int)ct_value_to_number(ctx, argv[0]);
-    int priority = (int)ct_value_to_number(ctx, argv[1]);
+    if (!JSValueIsNumber(ctx, argv[0])) {
+        ct_throw_type_error(ctx, exception, "osSetPriority pid must be a number");
+        return JSValueMakeUndefined(ctx);
+    }
+    double pid_number = JSValueToNumber(ctx, argv[0], NULL);
+    if (!isfinite(pid_number) || trunc(pid_number) != pid_number || pid_number < 0 || pid_number > INT_MAX) {
+        ct_throw_type_error(ctx, exception, "osSetPriority pid must be a finite non-negative 32-bit integer");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    if (!JSValueIsNumber(ctx, argv[1])) {
+        ct_throw_type_error(ctx, exception, "osSetPriority priority must be a number");
+        return JSValueMakeUndefined(ctx);
+    }
+    double priority_number = JSValueToNumber(ctx, argv[1], NULL);
+    if (!isfinite(priority_number) || trunc(priority_number) != priority_number || priority_number < -20 || priority_number > 19) {
+        ct_throw_type_error(ctx, exception, "osSetPriority priority must be an integer between -20 and 19");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    int pid = (int)pid_number;
+    int priority = (int)priority_number;
 #if defined(_WIN32)
     DWORD priority_class = priority <= -20 ? REALTIME_PRIORITY_CLASS
         : priority <= -14 ? HIGH_PRIORITY_CLASS
@@ -31089,7 +31120,37 @@ static JSValueRef ct_wait_for_promise_host(JSContextRef ctx, JSObjectRef functio
         ct_throw_message(ctx, exception, "cottontail.waitForPromise(promise) requires a native promise");
         return JSValueMakeUndefined(ctx);
     }
+
+    /* An omitted or explicitly undefined timeout preserves the original
+     * unbounded behavior. A supplied timeout is a finite, non-negative number
+     * of milliseconds; zero performs a status-only check. */
+    bool bounded = argc >= 2 && !JSValueIsUndefined(ctx, argv[1]);
+    double timeout_ms = 0;
+    if (bounded) {
+        JSValueRef conversion_exception = NULL;
+        timeout_ms = JSValueToNumber(ctx, argv[1], &conversion_exception);
+        if (conversion_exception != NULL) {
+            if (exception != NULL) *exception = conversion_exception;
+            return JSValueMakeUndefined(ctx);
+        }
+        if (!isfinite(timeout_ms) || timeout_ms < 0) {
+            ct_throw_type_error(ctx, exception, "cottontail.waitForPromise timeout must be a finite non-negative number");
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+
+    uint64_t started_at_ns = bounded ? ct_timer_now_ns() : 0;
+    uint64_t timeout_ns = bounded ? ct_timer_ms_to_ns(timeout_ms) : UINT64_MAX;
     while (status == 0) {
+        uint64_t elapsed_ns = 0;
+        if (bounded) {
+            uint64_t now_ns = ct_timer_now_ns();
+            /* Fail closed if the monotonic clock is unavailable or moves
+             * backwards; a finite wait must never silently become unbounded. */
+            if (started_at_ns == 0 || now_ns == 0 || now_ns < started_at_ns) break;
+            elapsed_ns = now_ns - started_at_ns;
+            if (elapsed_ns >= timeout_ns) break;
+        }
         int delay_ms = 16;
         char *error = NULL;
         if (ct_jsc_runtime_tick_with_delay(runtime, &delay_ms, &error) != 0) {
@@ -31099,8 +31160,20 @@ static JSValueRef ct_wait_for_promise_host(JSContextRef ctx, JSObjectRef functio
         }
         status = ct_jsc_promise_status(argv[0]);
         if (status != 0) break;
+        if (bounded) {
+            uint64_t now_ns = ct_timer_now_ns();
+            if (now_ns == 0 || now_ns < started_at_ns) break;
+            elapsed_ns = now_ns - started_at_ns;
+            if (elapsed_ns >= timeout_ns) break;
+            uint64_t remaining_ns = timeout_ns - elapsed_ns;
+            uint64_t remaining_ms = remaining_ns / 1000000ULL;
+            if (remaining_ns % 1000000ULL != 0) remaining_ms += 1;
+            if ((uint64_t)delay_ms > remaining_ms) delay_ms = (int)remaining_ms;
+        }
         ct_runtime_wait(runtime, delay_ms);
+        status = ct_jsc_promise_status(argv[0]);
     }
+    if (status == 0) status = ct_jsc_promise_status(argv[0]);
     return JSValueMakeNumber(ctx, status);
 }
 

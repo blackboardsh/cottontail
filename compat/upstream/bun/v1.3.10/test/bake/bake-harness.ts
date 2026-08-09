@@ -173,6 +173,11 @@ async function maybeWaitInteractive(message: string) {
 }
 
 const hmrClientInitRegex = /\[Bun\] (Live|Hot-module)-reloading socket connected, waiting for changes/;
+// COTTONTAIL-COMPAT: The Node-hosted browser client has a separate process and
+// module startup path. Keep its readiness allowance scoped to client startup
+// while scaling it for the slower supported environments.
+const hmrClientReadyTimeout =
+  (isWindows ? 10_000 : 5_000) * (isDebugBuild ? 3 : 1) * ASAN_TIMEOUT_MULTIPLIER;
 
 type ErrorSpec = string;
 
@@ -518,7 +523,7 @@ export class Dev extends EventEmitter {
     this.output.on("panic", onPanic);
     if (this.nodeEnv === "development") {
       try {
-        await client.output.waitForLine(hmrClientInitRegex);
+        await client.output.waitForLine(hmrClientInitRegex, hmrClientReadyTimeout);
       } catch (e) {
         client[Symbol.asyncDispose]();
         throw e;
@@ -826,7 +831,7 @@ export class Client extends EventEmitter {
       this.#proc.send({ type: "hard-reload" });
 
       if (this.hmr) {
-        await this.output.waitForLine(hmrClientInitRegex);
+        await this.output.waitForLine(hmrClientInitRegex, hmrClientReadyTimeout);
         await this.expectErrorOverlay(options.errors ?? []);
       }
     });

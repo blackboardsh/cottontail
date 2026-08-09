@@ -37,6 +37,9 @@ compat/upstream/bun/*/packages/*
 !compat/upstream/bun/*/packages/bun-native-bundler-plugin-api/
 compat/upstream/bun/*/packages/bun-native-bundler-plugin-api/*
 !compat/upstream/bun/*/packages/bun-native-bundler-plugin-api/bundler_plugin.h
+!compat/upstream/bun/*/packages/bun-error/
+compat/upstream/bun/*/packages/bun-error/*
+!compat/upstream/bun/*/packages/bun-error/runtime-error.ts
 !compat/upstream/bun/*/packages/bun-plugin-svelte/
 !compat/upstream/bun/*/packages/bun-plugin-svelte/**
 compat/upstream/bun/*/packages/bun-plugin-svelte/node_modules/

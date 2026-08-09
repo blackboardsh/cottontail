@@ -844,6 +844,20 @@ pub fn scanImportsJson(source_code: []const u8, loader: []const u8) ![]u8 {
     return process(.scan_imports, source_code, "", loader, &error_message);
 }
 
+/// Scan the imports that runtime transpilation will actually emit. In
+/// particular, JSX using the automatic runtime gains an implicit
+/// `react/jsx-runtime` (or `jsx-dev-runtime`) dependency that is intentionally
+/// absent from Bun.Transpiler.scanImports(). Runtime bootstrap preflight must
+/// see that dependency before deciding that a reduced bootstrap is safe. This
+/// standalone scan has no project resolver, so a tsconfig-selected classic
+/// runtime may conservatively choose the full bootstrap; source-level classic
+/// pragmas are honored by the parser.
+pub fn scanRuntimeImportsJson(source_code: []const u8, loader: []const u8) ![]u8 {
+    var error_message: ?[*:0]u8 = null;
+    defer if (error_message) |message| ct_transpiler_string_free(message);
+    return process(.scan_imports, source_code, "{\"jsxAutoImport\":true}", loader, &error_message);
+}
+
 pub fn scanImportRangesJson(source_code: []const u8, loader: []const u8) ![]u8 {
     var error_message: ?[*:0]u8 = null;
     defer if (error_message) |message| ct_transpiler_string_free(message);

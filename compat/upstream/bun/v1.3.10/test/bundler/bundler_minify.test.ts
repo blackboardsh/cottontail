@@ -126,8 +126,11 @@ describe("bundler", () => {
       expect(code).toContain("class D");
       expect(code).toContain("class E");
       expect(code).toContain("class F");
-      // Anonymous functions/classes stay anonymous
-      expect(code).toMatch(/\w+ = function\(\) \{\}/); // GH stays anonymous
+      // Anonymous functions/classes stay anonymous. Cottontail may preserve
+      // GH's inferred runtime name with an explicit __name() wrapper.
+      expect(code).toMatch(
+        /\bGH\s*=\s*(?:\/\*\s*@__PURE__\s*\*\/\s*)?(?:function\s*\(\)\s*\{\s*\}|__name\s*\(\s*function\s*\(\)\s*\{\s*\}\s*,\s*["']GH["']\s*\))/,
+      );
       expect(code).toMatch(/\w+ = class \{\s*\}/); // OP stays anonymous
     },
     minifySyntax: true,

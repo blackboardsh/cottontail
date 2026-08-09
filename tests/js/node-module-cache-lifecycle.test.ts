@@ -114,6 +114,10 @@ test("large acyclic ESM reloads preserve fresh namespaces", async () => {
     expect([first.evaluation, second.evaluation, third.evaluation]).toEqual([1, 2, 3]);
     expect(first).not.toBe(second);
     expect(second).not.toBe(third);
+    for (const namespace of [first, second, third]) {
+      const keys = Object.keys(namespace);
+      expect(keys.every((key, index) => index === 0 || keys[index - 1] < key)).toBe(true);
+    }
     expect(third.deliberatelyLongCacheLifecycleExportName4999).toBe(4999);
     expect(Reflect.ownKeys(third)).not.toContain("__esModule");
     expect(third[Symbol.toStringTag]).toBe("Module");

@@ -1,5 +1,5 @@
 import { readFileSync, realpathSync } from "fs";
-import { tls as cert1 } from "harness";
+import { tls as cert1, isASAN, isCI, isDebug } from "harness";
 import { AddressInfo } from "net";
 import { createTest } from "node-harness";
 import { once } from "node:events";
@@ -18,6 +18,7 @@ const certFile = join(import.meta.dir, "fixtures", "rsa_cert.crt");
 const cert = readFileSync(certFile);
 
 const COMMON_CERT = { ...cert1 };
+const functionalWatchdogMs = isDebug || isASAN || isCI ? 2000 : 500;
 
 const socket_domain = join(realpathSync(tmpdir()), "node-tls-server.sock");
 
@@ -33,14 +34,11 @@ describe("tls.createServer listen", () => {
     const { mustCall, mustNotCall } = createCallCheckCtx(done);
 
     const server: Server = createServer(COMMON_CERT);
-    let timeout: Timer;
     const closeAndFail = () => {
-      clearTimeout(timeout);
       server.close();
       mustNotCall()();
     };
     server.on("error", closeAndFail);
-    timeout = setTimeout(closeAndFail, 100);
 
     server.listen(
       0,
@@ -61,14 +59,11 @@ describe("tls.createServer listen", () => {
 
     const server: Server = createServer(COMMON_CERT);
 
-    let timeout: Timer;
     const closeAndFail = () => {
-      clearTimeout(timeout);
       server.close();
       mustNotCall()();
     };
     server.on("error", closeAndFail);
-    timeout = setTimeout(closeAndFail, 100);
 
     server.listen(
       0,
@@ -90,9 +85,7 @@ describe("tls.createServer listen", () => {
 
     const server: Server = createServer(COMMON_CERT);
 
-    let timeout: Timer;
     const closeAndFail = () => {
-      clearTimeout(timeout);
       server.close();
       mustNotCall()();
     };
@@ -100,13 +93,10 @@ describe("tls.createServer listen", () => {
     server.on("error", closeAndFail).on(
       "listening",
       mustCall(() => {
-        clearTimeout(timeout);
         server.close();
         done();
       }),
     );
-
-    timeout = setTimeout(closeAndFail, 100);
 
     server.listen(0, "0.0.0.0");
   });
@@ -116,14 +106,11 @@ describe("tls.createServer listen", () => {
 
     const server: Server = createServer(COMMON_CERT);
 
-    let timeout: Timer;
     const closeAndFail = () => {
-      clearTimeout(timeout);
       server.close();
       mustNotCall()();
     };
     server.on("error", closeAndFail);
-    timeout = setTimeout(closeAndFail, 100);
 
     server.listen(
       0,
@@ -145,14 +132,11 @@ describe("tls.createServer listen", () => {
 
     const server: Server = createServer(COMMON_CERT);
 
-    let timeout: Timer;
     const closeAndFail = () => {
-      clearTimeout(timeout);
       server.close();
       mustNotCall()();
     };
     server.on("error", closeAndFail);
-    timeout = setTimeout(closeAndFail, 100);
 
     server.listen(
       0,
@@ -172,14 +156,11 @@ describe("tls.createServer listen", () => {
 
     const server: Server = createServer(COMMON_CERT);
 
-    let timeout: Timer;
     const closeAndFail = () => {
-      clearTimeout(timeout);
       server.close();
       mustNotCall()();
     };
     server.on("error", closeAndFail);
-    timeout = setTimeout(closeAndFail, 100);
 
     server.listen(
       mustCall(() => {
@@ -199,14 +180,11 @@ describe("tls.createServer listen", () => {
 
     const server: Server = createServer(COMMON_CERT);
 
-    let timeout: Timer;
     const closeAndFail = () => {
-      clearTimeout(timeout);
       server.close();
       mustNotCall()();
     };
     server.on("error", closeAndFail);
-    timeout = setTimeout(closeAndFail, 100);
 
     server.listen(
       socket_domain,
@@ -397,8 +375,12 @@ describe("tls.createServer events", () => {
 
     server.on("error", closeAndFail);
 
-    //should be faster than 100ms
-    timeout = setTimeout(closeAndFail, 100);
+    // First `Bun.connect({tls:true})` of the process triggers the once-only
+    // bundled-root-store build (`us_get_shared_default_ca_store`, ~150 ms in
+    // debug+ASAN) so SSL_get_verify_result is real instead of the false
+    // X509_V_OK VERIFY_NONE used to report. The condition assertion is the
+    // point; the old 100 ms was a perf claim that is now load-order-dependent.
+    timeout = setTimeout(closeAndFail, functionalWatchdogMs);
 
     server.listen(
       mustCall(async () => {
@@ -445,8 +427,12 @@ describe("tls.createServer events", () => {
     };
     server.on("error", closeAndFail);
 
-    //should be faster than 100ms
-    timeout = setTimeout(closeAndFail, 100);
+    // First `Bun.connect({tls:true})` of the process triggers the once-only
+    // bundled-root-store build (`us_get_shared_default_ca_store`, ~150 ms in
+    // debug+ASAN) so SSL_get_verify_result is real instead of the false
+    // X509_V_OK VERIFY_NONE used to report. The condition assertion is the
+    // point; the old 100 ms was a perf claim that is now load-order-dependent.
+    timeout = setTimeout(closeAndFail, functionalWatchdogMs);
 
     server.listen(
       mustCall(async () => {
@@ -597,8 +583,12 @@ describe("tls.createServer events", () => {
 
     server.on("error", closeAndFail);
 
-    //should be faster than 100ms
-    timeout = setTimeout(closeAndFail, 100);
+    // First `Bun.connect({tls:true})` of the process triggers the once-only
+    // bundled-root-store build (`us_get_shared_default_ca_store`, ~150 ms in
+    // debug+ASAN) so SSL_get_verify_result is real instead of the false
+    // X509_V_OK VERIFY_NONE used to report. The condition assertion is the
+    // point; the old 100 ms was a perf claim that is now load-order-dependent.
+    timeout = setTimeout(closeAndFail, functionalWatchdogMs);
 
     server.listen(
       mustCall(async () => {

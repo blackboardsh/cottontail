@@ -15,6 +15,9 @@ pub const BundleOptions = struct {
     conditions: []const []const u8 = &.{},
     node_path: ?[]const u8 = null,
     tsconfig_override: ?[]const u8 = null,
+    /// Canonical source root used for output naming. Resolution still uses the
+    /// caller's working directory, matching Bun's `--root` behavior.
+    root_dir: ?[]const u8 = null,
     source_map: compiler.schema.api.SourceMapMode = .none,
     /// Internal runtime bundles can load these exact source paths from disk
     /// when formatting an error instead of copying them into every hot map.
@@ -113,6 +116,20 @@ pub const BundleOptions = struct {
     /// bundler errors if the graph would emit more than one output file.
     supports_multiple_outputs: bool = true,
 };
+
+/// Match CLI --tsconfig-override handling before any internal cwd changes.
+/// The caller owns the returned absolute path when an override is present.
+fn resolveTsconfigOverrideAlloc(
+    allocator: std.mem.Allocator,
+    working_dir: []const u8,
+    tsconfig_override: ?[]const u8,
+) !?[]u8 {
+    const tsconfig = tsconfig_override orelse return null;
+    return try allocator.dupe(
+        u8,
+        compiler.path.joinAbsString(working_dir, &.{tsconfig}, .auto),
+    );
+}
 
 /// Process-wide worker pool shared by every bundle. Passing an external pool
 /// into BundleV2 keeps the (thread-owning) ThreadPool out of the per-bundle
@@ -822,6 +839,8 @@ pub fn bundleEntryPointGraphWithOptions(
     compiler.cli.start_time = compiler.nanoTimestamp();
     const working_dir_z = try allocator.dupeZ(u8, working_dir);
     defer allocator.free(working_dir_z);
+    const tsconfig_override = try resolveTsconfigOverrideAlloc(allocator, working_dir, options.tsconfig_override);
+    defer if (tsconfig_override) |path| allocator.free(path);
 
     const entry_points: []const []const u8 = if (options.additional_entry_points.len > 0) entries: {
         const combined = try allocator.alloc([]const u8, options.additional_entry_points.len + 1);
@@ -839,7 +858,7 @@ pub fn bundleEntryPointGraphWithOptions(
     transform_options.output_dir = "";
     transform_options.source_map = options.source_map;
     transform_options.conditions = options.conditions;
-    transform_options.tsconfig_override = options.tsconfig_override;
+    transform_options.tsconfig_override = tsconfig_override;
     transform_options.packages = if (options.external_packages) .external else .bundle;
     transform_options.external = options.external;
     transform_options.drop = options.drop;
@@ -968,7 +987,7 @@ pub fn bundleEntryPointGraphWithOptions(
     // Match Bun's build/standalone compiler output configuration. The output
     // graph owns every generated file, so code splitting and file-loader
     // assets are valid here instead of being rejected as stdout-only output.
-    transpiler.options.root_dir = working_dir;
+    transpiler.options.root_dir = options.root_dir orelse working_dir;
     transpiler.options.entry_naming = options.entry_naming;
     transpiler.options.chunk_naming = options.chunk_naming;
     transpiler.options.asset_naming = options.asset_naming;
@@ -1251,7 +1270,11 @@ pub export fn ct_bundle_entry_point(
     return output.ptr;
 }
 
-pub fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !BundleOptions {
+pub fn parseBuildOptions(
+    options_json: []const u8,
+    working_dir: []const u8,
+    allocator: std.mem.Allocator,
+) !BundleOptions {
     if (options_json.len == 0) return .{};
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, options_json, .{});
     if (parsed.value != .object) return error.InvalidOptions;
@@ -1314,6 +1337,18 @@ pub fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator)
         if (value == .string) options.tsconfig_override = value.string;
     } else if (object.get("tsconfigOverride")) |value| {
         if (value == .string) options.tsconfig_override = value.string;
+    }
+    if (object.get("root")) |value| {
+        if (value == .string and value.string.len > 0) {
+            // Bun's CLI resolves --root before entering the bundler. Native
+            // callers supply their own cwd (including the plugin graph's
+            // shadow directory), so anchor the JS option to that cwd instead
+            // of whichever directory the process happens to use internally.
+            options.root_dir = try allocator.dupe(
+                u8,
+                compiler.path.joinAbsString(working_dir, &.{value.string}, .auto),
+            );
+        }
     }
     if (object.get("env")) |value| switch (value) {
         .null => {},
@@ -1591,6 +1626,27 @@ pub fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator)
         else => {},
     };
     return options;
+}
+
+test "build options resolve an explicit root against the caller working directory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const working_dir = if (compiler.Environment.isWindows)
+        "C:\\workspace\\project"
+    else
+        "/workspace/project";
+    const expected = if (compiler.Environment.isWindows)
+        "C:\\workspace\\project\\packages"
+    else
+        "/workspace/project/packages";
+    const options = try parseBuildOptions(
+        "{\"root\":\"src/../packages\"}",
+        working_dir,
+        arena.allocator(),
+    );
+
+    try std.testing.expectEqualStrings(expected, options.root_dir.?);
 }
 
 /// Bun's JS API prefixes relative naming templates with "./" (see
@@ -2253,7 +2309,7 @@ pub fn buildEntryPointsJson(
         setError(error_out, "Bun.build requires at least one entry point", .{});
         return error.InvalidOptions;
     }
-    var options = parseBuildOptions(request_json, arena_allocator) catch |err| {
+    var options = parseBuildOptions(request_json, working_dir, arena_allocator) catch |err| {
         if (err == error.InvalidLoader) {
             // Extract the invalid loader name from the request for the error message
             if (request_object.get("loader")) |value| {
@@ -2301,14 +2357,12 @@ pub fn buildEntryPointsJson(
         (std.fs.path.dirname(entry_points.items[0]) orelse ".")
     else
         compiler.path.getIfExistsLongestCommonPath(entry_points.items) orelse ".";
-    const requested_root = if (request_object.get("root")) |value|
-        if (value == .string and value.string.len > 0) value.string else default_root
-    else
-        default_root;
-    const build_root = if (std.fs.path.isAbsolute(requested_root))
-        requested_root
-    else
-        try std.fs.path.resolve(arena_allocator, &.{ working_dir, requested_root });
+    const build_root = options.root_dir orelse try arena_allocator.dupe(
+        u8,
+        compiler.path.joinAbsString(working_dir, &.{default_root}, .auto),
+    );
+    const tsconfig_override = try resolveTsconfigOverrideAlloc(allocator, working_dir, options.tsconfig_override);
+    defer if (tsconfig_override) |path| allocator.free(path);
     const build_root_z = try allocator.dupeZ(u8, build_root);
     defer allocator.free(build_root_z);
     const working_dir_z = try allocator.dupeZ(u8, working_dir);
@@ -2324,7 +2378,7 @@ pub fn buildEntryPointsJson(
     transform_options.output_dir = "";
     transform_options.source_map = options.source_map;
     transform_options.conditions = options.conditions;
-    transform_options.tsconfig_override = options.tsconfig_override;
+    transform_options.tsconfig_override = tsconfig_override;
     transform_options.packages = if (options.external_packages) .external else .bundle;
     transform_options.external = options.external;
     transform_options.drop = options.drop;
@@ -2704,7 +2758,7 @@ pub export fn ct_bundle_entry_point_options(
     const options_json = if (options_ptr) |ptr| ptr[0..options_len] else "";
     var arena = std.heap.ArenaAllocator.init(c_allocator);
     defer arena.deinit();
-    const options = parseBuildOptions(options_json, arena.allocator()) catch |err| {
+    const options = parseBuildOptions(options_json, working_dir, arena.allocator()) catch |err| {
         setError(error_out, "Invalid Bun.build options: {s}", .{@errorName(err)});
         return null;
     };

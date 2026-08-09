@@ -9,6 +9,7 @@
   "copiedPaths": [
     "test",
     "packages/bun-native-bundler-plugin-api/bundler_plugin.h",
+    "packages/bun-error/runtime-error.ts",
     "packages/bun-plugin-svelte",
     "packages/bun-types/package.json",
     "src/api/schema.js",

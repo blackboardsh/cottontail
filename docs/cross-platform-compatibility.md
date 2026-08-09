@@ -17,10 +17,13 @@ Cottontail owns these pinned upstream snapshots:
 - Node 24.11.1: on Linux, 4,969 source files recognized by Node's own
   `tools/test.py`, mapping to 4,962 harness selectors; all are currently
   enabled by the common Cottontail status contract.
-- Bun 1.3.10: Cottontail owns 1,343 runtime files; Hutch owns 102
-  package-manager and project-command files. Cottontail's runtime tier contains
-  1,338 enabled files and five performance expected failures. Hutch currently
-  records 83 passing files and 19 inherited functional expected failures.
+- Bun 1.3.10: Cottontail owns 1,342 runtime files; Hutch owns 103 Bun-derived
+  JavaScript tests covering package management, project commands, and public
+  Next orchestration. Cottontail's tier contains 1,318 enabled files, 20 tracked
+  expected failures, and four explicitly out-of-scope files. Hutch records zero
+  expected failures: its previously owned 100 files have a measured passing
+  baseline, while the three transferred Next Pages files remain enabled pending
+  a focused macOS strict result.
 
 The Node inventory is harness-derived rather than an extension scan. Files
 under `test/fixtures` and other helpers that Node's harness cannot select are
@@ -75,8 +78,8 @@ compatibility. Synchronous fatal signals remain owned by Cottontail's native
 crash handler rather than exposed as JavaScript signal events.
 
 Performance benchmarking and tuning remain deferred during this functional
-bring-up. Cottontail's five performance expected failures remain separate from
-Hutch's 19 measured package-manager parity gaps.
+bring-up. Keep Cottontail's 20 tracked expected failures separate from Hutch's
+103-file enabled compatibility suite.
 
 ## Definition of done
 
@@ -94,10 +97,10 @@ Each target must:
 2. Pass Cottontail's local JavaScript behavior suite.
 3. Pass every platform-applicable enabled Node 24.11.1 upstream test.
 4. Pass every platform-applicable enabled Cottontail-owned Bun 1.3.10 runtime
-   test and every Hutch-owned enabled package-manager test.
-5. Preserve the five runtime performance expected failures and the 19 global
-   Hutch package-manager expected failures without adding platform-specific
-   expected failures, disabled tests, stubs, or Cottontail-only skips.
+   test and every Hutch-owned enabled Bun-derived JavaScript test.
+5. Preserve the 20 reviewed Cottontail expected failures and Hutch's zero
+   expected failures without adding platform-specific expected failures,
+   disabled tests, stubs, or Cottontail-only skips.
 6. Install the Bun snapshot dependencies using Hutch on a clean platform-native
    `node_modules` tree.
 7. Run from the packaged archive outside the source checkout.
@@ -227,7 +230,7 @@ tests are selected.
 ## Establish a native baseline
 
 Capture logs from one complete run before changing behavior. Do not run the full
-corpus after every fix.
+compatibility suite after every fix.
 
 ### Linux
 
@@ -446,9 +449,9 @@ JSC ABI, atomics, or package optional dependencies are involved.
 
 - A timeout, crash, or missing fixture is not evidence that API behavior is
   implemented.
-- The five Cottontail-owned expected failures are performance quarantines.
-  Hutch separately records 19 pre-existing functional package-manager gaps.
-  Cross-platform work must not add platform-specific exceptions to either list.
+- Cottontail has 20 reviewed expected failures; Hutch's 103 owned files remain
+  enabled with zero expected failures. Cross-platform work must not add
+  platform-specific exceptions to either list.
 
 ## Final native gate
 
@@ -462,7 +465,7 @@ node scripts/run-upstream-tests.js node
 node scripts/run-upstream-tests.js bun --jobs 2
 node scripts/run-upstream-tests.js bun \
   --include-expected-failures --jobs 2
-(cd ../dash-cloud/hutch && \
+(cd ../hutch && \
   node scripts/run-bun-package-manager-tests.js --all --jobs 4)
 node scripts/package-release.js
 ```
@@ -530,8 +533,8 @@ Use this prompt from the repository root on a native VM:
 > as the other platforms. First make the native build and local JavaScript suite
 > pass, then establish the upstream Node and Bun failure baseline. Group
 > failures by root cause and fix actual behavior in the lowest correct native,
-> runtime, or Hutch package-manager layer. Run Cottontail-owned runtime files
-> here and Hutch-owned package-manager files from the sibling Hutch checkout.
+> runtime, or Hutch layer. Run Cottontail-owned runtime files here and
+> Hutch-owned Bun-derived JavaScript tests from the sibling Hutch checkout.
 > Do not add stubs, expected failures, disabled tests, or Cottontail-only
 > platform skips. Use focused upstream files and subsystem runs while iterating,
 > preserve macOS behavior, and continue until the complete platform-applicable

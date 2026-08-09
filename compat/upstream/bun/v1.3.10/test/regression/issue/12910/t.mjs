@@ -2,7 +2,10 @@
 process.exitCode = 1;
 
 try {
-  import("./t3.mjs");
+  // This regression stresses the import/require race, not unhandled-rejection
+  // policy. Observe the intentionally throwing dynamic import while require()
+  // reports the same module failure synchronously below.
+  void import("./t3.mjs").catch(() => {});
   require("./t3.mjs");
 } catch (e) {
   console.log(e);

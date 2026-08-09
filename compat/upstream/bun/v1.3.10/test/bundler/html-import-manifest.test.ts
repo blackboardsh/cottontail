@@ -1,5 +1,22 @@
-import { describe, expect } from "bun:test";
+import { describe, expect, test } from "bun:test";
+import { tempDirWithFiles } from "harness";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { itBundled } from "./expectBundled";
+
+const etagPattern = /^[A-Za-z0-9_-]{11}$/;
+
+function normalizeGeneratedETags(manifest: any) {
+  return {
+    ...manifest,
+    files: manifest.files.map((file: any) => {
+      expect(file.headers.etag).toMatch(etagPattern);
+      return file.loader === "file"
+        ? file
+        : { ...file, headers: { ...file.headers, etag: "<generated-etag>" } };
+    }),
+  };
+}
 
 describe.concurrent("bundler", () => {
   // Test HTML import manifest with enhanced metadata
@@ -96,8 +113,9 @@ console.log(favicon);
     target: "bun",
 
     run: {
-      validate({ stdout, stderr }) {
-        expect(stdout).toMatchInlineSnapshot(`
+      validate({ stdout }) {
+        const manifest = normalizeGeneratedETags(JSON.parse(stdout));
+        expect(JSON.stringify(manifest, null, 2) + "\n").toMatchInlineSnapshot(`
           "{
             "index": "./client.html",
             "files": [
@@ -107,7 +125,7 @@ console.log(favicon);
                 "loader": "js",
                 "isEntry": true,
                 "headers": {
-                  "etag": "Ax71YVYyZQc",
+                  "etag": "<generated-etag>",
                   "content-type": "text/javascript;charset=utf-8"
                 }
               },
@@ -117,7 +135,7 @@ console.log(favicon);
                 "loader": "html",
                 "isEntry": true,
                 "headers": {
-                  "etag": "hZ3u5t2Rmuo",
+                  "etag": "<generated-etag>",
                   "content-type": "text/html;charset=utf-8"
                 }
               },
@@ -127,7 +145,7 @@ console.log(favicon);
                 "loader": "css",
                 "isEntry": true,
                 "headers": {
-                  "etag": "0k_h5oYVQlA",
+                  "etag": "<generated-etag>",
                   "content-type": "text/css;charset=utf-8"
                 }
               },
@@ -222,14 +240,14 @@ console.log("About manifest:", aboutHtml);
         }
       }
 
-      expect(manifests).toMatchInlineSnapshot(`
+      expect(manifests.map(manifest => normalizeGeneratedETags(manifest))).toMatchInlineSnapshot(`
         [
           {
             "files": [
               {
                 "headers": {
                   "content-type": "text/javascript;charset=utf-8",
-                  "etag": "DLJP98vzFzQ",
+                  "etag": "<generated-etag>",
                 },
                 "input": "home.html",
                 "isEntry": true,
@@ -239,7 +257,7 @@ console.log("About manifest:", aboutHtml);
               {
                 "headers": {
                   "content-type": "text/html;charset=utf-8",
-                  "etag": "_Qy4EtlcGvs",
+                  "etag": "<generated-etag>",
                 },
                 "input": "home.html",
                 "isEntry": true,
@@ -249,7 +267,7 @@ console.log("About manifest:", aboutHtml);
               {
                 "headers": {
                   "content-type": "text/css;charset=utf-8",
-                  "etag": "6qg2qb7a2qo",
+                  "etag": "<generated-etag>",
                 },
                 "input": "home.html",
                 "isEntry": true,
@@ -264,7 +282,7 @@ console.log("About manifest:", aboutHtml);
               {
                 "headers": {
                   "content-type": "text/javascript;charset=utf-8",
-                  "etag": "t8rrkgPylZo",
+                  "etag": "<generated-etag>",
                 },
                 "input": "about.html",
                 "isEntry": true,
@@ -274,7 +292,7 @@ console.log("About manifest:", aboutHtml);
               {
                 "headers": {
                   "content-type": "text/html;charset=utf-8",
-                  "etag": "igL7YEH9e0I",
+                  "etag": "<generated-etag>",
                 },
                 "input": "about.html",
                 "isEntry": true,
@@ -284,7 +302,7 @@ console.log("About manifest:", aboutHtml);
               {
                 "headers": {
                   "content-type": "text/css;charset=utf-8",
-                  "etag": "DE8kdBXWhVg",
+                  "etag": "<generated-etag>",
                 },
                 "input": "about.html",
                 "isEntry": true,
@@ -297,6 +315,42 @@ console.log("About manifest:", aboutHtml);
         ]
       `);
     },
+  });
+
+  test("html-import/etag-changes-with-referenced-chunks", async () => {
+    const dir = tempDirWithFiles("html-etag", {
+      "server.ts": `import manifest from "./index.html"; console.log(JSON.stringify(manifest));`,
+      "index.html": `<!doctype html><script type="module" src="./app.ts"></script>`,
+      "app.ts": `console.log(1);`,
+    });
+
+    async function buildAndReadManifest() {
+      const outdir = join(dir, "out");
+      const result = await Bun.build({ entrypoints: [join(dir, "server.ts")], outdir, target: "bun" });
+      expect(result.success).toBe(true);
+      const server = readFileSync(join(outdir, "server.js"), "utf8");
+      const match = server.match(/__jsonParse\("(.+?)"\)/s)!;
+      return JSON.parse(JSON.parse('"' + match[1] + '"')) as {
+        files: Array<{ loader: string; path: string; headers: { etag: string } }>;
+      };
+    }
+
+    const before = await buildAndReadManifest();
+    const unchanged = await buildAndReadManifest();
+    const file = (manifest: typeof before, loader: string) => manifest.files.find(item => item.loader === loader)!;
+
+    for (const loader of ["js", "html"]) {
+      expect(file(before, loader).path).toBe(file(unchanged, loader).path);
+      expect(file(before, loader).headers.etag).toBe(file(unchanged, loader).headers.etag);
+      expect(file(before, loader).headers.etag).toMatch(etagPattern);
+    }
+
+    writeFileSync(join(dir, "app.ts"), `console.log(2);`);
+    const after = await buildAndReadManifest();
+
+    expect(file(before, "js").path).not.toBe(file(after, "js").path);
+    expect(file(before, "html").path).toBe(file(after, "html").path);
+    expect(file(before, "html").headers.etag).not.toBe(file(after, "html").headers.etag);
   });
 
   // Test that import with {type: 'file'} still works as a file import

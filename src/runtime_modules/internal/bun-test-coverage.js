@@ -334,6 +334,18 @@ function emptyReport(path) {
   };
 }
 
+function isGeneratedModuleWrapper(source, starts, functionStart) {
+  if (!Number.isSafeInteger(functionStart) || functionStart < 0 || functionStart > source.length) {
+    return false;
+  }
+  const generatedLine = lineForOffset(starts, functionStart);
+  const prefix = source.slice(starts[generatedLine] ?? 0, functionStart);
+  // The linker emits these declarations at the start of a generated line.
+  // Matching the declaration shape matters: user code can legitimately pass a
+  // callback to an object method called __esmForce, __esm, or __commonJS.
+  return /^(?:var init_[\w$]+ = __esm(?:Force)?|var require_[\w$]+ = __commonJS)\($/.test(prefix);
+}
+
 function collectReports(options) {
   const host = globalThis.cottontail;
   if (typeof host?.collectTestCoverage !== "function") {
@@ -370,8 +382,7 @@ function collectReports(options) {
     : nativeCoverage.functions;
   const userFunctions = functions.filter((fn) => {
     const localStart = fn.start - sourceOffset;
-    const prefix = evaluatedSource.slice(Math.max(0, localStart - 64), localStart);
-    return !/__(?:esm|commonJS)\(\s*$/.test(prefix);
+    return !isGeneratedModuleWrapper(evaluatedSource, starts, localStart);
   });
 
   function reportFor(mapping) {

@@ -1172,9 +1172,14 @@ static napi_value test_deferred_exceptions(const Napi::CallbackInfo &info) {
   status = napi_wrap(
       env, object, nullptr,
       +[](napi_env env, void *data, void *finalize_hint) {
-        puts("finalizer start");
-        printf("napi_throw status: %d\n", napi_throw(env, ok(env)));
-        puts("finalizer end");
+        node_api_post_finalizer(
+            env,
+            +[](napi_env env, void *data, void *finalize_hint) {
+              puts("finalizer start");
+              printf("napi_throw status: %d\n", napi_throw(env, ok(env)));
+              puts("finalizer end");
+            },
+            data, finalize_hint);
       },
       nullptr, nullptr);
 

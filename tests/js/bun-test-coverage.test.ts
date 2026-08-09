@@ -153,3 +153,37 @@ test("coverage finalizes for files that register no tests", () => {
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("coverage distinguishes generated ESM wrappers from user callbacks", () => {
+  const directory = fixture({
+    "sample.test.ts": `
+import { expect, test } from "bun:test";
+import { api, callback } from "./source";
+test("coverage", () => {
+  expect(typeof api).toBe("object");
+  expect(typeof callback).toBe("function");
+});
+`,
+    "source.ts": `
+export const api = { __esmForce(callback) { return callback; } };
+export const callback = api.__esmForce(() => "not called");
+`,
+  });
+  try {
+    const result = run(directory, [
+      "--coverage",
+      "--coverage-reporter=lcov",
+      "--coverage-dir=artifacts",
+      "sample.test.ts",
+    ]);
+    expect(result.exitCode, result.stderrText).toBe(0);
+    const lcov = readFileSync(join(directory, "artifacts", "lcov.info"), "utf8");
+    const sourceRecord = lcov.match(/SF:source\.ts\n([\s\S]*?)end_of_record/)?.[1] ?? "";
+    // The object method ran and the returned callback did not. The synthetic
+    // init_source wrapper must not become a third source-level function.
+    expect(sourceRecord).toContain("FNF:2");
+    expect(sourceRecord).toContain("FNH:1");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

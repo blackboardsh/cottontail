@@ -1,4 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
+import { Buffer } from "node:buffer";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +14,7 @@ test("bundled test modules resolve global require from their source file", () =>
   expect(require("./fixtures/require-resolve-target.js")).toBe("ok");
   expect(require.resolve("./fixtures/require-resolve-target.js")).toBe(target);
   expect(require.resolve.paths("./fixtures/require-resolve-target.js")).toEqual([import.meta.dir]);
+  expect(require.resolve.paths(target)).toEqual(require.resolve.paths("loader-search-probe"));
 });
 
 test("CommonJS top-level this is the initial exports object", () => {
@@ -87,6 +89,91 @@ test("require preserves re-exports from side-effect-free ESM packages", () => {
   writeFileSync(join(packageDir, "lib.js"), "export const value = 42;\n");
 
   expect(require(join(packageDir, "index.js")).value).toBe(42);
+});
+
+test("implicit JSX extensions preserve filename grammar through a wrapped .js loader", () => {
+  const Module = require("node:module");
+  const original = Module._extensions[".js"];
+  const jsTarget = join(root, "extension-loader-jsx.js");
+  const jsxTarget = join(root, "extension-loader.jsx");
+  const tsxTarget = join(root, "extension-loader.tsx");
+  const reactRoot = join(root, "node_modules", "react");
+  require("node:fs").mkdirSync(reactRoot, { recursive: true });
+  writeFileSync(join(reactRoot, "package.json"), JSON.stringify({
+    name: "react",
+    exports: {
+      "./jsx-runtime": "./jsx-runtime.js",
+      "./jsx-dev-runtime": "./jsx-runtime.js",
+    },
+  }));
+  writeFileSync(join(reactRoot, "jsx-runtime.js"), [
+    "exports.Fragment = Symbol.for('loader.fragment');",
+    "exports.jsx = (type, props) => ({ type, props });",
+    "exports.jsxs = exports.jsx;",
+    "exports.jsxDEV = exports.jsx;",
+    "",
+  ].join("\n"));
+  writeFileSync(jsTarget, [
+    "/** @jsx h */",
+    "const h = (type, props) => ({ type, props });",
+    'module.exports = <div id="invalid-js-grammar" />;',
+    "",
+  ].join("\n"));
+  writeFileSync(jsxTarget, [
+    "/** @jsx h */",
+    "const h = (type, props) => ({ type, props });",
+    "export const marker = 42;",
+    'export function render() { return <div id="jsx" />; }',
+    "",
+  ].join("\n"));
+  writeFileSync(tsxTarget, [
+    "/** @jsx h */",
+    "const h = (type: string, props: Record<string, unknown>) => ({ type, props });",
+    "type Marker = number;",
+    "export const marker: Marker = 73;",
+    'export function render(): unknown { return <main id="tsx" />; }',
+    "",
+  ].join("\n"));
+
+  try {
+    expect(Object.keys(Module._extensions)).not.toContain(".jsx");
+    expect(Object.keys(Module._extensions)).not.toContain(".tsx");
+    Module._extensions[".js"] = (module, filename) => original(module, filename);
+    const jsx = require(jsxTarget);
+    const tsx = require(tsxTarget);
+    expect(jsx.marker).toBe(42);
+    expect(jsx.render()).toEqual({ type: "div", props: { id: "jsx" } });
+    expect(tsx.marker).toBe(73);
+    expect(tsx.render()).toEqual({ type: "main", props: { id: "tsx" } });
+    expect(() => require(jsTarget)).toThrow(/Unexpected(?: token)? ['"]?</);
+  } finally {
+    Module._extensions[".js"] = original;
+    delete require.cache[jsTarget];
+    delete require.cache[jsxTarget];
+    delete require.cache[tsxTarget];
+  }
+});
+
+test("cross-assigned extension handlers retain their selected grammar", () => {
+  const Module = require("node:module");
+  const originalJs = Module._extensions[".js"];
+  const originalTs = Module._extensions[".ts"];
+  const jsAsTsTarget = join(root, "extension-loader.as-ts");
+  const tsxAsJsTarget = join(root, "extension-loader-explicit.tsx");
+  writeFileSync(jsAsTsTarget, "const marker: number = 91; module.exports = marker;\n");
+  writeFileSync(tsxAsJsTarget, "export const element = <div>Hello</div>;\n");
+
+  try {
+    Module._extensions[".as-ts"] = originalTs;
+    Module._extensions[".tsx"] = originalJs;
+    expect(require(jsAsTsTarget)).toBe(91);
+    expect(() => require(tsxAsJsTarget)).toThrow();
+  } finally {
+    delete Module._extensions[".as-ts"];
+    delete Module._extensions[".tsx"];
+    delete require.cache[jsAsTsTarget];
+    delete require.cache[tsxAsJsTarget];
+  }
 });
 
 test("a failed synchronous TLA require is evicted before dynamic import", async () => {
@@ -188,6 +275,35 @@ test("source-map support validates and resets Node options", () => {
   expect(getSourceMapsSupport()).toEqual({ enabled: false, nodeModules: false, generatedCode: true });
 });
 
+test("source-mapped CommonJS stacks remove wrapper offsets from every frame", () => {
+  const target = join(root, "mapped-commonjs-stack.cjs");
+  const original = join(root, "mapped-commonjs-stack.ts");
+  const originalSource = [
+    "function mappedCaller() {",
+    "  mappedThrower();",
+    "}",
+    "function mappedThrower() {",
+    "  throw new Error('multi-frame-map');",
+    "}",
+    "mappedCaller();",
+    "",
+  ].join("\n");
+  const sourceMap = Buffer.from(JSON.stringify({
+    version: 3,
+    sources: ["mapped-commonjs-stack.ts"],
+    sourcesContent: [originalSource],
+    names: [],
+    mappings: "AAAA;AACA;AACA;AACA;AACA;AACA;AACA",
+  })).toString("base64");
+  writeFileSync(target, `${originalSource}//# sourceMappingURL=data:application/json;base64,${sourceMap}\n`);
+
+  const child = Bun.spawnSync({ cmd: [process.execPath, target] });
+  const stderr = child.stderr.toString();
+  expect(child.exitCode).toBe(1);
+  expect(stderr).toContain(`${original}:5:1`);
+  expect(stderr).toContain(`${original}:2:1`);
+});
+
 test("CommonJS compilation honors Module.wrapper mutations", () => {
   const Module = require("node:module");
   const originalWrapper = Module.wrapper;
@@ -277,7 +393,7 @@ test("resolver handles bare files, NUL requests, and private node prefixes", () 
   const localRequire = require("node:module").createRequire(entry);
 
   expect(localRequire("bare-file")).toBe(42);
-  expect(() => localRequire("a\0b")).toThrow("Cannot find module 'a\0b'");
+  expect(() => localRequire("a\0b")).toThrow("Cannot find package 'a\0b'");
   expect(() => localRequire("node:internal/test/binding")).toThrow("No such built-in module");
   expect(() => localRequire(1 as any)).toThrow('The "id" argument');
   expect(() => localRequire("")).toThrow("must be a non-empty string");

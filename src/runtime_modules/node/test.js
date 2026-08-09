@@ -32,6 +32,10 @@ const events = [];
 // becomes the primary; later instances re-export its interface and skip all
 // process-global side effects. Mirrors bun/test.js's bunTestModule handling.
 const primaryTestModuleKey = Symbol.for("cottontail.internal.nodeTestModule");
+// Module evaluation alone is not test execution. This signal flips only when
+// an API actually registers test work, so default-app can distinguish a test
+// entry from an ordinary application that happens to import node:test.
+const testRegisteredKey = Symbol.for("cottontail.internal.testRegistered");
 const primaryTestModule = globalThis[primaryTestModuleKey] ?? null;
 const Promise = globalThis.Promise;
 const queueMicrotask = globalThis.queueMicrotask.bind(globalThis);
@@ -298,18 +302,6 @@ function installUnhandledRejectionCapture() {
   unhandledRejectionCaptureInstalled = true;
   processGlobal[unhandledRejectionHandlerKey] = (reason, promise) => {
     const error = reason instanceof Error ? reason : new Error(String(reason));
-    // bun/test.js's throw matchers block in waitForPromise; while blocked, a
-    // sibling promise of the one under assertion can reject before its own
-    // matcher attaches a handler. Bun quietly captures that rejection instead
-    // of failing the test (Expect.getValueAsToThrow's unhandledRejectionScope).
-    const quietCapture = globalThis.__cottontailQuietUnhandledRejectionCapture;
-    if (quietCapture) {
-      if (!quietCapture.didCapture) {
-        quietCapture.didCapture = true;
-        quietCapture.value = reason;
-      }
-      return;
-    }
     const owner = promise && typeof promise === "object" ? promiseOwners.get(promise) : null;
     if (owner?.kind === "test" && typeof owner.failExternal === "function") {
       // Late rejections owned by an already-finished test stay with that
@@ -685,9 +677,9 @@ function invokeDoneCallback(callback, thisValue, args) {
 
 function invokeTestCallback(record, context) {
   const execution = executionStorage.getStore?.() ?? activeExecution;
-  if (execution && record.options.timeout != null) {
+  if (execution) {
     const duration = timeoutFor(record.options);
-    if (duration > 0) execution.deadline = runnerDateNow() + duration;
+    execution.deadline = duration > 0 ? runnerDateNow() + duration : null;
   }
   return withTimeout(async () => {
     let value;
@@ -1610,8 +1602,8 @@ globalThis.__cottontailNoteDanglingProcessKilled = () => {
   return true;
 };
 
-// Milliseconds left before the current test's explicit timeout, or null when
-// no explicit per-test timeout is active.
+// Milliseconds left before the current test's active timeout, or null when
+// timeouts are disabled for the test.
 globalThis.__cottontailCurrentTestRemainingMs = () => {
   const execution = executionStorage.getStore?.() ?? activeExecution;
   if (!execution || execution.deadline == null) return null;
@@ -2110,6 +2102,7 @@ function makeTestFunction(defaultOptions = {}) {
     promiseThen(record.result, undefined, () => {});
     tests.push(record);
     currentSuite.children.push(record);
+    globalThis[testRegisteredKey] = true;
     if (record.options.only) hasOnly = true;
     selectionDirty = true;
     for (let suite = currentSuite; suite; suite = suite.parent) suite.afterRan = false;
@@ -2130,6 +2123,7 @@ function suiteFunction(name, options, callback, defaultOptions = {}) {
   const parent = currentSuite;
   const child = createSuite(parsed.name, suiteOptions, parent);
   parent.children.push(child);
+  globalThis[testRegisteredKey] = true;
   if (suiteOptions.only) hasOnly = true;
   selectionDirty = true;
   if (suiteOptions.__bunDeferredDefinition) {
@@ -2174,6 +2168,7 @@ export const skip = primaryTestModule?.skip ?? makeTestFunction({ skip: true });
 export const todo = primaryTestModule?.todo ?? makeTestFunction({ todo: true });
 
 function beforeImpl(fn, options = {}) {
+  globalThis[testRegisteredKey] = true;
   const execution = currentExecution();
   if (execution) execution.afterBodyHooks.unshift({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
   else {
@@ -2191,6 +2186,7 @@ function beforeImpl(fn, options = {}) {
 export const before = primaryTestModule?.before ?? beforeImpl;
 
 function afterImpl(fn, options = {}) {
+  globalThis[testRegisteredKey] = true;
   const execution = currentExecution();
   if (execution) execution.afterBodyHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
   else {
@@ -2206,6 +2202,7 @@ function beforeEachImpl(fn, options = {}) {
   if (currentExecution()) {
     throw new Error("Cannot call beforeEach() inside a test. Call it inside describe() instead.");
   }
+  globalThis[testRegisteredKey] = true;
   currentSuite.beforeEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0, registrationFile: currentSuite === rootSuite ? deriveCallerTestFile() : undefined });
   scheduleRun();
 }
@@ -2213,6 +2210,7 @@ function beforeEachImpl(fn, options = {}) {
 export const beforeEach = primaryTestModule?.beforeEach ?? beforeEachImpl;
 
 function afterEachImpl(fn, options = {}) {
+  globalThis[testRegisteredKey] = true;
   const execution = currentExecution();
   if (execution) execution.afterEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
   else currentSuite.afterEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0, registrationFile: currentSuite === rootSuite ? deriveCallerTestFile() : undefined });

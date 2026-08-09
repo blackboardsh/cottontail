@@ -1345,6 +1345,7 @@ fn nativeBuildGeneration(
     var loader_values: std.ArrayList([]const u8) = .empty;
     var outdir: ?[]const u8 = null;
     var outfile: ?[]const u8 = null;
+    var root_dir: ?[]const u8 = null;
     var metafile_json_path: ?[]const u8 = null;
     var metafile_markdown_path: ?[]const u8 = null;
     var compile = false;
@@ -1571,6 +1572,17 @@ fn nativeBuildGeneration(
         } else if (std.mem.eql(u8, arg, "--outfile") and index + 1 < args.len) {
             index += 1;
             outfile = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--root=") or std.mem.eql(u8, arg, "--root")) {
+            const path = if (std.mem.eql(u8, arg, "--root")) path: {
+                if (index + 1 >= args.len) {
+                    try stderr.writeAll("error: --root requires a value\n");
+                    try stderr.flush();
+                    return 1;
+                }
+                index += 1;
+                break :path args[index];
+            } else arg["--root=".len..];
+            root_dir = if (path.len > 0) path else null;
         } else if (std.mem.startsWith(u8, arg, "--banner=")) {
             options.banner = arg["--banner=".len..];
         } else if (std.mem.eql(u8, arg, "--banner") and index + 1 < args.len) {
@@ -1717,6 +1729,22 @@ fn nativeBuildGeneration(
     options.conditions = conditions.items;
     options.define_keys = define_keys.items;
     options.define_values = define_values.items;
+    if (root_dir) |path| {
+        var directory = std.Io.Dir.cwd().openDir(init.io, path, .{}) catch |err| {
+            try stderr.print("{s} opening root directory \"{s}\"\n", .{ @errorName(err), path });
+            try stderr.flush();
+            return 1;
+        };
+        defer directory.close(init.io);
+
+        var canonical_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const canonical_len = directory.realPath(init.io, &canonical_buffer) catch |err| {
+            try stderr.print("{s} resolving root directory \"{s}\"\n", .{ @errorName(err), path });
+            try stderr.flush();
+            return 1;
+        };
+        options.root_dir = try allocator.dupe(u8, canonical_buffer[0..canonical_len]);
+    }
     if (app) {
         if (entries.items.len != 1) {
             try stderr.writeAll("error: --app requires exactly one entrypoint\n");
@@ -1840,6 +1868,7 @@ fn nativeBuildGeneration(
         .publicPath = options.public_path,
         .bundle = !options.transform_only,
         .compileToStandaloneHtml = options.compile_to_standalone_html,
+        .root = options.root_dir,
         .tsconfig = options.tsconfig_override,
         .env = env_option,
         .naming = NamingRequest{
