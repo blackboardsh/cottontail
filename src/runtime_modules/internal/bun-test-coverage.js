@@ -464,9 +464,7 @@ function collectReports(options) {
   const sourceRoot = resolve(String(globalThis.__cottontailBundleSourceRoot ?? cwd));
   const sourceCache = new Map();
   const reports = new Map();
-  const functions = nativeCoverage.functions.length > 1
-    ? nativeCoverage.functions.slice(1)
-    : nativeCoverage.functions;
+  const functions = nativeCoverage.functions;
 
   function reportFor(mapping) {
     if (sourceCache.has(mapping.source)) return sourceCache.get(mapping.source);
