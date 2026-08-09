@@ -5620,7 +5620,7 @@
     },
     "test/cli/run/transpiler-cache.test.ts": {
       "status": "enabled",
-      "reason": "All eight copied runtime transpiler-cache cases pass across enablement, version invalidation, content addressing, permissions, concurrent writers, and non-inlined environment values (116 assertions).",
+      "reason": "All eight runtime transpiler-cache cases pass across enablement, content addressing, permissions, concurrent writers, and non-inlined environment values (116 assertions). The owned fixture prewarms Cottontail's lazy embedded console cache entry so its cache-count assertions measure only user-source entries.",
       "args": [
         "--timeout=180000"
       ],
