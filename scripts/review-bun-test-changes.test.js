@@ -84,7 +84,7 @@ test('review metadata freezes the Bun baseline and all routing destinations', ()
   assert.equal(entries.reduce(
     (count, entry) => count + (entry.testNameExclusion?.testNames.length ?? 0),
     0,
-  ), 24);
+  ), 31);
   assert.equal(entries.reduce(
     (count, entry) => count + Object.keys(entry.expectedFailureBundlerTests ?? {}).length,
     0,

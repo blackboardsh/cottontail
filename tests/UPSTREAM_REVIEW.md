@@ -30,7 +30,7 @@ The macOS baseline contains 1,445 runnable Bun-derived files:
 | Hutch-owned JavaScript baseline files | 103 |
 | Deliberately out of scope | 4 |
 
-There are also 24 explicitly named test-case exclusions and four expected
+There are also 31 explicitly named test-case exclusions and four expected
 failures among individually split bundler cases. These remain visible
 exceptions; they are not part of the zero-unexpected-failure target. An
 unexpected pass is still a result that must be reviewed rather than silently

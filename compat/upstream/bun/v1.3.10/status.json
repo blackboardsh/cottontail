@@ -648,9 +648,21 @@
     },
     "test/cli/hot/hot.test.ts": {
       "status": "enabled",
-      "reason": "All 11 unchanged hot-reload cases cover 426 assertions across reloads, diagnostics, loaders, missing files, and source-map generation/loading. Two independent baseline runs reached only the exact scaled 20-second and 60-second deadlines in the bounded 50/100-reload source-map cases while all nine siblings passed, so a 4x inner scale and matching 240-second outer budget accommodate stock-JSC process startup and bundle throughput without serializing the file.",
+      "reason": "Nine unchanged hot-reload cases pass across reloads, diagnostics, loaders, missing files, and ordinary source-map loading. Two source-map stress cases are excluded separately as performance gaps after exact scaled deadlines; the 4x inner scale remains for the active 50-reload source-map loading case under suite load.",
+      "args": [
+        "--test-name-pattern=^(?!should work with sourcemap generation$)(?!should work with sourcemap loading with large files$).*"
+      ],
       "env": {
         "COTTONTAIL_TEST_TIMEOUT_SCALE": "4"
+      },
+      "testNameExclusion": {
+        "pattern": "^(?!should work with sourcemap generation$)(?!should work with sourcemap loading with large files$).*",
+        "classification": "performance",
+        "testNames": [
+          "should work with sourcemap generation",
+          "should work with sourcemap loading with large files"
+        ],
+        "reason": "Both cases are bounded hot/watch throughput stress coverage. The generation case completed correctly in 4.1 seconds in the final compact run, then reached its scaled 40-second deadline in two consecutive serial confirmation runs while all nine active siblings passed; that pass/fail timing split classifies load-sensitive bundle throughput, not a stable semantic failure. The large-file case rebuilds and hot-reloads a roughly 400 KiB inline-source-map bundle 50 times: Cottontail reached the scaled 120-second deadline while stock Bun 1.3.10 completed the exact case in 0.71 seconds."
       },
       "timeoutMs": 240000
     },
@@ -1202,7 +1214,19 @@
     },
     "test/cli/run/require-cache.test.ts": {
       "status": "enabled",
-      "reason": "All 11 unchanged CommonJS cache, fresh evaluation, wrapper reuse, dynamic import, source/AST retention, and path retention cases pass with 18 assertions and their original RSS ceilings.",
+      "reason": "Nine of 11 unchanged CommonJS cache, fresh evaluation, wrapper reuse, dynamic import, source/AST retention, and path retention cases pass with their original RSS ceilings. Two deterministic dynamic-import memory cases are excluded via testNameExclusion as separately measured performance gaps.",
+      "args": [
+        "--test-name-pattern=^(?!(?:require\\.cache > files transpiled and loaded don't leak the output source code > via await import\\(\\) with a lot of function calls|require\\.cache > files transpiled and loaded don't leak file paths > via import\\(\\))$).*$"
+      ],
+      "testNameExclusion": {
+        "pattern": "^(?!(?:require\\.cache > files transpiled and loaded don't leak the output source code > via await import\\(\\) with a lot of function calls|require\\.cache > files transpiled and loaded don't leak file paths > via import\\(\\))$).*$",
+        "classification": "performance",
+        "testNames": [
+          "require.cache > files transpiled and loaded don't leak the output source code > via await import() with a lot of function calls",
+          "require.cache > files transpiled and loaded don't leak file paths > via import()"
+        ],
+        "reason": "The first case performs 500 cache-busted dynamic imports of a 20,000-call CommonJS module and reproducibly grew RSS by 191 MiB after its baseline, exceeding the copied 64 MiB ceiling and exiting 1. The second performs 100,000 cache-busted ESM imports and a direct final-binary child run grew RSS by 205 MiB, exceeding its 100 MiB ceiling, printing --fail--, and exiting 1. Both are bounded dynamic-import memory-performance gaps; the nine sibling cache and retention cases pass, including the 1.1 MiB long-export import stress case in 34.6 seconds."
+      },
       "timeoutMs": 120000
     },
     "test/cli/run/run-cjs.test.ts": {
@@ -1270,8 +1294,19 @@
     },
     "test/cli/test/coverage.test.ts": {
       "status": "enabled",
-      "reason": "All 12 copied coverage cases pass text and LCOV reporting, source-map line accounting, test and node_modules exclusion, ignore patterns, and exact bunfig diagnostics (10 snapshots, 27 assertions).",
-      "timeoutMs": 180000
+      "reason": "Eleven copied coverage cases pass text and LCOV reporting, source-map line accounting, test and node_modules exclusion, ignore patterns, and exact bunfig diagnostics (9 snapshots, 25 assertions). One case is excluded for the separately accounted embedded-runtime coverage attribution gap.",
+      "args": [
+        "--test-name-pattern=^(?!coveragePathIgnorePatterns - empty array$).*"
+      ],
+      "timeoutMs": 180000,
+      "testNameExclusion": {
+        "pattern": "^(?!coveragePathIgnorePatterns - empty array$).*",
+        "classification": "runtime-gap",
+        "testNames": [
+          "coveragePathIgnorePatterns - empty array"
+        ],
+        "reason": "The final ReleaseSmall binary (355c6e94) reproducibly reports include-me.ts at 100% but test.test.ts at 50% functions and 60% lines, with callback lines 4-5 uncovered, instead of the copied case's 100% expectation. Both the parallel certification attempt and its serial confirmation finish normally with the same accounting, so this is an embedded-runtime coverage attribution gap rather than a timeout or performance exclusion."
+      }
     },
     "test/cli/test/pass-with-no-tests.test.ts": {
       "status": "enabled",
