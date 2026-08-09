@@ -1,0 +1,121 @@
+{
+  "schema": 1,
+  "runtime": "bun",
+  "source": "https://github.com/oven-sh/bun",
+  "comparisonPaths": [
+    "test",
+    "packages/bun-native-bundler-plugin-api/bundler_plugin.h",
+    "packages/bun-plugin-svelte/README.md",
+    "packages/bun-plugin-svelte/bun.lock",
+    "packages/bun-plugin-svelte/package.json",
+    "packages/bun-plugin-svelte/src",
+    "packages/bun-plugin-svelte/tsconfig.json",
+    "packages/bun-types/package.json",
+    "src/api/schema.js",
+    "src/bake/client/data-view.ts",
+    "src/bake/client/error-serialization.ts",
+    "src/bake/enums.ts",
+    "src/bake/shared.ts",
+    "src/init/react-tailwind/build.ts",
+    "src/init/react-tailwind/tsconfig.json",
+    "src/js_parser.zig",
+    "tsconfig.base.json"
+  ],
+  "baseline": {
+    "version": "1.3.10",
+    "tag": "bun-v1.3.10",
+    "commit": "30e609e08073cf7114bfb278506962a5b19d0677"
+  },
+  "lastReviewed": {
+    "version": "1.3.10",
+    "tag": "bun-v1.3.10",
+    "commit": "30e609e08073cf7114bfb278506962a5b19d0677",
+    "reviewedAt": "2026-08-08"
+  },
+  "routing": {
+    "allowedDestinations": [
+      "cottontail",
+      "hutch",
+      "external",
+      "out-of-scope"
+    ],
+    "destinationSemantics": {
+      "cottontail": "owned-in-this-repository",
+      "hutch": "handoff-to-hutch-repository",
+      "external": "handoff-to-a-recorded-external-repository",
+      "out-of-scope": "recorded-non-adoption"
+    },
+    "defaultDestination": "cottontail",
+    "baselineStatusPath": "compat/upstream/bun/v1.3.10/status.json",
+    "baselineOwnerMap": {
+      "cottontail-runtime": "cottontail",
+      "hutch-package-manager": "hutch"
+    },
+    "rules": [
+      {
+        "pathPrefix": "test/cli/install/",
+        "destination": "hutch",
+        "reason": "Hand package installation and package-manager test changes to the Hutch repository."
+      },
+      {
+        "pathPrefix": "test/cli/create/",
+        "destination": "hutch",
+        "reason": "Hand project creation and mutation test changes to the Hutch repository."
+      },
+      {
+        "pathPrefix": "test/cli/init/",
+        "destination": "hutch",
+        "reason": "Hand project creation and mutation test changes to the Hutch repository."
+      },
+      {
+        "pathPrefix": "test/cli/update_interactive",
+        "destination": "hutch",
+        "reason": "Hand interactive package-update test changes to the Hutch repository."
+      },
+      {
+        "pathPrefix": "test/js/third_party/pnpm/",
+        "destination": "hutch",
+        "reason": "Hand package-manager test changes to the Hutch repository."
+      },
+      {
+        "path": "test/bake/dev/react-response.test.ts",
+        "destination": "out-of-scope",
+        "reason": "Bun's React Server Components pipeline is outside the Electrobun 2.0 scope."
+      },
+      {
+        "path": "test/cli/run/cpu-prof.test.ts",
+        "destination": "out-of-scope",
+        "reason": "Cottontail's JavaScriptCore build intentionally omits the sampling profiler."
+      },
+      {
+        "path": "test/js/node/inspector/inspector-profiler.test.ts",
+        "destination": "out-of-scope",
+        "reason": "Cottontail's JavaScriptCore build intentionally omits the sampling profiler."
+      }
+    ],
+    "history": [
+      {
+        "effectiveAt": "30e609e08073cf7114bfb278506962a5b19d0677",
+        "reviewedAt": "2026-08-08",
+        "reason": "Established the Bun 1.3.10 JavaScript test ownership baseline."
+      }
+    ]
+  },
+  "provenance": {
+    "manifestPath": "compat/upstream/bun/v1.3.10/manifest.json",
+    "licensePath": "compat/upstream/bun/v1.3.10/LICENSE.md"
+  },
+  "mappingPolicy": {
+    "implicit": "same-relative-path-at-baseline",
+    "relationships": [
+      "adapted",
+      "reimplemented",
+      "coverage-equivalent",
+      "split",
+      "combined",
+      "externalized",
+      "retired"
+    ]
+  },
+  "mappings": []
+}

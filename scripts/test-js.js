@@ -75,6 +75,12 @@ function runCase(testCase) {
     }
   }
 
+  for (const expected of testCase.stdoutMatches ?? []) {
+    if (!expected.test(stdoutSearch)) {
+      fail(`Test "${testCase.name}" stdout did not match: ${expected}`);
+    }
+  }
+
   for (const expected of testCase.stderrIncludes ?? []) {
     if (!result.stderr.includes(expected)) {
       fail(`Test "${testCase.name}" stderr did not include: ${expected}`);
@@ -196,7 +202,7 @@ try {
       executablePath: process.execPath,
       argv: ['--test-reporter=tap', '--test', join(rootDir, 'tests', 'upstream-runner.test.mjs')],
       expectExitCode: 0,
-      stdoutIncludes: ['# tests 15', '# pass 15', '# fail 0'],
+      stdoutMatches: [/^# pass [1-9]\d*\r?$/m, /^# fail 0\r?$/m],
     },
     {
       name: 'internal-runtime-bindings',

@@ -21,17 +21,23 @@ Regenerate and view in one command with:
 bun run compat:surface:all
 ```
 
-## Upstream Test Snapshots
+## JavaScript Baseline Tests
 
-`compat/upstream/` contains snapshots copied from the Node and Bun repositories.
-Runtime tests remain owned here. Hutch owns 102 package-manager, project
-mutation, and package-script files copied into its own compatibility directory;
-the ownership index there assigns all 1,445 Bun v1.3.10 runnable files to
-exactly one repository. Together the repositories preserve the canonical
-denominator without double-counting tests. Hutch's executable report currently
-classifies those 102 files as 83 enabled and 19 inherited expected failures;
-run its `scripts/run-bun-package-manager-tests.js --check` command for the
-authoritative package-manager count.
+`compat/upstream/` contains the Node snapshot and the frozen source baseline for
+the Bun-derived JavaScript tests. The Bun tree is no longer a live mirror:
+Cottontail and Hutch own their tests and may adapt them as the products diverge
+from Bun. The exact Bun v1.3.10 ownership index assigns 1,345 runnable files to
+Cottontail and 100 package-manager, project-mutation, and package-script files
+to Hutch. Cottontail currently enables 1,324 files, carries 18 whole-file
+expected failures, and deliberately leaves three files out of scope. Hutch's
+100 files run from its own repository. A `hutch` review route means handoff to
+that repository, not vendoring Hutch tests or creating a permanent Cottontail
+dependency on Hutch. The long-term dependency direction is Hutch to Cottontail.
+
+The ownership boundary, reviewed-through Bun commit, future tag-diff process,
+and provenance policy are recorded in
+[`tests/UPSTREAM_REVIEW.md`](../tests/UPSTREAM_REVIEW.md). The adjacent
+`tests/upstream-review.json` supplies the small machine-readable review policy.
 
 Cottontail-local package-manager and project-command regressions also live
 under Hutch's `tests/package-manager/` directory and run through
@@ -127,10 +133,18 @@ still fail:
 bun run compat:upstream:xfail
 ```
 
-Refresh the copied snapshots from the versions in `targets.json`:
+Refresh the Node snapshot from the version in `targets.json`:
 
 ```sh
 bun run compat:upstream:import
+```
+
+Bun replacement is disabled by default because the old import operation deletes
+destination paths and can erase intentional local adaptations. Review a newer
+Bun tag without changing local tests instead:
+
+```sh
+bun run compat:bun-tests:review --to bun-v1.3.11
 ```
 
 Upstream tests run against the vendored JavaScriptCore build — the only engine
@@ -141,10 +155,12 @@ build, but Cottontail installs a tested, isolated `node:vm`-backed compatibility
 constructor. Consequently, `test/js/bun/jsc/shadow.test.js` is enabled rather
 than an expected failure.
 
-The copied tests are now part of Cottontail's owned compatibility corpus. Do not
-silently rewrite them to pass. When a copied upstream test needs local
-adaptation, either fix Cottontail/the runner or document the ownership decision
-in the relevant `status.json`.
+The Bun-derived tests are now part of Cottontail's owned JavaScript baseline
+suite. Do not silently rewrite them to pass. When an upstream-derived test
+needs local adaptation, either fix Cottontail/the runner or document the
+ownership decision in the relevant `status.json`. Preserve its inline notices
+and the snapshot's license and provenance records; Bun may be the immediate
+comparison source rather than the test's original author.
 
 The generated `api-surface.json` is intentionally an inventory, not a behavior
 test result. It records:

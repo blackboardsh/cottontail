@@ -66,6 +66,11 @@ test('runs the strict complete Cottontail-owned Bun tier without publishing', ()
     hutchOwned.every((entry) => entry.status === 'skip' || entry.status === 'disabled'),
     'Hutch-owned files must remain excluded from Cottontail execution',
   );
+  const cottontailOutOfScope = Object.values(status.tests ?? {}).filter(
+    (entry) =>
+      entry.owner !== 'hutch-package-manager' &&
+      (entry.status === 'skip' || entry.status === 'disabled'),
+  );
 
   const output = execFileSync(
     process.execPath,
@@ -78,7 +83,7 @@ test('runs the strict complete Cottontail-owned Bun tier without publishing', ()
   const disabled = countFromList(output, 'disabled');
   const notEnabled = countFromList(output, 'not-enabled');
 
-  assert.equal(disabled, hutchOwned.length);
+  assert.equal(disabled, hutchOwned.length + cottontailOutOfScope.length);
   assert.equal(notEnabled, 0);
   assert.equal(discovered - disabled, enabled + expectedFailures);
 });
