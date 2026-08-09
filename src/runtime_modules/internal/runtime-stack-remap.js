@@ -64,6 +64,21 @@ function installLightErrorConstructor(name) {
   Object.defineProperty(CottontailLightError, "__cottontailLightError", { value: true });
   Object.defineProperty(CottontailLightError, "__cottontailOriginalError", { value: NativeError });
   Object.setPrototypeOf(CottontailLightError, NativeError);
+  const stackTraceLimit = Object.getOwnPropertyDescriptor(NativeError, "stackTraceLimit");
+  if (stackTraceLimit) {
+    Object.defineProperty(CottontailLightError, "stackTraceLimit", {
+      configurable: stackTraceLimit.configurable,
+      enumerable: stackTraceLimit.enumerable,
+      get() {
+        return Reflect.get(NativeError, "stackTraceLimit", NativeError);
+      },
+      set(value) {
+        // JSC stores the effective limit on the native Error constructor.
+        // Forward assignments instead of shadowing it on this wrapper.
+        Reflect.set(NativeError, "stackTraceLimit", value, NativeError);
+      },
+    });
+  }
   CottontailLightError.prototype = NativeError.prototype;
   globalThis[name] = CottontailLightError;
 }

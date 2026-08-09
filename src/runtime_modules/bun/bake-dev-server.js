@@ -1,5 +1,5 @@
 import path from "../node/path.js";
-import { readFileSync, readdirSync, statSync, writeFileSync } from "../node/fs.js";
+import { readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "../node/fs.js";
 import { pathToFileURL } from "../node/url.js";
 import { __setBuiltinModules } from "../node/module.js";
 import bundledReactRefreshModule from "./bake-react-refresh.txt";
@@ -35,6 +35,14 @@ import {
 const bunRuntime = globalThis[Symbol.for("cottontail.internal.bunRuntimeBridge")];
 if (bunRuntime?.abiVersion !== 1) throw new Error("Cottontail Bun runtime bridge ABI mismatch");
 const { Bun, HTMLRewriter, Response: RuntimeResponse, serve } = bunRuntime;
+
+export function canonicalBakeProjectRoot(root = globalThis.process?.cwd?.() ?? ".") {
+  try {
+    return realpathSync(root);
+  } catch {
+    return path.resolve(root);
+  }
+}
 
 let responseOptionsAsyncLocalStorage = null;
 let BakeResponse = null;
@@ -557,10 +565,21 @@ function matchesHtmlRoute(pattern, pathname) {
   return pathname === prefix || pathname.startsWith(`${prefix}/`);
 }
 
+export function normalizeBakeAssetPath(relativePath, publicPath = "/") {
+  const encodedRelative = String(relativePath)
+    .split("/")
+    .map(segment => segment === "." || segment === ".." ? segment : encodeURIComponent(segment))
+    .join("/");
+  const prefix = normalizePrefix(publicPath);
+  const assetPath = prefix === "/" ? `/${encodedRelative}` : `${prefix}/${encodedRelative}`;
+  const url = new URL("http://localhost");
+  url.pathname = assetPath;
+  return url.pathname;
+}
+
 function outputAssetPath(outdir, artifact, publicPath) {
   const relative = path.relative(outdir, artifact.path).replaceAll(path.sep, "/").replace(/^\.\//, "");
-  const prefix = normalizePrefix(publicPath);
-  return prefix === "/" ? `/${relative}` : `${prefix}/${relative}`;
+  return normalizeBakeAssetPath(relative, publicPath);
 }
 
 function isJavaScriptEntry(artifact) {
@@ -934,7 +953,7 @@ async function buildChangedHtmlHmrModules(projectRoot, changedPaths, previousBun
 }
 
 function createHtmlDispatcher(config, development) {
-  const projectRoot = globalThis.process?.cwd?.() ?? ".";
+  const projectRoot = canonicalBakeProjectRoot();
   const routes = { ...(config.routes ?? {}) };
   const staticRoutes = { ...(config.static ?? {}) };
   const htmlRoutes = [];
@@ -943,7 +962,14 @@ function createHtmlDispatcher(config, development) {
     for (const [pattern, value] of Object.entries(routeTable)) {
       if (!isHtmlAsset(value)) continue;
       const htmlPath = typeof value === "string" ? value : value.index;
-      htmlRoutes.push({ id: htmlRoutes.length, pattern, path: path.resolve(projectRoot, htmlPath) });
+      htmlRoutes.push({
+        id: htmlRoutes.length,
+        pattern,
+        // COTTONTAIL-COMPAT: macOS exposes /tmp as a symlink to /private/tmp.
+        // Keep HTML routes in the same canonical namespace as Bun.build's
+        // metafile, watcher paths, and source maps.
+        path: canonicalBakeProjectRoot(path.resolve(projectRoot, htmlPath)),
+      });
       delete routeTable[pattern];
     }
   }

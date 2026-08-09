@@ -943,8 +943,12 @@ export function createBunBuildFacade(dependencies) {
     const shadowName = (sourcePath, loader, entryName, namespace = "file") => {
       const base = String(entryName ?? sourcePath).replace(/\\/g, "/").split("/").pop() || "module";
       const known = /\.(tsx|ts|jsx|mjs|cjs|js|css|html|json|toml|txt|wasm)$/i.exec(base);
-      const stem = known ? base.slice(0, -known[0].length) : base;
       const sourceExtension = ctBuildSourceExtension(base);
+      const stem = known
+        ? base.slice(0, -known[0].length)
+        : loader === "file" && sourceExtension
+          ? base.slice(0, -sourceExtension.length)
+          : base;
       const ext = loader === "file"
         ? (sourceExtension || ".bin")
         : (bundleLoaderExtensions[loader] ?? (known ? known[0] : ".js"));

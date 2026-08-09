@@ -924,6 +924,45 @@ function limitedCallSites(stack, fallbackSourceURL = undefined, configuredLimit 
   return Number.isFinite(limit) && limit >= 0 ? sites.slice(0, Math.floor(limit)) : sites;
 }
 
+const asyncFunctionPrototype = Object.getPrototypeOf(async function() {});
+
+function isAsyncFunction(value) {
+  try {
+    return Object.getPrototypeOf(value) === asyncFunctionPrototype;
+  } catch {
+    return false;
+  }
+}
+
+// COTTONTAIL-COMPAT: Error.captureStackTrace - stock JSC filters an async
+// constructorOpt before tracking its await ancestry. Native filtering remains
+// authoritative for synchronous functions; this fallback mirrors Bun's name
+// match for a resumed async function. Remove it when the vendored engine
+// provides Bun's capture-then-filter behavior.
+function callSitesBelowAsyncConstructor(callSites, constructorOpt) {
+  let constructorName = "";
+  try {
+    // Reading `.name` can invoke a user-defined getter. Bun gets the
+    // executable name internally, without observable property access; the
+    // ordinary own data property is the closest side-effect-free JS view.
+    const name = Object.getOwnPropertyDescriptor(constructorOpt, "name")?.value;
+    if (typeof name === "string") constructorName = name;
+  } catch {}
+  for (let index = 0; index < callSites.length; index += 1) {
+    const site = callSites[index];
+    // A resumed async function is the last synchronous boundary. Its parents
+    // are synthetic async frames and must survive when that boundary matches.
+    if (site.isAsync()) break;
+    if (site.getFunction() === constructorOpt ||
+        (constructorName !== "" && site.getFunctionName() === constructorName)) {
+      return callSites.slice(index + 1);
+    }
+  }
+  // Bun's capture-then-filter rewrite clears the trace when constructorOpt is
+  // not found before the first synthetic async frame.
+  return [];
+}
+
 const bunAccessedErrorStacks = new WeakSet();
 let prepareStackTraceRecursionGuard = false;
 
@@ -931,14 +970,45 @@ if (typeof nativeCaptureStackTrace === "function" && !Error.captureStackTrace.__
   const captureStackTrace = function(target, constructorOpt = undefined) {
     const prepare = Error.prepareStackTrace;
     const requestedLimit = Error.stackTraceLimit;
+    const requestedLimitNumber = Number(requestedLimit);
+    let collectingWithInternalState = true;
     Error.prepareStackTrace = undefined;
-    if (Number.isFinite(Number(requestedLimit)) && Number(requestedLimit) < 100) Error.stackTraceLimit = 100;
+    // Apply the requested limit only after the JS wrapper and constructorOpt
+    // boundary have been removed. Otherwise either one can consume visible
+    // frame slots before the user portion of the trace is reached.
+    if (Number.isFinite(requestedLimitNumber) && requestedLimitNumber >= 0) Error.stackTraceLimit = Infinity;
     try {
-      const holder = {};
-      nativeCaptureStackTrace(holder, constructorOpt);
-      const rawStack = ctRemapStackString(holder.stack);
-      const callSites = limitedCallSites(rawStack, undefined, requestedLimit);
+      let rawStack;
+      let callSites;
+      if (typeof constructorOpt === "function") {
+        const filteredHolder = {};
+        nativeCaptureStackTrace(filteredHolder, constructorOpt);
+        rawStack = ctRemapStackString(filteredHolder.stack);
+        callSites = limitedCallSites(rawStack, undefined, Infinity);
+        if (callSites.length === 0 && isAsyncFunction(constructorOpt)) {
+          const asyncHolder = {};
+          nativeCaptureStackTrace(asyncHolder);
+          rawStack = ctRemapStackString(asyncHolder.stack);
+          callSites = callSitesBelowAsyncConstructor(
+            limitedCallSites(rawStack, undefined, Infinity),
+            constructorOpt,
+          );
+        }
+      } else {
+        const holder = {};
+        nativeCaptureStackTrace(holder);
+        rawStack = ctRemapStackString(holder.stack);
+        callSites = limitedCallSites(rawStack, undefined, Infinity);
+      }
+      if (Number.isFinite(requestedLimitNumber) && requestedLimitNumber >= 0) {
+        callSites = callSites.slice(0, Math.floor(requestedLimitNumber));
+      }
       if (constructorOpt === undefined) reanchorTopFrameOnCaptureStackTrace(callSites[0]);
+      // Native collection needs prepareStackTrace disabled and an expanded
+      // limit, but user formatting must observe the requested public state.
+      Error.stackTraceLimit = requestedLimit;
+      Error.prepareStackTrace = prepare;
+      collectingWithInternalState = false;
       Object.defineProperty(target, "stack", {
         configurable: true,
         enumerable: false,
@@ -966,8 +1036,13 @@ if (typeof nativeCaptureStackTrace === "function" && !Error.captureStackTrace.__
         target.stack = `${name}${message}${frames ? `\n${frames}` : ""}`;
       }
     } finally {
-      Error.stackTraceLimit = requestedLimit;
-      Error.prepareStackTrace = prepare;
+      // Once public state is restored, preserve any changes made by the user
+      // prepareStackTrace callback just like V8/Bun do. This cleanup is only
+      // for failures during native collection or the restoration itself.
+      if (collectingWithInternalState) {
+        Error.stackTraceLimit = requestedLimit;
+        Error.prepareStackTrace = prepare;
+      }
     }
   };
   Object.defineProperty(captureStackTrace, "__cottontailStructuredCallSites", { value: true });
@@ -984,8 +1059,10 @@ function installNodeStyleErrorConstructor(name) {
   // values.
   if (NativeError.__cottontailLightError) NativeError = NativeError.__cottontailOriginalError;
   const CottontailError = function(...args) {
-    const requestedLimit = NativeError.stackTraceLimit;
-    if (Number.isFinite(Number(requestedLimit)) && Number(requestedLimit) < 100) NativeError.stackTraceLimit = 100;
+    const requestedLimit = Reflect.get(NativeError, "stackTraceLimit", NativeError);
+    if (Number.isFinite(Number(requestedLimit)) && Number(requestedLimit) < 100) {
+      Reflect.set(NativeError, "stackTraceLimit", 100, NativeError);
+    }
     const StackError = globalThis.Error;
     const nativePrepare = StackError?.prepareStackTrace;
     const underlyingPrepare = NativeError.prepareStackTrace;
@@ -997,7 +1074,7 @@ function installNodeStyleErrorConstructor(name) {
       error = Reflect.construct(NativeError, args, new.target || CottontailError);
       rawStack = error.stack;
     } finally {
-      NativeError.stackTraceLimit = requestedLimit;
+      Reflect.set(NativeError, "stackTraceLimit", requestedLimit, NativeError);
       Reflect.set(NativeError, "prepareStackTrace", underlyingPrepare);
       if (StackError) Reflect.set(StackError, "prepareStackTrace", nativePrepare);
     }
@@ -1112,10 +1189,13 @@ function installNodeStyleErrorConstructor(name) {
       configurable: stackTraceLimit.configurable,
       enumerable: stackTraceLimit.enumerable,
       get() {
-        return NativeError.stackTraceLimit;
+        return Reflect.get(NativeError, "stackTraceLimit", NativeError);
       },
       set(value) {
-        NativeError.stackTraceLimit = value;
+        // Embedded runtime modules can compile a direct built-in property put
+        // without calling ErrorConstructor::put, leaving JSC's per-global
+        // stack limit stale even though the visible property changed.
+        Reflect.set(NativeError, "stackTraceLimit", value, NativeError);
       },
     });
   }
@@ -5519,6 +5599,21 @@ function serveHtmlFileDescriptor(path, headers, loader = "file", kind = "entry-p
   return { path, headers: new Headers(headers), loader, kind, hash, sourcemap, cacheKey: {} };
 }
 
+function hasStandaloneServeHtmlFile(path) {
+  const files = globalThis.__cottontailStandaloneFiles;
+  if (files == null) return false;
+  const raw = String(path);
+  const normalized = raw.replace(/\\/g, "/");
+  for (const candidate of normalized === raw ? [raw] : [raw, normalized]) {
+    if (typeof files.has === "function" && typeof files.get === "function") {
+      if (files.has(candidate)) return true;
+    } else if (typeof files === "object" && Object.prototype.hasOwnProperty.call(files, candidate)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function registerServeHtmlManifest(state, manifest) {
   const existing = state.manifests.get(manifest);
   if (existing) return existing;
@@ -5528,8 +5623,11 @@ function registerServeHtmlManifest(state, manifest) {
     if (item == null || typeof item !== "object" || typeof item.path !== "string") continue;
     const absolutePath = nodePathResolve(cwd, item.path);
     let stat;
-    try { stat = cottontail.statSync(absolutePath, true); } catch {}
-    if (!stat?.isFile) {
+    const isStandaloneFile = hasStandaloneServeHtmlFile(absolutePath);
+    if (!isStandaloneFile) {
+      try { stat = cottontail.statSync(absolutePath, true); } catch {}
+    }
+    if (!isStandaloneFile && !stat?.isFile) {
       throw new TypeError(`Bundled file ${item.path} not found. You may want to configure --asset-naming or \`naming\` when bundling.`);
     }
     const descriptor = serveHtmlFileDescriptor(

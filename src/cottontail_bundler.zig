@@ -1344,10 +1344,16 @@ pub fn parseBuildOptions(
             // callers supply their own cwd (including the plugin graph's
             // shadow directory), so anchor the JS option to that cwd instead
             // of whichever directory the process happens to use internally.
-            options.root_dir = try allocator.dupe(
-                u8,
-                compiler.path.joinAbsString(working_dir, &.{value.string}, .auto),
-            );
+            const resolved_root = compiler.path.joinAbsString(working_dir, &.{value.string}, .auto);
+            // Resolver source paths are canonical (for example, macOS turns
+            // /var into /private/var). Canonicalize an existing root too so
+            // [dir] naming compares paths in the same namespace instead of
+            // emitting traversal segments outside the standalone graph.
+            options.root_dir = std.Io.Dir.cwd().realPathFileAlloc(
+                std.Io.Threaded.global_single_threaded.io(),
+                resolved_root,
+                allocator,
+            ) catch try allocator.dupe(u8, resolved_root);
         }
     }
     if (object.get("env")) |value| switch (value) {

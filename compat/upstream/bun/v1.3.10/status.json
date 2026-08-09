@@ -48,7 +48,11 @@
     },
     "test/bundler/transpiler/jsx-production.test.ts": {
       "status": "enabled",
-      "reason": "Production JSX transform modes and generated output behavior pass upstream coverage under Cottontail."
+      "reason": "Production JSX transform modes and generated output behavior remain enabled across all 32 concurrent parent/child environment cases. The 30-second inner budget covers stock-JSC child startup on loaded builders; the focused 040850Z run's only per-case failures hit the copied 5-second deadline, so the 60-second outer budget preserves concurrency without hiding a semantic failure.",
+      "args": [
+        "--timeout=30000"
+      ],
+      "timeoutMs": 60000
     },
     "test/bundler/transpiler/macro-test.test.ts": {
       "status": "enabled",
@@ -111,13 +115,17 @@
     },
     "test/bake/dev/bundle.test.ts": {
       "status": "enabled",
-      "reason": "Bake bundle graph recovery, HTML diagnostics, client-side import validation, and loader behavior pass all 16 copied cases with 39 assertions; the outer budget covers cold multi-server startup.",
-      "timeoutMs": 120000
+      "reason": "Bake bundle graph recovery, HTML diagnostics, client-side import validation, and loader behavior pass all 16 copied cases with 39 assertions. These cases use the owned Bake harness's disconnect-aware, distinct-client HMR synchronization and encoded, normalized development-asset routes. They run serially because concurrent cold dev-server/HMR cases can exhaust their copied deadlines; the focused serial file completes in about 86 seconds within its outer budget.",
+      "timeoutMs": 120000,
+      "serial": true
     },
     "test/bake/dev/css.test.ts": {
       "status": "enabled",
-      "reason": "Bake CSS graph recovery, route attachments, content mutation, assets, diagnostics, and HTML invalidation pass all 12 copied cases with 62 assertions; the outer budget covers cold multi-server startup.",
-      "timeoutMs": 120000
+      "reason": "Bake CSS graph recovery, route attachments, content mutation, assets, diagnostics, and HTML invalidation pass all 12 copied cases with 62 assertions. These cases use the owned Bake harness's disconnect-aware, distinct-client HMR synchronization and encoded, normalized development-asset routes. A 2x copied-case deadline scale covers stock-JSC cold dev-server startup for the HTML invalidation case; the outer budget remains unchanged.",
+      "timeoutMs": 120000,
+      "env": {
+        "COTTONTAIL_TEST_TIMEOUT_SCALE": "2"
+      }
     },
     "test/bake/dev/ecosystem.test.ts": {
       "status": "enabled",
@@ -138,12 +146,12 @@
     },
     "test/bake/dev/esm.test.ts": {
       "status": "enabled",
-      "reason": "Bake ESM evaluation, namespace imports, live bindings, and runtime require/top-level-await diagnostics pass all 13 copied cases (36 assertions); the outer budget covers cold multi-server startup.",
+      "reason": "Bake ESM evaluation, namespace imports, live bindings, runtime require/top-level-await diagnostics, and browser-field preloads pass all 14 copied cases with 40 assertions. These cases use the owned Bake harness's disconnect-aware, distinct-client HMR synchronization and encoded, normalized development-asset routes; the outer budget covers cold multi-server startup.",
       "timeoutMs": 120000
     },
     "test/bake/dev/hot.test.ts": {
       "status": "enabled",
-      "reason": "Bake HTML hot updates, dependency invalidation, self-acceptance, syntax errors, and recovery pass all 8 copied cases (48 assertions); the outer budget covers cold multi-server startup.",
+      "reason": "Bake HTML hot updates, dependency invalidation, self-acceptance, syntax errors, and recovery pass all 8 copied cases with 48 assertions. These cases use the owned Bake harness's disconnect-aware, distinct-client HMR synchronization and encoded, normalized development-asset routes; the outer budget covers cold multi-server startup.",
       "timeoutMs": 120000
     },
     "test/bake/dev/import-meta-inline.test.ts": {
@@ -185,7 +193,7 @@
     },
     "test/bake/dev/sourcemap.test.ts": {
       "status": "enabled",
-      "reason": "Bake client source maps preserve original sources across primary and hot-reload chunks (2 cases, 6 assertions); the outer budget covers cold server startup.",
+      "reason": "Bake client source maps preserve original sources across 2 copied primary and hot-reload chunk cases with 6 assertions. These cases use the owned Bake harness's disconnect-aware, distinct-client HMR synchronization and encoded, normalized development-asset routes; the outer budget covers cold server startup.",
       "timeoutMs": 120000
     },
     "test/bake/dev/ssg-pages-router.test.ts": {
@@ -367,11 +375,15 @@
     },
     "test/bundler/bundler_html.test.ts": {
       "status": "enabled",
-      "reason": "Passes via the official runner on the native-bundler pipeline (file registers no tests in this environment, matching Bun CI)."
+      "reason": "All 21 generated HTML bundler cases pass with 122 assertions across HTML entry points, diagnostics, public paths, asset loaders, plugins, and cyclic JavaScript/HTML graphs."
     },
     "test/bundler/bundler_html_server.test.ts": {
       "status": "enabled",
-      "reason": "Passes via the official runner on the native-bundler pipeline (file registers no tests in this environment, matching Bun CI)."
+      "reason": "All four generated API/CLI compile-and-run cases cover single and multiple HTML routes. A 2x inner deadline scale accommodates the bounded stock-JSC compile, server startup, and fetch sequence without changing the copied cases; the outer budget covers the four-case aggregate.",
+      "env": {
+        "COTTONTAIL_TEST_TIMEOUT_SCALE": "2"
+      },
+      "timeoutMs": 60000
     },
     "test/bundler/bundler_jsx.test.ts": {
       "status": "enabled",
@@ -397,7 +409,14 @@
     },
     "test/bundler/bundler_minify.test.ts": {
       "status": "enabled",
-      "reason": "Defines 32 generated itBundled minification cases. The owned KeepNamesPreservesNames assertion accepts both Bun's anonymous-function output and Cottontail's explicit __name wrapper for the same inferred GH runtime name."
+      "reason": "Defines 32 generated itBundled minification cases. Thirty-one retain the exact copied expectations; KeepNamesPreservesNames remains a strict case-level expected failure because Cottontail intentionally emits explicit __name wrappers while preserving the anonymous inner function/class and assignment-inferred runtime names.",
+      "splitBundlerTests": true,
+      "expectedFailureBundlerTests": {
+        "minify/KeepNamesPreservesNames": "Cottontail preserves GH and OP runtime names with explicit __name wrappers, while the copied Bun assertion requires the anonymous function/class to appear as the direct assignment value. Owned native-build coverage verifies the wrapper keeps the inner syntax anonymous and the inferred runtime names intact."
+      },
+      "expectedFailureBundlerTestClassifications": {
+        "minify/KeepNamesPreservesNames": "upstream"
+      }
     },
     "test/bundler/bundler_minify_symbol_for.test.ts": {
       "status": "enabled",
@@ -629,11 +648,11 @@
     },
     "test/cli/hot/hot.test.ts": {
       "status": "enabled",
-      "reason": "All 11 unchanged hot-reload cases pass with 426 assertions across reloads, diagnostics, loaders, missing files, and source-map generation/loading. Deadlines are scaled for Cottontail's stock-JSC process startup and bundle throughput.",
+      "reason": "All 11 unchanged hot-reload cases cover 426 assertions across reloads, diagnostics, loaders, missing files, and source-map generation/loading. Two independent baseline runs reached only the exact scaled 20-second and 60-second deadlines in the bounded 50/100-reload source-map cases while all nine siblings passed, so a 4x inner scale and matching 240-second outer budget accommodate stock-JSC process startup and bundle throughput without serializing the file.",
       "env": {
-        "COTTONTAIL_TEST_TIMEOUT_SCALE": "2"
+        "COTTONTAIL_TEST_TIMEOUT_SCALE": "4"
       },
-      "timeoutMs": 120000
+      "timeoutMs": 240000
     },
     "test/cli/install/bad-workspace.test.ts": {
       "status": "skip",
@@ -1650,7 +1669,10 @@
     },
     "test/js/bun/import-attributes/import-attributes.test.ts": {
       "status": "enabled",
-      "reason": "Static and dynamic import attributes select Bun-compatible JS, JSX, TS, TSX, JSON, JSONC, TOML, YAML, text, file, SQLite, WebAssembly, and failure loaders across all 12 copied cases (91 assertions, 8 snapshots).",
+      "reason": "Static and dynamic import attributes select Bun-compatible JS, JSX, TS, TSX, JSON, JSONC, TOML, YAML, text, file, SQLite, WebAssembly, and failure loaders across all 12 copied cases (91 assertions, 8 snapshots). The 30-second inner deadline covers each case's bounded sequence of stock-JSC child launches; the focused 040850Z failures all arrived at roughly the copied 5-second default, while the existing 600-second outer budget remains unchanged.",
+      "args": [
+        "--timeout=30000"
+      ],
       "timeoutMs": 600000
     },
     "test/js/bun/ini/ini.test.ts": {
@@ -1778,7 +1800,7 @@
     },
     "test/js/bun/repl/repl.test.ts": {
       "status": "enabled",
-      "reason": "Bun-compatible piped and PTY REPL evaluation, persistence, TypeScript, imports, commands, errors, history, editing, signals, and -e/-p lifecycle behavior pass all 105 copied cases and 224 assertions.",
+      "reason": "Bun-compatible piped and PTY REPL evaluation, persistence, TypeScript, imports, commands, errors, history, editing, signals, and -e/-p lifecycle behavior cover all 105 copied cases and 224 assertions. The owned PTY helper clears pending editor input with Ctrl+C before issuing .exit, so tab-completion coverage cannot turn teardown into an unterminated command.",
       "args": [
         "--timeout",
         "30000",
@@ -2477,9 +2499,12 @@
     },
     "test/js/bun/test/snapshot-tests/snapshots/snapshot.test.ts": {
       "status": "enabled",
-      "reason": "External and inline snapshot conformance passes after excluding the separately classified grow-file performance case. The remaining aggregate still launches roughly 160 nested Cottontail test processes, so it keeps its verified 300-second outer budget and serial scheduling.",
+      "reason": "External and inline snapshot conformance remains an exact upstream source copy after excluding the separately classified grow-file performance case. The runner scales its copied five-second nested-process deadlines to 30 seconds for stock-JSC startup; the remaining aggregate launches roughly 160 Cottontail test processes, so it keeps its verified 300-second outer budget and serial scheduling.",
       "timeoutMs": 300000,
       "serial": true,
+      "env": {
+        "COTTONTAIL_TEST_TIMEOUT_SCALE": "6"
+      },
       "args": [
         "--test-name-pattern=^(?!.*grow file for new snapshot).*$"
       ],
@@ -4233,9 +4258,9 @@
     },
     "test/js/web/fetch/fetch.test.ts": {
       "status": "enabled",
-      "reason": "Fetch, Request, Response, Headers, Blob, Bun.file, redirects, framing, duplex uploads, aborts, and response lifecycle ownership cover 338 of 341 copied cases. A 10-second test timeout covers cold native compilation of the two --smol lifecycle child fixtures; the 300s harness budget covers the ~115s suite wall time. Three cases are excluded (see testNameExclusion): #3545 for external DNS (environment), and two HTTPS cases for the TLS-server parallel-load timing budget (performance).",
+      "reason": "Fetch, Request, Response, Headers, Blob, Bun.file, redirects, framing, duplex uploads, aborts, and response lifecycle ownership cover 338 of 341 copied cases. A 30-second per-test deadline covers cold native compilation of the two --smol lifecycle children and the loaded-builder event-loop turn latency observed in the local Bun.file request/response case; the 300-second harness budget remains unchanged. Three cases are excluded (see testNameExclusion): #3545 for external DNS (environment), and two HTTPS cases for the separately accounted TLS-server parallel-load timing budget (performance).",
       "args": [
-        "--timeout=10000",
+        "--timeout=30000",
         "--test-name-pattern=^(?!.*#3545)(?!.*simultaneous HTTPS fetch)(?!.*website with tlsextname).*$"
       ],
       "testNameExclusion": {
@@ -4246,7 +4271,7 @@
           "simultaneous HTTPS fetch",
           "website with tlsextname"
         ],
-        "reason": "This is a mixed exclusion. The schema records one aggregate classification per file, so the performance value above is the dominant scheduling bucket rather than a claim that all three cases are performance exclusions. Exact split: 'simultaneous HTTPS fetch' and 'website with tlsextname' are PERFORMANCE; both pass in isolation (<1s) but time out at 10000ms only under full-suite parallel load. Root cause is the TLS-server ~72ms synchronous per-context setup (escalation item 20): the single shared httpsServer serializes concurrent TLS handshakes, and 80 simultaneous HTTPS fetches (4 batches x 20) plus the other concurrent HTTPS cases exceed the per-test 10s deadline. Deterministic on this platform -- both the authoritative JavaScript baseline run and two clean A/B baseline runs (main binary) failed exactly these two, with all HTTP (non-TLS) siblings passing. Not the net-layer socket-read latency: a candidate socket-pump speedup (setImmediate) was measured to make this suite WORSE (2 -> 9 failures) via event-loop busy-spin, confirming the residual is TLS-server setup, not read scheduling. The fix is native async TLS-context setup, grouped with the deferred event-loop work; not a correctness gap. '#3545' is ENVIRONMENT: it fetches http://example.com and external DNS is not available on every compatibility host."
+        "reason": "This is a mixed exclusion. The schema records one aggregate classification per file, so the performance value above is the dominant scheduling bucket rather than a claim that all three cases are performance exclusions. Exact split: 'simultaneous HTTPS fetch' and 'website with tlsextname' are PERFORMANCE; both pass in isolation (<1s) but deterministically exceeded the former 10-second budget only under full-suite parallel load. Raising the general per-test deadline for bounded local file-backed request/response work does not silently re-enable or reclassify this separately accounted 80-connection TLS stress pair. Root cause is the TLS-server ~72ms synchronous per-context setup (escalation item 20): the single shared httpsServer serializes concurrent TLS handshakes, and 80 simultaneous HTTPS fetches (4 batches x 20) plus the other concurrent HTTPS cases exceeded that prior deadline. Both the authoritative JavaScript baseline run and two clean A/B baseline runs (main binary) failed exactly these two, with all HTTP (non-TLS) siblings passing. Not the net-layer socket-read latency: a candidate socket-pump speedup (setImmediate) was measured to make this suite WORSE (2 -> 9 failures) via event-loop busy-spin, confirming the residual is TLS-server setup, not read scheduling. The fix is native async TLS-context setup, grouped with the deferred event-loop work; not a correctness gap. '#3545' is ENVIRONMENT: it fetches http://example.com and external DNS is not available on every compatibility host."
       },
       "timeoutMs": 300000
     },
@@ -4413,7 +4438,7 @@
     },
     "test/napi/napi.test.ts": {
       "status": "enabled",
-      "reason": "All 93 active copied cases pass across native-addon bundling and compilation, registration, handle and finalizer lifetimes, async work, thread-safe functions, cleanup hooks, errors, and Node output parity (470 assertions). The owned standalone fixture routes its deferred napi_throw check through node_api_post_finalizer instead of invoking a GC-unsafe N-API operation directly from a finalizer. The file runs serially because it installs and rebuilds the shared napi-app native build directory also used by napi-value-ffi.test.ts.",
+      "reason": "All 93 active copied cases cover native-addon bundling and compilation, registration, handle and finalizer lifetimes, async work, thread-safe functions, cleanup hooks, errors, and Node output parity (470 assertions). The owned fixtures route the deferred napi_throw check through node_api_post_finalizer, retain the wrapped object until environment teardown so the check cannot race ordinary GC, and stringify uncaught non-Error values without making the comparison handler throw. The file runs serially because it installs and rebuilds the shared napi-app native build directory also used by napi-value-ffi.test.ts.",
       "args": [
         "--timeout=120000",
         "--max-concurrency=4"
@@ -5760,7 +5785,10 @@
     },
     "test/js/node/tls/node-tls-server.test.ts": {
       "status": "enabled",
-      "reason": "All cases are in scope. The owned test ports Bun's later load-order-independent watchdogs: successful listen cases rely on the test harness timeout, while TLS data/end/echo retain 500ms functional watchdogs (2s in debug)."
+      "reason": "All cases are in scope. The owned test ports Bun's later load-order-independent watchdogs: successful listen cases rely on the test harness timeout, while TLS data/end/echo retain 500ms functional watchdogs (2s in debug). Its Unix-domain fixture uses a short per-process pathname with afterAll cleanup, and the runner supplies an owned short temp root to stay below macOS sockaddr_un limits.",
+      "env": {
+        "COTTONTAIL_UPSTREAM_SHORT_TEMP": "1"
+      }
     },
     "test/js/node/util/bun-inspect.test.ts": {
       "status": "enabled",

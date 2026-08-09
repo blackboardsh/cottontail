@@ -71,7 +71,15 @@ compat/upstream/bun/*/sqlite:*
 compat/upstream/bun/*/test/js/third_party/prisma/prisma/sqlite/dev.db*
 
 # compile-mode diagnostics emitted at the repository root
+/app
+/app.exe
+/app.exe.map
+/app.map
 /chunk-*.js.map
 /entry
+/entry.exe
+/entry.exe.map
 /entry.map
+/nosourcemap_entry
+/nosourcemap_entry.exe
 /tests/js/fixtures/debug-compile-split/

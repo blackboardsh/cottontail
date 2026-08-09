@@ -88,7 +88,7 @@ test('review metadata freezes the Bun baseline and all routing destinations', ()
   assert.equal(entries.reduce(
     (count, entry) => count + Object.keys(entry.expectedFailureBundlerTests ?? {}).length,
     0,
-  ), 4);
+  ), 5);
 
   const [newNextPagesTest] = addRouting([
     { status: 'A', path: 'test/integration/next-pages/test/new-upstream.test.ts' },

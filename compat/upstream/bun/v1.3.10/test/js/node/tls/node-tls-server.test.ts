@@ -1,4 +1,4 @@
-import { readFileSync, realpathSync } from "fs";
+import { readFileSync, realpathSync, rmSync } from "fs";
 import { tls as cert1, isASAN, isCI, isDebug } from "harness";
 import { AddressInfo } from "net";
 import { createTest } from "node-harness";
@@ -8,7 +8,7 @@ import { join } from "path";
 import type { PeerCertificate } from "tls";
 import tls, { connect, createServer, rootCertificates, Server, TLSSocket } from "tls";
 
-const { describe, expect, it, createCallCheckCtx } = createTest(import.meta.path);
+const { afterAll, describe, expect, it, createCallCheckCtx } = createTest(import.meta.path);
 
 const passKeyFile = join(import.meta.dir, "fixtures", "rsa_private_encrypted.pem");
 const passKey = readFileSync(passKeyFile);
@@ -20,7 +20,11 @@ const cert = readFileSync(certFile);
 const COMMON_CERT = { ...cert1 };
 const functionalWatchdogMs = isDebug || isASAN || isCI ? 2000 : 500;
 
-const socket_domain = join(realpathSync(tmpdir()), "node-tls-server.sock");
+// Isolate the fixture from overlapping test processes while retaining a short
+// pathname for macOS's sockaddr_un limit.
+const socket_domain = join(realpathSync(tmpdir()), `bun-tls-${process.pid}.sock`);
+
+afterAll(() => rmSync(socket_domain, { force: true }));
 
 describe("tls.createServer listen", () => {
   it("should throw when no port or path when using options", done => {

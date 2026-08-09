@@ -449,32 +449,72 @@ export class Dev extends EventEmitter {
     let dev = this;
     return new Promise<void>((resolve, reject) => {
       let timer: NodeJS.Timer | null = null;
-      let clientWaits = 0;
+      // COTTONTAIL-COMPAT: Snapshot the client cohort for this update. A
+      // reconnect or teardown must not change the completion threshold, and a
+      // client may report readiness more than once while the build finishes.
+      // An expected-client failure rejects promptly instead of lowering the
+      // threshold or waiting for the outer test timeout.
+      const expectedClients = new Set(dev.connectedClients);
+      const clientsSeen = new Set<Client>();
       let seenMainEvent = false;
-      function cleanupAndResolve() {
-        verboseSynchronization("Cleaning up and resolving");
+      let settled = false;
+      const disposes = new Set<() => void>();
+      function cleanup() {
         timer !== null && clearTimeout(timer);
         dev.off("watch_synchronization", onEvent);
         for (const dispose of disposes) {
           dispose();
         }
-        if (fastBatches) resolve();
-        else setTimeout(resolve, 250);
+        disposes.clear();
       }
-      const disposes = new Set<() => void>();
-      for (const client of dev.connectedClients) {
+      function cleanupAndResolve() {
+        if (settled) return;
+        settled = true;
+        verboseSynchronization("Cleaning up and resolving");
+        cleanup();
+        if (fastBatches) resolve();
+        else timer = setTimeout(resolve, 250);
+      }
+      function cleanupAndReject(error: Error) {
+        if (settled) return;
+        settled = true;
+        verboseSynchronization("Cleaning up and rejecting");
+        cleanup();
+        reject(error);
+      }
+      for (const client of expectedClients) {
         const socketEventHandler = () => {
-          verboseSynchronization("Client received event");
-          clientWaits++;
-          if (seenMainEvent && clientWaits === dev.connectedClients.size) {
+          clientsSeen.add(client);
+          verboseSynchronization(`Client received event (${clientsSeen.size}/${expectedClients.size})`);
+          if (seenMainEvent && clientsSeen.size === expectedClients.size) {
             client.off("received-hmr-event", socketEventHandler);
             cleanupAndResolve();
           }
         };
+        const exitHandler = (exitCode: string | number | null, error?: Error) => {
+          const detail = error?.message
+            ? `: ${error.message}`
+            : exitCode == null
+              ? ""
+              : ` (exit ${exitCode})`;
+          cleanupAndReject(new Error(`HMR client exited before hot-reload synchronization completed${detail}`));
+        };
+        const errorHandler = (error: unknown) => {
+          const detail = error instanceof Error ? error.message : String(error);
+          cleanupAndReject(new Error(`HMR client failed before hot-reload synchronization completed: ${detail}`));
+        };
         client.on("received-hmr-event", socketEventHandler);
+        client.on("exit", exitHandler);
+        client.on("error", errorHandler);
         disposes.add(() => {
           client.off("received-hmr-event", socketEventHandler);
+          client.off("exit", exitHandler);
+          client.off("error", errorHandler);
         });
+        if (client.exited) {
+          exitHandler(client.exitCode);
+          return;
+        }
       }
       async function onEvent(kind: WatchSynchronization) {
         assert(kind !== WatchSynchronization.Started, "WatchSynchronization.Started should not be emitted");
@@ -482,15 +522,15 @@ export class Dev extends EventEmitter {
           seenMainEvent = true;
           cleanupAndResolve();
         } else if (kind === WatchSynchronization.AnyBuildFinishedWaitForWebSockets) {
-          verboseSynchronization("Need to wait for (" + clientWaits + "/" + dev.connectedClients.size + ") clients");
+          verboseSynchronization("Need to wait for (" + clientsSeen.size + "/" + expectedClients.size + ") clients");
           seenMainEvent = true;
-          if (clientWaits === dev.connectedClients.size) {
+          if (clientsSeen.size === expectedClients.size) {
             cleanupAndResolve();
           }
         } else if (kind === WatchSynchronization.ResultDidNotBundle) {
           if (wantsHmrEvent) {
             await Bun.sleep(500);
-            if (seenMainEvent) return;
+            if (settled || seenMainEvent) return;
             console.warn(
               "\x1b[33mWARN: Dev Server did not pick up any changed files. Consider wrapping this call in expectNoWebSocketActivity\x1b[35m",
             );

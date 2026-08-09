@@ -7,6 +7,11 @@ const workflowPath = new URL('../.github/workflows/bun-compat.yml', import.meta.
 const hutchManifestPath = new URL('../compat/upstream/hutch.json', import.meta.url);
 const hutchSetupPath = new URL('./setup-upstream-hutch.js', import.meta.url);
 const statusPath = new URL('../compat/upstream/bun/v1.3.10/status.json', import.meta.url);
+const expectBundledPath = new URL(
+  '../compat/upstream/bun/v1.3.10/test/bundler/expectBundled.ts',
+  import.meta.url,
+);
+const bunTestAdapterPath = new URL('../src/runtime_modules/node/test.js', import.meta.url);
 // Windows runners may check the repository out with CRLF line endings;
 // normalize so the contract regexes match regardless of checkout config.
 const readText = (path) => readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
@@ -14,6 +19,8 @@ const workflow = readText(workflowPath);
 const hutchManifest = JSON.parse(readText(hutchManifestPath));
 const hutchSetup = readText(hutchSetupPath);
 const status = JSON.parse(readText(statusPath));
+const expectBundled = readText(expectBundledPath);
+const bunTestAdapter = readText(bunTestAdapterPath);
 
 function workflowTriggers(source) {
   const end = source.indexOf('\npermissions:');
@@ -113,4 +120,21 @@ test('builds and passes the pinned Hutch engine to split package fixtures', () =
     workflow,
     /--hutch "\$HUTCH_ENGINE" --test test\/bundler\/bundler_npm\.test\.ts --case '\^npm\/LodashES\$' --expect-pass --jobs 1/,
   );
+});
+
+test('generated bundler deadlines use the owned timeout scale exactly once', () => {
+  assert.doesNotMatch(
+    expectBundled,
+    /COTTONTAIL_TEST_TIMEOUT_SCALE/,
+    'the copied generated-bundler harness must not apply the owned adapter scale a second time',
+  );
+  assert.match(
+    bunTestAdapter,
+    /const configuredTimeoutScale = Number\([\s\S]*COTTONTAIL_TEST_TIMEOUT_SCALE[\s\S]*return duration \* timeoutScale;/,
+  );
+
+  const htmlServer = status.tests['test/bundler/bundler_html_server.test.ts'];
+  assert.equal(htmlServer.status, 'enabled');
+  assert.deepEqual(htmlServer.env, { COTTONTAIL_TEST_TIMEOUT_SCALE: '2' });
+  assert.equal(htmlServer.timeoutMs, 60_000);
 });

@@ -4868,6 +4868,15 @@ fn bundleScriptNative(
     const is_internal_macro_eval = is_eval_entrypoint and for (exec_args) |arg| {
         if (std.mem.eql(u8, arg, "--cottontail-macro-mode")) break true;
     } else false;
+    var runtime_cli_define_keys: std.ArrayList([]const u8) = .empty;
+    var runtime_cli_define_values: std.ArrayList([]const u8) = .empty;
+    try cli_run_execution.collectRuntimeDefines(
+        ctx.allocator,
+        &runtime_cli_define_keys,
+        &runtime_cli_define_values,
+        exec_args,
+    );
+    const has_runtime_cli_defines = runtime_cli_define_keys.items.len > 0;
     // A nested `cottontail -e` is a new runtime invocation. Parent test-runner
     // bookkeeping must not turn its launcher into another test harness.
     const is_test_cli_execution = !is_eval_entrypoint and
@@ -4920,7 +4929,7 @@ fn bundleScriptNative(
         .test_cli_execution = is_test_runtime_execution,
         .wasm_entrypoint = is_wasm_entrypoint,
         .uses_module_mock = entrypoint_uses_module_mock,
-    }) and !has_bun_compat_transform and
+    }) and !has_runtime_cli_defines and !has_bun_compat_transform and
         // The reusable launcher resolves the original entry from disk after
         // its wrapper has been bundled, so compiler-only tsconfig path aliases
         // cannot reach that graph. An explicit override must use the native
@@ -5052,6 +5061,7 @@ fn bundleScriptNative(
         !ignore_dce_annotations and
         reload_dependencies_out == null and
         features.items.len == 0 and
+        !has_runtime_cli_defines and
         tsconfig_override == null and
         !package_json_patch.active and
         ctx.environ_map.get("COTTONTAIL_RUNTIME_MODULES_DIR") == null and
@@ -5196,6 +5206,10 @@ fn bundleScriptNative(
     var runtime_define_values: std.ArrayList([]const u8) = .empty;
     try runtime_define_keys.appendSlice(ctx.allocator, options.define_keys);
     try runtime_define_values.appendSlice(ctx.allocator, options.define_values);
+    // Runtime CLI defines follow configured/build defines, matching the CLI's
+    // last-value-wins precedence when the compiler normalizes these arrays.
+    try runtime_define_keys.appendSlice(ctx.allocator, runtime_cli_define_keys.items);
+    try runtime_define_values.appendSlice(ctx.allocator, runtime_cli_define_values.items);
     for ([_]struct { key: []const u8, value: []const u8 }{
         .{ .key = "import.meta.resolveSync", .value = "globalThis.__ctMetaResolveSync" },
         .{ .key = "import.meta.resolve", .value = "globalThis.__ctMetaResolve" },
@@ -7058,26 +7072,36 @@ fn buildCliPreloadImports(ctx: *const Context, script_abs: []const u8, exec_args
 // 1 fail + 1 error) instead of surfacing as a fatal process error. Emits the
 // `catch` clause for the entry wrapper's `try`/`finally`; the JS side lives in
 // the runner (Symbol.for("cottontail.internal.testModuleLoadError")). The hook
-// is registered lazily with the runner module, so the catch loads "bun:test"
-// first when nothing claimed the error. Outside test mode this is empty.
+// is registered lazily with the runner module, so the catch loads the bun:test
+// runtime module first when nothing claimed the error. Use its absolute virtual
+// path so bare wrappers do not depend on the builtin-import lowering helper.
+// Outside test mode this is empty.
 fn testModuleLoadErrorCatch(ctx: *const Context, test_cli_execution: bool, path_literal: []const u8) ![]const u8 {
     if (!test_cli_execution) return "";
-    return std.fmt.allocPrint(ctx.allocator, " catch (error) {{ const __ctLoadErrorHook = () => globalThis[Symbol.for(\"cottontail.internal.testModuleLoadError\")]?.(error, {s}); if (!__ctLoadErrorHook()) {{ try {{ await import(\"bun:test\"); }} catch {{}} if (!__ctLoadErrorHook()) throw error; }} }}", .{path_literal});
+    const bun_test_literal = try jsonStringLiteral(
+        ctx,
+        try runtimeModulePath(ctx, &.{ "bun", "test.js" }),
+    );
+    return std.fmt.allocPrint(ctx.allocator, " catch (error) {{ const __ctLoadErrorHook = () => globalThis[Symbol.for(\"cottontail.internal.testModuleLoadError\")]?.(error, {s}); if (!__ctLoadErrorHook()) {{ try {{ await import({s}); }} catch {{}} if (!__ctLoadErrorHook()) throw error; }} }}", .{ path_literal, bun_test_literal });
 }
 
 // Finish a single-file test entry through the same node:test runner used by
 // files that import bun:test themselves. Explicit files without registrations
 // still need an empty coverage report, so load the runner on demand and mark
 // the entrypoint as complete before invoking its finalizer hook.
-fn testModuleFinalizeSource(test_cli_execution: bool) []const u8 {
+fn testModuleFinalizeSource(ctx: *const Context, test_cli_execution: bool) ![]const u8 {
     if (!test_cli_execution) return "  globalThis.__cottontailLoadingTestModules = false;\n" ++
         "  globalThis[Symbol.for(\"cottontail.internal.startTestRun\")]?.();";
-    return "  globalThis.__cottontailLoadingTestModules = false;\n" ++
+    const node_test_literal = try jsonStringLiteral(
+        ctx,
+        try runtimeModulePath(ctx, &.{ "node", "test.js" }),
+    );
+    return std.fmt.allocPrint(ctx.allocator, "  globalThis.__cottontailLoadingTestModules = false;\n" ++
         "  globalThis.__cottontailTestEntrypointLoaded = true;\n" ++
-        "  if (typeof globalThis[Symbol.for(\"cottontail.internal.startTestRun\")] !== \"function\") {\n" ++
-        "    globalThis.__cottontailNodeTestRuntime = await import(\"node:test\");\n" ++
-        "  }\n" ++
-        "  globalThis[Symbol.for(\"cottontail.internal.startTestRun\")]?.();";
+        "  if (typeof globalThis[Symbol.for(\"cottontail.internal.startTestRun\")] !== \"function\") {{\n" ++
+        "    globalThis.__cottontailNodeTestRuntime = await import({s});\n" ++
+        "  }}\n" ++
+        "  globalThis[Symbol.for(\"cottontail.internal.startTestRun\")]?.();", .{node_test_literal});
 }
 
 fn writeReusedReloadEntryWrapper(
@@ -7111,7 +7135,7 @@ fn writeReusedReloadEntryWrapper(
         test_header_signal,
         try jsonStringLiteral(ctx, script_import_abs),
         try testModuleLoadErrorCatch(ctx, test_cli_execution, try jsonStringLiteral(ctx, script_abs)),
-        testModuleFinalizeSource(test_cli_execution),
+        try testModuleFinalizeSource(ctx, test_cli_execution),
     });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
@@ -7166,7 +7190,7 @@ fn writeBareRuntimeEntryWrapper(
         test_header_signal,
         try jsonStringLiteral(ctx, script_import_abs),
         try testModuleLoadErrorCatch(ctx, test_cli_execution, try jsonStringLiteral(ctx, script_abs)),
-        testModuleFinalizeSource(test_cli_execution),
+        try testModuleFinalizeSource(ctx, test_cli_execution),
     });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
@@ -7299,7 +7323,7 @@ fn writeMinimalRuntimeEntryWrapper(
         preload_imports,
         try jsonStringLiteral(ctx, script_import_abs),
         try testModuleLoadErrorCatch(ctx, test_cli_execution, try jsonStringLiteral(ctx, script_abs)),
-        testModuleFinalizeSource(test_cli_execution),
+        try testModuleFinalizeSource(ctx, test_cli_execution),
     });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
@@ -7445,7 +7469,7 @@ fn writeCottontailEntryWrapper(
             script_literal,
             script_import_literal,
             try testModuleLoadErrorCatch(ctx, test_cli_execution, script_literal),
-            testModuleFinalizeSource(test_cli_execution),
+            try testModuleFinalizeSource(ctx, test_cli_execution),
         },
     );
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
@@ -7655,6 +7679,102 @@ fn collectSelfNamespaceExports(
     return try exports.toOwnedSlice(allocator);
 }
 
+fn appendSelfNamespaceRegistration(
+    ctx: *const Context,
+    output: *std.ArrayList(u8),
+    source: []const u8,
+    self_path: []const u8,
+) !void {
+    const self_exports = try collectSelfNamespaceExports(ctx.allocator, source);
+    defer ctx.allocator.free(self_exports);
+    try output.appendSlice(ctx.allocator,
+        \\{
+        \\  const __ctSelfMarkerValues = new WeakMap();
+        \\  const __ctSelfNamespacePrototype = Object.create(null);
+        \\  Object.defineProperty(__ctSelfNamespacePrototype, "__esModule", {
+        \\    get() { return __ctSelfMarkerValues.get(this); },
+        \\    set(value) { if (value === true) __ctSelfMarkerValues.set(this, true); else __ctSelfMarkerValues.delete(this); },
+        \\  });
+        \\  const __ctSelfNamespace = globalThis.__cottontailCreateRegisteredSelfModuleNamespace?.() ?? Object.create(__ctSelfNamespacePrototype);
+        \\  if (__ctSelfNamespace[Symbol.toStringTag] !== "Module") Object.defineProperty(__ctSelfNamespace, Symbol.toStringTag, { value: "Module" });
+        \\
+    );
+    for (self_exports) |item| {
+        try output.appendSlice(ctx.allocator, "  Object.defineProperty(__ctSelfNamespace, ");
+        try output.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, item.exported_name));
+        try output.appendSlice(ctx.allocator, ", { enumerable: true, get: () => ");
+        try output.appendSlice(ctx.allocator, item.local_name);
+        try output.appendSlice(ctx.allocator, " });\n");
+    }
+    const self_path_literal = try jsonStringLiteral(ctx, self_path);
+    try output.appendSlice(
+        ctx.allocator,
+        "  const __ctSelfNamespaces = globalThis[Symbol.for(\"cottontail.registeredSelfEsmNamespaces\")] ??= new Map();\n",
+    );
+    try output.appendSlice(ctx.allocator, "  __ctSelfNamespaces.set(");
+    try output.appendSlice(ctx.allocator, self_path_literal);
+    try output.appendSlice(ctx.allocator, ", __ctSelfNamespace);\n");
+    try output.appendSlice(
+        ctx.allocator,
+        "  globalThis.__cottontailGetRegisteredSelfModuleNamespace ??= path => __ctSelfNamespaces.get(String(path));\n" ++
+            "  globalThis.__cottontailImportRegisteredSelfModule ??= async path => __ctSelfNamespaces.get(String(path));\n" ++
+            "  globalThis.__cottontailRegisterSelfModuleNamespace?.(",
+    );
+    try output.appendSlice(ctx.allocator, self_path_literal);
+    try output.appendSlice(ctx.allocator, ", __ctSelfNamespace);\n}\n");
+}
+
+fn hasLiteralSelfRequire(
+    ctx: *const Context,
+    source: []const u8,
+    source_path: []const u8,
+    resolution_dir: []const u8,
+) !bool {
+    var cursor: usize = 0;
+    while (cursor < source.len) {
+        if (source[cursor] == '\'' or source[cursor] == '"' or source[cursor] == '`') {
+            cursor = skipQuotedJavaScript(source, cursor);
+            continue;
+        }
+        if (source[cursor] == '/') {
+            const after_comment = skipJavaScriptComment(source, cursor);
+            if (after_comment != cursor) {
+                cursor = after_comment;
+                continue;
+            }
+        }
+        if (!std.mem.startsWith(u8, source[cursor..], "require") or
+            (cursor > 0 and isIdentifierPart(source[cursor - 1])) or
+            (cursor + "require".len < source.len and isIdentifierPart(source[cursor + "require".len])))
+        {
+            cursor += 1;
+            continue;
+        }
+        var argument = skipWhitespace(source, cursor + "require".len);
+        if (argument >= source.len or source[argument] != '(') {
+            cursor += "require".len;
+            continue;
+        }
+        argument = skipWhitespace(source, argument + 1);
+        if (argument >= source.len or (source[argument] != '\'' and source[argument] != '"')) {
+            cursor += "require".len;
+            continue;
+        }
+        const specifier_end = skipQuotedJavaScript(source, argument);
+        const specifier = (try decodeJavaScriptStringPrefix(ctx.allocator, source[argument..specifier_end])) orelse {
+            cursor = specifier_end;
+            continue;
+        };
+        const target_path = (try resolveDynamicImportTarget(ctx, resolution_dir, specifier)) orelse {
+            cursor = specifier_end;
+            continue;
+        };
+        if (std.mem.eql(u8, target_path, source_path)) return true;
+        cursor = specifier_end;
+    }
+    return false;
+}
+
 fn rewriteSelfNamespaceImports(
     ctx: *const Context,
     source: []const u8,
@@ -7688,6 +7808,40 @@ fn rewriteSelfNamespaceImports(
         }
 
         const clause_start = skipWhitespace(source, cursor + "import".len);
+        if (clause_start < source.len and source[clause_start] == '(') {
+            const specifier_start = skipWhitespace(source, clause_start + 1);
+            if (specifier_start < source.len and
+                (source[specifier_start] == '\'' or source[specifier_start] == '"'))
+            {
+                const specifier_end = skipQuotedJavaScript(source, specifier_start);
+                const call_end = skipWhitespace(source, specifier_end);
+                if (call_end < source.len and source[call_end] == ')') {
+                    const specifier = (try decodeJavaScriptStringPrefix(
+                        ctx.allocator,
+                        source[specifier_start..specifier_end],
+                    )) orelse {
+                        cursor = call_end + 1;
+                        continue;
+                    };
+                    const target_path = (try resolveDynamicImportTarget(ctx, resolution_dir, specifier)) orelse {
+                        cursor = call_end + 1;
+                        continue;
+                    };
+                    if (std.mem.eql(u8, target_path, source_path)) {
+                        try output.appendSlice(ctx.allocator, source[copied_until..cursor]);
+                        try output.appendSlice(ctx.allocator, "globalThis.__cottontailImportRegisteredSelfModule(");
+                        try output.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, source_path));
+                        try output.append(ctx.allocator, ')');
+                        copied_until = call_end + 1;
+                        cursor = copied_until;
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+            cursor += "import".len;
+            continue;
+        }
         if (clause_start >= source.len or source[clause_start] != '*') {
             cursor += "import".len;
             continue;
@@ -7848,8 +8002,22 @@ fn writeBunCompatTransformedSource(
         (try originalPathFromSourceMarker(ctx.allocator, source)) orelse script_abs
     else
         script_abs;
-    if (try rewriteSelfNamespaceImports(ctx, transformed_source, script_abs, resolution_dir)) |transformed| {
+    var rewrote_self_namespace = false;
+    if (try rewriteSelfNamespaceImports(ctx, transformed_source, original_path, resolution_dir)) |transformed| {
         transformed_source = transformed;
+        rewrote_self_namespace = true;
+        changed = true;
+    }
+    var registered_self_namespace = false;
+    const needs_self_registration = sourceLooksEsm(transformed_source) and
+        (rewrote_self_namespace or
+            try hasLiteralSelfRequire(ctx, transformed_source, original_path, resolution_dir));
+    if (needs_self_registration) {
+        var registered_source: std.ArrayList(u8) = .empty;
+        try appendSelfNamespaceRegistration(ctx, &registered_source, transformed_source, original_path);
+        try registered_source.appendSlice(ctx.allocator, transformed_source);
+        transformed_source = try registered_source.toOwnedSlice(ctx.allocator);
+        registered_self_namespace = true;
         changed = true;
     }
     const plain_common_js = !sourceLooksEsm(transformed_source) and
@@ -7858,13 +8026,14 @@ fn writeBunCompatTransformedSource(
             std.mem.indexOf(u8, transformed_source, "module.exports") != null or
             std.mem.indexOf(u8, transformed_source, "exports.") != null);
     if (!plain_common_js) {
+        const query_self_alias: ?[]const u8 = if (registered_self_namespace) null else original_path;
         if (try rewriteQueryImports(
             ctx,
             transformed_source,
             resolution_dir,
             transpilerLoaderForPath(script_abs),
             preserve_static_html_imports,
-            original_path,
+            query_self_alias,
         )) |transformed| {
             transformed_source = transformed;
             changed = true;
@@ -8422,6 +8591,8 @@ fn scanDynamicImports(
     const is_bun_transpiled_artifact = hasBunTranspiledPragma(source);
     var runtime_dynamic_import_starts: std.ArrayList(usize) = .empty;
     defer runtime_dynamic_import_starts.deinit(ctx.allocator);
+    var runtime_static_import_starts: std.ArrayList(usize) = .empty;
+    defer runtime_static_import_starts.deinit(ctx.allocator);
     var has_runtime_import_ranges = false;
     if (source_loader) |loader| {
         const ranges_json = native_transpiler.scanImportRangesJson(source, loader) catch null;
@@ -8438,9 +8609,11 @@ fn scanDynamicImports(
                 defer document.deinit();
                 has_runtime_import_ranges = true;
                 for (document.value) |record| {
-                    if (record.start >= 0 and std.mem.eql(u8, record.kind, "dynamic-import")) {
-                        try runtime_dynamic_import_starts.append(ctx.allocator, @intCast(record.start));
-                    }
+                    if (record.start < 0) continue;
+                    if (std.mem.eql(u8, record.kind, "dynamic-import"))
+                        try runtime_dynamic_import_starts.append(ctx.allocator, @intCast(record.start))
+                    else if (std.mem.eql(u8, record.kind, "import-statement"))
+                        try runtime_static_import_starts.append(ctx.allocator, @intCast(record.start));
                 }
             }
         }
@@ -8601,6 +8774,24 @@ fn scanDynamicImports(
             if (specifier_end > source.len) {
                 cursor += "import".len;
                 continue;
+            }
+            if (has_runtime_import_ranges) {
+                var is_runtime_import = false;
+                for (runtime_static_import_starts.items) |start| {
+                    if (start == specifier_start) {
+                        is_runtime_import = true;
+                        break;
+                    }
+                }
+                // The compatibility scanner intentionally recognizes a few
+                // Bun-only import forms in addition to the parser. For
+                // ordinary static imports, however, the parser is the source
+                // of truth: import-looking text inside strings and templates
+                // must remain data (bundler fixtures frequently contain it).
+                if (!is_runtime_import) {
+                    cursor = specifier_end;
+                    continue;
+                }
             }
             const semicolon = std.mem.indexOfScalarPos(u8, source, specifier_end, ';') orelse {
                 cursor = specifier_end;
@@ -9044,6 +9235,8 @@ fn appendDynamicTargetFactory(
         \\const __ctPath{d} = {s};
         \\const __ctURL{d} = __ctDynamicPathToFileURL(__ctPath{d}).href;
         \\function __ctLoad{d}(specifier, options) {{
+        \\  const __ctRegisteredSelf = globalThis.__cottontailGetRegisteredSelfModuleNamespace?.(__ctPath{d});
+        \\  if (__ctRegisteredSelf !== undefined) return Promise.resolve(__ctRegisteredSelf);
         \\  const __ctText = String(specifier);
         \\  const __ctMarker = __ctText.search(/[?#]/);
         \\  const __ctSuffix = __ctMarker < 0 ? "" : __ctText.slice(__ctMarker);
@@ -9084,7 +9277,7 @@ fn appendDynamicTargetFactory(
         \\    const module = {{ exports: {{}} }};
         \\    const exports = module.exports;
         \\
-    , .{ index, path_literal, index, index, index, index, index, inferred_loader_literal, index, index, dirname_literal, dirname_literal, basename_literal, index, index, index, index, index, raw_literal, index, index, index, index });
+    , .{ index, path_literal, index, index, index, index, index, index, inferred_loader_literal, index, index, dirname_literal, dirname_literal, basename_literal, index, index, index, index, index, raw_literal, index, index, index, index });
     try output.appendSlice(ctx.allocator, prefix);
     try output.appendSlice(ctx.allocator, "    const __ctDefaultFactorySource = ");
     try appendDynamicFactorySourceLiteral(
@@ -9572,24 +9765,7 @@ fn rewriteQueryImports(
     // exports so a dynamic self-import (`await import(import.meta.path)`)
     // returns the in-flight module instead of re-evaluating the source.
     if (self_alias_path) |self_path| {
-        const self_exports = try collectSelfNamespaceExports(ctx.allocator, source);
-        defer ctx.allocator.free(self_exports);
-        try output.appendSlice(ctx.allocator,
-            \\{
-            \\  const __ctSelfNamespace = {};
-            \\  Object.defineProperty(__ctSelfNamespace, Symbol.toStringTag, { value: "Module" });
-            \\
-        );
-        for (self_exports) |item| {
-            try output.appendSlice(ctx.allocator, "  Object.defineProperty(__ctSelfNamespace, ");
-            try output.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, item.exported_name));
-            try output.appendSlice(ctx.allocator, ", { enumerable: true, get: () => ");
-            try output.appendSlice(ctx.allocator, item.local_name);
-            try output.appendSlice(ctx.allocator, " });\n");
-        }
-        try output.appendSlice(ctx.allocator, "  globalThis.__cottontailRegisterSelfModuleNamespace?.(");
-        try output.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, self_path));
-        try output.appendSlice(ctx.allocator, ", __ctSelfNamespace);\n}\n");
+        try appendSelfNamespaceRegistration(ctx, &output, source, self_path);
     }
 
     var copied_until: usize = 0;
@@ -9782,7 +9958,7 @@ fn writeLazyRuntimeEntryWrapper(
         cpu_profiler_start_statement,
         preload_imports,
         try testModuleLoadErrorCatch(ctx, test_cli_execution, try jsonStringLiteral(ctx, script_abs)),
-        testModuleFinalizeSource(test_cli_execution),
+        try testModuleFinalizeSource(ctx, test_cli_execution),
     });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
@@ -9938,7 +10114,7 @@ fn writeSelectiveEvalCommonJsEntryWrapper(
         cpu_profiler_start_statement,
         preload_imports,
         try testModuleLoadErrorCatch(ctx, test_cli_execution, "__ctEntryPath"),
-        testModuleFinalizeSource(test_cli_execution),
+        try testModuleFinalizeSource(ctx, test_cli_execution),
     });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
@@ -10031,7 +10207,7 @@ fn writeLazyCommonJsEntryWrapper(
         preload_imports,
         main_action,
         try testModuleLoadErrorCatch(ctx, test_cli_execution, script_literal),
-        testModuleFinalizeSource(test_cli_execution),
+        try testModuleFinalizeSource(ctx, test_cli_execution),
     });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
@@ -10369,7 +10545,7 @@ fn writeRuntimeEntryWrapper(
         \\}}{s} finally {{
         \\{s}
         \\}}
-    , .{ test_header_signal, cpu_profiler_start_statement, preload_imports, main_action, try testModuleLoadErrorCatch(ctx, test_cli_execution, script_literal), testModuleFinalizeSource(test_cli_execution) });
+    , .{ test_header_signal, cpu_profiler_start_statement, preload_imports, main_action, try testModuleLoadErrorCatch(ctx, test_cli_execution, script_literal), try testModuleFinalizeSource(ctx, test_cli_execution) });
     const bootstrap = try std.fmt.allocPrint(
         ctx.allocator,
         \\globalThis.__cottontailBundleSourceMap ??= {s};

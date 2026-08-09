@@ -334,16 +334,103 @@ function emptyReport(path) {
   };
 }
 
-function isGeneratedModuleWrapper(source, starts, functionStart) {
+function generatedFunctionBody(source, starts, functionStart) {
   if (!Number.isSafeInteger(functionStart) || functionStart < 0 || functionStart > source.length) {
-    return false;
+    return null;
   }
-  const generatedLine = lineForOffset(starts, functionStart);
-  const prefix = source.slice(starts[generatedLine] ?? 0, functionStart);
-  // The linker emits these declarations at the start of a generated line.
-  // Matching the declaration shape matters: user code can legitimately pass a
-  // callback to an object method called __esmForce, __esm, or __commonJS.
-  return /^(?:var init_[\w$]+ = __esm(?:Force)?|var require_[\w$]+ = __commonJS)\($/.test(prefix);
+
+  const triviaOnly = (start, end) => {
+    let cursor = start;
+    while (cursor < end) {
+      const code = source.charCodeAt(cursor);
+      if (code === 9 || code === 10 || code === 13 || code === 32) {
+        cursor += 1;
+        continue;
+      }
+      if (source.startsWith("/*", cursor)) {
+        const close = source.indexOf("*/", cursor + 2);
+        if (close < 0 || close + 2 > end) return false;
+        cursor = close + 2;
+        continue;
+      }
+      if (source.startsWith("//", cursor)) {
+        const newline = source.indexOf("\n", cursor + 2);
+        if (newline < 0 || newline >= end) return false;
+        cursor = newline + 1;
+        continue;
+      }
+      return false;
+    }
+    return true;
+  };
+
+  const windowStart = Math.max(0, functionStart - 512);
+  const direct = source.slice(functionStart, Math.min(source.length, functionStart + 512));
+  const directHeader = direct.match(/^(?:(?:async\s+)?function(?:\s*\*)?(?:\s+[$\w]+)?\s*\([^()]*\)|(?:async\s+)?(?:\([^()]*\)|[$\w]+)\s*=>|(?:(?:get|set|async)\s+)?(?:[$\w]+|\[[^\]\n]+\])\s*\([^()]*\))\s*/);
+  let headerStart = windowStart;
+  let arrow = false;
+  let bodyStart = source[functionStart] === "{" ? functionStart : -1;
+  if (directHeader != null) {
+    headerStart = functionStart;
+    arrow = directHeader[0].includes("=>");
+    const afterHeader = functionStart + directHeader[0].length;
+    bodyStart = afterHeader;
+  }
+  if (bodyStart < 0) {
+    for (let open = source.lastIndexOf("{", functionStart - 1);
+      open >= windowStart;
+      open = source.lastIndexOf("{", open - 1)) {
+      if (triviaOnly(open + 1, functionStart)) {
+        bodyStart = open;
+        break;
+      }
+    }
+  }
+
+  if (directHeader == null && bodyStart >= 0) {
+    const header = source.slice(windowStart, bodyStart);
+    const match = header.match(/(?:\b(?:async\s+)?function(?:\s*\*)?(?:\s+[$\w]+)?\s*\([^()]*\)|(?:\([^()]*\)|[$\w]+)\s*=>|(?:(?:get|set|async)\s+)?(?:[$\w]+|\[[^\]\n]+\])\s*\([^()]*\))\s*$/);
+    if (match == null) return null;
+    headerStart = windowStart + (match.index ?? 0);
+    arrow = match[0].includes("=>");
+  } else if (directHeader == null) {
+    const arrowOffset = source.lastIndexOf("=>", functionStart);
+    if (arrowOffset < windowStart || !triviaOnly(arrowOffset + 2, functionStart)) return null;
+    const header = source.slice(windowStart, arrowOffset + 2);
+    const match = header.match(/(?:\([^()]*\)|[$\w]+)\s*=>\s*$/);
+    if (match == null) return null;
+    headerStart = windowStart + (match.index ?? 0);
+    bodyStart = functionStart;
+    arrow = true;
+  }
+
+  const generatedLine = lineForOffset(starts, headerStart);
+  const lineStart = starts[generatedLine] ?? 0;
+  const declaration = source.slice(lineStart, bodyStart + 1);
+  const syntheticModuleWrapper = /^\s*var\s+(?:init_|require_)[\w$]*\s*=\s*__(?:esm(?:Force)?|commonJS)\b/.test(declaration);
+  const exportGetter = arrow && /^\s*[$\w]+\s*:\s*(?:async\s+)?(?:\([^()]*\)|[$\w]+)\s*=>/.test(declaration) &&
+    source.lastIndexOf("__export(", lineStart) > source.lastIndexOf("});", lineStart);
+  return { start: bodyStart, synthetic: syntheticModuleWrapper || exportGetter };
+}
+
+function recordFunction(report, key, bounds, executed) {
+  report.functions.set(key, report.functions.get(key) === true || executed);
+  report.functionRanges.push({ ...bounds, executed });
+  if (executed) return;
+
+  for (let line = bounds.minimum; line <= bounds.maximum; line += 1) {
+    report.executableLines.delete(line);
+    report.lineHits.delete(line);
+  }
+  const end = Math.min(bounds.maximum, report.lineCount);
+  for (let line = bounds.minimum; line < end; line += 1) {
+    report.executableLines.add(line);
+  }
+  const terminal = report.sourceLines[bounds.maximum]?.trim() ?? "";
+  if (/^(?:return|throw)\s+(?:[-+]?\d|true\b|false\b|null\b|undefined\b)/.test(terminal)) {
+    report.executableLines.add(bounds.maximum);
+    report.lineHits.set(bounds.maximum, 1);
+  }
 }
 
 function collectReports(options) {
@@ -380,10 +467,6 @@ function collectReports(options) {
   const functions = nativeCoverage.functions.length > 1
     ? nativeCoverage.functions.slice(1)
     : nativeCoverage.functions;
-  const userFunctions = functions.filter((fn) => {
-    const localStart = fn.start - sourceOffset;
-    return !isGeneratedModuleWrapper(evaluatedSource, starts, localStart);
-  });
 
   function reportFor(mapping) {
     if (sourceCache.has(mapping.source)) return sourceCache.get(mapping.source);
@@ -436,47 +519,88 @@ function collectReports(options) {
     }
   }
 
-  for (const fn of userFunctions) {
-    if (fn.start < sourceOffset || fn.end > sourceEnd) continue;
+  function mappedFunctionCandidate(fn, start, end, coordinate) {
+    if (!Number.isFinite(start) || !Number.isFinite(end) ||
+        start < 0 || end > evaluatedSource.length || end <= start) {
+      return null;
+    }
+    const body = generatedFunctionBody(evaluatedSource, starts, start);
+    if (body == null || body.synthetic) return null;
     const rangeMappings = mappingsForRange(
       mappings,
       starts,
       evaluatedSource.length,
-      fn.start - sourceOffset,
-      fn.end - sourceOffset,
+      start,
+      end,
     );
-    const reportsInFunction = new Map();
+    let report = null;
+    let bounds = null;
+    let first = null;
+    let last = null;
+    let hasForeignMapping = false;
     for (const { mapping } of rangeMappings) {
-      const report = reportFor(mapping);
-      if (report == null) continue;
+      const mappedReport = reportFor(mapping);
+      if (mappedReport == null) {
+        // A native provider range that enters another bundled source is a
+        // linker/runtime function, even when its remaining mapped extent
+        // happens to touch exactly one project module.
+        hasForeignMapping = true;
+        continue;
+      }
+      if (report != null && report !== mappedReport) return null;
+      report = mappedReport;
       const line = options.ignoreSourceMaps ? mapping.generatedLine : mapping.originalLine;
-      if (!Number.isSafeInteger(line) || line < 0) continue;
-      const bounds = reportsInFunction.get(report);
-      if (bounds == null) reportsInFunction.set(report, { minimum: line, maximum: line });
+      const column = options.ignoreSourceMaps ? mapping.generatedColumn : mapping.originalColumn;
+      if (!Number.isSafeInteger(line) || line < 0 || !Number.isSafeInteger(column) || column < 0) continue;
+      const point = { line, column };
+      first ??= point;
+      last = point;
+      if (bounds == null) bounds = { minimum: line, maximum: line };
       else {
         bounds.minimum = Math.min(bounds.minimum, line);
         bounds.maximum = Math.max(bounds.maximum, line);
       }
     }
-    for (const [report, bounds] of reportsInFunction) {
-      const key = `${fn.start}:${fn.end}`;
-      report.functions.set(key, report.functions.get(key) === true || fn.executed);
-      report.functionRanges.push({ ...bounds, executed: fn.executed });
-      if (!fn.executed) {
-        for (let line = bounds.minimum; line <= bounds.maximum; line += 1) {
-          report.executableLines.delete(line);
-          report.lineHits.delete(line);
-        }
-        const end = Math.min(bounds.maximum, report.lineCount);
-        for (let line = bounds.minimum; line < end; line += 1) {
-          report.executableLines.add(line);
-        }
-        const terminal = report.sourceLines[bounds.maximum]?.trim() ?? "";
-        if (/^(?:return|throw)\s+(?:[-+]?\d|true\b|false\b|null\b|undefined\b)/.test(terminal)) {
-          report.executableLines.add(bounds.maximum);
-          report.lineHits.set(bounds.maximum, 1);
-        }
-      }
+    if (report == null || bounds == null || first == null || last == null || hasForeignMapping) return null;
+    return { fn, report, bounds, first, last, bodyStart: body.start, coordinate, executed: fn.executed };
+  }
+
+  const candidatesByReport = new Map();
+  function addFunctionCandidate(candidate) {
+    if (candidate == null) return;
+    let candidates = candidatesByReport.get(candidate.report);
+    if (candidates == null) candidatesByReport.set(candidate.report, candidates = new Map());
+    const existing = candidates.get(candidate.bodyStart);
+    if (existing == null) candidates.set(candidate.bodyStart, candidate);
+    else if (candidate.executed && !existing.executed) candidates.set(candidate.bodyStart, candidate);
+  }
+  for (const fn of functions) {
+    const provider = mappedFunctionCandidate(
+      fn,
+      fn.start - sourceOffset,
+      fn.end - sourceOffset,
+      "provider",
+    );
+    if (fn.executed) {
+      // Executed ranges use source-provider coordinates.
+      addFunctionCandidate(provider);
+      continue;
+    }
+    const parser = mappedFunctionCandidate(fn, fn.start, fn.end, "parser");
+    // Depending on when JSC discovers a nested function, an unexecuted range
+    // can use parser-local or source-provider coordinates. A coordinate is
+    // evidence only when its start is anchored to generated function syntax.
+    // Reject an ambiguous tuple instead of inventing a second source function.
+    if (provider == null) addFunctionCandidate(parser);
+    else if (parser == null) addFunctionCandidate(provider);
+    else if (provider.report === parser.report && provider.bodyStart === parser.bodyStart) {
+      addFunctionCandidate(provider);
+    }
+  }
+
+  for (const [report, candidates] of candidatesByReport) {
+    for (const candidate of candidates.values()) {
+      recordFunction(report, `native:${candidate.bodyStart}`, candidate.bounds, candidate.executed);
     }
   }
 
@@ -485,6 +609,15 @@ function collectReports(options) {
       if (!/^\s*(?:export\s+)?(?:default\s+)?class(?:\s|{)/.test(report.sourceLines[line])) continue;
       if (report.functionRanges.some((range) => line >= range.minimum && line <= range.maximum)) continue;
       report.functions.set(`class:${line}`, false);
+    }
+
+    if ([...report.lineHits.values()].some((hits) => hits > 0)) {
+      for (const line of report.executableLines) {
+        const source = report.sourceLines[line]?.trimStart() ?? "";
+        if (/^(?:import(?:\s|["'])|export\s*{)/.test(source) && (report.lineHits.get(line) ?? 0) === 0) {
+          report.lineHits.set(line, 1);
+        }
+      }
     }
   }
 
@@ -542,7 +675,9 @@ function uncoveredLines(report) {
 }
 
 function writeTextReport(reports, threshold, emit) {
-  if (reports.length === 0 && !globalThis.__cottontailBunTestUsed) return false;
+  if (reports.length === 0 &&
+      !globalThis.__cottontailBunTestUsed &&
+      !globalThis.__cottontailTestEntrypointLoaded) return false;
   const metrics = reports.map(reportMetrics);
   const average = reports.length === 0
     ? { functions: 0, lines: 0, statements: 0 }

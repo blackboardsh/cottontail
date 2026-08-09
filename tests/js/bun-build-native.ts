@@ -246,7 +246,14 @@ assert(clearedPluginRejected, "clearAll should remove pending runtime plugin reg
 const keepNamesResult = await Bun.build({
   entrypoints: ["virtual-keep-names.js"],
   files: {
-    "virtual-keep-names.js": "function LongFunctionName() {}; console.log(LongFunctionName.name);",
+    "virtual-keep-names.js": `
+      function LongFunctionName() {}
+      var GH = function() {};
+      var OP = class {};
+      if (LongFunctionName.name !== "LongFunctionName" || GH.name !== "GH" || OP.name !== "OP") {
+        throw new Error("keepNames did not preserve inferred runtime names");
+      }
+    `,
   },
   target: "bun",
   conditions: "development",
@@ -256,6 +263,15 @@ const keepNamesResult = await Bun.build({
 assert(keepNamesResult.success, "Bun.build should accept a single string condition");
 const keepNamesSource = await keepNamesResult.outputs[0].text();
 assert(keepNamesSource.includes('"LongFunctionName"'), "minify.keepNames should preserve the original function name");
+assert(
+  /\w+\(\s*function\s*\(\)\s*\{\s*\}\s*,\s*["']GH["']\s*\)/.test(keepNamesSource),
+  "minify.keepNames should wrap an anonymous inferred-name function without naming its inner function",
+);
+assert(
+  /\w+\(\s*class\s*\{\s*\}\s*,\s*["']OP["']\s*\)/.test(keepNamesSource),
+  "minify.keepNames should wrap an anonymous inferred-name class without naming its inner class",
+);
+new Function(keepNamesSource)();
 
 const inlineImportMetaResult = await Bun.build({
   entrypoints: ["virtual-inline-import-meta.js"],

@@ -35910,6 +35910,12 @@ static JSValueRef ct_transpiler_scan_imports_native(JSContextRef ctx, JSObjectRe
     return ct_transpiler_process_native(ctx, argc, argv, exception, 2);
 }
 
+static JSValueRef ct_transpiler_scan_module_syntax_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    return ct_transpiler_process_native(ctx, argc, argv, exception, 4);
+}
+
 static JSValueRef ct_bundle_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -38548,6 +38554,7 @@ static char *ct_prepare_source_with_wrappers(
     const char *prefix,
     const char *suffix,
     size_t *source_offset_out,
+    size_t *source_byte_offset_out,
     size_t *source_length_out
 ) {
     size_t prefix_len = strlen(prefix);
@@ -38562,7 +38569,19 @@ static char *ct_prepare_source_with_wrappers(
         free(builder.data);
         return NULL;
     }
-    if (source_offset_out != NULL) *source_offset_out = builder.len;
+    // JSC coverage ranges use JavaScript UTF-16 code-unit offsets, while the
+    // coverage source is still sliced out of this UTF-8 byte buffer.
+    const size_t source_byte_offset = builder.len;
+    if (source_byte_offset_out != NULL) *source_byte_offset_out = source_byte_offset;
+    if (source_offset_out != NULL) {
+        JSStringRef wrapped_prefix = ct_js_string_from_utf8_len(builder.data, source_byte_offset);
+        if (wrapped_prefix == NULL) {
+            free(builder.data);
+            return NULL;
+        }
+        *source_offset_out = JSStringGetLength(wrapped_prefix);
+        JSStringRelease(wrapped_prefix);
+    }
 
     const char *start = (const char *)source;
     const char *end = start + source_len;
@@ -38640,8 +38659,7 @@ static char *ct_prepare_source_with_wrappers(
     free(meta_builder.data);
 
     if (source_length_out != NULL) {
-        const size_t source_offset = source_offset_out != NULL ? *source_offset_out : 0;
-        *source_length_out = builder.len - source_offset;
+        *source_length_out = builder.len - source_byte_offset;
     }
 
     if (!ct_sb_append_bytes(&builder, suffix, suffix_len)) {
@@ -38656,6 +38674,7 @@ static char *ct_prepare_wrapped_source(
     size_t source_len,
     const char *filename,
     size_t *source_offset_out,
+    size_t *source_byte_offset_out,
     size_t *source_length_out
 ) {
     return ct_prepare_source_with_wrappers(
@@ -38669,6 +38688,7 @@ static char *ct_prepare_wrapped_source(
         "e=>{globalThis.__ctError=e;globalThis.__ctErrorSet=true;globalThis.__ctDone=true;});}"
         "finally{globalThis.__cottontailSuppressAsyncHookPromise=false;}})();",
         source_offset_out,
+        source_byte_offset_out,
         source_length_out
     );
 }
@@ -38680,6 +38700,7 @@ static char *ct_prepare_sync_source(const uint8_t *source, size_t source_len, co
         filename,
         "(()=>{\n",
         "\n})();",
+        NULL,
         NULL,
         NULL
     );
@@ -38862,12 +38883,14 @@ static int ct_jsc_runtime_eval_internal(
     if (runtime->reload_requested) return CT_JSC_EVAL_RELOAD;
     JSContextRef ctx = runtime->context;
     size_t coverage_source_offset = 0;
+    size_t coverage_source_byte_offset = 0;
     size_t coverage_source_length = 0;
     char *wrapped = ct_prepare_wrapped_source(
         source,
         source_len,
         filename,
         &coverage_source_offset,
+        &coverage_source_byte_offset,
         &coverage_source_length);
     if (wrapped == NULL) {
         ct_set_error_out(error_out, ct_duplicate_bytes("Out of memory", 13));
@@ -38897,7 +38920,7 @@ static int ct_jsc_runtime_eval_internal(
                 ctx,
                 runtime->host_object,
                 "coverageSource",
-                ct_make_string_len(ctx, wrapped + coverage_source_offset, coverage_source_length),
+                ct_make_string_len(ctx, wrapped + coverage_source_byte_offset, coverage_source_length),
                 &exception);
         }
     }
@@ -39053,7 +39076,7 @@ int ct_jsc_generate_bytecode(
     if (error_out != NULL) *error_out = NULL;
     if (bytecode_out == NULL || bytecode_len_out == NULL) return -1;
 
-    char *wrapped = ct_prepare_wrapped_source(source, source_len, filename, NULL, NULL);
+    char *wrapped = ct_prepare_wrapped_source(source, source_len, filename, NULL, NULL, NULL);
     if (wrapped == NULL) {
         ct_set_error_out(error_out, ct_duplicate_bytes("Out of memory", 13));
         return -1;

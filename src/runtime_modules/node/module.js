@@ -5,6 +5,15 @@ import { openRuntimeTranspilerCache } from "../internal/runtime-transpiler-cache
 import * as path from "./path.js";
 import * as url from "./url.js";
 
+// Runtime module loading must not depend on user-replaceable globals. Bun
+// deliberately permits replacing Promise and Set, while import() continues to
+// use the realm intrinsics captured before user code runs.
+const IntrinsicPromise = globalThis.Promise;
+const IntrinsicSet = globalThis.Set;
+const intrinsicPromiseResolve = IntrinsicPromise.resolve.bind(IntrinsicPromise);
+const intrinsicPromiseReject = IntrinsicPromise.reject.bind(IntrinsicPromise);
+const intrinsicQueueMicrotask = globalThis.queueMicrotask.bind(globalThis);
+
 const kLazyBuiltin = Symbol.for("cottontail.lazyBuiltin");
 function lazyBuiltin(load) {
   let cached;
@@ -238,9 +247,10 @@ const nodeModulePathsCacheLimit = 256;
 const smolModuleCacheGcInterval = 16;
 const smolDynamicModuleCacheGcInterval = 1024;
 const bundledAsyncEsmGraphCache = new Map();
+const runtimeEsmLinkageRecords = new Map();
 const nativeObjectDefineProperty = Object.defineProperty;
 const builtinModuleMap = new Map();
-const builtinNamespaceEntries = new Set();
+const builtinNamespaceEntries = new IntrinsicSet();
 const builtinImportNamespaces = new Map();
 const kBuiltinImportNamespaces = Symbol.for("cottontail.node.builtinImportNamespaces");
 let modulePathCache = Object.create(null);
@@ -260,7 +270,7 @@ const hookResolvedFormats = new Map();
 const sourceMapCache = new Map();
 // Files already probed and found to carry no source map. Without this, every
 // stack-string remap re-read every frame's file from disk.
-const sourceMapMisses = new Set();
+const sourceMapMisses = new IntrinsicSet();
 // Remapping a stack string is a pure function of the registered source maps,
 // and the same stack recurs constantly (loops, repeated assertions).
 const remappedStacks = new Map();
@@ -283,12 +293,12 @@ const runtimePluginOnLoad = [];
 const runtimePluginVirtualModules = new Map();
 const runtimePluginResolvedModules = new Map();
 const runtimePluginPendingLoads = new Map();
-const runtimePluginInvalidatableKeys = new Set();
+const runtimePluginInvalidatableKeys = new IntrinsicSet();
 const runtimePluginRevisions = new Map();
 let runtimePluginGeneration = 0;
 const runtimePluginNamespacePattern = /^[/@A-Za-z0-9_-]+$/;
 
-const hotReloadHooks = globalThis.__cottontailHotReloadHooks ?? new Set();
+const hotReloadHooks = globalThis.__cottontailHotReloadHooks ?? new IntrinsicSet();
 if (globalThis.__cottontailHotReloadHooks == null) {
   Object.defineProperty(globalThis, "__cottontailHotReloadHooks", { value: hotReloadHooks, configurable: true });
 }
@@ -297,8 +307,11 @@ hotReloadHooks.add(() => {
   commonJsWrapperFactoryCache.clear();
   bundledCommonJsFactoryCache.clear();
   runtimeEsmWrapperCache.clear();
+  asyncEsmModuleCache.clear();
+  registeredSelfEsmNamespaces.clear();
   nodeModulePathsCache.clear();
   bundledAsyncEsmGraphCache.clear();
+  runtimeEsmLinkageRecords.clear();
   builtinModuleMap.clear();
   builtinNamespaceEntries.clear();
   builtinImportNamespaces.clear();
@@ -422,7 +435,7 @@ function runtimePluginLoadIsCurrent(descriptor, token) {
 }
 
 function discardStaleRuntimePluginRegistryEntry(descriptor, token) {
-  queueMicrotask(() => {
+  intrinsicQueueMicrotask(() => {
     if (runtimePluginLoadIsCurrent(descriptor, token)) return;
     if (runtimePluginRevision(descriptor.key) !== token.revision && commonJsCache.has(descriptor.key)) return;
     globalThis.Loader?.registry?.delete?.(descriptor.key);
@@ -462,7 +475,7 @@ function unwrapRuntimePluginResolveResult(result) {
   if (status === 0) throw new TypeError("onResolve() doesn't support pending promises yet");
   const settled = cottontail.promiseResult(result);
   if (status === 2) {
-    Promise.resolve(result).catch(() => {});
+    intrinsicPromiseResolve(result).catch(() => {});
     throw settled;
   }
   return settled;
@@ -624,7 +637,7 @@ function normalizeRuntimePluginLoadResult(result, descriptor) {
       : "onLoad() expects an object returned");
   }
   const loader = result.loader == null ? runtimePluginDefaultLoader(descriptor.path) : String(result.loader);
-  if (!new Set(["js", "jsx", "object", "ts", "tsx", "toml", "yaml", "json", "md"]).has(loader)) {
+  if (!new IntrinsicSet(["js", "jsx", "object", "ts", "tsx", "toml", "yaml", "json", "md"]).has(loader)) {
     throw new TypeError('Expected loader to be one of "js", "jsx", "object", "ts", "tsx", "toml", "yaml", "json", or "md"');
   }
   if (result.resolveDir != null && typeof result.resolveDir !== "string") {
@@ -735,7 +748,7 @@ function evaluateRuntimePluginResult(descriptor, rawResult) {
   if (namespace && typeof namespace.then === "function") {
     return {
       async: true,
-      promise: Promise.resolve(namespace).then((value) => {
+      promise: intrinsicPromiseResolve(namespace).then((value) => {
         if (value && typeof value === "object" && !Object.hasOwn(value, "__esModule")) {
           Object.defineProperty(value, "__esModule", { value: true, configurable: true });
         }
@@ -771,10 +784,10 @@ function loadRuntimePluginSync(descriptor) {
     rawResult = cottontail.promiseResult(rawResult);
   } else if (status === 2) {
     const reason = cottontail.promiseResult(rawResult);
-    Promise.resolve(rawResult).catch(() => {});
+    intrinsicPromiseResolve(rawResult).catch(() => {});
     throw reason;
   } else if (status === 0) {
-    Promise.resolve(rawResult).catch(() => {});
+    intrinsicPromiseResolve(rawResult).catch(() => {});
     throw new TypeError(`require() async module "${descriptor.key}" is unsupported. use "await import()" instead.`);
   }
   const evaluated = evaluateRuntimePluginResult(descriptor, rawResult);
@@ -822,12 +835,12 @@ function importRuntimePlugin(descriptor) {
     rawResult = cottontail.promiseResult(rawResult);
   } else if (status === 2) {
     const reason = cottontail.promiseResult(rawResult);
-    Promise.resolve(rawResult).catch(() => {});
+    intrinsicPromiseResolve(rawResult).catch(() => {});
     throw reason;
   }
-  const output = status === 0 ? Promise.resolve(rawResult).then(finish) : finish(rawResult);
+  const output = status === 0 ? intrinsicPromiseResolve(rawResult).then(finish) : finish(rawResult);
   if (runtimePluginPromiseStatus(output) < 0) return output;
-  const pending = Promise.resolve(output);
+  const pending = intrinsicPromiseResolve(output);
   runtimePluginPendingLoads.set(descriptor.key, pending);
   pending.then(
     () => {
@@ -926,7 +939,7 @@ globalThis.__cottontailImportPluginModule = (specifier, referrer, options, resol
   try {
     return tryImportRuntimePlugin(specifier, referrer, options, resolvedPath);
   } catch (error) {
-    return { matched: true, value: Promise.reject(error) };
+    return { matched: true, value: intrinsicPromiseReject(error) };
   }
 };
 
@@ -977,7 +990,7 @@ function bunModuleMockFor(...keys) {
 // require("fs/promises") === require("fs").promises and
 // require("dns/promises") === require("dns").promises; storing the raw
 // namespace here would break those identities.
-const kUnwrapDefaultBuiltins = new Set([
+const kUnwrapDefaultBuiltins = new IntrinsicSet([
   // constants.js declares the union of platform-specific ESM names, while
   // CommonJS exposes only the host-filtered default object.
   "constants",
@@ -1217,6 +1230,10 @@ function embeddedRuntimeRelativePath(path) {
   return text.slice(markerIndex + marker.length);
 }
 
+function isEmbeddedRuntimePath(path) {
+  return embeddedRuntimeRelativePath(path) !== null;
+}
+
 function embeddedRuntimeSourceEntry(path) {
   const relativePath = embeddedRuntimeRelativePath(path);
   if (relativePath == null) return { found: false, value: undefined };
@@ -1327,7 +1344,7 @@ function isDirectory(path) {
 
 function readPackageJson(path) {
   try {
-    return JSON.parse(readModuleFile(path));
+    return parseJSONC(String(readModuleFile(path)));
   } catch {
     return null;
   }
@@ -1455,7 +1472,7 @@ function loadTsconfigCompilerOptions(dir) {
   let entry = null;
   try {
     const file = join(dir, "tsconfig.json");
-    if (isFile(file)) entry = readTsconfigCompilerOptions(file, new Set());
+    if (isFile(file)) entry = readTsconfigCompilerOptions(file, new IntrinsicSet());
   } catch {}
   if (!entry) {
     const parent = dirname(dir);
@@ -1600,7 +1617,7 @@ function nodePathEntries() {
   const dynamicEntries = typeof value === "string"
     ? value.split(delimiter).filter(Boolean).map((entry) => resolve(entry))
     : [];
-  return [...new Set([...dynamicEntries, ...(Array.isArray(globalPaths) ? globalPaths : [])])];
+  return [...new IntrinsicSet([...dynamicEntries, ...(Array.isArray(globalPaths) ? globalPaths : [])])];
 }
 
 function nodeModulesLookupDir(dir) {
@@ -1708,14 +1725,26 @@ function resolveAsFile(candidate) {
   // Keep JSX in the fallback list because Bun loads it without exposing a
   // public require.extensions entry.
   const extensions = [...Object.keys(_extensions), ".tsx", ".jsx"];
-  for (const ext of new Set(extensions)) {
+  for (const ext of new IntrinsicSet(extensions)) {
     if (isFile(`${candidate}${ext}`)) return `${candidate}${ext}`;
   }
   return null;
 }
 
-function resolveAsDirectory(candidate, kind = "require") {
+function directoryResolutionCycleKey(candidate) {
+  try {
+    const real = cottontail.realpathSync(candidate);
+    if (typeof real === "string" && real.length > 0) return resolve(real);
+  } catch {}
+  return resolve(candidate);
+}
+
+function resolveAsDirectory(candidate, kind = "require", seenDirectories = undefined) {
   if (!isDirectory(candidate)) return null;
+  const visited = seenDirectories ?? new IntrinsicSet();
+  const cycleKey = directoryResolutionCycleKey(candidate);
+  if (visited.has(cycleKey)) return null;
+  visited.add(cycleKey);
   const packagePath = join(candidate, "package.json");
   const packageJson = !standaloneAutoloadDisabled("disableAutoloadPackageJson") && isFile(packagePath)
     ? readPackageJson(packagePath)
@@ -1728,18 +1757,40 @@ function resolveAsDirectory(candidate, kind = "require") {
   const mainField = typeof packageMain === "string" ? packageMain : "";
   if (mainField) {
     const mainCandidate = resolve(candidate, mainField);
-    const mainResolved = resolveAsFile(mainCandidate) || resolveAsDirectory(mainCandidate, kind);
+    const mainResolved = resolveAsFile(mainCandidate) || resolveAsDirectory(mainCandidate, kind, visited);
     if (mainResolved) return mainResolved;
   }
-  const indexResolved = resolveAsFile(join(candidate, "index"));
-  if (indexResolved && mainField) {
-    currentProcessBuiltin().emitWarning?.(
-      `Invalid 'main' field in '${packagePath}' of '${mainField}'. Please either fix that or report it to the module author`,
-      "DeprecationWarning",
-      "DEP0128",
-    );
+  const packageModule = packageJsonValue(packageJson, "module");
+  const moduleField = typeof packageModule === "string" ? packageModule : "";
+  const resolveModuleField = () => {
+    if (!moduleField) return null;
+    const moduleCandidate = resolve(candidate, moduleField);
+    return resolveAsFile(moduleCandidate) || resolveAsDirectory(moduleCandidate, kind, visited);
+  };
+  // Bun's ESM runtime resolution gives `module` priority over the legacy
+  // index candidate (but never over a valid `main`).
+  if (kind === "import") {
+    const moduleResolved = resolveModuleField();
+    if (moduleResolved) return moduleResolved;
   }
-  return indexResolved;
+  const indexResolved = resolveAsFile(join(candidate, "index"));
+  if (indexResolved) {
+    if (mainField) {
+      currentProcessBuiltin().emitWarning?.(
+        `Invalid 'main' field in '${packagePath}' of '${mainField}'. Please either fix that or report it to the module author`,
+        "DeprecationWarning",
+        "DEP0128",
+      );
+    }
+    return indexResolved;
+  }
+  // CommonJS keeps legacy index precedence and uses `module` only as its final
+  // package entry fallback. ESM already attempted the field above.
+  if (kind !== "import") {
+    const moduleResolved = resolveModuleField();
+    if (moduleResolved) return moduleResolved;
+  }
+  return null;
 }
 
 function requestRequiresDirectory(request) {
@@ -1806,19 +1857,19 @@ function customResolverConditionsKey() {
 
 function resolverConditions(kind) {
   if (activeResolverConditions !== null) return activeResolverConditions;
-  return new Set(["bun", "node", kind === "import" ? "import" : "require", ...customResolverConditions(), "default"]);
+  return new IntrinsicSet(["bun", "node", kind === "import" ? "import" : "require", ...customResolverConditions(), "default"]);
 }
 
 function conditionsFromHookContext(context, kind) {
   if (context?.conditions === undefined) {
-    return new Set(["bun", "node", kind === "import" ? "import" : "require", ...customResolverConditions(), "default"]);
+    return new IntrinsicSet(["bun", "node", kind === "import" ? "import" : "require", ...customResolverConditions(), "default"]);
   }
   if (!Array.isArray(context.conditions) || context.conditions.some((condition) => typeof condition !== "string")) {
     const error = new TypeError(`The property 'conditions' is invalid. Received ${formatInvalidValue(context.conditions)}`);
     error.code = "ERR_INVALID_ARG_VALUE";
     throw error;
   }
-  return new Set([...context.conditions, "default"]);
+  return new IntrinsicSet([...context.conditions, "default"]);
 }
 
 // Bun resolves package targets against a logical "/" URL first. Keeping the
@@ -2273,7 +2324,7 @@ function packageImportNotDefinedError(specifier, basePath) {
   );
 }
 
-function resolvePackageImports(specifier, basePath, kind, seen = new Set()) {
+function resolvePackageImports(specifier, basePath, kind, seen = new IntrinsicSet()) {
   if (specifier === "#" || specifier.startsWith("#/")) throw packageImportNotDefinedError(specifier, basePath);
   const scope = nearestPackageScope(basePath);
   const imports = packageJsonValue(scope?.packageJson, "imports");
@@ -2371,7 +2422,7 @@ function resolveRequestCore(request, basePath, kind = "require", packageImportSe
     return originalText;
   }
   if (originalText.startsWith("#")) {
-    return resolvePackageImports(originalText, basePath, kind, packageImportSeen ?? new Set());
+    return resolvePackageImports(originalText, basePath, kind, packageImportSeen ?? new IntrinsicSet());
   }
   if (originalText.startsWith("file:")) {
     const { bare: fileUrl, suffix } = splitSpecifierSuffix(originalText);
@@ -2777,7 +2828,26 @@ function replaceDynamicImportExpressions(source) {
       break;
     }
     if (text[after] === "{") return '["import"](';
-    return "__ctDynamicImport(";
+    // Wait-cycle ancestry is meaningful only when this import's promise is a
+    // direct await operand. Plain dynamic imports are reachability edges, not
+    // wait edges; treating them alike creates false cycles between siblings.
+    let before = offset - 1;
+    const skipTriviaBackwards = () => {
+      while (before >= 0 && (mask[before] !== 1 || /\s/.test(text[before]))) before -= 1;
+    };
+    skipTriviaBackwards();
+    // Also recognize `await (import(...))` and redundant nested parentheses.
+    while (text[before] === "(") {
+      before -= 1;
+      skipTriviaBackwards();
+    }
+    const wordEnd = before + 1;
+    while (before >= 0 && /[\w$\u0080-\uffff]/.test(text[before])) before -= 1;
+    const word = text.slice(before + 1, wordEnd);
+    skipTriviaBackwards();
+    const directlyAwaited = word === "await" &&
+      (before < 0 || !/[\w$#.\u0080-\uffff]/.test(text[before]));
+    return directlyAwaited ? "__ctAwaitedDynamicImport(" : "__ctDynamicImport(";
   });
 }
 
@@ -2923,7 +2993,12 @@ const FUNCTION_WRAPPER_LINE_OFFSET = 2;
 const CJS_FILENAME_BINDING = "__cottontailCjsFilename_4b86f6";
 const CJS_DIRNAME_BINDING = "__cottontailCjsDirname_4b86f6";
 const CJS_DYNAMIC_IMPORT_BINDING = "__cottontailCjsDynamicImport_4b86f6";
+const CJS_REQUIRE_BINDING = "__cottontailCjsRequire_4b86f6";
 const ESM_EXPORTS_BINDING = "__cottontailEsmNamespace_4b86f6";
+const ESM_EVALUATION_COMPLETED_BINDING = "__cottontailEsmEvaluationCompleted_4b86f6";
+const ESM_REQUIRE_BINDING = "__cottontailEsmRequire_4b86f6";
+const ESM_PROMISE_RESOLVE_BINDING = "__cottontailPromiseResolve_4b86f6";
+const ESM_SET_BINDING = "__cottontailSet_4b86f6";
 
 function markModuleCompileError(error, filename, source, lineOffset = FUNCTION_WRAPPER_LINE_OFFSET) {
   if (error instanceof SyntaxError || /syntax error/i.test(String(error?.message ?? error))) {
@@ -2964,10 +3039,16 @@ function compileAsyncModuleWrapper(args, source, filename, diagnosticSource = so
   const useNativeCompiler = nativeCompilerUsable(source);
   try {
     if (useNativeCompiler) {
-      return cottontail.compileFunction(`(async function(${args.join(",")}) {\n${source}\n})`, filename);
+      return {
+        run: cottontail.compileFunction(`(async function(${args.join(",")}) {\n${source}\n})`, filename),
+        wrapperLineOffset: 1,
+      };
     }
     const AsyncFunction = (async () => {}).constructor;
-    return new AsyncFunction(...args, `${source}\n//# sourceURL=${sourceURLForResolved(filename)}`);
+    return {
+      run: new AsyncFunction(...args, `${source}\n//# sourceURL=${sourceURLForResolved(filename)}`),
+      wrapperLineOffset: FUNCTION_WRAPPER_LINE_OFFSET,
+    };
   } catch (error) {
     throw markModuleCompileError(error, filename, diagnosticSource, useNativeCompiler ? 1 : FUNCTION_WRAPPER_LINE_OFFSET);
   }
@@ -2991,7 +3072,18 @@ function compilePublicCommonJsWrapper(source, filename) {
     moduleDirname = cached.moduleDirname;
     dynamicImport = cached.dynamicImport;
   } else {
-    const factorySource = `(function(${internalArgs.join(",")}) { return ${prefix}${source}${suffix}\n})`;
+    // Bun permits a CommonJS artifact to install its own leading lexical
+    // `require` binding. The Node-style wrapper's `require` formal would make
+    // that source fail to parse before its local binding can shadow anything.
+    // Rename only the wrapper formal for this shape; the source owns every
+    // reference to `require`, so no injected alias (and no extra scope) is
+    // needed.
+    const code = codeOnlyText(source);
+    const hasLeadingLexicalRequire = /^(?:\s*;\s*)*(?:const|let|class)\s+require\b/.test(code);
+    const compilePrefix = hasLeadingLexicalRequire
+      ? prefix.replace(/\brequire\b(?=\s*,\s*module\b)/, CJS_REQUIRE_BINDING)
+      : prefix;
+    const factorySource = `(function(${internalArgs.join(",")}) { return ${compilePrefix}${source}${suffix}\n})`;
     try {
       createWrapper = typeof cottontail.compileFunction === "function"
         ? cottontail.compileFunction(factorySource, filename)
@@ -3177,9 +3269,38 @@ function formatExtensionCompileSource(source, leadingNewline = false) {
 }
 
 function sourceRequiresAsyncModuleExecution(filename, source) {
+  // This native scan uses the same module grammar as the linker. In
+  // particular, it distinguishes top-level `await (conditional)` from a
+  // script-goal call to an identifier named `await`, which Function-based
+  // probes cannot do reliably in JSC.
+  if (typeof cottontail.transpilerScanModuleSyntax === "function") {
+    try {
+      const syntax = JSON.parse(cottontail.transpilerScanModuleSyntax(
+        String(source),
+        "{}",
+        runtimeEsmGraphLoader(filename),
+      ));
+      return syntax?.hasTopLevelAwait === true;
+    } catch {}
+  }
+  let probeSource = maybeStripTypeScript(filename, source);
+  // Function constructors parse `await(value)` as a call to an identifier in
+  // script grammar. Ask Bun's parser to print only this ambiguous shape first;
+  // it canonicalizes a real top-level await while preserving a legal nested
+  // binding such as `function call(await) { return await(value); }`.
+  if (typeof cottontail.transpilerTransform === "function" &&
+      /(?<![.\w$])await\s*\(/.test(codeOnlyText(probeSource))) {
+    try {
+      probeSource = String(cottontail.transpilerTransform(
+        probeSource,
+        JSON.stringify({ target: "bun", deadCodeElimination: false }),
+        runtimeEsmGraphLoader(filename),
+      ));
+    } catch {}
+  }
   let transformed;
   try {
-    transformed = transformEsmSourceForDynamicImport(maybeStripTypeScript(filename, source));
+    transformed = transformEsmSourceForDynamicImport(probeSource);
   } catch {
     return false;
   }
@@ -3197,17 +3318,8 @@ function sourceRequiresAsyncModuleExecution(filename, source) {
       /\busing\s+([$_\p{ID_Start}][$_\u200C\u200D\p{ID_Continue}]*)\s*=/gu,
       "const $1 =",
     );
-  const parameters = [
-    ESM_EXPORTS_BINDING,
-    "require",
-    "module",
-    "__filename",
-    "__dirname",
-    "__ctImportMeta",
-    "Error",
-  ];
   try {
-    new Function(...parameters, transformed);
+    new Function(transformed);
     return false;
   } catch (syncError) {
     if (!(syncError instanceof SyntaxError)) return false;
@@ -3215,7 +3327,7 @@ function sourceRequiresAsyncModuleExecution(filename, source) {
 
   try {
     const AsyncFunction = (async () => {}).constructor;
-    new AsyncFunction(...parameters, transformed);
+    new AsyncFunction(transformed);
     return true;
   } catch {
     return false;
@@ -3262,6 +3374,341 @@ function runtimeEsmGraphLoader(filename) {
   if (extension === "ts" || extension === "mts" || extension === "cts") return "ts";
   if (extension === "jsx") return "jsx";
   return "js";
+}
+
+const runtimeEsmExportNotFound = Symbol("cottontail.runtimeEsmExportNotFound");
+const runtimeEsmExportAmbiguous = Symbol("cottontail.runtimeEsmExportAmbiguous");
+const runtimeEsmExportUnknown = Symbol("cottontail.runtimeEsmExportUnknown");
+const runtimeEsmIdentifierPattern = /^[A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*$/;
+
+function collectRuntimeEsmCodeMatches(source, pattern, visit) {
+  replaceCodePattern(source, pattern, (...args) => {
+    visit(...args);
+    return args[0];
+  });
+}
+
+function runtimeEsmSpecifierText(literal) {
+  const text = String(literal);
+  return text.length >= 2 ? text.slice(1, -1) : text;
+}
+
+function runtimeEsmLocalToken(record, name) {
+  let token = record.localTokens.get(name);
+  if (token === undefined) {
+    token = { record, name };
+    record.localTokens.set(name, token);
+  }
+  return token;
+}
+
+function addRuntimeEsmLinkageSpecifier(record, specifier) {
+  const text = String(specifier);
+  if (!record.specifierSet.has(text)) {
+    record.specifierSet.add(text);
+    record.specifiers.push(text);
+  }
+}
+
+function runtimeEsmLinkageRecord(filename, source, loader) {
+  const key = String(filename);
+  const text = String(source);
+  const cached = runtimeEsmLinkageRecords.get(key);
+  if (cached?.source === text && cached.loader === loader) return cached;
+
+  const record = {
+    key,
+    filename: splitSpecifierSuffix(key).bare,
+    source: text,
+    loader,
+    scanError: null,
+    explicit: new Map(),
+    localTokens: new Map(),
+    namedImports: [],
+    reexports: [],
+    stars: [],
+    specifiers: [],
+    specifierSet: new IntrinsicSet(),
+    dependencyBySpecifier: new Map(),
+    dependencies: [],
+    building: false,
+    built: false,
+    validated: false,
+  };
+  runtimeEsmLinkageRecords.set(key, record);
+
+  let scan;
+  try {
+    scan = JSON.parse(cottontail.transpilerScan(text, "{}", loader));
+  } catch (error) {
+    record.scanError = error;
+    return record;
+  }
+  for (const name of Array.isArray(scan?.exports) ? scan.exports : []) {
+    const exported = String(name);
+    record.explicit.set(exported, { kind: "local", token: runtimeEsmLocalToken(record, exported) });
+  }
+  for (const item of Array.isArray(scan?.imports) ? scan.imports : []) {
+    if (item?.kind === "import-statement") addRuntimeEsmLinkageSpecifier(record, item.path);
+  }
+
+  const addNamedImports = (names, literal) => {
+    const specifier = runtimeEsmSpecifierText(literal);
+    addRuntimeEsmLinkageSpecifier(record, specifier);
+    for (const binding of importedBindingEntries(names)) {
+      if (!runtimeEsmIdentifierPattern.test(binding.imported) ||
+          !runtimeEsmIdentifierPattern.test(binding.local)) continue;
+      record.namedImports.push({
+        specifier,
+        imported: binding.imported,
+        local: binding.local,
+      });
+    }
+  };
+  collectRuntimeEsmCodeMatches(
+    text,
+    /\bimport\s+[A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*\s*,\s*\{([^}]*)\}\s*from\s*(['"][^'"]+['"])(?:\s+(?:with|assert)\s*\{[^}]*\})?\s*;?/g,
+    (_all, names, literal) => addNamedImports(names, literal),
+  );
+  collectRuntimeEsmCodeMatches(
+    text,
+    /\bimport\s*\{([^}]*)\}\s*from\s*(['"][^'"]+['"])(?:\s+(?:with|assert)\s*\{[^}]*\})?\s*;?/g,
+    (_all, names, literal) => addNamedImports(names, literal),
+  );
+
+  const importedByLocal = new Map();
+  for (const imported of record.namedImports) importedByLocal.set(imported.local, imported);
+  collectRuntimeEsmCodeMatches(
+    text,
+    /\bexport\s*\{([^}]*)\}\s*from\s*(['"][^'"]+['"])(?:\s+(?:with|assert)\s*\{[^}]*\})?\s*;?/g,
+    (_all, names, literal) => {
+      const specifier = runtimeEsmSpecifierText(literal);
+      addRuntimeEsmLinkageSpecifier(record, specifier);
+      for (const part of String(names).split(",")) {
+        const pieces = part.trim().split(/\s+as\s+/);
+        const imported = pieces[0]?.trim();
+        const exported = (pieces[1] ?? pieces[0])?.trim();
+        if (!runtimeEsmIdentifierPattern.test(imported ?? "") ||
+            !runtimeEsmIdentifierPattern.test(exported ?? "") ||
+            !record.explicit.has(exported)) continue;
+        const edge = { specifier, imported, exported };
+        record.reexports.push(edge);
+        record.explicit.set(exported, { kind: "indirect", edge });
+      }
+    },
+  );
+  collectRuntimeEsmCodeMatches(
+    text,
+    /\bexport\s*\{([^}]*)\}\s*(?:from\s*(['"][^'"]+['"]))?(?:\s+(?:with|assert)\s*\{[^}]*\})?\s*;?/g,
+    (_all, names, literal) => {
+      if (literal !== undefined) return;
+      for (const part of String(names).split(",")) {
+        const pieces = part.trim().split(/\s+as\s+/);
+        const local = pieces[0]?.trim();
+        const exported = (pieces[1] ?? pieces[0])?.trim();
+        if (!runtimeEsmIdentifierPattern.test(local ?? "") ||
+            !runtimeEsmIdentifierPattern.test(exported ?? "") ||
+            !record.explicit.has(exported)) continue;
+        const imported = importedByLocal.get(local);
+        if (imported !== undefined) {
+          const edge = { ...imported, exported };
+          record.reexports.push(edge);
+          record.explicit.set(exported, { kind: "indirect", edge });
+        } else {
+          record.explicit.set(exported, { kind: "local", token: runtimeEsmLocalToken(record, local) });
+        }
+      }
+    },
+  );
+  collectRuntimeEsmCodeMatches(
+    text,
+    /\bexport\s+default\s+(?:(?:async\s+)?function\s*\*?|class\s+)([A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*)/g,
+    (_all, local) => {
+      if (record.explicit.has("default")) {
+        record.explicit.set("default", { kind: "local", token: runtimeEsmLocalToken(record, local) });
+      }
+    },
+  );
+  collectRuntimeEsmCodeMatches(
+    text,
+    /\bexport\s*\*\s*from\s*(['"][^'"]+['"])(?:\s+(?:with|assert)\s*\{[^}]*\})?\s*;?/g,
+    (_all, literal) => {
+      const specifier = runtimeEsmSpecifierText(literal);
+      addRuntimeEsmLinkageSpecifier(record, specifier);
+      record.stars.push({ specifier });
+    },
+  );
+  return record;
+}
+
+function runtimeEsmLinkageDependency(record, specifier) {
+  if (record.dependencyBySpecifier.has(specifier)) {
+    return record.dependencyBySpecifier.get(specifier);
+  }
+  let dependency = null;
+  const local = specifier.startsWith(".") || specifier.startsWith("/") || specifier.startsWith("file:");
+  if (local && moduleHooks.length === 0 && runtimePluginOnResolve.length === 0 && runtimePluginOnLoad.length === 0) {
+    try {
+      const resolved = resolveRequest(specifier, record.filename, false, "import");
+      const { bare: resolvedPath, suffix } = splitSpecifierSuffix(resolved);
+      const extension = String(resolvedPath).toLowerCase().match(/\.[^.\\/]+$/)?.[0];
+      const linkageLoader = extension === ".tsx" ? "tsx"
+        : extension === ".ts" || extension === ".mts" ? "ts"
+        : extension === ".jsx" ? "jsx"
+        : extension === ".js" || extension === ".mjs" ? "js"
+        : null;
+      if (!suffix && linkageLoader !== null && modulePathExists(resolvedPath)) {
+        const source = readModuleFile(resolvedPath).replace(/^#![^\n]*(\n|$)/, "");
+        if (hasEsmSyntax(source) || !hasCommonJsSyntax(source)) {
+          dependency = runtimeEsmLinkageRecord(resolved, source, linkageLoader);
+        }
+      }
+    } catch {}
+  }
+  record.dependencyBySpecifier.set(specifier, dependency);
+  if (dependency !== null && !record.dependencies.includes(dependency)) record.dependencies.push(dependency);
+  return dependency;
+}
+
+function buildRuntimeEsmLinkageGraph(record) {
+  if (record.built || record.building || record.scanError !== null) return;
+  record.building = true;
+  for (const specifier of record.specifiers) {
+    const dependency = runtimeEsmLinkageDependency(record, specifier);
+    if (dependency !== null) buildRuntimeEsmLinkageGraph(dependency);
+  }
+  for (const edge of record.reexports) {
+    edge.dependency = runtimeEsmLinkageDependency(record, edge.specifier);
+  }
+  for (const edge of record.stars) {
+    edge.dependency = runtimeEsmLinkageDependency(record, edge.specifier);
+  }
+  for (const edge of record.namedImports) {
+    edge.dependency = runtimeEsmLinkageDependency(record, edge.specifier);
+  }
+  record.building = false;
+  record.built = true;
+}
+
+function resolveRuntimeEsmExport(record, name, resolveSet = new IntrinsicSet()) {
+  if (record === null) return runtimeEsmExportUnknown;
+  const marker = `${record.key}\0${name}`;
+  if (resolveSet.has(marker)) return runtimeEsmExportNotFound;
+  resolveSet.add(marker);
+  try {
+    const explicit = record.explicit.get(name);
+    if (explicit?.kind === "local") return explicit.token;
+    if (explicit?.kind === "indirect") {
+      return resolveRuntimeEsmExport(explicit.edge.dependency ?? null, explicit.edge.imported, resolveSet);
+    }
+    if (name === "default") return runtimeEsmExportNotFound;
+    let found = runtimeEsmExportNotFound;
+    let sawUnknown = false;
+    for (const edge of record.stars) {
+      const resolved = resolveRuntimeEsmExport(edge.dependency ?? null, name, resolveSet);
+      if (resolved === runtimeEsmExportAmbiguous) return resolved;
+      if (resolved === runtimeEsmExportUnknown) {
+        sawUnknown = true;
+      } else if (resolved !== runtimeEsmExportNotFound) {
+        if (found !== runtimeEsmExportNotFound && found !== resolved) return runtimeEsmExportAmbiguous;
+        found = resolved;
+      }
+    }
+    return sawUnknown ? runtimeEsmExportUnknown : found;
+  } finally {
+    resolveSet.delete(marker);
+  }
+}
+
+function runtimeEsmUsageSource(record) {
+  let source = record.source;
+  if (record.loader === "ts" || record.loader === "tsx") {
+    source = maybeStripTypeScript(record.filename, source);
+  }
+  source = replaceCodePattern(
+    source,
+    /\bimport\s+[A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*\s*,\s*\{[^}]*\}\s*from\s*['"][^'"]+['"](?:\s+(?:with|assert)\s*\{[^}]*\})?\s*;?/g,
+    ";",
+  );
+  source = replaceCodePattern(
+    source,
+    /\bimport\s*\{[^}]*\}\s*from\s*['"][^'"]+['"](?:\s+(?:with|assert)\s*\{[^}]*\})?\s*;?/g,
+    ";",
+  );
+  return replaceCodePattern(
+    source,
+    /\bexport\s*\{[^}]*\}(?:\s*from\s*['"][^'"]+['"])?(?:\s+(?:with|assert)\s*\{[^}]*\})?\s*;?/g,
+    ";",
+  );
+}
+
+function runtimeEsmIdentifierIsUsed(source, name) {
+  const escaped = String(name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const matcher = new RegExp(`(^|[^\\w$\\u0080-\\uffff])${escaped}(?![\\w$\\u0080-\\uffff])`, "g");
+  const mask = codePositionMask(source);
+  let match;
+  while ((match = matcher.exec(source)) !== null) {
+    const offset = match.index + match[1].length;
+    if (mask[offset] === 1) return true;
+  }
+  return false;
+}
+
+function runtimeEsmAmbiguousExportError(name) {
+  return new SyntaxError(
+    `Export named '${name}' cannot be resolved due to ambiguous multiple bindings in module`,
+  );
+}
+
+function throwRuntimeEsmScanError(record, directEntry) {
+  const diagnostic = String(record.scanError?.message ?? record.scanError);
+  if (directEntry) throw record.scanError;
+  const duplicate = diagnostic.match(/Multiple exports with the same name "([^"]+)"/);
+  if (duplicate) throw new SyntaxError(`Cannot export a duplicate name '${duplicate[1]}'.`);
+  throw new SyntaxError(diagnostic);
+}
+
+function validateRuntimeEsmLinkageRecord(record, root, directEntry, visited) {
+  if (record.scanError !== null) throwRuntimeEsmScanError(record, directEntry && record === root);
+  if (record.validated || visited.has(record)) return;
+  visited.add(record);
+  for (const dependency of record.dependencies) {
+    validateRuntimeEsmLinkageRecord(dependency, root, directEntry, visited);
+  }
+
+  const isTypeScript = record.loader === "ts" || record.loader === "tsx";
+  for (const edge of record.reexports) {
+    const resolved = resolveRuntimeEsmExport(edge.dependency ?? null, edge.imported);
+    if (resolved === runtimeEsmExportAmbiguous) throw runtimeEsmAmbiguousExportError(edge.imported);
+    if (resolved === runtimeEsmExportNotFound && !isTypeScript) {
+      throw new SyntaxError(`export '${edge.imported}' not found in '${edge.specifier}'`);
+    }
+  }
+
+  const usageSource = isTypeScript ? runtimeEsmUsageSource(record) : record.source;
+  for (const edge of record.namedImports) {
+    if (isTypeScript && !runtimeEsmIdentifierIsUsed(usageSource, edge.local)) continue;
+    const resolved = resolveRuntimeEsmExport(edge.dependency ?? null, edge.imported);
+    if (resolved === runtimeEsmExportAmbiguous) throw runtimeEsmAmbiguousExportError(edge.imported);
+    if (resolved !== runtimeEsmExportNotFound) continue;
+    const defaultResolution = resolveRuntimeEsmExport(edge.dependency ?? null, "default");
+    const namedLocalToken = edge.dependency?.localTokens.get(edge.imported);
+    const suggestion = namedLocalToken !== undefined && defaultResolution === namedLocalToken
+      ? " Did you mean to import default?"
+      : "";
+    const target = edge.dependency?.filename ?? edge.specifier;
+    throw new SyntaxError(
+      `Export named '${edge.imported}' not found in module '${target}'.${suggestion}`,
+    );
+  }
+  record.validated = true;
+}
+
+function validateRuntimeEsmLinkage(filename, source, loader, directEntry) {
+  if (typeof cottontail.transpilerScan !== "function") return;
+  const root = runtimeEsmLinkageRecord(filename, source, loader);
+  buildRuntimeEsmLinkageGraph(root);
+  validateRuntimeEsmLinkageRecord(root, root, directEntry, new IntrinsicSet());
 }
 
 function runtimeEsmRootHasBarePackageEdges(entryPath, entrySource) {
@@ -3500,6 +3947,12 @@ function executeDefaultExtension(module, filename, loader) {
     (/(?<![.\w$])await\b/.test(originalSource) &&
       sourceRequiresAsyncModuleExecution(filename, originalSource));
   const isEmbeddedRuntimeSource = embeddedRuntimeSourceEntry(filename).found;
+  if (originalIsEsm && !isEmbeddedRuntimePath(filename) && !isGeneratedRuntimeBundlePath(filename)) {
+    validateRuntimeEsmLinkage(filename, originalSource, loader, module === mainModule);
+  }
+  if (originalIsEsm && sourceRequiresAsyncModuleExecution(filename, originalSource)) {
+    throw new TypeError(`require() async module "${filename}" is unsupported. use "await import()" instead.`);
+  }
   const useRuntimeEsmSource = isEmbeddedRuntimeSource ||
     (runtimeEsmSourceExecutionDepth > 0 &&
       (originalSource.length < 256 * 1024 || runtimeEsmRootHasStaticImportEdges(filename, originalSource)));
@@ -3698,6 +4151,7 @@ function createModuleNamespace() {
   Object.defineProperty(namespace, Symbol.toStringTag, { value: "Module" });
   return namespace;
 }
+globalThis.__cottontailCreateRegisteredSelfModuleNamespace = () => createModuleNamespace();
 
 // An ES module namespace exposes its own string keys in ascending code-unit
 // order ([[OwnPropertyKeys]] sorts the exported names). Cottontail populates
@@ -3823,7 +4277,7 @@ function namespaceFromCommonJs(value, packageTypeModule = false, additionalNames
     ) ? value.default : value,
   });
   if (value && (typeof value === "object" || typeof value === "function")) {
-    for (const key of new Set([...Object.keys(value), ...additionalNames])) {
+    for (const key of new IntrinsicSet([...Object.keys(value), ...additionalNames])) {
       if (key !== "default" && (packageTypeModule || key !== "__esModule")) {
         Object.defineProperty(namespace, key, {
           configurable: true,
@@ -3921,8 +4375,8 @@ function staticImportCall(specifier, asyncStaticImports, attributeKeyword, attri
 
 // Single line (no trailing newline) so prepending it does not shift line
 // numbers of the transformed module source.
-const staticImportHelperSource = `const __ctStaticImport = (spec) => { const value = require(spec); const builtinMap = globalThis.__cottontailBuiltinModules; const registeredNamespace = builtinMap?.[Symbol.for("cottontail.node.builtinImportNamespaces")]?.get(String(spec)); if (registeredNamespace !== undefined && builtinMap.get(String(spec)) === value) return registeredNamespace; if (value && (typeof value === "object" || typeof value === "function") && value[Symbol.toStringTag] === "Module") return value; const ns = { default: value }; if (value && (typeof value === "object" || typeof value === "function")) { for (const key of Object.keys(value)) { if (key !== "default") ns[key] = value[key]; } if (value.__esModule && Object.hasOwn(value, "default")) ns.default = value.default; } return ns; }; const __ctDynamicImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options); `;
-const asyncStaticImportHelperSource = `const __ctDynamicImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options, true, __ctModuleAncestors); const __ctStaticImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options, true, __ctModuleAncestors); `;
+const staticImportHelperSource = `const __ctStaticImport = (spec) => { const value = require(spec); const builtinMap = globalThis.__cottontailBuiltinModules; const registeredNamespace = builtinMap?.[Symbol.for("cottontail.node.builtinImportNamespaces")]?.get(String(spec)); if (registeredNamespace !== undefined && builtinMap.get(String(spec)) === value) return registeredNamespace; if (value && (typeof value === "object" || typeof value === "function") && value[Symbol.toStringTag] === "Module") return value; const ns = { default: value }; if (value && (typeof value === "object" || typeof value === "function")) { for (const key of Object.keys(value)) { if (key !== "default") ns[key] = value[key]; } if (value.__esModule && Object.hasOwn(value, "default")) ns.default = value.default; } return ns; }; const __ctDynamicImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options); const __ctAwaitedDynamicImport = __ctDynamicImport; `;
+const asyncStaticImportHelperSource = `const __ctDynamicImport = (spec, options) => ${ESM_PROMISE_RESOLVE_BINDING}(globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options, true, __ctModuleAncestors, false)); const __ctAwaitedDynamicImport = (spec, options) => ${ESM_PROMISE_RESOLVE_BINDING}(globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options, true, __ctModuleAncestors, true)); const __ctStaticImport = (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options, true, new ${ESM_SET_BINDING}(__ctModuleAncestors), true); `;
 const esmExportDeclarationTrivia = String.raw`((?:\s|\/\*(?:[^*]|\*(?!\/))*\*\/|\/\/[^\r\n]*(?:\r?\n|$))*)`;
 
 function esmExportDeclarationPattern(declaration) {
@@ -4281,19 +4735,131 @@ function isAsyncModuleRequireError(error) {
 const asyncEsmModuleCache = new Map();
 const dynamicEsmFactoryCache = new Map();
 const asyncDynamicEsmFactoryCache = new Map();
+const registeredSelfEsmNamespacesKey = Symbol.for("cottontail.registeredSelfEsmNamespaces");
+const registeredSelfEsmNamespaces = globalThis[registeredSelfEsmNamespacesKey] ??= new Map();
+const asyncEsmEvaluationContextKey = Symbol("cottontail.asyncEsmEvaluationContext");
+const asyncEsmEvaluationContexts = new WeakMap();
+
+function drainAsyncEsmEvaluationChildren(context) {
+  const pending = context.pending;
+  context.pending = [];
+  for (const start of pending) start();
+}
+
+function releaseAsyncEsmEvaluationChildren(context) {
+  if (context.released) return;
+  context.released = true;
+  drainAsyncEsmEvaluationChildren(context);
+}
+
+function scheduleAsyncEsmEvaluationRelease(context) {
+  if (context.released || context.releaseScheduled) return;
+  context.releaseScheduled = true;
+  intrinsicQueueMicrotask(() => {
+    // The public normalization facade settles in the first reaction. Give
+    // the import expression's own async adoption job one checkpoint to settle
+    // its visible promise before releasing nested children.
+    intrinsicQueueMicrotask(() => {
+      context.releaseScheduled = false;
+      if (context.settled && context.publicConsumers === 0) {
+        releaseAsyncEsmEvaluationChildren(context);
+      }
+    });
+  });
+}
+
+function scheduleAsyncEsmEvaluation(parentAncestors, start) {
+  const parentContext = parentAncestors?.[asyncEsmEvaluationContextKey];
+  if (parentContext != null && !parentContext.released) {
+    parentContext.pending.push(start);
+    if (!parentContext.checkpointScheduled) {
+      parentContext.checkpointScheduled = true;
+      intrinsicQueueMicrotask(() => {
+        parentContext.checkpointScheduled = false;
+        // The importing module suspended after requesting this child. Start
+        // it now so top-level `await import()` can make progress. If the
+        // parent completed in the same job, its evaluation reaction releases
+        // the child after settling the parent's public promise instead.
+        if (!parentContext.completed) drainAsyncEsmEvaluationChildren(parentContext);
+      });
+    }
+    return;
+  }
+  start();
+}
+
+function scheduleAsyncModuleImport(parentAncestors, load) {
+  const parentContext = parentAncestors?.[asyncEsmEvaluationContextKey];
+  if (parentContext == null || parentContext.released) return load();
+
+  let resolveImport;
+  let rejectImport;
+  const promise = new IntrinsicPromise((resolve, reject) => {
+    resolveImport = resolve;
+    rejectImport = reject;
+  });
+  scheduleAsyncEsmEvaluation(parentAncestors, () => {
+    try {
+      resolveImport(load());
+    } catch (error) {
+      rejectImport(safelyNormalizeDynamicImportError(error));
+    }
+  });
+  return promise;
+}
+
+function normalizedDynamicImportPromise(result) {
+  const promise = intrinsicPromiseResolve(result);
+  const context = asyncEsmEvaluationContexts.get(promise);
+  let resolvePublic;
+  let rejectPublic;
+  const publicPromise = new IntrinsicPromise((resolve, reject) => {
+    resolvePublic = resolve;
+    rejectPublic = reject;
+  });
+  if (context != null) context.publicConsumers += 1;
+  promise.then(
+    value => {
+      resolvePublic(value);
+      if (context != null) {
+        context.publicConsumers -= 1;
+        scheduleAsyncEsmEvaluationRelease(context);
+      }
+    },
+    error => {
+      rejectPublic(safelyNormalizeDynamicImportError(error));
+      if (context != null) {
+        context.publicConsumers -= 1;
+        scheduleAsyncEsmEvaluationRelease(context);
+      }
+    },
+  );
+  return publicPromise;
+}
+
+function settleAsyncEsmRecord(record) {
+  record.settled = true;
+  const ancestors = record.moduleAncestors;
+  if (ancestors != null) {
+    try { delete ancestors[asyncEsmEvaluationContextKey]; } catch {}
+  }
+  record.moduleAncestors = null;
+}
 
 // User code (bun:test fixtures in particular) can invalidate the dynamic
 // import() cache directly via `Loader.registry.delete(key)`. That native Map
 // is the source of truth for import() dedup, but this runtime also keeps its
-// own execution caches (commonJsCache, asyncEsmModuleCache,
-// dynamicEsmFactoryCache, asyncDynamicEsmFactoryCache) populated by the fast
-// paths in executeDynamicImportSource/loadCommonJsModule. Deleting only from
-// Loader.registry left those stale, so re-importing the same resolved path
-// (e.g. the bare specifier after previously importing it with a `?query`
-// suffix, or vice versa) served an already-evaluated module instead of
-// re-executing it. `globalThis.Loader` does not exist yet while this module
-// evaluates (it's installed later by the native bootstrap), so the patch is
-// applied lazily and idempotently the first time it's needed.
+// own evaluated-module caches (commonJsCache and asyncEsmModuleCache)
+// populated by the fast paths in executeDynamicImportSource/loadCommonJsModule.
+// Deleting only from Loader.registry left those stale, so re-importing the same
+// resolved path (e.g. the bare specifier after previously importing it with a
+// `?query` suffix, or vice versa) served an already-evaluated module instead of
+// re-executing it. Keep the compiled factory caches: their entries compare the
+// complete current source before reuse, and throwing them away makes cache
+// churn re-transform and recompile unchanged modules. `globalThis.Loader` does
+// not exist yet while this module evaluates (it's installed later by the native
+// bootstrap), so the patch is applied lazily and idempotently the first time
+// it's needed.
 let loaderRegistryPatched = false;
 function ensureLoaderRegistryPatched() {
   if (loaderRegistryPatched) return;
@@ -4301,13 +4867,33 @@ function ensureLoaderRegistryPatched() {
   if (!nativeRegistry || typeof nativeRegistry.delete !== "function") return;
   loaderRegistryPatched = true;
   const nativeDelete = nativeRegistry.delete.bind(nativeRegistry);
+  const nativeClear = typeof nativeRegistry.clear === "function"
+    ? nativeRegistry.clear.bind(nativeRegistry)
+    : null;
   nativeRegistry.delete = function cottontailLoaderRegistryDelete(key) {
     commonJsCache.delete(key);
     asyncEsmModuleCache.delete(key);
-    dynamicEsmFactoryCache.delete(key);
-    asyncDynamicEsmFactoryCache.delete(key);
+    registeredSelfEsmNamespaces.delete(key);
     return nativeDelete(key);
   };
+  if (nativeClear != null) {
+    nativeRegistry.clear = function cottontailLoaderRegistryClear() {
+      // Retain source-validated compiled factories, but discard every
+      // evaluated import record represented by the native registry.
+      if (typeof nativeRegistry.keys === "function") {
+        for (const key of nativeRegistry.keys()) {
+          commonJsCache.delete(key);
+          asyncEsmModuleCache.delete(key);
+        }
+      }
+      for (const [key, module] of commonJsCache) {
+        if (module?.[dynamicImportModuleKey] === true) commonJsCache.delete(key);
+      }
+      asyncEsmModuleCache.clear();
+      registeredSelfEsmNamespaces.clear();
+      return nativeClear();
+    };
+  }
 }
 
 // Entrypoints and test files execute from a generated .cottontail-compat-*
@@ -4318,10 +4904,33 @@ function ensureLoaderRegistryPatched() {
 // returning the in-flight namespace (ESM cyclic semantics). The generated
 // wrapper calls this once, at the top of its own evaluation, with a
 // getter-backed namespace over its exported bindings.
-globalThis.__cottontailRegisterSelfModuleNamespace ??= (resolvedPath, namespace) => {
+globalThis.__cottontailRegisterSelfModuleNamespace = (resolvedPath, namespace) => {
   const key = String(resolvedPath);
-  const promise = Promise.resolve(namespace);
-  if (!asyncEsmModuleCache.has(key)) asyncEsmModuleCache.set(key, { namespace, promise });
+  const keys = new IntrinsicSet([key]);
+  try {
+    const real = cottontail.realpathSync(key);
+    if (typeof real === "string" && real.length > 0) keys.add(real);
+  } catch {}
+  const promise = intrinsicPromiseResolve(namespace);
+  for (const alias of keys) {
+    registeredSelfEsmNamespaces.set(alias, namespace);
+    const existing = asyncEsmModuleCache.get(alias);
+    if (existing != null) {
+      // The native linker's getter-backed namespace is authoritative for the
+      // entry alias even if the launcher installed a provisional record.
+      existing.namespace = namespace;
+      existing.allowSynchronousRequire = true;
+    } else {
+      asyncEsmModuleCache.set(alias, {
+        namespace,
+        promise,
+        // The generated entry is already executing under the native linker.
+        // A same-file require() must share that live namespace rather than try
+        // to synchronously evaluate its top-level-await source a second time.
+        allowSynchronousRequire: true,
+      });
+    }
+  }
   const registry = globalThis.Loader?.registry;
   // Overwrite, don't set-if-absent: the bundled dynamic-import helper
   // (`__esmDyn` in the bundler runtime) registers the entry's key with a
@@ -4329,33 +4938,76 @@ globalThis.__cottontailRegisterSelfModuleNamespace ??= (resolvedPath, namespace)
   // self-import during evaluation must get this in-flight namespace instead,
   // or it deadlocks awaiting its own completion. This runs at the top of the
   // module's own evaluation, so it is the authoritative entry for the key.
-  if (registry != null) registry.set(key, promise);
+  if (registry != null) {
+    for (const alias of keys) registry.set(alias, promise);
+  }
 };
+globalThis.__cottontailGetRegisteredSelfModuleNamespace = resolvedPath =>
+  registeredSelfEsmNamespaces.get(String(resolvedPath));
+globalThis.__cottontailImportRegisteredSelfModule = resolvedPath =>
+  intrinsicPromiseResolve(registeredSelfEsmNamespaces.get(String(resolvedPath)));
 
-function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, originalSource, ancestors = undefined) {
+function executeAsyncDynamicImportSource(
+  resolved,
+  resolvedPath,
+  suffix,
+  originalSource,
+  ancestors = undefined,
+  waitEdge = false,
+) {
   const cacheKey = String(resolved);
   const sourceName = `${resolvedPath}${suffix}`;
   const cached = asyncEsmModuleCache.get(cacheKey);
   if (cached !== undefined) {
+    // Deferred siblings can become cyclic before either begins evaluation.
+    // If an evaluating cached module is newly reached from this import chain,
+    // merge that chain into the Set its transformed helpers will carry. A
+    // later back-edge can then observe the in-flight namespace instead of two
+    // sibling promises waiting on one another forever.
+    if (waitEdge && ancestors != null && cached.moduleAncestors != null && cached.settled === false) {
+      for (const ancestor of ancestors) cached.moduleAncestors.add(ancestor);
+    }
     // A module in this import chain's ancestry (across static AND dynamic
     // import edges — the transformed helpers thread __ctModuleAncestors
     // through both) is still evaluating; awaiting its completion promise
     // would deadlock, since it cannot finish until this import settles. Bun
     // resolves such cycles with the in-flight namespace (live partial
-    // exports), so do the same. `cached.promise` is null while the module's
-    // synchronous prefix is still on the stack below us — that is the same
-    // cycle case arriving before the promise was even installed.
-    return ancestors?.has(cacheKey) ? cached.namespace : (cached.promise ?? cached.namespace);
+    // exports), so do the same. The fallback also covers legacy or externally
+    // registered in-flight records whose completion promise is not installed.
+    return waitEdge && ancestors?.has(cacheKey)
+      ? cached.namespace
+      : (cached.promise ?? cached.namespace);
   }
   const namespace = createModuleNamespace();
-  const record = { namespace, promise: null };
-  asyncEsmModuleCache.set(cacheKey, record);
-  const moduleAncestors = new Set(ancestors ?? []);
+  let moduleAncestors = new IntrinsicSet(waitEdge ? (ancestors ?? []) : []);
   moduleAncestors.add(cacheKey);
+  const evaluationContext = {
+    pending: [],
+    released: false,
+    completed: false,
+    checkpointScheduled: false,
+    releaseScheduled: false,
+    publicConsumers: 0,
+    settled: false,
+  };
+  Object.defineProperty(moduleAncestors, asyncEsmEvaluationContextKey, {
+    value: evaluationContext,
+    configurable: true,
+  });
+  const record = {
+    namespace,
+    promise: null,
+    moduleAncestors,
+    evaluationContext,
+    settled: false,
+  };
+  asyncEsmModuleCache.set(cacheKey, record);
   let run;
+  let wrapperLineOffset;
   const cachedFactory = asyncDynamicEsmFactoryCache.get(cacheKey);
   if (cachedFactory?.source === originalSource) {
     run = cachedFactory.run;
+    wrapperLineOffset = cachedFactory.wrapperLineOffset;
   } else {
     const transformed = transformEsmSourceForDynamicImport(
       maybeTransformRuntimeSyntax(resolvedPath, maybeStripTypeScript(resolvedPath, originalSource)),
@@ -4364,62 +5016,160 @@ function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, origina
     maybeRegisterSourceMap(resolvedPath, transformed);
     recordCompileCache(resolvedPath, transformed);
     try {
-      run = compileAsyncModuleWrapper(
-        [ESM_EXPORTS_BINDING, "require", "__filename", "__dirname", "__ctImportMeta", "__ctModuleAncestors", "Error"],
-        transformed,
+      const evaluationSource = `with ({ require: ${ESM_REQUIRE_BINDING} }) { try { ${transformed}\n} finally { ${ESM_EVALUATION_COMPLETED_BINDING}(); } }`;
+      ({ run, wrapperLineOffset } = compileAsyncModuleWrapper(
+        [
+          ESM_EXPORTS_BINDING,
+          ESM_REQUIRE_BINDING,
+          "__filename",
+          "__dirname",
+          "__ctImportMeta",
+          "__ctModuleAncestors",
+          "Error",
+          ESM_EVALUATION_COMPLETED_BINDING,
+          ESM_PROMISE_RESOLVE_BINDING,
+          ESM_SET_BINDING,
+        ],
+        evaluationSource,
         sourceName,
         originalSource,
-      );
+      ));
     } catch (error) {
       asyncEsmModuleCache.delete(cacheKey);
       throw error;
     }
-    asyncDynamicEsmFactoryCache.set(cacheKey, { source: originalSource, run });
+    asyncDynamicEsmFactoryCache.set(cacheKey, { source: originalSource, run, wrapperLineOffset });
   }
-  record.promise = run(
-    namespace,
-    // An ES module's `require` resolves against its own path. Without this
-    // binding the module falls through to the global require installed by the
-    // generated launcher, whose base is the launcher artifact directory.
-    createEsmRequire(hookRequireBase(resolvedPath), { exports: namespace }),
-    resolvedPath,
-    dirname(resolvedPath),
-    importMetaForHookModule(resolvedPath, suffix),
-    moduleAncestors,
-    dynamicModuleErrorConstructor(sourceName, originalSource),
-  ).then(
-    () => finalizeEsmNamespaceOrder(namespace),
-    error => {
-      if (asyncEsmModuleCache.get(cacheKey) === record) asyncEsmModuleCache.delete(cacheKey);
-      throw error;
-    },
+  const normalizeEvaluationError = error => safelyNormalizeDynamicImportError(
+    remapThrownModuleError(error, resolvedPath, wrapperLineOffset),
   );
+  let resolveEvaluation;
+  let rejectEvaluation;
+  record.promise = new IntrinsicPromise((resolve, reject) => {
+    resolveEvaluation = resolve;
+    rejectEvaluation = reject;
+  });
+  asyncEsmEvaluationContexts.set(record.promise, evaluationContext);
+  let started = false;
+  const start = () => {
+    if (started) return;
+    started = true;
+
+    let execution;
+    try {
+      execution = run(
+        namespace,
+        // An ES module's `require` resolves against its own path. Without this
+        // binding the module falls through to the global require installed by the
+        // generated launcher, whose base is the launcher artifact directory.
+        createEsmRequire(hookRequireBase(resolvedPath), { exports: namespace }),
+        resolvedPath,
+        dirname(resolvedPath),
+        importMetaForHookModule(resolvedPath, suffix),
+        moduleAncestors,
+        dynamicModuleErrorConstructor(sourceName, originalSource),
+        () => { evaluationContext.completed = true; },
+        intrinsicPromiseResolve,
+        IntrinsicSet,
+      );
+    } catch (error) {
+      settleAsyncEsmRecord(record);
+      moduleAncestors = null;
+      evaluationContext.settled = true;
+      if (asyncEsmModuleCache.get(cacheKey) === record) asyncEsmModuleCache.delete(cacheKey);
+      rejectEvaluation(normalizeEvaluationError(error));
+      scheduleAsyncEsmEvaluationRelease(evaluationContext);
+      return;
+    }
+
+    intrinsicPromiseResolve(execution).then(
+      () => {
+        try {
+          const finalized = finalizeEsmNamespaceOrder(namespace);
+          settleAsyncEsmRecord(record);
+          moduleAncestors = null;
+          evaluationContext.settled = true;
+          resolveEvaluation(finalized);
+        } catch (error) {
+          settleAsyncEsmRecord(record);
+          moduleAncestors = null;
+          evaluationContext.settled = true;
+          if (asyncEsmModuleCache.get(cacheKey) === record) asyncEsmModuleCache.delete(cacheKey);
+          rejectEvaluation(safelyNormalizeDynamicImportError(error));
+        }
+        // Resolving the public evaluation promise enqueues all handlers that
+        // were attached by the importing module. Queue child evaluation after
+        // those handlers instead of guessing at a fixed number of Promise
+        // reactions between the module record and import().
+        scheduleAsyncEsmEvaluationRelease(evaluationContext);
+      },
+      error => {
+        settleAsyncEsmRecord(record);
+        moduleAncestors = null;
+        evaluationContext.settled = true;
+        if (asyncEsmModuleCache.get(cacheKey) === record) asyncEsmModuleCache.delete(cacheKey);
+        rejectEvaluation(normalizeEvaluationError(error));
+        scheduleAsyncEsmEvaluationRelease(evaluationContext);
+      },
+    );
+  };
+
+  scheduleAsyncEsmEvaluation(ancestors, start);
   return record.promise;
 }
 
-function executeDynamicImportSource(resolved, source, format, forceAsync = false, asyncAncestors = undefined) {
+function executeDynamicImportSource(
+  resolved,
+  source,
+  format,
+  forceAsync = false,
+  asyncAncestors = undefined,
+  asyncWaitEdge = false,
+) {
   const { bare: resolvedPath, suffix } = splitSpecifierSuffix(resolved);
   const sourceName = `${resolvedPath}${suffix}`;
   const sourceText = String(source ?? "").replace(/^#!/, "//");
   const effectiveFormat = format ?? formatForHookSource(resolvedPath, sourceText);
+  const synchronousResult = load => forceAsync
+    ? scheduleAsyncModuleImport(asyncAncestors, load)
+    : load();
   if (effectiveFormat === "builtin") {
-    return namespaceFromBuiltin(resolvedPath, loadBuiltinOrReplacement(resolvedPath));
+    return synchronousResult(() => namespaceFromBuiltin(resolvedPath, loadBuiltinOrReplacement(resolvedPath)));
   }
   if (effectiveFormat === "json" || String(resolvedPath).endsWith(".json")) {
-    const jsonSource = sourceText;
-    try {
-      return { default: JSON.parse(jsonSource) };
-    } catch (error) {
-      if (/(^|[\\/])package\.json$/.test(String(resolvedPath))) return { default: parseJSONC(jsonSource) };
-      throw error;
-    }
+    return synchronousResult(() => {
+      const jsonSource = sourceText;
+      try {
+        return { default: JSON.parse(jsonSource) };
+      } catch (error) {
+        if (/(^|[\\/])package\.json$/.test(String(resolvedPath))) return { default: parseJSONC(jsonSource) };
+        throw error;
+      }
+    });
   }
   if (effectiveFormat === "commonjs" || String(resolvedPath).endsWith(".cjs")) {
-    return namespaceFromCommonJs(executeHookSource(
+    return synchronousResult(() => namespaceFromCommonJs(executeHookSource(
       resolvedPath,
       replaceCodePattern(source, /\bimport\.meta\b/g, "__ctImportMeta"),
       "commonjs",
-    ), packageTypeIsModule(resolvedPath));
+    ), packageTypeIsModule(resolvedPath)));
+  }
+  if (!suffix && isAbsolute(resolvedPath) && !isEmbeddedRuntimePath(resolvedPath) &&
+      !isGeneratedRuntimeBundlePath(resolvedPath) && /\.(?:[cm]?[jt]s|[jt]sx)$/i.test(resolvedPath) &&
+      modulePathExists(resolvedPath) && hasEsmSyntax(sourceText)) {
+    let fileSource;
+    try { fileSource = readModuleFile(resolvedPath).replace(/^#!/, "//"); } catch {}
+    // Hooks, plugins, and generated Bake/build inputs can deliberately reuse
+    // an existing filename while supplying contents with a different loader.
+    // Link only the actual file bytes here; scanning those virtual contents
+    // with the filename-derived loader turns HTML or TypeScript into bogus JS
+    // parse errors before their owning loader sees them.
+    if (fileSource === sourceText) {
+      const entryPath = globalThis.process?.argv?.[1];
+      const directEntry = typeof entryPath === "string" && entryPath.length > 0 &&
+        runtimeEsmGraphPathKey(resolvedPath) === runtimeEsmGraphPathKey(entryPath);
+      validateRuntimeEsmLinkage(resolved, sourceText, runtimeEsmGraphLoader(resolvedPath), directEntry);
+    }
   }
   if (!forceAsync &&
       isAbsolute(resolvedPath) &&
@@ -4436,6 +5186,7 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
         suffix,
         asyncGraph.source,
         asyncAncestors,
+        asyncWaitEdge,
       );
     }
     runtimeEsmSourceExecutionDepth += 1;
@@ -4446,10 +5197,24 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
     } finally {
       runtimeEsmSourceExecutionDepth -= 1;
     }
-    return executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, sourceText, asyncAncestors);
+    return executeAsyncDynamicImportSource(
+      resolved,
+      resolvedPath,
+      suffix,
+      sourceText,
+      asyncAncestors,
+      asyncWaitEdge,
+    );
   }
   if (forceAsync) {
-    return executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, sourceText, asyncAncestors);
+    return executeAsyncDynamicImportSource(
+      resolved,
+      resolvedPath,
+      suffix,
+      sourceText,
+      asyncAncestors,
+      asyncWaitEdge,
+    );
   }
   const namespace = createModuleNamespace();
   const originalSource = sourceText;
@@ -4482,7 +5247,14 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
       // outputs re-imported via blob: URLs). Preserve synchronous evaluation for
       // ordinary modules and only retry syntax containing await asynchronously.
       if (!(error instanceof SyntaxError) || !/(?<![.\w$])await\b/.test(transformed)) throw error;
-      return executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, originalSource);
+      return executeAsyncDynamicImportSource(
+        resolved,
+        resolvedPath,
+        suffix,
+        originalSource,
+        asyncAncestors,
+        asyncWaitEdge,
+      );
     }
     dynamicEsmFactoryCache.set(factoryCacheKey, { source: originalSource, run });
   }
@@ -4499,48 +5271,82 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
     );
   } catch (error) {
     if (!isAsyncModuleRequireError(error)) throw error;
-    return executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, originalSource);
+    return executeAsyncDynamicImportSource(
+      resolved,
+      resolvedPath,
+      suffix,
+      originalSource,
+      asyncAncestors,
+      asyncWaitEdge,
+    );
   }
   return finalizeEsmNamespaceOrder(namespace);
 }
 
-function importResolvedRuntimeModule(resolved, options = undefined, forceAsync = false, asyncAncestors = undefined) {
+function importResolvedRuntimeModule(
+  resolved,
+  options = undefined,
+  forceAsync = false,
+  asyncAncestors = undefined,
+  asyncWaitEdge = false,
+) {
+  const synchronousResult = load => forceAsync
+    ? scheduleAsyncModuleImport(asyncAncestors, load)
+    : load();
   const cachedPluginModule = commonJsCache.get(resolved);
   if (cachedPluginModule && Object.hasOwn(cachedPluginModule, "__cottontailPluginNamespace")) {
-    return cachedPluginModule.__cottontailPluginNamespace;
+    return synchronousResult(() => cachedPluginModule.__cottontailPluginNamespace);
   }
-  if (cachedPluginModule?.[runtimeEsmSourceModuleKey] === true) return cachedPluginModule.exports;
+  if (cachedPluginModule?.[runtimeEsmSourceModuleKey] === true) {
+    return synchronousResult(() => cachedPluginModule.exports);
+  }
   const loader = options?.with?.type ?? options?.assert?.type ?? options?.type;
   const resolvedPath = splitSpecifierSuffix(resolved).bare;
   if (loader === "text") {
-    return { default: readModuleFile(resolvedPath) };
+    return synchronousResult(() => ({ default: readModuleFile(resolvedPath) }));
   }
   if (loader === "file") {
-    return { default: resolvedPath };
+    return synchronousResult(() => ({ default: resolvedPath }));
   }
   if (loader === "sqlite" || loader === "sqlite_embedded") {
-    const sqliteModule = loadBuiltinOrReplacement("bun:sqlite");
-    const Database = sqliteModule?.Database ?? sqliteModule?.default;
-    const embedded = standaloneFileEntry(resolvedPath);
-    const db = new Database(embedded.found ? standaloneFileBytes(embedded.value) : resolvedPath);
-    return { db, default: db, __esModule: true };
+    return synchronousResult(() => {
+      const sqliteModule = loadBuiltinOrReplacement("bun:sqlite");
+      const Database = sqliteModule?.Database ?? sqliteModule?.default;
+      const embedded = standaloneFileEntry(resolvedPath);
+      const db = new Database(embedded.found ? standaloneFileBytes(embedded.value) : resolvedPath);
+      return { db, default: db, __esModule: true };
+    });
   }
   const resolvedMock = bunModuleMockFor(resolved);
-  if (resolvedMock.found) return namespaceFromCommonJs(resolvedMock.value);
+  if (resolvedMock.found) return synchronousResult(() => namespaceFromCommonJs(resolvedMock.value));
   const resolvedByHook = hookResolvedFormats.has(resolved);
   const loadResult = runLoadHooks(resolved);
   if (loadResult !== undefined) {
-    return executeDynamicImportSource(resolved, loadResult.source, loadResult.format, forceAsync, asyncAncestors);
+    return executeDynamicImportSource(
+      resolved,
+      loadResult.source,
+      loadResult.format,
+      forceAsync,
+      asyncAncestors,
+      asyncWaitEdge,
+    );
   }
   if (builtinModuleMap.has(resolved) || hasRuntimePackageReplacement(resolved)) {
-    return namespaceFromBuiltin(resolved, loadBuiltinOrReplacement(resolved));
+    return synchronousResult(() => namespaceFromBuiltin(resolved, loadBuiltinOrReplacement(resolved)));
   }
   if (/\.html?$/i.test(resolvedPath)) {
-    return { default: { index: resolvedPath, files: null } };
+    return synchronousResult(() => ({ default: { index: resolvedPath, files: null } }));
   }
   const embedded = standaloneFileEntry(resolvedPath);
   if (embedded.found && hasEsmSyntax(embedded.value)) {
-    return executeDynamicImportSource(resolved, embedded.value, "module", forceAsync, asyncAncestors);
+    return executeDynamicImportSource(
+      resolved,
+      embedded.value,
+      "module",
+      forceAsync,
+      asyncAncestors,
+      asyncWaitEdge,
+    );
   }
   const resolvedFormat = resolvedByHook ? hookResolvedFormats.get(resolved) : formatForResolved(resolved);
   if (resolvedFormat === "commonjs") {
@@ -4548,16 +5354,37 @@ function importResolvedRuntimeModule(resolved, options = undefined, forceAsync =
     if (/\.(?:js|jsx|ts|tsx)$/i.test(resolvedPath)) {
       source = embedded.found ? embedded.value : readModuleFile(resolvedPath);
       if (hasEsmSyntax(source)) {
-        return executeDynamicImportSource(resolved, source, "module", forceAsync, asyncAncestors);
+        return executeDynamicImportSource(
+          resolved,
+          source,
+          "module",
+          forceAsync,
+          asyncAncestors,
+          asyncWaitEdge,
+        );
       }
     }
     if (forceAsync && source !== undefined && sourceRequiresAsyncModuleExecution(resolvedPath, source)) {
-      return executeDynamicImportSource(resolved, source, "module", true, asyncAncestors);
+      return executeDynamicImportSource(
+        resolved,
+        source,
+        "module",
+        true,
+        asyncAncestors,
+        asyncWaitEdge,
+      );
     }
-    const value = loadCommonJsModule(resolved);
-    const loadedModule = commonJsCache.get(resolved);
-    if (loadedModule) loadedModule[dynamicImportModuleKey] = true;
-    return namespaceFromCommonJs(value, packageTypeIsModule(resolvedPath));
+    const load = () => {
+      const value = loadCommonJsModule(resolved);
+      const loadedModule = commonJsCache.get(resolved);
+      if (loadedModule) loadedModule[dynamicImportModuleKey] = true;
+      return namespaceFromCommonJs(value, packageTypeIsModule(resolvedPath));
+    };
+    // A dynamic import of a source file without ESM syntax takes this
+    // synchronous CommonJS path. Defer its evaluation with the same parent
+    // context used by async ESM records so its side effects do not overtake
+    // completion handlers for the importing module.
+    return synchronousResult(load);
   }
   return executeDynamicImportSource(
     resolved,
@@ -4565,6 +5392,7 @@ function importResolvedRuntimeModule(resolved, options = undefined, forceAsync =
     resolvedFormat,
     forceAsync,
     asyncAncestors,
+    asyncWaitEdge,
   );
 }
 
@@ -4574,24 +5402,38 @@ export function __importModule(
   options = undefined,
   forceAsync = false,
   asyncAncestors = undefined,
+  asyncWaitEdge = false,
 ) {
   ensureLoaderRegistryPatched();
   const directMock = bunModuleMockFor(specifier);
   if (directMock.found) {
     if (directMock.value && typeof directMock.value.then === "function") {
-      return Promise.resolve(directMock.value).then(namespaceFromCommonJs);
+      return intrinsicPromiseResolve(directMock.value).then(namespaceFromCommonJs);
     }
-    return namespaceFromCommonJs(directMock.value);
+    const load = () => namespaceFromCommonJs(directMock.value);
+    return forceAsync ? scheduleAsyncModuleImport(asyncAncestors, load) : load();
   }
   // `import(URL.createObjectURL(blob))`: Bun evaluates the Blob's contents as
   // an ES module (e.g. re-importing a Bun.build output). The object-URL
   // registry lives on globalThis (installed by the Blob shim).
   const specifierText = String(specifier);
   const virtualNamespace = globalThis.__cottontailVirtualModuleNamespaces?.get(specifierText);
-  if (virtualNamespace !== undefined) return virtualNamespace;
-  const parent = referrer == null
+  if (virtualNamespace !== undefined) {
+    const load = () => virtualNamespace;
+    return forceAsync ? scheduleAsyncModuleImport(asyncAncestors, load) : load();
+  }
+  let parent = referrer == null
     ? cottontail.cwd()
     : (String(referrer).startsWith("file:") ? fileURLToPath(String(referrer)) : String(referrer));
+  // Generated entry launchers inject bunfig/CLI preloads into their own
+  // module body. Those imports still belong to the user's entrypoint;
+  // resolving beside the temporary launcher loses the project context.
+  if (isGeneratedRuntimeBundlePath(parent)) {
+    const mainPath = currentProcessBuiltin().argv?.[1];
+    if (typeof mainPath === "string" && mainPath.length > 0) {
+      parent = isAbsolute(mainPath) ? mainPath : resolve(cottontail.cwd(), mainPath);
+    }
+  }
   if (specifierText.startsWith("data:")) {
     const comma = specifierText.indexOf(",");
     const metadata = comma < 0 ? "" : specifierText.slice(5, comma);
@@ -4620,6 +5462,7 @@ export function __importModule(
       "module",
       forceAsync,
       asyncAncestors,
+      asyncWaitEdge,
     );
   }
   if (specifierText.startsWith("blob:")) {
@@ -4627,25 +5470,42 @@ export function __importModule(
     if (blob && typeof blob.text === "function") {
       const extension = /typescript/i.test(String(blob.type ?? "")) ? "ts" : "mjs";
       const virtualPath = join(cottontail.cwd(), `__cottontail-blob-${specifierText.replace(/[^a-zA-Z0-9._-]/g, "_")}.${extension}`);
-      return Promise.resolve(blob.text()).then((source) =>
-        executeDynamicImportSource(virtualPath, source, "module", forceAsync, asyncAncestors));
+      return intrinsicPromiseResolve(blob.text()).then((source) =>
+        executeDynamicImportSource(
+          virtualPath,
+          source,
+          "module",
+          forceAsync,
+          asyncAncestors,
+          asyncWaitEdge,
+        ));
     }
     throw moduleNotFoundError(specifierText, false);
   }
   const pluginAttempt = tryImportRuntimePlugin(specifierText, parent, options);
-  if (pluginAttempt?.matched) return pluginAttempt.value;
+  if (pluginAttempt?.matched) {
+    if (!forceAsync || isPromiseLike(pluginAttempt.value)) return pluginAttempt.value;
+    return scheduleAsyncModuleImport(asyncAncestors, () => pluginAttempt.value);
+  }
   if (specifierText.includes("://") && !/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(specifierText)) {
     throw dynamicResolveMessage(`Cannot find module '${specifierText}' from '${parent}'`);
   }
   const resolved = pluginAttempt?.resolved ?? resolveRequest(String(specifier), parent, true, "import");
-  if (forceAsync) return importResolvedRuntimeModule(resolved, options, true, asyncAncestors);
+  const registeredSelfNamespace = registeredSelfEsmNamespaces.get(resolved);
+  if (registeredSelfNamespace !== undefined) {
+    const load = () => registeredSelfNamespace;
+    return forceAsync ? scheduleAsyncModuleImport(asyncAncestors, load) : load();
+  }
+  if (forceAsync) {
+    return importResolvedRuntimeModule(resolved, options, true, asyncAncestors, asyncWaitEdge);
+  }
 
   const loader = options?.with?.type ?? options?.assert?.type ?? options?.type;
   const cacheKey = loader == null ? String(resolved) : `${resolved}\0${loader}`;
   const registry = globalThis.Loader?.registry;
   if (registry?.has?.(cacheKey)) return registry.get(cacheKey);
 
-  const result = importResolvedRuntimeModule(resolved, options, false, asyncAncestors);
+  const result = importResolvedRuntimeModule(resolved, options, false, asyncAncestors, asyncWaitEdge);
   if (!isPromiseLike(result)) {
     // Rewritten import() call sites are async functions already. Preserve the
     // evaluated namespace directly so synchronous modules do not allocate two
@@ -4655,7 +5515,7 @@ export function __importModule(
     registry?.set?.(cacheKey, result);
     return result;
   }
-  const promise = Promise.resolve(result);
+  const promise = intrinsicPromiseResolve(result);
   registry?.set?.(cacheKey, promise);
   promise.catch(() => {
     if (registry?.get?.(cacheKey) === promise) registry.delete(cacheKey);
@@ -4680,6 +5540,14 @@ function normalizeDynamicImportError(error) {
   return error;
 }
 
+function safelyNormalizeDynamicImportError(error) {
+  try {
+    return normalizeDynamicImportError(error);
+  } catch {
+    return error;
+  }
+}
+
 // The native dynamic-import shim (cottontail.importModule) stringifies any
 // exception thrown synchronously by this hook, losing error identity (e.g.
 // error.code). Return a rejected promise instead so the original Error object
@@ -4690,23 +5558,27 @@ globalThis.__cottontailImportModule = (
   options,
   forceAsync = false,
   asyncAncestors = undefined,
+  asyncWaitEdge = false,
 ) => {
   try {
-    const result = __importModule(specifier, referrer, options, forceAsync, asyncAncestors);
+    const result = __importModule(
+      specifier,
+      referrer,
+      options,
+      forceAsync,
+      asyncAncestors,
+      asyncWaitEdge,
+    );
     if (result && typeof result.then === "function") {
-      const normalized = Promise.resolve(result).catch(error => {
-        throw normalizeDynamicImportError(error);
-      });
-      normalized.catch(() => {});
-      return normalized;
+      // Every import expression gets a fresh public promise even when it
+      // observes a shared in-flight module record. The facade also gives the
+      // scheduler a precise boundary after the importer's reactions have been
+      // enqueued, without pre-handling rejection on the public promise.
+      return normalizedDynamicImportPromise(result);
     }
     return result;
   } catch (error) {
-    const rejected = Promise.reject(normalizeDynamicImportError(error));
-    // Pre-attach a no-op handler so the runtime's unhandled-rejection tracker
-    // does not flag it before the awaiting caller attaches its own handler.
-    rejected.catch(() => {});
-    return rejected;
+    return intrinsicPromiseReject(safelyNormalizeDynamicImportError(error));
   }
 };
 
@@ -4799,6 +5671,15 @@ function loadCommonJsModule(resolved, parent = null, isMain = false) {
   if (mocked.found) return mocked.value;
   const pathMock = suffix ? bunModuleMockFor(resolvedPath) : { found: false, value: undefined };
   if (pathMock.found) return pathMock.value;
+  const registeredSelfNamespace = registeredSelfEsmNamespaces.get(resolved);
+  if (registeredSelfNamespace !== undefined) {
+    // Bun's require(ESM) view exposes the virtual interop marker on the same
+    // live namespace object; the marker remains inherited/non-exported.
+    try { registeredSelfNamespace.__esModule = true; } catch {}
+    return registeredSelfNamespace;
+  }
+  const registeredEsm = asyncEsmModuleCache.get(resolved);
+  if (registeredEsm?.allowSynchronousRequire === true) return registeredEsm.namespace;
   if (commonJsCache.has(resolved)) {
     const cached = commonJsCache.get(resolved);
     attachModuleChild(parent, cached);
@@ -5135,7 +6016,7 @@ function isGeneratedBundlePath(path) {
   const key = `${typeof bundlePath === "string" ? bundlePath : ""} ${typeof mapPath === "string" ? mapPath : ""}`;
   if (generatedBundlePathsKey !== key) {
     generatedBundlePathsKey = key;
-    generatedBundlePaths = new Set();
+    generatedBundlePaths = new IntrinsicSet();
     if (typeof bundlePath === "string" && bundlePath !== "") generatedBundlePaths.add(bundlePath);
     if (typeof mapPath === "string" && mapPath.endsWith(".map")) {
       generatedBundlePaths.add(mapPath.slice(0, -".map".length));
@@ -5740,7 +6621,7 @@ function originalErrorLocation(error, metadata) {
   };
 }
 
-function bunUncaughtCodeFrame(location, message) {
+function bunUncaughtCodeFrame(location, error) {
   if (typeof location?.source !== "string") return null;
   const lines = location.source.split(/\r?\n/);
   const start = Math.max(1, location.line - 5);
@@ -5749,7 +6630,13 @@ function bunUncaughtCodeFrame(location, message) {
     frame.push(`${line} | ${lines[line - 1]}`);
   }
   frame.push(`${" ".repeat(String(location.line).length + 3 + Math.max(0, location.column - 1))}^`);
-  frame.push(`error: ${String(message ?? "")}`);
+  const errorName = String(error?.name ?? "Error");
+  const label = errorName === "Error"
+    ? "error"
+    : errorName === "AssertionError" && error?.code === "ERR_ASSERTION"
+      ? "AssertionError [ERR_ASSERTION]"
+      : errorName;
+  frame.push(`${label}: ${String(error?.message ?? "")}`);
   return frame.join("\n");
 }
 
@@ -5768,9 +6655,17 @@ globalThis.__cottontailFormatUncaughtModuleError = error => {
       ? `\nnote: missing sourcemaps for ${metadata.filename}\nnote: consider bundling with '--sourcemap' to get unminified traces`
       : "";
     const location = originalErrorLocation(error, metadata);
-    const codeFrame = bunUncaughtCodeFrame(location, error?.message);
+    const codeFrame = bunUncaughtCodeFrame(location, error);
     if (codeFrame && location) {
-      const frames = String(error.stack ?? "").split(/\r?\n/).slice(1).join("\n");
+      const frames = String(error.stack ?? "").split(/\r?\n/).slice(1).map(frameLine => {
+        const trailing = frameLine.trim();
+        if (/^at\b/.test(trailing)) return `    ${trailing}`;
+        const jscFrame = /^(.*?)@(.+:\d+:\d+)$/.exec(trailing);
+        if (!jscFrame) return trailing;
+        return jscFrame[1]
+          ? `    at ${jscFrame[1]} (${jscFrame[2]})`
+          : `    at ${jscFrame[2]}`;
+      }).join("\n");
       error.stack = `${codeFrame}\n    at ${location.filename}:${location.line}:${location.column}${frames ? `\n${frames}` : ""}${missingSourceMapNotes}`;
       Object.defineProperty(error, "__cottontailFormattedStack", { value: true, configurable: true });
       return;
@@ -6430,7 +7325,7 @@ function applyMaskRanges(source, ranges) {
 }
 
 function moduleBindingAliasPositions(source) {
-  const positions = new Set();
+  const positions = new IntrinsicSet();
   const code = codeOnlyText(source);
   const declarations = [
     /\b(?:import|export)\s+(?:type\s+)?(?:[A-Za-z_$\u0080-\uffff][\w$\u0080-\uffff]*\s*,\s*)?\{[^{}]*\}/g,
@@ -6474,16 +7369,16 @@ function stripTypeScriptTypesPreserveWhitespace(source) {
       continue;
     }
     if (wordAt(source, cursor, "implements")) {
-      addMaskRange(ranges, cursor, findTypeEnd(source, cursor + "implements".length, new Set(["{", "\n"])));
+      addMaskRange(ranges, cursor, findTypeEnd(source, cursor + "implements".length, new IntrinsicSet(["{", "\n"])));
       continue;
     }
     if (wordAt(source, cursor, "as")) {
       if (moduleBindingAliases.has(cursor)) continue;
-      addMaskRange(ranges, cursor, findTypeEnd(source, cursor + 2, new Set([";", ",", ")", "]", "}", "\n"])));
+      addMaskRange(ranges, cursor, findTypeEnd(source, cursor + 2, new IntrinsicSet([";", ",", ")", "]", "}", "\n"])));
       continue;
     }
     if (wordAt(source, cursor, "satisfies")) {
-      addMaskRange(ranges, cursor, findTypeEnd(source, cursor + 9, new Set([";", ",", ")", "]", "}", "\n"])));
+      addMaskRange(ranges, cursor, findTypeEnd(source, cursor + 9, new IntrinsicSet([";", ",", ")", "]", "}", "\n"])));
       continue;
     }
     if (char === "<") {
@@ -6501,7 +7396,7 @@ function stripTypeScriptTypesPreserveWhitespace(source) {
       continue;
     }
     if (char === ":" && shouldMaskTypeColon(source, cursor)) {
-      const end = findTypeEnd(source, cursor + 1, new Set(["=", ",", ")", ";", "{", "}", "\n"]));
+      const end = findTypeEnd(source, cursor + 1, new IntrinsicSet(["=", ",", ")", ";", "{", "}", "\n"]));
       if (end > cursor + 1) addMaskRange(ranges, cursor, end);
       continue;
     }

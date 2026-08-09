@@ -187,3 +187,81 @@ export const callback = api.__esmForce(() => "not called");
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("coverage does not attribute module initializer ranges to user functions", () => {
+  const directory = fixture({
+    "demo1.ts": `
+export class Y {
+#hello;
+};
+`,
+    "demo2.ts": `
+import { Y } from "./demo1";
+
+export function covered() {
+  // this function IS covered
+  return Y;
+}
+
+export function uncovered() {
+  // this function is not covered
+  return 42;
+}
+
+covered();
+`,
+  });
+  try {
+    const result = run(directory, [
+      "--coverage",
+      "--coverage-reporter=lcov",
+      "--coverage-dir=artifacts",
+      "./demo2.ts",
+    ]);
+    expect(result.exitCode, result.stderrText).toBe(0);
+    const lcov = readFileSync(join(directory, "artifacts", "lcov.info"), "utf8");
+    const demo1 = lcov.match(/SF:demo1\.ts\n([\s\S]*?)end_of_record/)?.[1] ?? "";
+    const demo2 = lcov.match(/SF:demo2\.ts\n([\s\S]*?)end_of_record/)?.[1] ?? "";
+    expect(demo1).toContain("FNF:1\nFNH:0");
+    expect(demo2).toContain("FNF:2\nFNH:1");
+    expect(demo2).toMatch(/^DA:4,[1-9]\d*$/m);
+    expect(demo2).toMatch(/^DA:6,[1-9]\d*$/m);
+    expect(demo2).toMatch(/^DA:14,[1-9]\d*$/m);
+    expect(demo2).toContain("DA:9,0\nDA:10,0\nDA:11,1");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("coverage preserves nested user functions inside an executed declaration", () => {
+  const directory = fixture({
+    "sample.test.ts": `
+import { expect, test } from "bun:test";
+import "./source";
+test("nested coverage", () => expect(true).toBe(true));
+`,
+    "source.ts": `
+export function outer() {
+  const never = () => 1;
+}
+
+outer();
+`,
+  });
+  try {
+    const result = run(directory, [
+      "--coverage",
+      "--coverage-reporter=lcov",
+      "--coverage-dir=artifacts",
+      "./sample.test.ts",
+    ]);
+    expect(result.exitCode, result.stderrText).toBe(0);
+    const lcov = readFileSync(join(directory, "artifacts", "lcov.info"), "utf8");
+    const source = lcov.match(/SF:source\.ts\n([\s\S]*?)end_of_record/)?.[1] ?? "";
+    expect(source).toContain("FNF:2\nFNH:1");
+    expect(source).toMatch(/^DA:2,[1-9]\d*$/m);
+    expect(source).toMatch(/^DA:6,[1-9]\d*$/m);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

@@ -150,7 +150,9 @@ async function withTerminalRepl(
     await waitFor(/\u276f|> /); // Wait for prompt
     await fn({ terminal, proc: spawnedProc, send, waitFor, allOutput });
 
-    if (!processFinished) send(".exit\n");
+    // A terminal test may intentionally leave text in the editor (for example,
+    // tab completion leaves ".help " pending). Clear it before issuing .exit.
+    if (!processFinished) send("\x03.exit\n");
     const cleanExit = await Promise.race([exitPromise, Bun.sleep(2000).then(() => null)]);
     if (cleanExit === null) throw new Error("REPL did not exit within 2000ms after .exit");
     if (cleanExit.type === "error") {

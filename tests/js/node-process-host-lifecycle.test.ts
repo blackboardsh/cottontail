@@ -12,8 +12,8 @@ afterAll(() => {
   rmSync(fixtureDirectory, { recursive: true, force: true });
 });
 
-async function runSource(source: string) {
-  const fixture = join(fixtureDirectory, `fixture-${fixtureId++}.js`);
+async function runSource(source: string, extension = "js") {
+  const fixture = join(fixtureDirectory, `fixture-${fixtureId++}.${extension}`);
   writeFileSync(fixture, source);
   const child = Bun.spawn({
     cmd: [process.execPath, fixture],
@@ -118,6 +118,17 @@ test("uncaught ReferenceError messages use Node wording", async () => {
   expect(result.exitCode).toBe(1);
   expect(result.stderr).toContain("ReferenceError: missingLifecycleBinding is not defined");
   expect(result.stderr).not.toContain("Can't find variable:");
+});
+
+test("transpiled CommonJS code frames retain the ReferenceError name", async () => {
+  const result = await runSource(`
+    const marker: string = "ready";
+    missingTypedLifecycleBinding(marker);
+  `, "cts");
+
+  expect(result.exitCode).toBe(1);
+  expect(result.stderr).toContain("ReferenceError: missingTypedLifecycleBinding is not defined");
+  expect(result.stderr).not.toContain("\nerror: missingTypedLifecycleBinding is not defined");
 });
 
 test("a monitor-only nextTick exception is routed once", async () => {
