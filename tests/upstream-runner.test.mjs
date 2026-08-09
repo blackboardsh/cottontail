@@ -408,16 +408,17 @@ function installBundlerDiscoveryFixture(fixture, mode) {
   mkdirSync(dirname(absolutePath), { recursive: true });
   writeFileSync(absolutePath, [
     'const prefix = "COTTONTAIL_BUNDLER_TEST_ID:";',
+    'const mode = process.env.COTTONTAIL_RUNNER_DISCOVERY_MODE;',
     'if (process.env.COTTONTAIL_BUNDLER_TEST_DISCOVER === "1") {',
     '  process.stdout.write(`${prefix}"case/one"\\n`);',
-    '  const mode = process.env.COTTONTAIL_RUNNER_DISCOVERY_MODE;',
     '  if (mode === "nonzero") process.exit(2);',
     '  if (mode === "duplicate") process.stdout.write(`${prefix}"case/one"\\n`);',
     '  if (mode === "partial") process.stdout.write(`${prefix}{`);',
     '  if (mode === "truncated") process.stdout.write("x".repeat(4096));',
     '  if (mode === "timeout") setInterval(() => {}, 1000);',
     '} else {',
-    '  process.stderr.write("\\n 1 pass\\n 0 fail\\n 1 expect() calls\\nRan 1 test across 1 file.\\n");',
+    '  const count = mode === "duplicate" ? 2 : 1;',
+    '  process.stderr.write(`\\n ${count} pass\\n 0 fail\\n ${count} expect() calls\\nRan ${count} tests across 1 file.\\n`);',
     '}',
     '',
   ].join("\n"));
@@ -1141,12 +1142,15 @@ test("split bundler discovery fails closed on incomplete output", async (t) => {
   }
 });
 
-test("split bundler discovery rejects duplicate case IDs", (t) => {
+test("split bundler discovery groups duplicate scoped case IDs", (t) => {
   const fixture = createFixture(t);
   const path = installBundlerDiscoveryFixture(fixture, "duplicate");
   const result = runRunner(fixture, ["--test", path], { runtime: "bun" });
-  assert.equal(result.status, 1, result.stdout + result.stderr);
-  assert.match(result.stderr, /Duplicate itBundled discovery ID[^\n]*case\/one/);
+  assertSucceeded(result);
+  assert.match(
+    result.stdout,
+    /\[1\/1\] ok bun test\/bundler\/discovery\.test\.js \[case\/one\] \(2 tests, 2 assertions\)/,
+  );
 });
 
 test("resume skips matching passes, reruns failures, and rejects changed tests", (t) => {

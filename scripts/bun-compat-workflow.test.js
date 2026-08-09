@@ -138,11 +138,3 @@ test('generated bundler deadlines use the owned timeout scale exactly once', () 
   assert.deepEqual(htmlServer.env, { COTTONTAIL_TEST_TIMEOUT_SCALE: '2' });
   assert.equal(htmlServer.timeoutMs, 60_000);
 });
-
-test('conditional duplicate bundler IDs remain grouped by describe scope', () => {
-  const environment = status.tests['test/bundler/bundler_env.test.ts'];
-  assert.equal(environment.status, 'enabled');
-  assert.equal(environment.splitBundlerTests, undefined);
-  assert.match(environment.reason, /describe scopes intentionally reuse two itBundled leaf IDs/);
-  assert.match(environment.reason, /stays in one process/);
-});

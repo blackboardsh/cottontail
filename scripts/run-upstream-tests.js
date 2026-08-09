@@ -1943,7 +1943,10 @@ function discoverBundlerTestIds(entry, snapshotRoot, target) {
       if (typeof id !== 'string' || id.length === 0) {
         fail(`Invalid itBundled discovery ID in ${entry.path}: ${line}`);
       }
-      if (seen.has(id)) fail(`Duplicate itBundled discovery ID in ${entry.path}: ${id}`);
+      // Bun permits the same leaf test name in separate describe scopes. The
+      // exact BUN_BUNDLER_TEST_FILTER intentionally selects all registrations
+      // sharing that leaf ID, so represent them with one grouped runner unit.
+      if (seen.has(id)) continue;
       seen.add(id);
       ids.push(id);
     } catch {

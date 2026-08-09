@@ -360,7 +360,8 @@
     },
     "test/bundler/bundler_env.test.ts": {
       "status": "enabled",
-      "reason": "All seven API/CLI environment-injection variants pass together with seven assertions. The API and CLI describe scopes intentionally reuse two itBundled leaf IDs, so this light file stays in one process while covering inline, disabled, prefix-filtered, nested literal references, and a runtime PATH intentionally replaced with an unusable value."
+      "reason": "All seven API/CLI environment-injection variants pass with seven assertions, covering inline, disabled, prefix-filtered, nested literal references, and a runtime PATH intentionally replaced with an unusable value.",
+      "splitBundlerTests": true
     },
     "test/bundler/bundler_footer.test.ts": {
       "status": "enabled",
@@ -5444,7 +5445,7 @@
     "test/cli/run/run-autoinstall.test.ts": {
       "status": "skip",
       "owner": "hutch-package-manager",
-      "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
+      "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split. The shared copied fixture checks the core missing-package diagnostic independently of Bun's error: prefix and Cottontail's ResolveMessage: prefix."
     },
     "test/cli/run/run-shell.test.ts": {
       "status": "skip",

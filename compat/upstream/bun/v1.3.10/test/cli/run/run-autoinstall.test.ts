@@ -37,11 +37,15 @@ describe("basic autoinstall", () => {
           stderr: "pipe",
         });
 
+        // Auto-install behavior is the contract here. Bun prefixes this
+        // diagnostic with "error:", while Cottontail exposes it as a
+        // ResolveMessage.
+        const missingPackageMessage = "Cannot find package 'is-even'";
         if (should_install) {
-          expect(stderr?.toString("utf8")).not.toContain("error: Cannot find package 'is-even'");
+          expect(stderr?.toString("utf8")).not.toContain(missingPackageMessage);
           expect(stdout?.toString("utf8")).toBe("true\n");
         } else {
-          expect(stderr?.toString("utf8")).toContain("error: Cannot find package 'is-even'");
+          expect(stderr?.toString("utf8")).toContain(missingPackageMessage);
         }
       });
     }
@@ -81,6 +85,6 @@ test("--install=fallback to install missing packages", async () => {
     stderr: "pipe",
   });
 
-  expect(stderr?.toString("utf8")).not.toContain("error: Cannot find package 'is-odd'");
+  expect(stderr?.toString("utf8")).not.toContain("Cannot find package 'is-odd'");
   expect(stdout?.toString("utf8")).toBe("true false\n");
 });
