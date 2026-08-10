@@ -62,7 +62,7 @@ test("selective bootstrap supports process.chdir", () => {
   ]);
   expect(String(result.stderr)).toBe("");
   expect(result.exitCode).toBe(0);
-  expect(String(result.stdout).trim()).toBe(realpathSync(destination));
+  expect(realpathSync(String(result.stdout).trim())).toBe(realpathSync(destination));
 });
 
 test("full-runtime globals select the complete bootstrap", () => {
@@ -163,7 +163,7 @@ test("selective bootstrap initializes process before transitive runtime modules"
 
   const argv = JSON.parse(String(result.stdout));
   expect(argv[0]).toBe(process.execPath);
-  expect(argv[1]).toBe(realpathSync(fixture));
+  expect(realpathSync(argv[1])).toBe(realpathSync(fixture));
   expect(argv.slice(2)).toEqual(userArguments);
 });
 
