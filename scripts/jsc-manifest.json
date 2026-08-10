@@ -1,9 +1,9 @@
 {
   "repo": "blackboardsh/jsc",
-  "tag": "jsc-WebKit-7624.4.5.14.1-8e1bb5dd5c10",
+  "tag": "jsc-WebKit-7624.4.5.14.1-3e3b690d0089",
   "upstreamTag": "WebKit-7624.4.5.14.1",
   "upstreamCommit": "27877cc2acd8a3cea8b3827ddb48d6c6c0177714",
-  "jscBuildRevision": "8e1bb5dd5c104d8144bede52324058b6f35f60f3",
+  "jscBuildRevision": "3e3b690d00890932269d9200663c0498b8b43e07",
   "icuFallback": {
     "version": "70.1",
     "abi": 70,
@@ -17,23 +17,23 @@
   "assets": {
     "macos-arm64": {
       "name": "cottontail-jsc-macos-arm64.tar.gz",
-      "url": "https://electrobun-artifacts.blackboard.sh/jsc/builds/8e1bb5dd5c104d8144bede52324058b6f35f60f3/macos-arm64/jsc.tar.gz",
-      "sha256": "842c3c784adf9621247b01777a9fcd3a4856c9bd47b22d256adf2f2d9b70a929"
+      "url": "https://electrobun-artifacts.blackboard.sh/jsc/builds/3e3b690d00890932269d9200663c0498b8b43e07/macos-arm64/jsc.tar.gz",
+      "sha256": "292846bb138f508b4ba89c519cbcb0e7b8eb654b8e7adc4fc442d0fd9f1735e2"
     },
     "linux-amd64": {
       "name": "cottontail-jsc-linux-amd64.tar.gz",
-      "url": "https://electrobun-artifacts.blackboard.sh/jsc/builds/8e1bb5dd5c104d8144bede52324058b6f35f60f3/linux-x64/jsc.tar.gz",
-      "sha256": "c40f09a71f0faaab2758baac287c48af80123fd92c079469517f05df32914b3e"
+      "url": "https://electrobun-artifacts.blackboard.sh/jsc/builds/3e3b690d00890932269d9200663c0498b8b43e07/linux-x64/jsc.tar.gz",
+      "sha256": "2d2fcc3adc9708828ca2522bcac81d209ea5d9587b1c26137a473c947e007b0b"
     },
     "linux-arm64": {
       "name": "cottontail-jsc-linux-arm64.tar.gz",
-      "url": "https://electrobun-artifacts.blackboard.sh/jsc/builds/8e1bb5dd5c104d8144bede52324058b6f35f60f3/linux-arm64/jsc.tar.gz",
-      "sha256": "3f3927aa1dbb3b397ece8db8306e610185212bfc4e46cfc14e4221b1beac1710"
+      "url": "https://electrobun-artifacts.blackboard.sh/jsc/builds/3e3b690d00890932269d9200663c0498b8b43e07/linux-arm64/jsc.tar.gz",
+      "sha256": "5e5ddab5c3b1ce7e0a225bfc32dfef1243d9c44f3430f71102500d45eb78ee34"
     },
     "windows-amd64": {
       "name": "cottontail-jsc-windows-amd64.tar.gz",
-      "url": "https://electrobun-artifacts.blackboard.sh/jsc/builds/8e1bb5dd5c104d8144bede52324058b6f35f60f3/windows-x64/jsc.tar.gz",
-      "sha256": "e94f2ccad299c5ec589c9bf1f875a086bd79d790d0bcdb63e82d10d0fd74008a"
+      "url": "https://electrobun-artifacts.blackboard.sh/jsc/builds/3e3b690d00890932269d9200663c0498b8b43e07/windows-x64/jsc.tar.gz",
+      "sha256": "cf83607f52554ab9d6ae056963e2ab0ca10d3affbbcf717461ab4340ef5266c9"
     }
   }
 }
