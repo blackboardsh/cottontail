@@ -473,8 +473,9 @@ test("async generated-module errors retain the evaluated source line", () => {
   const firstFrame = stderr.split(/\r?\n/).map(line => line.trim()).find(line => line.startsWith("at "));
   expect(child.exitCode).not.toBe(0);
   expect(stderr).toContain("2 | missing();");
-  expect(firstFrame).toContain(`/${basename(target)}:2:`);
-  expect(firstFrame).not.toContain(".cottontail-embedded-runtime/node/module.js");
+  const normalizedFirstFrame = firstFrame?.replaceAll("\\", "/");
+  expect(normalizedFirstFrame).toContain(`/${basename(target)}:2:`);
+  expect(normalizedFirstFrame).not.toContain(".cottontail-embedded-runtime/node/module.js");
 });
 
 test("sync generated wrappers define the direct-await dynamic import helper", () => {
