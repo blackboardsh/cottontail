@@ -53,7 +53,10 @@ jobs:
           scripts/import-upstream-tests.test.js
           scripts/review-bun-test-changes.test.js
           tests/upstream-status-accounting.test.mjs
-          tests/upstream-runner.test.mjs
+
+      - name: Validate upstream runner contracts
+        if: matrix.os != 'windows'
+        run: node --test tests/upstream-runner.test.mjs
 
       - name: Validate platform-resolved Bun status accounting
         run: node scripts/check-bun-status.js
@@ -207,6 +210,12 @@ jobs:
             node -e 'const fs = require("node:fs"); const path = process.argv[1]; if (!fs.statSync(path).isFile()) process.exit(1)' "$hutch_job_launcher"
             node -e 'require("node:fs").appendFileSync(process.env.GITHUB_OUTPUT, `job_launcher=${process.argv[1]}\n`)' "$hutch_job_launcher"
           fi
+
+      - name: Validate upstream runner contracts on Windows
+        if: matrix.os == 'windows'
+        env:
+          COTTONTAIL_UPSTREAM_JOB_LAUNCHER: ${{ steps.hutch-engine.outputs.job_launcher }}
+        run: node --test tests/upstream-runner.test.mjs
 
       - name: Save pinned Hutch compatibility engine
         if: steps.pinned-hutch.outputs.cache-hit != 'true'

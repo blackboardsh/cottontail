@@ -30,6 +30,17 @@ function workflowTriggers(source) {
   return source.slice(0, end);
 }
 
+function workflowStep(name) {
+  const marker = `      - name: ${name}\n`;
+  const start = workflow.indexOf(marker);
+  assert.notEqual(start, -1, `missing workflow step: ${name}`);
+  const end = workflow.indexOf('\n      - name:', start + marker.length);
+  return {
+    source: workflow.slice(start, end === -1 ? workflow.length : end),
+    start,
+  };
+}
+
 function countFromList(output, label) {
   const match = output.match(new RegExp(`^  ${label}: (\\d+)`, 'm'));
   assert.ok(match, `missing ${label} count in upstream runner output`);
@@ -63,6 +74,37 @@ test('cross-platform default-shell steps avoid POSIX line continuations', () => 
       );
     }
   }
+});
+
+test('Windows runner contracts wait for the native Hutch job launcher', () => {
+  const earlyContracts = workflowStep('Validate compatibility runner contracts');
+  const nonWindowsRunner = workflowStep('Validate upstream runner contracts');
+  const buildHutch = workflowStep('Build pinned Hutch compatibility engine');
+  const windowsRunner = workflowStep('Validate upstream runner contracts on Windows');
+
+  assert.doesNotMatch(earlyContracts.source, /tests\/upstream-runner\.test\.mjs/);
+  assert.match(nonWindowsRunner.source, /if: matrix\.os != 'windows'/);
+  assert.match(nonWindowsRunner.source, /run: node --test tests\/upstream-runner\.test\.mjs/);
+  assert.ok(
+    nonWindowsRunner.start < buildHutch.start,
+    'non-Windows runner contracts should remain an early validation gate',
+  );
+
+  assert.match(windowsRunner.source, /if: matrix\.os == 'windows'/);
+  assert.match(
+    windowsRunner.source,
+    /COTTONTAIL_UPSTREAM_JOB_LAUNCHER: \$\{\{ steps\.hutch-engine\.outputs\.job_launcher \}\}/,
+  );
+  assert.match(windowsRunner.source, /run: node --test tests\/upstream-runner\.test\.mjs/);
+  assert.ok(
+    buildHutch.start < windowsRunner.start,
+    'Windows runner contracts must wait until Hutch creates the native launcher',
+  );
+  assert.equal(
+    workflow.match(/run: node --test tests\/upstream-runner\.test\.mjs/g)?.length,
+    2,
+    'the runner contracts must execute exactly once per matrix leg',
+  );
 });
 
 test('runs the strict complete Cottontail-owned Bun tier without publishing', () => {
