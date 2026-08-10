@@ -58,7 +58,7 @@ try {
 if (nativeBlake2b256Error != null) {
   strictEqual(process.platform, "linux", "native BLAKE2b-256 should only require the public fallback on Linux");
   strictEqual(
-    (nativeBlake2b256Error as Error).message,
+    nativeBlake2b256Error,
     "Unsupported digest algorithm",
     "native BLAKE2b-256 failed for an unexpected reason",
   );
