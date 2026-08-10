@@ -1959,15 +1959,18 @@ async function prepareBunTestDependencies(entries, snapshotRoot) {
     }
     const setupScript = join(rootDir, 'scripts', scriptName);
     const setupArgs = [setupScript, '--snapshot', snapshotRoot];
+    const setupEnvironment = immutableBinaryEnvironment();
     if (scriptName === 'setup-upstream-svelte.js') {
       if (hutchPath == null) {
         fail(`Svelte fixture preparation requires --hutch for ${testPath}.`);
       }
       setupArgs.push('--hutch', hutchPath);
+      setupEnvironment.COTTONTAIL_BINARY = binaryPath;
+      setupEnvironment.DASH_COTTONTAIL = binaryPath;
     }
     const result = await spawnCapturedAsync(process.execPath, setupArgs, {
       cwd: rootDir,
-      env: immutableBinaryEnvironment(),
+      env: setupEnvironment,
       stdio: 'inherit',
     });
     if (result.error) fail(`Failed to prepare the ${name} upstream fixture: ${result.error.message}`);

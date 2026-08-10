@@ -30,6 +30,7 @@ function createFixture(t) {
   const bunSnapshotRoot = join(fixtureRoot, "bun-snapshot");
   const capturePath = join(fixtureRoot, "harness-invocations.jsonl");
   const bunCapturePath = join(fixtureRoot, "bun-invocations.jsonl");
+  const hutchCapturePath = join(fixtureRoot, "hutch-invocations.jsonl");
   const environmentCapturePath = join(fixtureRoot, "harness-environment.jsonl");
   const reportsRoot = join(fixtureRoot, "reports");
   const locksRoot = join(fixtureRoot, "locks");
@@ -46,6 +47,7 @@ function createFixture(t) {
     fixtureRoot,
     process.platform === "win32" ? "hutch-engine.cmd" : "hutch-engine",
   );
+  const hutchEngineDriverPath = join(fixtureRoot, "hutch-engine-driver.cjs");
   t.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
 
   const testPaths = [
@@ -177,6 +179,7 @@ function createFixture(t) {
     "test/js/pass-after.test.js": { exitCode: 0, delayMs: 120 },
     "test/js/pass-fast.test.js": { exitCode: 0, delayMs: 5 },
     "test/js/timeout-budget.test.js": { exitCode: 0, delayMs: 120 },
+    "test/integration/svelte/client-side.test.ts": { exitCode: 0, delayMs: 5 },
   };
   for (const [testPath, behavior] of Object.entries(bunTests)) {
     const absolutePath = join(bunSnapshotRoot, testPath);
@@ -222,6 +225,19 @@ function createFixture(t) {
     version: "1.3.10-test",
     commit: "abcdef0123456789abcdef0123456789abcdef01",
   }, null, 2));
+
+  const sveltePluginRoot = join(bunSnapshotRoot, "packages", "bun-plugin-svelte");
+  const bunTypesRoot = join(bunSnapshotRoot, "packages", "bun-types");
+  mkdirSync(sveltePluginRoot, { recursive: true });
+  mkdirSync(bunTypesRoot, { recursive: true });
+  writeFileSync(join(sveltePluginRoot, "package.json"), JSON.stringify({
+    name: "bun-plugin-svelte",
+    version: "0.0.6",
+  }));
+  writeFileSync(join(bunTypesRoot, "package.json"), JSON.stringify({
+    name: "bun-types",
+    version: "1.3.10-test",
+  }));
 
   writeFileSync(
     join(snapshotRoot, "status.json"),
@@ -286,17 +302,42 @@ function createFixture(t) {
       "",
     ].join("\n"),
   );
+  writeFileSync(
+    hutchEngineDriverPath,
+    [
+      'const { spawnSync } = require("node:child_process");',
+      'const { appendFileSync, mkdirSync } = require("node:fs");',
+      'const { join } = require("node:path");',
+      'if (process.argv[2] === "install") {',
+      '  appendFileSync(process.env.COTTONTAIL_RUNNER_HUTCH_CAPTURE, JSON.stringify({',
+      '    cottontailBinary: process.env.COTTONTAIL_BINARY ?? null,',
+      '    dashCottontail: process.env.DASH_COTTONTAIL ?? null,',
+      '    hutchLauncherPath: process.env.HUTCH_LAUNCHER_PATH ?? null,',
+      '  }) + "\\n");',
+      '  mkdirSync(join(process.cwd(), "node_modules", "svelte", "compiler"), { recursive: true });',
+      '  process.exit(0);',
+      '}',
+      'const result = spawnSync(process.env.COTTONTAIL_BINARY, process.argv.slice(2), {',
+      '  env: process.env,',
+      '  stdio: "inherit",',
+      '});',
+      'if (result.error) throw result.error;',
+      'process.exit(result.status ?? 1);',
+      '',
+    ].join("\n"),
+  );
 
   if (process.platform === "win32") {
     const nodePath = process.execPath.replaceAll("%", "%%");
     const shimPath = preflightShimPath.replaceAll("%", "%%");
+    const hutchDriver = hutchEngineDriverPath.replaceAll("%", "%%");
     writeFileSync(
       cottontailBinaryPath,
       `@echo off\r\nif "%COTTONTAIL_UPSTREAM_PREFLIGHT%"=="1" set "NODE_OPTIONS=--require=\\"${shimPath}\\""\r\n"${nodePath}" %*\r\n`,
     );
     writeFileSync(
       hutchEnginePath,
-      "@echo off\r\n\"%COTTONTAIL_BINARY%\" %*\r\n",
+      `@echo off\r\n"${nodePath}" "${hutchDriver}" %*\r\n`,
     );
   } else {
     writeFileSync(
@@ -321,13 +362,7 @@ function createFixture(t) {
       hutchEnginePath,
       [
         "#!/usr/bin/env node",
-        'const { spawnSync } = require("node:child_process");',
-        "const result = spawnSync(process.env.COTTONTAIL_BINARY, process.argv.slice(2), {",
-        "  env: process.env,",
-        '  stdio: "inherit",',
-        "});",
-        "if (result.error) throw result.error;",
-        "process.exit(result.status ?? 1);",
+        `require(${JSON.stringify(hutchEngineDriverPath)});`,
         "",
       ].join("\n"),
     );
@@ -341,6 +376,7 @@ function createFixture(t) {
     capturePath,
     cottontailBinaryPath,
     environmentCapturePath,
+    hutchCapturePath,
     hutchEnginePath,
     locksRoot,
     preflightShimPath,
@@ -363,6 +399,7 @@ function runRunner(fixture, args, {
     COTTONTAIL_UPSTREAM_TARGETS_PATH: fixture.targetsPath,
     COTTONTAIL_RUNNER_TEST_CAPTURE: fixture.capturePath,
     COTTONTAIL_RUNNER_BUN_CAPTURE: fixture.bunCapturePath,
+    COTTONTAIL_RUNNER_HUTCH_CAPTURE: fixture.hutchCapturePath,
     COTTONTAIL_BASELINE_REPORTS_DIR: fixture.reportsRoot,
     COTTONTAIL_BASELINE_LOCK_DIR: fixture.locksRoot,
     COTTONTAIL_BASELINE_STATE_DIR: fixture.stateRoot,
@@ -564,6 +601,36 @@ test("Hutch is exposed as the CLI while Cottontail remains the test runtime", (t
   assert.equal(environment.hutchLauncherVersion, null);
   assert.equal(environment.hutchActiveChannel, null);
   assert.deepEqual(environment.loaderVars, []);
+});
+
+test("Svelte fixture installation uses the runner-pinned Cottontail binary", (t) => {
+  const fixture = createFixture(t);
+  const poisonedBinary = join(dirname(fixture.targetsPath), "unpublished-canary-cottontail");
+  const result = runRunner(
+    fixture,
+    [
+      "--hutch",
+      fixture.hutchEnginePath,
+      "--test",
+      "test/integration/svelte/client-side.test.ts",
+    ],
+    {
+      runtime: "bun",
+      environment: {
+        COTTONTAIL_BINARY: poisonedBinary,
+        DASH_COTTONTAIL: poisonedBinary,
+        HUTCH_LAUNCHER_PATH: "/wrong/outer/hutch",
+      },
+    },
+  );
+  assertSucceeded(result);
+
+  const [install] = readJsonLines(fixture.hutchCapturePath);
+  assert.ok(install, "expected the selected Hutch engine to install the Svelte fixture");
+  assert.equal(install.cottontailBinary, install.dashCottontail);
+  assert.equal(basename(install.cottontailBinary), basename(fixture.cottontailBinaryPath));
+  assert.notEqual(install.cottontailBinary, poisonedBinary);
+  assert.equal(install.hutchLauncherPath, null);
 });
 
 test("the outer Hutch launcher is rejected clearly", (t) => {
