@@ -11,6 +11,9 @@ const maxStdioStartupDurationMs = isWindows ? 30_000 : 5_000;
 // This is a bounded hang detector, not a startup microbenchmark. Empty caches
 // and a loaded host can legitimately take more than one second.
 const coldReadlineTimeoutMs = isWindows ? 30_000 : 5_000;
+// The bytecode regression launches a compiler and two standalone executables.
+// Windows x64 emulation can exceed Bun's default five-second test deadline.
+const compiledBytecodeTimeoutMs = isWindows ? 30_000 : 5_000;
 const temporaryDirectory = mkdtempSync(join(tmpdir(), "cottontail-runtime-bootstrap-"));
 
 afterAll(() => rmSync(temporaryDirectory, { recursive: true, force: true }));
@@ -406,7 +409,7 @@ test("compiled bytecode is embedded and invalidates when source identity changes
   expect(invalidated.exitCode).toBe(0);
   expect(String(invalidated.stderr)).toBe("");
   expect(String(invalidated.stdout).trim()).toBe("bytecode-two");
-});
+}, { timeout: compiledBytecodeTimeoutMs });
 
 test("nested test runs remove per-invocation artifacts on process.exit", () => {
   const cleanupRoot = join(temporaryDirectory, "artifact-cleanup");
