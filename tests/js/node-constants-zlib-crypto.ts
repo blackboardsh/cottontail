@@ -44,6 +44,12 @@ strictEqual(requiredConstants.EACCES, EACCES, "require constants mismatch");
 strictEqual(Object.isFrozen(requiredConstants), true, "require constants should be frozen");
 ok(Number.isInteger(constants.S_IFDIR), "constants should expose fs mode constants");
 
+// Linux open(2) flag numbers are ABI-specific. x64 and arm64 assign
+// O_DIRECTORY and O_DIRECT to the opposite bits.
+const expectedLinuxOpenConstants = process.arch === "x64" || process.arch === "ia32"
+  ? { O_DIRECTORY: 65536, O_DIRECT: 16384 }
+  : { O_DIRECTORY: 16384, O_DIRECT: 65536 };
+
 const expectedPlatformConstants = process.platform === "linux"
   ? {
       EADDRINUSE: 98,
@@ -51,8 +57,7 @@ const expectedPlatformConstants = process.platform === "linux"
       ENOBUFS: 105,
       ETIMEDOUT: 110,
       O_CREAT: 64,
-      O_DIRECTORY: 16384,
-      O_DIRECT: 65536,
+      ...expectedLinuxOpenConstants,
       O_NOATIME: 262144,
       O_NONBLOCK: 2048,
       O_SYNC: 1052672,
@@ -105,6 +110,11 @@ if (process.platform === "linux") {
 if ("O_CREAT" in expectedPlatformConstants) {
   for (const name of ["O_CREAT", "O_DIRECTORY", "O_DIRECT", "O_NOATIME"]) {
     if (name in expectedPlatformConstants) {
+      strictEqual(
+        (fsConstants as Record<string, unknown>)[name],
+        (constants as Record<string, unknown>)[name],
+        `fs.constants ${name} should match node:constants`,
+      );
       strictEqual(
         (fsConstants as Record<string, unknown>)[name],
         (expectedPlatformConstants as Record<string, unknown>)[name],
