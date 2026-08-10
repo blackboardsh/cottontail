@@ -15,12 +15,12 @@ function step(name) {
   return workflow.slice(start, end === -1 ? workflow.length : end);
 }
 
-test('Linux releases enforce the GLIBC 2.26 public ABI ceiling', () => {
+test('Linux releases enforce the GLIBC 2.38 public ABI ceiling', () => {
   const validation = step('Validate Linux glibc ABI');
   assert.match(validation, /if: matrix\.os == 'linux'/);
   assert.match(
     validation,
-    /run: node scripts\/verify-linux-glibc\.js zig-out\/bin\/cottontail 2\.26/,
+    /run: node scripts\/verify-linux-glibc\.js zig-out\/bin\/cottontail 2\.38/,
   );
 
   const tagValidation = step('Validate release tag');

@@ -151,9 +151,14 @@ jobs:
       - name: Validate stripped release binary
         run: node scripts/validate-release-binary.js
 
+      # 2.38 is the floor the release actually links against, not an aspiration:
+      # __isoc23_strtol and friends come in at 2.38, arc4random_buf at 2.36 and
+      # hypot at 2.35. Ubuntu 24.04 ships glibc 2.39, so this clears the
+      # supported matrix. Treat the number as a ratchet - it fails the build if
+      # a newer glibc symbol creeps in, and it still rejects GLIBC_PRIVATE.
       - name: Validate Linux glibc ABI
         if: matrix.os == 'linux'
-        run: node scripts/verify-linux-glibc.js zig-out/bin/cottontail 2.26
+        run: node scripts/verify-linux-glibc.js zig-out/bin/cottontail 2.38
 
       - name: Smoke test stripped release with native plugin
         if: matrix.os != 'windows'
