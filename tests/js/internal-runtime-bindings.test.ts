@@ -167,6 +167,17 @@ describe("internal runtime bindings", () => {
     expect(report.sharedObjects.length).toBeGreaterThan(0);
     expect(Array.isArray(report.workers)).toBe(true);
 
+    const hasGlibc = report.sharedObjects.some(
+      (path: unknown) => typeof path === "string" && /(?:^|\/)libc\.so\.6$/.test(path),
+    );
+    if (process.platform === "linux" && hasGlibc) {
+      expect(report.header.glibcVersionCompiler).toMatch(/^\d+\.\d+/);
+      expect(report.header.glibcVersionRuntime).toMatch(/^\d+\.\d+/);
+    } else {
+      expect(report.header.glibcVersionCompiler).toBeUndefined();
+      expect(report.header.glibcVersionRuntime).toBeUndefined();
+    }
+
     const directory = mkdtempSync(join(tmpdir(), "cottontail-report-"));
     temporaryDirectories.push(directory);
     const previousDirectory = process.report.directory;

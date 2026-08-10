@@ -11,6 +11,16 @@ const addon = require(addonPath);
 const abiVisibility = addon.abiVisibility();
 assert(abiVisibility.napiVisible, "native addons should resolve the retained N-API ABI");
 assert(abiVisibility.internalHidden, "non-ABI executable symbols should not resolve through dlsym");
+if (process.platform === "linux") {
+  assert(addon.uvVersion() === ((1 << 16) | (50 << 8) | 1), "native addons should call the public numeric libuv version ABI");
+  assert(addon.uvVersionString() === "1.50.1-dev", "native addons should call the public libuv version ABI");
+  const before = Date.now();
+  const uvNow = addon.uvGettimeofday();
+  const after = Date.now();
+  assert(uvNow >= before - 1000 && uvNow <= after + 1000, "native addons should call the public libuv wall-clock ABI");
+  assert(addon.uvRwlockLifecycle(), "native addons should call the public libuv read/write-lock ABI");
+  assert(addon.uvSemaphoreLifecycle(), "native addons should call the public libuv semaphore ABI");
+}
 const external = addon.createState();
 const filter = /\.ts$/g;
 

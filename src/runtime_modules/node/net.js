@@ -1207,6 +1207,23 @@ class SocketImpl extends Duplex {
         return;
       }
       if (event.type === "error") {
+        // Linux can report EBADF from a queued libuv read-watch callback after
+        // the local side has already completed its writable shutdown. The fd
+        // is still owned by this Socket and is closed by destroy below; at
+        // this point EBADF is the terminal peer notification, not a failed
+        // application operation. Treat it like EOF so memory-BIO TLS upgrades
+        // can finish their close_notify exchange without turning a successful
+        // response into a socket error.
+        if (
+          process.platform === "linux" &&
+          this._nativeShutdownSent &&
+          (event.code === "EBADF" || Number(event.errno) === 9) &&
+          /bad file descriptor/i.test(String(event.message ?? ""))
+        ) {
+          this._stopRead();
+          this._emitEnd();
+          return;
+        }
         const error = new Error(event.message || "socket read failed");
         if (event.code != null) error.code = String(event.code);
         else if (/connection reset/i.test(error.message)) error.code = "ECONNRESET";

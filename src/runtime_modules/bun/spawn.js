@@ -1311,15 +1311,31 @@ export function createBunSpawnRuntime(deps) {
 
     const maxBuffer = nativeOptions.maxBuffer == null ? Infinity : nativeOptions.maxBuffer;
     const killSignal = nativeOptions.killSignal;
+    const closeCapturedOutput = () => {
+      // A subprocess can exit while one of its descendants still owns the
+      // inherited pipe (for example `bun exec yes`). Merely signalling the
+      // direct child leaves that writer alive and lets the native event queue
+      // grow without bound. Closing our read ends gives every remaining
+      // writer the normal broken-pipe signal and also makes both public
+      // streams settle.
+      if (nativeOptions.stdout === "pipe") host.spawnCloseOutput?.(native.id, 1);
+      if (nativeOptions.stderr === "pipe") host.spawnCloseOutput?.(native.id, 2);
+    };
     const enforceMaxBuffer = () => {
       if (exceededMaxBuffer || !Number.isFinite(maxBuffer)) return;
       if ((nativeOptions.stdout === "pipe" && stdoutLength > maxBuffer) ||
           (nativeOptions.stderr === "pipe" && stderrLength > maxBuffer)) {
         exceededMaxBuffer = true;
         child.kill(killSignal);
+        closeCapturedOutput();
       }
     };
-    if (Number(nativeOptions.timeout) > 0) timeoutTimer = setTimeout(() => child.kill(killSignal), nativeOptions.timeout);
+    if (Number(nativeOptions.timeout) > 0) {
+      timeoutTimer = setTimeout(() => {
+        child.kill(killSignal);
+        closeCapturedOutput();
+      }, nativeOptions.timeout);
+    }
 
     child.exited = new Promise((resolve, reject) => {
       const completeExit = result => {
@@ -1376,6 +1392,10 @@ export function createBunSpawnRuntime(deps) {
       unregisterSpawnListener = globalThis.__cottontailRegisterSpawnListener?.(native.id, event => {
         if (!event) return;
         if (event.type === "stdout" || event.type === "stderr") {
+          // The native reader may already have queued pipe events before the
+          // first over-limit event reached JavaScript. Retaining those chunks
+          // defeats maxBuffer even though the process has been signalled.
+          if (exceededMaxBuffer) return;
           const chunk = asBuffer(event.data ?? new ArrayBuffer(0));
           if (chunk.byteLength === 0) return;
           const isStdout = event.type === "stdout";

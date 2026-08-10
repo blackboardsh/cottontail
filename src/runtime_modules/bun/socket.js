@@ -631,7 +631,9 @@ function normalizeBunSocketOptions(options) {
     if (unix.startsWith("file://") || unix.startsWith("unix://") || unix.startsWith("sock://")) {
       unix = unix.slice(7);
     }
-    if (unix.includes("\0")) throw new TypeError("unix must not contain NUL bytes");
+    const nulIndex = unix.indexOf("\0");
+    const linuxAbstractPath = process.platform === "linux" && nulIndex === 0 && !unix.slice(1).includes("\0");
+    if (nulIndex !== -1 && !linuxAbstractPath) throw new TypeError("unix must not contain NUL bytes");
   }
 
   let hostname = "";

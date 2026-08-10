@@ -6,6 +6,7 @@ import * as dns from "node:dns";
 import * as dnsPromises from "node:dns/promises";
 
 const originalServers = dns.getServers();
+const originalPromiseServers = dnsPromises.getServers();
 
 const recordTypes = {
   A: 1,
@@ -122,6 +123,7 @@ async function createDnsServer() {
 
 afterEach(() => {
   dns.setServers(originalServers);
+  dnsPromises.setServers(originalPromiseServers);
 });
 
 test("setServers skips holes, observes shrinking arrays, and canonicalizes default ports", () => {
@@ -201,6 +203,17 @@ test("resolve and lookupService expose synchronous Node argument errors", () => 
   });
 });
 
+test.skipIf(process.platform === "darwin")(
+  "lookupService requires a reverse hostname instead of returning a numeric address",
+  async () => {
+    await assert.rejects(dnsPromises.lookupService("255.255.255.255", 443), {
+      code: "ENOTFOUND",
+      syscall: "getnameinfo",
+      hostname: "255.255.255.255",
+    });
+  },
+);
+
 test("falsey lookup values retain the deprecated null-address result", async () => {
   for (const hostname of ["", null, undefined, 0, Number.NaN]) {
     expect(await dnsPromises.lookup(hostname as never)).toEqual({ address: null, family: 4 });
@@ -232,7 +245,7 @@ test("resolve4 queries a selected non-default UDP resolver", async () => {
   });
 
   try {
-    dns.setServers([`127.0.0.1:${server.address().port}`]);
+    dnsPromises.setServers([`127.0.0.1:${server.address().port}`]);
     expect(await dnsPromises.resolve4("example.test", { ttl: true })).toEqual([
       { address: "192.0.2.42", ttl: 42 },
     ]);

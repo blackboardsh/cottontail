@@ -2848,6 +2848,20 @@ function normalizedFetchAbortReason(signal) {
 
 function normalizeFetchNetworkError(error) {
   if (error?.name === "AbortError" || error?.name === "TimeoutError") return error;
+  // Linux can report a reset socket as EBADF when the descriptor is invalidated
+  // before libuv delivers its queued read event. That is native watcher
+  // bookkeeping, not a meaningful fetch error; fetch observes a connected peer
+  // disappearing before any response as ECONNRESET.
+  if (
+    process.platform === "linux" &&
+    error?.code === "EBADF" &&
+    /bad file descriptor/i.test(String(error?.message ?? ""))
+  ) {
+    const normalized = new Error("The socket connection was closed unexpectedly.");
+    normalized.code = "ECONNRESET";
+    normalized.cause = error;
+    return normalized;
+  }
   if (typeof error?.message === "string" && /^self-signed certificate\b/i.test(error.message)) {
     error.message = error.message.replace(/^self-signed certificate/i, "self signed certificate");
     return error;
@@ -3479,7 +3493,7 @@ async function fetchOnceFromNodeHttp(request, redirected = false, transport = {}
     if (error && error.__cottontailPooledRetry) {
       return fetchSocketAttempt(request, redirected, transport, false);
     }
-    throw error;
+    throw normalizeFetchNetworkError(error);
   }
 }
 
@@ -6105,7 +6119,9 @@ function normalizeServeHostname(value) {
 function normalizeServeUnixPath(value) {
   if (value === null || value === undefined) return "";
   const path = coerceServeOptionString(value, "unix");
-  if (path.includes("\0")) throw new TypeError("unix must not contain NUL bytes");
+  const nulIndex = path.indexOf("\0");
+  const linuxAbstractPath = process.platform === "linux" && nulIndex === 0 && !path.slice(1).includes("\0");
+  if (nulIndex !== -1 && !linuxAbstractPath) throw new TypeError("unix must not contain NUL bytes");
   return path;
 }
 
@@ -12800,7 +12816,13 @@ function validateSecretOptions(method, options, needsValue = false) {
 }
 
 function secretCommand(args, input = undefined) {
-  return spawnSync(args, { input, stdin: input == null ? "ignore" : "pipe", stdout: "pipe", stderr: "pipe" });
+  const encodedInput = typeof input === "string" ? new TextEncoder().encode(input) : input;
+  return spawnSync(args, {
+    input: encodedInput,
+    stdin: encodedInput == null ? "ignore" : "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
 }
 
 function secretCommandError(result, operation) {
@@ -12854,7 +12876,7 @@ export const secrets = {
     if (process.platform === "linux") {
       const result = secretCommand(
         ["secret-tool", "store", `--label=${options.service}`, "service", options.service, "name", options.name],
-        `${options.value}\n`,
+        options.value,
       );
       if (result.exitCode !== 0) secretCommandError(result, "store");
       return;
@@ -13846,7 +13868,7 @@ if (typeof globalThis.WebAssembly === "object" && typeof globalThis.WebAssembly.
 if (globalThis.navigator == null) {
   const navigatorPlatform = cottontail.platform?.() === "darwin" ? "MacIntel" :
     cottontail.platform?.() === "win32" ? "Win32" :
-    `Linux ${cottontail.arch?.() === "arm64" ? "aarch64" : "x86_64"}`;
+    "Linux x86_64";
   globalThis.navigator = {
     userAgent: `Bun/${version}`,
     platform: navigatorPlatform,

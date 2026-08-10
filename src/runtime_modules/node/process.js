@@ -1296,6 +1296,12 @@ function makeReport() {
       cpus: diagnostics.cpus,
       networkInterfaces,
     };
+    if (typeof diagnostics.glibcVersionCompiler === "string") {
+      reportData.header.glibcVersionCompiler = diagnostics.glibcVersionCompiler;
+    }
+    if (typeof diagnostics.glibcVersionRuntime === "string") {
+      reportData.header.glibcVersionRuntime = diagnostics.glibcVersionRuntime;
+    }
     if (diagnostics.userLimits !== undefined) reportData.userLimits = diagnostics.userLimits;
     return reportData;
   };

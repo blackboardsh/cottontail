@@ -100,8 +100,32 @@ const systemErrorDetails = [
   ["ENOMEM", -12, "out of memory", /out of memory|cannot allocate memory/i],
 ];
 
-export function makeBunFileError(error, target, syscall = "open") {
+function remapStructuredErrorSyscall(error, target, syscall) {
+  const path = typeof error.path === "string" ? error.path : typeof target === "string" ? target : undefined;
+  const source = String(error.message ?? error);
+  const marker = `, ${error.syscall}`;
+  const markerIndex = source.lastIndexOf(marker);
+  const prefix = markerIndex >= 0 ? source.slice(0, markerIndex) : source;
+  const pathSuffix = path === undefined ? "" : ` '${path}'`;
+  const message = `${prefix}, ${syscall}${pathSuffix}`;
+  const result = new Error(message);
+  const nameDescriptor = Object.getOwnPropertyDescriptor(error, "name");
+  if (nameDescriptor !== undefined) Object.defineProperty(result, "name", nameDescriptor);
+  result.errno = error.errno;
+  result.code = error.code;
+  result.syscall = syscall;
+  if (path !== undefined) result.path = path;
+  const causeDescriptor = Object.getOwnPropertyDescriptor(error, "cause");
+  if (causeDescriptor !== undefined) Object.defineProperty(result, "cause", causeDescriptor);
+  if (typeof error.stack === "string") result.stack = error.stack.replace(source, message);
+  return result;
+}
+
+export function makeBunFileError(error, target, syscall = "open", remapSyscall = false) {
   if (error?.code && error?.syscall && (target == null || error.path != null || typeof target === "number")) {
+    if (remapSyscall && error.syscall !== syscall) {
+      return remapStructuredErrorSyscall(error, target, syscall);
+    }
     return error;
   }
 
@@ -111,8 +135,8 @@ export function makeBunFileError(error, target, syscall = "open") {
   const [code, errno, reason] = detail ?? [String(error?.code ?? "EIO"), -5, source || "I/O error"];
   const pathSuffix = typeof target === "string" ? ` '${target}'` : "";
   const result = new Error(`${code}: ${reason}, ${syscall}${pathSuffix}`);
-  result.code = code;
   result.errno = errno;
+  result.code = code;
   result.syscall = syscall;
   if (typeof target === "string") result.path = target;
   return result;
@@ -803,7 +827,9 @@ function createBunFile(state) {
     },
     async stat() {
       try { return currentStat(state); } catch (error) {
-        throw makeBunFileError(error, descriptorTarget(state.descriptor), "stat");
+        const pathBackedLinuxFile = state.descriptor.kind === "path" && process.platform === "linux";
+        const syscall = pathBackedLinuxFile ? "statx" : "stat";
+        throw makeBunFileError(error, descriptorTarget(state.descriptor), syscall, pathBackedLinuxFile);
       }
     },
     write(data, options = undefined) {

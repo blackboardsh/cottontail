@@ -9,6 +9,13 @@ const tmpDir = cottontail.env("COTTONTAIL_TMP_DIR");
 assert(tmpDir, "COTTONTAIL_TMP_DIR missing");
 cottontail.mkdirSync(tmpDir, true);
 
+const expectedNavigatorPlatform = cottontail.platform() === "darwin"
+  ? "MacIntel"
+  : cottontail.platform() === "win32"
+    ? "Win32"
+    : "Linux x86_64";
+assert(navigator.platform === expectedNavigatorPlatform, "navigator.platform mismatch");
+
 assert(
   FFIType.int === 5 && FFIType.int === FFIType.i32 && FFIType.int === FFIType.c_int,
   "FFIType.int should match Bun's i32 and c_int enum value",
@@ -185,8 +192,8 @@ if (canTestSecrets) {
   const service = `cottontail-local-test-${Date.now()}`;
   const name = "roundtrip";
   try {
-    await Bun.secrets.set({ service, name, value: "密码🔒\n\t" });
-    assert(await Bun.secrets.get({ service, name }) === "密码🔒\n\t", "Bun.secrets roundtrip mismatch");
+    await Bun.secrets.set({ service, name, value: "密码🔒\n\t\r" });
+    assert(await Bun.secrets.get({ service, name }) === "密码🔒\n\t\r", "Bun.secrets roundtrip mismatch");
     assert(await Bun.secrets.delete({ service, name }) === true, "Bun.secrets delete mismatch");
     assert(await Bun.secrets.get({ service, name }) === null, "Bun.secrets missing credential mismatch");
   } finally {

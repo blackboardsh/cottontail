@@ -202,6 +202,15 @@ extern void JSGlobalContextSetUnhandledRejectionCallback(
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__linux__) && __has_include(<gnu/libc-version.h>)
+#include <gnu/libc-version.h>
+#if defined(__GLIBC__)
+#define CT_HAS_GLIBC_DIAGNOSTICS 1
+#endif
+#endif
+#ifndef CT_HAS_GLIBC_DIAGNOSTICS
+#define CT_HAS_GLIBC_DIAGNOSTICS 0
+#endif
 #if defined(_WIN32)
 #include <direct.h>
 #include <io.h>
@@ -374,6 +383,41 @@ static void ct_jsc_configure_gc_signal_once(void) {
 
 static void ct_jsc_configure_gc_signal(void) {
     (void)pthread_once(&ct_jsc_gc_signal_once, ct_jsc_configure_gc_signal_once);
+}
+#endif
+
+#if defined(COTTONTAIL_VENDORED_JSC) && defined(__linux__) && defined(__aarch64__)
+static bool ct_jsc_option_value_is_true(const char *value) {
+    return value != NULL && (
+        strcmp(value, "1") == 0 ||
+        strcasecmp(value, "true") == 0 ||
+        strcasecmp(value, "yes") == 0
+    );
+}
+
+static bool ct_jsc_apply_platform_dfg_default(void) {
+    /* WebKit 7624's DFG/FTL tiers intermittently emit invalid cell accesses on
+     * Linux ARM64 under ordinary compiler-heavy workloads (Svelte and esbuild).
+     * The baseline JIT is stable. Apply this only while JSC latches its initial
+     * options so process.env and subsequently spawned children remain clean.
+     * A direct DFG setting or an explicit request to enable FTL remains
+     * authoritative for users who deliberately opt back into those tiers. */
+    if (getenv("JSC_useDFGJIT") != NULL) return false;
+    if (ct_jsc_option_value_is_true(getenv("JSC_useFTLJIT"))) return false;
+    if (setenv("JSC_useDFGJIT", "false", 0) != 0) return false;
+    return true;
+}
+
+static void ct_jsc_restore_platform_dfg_default(bool applied) {
+    if (applied) unsetenv("JSC_useDFGJIT");
+}
+#else
+static bool ct_jsc_apply_platform_dfg_default(void) {
+    return false;
+}
+
+static void ct_jsc_restore_platform_dfg_default(bool applied) {
+    (void)applied;
 }
 #endif
 
@@ -1942,7 +1986,11 @@ extern void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx);
 #define CT_TLS_CONNECTION_EVENT_ID_BASE 0x20000000u
 #define CT_TLS_SERVER_EVENT_ID_BASE 0x80000000u
 
+#define CT_STRINGIFY_VALUE_INNER(value) #value
+#define CT_STRINGIFY_VALUE(value) CT_STRINGIFY_VALUE_INNER(value)
+
 static int ct_get_bytes(JSContextRef ctx, JSValueRef value, uint8_t **out_data, size_t *out_len);
+static bool ct_set_nonblocking_fd(int fd);
 static void ct_queue_fd_binary(CtJscRuntime *runtime, uint32_t id, const char *type, const char *data, size_t data_len);
 static void ct_queue_fd_data(CtJscRuntime *runtime, uint32_t id, const char *data, size_t data_len);
 static void ct_queue_fd_simple(CtJscRuntime *runtime, uint32_t id, const char *type, const char *message);
@@ -2686,6 +2734,8 @@ typedef struct CtHttpServer {
     size_t max_body_size;
     char *hostname;
     char *unix_path;
+    size_t unix_path_len;
+    bool unix_path_abstract;
     bool stopping;
     bool stopped;
     bool listen_fd_closed;
@@ -4240,16 +4290,12 @@ static int ct_http_take_body_piece(
 
 static int ct_http_socket_read_ready(int fd, int timeout_ms) {
     fd_set read_fds;
-    fd_set error_fds;
     FD_ZERO(&read_fds);
-    FD_ZERO(&error_fds);
 #if defined(_WIN32)
     SOCKET socket_value = ct_windows_socket_from_fd(fd);
     FD_SET(socket_value, &read_fds);
-    FD_SET(socket_value, &error_fds);
 #else
     FD_SET(fd, &read_fds);
-    FD_SET(fd, &error_fds);
 #endif
     struct timeval timeout;
     timeout.tv_sec = timeout_ms / 1000;
@@ -4262,13 +4308,18 @@ static int ct_http_socket_read_ready(int fd, int timeout_ms) {
 #endif
         &read_fds,
         NULL,
-        &error_fds,
+        NULL,
         &timeout
     );
 #if defined(_WIN32)
     if (result == SOCKET_ERROR) errno = ct_windows_socket_errno();
 #endif
-    return result;
+    if (result <= 0) return result;
+#if defined(_WIN32)
+    return FD_ISSET(socket_value, &read_fds) ? 1 : 0;
+#else
+    return FD_ISSET(fd, &read_fds) ? 1 : 0;
+#endif
 }
 
 /* Returns 1 after reading, 0 on timeout, and -1 on disconnect/error. */
@@ -4298,6 +4349,47 @@ static bool ct_http_peer_disconnected(int fd, int timeout_ms) {
     if (peeked == 0) return true;
     if (peeked < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) return true;
     return false;
+}
+
+static void ct_http_settle_rejected_request(int fd) {
+    /* Closing a TCP socket while rejected request bytes are still in flight
+       can turn the close into a reset on Linux and discard the 4xx response
+       before the client reads it. Stop writing, then briefly drain the peer
+       so the response and FIN remain observable. */
+    if (shutdown(fd, SHUT_WR) != 0 && errno != ENOTCONN) return;
+    if (!ct_set_nonblocking_fd(fd)) return;
+
+    char discard[4096];
+    struct timespec started;
+    bool has_deadline = clock_gettime(CLOCK_MONOTONIC, &started) == 0;
+    int fallback_attempts = 0;
+    for (;;) {
+        int wait_ms = 10;
+        if (has_deadline) {
+            struct timespec now;
+            if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+                now.tv_sec < started.tv_sec ||
+                (now.tv_sec == started.tv_sec && now.tv_nsec < started.tv_nsec)) break;
+            int64_t elapsed_ms = (int64_t)(now.tv_sec - started.tv_sec) * 1000 +
+                (int64_t)(now.tv_nsec - started.tv_nsec) / 1000000;
+            if (elapsed_ms >= 100) break;
+            if (100 - elapsed_ms < wait_ms) wait_ms = (int)(100 - elapsed_ms);
+        } else if (fallback_attempts >= 10) {
+            break;
+        }
+        fallback_attempts += 1;
+
+        int ready = ct_http_socket_read_ready(fd, wait_ms);
+        if (ready == 0) continue;
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        ssize_t read_count = recv(fd, discard, sizeof(discard), 0);
+        if (read_count > 0) continue;
+        if (read_count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        break;
+    }
 }
 
 static void ct_http_send_response(CtHttpRequest *request) {
@@ -4448,7 +4540,7 @@ static ssize_t ct_http_send_forward_response_head(CtHttpRequest *request, bool k
     return result;
 }
 
-static void ct_http_send_status_response(int fd, int status, const char *reason, const char *body) {
+static bool ct_http_send_status_response(int fd, int status, const char *reason, const char *body) {
     size_t body_len = strlen(body);
     int response_len = snprintf(
         NULL,
@@ -4459,9 +4551,9 @@ static void ct_http_send_status_response(int fd, int status, const char *reason,
         body_len,
         body
     );
-    if (response_len < 0) return;
+    if (response_len < 0) return false;
     char *response = (char *)malloc((size_t)response_len + 1);
-    if (response == NULL) return;
+    if (response == NULL) return false;
     snprintf(
         response,
         (size_t)response_len + 1,
@@ -4471,8 +4563,9 @@ static void ct_http_send_status_response(int fd, int status, const char *reason,
         body_len,
         body
     );
-    ct_http_send_all(fd, response, (size_t)response_len);
+    bool sent = ct_http_send_all(fd, response, (size_t)response_len) >= 0;
     free(response);
+    return sent;
 }
 
 static void ct_http_request_mark_aborted(CtHttpRequest *request) {
@@ -4847,17 +4940,30 @@ static int ct_http_process_request_body(CtHttpServer *server, CtHttpRequest *req
         if (body_status == 2) return 0;
         if (body_status < 0) {
             pthread_mutex_lock(&request->mutex);
-            bool can_send_error = !request->response_sent;
+            bool response_already_sent = request->response_sent;
+            bool can_send_error = !response_already_sent;
             request->response_sent = true;
             pthread_mutex_unlock(&request->mutex);
+            bool should_settle = response_already_sent;
             if (can_send_error) {
                 if (body_status == -2) {
-                    ct_http_send_status_response(request->client_fd, 413, "Payload Too Large", "Payload Too Large");
+                    should_settle = ct_http_send_status_response(
+                        request->client_fd,
+                        413,
+                        "Payload Too Large",
+                        "Payload Too Large"
+                    );
                 } else {
-                    ct_http_send_status_response(request->client_fd, 400, "Bad Request", "Bad Request");
+                    should_settle = ct_http_send_status_response(
+                        request->client_fd,
+                        400,
+                        "Bad Request",
+                        "Bad Request"
+                    );
                 }
             }
             ct_http_request_mark_aborted(request);
+            if (should_settle) ct_http_settle_rejected_request(request->client_fd);
             return -1;
         }
 
@@ -4931,18 +5037,25 @@ static void *ct_http_client_thread(void *opaque) {
             server->max_body_size
         );
         if (head_status != 0) {
+            bool response_sent = false;
             if (!ct_http_server_is_stopped(server) && (input.len > 0 || head_status == 1)) {
                 if (head_status == 1) {
-                    ct_http_send_status_response(
+                    response_sent = ct_http_send_status_response(
                         request->client_fd,
                         413,
                         "Payload Too Large",
                         "Payload Too Large"
                     );
                 } else {
-                    ct_http_send_status_response(request->client_fd, 400, "Bad Request", "Bad Request");
+                    response_sent = ct_http_send_status_response(
+                        request->client_fd,
+                        400,
+                        "Bad Request",
+                        "Bad Request"
+                    );
                 }
             }
+            if (response_sent) ct_http_settle_rejected_request(request->client_fd);
             break;
         }
 
@@ -5430,10 +5543,10 @@ static void ct_reload_trace_event(
     if (filename_len > 0) memcpy(full_path + offset, filename, filename_len);
     full_path[full_len] = '\0';
 
-    uv_timeval64_t now;
-    int time_status = uv_gettimeofday(&now);
+    struct timespec now;
+    int time_status = clock_gettime(CLOCK_REALTIME, &now);
     long long timestamp = time_status == 0
-        ? (long long)now.tv_sec * 1000LL + (long long)(now.tv_usec / 1000)
+        ? (long long)now.tv_sec * 1000LL + (long long)(now.tv_nsec / 1000000L)
         : (long long)time(NULL) * 1000LL;
 
     fprintf(file, "{\"timestamp\":%lld,\"files\":{", timestamp);
@@ -13513,7 +13626,15 @@ static JSValueRef ct_dns_lookup_service(JSContextRef ctx, JSObjectRef function, 
 
     char hostname[NI_MAXHOST];
     char service[NI_MAXSERV];
-    int status = getnameinfo((struct sockaddr *)&storage, storage_len, hostname, sizeof(hostname), service, sizeof(service), 0);
+    int status = getnameinfo(
+        (struct sockaddr *)&storage,
+        storage_len,
+        hostname,
+        sizeof(hostname),
+        service,
+        sizeof(service),
+        NI_NAMEREQD
+    );
     if (status != 0) {
         ct_throw_message(ctx, exception, gai_strerror(status));
         return JSValueMakeUndefined(ctx);
@@ -13567,7 +13688,7 @@ static JSValueRef ct_dns_lookup_service_async(JSContextRef ctx, JSObjectRef func
         &request->request.lookup_service,
         ct_dns_lookup_service_after,
         (const struct sockaddr *)&request->address,
-        0
+        NI_NAMEREQD
     );
     if (status != 0) {
         ct_dns_request_free(request);
@@ -14631,13 +14752,13 @@ static int ct_tcp_resolve_address(JSContextRef ctx, const char *address, int por
     return 0;
 }
 
-static void ct_set_nonblocking_fd(int fd) {
+static bool ct_set_nonblocking_fd(int fd) {
 #if defined(_WIN32)
     u_long nonblocking = 1;
-    ioctlsocket(fd, FIONBIO, &nonblocking);
+    return ioctlsocket(ct_windows_socket_from_fd(fd), FIONBIO, &nonblocking) != SOCKET_ERROR;
 #else
     int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 #endif
 }
 
@@ -15317,11 +15438,20 @@ static JSValueRef ct_tcp_socket_connect_set_ref(JSContextRef ctx, JSObjectRef fu
     return JSValueMakeBoolean(ctx, operation != NULL);
 }
 
-static JSObjectRef ct_unix_address_from_path(JSContextRef ctx, const char *path, JSValueRef *exception) {
+static JSObjectRef ct_unix_address_from_path_len(
+    JSContextRef ctx,
+    const char *path,
+    size_t path_len,
+    JSValueRef *exception
+) {
     JSObjectRef result = ct_make_object(ctx);
-    ct_set_property(ctx, result, "path", ct_make_string(ctx, path != NULL ? path : ""), exception);
+    ct_set_property(ctx, result, "path", ct_make_string_len(ctx, path, path != NULL ? path_len : 0), exception);
     ct_set_property(ctx, result, "family", ct_make_string(ctx, "Unix"), exception);
     return result;
+}
+
+static JSObjectRef ct_unix_address_from_path(JSContextRef ctx, const char *path, JSValueRef *exception) {
+    return ct_unix_address_from_path_len(ctx, path, path != NULL ? strlen(path) : 0, exception);
 }
 
 static JSObjectRef ct_unix_address_from_fd(JSContextRef ctx, int fd, bool peer, JSValueRef *exception) {
@@ -15335,6 +15465,12 @@ static JSObjectRef ct_unix_address_from_fd(JSContextRef ctx, int fd, bool peer, 
     if (status != 0) return ct_unix_address_from_path(ctx, "", exception);
     size_t base_len = offsetof(struct sockaddr_un, sun_path);
     size_t path_capacity = address_len > base_len ? (size_t)(address_len - base_len) : 0;
+#if defined(__linux__)
+    if (path_capacity > 0 && address.sun_path[0] == '\0') {
+        if (path_capacity > sizeof(address.sun_path)) path_capacity = sizeof(address.sun_path);
+        return ct_unix_address_from_path_len(ctx, address.sun_path, path_capacity, exception);
+    }
+#endif
     size_t path_len = strnlen(address.sun_path, path_capacity);
     char path[sizeof(address.sun_path) + 1];
     if (path_len > sizeof(address.sun_path)) path_len = sizeof(address.sun_path);
@@ -15551,9 +15687,17 @@ static JSValueRef ct_unix_server_listen(JSContextRef ctx, JSObjectRef function, 
         return JSValueMakeUndefined(ctx);
     }
     signal(SIGPIPE, SIG_IGN);
-    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    size_t path_len = 0;
+    char *path = ct_value_to_utf8_copy(ctx, argv[0], &path_len);
     if (path == NULL) return JSValueMakeUndefined(ctx);
-    if (strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+#if defined(__linux__)
+    bool abstract_path = path_len > 0 && path[0] == '\0';
+#else
+    bool abstract_path = false;
+#endif
+    if (path_len == 0 || (abstract_path
+            ? path_len > sizeof(((struct sockaddr_un *)0)->sun_path)
+            : path_len >= sizeof(((struct sockaddr_un *)0)->sun_path))) {
         free(path);
         ct_throw_message(ctx, exception, "Unix socket path is too long");
         return JSValueMakeUndefined(ctx);
@@ -15569,20 +15713,23 @@ static JSValueRef ct_unix_server_listen(JSContextRef ctx, JSObjectRef function, 
     struct sockaddr_un address;
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
-    strncpy(address.sun_path, path, sizeof(address.sun_path) - 1);
-    unlink(path);
+    memcpy(address.sun_path, path, path_len + (abstract_path ? 0 : 1));
+    if (!abstract_path) unlink(path);
+    socklen_t address_len = abstract_path
+        ? (socklen_t)(offsetof(struct sockaddr_un, sun_path) + path_len)
+        : (socklen_t)sizeof(address);
 
     int backlog = 128;
     if (argc >= 2 && !ct_value_to_int_checked(ctx, argv[1], 0, INT_MAX, &backlog, exception, "Invalid socket backlog")) {
         close(fd);
-        unlink(path);
+        if (!abstract_path) unlink(path);
         free(path);
         return JSValueMakeUndefined(ctx);
     }
-    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0 || listen(fd, backlog) != 0) {
+    if (bind(fd, (struct sockaddr *)&address, address_len) != 0 || listen(fd, backlog) != 0) {
         char *message = ct_duplicate_string(strerror(errno));
         close(fd);
-        unlink(path);
+        if (!abstract_path) unlink(path);
         free(path);
         ct_throw_message(ctx, exception, message != NULL ? message : "Unix socket listen failed");
         free(message);
@@ -15592,8 +15739,8 @@ static JSValueRef ct_unix_server_listen(JSContextRef ctx, JSObjectRef function, 
 
     JSObjectRef result = ct_make_object(ctx);
     ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, fd), exception);
-    ct_set_property(ctx, result, "path", ct_make_string(ctx, path), exception);
-    JSObjectRef local = ct_unix_address_from_path(ctx, path, exception);
+    ct_set_property(ctx, result, "path", ct_make_string_len(ctx, path, path_len), exception);
+    JSObjectRef local = ct_unix_address_from_path_len(ctx, path, path_len, exception);
     ct_set_property(ctx, result, "address", local, exception);
     free(path);
     return result;
@@ -15822,9 +15969,17 @@ static JSValueRef ct_unix_socket_connect(JSContextRef ctx, JSObjectRef function,
         return JSValueMakeUndefined(ctx);
     }
     signal(SIGPIPE, SIG_IGN);
-    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    size_t path_len = 0;
+    char *path = ct_value_to_utf8_copy(ctx, argv[0], &path_len);
     if (path == NULL) return JSValueMakeUndefined(ctx);
-    if (strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+#if defined(__linux__)
+    bool abstract_path = path_len > 0 && path[0] == '\0';
+#else
+    bool abstract_path = false;
+#endif
+    if (path_len == 0 || (abstract_path
+            ? path_len > sizeof(((struct sockaddr_un *)0)->sun_path)
+            : path_len >= sizeof(((struct sockaddr_un *)0)->sun_path))) {
         free(path);
         ct_throw_message(ctx, exception, "Unix socket path is too long");
         return JSValueMakeUndefined(ctx);
@@ -15840,8 +15995,11 @@ static JSValueRef ct_unix_socket_connect(JSContextRef ctx, JSObjectRef function,
     struct sockaddr_un address;
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
-    strncpy(address.sun_path, path, sizeof(address.sun_path) - 1);
-    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+    memcpy(address.sun_path, path, path_len + (abstract_path ? 0 : 1));
+    socklen_t address_len = abstract_path
+        ? (socklen_t)(offsetof(struct sockaddr_un, sun_path) + path_len)
+        : (socklen_t)sizeof(address);
+    if (connect(fd, (struct sockaddr *)&address, address_len) != 0) {
         char *message = ct_duplicate_string(strerror(errno));
         close(fd);
         free(path);
@@ -15855,7 +16013,7 @@ static JSValueRef ct_unix_socket_connect(JSContextRef ctx, JSObjectRef function,
     ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, fd), exception);
     JSObjectRef local = ct_unix_address_from_fd(ctx, fd, false, exception);
     if (local != NULL) ct_set_property(ctx, result, "local", local, exception);
-    JSObjectRef remote = ct_unix_address_from_path(ctx, path, exception);
+    JSObjectRef remote = ct_unix_address_from_path_len(ctx, path, path_len, exception);
     ct_set_property(ctx, result, "remote", remote, exception);
     free(path);
     return result;
@@ -21336,6 +21494,13 @@ static JSValueRef ct_runtime_diagnostics(JSContextRef ctx, JSObjectRef function,
     ct_set_property(ctx, result, "workers", ct_runtime_worker_diagnostics(runtime, ctx, exception), exception);
     ct_set_property(ctx, result, "nativeStack", ct_runtime_native_stack(ctx, exception), exception);
     ct_set_property(ctx, result, "sharedObjects", ct_runtime_shared_objects(ctx, exception), exception);
+#if CT_HAS_GLIBC_DIAGNOSTICS
+    ct_set_property(ctx, result, "glibcVersionCompiler", ct_make_string(ctx, CT_STRINGIFY_VALUE(__GLIBC__) "." CT_STRINGIFY_VALUE(__GLIBC_MINOR__)), exception);
+    const char *glibc_runtime_version = gnu_get_libc_version();
+    if (glibc_runtime_version != NULL && glibc_runtime_version[0] != '\0') {
+        ct_set_property(ctx, result, "glibcVersionRuntime", ct_make_string(ctx, glibc_runtime_version), exception);
+    }
+#endif
 #if !defined(_WIN32)
     ct_set_property(ctx, result, "userLimits", ct_runtime_user_limits(ctx, exception), exception);
 #endif
@@ -34699,6 +34864,8 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
     const char *hostname = "127.0.0.1";
     char *hostname_arg = NULL;
     char *unix_path = NULL;
+    size_t unix_path_len = 0;
+    bool unix_path_abstract = false;
     int port_value = 0;
     size_t max_body_size = CT_HTTP_DEFAULT_MAX_BODY_SIZE;
     if (argc >= 1 && !JSValueIsUndefined(ctx, argv[0]) && !JSValueIsNull(ctx, argv[0])) {
@@ -34707,11 +34874,14 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
     }
     if (argc >= 2) port_value = (int)ct_value_to_number(ctx, argv[1]);
     if (argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2])) {
-        unix_path = ct_value_to_string_copy(ctx, argv[2]);
-        if (unix_path != NULL && unix_path[0] == 0) {
+        unix_path = ct_value_to_utf8_copy(ctx, argv[2], &unix_path_len);
+        if (unix_path != NULL && unix_path_len == 0) {
             free(unix_path);
             unix_path = NULL;
         }
+#if defined(__linux__)
+        unix_path_abstract = unix_path != NULL && unix_path[0] == '\0';
+#endif
     }
     if (argc >= 4) {
         double configured_max_body_size = ct_value_to_number(ctx, argv[3]);
@@ -34749,20 +34919,24 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
         struct sockaddr_un addr;
         memset(&addr, 0, sizeof(addr));
         addr.sun_family = AF_UNIX;
-        size_t path_len = strlen(unix_path);
-        if (path_len == 0 || path_len >= sizeof(addr.sun_path)) {
+        if (unix_path_len == 0 || (unix_path_abstract
+                ? unix_path_len > sizeof(addr.sun_path)
+                : unix_path_len >= sizeof(addr.sun_path))) {
             close(listen_fd);
             free(hostname_arg);
             free(unix_path);
             ct_throw_message(ctx, exception, "Unix socket path is too long");
             return JSValueMakeUndefined(ctx);
         }
-        memcpy(addr.sun_path, unix_path, path_len + 1);
-        unlink(unix_path);
-        if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(listen_fd, 128) != 0) {
+        memcpy(addr.sun_path, unix_path, unix_path_len + (unix_path_abstract ? 0 : 1));
+        if (!unix_path_abstract) unlink(unix_path);
+        socklen_t unix_address_len = unix_path_abstract
+            ? (socklen_t)(offsetof(struct sockaddr_un, sun_path) + unix_path_len)
+            : (socklen_t)sizeof(addr);
+        if (bind(listen_fd, (struct sockaddr *)&addr, unix_address_len) != 0 || listen(listen_fd, 128) != 0) {
             int bind_errno = errno;
             close(listen_fd);
-            unlink(unix_path);
+            if (!unix_path_abstract) unlink(unix_path);
             free(hostname_arg);
             free(unix_path);
             ct_throw_message(ctx, exception, strerror(bind_errno));
@@ -34804,7 +34978,7 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
     CtHttpServer *server = (CtHttpServer *)calloc(1, sizeof(CtHttpServer));
     if (server == NULL) {
         close(listen_fd);
-        if (unix_path != NULL) unlink(unix_path);
+        if (unix_path != NULL && !unix_path_abstract) unlink(unix_path);
         ct_throw_message(ctx, exception, "Out of memory");
         free(hostname_arg);
         free(unix_path);
@@ -34815,6 +34989,8 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
     server->max_body_size = max_body_size;
     server->hostname = unix_path == NULL ? ct_duplicate_string(hostname) : NULL;
     server->unix_path = unix_path;
+    server->unix_path_len = unix_path_len;
+    server->unix_path_abstract = unix_path_abstract;
     server->runtime = ct_callback_runtime(function);
     pthread_mutex_init(&server->mutex, NULL);
     pthread_cond_init(&server->clients_cond, NULL);
@@ -34832,7 +35008,7 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
         pthread_mutex_unlock(&ct_http_servers_mutex);
         close(listen_fd);
         free(server->hostname);
-        if (server->unix_path != NULL) unlink(server->unix_path);
+        if (server->unix_path != NULL && !server->unix_path_abstract) unlink(server->unix_path);
         free(server->unix_path);
         pthread_cond_destroy(&server->clients_cond);
         pthread_mutex_destroy(&server->mutex);
@@ -34845,7 +35021,13 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
     JSObjectRef result = ct_make_object(ctx);
     ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, server->id), exception);
     if (server->unix_path != NULL) {
-        ct_set_property(ctx, result, "address", ct_make_string(ctx, server->unix_path), exception);
+        ct_set_property(
+            ctx,
+            result,
+            "address",
+            ct_make_string_len(ctx, server->unix_path, server->unix_path_len),
+            exception
+        );
     } else {
         ct_set_property(ctx, result, "port", JSValueMakeNumber(ctx, server->port), exception);
         ct_set_property(ctx, result, "hostname", ct_make_string(ctx, server->hostname), exception);
@@ -35532,7 +35714,7 @@ static void ct_http_stop_server(CtHttpServer *server, bool remove_from_global_li
     }
     free(server->request_target_cache);
     free(server->hostname);
-    if (server->unix_path != NULL) unlink(server->unix_path);
+    if (server->unix_path != NULL && !server->unix_path_abstract) unlink(server->unix_path);
     free(server->unix_path);
     pthread_cond_destroy(&server->clients_cond);
     pthread_mutex_destroy(&server->mutex);
@@ -37338,6 +37520,7 @@ static CtJscRuntime *ct_jsc_runtime_create_internal(
     char *previous_async_stack_trace_option = async_stack_trace_option != NULL ? strdup(async_stack_trace_option) : NULL;
     const char *cf_user_text_encoding = getenv("__CF_USER_TEXT_ENCODING");
     char *previous_cf_user_text_encoding = cf_user_text_encoding != NULL ? strdup(cf_user_text_encoding) : NULL;
+    bool platform_dfg_default_applied = ct_jsc_apply_platform_dfg_default();
     if (explicit_resource_option == NULL) {
         setenv("JSC_useExplicitResourceManagement", "true", 1);
     }
@@ -37372,6 +37555,7 @@ static CtJscRuntime *ct_jsc_runtime_create_internal(
         unsetenv("JSC_useShadowRealm");
     }
 #endif
+    ct_jsc_restore_platform_dfg_default(platform_dfg_default_applied);
     if (runtime->context != NULL && terminate_callback != NULL) {
         /* Stock JSC only guarantees watchdog interruption when the limit is
          * installed before script execution. A false callback result rearms
@@ -39092,10 +39276,12 @@ int ct_jsc_generate_bytecode(
     char *previous_explicit_resource_option = explicit_resource_option != NULL ? strdup(explicit_resource_option) : NULL;
     const char *async_stack_trace_option = getenv("JSC_useAsyncStackTrace");
     char *previous_async_stack_trace_option = async_stack_trace_option != NULL ? strdup(async_stack_trace_option) : NULL;
+    bool platform_dfg_default_applied = ct_jsc_apply_platform_dfg_default();
     if (explicit_resource_option == NULL) setenv("JSC_useExplicitResourceManagement", "true", 1);
     if (async_stack_trace_option == NULL) setenv("JSC_useAsyncStackTrace", "true", 1);
 
     JSGlobalContextRef context = JSGlobalContextCreateInGroup(NULL, NULL);
+    ct_jsc_restore_platform_dfg_default(platform_dfg_default_applied);
 
     if (previous_explicit_resource_option != NULL) {
         setenv("JSC_useExplicitResourceManagement", previous_explicit_resource_option, 1);

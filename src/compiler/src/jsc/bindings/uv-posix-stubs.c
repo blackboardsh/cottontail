@@ -776,12 +776,6 @@ UV_EXTERN int uv_getrusage_thread(uv_rusage_t* rusage)
     __builtin_unreachable();
 }
 
-UV_EXTERN int uv_gettimeofday(uv_timeval64_t* tv)
-{
-    __bun_throw_not_implemented("uv_gettimeofday");
-    __builtin_unreachable();
-}
-
 UV_EXTERN uv_handle_type uv_guess_handle(uv_file file)
 {
     __bun_throw_not_implemented("uv_guess_handle");
@@ -1423,84 +1417,6 @@ UV_EXTERN int uv_run(uv_loop_t*, uv_run_mode mode)
     __builtin_unreachable();
 }
 
-UV_EXTERN void uv_rwlock_destroy(uv_rwlock_t* rwlock)
-{
-    __bun_throw_not_implemented("uv_rwlock_destroy");
-    __builtin_unreachable();
-}
-
-UV_EXTERN int uv_rwlock_init(uv_rwlock_t* rwlock)
-{
-    __bun_throw_not_implemented("uv_rwlock_init");
-    __builtin_unreachable();
-}
-
-UV_EXTERN void uv_rwlock_rdlock(uv_rwlock_t* rwlock)
-{
-    __bun_throw_not_implemented("uv_rwlock_rdlock");
-    __builtin_unreachable();
-}
-
-UV_EXTERN void uv_rwlock_rdunlock(uv_rwlock_t* rwlock)
-{
-    __bun_throw_not_implemented("uv_rwlock_rdunlock");
-    __builtin_unreachable();
-}
-
-UV_EXTERN int uv_rwlock_tryrdlock(uv_rwlock_t* rwlock)
-{
-    __bun_throw_not_implemented("uv_rwlock_tryrdlock");
-    __builtin_unreachable();
-}
-
-UV_EXTERN int uv_rwlock_trywrlock(uv_rwlock_t* rwlock)
-{
-    __bun_throw_not_implemented("uv_rwlock_trywrlock");
-    __builtin_unreachable();
-}
-
-UV_EXTERN void uv_rwlock_wrlock(uv_rwlock_t* rwlock)
-{
-    __bun_throw_not_implemented("uv_rwlock_wrlock");
-    __builtin_unreachable();
-}
-
-UV_EXTERN void uv_rwlock_wrunlock(uv_rwlock_t* rwlock)
-{
-    __bun_throw_not_implemented("uv_rwlock_wrunlock");
-    __builtin_unreachable();
-}
-
-UV_EXTERN void uv_sem_destroy(uv_sem_t* sem)
-{
-    __bun_throw_not_implemented("uv_sem_destroy");
-    __builtin_unreachable();
-}
-
-UV_EXTERN int uv_sem_init(uv_sem_t* sem, unsigned int value)
-{
-    __bun_throw_not_implemented("uv_sem_init");
-    __builtin_unreachable();
-}
-
-UV_EXTERN void uv_sem_post(uv_sem_t* sem)
-{
-    __bun_throw_not_implemented("uv_sem_post");
-    __builtin_unreachable();
-}
-
-UV_EXTERN int uv_sem_trywait(uv_sem_t* sem)
-{
-    __bun_throw_not_implemented("uv_sem_trywait");
-    __builtin_unreachable();
-}
-
-UV_EXTERN void uv_sem_wait(uv_sem_t* sem)
-{
-    __bun_throw_not_implemented("uv_sem_wait");
-    __builtin_unreachable();
-}
-
 UV_EXTERN int uv_send_buffer_size(uv_handle_t* handle, int* value)
 {
     __bun_throw_not_implemented("uv_send_buffer_size");
@@ -2062,18 +1978,6 @@ UV_EXTERN int uv_utf16_to_wtf8(const uint16_t* utf16,
     size_t* wtf8_len_ptr)
 {
     __bun_throw_not_implemented("uv_utf16_to_wtf8");
-    __builtin_unreachable();
-}
-
-UV_EXTERN unsigned int uv_version(void)
-{
-    __bun_throw_not_implemented("uv_version");
-    __builtin_unreachable();
-}
-
-UV_EXTERN const char* uv_version_string(void)
-{
-    __bun_throw_not_implemented("uv_version_string");
     __builtin_unreachable();
 }
 

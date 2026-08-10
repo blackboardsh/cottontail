@@ -155,6 +155,52 @@ test("Bun.listen and Bun.connect exchange Unix socket data", async () => {
   }
 });
 
+test.skipIf(process.platform !== "linux")(
+  "Bun.listen and Bun.connect preserve Linux abstract Unix socket names",
+  async () => {
+    const path = `\0cottontail-bun-net-${process.pid}-${Date.now()}`;
+    const received = Promise.withResolvers<string>();
+    const server = Bun.listen({
+      unix: path,
+      socket: {
+        data(socket, data) {
+          socket.end(`abstract:${data}`);
+        },
+      },
+    });
+    const socketName: Record<string, unknown> = {};
+    server.getsockname(socketName);
+    expect(server.unix).toBe(path);
+    expect(socketName).toEqual({ family: "Unix", address: path });
+    expect(() => Bun.listen({
+      unix: `${path}\0suffix`,
+      socket: { data() {} },
+    })).toThrow("unix must not contain NUL bytes");
+
+    try {
+      const client = await Bun.connect({
+        unix: path,
+        socket: {
+          open(socket) {
+            socket.write("hello");
+          },
+          data(socket, data) {
+            received.resolve(data.toString());
+            socket.end();
+          },
+          error(_socket, error) {
+            received.reject(error);
+          },
+        },
+      });
+      expect(await withTimeout(received.promise)).toBe("abstract:hello");
+      client.end();
+    } finally {
+      server.stop(true);
+    }
+  },
+);
+
 test("Bun sockets validate handlers and binaryType", () => {
   const lifecycleOnly = Bun.listen({
     hostname: "127.0.0.1",

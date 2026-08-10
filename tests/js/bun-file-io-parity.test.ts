@@ -1,4 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
+import { statSync, symlinkSync } from "node:fs";
 
 const root = `${cottontail.cwd()}/.cottontail-tmp/bun-file-io-${process.pid}-${Date.now()}`;
 const encoder = new TextEncoder();
@@ -52,6 +53,42 @@ test("path-backed streams report open errors before returning a reader", () => {
     expect.objectContaining({ code: "ENOENT", syscall: "open" }),
   );
 });
+
+test("path-backed stat errors use Bun's platform syscall name", async () => {
+  const path = fixture("missing-stat.txt");
+  let statError: NodeJS.ErrnoException | undefined;
+  try {
+    await Bun.file(path).stat();
+  } catch (error) {
+    statError = error as NodeJS.ErrnoException;
+  }
+
+  const syscall = process.platform === "linux" ? "statx" : "stat";
+  expect(statError).toMatchObject({ code: "ENOENT", syscall, path });
+  expect(statError?.message).toBe(`ENOENT: no such file or directory, ${syscall} '${path}'`);
+  expect(Object.keys(statError ?? {})).toEqual(["errno", "code", "syscall", "path"]);
+  expect(Object.prototype.propertyIsEnumerable.call(statError, "name")).toBe(false);
+});
+
+test.skipIf(process.platform === "win32")(
+  "path-backed stat preserves non-ENOENT system error metadata",
+  async () => {
+    const path = fixture("stat-loop");
+    symlinkSync(path, path);
+
+    let nodeError: NodeJS.ErrnoException | undefined;
+    let bunError: NodeJS.ErrnoException | undefined;
+    try { statSync(path); } catch (error) { nodeError = error as NodeJS.ErrnoException; }
+    try { await Bun.file(path).stat(); } catch (error) { bunError = error as NodeJS.ErrnoException; }
+
+    expect(bunError).toMatchObject({
+      code: nodeError?.code,
+      errno: nodeError?.errno,
+      path,
+      syscall: process.platform === "linux" ? "statx" : "stat",
+    });
+  },
+);
 
 test("descriptor-backed files consume the fd cursor without taking ownership", async () => {
   const path = fixture("descriptor.txt");

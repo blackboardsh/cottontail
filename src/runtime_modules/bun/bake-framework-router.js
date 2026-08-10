@@ -23,6 +23,67 @@ const javascriptExtensions = new Set([
 ]);
 
 const defaultScannedExtensions = [".tsx", ".ts", ".jsx", ".js"];
+const resolverNameEncoder = new TextEncoder();
+
+function resolverMapKey(name) {
+  return String(name).replace(/[A-Z]/g, character => character.toLowerCase());
+}
+
+function resolverMapHash(key) {
+  return BigInt(cottontail.hashValue(0, resolverNameEncoder.encode(key), "0"));
+}
+
+function resolverMapCapacity(size) {
+  let requested = Math.floor(size * 100 / 80) + 1;
+  let capacity = 1;
+  while (capacity < requested) capacity *= 2;
+  return Math.max(capacity, 8);
+}
+
+function insertResolverMapEntry(slots, record) {
+  const mask = slots.length - 1;
+  let index = Number(resolverMapHash(record.key) & BigInt(mask));
+  while (slots[index] !== undefined) {
+    if (slots[index].key === record.key) {
+      slots[index] = record;
+      return false;
+    }
+    index = (index + 1) & mask;
+  }
+  slots[index] = record;
+  return true;
+}
+
+// Bun's resolver stores directory entries in std.HashMap using a lowercase
+// Wyhash key, then scans the occupied buckets from low to high. Reproduce that
+// map layout so route precedence matches Bun across backing filesystems. The
+// incremental growth and insertion order matter when names collide.
+export function orderResolverEntries(entries) {
+  let slots = [];
+  let size = 0;
+  let available = 0;
+  for (const entry of entries) {
+    if (available === 0) {
+      const prior = slots;
+      slots = new Array(resolverMapCapacity(size + 1));
+      available = Math.floor(slots.length * 80 / 100);
+      size = 0;
+      for (const record of prior) {
+        if (record === undefined) continue;
+        if (insertResolverMapEntry(slots, record)) {
+          size += 1;
+          available -= 1;
+        }
+      }
+    }
+    const record = { key: resolverMapKey(entry.name), entry };
+    if (insertResolverMapEntry(slots, record)) {
+      size += 1;
+      available -= 1;
+    }
+  }
+  return slots.filter(record => record !== undefined).map(record => record.entry);
+}
 
 function routeError(message, start, length) {
   throw new Error(`${message} (${start}:${length})`);
@@ -392,10 +453,7 @@ export class FrameworkRouter {
       return;
     }
 
-    // Bun's resolver directory map iterates newest entries first. Reversing the
-    // filesystem enumeration preserves that stable route-tree ordering.
-    for (let index = entries.length - 1; index >= 0; index -= 1) {
-      const entry = entries[index];
+    for (const entry of orderResolverEntries(entries)) {
       if (entry.isDirectory()) {
         if ((this.ignoreUnderscores && entry.name.startsWith("_")) || this.ignoreDirs.has(entry.name)) continue;
         this.scanDirectory(path.join(directory, entry.name), errors);
@@ -521,6 +579,7 @@ export class FrameworkRouter {
 export const frameworkRouterInternals = {
   parseRoutePattern,
   FrameworkRouter,
+  orderResolverEntries,
 };
 
 export default frameworkRouterInternals;
