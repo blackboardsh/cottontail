@@ -1859,13 +1859,13 @@
       "reason": "The 25 active cases cover fd adoption, connection lifecycle, 1 GB transfer, native drain readiness, callback errors, and TLS upgrades. One adopted-fd peer-close case is excluded only for its fixed 10 ms callback microbenchmark on Linux.",
       "serial": true,
       "args": [
-        "--test-name-pattern=^(?!should not crash when a socket from a file descriptor is closed after opening$).*$"
+        "--test-name-pattern=^(?!socket > should not crash when a socket from a file descriptor is already closed after opening$).*$"
       ],
       "testNameExclusion": {
-        "pattern": "^(?!should not crash when a socket from a file descriptor is closed after opening$).*$",
+        "pattern": "^(?!socket > should not crash when a socket from a file descriptor is already closed after opening$).*$",
         "classification": "performance",
         "testNames": [
-          "should not crash when a socket from a file descriptor is closed after opening"
+          "socket > should not crash when a socket from a file descriptor is already closed after opening"
         ],
         "reason": "Three focused final-binary probes observed open exactly once, data zero times, and close exactly once after 21.2-23.6 ms. The copied case samples after a fixed 10 ms wait, before the callback arrives on ARM64/QEMU; ordinary close semantics succeed by 100 ms in every probe."
       },
