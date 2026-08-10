@@ -1,5 +1,6 @@
 import { strictEqual } from "node:assert/strict";
 import {
+  createHash,
   generateKeyPairSync,
   privateDecrypt,
   privateEncrypt,
@@ -43,10 +44,29 @@ strictEqual(
   "31d6cfe0d16ae931b73c59d7e0c089c0",
   "native MD4 vector mismatch",
 );
+const blake2b256Empty = "0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8";
+let nativeBlake2b256Error: unknown;
+try {
+  strictEqual(
+    Buffer.from(native.cryptoHashSync("blake2b256", new Uint8Array())).toString("hex"),
+    blake2b256Empty,
+    "native BLAKE2b-256 vector mismatch",
+  );
+} catch (error) {
+  nativeBlake2b256Error = error;
+}
+if (nativeBlake2b256Error != null) {
+  strictEqual(process.platform, "linux", "native BLAKE2b-256 should only require the public fallback on Linux");
+  strictEqual(
+    (nativeBlake2b256Error as Error).message,
+    "Unsupported digest algorithm",
+    "native BLAKE2b-256 failed for an unexpected reason",
+  );
+}
 strictEqual(
-  Buffer.from(native.cryptoHashSync("blake2b256", new Uint8Array())).toString("hex"),
-  "0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8",
-  "native BLAKE2b-256 vector mismatch",
+  createHash("blake2b256").digest("hex"),
+  blake2b256Empty,
+  "node:crypto BLAKE2b-256 public fallback vector mismatch",
 );
 
 const password = new TextEncoder().encode("pass");
