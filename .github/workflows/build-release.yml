@@ -49,7 +49,7 @@ jobs:
       - name: Validate release tag
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          node --test scripts/release-binary-contract.test.js scripts/release-contract.test.js scripts/release-version.test.js scripts/x64-baseline-release.test.js
+          node --test scripts/build-release-workflow.test.js scripts/release-binary-contract.test.js scripts/release-contract.test.js scripts/release-version.test.js scripts/verify-linux-glibc.test.js scripts/x64-baseline-release.test.js
           node scripts/validate-release-tag.js
 
       - name: Restore vendored toolchains
@@ -147,6 +147,10 @@ jobs:
       - name: Validate stripped release binary
         run: node scripts/validate-release-binary.js
 
+      - name: Validate Linux glibc ABI
+        if: matrix.os == 'linux'
+        run: node scripts/verify-linux-glibc.js zig-out/bin/cottontail 2.26
+
       - name: Smoke test stripped release with native plugin
         if: matrix.os != 'windows'
         run: node scripts/test-release-native-plugin.js
@@ -182,9 +186,43 @@ jobs:
           node scripts/package-release.js
           if ($LASTEXITCODE -ne 0) { throw "Windows packaging failed" }
 
-      # COTTONTAIL-COMPAT: Packaged ICU fallback - the current JSC artifact
-      # crashes without system ICU; restore this smoke after the JSC fallback
-      # is repaired independently.
+      - name: Smoke test packaged pinned ICU fallback
+        if: matrix.os == 'linux'
+        run: |
+          archive=$(find "$PWD/release" -maxdepth 1 -name 'cottontail-*-linux-*.tar.gz' -print -quit)
+          test -n "$archive"
+          smoke_image="cottontail-icu-smoke:${GITHUB_RUN_ID}-${{ matrix.platform }}"
+          trap 'docker image rm --force "$smoke_image" >/dev/null 2>&1 || true' EXIT
+          docker build --tag "$smoke_image" - <<'DOCKERFILE'
+          FROM ubuntu:24.04
+          RUN apt-get update >/dev/null \
+            && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              libatomic1 libbrotli1 libffi8 libgcc-s1 libstdc++6 zlib1g >/dev/null \
+            && mkdir -p /app /work \
+            && rm -rf /var/lib/apt/lists/*
+          DOCKERFILE
+          docker run --rm \
+            --network none \
+            --read-only \
+            --tmpfs /app:rw,exec \
+            --tmpfs /tmp:rw,exec \
+            --tmpfs /work:rw,exec \
+            --workdir /work \
+            --env HOME=/unwritable \
+            --env XDG_DATA_HOME=/unwritable \
+            -v "$archive:/release.tar.gz:ro" \
+            -v "$PWD/tests/js/icu-fallback-smoke.js:/icu-fallback-smoke.js:ro" \
+            "$smoke_image" \
+            bash -euc '
+              if ldconfig -p | grep -q "libicu"; then
+                echo "minimal test image unexpectedly contains system ICU" >&2
+                exit 1
+              fi
+              tar -xzf /release.tar.gz --strip-components=1 -C /app
+              test -f /app/share/cottontail/icu/70.1/icudt70l.dat
+              test -f /app/share/cottontail/icu/70.1/LICENSE
+              test "$(/app/bin/cottontail /icu-fallback-smoke.js)" = "icu fallback passed"
+            '
 
       - name: Retain release artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
