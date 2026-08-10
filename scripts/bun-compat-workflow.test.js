@@ -7,10 +7,20 @@ const workflowPath = new URL('../.github/workflows/bun-compat.yml', import.meta.
 const hutchManifestPath = new URL('../compat/upstream/hutch.json', import.meta.url);
 const hutchSetupPath = new URL('./setup-upstream-hutch.js', import.meta.url);
 const statusPath = new URL('../compat/upstream/bun/v1.3.10/status.json', import.meta.url);
-const workflow = readFileSync(workflowPath, 'utf8');
-const hutchManifest = JSON.parse(readFileSync(hutchManifestPath, 'utf8'));
-const hutchSetup = readFileSync(hutchSetupPath, 'utf8');
-const status = JSON.parse(readFileSync(statusPath, 'utf8'));
+const expectBundledPath = new URL(
+  '../compat/upstream/bun/v1.3.10/test/bundler/expectBundled.ts',
+  import.meta.url,
+);
+const bunTestAdapterPath = new URL('../src/runtime_modules/node/test.js', import.meta.url);
+// Windows runners may check the repository out with CRLF line endings;
+// normalize so the contract regexes match regardless of checkout config.
+const readText = (path) => readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
+const workflow = readText(workflowPath);
+const hutchManifest = JSON.parse(readText(hutchManifestPath));
+const hutchSetup = readText(hutchSetupPath);
+const status = JSON.parse(readText(statusPath));
+const expectBundled = readText(expectBundledPath);
+const bunTestAdapter = readText(bunTestAdapterPath);
 
 function workflowTriggers(source) {
   const end = source.indexOf('\npermissions:');
@@ -63,6 +73,11 @@ test('runs the strict complete Cottontail-owned Bun tier without publishing', ()
     hutchOwned.every((entry) => entry.status === 'skip' || entry.status === 'disabled'),
     'Hutch-owned files must remain excluded from Cottontail execution',
   );
+  const cottontailOutOfScope = Object.values(status.tests ?? {}).filter(
+    (entry) =>
+      entry.owner !== 'hutch-package-manager' &&
+      (entry.status === 'skip' || entry.status === 'disabled'),
+  );
 
   const output = execFileSync(
     process.execPath,
@@ -75,7 +90,7 @@ test('runs the strict complete Cottontail-owned Bun tier without publishing', ()
   const disabled = countFromList(output, 'disabled');
   const notEnabled = countFromList(output, 'not-enabled');
 
-  assert.equal(disabled, hutchOwned.length);
+  assert.equal(disabled, hutchOwned.length + cottontailOutOfScope.length);
   assert.equal(notEnabled, 0);
   assert.equal(discovered - disabled, enabled + expectedFailures);
 });
@@ -105,4 +120,21 @@ test('builds and passes the pinned Hutch engine to split package fixtures', () =
     workflow,
     /--hutch "\$HUTCH_ENGINE" --test test\/bundler\/bundler_npm\.test\.ts --case '\^npm\/LodashES\$' --expect-pass --jobs 1/,
   );
+});
+
+test('generated bundler deadlines use the owned timeout scale exactly once', () => {
+  assert.doesNotMatch(
+    expectBundled,
+    /COTTONTAIL_TEST_TIMEOUT_SCALE/,
+    'the copied generated-bundler harness must not apply the owned adapter scale a second time',
+  );
+  assert.match(
+    bunTestAdapter,
+    /const configuredTimeoutScale = Number\([\s\S]*COTTONTAIL_TEST_TIMEOUT_SCALE[\s\S]*return duration \* timeoutScale;/,
+  );
+
+  const htmlServer = status.tests['test/bundler/bundler_html_server.test.ts'];
+  assert.equal(htmlServer.status, 'enabled');
+  assert.deepEqual(htmlServer.env, { COTTONTAIL_TEST_TIMEOUT_SCALE: '2' });
+  assert.equal(htmlServer.timeoutMs, 60_000);
 });

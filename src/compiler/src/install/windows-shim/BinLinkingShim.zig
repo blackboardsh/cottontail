@@ -185,7 +185,7 @@ pub const Shebang = struct {
 
         const line = line: {
             var line_i = bun.strings.indexOfCharUsize(contents, '\n') orelse return parseFromBinPath(bin_path);
-            std.debug.assert(line_i >= 1);
+            bun.assert(line_i >= 1);
             if (contents[line_i - 1] == '\r') {
                 line_i -= 1;
             }
@@ -214,14 +214,14 @@ pub fn encodedLength(options: @This()) usize {
     const l = ((options.bin_path.len + "\" ".len) * @sizeOf(u16)) +
         @sizeOf(Flags) +
         if (options.shebang) |s| s.encodedLength() else 0;
-    std.debug.assert(l % 2 == 0);
+    bun.assert(l % 2 == 0);
     return l;
 }
 
 /// The buffer must be exactly the correct length given by encodedLength
 pub fn encodeInto(options: @This(), buf: []u8) !void {
-    std.debug.assert(buf.len == options.encodedLength());
-    std.debug.assert(options.bin_path[0] != '/');
+    bun.assert(buf.len == options.encodedLength());
+    bun.assert(options.bin_path[0] != '/');
 
     var wbuf = @as([*]u16, @ptrCast(@alignCast(&buf[0])))[0 .. buf.len / 2];
 
@@ -242,13 +242,13 @@ pub fn encodeInto(options: @This(), buf: []u8) !void {
     if (options.shebang) |s| {
         flags.is_node = bun.strings.hasPrefixComptime(s.launcher, "node") and
             (s.launcher.len == 4 or s.launcher[4] == ' ');
-        if (flags.is_node) std.debug.assert(flags.is_node_or_bun);
+        if (flags.is_node) bun.assert(flags.is_node_or_bun);
 
         const encoded = bun.strings.convertUTF8toUTF16InBuffer(
             wbuf[0..s.utf16_len],
             s.launcher,
         );
-        std.debug.assert(encoded.len == s.utf16_len);
+        bun.assert(encoded.len == s.utf16_len);
         wbuf = wbuf[s.utf16_len..];
 
         wbuf[0] = ' ';

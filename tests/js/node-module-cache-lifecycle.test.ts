@@ -96,12 +96,19 @@ test("CommonJS reloads create fresh wrappers from one cached factory", () => {
 
 test("large acyclic ESM reloads preserve fresh namespaces", async () => {
   const target = join(root, "large-esm-reload.mjs");
+  const host = (globalThis as any).cottontail;
+  const originalCompileFunction = host.compileFunction;
+  let compileCount = 0;
   let source = "globalThis.__largeEsmEvaluation = (globalThis.__largeEsmEvaluation ?? 0) + 1;\n";
   source += "export const evaluation = globalThis.__largeEsmEvaluation;\n";
   for (let index = 0; index < 5_000; index += 1) {
     source += `export const deliberatelyLongCacheLifecycleExportName${index} = ${index};\n`;
   }
   writeFileSync(target, source);
+  host.compileFunction = (...args: unknown[]) => {
+    compileCount += 1;
+    return originalCompileFunction(...args);
+  };
 
   try {
     const first = await import(target);
@@ -114,6 +121,10 @@ test("large acyclic ESM reloads preserve fresh namespaces", async () => {
     expect([first.evaluation, second.evaluation, third.evaluation]).toEqual([1, 2, 3]);
     expect(first).not.toBe(second);
     expect(second).not.toBe(third);
+    for (const namespace of [first, second, third]) {
+      const keys = Object.keys(namespace);
+      expect(keys.every((key, index) => index === 0 || keys[index - 1] < key)).toBe(true);
+    }
     expect(third.deliberatelyLongCacheLifecycleExportName4999).toBe(4999);
     expect(Reflect.ownKeys(third)).not.toContain("__esModule");
     expect(third[Symbol.toStringTag]).toBe("Module");
@@ -123,10 +134,51 @@ test("large acyclic ESM reloads preserve fresh namespaces", async () => {
       enumerable: true,
     });
     expect(typeof evaluationDescriptor.get).toBe("function");
+    expect(compileCount).toBe(1);
   } finally {
+    host.compileFunction = originalCompileFunction;
     delete (globalThis as any).__largeEsmEvaluation;
     delete require.cache[target];
   }
+});
+
+test("Loader.registry.clear reloads async ESM without recompiling unchanged source", () => {
+  const target = join(root, "loader-registry-clear-target.mjs");
+  const entry = join(root, "loader-registry-clear-entry.mjs");
+  writeFileSync(target, [
+    "globalThis.__registryClearEvaluation = (globalThis.__registryClearEvaluation ?? 0) + 1;",
+    "await 0;",
+    "export const evaluation = globalThis.__registryClearEvaluation;",
+    "",
+  ].join("\n"));
+  writeFileSync(entry, [
+    'require("node:module");',
+    `const target = ${JSON.stringify(target)};`,
+    "const host = globalThis.cottontail;",
+    "const originalCompileFunction = host.compileFunction;",
+    "let compileCount = 0;",
+    "host.compileFunction = (...args) => {",
+    "  if (String(args[1]) === target) compileCount += 1;",
+    "  return originalCompileFunction(...args);",
+    "};",
+    "try {",
+    "  const first = await globalThis.__cottontailImportModule(target, import.meta.path, undefined, true);",
+    "  Loader.registry.clear();",
+    "  const second = await globalThis.__cottontailImportModule(target, import.meta.path, undefined, true);",
+    '  if (first === second) throw new Error("stale namespace");',
+    '  if (first.evaluation !== 1 || second.evaluation !== 2) throw new Error("stale evaluation");',
+    '  if (compileCount !== 1) throw new Error(`compiled ${compileCount} times`);',
+    '  console.log("registry-clear-ok");',
+    "} finally {",
+    "  host.compileFunction = originalCompileFunction;",
+    "}",
+    "",
+  ].join("\n"));
+
+  const child = Bun.spawnSync({ cmd: [process.execPath, entry] });
+  expect(child.exitCode).toBe(0);
+  expect(child.stdout.toString()).toBe("registry-clear-ok\n");
+  expect(child.stderr.toString()).toBe("");
 });
 
 test("module lookup path caches preserve independently mutable arrays", () => {

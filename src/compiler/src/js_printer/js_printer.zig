@@ -390,6 +390,9 @@ pub const Options = struct {
     /// Runtime execution bundles must resolve import() from the original source
     /// module instead of the generated bundle's directory.
     runtime_dynamic_imports: bool = false,
+    /// Runtime helper `__esmDyn` for registry-aware dynamic imports of bundled
+    /// ESM modules (only valid when runtime_dynamic_imports is set).
+    esm_dyn_ref: Ref = Ref.None,
     allocator: std.mem.Allocator = default_allocator,
     source_map_allocator: ?std.mem.Allocator = null,
     source_map_handler: ?SourceMapHandler = null,
@@ -462,6 +465,11 @@ pub const RequireOrImportMeta = struct {
     exports_ref: Ref = Ref.None,
     is_wrapper_async: bool = false,
     was_unwrapped_require: bool = false,
+    /// Absolute path of the target module's source. Used as the
+    /// `Loader.registry` key for registry-aware dynamic imports of bundled
+    /// modules (`__esmDyn`); import record paths can still hold the raw
+    /// relative specifier.
+    source_path_text: string = "",
 
     pub const Callback = struct {
         const Fn = fn (*anyopaque, u32, bool) RequireOrImportMeta;
@@ -1674,6 +1682,40 @@ fn NewPrinter(
                 }
 
                 var meta = p.options.requireOrImportMetaForSource(record.source_index.get(), was_unwrapped_require);
+
+                // COTTONTAIL-COMPAT: dynamic imports of bundled ESM modules in
+                // runtime bundles go through the `__esmDyn` helper so they are
+                // registered in `Loader.registry` under the resolved path (the
+                // key Bun would use) and `Loader.registry.delete(path)` makes
+                // the next `import()` genuinely re-execute the module. Keep
+                // the exports ref even when the result is unused: the cached
+                // registry promise must resolve to the namespace so any later
+                // import of the same key observes it. Dynamic SELF-imports are
+                // excluded: they keep the plain `init().then(...)` emission
+                // that the self-import machinery patches and aliases
+                // (placeholder promise, exports proxy,
+                // __cottontailRegisterSelfModuleNamespace).
+                if (record.kind == .dynamic and
+                    p.options.runtime_dynamic_imports and
+                    p.options.esm_dyn_ref.isValid() and
+                    meta.wrapper_ref.isValid() and
+                    meta.exports_ref.isValid() and
+                    meta.source_path_text.len > 0 and
+                    !meta.was_unwrapped_require and
+                    !record.flags.wrap_with_to_esm and
+                    !(if (p.options.source_path) |sp| strings.eql(sp.text, meta.source_path_text) else false))
+                {
+                    p.printSpaceBeforeIdentifier();
+                    p.printSymbol(p.options.esm_dyn_ref);
+                    p.print("(");
+                    p.printStringLiteralUTF8(meta.source_path_text, false);
+                    p.print(", ");
+                    p.printSymbol(meta.wrapper_ref);
+                    p.print(", ");
+                    p.printSymbol(meta.exports_ref);
+                    p.print(")");
+                    return;
+                }
 
                 // Don't need the namespace object if the result is unused anyway
                 if (flags.contains(.expr_result_is_unused)) {
@@ -5345,22 +5387,29 @@ fn NewPrinter(
             // Special-case lazy-export AST
             if (ast.has_lazy_export) {
                 @branchHint(.unlikely);
-                const lazy_export = for (func.body.stmts) |stmt| {
+                // A module flagged `has_lazy_export` normally carries either an
+                // `s_lazy_export` or `s_export_default` statement in its wrapper.
+                // During incremental dev-server rebundles, a file can transiently
+                // become empty (e.g. edited to "" then rewritten), reaching this
+                // printer with the flag still set but no default-export statement.
+                // Treat a missing default as `undefined` (an empty module body)
+                // instead of crashing the dev server with a panic.
+                const lazy_export: ?Expr = for (func.body.stmts) |stmt| {
                     switch (stmt.data) {
                         .s_lazy_export => |expr| break Expr{ .data = expr.*, .loc = stmt.loc },
                         .s_export_default => |export_default| break export_default.value.toExpr(),
                         else => {},
                     }
-                } else @panic("Internal error: lazy export module is missing its default export");
+                } else null;
                 p.printFnArgs(func.open_parens_loc, func.args, func.flags.contains(.has_rest_arg), false);
                 p.printSpace();
                 p.print("{\n");
-                if (lazy_export.data != .e_undefined) {
+                if (lazy_export != null and lazy_export.?.data != .e_undefined) {
                     p.indent();
                     p.printIndent();
                     p.printSymbol(p.options.hmr_ref);
                     p.print(".cjs.exports = ");
-                    p.printExpr(lazy_export, .comma, .{});
+                    p.printExpr(lazy_export.?, .comma, .{});
                     p.print("; // bun .s_lazy_export\n");
                     p.unindent();
                 }

@@ -1,6 +1,29 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const host = @import("host.zig");
 const standalone_executable = @import("standalone_executable.zig");
+const cottontail_version = @import("version.zig").version;
+
+// Bun ends an uncaught run-mode error report with "\n\nBun v<v> (<os> <arch>)".
+// Cottontail prints its own product-identity analog. Platform names mirror
+// Bun's lowercase style (macos/linux/windows).
+const crash_footer_platform = switch (builtin.os.tag) {
+    .macos => "macos",
+    .linux => "linux",
+    .windows => "windows",
+    else => "unknown",
+};
+const crash_footer_arch = switch (builtin.cpu.arch) {
+    .aarch64 => "arm64",
+    .x86_64 => "x64",
+    .x86 => "x86",
+    else => "unknown",
+};
+// One leading newline here: writeStderrLine already terminated the message
+// with "\n", so this yields the "\n\n" blank-line separator Bun uses before
+// the footer, then the footer line, then a trailing newline.
+const crash_footer = "\nCottontail v" ++ cottontail_version ++
+    " (" ++ crash_footer_platform ++ " " ++ crash_footer_arch ++ ")\n";
 
 const c = @cImport({
     @cInclude("jsc_runner.h");
@@ -69,6 +92,9 @@ pub const Runtime = struct {
     handle: *c.CtJscRuntime,
     max_script_size: usize = 64 * 1024 * 1024,
     max_bytecode_size: usize = 128 * 1024 * 1024,
+    // Set for `cottontail test`: the bun:test reporter owns failure output, so
+    // the run-mode crash footer must be suppressed.
+    test_runtime: bool = false,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator) !Runtime {
         return initWithStackSize(io, allocator, 0);
@@ -140,7 +166,7 @@ pub const Runtime = struct {
             };
 
             if (eval_error != null) {
-                self.writeStderrLine(std.mem.span(eval_error));
+                self.writeStderrLine(errorSpan(eval_error));
             } else {
                 self.writeStderrLine("Failed to set cottontail.args");
             }
@@ -150,6 +176,7 @@ pub const Runtime = struct {
     }
 
     pub fn setTestRuntimeExecution(self: *Runtime) !void {
+        self.test_runtime = true;
         try self.evalImmediate(
             "globalThis.__cottontailBunTestRuntime = true;",
             "cottontail:test-runtime-bootstrap",
@@ -190,7 +217,7 @@ pub const Runtime = struct {
             &eval_error,
         ) != 0) {
             defer if (eval_error != null) c.ct_jsc_string_free(eval_error);
-            if (eval_error != null) self.writeStderrLine(std.mem.span(eval_error));
+            if (eval_error != null) self.writeStderrLine(errorSpan(eval_error));
             return error.SourceMapSetupFailed;
         }
     }
@@ -229,7 +256,7 @@ pub const Runtime = struct {
             &eval_error,
         ) != 0) {
             defer if (eval_error != null) c.ct_jsc_string_free(eval_error);
-            if (eval_error != null) self.writeStderrLine(std.mem.span(eval_error));
+            if (eval_error != null) self.writeStderrLine(errorSpan(eval_error));
             return error.SourceMapSetupFailed;
         }
     }
@@ -243,7 +270,7 @@ pub const Runtime = struct {
             &eval_error,
         ) != 0) {
             defer if (eval_error != null) c.ct_jsc_string_free(eval_error);
-            if (eval_error != null) self.writeStderrLine(std.mem.span(eval_error));
+            if (eval_error != null) self.writeStderrLine(errorSpan(eval_error));
             return error.StandaloneGraphSetupFailed;
         }
     }
@@ -270,33 +297,66 @@ pub const Runtime = struct {
             &eval_error,
         ) != 0) {
             defer if (eval_error != null) c.ct_jsc_string_free(eval_error);
-            if (eval_error != null) self.writeStderrLine(std.mem.span(eval_error));
+            if (eval_error != null) self.writeStderrLine(errorSpan(eval_error));
             return error.StandaloneFlagsSetupFailed;
         }
     }
 
+    /// Map a file read-only. The event loop runs inside the eval call, so
+    /// buffers passed to it stay alive for the entire process; file-backed
+    /// clean pages stay out of phys_footprint while anonymous readFileAlloc
+    /// copies are dirty for the whole run. Mappings are intentionally left in
+    /// place until process exit (JSC may retain pointers into the cached
+    /// bytecode for lazy function decoding).
+    fn mapFileForRead(self: *Runtime, path: []const u8, max_size: usize) ?[]const u8 {
+        if (builtin.os.tag == .windows) return null;
+        const file = std.Io.Dir.cwd().openFile(self.io, path, .{}) catch return null;
+        defer file.close(self.io);
+        const stat = file.stat(self.io) catch return null;
+        if (stat.size == 0) return null;
+        const len = std.math.cast(usize, stat.size) orelse return null;
+        if (len > max_size) return null;
+        const mapped = std.posix.mmap(
+            null,
+            len,
+            .{ .READ = true },
+            .{ .TYPE = .PRIVATE },
+            file.handle,
+            0,
+        ) catch return null;
+        return mapped[0..len];
+    }
+
     pub fn runFile(self: *Runtime, script_path: [:0]const u8) u8 {
-        const source = std.Io.Dir.cwd().readFileAlloc(
-            self.io,
-            script_path,
-            self.allocator,
-            .limited(self.max_script_size),
-        ) catch |err| {
-            self.writeLoadError(script_path, err);
-            return 1;
+        var source_owned = false;
+        const source: []const u8 = self.mapFileForRead(script_path, self.max_script_size) orelse blk: {
+            source_owned = true;
+            break :blk std.Io.Dir.cwd().readFileAlloc(
+                self.io,
+                script_path,
+                self.allocator,
+                .limited(self.max_script_size),
+            ) catch |err| {
+                self.writeLoadError(script_path, err);
+                return 1;
+            };
         };
-        defer self.allocator.free(source);
+        defer if (source_owned) self.allocator.free(@constCast(source));
 
         const bytecode_path = std.mem.concat(self.allocator, u8, &.{ script_path, ".jsc" }) catch
             return self.runSource(source, script_path);
         defer self.allocator.free(bytecode_path);
-        const bytecode = std.Io.Dir.cwd().readFileAlloc(
-            self.io,
-            bytecode_path,
-            self.allocator,
-            .limited(self.max_bytecode_size),
-        ) catch return self.runSource(source, script_path);
-        defer self.allocator.free(bytecode);
+        var bytecode_owned = false;
+        const bytecode: []const u8 = self.mapFileForRead(bytecode_path, self.max_bytecode_size) orelse blk: {
+            bytecode_owned = true;
+            break :blk std.Io.Dir.cwd().readFileAlloc(
+                self.io,
+                bytecode_path,
+                self.allocator,
+                .limited(self.max_bytecode_size),
+            ) catch return self.runSource(source, script_path);
+        };
+        defer if (bytecode_owned) self.allocator.free(@constCast(bytecode));
 
         return self.runSourceWithBytecode(source, script_path, bytecode);
     }
@@ -311,7 +371,7 @@ pub const Runtime = struct {
             &eval_error,
         ) != 0) {
             defer if (eval_error != null) c.ct_jsc_string_free(eval_error);
-            if (eval_error != null) self.writeStderrLine(std.mem.span(eval_error));
+            if (eval_error != null) self.writeStderrLine(errorSpan(eval_error));
             return error.ImmediateEvalFailed;
         }
     }
@@ -363,11 +423,15 @@ pub const Runtime = struct {
             };
 
             if (eval_status == -13) return 13;
-            if (eval_error != null) {
-                self.writeStderrLine(std.mem.span(eval_error));
-            } else {
-                self.writeStderrLine("Unknown JavaScript exception");
-            }
+            // Message and the product-identity crash footer (matching Bun's
+            // trailing "Bun v<v> (<os> <arch>)") share one writer: a second
+            // File.stderr().writer() would rewrite a regular-file stderr from
+            // offset 0 and corrupt the report. The footer is run-mode only;
+            // `cottontail test` surfaces failures through the bun:test reporter.
+            self.writeStderrCrash(
+                if (eval_error != null) errorSpan(eval_error) else "Unknown JavaScript exception",
+                !self.test_runtime,
+            );
 
             const routed_fatal = ct_jsc_runtime_had_fatal_exception(self.handle) != 0;
             const shutdown_status = self.emitProcessShutdown(false);
@@ -398,7 +462,7 @@ pub const Runtime = struct {
             &watch_error,
         ) != 0) {
             defer if (watch_error != null) c.ct_jsc_string_free(watch_error);
-            if (watch_error != null) self.writeStderrLine(std.mem.span(watch_error));
+            if (watch_error != null) self.writeStderrLine(errorSpan(watch_error));
             return error.WatchSetupFailed;
         }
     }
@@ -407,7 +471,7 @@ pub const Runtime = struct {
         var wait_error: [*c]u8 = null;
         if (c.ct_jsc_runtime_wait_for_reload(self.handle, &wait_error) != 0) {
             defer if (wait_error != null) c.ct_jsc_string_free(wait_error);
-            if (wait_error != null) self.writeStderrLine(std.mem.span(wait_error));
+            if (wait_error != null) self.writeStderrLine(errorSpan(wait_error));
             return error.ReloadWaitFailed;
         }
         _ = c.ct_jsc_runtime_take_reload_request(self.handle);
@@ -417,7 +481,7 @@ pub const Runtime = struct {
         var cleanup_error: [*c]u8 = null;
         if (c.ct_jsc_runtime_prepare_hot_reload(self.handle, &cleanup_error) != 0) {
             defer if (cleanup_error != null) c.ct_jsc_string_free(cleanup_error);
-            if (cleanup_error != null) self.writeStderrLine(std.mem.span(cleanup_error));
+            if (cleanup_error != null) self.writeStderrLine(errorSpan(cleanup_error));
             return error.HotReloadCleanupFailed;
         }
     }
@@ -458,7 +522,7 @@ pub const Runtime = struct {
         }
         if (status != 0) {
             if (eval_error != null) {
-                self.writeReloadError(std.mem.span(eval_error));
+                self.writeReloadError(errorSpan(eval_error));
             } else if (status != -13) {
                 self.writeStderrLine("Unknown JavaScript exception");
             }
@@ -511,7 +575,7 @@ pub const Runtime = struct {
             };
 
             if (eval_error != null) {
-                self.writeStderrLine(std.mem.span(eval_error));
+                self.writeStderrLine(errorSpan(eval_error));
             } else {
                 self.writeStderrLine("Unknown JavaScript exception during process shutdown");
             }
@@ -530,7 +594,7 @@ pub const Runtime = struct {
         ) != 0) {
             defer if (lifecycle_error != null) c.ct_jsc_string_free(lifecycle_error);
             if (lifecycle_error != null) {
-                self.writeStderrLine(std.mem.span(lifecycle_error));
+                self.writeStderrLine(errorSpan(lifecycle_error));
             } else {
                 self.writeStderrLine("Unknown JavaScript exception during process shutdown");
             }
@@ -549,7 +613,7 @@ pub const Runtime = struct {
             };
 
             if (eval_error != null) {
-                self.writeStderrLine(std.mem.span(eval_error));
+                self.writeStderrLine(errorSpan(eval_error));
             } else {
                 self.writeStderrLine("Unknown JavaScript exception during Cottontail tick");
             }
@@ -608,7 +672,7 @@ pub const Runtime = struct {
         };
         if (status != 0) {
             defer if (inspector_error != null) c.ct_jsc_string_free(inspector_error);
-            if (inspector_error != null) self.writeStderrLine(std.mem.span(inspector_error));
+            if (inspector_error != null) self.writeStderrLine(errorSpan(inspector_error));
             return error.InspectorStartFailed;
         }
         if (url == null) return null;
@@ -680,12 +744,29 @@ pub const Runtime = struct {
         stderr.flush() catch {};
     }
 
+    // COTTONTAIL-COMPAT: exception text may embed U+0000, so its byte length
+    // comes from the runtime instead of NUL-terminated span().
+    fn errorSpan(message: [*c]u8) []const u8 {
+        if (message == null) return "";
+        return message[0..c.ct_jsc_string_length(message)];
+    }
+
     fn writeStderrLine(self: *Runtime, message: []const u8) void {
         var stderr_buffer: [1024]u8 = undefined;
         var stderr_writer = std.Io.File.stderr().writer(self.io, &stderr_buffer);
         const stderr = &stderr_writer.interface;
 
         stderr.print("{s}\n", .{message}) catch {};
+        stderr.flush() catch {};
+    }
+
+    fn writeStderrCrash(self: *Runtime, message: []const u8, with_footer: bool) void {
+        var stderr_buffer: [1024]u8 = undefined;
+        var stderr_writer = std.Io.File.stderr().writer(self.io, &stderr_buffer);
+        const stderr = &stderr_writer.interface;
+
+        stderr.print("{s}\n", .{message}) catch {};
+        if (with_footer) stderr.writeAll(crash_footer) catch {};
         stderr.flush() catch {};
     }
 };

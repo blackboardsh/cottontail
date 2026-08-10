@@ -37,6 +37,9 @@ compat/upstream/bun/*/packages/*
 !compat/upstream/bun/*/packages/bun-native-bundler-plugin-api/
 compat/upstream/bun/*/packages/bun-native-bundler-plugin-api/*
 !compat/upstream/bun/*/packages/bun-native-bundler-plugin-api/bundler_plugin.h
+!compat/upstream/bun/*/packages/bun-error/
+compat/upstream/bun/*/packages/bun-error/*
+!compat/upstream/bun/*/packages/bun-error/runtime-error.ts
 !compat/upstream/bun/*/packages/bun-plugin-svelte/
 !compat/upstream/bun/*/packages/bun-plugin-svelte/**
 compat/upstream/bun/*/packages/bun-plugin-svelte/node_modules/
@@ -65,9 +68,18 @@ compat/upstream/bun/*/nosourcemap_entry
 compat/upstream/bun/*/test*file.db
 compat/upstream/bun/*/*.db*
 compat/upstream/bun/*/sqlite:*
+compat/upstream/bun/*/test/js/third_party/prisma/prisma/sqlite/dev.db*
 
 # compile-mode diagnostics emitted at the repository root
+/app
+/app.exe
+/app.exe.map
+/app.map
 /chunk-*.js.map
 /entry
+/entry.exe
+/entry.exe.map
 /entry.map
+/nosourcemap_entry
+/nosourcemap_entry.exe
 /tests/js/fixtures/debug-compile-split/

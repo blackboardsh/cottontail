@@ -1172,14 +1172,31 @@ static napi_value test_deferred_exceptions(const Napi::CallbackInfo &info) {
   status = napi_wrap(
       env, object, nullptr,
       +[](napi_env env, void *data, void *finalize_hint) {
-        puts("finalizer start");
-        printf("napi_throw status: %d\n", napi_throw(env, ok(env)));
-        puts("finalizer end");
+        node_api_post_finalizer(
+            env,
+            +[](napi_env env, void *data, void *finalize_hint) {
+              puts("finalizer start");
+              printf("napi_throw status: %d\n", napi_throw(env, ok(env)));
+              puts("finalizer end");
+            },
+            data, finalize_hint);
       },
       nullptr, nullptr);
 
   if (status != napi_ok) {
     printf("napi_wrap failed: %d\n", status);
+    return nullptr;
+  }
+
+  // Keep the wrapped object alive until environment teardown. Otherwise a GC
+  // may run the basic finalizer while JavaScript is still available, making
+  // the posted finalizer's napi_throw succeed instead of returning
+  // napi_cannot_run_js during teardown. That timing is not part of this test.
+  napi_ref object_ref;
+  status = napi_create_reference(env, object, 1, &object_ref);
+
+  if (status != napi_ok) {
+    printf("napi_create_reference failed: %d\n", status);
     return nullptr;
   }
 

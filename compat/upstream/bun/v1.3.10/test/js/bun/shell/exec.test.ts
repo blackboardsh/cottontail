@@ -19,7 +19,7 @@ describe("bun exec", () => {
   TestBuilder.command`${BUN} exec`
     .env(bunEnv)
     .stdout(
-      'Usage: bun exec <script>\n\nExecute a shell script directly from Bun.\n\nNote: If executing this from a shell, make sure to escape the string!\n\nExamples:\n  bun exec "echo hi"\n  bun exec "echo \\"hey friends\\"!"\n',
+      'Usage: cottontail exec <script>\n\nExecute a shell script directly from Cottontail.\n\nNote: If executing this from a shell, make sure to escape the string!\n\nExamples:\n  cottontail exec "echo hi"\n  cottontail exec "echo \\"hey friends\\"!"\n',
     )
     .runAsTest("no args prints help text");
 
@@ -81,7 +81,7 @@ describe("bun exec", () => {
   test("bun works even when not in PATH", async () => {
     const val = await $`bun exec 'bun'`.env({ ...bunEnv, PATH: "" }).nothrow();
     expect(val.stderr.toString()).not.toContain("bun: command not found: bun");
-    expect(val.stdout.toString()).toContain("Bun is a fast JavaScript runtime");
+    expect(val.stdout.toString()).toContain("Cottontail is a small, batteries included, and high performance JS runtime");
   });
 
   test("works with latin1 paths", async () => {

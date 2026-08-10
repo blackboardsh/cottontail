@@ -22,6 +22,21 @@ import { finalizeTestReporters } from "../internal/bun-test-reporters.js";
 
 const tests = [];
 const events = [];
+
+// This module can be evaluated more than once in a single process: the lazy
+// `describe`/`test`/`expect` globals reach one loader-cache key while
+// `bun:test` (and `Bun.jest(file)`) reaches another. Both instances must
+// share a single registration/reporter state — otherwise the first runner to
+// drain prints a partial summary and process.exit()s while the other
+// instance's tests are still in flight. The first instance to evaluate
+// becomes the primary; later instances re-export its interface and skip all
+// process-global side effects. Mirrors bun/test.js's bunTestModule handling.
+const primaryTestModuleKey = Symbol.for("cottontail.internal.nodeTestModule");
+// Module evaluation alone is not test execution. This signal flips only when
+// an API actually registers test work, so default-app can distinguish a test
+// entry from an ordinary application that happens to import node:test.
+const testRegisteredKey = Symbol.for("cottontail.internal.testRegistered");
+const primaryTestModule = globalThis[primaryTestModuleKey] ?? null;
 const Promise = globalThis.Promise;
 const queueMicrotask = globalThis.queueMicrotask.bind(globalThis);
 const runnerSetTimeout = globalThis.setTimeout;
@@ -49,6 +64,7 @@ let unhandledRejectionCaptureInstalled = false;
 let asyncFailureGuardsInstalled = false;
 let currentSuite;
 let activeExecution = null;
+let nodeTestStartRunHookInstalled = false;
 let runScheduled = false;
 let runnerActive = false;
 let runAgain = false;
@@ -72,6 +88,7 @@ let skippedTests = 0;
 let todoTests = 0;
 let runnerErrors = 0;
 let nextReportOrder = 0;
+let moduleLoadErrorAt = 0;
 const failures = [];
 const selectedRecords = new Set();
 
@@ -107,7 +124,11 @@ const testReporterFinalizers = [
     finalize: () => writeJunitReport(tests, rootSuite, junitOptions),
   },
 ];
-const testFileCount = Math.max(1, Number(globalThis.process?.env?.COTTONTAIL_TEST_FILE_COUNT ?? 1) || 1);
+const testFileCount = Math.max(1, Number(
+  globalThis.__cottontailBunTestFileCount ??
+    globalThis.process?.env?.COTTONTAIL_TEST_FILE_COUNT ??
+    1,
+) || 1);
 const configuredTimeoutScale = Number(globalThis.process?.env?.COTTONTAIL_TEST_TIMEOUT_SCALE ?? 1);
 const timeoutScale = Number.isFinite(configuredTimeoutScale) && configuredTimeoutScale >= 1
   ? configuredTimeoutScale
@@ -195,7 +216,7 @@ function installDotsConsoleHooks() {
   }
 }
 
-installDotsConsoleHooks();
+if (!primaryTestModule) installDotsConsoleHooks();
 
 function isTruthyEnvValue(value) {
   if (value == null) return false;
@@ -246,6 +267,7 @@ function installUncaughtCapture() {
   const processGlobal = globalThis.process;
   uncaughtCaptureInstalled = true;
   processGlobal[uncaughtCaptureHandlerKey] = (error) => {
+    tagThrowSiteError(error);
     const execution = executionStorage.getStore();
     if (execution?.failExternal) {
       execution.failExternal(error);
@@ -280,18 +302,6 @@ function installUnhandledRejectionCapture() {
   unhandledRejectionCaptureInstalled = true;
   processGlobal[unhandledRejectionHandlerKey] = (reason, promise) => {
     const error = reason instanceof Error ? reason : new Error(String(reason));
-    // bun/test.js's throw matchers block in waitForPromise; while blocked, a
-    // sibling promise of the one under assertion can reject before its own
-    // matcher attaches a handler. Bun quietly captures that rejection instead
-    // of failing the test (Expect.getValueAsToThrow's unhandledRejectionScope).
-    const quietCapture = globalThis.__cottontailQuietUnhandledRejectionCapture;
-    if (quietCapture) {
-      if (!quietCapture.didCapture) {
-        quietCapture.didCapture = true;
-        quietCapture.value = reason;
-      }
-      return;
-    }
     const owner = promise && typeof promise === "object" ? promiseOwners.get(promise) : null;
     if (owner?.kind === "test" && typeof owner.failExternal === "function") {
       // Late rejections owned by an already-finished test stay with that
@@ -330,20 +340,36 @@ function guardAsyncCallback(callback, captureReturnedPromise = true, externalOnT
     // running would fail an unrelated victim (bun absorbs late throws from a
     // finished test's stray timers). The captured execution's failExternal is
     // a no-op once the attempt has settled.
-    const execution = capturedExecution;
+    let execution = capturedExecution;
     try {
       const result = callback.apply(this, args);
       if (captureReturnedPromise && result && typeof result.then === "function" && execution) {
-        promiseThen(result, undefined, execution.failExternal);
+        promiseThen(result, undefined, (error) => routeGuardedError(execution, error));
       }
       return result;
     } catch (error) {
       if (!externalOnThrow) throw error;
-      if (execution?.failExternal) execution.failExternal(error);
-      else recordUnhandledError(error);
+      routeGuardedError(execution, tagThrowSiteError(error));
       return undefined;
     }
   };
+}
+
+function routeGuardedError(execution, error) {
+  // Exception to the owner attribution above: an expect() assertion binds to
+  // the test that is running when the matcher executes, not to the test that
+  // scheduled the callback. bun_test.fixture's "misattributed error" relies on
+  // this — the stray timer's failing expect is caught by the currently-running
+  // `.failing` test, which then passes.
+  if (error?.__cottontailBunExpectation && execution?.kind === "test" && !execution.active) {
+    const current = currentExecution();
+    if (current?.kind === "test" && current.active && typeof current.failExternal === "function") {
+      current.failExternal(error);
+      return;
+    }
+  }
+  if (execution?.failExternal) execution.failExternal(error);
+  else recordUnhandledError(error);
 }
 
 function copyTimerMetadata(wrapper, original) {
@@ -410,6 +436,46 @@ function installAsyncFailureGuards() {
     return result;
   };
   Object.defineProperty(globalThis.Promise.reject, "name", { value: "reject", configurable: true });
+}
+
+// When several node:test files run together (`bun test a.js b.js`), Bun's
+// aggregate entry statically imports every transformed file, so the global
+// __filename / __cottontailRegisteringTestFile settle on the *last* file by the
+// time top-level test()/hook registrations run. Bun/Node attribute each
+// registration to the file where it lexically appears; recover that from the
+// call stack, which still carries the correct per-file frame. Returns null when
+// no user frame can be identified (single-file runs fall back to the globals).
+function deriveCallerTestFile() {
+  let stack = String(new Error().stack ?? "");
+  try {
+    stack = globalThis.__cottontailRemapStackString?.(stack) ?? stack;
+  } catch {}
+  for (const line of stack.split("\n")) {
+    const match = /(?:\(|@|\bat\s+)([^()@]+):(\d+):(\d+)\)?$/.exec(line.trim());
+    if (!match) continue;
+    const file = match[1];
+    if (!file || file.startsWith("node:") || file.startsWith("bun:")) continue;
+    // Skip the generated multi-file aggregate entry and per-file entry wrappers.
+    if (file.includes("test-aggregate-") || file.includes("script-entry-")) continue;
+    if (!file.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(file)) continue;
+    return file;
+  }
+  return null;
+}
+
+// Root-level beforeEach/afterEach registered while loading file A must only run
+// for file A's tests — Bun keeps each file's global hooks scoped to that file
+// even when multiple files run together. Non-root (describe) hooks already live
+// in a single file, so they are returned untouched. Hooks with no recorded
+// file (single-file fallback) always run, preserving prior behavior.
+function scopedEachHooks(suite, hooks, record) {
+  if (suite !== rootSuite || !hooks || hooks.length === 0) return hooks;
+  let needsFilter = false;
+  for (const hook of hooks) {
+    if (hook.registrationFile != null) { needsFilter = true; break; }
+  }
+  if (!needsFilter) return hooks;
+  return hooks.filter((hook) => hook.registrationFile == null || hook.registrationFile === record.filePath);
 }
 
 function createSuite(name, options = {}, parent = null) {
@@ -604,22 +670,30 @@ function invokeDoneCallback(callback, thisValue, args) {
       const result = callback.apply(thisValue, [...args, done]);
       if (result && typeof result.then === "function") promiseThen(result, undefined, done);
     } catch (error) {
-      done(error);
+      done(tagThrowSiteError(error));
     }
   });
 }
 
 function invokeTestCallback(record, context) {
   const execution = executionStorage.getStore?.() ?? activeExecution;
-  if (execution && record.options.timeout != null) {
+  if (execution) {
     const duration = timeoutFor(record.options);
-    if (duration > 0) execution.deadline = runnerDateNow() + duration;
+    execution.deadline = duration > 0 ? runnerDateNow() + duration : null;
   }
   return withTimeout(async () => {
     let value;
     if (typeof record.fn !== "function") value = undefined;
     else if (record.fn.length >= 2) value = await invokeDoneCallback(record.fn, undefined, [context]);
-    else value = await record.fn(context);
+    else {
+      let result;
+      try {
+        result = record.fn(context);
+      } catch (error) {
+        throw tagThrowSiteError(error);
+      }
+      value = await result;
+    }
     // Bun keeps a test alive until matcher-produced promises settle (e.g.
     // expect(asyncFn).toThrow() — issue #23865); they race the test timeout.
     while (execution?.pendingPromises?.length) {
@@ -639,7 +713,7 @@ function invokeHook(hook, context) {
         else if (hook.fn.length >= 2) result = invokeDoneCallback(hook.fn, undefined, [context]);
         else result = hook.fn(context);
       } catch (error) {
-        throw annotatePrimitiveError(error, context?.filePath ?? hook.filePath);
+        throw annotatePrimitiveError(tagThrowSiteError(error), context?.filePath ?? hook.filePath);
       }
       return promiseThen(
         runnerPromiseResolve(result),
@@ -660,7 +734,7 @@ async function runHookList(hooks, context, reverseLayers = false) {
     try {
       await invokeHook(hook, context);
     } catch (error) {
-      return error;
+      return materializeErrorStack(error);
     }
   }
   return null;
@@ -670,9 +744,13 @@ function tagPerTestHookError(error) {
   if (error === null) return null;
   if ((typeof error === "object" || typeof error === "function") &&
       Object.prototype.hasOwnProperty.call(error, "__cottontailBunPrimitiveError")) {
+    // annotatePrimitiveError already resolved a source location for this
+    // primitive throw; keep the annotated error for display (bun prints the
+    // source excerpt + stack for hook callbacks that throw primitives) instead
+    // of the raw value, which would print without any location.
     const wrapped = new Error(String(error.__cottontailBunPrimitiveError));
     wrapped.code = "ERR_BUN_TEST_CALLBACK_FAILURES";
-    wrapped.errors = [error.__cottontailBunPrimitiveError];
+    wrapped.errors = [error];
     return wrapped;
   }
   if (typeof error !== "object" && typeof error !== "function") {
@@ -790,10 +868,15 @@ async function defineDeferredSuite(suite) {
     let rejectExternal;
     const failure = new Promise((_, reject) => { rejectExternal = reject; });
     const target = { kind: "describe", failExternal: rejectExternal };
-    const result = failureStorage.run(
-      target,
-      () => typeof suite.definitionFn === "function" ? suite.definitionFn() : undefined,
-    );
+    let result;
+    try {
+      result = failureStorage.run(
+        target,
+        () => typeof suite.definitionFn === "function" ? suite.definitionFn() : undefined,
+      );
+    } catch (error) {
+      throw tagThrowSiteError(error);
+    }
     await runnerPromiseRace([runnerPromiseResolve(result), failure]);
     suite.definitionState = "defined";
   } catch (error) {
@@ -916,6 +999,17 @@ function reapDanglingProcesses(execution) {
   }
 }
 
+// The engine computes error.stack lazily on first read; by report time the
+// throwing context is gone and the captured frames can drift (bundle paths, or
+// positions from a later test's error). Reading .stack when the runner first
+// captures an error freezes the correct frames.
+function materializeErrorStack(error) {
+  if (error instanceof Error) {
+    try { void error.stack; } catch {}
+  }
+  return error;
+}
+
 async function executeAttempt(record) {
   const context = new TestContext(record);
   const execution = {
@@ -930,7 +1024,7 @@ async function executeAttempt(record) {
     activeExecution = execution;
     const externalFailure = new Promise((_, reject) => {
       execution.failExternal = (error) => {
-        const normalized = bunAsyncCallbackFailure(record, error);
+        const normalized = bunAsyncCallbackFailure(record, materializeErrorStack(error));
         (execution.externalErrors ??= []).push(normalized);
         reject(normalized);
       };
@@ -944,7 +1038,7 @@ async function executeAttempt(record) {
     try {
       if (!setupError) {
         for (const suite of chain) {
-          const error = tagPerTestHookError(await runHookList(suite.beforeEachHooks, context));
+          const error = tagPerTestHookError(await runHookList(scopedEachHooks(suite, suite.beforeEachHooks, record), context));
           setupError ??= error;
           if (error) break;
         }
@@ -955,7 +1049,7 @@ async function executeAttempt(record) {
           await drainPostBodyTurn(execution);
           if (execution.externalErrors?.length) throw execution.externalErrors[0];
         } catch (error) {
-          bodyError = annotatePrimitiveError(error, record.filePath);
+          bodyError = annotatePrimitiveError(materializeErrorStack(error), record.filePath);
         }
         // Like bun, a timed-out test kills subprocesses it left running.
         if (bodyError?.code === "ERR_TEST_TIMEOUT") reapDanglingProcesses(execution);
@@ -967,7 +1061,7 @@ async function executeAttempt(record) {
         const dynamicAfterEachError = tagPerTestHookError(await runHookList(execution.afterEachHooks, context));
         cleanupError ??= dynamicAfterEachError;
         for (const suite of Array.from(chain).reverse()) {
-          const afterEachError = tagPerTestHookError(await runHookList(suite.afterEachHooks, context, true));
+          const afterEachError = tagPerTestHookError(await runHookList(scopedEachHooks(suite, suite.afterEachHooks, record), context, true));
           cleanupError ??= afterEachError;
         }
       }
@@ -986,7 +1080,7 @@ async function executeAttempt(record) {
   });
 }
 
-globalThis.__cottontailRecordTestAssertionCount = (count) => {
+if (!primaryTestModule) globalThis.__cottontailRecordTestAssertionCount = (count) => {
   const execution = executionStorage.getStore?.() ?? activeExecution;
   if (!execution?.record) return;
   (execution.record.attemptAssertionCounts ??= []).push(Math.max(0, Number(count) || 0));
@@ -1096,6 +1190,7 @@ async function execute(record) {
 }
 
 function recordHookFailure(name, error, isRunnerError = false, filePath = undefined) {
+  materializeErrorStack(error);
   const record = {
     name,
     status: isRunnerError ? "error" : "fail",
@@ -1111,6 +1206,7 @@ function recordHookFailure(name, error, isRunnerError = false, filePath = undefi
 }
 
 function recordUnhandledError(error) {
+  materializeErrorStack(error);
   const record = {
     name: "Unhandled error between tests",
     status: "error",
@@ -1126,22 +1222,50 @@ function recordUnhandledError(error) {
 
 // Bun installs its test-runner rejection handlers before loading each test
 // entrypoint, so module-scope failures use the same reporter as test failures.
-if (testCliModeEnabled()) {
+// Only the primary instance's handlers are live; a delegating instance's
+// handlers would route errors into state nothing registers into.
+if (!primaryTestModule && testCliModeEnabled()) {
   installUncaughtCapture();
   installUnhandledRejectionCapture();
 }
 
 async function runConcurrentRecords(records) {
-  const batchSize = Number.isFinite(maxConcurrency)
+  const limit = Number.isFinite(maxConcurrency)
     ? Math.max(1, maxConcurrency)
     : Math.max(1, records.length);
+  const inFlight = new Set();
   let cursor = 0;
+  // Bun's concurrent scheduler is a rolling window, not batches: a new test
+  // starts the moment a running one settles (max-concurrency 3 yields an
+  // execution pattern of 1,2,3,3,3,...). Between launches Bun drains the
+  // microtask queue, so a chain that settles without macrotask work (sync or
+  // immediately-resolved async bodies/hooks) completes fully — hooks
+  // included — before the next test starts, while a chain pending on real
+  // async work stays in flight and the next test launches right away. The
+  // drain must never yield to macrotasks (timers would interleave into the
+  // launch sequence); the round cap only bounds pathological chains that
+  // reschedule microtasks forever without settling.
   while (cursor < records.length && !bailReached()) {
-    const batch = [];
-    while (cursor < records.length && batch.length < batchSize) {
-      batch.push(execute(records[cursor++]));
+    while (inFlight.size >= limit) {
+      await runnerPromiseRace(Array.from(inFlight));
     }
-    await runnerPromiseAll(batch);
+    if (bailReached()) break;
+    let settled = false;
+    const promise = execute(records[cursor++]);
+    runnerPromiseThen.call(promise, () => {
+      settled = true;
+      inFlight.delete(promise);
+    }, () => {
+      settled = true;
+      inFlight.delete(promise);
+    });
+    inFlight.add(promise);
+    for (let round = 0; round < 4096 && !settled; round += 1) {
+      await runnerPromiseResolve();
+    }
+  }
+  while (inFlight.size > 0) {
+    await runnerPromiseRace(Array.from(inFlight));
   }
 }
 
@@ -1162,10 +1286,11 @@ async function executeSuite(suite, concurrentGroup) {
   const hasRunnableWork = suiteHasRunnableWork(suite);
   // Bun still runs hooks for suites that are empty or whose tests are all
   // skipped, but not for suites whose tests were deselected by `.only`
-  // (issue #14135).
+  // (issue #14135). The root suite is no exception: a file with only
+  // top-level beforeAll/afterAll hooks and no tests still runs them.
   const runnable = hasRunnableWork ||
     (suiteHasLifecycleWork(suite) && (!suiteHasTestRecords(suite) || suiteHasSelectedTest(suite)));
-  const shouldRunBefore = runnable && !suite.beforeRan && (suite !== rootSuite || hasRunnableWork);
+  const shouldRunBefore = runnable && !suite.beforeRan;
   if (shouldRunBefore) {
     if (suite.beforeHooks.length > 0) await flushConcurrent(concurrentGroup);
     suite.beforeRan = true;
@@ -1251,6 +1376,7 @@ function parseStackFrame(line) {
       filePath: normalizeDiagnosticPath(match[2]),
       line: Number(match[3]),
       column: Number(match[4]),
+      bare: false,
     };
   }
   match = /^\s*at\s+(?:(.*?)\s+\()?(.+):(\d+):(\d+)\)?$/.exec(text);
@@ -1260,6 +1386,9 @@ function parseStackFrame(line) {
     filePath: normalizeDiagnosticPath(match[2]),
     line: Number(match[3]),
     column: Number(match[4]),
+    // Top-level frames print bare in Bun ("at /path/file.js:1:3", no function
+    // name or parens) — preserve that instead of synthesizing "<anonymous>".
+    bare: match[1] === undefined && !text.includes("("),
   };
 }
 
@@ -1285,6 +1414,15 @@ function failureStackFrames(error) {
         path.includes("/.cottontail-tmp/") || path.endsWith("/script.bundle.mjs")) continue;
     frames.push(frame);
   }
+  for (const frame of frames) {
+    // A column past the end of the source line (e.g. the engine reports
+    // "Unexpected end of file" one past the last character) is never
+    // printable; Bun clamps the caret to the last character.
+    const sourceLine = sourceLinesFor(frame.filePath)?.[frame.line - 1];
+    if (sourceLine && frame.column > sourceLine.length) {
+      frame.column = Math.max(1, sourceLine.length);
+    }
+  }
   for (const frame of error?.__cottontailBunAsyncParentFrames ?? []) {
     if (!frame?.filePath || !Number.isFinite(frame.line) || !Number.isFinite(frame.column)) continue;
     if (frames.some((candidate) => candidate.filePath === frame.filePath &&
@@ -1296,7 +1434,35 @@ function failureStackFrames(error) {
       column: Number(frame.column),
     });
   }
-  return frames.map(normalizeConstructedErrorFrame);
+  // Errors that reached the reporter through the exception path (a synchronous
+  // throw, as opposed to a promise rejection) carry JSC's throw-site position:
+  // for `throw new Error(...)` that is the closing paren of the constructor
+  // call, not the constructor-name position the engine captures at
+  // construction. Verified against Bun 1.3.10 (sync body/hook/describe throws
+  // and timer-callback throws use the closing paren; async throws and
+  // rejections use the constructor name).
+  if (error?.__cottontailBunThrowSite && frames.length > 0) {
+    frames[0] = normalizeConstructedErrorFrame(frames[0]);
+  }
+  return frames;
+}
+
+function normalizeConstructedErrorFrame(frame) {
+  const sourceLine = sourceLinesFor(frame.filePath)?.[frame.line - 1];
+  if (!sourceLine || !/\bnew\s+(?:Error|[A-Za-z_$][\w$]*Error)\s*\(/.test(sourceLine)) return frame;
+  const closingParen = sourceLine.lastIndexOf(")");
+  return closingParen < 0 ? frame : { ...frame, column: closingParen + 1 };
+}
+
+// Marks an error that arrived through the exception path so its top frame is
+// printed with the throw-site column (see failureStackFrames).
+function tagThrowSiteError(error) {
+  if (error instanceof Error && !error.__cottontailBunExpectation) {
+    try {
+      Object.defineProperty(error, "__cottontailBunThrowSite", { value: true, configurable: true });
+    } catch {}
+  }
+  return error;
 }
 
 function sourceLinesFor(path) {
@@ -1314,13 +1480,6 @@ function sourceLinesFor(path) {
   return lines;
 }
 
-function normalizeConstructedErrorFrame(frame) {
-  const sourceLine = sourceLinesFor(frame.filePath)?.[frame.line - 1];
-  if (!sourceLine || !/\bnew\s+(?:Error|[A-Za-z_$][\w$]*Error)\s*\(/.test(sourceLine)) return frame;
-  const closingParen = sourceLine.lastIndexOf(")");
-  return closingParen < 0 ? frame : { ...frame, column: closingParen + 1 };
-}
-
 function durationSuffix(durationMs) {
   const duration = Number(durationMs);
   return Number.isFinite(duration) && duration >= 10 ? ` [${duration.toFixed(2)}ms]` : "";
@@ -1335,11 +1494,7 @@ function appendSourceFrame(lines, frame) {
     lines.push(`${String(lineNumber).padStart(width)} | ${sourceLines[lineNumber - 1]}`);
   }
   const sourceLine = sourceLines[frame.line - 1];
-  let column = Math.max(1, Math.min(Number(frame.column) || 1, sourceLine.length + 1));
-  if (/\bnew\s+(?:Error|[A-Za-z_$][\w$]*Error)\s*\(/.test(sourceLine)) {
-    const closingParen = sourceLine.lastIndexOf(")");
-    if (closingParen >= 0) column = closingParen + 1;
-  }
+  const column = Math.max(1, Math.min(Number(frame.column) || 1, sourceLine.length + 1));
   lines.push(`${" ".repeat(width + 3 + column - 1)}^`);
 }
 
@@ -1365,13 +1520,16 @@ function appendErrorDiagnostic(lines, error) {
   lines.push(`error: ${formatFailure(error)}`);
   for (const frame of frames.slice(0, 5)) {
     const functionName = frame.functionName === "@" ? "<anonymous>" : frame.functionName;
+    const location = frame.bare
+      ? `${frame.filePath}:${frame.line}:${frame.column}`
+      : `${functionName} (${frame.filePath}:${frame.line}:${frame.column})`;
     if (error?.__cottontailBunExpectation) {
       if (!formatFailure(error).endsWith("\n")) lines.push("");
-      lines.push(`      at ${functionName} (${frame.filePath}:${frame.line}:${frame.column})`);
+      lines.push(`      at ${location}`);
     } else if (error?.__cottontailBunPerTestHook) {
-      lines.push(`      at ${functionName} (${frame.filePath}:${frame.line}:${frame.column})`);
+      lines.push(`      at ${location}`);
     } else {
-      lines.push(`    at ${functionName} (${frame.filePath}:${frame.line}:${frame.column})`);
+      lines.push(`    at ${location}`);
     }
   }
 }
@@ -1385,6 +1543,9 @@ function fullTestName(record) {
   return names.join(" > ") || record.name || "test runner";
 }
 
+// These introspection hooks must read the primary instance's execution state;
+// a delegating instance's execution storage never runs any test.
+if (!primaryTestModule) {
 globalThis.__cottontailCurrentTestName = () => {
   const execution = executionStorage.getStore?.();
   return execution?.record ? fullTestName(execution.record) : "";
@@ -1441,13 +1602,14 @@ globalThis.__cottontailNoteDanglingProcessKilled = () => {
   return true;
 };
 
-// Milliseconds left before the current test's explicit timeout, or null when
-// no explicit per-test timeout is active.
+// Milliseconds left before the current test's active timeout, or null when
+// timeouts are disabled for the test.
 globalThis.__cottontailCurrentTestRemainingMs = () => {
   const execution = executionStorage.getStore?.() ?? activeExecution;
   if (!execution || execution.deadline == null) return null;
   return Math.max(0, execution.deadline - runnerDateNow());
 };
+}
 
 function appendFailure(lines, record, error) {
   if (record.unhandledBetweenTests) {
@@ -1714,7 +1876,12 @@ function reportResults() {
     lines.push(` ${assertionCount} expect() calls`);
   }
   const total = passedTests + skippedTests + todoTests + failedTests;
-  lines.push(`Ran ${total} ${total === 1 ? "test" : "tests"} across ${testFileCount} ${testFileCount === 1 ? "file" : "files"}.${durationSuffix(runDurationMs)}`);
+  // A run aborted by a module load error has no test durations to sum, but
+  // Bun still prints the elapsed wall time on the "Ran ..." line.
+  const ranSuffix = moduleLoadErrorAt > 0
+    ? ` [${Math.max(0, runnerDateNow() - moduleLoadErrorAt).toFixed(2)}ms]`
+    : durationSuffix(runDurationMs);
+  lines.push(`Ran ${total} ${total === 1 ? "test" : "tests"} across ${testFileCount} ${testFileCount === 1 ? "file" : "files"}.${ranSuffix}`);
   console.error(lines.join("\n"));
 }
 
@@ -1798,6 +1965,27 @@ function scheduleRun() {
   }
   installUncaughtCapture();
   installAsyncFailureGuards();
+  // COTTONTAIL-COMPAT: under the bun-test CLI, a test file with top-level
+  // await suspends mid-module, which drains the microtask queue. Starting the
+  // runner there would make any registration after the await look like it
+  // happened inside a running test, so defer until the loader clears the flag
+  // and re-enters through the startTestRun hook. This MUST stay scoped to CLI
+  // mode: standalone node:test allows `await test(...)` at module top level,
+  // where the runner has to start while the module is still evaluating —
+  // gating there deadlocks the file (run waits on module end, module end
+  // waits on the run).
+  if (globalThis.__cottontailLoadingTestModules === true && testCliModeEnabled()) {
+    if (!nodeTestStartRunHookInstalled) {
+      nodeTestStartRunHookInstalled = true;
+      const hookKey = Symbol.for("cottontail.internal.startTestRun");
+      const prior = globalThis[hookKey];
+      globalThis[hookKey] = () => {
+        if (typeof prior === "function") prior();
+        scheduleRun();
+      };
+    }
+    return;
+  }
   if (runnerActive) {
     runAgain = true;
     return;
@@ -1845,7 +2033,33 @@ function scheduleRun() {
   });
 }
 
-globalThis[Symbol.for("cottontail.internal.startTestRun")] = scheduleRun;
+if (!primaryTestModule) globalThis[Symbol.for("cottontail.internal.startTestRun")] = scheduleRun;
+
+// A test entry module that fails to parse or evaluate never registers any
+// tests, but Bun still reports the load failure through the test reporter: an
+// "Unhandled error between tests" banner that counts as one failed test and
+// one error (0 pass / 1 fail / 1 error / Ran 1 test). The entry wrappers call
+// this hook from their `await import(...)` catch; it returns true when the
+// error was claimed so the wrapper can stop it from also surfacing as a fatal
+// process error.
+if (!primaryTestModule) {
+  globalThis[Symbol.for("cottontail.internal.testModuleLoadError")] = (error, filePath = undefined) => {
+    const record = {
+      name: "Unhandled error between tests",
+      status: "error",
+      suite: rootSuite,
+      filePath: String(filePath ?? globalThis.__cottontailRegisteringTestFile ?? ""),
+      unhandledBetweenTests: true,
+      reportOrder: nextReportOrder++,
+    };
+    runnerErrors += 1;
+    failedTests += 1;
+    moduleLoadErrorAt = runnerDateNow();
+    failures.push({ record, error });
+    emit("test:fail", { name: record.name, error });
+    return true;
+  };
+}
 
 function normalizeCountOption(value, name) {
   const count = Number(value);
@@ -1867,15 +2081,17 @@ function makeTestFunction(defaultOptions = {}) {
   const fn = function nodeTest(name, options, callback) {
     if (currentExecution()) throw nestedTestNotImplemented("test");
     const parsed = parseTestArgs(name, options, callback);
+    const derivedFile = deriveCallerTestFile();
+    const recordFilePath = String(
+      derivedFile ?? globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? globalThis.process?.argv?.[1] ?? "",
+    );
     const record = {
       name: parsed.name,
       options: validateTestOptions({ ...defaultOptions, ...parsed.options }),
       fn: parsed.fn,
       suite: currentSuite,
-      filePath: String(globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? globalThis.process?.argv?.[1] ?? ""),
-      registrationLine: Number(parsed.options.__bunRegistrationLine) || captureTestRegistrationLine(
-        String(globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? globalThis.process?.argv?.[1] ?? ""),
-      ),
+      filePath: recordFilePath,
+      registrationLine: Number(parsed.options.__bunRegistrationLine) || captureTestRegistrationLine(recordFilePath),
       ran: false,
       result: null,
     };
@@ -1886,6 +2102,7 @@ function makeTestFunction(defaultOptions = {}) {
     promiseThen(record.result, undefined, () => {});
     tests.push(record);
     currentSuite.children.push(record);
+    globalThis[testRegisteredKey] = true;
     if (record.options.only) hasOnly = true;
     selectionDirty = true;
     for (let suite = currentSuite; suite; suite = suite.parent) suite.afterRan = false;
@@ -1895,8 +2112,8 @@ function makeTestFunction(defaultOptions = {}) {
   return fn;
 }
 
-export const test = makeTestFunction();
-export const it = test;
+export const test = primaryTestModule?.test ?? makeTestFunction();
+export const it = primaryTestModule?.it ?? test;
 
 function suiteFunction(name, options, callback, defaultOptions = {}) {
   if (currentExecution()) throw nestedTestNotImplemented("describe");
@@ -1906,6 +2123,7 @@ function suiteFunction(name, options, callback, defaultOptions = {}) {
   const parent = currentSuite;
   const child = createSuite(parsed.name, suiteOptions, parent);
   parent.children.push(child);
+  globalThis[testRegisteredKey] = true;
   if (suiteOptions.only) hasOnly = true;
   selectionDirty = true;
   if (suiteOptions.__bunDeferredDefinition) {
@@ -1929,7 +2147,7 @@ function suiteFunction(name, options, callback, defaultOptions = {}) {
     emit("test:suite:finish", { name: parsed.name });
     return promiseThen(completion, undefined, () => {});
   } catch (error) {
-    child.definitionError = error;
+    child.definitionError = tagThrowSiteError(error);
     emit("test:suite:finish", { name: parsed.name });
     scheduleRun();
     return runnerPromiseResolve();
@@ -1938,18 +2156,19 @@ function suiteFunction(name, options, callback, defaultOptions = {}) {
   }
 }
 
-export const describe = Object.assign(suiteFunction, {
+export const describe = primaryTestModule?.describe ?? Object.assign(suiteFunction, {
   only: (...args) => suiteFunction(args[0], args[1], args[2], { only: true }),
   skip: (...args) => suiteFunction(args[0], args[1], args[2], { skip: true }),
   todo: (...args) => suiteFunction(args[0], args[1], args[2], { todo: true }),
 });
 
-export const suite = describe;
-export const only = makeTestFunction({ only: true });
-export const skip = makeTestFunction({ skip: true });
-export const todo = makeTestFunction({ todo: true });
+export const suite = primaryTestModule?.suite ?? describe;
+export const only = primaryTestModule?.only ?? makeTestFunction({ only: true });
+export const skip = primaryTestModule?.skip ?? makeTestFunction({ skip: true });
+export const todo = primaryTestModule?.todo ?? makeTestFunction({ todo: true });
 
-export function before(fn, options = {}) {
+function beforeImpl(fn, options = {}) {
+  globalThis[testRegisteredKey] = true;
   const execution = currentExecution();
   if (execution) execution.afterBodyHooks.unshift({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
   else {
@@ -1964,7 +2183,10 @@ export function before(fn, options = {}) {
   }
 }
 
-export function after(fn, options = {}) {
+export const before = primaryTestModule?.before ?? beforeImpl;
+
+function afterImpl(fn, options = {}) {
+  globalThis[testRegisteredKey] = true;
   const execution = currentExecution();
   if (execution) execution.afterBodyHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
   else {
@@ -1974,22 +2196,30 @@ export function after(fn, options = {}) {
   }
 }
 
-export function beforeEach(fn, options = {}) {
+export const after = primaryTestModule?.after ?? afterImpl;
+
+function beforeEachImpl(fn, options = {}) {
   if (currentExecution()) {
     throw new Error("Cannot call beforeEach() inside a test. Call it inside describe() instead.");
   }
-  currentSuite.beforeEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
+  globalThis[testRegisteredKey] = true;
+  currentSuite.beforeEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0, registrationFile: currentSuite === rootSuite ? deriveCallerTestFile() : undefined });
   scheduleRun();
 }
 
-export function afterEach(fn, options = {}) {
+export const beforeEach = primaryTestModule?.beforeEach ?? beforeEachImpl;
+
+function afterEachImpl(fn, options = {}) {
+  globalThis[testRegisteredKey] = true;
   const execution = currentExecution();
   if (execution) execution.afterEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
-  else currentSuite.afterEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
+  else currentSuite.afterEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0, registrationFile: currentSuite === rootSuite ? deriveCallerTestFile() : undefined });
   scheduleRun();
 }
 
-export function onTestFinished(fn, options = {}) {
+export const afterEach = primaryTestModule?.afterEach ?? afterEachImpl;
+
+function onTestFinishedImpl(fn, options = {}) {
   if (typeof fn !== "function") throw new TypeError("onTestFinished requires a callback");
   const execution = currentExecution();
   if (!execution) throw new Error("Cannot call onTestFinished() outside of a test");
@@ -1999,11 +2229,15 @@ export function onTestFinished(fn, options = {}) {
   execution.finishHooks.push({ fn, options });
 }
 
-export function setDefaultTimeout(timeout) {
+export const onTestFinished = primaryTestModule?.onTestFinished ?? onTestFinishedImpl;
+
+function setDefaultTimeoutImpl(timeout) {
   const value = Number(timeout);
   if (!Number.isFinite(value) || value < 0) throw new TypeError("timeout must be a non-negative number");
   defaultTimeout = value;
 }
+
+export const setDefaultTimeout = primaryTestModule?.setDefaultTimeout ?? setDefaultTimeoutImpl;
 
 class MockTracker {
   constructor() {
@@ -2070,16 +2304,16 @@ class MockTracker {
   }
 }
 
-export const mock = new MockTracker();
+export const mock = primaryTestModule?.mock ?? new MockTracker();
 
-export const assert = {
+export const assert = primaryTestModule?.assert ?? {
   ...nodeAssert,
   register(name, fn) {
     this[name] = fn;
   },
 };
 
-export const snapshot = {
+export const snapshot = primaryTestModule?.snapshot ?? {
   _serializers: [],
   _resolveSnapshotPath: null,
   setDefaultSnapshotSerializers(serializers = []) {
@@ -2101,28 +2335,54 @@ async function *runEvents(options = {}) {
   yield *events;
 }
 
-export function run(options = {}) {
+function runImpl(options = {}) {
   return Readable.from(runEvents(options));
 }
 
-Object.assign(test, {
-  after,
-  afterEach,
-  assert,
-  before,
-  beforeEach,
-  describe,
-  it,
-  mock,
-  onTestFinished,
-  only,
-  run,
-  setDefaultTimeout,
-  skip,
-  snapshot,
-  suite,
-  test,
-  todo,
-});
+export const run = primaryTestModule?.run ?? runImpl;
+
+// The primary instance publishes its interface so later evaluations of this
+// module (a different loader-cache key for the same file) delegate to it
+// instead of building a second, divergent runner state.
+if (!primaryTestModule) {
+  Object.assign(test, {
+    after,
+    afterEach,
+    assert,
+    before,
+    beforeEach,
+    describe,
+    it,
+    mock,
+    onTestFinished,
+    only,
+    run,
+    setDefaultTimeout,
+    skip,
+    snapshot,
+    suite,
+    test,
+    todo,
+  });
+  globalThis[primaryTestModuleKey] = {
+    test,
+    it,
+    describe,
+    suite,
+    only,
+    skip,
+    todo,
+    before,
+    after,
+    beforeEach,
+    afterEach,
+    onTestFinished,
+    setDefaultTimeout,
+    mock,
+    assert,
+    snapshot,
+    run,
+  };
+}
 
 export default test;

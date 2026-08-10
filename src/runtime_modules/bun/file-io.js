@@ -100,8 +100,32 @@ const systemErrorDetails = [
   ["ENOMEM", -12, "out of memory", /out of memory|cannot allocate memory/i],
 ];
 
-export function makeBunFileError(error, target, syscall = "open") {
+function remapStructuredErrorSyscall(error, target, syscall) {
+  const path = typeof error.path === "string" ? error.path : typeof target === "string" ? target : undefined;
+  const source = String(error.message ?? error);
+  const marker = `, ${error.syscall}`;
+  const markerIndex = source.lastIndexOf(marker);
+  const prefix = markerIndex >= 0 ? source.slice(0, markerIndex) : source;
+  const pathSuffix = path === undefined ? "" : ` '${path}'`;
+  const message = `${prefix}, ${syscall}${pathSuffix}`;
+  const result = new Error(message);
+  const nameDescriptor = Object.getOwnPropertyDescriptor(error, "name");
+  if (nameDescriptor !== undefined) Object.defineProperty(result, "name", nameDescriptor);
+  result.errno = error.errno;
+  result.code = error.code;
+  result.syscall = syscall;
+  if (path !== undefined) result.path = path;
+  const causeDescriptor = Object.getOwnPropertyDescriptor(error, "cause");
+  if (causeDescriptor !== undefined) Object.defineProperty(result, "cause", causeDescriptor);
+  if (typeof error.stack === "string") result.stack = error.stack.replace(source, message);
+  return result;
+}
+
+export function makeBunFileError(error, target, syscall = "open", remapSyscall = false) {
   if (error?.code && error?.syscall && (target == null || error.path != null || typeof target === "number")) {
+    if (remapSyscall && error.syscall !== syscall) {
+      return remapStructuredErrorSyscall(error, target, syscall);
+    }
     return error;
   }
 
@@ -111,8 +135,8 @@ export function makeBunFileError(error, target, syscall = "open") {
   const [code, errno, reason] = detail ?? [String(error?.code ?? "EIO"), -5, source || "I/O error"];
   const pathSuffix = typeof target === "string" ? ` '${target}'` : "";
   const result = new Error(`${code}: ${reason}, ${syscall}${pathSuffix}`);
-  result.code = code;
   result.errno = errno;
+  result.code = code;
   result.syscall = syscall;
   if (typeof target === "string") result.path = target;
   return result;
@@ -571,8 +595,16 @@ function streamFile(state, chunkSize) {
   return stream;
 }
 
+// The native UTF-8 conversion stops at the first unpaired surrogate, which
+// would silently truncate the write. Bun encodes unpaired surrogates as U+FFFD
+// like every other string sink, so normalize before crossing the boundary.
+function wellFormedForUtf8(text) {
+  return typeof text.isWellFormed === "function" && !text.isWellFormed() ? text.toWellFormed() : text;
+}
+
 function writeAllToFd(fd, source, target) {
   const isString = typeof source === "string";
+  if (isString) source = wellFormedForUtf8(source);
   const requestedLength = isString ? source.length * 3 : source.byteLength;
   if (requestedLength === 0) return 0;
   let written;
@@ -795,7 +827,9 @@ function createBunFile(state) {
     },
     async stat() {
       try { return currentStat(state); } catch (error) {
-        throw makeBunFileError(error, descriptorTarget(state.descriptor), "stat");
+        const pathBackedLinuxFile = state.descriptor.kind === "path" && process.platform === "linux";
+        const syscall = pathBackedLinuxFile ? "statx" : "stat";
+        throw makeBunFileError(error, descriptorTarget(state.descriptor), syscall, pathBackedLinuxFile);
       }
     },
     write(data, options = undefined) {
@@ -872,7 +906,7 @@ export function file(path, options = undefined) {
 }
 
 function normalizeWriteOptions(options) {
-  if (options == null) return { createPath: true, createPathWasSet: false, mode: 0o664 };
+  if (options == null) return { createPath: true, createPathWasSet: false, mode: 0o664, modeWasSet: false };
   if (typeof options !== "object") throw invalidArgumentType("Expected options to be an object for 'write'.");
   let createPath = true;
   let createPathWasSet = false;
@@ -884,7 +918,9 @@ function normalizeWriteOptions(options) {
     createPath = options.createPath;
   }
   let mode = 0o664;
+  let modeWasSet = false;
   if (options.mode != null) {
+    modeWasSet = true;
     if (typeof options.mode !== "number" || !Number.isFinite(options.mode)) {
       throw invalidArgumentType("Expected options.mode to be a number for 'write'.");
     }
@@ -897,7 +933,7 @@ function normalizeWriteOptions(options) {
   }
   // Bun 1.3.10 only parses createPath and mode for local files. In particular,
   // an AbortSignal in this object is intentionally ignored.
-  return { createPath, createPathWasSet, mode };
+  return { createPath, createPathWasSet, mode, modeWasSet };
 }
 
 function normalizeWriteDestination(destination, options) {
@@ -980,11 +1016,24 @@ function openWriteDestination(destination, options) {
   if (destination.kind === "stream") return { fd: null, owned: false, stream: destination.stream };
   if (destination.kind === "fd") return { fd: destination.fd, owned: false, stream: null };
   ensureDestinationParent(destination, options);
+  let fd;
   try {
-    return { fd: cottontail.openFd(destination.path, "wnt", options.mode), owned: true, stream: null };
+    fd = cottontail.openFd(destination.path, "wnt", options.mode);
   } catch (error) {
     throw makeBunFileError(error, destination.path, "open");
   }
+  if (options.modeWasSet) {
+    // open(2) only applies the mode when it creates the file; an explicit
+    // mode must also replace the permissions of an existing destination
+    // (and bypass umask for newly created ones), matching Bun's write_file.
+    try {
+      cottontail.fchmodSync(fd, options.mode);
+    } catch (error) {
+      try { cottontail.closeFd(fd); } catch {}
+      throw makeBunFileError(error, destination.path, "chmod");
+    }
+  }
+  return { fd, owned: true, stream: null };
 }
 
 function closeWriteDestination(opened) {

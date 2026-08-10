@@ -6,6 +6,7 @@
 void ct_sync_signal_forwarding_begin(void) {}
 void ct_sync_signal_forwarding_set_pid(int64_t pid) { (void)pid; }
 void ct_sync_signal_forwarding_end(void) {}
+int ct_sync_signal_forwarding_forwarded_termination(void) { return 0; }
 
 __declspec(noreturn) void ct_exit_with_signal(int signal_number) {
     ExitProcess((UINT)(128 + signal_number));
@@ -18,6 +19,12 @@ __declspec(noreturn) void ct_exit_with_signal(int signal_number) {
 static volatile sig_atomic_t ct_forward_pid = 0;
 static volatile sig_atomic_t ct_pending_signal = 0;
 static volatile sig_atomic_t ct_forwarding_active = 0;
+// A forwarded termination signal was addressed to *this* process. Handing it to
+// the synchronous child must never make the parent immune to it: the caller
+// re-raises it once the child is reaped. Without this the parent silently
+// swallows SIGTERM for the whole lifetime of a spawn loop and outlives every
+// supervisor that does not escalate to SIGKILL.
+static volatile sig_atomic_t ct_forwarded_termination = 0;
 static struct sigaction ct_previous_actions[NSIG];
 static unsigned char ct_action_installed[NSIG];
 
@@ -41,7 +48,23 @@ static const int ct_forwarded_signals[] = {
 #endif
 };
 
+static int ct_is_termination_signal(int signal_number) {
+    switch (signal_number) {
+        case SIGHUP:
+        case SIGINT:
+        case SIGQUIT:
+        case SIGABRT:
+        case SIGTERM:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 static void ct_forward_signal(int signal_number) {
+    if (ct_is_termination_signal(signal_number) && ct_forwarded_termination == 0) {
+        ct_forwarded_termination = signal_number;
+    }
     sig_atomic_t pid = ct_forward_pid;
     if (pid == 0) {
         ct_pending_signal = signal_number;
@@ -55,6 +78,7 @@ void ct_sync_signal_forwarding_begin(void) {
     ct_forwarding_active = 1;
     ct_forward_pid = 0;
     ct_pending_signal = 0;
+    ct_forwarded_termination = 0;
     memset(ct_action_installed, 0, sizeof(ct_action_installed));
 
     struct sigaction action;
@@ -92,6 +116,14 @@ void ct_sync_signal_forwarding_end(void) {
         ct_action_installed[signal_number] = 0;
     }
     ct_forwarding_active = 0;
+}
+
+// Consumed after the synchronous child is reaped. `end()` deliberately leaves
+// this set so the caller can still observe a signal that arrived mid-wait.
+int ct_sync_signal_forwarding_forwarded_termination(void) {
+    int signal_number = (int)ct_forwarded_termination;
+    ct_forwarded_termination = 0;
+    return signal_number;
 }
 
 __attribute__((noreturn)) void ct_exit_with_signal(int signal_number) {

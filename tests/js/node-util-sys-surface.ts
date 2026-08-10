@@ -99,13 +99,16 @@ await abortedPromise;
 
 const stringDiff = diff("a\nb", "a\nc");
 assert(Array.isArray(stringDiff) && stringDiff.some(([type]) => type === 1) && stringDiff.some(([type]) => type === -1), "diff mismatch");
+// The error helpers above temporarily set Error.stackTraceLimit to zero.
+// A bare-entry Error wrapper must restore JSC's native limit, not only its
+// own visible property, before getCallSites captures the next stack.
 const callSites = getCallSites(1);
 assert(
   Array.isArray(callSites) &&
     typeof callSites[0]?.scriptName === "string" &&
     Number.isInteger(callSites[0]?.lineNumber) &&
     Number.isInteger(callSites[0]?.columnNumber),
-  "getCallSites mismatch",
+  "getCallSites after util error helpers mismatch",
 );
 assert(typeof debuglog("test") === "function", "debuglog mismatch");
 

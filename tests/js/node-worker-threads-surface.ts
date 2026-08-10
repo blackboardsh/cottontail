@@ -43,6 +43,11 @@ setEnvironmentData("key", { value: 42 });
 assert(getEnvironmentData("key").value === 42, "environmentData mismatch");
 setEnvironmentData("shared", { token: "env", count: 7n });
 
+// Cold CI runners need a wider worker-startup budget than local dev machines.
+// Worker startup is currently ~235ms/worker (see escalation item 34), so a
+// 1.5s budget flakes when the full test-js suite loads the machine. Keep a
+// generous local budget until worker VM-snapshot startup lands.
+const workerResponseTimeoutMs = (process.env.CI === "true" || process.env.CI === "1") ? 15_000 : 8_000;
 const marked = {};
 markAsUntransferable(marked);
 markAsUncloneable(marked);
@@ -159,7 +164,7 @@ assert(worker.threadName === "cottontail-worker", "Worker threadName mismatch");
 assert(typeof worker.postMessage === "function", "Worker postMessage mismatch");
 const messages: any[] = [];
 const reply = new Promise<any>((resolve, reject) => {
-  const timeout = setTimeout(() => reject(new Error("worker_threads response timed out")), 1500);
+  const timeout = setTimeout(() => reject(new Error("worker_threads response timed out")), workerResponseTimeoutMs);
   worker.on("message", (message) => {
     messages.push(message);
     if (message.type === "ready") {
@@ -223,7 +228,7 @@ assert(
 
 const transferredChannel = new MessageChannel();
 const transferredPortReply = new Promise<any>((resolve, reject) => {
-  const timeout = setTimeout(() => reject(new Error("transferred MessagePort timed out")), 1500);
+  const timeout = setTimeout(() => reject(new Error("transferred MessagePort timed out")), workerResponseTimeoutMs);
   transferredChannel.port1.on("message", (message) => {
     if (message.type === "port-ready") {
       transferredChannel.port1.postMessage({
@@ -252,7 +257,7 @@ const sharedView = new Int32Array(sharedBuffer);
 Atomics.store(sharedView, 0, 7);
 Atomics.store(sharedView, 1, 0);
 const sharedReplyPromise = new Promise<any>((resolve, reject) => {
-  const timeout = setTimeout(() => reject(new Error("SharedArrayBuffer worker response timed out")), 1500);
+  const timeout = setTimeout(() => reject(new Error("SharedArrayBuffer worker response timed out")), workerResponseTimeoutMs);
   worker.on("message", (message) => {
     if (message.type === "shared-done") {
       clearTimeout(timeout);
@@ -284,7 +289,7 @@ const waitView = new Int32Array(waitBuffer);
 Atomics.store(waitView, 0, 1);
 Atomics.store(waitView, 1, 1);
 const waitStartedPromise = new Promise<void>((resolve, reject) => {
-  const timeout = setTimeout(() => reject(new Error("Atomics.wait worker start timed out")), 1500);
+  const timeout = setTimeout(() => reject(new Error("Atomics.wait worker start timed out")), workerResponseTimeoutMs);
   worker.on("message", (message) => {
     if (message.type === "wait-started") {
       clearTimeout(timeout);
@@ -293,7 +298,7 @@ const waitStartedPromise = new Promise<void>((resolve, reject) => {
   });
 });
 const waitResultPromise = new Promise<any>((resolve, reject) => {
-  const timeout = setTimeout(() => reject(new Error("Atomics.wait worker result timed out")), 1500);
+  const timeout = setTimeout(() => reject(new Error("Atomics.wait worker result timed out")), workerResponseTimeoutMs);
   worker.on("message", (message) => {
     if (message.type === "wait-result") {
       clearTimeout(timeout);

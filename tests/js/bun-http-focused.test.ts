@@ -48,6 +48,138 @@ function withTimeout(promise, message, timeout = 3000) {
   ]).finally(() => clearTimeout(timer));
 }
 
+function exchangeRejectedRequest({
+  server,
+  initial,
+  triggerAfterResponse,
+  trailing,
+  expectedStatus,
+  trailingDelay = 25,
+  probeDelay = 20,
+  endDelay = 5,
+}) {
+  let client;
+  let trailingTimer;
+  let probeTimer;
+  let endTimer;
+  let completed = false;
+  const exchange = new Promise((resolve, reject) => {
+    let response = "";
+    let triggerWritten = triggerAfterResponse == null;
+    let trailingWritten = false;
+    let probeWritten = false;
+    let ending = false;
+
+    const fail = error => {
+      if (completed) return;
+      completed = true;
+      clearTimeout(trailingTimer);
+      clearTimeout(probeTimer);
+      clearTimeout(endTimer);
+      try { client?.terminate(); } catch {}
+      reject(error);
+    };
+    const writeExact = (socket, bytes, label) => {
+      let written;
+      try {
+        written = socket.write(bytes);
+        socket.flush();
+      } catch (error) {
+        fail(error);
+        return false;
+      }
+      const expected = Buffer.byteLength(bytes);
+      if (written !== expected) {
+        fail(new Error(`${label} wrote ${written} of ${expected} bytes`));
+        return false;
+      }
+      return true;
+    };
+    const maybeEnd = socket => {
+      if (ending || probeWritten || probeTimer != null || !trailingWritten || !response.includes(expectedStatus)) return;
+      probeTimer = setTimeout(() => {
+        probeTimer = null;
+        if (completed || !writeExact(socket, "!", "post-trailing request probe")) return;
+        probeWritten = true;
+        endTimer = setTimeout(() => {
+          endTimer = null;
+          if (completed) return;
+          ending = true;
+          socket.end();
+        }, endDelay);
+      }, probeDelay);
+    };
+    const scheduleTrailing = socket => {
+      if (trailingWritten || trailingTimer != null) return;
+      trailingTimer = setTimeout(() => {
+        trailingTimer = null;
+        if (completed || !writeExact(socket, trailing, "trailing request fragment")) return;
+        trailingWritten = true;
+        maybeEnd(socket);
+      }, trailingDelay);
+    };
+    const triggerMalformedBody = socket => {
+      if (triggerWritten || triggerAfterResponse == null) return;
+      if (!writeExact(socket, triggerAfterResponse, "malformed request fragment")) return;
+      triggerWritten = true;
+      scheduleTrailing(socket);
+    };
+    const observeResponse = socket => {
+      if (!response.includes(expectedStatus)) return;
+      triggerMalformedBody(socket);
+      maybeEnd(socket);
+    };
+
+    Bun.connect({
+      hostname: server.hostname,
+      port: server.port,
+      allowHalfOpen: true,
+      socket: {
+        open(socket) {
+          client = socket;
+          if (!writeExact(socket, initial, "initial request fragment")) return;
+          if (triggerAfterResponse == null) scheduleTrailing(socket);
+        },
+        data(socket, data) {
+          response += data.toString();
+          observeResponse(socket);
+        },
+        end(socket) {
+          observeResponse(socket);
+        },
+        error(_socket, error) {
+          fail(error);
+        },
+        close(_socket, error) {
+          if (completed) return;
+          if (error != null) return fail(error);
+          if (!triggerWritten) return fail(new Error("malformed request fragment was not written"));
+          if (!trailingWritten) return fail(new Error("trailing request fragment was not written"));
+          if (!probeWritten) return fail(new Error("peer closed before the post-trailing probe was written"));
+          if (!ending) return fail(new Error("peer closed before the client finished its trailing fragment"));
+          if (!response.includes(expectedStatus)) {
+            return fail(new Error(`response did not contain ${expectedStatus}: ${JSON.stringify(response)}`));
+          }
+          completed = true;
+          clearTimeout(trailingTimer);
+          clearTimeout(probeTimer);
+          clearTimeout(endTimer);
+          resolve(response);
+        },
+      },
+    }).catch(fail);
+  });
+
+  return withTimeout(exchange, `rejected request did not settle after ${expectedStatus}`).finally(() => {
+    clearTimeout(trailingTimer);
+    clearTimeout(probeTimer);
+    clearTimeout(endTimer);
+    if (!completed) {
+      try { client?.terminate(); } catch {}
+    }
+  });
+}
+
 function readRawHttpResponse(socket) {
   return new Promise((resolve, reject) => {
     let buffered = Buffer.alloc(0);
@@ -450,6 +582,42 @@ test("Bun.serve graceful stop waits for upgraded WebSockets", async () => {
   }
 });
 
+test("ServerWebSocket applies positive backpressure limits to empty frames", async () => {
+  const sends = Promise.withResolvers<number[]>();
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request, activeServer) {
+      if (activeServer.upgrade(request)) return;
+      return new Response("upgrade required", { status: 426 });
+    },
+    websocket: {
+      backpressureLimit: 1,
+      open(socket) {
+        sends.resolve([
+          socket.send(""),
+          socket.send(""),
+          socket.send(""),
+        ]);
+      },
+      message() {},
+    },
+  });
+  const client = new WebSocket(server.url.href.replace(/^http/, "ws"));
+  try {
+    await new Promise((resolve, reject) => {
+      client.addEventListener("open", resolve, { once: true });
+      client.addEventListener("error", reject, { once: true });
+    });
+    // Empty payloads report zero bytes, but the second queued frame must still
+    // enter backpressure and later sends must be dropped until it drains.
+    expect(await sends.promise).toEqual([0, -1, 0]);
+  } finally {
+    client.close();
+    await server.stop(true);
+  }
+});
+
 test("native Bun.serve dispatches a nested request while its outer handler is pending", async () => {
   let server;
   server = Bun.serve({
@@ -506,6 +674,88 @@ test("native Bun.serve streams partial Content-Length and chunked request bodies
       await server.stop(true);
     }
   }
+});
+
+test("native Bun.serve preserves a 400 response for a fragmented invalid chunk terminator", async () => {
+  using server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      await request.text();
+      return new Response("unexpected");
+    },
+  });
+
+  const response = await exchangeRejectedRequest({
+    server,
+    initial: "POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nTestX",
+    trailing: "\n0\r\n\r\n",
+    expectedStatus: "400 Bad Request",
+    trailingDelay: 50,
+  });
+
+  expect(response).toStartWith("HTTP/1.1 400 Bad Request");
+});
+
+test("native Bun.serve preserves an early application response after a malformed discarded body", async () => {
+  using server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch() {
+      return new Response("early");
+    },
+  });
+
+  const response = await exchangeRejectedRequest({
+    server,
+    initial: "POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nTest",
+    triggerAfterResponse: "X",
+    trailing: "\n0\r\n\r\n",
+    expectedStatus: "200 OK",
+  });
+
+  expect(response).toContain("\r\n\r\nearly");
+});
+
+test("native Bun.serve preserves a head-level 413 while oversized body bytes are still arriving", async () => {
+  using server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    maxRequestBodySize: 10,
+    fetch() {
+      throw new Error("oversized request must not dispatch");
+    },
+  });
+
+  const response = await exchangeRejectedRequest({
+    server,
+    initial: "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\n",
+    trailing: "hello world",
+    expectedStatus: "413 Payload Too Large",
+  });
+
+  expect(response).toStartWith("HTTP/1.1 413 Payload Too Large");
+});
+
+test("a rejected plaintext TLS handshake is ECONNRESET and leaves Bun.serve healthy", async () => {
+  using server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    tls: { cert, key },
+    fetch: () => new Response("secure response"),
+  });
+
+  let handshakeError;
+  try {
+    await fetch(`http://${server.hostname}:${server.port}`, { tls: { rejectUnauthorized: false } });
+  } catch (error) {
+    handshakeError = error;
+  }
+  expect(handshakeError).toBeInstanceOf(Error);
+  expect(handshakeError.code).toBe("ECONNRESET");
+
+  const response = await fetch(server.url, { tls: { rejectUnauthorized: false } });
+  expect(await response.text()).toBe("secure response");
 });
 
 test("native Bun.serve buffers pristine text and JSON bodies without changing stream semantics", async () => {
@@ -1440,5 +1690,20 @@ test("node:http promptly rejects an invalid request method prefix", async () => 
   } finally {
     server.close();
     await once(server, "close");
+  }
+});
+
+test.if(process.platform === "linux")("Bun.serve privileged-port errors include the listen address", () => {
+  let server;
+  try {
+    server = Bun.serve({
+      port: 1003,
+      fetch: () => new Response("ok"),
+    });
+  } catch (error) {
+    expect(error.message).toContain("permission denied 0.0.0.0:1003");
+    expect(error.code).toBe("EACCES");
+  } finally {
+    server?.stop(true);
   }
 });

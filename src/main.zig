@@ -52,7 +52,7 @@ fn commandDisplayVersion(init: std.process.Init) []const u8 {
 }
 const help_text_template =
     \\cottontail {s}
-    \\Cottontail is a Bun-compatible JavaScript runtime built with Zig and JavaScriptCore.
+    \\Cottontail is a small, batteries included, and high performance JS runtime.
     \\
     \\Usage:
     \\  cottontail <entrypoint.js|entrypoint.ts> [args...]
@@ -169,7 +169,7 @@ fn reportHutchScript(stderr: *std.Io.Writer, script_name: []const u8) !void {
 }
 
 const test_help_text =
-    \\Usage: bun test [flags] [<patterns>]
+    \\Usage: cottontail test [flags] [<patterns>]
     \\  Run all matching test files and print the results to stdout
     \\
     \\Flags:
@@ -195,9 +195,17 @@ const test_help_text =
 
 fn commandHasHelpFlag(args: []const [:0]const u8, start: usize) bool {
     if (start >= args.len) return false;
-    for (args[start..]) |arg| {
+    var index = start;
+    while (index < args.len) {
+        const arg = args[index];
         if (std.mem.eql(u8, arg, "--")) return false;
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
+        if (cli_run_execution.isRuntimeDefineFlag(arg)) {
+            const span = cli_run_execution.runtimeDefineSpan(args, index) catch return false;
+            index += span;
+        } else {
+            index += 1;
+        }
     }
     return false;
 }
@@ -230,6 +238,17 @@ const CliParseError = error{
 fn appendExecArg(exec_args: [][:0]const u8, exec_len: *usize, arg: [:0]const u8) void {
     exec_args[exec_len.*] = arg;
     exec_len.* += 1;
+}
+
+fn appendRuntimeDefineArgs(
+    args: []const [:0]const u8,
+    index: usize,
+    exec_args: [][:0]const u8,
+    exec_len: *usize,
+) !usize {
+    const span = try cli_run_execution.runtimeDefineSpan(args, index);
+    for (args[index .. index + span]) |arg| appendExecArg(exec_args, exec_len, arg);
+    return span;
 }
 
 fn argAfterPrefix(allocator: std.mem.Allocator, arg: [:0]const u8, prefix: []const u8) ![:0]const u8 {
@@ -367,7 +386,6 @@ fn runCommandFlagTakesValue(arg: []const u8) bool {
         "--print",
         "--preload",
         "--port",
-        "--define",
     };
     for (value_flags) |candidate| {
         if (std.mem.eql(u8, arg, candidate)) return true;
@@ -376,46 +394,7 @@ fn runCommandFlagTakesValue(arg: []const u8) bool {
 }
 
 fn runtimeFlagTakesValue(arg: []const u8) bool {
-    if (std.mem.indexOfScalar(u8, arg, '=') != null) return false;
-    if (cli_run_execution.flagTakesValue(arg)) return true;
-    const value_flags = [_][]const u8{
-        "-r",
-        "--require",
-        "--import",
-        "--loader",
-        "--experimental-loader",
-        "--conditions",
-        "--feature",
-        "--fetch-preconnect",
-        "--console-depth",
-        "--cpu-prof-dir",
-        "--cpu-prof-name",
-        "--cpu-prof-interval",
-        "--heap-prof-dir",
-        "--heap-prof-name",
-        "--input-type",
-        "--experimental-default-type",
-        "--inspect-publish-uid",
-        "--icu-data-dir",
-        "--preload",
-        "--env-file",
-        "--env-file-if-exists",
-        "--user-agent",
-        "--tsconfig-override",
-        "--diagnostic-dir",
-        "--redirect-warnings",
-        "--snapshot-blob",
-        "--allow-fs-read",
-        "--allow-fs-write",
-        "--test-name-pattern",
-        "--test-reporter",
-        "--test-reporter-destination",
-        "--test-shard",
-    };
-    for (value_flags) |candidate| {
-        if (std.mem.eql(u8, arg, candidate)) return true;
-    }
-    return false;
+    return cli_run_execution.flagTakesValue(arg);
 }
 
 fn missingProfilerOptionValue(args: []const [:0]const u8) ?[]const u8 {
@@ -442,11 +421,13 @@ fn missingProfilerOptionValue(args: []const [:0]const u8) ?[]const u8 {
 
 fn isRuntimeFlag(arg: []const u8) bool {
     if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "-i")) return true;
+    if (cli_run_execution.isRuntimeDefineFlag(arg)) return true;
     return std.mem.startsWith(u8, arg, "--");
 }
 
 fn testFlagTakesValue(arg: []const u8) bool {
     if (std.mem.indexOfScalar(u8, arg, '=') != null) return false;
+    if (cli_run_execution.runtimeDefineFlagTakesValue(arg)) return true;
     const value_flags = [_][]const u8{
         "-c",
         "-t",
@@ -490,26 +471,36 @@ fn isInspectorRuntimeFlag(arg: []const u8) bool {
     return false;
 }
 
-fn testInspectorExecArgs(
+fn testRuntimeExecArgs(
     allocator: std.mem.Allocator,
     args: []const [:0]const u8,
 ) ![]const [:0]const u8 {
-    var count: usize = 0;
-    for (args[2..]) |arg| {
-        if (isInspectorRuntimeFlag(arg)) count += 1;
+    var result: std.ArrayList([:0]const u8) = .empty;
+    var index: usize = 2;
+    while (index < args.len) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (isInspectorRuntimeFlag(arg)) {
+            try result.append(allocator, arg);
+            index += 1;
+            continue;
+        }
+        if (cli_run_execution.isRuntimeDefineFlag(arg)) {
+            const span = try cli_run_execution.runtimeDefineSpan(args, index);
+            try result.appendSlice(allocator, args[index .. index + span]);
+            index += span;
+            continue;
+        }
+        index += testFlagSpan(args, index);
     }
-    const result = try allocator.alloc([:0]const u8, count);
-    var output_index: usize = 0;
-    for (args[2..]) |arg| {
-        if (!isInspectorRuntimeFlag(arg)) continue;
-        result[output_index] = arg;
-        output_index += 1;
-    }
-    return result;
+    return try result.toOwnedSlice(allocator);
 }
 
 fn testFlagSpan(args: []const [:0]const u8, index: usize) usize {
     const arg = args[index];
+    if (cli_run_execution.isRuntimeDefineFlag(arg)) {
+        return cli_run_execution.runtimeDefineSpan(args, index) catch 1;
+    }
     if (!testFlagTakesValue(arg) or index + 1 >= args.len) return 1;
     // `--bail` has an optional numeric value. A following path/filter belongs
     // to test discovery, while `--bail 3` consumes the number.
@@ -1341,8 +1332,11 @@ fn nativeBuildGeneration(
     var conditions: std.ArrayList([]const u8) = .empty;
     var define_keys: std.ArrayList([]const u8) = .empty;
     var define_values: std.ArrayList([]const u8) = .empty;
+    var loader_extensions: std.ArrayList([]const u8) = .empty;
+    var loader_values: std.ArrayList([]const u8) = .empty;
     var outdir: ?[]const u8 = null;
     var outfile: ?[]const u8 = null;
+    var root_dir: ?[]const u8 = null;
     var metafile_json_path: ?[]const u8 = null;
     var metafile_markdown_path: ?[]const u8 = null;
     var compile = false;
@@ -1546,6 +1540,19 @@ fn nativeBuildGeneration(
         } else if (std.mem.eql(u8, arg, "--external") and index + 1 < args.len) {
             index += 1;
             try external.append(allocator, args[index]);
+        } else if (std.mem.startsWith(u8, arg, "--loader=")) {
+            const loader_arg = arg["--loader=".len..];
+            if (std.mem.indexOfScalar(u8, loader_arg, ':')) |colon_idx| {
+                try loader_extensions.append(allocator, loader_arg[0..colon_idx]);
+                try loader_values.append(allocator, loader_arg[colon_idx + 1 ..]);
+            }
+        } else if (std.mem.eql(u8, arg, "--loader") and index + 1 < args.len) {
+            index += 1;
+            const loader_arg = args[index];
+            if (std.mem.indexOfScalar(u8, loader_arg, ':')) |colon_idx| {
+                try loader_extensions.append(allocator, loader_arg[0..colon_idx]);
+                try loader_values.append(allocator, loader_arg[colon_idx + 1 ..]);
+            }
         } else if (std.mem.startsWith(u8, arg, "--outdir=")) {
             outdir = arg["--outdir=".len..];
         } else if (std.mem.eql(u8, arg, "--outdir") and index + 1 < args.len) {
@@ -1556,6 +1563,17 @@ fn nativeBuildGeneration(
         } else if (std.mem.eql(u8, arg, "--outfile") and index + 1 < args.len) {
             index += 1;
             outfile = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--root=") or std.mem.eql(u8, arg, "--root")) {
+            const path = if (std.mem.eql(u8, arg, "--root")) path: {
+                if (index + 1 >= args.len) {
+                    try stderr.writeAll("error: --root requires a value\n");
+                    try stderr.flush();
+                    return 1;
+                }
+                index += 1;
+                break :path args[index];
+            } else arg["--root=".len..];
+            root_dir = if (path.len > 0) path else null;
         } else if (std.mem.startsWith(u8, arg, "--banner=")) {
             options.banner = arg["--banner=".len..];
         } else if (std.mem.eql(u8, arg, "--banner") and index + 1 < args.len) {
@@ -1702,6 +1720,22 @@ fn nativeBuildGeneration(
     options.conditions = conditions.items;
     options.define_keys = define_keys.items;
     options.define_values = define_values.items;
+    if (root_dir) |path| {
+        var directory = std.Io.Dir.cwd().openDir(init.io, path, .{}) catch |err| {
+            try stderr.print("{s} opening root directory \"{s}\"\n", .{ @errorName(err), path });
+            try stderr.flush();
+            return 1;
+        };
+        defer directory.close(init.io);
+
+        var canonical_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const canonical_len = directory.realPath(init.io, &canonical_buffer) catch |err| {
+            try stderr.print("{s} resolving root directory \"{s}\"\n", .{ @errorName(err), path });
+            try stderr.flush();
+            return 1;
+        };
+        options.root_dir = try allocator.dupe(u8, canonical_buffer[0..canonical_len]);
+    }
     if (app) {
         if (entries.items.len != 1) {
             try stderr.writeAll("error: --app requires exactly one entrypoint\n");
@@ -1809,6 +1843,10 @@ fn nativeBuildGeneration(
     for (options.define_keys, options.define_values) |key, value| {
         try define_object.put(allocator, key, .{ .string = value });
     }
+    var loader_object: std.json.ObjectMap = .{};
+    for (loader_extensions.items, loader_values.items) |ext, loader_name| {
+        try loader_object.put(allocator, ext, .{ .string = loader_name });
+    }
     const request = .{
         .entrypoints = entries.items,
         .target = @tagName(options.target),
@@ -1821,6 +1859,7 @@ fn nativeBuildGeneration(
         .publicPath = options.public_path,
         .bundle = !options.transform_only,
         .compileToStandaloneHtml = options.compile_to_standalone_html,
+        .root = options.root_dir,
         .tsconfig = options.tsconfig_override,
         .env = env_option,
         .naming = NamingRequest{
@@ -1830,6 +1869,7 @@ fn nativeBuildGeneration(
         },
         .conditions = options.conditions,
         .define = std.json.Value{ .object = define_object },
+        .loader = std.json.Value{ .object = loader_object },
         .splitting = options.code_splitting,
         .banner = options.banner,
         .footer = options.footer,
@@ -1862,6 +1902,7 @@ fn nativeBuildGeneration(
             (std.fs.path.dirname(path) orelse ".")
         else
             outdir,
+        .__cottontailSupportsMultipleOutputs = outdir != null,
     };
     const request_json = try std.json.Stringify.valueAlloc(allocator, request, .{});
     var error_message: ?[*:0]u8 = null;
@@ -1961,12 +2002,49 @@ fn nativeBuildGeneration(
     }
 
     if (result.get("logs")) |logs| {
+        var printed_warning = false;
         if (logs == .array) for (logs.array.items) |log| {
             if (log != .object) continue;
             const level = log.object.get("level") orelse continue;
             const message = log.object.get("message") orelse continue;
             if (level != .string or message != .string or !std.mem.eql(u8, level.string, "warning")) continue;
+            if (printed_warning) try stderr.writeAll("\n");
+            printed_warning = true;
+            if (log.object.get("position")) |position| {
+                if (position == .object) {
+                    const line_text = position.object.get("lineText");
+                    const line = position.object.get("line");
+                    const column = position.object.get("column");
+                    if (line_text != null and line_text.? == .string and
+                        line != null and line.? == .integer and line.?.integer > 0 and
+                        column != null and column.? == .integer and column.?.integer > 0)
+                    {
+                        try stderr.print("{} | {s}\n", .{ line.?.integer, line_text.?.string });
+                        const caret_padding = std.fmt.count("{} | ", .{line.?.integer}) +
+                            @as(usize, @intCast(column.?.integer - 1));
+                        try stderr.splatByteAll(' ', caret_padding);
+                        try stderr.writeAll("^\n");
+                    }
+                }
+            }
             try stderr.print("warn: {s}\n", .{message.string});
+            if (log.object.get("position")) |position| {
+                if (position == .object) {
+                    const file = position.object.get("file");
+                    const line = position.object.get("line");
+                    const column = position.object.get("column");
+                    if (file != null and file.? == .string and
+                        line != null and line.? == .integer and
+                        column != null and column.? == .integer)
+                    {
+                        try stderr.print("   at {s}:{}:{}\n", .{
+                            file.?.string,
+                            line.?.integer,
+                            column.?.integer,
+                        });
+                    }
+                }
+            }
         };
         try stderr.flush();
     }
@@ -2173,6 +2251,10 @@ fn writeMultiTestEntrypoint(
         try appendJavaScriptStringLiteral(allocator, &marker_source, test_directory);
         try marker_source.appendSlice(allocator, ";\nglobalThis.__cottontailRegisteringTestFile = ");
         try appendJavaScriptStringLiteral(allocator, &marker_source, absolute);
+        // Each test file observes Bun.main as its own path; assigning it in
+        // the per-file marker also resets any override a previous file set.
+        try marker_source.appendSlice(allocator, ";\nglobalThis.Bun.main = ");
+        try appendJavaScriptStringLiteral(allocator, &marker_source, absolute);
         try marker_source.appendSlice(allocator, ";\n");
         try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = marker_path, .data = marker_source.items });
 
@@ -2221,6 +2303,17 @@ fn runMultipleTestFilesWithBail(
     try stdout_writer.interface.print("bun test v{s} (cottontail)\n", .{testRunnerDisplayVersion(init)});
     try stdout_writer.interface.flush();
     try init.environ_map.put("COTTONTAIL_TEST_CLI_HEADER_PRINTED", "1");
+    // Bun's `bun test` defaults NODE_ENV to "test" as a real environment
+    // variable (visible to dynamic process.env reads and dotenv suffix
+    // selection) when the caller has not set it. Establish it before the
+    // runtime evaluates any user module.
+    if (init.environ_map.get("NODE_ENV") == null) {
+        try init.environ_map.put("NODE_ENV", "test");
+        // The in-process runtime builds process.env from the real environ
+        // (getenv), so mirror the default there too — not only in the map used
+        // to spawn child processes.
+        _ = setenv("NODE_ENV", "test", 1);
+    }
 
     var summary_id: [8]u8 = undefined;
     init.io.random(&summary_id);
@@ -2479,11 +2572,14 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
         try appendDiscoveredTestFiles(init, allocator, positionals.items, &test_files);
     } else {
         for (positionals.items) |path| {
-            if (openTestDirectory(init.io, path)) |directory| {
+            // Bun treats an empty positional as the current directory (shell
+            // templates like `bun test ${""} ./file.test.ts` produce one).
+            const effective: [:0]const u8 = if (path.len == 0) "." else path;
+            if (openTestDirectory(init.io, effective)) |directory| {
                 expanded_directory = true;
-                try appendTestDirectoryFiles(init, allocator, path, directory, &test_files);
+                try appendTestDirectoryFiles(init, allocator, effective, directory, &test_files);
             } else {
-                try test_files.append(allocator, path);
+                try test_files.append(allocator, effective);
             }
         }
     }
@@ -2503,8 +2599,13 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
         (generated_entrypoint or !isGithubTestReporting(init.environ_map)))
     {
         if (!generated_entrypoint) {
+            // In-process bookkeeping only: the map is a private copy, so the
+            // marker never reaches this process' real environment. Calling
+            // setenv() here would leak it into every child the test spawns
+            // (`env: { ...process.env }`), and those children would then take
+            // the test-runtime module pipeline instead of behaving like a
+            // directly invoked runtime. Bun leaks no such marker.
             try init.environ_map.put("COTTONTAIL_TEST_FILE_COUNT", "1");
-            _ = setenv("COTTONTAIL_TEST_FILE_COUNT", "1", 1);
         }
         return null;
     }
@@ -2530,6 +2631,15 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
     try stdout_writer.interface.print("bun test v{s} (cottontail)\n", .{testRunnerDisplayVersion(init)});
     try stdout_writer.interface.flush();
     try init.environ_map.put("COTTONTAIL_TEST_CLI_HEADER_PRINTED", "1");
+    // See runSingleTestFile: `bun test` defaults NODE_ENV to "test" unless the
+    // caller already set it, before any user module is evaluated.
+    if (init.environ_map.get("NODE_ENV") == null) {
+        try init.environ_map.put("NODE_ENV", "test");
+        // The in-process runtime builds process.env from the real environ
+        // (getenv), so mirror the default there too — not only in the map used
+        // to spawn child processes.
+        _ = setenv("NODE_ENV", "test", 1);
+    }
     try init.environ_map.put(
         "COTTONTAIL_TEST_FILE_COUNT",
         try std.fmt.allocPrint(allocator, "{d}", .{entrypoint_count}),
@@ -2580,7 +2690,9 @@ fn testBailLimit(args: []const [:0]const u8) ?usize {
 const TestCliValidationError = enum {
     invalid_bail,
     invalid_coverage_reporter,
+    invalid_define,
     invalid_timeout,
+    missing_define,
 };
 
 fn validateTestCliOptions(args: []const [:0]const u8) ?TestCliValidationError {
@@ -2588,6 +2700,7 @@ fn validateTestCliOptions(args: []const [:0]const u8) ?TestCliValidationError {
     var index: usize = 2;
     while (index < args.len) {
         const arg = args[index];
+        if (std.mem.eql(u8, arg, "--")) break;
         if (std.mem.startsWith(u8, arg, "--bail=")) {
             const value = std.fmt.parseUnsigned(usize, arg["--bail=".len..], 10) catch
                 return .invalid_bail;
@@ -2617,6 +2730,14 @@ fn validateTestCliOptions(args: []const [:0]const u8) ?TestCliValidationError {
                 return .invalid_coverage_reporter;
             }
             index += 1;
+        } else if (cli_run_execution.isRuntimeDefineFlag(arg)) {
+            const span = cli_run_execution.runtimeDefineSpan(args, index) catch |err| return switch (err) {
+                error.MissingRuntimeDefineValue => .missing_define,
+                error.InvalidRuntimeDefineValue => .invalid_define,
+            };
+            index += span - 1;
+        } else if (testFlagTakesValue(arg)) {
+            index += testFlagSpan(args, index) - 1;
         }
         index += 1;
     }
@@ -2779,6 +2900,10 @@ fn parseRunInvocation(
             break;
         }
         if (!std.mem.startsWith(u8, arg, "-")) break;
+        if (cli_run_execution.isRuntimeDefineFlag(arg)) {
+            index += try appendRuntimeDefineArgs(args, index, exec_args_storage, exec_len);
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "-c=")) {
             flags.config_path = arg["-c=".len..];
             appendExecArg(exec_args_storage, exec_len, arg);
@@ -2860,13 +2985,13 @@ fn parseInvocation(io: std.Io, allocator: std.mem.Allocator, args: []const [:0]c
     }
 
     if (std.mem.eql(u8, args[1], "test")) {
-        const inspector_exec_args = try testInspectorExecArgs(allocator, args);
+        const runtime_exec_args = try testRuntimeExecArgs(allocator, args);
         if (testEntrypointIndex(args)) |entrypoint_index| {
             return .{
                 .mode = .script,
                 .payload = try resolveTestEntrypoint(io, allocator, args[entrypoint_index]),
                 .args = try testScriptArgs(allocator, args, entrypoint_index),
-                .exec_args = inspector_exec_args,
+                .exec_args = runtime_exec_args,
             };
         }
 
@@ -2874,7 +2999,7 @@ fn parseInvocation(io: std.Io, allocator: std.mem.Allocator, args: []const [:0]c
             .mode = .script,
             .payload = try defaultTestEntrypoint(io, allocator),
             .args = args[2..],
-            .exec_args = inspector_exec_args,
+            .exec_args = runtime_exec_args,
         };
     }
 
@@ -2892,6 +3017,11 @@ fn parseInvocation(io: std.Io, allocator: std.mem.Allocator, args: []const [:0]c
                 .exec_args = exec_args_storage[0..exec_len],
                 .flags = flags,
             };
+        }
+
+        if (cli_run_execution.isRuntimeDefineFlag(arg)) {
+            index += try appendRuntimeDefineArgs(args, index, exec_args_storage, &exec_len);
+            continue;
         }
 
         if (std.mem.startsWith(u8, arg, "-c=")) {
@@ -3346,7 +3476,11 @@ pub fn main(init: std.process.Init) !void {
             .invalid_coverage_reporter => try stderr.writeAll(
                 "error: invalid coverage reporter. Available options: 'text' (console output), 'lcov' (code coverage file)\n",
             ),
+            .invalid_define => try stderr.writeAll("error: expected \":\" separator\n"),
             .invalid_timeout => try stderr.writeAll("error: Invalid timeout\n"),
+            .missing_define => try stderr.writeAll(
+                "error: The argument '-d/--define' requires a value but none was supplied.\n",
+            ),
         }
         try stderr.flush();
         std.process.exit(1);
@@ -3368,6 +3502,11 @@ pub fn main(init: std.process.Init) !void {
             try stdout.flush();
         }
         try init.environ_map.put("COTTONTAIL_TEST_CLI_HEADER_PRINTED", "1");
+        // `bun test` defaults NODE_ENV to "test" unless the caller set it.
+        if (init.environ_map.get("NODE_ENV") == null) {
+            try init.environ_map.put("NODE_ENV", "test");
+            _ = setenv("NODE_ENV", "test", 1);
+        }
     }
 
     const invocation = parseInvocation(init.io, init.arena.allocator(), args) catch |err| switch (err) {
@@ -3383,6 +3522,16 @@ pub fn main(init: std.process.Init) !void {
         },
         CliParseError.MissingPrintSource => {
             try stderr.print("cottontail: -p/--print requires an expression argument\n", .{});
+            try stderr.flush();
+            std.process.exit(1);
+        },
+        cli_run_execution.RuntimeDefineError.MissingRuntimeDefineValue => {
+            try stderr.writeAll("error: The argument '-d/--define' requires a value but none was supplied.\n");
+            try stderr.flush();
+            std.process.exit(1);
+        },
+        cli_run_execution.RuntimeDefineError.InvalidRuntimeDefineValue => {
+            try stderr.writeAll("error: expected \":\" separator\n");
             try stderr.flush();
             std.process.exit(1);
         },
@@ -3480,8 +3629,8 @@ pub fn main(init: std.process.Init) !void {
 
 test "help text mentions cottontail and script usage" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "cottontail") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "Bun-compatible JavaScript runtime") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "JavaScriptCore") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "batteries included") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "high performance JS runtime") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<entrypoint.js|entrypoint.ts>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "cottontail build") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "provided by Hutch") != null);
@@ -3511,25 +3660,133 @@ test "runtime flags can precede the test command" {
     try std.testing.expectEqualStrings("--conditions", normalized[3]);
     try std.testing.expectEqualStrings("shell", normalized[4]);
     try std.testing.expectEqualStrings("suite.test.ts", normalized[5]);
+
+    const define_args = [_][:0]const u8{ "cottontail", "-dIMPORT_META:\"defined\"", "test", "suite.test.ts" };
+    const normalized_define = try normalizeLeadingTestRuntimeFlags(std.testing.allocator, &define_args);
+    defer std.testing.allocator.free(normalized_define);
+    try std.testing.expectEqualStrings("test", normalized_define[1]);
+    try std.testing.expectEqualStrings("-dIMPORT_META:\"defined\"", normalized_define[2]);
+    try std.testing.expectEqualStrings("suite.test.ts", normalized_define[3]);
 }
 
-test "test execution preserves inspector runtime flags" {
+test "test execution preserves inspector and define runtime flags" {
     const args = [_][:0]const u8{
         "cottontail",
         "test",
         ".cottontail-tmp/test-aggregate-abcd/entry.mjs",
         "--inspect-wait=unix:/tmp/inspector.sock",
+        "--define",
+        "import.meta.url:\"test-url\"",
         "--timeout=1000",
     };
-    const inspector_args = try testInspectorExecArgs(std.testing.allocator, &args);
-    defer std.testing.allocator.free(inspector_args);
-    try std.testing.expectEqual(@as(usize, 1), inspector_args.len);
-    try std.testing.expectEqualStrings("--inspect-wait=unix:/tmp/inspector.sock", inspector_args[0]);
+    const runtime_args = try testRuntimeExecArgs(std.testing.allocator, &args);
+    defer std.testing.allocator.free(runtime_args);
+    try std.testing.expectEqual(@as(usize, 3), runtime_args.len);
+    try std.testing.expectEqualStrings("--inspect-wait=unix:/tmp/inspector.sock", runtime_args[0]);
+    try std.testing.expectEqualStrings("--define", runtime_args[1]);
+    try std.testing.expectEqualStrings("import.meta.url:\"test-url\"", runtime_args[2]);
 }
 
 test "runtime user agent consumes its value" {
     try std.testing.expect(runtimeFlagTakesValue("--user-agent"));
     try std.testing.expect(!runtimeFlagTakesValue("--user-agent=Cottontail/1.0"));
+}
+
+test "runtime define consumes only its spaced value" {
+    try std.testing.expect(runtimeFlagTakesValue("--define"));
+    try std.testing.expect(runtimeFlagTakesValue("-d"));
+    try std.testing.expect(!runtimeFlagTakesValue("--define=import.meta.url=\"defined\""));
+    try std.testing.expect(!runtimeFlagTakesValue("-dIMPORT_META:\"defined\""));
+}
+
+test "runtime define parsing preserves the entrypoint and script arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const args = [_][:0]const u8{
+        "cottontail",
+        "--define",
+        "import.meta.url=\"defined\"",
+        "entry.mjs",
+        "--define",
+        "import.meta.url=\"script-argument\"",
+    };
+    const invocation = try parseInvocation(
+        std.Io.Threaded.global_single_threaded.io(),
+        arena.allocator(),
+        &args,
+    );
+
+    try std.testing.expectEqualStrings("entry.mjs", invocation.payload);
+    try std.testing.expectEqual(@as(usize, 2), invocation.exec_args.len);
+    try std.testing.expectEqualStrings("--define", invocation.exec_args[0]);
+    try std.testing.expectEqualStrings("import.meta.url=\"defined\"", invocation.exec_args[1]);
+    try std.testing.expectEqual(@as(usize, 2), invocation.args.len);
+    try std.testing.expectEqualStrings("--define", invocation.args[0]);
+    try std.testing.expectEqualStrings("import.meta.url=\"script-argument\"", invocation.args[1]);
+}
+
+test "runtime define parsing routes test-subcommand forms without stealing the entrypoint" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const args = [_][:0]const u8{
+        "cottontail",
+        "test",
+        "--define=import.meta.url:\"long-inline\"",
+        "-d",
+        "IMPORT_META=\"short-spaced\"",
+        "suite.test.ts",
+    };
+    const invocation = try parseInvocation(
+        std.Io.Threaded.global_single_threaded.io(),
+        arena.allocator(),
+        &args,
+    );
+
+    try std.testing.expectEqualStrings("suite.test.ts", invocation.payload);
+    try std.testing.expectEqual(@as(usize, 3), invocation.exec_args.len);
+    try std.testing.expectEqualStrings("--define=import.meta.url:\"long-inline\"", invocation.exec_args[0]);
+    try std.testing.expectEqualStrings("-d", invocation.exec_args[1]);
+    try std.testing.expectEqualStrings("IMPORT_META=\"short-spaced\"", invocation.exec_args[2]);
+    try std.testing.expectEqual(@as(?usize, 5), testEntrypointIndex(&args));
+}
+
+test "runtime define parsing rejects malformed and missing values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const malformed = [_][:0]const u8{ "cottontail", "--define=NO_SEPARATOR", "entry.mjs" };
+    const missing = [_][:0]const u8{ "cottontail", "run", "-d" };
+    const malformed_test = [_][:0]const u8{ "cottontail", "test", "--define", "NO_SEPARATOR", "suite.test.ts" };
+
+    try std.testing.expectError(
+        error.InvalidRuntimeDefineValue,
+        parseInvocation(io, arena.allocator(), &malformed),
+    );
+    try std.testing.expectError(
+        error.MissingRuntimeDefineValue,
+        parseInvocation(io, arena.allocator(), &missing),
+    );
+    try std.testing.expectEqual(TestCliValidationError.invalid_define, validateTestCliOptions(&malformed_test).?);
+    try std.testing.expectError(
+        error.InvalidRuntimeDefineValue,
+        parseInvocation(io, arena.allocator(), &malformed_test),
+    );
+}
+
+test "runtime define routing ignores define-looking test option values" {
+    const args = [_][:0]const u8{
+        "cottontail",
+        "test",
+        "--test-name-pattern",
+        "--define=NOT_A_RUNTIME_FLAG",
+        "suite.test.ts",
+    };
+
+    const runtime_args = try testRuntimeExecArgs(std.testing.allocator, &args);
+    defer std.testing.allocator.free(runtime_args);
+    try std.testing.expectEqual(@as(usize, 0), runtime_args.len);
+    try std.testing.expectEqual(@as(?usize, 4), testEntrypointIndex(&args));
+    try std.testing.expectEqual(@as(?TestCliValidationError, null), validateTestCliOptions(&args));
 }
 
 test "test entrypoint names use supported test extensions" {
@@ -3555,9 +3812,13 @@ test "test help flags are handled before discovery" {
     const long = [_][:0]const u8{ "cottontail", "test", "--help" };
     const short = [_][:0]const u8{ "cottontail", "test", "-h" };
     const script_arg = [_][:0]const u8{ "cottontail", "test", "suite.test.ts", "--", "--help" };
+    const define_value = [_][:0]const u8{ "cottontail", "test", "--define", "HELP:\"--help\"", "--help" };
+    const invalid_define = [_][:0]const u8{ "cottontail", "test", "--define", "--help" };
     try std.testing.expect(commandHasHelpFlag(&long, 2));
     try std.testing.expect(commandHasHelpFlag(&short, 2));
     try std.testing.expect(!commandHasHelpFlag(&script_arg, 2));
+    try std.testing.expect(commandHasHelpFlag(&define_value, 2));
+    try std.testing.expect(!commandHasHelpFlag(&invalid_define, 2));
 }
 
 test "test flag values are not treated as additional entrypoints" {
@@ -3595,11 +3856,17 @@ test "test CLI validation rejects invalid bail timeout and coverage values" {
     const bail_zero = [_][:0]const u8{ "cottontail", "test", "--bail=0" };
     const timeout_text = [_][:0]const u8{ "cottontail", "test", "--timeout", "wat" };
     const coverage_reporter = [_][:0]const u8{ "cottontail", "test", "--coverage-reporter", "json" };
-    const valid = [_][:0]const u8{ "cottontail", "test", "--bail", "3", "--timeout=50" };
+    const invalid_define = [_][:0]const u8{ "cottontail", "test", "--define=NO_SEPARATOR" };
+    const missing_define = [_][:0]const u8{ "cottontail", "test", "-d" };
+    const after_separator = [_][:0]const u8{ "cottontail", "test", "suite.test.ts", "--", "--define=NO_SEPARATOR" };
+    const valid = [_][:0]const u8{ "cottontail", "test", "--bail", "3", "--timeout=50", "-dVALID:1" };
     try std.testing.expectEqual(TestCliValidationError.invalid_bail, validateTestCliOptions(&bail_text).?);
     try std.testing.expectEqual(TestCliValidationError.invalid_bail, validateTestCliOptions(&bail_zero).?);
     try std.testing.expectEqual(TestCliValidationError.invalid_timeout, validateTestCliOptions(&timeout_text).?);
     try std.testing.expectEqual(TestCliValidationError.invalid_coverage_reporter, validateTestCliOptions(&coverage_reporter).?);
+    try std.testing.expectEqual(TestCliValidationError.invalid_define, validateTestCliOptions(&invalid_define).?);
+    try std.testing.expectEqual(TestCliValidationError.missing_define, validateTestCliOptions(&missing_define).?);
+    try std.testing.expectEqual(@as(?TestCliValidationError, null), validateTestCliOptions(&after_separator));
     try std.testing.expectEqual(@as(?TestCliValidationError, null), validateTestCliOptions(&valid));
 }
 

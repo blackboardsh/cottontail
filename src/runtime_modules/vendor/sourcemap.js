@@ -22,6 +22,7 @@ let cachedSourceRoot;
 let cachedState; // undefined = never attempted for cachedMapPath, null = load failed
 const adjacentBundleStates = new Map();
 const virtualSourceMappings = new WeakMap();
+const remapStackMemo = new WeakMap();
 
 function isWindowsAbsolutePath(path) {
   return /^[A-Za-z]:[\\/]/.test(String(path)) || /^[\\/]{2}[^\\/]/.test(String(path));
@@ -60,14 +61,73 @@ function normalizePath(path) {
   return root + out.join("/");
 }
 
+function decodeUrlComponent(text) {
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
+}
+
+function fileUrlPath(path) {
+  const text = String(path);
+  if (!/^file:/i.test(text)) return text;
+  try {
+    const url = new URL(text);
+    if (url.protocol !== "file:") return text;
+    let pathname = decodeUrlComponent(url.pathname);
+    if (url.hostname && url.hostname.toLowerCase() !== "localhost") {
+      pathname = `//${decodeUrlComponent(url.hostname)}${pathname}`;
+    } else if (/^\/[A-Za-z]:[\\/]/.test(pathname)) {
+      // WHATWG file URLs spell a local Windows drive as /C:/..., while source
+      // maps and the runtime's filesystem APIs use C:/....
+      pathname = pathname.slice(1);
+    }
+    return pathname;
+  } catch {
+    return text;
+  }
+}
+
+function normalizeLocationPath(path) {
+  return normalizePath(fileUrlPath(path));
+}
+
+function pathComparisonKey(path) {
+  const normalized = normalizeLocationPath(path);
+  return isWindowsAbsolutePath(normalized) ? normalized.toLowerCase() : normalized;
+}
+
+// `state.sources` never changes after buildState, but locating a frame's
+// source used to re-normalize every entry on every lookup — O(sources) string
+// work per stack frame, which dominates Error.prototype.stack.
+const normalizedSourcesCache = new WeakMap();
+
+function normalizedSources(state) {
+  let entry = normalizedSourcesCache.get(state);
+  if (entry === undefined) {
+    const list = state.sources.map(candidate => normalizePath(candidate));
+    const byPath = new Map();
+    const byComparisonPath = new Map();
+    for (let index = 0; index < list.length; index += 1) {
+      if (!byPath.has(list[index])) byPath.set(list[index], index);
+      const comparisonPath = pathComparisonKey(list[index]);
+      if (!byComparisonPath.has(comparisonPath)) byComparisonPath.set(comparisonPath, index);
+    }
+    entry = { list, byPath, byComparisonPath };
+    normalizedSourcesCache.set(state, entry);
+  }
+  return entry;
+}
+
 function resolveSource(mapDir, sourceRoot, source) {
   let text = String(source);
   if (!isWindowsAbsolutePath(text) && /^[A-Za-z][A-Za-z0-9+.-]*:/.test(text)) {
-    if (text.startsWith("file://")) text = text.slice("file://".length);
+    if (/^file:/i.test(text)) text = fileUrlPath(text);
     else return text;
   }
   if (sourceRoot && !isAbsolutePath(text)) {
-    const root = String(sourceRoot);
+    const root = fileUrlPath(sourceRoot);
     text = /[\\/]$/.test(root) ? root + text : `${root}/${text}`;
   }
   if (isAbsolutePath(text)) return normalizePath(text);
@@ -413,6 +473,31 @@ function buildState(mapPath, mapData, configuredBundlePath, configuredSourceRoot
     const sourceBase = typeof configuredRoot === "string" && configuredRoot !== "" ? configuredRoot : mapDir;
     const sources = map.sources.map((source) => resolveSource(sourceBase, map.sourceRoot, source));
     const generatedSources = map.sources.map((source) => resolveSource(mapDir, map.sourceRoot, source));
+    // Only sources whose generated path differs from the resolved original
+    // path need rewriting in stack strings; scanning the stack once per source
+    // otherwise costs O(sources) substring searches per remap. Grouping those
+    // by directory lets one search per directory rule out every file under it,
+    // which is what happens for essentially every stack.
+    const rewritableGroups = new Map();
+    for (let index = 0; index < generatedSources.length; index += 1) {
+      const generated = generatedSources[index];
+      if (generated === sources[index]) continue;
+      const prefix = generated.slice(0, generated.lastIndexOf("/") + 1);
+      const basename = generated.slice(prefix.length);
+      let group = rewritableGroups.get(prefix);
+      if (group === undefined) {
+        group = { indices: [], byBasename: new Map(), lengths: new Set() };
+        rewritableGroups.set(prefix, group);
+      }
+      group.indices.push(index);
+      group.lengths.add(basename.length);
+      const bucket = group.byBasename.get(basename);
+      if (bucket) bucket.push(index);
+      else group.byBasename.set(basename, [index]);
+    }
+    for (const group of rewritableGroups.values()) {
+      group.lengths = [...group.lengths].sort((left, right) => right - left);
+    }
     const sourceLines = new Array(map.sources.length);
     const bundlePath = typeof configuredBundlePath === "string" && configuredBundlePath !== ""
       ? configuredBundlePath
@@ -423,6 +508,7 @@ function buildState(mapPath, mapData, configuredBundlePath, configuredSourceRoot
     return {
       sources,
       generatedSources,
+      rewritableGroups,
       sourceContentText: map.sourceContentSpans ? text : null,
       sourceContentSpans: map.sourceContentSpans,
       sourceLines,
@@ -671,10 +757,8 @@ function remapVirtualSourceFrame(state, file, line, column) {
     : null;
   const matchesEntry = entrySource &&
     (entrySource === relativeSource || entrySource.endsWith(`/${relativeSource}`));
-  const sourceIndex = state.sources.findIndex(candidate => {
-    const normalized = normalizePath(candidate);
-    return normalized === relativeSource || normalized.endsWith(`/${relativeSource}`);
-  });
+  const sourceIndex = normalizedSources(state).list.findIndex(normalized =>
+    normalized === relativeSource || normalized.endsWith(`/${relativeSource}`));
   const mapping = sourceIndex < 0 ? null : virtualSourceMapping(state, sourceIndex);
   if (!mapping || mapping.anchors.length === 0) {
     return matchesEntry
@@ -766,20 +850,23 @@ export function remapErrorPosition(line, column) {
   };
 }
 
-export function sourceContextForLocation(source, line, column) {
-  const state = getState();
-  if (!state || typeof source !== "string") return null;
-  const normalized = normalizePath(source.startsWith("file://") ? source.slice("file://".length) : source);
-  let sourceIndex = state.sources.findIndex(candidate => normalizePath(candidate) === normalized);
+function sourceContextForState(state, normalized, line, column, allowEntryFallback, visited) {
+  if (!state || visited.has(state)) return null;
+  visited.add(state);
+  const normalizedList = normalizedSources(state);
+  let sourceIndex = normalizedList.byPath.get(normalized) ??
+    normalizedList.byComparisonPath.get(pathComparisonKey(normalized)) ?? -1;
+  const matchingSourceIndex = sourceIndex;
   const entrySource = typeof globalThis.__filename === "string"
-    ? normalizePath(globalThis.__filename)
+    ? normalizeLocationPath(globalThis.__filename)
     : null;
-  if (sourceIndex < 0 && normalized === entrySource) {
-    const entryParts = normalized.split("/");
+  if (allowEntryFallback && sourceIndex < 0 && entrySource !== null &&
+      pathComparisonKey(normalized) === pathComparisonKey(entrySource)) {
+    const entryParts = pathComparisonKey(normalized).split("/");
     let bestIndex = -1;
     let bestSuffix = 1;
     for (let index = 0; index < state.sources.length; index += 1) {
-      const candidateParts = normalizePath(state.sources[index]).split("/");
+      const candidateParts = pathComparisonKey(normalizedList.list[index]).split("/");
       let suffix = 0;
       while (suffix < entryParts.length && suffix < candidateParts.length &&
           entryParts[entryParts.length - suffix - 1] === candidateParts[candidateParts.length - suffix - 1]) {
@@ -792,15 +879,64 @@ export function sourceContextForLocation(source, line, column) {
     }
     sourceIndex = bestIndex;
   }
-  const sourceLines = sourceIndex < 0 ? null : sourceLinesForIndex(state, sourceIndex);
-  if (sourceIndex < 0 || !sourceLines) return null;
-  const virtual = virtualSourceMapping(state, sourceIndex);
-  return {
-    source: virtual?.source ?? state.sources[sourceIndex],
-    line: Number(line),
-    column: Number(column),
-    lines: virtual?.originalLines ?? sourceLines,
-  };
+  // When the same source path occurs in both the outer map and the inline map
+  // embedded in that source, the final remapped frame belongs to the nested
+  // map. Prefer that specifically-associated cached state before accepting the
+  // outer map's generated source text.
+  const matchingNested = matchingSourceIndex < 0 ? null : state.nestedStates.get(matchingSourceIndex);
+  if (matchingNested) {
+    const context = sourceContextForState(matchingNested, normalized, line, column, false, visited);
+    if (context) return context;
+  }
+  if (sourceIndex >= 0) {
+    const sourceLines = sourceLinesForIndex(state, sourceIndex);
+    if (sourceLines) {
+      const virtual = virtualSourceMapping(state, sourceIndex);
+      return {
+        source: virtual?.source ?? state.sources[sourceIndex],
+        line: Number(line),
+        column: Number(column),
+        lines: virtual?.originalLines ?? sourceLines,
+      };
+    }
+  }
+
+  // Stack remapping may descend through an inline source map embedded in one
+  // of this map's sources. `finalizeMappedPosition()` caches each map it
+  // actually traversed in `nestedStates`; consult those already-decoded maps
+  // so the uncaught formatter can recover the original source text too.
+  // Deliberately do not probe every source here: that would read unrelated
+  // files merely to render one exception.
+  for (const nested of state.nestedStates.values()) {
+    if (nested === matchingNested) continue;
+    const context = sourceContextForState(nested, normalized, line, column, false, visited);
+    if (context) return context;
+  }
+  return null;
+}
+
+export function sourceContextForLocation(source, line, column) {
+  const state = getState();
+  if (!state || typeof source !== "string") return null;
+  const normalized = normalizeLocationPath(source);
+  return sourceContextForState(state, normalized, line, column, true, new Set());
+}
+
+function sourceContextForExternalFile(source, line, column) {
+  const normalized = normalizeLocationPath(source);
+  if (!isAbsolutePath(normalized)) return null;
+  try {
+    const contents = readMapText(normalized);
+    if (typeof contents !== "string") return null;
+    return {
+      source: normalized,
+      line: Number(line),
+      column: Number(column),
+      lines: contents.split(/\r?\n/),
+    };
+  } catch {
+    return null;
+  }
 }
 
 function preferConstructedErrorCallSite(state, generatedLine, generatedColumn, mapped) {
@@ -862,6 +998,39 @@ function preferConstructedErrorCallSite(state, generatedLine, generatedColumn, m
   return previousMappedSource.trim() === "" ? mapped : previous;
 }
 
+const EMPTY_INDICES = [];
+
+// Indices of rewritable sources whose generated path could possibly occur in
+// `text`, in ascending order (matching the order a full scan would visit).
+function rewritableCandidates(state, text) {
+  const groups = state.rewritableGroups;
+  if (groups.size === 0) return EMPTY_INDICES;
+  let candidates = null;
+  const add = (indices) => {
+    if (candidates === null) candidates = new Set();
+    for (const index of indices) candidates.add(index);
+  };
+  for (const [prefix, group] of groups) {
+    if (prefix === "") {
+      add(group.indices);
+      continue;
+    }
+    // Every occurrence of a generated path starts with an occurrence of its
+    // directory prefix, so only the text right after each such occurrence can
+    // name one of the group's files.
+    for (let at = text.indexOf(prefix); at >= 0; at = text.indexOf(prefix, at + 1)) {
+      const start = at + prefix.length;
+      for (const length of group.lengths) {
+        if (start + length > text.length) continue;
+        const bucket = group.byBasename.get(text.slice(start, start + length));
+        if (bucket) add(bucket);
+      }
+    }
+  }
+  if (candidates === null) return EMPTY_INDICES;
+  return [...candidates].sort((left, right) => left - right);
+}
+
 export function remapStackString(stack) {
   if (typeof stack !== "string" || stack === "") return stack;
   const mapPath = globalThis.__cottontailBundleSourceMap;
@@ -871,6 +1040,18 @@ export function remapStackString(stack) {
   if (!hasMapPath && !hasMapData) return remapAdjacentBundleFrames(stack);
   const state = getState();
   if (!state) return remapAdjacentBundleFrames(stack);
+  // Remapping is a pure function of the stack text, the (cached) map state and
+  // the entry filename, and identical stacks recur constantly — loops, retried
+  // assertions, repeated `new Error()` at one site.
+  const entryFilename = typeof globalThis.__filename === "string" ? globalThis.__filename : null;
+  let memo = remapStackMemo.get(state);
+  if (memo === undefined) remapStackMemo.set(state, memo = { entryFilename, entries: new Map() });
+  if (memo.entryFilename !== entryFilename) {
+    memo.entryFilename = entryFilename;
+    memo.entries.clear();
+  }
+  const memoized = memo.entries.get(stack);
+  if (memoized !== undefined) return memoized;
   let remapped = stack;
   if (state?.bundleRegExp) {
     state.bundleRegExp.lastIndex = 0;
@@ -892,10 +1073,10 @@ export function remapStackString(stack) {
       },
     );
   }
-  for (let index = 0; index < state.generatedSources.length; index += 1) {
+  for (const index of rewritableCandidates(state, remapped)) {
     const generated = state.generatedSources[index];
     const original = state.sources[index];
-    if (generated === original || !remapped.includes(generated)) continue;
+    if (!remapped.includes(generated)) continue;
     const virtual = virtualSourceMapping(state, index);
     if (virtual) {
       const sourcePattern = escapeRegExp(generated);
@@ -907,19 +1088,34 @@ export function remapStackString(stack) {
         },
       );
     } else {
-      remapped = remapped.replaceAll(generated, original);
+      // A generated path is only a frame when it starts at a path boundary and
+      // carries a position. Replacing it as a bare substring corrupts frames
+      // that already name the original file: for sources outside the bundle
+      // directory the generated path walks past the filesystem root, leaving a
+      // suffix of the original path that then gets the original prefixed onto
+      // it once per remap.
+      remapped = remapped.replace(
+        new RegExp(`(^|[\\s(@]|file:\\/\\/)${escapeRegExp(generated)}(?=:\\d+:\\d+)`, "gm"),
+        (match, prefix) => `${prefix}${original}`,
+      );
     }
   }
   remapped = remapAdjacentBundleFrames(remapped);
   const activeBundlePath = state?.bundlePath;
-  return remapped
+  const activeBundleComparisonPath = activeBundlePath ? pathComparisonKey(activeBundlePath) : null;
+  const result = remapped
     .split("\n")
     .filter((line) => {
-      if (!activeBundlePath) return true;
-      const isFrame = /^\s*at\b/.test(line) || line.includes(`@${activeBundlePath}:`);
-      return !(isFrame && line.includes(activeBundlePath));
+      if (!activeBundleComparisonPath) return true;
+      const frame = /@(.+):(\d+):(\d+)$/.exec(line) ??
+        /^\s*at\s+.*?\s+\((.+):(\d+):(\d+)\)$/.exec(line) ??
+        /^\s*at\s+(?:async\s+)?(.+):(\d+):(\d+)$/.exec(line);
+      return !frame || pathComparisonKey(frame[1]) !== activeBundleComparisonPath;
     })
     .join("\n");
+  if (memo.entries.size >= 512) memo.entries.clear();
+  memo.entries.set(stack, result);
+  return result;
 }
 
 function remapAdjacentBundleFrames(stack) {
@@ -933,6 +1129,126 @@ function remapAdjacentBundleFrames(stack) {
     const display = finalizeMappedPosition(state, mapped);
     return display ? `${display.source}:${display.line}:${display.column}` : match;
   });
+}
+
+const FRAME_KEYWORDS = new Set([
+  "abstract", "async", "await", "break", "case", "catch", "class", "const",
+  "continue", "debugger", "default", "delete", "do", "else", "enum", "export",
+  "extends", "false", "finally", "for", "from", "function", "get", "if",
+  "implements", "import", "in", "instanceof", "interface", "let", "new", "null",
+  "of", "package", "private", "protected", "public", "return", "set", "static",
+  "super", "switch", "this", "throw", "true", "try", "typeof", "undefined",
+  "var", "void", "while", "with", "yield",
+]);
+
+// Colorize a single source line for the uncaught-error code frame, mirroring
+// Bun's highlighted frame under FORCE_COLOR. This is best-effort: it never
+// throws and falls back to the raw text. Beyond cosmetics, inserting escapes
+// between tokens (e.g. `JSON` / `.stringify`) matches Bun's observable output,
+// which tools depend on when scanning highlighted frames.
+function highlightFrameLine(text) {
+  const RESET = "\x1b[0m";
+  const KEYWORD = "\x1b[35m";
+  const STRING = "\x1b[32m";
+  const NUMBER = "\x1b[33m";
+  const COMMENT = "\x1b[2m";
+  const PROPERTY = "\x1b[36m";
+  const isIdentStart = (c) => c === "_" || c === "$" || (c >= "a" && c <= "z") || (c >= "A" && c <= "Z");
+  const isIdentPart = (c) => isIdentStart(c) || (c >= "0" && c <= "9");
+  const isDigit = (c) => c >= "0" && c <= "9";
+  try {
+    let out = "";
+    let i = 0;
+    let lastSignificant = "";
+    const n = text.length;
+    while (i < n) {
+      const c = text[i];
+      // Comments
+      if (c === "/" && text[i + 1] === "/") {
+        out += COMMENT + text.slice(i) + RESET;
+        break;
+      }
+      if (c === "/" && text[i + 1] === "*") {
+        const end = text.indexOf("*/", i + 2);
+        const stop = end === -1 ? n : end + 2;
+        out += COMMENT + text.slice(i, stop) + RESET;
+        i = stop;
+        continue;
+      }
+      // Strings and template literals
+      if (c === '"' || c === "'" || c === "`") {
+        const quote = c;
+        let j = i + 1;
+        let segment = c;
+        while (j < n) {
+          const cj = text[j];
+          if (cj === "\\") { segment += cj + (text[j + 1] ?? ""); j += 2; continue; }
+          if (quote === "`" && cj === "$" && text[j + 1] === "{") {
+            // Close the string run, highlight the interpolated expression,
+            // then resume the template string after the matching brace.
+            out += STRING + segment + RESET;
+            let depth = 1;
+            let k = j + 2;
+            while (k < n && depth > 0) {
+              if (text[k] === "{") depth += 1;
+              else if (text[k] === "}") depth -= 1;
+              if (depth === 0) break;
+              k += 1;
+            }
+            out += "${" + highlightFrameLine(text.slice(j + 2, k)) + (k < n ? "}" : "");
+            j = k + 1;
+            segment = "";
+            continue;
+          }
+          segment += cj;
+          if (cj === quote) { j += 1; break; }
+          j += 1;
+        }
+        out += STRING + segment + RESET;
+        i = j;
+        lastSignificant = quote;
+        continue;
+      }
+      // Numbers
+      if (isDigit(c) || (c === "." && isDigit(text[i + 1]) && lastSignificant !== ")" && !isIdentPart(lastSignificant))) {
+        let j = i;
+        while (j < n && (isIdentPart(text[j]) || text[j] === "." )) j += 1;
+        out += NUMBER + text.slice(i, j) + RESET;
+        i = j;
+        lastSignificant = text[j - 1];
+        continue;
+      }
+      // Identifiers / keywords / properties
+      if (isIdentStart(c)) {
+        let j = i;
+        while (j < n && isIdentPart(text[j])) j += 1;
+        const word = text.slice(i, j);
+        if (FRAME_KEYWORDS.has(word)) {
+          out += KEYWORD + word + RESET;
+        } else if (lastSignificant === ".") {
+          out += PROPERTY + word + RESET;
+        } else {
+          out += word;
+        }
+        i = j;
+        lastSignificant = word[word.length - 1];
+        continue;
+      }
+      out += c;
+      if (c !== " " && c !== "\t") lastSignificant = c;
+      i += 1;
+    }
+    return out;
+  } catch {
+    return text;
+  }
+}
+
+function frameColorsEnabled() {
+  const env = globalThis.process?.env;
+  if (env?.FORCE_COLOR !== undefined) return env.FORCE_COLOR !== "0";
+  if (env?.NO_COLOR !== undefined || env?.NODE_DISABLE_COLORS !== undefined) return false;
+  return Boolean(globalThis.process?.stderr?.isTTY);
 }
 
 export function formatUncaughtBundleError(error) {
@@ -952,20 +1268,49 @@ export function formatUncaughtBundleError(error) {
         return true;
       }
     }
-    for (const frameLine of stack.split(/\r?\n/)) {
+    const stackLines = stack.split(/\r?\n/);
+    for (let frameIndex = 0; frameIndex < stackLines.length; frameIndex += 1) {
+      const frameLine = stackLines[frameIndex];
       const frame = /@(.+):(\d+):(\d+)$/.exec(frameLine) ??
         /^\s*at\s+.*?\s+\((.+):(\d+):(\d+)\)$/.exec(frameLine) ??
         /^\s*at\s+(.+):(\d+):(\d+)$/.exec(frameLine);
       if (!frame) continue;
-      const context = sourceContextForLocation(frame[1], Number(frame[2]), Number(frame[3]));
+      // Dynamically evaluated files are not sources in the entry bundle's map.
+      // Prefer their own readable frame before walking on to a later embedded-
+      // runtime frame, which would otherwise misattribute the exception.
+      const context = sourceContextForLocation(frame[1], Number(frame[2]), Number(frame[3])) ??
+        sourceContextForExternalFile(frame[1], Number(frame[2]), Number(frame[3]));
       if (!context || !Array.isArray(context.lines)) continue;
-      const line = Number(context.line);
-      const column = Number(context.column);
+      let line = Number(context.line);
+      let column = Number(context.column);
       if (!Number.isFinite(line) || !Number.isFinite(column)) continue;
+      // Anchor the code frame on the site where the Error was constructed, the
+      // way Bun does (its `error.stack[0]` is the `new Error(...)` call). When a
+      // multi-line construction spans several source lines, the frame position
+      // cottontail records can land on a later line (e.g. the following `throw`
+      // or a closing `)}`), producing a wide window that spills the tail of the
+      // construction. If the anchored line does not already name the
+      // construction but a nearby preceding line does, re-anchor to it.
+      const anchoredLine = context.lines[line - 1] ?? "";
+      const errorCtor = String(error?.name ?? "Error").replace(/[^A-Za-z0-9_$]/g, "");
+      const ctorPattern = new RegExp(`\\bnew\\s+(${errorCtor}|(?:Aggregate|Eval|Range|Reference|Syntax|Type|URI)?Error)\\b`);
+      if (errorCtor && !ctorPattern.test(anchoredLine)) {
+        for (let candidate = line; candidate >= Math.max(1, line - 6); candidate -= 1) {
+          const text = context.lines[candidate - 1] ?? "";
+          const match = ctorPattern.exec(text);
+          if (match) {
+            line = candidate;
+            column = match.index + match[0].lastIndexOf(match[1]) + 1;
+            break;
+          }
+        }
+      }
       const start = Math.max(1, line - 5);
       const codeFrame = [];
+      const colorize = frameColorsEnabled();
       for (let sourceLine = start; sourceLine <= line && sourceLine <= context.lines.length; sourceLine += 1) {
-        codeFrame.push(`${sourceLine} | ${context.lines[sourceLine - 1]}`);
+        const raw = context.lines[sourceLine - 1] ?? "";
+        codeFrame.push(`${sourceLine} | ${colorize ? highlightFrameLine(raw) : raw}`);
       }
       codeFrame.push(`${" ".repeat(String(line).length + 3 + Math.max(0, column - 1))}^`);
       const errorName = String(error?.name ?? "Error");
@@ -976,6 +1321,31 @@ export function formatUncaughtBundleError(error) {
           : errorName;
       codeFrame.push(`${label}: ${String(error?.message ?? "")}`);
       codeFrame.push(`    at ${context.source}:${line}:${column}`);
+      // The code frame replaces the first stack frame, but callers are still
+      // diagnostically important (and may come from different source files).
+      // Preserve the remaining remapped frames instead of collapsing the
+      // entire trace to the construction site.
+      for (let trailingIndex = frameIndex + 1; trailingIndex < stackLines.length; trailingIndex += 1) {
+        const trailing = stackLines[trailingIndex].trim();
+        if (/^at\b/.test(trailing)) {
+          codeFrame.push(`    ${trailing}`);
+          continue;
+        }
+        const jscFrame = /^(.*?)@(.+:\d+:\d+)$/.exec(trailing);
+        if (!jscFrame) continue;
+        codeFrame.push(jscFrame[1]
+          ? `    at ${jscFrame[1]} (${jscFrame[2]})`
+          : `    at ${jscFrame[2]}`);
+      }
+      const firstLine = context.lines[0] ?? "";
+      const pragmaLine = /^\uFEFF?#!/.test(firstLine) ? context.lines[1] ?? "" : firstLine;
+      const isBunBundle = /^\/\/ @bun(?:\s|$)/.test(pragmaLine.replace(/^\uFEFF/, ""));
+      const advertisesSourceMap = context.lines.some(sourceLine =>
+        /^\s*\/\/# sourceMappingURL=/.test(sourceLine));
+      if (isBunBundle && !advertisesSourceMap) {
+        codeFrame.push(`note: missing sourcemaps for ${context.source}`);
+        codeFrame.push("note: consider bundling with '--sourcemap' to get unminified traces");
+      }
       error.stack = codeFrame.join("\n");
       Object.defineProperty(error, "__cottontailFormattedStack", { value: true, configurable: true });
       return true;

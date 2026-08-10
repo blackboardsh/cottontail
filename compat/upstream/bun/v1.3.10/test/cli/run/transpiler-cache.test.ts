@@ -54,6 +54,14 @@ beforeEach(() => {
   temp_dir = realpathSync(temp_dir);
   cache_dir = join(temp_dir, ".cache");
   env.BUN_RUNTIME_TRANSPILER_CACHE_PATH = cache_dir;
+
+  // Cottontail lazily compiles its embedded console implementation into the
+  // same cache on first use. Prime that runtime-only entry with a source file
+  // below the cache threshold so the assertions below measure user sources.
+  const prewarm = join(temp_dir, "prewarm.js");
+  writeFileSync(prewarm, 'console.log("")');
+  bunRun(prewarm, env);
+  prev_cache_count = readdirSync(cache_dir).length;
 });
 
 describe("transpiler cache", () => {
@@ -81,7 +89,7 @@ describe("transpiler cache", () => {
     writeFileSync(join(temp_dir, "a.js"), dummyFile(50 * 1024 - 1, "1", "a"));
     const a = bunRun(join(temp_dir, "a.js"), env);
     expect(a.stdout == "a");
-    expect(!existsSync(cache_dir)).toBeTrue();
+    expect(newCacheCount()).toBe(0);
   });
   test("it is indeed content addressable", async () => {
     writeFileSync(join(temp_dir, "a.js"), dummyFile(50 * 1024, "1", "b"));

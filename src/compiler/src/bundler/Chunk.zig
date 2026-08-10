@@ -370,7 +370,18 @@ pub const Chunk = struct {
 
                                 const cheap_normalizer = cheapPrefixNormalizer(
                                     import_prefix,
-                                    if (from_chunk_dir.len == 0 or force_absolute_path)
+                                    // For an HTML chunk with a public_path (import_prefix) set,
+                                    // referenced chunks/assets are served at `public_path +
+                                    // dest_path` (their final_rel_path), not relative to the HTML
+                                    // file. Computing a path relative to the HTML's output
+                                    // directory only yields a servable URL when the HTML entry sits
+                                    // at the output root; when the app is rooted in a deep absolute
+                                    // directory (e.g. dev-server bundles under /tmp/...), the
+                                    // relative computation produces unservable `../../..`
+                                    // traversals, so the browser loads HTML instead of the chunk
+                                    // and HMR never initializes. Use the public_path-absolute form.
+                                    if (from_chunk_dir.len == 0 or force_absolute_path or
+                                        (import_prefix.len > 0 and chunk.content == .html))
                                         file_path
                                     else
                                         bun.path.relativePlatformBuf(relative_platform_buf, from_chunk_dir, file_path, .posix, false),
@@ -492,7 +503,18 @@ pub const Chunk = struct {
                                 bun.path.platformToPosixInPlace(u8, @constCast(file_path));
                                 const cheap_normalizer = cheapPrefixNormalizer(
                                     import_prefix,
-                                    if (from_chunk_dir.len == 0 or force_absolute_path)
+                                    // For an HTML chunk with a public_path (import_prefix) set,
+                                    // referenced chunks/assets are served at `public_path +
+                                    // dest_path` (their final_rel_path), not relative to the HTML
+                                    // file. Computing a path relative to the HTML's output
+                                    // directory only yields a servable URL when the HTML entry sits
+                                    // at the output root; when the app is rooted in a deep absolute
+                                    // directory (e.g. dev-server bundles under /tmp/...), the
+                                    // relative computation produces unservable `../../..`
+                                    // traversals, so the browser loads HTML instead of the chunk
+                                    // and HMR never initializes. Use the public_path-absolute form.
+                                    if (from_chunk_dir.len == 0 or force_absolute_path or
+                                        (import_prefix.len > 0 and chunk.content == .html))
                                         file_path
                                     else
                                         bun.path.relativePlatformBuf(relative_platform_buf, from_chunk_dir, file_path, .posix, false),

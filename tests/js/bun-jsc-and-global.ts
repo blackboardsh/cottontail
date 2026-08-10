@@ -273,4 +273,59 @@ assert(shadowRealmObjectError instanceof TypeError, "ShadowRealm should reject o
 assert(shadowRealm.evaluate("globalThis.answer = 42; answer") === 42, "ShadowRealm compatibility evaluation mismatch");
 assert((globalThis as any).answer === undefined, "ShadowRealm compatibility global should stay isolated");
 
+if (process.platform === "linux" && process.arch === "arm64") {
+  const defaultEnvironment = { ...process.env, JSC_dumpOptions: "1" };
+  delete defaultEnvironment.JSC_useDFGJIT;
+  delete defaultEnvironment.JSC_useFTLJIT;
+  const stress = Bun.spawnSync({
+    cmd: [process.execPath, new URL("./fixtures/jsc-linux-arm64-tiering-stress.js", import.meta.url).pathname],
+    env: defaultEnvironment,
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: 15_000,
+  });
+  const stressStdout = new TextDecoder().decode(stress.stdout);
+  const stressStderr = new TextDecoder().decode(stress.stderr);
+  assert(stress.exitCode === 0, `Linux ARM64 JSC tiering stress failed: ${stressStderr}`);
+  assert(stressStdout.includes("jsc tiering stress passed"), "Linux ARM64 JSC tiering stress did not finish");
+  assert(
+    stressStderr.includes("useDFGJIT=false (default: true)"),
+    `Linux ARM64 JSC DFG safety default was not latched: ${stressStderr}`,
+  );
+
+  const explicitDfg = Bun.spawnSync({
+    cmd: [process.execPath, "-e", "console.log(process.env.JSC_useDFGJIT)"],
+    env: { ...defaultEnvironment, JSC_useDFGJIT: "true" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const explicitDfgStdout = new TextDecoder().decode(explicitDfg.stdout);
+  const explicitDfgStderr = new TextDecoder().decode(explicitDfg.stderr);
+  assert(explicitDfg.exitCode === 0, `explicit Linux ARM64 DFG override failed: ${explicitDfgStderr}`);
+  assert(explicitDfgStdout === "true\n", "explicit Linux ARM64 DFG override was not preserved in process.env");
+  assert(
+    explicitDfgStderr.includes("useDFGJIT=true (default: true)"),
+    `explicit Linux ARM64 DFG override was not latched: ${explicitDfgStderr}`,
+  );
+
+  const explicitFtl = Bun.spawnSync({
+    cmd: [
+      process.execPath,
+      "-e",
+      "console.log(String(process.env.JSC_useDFGJIT), process.env.JSC_useFTLJIT)",
+    ],
+    env: { ...defaultEnvironment, JSC_dumpOptions: "2", JSC_useFTLJIT: "true" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const explicitFtlStdout = new TextDecoder().decode(explicitFtl.stdout);
+  const explicitFtlStderr = new TextDecoder().decode(explicitFtl.stderr);
+  assert(explicitFtl.exitCode === 0, `explicit Linux ARM64 FTL override failed: ${explicitFtlStderr}`);
+  assert(explicitFtlStdout === "undefined true\n", "explicit FTL override should not inject a DFG environment value");
+  assert(
+    explicitFtlStderr.includes("useDFGJIT=true") && explicitFtlStderr.includes("useFTLJIT=true"),
+    `explicit Linux ARM64 FTL override did not retain both optimizing tiers: ${explicitFtlStderr}`,
+  );
+}
+
 console.log("bun jsc and global passed");

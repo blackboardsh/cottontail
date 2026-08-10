@@ -55,7 +55,9 @@ describe("internal runtime bindings", () => {
     const detachedStart = signal.start;
     const detachedStop = signal.stop;
 
-    expect(binding).toBe(process.binding("signal_wrap"));
+    // Bun 1.3.10's public process.binding("signal_wrap") throws; the internal
+    // surface keeps it. Assert cache identity through internalBinding instead.
+    expect(binding).toBe(internalBinding("signal_wrap"));
     expect(Object.keys(binding)).toEqual(["Signal"]);
     expect(Object.keys(Signal.prototype)).toEqual(["start", "stop"]);
     for (const invoke of [() => detachedStart(9), () => detachedStop()]) {
@@ -164,6 +166,17 @@ describe("internal runtime bindings", () => {
     expect(report.nativeStack.length).toBeGreaterThan(0);
     expect(report.sharedObjects.length).toBeGreaterThan(0);
     expect(Array.isArray(report.workers)).toBe(true);
+
+    const hasGlibc = report.sharedObjects.some(
+      (path: unknown) => typeof path === "string" && /(?:^|\/)libc\.so\.6$/.test(path),
+    );
+    if (process.platform === "linux" && hasGlibc) {
+      expect(report.header.glibcVersionCompiler).toMatch(/^\d+\.\d+/);
+      expect(report.header.glibcVersionRuntime).toMatch(/^\d+\.\d+/);
+    } else {
+      expect(report.header.glibcVersionCompiler).toBeUndefined();
+      expect(report.header.glibcVersionRuntime).toBeUndefined();
+    }
 
     const directory = mkdtempSync(join(tmpdir(), "cottontail-report-"));
     temporaryDirectories.push(directory);

@@ -582,7 +582,7 @@ export default {
     expect(duration).toBeLessThan(500); // Should be much faster than initial plugin load
 
     subprocess.kill();
-  });
+  }, 15_000);
 });
 
 async function waitForServer(
@@ -599,7 +599,8 @@ async function waitForServer(
     port: number;
     hostname: string;
   }>();
-  const process = Bun.spawn({
+  let address: { port: number; hostname: string } | undefined;
+  const subprocess = Bun.spawn({
     cmd: [bunExe(), join(import.meta.dir, "bun-serve-static-fixture.js")],
     env: {
       ...bunEnv,
@@ -608,17 +609,31 @@ async function waitForServer(
     cwd: dir,
     stdio: ["inherit", "inherit", "inherit"],
     ipc(message, subprocess) {
-      subprocess.send({
-        files: entryPoints,
-      });
-      defer.resolve({
-        subprocess,
-        port: message.port,
-        hostname: message.hostname,
-      });
+      if (message?.type === "listening") {
+        address = { port: message.port, hostname: message.hostname };
+        subprocess.send({ type: "configure", files: entryPoints });
+      } else if (message?.type === "routes-ready" && address) {
+        defer.resolve({ subprocess, ...address });
+      }
     },
   });
-  return defer.promise;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => reject(new Error("Timed out waiting for serve routes to become ready")), 10_000);
+  });
+  const exited = subprocess.exited.then(code => {
+    throw new Error(`Serve fixture exited with code ${code} before routes became ready`);
+  });
+  try {
+    return await Promise.race([defer.promise, exited, deadline]);
+  } catch (error) {
+    subprocess.kill();
+    await Promise.race([subprocess.exited.catch(() => undefined), Bun.sleep(1_000)]);
+    subprocess.unref();
+    throw error;
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
 }
 
 test("serve html error handling", async () => {

@@ -1,5 +1,6 @@
 import "../bun/ffi.js";
 import picomatch from "../vendor/picomatch.js";
+import { _wrapAsyncCallback } from "./async_hooks.js";
 import constantsObject from "./constants.js";
 import { EventEmitter } from "./events.js";
 import { dirname, isAbsolute, join, relative, resolve, toNamespacedPath } from "./path.js";
@@ -1597,6 +1598,12 @@ export async function openAsBlob(path, options = {}) {
 // non-configurable accessors (closed, writableEnded, ...). Plain assignment to
 // those throws in strict mode, so instance state is installed as own data
 // properties which shadow the prototype accessors.
+// Marks objects actually built by ReadStreamImpl (with the fd-pump own state).
+// process.stdin is a plain Readable that gets FsReadStream.prototype grafted on
+// for public identity; it lacks this brand, so the fd-pump methods below must
+// fall back to the base Readable behavior instead of driving _pump().
+const kFdReadStreamState = Symbol("kFdReadStreamState");
+
 function defineOwnState(target, values) {
   for (const key of Object.keys(values)) {
     Object.defineProperty(target, key, {
@@ -1653,6 +1660,7 @@ class ReadStreamImpl extends Readable {
       : validateInteger(options.end, "end", 0, Number.MAX_SAFE_INTEGER);
     if (start != null && end != null && start > end) throw outOfRange("start", `<= ${end}`, start);
     if (fdHandle) fd = fdHandle._acquireStreamRef("createReadStream");
+    this[kFdReadStreamState] = true;
     defineOwnState(this, {
       path: hasFd ? path : normalizePath(path),
       flags: options?.flags || "r",
@@ -1756,6 +1764,9 @@ class ReadStreamImpl extends Readable {
   }
 
   _pump() {
+    // Defensive: never drive the fd pump on an object that lacks ReadStreamImpl's
+    // own state (e.g. FsReadStream.prototype grafted onto process.stdin).
+    if (!this[kFdReadStreamState]) return;
     if (this.destroyed || this.readableEnded || this._paused || this._reading) return;
     this._reading = true;
     let asyncRead = false;
@@ -1856,6 +1867,11 @@ class ReadStreamImpl extends Readable {
 
   resume() {
     if (typeof super.resume === "function") super.resume();
+    // When this prototype is grafted onto process.stdin (a plain Readable that
+    // never ran ReadStreamImpl's constructor), it has no fd-pump state. Driving
+    // _pump() there reads an undefined highWaterMark and throws; the base
+    // Readable.resume() already scheduled the object's own _read(), so stop here.
+    if (!this[kFdReadStreamState]) return this;
     if (!this._paused) return this;
     this._paused = false;
     queueMicrotask(() => this._pump());
@@ -2571,6 +2587,17 @@ function watchFilename(data, encoding) {
   return encoding === "buffer" ? bytes : bytes.toString(encoding);
 }
 
+// Last path segment, ignoring a trailing separator (basename isn't imported
+// here). Used to recognise the watcher's self-referential directory event.
+function watchPathBasename(p) {
+  let value = String(p ?? "");
+  while (value.length > 1 && (value.endsWith("/") || value.endsWith("\\"))) {
+    value = value.slice(0, -1);
+  }
+  const index = Math.max(value.lastIndexOf("/"), value.lastIndexOf("\\"));
+  return index >= 0 ? value.slice(index + 1) : value;
+}
+
 function watchAbortError(signal) {
   const reason = signal?.reason;
   if (reason instanceof Error && reason.name !== "AbortError") return reason;
@@ -2643,7 +2670,10 @@ class FSWatcher extends EventEmitter {
     this._abortQueued = false;
     this._id = null;
     this._listeners = installFsWatchDispatcher();
-    this._onNativeEvent = event => this._handleNativeEvent(event);
+    // Capture the AsyncLocalStorage context active at fs.watch() time so the
+    // watch callback (dispatched later from a native fd event) runs with it,
+    // matching Node/Bun. Without the wrap the callback sees an empty store.
+    this._onNativeEvent = _wrapAsyncCallback(event => this._handleNativeEvent(event));
     this._onAbort = () => this._abort();
     if (typeof listener === "function") this.on("change", listener);
 
@@ -2654,6 +2684,23 @@ class FSWatcher extends EventEmitter {
 
     try {
       validateWatchRoot(this._path);
+      try {
+        this._rootIsDirectory = lstatSync(this._path).isSymbolicLink()
+          ? statSync(this._path).isDirectory()
+          : lstatSync(this._path).isDirectory();
+      } catch {
+        this._rootIsDirectory = false;
+      }
+      // The self-referential directory event carries the basename of the path
+      // libuv actually watches — the resolved target when the root is a symlink
+      // (or chain of symlinks) — so track both the given and resolved basenames.
+      this._rootBasename = watchPathBasename(this._path);
+      this._rootRealBasename = this._rootBasename;
+      if (this._rootIsDirectory) {
+        try {
+          this._rootRealBasename = watchPathBasename(realpathSync(this._path));
+        } catch {}
+      }
       if (typeof cottontail.fsWatchStart !== "function") {
         const error = new Error("ENOSYS: native filesystem watching is unavailable");
         error.code = "ENOSYS";
@@ -2672,6 +2719,14 @@ class FSWatcher extends EventEmitter {
   _handleNativeEvent(event) {
     if (this._closed) return;
     if (event?.type === "rename" || event?.type === "change") {
+      // libuv surfaces a self-referential "change" for the watched directory
+      // itself when its contents change (the directory's mtime bumps). Node/Bun
+      // only report events for a directory's entries, never the directory node,
+      // so drop the event whose name is the watched directory's own basename.
+      if (event.type === "change" && this._rootIsDirectory && event.data != null) {
+        const name = bufferFrom(event.data).toString("utf8");
+        if (name === this._rootBasename || name === this._rootRealBasename) return;
+      }
       this.emit("change", event.type, watchFilename(event.data, this._encoding));
       return;
     }
@@ -2694,7 +2749,13 @@ class FSWatcher extends EventEmitter {
       this._abortQueued = false;
       if (this._closed) return;
       try {
-        this.emit("error", watchAbortError(this._signal));
+        // Match Bun: surface the abort as an "error" only when something is
+        // listening. With no error listener the watcher aborts quietly and
+        // just closes, rather than letting EventEmitter throw on an unhandled
+        // "error" event (e.g. a handler that only observes "close").
+        if (this.listenerCount("error") > 0) {
+          this.emit("error", watchAbortError(this._signal));
+        }
       } finally {
         this.close();
       }

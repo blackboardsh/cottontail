@@ -20,6 +20,13 @@ Object.defineProperty(g, "__cottontailPrepareHotReload", { configurable: true, v
   for (const hook of hooks) {
     try { hook(); } catch (error) { console.error(error); }
   }
+  // The Loader.registry shim persists across hot generations (`??=` global)
+  // while each generation's bundle is a fresh evaluation. Registry-aware
+  // bundled dynamic imports (__esmDyn) consult it before executing, so stale
+  // entries from the previous generation would suppress re-execution of the
+  // reloaded entry graph. Bun's --hot likewise evicts registry entries so the
+  // next import re-runs the module.
+  g.Loader?.registry?.clear?.();
   g.process?.__cottontailListeners?.clear?.();
   if (g.process) g.process.exitCode = 0;
   g.__ctUnhandledRejection = undefined;
@@ -361,9 +368,17 @@ if (cottontail.isWorker?.() === true && typeof g.__cottontailWorkerEvalSource ==
     }
   } catch {}
 }
+// The `bun test` CLI hands these markers to the runtime process it re-execs.
+// They are implementation details of that handoff: promote them to internal
+// globals and drop them from process.env so children spawned by tests (which
+// copy process.env) run exactly like a directly invoked runtime.
 if (g.process.env?.COTTONTAIL_TEST_CLI_HEADER_PRINTED === "1") {
   globalThis.__cottontailBunTestHeaderPrinted = true;
   delete g.process.env.COTTONTAIL_TEST_CLI_HEADER_PRINTED;
+}
+if (g.process.env?.COTTONTAIL_TEST_FILE_COUNT !== undefined) {
+  globalThis.__cottontailBunTestFileCount = g.process.env.COTTONTAIL_TEST_FILE_COUNT;
+  delete g.process.env.COTTONTAIL_TEST_FILE_COUNT;
 }
 g.process.execPath ??= cottontailExecPath;
 g.process.argv0 ??= g.process.execPath;
@@ -399,7 +414,41 @@ if (typeof cottontail.gc === "function" &&
 g.process.versions ??= { node: "24.0.0", cottontail: "0.0.0-dev" };
 g.process.versions.node ??= "24.0.0";
 g.process.release ??= { name: "cottontail" };
+// Node exposes the node-gyp build configuration on every process, including
+// worker threads that stay on this lean process object.
+g.process.config ??= Object.freeze({
+  target_defaults: Object.freeze({
+    cflags: Object.freeze([]),
+    default_configuration: "Release",
+    defines: Object.freeze([]),
+    include_dirs: Object.freeze([]),
+    libraries: Object.freeze([]),
+  }),
+  variables: Object.freeze({
+    clang: 1,
+    host_arch: g.process.arch,
+    target_arch: g.process.arch,
+    enable_lto: false,
+    node_target_type: "executable",
+    node_use_openssl: true,
+    node_shared_zlib: false,
+  }),
+});
 g.process.emitWarning ??= (message, type = "Warning") => console.warn(`${type}: ${message}`);
+g.process.features ??= Object.freeze({
+  inspector: false,
+  debug: false,
+  uv: true,
+  ipv6: true,
+  openssl_is_boringssl: false,
+  tls_alpn: false,
+  tls_sni: false,
+  tls_ocsp: false,
+  tls: false,
+  cached_builtins: false,
+  require_module: true,
+  typescript: "transform",
+});
 g.process.stdin ??= createReadableStdio(0);
 g.process.stdout ??= createWritableStdio(1);
 g.process.stderr ??= createWritableStdio(2);
@@ -1072,6 +1121,8 @@ const consoleErrorSource = (error) => {
   return { filename, lines, lineIndex: index, column: columnIndex + 1, plainError };
 };
 
+let consoleGroupIndent = "";
+
 const formatConsoleError = (error, level, separate = true) => {
   const source = consoleErrorSource(error);
   if (!source) return undefined;
@@ -1104,17 +1155,24 @@ const formatConsoleError = (error, level, separate = true) => {
   return excerpt.join("\n");
 };
 
+// If the selective bootstrap (runtime-bootstrap-core.js) already installed a
+// compatible console formatter, skip the full-runtime replacement to avoid
+// double-formatting.  The bootstrap writes directly to process.stdout/stderr,
+// so its output is correct even without ffi.js re-wrapping the methods.
+if (!console[Symbol.for("cottontail.consoleBootstrapEnhanced")]) {
 const nativeConsoleLog = console.log?.bind(console);
 const nativeConsoleError = console.error?.bind(console);
 const nativeConsoleWarn = console.warn?.bind(console) ?? nativeConsoleError;
-let consoleGroupIndent = "";
+consoleGroupIndent = "";
 const emitConsoleText = (writer, text) => {
   const processStream = writer === nativeConsoleLog
     ? globalThis.process?.stdout
     : globalThis.process?.stderr;
   if (processStream && typeof processStream.write === "function") {
     const output = String(text);
-    processStream.write(output.endsWith("\n") ? output : `${output}\n`);
+    // Bun and Node always append the newline, even when the formatted output
+    // already ends with one (console.log("abc\n") prints "abc\n\n").
+    processStream.write(`${output}\n`);
     return;
   }
   writer?.(text);
@@ -1202,6 +1260,16 @@ console.debug = console.log;
   console.timeLog = (label = "default", ...data) => logTime(label, data, false);
   console.timeEnd = (label = "default") => logTime(label, [], true);
 }
+} else {
+  // Bootstrap already enhanced the console.  Ensure the internal error-report
+  // symbol is still wired up (the bootstrap does not know about writeConsole).
+  if (!Object.getOwnPropertyDescriptor(console, Symbol.for("cottontail.reportError.console"))) {
+    Object.defineProperty(console, Symbol.for("cottontail.reportError.console"), {
+      value: (error) => console.error(error),
+      configurable: true,
+    });
+  }
+}
 
 // Blocking terminal prompts read stdin one byte at a time until newline/EOF.
 // Keep these in the shared FFI bootstrap so selective and full runtimes expose
@@ -1253,8 +1321,14 @@ g.global ??= g;
 g.self ??= g;
 g.performance ??= {};
 {
+  // Measure from process start (Bun parity: floor(process.uptime()) tracks
+  // floor(performance.now()/1000)), not from this module's eval time.
+  const uptimeNs = Number(cottontail?.processInfo?.("uptime")) * 1e9;
   const monotonicNow = typeof cottontail?.nanotime === "function"
-    ? (() => { const base = cottontail.nanotime(); return () => Number(cottontail.nanotime() - base) / 1e6; })()
+    ? (() => {
+        const base = cottontail.nanotime() - (Number.isFinite(uptimeNs) ? uptimeNs : 0);
+        return () => Number(cottontail.nanotime() - base) / 1e6;
+      })()
     : (() => { const base = Date.now(); return () => Date.now() - base; })();
   const timeOrigin = Date.now() - monotonicNow();
   if (g.performance.timeOrigin == null || !(g.performance.timeOrigin > 0)) {
@@ -1587,8 +1661,8 @@ function installBlobGlobals() {
         if (typeof parts === "string" || parts == null) throw new TypeError("File bits must be an iterable object");
         super(parts, options);
         Object.defineProperties(this, {
-          name: { configurable: true, value: String(name) },
-          lastModified: { configurable: true, value: Number(options?.lastModified ?? Date.now()) },
+          name: { configurable: true, writable: true, value: String(name) },
+          lastModified: { configurable: true, writable: true, value: Number(options?.lastModified ?? Date.now()) },
         });
       }
     }
@@ -2101,7 +2175,23 @@ async function bunWrite(path, data) {
 }
 
 g.Bun ??= {};
-g.Bun.argv ??= cottontail.argv || ["cottontail", ...(cottontail.args || [])];
+if (!Object.prototype.hasOwnProperty.call(g.Bun, "argv")) {
+  // Bun.argv and process.argv are the same array, so the executable rewrite
+  // node/process.js applies to argv[0] has to be visible through both.
+  let argvOverride;
+  Object.defineProperty(g.Bun, "argv", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (argvOverride !== undefined) return argvOverride;
+      const argv = g.process?.argv;
+      return Array.isArray(argv) ? argv : cottontail.argv || ["cottontail", ...(cottontail.args || [])];
+    },
+    set(value) {
+      argvOverride = value;
+    },
+  });
+}
 g.Bun.env ??= processObject.env;
 g.Bun.file ??= bunFile;
 g.Bun.write ??= bunWrite;
@@ -3911,6 +4001,30 @@ function ccArguments(value) {
   return (Array.isArray(value) ? value : [value]).map(String);
 }
 
+// Match Bun's embedded TinyCC default include/library search paths so headers
+// like <node/node_api.h> installed under /usr/local or Homebrew are found when
+// compiling through the system compiler (zig cc / clang), which does not search
+// these directories by default.
+function systemCcSearchFlags() {
+  const flags = [];
+  const addInclude = dir => {
+    if (dir && cottontail.existsSync(dir)) flags.push(`-I${dir}`);
+  };
+  const addLibrary = dir => {
+    if (dir && cottontail.existsSync(dir)) flags.push(`-L${dir}`);
+  };
+  const platformName = platform();
+  if (platformName === "darwin" && cottontail.arch() === "arm64") {
+    addInclude("/opt/homebrew/include");
+    addLibrary("/opt/homebrew/lib");
+  }
+  if (platformName !== "win32") {
+    addInclude("/usr/local/include");
+    addLibrary("/usr/local/lib");
+  }
+  return flags;
+}
+
 function windowsNapiImportLibrary(compiler, sourcePaths, dir) {
   if (platform() !== "win32" || compiler.kind !== "zig") return null;
   const names = new Set();
@@ -3966,11 +4080,14 @@ export function cc(options) {
       ? ["-shared"]
       : ["-shared", "-fPIC"];
   const defines = Object.entries(options.define || {}).map(([name, value]) => `-D${name}=${value == null ? "1" : String(value)}`);
+  const includeDirs = ccArguments(options.include).map(dir => `-I${dir}`);
   const args = [
     ...compiler.prefix,
     ...sourcePaths,
     ...(napiImportLibrary ? [napiImportLibrary] : []),
     ...sharedArgs,
+    ...includeDirs,
+    ...systemCcSearchFlags(),
     ...defines,
     "-o",
     output,

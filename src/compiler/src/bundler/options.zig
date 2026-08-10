@@ -77,6 +77,11 @@ pub const AllowUnresolved = union(enum) {
 pub const ExternalModules = struct {
     node_modules: std.BufSet,
     abs_paths: std.BufSet,
+    /// Original, un-normalized path-like external specifiers (e.g. "./foo",
+    /// "./external.css"). Matched exactly against the import specifier text so
+    /// that relative externals are honored regardless of the working directory
+    /// used to normalize `abs_paths`.
+    exact: std.BufSet,
     patterns: []const WildcardPattern,
 
     pub const WildcardPattern = struct {
@@ -114,6 +119,7 @@ pub const ExternalModules = struct {
         var result = ExternalModules{
             .node_modules = std.BufSet.init(allocator),
             .abs_paths = std.BufSet.init(allocator),
+            .exact = std.BufSet.init(allocator),
             .patterns = default_wildcard_patterns[0..],
         };
 
@@ -158,6 +164,12 @@ pub const ExternalModules = struct {
             } else if (resolver.isPackagePath(external)) {
                 result.node_modules.insert(external) catch unreachable;
             } else {
+                // Match the specifier exactly as written (cwd-independent). This
+                // mirrors esbuild/Bun keeping e.g. `import "./foo"` external when
+                // "./foo" is listed, even when `abs_paths` normalization uses a
+                // different working directory than the importing file.
+                result.exact.insert(external) catch unreachable;
+
                 const normalized = validatePath(log, fs, cwd, external, allocator, "external path");
 
                 if (normalized.len > 0) {

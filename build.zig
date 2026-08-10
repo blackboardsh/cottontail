@@ -85,7 +85,7 @@ const libuv_windows_sources = &.{
 };
 
 /// Must match scripts/jsc-manifest.json (the setup script vendors this tag).
-const jsc_vendor_tag = "jsc-WebKit-7624.2.5.10.6-d61c3cb19f2d";
+const jsc_vendor_tag = "jsc-WebKit-7624.4.5.14.1-8e1bb5dd5c10";
 
 fn jscVendorPlatformKey(target: std.Target) ?[]const u8 {
     return switch (target.os.tag) {
@@ -535,6 +535,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             "-Wno-deprecated-declarations",
             "-DSQLITE_ENABLE_COLUMN_METADATA",
             "-DSQLITE_ENABLE_FTS5",
+            "-DSQLITE_ENABLE_MATH_FUNCTIONS",
             "-DSQLITE_ENABLE_SESSION",
             "-DSQLITE_ENABLE_PREUPDATE_HOOK",
             "-DSQLITE_ENABLE_UPDATE_DELETE_LIMIT",
@@ -681,7 +682,21 @@ pub fn build(b: *std.Build) void {
 
     configureJsc(exe, b);
 
-    b.installArtifact(exe);
+    const install_exe = b.addInstallArtifact(exe, .{});
+    if (target.result.os.tag == .linux and optimize == .ReleaseSmall) {
+        // Zig 0.16 accepts the ELF version script above but its built-in linker
+        // does not apply it. Keep ordinary release installs on the same native-
+        // addon ABI allowlist as scripts/build-release.js instead of exposing
+        // every symbol pulled in by -rdynamic.
+        const restrict_exports = b.addSystemCommand(&.{"node"});
+        restrict_exports.addFileArg(b.path("scripts/restrict-linux-release-exports.js"));
+        restrict_exports.addArg(b.getInstallPath(.bin, exe.out_filename));
+        restrict_exports.addFileArg(b.path("src/compiler/src/symbols.dyn"));
+        restrict_exports.step.dependOn(&install_exe.step);
+        b.getInstallStep().dependOn(&restrict_exports.step);
+    } else {
+        b.getInstallStep().dependOn(&install_exe.step);
+    }
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -719,7 +734,13 @@ pub fn build(b: *std.Build) void {
     );
     build_native_plugin_step.dependOn(&install_native_plugin_fixture.step);
 
-    const run_native_plugin_test = b.addRunArtifact(exe);
+    const run_native_plugin_test = if (target.result.os.tag == .linux and optimize == .ReleaseSmall)
+        b.addSystemCommand(&.{b.getInstallPath(.bin, exe.out_filename)})
+    else
+        b.addRunArtifact(exe);
+    if (target.result.os.tag == .linux and optimize == .ReleaseSmall) {
+        run_native_plugin_test.step.dependOn(b.getInstallStep());
+    }
     run_native_plugin_test.step.dependOn(&install_native_plugin_fixture.step);
     run_native_plugin_test.addArg("run");
     run_native_plugin_test.addFileArg(b.path("tests/js/bun-native-plugin.ts"));

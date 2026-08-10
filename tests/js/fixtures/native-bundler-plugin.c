@@ -1,3 +1,7 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include <node_api.h>
 
 #include <stdint.h>
@@ -6,6 +10,30 @@
 
 #if defined(__linux__)
 #include <dlfcn.h>
+#include <pthread.h>
+#include <semaphore.h>
+
+typedef struct {
+    int64_t tv_sec;
+    int32_t tv_usec;
+} CtUvTimeval64;
+
+extern int uv_gettimeofday(CtUvTimeval64 *tv);
+extern void uv_rwlock_destroy(pthread_rwlock_t *rwlock);
+extern int uv_rwlock_init(pthread_rwlock_t *rwlock);
+extern void uv_rwlock_rdlock(pthread_rwlock_t *rwlock);
+extern void uv_rwlock_rdunlock(pthread_rwlock_t *rwlock);
+extern int uv_rwlock_tryrdlock(pthread_rwlock_t *rwlock);
+extern int uv_rwlock_trywrlock(pthread_rwlock_t *rwlock);
+extern void uv_rwlock_wrlock(pthread_rwlock_t *rwlock);
+extern void uv_rwlock_wrunlock(pthread_rwlock_t *rwlock);
+extern void uv_sem_destroy(sem_t *sem);
+extern int uv_sem_init(sem_t *sem, unsigned int value);
+extern void uv_sem_post(sem_t *sem);
+extern int uv_sem_trywait(sem_t *sem);
+extern void uv_sem_wait(sem_t *sem);
+extern unsigned int uv_version(void);
+extern const char *uv_version_string(void);
 #endif
 
 typedef struct NativePluginArguments NativePluginArguments;
@@ -212,6 +240,98 @@ static napi_value abi_visibility(napi_env env, napi_callback_info info) {
     return result;
 }
 
+static napi_value uv_version_string_value(napi_env env, napi_callback_info info) {
+    (void)info;
+    napi_value result = NULL;
+
+#if defined(__linux__)
+    const char *version = uv_version_string();
+    if (version == NULL || napi_create_string_utf8(env, version, NAPI_AUTO_LENGTH, &result) != napi_ok) return NULL;
+#else
+    if (napi_get_undefined(env, &result) != napi_ok) return NULL;
+#endif
+
+    return result;
+}
+
+static napi_value uv_version_value(napi_env env, napi_callback_info info) {
+    (void)info;
+    napi_value result = NULL;
+
+#if defined(__linux__)
+    if (napi_create_uint32(env, uv_version(), &result) != napi_ok) return NULL;
+#else
+    if (napi_get_undefined(env, &result) != napi_ok) return NULL;
+#endif
+
+    return result;
+}
+
+static napi_value uv_gettimeofday_value(napi_env env, napi_callback_info info) {
+    (void)info;
+    napi_value result = NULL;
+
+#if defined(__linux__)
+    CtUvTimeval64 now;
+    if (uv_gettimeofday(&now) != 0 ||
+        napi_create_double(env, (double)now.tv_sec * 1000.0 + (double)now.tv_usec / 1000.0, &result) != napi_ok) {
+        return NULL;
+    }
+#else
+    if (napi_get_undefined(env, &result) != napi_ok) return NULL;
+#endif
+
+    return result;
+}
+
+static napi_value uv_semaphore_lifecycle(napi_env env, napi_callback_info info) {
+    (void)info;
+    int success = 1;
+
+#if defined(__linux__)
+    sem_t semaphore;
+    success = uv_sem_init(&semaphore, 0) == 0;
+    if (success) {
+        uv_sem_post(&semaphore);
+        uv_sem_wait(&semaphore);
+        uv_sem_post(&semaphore);
+        success = uv_sem_trywait(&semaphore) == 0;
+        uv_sem_destroy(&semaphore);
+    }
+#endif
+
+    napi_value result = NULL;
+    if (napi_get_boolean(env, success, &result) != napi_ok) return NULL;
+    return result;
+}
+
+static napi_value uv_rwlock_lifecycle(napi_env env, napi_callback_info info) {
+    (void)info;
+    int success = 1;
+
+#if defined(__linux__)
+    pthread_rwlock_t rwlock;
+    success = uv_rwlock_init(&rwlock) == 0;
+    if (success) {
+        uv_rwlock_rdlock(&rwlock);
+        uv_rwlock_rdunlock(&rwlock);
+        success = uv_rwlock_tryrdlock(&rwlock) == 0;
+        if (success) uv_rwlock_rdunlock(&rwlock);
+        if (success) {
+            uv_rwlock_wrlock(&rwlock);
+            uv_rwlock_wrunlock(&rwlock);
+            success = uv_rwlock_trywrlock(&rwlock) == 0;
+            if (success) uv_rwlock_wrunlock(&rwlock);
+        }
+        uv_rwlock_destroy(&rwlock);
+    }
+#endif
+
+    napi_value result = NULL;
+    if (napi_get_boolean(env, success, &result) != napi_ok) return NULL;
+    return result;
+}
+
 static int export_function(napi_env env, napi_value exports, const char *name, napi_callback callback) {
     napi_value function = NULL;
     if (napi_create_function(env, name, NAPI_AUTO_LENGTH, callback, NULL, &function) != napi_ok) return 0;
@@ -222,5 +342,10 @@ NAPI_MODULE_INIT() {
     if (!export_function(env, exports, "createState", create_state)) return NULL;
     if (!export_function(env, exports, "stateCounts", state_counts)) return NULL;
     if (!export_function(env, exports, "abiVisibility", abi_visibility)) return NULL;
+    if (!export_function(env, exports, "uvVersion", uv_version_value)) return NULL;
+    if (!export_function(env, exports, "uvVersionString", uv_version_string_value)) return NULL;
+    if (!export_function(env, exports, "uvGettimeofday", uv_gettimeofday_value)) return NULL;
+    if (!export_function(env, exports, "uvRwlockLifecycle", uv_rwlock_lifecycle)) return NULL;
+    if (!export_function(env, exports, "uvSemaphoreLifecycle", uv_semaphore_lifecycle)) return NULL;
     return exports;
 }

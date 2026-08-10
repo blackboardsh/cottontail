@@ -283,19 +283,6 @@ if (inheritedSpawnExecPath != null) {
   });
   try { delete globalThis.process.env.COTTONTAIL_SPAWN_EXEC_PATH; } catch {}
 }
-const inheritedFileBackedStdin = globalThis.process?.env?.COTTONTAIL_SPAWN_STDIN_FILE === "1";
-if (inheritedFileBackedStdin) {
-  const stream = globalThis.process?.stdin;
-  for (const method of ["ref", "unref"]) {
-    try {
-      delete stream?.[method];
-      if (typeof stream?.[method] === "function") {
-        Object.defineProperty(stream, method, { value: undefined, configurable: true });
-      }
-    } catch {}
-  }
-  try { delete globalThis.process.env.COTTONTAIL_SPAWN_STDIN_FILE; } catch {}
-}
 
 let ctEvalOffsetMap;
 let ctEvalLineOffset;
@@ -614,8 +601,12 @@ class CottontailCallSite {
         : "<anonymous>";
       const name = this.functionName
         ? `${this.constructorFrame ? "new " : ""}${this.functionName}`
-        : "unknown";
-      return `${name} (${location})`;
+        : "<anonymous>";
+      // V8 prefixes frames resumed after an await with "async " (e.g.
+      // "at async foo (...)"); JSC carries the marker on the raw frame name,
+      // which limitedCallSites strips into asyncFrame.
+      const asyncPrefix = this.asyncFrame ? "async " : "";
+      return `${asyncPrefix}${name} (${location})`;
     }
     get [Symbol.toStringTag]() { return "CallSite"; }
   }
@@ -655,13 +646,19 @@ function correctCallerLocations(sites) {
     const callee = sites[index - 1].functionName;
     const caller = sites[index];
     if (!callee || !caller.fileName || !Number.isFinite(caller.lineNumber)) continue;
+    // Dynamically evaluated sources have no source map, so Bun reports their
+    // frames at the raw JSC positions rather than at the call expression.
+    if (dynamicSources.has(caller.fileName)) continue;
     const context = bundleSourceContextForLocation(caller.fileName, caller.lineNumber, caller.columnNumber);
-    if (!Array.isArray(context?.lines)) continue;
-    const target = Math.max(0, Math.min(context.lines.length - 1, Number(context.line ?? caller.lineNumber) - 1));
+    // Frames whose file is not part of the bundle (dynamically evaluated
+    // sources, plain scripts) still have readable source lines.
+    const lines = Array.isArray(context?.lines) ? context.lines : frameSourceLines(caller.fileName);
+    if (!Array.isArray(lines)) continue;
+    const target = Math.max(0, Math.min(lines.length - 1, Number(context?.line ?? caller.lineNumber) - 1));
     const escaped = callee.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const invocation = new RegExp(`\\b${escaped}\\s*\\(`);
     for (let sourceIndex = target; sourceIndex >= Math.max(0, target - 12); sourceIndex -= 1) {
-      const sourceLine = context.lines[sourceIndex];
+      const sourceLine = lines[sourceIndex];
       const match = invocation.exec(sourceLine);
       if (!match || new RegExp(`\\b(?:function|class)\\s+${escaped}\\b`).test(sourceLine)) continue;
       caller.lineNumber = sourceIndex + 1;
@@ -686,7 +683,174 @@ function evalSourceURLFromCallSites(sites) {
   return null;
 }
 
-const parseCallSites = (stack, fallbackSourceURL = undefined) => {
+// Direct `eval` is a syntactic form, so there is no hook that could record the
+// evaluated text. JSC also drops the URL of eval'd frames entirely in this
+// embedding ("hello@" with no location at all), which leaves the source
+// literal in the calling file as the only place the text and the
+// `//# sourceURL` name can still be recovered from.
+function dynamicEvalSourceNearLine(fileName, lineNumber) {
+  const lines = frameSourceLines(fileName);
+  if (!Array.isArray(lines)) return null;
+  const text = lines.join("\n");
+  const anchor = Number.isFinite(lineNumber) ? lineNumber : 1;
+  const pattern = /(?:\/\/|\/\*)[#@]\s*sourceURL\s*=\s*([^\s*`'"}\r\n]+)/g;
+  let best = null;
+  for (let match; (match = pattern.exec(text)) !== null;) {
+    const open = text.lastIndexOf("`", match.index);
+    const close = text.indexOf("`", match.index);
+    if (open < 0 || close < 0) continue;
+    const source = text.slice(open + 1, close);
+    const startLine = text.slice(0, open).split("\n").length;
+    const distance = Math.abs(startLine - anchor);
+    if (best === null || distance < best.distance) best = { name: match[1], source, distance };
+  }
+  return best;
+}
+
+// Frames of directly eval'd code arrive with no file, line or column at all,
+// followed by the native `eval` frame and then the calling frame. Recover the
+// `//# sourceURL` name and the evaluated text from the caller's source so the
+// frames (and code frames rendered from them) name the eval'd script the way
+// Bun does.
+function resolveDynamicEvalFrames(sites, evalPosition) {
+  let boundary = 0;
+  while (boundary < sites.length && !sites[boundary].fileName) boundary += 1;
+  if (boundary === 0 || boundary >= sites.length) return;
+  const evalSite = sites[boundary];
+  if (!evalSite.nativeFrame || !evalSite.evalFrame) return;
+  const caller = sites[boundary + 1];
+  if (!caller?.fileName) return;
+  const found = dynamicEvalSourceNearLine(caller.fileName, caller.lineNumber);
+  if (!found) return;
+  globalThis.__cottontailRegisterDynamicSource(found.name, found.source);
+  const lines = found.source.split(/\r?\n/);
+  for (let index = 0; index < boundary; index += 1) sites[index].fileName = found.name;
+  const top = sites[0];
+  if (Number.isFinite(Number(evalPosition?.line))) {
+    top.lineNumber = Number(evalPosition.line);
+    top.columnNumber = Number(evalPosition.column);
+  }
+  // The remaining eval'd frames only have a function name; locate the call to
+  // the frame above them in the evaluated source, which is where JSC would
+  // have reported them (at the call's open paren).
+  for (let index = 1; index < boundary; index += 1) {
+    const callee = sites[index - 1].functionName;
+    if (!callee || !/^[A-Za-z_$][\w$]*$/.test(callee)) continue;
+    const invocation = new RegExp(`\\b${callee}\\s*\\(`);
+    for (let line = 0; line < lines.length; line += 1) {
+      if (new RegExp(`\\b(?:function|class)\\s+${callee}\\b`).test(lines[line])) continue;
+      const match = invocation.exec(lines[line]);
+      if (!match) continue;
+      sites[index].lineNumber = line + 1;
+      sites[index].columnNumber = match.index + match[0].length;
+      break;
+    }
+  }
+}
+
+const frameSourceLinesCache = new Map();
+
+// Source text of code that was evaluated rather than loaded from disk (vm
+// scripts, `//# sourceURL` eval), keyed by the name its stack frames use.
+// node:vm registers entries here so code frames can be rendered for them.
+const dynamicSources = new Map();
+const dynamicCallSitesSymbol = Symbol("cottontail.callSites");
+globalThis.__cottontailRegisterDynamicSource ??= (sourceName, source) => {
+  if (typeof sourceName !== "string" || sourceName === "" || typeof source !== "string") return;
+  if (dynamicSources.size > 64 && !dynamicSources.has(sourceName)) dynamicSources.clear();
+  dynamicSources.set(sourceName, source);
+  frameSourceLinesCache.delete(sourceName);
+};
+
+// Source lines for a stack frame's file, preferring the bundle source map's
+// embedded original sources and falling back to reading the file from disk.
+function frameSourceLines(fileName) {
+  if (typeof fileName !== "string" || fileName === "") return null;
+  const dynamic = dynamicSources.get(fileName);
+  if (dynamic !== undefined) return dynamic.split(/\r?\n/);
+  if (frameSourceLinesCache.has(fileName)) return frameSourceLinesCache.get(fileName);
+  if (frameSourceLinesCache.size > 64) frameSourceLinesCache.clear();
+  let lines = null;
+  const context = bundleSourceContextForLocation(fileName, 1, 1);
+  if (Array.isArray(context?.lines)) {
+    lines = context.lines;
+  } else {
+    let path = fileName;
+    if (path.startsWith("file://")) {
+      try { path = nodeFileURLToPath(path); } catch {}
+    }
+    try { lines = String(cottontail.readFile(path)).split(/\r?\n/); } catch { lines = null; }
+  }
+  frameSourceLinesCache.set(fileName, lines);
+  return lines;
+}
+
+// JSC records the position of a frame suspended at a JS-level call as the
+// return address (the op after the call), so stacks captured through the
+// CottontailError/captureStackTrace wrappers attribute their top frame to the
+// statement after the error-originating call. Bun attributes it to the call
+// itself. Re-anchor the top frame on the originating expression by scanning
+// the source near the reported position.
+function reanchorTopFrame(site, pattern, columnOf, message = undefined) {
+  if (!site?.fileName || !Number.isFinite(site.lineNumber)) return;
+  // Dynamically evaluated sources are not transpiled, so JSC's position is
+  // already the one Bun reports.
+  if (dynamicSources.has(site.fileName)) return;
+  const lines = frameSourceLines(site.fileName);
+  if (!Array.isArray(lines)) return;
+  // When the error message appears verbatim in the source it disambiguates
+  // which of several nearby `new Error(...)` expressions produced this error.
+  const hint = typeof message === "string" && message !== "" && !message.includes("\n") ? message : null;
+  const reportedLine = Math.min(site.lineNumber, lines.length);
+  for (const requireHint of hint === null ? [false] : [true, false]) {
+    for (let offset = 0; offset <= 4; offset += 1) {
+      for (const line of offset === 0 ? [reportedLine] : [reportedLine - offset, reportedLine + offset]) {
+        if (line < 1 || line > lines.length) continue;
+        const text = lines[line - 1];
+        if (requireHint && !text.includes(hint)) continue;
+        pattern.lastIndex = 0;
+        let match;
+        let found = null;
+        while ((match = pattern.exec(text)) !== null) {
+          const anchorColumn = match.index + match[0].length; // 1-based column just past the match
+          // On the reported line the originating call must end at or before the
+          // reported position.
+          if (line === reportedLine && Number.isFinite(site.columnNumber) && anchorColumn > site.columnNumber) continue;
+          found = match;
+        }
+        if (!found) continue;
+        site.lineNumber = line;
+        site.columnNumber = columnOf(found);
+        return;
+      }
+    }
+  }
+}
+
+// `new Error(...)` frames point at the constructor name (Bun: `at <anonymous>
+// (file:32:19)` for `  const err = new Error(...)`).
+function reanchorTopFrameOnConstructor(site, constructorName, message = undefined) {
+  if (typeof constructorName !== "string" || !/^[A-Za-z_$][\w$]*$/.test(constructorName)) return;
+  const escaped = constructorName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  reanchorTopFrame(
+    site,
+    new RegExp(`\\bnew\\s+${escaped}\\s*\\(`, "g"),
+    (match) => match.index + match[0].lastIndexOf("(") - constructorName.length + 1,
+    message,
+  );
+}
+
+// `Error.captureStackTrace(obj)` frames point at the call's open paren (Bun:
+// `at f (file:12:26)` for `  Error.captureStackTrace(err);`).
+function reanchorTopFrameOnCaptureStackTrace(site) {
+  reanchorTopFrame(
+    site,
+    /\.captureStackTrace\s*\(/g,
+    (match) => match.index + match[0].length,
+  );
+}
+
+const parseCallSites = (stack, fallbackSourceURL = undefined, evalPosition = undefined) => {
   const sites = String(stack ?? "").split("\n").filter(Boolean).map((line) => {
     const separator = line.indexOf("@");
     let functionName = separator < 0 ? line : line.slice(0, separator);
@@ -718,6 +882,7 @@ const parseCallSites = (stack, fallbackSourceURL = undefined) => {
       constructorFrame: constructorName !== null,
     });
   });
+  resolveDynamicEvalFrames(sites, evalPosition);
   correctCallerLocations(sites);
   const hasEvalFrames = sites.slice(0, 3).some(site => site.evalFrame || site.nativeFrame);
   const evalSourceURL = evalSourceURLFromCallSites(sites);
@@ -730,28 +895,120 @@ const parseCallSites = (stack, fallbackSourceURL = undefined) => {
       }
     }
   }
-  return sites;
+  // Cottontail runs user entry points and test callbacks through its own JS
+  // machinery (node:module loader, node:async_hooks storage wrappers, the
+  // node:test runner). Bun's native driver never surfaces those frames, so
+  // stacks captured in user code hide the loader frames entirely and end at
+  // the outermost user frame.
+  const visible = sites.filter((site) => {
+    const fileName = site.fileName;
+    // Note: the location parser splits ":line:column" off, so the fileName of
+    // a "node:module:2783:19" frame is exactly "node:module".
+    return fileName !== "node:module";
+  });
+  while (visible.length > 0) {
+    const fileName = visible[visible.length - 1].fileName;
+    if (typeof fileName === "string" && /^(?:node|bun):/.test(fileName)) visible.pop();
+    else break;
+  }
+  return visible;
 };
 
-function limitedCallSites(stack, fallbackSourceURL = undefined, configuredLimit = Error.stackTraceLimit) {
-  const sites = parseCallSites(stack, fallbackSourceURL);
+function limitedCallSites(stack, fallbackSourceURL = undefined, configuredLimit = Error.stackTraceLimit, evalPosition = undefined) {
+  let sites = parseCallSites(stack, fallbackSourceURL, evalPosition);
+  sites = sites.filter((site) => {
+    const f = site.file ?? site.getFileName?.() ?? "";
+    return !(f.includes("runtime_modules/bun/index.js") || f.includes(".cottontail-embedded-runtime") || f.includes("/src/runtime_modules/") || f.includes(".cottontail-tmp") || f.includes("cottontail:") || f.includes("cottontail-direct-entry"));
+  });
   const limit = Number(configuredLimit);
   return Number.isFinite(limit) && limit >= 0 ? sites.slice(0, Math.floor(limit)) : sites;
 }
 
+const asyncFunctionPrototype = Object.getPrototypeOf(async function() {});
+
+function isAsyncFunction(value) {
+  try {
+    return Object.getPrototypeOf(value) === asyncFunctionPrototype;
+  } catch {
+    return false;
+  }
+}
+
+// COTTONTAIL-COMPAT: Error.captureStackTrace - stock JSC filters an async
+// constructorOpt before tracking its await ancestry. Native filtering remains
+// authoritative for synchronous functions; this fallback mirrors Bun's name
+// match for a resumed async function. Remove it when the vendored engine
+// provides Bun's capture-then-filter behavior.
+function callSitesBelowAsyncConstructor(callSites, constructorOpt) {
+  let constructorName = "";
+  try {
+    // Reading `.name` can invoke a user-defined getter. Bun gets the
+    // executable name internally, without observable property access; the
+    // ordinary own data property is the closest side-effect-free JS view.
+    const name = Object.getOwnPropertyDescriptor(constructorOpt, "name")?.value;
+    if (typeof name === "string") constructorName = name;
+  } catch {}
+  for (let index = 0; index < callSites.length; index += 1) {
+    const site = callSites[index];
+    // A resumed async function is the last synchronous boundary. Its parents
+    // are synthetic async frames and must survive when that boundary matches.
+    if (site.isAsync()) break;
+    if (site.getFunction() === constructorOpt ||
+        (constructorName !== "" && site.getFunctionName() === constructorName)) {
+      return callSites.slice(index + 1);
+    }
+  }
+  // Bun's capture-then-filter rewrite clears the trace when constructorOpt is
+  // not found before the first synthetic async frame.
+  return [];
+}
+
 const bunAccessedErrorStacks = new WeakSet();
+let prepareStackTraceRecursionGuard = false;
 
 if (typeof nativeCaptureStackTrace === "function" && !Error.captureStackTrace.__cottontailStructuredCallSites) {
   const captureStackTrace = function(target, constructorOpt = undefined) {
     const prepare = Error.prepareStackTrace;
     const requestedLimit = Error.stackTraceLimit;
+    const requestedLimitNumber = Number(requestedLimit);
+    let collectingWithInternalState = true;
     Error.prepareStackTrace = undefined;
-    if (Number.isFinite(Number(requestedLimit)) && Number(requestedLimit) < 100) Error.stackTraceLimit = 100;
+    // Apply the requested limit only after the JS wrapper and constructorOpt
+    // boundary have been removed. Otherwise either one can consume visible
+    // frame slots before the user portion of the trace is reached.
+    if (Number.isFinite(requestedLimitNumber) && requestedLimitNumber >= 0) Error.stackTraceLimit = Infinity;
     try {
-      const holder = {};
-      nativeCaptureStackTrace(holder, constructorOpt);
-      const rawStack = ctRemapStackString(holder.stack);
-      const callSites = limitedCallSites(rawStack, undefined, requestedLimit);
+      let rawStack;
+      let callSites;
+      if (typeof constructorOpt === "function") {
+        const filteredHolder = {};
+        nativeCaptureStackTrace(filteredHolder, constructorOpt);
+        rawStack = ctRemapStackString(filteredHolder.stack);
+        callSites = limitedCallSites(rawStack, undefined, Infinity);
+        if (callSites.length === 0 && isAsyncFunction(constructorOpt)) {
+          const asyncHolder = {};
+          nativeCaptureStackTrace(asyncHolder);
+          rawStack = ctRemapStackString(asyncHolder.stack);
+          callSites = callSitesBelowAsyncConstructor(
+            limitedCallSites(rawStack, undefined, Infinity),
+            constructorOpt,
+          );
+        }
+      } else {
+        const holder = {};
+        nativeCaptureStackTrace(holder);
+        rawStack = ctRemapStackString(holder.stack);
+        callSites = limitedCallSites(rawStack, undefined, Infinity);
+      }
+      if (Number.isFinite(requestedLimitNumber) && requestedLimitNumber >= 0) {
+        callSites = callSites.slice(0, Math.floor(requestedLimitNumber));
+      }
+      if (constructorOpt === undefined) reanchorTopFrameOnCaptureStackTrace(callSites[0]);
+      // Native collection needs prepareStackTrace disabled and an expanded
+      // limit, but user formatting must observe the requested public state.
+      Error.stackTraceLimit = requestedLimit;
+      Error.prepareStackTrace = prepare;
+      collectingWithInternalState = false;
       Object.defineProperty(target, "stack", {
         configurable: true,
         enumerable: false,
@@ -759,7 +1016,19 @@ if (typeof nativeCaptureStackTrace === "function" && !Error.captureStackTrace.__
         value: rawStack,
       });
       if (typeof prepare === "function") {
-        target.stack = prepare(target, callSites);
+        if (prepareStackTraceRecursionGuard) {
+          const name = String(target.name || target.constructor?.name || "Error");
+          const message = target.message == null || target.message === "" ? "" : `: ${String(target.message)}`;
+          const frames = callSites.map((site) => `    at ${site.toString()}`).join("\n");
+          target.stack = `${name}${message}${frames ? `\n${frames}` : ""}`;
+        } else {
+          prepareStackTraceRecursionGuard = true;
+          try {
+            target.stack = prepare(target, callSites);
+          } finally {
+            prepareStackTraceRecursionGuard = false;
+          }
+        }
       } else {
         const name = String(target.name || target.constructor?.name || "Error");
         const message = target.message == null || target.message === "" ? "" : `: ${String(target.message)}`;
@@ -767,8 +1036,13 @@ if (typeof nativeCaptureStackTrace === "function" && !Error.captureStackTrace.__
         target.stack = `${name}${message}${frames ? `\n${frames}` : ""}`;
       }
     } finally {
-      Error.stackTraceLimit = requestedLimit;
-      Error.prepareStackTrace = prepare;
+      // Once public state is restored, preserve any changes made by the user
+      // prepareStackTrace callback just like V8/Bun do. This cleanup is only
+      // for failures during native collection or the restoration itself.
+      if (collectingWithInternalState) {
+        Error.stackTraceLimit = requestedLimit;
+        Error.prepareStackTrace = prepare;
+      }
     }
   };
   Object.defineProperty(captureStackTrace, "__cottontailStructuredCallSites", { value: true });
@@ -776,11 +1050,19 @@ if (typeof nativeCaptureStackTrace === "function" && !Error.captureStackTrace.__
 }
 
 function installNodeStyleErrorConstructor(name) {
-  const NativeError = globalThis[name];
+  let NativeError = globalThis[name];
   if (typeof NativeError !== "function" || NativeError.__cottontailStackHeader) return;
+  // The always-loaded bootstrap installs a light position-remap wrapper (see
+  // internal/runtime-stack-remap.js). Unwrap it and wrap the original
+  // constructor so the rich layer here is the single wrapper — otherwise both
+  // layers would remap line/column and the second would remap already-mapped
+  // values.
+  if (NativeError.__cottontailLightError) NativeError = NativeError.__cottontailOriginalError;
   const CottontailError = function(...args) {
-    const requestedLimit = NativeError.stackTraceLimit;
-    if (Number.isFinite(Number(requestedLimit)) && Number(requestedLimit) < 100) NativeError.stackTraceLimit = 100;
+    const requestedLimit = Reflect.get(NativeError, "stackTraceLimit", NativeError);
+    if (Number.isFinite(Number(requestedLimit)) && Number(requestedLimit) < 100) {
+      Reflect.set(NativeError, "stackTraceLimit", 100, NativeError);
+    }
     const StackError = globalThis.Error;
     const nativePrepare = StackError?.prepareStackTrace;
     const underlyingPrepare = NativeError.prepareStackTrace;
@@ -792,9 +1074,15 @@ function installNodeStyleErrorConstructor(name) {
       error = Reflect.construct(NativeError, args, new.target || CottontailError);
       rawStack = error.stack;
     } finally {
-      NativeError.stackTraceLimit = requestedLimit;
+      Reflect.set(NativeError, "stackTraceLimit", requestedLimit, NativeError);
       Reflect.set(NativeError, "prepareStackTrace", underlyingPrepare);
       if (StackError) Reflect.set(StackError, "prepareStackTrace", nativePrepare);
+    }
+    if (Number(requestedLimit) === 0) {
+      // Bun captures no stack while Error.stackTraceLimit is 0: the error has
+      // no own "stack" property and reading it yields undefined.
+      delete error.stack;
+      rawStack = undefined;
     }
     const generatedPosition = {
       line: Number(error.line),
@@ -849,9 +1137,29 @@ function installNodeStyleErrorConstructor(name) {
             // caller file names).
             const prepare = Error.prepareStackTrace;
             const remappedStack = ctRemapStackString(rawStack);
-            const callSites = limitedCallSites(remappedStack, generatedPosition.sourceURL);
+            const callSites = limitedCallSites(
+              remappedStack, generatedPosition.sourceURL, Error.stackTraceLimit, generatedPosition);
+            try {
+              Object.defineProperty(error, dynamicCallSitesSymbol, { configurable: true, value: callSites });
+            } catch {}
+            reanchorTopFrameOnConstructor(callSites[0], error.constructor?.name ?? name, error.message);
             if (typeof prepare === "function") {
-              cached = prepare(error, callSites);
+              if (prepareStackTraceRecursionGuard) {
+                const errorName = error.name === undefined ? name : String(error.name);
+                const errorMessage = error.message == null ? "" : String(error.message);
+                const header = errorName === ""
+                  ? errorMessage
+                  : errorMessage === "" ? errorName : `${errorName}: ${errorMessage}`;
+                const frames = callSites.map((site) => `    at ${site.toString()}`).join("\n");
+                cached = `${header}${frames ? `\n${frames}` : ""}`;
+              } else {
+                prepareStackTraceRecursionGuard = true;
+                try {
+                  cached = prepare(error, callSites);
+                } finally {
+                  prepareStackTraceRecursionGuard = false;
+                }
+              }
               return cached;
             }
             const errorName = error.name === undefined ? name : String(error.name);
@@ -881,10 +1189,13 @@ function installNodeStyleErrorConstructor(name) {
       configurable: stackTraceLimit.configurable,
       enumerable: stackTraceLimit.enumerable,
       get() {
-        return NativeError.stackTraceLimit;
+        return Reflect.get(NativeError, "stackTraceLimit", NativeError);
       },
       set(value) {
-        NativeError.stackTraceLimit = value;
+        // Embedded runtime modules can compile a direct built-in property put
+        // without calling ErrorConstructor::put, leaving JSC's per-global
+        // stack limit stale even though the visible property changed.
+        Reflect.set(NativeError, "stackTraceLimit", value, NativeError);
       },
     });
   }
@@ -937,11 +1248,74 @@ if (Error.prepareStackTrace === undefined) {
   Error.prepareStackTrace = defaultPrepareStackTrace;
 }
 
+// JSC names the top-level frame of a program "global code" (and of a direct
+// eval "eval code"); Bun renders the former with no function name at all and
+// the latter as "eval".
+function bunStackFrameText(site) {
+  const functionName = site.getFunctionName?.() ?? site.functionName ?? null;
+  if (functionName === "global code" || functionName === "module code") {
+    const fileName = site.getFileName?.() ?? site.fileName ?? null;
+    if (!fileName) return "at <anonymous> (unknown)";
+    const line = site.getLineNumber?.() ?? site.lineNumber;
+    const column = site.getColumnNumber?.() ?? site.columnNumber;
+    return `at ${fileName}${line == null ? "" : `:${line}${column == null ? "" : `:${column}`}`}`;
+  }
+  if (functionName === "eval code") {
+    const clone = new CottontailCallSite(site);
+    clone.functionName = "eval";
+    return `at ${clone.toString()}`;
+  }
+  return `at ${site.toString()}`;
+}
+
 // Shared hooks so other runtime modules (uncaught-error printing, test
 // reporters) can remap bundle stack positions without importing this module.
+globalThis.__cottontailBunStackFrames ??= (stack, fallbackSourceURL = undefined) =>
+  limitedCallSites(ctRemapStackString(stack), fallbackSourceURL, Infinity);
+globalThis.__cottontailBunStackFrameText ??= bunStackFrameText;
 globalThis.__cottontailRemapStackString ??= ctRemapStackString;
 globalThis.__cottontailRemapPosition ??= remapBundlePosition;
 globalThis.__cottontailSourceContextForLocation ??= bundleSourceContextForLocation;
+
+// Run-mode uncaught printer for the FULL runtime path (entries that use
+// `require`, etc.). The selective bootstrap (internal/runtime-bootstrap-core.js)
+// installs its own formatter, and bun:test installs a richer one — this only
+// fills the gap for full run mode, where neither is loaded. It renders coded
+// system errors (ENOENT, ...) the way Bun does — no "Error:" prefix and a
+// right-aligned path/syscall/errno/code block — and defers everything else to
+// the native fallback by returning undefined. Descriptor reads keep a
+// booby-trapped accessor (e.g. err-fd-fixture's throwing `fd`) from aborting
+// the report.
+if (globalThis.__cottontailFormatUncaughtException == null) {
+  const ownDescriptorValue = (object, key) => {
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(object, key);
+      return descriptor && "value" in descriptor ? descriptor.value : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  globalThis.__cottontailFormatUncaughtException = (error) => {
+    if (!error || typeof error !== "object") return undefined;
+    const code = ownDescriptorValue(error, "code");
+    const syscall = ownDescriptorValue(error, "syscall");
+    const errno = ownDescriptorValue(error, "errno");
+    const message = ownDescriptorValue(error, "message");
+    if (typeof code !== "string" || typeof syscall !== "string" ||
+        typeof errno !== "number" || typeof message !== "string") {
+      return undefined;
+    }
+    const path = ownDescriptorValue(error, "path");
+    const fields = [
+      ...(path === undefined ? [] : [["path", JSON.stringify(path)]]),
+      ["syscall", JSON.stringify(syscall)],
+      ["errno", String(errno)],
+      ["code", JSON.stringify(code)],
+    ];
+    return `${message}\n${fields.map(([key, field], index) =>
+      `${key.padStart(8)}: ${field}${index + 1 === fields.length ? "" : ","}`).join("\n")}`;
+  };
+}
 
 if (typeof JSON.parse === "function" && !JSON.parse.__cottontailStackHeader) {
   const nativeJSONParse = JSON.parse;
@@ -1568,12 +1942,22 @@ function normalizeSpawnOptions(options = {}, defaults = {}, sync = false) {
     input = sharedArrayBufferBytes(input);
   }
   const stdinFileBacked = input != null && isBunFileLike(input) && typeof input._bunFilePath === "string";
-  // Bun.file(...) as stdin: read the file contents and feed them as input,
-  // matching bun's behavior of wiring the file to the child's stdin.
+  // Bun.file(...) as stdin: hand the child the opened descriptor so it sees a
+  // real file (seekable, no ref/unref on process.stdin) instead of a pipe. An
+  // unopenable path leaves the child with empty stdin, which is what Bun does.
   if (stdinFileBacked) {
+    let fileFd = null;
     try {
-      input = asBuffer(cottontail.readFileBuffer ? cottontail.readFileBuffer(input._bunFilePath) : cottontail.readFile(input._bunFilePath));
+      fileFd = Number(cottontail.openFd(input._bunFilePath, "r", 0o666));
     } catch {
+      fileFd = null;
+    }
+    if (fileFd != null && Number.isInteger(fileFd) && fileFd >= 0) {
+      details.stdinFd = fileFd;
+      details.stdinFdOwned = true;
+      stdin = "inherit";
+      input = undefined;
+    } else {
       input = asBuffer("");
     }
   }
@@ -1617,7 +2001,7 @@ function normalizeSpawnOptions(options = {}, defaults = {}, sync = false) {
     stdoutFd: details.stdoutFd,
     stderrFd: details.stderrFd,
     extraStdio: details.extraStdio,
-    stdinFileBacked,
+    stdinFdOwned: details.stdinFdOwned === true,
     input: input != null && input !== "pipe" && input !== "inherit" && input !== "ignore" ? input : undefined,
     killSignal: killSignalNumber,
     maxBuffer,
@@ -1688,7 +2072,6 @@ function prepareNativeSpawnOptions(file, nativeOptions, args = []) {
       : { ...nativeOptions.env };
     env.COTTONTAIL_SPAWN_EXEC_PATH = nodePathResolve(String(file));
     if (nativeOptions.argv0 !== undefined) env.COTTONTAIL_SPAWN_ARGV0 = nativeOptions.argv0;
-    if (nativeOptions.stdinFileBacked) env.COTTONTAIL_SPAWN_STDIN_FILE = "1";
     return {
       ...nativeOptions,
       env,
@@ -1701,12 +2084,17 @@ function prepareNativeSpawnOptions(file, nativeOptions, args = []) {
     const env = nativeOptions.env === undefined
       ? withoutElectrobunHostEnv(currentProcessEnv())
       : { ...nativeOptions.env };
+    const injected = [];
     for (const key of ["DASH_COTTONTAIL", "COTTONTAIL_BINARY"]) {
-      if (env[key] === undefined) {
-        const inherited = currentProcessEnv()[key];
-        if (inherited !== undefined) env[key] = String(inherited);
-      }
+      if (env[key] !== undefined) continue;
+      const inherited = globalThis.__cottontailFacadeRoutingEnv?.[key] ?? currentProcessEnv()[key];
+      if (inherited === undefined) continue;
+      env[key] = String(inherited);
+      injected.push(key);
     }
+    // The wrapper's runtime drops exactly what we added here, so a child that
+    // was given an explicit environment still observes only that environment.
+    if (injected.length > 0) env.COTTONTAIL_SPAWN_ROUTING = injected.join(",");
     return {
       ...nativeOptions,
       env,
@@ -2460,6 +2848,20 @@ function normalizedFetchAbortReason(signal) {
 
 function normalizeFetchNetworkError(error) {
   if (error?.name === "AbortError" || error?.name === "TimeoutError") return error;
+  // Linux can report a reset socket as EBADF when the descriptor is invalidated
+  // before libuv delivers its queued read event. That is native watcher
+  // bookkeeping, not a meaningful fetch error; fetch observes a connected peer
+  // disappearing before any response as ECONNRESET.
+  if (
+    process.platform === "linux" &&
+    error?.code === "EBADF" &&
+    /bad file descriptor/i.test(String(error?.message ?? ""))
+  ) {
+    const normalized = new Error("The socket connection was closed unexpectedly.");
+    normalized.code = "ECONNRESET";
+    normalized.cause = error;
+    return normalized;
+  }
   if (typeof error?.message === "string" && /^self-signed certificate\b/i.test(error.message)) {
     error.message = error.message.replace(/^self-signed certificate/i, "self signed certificate");
     return error;
@@ -2904,6 +3306,14 @@ function fetchOnceUsingNodeClient(request, redirected = false, transport = {}, o
   }
 }
 
+function fetchRequestTargetPath(url) {
+  // Collapse leading duplicate slashes ("//redirect" -> "/redirect") so the
+  // origin-form request-target isn't misread as an authority. Bun normalizes
+  // only leading slashes; internal ones ("/a//b") are preserved verbatim.
+  const pathname = (url.pathname || "/").replace(/^\/{2,}/, "/");
+  return `${pathname}${url.search || ""}`;
+}
+
 function dispatchNodeFetchRequest(request, redirected, transport, onResponse, url, keepalive, body) {
   if (body.length != null && !request.headers.has("content-length") && !request.headers.has("transfer-encoding")) {
     request.headers.set("Content-Length", String(body.length));
@@ -2912,7 +3322,7 @@ function dispatchNodeFetchRequest(request, redirected, transport, onResponse, ur
   let client = url.protocol === "https:" ? nodeHttps : nodeHttp;
   let hostname = String(url.hostname).replace(/^\[|\]$/g, "");
   let port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
-  let path = `${url.pathname || "/"}${url.search || ""}`;
+  let path = fetchRequestTargetPath(url);
   let tlsOptions = null;
   const getTlsOptions = () => tlsOptions ??= fetchTlsOptions(url, transport.tlsConfig);
   let agent = keepalive ? defaultFetchHttpAgent() : false;
@@ -3083,16 +3493,65 @@ async function fetchOnceFromNodeHttp(request, redirected = false, transport = {}
     if (error && error.__cottontailPooledRetry) {
       return fetchSocketAttempt(request, redirected, transport, false);
     }
-    throw error;
+    throw normalizeFetchNetworkError(error);
   }
 }
 
 const EMPTY_BUFFER = new Uint8Array(0);
 
+// Bun caps simultaneous outbound HTTP requests (BUN_CONFIG_MAX_HTTP_REQUESTS,
+// default 256) and queues the rest. Without the cap, a burst of thousands of
+// concurrent fetches opens a socket (and a connect helper thread) apiece,
+// wedging both this process and any thread-per-connection peer.
+const maxSimultaneousFetchSockets = (() => {
+  const raw = Number(globalThis.process?.env?.BUN_CONFIG_MAX_HTTP_REQUESTS);
+  return Number.isFinite(raw) && raw >= 1 ? Math.min(Math.trunc(raw), 65336) : 256;
+})();
+let activeFetchSocketCount = 0;
+const pendingFetchSocketWaiters = [];
+
+function acquireFetchSocketSlot(signal) {
+  if (activeFetchSocketCount < maxSimultaneousFetchSockets) {
+    activeFetchSocketCount += 1;
+    return null;
+  }
+  return new Promise((resolve, reject) => {
+    const waiter = { resolve, reject, signal, onAbort: null };
+    if (signal && typeof signal.addEventListener === "function") {
+      waiter.onAbort = () => {
+        const index = pendingFetchSocketWaiters.indexOf(waiter);
+        if (index !== -1) pendingFetchSocketWaiters.splice(index, 1);
+        reject(normalizedFetchAbortReason(signal));
+      };
+      signal.addEventListener("abort", waiter.onAbort, { once: true });
+    }
+    pendingFetchSocketWaiters.push(waiter);
+  });
+}
+
+function releaseFetchSocketSlot() {
+  const waiter = pendingFetchSocketWaiters.shift();
+  if (waiter != null) {
+    waiter.signal?.removeEventListener?.("abort", waiter.onAbort);
+    // The slot transfers to the waiter; the active count stays constant.
+    waiter.resolve();
+    return;
+  }
+  if (activeFetchSocketCount > 0) activeFetchSocketCount -= 1;
+}
+
 async function fetchSocketAttempt(request, redirected, transport, usePool) {
   const body = request.method === "GET" || request.method === "HEAD"
     ? Buffer.alloc(0)
     : Buffer.from(await bytesFromBody(request._body));
+  const slotWait = acquireFetchSocketSlot(request.signal);
+  if (slotWait != null) await slotWait;
+  let fetchSocketSlotReleased = false;
+  const releaseFetchSlot = () => {
+    if (fetchSocketSlotReleased) return;
+    fetchSocketSlotReleased = true;
+    releaseFetchSocketSlot();
+  };
   return new Promise((resolve, reject) => {
     const suppliedUrl = transport.parsedUrl;
     const url = suppliedUrl?.href === request.url ? suppliedUrl : parsedFetchUrl(request.url);
@@ -3144,6 +3603,7 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
         : nodeNet.connect(port, hostname));
 
     const cleanup = () => {
+      releaseFetchSlot();
       try { socket.destroy?.(); } catch {}
     };
 
@@ -3152,6 +3612,7 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
     let socketGone = false;
     let responseConnectionClose = false;
     const repoolSocket = () => {
+      releaseFetchSlot();
       for (const name of ["data", "error", "end", "close", "connect", "secureConnect"]) {
         socket.removeAllListeners?.(name);
       }
@@ -3225,7 +3686,7 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
     ) {
       headerLines.push("Content-Length: 0");
     }
-    const path = `${url.pathname || "/"}${url.search || ""}`;
+    const path = fetchRequestTargetPath(url);
     const head = `${request.method} ${path} HTTP/1.1\r\n${headerLines.join("\r\n")}\r\n\r\n`;
 
     let requestSent = false;
@@ -3964,6 +4425,8 @@ function decodeFetchResponse(response, decompress = true) {
 
 function activeServeRequestBody(body) {
   let controller;
+  let bodyReader = null;
+  let bodyIterator = null;
   const state = {
     byteSize: requestBodyByteSize(body),
     settled: false,
@@ -3979,11 +4442,43 @@ function activeServeRequestBody(body) {
       }
     },
   };
+  // Open-ended bodies (streams, async iterables, node Readables) must feed
+  // the handler incrementally: one chunk per pull, so a server reading the
+  // request body sees data as the client produces it (node-fetch "request
+  // body streams properly"). Buffered bodies keep the single-shot path.
+  const isOpenEndedBody = body != null && typeof body !== "string" &&
+    !(body instanceof ArrayBuffer) && !ArrayBuffer.isView(body) &&
+    !(typeof globalThis.Blob === "function" && body instanceof globalThis.Blob) &&
+    (typeof body?.getReader === "function" || typeof body?.[Symbol.asyncIterator] === "function" ||
+     typeof body?.pipe === "function" || typeof body?.read === "function");
   const stream = new globalThis.ReadableStream({
     start(value) {
       controller = value;
     },
     pull() {
+      if (state.settled) return state.pending;
+      if (isOpenEndedBody) {
+        state.pending = (async () => {
+          if (!bodyReader && !bodyIterator) {
+            if (typeof body.getReader === "function") bodyReader = body.getReader();
+            else if (typeof body[Symbol.asyncIterator] === "function") bodyIterator = body[Symbol.asyncIterator]();
+          }
+          if (!bodyReader && !bodyIterator) throw new TypeError("Expected a streaming request body");
+          const { done, value } = bodyReader ? await bodyReader.read() : await bodyIterator.next();
+          if (state.settled) return;
+          if (done) {
+            state.settled = true;
+            controller.close();
+            return;
+          }
+          controller.enqueue(typeof value === "string" ? new TextEncoder().encode(value) : asBuffer(value));
+        })().catch((error) => {
+          if (state.settled) return;
+          state.settled = true;
+          try { controller.error(error); } catch {}
+        });
+        return state.pending;
+      }
       if (state.started) return state.pending;
       state.started = true;
       state.pending = new Promise((resolve) => setTimeout(resolve, 0))
@@ -4426,25 +4921,57 @@ function isMissingFileError(error) {
   return text.includes("ENOENT") || text.includes("No such file or directory") || text.includes("FileNotFound");
 }
 
+// Serve a previously cached static-route snapshot without touching the source
+// Response: no clone, no body snapshot, no byte copies. The cached bytes are
+// shared across requests; the native transport memcpy's them synchronously.
+function finishCachedServeResponse(cached, request) {
+  const method = String(request.method || "GET").toUpperCase();
+  const status = cached.status;
+  const headers = new Headers(cached.headers);
+  if ((method === "GET" || method === "HEAD") && status === 200 && (
+    ifModifiedSinceNotModified(request.headers.get("if-modified-since"), headers.get("last-modified")) ||
+    ifNoneMatchMatches(request.headers.get("if-none-match"), headers.get("etag"))
+  )) {
+    headers.delete("content-length");
+    return normalizeResponse(new Response(null, {
+      status: 304,
+      statusText: cached.statusText,
+      headers,
+    }), request);
+  }
+  const response = new Response(null, {
+    status,
+    statusText: cached.statusText,
+    headers,
+  });
+  if (method !== "HEAD" && statusAllowsBody(status)) response._body = cached.bytes;
+  return normalizeResponse(response, request);
+}
+
+function serveCachedResponse(cached, request, options) {
+  const body = cached.body;
+  if (options.allowFileFallback && isBunFileLike(body) && typeof body.exists === "function") {
+    return Promise.resolve(body.exists()).then(
+      (exists) => (exists ? finishCachedServeResponse(cached, request) : null),
+    );
+  }
+  return finishCachedServeResponse(cached, request);
+}
+
 async function prepareServeResponse(value, request, options = {}) {
-  const cached = options.cacheKey && typeof options.cacheKey === "object"
-    ? serveResponseCache.get(options.cacheKey)
-    : null;
-  const sourceResponse = cached
-    ? cached.response.clone()
-    : normalizeResponse(value instanceof Response
+  const sourceResponse = normalizeResponse(value instanceof Response
       // Static routes share one Response object across requests; take the body
       // from a clone so the original is never consumed, even on paths that do
       // not populate the response cache (HEAD, missing files).
       ? (options.cacheKey != null ? value.clone() : value)
       : new Response(value));
   const headers = new Headers(sourceResponse.headers);
-  const body = cached ? cached.body : sourceResponse._takeBody();
+  const body = sourceResponse._takeBody();
   const method = String(request.method || "GET").toUpperCase();
   const isFile = isBunFileLike(body);
   const fileSlice = bunFileSliceMetadata(body);
   const emptyFileSlice = isFile && bunFileServeSliceIsEmpty(body);
-  const sourceStreaming = !cached && isStreamingBody(body);
+  const sourceStreaming = isStreamingBody(body);
   if (sourceStreaming) trackServeReadableStream(body);
   const streaming = method !== "HEAD" && sourceStreaming;
 
@@ -4453,15 +4980,15 @@ async function prepareServeResponse(value, request, options = {}) {
   }
 
   let status = sourceResponse.status;
-  let bytes = cached?.bytes ?? new Uint8Array(0);
+  let bytes = new Uint8Array(0);
   if (statusAllowsBody(status)) {
-    if (!cached && method === "HEAD" && isFile && Number.isFinite(Number(body.size))) {
+    if (method === "HEAD" && isFile && Number.isFinite(Number(body.size))) {
       bytes = { byteLength: Number(body.size) };
-    } else if (!cached && method === "HEAD" && sourceStreaming) {
+    } else if (method === "HEAD" && sourceStreaming) {
       bytes = { byteLength: 0 };
-    } else if (!cached && !streaming && emptyFileSlice) {
+    } else if (!streaming && emptyFileSlice) {
       bytes = new Uint8Array(0);
-    } else if (!cached && !streaming) {
+    } else if (!streaming) {
       try {
         bytes = await bytesFromBody(body);
       } catch (error) {
@@ -4514,13 +5041,11 @@ async function prepareServeResponse(value, request, options = {}) {
     headers.set("ETag", entityTagForBytes(bytes));
   }
 
-  if (!streaming && !cached && options.cacheKey && typeof options.cacheKey === "object" && bytes instanceof Uint8Array) {
+  if (!streaming && options.cacheKey && typeof options.cacheKey === "object" && bytes instanceof Uint8Array) {
     serveResponseCache.set(options.cacheKey, {
-      response: new Response(bytes, {
-        status,
-        statusText: sourceResponse.statusText,
-        headers: new Headers(headers),
-      }),
+      status,
+      statusText: sourceResponse.statusText,
+      headers: new Headers(headers),
       body,
       bytes,
     });
@@ -4575,6 +5100,10 @@ function prepareServeResponseResult(value, request, options = {}) {
   if (isPromiseLike(value)) {
     return value.then((resolved) => prepareServeResponseResult(resolved, request, options));
   }
+  const cached = options.cacheKey && typeof options.cacheKey === "object"
+    ? serveResponseCache.get(options.cacheKey)
+    : null;
+  if (cached != null) return serveCachedResponse(cached, request, options);
   return prepareServeResponseSync(value, request, options) ?? prepareServeResponse(value, request, options);
 }
 
@@ -4584,7 +5113,7 @@ function runFetchFallback(options, request, server) {
     const prepare = (resolved) => prepareServeResponseResult(
       resolved instanceof Response
         ? resolved
-        : new Response("Welcome to Bun! To get started, return a Response object.", {
+        : new Response("Welcome to Cottontail! To get started, return a Response object.", {
           status: 200,
           headers: { "content-type": "text/plain; charset=utf-8" },
         }),
@@ -4685,12 +5214,43 @@ function serveResponseWithIdleTimeout(response, idleTimeoutSeconds) {
   return timedResponse;
 }
 
+const serveDispatchFinishedSymbol = Symbol.for("cottontail.serveDispatchFinished");
+
+function markServeDispatchFinished(request, response) {
+  if (request == null) return;
+  // The response may still stream from the request's own body (echo
+  // handlers); leave those alone.
+  const responseBody = response?._body;
+  if (responseBody != null && (responseBody === request._body || responseBody === request._bodyStream)) return;
+  request[serveDispatchFinishedSymbol] = true;
+}
+
+// The native transport force-aborts a request body left unread (even one with
+// a reader attached) when the request is disposed after its response ends.
+// In-process dispatch has no later disposal step, so do it here: pending
+// reads reject with AbortError exactly as they would over a real socket.
+function disposeServeDispatchRequestBody(request, response) {
+  const body = request?._body;
+  const state = body?.[activeServeRequestBodyStateSymbol];
+  if (!state || state.settled || response?._body === body) return;
+  // A streaming response may still be transforming the request body while
+  // the client consumes it; the request only ends with the response there.
+  if (isStreamingBody(response?._body)) return;
+  state.abort(new globalThis.DOMException("The connection was closed.", "AbortError"));
+}
+
 async function dispatchServeFetch(options, server, input, init = {}) {
   const request = input instanceof Request ? input : new Request(String(input), init);
   const dispatchRequest = normalizedServeDispatchRequest(request);
   let response;
   try {
-    response = await runServeHandler(options, dispatchRequest, server);
+    const pending = runServeHandler(options, dispatchRequest, server);
+    // A handler that returned synchronously can never consume the request
+    // body afterwards. Mark before any microtask runs so a body read issued
+    // during the handler rejects with AbortError (as over a real socket)
+    // instead of resolving with bytes the handler never waited for.
+    if (!isPromiseLike(pending)) markServeDispatchFinished(dispatchRequest, pending);
+    response = await pending;
   } catch (error) {
     if (typeof options.error !== "function") {
       finishActiveServeRequestBody(dispatchRequest, null);
@@ -4700,7 +5260,9 @@ async function dispatchServeFetch(options, server, input, init = {}) {
       response = await serveErrorResponse(options, error);
     }
   }
+  markServeDispatchFinished(dispatchRequest, response);
   finishActiveServeRequestBody(dispatchRequest, response);
+  disposeServeDispatchRequestBody(dispatchRequest, response);
   response = serveResponseWithIdleTimeout(response, requestIdleTimeout(dispatchRequest, options.idleTimeout));
   response.url = request.url;
   return response;
@@ -5051,6 +5613,21 @@ function serveHtmlFileDescriptor(path, headers, loader = "file", kind = "entry-p
   return { path, headers: new Headers(headers), loader, kind, hash, sourcemap, cacheKey: {} };
 }
 
+function hasStandaloneServeHtmlFile(path) {
+  const files = globalThis.__cottontailStandaloneFiles;
+  if (files == null) return false;
+  const raw = String(path);
+  const normalized = raw.replace(/\\/g, "/");
+  for (const candidate of normalized === raw ? [raw] : [raw, normalized]) {
+    if (typeof files.has === "function" && typeof files.get === "function") {
+      if (files.has(candidate)) return true;
+    } else if (typeof files === "object" && Object.prototype.hasOwnProperty.call(files, candidate)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function registerServeHtmlManifest(state, manifest) {
   const existing = state.manifests.get(manifest);
   if (existing) return existing;
@@ -5060,8 +5637,11 @@ function registerServeHtmlManifest(state, manifest) {
     if (item == null || typeof item !== "object" || typeof item.path !== "string") continue;
     const absolutePath = nodePathResolve(cwd, item.path);
     let stat;
-    try { stat = cottontail.statSync(absolutePath, true); } catch {}
-    if (!stat?.isFile) {
+    const isStandaloneFile = hasStandaloneServeHtmlFile(absolutePath);
+    if (!isStandaloneFile) {
+      try { stat = cottontail.statSync(absolutePath, true); } catch {}
+    }
+    if (!isStandaloneFile && !stat?.isFile) {
       throw new TypeError(`Bundled file ${item.path} not found. You may want to configure --asset-naming or \`naming\` when bundling.`);
     }
     const descriptor = serveHtmlFileDescriptor(
@@ -5097,6 +5677,17 @@ function registerServeHtmlOptions(state, options) {
   visitServeHtmlRouteValues(state, options?.static);
 }
 
+function invalidateServeHtmlState(state, options = undefined) {
+  if (!state) return;
+  state.generation++;
+  if (options !== undefined) state.options = options;
+  state.assets.clear();
+  state.manifests = new WeakMap();
+  state.sources.clear();
+  state.htmlBySource.clear();
+  state.builtSources.clear();
+}
+
 function createServeHtmlState(options) {
   const state = {
     assets: new Map(),
@@ -5105,8 +5696,10 @@ function createServeHtmlState(options) {
     htmlBySource: new Map(),
     builtSources: new Set(),
     buildPromise: null,
+    buildGeneration: -1,
     configPromise: null,
-    preparedBuildReady: false,
+    generation: 0,
+    options,
   };
   registerServeHtmlOptions(state, options);
   return state;
@@ -5218,7 +5811,17 @@ function serializeServeBuildErrors(owner, root, logs) {
   return globalThis.Buffer.from(new Uint8Array(bytes)).toString("base64");
 }
 
+function invalidateFailedServeHtmlBatch(state, development, batch) {
+  if (!development) return;
+  // A failed development rebuild must not leave the affected HTML routes
+  // serving their previous successful descriptors. Keep unrelated generated
+  // assets intact, but make the next route request observe (and report) the
+  // failed build instead of returning stale HTML with a 200 status.
+  for (const source of batch) state.htmlBySource.delete(nodePathResolve(source));
+}
+
 async function buildServeHtmlBatch(state, options, batch) {
+  const generation = state.generation;
   const development = serveIsDevelopment(options);
   const root = commonHtmlBuildRoot(batch);
   const inspectorState = state.inspectorState;
@@ -5230,6 +5833,7 @@ async function buildServeHtmlBatch(state, options, batch) {
     });
   }
   const config = await serveHtmlBuildConfig(state);
+  if (generation !== state.generation) return;
   const buildOptions = {
     entrypoints: batch,
     target: "browser",
@@ -5251,6 +5855,8 @@ async function buildServeHtmlBatch(state, options, batch) {
   try {
     result = await build(buildOptions);
   } catch (error) {
+    if (generation !== state.generation) return;
+    invalidateFailedServeHtmlBatch(state, development, batch);
     const logs = error instanceof AggregateError ? error.errors : [error];
     if (inspectorState) {
       inspectorEmit("BunFrontendDevServer.bundleFailed", {
@@ -5260,7 +5866,9 @@ async function buildServeHtmlBatch(state, options, batch) {
     }
     throw error;
   }
+  if (generation !== state.generation) return;
   if (!result.success) {
+    invalidateFailedServeHtmlBatch(state, development, batch);
     if (inspectorState) {
       inspectorEmit("BunFrontendDevServer.bundleFailed", {
         serverId: inspectorState.id,
@@ -5306,6 +5914,7 @@ async function buildServeHtmlBatch(state, options, batch) {
   for (const { descriptor } of outputDescriptors) {
     if (!new Set(["html", "css", "js"]).has(descriptor.loader)) continue;
     let contents = await descriptor.artifact.text();
+    if (generation !== state.generation) return;
     if (!contents.includes("/../")) continue;
     for (const { route } of outputDescriptors) {
       const basename = nodePathBasename(route);
@@ -5315,6 +5924,7 @@ async function buildServeHtmlBatch(state, options, batch) {
     descriptor.body = contents;
   }
 
+  if (generation !== state.generation) return;
   const unmatched = [...htmlOutputs];
   for (const source of batch) {
     const relative = nodePathRelative(root, source).replace(/\\/g, "/").replace(/^\.\//, "");
@@ -5336,29 +5946,43 @@ async function buildServeHtmlBatch(state, options, batch) {
   }
 }
 
+function startServeHtmlBuild(state, options, batch) {
+  const generation = state.generation;
+  let promise;
+  promise = buildServeHtmlBatch(state, options, batch).finally(() => {
+    if (state.buildPromise !== promise) return;
+    state.buildPromise = null;
+    state.buildGeneration = -1;
+  });
+  state.buildPromise = promise;
+  state.buildGeneration = generation;
+  return promise;
+}
+
 function ensureServeHtmlSource(state, options, source) {
   const absoluteSource = nodePathResolve(source);
+  const generation = state.generation;
   state.sources.add(absoluteSource);
   const ready = state.htmlBySource.get(absoluteSource);
   const development = serveIsDevelopment(options);
-  if (ready && (!development || state.preparedBuildReady)) {
-    state.preparedBuildReady = false;
-    return Promise.resolve(ready);
-  }
-  if (!state.buildPromise) {
-    if (development) {
-      state.assets.clear();
-      state.htmlBySource.clear();
-      state.builtSources.clear();
-    }
+  if (ready && !development) return Promise.resolve(ready);
+  if (!state.buildPromise || state.buildGeneration !== generation) {
     const batch = development
       ? [...state.sources]
       : [...state.sources].filter(path => !state.builtSources.has(path));
-    state.buildPromise = buildServeHtmlBatch(state, options, batch).finally(() => {
-      state.buildPromise = null;
-    });
+    startServeHtmlBuild(state, options, batch);
   }
-  return state.buildPromise.then(() => {
+  const buildPromise = state.buildPromise;
+  return buildPromise.then(() => {
+    if (generation !== state.generation) {
+      // A reload owns the new source set. An older request may finish after the
+      // reload, but it must not add a removed source back or compile the new
+      // generation with its stale development/options object.
+      if (!state.sources.has(absoluteSource)) {
+        throw new Error(`HTML route was reloaded while bundling: ${absoluteSource}`);
+      }
+      return ensureServeHtmlSource(state, state.options, absoluteSource);
+    }
     const descriptor = state.htmlBySource.get(absoluteSource);
     if (descriptor) return descriptor;
     return ensureServeHtmlSource(state, options, absoluteSource);
@@ -5369,16 +5993,12 @@ async function prepareServeHtml(options, config) {
   if (options == null || typeof options !== "object") return;
   const state = options[serveHtmlStateSymbol] ?? createServeHtmlState(options);
   options[serveHtmlStateSymbol] = state;
+  state.options = options;
   state.configPromise = Promise.resolve(config);
   const batch = [...state.sources];
-  if (batch.length === 0 || state.buildPromise) return state.buildPromise;
-  state.buildPromise = buildServeHtmlBatch(state, options, batch);
-  try {
-    await state.buildPromise;
-    state.preparedBuildReady = true;
-  } finally {
-    state.buildPromise = null;
-  }
+  if (batch.length === 0) return;
+  if (state.buildPromise && state.buildGeneration === state.generation) return state.buildPromise;
+  await startServeHtmlBuild(state, options, batch);
 }
 
 Object.defineProperty(globalThis, prepareServeHtmlSymbol, {
@@ -5499,7 +6119,9 @@ function normalizeServeHostname(value) {
 function normalizeServeUnixPath(value) {
   if (value === null || value === undefined) return "";
   const path = coerceServeOptionString(value, "unix");
-  if (path.includes("\0")) throw new TypeError("unix must not contain NUL bytes");
+  const nulIndex = path.indexOf("\0");
+  const linuxAbstractPath = process.platform === "linux" && nulIndex === 0 && !path.slice(1).includes("\0");
+  if (nulIndex !== -1 && !linuxAbstractPath) throw new TypeError("unix must not contain NUL bytes");
   return path;
 }
 
@@ -5676,15 +6298,21 @@ function flushServerWebSocketFrames(state) {
   if (state.pendingFrames.length === 0) return;
   const frames = state.pendingFrames;
   const byteLength = state.pendingFrameBytes;
+  const payloadByteLength = state.pendingPayloadBytes;
   state.pendingFrames = [];
   state.pendingFrameBytes = 0;
+  state.pendingPayloadBytes = 0;
   const socket = state.socket;
-  if (!socket || socket.destroyed || !socket.writable || state.finalized) return;
+  if (!socket || socket.destroyed || !socket.writable || state.finalized) {
+    state.bufferedPayloadBytes = Math.max(0, state.bufferedPayloadBytes - payloadByteLength);
+    return;
+  }
   const output = frames.length === 1 ? frames[0] : Buffer.concat(frames, byteLength);
   const ok = socket.write(output, () => {
-    if (state.wantDrain && socket.writableLength === 0) scheduleServerWebSocketDrain(state);
+    state.bufferedPayloadBytes = Math.max(0, state.bufferedPayloadBytes - payloadByteLength);
+    if (state.wantDrain && state.bufferedPayloadBytes === 0) scheduleServerWebSocketDrain(state);
   });
-  if (!ok || socket.writableLength > state.config.backpressureLimit) {
+  if (!ok) {
     state.wantDrain = true;
     if (state.config.closeOnBackpressureLimit) terminateServerWebSocket(state);
   }
@@ -5706,19 +6334,23 @@ function sendServerWebSocketFrame(state, opcode, data, compress = false) {
   }
   const limit = state.config.backpressureLimit;
   if (state.wantDrain) return 0;
-  if (socket.writableLength + state.pendingFrameBytes > limit) {
-    state.wantDrain = true;
-    if (state.config.closeOnBackpressureLimit) terminateServerWebSocket(state);
-    return -1;
-  }
   const frame = encodeServerWebSocketFrame(opcode, payload, rsv1);
+  // Keep a positive byte ceiling effective for empty messages and control
+  // frames too. Their payload length is zero, but each queued frame still owns
+  // memory until the socket write completes.
+  const accountedPayloadByteLength = Math.max(1, payload.byteLength);
   state.pendingFrames.push(frame);
   state.pendingFrameBytes += frame.byteLength;
+  state.pendingPayloadBytes += accountedPayloadByteLength;
+  state.bufferedPayloadBytes += accountedPayloadByteLength;
   if (!state.frameFlushScheduled) {
     state.frameFlushScheduled = true;
     queueMicrotask(() => flushServerWebSocketFrames(state));
   }
-  if (socket.writableLength + state.pendingFrameBytes > limit) {
+  // Bun's backpressure limit is expressed in message payload bytes. The
+  // encoded RFC 6455 frame header is transport overhead: a one-byte message
+  // must still fit a one-byte limit and return 1. Zero disables the ceiling.
+  if (limit > 0 && state.bufferedPayloadBytes > limit) {
     state.wantDrain = true;
     if (state.config.closeOnBackpressureLimit) terminateServerWebSocket(state);
     return -1;
@@ -5809,6 +6441,8 @@ function terminateServerWebSocket(state) {
   state.pendingClose = { code: 1006, reason: "" };
   state.pendingFrames = [];
   state.pendingFrameBytes = 0;
+  state.pendingPayloadBytes = 0;
+  state.bufferedPayloadBytes = 0;
   try { state.socket?.destroy?.(); } catch {}
   queueMicrotask(() => {
     if (!state.finalized && state.socket?.destroyed) finalizeServerWebSocket(state, 1006, "");
@@ -5978,6 +6612,8 @@ function attachServerWebSocket(serverState, socket, head, data, deflate = null) 
     wantDrain: false,
     pendingFrames: [],
     pendingFrameBytes: 0,
+    pendingPayloadBytes: 0,
+    bufferedPayloadBytes: 0,
     frameFlushScheduled: false,
     finalized: false,
     opened: false,
@@ -6623,8 +7259,10 @@ function serveNodeBacked(options, context) {
       return server.stop(true);
     },
     reload(nextOptions = {}) {
-      registerServeHtmlOptions(activeOptions[serveHtmlStateSymbol], nextOptions);
-      activeOptions = { ...activeOptions, ...nextOptions };
+      const reloadedOptions = { ...activeOptions, ...nextOptions };
+      invalidateServeHtmlState(activeOptions[serveHtmlStateSymbol], reloadedOptions);
+      registerServeHtmlOptions(activeOptions[serveHtmlStateSymbol], reloadedOptions);
+      activeOptions = reloadedOptions;
       server.development = activeOptions.development ?? false;
       return server;
     },
@@ -7068,6 +7706,7 @@ export function serve(options) {
     normalizeServeDateHeader,
     normalizeServeListenErrorCode,
     parseHeadersText,
+    invalidateServeHtmlState,
     registerServeHtmlOptions,
     requestIdleTimeout,
     requestWithLazyURL,
@@ -8154,7 +8793,10 @@ function bunInspectDecodeOriginalPath(lines) {
 function bunInspectBuildMessageDiagnostic(error) {
   if (error?.name !== "BuildMessage") return null;
   const message = String(error.message ?? "");
-  const headline = message.split("\n", 1)[0];
+  // Module-load BuildMessages carry a pre-rendered diagnostic as their
+  // message ("<line> | <source>\n  ^\nerror: <headline>\n    at ..."); Bun's
+  // BuildMessage.message is the bare headline. Recover it when present.
+  const headline = /^error: (.+)$/m.exec(message)?.[1] ?? message.split("\n", 1)[0];
   const location = message.match(/(?:^|\n)\s*at\s+(.+):(\d+):(\d+)\s*$/m) ??
     String(error.stack ?? "").match(/(?:^|\n)\s*at\s+[^\n]*?\(?([^()\n]+):(\d+):(\d+)\)?/);
   if (!location) return null;
@@ -8182,10 +8824,68 @@ function bunInspectBuildMessageDiagnostic(error) {
   return output;
 }
 
+// Errors raised inside a vm context come from a sibling JSC realm whose Error
+// intrinsic never passes through the host stack machinery, so their `.stack`
+// is still a raw JSC trace ("hello@hellohello.js:4:33"). Their frames point at
+// a dynamically evaluated source registered by node:vm rather than a file on
+// disk, which is where the code frame has to come from.
+function bunInspectDynamicSourceDiagnostic(error) {
+  if (error === null || typeof error !== "object") return null;
+  if (Object.prototype.toString.call(error) !== "[object Error]") return null;
+  let rawStack;
+  // Reading `.stack` marks the error as "stack was accessed", which changes how
+  // the ordinary diagnostic renders frames; probing here must stay invisible.
+  const stackWasAccessed = bunAccessedErrorStacks.has(error);
+  try { rawStack = error.stack; } catch { return null; } finally {
+    if (!stackWasAccessed) bunAccessedErrorStacks.delete(error);
+  }
+  let sites = error[dynamicCallSitesSymbol];
+  if (!Array.isArray(sites)) {
+    // Errors raised inside a vm context come from a sibling JSC realm whose
+    // Error intrinsic never passes through the host stack machinery, so their
+    // `.stack` is still a raw JSC trace ("hello@hellohello.js:4:33").
+    if (typeof rawStack !== "string" || rawStack === "" || /^\s*at /m.test(rawStack)) return null;
+    sites = limitedCallSites(ctRemapStackString(rawStack), undefined, Infinity);
+  }
+  sites = sites.filter(site => site.fileName !== "node:vm" && !site.nativeFrame);
+  const top = sites[0];
+  const source = top ? dynamicSources.get(top.fileName) : undefined;
+  if (source === undefined || !Number.isFinite(top.lineNumber)) return null;
+  const lines = source.split(/\r?\n/);
+  const sourceLine = lines[top.lineNumber - 1];
+  if (sourceLine == null) return null;
+  // JSC reports the position of the `(` in `new Error(...)`; Bun's diagnostic
+  // points at the start of the whole construction expression.
+  let column = Number.isFinite(top.columnNumber) ? top.columnNumber : 1;
+  const constructions = /\bnew\s+[A-Za-z_$][\w$.]*\s*\(/g;
+  for (let match; (match = constructions.exec(sourceLine)) !== null;) {
+    if (match.index + match[0].length === column) {
+      column = match.index + 1;
+      break;
+    }
+  }
+  const caret = " ".repeat(String(top.lineNumber).length + 3 + Math.max(0, column - 1)) + "^";
+  const name = error.name === undefined ? "Error" : String(error.name);
+  const label = name === "Error" ? "error" : name;
+  const message = error.message === undefined || error.message === null ? "" : String(error.message);
+  const frames = sites
+    .map((site, index) => {
+      if (index !== 0) return `      ${bunStackFrameText(site)}`;
+      const clone = new CottontailCallSite(site);
+      clone.columnNumber = column;
+      return `      ${bunStackFrameText(clone)}`;
+    })
+    .join("\n");
+  return `${top.lineNumber} | ${sourceLine}\n${caret}\n${label}: ${message}\n${frames}\n`;
+}
+
 function bunInspectErrorDiagnostic(error, ctx = undefined) {
   const stackWasAccessed = bunAccessedErrorStacks.has(error);
   let stack;
   try { stack = error instanceof Error ? error.stack : null; } catch { return null; }
+  // A user-installed Error.prepareStackTrace may return the CallSite array
+  // itself; Bun still renders the diagnostic from the underlying frames.
+  if (Array.isArray(stack)) stack = stack.map((site) => `    at ${site}`).join("\n");
   if (typeof stack !== "string") return null;
   stack = ctRemapStackString(stack);
   const frame = stack.match(/(?:^|\n)\s*at [^\n]*?\(?([^()\n]+):(\d+):(\d+)\)?/);
@@ -8283,6 +8983,8 @@ function bunInspectErrorDiagnostic(error, ctx = undefined) {
         frame = stackWasAccessed
           ? `at ${frame.slice("at unknown (".length, -1)}`
           : `at <anonymous> (${frame.slice("at unknown (".length)}`;
+      } else if (stackWasAccessed && frame.startsWith("at <anonymous> (")) {
+        frame = `at ${frame.slice("at <anonymous> (".length, -1)}`;
       }
       return `      ${frame}`;
     })
@@ -8505,15 +9207,32 @@ function bunStyleInspect(value, ctx, indent, seen, depth) {
       seen.delete(value);
     }
   }
+  if (!(value instanceof Error) && typeof custom !== "function") {
+    const realmDiagnostic = bunInspectDynamicSourceDiagnostic(value);
+    if (realmDiagnostic !== null) return realmDiagnostic;
+  }
   if (value instanceof Error && value.__cottontailBunExpectation &&
       typeof globalThis.__cottontailInspectBunExpectationError === "function") {
     return globalThis.__cottontailInspectBunExpectationError(value, ctx.colors);
   }
   if (value instanceof Error && typeof custom !== "function") {
+    // Frames in a `//# sourceURL` eval name a source that only exists in
+    // memory; its diagnostic has to come from the recovered text.
+    const evalDiagnostic = bunInspectDynamicSourceDiagnostic(value);
+    if (evalDiagnostic !== null) return evalDiagnostic;
     if (value?.[dynamicErrorSourceSymbol]?.source != null) {
       return bunInspectDynamicErrorSource(value, nodeInspect(value, bunInspectNodeOptions(ctx, depth)));
     }
-    const diagnostic = bunInspectBuildMessageDiagnostic(value) ?? bunInspectErrorDiagnostic(value, ctx);
+    // Bun only renders the bare diagnostic (code frame + message + frames)
+    // for errors without own enumerable properties; extra properties are
+    // rendered by recursing, which is also what makes pathologically nested
+    // errors overflow the stack instead of collapsing to the diagnostic.
+    // BuildMessage always renders as a diagnostic (its enumerable "name" own
+    // property is an artifact of the JS-side class).
+    const errorKeys = Object.keys(value).filter((key) => key !== "stack" && key !== "message");
+    const diagnostic = errorKeys.length === 0 || value.name === "BuildMessage"
+      ? bunInspectBuildMessageDiagnostic(value) ?? bunInspectErrorDiagnostic(value, ctx)
+      : null;
     if (diagnostic !== null) {
       const causeDescriptor = Object.getOwnPropertyDescriptor(value, "cause");
       const cause = causeDescriptor && "value" in causeDescriptor ? causeDescriptor.value : undefined;
@@ -8524,7 +9243,6 @@ function bunStyleInspect(value, ctx, indent, seen, depth) {
         ? diagnostic
         : `${diagnostic.trimEnd()}\n\n${causeDiagnostic}`;
     }
-    const errorKeys = Object.keys(value).filter((key) => key !== "stack" && key !== "message");
     if (errorKeys.length === 0) {
       return bunInspectDynamicErrorSource(value, nodeInspect(value, bunInspectNodeOptions(ctx, depth)));
     }
@@ -9796,12 +10514,30 @@ async function createUdpSocket(options) {
       socket.close();
       throw new TypeError("connect must be an object");
     }
-    try {
-      socket.connect(Number(options.connect.port), String(options.connect.hostname ?? (type === "udp6" ? "::1" : "127.0.0.1")));
-    } catch (error) {
-      socket.close();
-      throw error;
-    }
+    // dgram connect is asynchronous (DNS lookup): a failure arrives as an
+    // 'error' event, which must reject this promise instead of going
+    // unhandled (udp_socket "connect with invalid hostname rejects").
+    await new Promise((resolve, reject) => {
+      const onError = (error) => {
+        socket.removeListener("connect", onConnect);
+        socket.close();
+        reject(error);
+      };
+      const onConnect = () => {
+        socket.removeListener("error", onError);
+        resolve();
+      };
+      socket.once("error", onError);
+      socket.once("connect", onConnect);
+      try {
+        socket.connect(Number(options.connect.port), String(options.connect.hostname ?? (type === "udp6" ? "::1" : "127.0.0.1")));
+      } catch (error) {
+        socket.removeListener("error", onError);
+        socket.removeListener("connect", onConnect);
+        socket.close();
+        reject(error);
+      }
+    });
   }
 
   const nativeAddress = socket.address();
@@ -10288,19 +11024,57 @@ export class Glob {
   scanSync(options = {}) {
     options = normalizeGlobScanOptions(options);
     const cwd = nodePathResolve(String(options.cwd ?? options.root ?? cottontail.cwd()));
-    const patternIsAbsolute = isAbsoluteGlobPath(normalizeGlobSeparators(this.pattern));
-    const compiledPattern = normalizeGlobSeparators(this.pattern);
-    const root = patternIsAbsolute ? absoluteGlobScanRoot(compiledPattern, cwd) : cwd;
+    const normalizedPattern = normalizeGlobSeparators(this.pattern);
+    const patternIsAbsolute = isAbsoluteGlobPath(normalizedPattern);
+    const compiledPattern = normalizedPattern;
+    // Detect leading dot-segments in the pattern (e.g. "./", "../", "../../")
+    // Bun preserves these in relative scan results and resolves them for the scan root.
+    let dotPrefix = "";
+    let scanRoot = cwd;
+    if (!patternIsAbsolute) {
+      const dotPrefixMatch = compiledPattern.match(/^((?:\.\.?\/)+)/);
+      if (dotPrefixMatch) {
+        dotPrefix = dotPrefixMatch[1];
+        // Resolve the scan root by applying the dot-segments to cwd
+        const prefixWithoutTrailingSlash = dotPrefix.endsWith("/") ? dotPrefix.slice(0, -1) : dotPrefix;
+        scanRoot = nodePathResolve(cwd, prefixWithoutTrailingSlash);
+      }
+    }
+    const root = patternIsAbsolute ? absoluteGlobScanRoot(compiledPattern, cwd) : scanRoot;
     if (patternIsAbsolute && root === "/" && absoluteRootGlobShouldNotScan(compiledPattern)) return [];
     const absolute = Boolean(options.absolute);
     const onlyFiles = options.onlyFiles !== false;
     const dot = Boolean(options.dot);
     const followSymlinks = Object.prototype.hasOwnProperty.call(options, "followSymlinks") && Boolean(options.followSymlinks);
+    // When the pattern has a dot-prefix, walkFiles generates paths relative to the
+    // resolved root (without the prefix). We need a matcher for the stripped pattern.
+    let strippedMatcher = null;
+    if (dotPrefix) {
+      const strippedPattern = compiledPattern.slice(dotPrefix.length);
+      if (strippedPattern) {
+        strippedMatcher = lazyPicomatch(strippedPattern, { dot: true });
+      }
+    }
     const results = [];
     for (const entry of walkFiles(root, { dot, onlyFiles, followSymlinks, throwErrorOnBrokenSymlink: Boolean(options.throwErrorOnBrokenSymlink) })) {
       const matchTarget = patternIsAbsolute ? entry.absolute : entry.relative;
-      if (!this.match(matchTarget) && !(entry.isDirectory && this.match(`${matchTarget}/`))) continue;
-      results.push(absolute || patternIsAbsolute ? entry.absolute : entry.relative);
+      let matches;
+      if (strippedMatcher) {
+        // Use the stripped pattern for matching against walkFiles' relative paths
+        matches = strippedMatcher(matchTarget) || (entry.isDirectory && strippedMatcher(`${matchTarget}/`));
+      } else {
+        matches = this.match(matchTarget) || (entry.isDirectory && this.match(`${matchTarget}/`));
+      }
+      if (!matches) continue;
+      if (absolute || patternIsAbsolute) {
+        results.push(entry.absolute);
+      } else if (dotPrefix) {
+        // Prepend the dot-prefix from the pattern to the relative path
+        const prefix = dotPrefix.endsWith("/") ? dotPrefix.slice(0, -1) : dotPrefix;
+        results.push(entry.relative ? `${prefix}/${entry.relative}` : prefix);
+      } else {
+        results.push(entry.relative);
+      }
     }
     return results;
   }
@@ -12042,7 +12816,13 @@ function validateSecretOptions(method, options, needsValue = false) {
 }
 
 function secretCommand(args, input = undefined) {
-  return spawnSync(args, { input, stdin: input == null ? "ignore" : "pipe", stdout: "pipe", stderr: "pipe" });
+  const encodedInput = typeof input === "string" ? new TextEncoder().encode(input) : input;
+  return spawnSync(args, {
+    input: encodedInput,
+    stdin: encodedInput == null ? "ignore" : "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
 }
 
 function secretCommandError(result, operation) {
@@ -12096,7 +12876,7 @@ export const secrets = {
     if (process.platform === "linux") {
       const result = secretCommand(
         ["secret-tool", "store", `--label=${options.service}`, "service", options.service, "name", options.name],
-        `${options.value}\n`,
+        options.value,
       );
       if (result.exitCode !== 0) secretCommandError(result, "store");
       return;
@@ -12848,7 +13628,21 @@ const BunObject = new Proxy(BunObjectTarget, {
 globalThis.__cottontailBunHasNonReifiedStatic = (value) => value === BunObject && !bunObjectReified;
 // String(Bun) must be "[object Bun]".
 Object.defineProperty(BunObjectTarget, Symbol.toStringTag, { value: "Bun", configurable: true });
-BunObject.argv = cottontail.argv || ["cottontail", ...(cottontail.args || [])];
+// Bun.argv and process.argv are the same array, so the executable rewrite
+// node/process.js applies to argv[0] has to be visible through both.
+let bunArgvOverride;
+Object.defineProperty(BunObject, "argv", {
+  configurable: true,
+  enumerable: true,
+  get() {
+    if (bunArgvOverride !== undefined) return bunArgvOverride;
+    const argv = globalThis.process?.argv;
+    return Array.isArray(argv) ? argv : cottontail.argv || ["cottontail", ...(cottontail.args || [])];
+  },
+  set(value) {
+    bunArgvOverride = value;
+  },
+});
 BunObject.env = globalThis.process?.env ?? cottontail.env();
 BunObject.$ = $;
 BunObject.ArrayBufferSink = ArrayBufferSink;
@@ -13074,7 +13868,7 @@ if (typeof globalThis.WebAssembly === "object" && typeof globalThis.WebAssembly.
 if (globalThis.navigator == null) {
   const navigatorPlatform = cottontail.platform?.() === "darwin" ? "MacIntel" :
     cottontail.platform?.() === "win32" ? "Win32" :
-    `Linux ${cottontail.arch?.() === "arm64" ? "aarch64" : "x86_64"}`;
+    "Linux x86_64";
   globalThis.navigator = {
     userAgent: `Bun/${version}`,
     platform: navigatorPlatform,
@@ -14342,6 +15136,23 @@ if (typeof globalThis.TextEncoder === "function" && typeof globalThis.TextEncode
     writable: true,
   });
 }
+// Capture the bootstrap-installed globals eagerly: Bun's undici builtin
+// binds the originals even if user code later replaces them (the
+// undici-primordials test sets them all to 42 before requiring undici).
+// These are installed before this module evaluates, so no lazy module
+// evaluation is forced. The runtime's own fetch/Response/Request/... are
+// module-scope bindings — already immune to global replacement — so they
+// stay lazy to avoid pulling web modules forward in the load order.
+const undiciPrimordialGlobals = {
+  File: globalThis.File,
+  Blob: globalThis.Blob,
+  AbortSignal: globalThis.AbortSignal,
+  AbortController: globalThis.AbortController,
+  CloseEvent: globalThis.CloseEvent,
+  ErrorEvent: globalThis.ErrorEvent,
+  MessageEvent: globalThis.MessageEvent,
+  EventTarget: globalThis.EventTarget,
+};
 const loadUndiciBuiltin = createLazyModule("node:undici", () => {
   const { createUndiciModule } = loadEmbeddedRuntimeModule("node/undici.js");
   return createUndiciModule({
@@ -14350,17 +15161,12 @@ const loadUndiciBuiltin = createLazyModule("node:undici", () => {
     Request,
     Headers,
     FormData,
-    File: globalThis.File,
-    Blob: globalThis.Blob,
     URL,
     URLSearchParams,
-    AbortSignal: globalThis.AbortSignal,
-    AbortController: globalThis.AbortController,
+    // Read lazily: the WebSocket global is itself lazily installed, and
+    // forcing it here reorders module evaluation (node-module-surface).
     WebSocket: globalThis.WebSocket,
-    CloseEvent: globalThis.CloseEvent,
-    ErrorEvent: globalThis.ErrorEvent,
-    MessageEvent: globalThis.MessageEvent,
-    EventTarget: globalThis.EventTarget,
+    ...undiciPrimordialGlobals,
   });
 });
 const undiciBuiltin = createLazyBuiltin(loadUndiciBuiltin);
@@ -14402,7 +15208,11 @@ for (const name of [
   "xtest",
   "xdescribe",
 ]) {
-  installLazyGlobal(name, () => loadBunTestModule()[name]);
+  // Resolve to the already-shared bun:test instance when one exists: the
+  // bunfig preload path evaluates the module through the ESM loader, and a
+  // second lazy evaluation would swallow global hook registrations
+  // (beforeEach never firing in describe-scoped suites).
+  installLazyGlobal(name, () => (globalThis[Symbol.for("cottontail.internal.bunTestModule")] ?? loadBunTestModule())[name]);
 }
 if (globalThis.Headers?.prototype && typeof globalThis.Headers.prototype.getAll !== "function") {
   Object.defineProperty(globalThis.Headers.prototype, "getAll", {

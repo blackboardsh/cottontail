@@ -1,5 +1,6 @@
 // ESM tests are about various esm features in development mode.
 import { isASAN, isCI } from "harness";
+import { expect } from "bun:test";
 import { devTest, emptyHtmlFile, minimalFramework } from "../bake-harness";
 
 const liveBindingTest = devTest("live bindings with `var`", {
@@ -305,6 +306,38 @@ if (!(isCI && isASAN))
       });
     },
   });
+devTest("deferred HTML entries keep root-relative and HTML-relative scripts distinct", {
+  files: {
+    "pages/index.html": emptyHtmlFile({
+      scripts: ["./entry.ts", "/entry.ts"],
+    }),
+    "pages/entry.ts": `
+      const mod = require('./esm');
+      console.log('nested-entry', mod);
+    `,
+    "pages/esm.ts": `
+      import './async';
+      export const value = 1;
+    `,
+    "pages/async.ts": `
+      await 1;
+    `,
+    "entry.ts": `
+      console.log('root-entry');
+    `,
+  },
+  htmlFiles: ["pages/index.html"],
+  async test(dev) {
+    const html = await dev.fetch("/pages").text();
+    const scriptUrls = [...html.matchAll(/<script[^>]+src="([^"]+)"/g)].map(match => match[1]);
+    expect(scriptUrls).toHaveLength(2);
+    expect(new Set(scriptUrls).size).toBe(2);
+
+    const sources = await Promise.all(scriptUrls.map(url => dev.fetch(url).text()));
+    expect(sources.some(source => source.includes("nested-entry"))).toBe(true);
+    expect(sources.some(source => source.includes("root-entry"))).toBe(true);
+  },
+});
 devTest("function that is assigned to should become a live binding", {
   files: {
     "index.html": emptyHtmlFile({

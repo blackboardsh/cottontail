@@ -13,6 +13,7 @@ let server = Bun.serve({
 });
 
 process.on("message", async message => {
+  if (message?.type !== "configure") return;
   const files = message.files || {};
   const routes = {};
   for (const [key, value] of Object.entries(files)) {
@@ -26,9 +27,12 @@ process.on("message", async message => {
       hmr: false,
     },
   });
+
+  process.send({ type: "routes-ready" });
 });
 
 process.send({
+  type: "listening",
   port: server.port,
   hostname: server.hostname,
 });

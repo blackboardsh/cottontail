@@ -34,6 +34,22 @@ const TransformConfig = struct {
     structured_errors: bool = false,
     eval_print: bool = false,
     log_level: compiler.logger.Log.Level = .warn,
+    // Resolved tsconfig options threaded from the entry-transform / module-load
+    // path. The standalone transpiler has no project resolver, so the caller
+    // (module.js) reads the project's tsconfig.json and forwards the effective
+    // compiler options here. Absent options keep the tsconfig-blind defaults.
+    experimental_decorators: bool = false,
+    emit_decorator_metadata: bool = false,
+    jsx_runtime: ?compiler.options.JSX.Runtime = null,
+    jsx_development: ?bool = null,
+    jsx_import_source: ?[]const u8 = null,
+    jsx_factory: ?[]const u8 = null,
+    jsx_fragment: ?[]const u8 = null,
+    // Inject the automatic-runtime JSX import (e.g. `import { jsxDEV } from
+    // "react/jsx-dev-runtime"`) into the output. The module loader sets this so
+    // transpiled modules can execute standalone; the Bun.Transpiler API leaves
+    // it off to match Bun's import-free transform output.
+    jsx_auto_import: bool = false,
 };
 
 const structured_diagnostics_prefix = "COTTONTAIL_DIAGNOSTICS:";
@@ -396,6 +412,28 @@ fn parseConfig(options_json: []const u8, loader_override: []const u8, arena: std
         if (jsonBool(object, "_cottontailPreserveUseStrict")) |value| config.preserve_use_strict = value;
         if (jsonBool(object, "_cottontailStructuredErrors")) |value| config.structured_errors = value;
         if (jsonBool(object, "_cottontailEvalPrint")) |value| config.eval_print = value;
+
+        // Resolved tsconfig compiler options forwarded from the module loader.
+        if (jsonBool(object, "experimentalDecorators")) |value| config.experimental_decorators = value;
+        if (jsonBool(object, "emitDecoratorMetadata")) |value| config.emit_decorator_metadata = value;
+        if (object.get("jsxRuntime")) |value| if (value == .string) {
+            if (std.mem.eql(u8, value.string, "automatic")) {
+                config.jsx_runtime = .automatic;
+            } else if (std.mem.eql(u8, value.string, "classic")) {
+                config.jsx_runtime = .classic;
+            }
+        };
+        if (jsonBool(object, "jsxDev")) |value| config.jsx_development = value;
+        if (object.get("jsxImportSource")) |value| if (value == .string and value.string.len > 0) {
+            config.jsx_import_source = value.string;
+        };
+        if (object.get("jsxFactory")) |value| if (value == .string and value.string.len > 0) {
+            config.jsx_factory = value.string;
+        };
+        if (object.get("jsxFragmentFactory")) |value| if (value == .string and value.string.len > 0) {
+            config.jsx_fragment = value.string;
+        };
+        if (jsonBool(object, "jsxAutoImport")) |value| config.jsx_auto_import = value;
         if (object.get("_cottontailInitialIndent")) |value| switch (value) {
             .integer => |count| {
                 if (count < 0 or count > 64) return error.InvalidIndentOption;
@@ -564,7 +602,33 @@ fn process(
     };
     defer define.deinit();
 
-    var parser_options = compiler.js_parser.Parser.Options.init(.{}, config.loader);
+    // Build the JSX pragma from the resolved tsconfig options forwarded by the
+    // caller. Absent options keep JSX.Pragma's defaults (automatic runtime),
+    // matching the previous tsconfig-blind behavior.
+    var jsx_pragma = compiler.options.JSX.Pragma{};
+    if (config.jsx_runtime) |runtime| jsx_pragma.runtime = runtime;
+    if (config.jsx_development) |development| jsx_pragma.development = development;
+    if (config.jsx_import_source) |import_source| {
+        jsx_pragma.package_name = compiler.options.JSX.Pragma.parsePackageName(import_source);
+        jsx_pragma.setImportSource(temporary_allocator);
+        jsx_pragma.classic_import_source = import_source;
+    }
+    if (config.jsx_factory) |factory| {
+        jsx_pragma.factory = try compiler.options.JSX.Pragma.memberListToComponentsIfDifferent(
+            temporary_allocator,
+            jsx_pragma.factory,
+            factory,
+        );
+    }
+    if (config.jsx_fragment) |fragment| {
+        jsx_pragma.fragment = try compiler.options.JSX.Pragma.memberListToComponentsIfDifferent(
+            temporary_allocator,
+            jsx_pragma.fragment,
+            fragment,
+        );
+    }
+
+    var parser_options = compiler.js_parser.Parser.Options.init(jsx_pragma, config.loader);
     var macro_context = compiler.ast.Macro.MacroContext.initStandalone();
     parser_options.macro_context = &macro_context;
     parser_options.transform_only = operation == .transform and !config.allow_runtime;
@@ -577,7 +641,28 @@ fn process(
     // Vanilla JavaScriptCore does not parse TC39 decorators. Bun's parser
     // already contains the complete lowering pass, so transform JavaScript
     // decorators instead of relying on engine-specific syntax support.
-    parser_options.features.standard_decorators = !config.loader.isTypeScript();
+    //
+    // Scans (import/module-syntax analysis) never lower decorators — they only
+    // need the source to parse — so they must be permissive: TypeScript `accessor`
+    // auto-accessor fields are valid syntax only in standard-decorator mode, and
+    // hardcoding legacy mode for TS made the entry-point import scan reject valid
+    // `accessor` fields with a syntax error before the real transpile ever ran.
+    //
+    // Transforms honor the resolved tsconfig forwarded by the caller: TypeScript
+    // uses legacy (experimental) decorator lowering only when the project enables
+    // `experimentalDecorators`/`emitDecoratorMetadata`, otherwise TC39 standard
+    // decorators. This mirrors the tsconfig-aware bundler path
+    // (bundler/transpiler.zig): `standard_decorators = !isTypeScript or
+    // !(experimental_decorators or emit_decorator_metadata)`. emitDecoratorMetadata
+    // implies legacy decorators (reflect-metadata), so it forces legacy too.
+    parser_options.features.emit_decorator_metadata = config.emit_decorator_metadata;
+    parser_options.features.standard_decorators = !config.loader.isTypeScript() or
+        operation != .transform or
+        !(config.experimental_decorators or config.emit_decorator_metadata);
+    // The module loader requests the automatic-runtime JSX import so transpiled
+    // modules import their `jsx`/`jsxDEV` helpers instead of referencing an
+    // undefined local. Bun.Transpiler leaves this off for import-free output.
+    parser_options.features.auto_import_jsx = config.jsx_auto_import;
     parser_options.features.dead_code_elimination = config.dead_code_elimination;
     parser_options.features.trim_unused_imports = config.trim_unused_imports;
     parser_options.features.replace_exports = config.replace_exports;
@@ -757,6 +842,20 @@ pub fn scanImportsJson(source_code: []const u8, loader: []const u8) ![]u8 {
     var error_message: ?[*:0]u8 = null;
     defer if (error_message) |message| ct_transpiler_string_free(message);
     return process(.scan_imports, source_code, "", loader, &error_message);
+}
+
+/// Scan the imports that runtime transpilation will actually emit. In
+/// particular, JSX using the automatic runtime gains an implicit
+/// `react/jsx-runtime` (or `jsx-dev-runtime`) dependency that is intentionally
+/// absent from Bun.Transpiler.scanImports(). Runtime bootstrap preflight must
+/// see that dependency before deciding that a reduced bootstrap is safe. This
+/// standalone scan has no project resolver, so a tsconfig-selected classic
+/// runtime may conservatively choose the full bootstrap; source-level classic
+/// pragmas are honored by the parser.
+pub fn scanRuntimeImportsJson(source_code: []const u8, loader: []const u8) ![]u8 {
+    var error_message: ?[*:0]u8 = null;
+    defer if (error_message) |message| ct_transpiler_string_free(message);
+    return process(.scan_imports, source_code, "{\"jsxAutoImport\":true}", loader, &error_message);
 }
 
 pub fn scanImportRangesJson(source_code: []const u8, loader: []const u8) ![]u8 {

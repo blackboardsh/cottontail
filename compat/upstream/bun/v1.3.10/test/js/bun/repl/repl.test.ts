@@ -26,21 +26,26 @@ async function runRepl(
     },
   });
 
-  const exitCode = await proc.exited;
-
-  const stdout = await new Response(proc.stdout).text();
-  const stderr = await new Response(proc.stderr).text();
+  const [exitCode, stdout, stderr] = await Promise.all([
+    proc.exited,
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
 
   return { stdout, stderr, exitCode };
 }
 
 const stripAnsi = Bun.stripANSI;
+type ReplProcess = ReturnType<typeof Bun.spawn>;
+type ReplExitResult =
+  | { type: "exit"; exitCode: number; signalCode: ReplProcess["signalCode"] }
+  | { type: "error"; error: unknown };
 
 // Helper to run REPL in a PTY and interact with it
 async function withTerminalRepl(
   fn: (helpers: {
     terminal: Bun.Terminal;
-    proc: Bun.ChildProcess;
+    proc: ReplProcess;
     send: (text: string) => void;
     waitFor: (pattern: string | RegExp, timeoutMs?: number) => Promise<string>;
     allOutput: () => string;
@@ -50,7 +55,7 @@ async function withTerminalRepl(
   let cursor = 0;
   let resolveWaiter: (() => void) | null = null;
 
-  await using terminal = new Bun.Terminal({
+  const terminal = new Bun.Terminal({
     cols: 120,
     rows: 40,
     data(_term, data) {
@@ -63,52 +68,126 @@ async function withTerminalRepl(
     },
   });
 
-  await using proc = Bun.spawn({
-    cmd: [bunExe(), "repl"],
-    terminal,
-    env: {
-      ...bunEnv,
-      TERM: "xterm-256color",
-    },
-  });
+  let proc: ReplProcess | undefined;
+  let observedExit: Promise<ReplExitResult> | undefined;
+  let processFinished = false;
 
-  const send = (text: string) => terminal.write(text);
+  try {
+    proc = Bun.spawn({
+      cmd: [bunExe(), "repl"],
+      terminal,
+      env: {
+        ...bunEnv,
+        TERM: "xterm-256color",
+      },
+    });
+    const spawnedProc = proc;
+    let exitResult: ReplExitResult | null = null;
 
-  const waitFor = async (pattern: string | RegExp, timeoutMs = 5000): Promise<string> => {
-    const deadline = Date.now() + timeoutMs;
-    while (true) {
-      const all = received.join("");
-      const recent = all.slice(cursor);
-      const matched = typeof pattern === "string" ? recent.includes(pattern) : pattern.test(recent);
-      if (matched) {
-        cursor = all.length;
-        return recent;
+    const exitPromise = spawnedProc.exited.then<ReplExitResult, ReplExitResult>(
+      exitCode => {
+        processFinished = true;
+        exitResult = { type: "exit", exitCode, signalCode: spawnedProc.signalCode };
+        resolveWaiter?.();
+        resolveWaiter = null;
+        return exitResult;
+      },
+      error => {
+        processFinished = spawnedProc.killed;
+        exitResult = { type: "error", error };
+        resolveWaiter?.();
+        resolveWaiter = null;
+        return exitResult;
+      },
+    );
+    observedExit = exitPromise;
+
+    const send = (text: string) => terminal.write(text);
+
+    const waitFor = async (pattern: string | RegExp, timeoutMs = 5000): Promise<string> => {
+      const deadline = Date.now() + timeoutMs;
+      while (true) {
+        const all = received.join("");
+        const recent = all.slice(cursor);
+        if (exitResult !== null) {
+          const exitDescription = exitResult.type === "error"
+            ? String(exitResult.error)
+            : exitResult.signalCode
+              ? `signal ${exitResult.signalCode}`
+              : `exit code ${exitResult.exitCode}`;
+          throw new Error(
+            `REPL exited with ${exitDescription} while waiting for pattern: ${pattern}\n` +
+              `Received so far:\n${stripAnsi(recent)}`,
+          );
+        }
+        const matched = typeof pattern === "string" ? recent.includes(pattern) : pattern.test(recent);
+        if (matched) {
+          cursor = all.length;
+          return recent;
+        }
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          throw new Error(
+            `Timed out waiting for pattern: ${pattern}\nReceived so far:\n${stripAnsi(recent)}`,
+          );
+        }
+
+        await new Promise<void>(resolve => {
+          let timer: ReturnType<typeof setTimeout>;
+          const wake = () => {
+            if (resolveWaiter === wake) resolveWaiter = null;
+            clearTimeout(timer);
+            resolve();
+          };
+          resolveWaiter = wake;
+          timer = setTimeout(wake, remaining);
+        });
       }
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        throw new Error(
-          `Timed out waiting for pattern: ${pattern}\nReceived so far:\n${stripAnsi(received.join("").slice(cursor))}`,
-        );
-      }
-      // Wait for the next chunk of terminal data (or time out).
+    };
 
-      await new Promise<void>(resolve => {
-        resolveWaiter = resolve;
-      });
-      resolveWaiter = null;
+    const allOutput = () => stripAnsi(received.join(""));
+
+    await waitFor(/\u276f|> /); // Wait for prompt
+    await fn({ terminal, proc: spawnedProc, send, waitFor, allOutput });
+
+    // A terminal test may intentionally leave text in the editor (for example,
+    // tab completion leaves ".help " pending). Clear it before issuing .exit.
+    if (!processFinished) send("\x03.exit\n");
+    const cleanExit = await Promise.race([exitPromise, Bun.sleep(2000).then(() => null)]);
+    if (cleanExit === null) throw new Error("REPL did not exit within 2000ms after .exit");
+    if (cleanExit.type === "error") {
+      throw new Error(`REPL exit promise rejected: ${String(cleanExit.error)}`);
     }
-  };
-
-  const allOutput = () => stripAnsi(received.join(""));
-
-  await waitFor(/\u276f|> /); // Wait for prompt
-
-  await fn({ terminal, proc, send, waitFor, allOutput });
-
-  // Clean exit
-  send(".exit\n");
-  await Promise.race([proc.exited, Bun.sleep(2000)]);
-  if (!proc.killed) proc.kill();
+    if (cleanExit.signalCode !== null || cleanExit.exitCode !== 0) {
+      throw new Error(
+        cleanExit.signalCode
+          ? `REPL exited with signal ${cleanExit.signalCode}`
+          : `REPL exited with code ${cleanExit.exitCode}`,
+      );
+    }
+  } finally {
+    try {
+      if (proc && !processFinished) {
+        try {
+          proc.kill();
+        } catch {}
+        if (observedExit) await Promise.race([observedExit, Bun.sleep(1000)]);
+      }
+      if (proc && !processFinished) {
+        try {
+          proc.kill("SIGKILL");
+        } catch {}
+        if (observedExit) await Promise.race([observedExit, Bun.sleep(1000)]);
+      }
+      if (proc && !processFinished) {
+        try {
+          proc.unref();
+        } catch {}
+      }
+    } finally {
+      terminal.close();
+    }
+  }
 }
 
 describe.concurrent("Bun REPL", () => {
@@ -756,8 +835,8 @@ describe.concurrent("Bun REPL", () => {
     test("shows welcome message with version", async () => {
       const { stdout, exitCode } = await runRepl([".exit"]);
       const output = stripAnsi(stdout);
-      expect(output).toContain("Welcome to Bun");
-      expect(output).toMatch(/Bun v\d+\.\d+\.\d+/);
+      expect(output).toContain("Welcome to Cottontail");
+      expect(output).toMatch(/Cottontail v\d+\.\d+\.\d+/);
       expect(exitCode).toBe(0);
     });
   });
@@ -782,7 +861,7 @@ describe.concurrent("Bun REPL", () => {
 
     test("-e does not show welcome message", async () => {
       const { stdout, exitCode } = await runReplWith(["-e", "1 + 1"]);
-      expect(stdout).not.toContain("Welcome to Bun");
+      expect(stdout).not.toContain("Welcome to Cottontail");
       expect(exitCode).toBe(0);
     });
 
@@ -917,7 +996,7 @@ describe.todoIf(isWindows)("Bun REPL (Terminal)", () => {
   test("shows welcome message and prompt", async () => {
     await withTerminalRepl(async ({ allOutput }) => {
       const output = allOutput();
-      expect(output).toContain("Welcome to Bun");
+      expect(output).toContain("Welcome to Cottontail");
       expect(output).toMatch(/\u276f|> /);
     });
   });

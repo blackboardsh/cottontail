@@ -821,11 +821,71 @@ function workerRunSource() {
   ].join("\n");
 }
 
+// Globals the full Bun runtime module installs. A worker thread starts without
+// them because it defers loading that module; they are published lazily so a
+// worker sees the same global surface as the main thread.
+const lazyWorkerWebGlobalNames = [
+  "ByteLengthQueuingStrategy",
+  "CloseEvent",
+  "CompressionStream",
+  "CountQueuingStrategy",
+  "Crypto",
+  "CryptoKey",
+  "CustomEvent",
+  "DOMException",
+  "DecompressionStream",
+  "ErrorEvent",
+  "Event",
+  "EventTarget",
+  "FormData",
+  "HTMLRewriter",
+  "Headers",
+  "MessageEvent",
+  "Performance",
+  "PerformanceEntry",
+  "PerformanceMark",
+  "PerformanceMeasure",
+  "PerformanceObserver",
+  "PerformanceObserverEntryList",
+  "PerformanceResourceTiming",
+  "PerformanceServerTiming",
+  "PerformanceTiming",
+  "ReadableByteStreamController",
+  "ReadableStream",
+  "ReadableStreamBYOBReader",
+  "ReadableStreamBYOBRequest",
+  "ReadableStreamDefaultController",
+  "ReadableStreamDefaultReader",
+  "Request",
+  "Response",
+  "SubtleCrypto",
+  "TextDecoderStream",
+  "TextEncoderStream",
+  "TransformStream",
+  "TransformStreamDefaultController",
+  "URLPattern",
+  "WebSocket",
+  "WritableStream",
+  "WritableStreamDefaultController",
+  "WritableStreamDefaultWriter",
+  "crypto",
+  "dispatchEvent",
+  "fetch",
+  "reportError",
+  "structuredClone",
+];
+
+// The lean wrapper is a pure import chain, so nothing can run between the
+// runtime imports and the worker entry: a source that touches a web platform
+// global has to take the full wrapper, which publishes them lazily.
+const lazyWorkerWebGlobalPattern = new RegExp(`\\b(?:${lazyWorkerWebGlobalNames.join("|")})\\b`);
+
 function canUseLeanWorkerWrapper(input, options) {
   if (input.kind === "eval" || String(input.filename).startsWith("data:")) return false;
   if (options.stdin === true || options.stdout === true || options.stderr === true) return false;
   try {
     const source = String(cottontail.readFile(input.filename));
+    if (lazyWorkerWebGlobalPattern.test(source)) return false;
     return !/(?:^|\n)\s*(?:import|export)\b|import\.meta|\b(?:Bun|require|module|exports|__filename|__dirname|throw)\b/.test(source);
   } catch {
     return false;
@@ -940,6 +1000,28 @@ function makeWorkerWrapper(input, options = {}, sharedEnvironmentGroupId = null)
     `  },`,
     `});`,
     `globalThis.Bun = __ctLazyBun;`,
+    // The web platform globals live in the full Bun runtime module, which a
+    // worker only pulls in on demand. Node exposes them on every thread, so
+    // publish self-replacing accessors that materialize the real globals on
+    // first touch. All pending accessors are removed before the module loads,
+    // so the runtime's own `globalThis.X == null` install guards still see the
+    // untouched global object.
+    `const __ctPendingWebGlobals = new Set(${JSON.stringify(lazyWorkerWebGlobalNames)}.filter((__ctName) => !(__ctName in globalThis)));`,
+    `const __ctDropPendingWebGlobals = () => {`,
+    `  for (const __ctName of __ctPendingWebGlobals) { try { delete globalThis[__ctName]; } catch {} }`,
+    `  __ctPendingWebGlobals.clear();`,
+    `};`,
+    `for (const __ctName of __ctPendingWebGlobals) {`,
+    `  Object.defineProperty(globalThis, __ctName, {`,
+    `    configurable: true,`,
+    `    enumerable: false,`,
+    `    get() { __ctDropPendingWebGlobals(); __ctLoadFullBun(); return globalThis[__ctName]; },`,
+    `    set(__ctValue) {`,
+    `      __ctDropPendingWebGlobals();`,
+    `      Object.defineProperty(globalThis, __ctName, { value: __ctValue, writable: true, enumerable: true, configurable: true });`,
+    `    },`,
+    `  });`,
+    `}`,
     `globalThis.__cottontailConfigureWorkerStdio?.();`,
     `globalThis.__cottontailWorkerThreadsNotifyReady?.();`,
     `try {`,

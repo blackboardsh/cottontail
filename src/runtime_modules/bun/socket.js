@@ -334,7 +334,11 @@ function attachBunSocketHandlers(socket, handlerState, data = undefined, connect
     const handlers = handlerState.current;
     const callback = handlers?.[name];
     if (typeof callback !== "function") {
-      if (name === "error") throw args[1];
+      // Bun's socket API treats the `error` handler as optional: a socket that
+      // faults (e.g. ECONNRESET on an abandoned connection) with no `error`
+      // handler is silently dropped, not escalated to an uncaught exception
+      // (verified against Bun 1.3.10). The `close` event still reports
+      // hadError via __cottontailBunCloseError.
       return undefined;
     }
     try {
@@ -627,7 +631,9 @@ function normalizeBunSocketOptions(options) {
     if (unix.startsWith("file://") || unix.startsWith("unix://") || unix.startsWith("sock://")) {
       unix = unix.slice(7);
     }
-    if (unix.includes("\0")) throw new TypeError("unix must not contain NUL bytes");
+    const nulIndex = unix.indexOf("\0");
+    const linuxAbstractPath = process.platform === "linux" && nulIndex === 0 && !unix.slice(1).includes("\0");
+    if (nulIndex !== -1 && !linuxAbstractPath) throw new TypeError("unix must not contain NUL bytes");
   }
 
   let hostname = "";

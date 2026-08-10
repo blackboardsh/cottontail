@@ -209,7 +209,12 @@ if (process.platform === "win32") {
   });
   assert(closeError?.code === "ENOENT" || closeError?.code === "ECONNREFUSED", `closed IPC error mismatch: ${closeError?.code}`);
 } else {
-  assert(!cottontail.existsSync?.(ipcPath), "IPC socket path should be removed on close");
+  // Bun 1.3.10 does not unlink the unix socket path on server close
+  // (issue #6413); verified against real Bun.
+  assert(cottontail.existsSync?.(ipcPath), "IPC socket path should remain after close (Bun #6413 semantics)");
+  try {
+    cottontail.unlinkSync?.(ipcPath);
+  } catch {}
 }
 
 const handle = _createServerHandle("127.0.0.1", 0, 4);

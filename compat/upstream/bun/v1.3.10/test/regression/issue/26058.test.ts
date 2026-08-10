@@ -31,8 +31,8 @@ describe("issue #26058 - bun repl startup time", () => {
     expect(stderr).not.toContain("bun add");
     expect(stdout).not.toContain("Resolving dependencies");
 
-    // The built-in REPL should print "Welcome to Bun" when starting
+    // The built-in REPL should print "Welcome to Cottontail" when starting
     // Even without a TTY, the welcome message should appear in stdout
-    expect(stdout).toContain("Welcome to Bun");
+    expect(stdout).toContain("Welcome to Cottontail");
   });
 });

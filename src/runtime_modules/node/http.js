@@ -118,7 +118,7 @@ function markSocketAsyncFree(socket) {
 export const METHODS = [
   "ACL", "BIND", "CHECKOUT", "CONNECT", "COPY", "DELETE", "GET", "HEAD", "LINK", "LOCK",
   "M-SEARCH", "MERGE", "MKACTIVITY", "MKCALENDAR", "MKCOL", "MOVE", "NOTIFY", "OPTIONS",
-  "PATCH", "POST", "PRI", "PROPFIND", "PROPPATCH", "PURGE", "PUT", "REBIND", "REPORT",
+  "PATCH", "POST", "PROPFIND", "PROPPATCH", "PURGE", "PUT", "QUERY", "REBIND", "REPORT",
   "SEARCH", "SOURCE", "SUBSCRIBE", "TRACE", "UNBIND", "UNLINK", "UNLOCK", "UNSUBSCRIBE",
 ];
 
@@ -485,6 +485,35 @@ function requestPath(url, options = undefined) {
   return `${url.pathname || "/"}${url.search || ""}`;
 }
 
+// COTTONTAIL-COMPAT: https-proxy-agent keeps the TLS settings it was
+// constructed with on `agent.connectOpts` and only forwards the per-request
+// options to the tunnelled `tls.connect`. Bun folds `agent.connectOpts` into
+// the request's TLS options at the lowest priority, so the same credentials
+// reach the target upgrade. Only TLS-shaped keys are copied; `connectOpts`
+// also carries the proxy's own host/port, which must never leak here.
+const AGENT_CONNECT_TLS_KEYS = [
+  "rejectUnauthorized",
+  "ca",
+  "cert",
+  "key",
+  "passphrase",
+  "ciphers",
+  "secureOptions",
+  "checkServerIdentity",
+];
+
+function agentConnectTlsOptions(agent) {
+  const connectOpts = agent?.connectOpts;
+  if (connectOpts == null || typeof connectOpts !== "object") return undefined;
+  let inherited;
+  for (const name of AGENT_CONNECT_TLS_KEYS) {
+    const value = connectOpts[name];
+    if (value === undefined) continue;
+    (inherited ??= {})[name] = value;
+  }
+  return inherited;
+}
+
 function normalizeListenArgs(args) {
   const list = Array.from(args);
   const callback = typeof list[list.length - 1] === "function" ? list.pop() : undefined;
@@ -636,7 +665,9 @@ function materializeIncomingHeaders(rawHeaders, joinDuplicateHeaders = false, ma
     ? Math.min(rawHeaders.length, count * 2)
     : rawHeaders.length;
   const raw = rawHeaders.slice(0, limit);
-  const headers = Object.create(null);
+  // Bun/Node expose req.headers as a plain object inheriting Object.prototype
+  // (upstream node-http "Headers should inherit from Object.prototype").
+  const headers = {};
 
   for (let index = 0; index + 1 < raw.length; index += 2) {
     const name = String(raw[index]).toLowerCase();
@@ -3036,6 +3067,7 @@ export class ClientRequest extends OutgoingMessage {
     const secure = this.protocol === "https:";
     const defaultPort = secure ? 443 : 80;
     const requestOptions = {
+      ...agentConnectTlsOptions(this.agent),
       ...this._options,
       protocol: this.protocol,
       secureEndpoint: secure,
@@ -3502,9 +3534,25 @@ export function _attachHttpConnection(server, socket) {
     clearKeepAliveTimer();
   };
 
-  const fail = (error, statusLine = error?.statusLine ?? (error?.code === "HPE_HEADER_OVERFLOW"
-    ? "431 Request Header Fields Too Large"
-    : error?.code === "HPE_INVALID_VERSION" ? "505 HTTP Version Not Supported" : "400 Bad Request")) => {
+  const fail = (error, statusLine = undefined) => {
+    // Bun's server surfaces most llhttp protocol violations as HPE_INTERNAL;
+    // only header-token and transfer-encoding errors keep their specific code.
+    if (error && typeof error.code === "string") {
+      if (error.code === "HPE_INVALID_VERSION") {
+        error.code = "HPE_INTERNAL";
+        if (error.statusLine == null) error.statusLine = "505 HTTP Version Not Supported";
+      } else if (
+        error.code === "HPE_LF_EXPECTED" ||
+        error.code === "HPE_CR_EXPECTED" ||
+        error.code === "HPE_STRICT" ||
+        error.code === "HPE_INVALID_CHUNK_SIZE"
+      ) {
+        error.code = "HPE_INTERNAL";
+      }
+    }
+    statusLine ??= error?.statusLine ?? (error?.code === "HPE_HEADER_OVERFLOW"
+      ? "431 Request Header Fields Too Large"
+      : error?.code === "HPE_INVALID_VERSION" ? "505 HTTP Version Not Supported" : "400 Bad Request");
     detachParser();
     // Parser failures must abort the request body without closing the
     // transport before a clientError listener or the fallback response runs.
@@ -4041,6 +4089,7 @@ export const WebSocket = typeof existingWebSocket === "function" ? existingWebSo
     this._messageState = createWebSocketMessageState();
     this._deflate = null;
     this._aborted = false;
+    this._connectAborted = false;
     this._pendingClose = null;
     this._pendingWriteFrames = [];
     this._pendingWriteBytes = 0;
@@ -4487,6 +4536,23 @@ export const WebSocket = typeof existingWebSocket === "function" ? existingWebSo
     this._finishClosingTransport(code, reason, false, payload);
   }
 
+  // Bun parity: `close()` while CONNECTING moves to CLOSING, cancels the
+  // in-flight handshake, and fires *no* error/close events. The socket is
+  // abandoned and the WebSocket stays in CLOSING, matching Bun's native
+  // client (upstream `WebSocket::close()` -> cancel with no event dispatch).
+  _abortConnecting() {
+    this._aborted = true;
+    this._connectAborted = true;
+    this.readyState = WebSocket.CLOSING;
+    this._pendingClose = null;
+    resetWebSocketMessageState(this._messageState);
+    if (this._closeTimer != null) clearTimeout(this._closeTimer);
+    this._closeTimer = null;
+    const socket = this._socket;
+    this._socket = null;
+    try { socket?.destroy?.(); } catch {}
+  }
+
   _abortHandshake(code, reason) {
     if (this.readyState === WebSocket.CLOSED) return;
     this.readyState = WebSocket.CLOSED;
@@ -4587,6 +4653,7 @@ export const WebSocket = typeof existingWebSocket === "function" ? existingWebSo
   }
 
   _failWithClose(error, code, reason, wasClean = false) {
+    if (this._connectAborted) return;
     if (this.readyState === WebSocket.CLOSED) return;
     const connectFailure = this.readyState === WebSocket.CONNECTING;
     const cause = error?.message ?? String(error);
@@ -4684,8 +4751,7 @@ export const WebSocket = typeof existingWebSocket === "function" ? existingWebSo
   close(code = 1000, reason = "") {
     if (this.readyState === WebSocket.CLOSED || this.readyState === WebSocket.CLOSING) return;
     if (this.readyState === WebSocket.CONNECTING) {
-      this._aborted = true;
-      this._abortHandshake(1006, "");
+      this._abortConnecting();
       return;
     }
     const closeCode = Number(code) || 1000;

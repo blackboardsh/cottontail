@@ -123,6 +123,98 @@ for (const [index, scenario] of directRunCases.entries()) {
   });
 }
 
+test("direct-run parser diagnostic: JavaScript cannot export an undeclared local", () => {
+  const directory = fixture("undeclared-javascript-export", {
+    "a.js": "export {not_found};\n",
+  });
+  const result = run(directory, ["a.js"]);
+  expect(result.exitCode, result.stderr).toBe(1);
+  expect(result.stdout.trim()).toBe("");
+  expect(result.stderr.replaceAll("\r\n", "\n")).toContain(
+    'error: "not_found" is not declared in this file',
+  );
+});
+
+const duplicateExportCases = [
+  {
+    name: "TypeScript duplicate indirect exports fail through an importer",
+    command: ["main.ts"],
+    files: {
+      "main.ts": "import {value} from './a'; console.log(value);\n",
+      "a.ts": "export {value} from './b'; export {value} from './c';\n",
+      "b.ts": "export type value = 'b';\n",
+      "c.ts": "export const value = 'c';\n",
+    },
+    expected: "SyntaxError: Cannot export a duplicate name 'value'.",
+  },
+  {
+    name: "JavaScript direct and indirect exports collide at the entrypoint",
+    command: ["a.js"],
+    files: {
+      "a.js": "export {value} from './b'; export const value = 'a';\n",
+      "b.js": "export const value = 'b';\n",
+    },
+    expected: 'error: Multiple exports with the same name "value"',
+  },
+  {
+    name: "TypeScript declaration and local export collide at the entrypoint",
+    command: ["a.ts"],
+    files: {
+      "a.ts": "export const value = 'a'; export {value};\n",
+    },
+    expected: 'error: Multiple exports with the same name "value"',
+  },
+  {
+    name: "JavaScript duplicate namespace aliases fail through an importer",
+    command: ["main.js"],
+    files: {
+      "main.js": "import {value} from './a'; console.log(value);\n",
+      "a.js": "export * as value from './c'; export * as value from './c';\n",
+      "c.js": "export const value = 'c';\n",
+    },
+    expected: "SyntaxError: Cannot export a duplicate name 'value'.",
+  },
+] as const;
+
+for (const [index, scenario] of duplicateExportCases.entries()) {
+  test(`direct-run duplicate diagnostic: ${scenario.name}`, () => {
+    const directory = fixture(`duplicate-${index}`, scenario.files);
+    const result = run(directory, [...scenario.command]);
+    expect(result.exitCode, result.stderr).toBe(1);
+    expect(result.stdout.trim()).toBe("");
+    expect(result.stderr.replaceAll("\r\n", "\n")).toContain(scenario.expected);
+  });
+}
+
+test("direct-run linker diagnostic: distinct star bindings are ambiguous", () => {
+  const directory = fixture("ambiguous-star-bindings", {
+    "main.ts": "import {value} from './barrel'; console.log(value);\n",
+    "barrel.ts": "export * from './left'; export * from './right';\n",
+    "left.ts": "export const value = 'left';\n",
+    "right.ts": "export const value = 'right';\n",
+  });
+  const result = run(directory, ["main.ts"]);
+  expect(result.exitCode, result.stderr).toBe(1);
+  expect(result.stdout.trim()).toBe("");
+  expect(result.stderr.replaceAll("\r\n", "\n")).toContain(
+    "SyntaxError: Export named 'value' cannot be resolved due to ambiguous multiple bindings in module",
+  );
+});
+
+test("direct-run linker accepts diamond stars that resolve to one binding", () => {
+  const directory = fixture("shared-star-binding", {
+    "main.ts": "import {value} from './barrel'; console.log(value);\n",
+    "barrel.ts": "export * from './left'; export * from './right';\n",
+    "left.ts": "export * from './leaf';\n",
+    "right.ts": "export * from './leaf';\n",
+    "leaf.ts": "export const value = 'leaf';\n",
+  });
+  const result = run(directory, ["main.ts"]);
+  expect(result.exitCode, result.stderr).toBe(0);
+  expect(result.stdout).toBe("leaf\n");
+  expect(result.stderr).toBe("");
+});
+
 test("bun test tsconfig override reports unresolved imports as missing modules", () => {
   const directory = fixture("test-tsconfig-override", {
     "math.test.ts": `

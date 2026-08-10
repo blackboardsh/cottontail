@@ -317,21 +317,69 @@ function processExists(pid) {
   }
 }
 
-function validatePriorityPid(pid, syscall) {
-  if (typeof pid !== "number" || !Number.isInteger(pid) || pid < -2147483648 || pid > 2147483647) {
-    const err = new TypeError(`The value of "pid" is out of range. It must be an integer. Received ${pid}`);
+function describePriorityValue(value) {
+  if (value === undefined) return "undefined";
+  if (value === null) return "null";
+  if (typeof value === "string") return `type string (${JSON.stringify(value)})`;
+  if (typeof value === "object") return `an instance of ${value?.constructor?.name ?? "Object"}`;
+  return `type ${typeof value} (${String(value)})`;
+}
+
+function validatePriorityPid(pid) {
+  if (typeof pid !== "number") {
+    const err = new TypeError(`The "pid" argument must be of type number. Received ${describePriorityValue(pid)}`);
+    err.code = "ERR_INVALID_ARG_TYPE";
+    throw err;
+  }
+  if (!Number.isInteger(pid)) {
+    const err = new RangeError(`The value of "pid" is out of range. It must be an integer. Received ${pid}`);
     err.code = "ERR_OUT_OF_RANGE";
     throw err;
   }
+  if (pid < -2147483648 || pid > 2147483647) {
+    const err = new RangeError(
+      `The value of "pid" is out of range. It must be >= -2147483648 and <= 2147483647. Received ${pid}`,
+    );
+    err.code = "ERR_OUT_OF_RANGE";
+    throw err;
+  }
+}
+
+function validatePriorityProcess(pid, syscall) {
   // The native binding cannot represent negative/unknown pids; emulate libuv's ESRCH.
   if (pid < 0 || (pid > 0 && !processExists(pid))) {
-    throw makeSystemError(syscall, -3, "ESRCH", "no such process");
+    throw makeSystemError(syscall, platform() === "win32" ? -4040 : -3, "ESRCH", "no such process");
+  }
+}
+
+function validatePriority(priority) {
+  if (typeof priority !== "number") {
+    const err = new TypeError(
+      `The "priority" argument must be of type number. Received ${describePriorityValue(priority)}`,
+    );
+    err.code = "ERR_INVALID_ARG_TYPE";
+    throw err;
+  }
+  if (!Number.isInteger(priority)) {
+    const err = new RangeError(
+      `The value of "priority" is out of range. It must be an integer. Received ${priority}`,
+    );
+    err.code = "ERR_OUT_OF_RANGE";
+    throw err;
+  }
+  if (priority < nodeConstants.PRIORITY_HIGHEST || priority > nodeConstants.PRIORITY_LOW) {
+    const err = new RangeError(
+      `The value of "priority" is out of range. It must be >= ${nodeConstants.PRIORITY_HIGHEST} and <= ${nodeConstants.PRIORITY_LOW}. Received ${priority}`,
+    );
+    err.code = "ERR_OUT_OF_RANGE";
+    throw err;
   }
 }
 
 export function getPriority(pid = 0) {
-  validatePriorityPid(Number(pid ?? 0), "uv_os_getpriority");
-  const target = Number(pid || globalThis.process?.pid || 0);
+  validatePriorityPid(pid);
+  validatePriorityProcess(pid, "uv_os_getpriority");
+  const target = pid || globalThis.process?.pid || 0;
   if (typeof cottontail.osGetPriority === "function") return Number(cottontail.osGetPriority(target));
   const value = shell(`ps -o ni= -p ${target || "$$"}`);
   const priority = Number(value.trim());
@@ -343,13 +391,17 @@ export function setPriority(pid, priority = undefined) {
     priority = pid;
     pid = globalThis.process?.pid ?? 0;
   }
-  validatePriorityPid(Number(pid ?? 0), "uv_os_setpriority");
-  const target = Number(pid || globalThis.process?.pid || 0);
+  validatePriorityPid(pid);
+  validatePriority(priority);
+  // Keep validation deterministic: an invalid priority wins over a process
+  // lookup failure, matching Node and Bun.
+  validatePriorityProcess(pid, "uv_os_setpriority");
+  const target = pid || globalThis.process?.pid || 0;
   if (typeof cottontail.osSetPriority === "function") {
-    cottontail.osSetPriority(target, Number(priority));
+    cottontail.osSetPriority(target, priority);
     return;
   }
-  const result = shell(`renice -n ${Number(priority)} -p ${target || "$$"} >/dev/null 2>&1; echo $?`);
+  const result = shell(`renice -n ${priority} -p ${target || "$$"} >/dev/null 2>&1; echo $?`);
   if (result && Number(result) !== 0) throw new Error("setPriority failed");
 }
 

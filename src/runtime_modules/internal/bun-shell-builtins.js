@@ -2,20 +2,25 @@
 // They operate on an interpreter context instead of process-global cwd/env so
 // pipelines and subshells receive Bun's copy-on-execute state.
 
-import {
-  appendFileSync,
-  cpSync,
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  readFileSync,
-  readdirSync,
-  renameSync,
-  rmdirSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from "../node/fs.js";
+// Bound lazily: see the note in bun-shell-runtime.js. A builtin that touches
+// the filesystem loads node/fs.js on its first call, but `echo`/`which`-only
+// scripts skip the whole node:stream + node:url + bun:ffi graph.
+let fsModule;
+function fs() {
+  return (fsModule ??= require("../node/fs.js"));
+}
+const appendFileSync = (...args) => fs().appendFileSync(...args);
+const cpSync = (...args) => fs().cpSync(...args);
+const existsSync = (...args) => fs().existsSync(...args);
+const lstatSync = (...args) => fs().lstatSync(...args);
+const mkdirSync = (...args) => fs().mkdirSync(...args);
+const readFileSync = (...args) => fs().readFileSync(...args);
+const readdirSync = (...args) => fs().readdirSync(...args);
+const renameSync = (...args) => fs().renameSync(...args);
+const rmdirSync = (...args) => fs().rmdirSync(...args);
+const rmSync = (...args) => fs().rmSync(...args);
+const statSync = (...args) => fs().statSync(...args);
+const writeFileSync = (...args) => fs().writeFileSync(...args);
 import { basename, dirname, isAbsolute, join, resolve } from "../node/path.js";
 
 const encoder = new TextEncoder();

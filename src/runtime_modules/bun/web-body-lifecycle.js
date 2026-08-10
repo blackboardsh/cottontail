@@ -1,7 +1,13 @@
 export function bodyStreamIsDisturbed(stream) {
-  return stream?._disturbed === true ||
-    stream?.readableDidRead === true ||
-    stream?.readableAborted === true;
+  if (stream == null) return false;
+  if (stream._disturbed === true) return true;
+  // Stream-like bodies (child process stdio, user objects) may inherit
+  // Readable's accessors without its internal state, so these reads throw.
+  try {
+    return stream.readableDidRead === true || stream.readableAborted === true;
+  } catch {
+    return false;
+  }
 }
 
 export function bodyWasUsed(owner) {

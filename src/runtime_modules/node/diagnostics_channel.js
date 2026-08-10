@@ -17,7 +17,11 @@ export class Channel {
   }
 
   unsubscribe(callback) {
-    return this._subscribers.delete(callback);
+    const removed = this._subscribers.delete(callback);
+    if (removed && this._subscribers.size === 0) {
+      channels.delete(this.name);
+    }
+    return removed;
   }
 
   publish(message) {

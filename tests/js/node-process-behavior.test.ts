@@ -27,8 +27,8 @@ afterEach(() => {
 
 describe("node:process behavior", () => {
   test("reports the supported Node contract and Bun compatibility", () => {
-    expect(process.version).toBe("v24.11.1");
-    expect(process.versions.node).toBe("24.11.1");
+    expect(process.version).toBe("v24.3.0");
+    expect(process.versions.node).toBe("24.3.0");
     expect(process.versions.cottontail).toBeString();
     expect(process.release.name).toBe("node");
     expect(process.release.sourceUrl).toContain(`/bun-v${process.versions.bun}/bun-`);
@@ -233,16 +233,16 @@ describe("node:process behavior", () => {
     expect([legacyRefable.refs, legacyRefable.unrefs]).toEqual([1, 1]);
   });
 
-  test("exposes an immutable allowed-flags set", () => {
+  test("exposes Bun's empty immutable allowed-flags set", () => {
+    // Bun 1.3.10 exposes an empty stub set here (verified against the real
+    // binary); keep the immutability contract.
     const flags = process.allowedNodeEnvironmentFlags;
-    const size = flags.size;
+    expect(flags).toBeInstanceOf(Set);
+    expect(flags.size).toBe(0);
     expect(Object.isFrozen(flags)).toBe(true);
-    expect(flags.has("perf_basic_prof")).toBe(true);
-    expect(flags.has("--stack-trace-limit=100")).toBe(true);
-    expect(flags.has("--stack-trace-limit=-=xX_nodejs_Xx=-")).toBe(true);
     flags.add("--cottontail-invalid");
     Set.prototype.add.call(flags, "--cottontail-invalid-2");
-    expect(flags.size).toBe(size);
+    expect(flags.size).toBe(0);
     expect(flags.has("--cottontail-invalid")).toBe(false);
     expect(flags.has("--cottontail-invalid-2")).toBe(false);
   });

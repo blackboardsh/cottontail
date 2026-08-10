@@ -2543,7 +2543,7 @@ pub fn renameatConcurrentlyWithoutFallback(
 
         //  sad path: let's try to delete the folder and then rename it
         if (to_dir_fd.isValid()) {
-            var to_dir = to_dir_fd.stdDir();
+            var to_dir = FD.stdDir(to_dir_fd);
             to_dir.deleteTree(to) catch {};
         } else {
             std.fs.deleteTreeAbsolute(to) catch {};

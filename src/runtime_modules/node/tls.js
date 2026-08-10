@@ -701,6 +701,29 @@ function validateTlsMaterial(name, value, allowKeyObject = false) {
   throw invalidArgType(name, "of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer", value);
 }
 
+// Building a native context to validate the credentials parses the whole CA
+// bundle, which dominates the cost of every TLS connection. The result only
+// depends on the material below, so identical material is validated once.
+const secureContextValidationCache = new Map();
+const secureContextValidationCacheLimit = 64;
+
+function secureContextValidationKey(credentials, context, protocols, advanced) {
+  if (advanced != null && Object.keys(advanced).length > 0) return null;
+  for (const value of [credentials.cert, credentials.key, credentials.ca, credentials.passphrase, context.ciphers]) {
+    if (value !== undefined && value !== null && typeof value !== "string") return null;
+  }
+  return JSON.stringify([
+    credentials.cert ?? null,
+    credentials.key ?? null,
+    credentials.ca ?? null,
+    credentials.passphrase ?? null,
+    context.ciphers ?? null,
+    protocols.minVersion ?? null,
+    protocols.maxVersion ?? null,
+    protocols.secureOptions ?? null,
+  ]);
+}
+
 class SecureContextImpl {
   constructor(options = {}) {
     if (options == null) options = {};
@@ -724,25 +747,41 @@ class SecureContextImpl {
     const protocols = tlsProtocolOptions(context);
     const credentials = tlsCredentialOptions(context);
     const advanced = tlsAdvancedOptions(context);
-    try {
-      const contextInfo = cottontail.tlsValidateSecureContext?.(
-        credentials.cert,
-        credentials.key,
-        credentials.passphrase,
-        credentials.ca,
-        context.ciphers,
-        protocols.minVersion,
-        protocols.maxVersion,
-        protocols.secureOptions,
-        advanced,
-      );
-      this._certificate = bufferFromNativeBytes(contextInfo?.certificate);
-      this._issuer = bufferFromNativeBytes(contextInfo?.issuer);
-      if (contextInfo?.dhWarning) {
-        process.emitWarning("DH parameter is less than 2048 bits", "SecurityWarning");
+    const cacheKey = secureContextValidationKey(credentials, context, protocols, advanced);
+    let validated = cacheKey == null ? undefined : secureContextValidationCache.get(cacheKey);
+    if (validated === undefined) {
+      try {
+        const contextInfo = cottontail.tlsValidateSecureContext?.(
+          credentials.cert,
+          credentials.key,
+          credentials.passphrase,
+          credentials.ca,
+          context.ciphers,
+          protocols.minVersion,
+          protocols.maxVersion,
+          protocols.secureOptions,
+          advanced,
+        );
+        validated = {
+          certificate: bufferFromNativeBytes(contextInfo?.certificate),
+          issuer: bufferFromNativeBytes(contextInfo?.issuer),
+          dhWarning: contextInfo?.dhWarning === true,
+        };
+      } catch (error) {
+        throw normalizeTlsError(error, "Failed to initialize TLS context");
       }
-    } catch (error) {
-      throw normalizeTlsError(error, "Failed to initialize TLS context");
+      if (cacheKey != null) {
+        if (secureContextValidationCache.size >= secureContextValidationCacheLimit) {
+          secureContextValidationCache.delete(secureContextValidationCache.keys().next().value);
+        }
+        secureContextValidationCache.set(cacheKey, validated);
+      }
+    }
+    // Each context owns its copy: these are handed out as _certificate/_issuer.
+    this._certificate = validated.certificate == null ? validated.certificate : Buffer.from(validated.certificate);
+    this._issuer = validated.issuer == null ? validated.issuer : Buffer.from(validated.issuer);
+    if (validated.dhWarning) {
+      process.emitWarning("DH parameter is less than 2048 bits", "SecurityWarning");
     }
     this.context = context;
     this.servername = options.servername;
@@ -888,6 +927,25 @@ export class TLSSocket extends Socket {
     this._tlsId = Number(native.id);
     this.fd = Number(native.fd ?? -1);
     this._tlsInfo = native;
+    // Expose the connection fd through _handle (Bun parity): when this socket
+    // wraps a parent socket, the fd was detached during the TLS upgrade, so
+    // the parent's fd stays null (issue #24575).
+    if (this._handle != null && typeof this._handle === "object" && this._handle.fd == null) {
+      const owner = this;
+      const inner = this._handle;
+      this._handle = {
+        _owner: owner,
+        get fd() { return owner.fd ?? -1; },
+        get owner() { return owner; },
+        set owner(value) { /* facade owner is fixed */ },
+        setNoDelay(value = true) { inner.setNoDelay?.(value); return 0; },
+        setKeepAlive(value = false, delay = 0) { inner.setKeepAlive?.(value, Number(delay) * 1000); return 0; },
+        close(callback) { owner.destroy(); if (typeof callback === "function") queueMicrotask(callback); },
+        ref() { owner.ref?.(); },
+        unref() { owner.unref?.(); },
+        hasRef() { return owner._refed !== false; },
+      };
+    }
     this.destroyed = false;
     this.readable = true;
     this.writable = !this._ending;
@@ -1952,7 +2010,21 @@ class ServerImpl extends NetServer {
     this._ticketKeys = ticketKeys;
     this._sessionTimeout = sessionTimeout;
     this._sessionIdContext = Buffer.from(sessionIdContext);
-    this.setSecureContext(options);
+    this._deferredError = null;
+    try {
+      this.setSecureContext(options);
+    } catch (error) {
+      // Credential errors (bad passphrase, missing cert) are deferred to
+      // listen() where they are emitted as 'error' events, matching Node.js.
+      // Other errors (e.g. invalid ciphers) are thrown synchronously.
+      const code = error?.code ?? "";
+      if (code === "ERR_OSSL_EVP_BAD_DECRYPT" || code === "ERR_MISSING_PASSPHRASE" ||
+          /bad decrypt|passphrase required|no certificate/i.test(error?.message ?? "")) {
+        this._deferredError = error;
+      } else {
+        throw error;
+      }
+    }
     if (typeof secureConnectionListener === "function") this.on("secureConnection", secureConnectionListener);
   }
 
@@ -2080,6 +2152,12 @@ class ServerImpl extends NetServer {
         error.code = "ERR_SOCKET_BAD_PORT";
         throw error;
       }
+    }
+    if (this._deferredError) {
+      const error = this._deferredError;
+      this._deferredError = null;
+      queueMicrotask(() => this.emit("error", normalizeTlsError(error)));
+      return this;
     }
     try {
       validateNativeServerContext(this._tlsOptions);
@@ -2645,7 +2723,7 @@ function lockRootCertificatesExport(namespace) {
 
 function installRootCertificatesExportLock() {
   const modules = globalThis.__cottontailBuiltinModules ??= new Map();
-  if (lockRootCertificatesExport(modules.get("tls") ?? modules.get("node:tls"))) return;
+  lockRootCertificatesExport(modules.get("tls") ?? modules.get("node:tls"));
 
   // Embedded modules are initialized before the builtin registry is filled.
   // Lock the generated namespace at the point where the registry receives it.
@@ -2663,8 +2741,38 @@ function installRootCertificatesExportLock() {
       return result;
     },
   });
+
+  // The native module system may return a different namespace object from
+  // require("tls") than what is stored in __cottontailBuiltinModules.
+  // Hook Module._load to patch the actual object that callers receive.
+  try {
+    const Module = require("module");
+    if (Module && typeof Module._load === "function" && !Module._load.__cottontailTlsLockPatched) {
+      const origLoad = Module._load;
+      Module._load = function(request, parent, isMain) {
+        const result = origLoad.call(this, request, parent, isMain);
+        if (request === "tls" || request === "node:tls") {
+          lockRootCertificatesExport(result);
+        }
+        return result;
+      };
+      Module._load.__cottontailTlsLockPatched = true;
+    }
+  } catch {}
 }
 
 installRootCertificatesExportLock();
+
+// Also patch the namespace object that require("tls") will return.
+// In Cottontail's module system, the overlay's module.exports may be the
+// same object as the native namespace.
+try {
+  if (typeof module !== "undefined" && module.exports) {
+    lockRootCertificatesExport(module.exports);
+  }
+} catch {}
+
+// Store the patching function globally so other code can apply it too.
+globalThis.__cottontailLockTlsRootCertificates = lockRootCertificatesExport;
 
 export default tlsDefault;

@@ -330,7 +330,7 @@ pub fn write(
         std.Io.Dir.cwd(),
         output_path,
         init.io,
-        .{ .make_path = true },
+        .{ .permissions = .executable_file, .make_path = true },
     );
     errdefer std.Io.Dir.cwd().deleteFile(init.io, output_path) catch {};
 

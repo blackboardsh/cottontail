@@ -45,6 +45,7 @@ const shaped = db.prepare("select id, name from users").as(User).get();
 assert(shaped instanceof User && shaped.name === "Ada", "bun:sqlite Statement.as mismatch");
 assert(db.prepare("select id from users where id = -1").get() === null, "bun:sqlite missing row should be null");
 assert(db.prepare("select x'DEADBEEF' as blob").get()?.blob instanceof Uint8Array, "bun:sqlite blob shape mismatch");
+assert(db.prepare("select acos(1) as value").get()?.value === 0, "bun:sqlite math functions mismatch");
 
 const expanded = db.prepare("select $value as value");
 assert(expanded.toString() === "select NULL as value", "bun:sqlite initial expanded SQL mismatch");

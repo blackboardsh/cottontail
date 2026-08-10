@@ -767,6 +767,22 @@ class Zlib extends Transform {
     if (this._mode === "zstdDecompress") {
       completed = decodeCompletedInput(this._mode, input, this._transformOptions());
     }
+    // zlib-wrapped/raw inflate stream transforms run with Z_SYNC_FLUSH, which
+    // decodes a truncated stream without complaint; at end-of-input Node
+    // (and Bun) require the stream to actually terminate, so re-run a strict
+    // Z_FINISH decode purely for its error (brotli/zstd already fail
+    // natively). The error is deferred until after the decoded output is
+    // pushed: consumers enforcing size limits (express body-parser's 413)
+    // must observe the data before the integrity error.
+    let strictError = null;
+    if (this._mode === "inflate" || this._mode === "inflateRaw" ||
+      this._mode === "gunzip" || this._mode === "unzip") {
+      try {
+        transformSync(this._mode, input, { ...this._transformOptions(), finishFlush: constants.Z_FINISH });
+      } catch (error) {
+        strictError = error;
+      }
+    }
     const output = completed === null ? transformSync(this._mode, input, this._transformOptions()) : completed.bytes;
     let bytes = output instanceof Uint8Array ? output : new Uint8Array(output);
     if (this._isDecompress) {
@@ -820,6 +836,7 @@ class Zlib extends Transform {
     }
     this._pushOutput(bytes);
     if (this._mode === "zstdCompress") this._emittedMember = true;
+    if (strictError) throw strictError;
     return true;
   }
 
@@ -1012,10 +1029,28 @@ function kMaxLengthLimit() {
 class Brotli extends Zlib {}
 class Zstd extends Zlib {}
 
+// Node's zlib constructors are plain functions, so `zlib.Inflate.call(this,
+// opts)` from a `util.inherits` subclass (pngjs's sync inflate does exactly
+// this) initializes the caller's object in place. The engine classes here are
+// ES classes that cannot be `.call`ed, so build the state on a real instance
+// and transplant it onto the caller, re-pointing the binding handle at its new
+// owner so error reporting still reaches the object the caller listens on.
+function adoptZlibInstanceState(target, instance) {
+  for (const key of Reflect.ownKeys(instance)) {
+    const descriptor = Object.getOwnPropertyDescriptor(instance, key);
+    if (descriptor !== undefined) Object.defineProperty(target, key, descriptor);
+  }
+  if (target._handle?._stream === instance) target._handle._stream = target;
+  return target;
+}
+
 function makeCallableZlibConstructor(name, Parent, mode) {
   const Constructor = {
     [name]: function(options = {}) {
-      if (!new.target) return new Constructor(options);
+      if (!new.target) {
+        const instance = new Constructor(options);
+        return this instanceof Constructor ? adoptZlibInstanceState(this, instance) : instance;
+      }
       return Reflect.construct(Parent, [mode, options], new.target);
     },
   }[name];
@@ -1068,7 +1103,21 @@ function callbackifySync(fn) {
 export function deflateSync(data, options = undefined) { return transformSync("deflate", data, options); }
 export function deflateRawSync(data, options = undefined) { return transformSync("deflateRaw", data, options); }
 export function gzipSync(data, options = undefined) { return transformSync("gzip", data, options); }
-export function inflateSync(data, options = undefined) { return transformSync("inflate", data, options); }
+export function inflateSync(data, options = undefined) {
+  // Bun.inflateSync aliases this one-shot and inflates raw deflate by
+  // default (BunObject.zig runs it with windowBits -15): when the zlib
+  // wrapper fails the header check, retry as a raw deflate stream and report
+  // the raw stream's error if that fails too (e.g. "invalid stored block
+  // lengths" instead of "incorrect header check").
+  try {
+    return transformSync("inflate", data, options);
+  } catch (error) {
+    // Only data errors fall through to the raw attempt; option-validation
+    // and output-limit failures are not format mismatches.
+    if (error instanceof Error) throw error;
+    return transformSync("inflateRaw", data, options);
+  }
+}
 export function inflateRawSync(data, options = undefined) { return transformSync("inflateRaw", data, options); }
 export function gunzipSync(data, options = undefined) { return decompressMembersSync("gunzip", data, options); }
 export function unzipSync(data, options = undefined) { return decompressMembersSync("unzip", data, options); }

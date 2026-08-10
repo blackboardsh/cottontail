@@ -57,7 +57,152 @@ for (const entry of interfaceEntries) {
 
 const priority = getPriority();
 assert(Number.isInteger(priority), "getPriority should return an integer");
+assert(getPriority(0) === priority, "getPriority(0) should target the current process");
 setPriority(process.pid, priority);
 assert(getPriority(process.pid) === priority, "setPriority should preserve same priority");
+
+function expectPriorityValidationError(
+  operation: () => unknown,
+  code: "ERR_INVALID_ARG_TYPE" | "ERR_OUT_OF_RANGE",
+  argument: "pid" | "priority",
+  label: string,
+) {
+  let caught: unknown;
+  try {
+    operation();
+  } catch (error) {
+    caught = error;
+  }
+  assert(caught instanceof Error, `${label} should throw a catchable Error`);
+  assert((caught as Error & { code?: string }).code === code, `${label} error code mismatch`);
+  assert(
+    code === "ERR_INVALID_ARG_TYPE" ? caught instanceof TypeError : caught instanceof RangeError,
+    `${label} error type mismatch`,
+  );
+  assert(caught.message.includes(`"${argument}"`), `${label} error should identify ${argument}`);
+}
+
+expectPriorityValidationError(
+  () => (os.setPriority as (...args: unknown[]) => void)(),
+  "ERR_INVALID_ARG_TYPE",
+  "priority",
+  "os.setPriority()",
+);
+expectPriorityValidationError(
+  () => (os.setPriority as (...args: unknown[]) => void)(Number.NaN),
+  "ERR_OUT_OF_RANGE",
+  "priority",
+  "os.setPriority(NaN)",
+);
+const invalidPriorityPidTypes: unknown[] = [null, true, false, "0", [], {}];
+for (const invalidPid of invalidPriorityPidTypes) {
+  expectPriorityValidationError(
+    () => (os.getPriority as (pid: unknown) => number)(invalidPid),
+    "ERR_INVALID_ARG_TYPE",
+    "pid",
+    `getPriority(${String(invalidPid)})`,
+  );
+  expectPriorityValidationError(
+    () => (os.setPriority as (pid: unknown, priority: number) => void)(invalidPid, priority),
+    "ERR_INVALID_ARG_TYPE",
+    "pid",
+    `setPriority(${String(invalidPid)}, priority)`,
+  );
+}
+for (const invalidPid of [Number.NaN, Infinity, -Infinity, 1.5, -2147483649, 2147483648]) {
+  expectPriorityValidationError(
+    () => getPriority(invalidPid),
+    "ERR_OUT_OF_RANGE",
+    "pid",
+    `getPriority(${invalidPid})`,
+  );
+  expectPriorityValidationError(
+    () => setPriority(invalidPid, priority),
+    "ERR_OUT_OF_RANGE",
+    "pid",
+    `setPriority(${invalidPid}, priority)`,
+  );
+}
+for (const invalidPriority of [null, true, false, "0", [], {}]) {
+  expectPriorityValidationError(
+    () => (os.setPriority as (pid: number, priority: unknown) => void)(process.pid, invalidPriority),
+    "ERR_INVALID_ARG_TYPE",
+    "priority",
+    `setPriority(process.pid, ${String(invalidPriority)})`,
+  );
+}
+for (const invalidPriority of [Number.NaN, Infinity, -Infinity, -21, 20, 1.5]) {
+  expectPriorityValidationError(
+    () => setPriority(process.pid, invalidPriority),
+    "ERR_OUT_OF_RANGE",
+    "priority",
+    `setPriority(${invalidPriority})`,
+  );
+}
+expectPriorityValidationError(
+  () => setPriority(2147483647, Number.NaN),
+  "ERR_OUT_OF_RANGE",
+  "priority",
+  "setPriority(unknown pid, NaN)",
+);
+expectPriorityValidationError(
+  () => (os.setPriority as (pid: number, priority: unknown) => void)(2147483647, "0"),
+  "ERR_INVALID_ARG_TYPE",
+  "priority",
+  "setPriority(unknown pid, string priority)",
+);
+
+let missingProcessError: unknown;
+try {
+  getPriority(-1);
+} catch (error) {
+  missingProcessError = error;
+}
+assert(missingProcessError instanceof Error, "getPriority(-1) should throw a catchable Error");
+assert(missingProcessError.name === "SystemError", "getPriority(-1) should throw a SystemError");
+assert(
+  (missingProcessError as Error & { code?: string }).code === "ERR_SYSTEM_ERROR",
+  "getPriority(-1) system error code mismatch",
+);
+assert(
+  (missingProcessError as Error & { errno?: number }).errno === (process.platform === "win32" ? -4040 : -3),
+  "getPriority(-1) system errno mismatch",
+);
+
+assert(typeof cottontail.osGetPriority === "function", "native osGetPriority binding missing");
+assert(typeof cottontail.osSetPriority === "function", "native osSetPriority binding missing");
+const nativeGetPriority = cottontail.osGetPriority as (...args: unknown[]) => unknown;
+const nativeSetPriority = cottontail.osSetPriority as (...args: unknown[]) => unknown;
+for (const [label, operation] of [
+  ["native osSetPriority()", () => nativeSetPriority()],
+  ["native osGetPriority(null)", () => nativeGetPriority(null)],
+  ["native osGetPriority(string)", () => nativeGetPriority("0")],
+  ["native osGetPriority(array)", () => nativeGetPriority([])],
+  ["native osGetPriority(object)", () => nativeGetPriority({})],
+  ["native osGetPriority(NaN)", () => nativeGetPriority(Number.NaN)],
+  ["native osGetPriority(negative pid)", () => nativeGetPriority(-1)],
+  ["native osGetPriority(out of range)", () => nativeGetPriority(2147483648)],
+  ["native osSetPriority(null pid)", () => nativeSetPriority(null, priority)],
+  ["native osSetPriority(string pid)", () => nativeSetPriority("0", priority)],
+  ["native osSetPriority(array pid)", () => nativeSetPriority([], priority)],
+  ["native osSetPriority(object pid)", () => nativeSetPriority({}, priority)],
+  ["native osSetPriority(NaN pid)", () => nativeSetPriority(Number.NaN, priority)],
+  ["native osSetPriority(negative pid)", () => nativeSetPriority(-1, priority)],
+  ["native osSetPriority(out-of-range pid)", () => nativeSetPriority(2147483648, priority)],
+  ["native osSetPriority(null priority)", () => nativeSetPriority(process.pid, null)],
+  ["native osSetPriority(string priority)", () => nativeSetPriority(process.pid, "0")],
+  ["native osSetPriority(array priority)", () => nativeSetPriority(process.pid, [])],
+  ["native osSetPriority(object priority)", () => nativeSetPriority(process.pid, {})],
+  ["native osSetPriority(NaN)", () => nativeSetPriority(process.pid, Number.NaN)],
+  ["native osSetPriority(out-of-range priority)", () => nativeSetPriority(process.pid, 20)],
+] as const) {
+  let caught: unknown;
+  try {
+    operation();
+  } catch (error) {
+    caught = error;
+  }
+  assert(caught instanceof Error, `${label} should throw a catchable Error`);
+}
 
 console.log("node os passed");

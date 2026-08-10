@@ -202,6 +202,15 @@ extern void JSGlobalContextSetUnhandledRejectionCallback(
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__linux__) && __has_include(<gnu/libc-version.h>)
+#include <gnu/libc-version.h>
+#if defined(__GLIBC__)
+#define CT_HAS_GLIBC_DIAGNOSTICS 1
+#endif
+#endif
+#ifndef CT_HAS_GLIBC_DIAGNOSTICS
+#define CT_HAS_GLIBC_DIAGNOSTICS 0
+#endif
 #if defined(_WIN32)
 #include <direct.h>
 #include <io.h>
@@ -374,6 +383,41 @@ static void ct_jsc_configure_gc_signal_once(void) {
 
 static void ct_jsc_configure_gc_signal(void) {
     (void)pthread_once(&ct_jsc_gc_signal_once, ct_jsc_configure_gc_signal_once);
+}
+#endif
+
+#if defined(COTTONTAIL_VENDORED_JSC) && defined(__linux__) && defined(__aarch64__)
+static bool ct_jsc_option_value_is_true(const char *value) {
+    return value != NULL && (
+        strcmp(value, "1") == 0 ||
+        strcasecmp(value, "true") == 0 ||
+        strcasecmp(value, "yes") == 0
+    );
+}
+
+static bool ct_jsc_apply_platform_dfg_default(void) {
+    /* WebKit 7624's DFG/FTL tiers intermittently emit invalid cell accesses on
+     * Linux ARM64 under ordinary compiler-heavy workloads (Svelte and esbuild).
+     * The baseline JIT is stable. Apply this only while JSC latches its initial
+     * options so process.env and subsequently spawned children remain clean.
+     * A direct DFG setting or an explicit request to enable FTL remains
+     * authoritative for users who deliberately opt back into those tiers. */
+    if (getenv("JSC_useDFGJIT") != NULL) return false;
+    if (ct_jsc_option_value_is_true(getenv("JSC_useFTLJIT"))) return false;
+    if (setenv("JSC_useDFGJIT", "false", 0) != 0) return false;
+    return true;
+}
+
+static void ct_jsc_restore_platform_dfg_default(bool applied) {
+    if (applied) unsetenv("JSC_useDFGJIT");
+}
+#else
+static bool ct_jsc_apply_platform_dfg_default(void) {
+    return false;
+}
+
+static void ct_jsc_restore_platform_dfg_default(bool applied) {
+    (void)applied;
 }
 #endif
 
@@ -1942,7 +1986,11 @@ extern void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx);
 #define CT_TLS_CONNECTION_EVENT_ID_BASE 0x20000000u
 #define CT_TLS_SERVER_EVENT_ID_BASE 0x80000000u
 
+#define CT_STRINGIFY_VALUE_INNER(value) #value
+#define CT_STRINGIFY_VALUE(value) CT_STRINGIFY_VALUE_INNER(value)
+
 static int ct_get_bytes(JSContextRef ctx, JSValueRef value, uint8_t **out_data, size_t *out_len);
+static bool ct_set_nonblocking_fd(int fd);
 static void ct_queue_fd_binary(CtJscRuntime *runtime, uint32_t id, const char *type, const char *data, size_t data_len);
 static void ct_queue_fd_data(CtJscRuntime *runtime, uint32_t id, const char *data, size_t data_len);
 static void ct_queue_fd_simple(CtJscRuntime *runtime, uint32_t id, const char *type, const char *message);
@@ -2686,6 +2734,8 @@ typedef struct CtHttpServer {
     size_t max_body_size;
     char *hostname;
     char *unix_path;
+    size_t unix_path_len;
+    bool unix_path_abstract;
     bool stopping;
     bool stopped;
     bool listen_fd_closed;
@@ -4180,8 +4230,11 @@ static int ct_http_take_body_piece(
         }
 
         if (request->chunk_expect_crlf) {
+            /* Reject a bad terminator as soon as the first byte lands so a
+               fragmented read cannot defer the 400 until more data arrives. */
+            if (input->len >= 1 && input->data[0] != '\r') return -1;
             if (input->len < 2) return 1;
-            if (input->data[0] != '\r' || input->data[1] != '\n') return -1;
+            if (input->data[1] != '\n') return -1;
             ct_http_read_buffer_consume(input, 2);
             request->chunk_expect_crlf = false;
             continue;
@@ -4237,16 +4290,12 @@ static int ct_http_take_body_piece(
 
 static int ct_http_socket_read_ready(int fd, int timeout_ms) {
     fd_set read_fds;
-    fd_set error_fds;
     FD_ZERO(&read_fds);
-    FD_ZERO(&error_fds);
 #if defined(_WIN32)
     SOCKET socket_value = ct_windows_socket_from_fd(fd);
     FD_SET(socket_value, &read_fds);
-    FD_SET(socket_value, &error_fds);
 #else
     FD_SET(fd, &read_fds);
-    FD_SET(fd, &error_fds);
 #endif
     struct timeval timeout;
     timeout.tv_sec = timeout_ms / 1000;
@@ -4259,13 +4308,18 @@ static int ct_http_socket_read_ready(int fd, int timeout_ms) {
 #endif
         &read_fds,
         NULL,
-        &error_fds,
+        NULL,
         &timeout
     );
 #if defined(_WIN32)
     if (result == SOCKET_ERROR) errno = ct_windows_socket_errno();
 #endif
-    return result;
+    if (result <= 0) return result;
+#if defined(_WIN32)
+    return FD_ISSET(socket_value, &read_fds) ? 1 : 0;
+#else
+    return FD_ISSET(fd, &read_fds) ? 1 : 0;
+#endif
 }
 
 /* Returns 1 after reading, 0 on timeout, and -1 on disconnect/error. */
@@ -4295,6 +4349,47 @@ static bool ct_http_peer_disconnected(int fd, int timeout_ms) {
     if (peeked == 0) return true;
     if (peeked < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) return true;
     return false;
+}
+
+static void ct_http_settle_rejected_request(int fd) {
+    /* Closing a TCP socket while rejected request bytes are still in flight
+       can turn the close into a reset on Linux and discard the 4xx response
+       before the client reads it. Stop writing, then briefly drain the peer
+       so the response and FIN remain observable. */
+    if (shutdown(fd, SHUT_WR) != 0 && errno != ENOTCONN) return;
+    if (!ct_set_nonblocking_fd(fd)) return;
+
+    char discard[4096];
+    struct timespec started;
+    bool has_deadline = clock_gettime(CLOCK_MONOTONIC, &started) == 0;
+    int fallback_attempts = 0;
+    for (;;) {
+        int wait_ms = 10;
+        if (has_deadline) {
+            struct timespec now;
+            if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+                now.tv_sec < started.tv_sec ||
+                (now.tv_sec == started.tv_sec && now.tv_nsec < started.tv_nsec)) break;
+            int64_t elapsed_ms = (int64_t)(now.tv_sec - started.tv_sec) * 1000 +
+                (int64_t)(now.tv_nsec - started.tv_nsec) / 1000000;
+            if (elapsed_ms >= 100) break;
+            if (100 - elapsed_ms < wait_ms) wait_ms = (int)(100 - elapsed_ms);
+        } else if (fallback_attempts >= 10) {
+            break;
+        }
+        fallback_attempts += 1;
+
+        int ready = ct_http_socket_read_ready(fd, wait_ms);
+        if (ready == 0) continue;
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        ssize_t read_count = recv(fd, discard, sizeof(discard), 0);
+        if (read_count > 0) continue;
+        if (read_count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        break;
+    }
 }
 
 static void ct_http_send_response(CtHttpRequest *request) {
@@ -4445,7 +4540,7 @@ static ssize_t ct_http_send_forward_response_head(CtHttpRequest *request, bool k
     return result;
 }
 
-static void ct_http_send_status_response(int fd, int status, const char *reason, const char *body) {
+static bool ct_http_send_status_response(int fd, int status, const char *reason, const char *body) {
     size_t body_len = strlen(body);
     int response_len = snprintf(
         NULL,
@@ -4456,9 +4551,9 @@ static void ct_http_send_status_response(int fd, int status, const char *reason,
         body_len,
         body
     );
-    if (response_len < 0) return;
+    if (response_len < 0) return false;
     char *response = (char *)malloc((size_t)response_len + 1);
-    if (response == NULL) return;
+    if (response == NULL) return false;
     snprintf(
         response,
         (size_t)response_len + 1,
@@ -4468,8 +4563,9 @@ static void ct_http_send_status_response(int fd, int status, const char *reason,
         body_len,
         body
     );
-    ct_http_send_all(fd, response, (size_t)response_len);
+    bool sent = ct_http_send_all(fd, response, (size_t)response_len) >= 0;
     free(response);
+    return sent;
 }
 
 static void ct_http_request_mark_aborted(CtHttpRequest *request) {
@@ -4482,6 +4578,12 @@ static void ct_http_request_mark_aborted(CtHttpRequest *request) {
         ct_http_body_chunk_free(request->body_chunk, request->body_chunk_len);
         request->body_chunk = NULL;
         request->body_chunk_len = 0;
+        /* No further body events can reach JavaScript once the request is
+           aborted, so release the connection thread from waiting on their
+           delivery. Without this a request that was buffering its body when
+           the abort landed keeps the client socket open forever. */
+        request->body_forwarding_reported = true;
+        request->body_buffering_reported = true;
         pthread_cond_broadcast(&request->cond);
     }
     pthread_mutex_unlock(&request->mutex);
@@ -4838,17 +4940,30 @@ static int ct_http_process_request_body(CtHttpServer *server, CtHttpRequest *req
         if (body_status == 2) return 0;
         if (body_status < 0) {
             pthread_mutex_lock(&request->mutex);
-            bool can_send_error = !request->response_sent;
+            bool response_already_sent = request->response_sent;
+            bool can_send_error = !response_already_sent;
             request->response_sent = true;
             pthread_mutex_unlock(&request->mutex);
+            bool should_settle = response_already_sent;
             if (can_send_error) {
                 if (body_status == -2) {
-                    ct_http_send_status_response(request->client_fd, 413, "Payload Too Large", "Payload Too Large");
+                    should_settle = ct_http_send_status_response(
+                        request->client_fd,
+                        413,
+                        "Payload Too Large",
+                        "Payload Too Large"
+                    );
                 } else {
-                    ct_http_send_status_response(request->client_fd, 400, "Bad Request", "Bad Request");
+                    should_settle = ct_http_send_status_response(
+                        request->client_fd,
+                        400,
+                        "Bad Request",
+                        "Bad Request"
+                    );
                 }
             }
             ct_http_request_mark_aborted(request);
+            if (should_settle) ct_http_settle_rejected_request(request->client_fd);
             return -1;
         }
 
@@ -4922,18 +5037,25 @@ static void *ct_http_client_thread(void *opaque) {
             server->max_body_size
         );
         if (head_status != 0) {
+            bool response_sent = false;
             if (!ct_http_server_is_stopped(server) && (input.len > 0 || head_status == 1)) {
                 if (head_status == 1) {
-                    ct_http_send_status_response(
+                    response_sent = ct_http_send_status_response(
                         request->client_fd,
                         413,
                         "Payload Too Large",
                         "Payload Too Large"
                     );
                 } else {
-                    ct_http_send_status_response(request->client_fd, 400, "Bad Request", "Bad Request");
+                    response_sent = ct_http_send_status_response(
+                        request->client_fd,
+                        400,
+                        "Bad Request",
+                        "Bad Request"
+                    );
                 }
             }
+            if (response_sent) ct_http_settle_rejected_request(request->client_fd);
             break;
         }
 
@@ -5196,6 +5318,27 @@ static char *ct_value_to_utf8_copy_checked(
     return buffer;
 }
 
+// COTTONTAIL-COMPAT: exception messages are user data and may embed U+0000, so
+// their true byte length cannot be recovered with strlen(). Record the length of
+// the most recently produced message alongside its address; ct_set_error_out
+// forwards it to the caller-visible record consulted by ct_jsc_string_length().
+// The pointer comparison is only ever made against a live allocation the caller
+// still owns, so an address can never be confused with a later one.
+static char *ct_exception_message_pointer = NULL;
+static size_t ct_exception_message_length = 0;
+
+static char *ct_track_exception_message(char *message, size_t length) {
+    ct_exception_message_pointer = message;
+    ct_exception_message_length = message != NULL ? length : 0;
+    return message;
+}
+
+static size_t ct_message_length(const char *message) {
+    if (message == NULL) return 0;
+    if (message == ct_exception_message_pointer) return ct_exception_message_length;
+    return strlen(message);
+}
+
 static char *ct_copy_exception(JSContextRef ctx, JSValueRef exception) {
     if (exception == NULL) return ct_duplicate_bytes("Unknown JavaScript exception", 28);
 
@@ -5230,16 +5373,24 @@ static char *ct_copy_exception(JSContextRef ctx, JSValueRef exception) {
         JSValueRef call_exception = NULL;
         JSValueRef formatted = JSObjectCallAsFunction(ctx, fn, NULL, 1, &arg, &call_exception);
         if (call_exception == NULL && formatted != NULL) {
-            char *copy = ct_value_to_string_copy(ctx, formatted);
-            if (copy != NULL) return copy;
+            size_t formatted_len = 0;
+            char *copy = ct_value_to_utf8_copy(ctx, formatted, &formatted_len);
+            if (copy != NULL) return ct_track_exception_message(copy, formatted_len);
         }
     }
-    return ct_value_to_string_copy(ctx, exception);
+    size_t fallback_len = 0;
+    char *fallback = ct_value_to_utf8_copy(ctx, exception, &fallback_len);
+    return ct_track_exception_message(fallback, fallback_len);
 }
+
+static char *ct_error_out_pointer = NULL;
+static size_t ct_error_out_length = 0;
 
 static void ct_set_error_out(char **error_out, char *message) {
     if (error_out != NULL) {
         *error_out = message;
+        ct_error_out_pointer = message;
+        ct_error_out_length = ct_message_length(message);
     } else {
         free(message);
     }
@@ -5392,10 +5543,10 @@ static void ct_reload_trace_event(
     if (filename_len > 0) memcpy(full_path + offset, filename, filename_len);
     full_path[full_len] = '\0';
 
-    uv_timeval64_t now;
-    int time_status = uv_gettimeofday(&now);
+    struct timespec now;
+    int time_status = clock_gettime(CLOCK_REALTIME, &now);
     long long timestamp = time_status == 0
-        ? (long long)now.tv_sec * 1000LL + (long long)(now.tv_usec / 1000)
+        ? (long long)now.tv_sec * 1000LL + (long long)(now.tv_nsec / 1000000L)
         : (long long)time(NULL) * 1000LL;
 
     fprintf(file, "{\"timestamp\":%lld,\"files\":{", timestamp);
@@ -11909,11 +12060,12 @@ static int ct_dispatch_signals(CtJscRuntime *runtime, char **error_out) {
         CtSignalWatcher *watcher = &runtime->signal_watchers[index];
         while (watcher->active && watcher->pending > 0) {
             watcher->pending -= 1;
-            JSValueRef arguments[1] = {
+            JSValueRef arguments[2] = {
                 ct_make_string(ctx, watcher->name),
+                JSValueMakeNumber(ctx, watcher->number),
             };
             JSValueRef exception = NULL;
-            JSValueRef emitted = ct_process_emit_event(ctx, watcher->name, 1, arguments, &exception);
+            JSValueRef emitted = ct_process_emit_event(ctx, watcher->name, 2, arguments, &exception);
             if (exception != NULL) {
                 JSValueRef thrown = exception;
                 if (ct_handle_uncaught_exception(runtime, thrown, &exception)) continue;
@@ -13474,7 +13626,15 @@ static JSValueRef ct_dns_lookup_service(JSContextRef ctx, JSObjectRef function, 
 
     char hostname[NI_MAXHOST];
     char service[NI_MAXSERV];
-    int status = getnameinfo((struct sockaddr *)&storage, storage_len, hostname, sizeof(hostname), service, sizeof(service), 0);
+    int status = getnameinfo(
+        (struct sockaddr *)&storage,
+        storage_len,
+        hostname,
+        sizeof(hostname),
+        service,
+        sizeof(service),
+        NI_NAMEREQD
+    );
     if (status != 0) {
         ct_throw_message(ctx, exception, gai_strerror(status));
         return JSValueMakeUndefined(ctx);
@@ -13528,7 +13688,7 @@ static JSValueRef ct_dns_lookup_service_async(JSContextRef ctx, JSObjectRef func
         &request->request.lookup_service,
         ct_dns_lookup_service_after,
         (const struct sockaddr *)&request->address,
-        0
+        NI_NAMEREQD
     );
     if (status != 0) {
         ct_dns_request_free(request);
@@ -14592,13 +14752,13 @@ static int ct_tcp_resolve_address(JSContextRef ctx, const char *address, int por
     return 0;
 }
 
-static void ct_set_nonblocking_fd(int fd) {
+static bool ct_set_nonblocking_fd(int fd) {
 #if defined(_WIN32)
     u_long nonblocking = 1;
-    ioctlsocket(fd, FIONBIO, &nonblocking);
+    return ioctlsocket(ct_windows_socket_from_fd(fd), FIONBIO, &nonblocking) != SOCKET_ERROR;
 #else
     int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 #endif
 }
 
@@ -15278,11 +15438,20 @@ static JSValueRef ct_tcp_socket_connect_set_ref(JSContextRef ctx, JSObjectRef fu
     return JSValueMakeBoolean(ctx, operation != NULL);
 }
 
-static JSObjectRef ct_unix_address_from_path(JSContextRef ctx, const char *path, JSValueRef *exception) {
+static JSObjectRef ct_unix_address_from_path_len(
+    JSContextRef ctx,
+    const char *path,
+    size_t path_len,
+    JSValueRef *exception
+) {
     JSObjectRef result = ct_make_object(ctx);
-    ct_set_property(ctx, result, "path", ct_make_string(ctx, path != NULL ? path : ""), exception);
+    ct_set_property(ctx, result, "path", ct_make_string_len(ctx, path, path != NULL ? path_len : 0), exception);
     ct_set_property(ctx, result, "family", ct_make_string(ctx, "Unix"), exception);
     return result;
+}
+
+static JSObjectRef ct_unix_address_from_path(JSContextRef ctx, const char *path, JSValueRef *exception) {
+    return ct_unix_address_from_path_len(ctx, path, path != NULL ? strlen(path) : 0, exception);
 }
 
 static JSObjectRef ct_unix_address_from_fd(JSContextRef ctx, int fd, bool peer, JSValueRef *exception) {
@@ -15296,6 +15465,12 @@ static JSObjectRef ct_unix_address_from_fd(JSContextRef ctx, int fd, bool peer, 
     if (status != 0) return ct_unix_address_from_path(ctx, "", exception);
     size_t base_len = offsetof(struct sockaddr_un, sun_path);
     size_t path_capacity = address_len > base_len ? (size_t)(address_len - base_len) : 0;
+#if defined(__linux__)
+    if (path_capacity > 0 && address.sun_path[0] == '\0') {
+        if (path_capacity > sizeof(address.sun_path)) path_capacity = sizeof(address.sun_path);
+        return ct_unix_address_from_path_len(ctx, address.sun_path, path_capacity, exception);
+    }
+#endif
     size_t path_len = strnlen(address.sun_path, path_capacity);
     char path[sizeof(address.sun_path) + 1];
     if (path_len > sizeof(address.sun_path)) path_len = sizeof(address.sun_path);
@@ -15512,9 +15687,17 @@ static JSValueRef ct_unix_server_listen(JSContextRef ctx, JSObjectRef function, 
         return JSValueMakeUndefined(ctx);
     }
     signal(SIGPIPE, SIG_IGN);
-    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    size_t path_len = 0;
+    char *path = ct_value_to_utf8_copy(ctx, argv[0], &path_len);
     if (path == NULL) return JSValueMakeUndefined(ctx);
-    if (strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+#if defined(__linux__)
+    bool abstract_path = path_len > 0 && path[0] == '\0';
+#else
+    bool abstract_path = false;
+#endif
+    if (path_len == 0 || (abstract_path
+            ? path_len > sizeof(((struct sockaddr_un *)0)->sun_path)
+            : path_len >= sizeof(((struct sockaddr_un *)0)->sun_path))) {
         free(path);
         ct_throw_message(ctx, exception, "Unix socket path is too long");
         return JSValueMakeUndefined(ctx);
@@ -15530,20 +15713,23 @@ static JSValueRef ct_unix_server_listen(JSContextRef ctx, JSObjectRef function, 
     struct sockaddr_un address;
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
-    strncpy(address.sun_path, path, sizeof(address.sun_path) - 1);
-    unlink(path);
+    memcpy(address.sun_path, path, path_len + (abstract_path ? 0 : 1));
+    if (!abstract_path) unlink(path);
+    socklen_t address_len = abstract_path
+        ? (socklen_t)(offsetof(struct sockaddr_un, sun_path) + path_len)
+        : (socklen_t)sizeof(address);
 
     int backlog = 128;
     if (argc >= 2 && !ct_value_to_int_checked(ctx, argv[1], 0, INT_MAX, &backlog, exception, "Invalid socket backlog")) {
         close(fd);
-        unlink(path);
+        if (!abstract_path) unlink(path);
         free(path);
         return JSValueMakeUndefined(ctx);
     }
-    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0 || listen(fd, backlog) != 0) {
+    if (bind(fd, (struct sockaddr *)&address, address_len) != 0 || listen(fd, backlog) != 0) {
         char *message = ct_duplicate_string(strerror(errno));
         close(fd);
-        unlink(path);
+        if (!abstract_path) unlink(path);
         free(path);
         ct_throw_message(ctx, exception, message != NULL ? message : "Unix socket listen failed");
         free(message);
@@ -15553,8 +15739,8 @@ static JSValueRef ct_unix_server_listen(JSContextRef ctx, JSObjectRef function, 
 
     JSObjectRef result = ct_make_object(ctx);
     ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, fd), exception);
-    ct_set_property(ctx, result, "path", ct_make_string(ctx, path), exception);
-    JSObjectRef local = ct_unix_address_from_path(ctx, path, exception);
+    ct_set_property(ctx, result, "path", ct_make_string_len(ctx, path, path_len), exception);
+    JSObjectRef local = ct_unix_address_from_path_len(ctx, path, path_len, exception);
     ct_set_property(ctx, result, "address", local, exception);
     free(path);
     return result;
@@ -15783,9 +15969,17 @@ static JSValueRef ct_unix_socket_connect(JSContextRef ctx, JSObjectRef function,
         return JSValueMakeUndefined(ctx);
     }
     signal(SIGPIPE, SIG_IGN);
-    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    size_t path_len = 0;
+    char *path = ct_value_to_utf8_copy(ctx, argv[0], &path_len);
     if (path == NULL) return JSValueMakeUndefined(ctx);
-    if (strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+#if defined(__linux__)
+    bool abstract_path = path_len > 0 && path[0] == '\0';
+#else
+    bool abstract_path = false;
+#endif
+    if (path_len == 0 || (abstract_path
+            ? path_len > sizeof(((struct sockaddr_un *)0)->sun_path)
+            : path_len >= sizeof(((struct sockaddr_un *)0)->sun_path))) {
         free(path);
         ct_throw_message(ctx, exception, "Unix socket path is too long");
         return JSValueMakeUndefined(ctx);
@@ -15801,8 +15995,11 @@ static JSValueRef ct_unix_socket_connect(JSContextRef ctx, JSObjectRef function,
     struct sockaddr_un address;
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
-    strncpy(address.sun_path, path, sizeof(address.sun_path) - 1);
-    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+    memcpy(address.sun_path, path, path_len + (abstract_path ? 0 : 1));
+    socklen_t address_len = abstract_path
+        ? (socklen_t)(offsetof(struct sockaddr_un, sun_path) + path_len)
+        : (socklen_t)sizeof(address);
+    if (connect(fd, (struct sockaddr *)&address, address_len) != 0) {
         char *message = ct_duplicate_string(strerror(errno));
         close(fd);
         free(path);
@@ -15816,7 +16013,7 @@ static JSValueRef ct_unix_socket_connect(JSContextRef ctx, JSObjectRef function,
     ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, fd), exception);
     JSObjectRef local = ct_unix_address_from_fd(ctx, fd, false, exception);
     if (local != NULL) ct_set_property(ctx, result, "local", local, exception);
-    JSObjectRef remote = ct_unix_address_from_path(ctx, path, exception);
+    JSObjectRef remote = ct_unix_address_from_path_len(ctx, path, path_len, exception);
     ct_set_property(ctx, result, "remote", remote, exception);
     free(path);
     return result;
@@ -20120,9 +20317,11 @@ static JSValueRef ct_tls_connection_write(JSContextRef ctx, JSObjectRef function
     size_t len = 0;
     char *text = NULL;
     if (ct_get_bytes(ctx, argv[1], &bytes, &len) != 0) {
-        text = ct_value_to_string_copy(ctx, argv[1]);
+        // COTTONTAIL-COMPAT: strings may contain U+0000; carry the byte length
+        // explicitly instead of relying on NUL termination.
+        text = ct_value_to_utf8_copy(ctx, argv[1], &len);
         bytes = (uint8_t *)text;
-        len = text != NULL ? strlen(text) : 0;
+        if (text == NULL) len = 0;
     }
     size_t written_total = 0;
     char *write_error = NULL;
@@ -20535,6 +20734,17 @@ static double ct_current_rss_bytes(void) {
     mach_task_basic_info_data_t info;
     mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
     if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) == KERN_SUCCESS) {
+        // resident_size keeps counting pages the allocator already returned to
+        // the kernel via MADV_FREE_REUSABLE; our synchronous scavenge in
+        // ct_jsc_collect_full generates hundreds of MB of them. Subtract the
+        // reusable total so rss reports memory the process actually holds
+        // (matching phys_footprint's treatment of reusable pages).
+        task_vm_info_data_t vm_info;
+        mach_msg_type_number_t vm_count = TASK_VM_INFO_COUNT;
+        if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm_info, &vm_count) == KERN_SUCCESS &&
+            (double)vm_info.reusable < (double)info.resident_size) {
+            return (double)info.resident_size - (double)vm_info.reusable;
+        }
         return (double)info.resident_size;
     }
 #elif defined(__linux__)
@@ -21284,6 +21494,13 @@ static JSValueRef ct_runtime_diagnostics(JSContextRef ctx, JSObjectRef function,
     ct_set_property(ctx, result, "workers", ct_runtime_worker_diagnostics(runtime, ctx, exception), exception);
     ct_set_property(ctx, result, "nativeStack", ct_runtime_native_stack(ctx, exception), exception);
     ct_set_property(ctx, result, "sharedObjects", ct_runtime_shared_objects(ctx, exception), exception);
+#if CT_HAS_GLIBC_DIAGNOSTICS
+    ct_set_property(ctx, result, "glibcVersionCompiler", ct_make_string(ctx, CT_STRINGIFY_VALUE(__GLIBC__) "." CT_STRINGIFY_VALUE(__GLIBC_MINOR__)), exception);
+    const char *glibc_runtime_version = gnu_get_libc_version();
+    if (glibc_runtime_version != NULL && glibc_runtime_version[0] != '\0') {
+        ct_set_property(ctx, result, "glibcVersionRuntime", ct_make_string(ctx, glibc_runtime_version), exception);
+    }
+#endif
 #if !defined(_WIN32)
     ct_set_property(ctx, result, "userLimits", ct_runtime_user_limits(ctx, exception), exception);
 #endif
@@ -21764,9 +21981,21 @@ static JSValueRef ct_os_network_interfaces(JSContextRef ctx, JSObjectRef functio
 static JSValueRef ct_os_get_priority(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
+    int pid = 0;
+    if (argc >= 1) {
+        if (!JSValueIsNumber(ctx, argv[0])) {
+            ct_throw_type_error(ctx, exception, "osGetPriority pid must be a number");
+            return JSValueMakeUndefined(ctx);
+        }
+        double pid_number = JSValueToNumber(ctx, argv[0], NULL);
+        if (!isfinite(pid_number) || trunc(pid_number) != pid_number || pid_number < 0 || pid_number > INT_MAX) {
+            ct_throw_type_error(ctx, exception, "osGetPriority pid must be a finite non-negative 32-bit integer");
+            return JSValueMakeUndefined(ctx);
+        }
+        pid = (int)pid_number;
+    }
 #if defined(_WIN32)
-    DWORD pid = argc >= 1 ? (DWORD)ct_value_to_number(ctx, argv[0]) : 0;
-    HANDLE process = pid == 0 ? GetCurrentProcess() : OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    HANDLE process = pid == 0 ? GetCurrentProcess() : OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
     if (process == NULL) {
         ct_throw_message(ctx, exception, "Unable to open process");
         return JSValueMakeUndefined(ctx);
@@ -21784,9 +22013,8 @@ static JSValueRef ct_os_get_priority(JSContextRef ctx, JSObjectRef function, JSO
         : priority_class == IDLE_PRIORITY_CLASS ? 19
         : 0;
 #else
-    id_t pid = argc >= 1 ? (id_t)ct_value_to_number(ctx, argv[0]) : 0;
     errno = 0;
-    int priority = getpriority(PRIO_PROCESS, pid);
+    int priority = getpriority(PRIO_PROCESS, (id_t)pid);
     if (priority == -1 && errno != 0) {
         ct_throw_message(ctx, exception, strerror(errno));
         return JSValueMakeUndefined(ctx);
@@ -21799,11 +22027,31 @@ static JSValueRef ct_os_set_priority(JSContextRef ctx, JSObjectRef function, JSO
     (void)function;
     (void)thisObject;
     if (argc < 2) {
-        ct_throw_message(ctx, exception, "osSetPriority(pid, priority) requires pid and priority");
+        ct_throw_type_error(ctx, exception, "osSetPriority(pid, priority) requires pid and priority");
         return JSValueMakeUndefined(ctx);
     }
-    int pid = (int)ct_value_to_number(ctx, argv[0]);
-    int priority = (int)ct_value_to_number(ctx, argv[1]);
+    if (!JSValueIsNumber(ctx, argv[0])) {
+        ct_throw_type_error(ctx, exception, "osSetPriority pid must be a number");
+        return JSValueMakeUndefined(ctx);
+    }
+    double pid_number = JSValueToNumber(ctx, argv[0], NULL);
+    if (!isfinite(pid_number) || trunc(pid_number) != pid_number || pid_number < 0 || pid_number > INT_MAX) {
+        ct_throw_type_error(ctx, exception, "osSetPriority pid must be a finite non-negative 32-bit integer");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    if (!JSValueIsNumber(ctx, argv[1])) {
+        ct_throw_type_error(ctx, exception, "osSetPriority priority must be a number");
+        return JSValueMakeUndefined(ctx);
+    }
+    double priority_number = JSValueToNumber(ctx, argv[1], NULL);
+    if (!isfinite(priority_number) || trunc(priority_number) != priority_number || priority_number < -20 || priority_number > 19) {
+        ct_throw_type_error(ctx, exception, "osSetPriority priority must be an integer between -20 and 19");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    int pid = (int)pid_number;
+    int priority = (int)priority_number;
 #if defined(_WIN32)
     DWORD priority_class = priority <= -20 ? REALTIME_PRIORITY_CLASS
         : priority <= -14 ? HIGH_PRIORITY_CLASS
@@ -24636,9 +24884,9 @@ static JSValueRef ct_write_file(JSContextRef ctx, JSObjectRef function, JSObject
             offset += written;
         }
     } else {
-        char *text = ct_value_to_string_copy(ctx, argv[1]);
+        size_t text_len = 0;
+        char *text = ct_value_to_utf8_copy(ctx, argv[1], &text_len);
         if (text != NULL) {
-            size_t text_len = strlen(text);
             size_t offset = 0;
             while (offset < text_len) {
                 size_t written = fwrite(text + offset, 1, text_len - offset, file);
@@ -29905,9 +30153,11 @@ static JSValueRef ct_spawn_write(JSContextRef ctx, JSObjectRef function, JSObjec
     size_t len = 0;
     char *text = NULL;
     if (ct_get_bytes(ctx, argv[1], &bytes, &len) != 0) {
-        text = ct_value_to_string_copy(ctx, argv[1]);
+        // COTTONTAIL-COMPAT: strings may contain U+0000; carry the byte length
+        // explicitly instead of relying on NUL termination.
+        text = ct_value_to_utf8_copy(ctx, argv[1], &len);
         bytes = (uint8_t *)text;
-        len = text != NULL ? strlen(text) : 0;
+        if (text == NULL) len = 0;
     }
     bool ok = false;
     int stdin_fd = -1;
@@ -30258,8 +30508,10 @@ static JSValueRef ct_gc(JSContextRef ctx, JSObjectRef function, JSObjectRef this
     bool force = argc > 0 && ct_value_to_bool(ctx, argv[0]);
 #if defined(__APPLE__)
     if (force) {
+        // ct_jsc_collect_full already runs malloc_zone_pressure_relief as part
+        // of its scavenge sequence; a second call here only manufactured more
+        // reusable pages.
         ct_jsc_collect_full(ctx);
-        malloc_zone_pressure_relief(NULL, 0);
     } else {
         JSGarbageCollect(ctx);
     }
@@ -31033,7 +31285,37 @@ static JSValueRef ct_wait_for_promise_host(JSContextRef ctx, JSObjectRef functio
         ct_throw_message(ctx, exception, "cottontail.waitForPromise(promise) requires a native promise");
         return JSValueMakeUndefined(ctx);
     }
+
+    /* An omitted or explicitly undefined timeout preserves the original
+     * unbounded behavior. A supplied timeout is a finite, non-negative number
+     * of milliseconds; zero performs a status-only check. */
+    bool bounded = argc >= 2 && !JSValueIsUndefined(ctx, argv[1]);
+    double timeout_ms = 0;
+    if (bounded) {
+        JSValueRef conversion_exception = NULL;
+        timeout_ms = JSValueToNumber(ctx, argv[1], &conversion_exception);
+        if (conversion_exception != NULL) {
+            if (exception != NULL) *exception = conversion_exception;
+            return JSValueMakeUndefined(ctx);
+        }
+        if (!isfinite(timeout_ms) || timeout_ms < 0) {
+            ct_throw_type_error(ctx, exception, "cottontail.waitForPromise timeout must be a finite non-negative number");
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+
+    uint64_t started_at_ns = bounded ? ct_timer_now_ns() : 0;
+    uint64_t timeout_ns = bounded ? ct_timer_ms_to_ns(timeout_ms) : UINT64_MAX;
     while (status == 0) {
+        uint64_t elapsed_ns = 0;
+        if (bounded) {
+            uint64_t now_ns = ct_timer_now_ns();
+            /* Fail closed if the monotonic clock is unavailable or moves
+             * backwards; a finite wait must never silently become unbounded. */
+            if (started_at_ns == 0 || now_ns == 0 || now_ns < started_at_ns) break;
+            elapsed_ns = now_ns - started_at_ns;
+            if (elapsed_ns >= timeout_ns) break;
+        }
         int delay_ms = 16;
         char *error = NULL;
         if (ct_jsc_runtime_tick_with_delay(runtime, &delay_ms, &error) != 0) {
@@ -31043,8 +31325,20 @@ static JSValueRef ct_wait_for_promise_host(JSContextRef ctx, JSObjectRef functio
         }
         status = ct_jsc_promise_status(argv[0]);
         if (status != 0) break;
+        if (bounded) {
+            uint64_t now_ns = ct_timer_now_ns();
+            if (now_ns == 0 || now_ns < started_at_ns) break;
+            elapsed_ns = now_ns - started_at_ns;
+            if (elapsed_ns >= timeout_ns) break;
+            uint64_t remaining_ns = timeout_ns - elapsed_ns;
+            uint64_t remaining_ms = remaining_ns / 1000000ULL;
+            if (remaining_ns % 1000000ULL != 0) remaining_ms += 1;
+            if ((uint64_t)delay_ms > remaining_ms) delay_ms = (int)remaining_ms;
+        }
         ct_runtime_wait(runtime, delay_ms);
+        status = ct_jsc_promise_status(argv[0]);
     }
+    if (status == 0) status = ct_jsc_promise_status(argv[0]);
     return JSValueMakeNumber(ctx, status);
 }
 
@@ -32378,11 +32672,26 @@ static JSValueRef ct_close_fd(JSContextRef ctx, JSObjectRef function, JSObjectRe
     return JSValueMakeUndefined(ctx);
 }
 
+/* macOS (and POSIX generally) rejects a single write/pwrite whose count
+   exceeds INT_MAX with EINVAL; clamp each syscall and loop instead. */
+#define CT_MAX_WRITE_CHUNK ((size_t)INT_MAX)
+
+/* Direct fd writes bypass the C stdio buffer. Flush it first so output
+   buffered by native addon printf() calls keeps program order relative to
+   console.log/process.stdout.write, matching Node and Bun. */
+static void ct_stdio_flush_for_fd(int fd) {
+    if (fd == 1) fflush(stdout);
+    else if (fd == 2) fflush(stderr);
+}
+
 static int ct_fd_write_bytes(int fd, const uint8_t *bytes, size_t len) {
     if (fd < 0) return EBADF;
+    ct_stdio_flush_for_fd(fd);
     size_t written_total = 0;
     while (written_total < len) {
-        ssize_t written = write(fd, bytes + written_total, len - written_total);
+        size_t chunk = len - written_total;
+        if (chunk > CT_MAX_WRITE_CHUNK) chunk = CT_MAX_WRITE_CHUNK;
+        ssize_t written = write(fd, bytes + written_total, chunk);
         if (written < 0) {
             if (errno == EINTR) continue;
             return errno;
@@ -32707,9 +33016,11 @@ static JSValueRef ct_fd_write(JSContextRef ctx, JSObjectRef function, JSObjectRe
     size_t len = 0;
     char *text = NULL;
     if (ct_get_bytes(ctx, argv[1], &bytes, &len) != 0) {
-        text = ct_value_to_string_copy(ctx, argv[1]);
+        // COTTONTAIL-COMPAT: strings may contain U+0000; carry the byte length
+        // explicitly instead of relying on NUL termination.
+        text = ct_value_to_utf8_copy(ctx, argv[1], &len);
         bytes = (uint8_t *)text;
-        len = text != NULL ? strlen(text) : 0;
+        if (text == NULL) len = 0;
     }
 
     int write_error = ct_fd_write_bytes(fd, bytes, len);
@@ -32730,9 +33041,11 @@ static JSValueRef ct_fd_write_status(JSContextRef ctx, JSObjectRef function, JSO
     size_t len = 0;
     char *text = NULL;
     if (ct_get_bytes(ctx, argv[1], &bytes, &len) != 0) {
-        text = ct_value_to_string_copy(ctx, argv[1]);
+        // COTTONTAIL-COMPAT: strings may contain U+0000; carry the byte length
+        // explicitly instead of relying on NUL termination.
+        text = ct_value_to_utf8_copy(ctx, argv[1], &len);
         bytes = (uint8_t *)text;
-        len = text != NULL ? strlen(text) : 0;
+        if (text == NULL) len = 0;
     }
 
     int write_error = ct_fd_write_bytes(fd, bytes, len);
@@ -32753,9 +33066,11 @@ static JSValueRef ct_fd_write_some(JSContextRef ctx, JSObjectRef function, JSObj
     size_t len = 0;
     char *text = NULL;
     if (ct_get_bytes(ctx, argv[1], &bytes, &len) != 0) {
-        text = ct_value_to_string_copy(ctx, argv[1]);
+        // COTTONTAIL-COMPAT: strings may contain U+0000; carry the byte length
+        // explicitly instead of relying on NUL termination.
+        text = ct_value_to_utf8_copy(ctx, argv[1], &len);
         bytes = (uint8_t *)text;
-        len = text != NULL ? strlen(text) : 0;
+        if (text == NULL) len = 0;
     }
     if (fd < 0 || bytes == NULL) {
         free(text);
@@ -32767,9 +33082,11 @@ static JSValueRef ct_fd_write_some(JSContextRef ctx, JSObjectRef function, JSObj
         return JSValueMakeNumber(ctx, 0);
     }
 
+    ct_stdio_flush_for_fd(fd);
     ssize_t written;
+    size_t chunk = len > CT_MAX_WRITE_CHUNK ? CT_MAX_WRITE_CHUNK : len;
     do {
-        written = write(fd, bytes, len);
+        written = write(fd, bytes, chunk);
     } while (written < 0 && errno == EINTR);
     free(text);
     if (written < 0) {
@@ -32799,9 +33116,11 @@ static JSValueRef ct_ipc_send(JSContextRef ctx, JSObjectRef function, JSObjectRe
     size_t len = 0;
     char *text = NULL;
     if (ct_get_bytes(ctx, argv[1], &bytes, &len) != 0) {
-        text = ct_value_to_string_copy(ctx, argv[1]);
+        // COTTONTAIL-COMPAT: strings may contain U+0000; carry the byte length
+        // explicitly instead of relying on NUL termination.
+        text = ct_value_to_utf8_copy(ctx, argv[1], &len);
         bytes = (uint8_t *)text;
-        len = text != NULL ? strlen(text) : 0;
+        if (text == NULL) len = 0;
     }
     if (fd < 0 || bytes == NULL) {
         free(text);
@@ -33023,11 +33342,14 @@ static JSValueRef ct_fd_write_at(JSContextRef ctx, JSObjectRef function, JSObjec
     if (offset > bytes_len) offset = bytes_len;
     if (length > bytes_len - offset) length = bytes_len - offset;
     bool has_position = argc >= 5 && !JSValueIsUndefined(ctx, argv[4]) && !JSValueIsNull(ctx, argv[4]);
+    if (!has_position) ct_stdio_flush_for_fd(fd);
     size_t written_total = 0;
     while (written_total < length) {
+        size_t chunk = length - written_total;
+        if (chunk > CT_MAX_WRITE_CHUNK) chunk = CT_MAX_WRITE_CHUNK;
         ssize_t count = has_position
-            ? pwrite(fd, bytes + offset + written_total, length - written_total, (off_t)ct_value_to_number(ctx, argv[4]) + (off_t)written_total)
-            : write(fd, bytes + offset + written_total, length - written_total);
+            ? pwrite(fd, bytes + offset + written_total, chunk, (off_t)ct_value_to_number(ctx, argv[4]) + (off_t)written_total)
+            : write(fd, bytes + offset + written_total, chunk);
         if (count < 0) {
             if (errno == EINTR) continue;
             free(text);
@@ -34542,6 +34864,8 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
     const char *hostname = "127.0.0.1";
     char *hostname_arg = NULL;
     char *unix_path = NULL;
+    size_t unix_path_len = 0;
+    bool unix_path_abstract = false;
     int port_value = 0;
     size_t max_body_size = CT_HTTP_DEFAULT_MAX_BODY_SIZE;
     if (argc >= 1 && !JSValueIsUndefined(ctx, argv[0]) && !JSValueIsNull(ctx, argv[0])) {
@@ -34550,11 +34874,14 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
     }
     if (argc >= 2) port_value = (int)ct_value_to_number(ctx, argv[1]);
     if (argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2])) {
-        unix_path = ct_value_to_string_copy(ctx, argv[2]);
-        if (unix_path != NULL && unix_path[0] == 0) {
+        unix_path = ct_value_to_utf8_copy(ctx, argv[2], &unix_path_len);
+        if (unix_path != NULL && unix_path_len == 0) {
             free(unix_path);
             unix_path = NULL;
         }
+#if defined(__linux__)
+        unix_path_abstract = unix_path != NULL && unix_path[0] == '\0';
+#endif
     }
     if (argc >= 4) {
         double configured_max_body_size = ct_value_to_number(ctx, argv[3]);
@@ -34592,20 +34919,24 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
         struct sockaddr_un addr;
         memset(&addr, 0, sizeof(addr));
         addr.sun_family = AF_UNIX;
-        size_t path_len = strlen(unix_path);
-        if (path_len == 0 || path_len >= sizeof(addr.sun_path)) {
+        if (unix_path_len == 0 || (unix_path_abstract
+                ? unix_path_len > sizeof(addr.sun_path)
+                : unix_path_len >= sizeof(addr.sun_path))) {
             close(listen_fd);
             free(hostname_arg);
             free(unix_path);
             ct_throw_message(ctx, exception, "Unix socket path is too long");
             return JSValueMakeUndefined(ctx);
         }
-        memcpy(addr.sun_path, unix_path, path_len + 1);
-        unlink(unix_path);
-        if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(listen_fd, 128) != 0) {
+        memcpy(addr.sun_path, unix_path, unix_path_len + (unix_path_abstract ? 0 : 1));
+        if (!unix_path_abstract) unlink(unix_path);
+        socklen_t unix_address_len = unix_path_abstract
+            ? (socklen_t)(offsetof(struct sockaddr_un, sun_path) + unix_path_len)
+            : (socklen_t)sizeof(addr);
+        if (bind(listen_fd, (struct sockaddr *)&addr, unix_address_len) != 0 || listen(listen_fd, 128) != 0) {
             int bind_errno = errno;
             close(listen_fd);
-            unlink(unix_path);
+            if (!unix_path_abstract) unlink(unix_path);
             free(hostname_arg);
             free(unix_path);
             ct_throw_message(ctx, exception, strerror(bind_errno));
@@ -34647,7 +34978,7 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
     CtHttpServer *server = (CtHttpServer *)calloc(1, sizeof(CtHttpServer));
     if (server == NULL) {
         close(listen_fd);
-        if (unix_path != NULL) unlink(unix_path);
+        if (unix_path != NULL && !unix_path_abstract) unlink(unix_path);
         ct_throw_message(ctx, exception, "Out of memory");
         free(hostname_arg);
         free(unix_path);
@@ -34658,6 +34989,8 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
     server->max_body_size = max_body_size;
     server->hostname = unix_path == NULL ? ct_duplicate_string(hostname) : NULL;
     server->unix_path = unix_path;
+    server->unix_path_len = unix_path_len;
+    server->unix_path_abstract = unix_path_abstract;
     server->runtime = ct_callback_runtime(function);
     pthread_mutex_init(&server->mutex, NULL);
     pthread_cond_init(&server->clients_cond, NULL);
@@ -34675,7 +35008,7 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
         pthread_mutex_unlock(&ct_http_servers_mutex);
         close(listen_fd);
         free(server->hostname);
-        if (server->unix_path != NULL) unlink(server->unix_path);
+        if (server->unix_path != NULL && !server->unix_path_abstract) unlink(server->unix_path);
         free(server->unix_path);
         pthread_cond_destroy(&server->clients_cond);
         pthread_mutex_destroy(&server->mutex);
@@ -34688,7 +35021,13 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
     JSObjectRef result = ct_make_object(ctx);
     ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, server->id), exception);
     if (server->unix_path != NULL) {
-        ct_set_property(ctx, result, "address", ct_make_string(ctx, server->unix_path), exception);
+        ct_set_property(
+            ctx,
+            result,
+            "address",
+            ct_make_string_len(ctx, server->unix_path, server->unix_path_len),
+            exception
+        );
     } else {
         ct_set_property(ctx, result, "port", JSValueMakeNumber(ctx, server->port), exception);
         ct_set_property(ctx, result, "hostname", ct_make_string(ctx, server->hostname), exception);
@@ -35375,7 +35714,7 @@ static void ct_http_stop_server(CtHttpServer *server, bool remove_from_global_li
     }
     free(server->request_target_cache);
     free(server->hostname);
-    if (server->unix_path != NULL) unlink(server->unix_path);
+    if (server->unix_path != NULL && !server->unix_path_abstract) unlink(server->unix_path);
     free(server->unix_path);
     pthread_cond_destroy(&server->clients_cond);
     pthread_mutex_destroy(&server->mutex);
@@ -35753,6 +36092,12 @@ static JSValueRef ct_transpiler_scan_imports_native(JSContextRef ctx, JSObjectRe
     return ct_transpiler_process_native(ctx, argc, argv, exception, 2);
 }
 
+static JSValueRef ct_transpiler_scan_module_syntax_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    return ct_transpiler_process_native(ctx, argc, argv, exception, 4);
+}
+
 static JSValueRef ct_bundle_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -35819,7 +36164,15 @@ static JSValueRef ct_compile_function_native(JSContextRef ctx, JSObjectRef funct
         return JSValueMakeUndefined(ctx);
     }
 
-    JSStringRef source = ct_js_string(source_bytes);
+    // COTTONTAIL-COMPAT: sources may embed U+0000, so build the JSString from
+    // the explicit byte length rather than treating the copy as NUL-terminated.
+    JSStringRef source = ct_js_string_from_utf8_len(source_bytes, source_len);
+    if (source == NULL) {
+        free(source_bytes);
+        free(filename);
+        ct_throw_message(ctx, exception, "Out of memory compiling function");
+        return JSValueMakeUndefined(ctx);
+    }
     JSStringRef source_url = ct_js_string(filename);
     JSValueRef eval_exception = NULL;
     JSValueRef result = JSEvaluateScript(ctx, source, NULL, source_url, 1, &eval_exception);
@@ -36255,28 +36608,69 @@ static JSValueRef ct_vm_context_create(
     static const char bridge_source[] =
         "(()=>{"
         "const g=globalThis;"
-        "const baseline=new Map(Reflect.ownKeys(g).map(key=>[key,Object.getOwnPropertyDescriptor(g,key)]));"
-        "let mirrored=new Set();"
+        /* Capture every intrinsic the bridge relies on: importSandbox mirrors
+         * sandbox properties onto the global, so a sandbox with an own
+         * `Map: undefined` (happy-dom's Window) would otherwise clobber the
+         * bridge's own machinery. */
+        "const NativeMap=Map;"
+        "const NativeSet=Set;"
+        "const ownKeys=Reflect.ownKeys;"
+        "const reflectSet=Reflect.set;"
+        "const getOwn=Object.getOwnPropertyDescriptor;"
+        "const defineProp=Object.defineProperty;"
+        /* Descriptor diffing alone cannot see assignments whose value equals the
+         * creation-time baseline (this.Set = globalThis.Set); Bun's contextify
+         * shares storage between sandbox and global, so every assignment lands
+         * on the sandbox regardless of value. Scripts therefore run with a
+         * transparent proxy of the global as `this` (and as `globalThis`) whose
+         * set trap records each write before forwarding it unchanged. */
+        "const assigned=new NativeMap();"
+        "const thisProxy=new Proxy(g,{"
+            "set(target,key,value){assigned.set(key,value);return reflectSet(target,key,value,target)}"
+        "});"
+        "defineProp(g,'globalThis',{value:thisProxy,writable:true,enumerable:false,configurable:true});"
+        "const drainAssigned=()=>{"
+            "const written=new NativeMap(assigned);"
+            "assigned.clear();"
+            "return written;"
+        "};"
+        "const baseline=new NativeMap(ownKeys(g).map(key=>[key,getOwn(g,key)]));"
+        "let mirrored=new NativeSet();"
+        "const sameVal=(x,y)=>x===y||(x!==x&&y!==y);"
         "const same=(a,b)=>a!==undefined&&b!==undefined&&a.configurable===b.configurable&&"
-            "a.enumerable===b.enumerable&&a.writable===b.writable&&a.value===b.value&&"
+            "a.enumerable===b.enumerable&&a.writable===b.writable&&sameVal(a.value,b.value)&&"
             "a.get===b.get&&a.set===b.set;"
-        "const define=(target,key,descriptor)=>{Object.defineProperty(target,key,descriptor)};"
+        "const define=(target,key,descriptor)=>{defineProp(target,key,descriptor)};"
         "function importSandbox(sandbox){"
-            "const next=new Set(Reflect.ownKeys(sandbox));"
+            "const next=new NativeSet(ownKeys(sandbox));"
             "for(const key of mirrored){if(!next.has(key)){"
                 "const descriptor=baseline.get(key);"
                 "if(descriptor===undefined)delete g[key];else define(g,key,descriptor);"
             "}}"
-            "for(const key of next)define(g,key,Object.getOwnPropertyDescriptor(sandbox,key));"
+            /* A sandbox key may collide with a non-configurable global
+             * (this.undefined = 5 exports `undefined` onto the sandbox); the
+             * definition fails where Bun's shared storage would simply shadow,
+             * so skip rather than throw. */
+            "for(const key of next){try{define(g,key,getOwn(sandbox,key))}catch{}}"
             "mirrored=next;"
+            "drainAssigned();"
         "}"
         "function exportSandbox(sandbox){"
-            "const next=new Set();"
-            "for(const key of Reflect.ownKeys(g)){"
-                "const descriptor=Object.getOwnPropertyDescriptor(g,key);"
+            "const written=drainAssigned();"
+            "const next=new NativeSet();"
+            "for(const key of ownKeys(g)){"
+                "const descriptor=getOwn(g,key);"
                 "const original=baseline.get(key);"
                 "if(mirrored.has(key)||original===undefined||!same(descriptor,original)){"
                     "define(sandbox,key,descriptor);next.add(key);"
+                "}else if(written.has(key)){"
+                    /* The assignment left the descriptor identical to baseline (e.g.
+                     * this.Set = globalThis.Set assigns the vm's own intrinsic back),
+                     * so descriptor diffing cannot see it. Bun's contextify shares
+                     * storage between sandbox and global, so the write lands on the
+                     * sandbox as a plain data property holding the written value. */
+                    "define(sandbox,key,{value:written.get(key),writable:true,enumerable:true,configurable:true});"
+                    "next.add(key);"
                 "}"
             "}"
             "for(const key of mirrored){if(!next.has(key))delete sandbox[key]}"
@@ -36292,7 +36686,7 @@ static JSValueRef ct_vm_context_create(
                 "error=>{exportSandbox(sandbox);throw error}"
             ");"
         "}"
-        "return{importSandbox,exportSandbox,settleResult};"
+        "return{importSandbox,exportSandbox,settleResult,thisProxy};"
         "})()";
     JSStringRef bridge_script = JSStringCreateWithUTF8CString(bridge_source);
     JSStringRef bridge_url = JSStringCreateWithUTF8CString("cottontail:vm-context-bootstrap");
@@ -36367,8 +36761,18 @@ static JSValueRef ct_vm_context_run(
         return JSValueMakeUndefined(ctx);
     }
 
+    /* Run with the bridge's tracking proxy as `this` so assignments to
+     * top-level `this` are recorded even when they do not change the global's
+     * descriptors. */
+    JSObjectRef script_this = NULL;
+    JSValueRef this_exception = NULL;
+    JSValueRef this_value = ct_get_property(entry->context, entry->bridge, "thisProxy", &this_exception);
+    if (this_exception == NULL && this_value != NULL && JSValueIsObject(entry->context, this_value)) {
+        script_this = (JSObjectRef)this_value;
+    }
+
     JSValueRef run_exception = NULL;
-    JSValueRef result = JSEvaluateScript(entry->context, script, NULL, source_url, 1, &run_exception);
+    JSValueRef result = JSEvaluateScript(entry->context, script, script_this, source_url, 1, &run_exception);
     JSStringRelease(script);
     if (source_url != NULL) JSStringRelease(source_url);
     if (result != NULL) JSValueProtect(entry->context, result);
@@ -37116,6 +37520,7 @@ static CtJscRuntime *ct_jsc_runtime_create_internal(
     char *previous_async_stack_trace_option = async_stack_trace_option != NULL ? strdup(async_stack_trace_option) : NULL;
     const char *cf_user_text_encoding = getenv("__CF_USER_TEXT_ENCODING");
     char *previous_cf_user_text_encoding = cf_user_text_encoding != NULL ? strdup(cf_user_text_encoding) : NULL;
+    bool platform_dfg_default_applied = ct_jsc_apply_platform_dfg_default();
     if (explicit_resource_option == NULL) {
         setenv("JSC_useExplicitResourceManagement", "true", 1);
     }
@@ -37150,6 +37555,7 @@ static CtJscRuntime *ct_jsc_runtime_create_internal(
         unsetenv("JSC_useShadowRealm");
     }
 #endif
+    ct_jsc_restore_platform_dfg_default(platform_dfg_default_applied);
     if (runtime->context != NULL && terminate_callback != NULL) {
         /* Stock JSC only guarantees watchdog interruption when the limit is
          * installed before script execution. A false callback result rearms
@@ -38332,6 +38738,7 @@ static char *ct_prepare_source_with_wrappers(
     const char *prefix,
     const char *suffix,
     size_t *source_offset_out,
+    size_t *source_byte_offset_out,
     size_t *source_length_out
 ) {
     size_t prefix_len = strlen(prefix);
@@ -38346,7 +38753,19 @@ static char *ct_prepare_source_with_wrappers(
         free(builder.data);
         return NULL;
     }
-    if (source_offset_out != NULL) *source_offset_out = builder.len;
+    // JSC coverage ranges use JavaScript UTF-16 code-unit offsets, while the
+    // coverage source is still sliced out of this UTF-8 byte buffer.
+    const size_t source_byte_offset = builder.len;
+    if (source_byte_offset_out != NULL) *source_byte_offset_out = source_byte_offset;
+    if (source_offset_out != NULL) {
+        JSStringRef wrapped_prefix = ct_js_string_from_utf8_len(builder.data, source_byte_offset);
+        if (wrapped_prefix == NULL) {
+            free(builder.data);
+            return NULL;
+        }
+        *source_offset_out = JSStringGetLength(wrapped_prefix);
+        JSStringRelease(wrapped_prefix);
+    }
 
     const char *start = (const char *)source;
     const char *end = start + source_len;
@@ -38424,8 +38843,7 @@ static char *ct_prepare_source_with_wrappers(
     free(meta_builder.data);
 
     if (source_length_out != NULL) {
-        const size_t source_offset = source_offset_out != NULL ? *source_offset_out : 0;
-        *source_length_out = builder.len - source_offset;
+        *source_length_out = builder.len - source_byte_offset;
     }
 
     if (!ct_sb_append_bytes(&builder, suffix, suffix_len)) {
@@ -38440,6 +38858,7 @@ static char *ct_prepare_wrapped_source(
     size_t source_len,
     const char *filename,
     size_t *source_offset_out,
+    size_t *source_byte_offset_out,
     size_t *source_length_out
 ) {
     return ct_prepare_source_with_wrappers(
@@ -38453,6 +38872,7 @@ static char *ct_prepare_wrapped_source(
         "e=>{globalThis.__ctError=e;globalThis.__ctErrorSet=true;globalThis.__ctDone=true;});}"
         "finally{globalThis.__cottontailSuppressAsyncHookPromise=false;}})();",
         source_offset_out,
+        source_byte_offset_out,
         source_length_out
     );
 }
@@ -38464,6 +38884,7 @@ static char *ct_prepare_sync_source(const uint8_t *source, size_t source_len, co
         filename,
         "(()=>{\n",
         "\n})();",
+        NULL,
         NULL,
         NULL
     );
@@ -38530,6 +38951,33 @@ static int ct_route_global_uncaught_exception(CtJscRuntime *runtime, const char 
 
 static bool ct_runtime_has_pending_native_events(CtJscRuntime *runtime) {
     bool pending = false;
+
+    if (runtime->uv_loop_initialized) {
+        /* A signal raised during script evaluation sits in libuv's queue
+         * until a loop turn moves it into watcher->pending. If any watcher is
+         * active, run one NOWAIT sweep first so a just-raised signal is
+         * observed here instead of terminating before its dispatch. */
+        bool has_active_signal_watcher = false;
+        for (size_t index = 0; index < runtime->signal_watcher_count; index += 1) {
+            if (runtime->signal_watchers[index].active) {
+                has_active_signal_watcher = true;
+                break;
+            }
+        }
+        if (has_active_signal_watcher) {
+            /* The watchers stay unref'd so listeners alone never keep the
+             * process alive — but that also means a NOWAIT uv_run returns
+             * without polling. Ref them for this one sweep so a signal
+             * raised just before termination is delivered into pending. */
+            for (size_t index = 0; index < runtime->signal_watcher_count; index += 1) {
+                if (runtime->signal_watchers[index].active) uv_ref((uv_handle_t *)&runtime->signal_watchers[index].handle);
+            }
+            (void)ct_runtime_uv_run(runtime, UV_RUN_NOWAIT);
+            for (size_t index = 0; index < runtime->signal_watcher_count; index += 1) {
+                if (runtime->signal_watchers[index].active) uv_unref((uv_handle_t *)&runtime->signal_watchers[index].handle);
+            }
+        }
+    }
 
     if (runtime->next_tick_pending) return true;
     if (runtime->referenced_timer_count > 0) return true;
@@ -38619,12 +39067,14 @@ static int ct_jsc_runtime_eval_internal(
     if (runtime->reload_requested) return CT_JSC_EVAL_RELOAD;
     JSContextRef ctx = runtime->context;
     size_t coverage_source_offset = 0;
+    size_t coverage_source_byte_offset = 0;
     size_t coverage_source_length = 0;
     char *wrapped = ct_prepare_wrapped_source(
         source,
         source_len,
         filename,
         &coverage_source_offset,
+        &coverage_source_byte_offset,
         &coverage_source_length);
     if (wrapped == NULL) {
         ct_set_error_out(error_out, ct_duplicate_bytes("Out of memory", 13));
@@ -38654,7 +39104,7 @@ static int ct_jsc_runtime_eval_internal(
                 ctx,
                 runtime->host_object,
                 "coverageSource",
-                ct_make_string_len(ctx, wrapped + coverage_source_offset, coverage_source_length),
+                ct_make_string_len(ctx, wrapped + coverage_source_byte_offset, coverage_source_length),
                 &exception);
         }
     }
@@ -38810,7 +39260,7 @@ int ct_jsc_generate_bytecode(
     if (error_out != NULL) *error_out = NULL;
     if (bytecode_out == NULL || bytecode_len_out == NULL) return -1;
 
-    char *wrapped = ct_prepare_wrapped_source(source, source_len, filename, NULL, NULL);
+    char *wrapped = ct_prepare_wrapped_source(source, source_len, filename, NULL, NULL, NULL);
     if (wrapped == NULL) {
         ct_set_error_out(error_out, ct_duplicate_bytes("Out of memory", 13));
         return -1;
@@ -38826,10 +39276,12 @@ int ct_jsc_generate_bytecode(
     char *previous_explicit_resource_option = explicit_resource_option != NULL ? strdup(explicit_resource_option) : NULL;
     const char *async_stack_trace_option = getenv("JSC_useAsyncStackTrace");
     char *previous_async_stack_trace_option = async_stack_trace_option != NULL ? strdup(async_stack_trace_option) : NULL;
+    bool platform_dfg_default_applied = ct_jsc_apply_platform_dfg_default();
     if (explicit_resource_option == NULL) setenv("JSC_useExplicitResourceManagement", "true", 1);
     if (async_stack_trace_option == NULL) setenv("JSC_useAsyncStackTrace", "true", 1);
 
     JSGlobalContextRef context = JSGlobalContextCreateInGroup(NULL, NULL);
+    ct_jsc_restore_platform_dfg_default(platform_dfg_default_applied);
 
     if (previous_explicit_resource_option != NULL) {
         setenv("JSC_useExplicitResourceManagement", previous_explicit_resource_option, 1);
@@ -39280,6 +39732,23 @@ char *ct_jsc_runtime_take_heap_snapshot(CtJscRuntime *runtime, bool gc_debugging
     return ct_jsc_heap_snapshot(runtime->context, gc_debugging ? 1 : 0);
 }
 
+// COTTONTAIL-COMPAT: error strings handed back through `error_out` are user
+// data and may embed U+0000. Callers must ask for the byte length instead of
+// measuring with strlen(), or output stops at the first NUL.
+size_t ct_jsc_string_length(const char *value) {
+    if (value == NULL) return 0;
+    if (value == ct_error_out_pointer) return ct_error_out_length;
+    return strlen(value);
+}
+
 void ct_jsc_string_free(char *value) {
+    if (value != NULL && value == ct_error_out_pointer) {
+        ct_error_out_pointer = NULL;
+        ct_error_out_length = 0;
+    }
+    if (value != NULL && value == ct_exception_message_pointer) {
+        ct_exception_message_pointer = NULL;
+        ct_exception_message_length = 0;
+    }
     free(value);
 }

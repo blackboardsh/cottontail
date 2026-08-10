@@ -7,6 +7,8 @@ const kConnectionCount = Symbol("connectionCount");
 // Allow a stock-JSC host-loop turn for bytes racing a graceful destroy to
 // be consumed before close(2), which otherwise converts the FIN into a reset.
 const gracefulDestroyDrainMilliseconds = 16;
+// Largest byte length a single Uint8Array can address, matching buffer.kMaxLength.
+const MAX_COALESCED_WRITEV_BYTES = 4294967296;
 // Windows named pipes cannot half-close. libuv keeps the readable side alive
 // briefly after writable shutdown, then closes the pipe and reports EOF.
 const windowsPipeEofTimeoutMilliseconds = 50;
@@ -59,6 +61,9 @@ function makeNodeError(ErrorType, message, code, details = undefined) {
   const error = new ErrorType(message);
   error.code = code;
   if (details) Object.assign(error, details);
+  if (typeof Error.captureStackTrace === "function") {
+    Error.captureStackTrace(error, makeNodeError);
+  }
   Object.defineProperty(error, "toString", {
     configurable: true,
     writable: true,
@@ -1202,6 +1207,23 @@ class SocketImpl extends Duplex {
         return;
       }
       if (event.type === "error") {
+        // Linux can report EBADF from a queued libuv read-watch callback after
+        // the local side has already completed its writable shutdown. The fd
+        // is still owned by this Socket and is closed by destroy below; at
+        // this point EBADF is the terminal peer notification, not a failed
+        // application operation. Treat it like EOF so memory-BIO TLS upgrades
+        // can finish their close_notify exchange without turning a successful
+        // response into a socket error.
+        if (
+          process.platform === "linux" &&
+          this._nativeShutdownSent &&
+          (event.code === "EBADF" || Number(event.errno) === 9) &&
+          /bad file descriptor/i.test(String(event.message ?? ""))
+        ) {
+          this._stopRead();
+          this._emitEnd();
+          return;
+        }
         const error = new Error(event.message || "socket read failed");
         if (event.code != null) error.code = String(event.code);
         else if (/connection reset/i.test(error.message)) error.code = "ECONNRESET";
@@ -1709,14 +1731,20 @@ class SocketImpl extends Duplex {
       // Connecting to a wildcard address targets the corresponding loopback.
       if (host === "0.0.0.0") host = "127.0.0.1";
       else if (host === "::") host = "::1";
-      this._resolveConnectAddresses(String(host), options, (error, addresses) => {
+      // Wrap the resolver continuation so the AsyncLocalStorage context active
+      // at connect() time survives the (possibly async) DNS lookup. Everything
+      // downstream — the connect-attempt listeners, _attachFd, the read watcher,
+      // write/end callbacks — captures its context from here, so an unwrapped
+      // hop loses context for every socket callback (only visible when the host
+      // needs resolving; literal IPs resolve synchronously).
+      this._resolveConnectAddresses(String(host), options, _wrapAsyncCallback((error, addresses) => {
         if (this.destroyed || !this.connecting) return;
         if (error) {
           failConnect(error);
           return;
         }
         this._attemptConnectAddresses(options, String(host), port, addresses);
-      });
+      }, { drainJobs: false }));
     } catch (rawError) {
       failConnect(rawError);
     }
@@ -1757,6 +1785,20 @@ class SocketImpl extends Duplex {
     }
     const parts = chunks.map(({ chunk, encoding }) => bytesFrom(chunk, encoding ?? this._defaultEncoding));
     const total = parts.reduce((length, part) => length + part.byteLength, 0);
+    // COTTONTAIL-COMPAT: a coalescing view cannot exceed the typed array limit,
+    // and node:http frames one chunked body write as head + payload + CRLF. A
+    // maximum-size payload therefore overflows the merge. Queue the parts
+    // individually instead; the outbound queue already preserves wire order.
+    if (total > MAX_COALESCED_WRITEV_BYTES) {
+      let remaining = parts.length;
+      let failure = null;
+      const done = (error) => {
+        if (error != null && failure == null) failure = error;
+        if (--remaining === 0) callback(failure);
+      };
+      for (const part of parts) this._write(part, "buffer", done);
+      return;
+    }
     const combined = new Uint8Array(total);
     let offset = 0;
     for (const part of parts) {
@@ -2268,7 +2310,9 @@ class ServerImpl extends EventEmitter {
       if (result != null) {
         this._fd = Number(result.fd);
         this._isPipe = options.path != null;
-        this._ownsPipePath = this._isPipe;
+        // Node/Bun do not remove the socket file on server.close(); only
+        // Bun.listen's fd-adopted servers opt into unlinking (issue #6413).
+        this._ownsPipePath = false;
         this._path = this._isPipe ? String(result.path ?? options.path) : null;
         this._address = this._isPipe ? this._path : result.address ?? null;
       }

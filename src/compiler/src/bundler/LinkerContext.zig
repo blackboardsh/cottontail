@@ -238,7 +238,14 @@ pub const LinkerContext = struct {
 
         var runtime_named_exports = &this.graph.ast.items(.named_exports)[Index.runtime.get()];
 
-        this.esm_runtime_ref = runtime_named_exports.get("__esm").?.ref;
+        // COTTONTAIL-COMPAT: only cottontail's internal runtime-launcher
+        // bundles get the force-capable `__esmForce` wrapper (needed by the
+        // registry-aware `__esmDyn` dynamic-import helper). User-facing
+        // `bun build` output keeps Bun's original `__esm` helper text, which
+        // upstream inline snapshots golden-match byte-for-byte.
+        this.esm_runtime_ref = runtime_named_exports.get(
+            if (this.options.runtime_dynamic_imports) "__esmForce" else "__esm",
+        ).?.ref;
         this.cjs_runtime_ref = runtime_named_exports.get("__commonJS").?.ref;
         this.promise_all_runtime_ref = runtime_named_exports.get("__promiseAll").?.ref;
 
@@ -1378,6 +1385,10 @@ pub const LinkerContext = struct {
             .has_run_symbol_renamer = true,
             .source_path = source.path,
             .runtime_dynamic_imports = c.options.runtime_dynamic_imports,
+            .esm_dyn_ref = if (c.options.runtime_dynamic_imports)
+                c.runtimeFunction("__esmDyn")
+            else
+                Ref.None,
 
             .allocator = alloc,
             .source_map_allocator = if (c.dev_server != null and
@@ -1458,6 +1469,7 @@ pub const LinkerContext = struct {
             .wrapper_ref = c.graph.ast.items(.wrapper_ref)[source_index],
 
             .was_unwrapped_require = was_unwrapped_require and c.graph.ast.items(.flags)[source_index].force_cjs_to_esm,
+            .source_path_text = c.parse_graph.input_files.items(.source)[source_index].path.text,
         };
     }
 

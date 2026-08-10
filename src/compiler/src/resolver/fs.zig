@@ -814,10 +814,13 @@ pub const FileSystem = struct {
         }
 
         pub const ModKey = struct {
-            inode: std.fs.File.INode = 0,
+            // cottontail: std.fs.File is unavailable in this tree; plain
+            // integer fields replace std.fs.File.INode/Mode and generate()
+            // stats through std.Io instead of an open std.fs.File.
+            inode: u64 = 0,
             size: u64 = 0,
             mtime: i128 = 0,
-            mode: std.fs.File.Mode = 0,
+            mode: u32 = 0,
 
             threadlocal var hash_name_buf: [1024]u8 = undefined;
 
@@ -856,10 +859,15 @@ pub const FileSystem = struct {
                 return bun.hash(&hash_bytes);
             }
 
-            pub fn generate(_: *RealFS, _: string, file: std.fs.File) anyerror!ModKey {
-                const stat = try file.stat();
+            pub fn generate(_: *RealFS, path: string) anyerror!ModKey {
+                const stat = try std.Io.Dir.cwd().statFile(
+                    std.Io.Threaded.global_single_threaded.io(),
+                    path,
+                    .{},
+                );
+                const mtime: i128 = stat.mtime.nanoseconds;
 
-                const seconds = @divTrunc(stat.mtime, @as(@TypeOf(stat.mtime), std.time.ns_per_s));
+                const seconds = @divTrunc(mtime, @as(i128, std.time.ns_per_s));
 
                 // We can't detect changes if the file system zeros out the modification time
                 if (seconds == 0 and std.time.ns_per_s == 0) {
@@ -869,15 +877,16 @@ pub const FileSystem = struct {
                 // Don't generate a modification key if the file is too new
                 const now = bun.nanoTimestamp();
                 const now_seconds = @divTrunc(now, std.time.ns_per_s);
-                if (seconds > seconds or (seconds == now_seconds and stat.mtime > now)) {
+                if (seconds > seconds or (seconds == now_seconds and mtime > now)) {
                     return error.Unusable;
                 }
 
                 return ModKey{
-                    .inode = stat.inode,
+                    // std.Io stat inodes are i64 on Windows, u64 elsewhere.
+                    .inode = @intCast(stat.inode),
                     .size = stat.size,
-                    .mtime = stat.mtime,
-                    .mode = stat.mode,
+                    .mtime = mtime,
+                    .mode = 0,
                     // .uid = stat.
                 };
             }

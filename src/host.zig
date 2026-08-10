@@ -2289,6 +2289,16 @@ pub export fn ct_host_spawn_sync(
     joinThread(stdout_thread);
     joinThread(stderr_thread);
 
+    // The forwarding scope routed any termination signal aimed at this process
+    // to the synchronous child. Returning to JavaScript here would make a
+    // spawn loop (every upstream test file that shells out) permanently immune
+    // to SIGTERM: the supervisor's timeout is swallowed, the runner keeps
+    // spawning, and each new child outlives whatever finally SIGKILLs it.
+    if (signal_scope.takeForwardedTermination()) |signal_number| {
+        signal_scope.deinit();
+        signal_forwarding.exitWithSignalNumber(signal_number);
+    }
+
     if (stdout_memfd) |file_handle| {
         readSpawnMemfd(file_handle, io, &stdout_context.output) catch |err| {
             setErrorOut(error_out, @errorName(err));

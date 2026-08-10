@@ -57,6 +57,12 @@ function normalizeSpawnError(error, file, cwd = undefined) {
   return out;
 }
 
+// Bun hands a subprocess pipe reader everything that is already buffered in a
+// single read() result, capped at 256 KiB per delivery. Delivering one
+// underlying pipe read per result instead splits bursts apart: a child that
+// console.log()s twice and exits produces two reads here but one in Bun.
+const MAX_PIPE_READ_BYTES = 256 * 1024;
+
 class ProcessReadable {
   constructor(concatChunks, cancel = undefined) {
     this._concatChunks = concatChunks;
@@ -107,10 +113,14 @@ class ProcessReadable {
     return this;
   }
 
-  listenerCount(name) { return (this._listeners.get(String(name)) ?? []).length; }
+  listenerCount(name) { return this._listeners.get(String(name))?.length ?? 0; }
 
+  // Every subprocess pipe chunk emits "data", so the no-listener case has to
+  // stay allocation-free: a 8 MiB stdout arrives as hundreds of chunks.
   emit(name, ...args) {
-    for (const handler of [...(this._listeners.get(String(name)) ?? [])]) handler(...args);
+    const handlers = this._listeners.get(String(name));
+    if (handlers === undefined || handlers.length === 0) return false;
+    for (const handler of [...handlers]) handler(...args);
     return this.listenerCount(name) > 0;
   }
 
@@ -142,15 +152,21 @@ class ProcessReadable {
     return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
   }
 
-  async bytes() {
-    if (this._locked && this._ended && this._chunks.length === 0 && !this._emptyReadClaimed) {
-      this._emptyReadClaimed = true;
-      return new Uint8Array(0);
-    }
+  // Drain every chunk into one array. Whole-body consumers join the pieces at
+  // the end anyway, so they bypass the per-read coalescing in _takeBuffered():
+  // merging buffered chunks into MAX_PIPE_READ_BYTES slices first would copy
+  // the entire payload an extra time before the final join.
+  async _drainChunks() {
     const reader = this.getReader();
     const chunks = [];
     try {
       for (;;) {
+        const buffered = this._chunks;
+        if (buffered.length > 0) {
+          for (let i = 0; i < buffered.length; i++) chunks.push(buffered[i]);
+          buffered.length = 0;
+          continue;
+        }
         const { done, value } = await reader.read();
         if (done) break;
         chunks.push(value);
@@ -159,7 +175,15 @@ class ProcessReadable {
       if (chunks.length === 0 && this._ended) this._emptyReadClaimed = true;
       else reader.releaseLock();
     }
-    return this._concatChunks(chunks);
+    return chunks;
+  }
+
+  async bytes() {
+    if (this._locked && this._ended && this._chunks.length === 0 && !this._emptyReadClaimed) {
+      this._emptyReadClaimed = true;
+      return new Uint8Array(0);
+    }
+    return this._concatChunks(await this._drainChunks());
   }
 
   async blob() {
@@ -167,18 +191,7 @@ class ProcessReadable {
       this._emptyReadClaimed = true;
       return new Blob([]);
     }
-    const reader = this.getReader();
-    const chunks = [];
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-      }
-    } finally {
-      if (chunks.length === 0 && this._ended) this._emptyReadClaimed = true;
-      else reader.releaseLock();
-    }
+    const chunks = await this._drainChunks();
     return globalThis.__cottontailBlobFromOwnedChunks?.(chunks) ?? new Blob(chunks);
   }
   async text() { return new TextDecoder().decode(await this.bytes()); }
@@ -193,6 +206,26 @@ class ProcessReadable {
     }
   }
 
+  // Take as much of the already-buffered data as one read() may deliver.
+  // Only chunks that arrived before the consumer asked are merged, so a live
+  // producer that writes, pauses, then writes again still yields separate
+  // chunks with their original timing.
+  _takeBuffered() {
+    const chunks = this._chunks;
+    if (chunks.length === 1) return chunks.shift();
+    let total = 0;
+    let count = 0;
+    while (count < chunks.length) {
+      const size = chunks[count].length;
+      if (count > 0 && total + size > MAX_PIPE_READ_BYTES) break;
+      total += size;
+      count++;
+      if (total >= MAX_PIPE_READ_BYTES) break;
+    }
+    if (count <= 1) return chunks.shift();
+    return this._concatChunks(chunks.splice(0, count));
+  }
+
   getReader() {
     if (this._locked) throw new TypeError("ReadableStream is locked");
     this._locked = true;
@@ -203,7 +236,7 @@ class ProcessReadable {
       read() {
         if (cancelled || released) return Promise.resolve({ done: true, value: undefined });
         if (owner._chunks.length > 0) {
-          return Promise.resolve({ done: false, value: owner._chunks.shift() });
+          return Promise.resolve({ done: false, value: owner._takeBuffered() });
         }
         if (owner._ended) return Promise.resolve({ done: true, value: undefined });
         return new Promise(resolve => owner._readRequests.push(resolve));
@@ -713,6 +746,11 @@ export function createBunSpawnRuntime(deps) {
       });
     } catch (error) {
       throw normalizeSpawnError(error, file, nativeOptions.cwd);
+    } finally {
+      // A Bun.file(...) stdin descriptor is opened for the child alone.
+      if (nativeOptions.stdinFdOwned && nativeOptions.stdinFd != null) {
+        try { host.closeFd?.(nativeOptions.stdinFd); } catch {}
+      }
     }
     const rawSignalCode = Number(result.signalCode ?? result.signal ?? 0);
     const exitCode = rawSignalCode > 0 ? null : Number(result.status ?? result.exitCode ?? 0);
@@ -873,9 +911,10 @@ export function createBunSpawnRuntime(deps) {
 
     const child = {
       pid: 0,
-      stdin: terminal ? null : nativeOptions.stdinFd != null && nativeOptions.stdinFd !== 0
-        ? nativeOptions.stdinFd
-        : undefined,
+      stdin: terminal ? null
+        : nativeOptions.stdinFd != null && nativeOptions.stdinFd !== 0 && !nativeOptions.stdinFdOwned
+          ? nativeOptions.stdinFd
+          : undefined,
       get stdout() {
         if (terminal) return null;
         if (nativeOptions.stdoutFd != null && nativeOptions.stdoutFd !== 1) return nativeOptions.stdoutFd;
@@ -1157,6 +1196,8 @@ export function createBunSpawnRuntime(deps) {
     const redirectFds = [];
     let stdoutRedirectFd;
     let stderrRedirectFd;
+    // A Bun.file(...) stdin descriptor is opened for the child alone.
+    if (nativeOptions.stdinFdOwned && nativeOptions.stdinFd != null) redirectFds.push(nativeOptions.stdinFd);
     try {
       if (nativeOptions.stdoutFilePath != null) {
         stdoutRedirectFd = host.openFd(nativeOptions.stdoutFilePath, "w", 0o666);
@@ -1239,7 +1280,7 @@ export function createBunSpawnRuntime(deps) {
       : null;
     child.stdin = terminal
       ? null
-      : nativeOptions.stdinFd != null && nativeOptions.stdinFd !== 0
+      : nativeOptions.stdinFd != null && nativeOptions.stdinFd !== 0 && !nativeOptions.stdinFdOwned
         ? nativeOptions.stdinFd
         : readableInput != null
           ? nativeOptions.input
@@ -1270,15 +1311,31 @@ export function createBunSpawnRuntime(deps) {
 
     const maxBuffer = nativeOptions.maxBuffer == null ? Infinity : nativeOptions.maxBuffer;
     const killSignal = nativeOptions.killSignal;
+    const closeCapturedOutput = () => {
+      // A subprocess can exit while one of its descendants still owns the
+      // inherited pipe (for example `bun exec yes`). Merely signalling the
+      // direct child leaves that writer alive and lets the native event queue
+      // grow without bound. Closing our read ends gives every remaining
+      // writer the normal broken-pipe signal and also makes both public
+      // streams settle.
+      if (nativeOptions.stdout === "pipe") host.spawnCloseOutput?.(native.id, 1);
+      if (nativeOptions.stderr === "pipe") host.spawnCloseOutput?.(native.id, 2);
+    };
     const enforceMaxBuffer = () => {
       if (exceededMaxBuffer || !Number.isFinite(maxBuffer)) return;
       if ((nativeOptions.stdout === "pipe" && stdoutLength > maxBuffer) ||
           (nativeOptions.stderr === "pipe" && stderrLength > maxBuffer)) {
         exceededMaxBuffer = true;
         child.kill(killSignal);
+        closeCapturedOutput();
       }
     };
-    if (Number(nativeOptions.timeout) > 0) timeoutTimer = setTimeout(() => child.kill(killSignal), nativeOptions.timeout);
+    if (Number(nativeOptions.timeout) > 0) {
+      timeoutTimer = setTimeout(() => {
+        child.kill(killSignal);
+        closeCapturedOutput();
+      }, nativeOptions.timeout);
+    }
 
     child.exited = new Promise((resolve, reject) => {
       const completeExit = result => {
@@ -1335,6 +1392,10 @@ export function createBunSpawnRuntime(deps) {
       unregisterSpawnListener = globalThis.__cottontailRegisterSpawnListener?.(native.id, event => {
         if (!event) return;
         if (event.type === "stdout" || event.type === "stderr") {
+          // The native reader may already have queued pipe events before the
+          // first over-limit event reached JavaScript. Retaining those chunks
+          // defeats maxBuffer even though the process has been signalled.
+          if (exceededMaxBuffer) return;
           const chunk = asBuffer(event.data ?? new ArrayBuffer(0));
           if (chunk.byteLength === 0) return;
           const isStdout = event.type === "stdout";

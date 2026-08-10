@@ -45,8 +45,12 @@ function setup() {
   }
 
   const workRoot = join(ROOT, 'vendors', `.zig-html-rewriter-${process.pid}`);
-  const archivePath = join(workRoot, 'source.tar.gz');
-  const extracted = join(workRoot, 'extracted');
+  // MSYS tar cannot chdir into drive-letter backslash paths; give it
+  // forward-slash paths on Windows.
+  const tarPath = (p) => (process.platform === 'win32' ? p.replace(/\\/g, '/') : p);
+  const tarLocalFlags = process.platform === 'win32' ? ['--force-local'] : [];
+  const archivePath = tarPath(join(workRoot, 'source.tar.gz'));
+  const extracted = tarPath(join(workRoot, 'extracted'));
   const prefix = `zig-html-rewriter-${MANIFEST.revision}`;
 
   console.log(`Vendoring ${MANIFEST.repo}@${MANIFEST.revision.slice(0, 12)}...`);
@@ -74,6 +78,9 @@ function setup() {
     }
 
     execFileSync('tar', [
+      // --force-local: on Windows an absolute archive path (D:\...) would
+      // otherwise be parsed as a remote host:file spec.
+      ...tarLocalFlags,
       '-xzf',
       archivePath,
       '--strip-components=1',

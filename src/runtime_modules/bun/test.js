@@ -66,7 +66,10 @@ function uncaughtRuntimeTrailer() {
   return `\n\nBun v${version}`;
 }
 
-globalThis.__cottontailFormatUncaughtException ??= (value) => {
+// Force-assign (not `??=`): the full runtime module (bun/index.js) now also
+// installs a run-mode uncaught formatter, and bun:test must stay authoritative
+// in test mode regardless of load order.
+globalThis.__cottontailFormatUncaughtException = (value) => {
   if (!value || typeof value !== "object") return null;
   if (value.__cottontailFormattedStack === true && typeof value.stack === "string") {
     return value.stack;
@@ -407,8 +410,8 @@ function bunDeepEqual(actual, expected, seen = new WeakMap()) {
   const expectedEntries = plainObjectEntries(expected);
   if (!actualEntries || !expectedEntries) return deepEqual(actual, expected);
   if (actualEntries.length !== expectedEntries.length) return false;
-  actualEntries.sort((left, right) => String(left[0]).localeCompare(String(right[0])));
-  expectedEntries.sort((left, right) => String(left[0]).localeCompare(String(right[0])));
+  actualEntries.sort((left, right) => codePointCompare(String(left[0]), String(right[0])));
+  expectedEntries.sort((left, right) => codePointCompare(String(left[0]), String(right[0])));
   for (let index = 0; index < actualEntries.length; index += 1) {
     if (actualEntries[index][0] !== expectedEntries[index][0]) return false;
     if (!bunDeepEqual(actualEntries[index][1], expectedEntries[index][1], seen)) return false;
@@ -596,14 +599,71 @@ function enumerableOwnKeys(value, symbolsOnly = false) {
     Object.prototype.propertyIsEnumerable.call(value, key));
 }
 
+// An own "__proto__" data property (e.g. JSON.parse('{"__proto__":…}'))
+// disqualifies an object's structure from JSC's fast property enumeration
+// (hasUnderscoreProtoPropertyExcludingOriginalProto), so Bun's deep equality
+// (Bun__deepEquals in bindings.cpp) falls back to its generic path there:
+// property names are collected across the whole prototype chain and values
+// are read with prototype-chain lookups (reading "__proto__" on an object
+// without an own "__proto__" yields its prototype). That is why Bun
+// considers JSON.parse('{"__proto__":x}') equal to the literal
+// `{ __proto__: x }`, but not the reverse.
+function hasOwnProtoDataProperty(value) {
+  const descriptor = Object.getOwnPropertyDescriptor(value, "__proto__");
+  return descriptor !== undefined && "value" in descriptor;
+}
+
+function protoChainEnumerableKeys(value) {
+  const keys = [];
+  const seen = new Set();
+  for (let cursor = value; cursor != null; cursor = Object.getPrototypeOf(cursor)) {
+    for (const key of Reflect.ownKeys(cursor)) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (Object.prototype.propertyIsEnumerable.call(cursor, key)) keys.push(key);
+    }
+  }
+  return keys;
+}
+
+function matchesProtoChainProperties(actual, expected, state, strict) {
+  const actualKeys = protoChainEnumerableKeys(actual);
+  const expectedKeys = protoChainEnumerableKeys(expected);
+  if (strict && actualKeys.length !== expectedKeys.length) return false;
+  const body = matchEverySequential(actualKeys, (key) => {
+    const rightHas = Reflect.has(expected, key);
+    if (!strict && actual[key] === undefined && !rightHas) return true;
+    if (!rightHas) return false;
+    return matchesExpected(actual[key], expected[key], state, strict);
+  });
+  return mapMatchResult(body, (matched) => {
+    if (!matched) return false;
+    for (let index = actualKeys.length; index < expectedKeys.length; index++) {
+      if (expected[expectedKeys[index]] !== undefined) return false;
+    }
+    return true;
+  });
+}
+
 function arrayDataValue(value, index) {
   const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
   return descriptor && "value" in descriptor ? descriptor.value : missingArrayValue;
 }
 
 function calculatedClassName(value) {
+  // Mirrors JSC's JSObject::calculatedClassName (used by Bun's strict deep
+  // equality): the own constructor's display name, else the prototype
+  // chain's constructor name, else Symbol.toStringTag, else "Object" — so a
+  // null-prototype object still classes as "Object" like a plain literal.
   try {
-    return value?.constructor?.name ?? Object.prototype.toString.call(value);
+    let name = Object.getOwnPropertyDescriptor(value, "constructor")?.value?.name;
+    if (name == null) name = Object.getPrototypeOf(value)?.constructor?.name;
+    if (name == null || name === "Object") {
+      const tag = value[Symbol.toStringTag];
+      if (typeof tag === "string") return tag;
+      if (name == null) return "Object";
+    }
+    return name;
   } catch {
     return Object.prototype.toString.call(value);
   }
@@ -655,6 +715,9 @@ function finishExpectedPair(state, result) {
 
 function matchesEnumerableProperties(actual, expected, state, strict) {
   if (strict && calculatedClassName(actual) !== calculatedClassName(expected)) return false;
+  if (hasOwnProtoDataProperty(actual) || hasOwnProtoDataProperty(expected)) {
+    return matchesProtoChainProperties(actual, expected, state, strict);
+  }
   const actualKeys = enumerableOwnKeys(actual);
   const expectedKeys = enumerableOwnKeys(expected);
   if (strict && actualKeys.length !== expectedKeys.length) return false;
@@ -902,10 +965,22 @@ function snapshotMatcherText(value) {
   }
 }
 
+function codePointCompare(a, b) {
+  const lenA = a.length;
+  const lenB = b.length;
+  const minLen = Math.min(lenA, lenB);
+  for (let i = 0; i < minLen; i++) {
+    const cpA = a.charCodeAt(i);
+    const cpB = b.charCodeAt(i);
+    if (cpA !== cpB) return cpA - cpB;
+  }
+  return lenA - lenB;
+}
+
 function snapshotObjectEntries(value) {
   return Reflect.ownKeys(value)
     .filter((key) => Object.prototype.propertyIsEnumerable.call(value, key))
-    .sort((left, right) => String(left).localeCompare(String(right)));
+    .sort((left, right) => codePointCompare(String(left), String(right)));
 }
 
 function snapshotObjectKey(key) {
@@ -2494,7 +2569,7 @@ class Expectation {
           () => this._check(false, "Expected function to throw"),
           (error) => checkThrown(true, error),
         );
-        // Bun drives async-function throw matchers to settlement before
+        // Bun drives negated async-function throw matchers to settlement before
         // expect() returns (verified against Bun 1.3.10). Without this,
         // teardown that runs when the test body exits — e.g. `using server =
         // Bun.serve(...)` disposing via stop(true) — races a still-pending
@@ -2508,27 +2583,34 @@ class Expectation {
           countAssertion();
           this._skipAssertionCount = true;
         }
-        if (!this._promiseMode && typeof globalThis.cottontail?.waitForPromise === "function") {
+        // A negated async throw matcher must finish before expect() returns:
+        // lexical `using` disposal can otherwise tear down an in-process
+        // server while the callback is still running. Positive async throw
+        // matchers stay on the runner's pending-promise path. Besides avoiding
+        // a nested pump for thread-pool operations that cannot make progress
+        // there, that lets a synchronous series of positive matchers attach
+        // all of its rejection handlers before the event loop advances.
+        if (!this._promiseMode && this._negate && typeof globalThis.cottontail?.drainJobs === "function") {
           let state = nativePromiseState(settled);
           if (state?.status === 0) {
-            // While blocked here, sibling promises rejected by the code under
-            // test have no handler yet (their own matchers run after we
-            // return). Bun routes such rejections to a quiet capture instead
-            // of failing the test (VirtualMachine.unhandledRejectionScope in
-            // Expect.getValueAsToThrow); do the same via a hook the test
-            // runner's unhandledRejection capture consults.
-            const quietCapture = { didCapture: false, value: undefined };
-            const previousQuietCapture = globalThis.__cottontailQuietUnhandledRejectionCapture;
-            globalThis.__cottontailQuietUnhandledRejectionCapture = quietCapture;
-            try {
-              globalThis.cottontail.waitForPromise(settled);
-            } finally {
-              globalThis.__cottontailQuietUnhandledRejectionCapture = previousQuietCapture;
+            for (let attempt = 0; attempt < 64; attempt += 1) {
+              globalThis.cottontail.drainJobs();
+              state = nativePromiseState(settled);
+              if (!state || state.status !== 0) break;
             }
-            state = nativePromiseState(settled);
-            if (state?.status === 1 && quietCapture.didCapture) {
-              checkThrown(true, quietCapture.value);
-              return undefined;
+
+            // Timers and in-process I/O need a real event-loop turn. Use the
+            // test runner's remaining timeout as the only wall-clock bound:
+            // this preserves the test's anti-hang contract without a hidden
+            // scheduling deadline that becomes flaky under host contention.
+            // Fake timers have no native event to pump and are advanced only
+            // by the explicit fake-timer APIs.
+            const remaining = globalThis.__cottontailCurrentTestRemainingMs?.();
+            if (state?.status === 0 && !fakeTimersEnabled &&
+                Number.isFinite(remaining) && remaining > 0 &&
+                typeof globalThis.cottontail.waitForPromise === "function") {
+              globalThis.cottontail.waitForPromise(settled, remaining);
+              state = nativePromiseState(settled);
             }
           }
           if (state?.status === 2) throw state.value;
@@ -3083,7 +3165,14 @@ expect.hasAssertions = () => {
 };
 expect.extend = installCustomMatchers;
 expect.addSnapshotSerializer = (_serializer) => { throw new Error("Not implemented"); };
-expect.unreachable = (message = "reached unreachable code") => { throw new nodeAssert.AssertionError({ message }); };
+expect.unreachable = (message = "reached unreachable code") => {
+  // Bun rethrows an Error argument as-is; otherwise it throws a plain Error
+  // named "UnreachableError" (verified against Bun 1.3.10).
+  if (message instanceof Error) throw message;
+  const error = new Error(String(message));
+  error.name = "UnreachableError";
+  throw error;
+};
 
 function normalizeMockImplementation(implementation, provided = true) {
   if (typeof implementation === "function") return implementation;
@@ -3436,6 +3525,41 @@ function doneContinuationFrame(error) {
   return null;
 }
 
+// Stacks captured synchronously inside a done-style callback come back with
+// the bundle's path but the original source coordinates (engine quirk); the
+// reporter drops those bundle frames and the failure prints without its
+// source excerpt. Re-point the top frame at the test file it actually came
+// from — the coordinates are already the original ones.
+function repairDoneErrorStackPath(error) {
+  if (!(error instanceof Error)) return;
+  const currentFile = normalizeDoneFramePath(globalThis.__cottontailCurrentTestFile?.());
+  if (!currentFile) return;
+  let stack;
+  try {
+    stack = error.stack;
+  } catch {
+    return;
+  }
+  if (typeof stack !== "string" || !stack.includes("script.bundle.mjs")) return;
+  const lines = stack.split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = /^(\s*at\s+(?:.*?\s+\()?|[^@\n]*@)([^\s()]*script\.bundle\.mjs):([0-9]+):([0-9]+)(\)?\s*)$/.exec(lines[index]);
+    if (!match) continue;
+    const lineNumber = Number(match[3]);
+    if (!Number.isFinite(lineNumber) || lineNumber < 1) continue;
+    let sourceLine = null;
+    try {
+      sourceLine = String(nodeReadFileSync(currentFile, "utf8")).split(/\r?\n/)[lineNumber - 1] ?? null;
+    } catch {}
+    if (sourceLine === null) continue;
+    lines[index] = `${match[1]}${currentFile}:${match[3]}:${match[4]}${match[5]}`;
+    try {
+      error.stack = lines.join("\n");
+    } catch {}
+    return;
+  }
+}
+
 function runDoneCallbackWithSchedulerTracking(callback, done) {
   const restorations = [];
   const replace = (owner, property, replacement) => {
@@ -3514,6 +3638,7 @@ function wrapDoneCallback(callback) {
     const done = (error) => {
       if (doneCalled || settled) return;
       doneCalled = true;
+      repairDoneErrorStackPath(error);
       const frame = doneContinuationFrame(error);
       const scheduler = doneSchedulerStorage.getStore();
       const previousFrame = frame && previousDoneFrames.get(frame.filePath);
@@ -3550,6 +3675,11 @@ function wrapDoneCallback(callback) {
     } catch (error) {
       callbackReturned = true;
       returnedPromiseSettled = true;
+      if (error instanceof Error && !error.__cottontailBunExpectation) {
+        try {
+          Object.defineProperty(error, "__cottontailBunThrowSite", { value: true, configurable: true });
+        } catch {}
+      }
       returnedPromiseError = error;
       finish();
     }
@@ -3597,9 +3727,31 @@ function wrapTestCallback(callback, inspectorId = 0) {
     resetAssertionState();
     let status = "pass";
     try {
-      await wrapped();
+      let result;
+      try {
+        result = wrapped();
+      } catch (syncError) {
+        // A synchronous throw propagates through Bun's native runner as an
+        // exception, and Bun reports its throw-site position (the closing
+        // paren for `throw new Error(...)`); errors delivered through a
+        // rejection report the construction site. Tag the sync throw so the
+        // reporter can tell them apart (verified against Bun 1.3.10).
+        if (syncError instanceof Error && !syncError.__cottontailBunExpectation) {
+          try {
+            Object.defineProperty(syncError, "__cottontailBunThrowSite", { value: true, configurable: true });
+          } catch {}
+        }
+        throw syncError;
+      }
+      await result;
       verifyAssertionState();
     } catch (error) {
+      // The engine computes error.stack lazily on first read; by report time
+      // the throwing context is gone and the captured frames drift. Reading it
+      // here — the closest runner frame to the throw — freezes the right one.
+      if (error instanceof Error) {
+        try { void error.stack; } catch {}
+      }
       status = error?.code === "ERR_TEST_FAILURE" && error?.failureType === "testTimeoutFailure" ? "timeout" : "fail";
       throw error;
     } finally {
@@ -4137,9 +4289,10 @@ function installShellConstructor() {
 }
 
 // Track subprocesses started inside tests so a test timeout can kill the
-// dangling ones, like bun does. Blocking Bun.spawnSync calls inside a test
-// with an explicit timeout get a watchdog that SIGKILLs the child at the
-// test deadline (bun's watchdog terminates blocked tests the same way).
+// dangling ones, like bun does. Blocking Bun.spawnSync calls inherit the
+// current test deadline through the native timeout option. Keeping the real
+// command intact matters for stdin, argv0, loader variables, and Darwin DYLD
+// instrumentation; a `/bin/sh` watchdog changes all four.
 function installTestSubprocessTracking() {
   const bun = globalThis.Bun;
   if (!bun || bun.__cottontailTestSpawnTracked) return;
@@ -4156,28 +4309,29 @@ function installTestSubprocessTracking() {
   Object.assign(wrappedSpawn, originalSpawn);
   bun.spawn = wrappedSpawn;
 
-  const deadlineCommand = (cmd, remainingMs) => {
-    const seconds = Math.max(Number(remainingMs), 5) / 1000;
-    const script = `"$@" & CT_CHILD=$!; ( /bin/sleep ${seconds}; kill -9 $CT_CHILD 2>/dev/null ) >/dev/null 2>&1 & CT_WATCH=$!; ` +
-      "{ wait $CT_CHILD; } 2>/dev/null; CT_STATUS=$?; kill $CT_WATCH 2>/dev/null; exit $CT_STATUS";
-    return ["/bin/sh", "-c", script, "sh", ...cmd.map(String)];
-  };
-
   const wrappedSpawnSync = function spawnSync(command, ...rest) {
     const remaining = globalThis.__cottontailCurrentTestRemainingMs?.();
-    const platform = globalThis.process?.platform;
-    if (remaining != null && Number.isFinite(remaining) && platform !== "win32") {
-      let wrappedCommand = null;
-      if (Array.isArray(command)) {
-        wrappedCommand = deadlineCommand(command, remaining);
+    if (remaining != null && Number.isFinite(remaining)) {
+      const deadlineTimeout = Math.max(5, Math.ceil(Number(remaining)));
+      const withDeadline = options => {
+        const current = Number(options?.timeout ?? 0);
+        if (!Number.isFinite(current) || current < 0) return { ...(options ?? {}) };
+        const timeout = current > 0 ? Math.min(current, deadlineTimeout) : deadlineTimeout;
+        return { ...(options ?? {}), timeout };
+      };
+      let deadlineCommand = command;
+      let deadlineRest = rest;
+      if (Array.isArray(command) && (rest.length === 0 || rest[0] == null ||
+          (typeof rest[0] === "object" && !Array.isArray(rest[0])))) {
+        deadlineRest = [withDeadline(rest[0]), ...rest.slice(1)];
       } else if (command && typeof command === "object" && Array.isArray(command.cmd)) {
-        wrappedCommand = { ...command, cmd: deadlineCommand(command.cmd, remaining) };
+        deadlineCommand = withDeadline(command);
+      } else {
+        return originalSpawnSync.call(bun, command, ...rest);
       }
-      if (wrappedCommand != null) {
-        const result = originalSpawnSync.call(bun, wrappedCommand, ...rest);
-        if (Number(result?.exitCode) === 137) globalThis.__cottontailNoteDanglingProcessKilled?.();
-        return result;
-      }
+      const result = originalSpawnSync.call(bun, deadlineCommand, ...deadlineRest);
+      if (result?.exitedDueToTimeout === true) globalThis.__cottontailNoteDanglingProcessKilled?.();
+      return result;
     }
     return originalSpawnSync.call(bun, command, ...rest);
   };

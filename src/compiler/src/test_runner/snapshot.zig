@@ -260,7 +260,7 @@ pub const Snapshots = struct {
             };
             var file: File = .{
                 .id = file_id,
-                .file = fd.stdFile(),
+                .file = bun.FD.stdFile(fd),
             };
             errdefer file.file.close();
 

@@ -22,6 +22,14 @@ void __bun_throw_not_implemented(const char* symbol_name)
 // Internals
 
 uint64_t uv__hrtime(uv_clocktype_t type);
+int ct_internal_uv_gettimeofday(uv_timeval64_t* tv);
+void ct_internal_uv_sem_destroy(uv_sem_t* sem);
+int ct_internal_uv_sem_init(uv_sem_t* sem, unsigned int value);
+void ct_internal_uv_sem_post(uv_sem_t* sem);
+int ct_internal_uv_sem_trywait(uv_sem_t* sem);
+void ct_internal_uv_sem_wait(uv_sem_t* sem);
+unsigned int ct_internal_uv_version(void);
+const char* ct_internal_uv_version_string(void);
 
 #if defined(__linux__)
 #include "uv-posix-polyfills-linux.c"
@@ -60,6 +68,46 @@ UV_EXTERN void uv_once(uv_once_t* guard, void (*callback)(void))
 UV_EXTERN uint64_t uv_hrtime(void)
 {
     return uv__hrtime(UV_CLOCK_PRECISE);
+}
+
+UV_EXTERN int uv_gettimeofday(uv_timeval64_t* tv)
+{
+    return ct_internal_uv_gettimeofday(tv);
+}
+
+UV_EXTERN unsigned int uv_version(void)
+{
+    return ct_internal_uv_version();
+}
+
+UV_EXTERN const char* uv_version_string(void)
+{
+    return ct_internal_uv_version_string();
+}
+
+UV_EXTERN void uv_sem_destroy(uv_sem_t* sem)
+{
+    ct_internal_uv_sem_destroy(sem);
+}
+
+UV_EXTERN int uv_sem_init(uv_sem_t* sem, unsigned int value)
+{
+    return ct_internal_uv_sem_init(sem, value);
+}
+
+UV_EXTERN void uv_sem_post(uv_sem_t* sem)
+{
+    ct_internal_uv_sem_post(sem);
+}
+
+UV_EXTERN int uv_sem_trywait(uv_sem_t* sem)
+{
+    return ct_internal_uv_sem_trywait(sem);
+}
+
+UV_EXTERN void uv_sem_wait(uv_sem_t* sem)
+{
+    ct_internal_uv_sem_wait(sem);
 }
 
 // Copy-pasted from libuv
@@ -135,6 +183,77 @@ UV_EXTERN int uv_mutex_trylock(uv_mutex_t* mutex)
 UV_EXTERN void uv_mutex_unlock(uv_mutex_t* mutex)
 {
     if (pthread_mutex_unlock(mutex))
+        abort();
+}
+
+// Copy-pasted from libuv
+UV_EXTERN int uv_rwlock_init(uv_rwlock_t* rwlock)
+{
+    return UV__ERR(pthread_rwlock_init(rwlock, NULL));
+}
+
+// Copy-pasted from libuv
+UV_EXTERN void uv_rwlock_destroy(uv_rwlock_t* rwlock)
+{
+    if (pthread_rwlock_destroy(rwlock))
+        abort();
+}
+
+// Copy-pasted from libuv
+UV_EXTERN void uv_rwlock_rdlock(uv_rwlock_t* rwlock)
+{
+    if (pthread_rwlock_rdlock(rwlock))
+        abort();
+}
+
+// Copy-pasted from libuv
+UV_EXTERN int uv_rwlock_tryrdlock(uv_rwlock_t* rwlock)
+{
+    int err;
+
+    err = pthread_rwlock_tryrdlock(rwlock);
+    if (err) {
+        if (err != EBUSY && err != EAGAIN)
+            abort();
+        return UV_EBUSY;
+    }
+
+    return 0;
+}
+
+// Copy-pasted from libuv
+UV_EXTERN void uv_rwlock_rdunlock(uv_rwlock_t* rwlock)
+{
+    if (pthread_rwlock_unlock(rwlock))
+        abort();
+}
+
+// Copy-pasted from libuv
+UV_EXTERN void uv_rwlock_wrlock(uv_rwlock_t* rwlock)
+{
+    if (pthread_rwlock_wrlock(rwlock))
+        abort();
+}
+
+// Copy-pasted from libuv
+UV_EXTERN int uv_rwlock_trywrlock(uv_rwlock_t* rwlock)
+{
+    int err;
+
+    err = pthread_rwlock_trywrlock(rwlock);
+    if (err) {
+        if (err != EBUSY && err != EAGAIN)
+            abort();
+        return UV_EBUSY;
+    }
+
+    return 0;
+}
+
+// Copy-pasted from libuv
+UV_EXTERN void uv_rwlock_wrunlock(uv_rwlock_t* rwlock)
+{
+    if (pthread_rwlock_unlock(rwlock))
         abort();
 }
 

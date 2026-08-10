@@ -110,10 +110,16 @@ function encodeValue(value, state) {
   if (Array.isArray(value)) return { type: "Array", id, value: value.map((item) => encodeValue(item, state)) };
   if (value instanceof Error) return { type: "Error", id, name: value.name, message: value.message, stack: value.stack };
   if (state.forStorage && isBlockList(value)) return { type: "Object", id, value: [] };
+  // child_process/cluster "advanced" IPC is the only consumer of this
+  // serializer (forStorage is always false here). Bun's cross-process
+  // structured serialization does not support Blob/File/BunFile — they arrive
+  // as empty plain objects (verified against Bun 1.3.10). Only the storage
+  // path (unused today) preserves their bytes.
   if (isBunFile(value)) {
+    if (!state.forStorage) return { type: "Object", id, value: [] };
     const bytes = bunFileBytes(value);
     return {
-      type: state.forStorage ? "StorageBunFile" : "File",
+      type: "StorageBunFile",
       id,
       bytes: encodeBytes(bytes),
       mime: String(value.type ?? ""),
@@ -122,6 +128,7 @@ function encodeValue(value, state) {
     };
   }
   if (typeof globalThis.Blob === "function" && value instanceof globalThis.Blob) {
+    if (!state.forStorage) return { type: "Object", id, value: [] };
     const bytes = value._bytes instanceof Uint8Array
       ? value._bytes
       : typeof value._getBytes === "function" ? value._getBytes() : new Uint8Array(0);

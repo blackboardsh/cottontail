@@ -1,14 +1,18 @@
 import { AsyncResource, _registerAsyncContextDependency, _wrapAsyncCallback } from "./async_hooks.js";
 
 export const captureRejectionSymbol = Symbol.for("nodejs.rejection");
-export const errorMonitor = Symbol("events.errorMonitor");
-export const kMaxEventTargetListeners = Symbol("events.maxEventTargetListeners");
-export const kMaxEventTargetListenersWarned = Symbol("events.maxEventTargetListenersWarned");
+// Symbol.for so that when ESM `import` and CJS `require` evaluate this module
+// as two separate records (they do under the test runner), both records share
+// the same keys — the anchored EventEmitter class is re-decorated by later
+// records and its methods must close over identical symbols.
+export const errorMonitor = Symbol.for("cottontail.events.errorMonitor");
+export const kMaxEventTargetListeners = Symbol.for("cottontail.events.maxEventTargetListeners");
+export const kMaxEventTargetListenersWarned = Symbol.for("cottontail.events.maxEventTargetListenersWarned");
 export let captureRejections = false;
 export let defaultMaxListeners = 10;
 export const usingDomains = false;
 
-const kCapture = Symbol("kCapture");
+const kCapture = Symbol.for("cottontail.events.kCapture");
 const kFirstEventParam = Symbol.for("nodejs.kFirstEventParam");
 const kResistStopPropagation = Symbol.for("nodejs.internal.event_target.kResistStopPropagation");
 
@@ -38,6 +42,17 @@ function checkAbortSignal(signal) {
 function EventEmitter(opts) {
   EventEmitter.init.call(this, opts);
 }
+// Anchor the constructor per-process. ESM `import "events"` and CJS
+// `require("events")` evaluate this module as two distinct records under the
+// test runner; without a shared class, an emitter built by one record fails
+// `x instanceof EventEmitter` against the other record's class. Node streams
+// extend the require-record class, so `writable.pipe()`'s unhandled 'error'
+// then escapes any `instanceof EventEmitter` guard that used the import record.
+// Later records re-run the setup below over this same shared object; that stays
+// consistent because every symbol it closes over is Symbol.for'd above.
+const __sharedEvents = (globalThis[Symbol.for("cottontail.internal.events")] ??= {});
+if (__sharedEvents.EventEmitter) EventEmitter = __sharedEvents.EventEmitter;
+else __sharedEvents.EventEmitter = EventEmitter;
 export default EventEmitter;
 export { EventEmitter };
 

@@ -270,7 +270,77 @@ fn getRuntimeSourceComptime(comptime target: options.Target) RuntimeSource {
         \\}
         \\
     };
-    const runtime_code = @embedFile("../runtime.js") ++ runtime_require ++ runtime_using_symbols;
+    // COTTONTAIL-COMPAT: helpers that only cottontail's internal
+    // runtime-launcher bundles use. They MUST be appended after every upstream
+    // runtime statement: `generateIsolatedHash` (which produces `//# debugId=`)
+    // mixes each chunk's runtime part indices into the hash, so inserting a
+    // statement anywhere earlier shifts the indices of the parts after it and
+    // changes the debugId of ordinary `bun build` output — which upstream
+    // inline snapshots golden-match. Appending keeps every upstream part index
+    // identical to real Bun's, and tree shaking drops both helpers from any
+    // bundle that does not reference them.
+    //
+    // `__esmForce` is the force-capable variant of `__esm`: the initializer
+    // keeps the original fn so a truthy `force` argument can re-run an
+    // already-evaluated module body. Static init calls pass no argument and
+    // behave exactly like `__esm`. It is selected instead of `__esm` only when
+    // `runtime_dynamic_imports` is set — see LinkerContext.load.
+    //
+    // `__esmDyn` is a registry-aware wrapper for `import()` of a bundled ESM
+    // module. Bun resolves dynamic imports at runtime and caches them in the
+    // JSC module loader registry (visible as `Loader.registry`), so user code
+    // can evict a module with `Loader.registry.delete(path)` and the next
+    // `import()` re-executes it. Cottontail pre-bundles statically-resolvable
+    // dynamic imports as lazily-initialized wrappers, which the registry never
+    // saw. This helper registers the import promise under the resolved path
+    // (the same key Bun uses) and force-re-runs the module initializer when a
+    // previously-registered key has been deleted from the registry. Its state
+    // Sets are created lazily inside the helper (rather than by a top-level
+    // IIFE) so the declaration is a side-effect-free function literal and
+    // stays tree-shakeable.
+    const runtime_cottontail_helpers =
+        \\export var __esmForce = (fn, res) => ((orig) => (force) => ((fn || force && (fn = orig)) && (res = fn(fn = 0)), res))(fn);
+        \\
+        \\export var __esmDyn = (key, init, ns) => {
+        \\  var seen = __esmDyn.s || (__esmDyn.s = new Set());
+        \\  var evaluating = __esmDyn.e || (__esmDyn.e = new Set());
+        \\  if (evaluating.has(key)) {
+        \\    var pending = init();
+        \\    return pending && typeof pending.then === "function" ? pending.then(() => ns) : Promise.resolve(ns);
+        \\  }
+        \\  var reg = globalThis.Loader && globalThis.Loader.registry;
+        \\  if (reg && reg.has(key)) return reg.get(key);
+        \\  var force = !!reg && seen.has(key);
+        \\  var promise = Promise.resolve().then(() => {
+        \\    evaluating.add(key);
+        \\    var res;
+        \\    try {
+        \\      res = init(force);
+        \\    } catch (error) {
+        \\      evaluating.delete(key);
+        \\      throw error;
+        \\    }
+        \\    if (res && typeof res.then === "function") {
+        \\      return res.then(() => (evaluating.delete(key), ns), (error) => {
+        \\        evaluating.delete(key);
+        \\        throw error;
+        \\      });
+        \\    }
+        \\    evaluating.delete(key);
+        \\    return ns;
+        \\  });
+        \\  if (reg) {
+        \\    seen.add(key);
+        \\    reg.set(key, promise);
+        \\    promise.catch(() => {
+        \\      if (reg.get(key) === promise) reg.delete(key);
+        \\    });
+        \\  }
+        \\  return promise;
+        \\};
+        \\
+    ;
+    const runtime_code = @embedFile("../runtime.js") ++ runtime_require ++ runtime_using_symbols ++ runtime_cottontail_helpers;
 
     const parse_task = ParseTask{
         .ctx = undefined,

@@ -429,7 +429,6 @@ struct NapiPostedFinalizer {
     napi_finalize callback { nullptr };
     void* data { nullptr };
     void* hint { nullptr };
-    bool is_finalizer { true };
 };
 
 struct NapiBufferFinalizer {
@@ -520,7 +519,11 @@ struct NapiEnv {
     JSObjectRef logically_detached_buffers { nullptr };
     std::thread::id owner_thread;
     bool destroying { false };
-    bool in_finalizer { false };
+    // Set while remaining finalizers run during environment teardown. Native
+    // calls that would run JavaScript fail with napi_cannot_run_js (module
+    // API version >= 10) or napi_pending_exception (older modules), matching
+    // Node's environment-shutdown behavior.
+    bool finishing_finalizers { false };
     bool in_basic_finalizer { false };
 };
 
@@ -1169,8 +1172,8 @@ static napi_status ensure_can_run_js(NapiEnv* env)
     if (!env)
         return napi_invalid_arg;
     check_basic_finalizer_safety(env);
-    if (env->in_finalizer)
-        return finish(env, napi_cannot_run_js);
+    if (env->finishing_finalizers)
+        return finish(env, env->module_api_version >= 10 ? napi_cannot_run_js : napi_pending_exception);
     if (env->pending_exception)
         return finish(env, napi_pending_exception);
     return napi_ok;
@@ -1448,26 +1451,21 @@ private:
 
 class BasicFinalizerScope {
 public:
-    BasicFinalizerScope(NapiEnv* env, bool basic, bool is_finalizer = true)
+    BasicFinalizerScope(NapiEnv* env, bool basic)
         : m_env(env)
-        , m_previous_finalizer(env->in_finalizer)
         , m_previous_basic(env->in_basic_finalizer)
     {
-        if (is_finalizer)
-            env->in_finalizer = true;
-        if (is_finalizer && basic)
+        if (basic)
             env->in_basic_finalizer = true;
     }
 
     ~BasicFinalizerScope()
     {
-        m_env->in_finalizer = m_previous_finalizer;
         m_env->in_basic_finalizer = m_previous_basic;
     }
 
 private:
     NapiEnv* m_env;
-    bool m_previous_finalizer;
     bool m_previous_basic;
 };
 
@@ -3135,13 +3133,15 @@ static void drain_finalizer_queues(NapiEnv* env)
         }
         if (basic.empty() && posted.empty())
             break;
+        // Teardown drain: JavaScript may no longer run, but GC-affecting
+        // calls are safe because the collector is not active here, so no
+        // BasicFinalizerScope. ensure_can_run_js gates JS access through
+        // env->finishing_finalizers instead.
         for (const auto& finalizer : basic) {
-            BasicFinalizerScope finalizer_scope(env, true);
             if (finalizer.callback)
                 finalizer.callback(reinterpret_cast<napi_env>(env), finalizer.data, finalizer.hint);
         }
         for (const auto& finalizer : posted) {
-            BasicFinalizerScope finalizer_scope(env, false, finalizer.is_finalizer);
             if (finalizer.callback)
                 finalizer.callback(reinterpret_cast<napi_env>(env), finalizer.data, finalizer.hint);
         }
@@ -3219,6 +3219,11 @@ static void destroy_single_env(NapiEnv* env)
         callback(reinterpret_cast<napi_env>(env), env->instance_data, env->instance_hint);
         std::fflush(nullptr);
     }
+
+    // Remaining finalizers run during environment shutdown: JavaScript can no
+    // longer be executed, so gated napi calls fail with napi_cannot_run_js or
+    // napi_pending_exception depending on the module API version.
+    env->finishing_finalizers = true;
 
     // ObjectWrap instances can retain one another through their wrap refs.
     // Run an unretained child's destructor before the parent it will unref.
@@ -4971,6 +4976,16 @@ extern "C" napi_status napi_escape_handle(
     return finish(env, napi_ok);
 }
 
+// Modules built with NAPI_EXPERIMENTAL run their finalizers directly from
+// garbage collection (emulated by draining the basic queue synchronously
+// after a collection, with GC-affecting napi calls forbidden). Finalizers
+// from stable-version modules are deferred to a later event-loop turn where
+// JavaScript execution is allowed, matching Node and Bun.
+static bool module_runs_finalizers_in_gc(const NapiEnv* env)
+{
+    return env && env->module_api_version == NAPI_VERSION_EXPERIMENTAL;
+}
+
 static NapiFinalizerData* create_finalizer(
     NapiEnv* env,
     void* data,
@@ -4998,7 +5013,7 @@ extern "C" napi_status napi_create_external(
     if (!env || !result)
         return invalid(env);
     std::call_once(classes_once, initialize_classes);
-    auto* finalizer = create_finalizer(env, data, finalize_callback, finalize_hint, true, false);
+    auto* finalizer = create_finalizer(env, data, finalize_callback, finalize_hint, true, module_runs_finalizers_in_gc(env));
     if (!finalizer)
         return finish(env, napi_generic_failure);
     JSObjectRef external = JSObjectMake(env->context, external_class, finalizer);
@@ -5105,7 +5120,7 @@ static napi_status attach_wrap_finalizer(
         return finish(env, napi_invalid_arg);
     if (exception)
         return caught(env, exception);
-    auto* finalizer = create_finalizer(env, data, callback, hint, false, false);
+    auto* finalizer = create_finalizer(env, data, callback, hint, false, module_runs_finalizers_in_gc(env));
     if (!finalizer)
         return finish(env, napi_generic_failure);
     JSObjectRef holder = JSObjectMake(env->context, finalizer_class, finalizer);
@@ -5215,7 +5230,7 @@ extern "C" napi_status napi_add_finalizer(
         return status != napi_ok ? status : invalid(env);
     char key[128];
     std::snprintf(key, sizeof(key), "__cottontail_napi_finalizer_%p_%llu", static_cast<void*>(env), static_cast<unsigned long long>(env->finalizer_key++));
-    status = attach_finalizer(env, target, key, native_object, finalize_callback, finalize_hint, true);
+    status = attach_finalizer(env, target, key, native_object, finalize_callback, finalize_hint, module_runs_finalizers_in_gc(env));
     if (status != napi_ok)
         return status;
     if (result)
@@ -5235,7 +5250,7 @@ extern "C" napi_status node_api_post_finalizer(
         return invalid(env);
     {
         std::lock_guard lock(env->async_mutex);
-        env->posted_finalizers.push_back({ finalize_callback, finalize_data, finalize_hint, false });
+        env->posted_finalizers.push_back({ finalize_callback, finalize_data, finalize_hint });
     }
     wake(env);
     return finish(env, napi_ok);
@@ -6016,7 +6031,7 @@ extern "C" napi_status napi_get_version(napi_env opaque_env, uint32_t* result)
 extern "C" napi_status napi_get_node_version(napi_env opaque_env, const napi_node_version** result)
 {
     // COTTONTAIL-COMPAT: Keep this synchronized with nodeCompatVersion in node/process.js.
-    static const napi_node_version version { 24, 11, 1, "node" };
+    static const napi_node_version version { 24, 3, 0, "node" };
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
     if (!env || !result)
         return invalid(env);
@@ -7207,7 +7222,7 @@ static bool drain_finalizer_queue(NapiEnv* env, bool basic, JSValueRef* exceptio
     while (!finalizers.empty()) {
         NapiPostedFinalizer finalizer = finalizers.front();
         finalizers.pop_front();
-        BasicFinalizerScope finalizer_scope(env, basic, finalizer.is_finalizer);
+        BasicFinalizerScope finalizer_scope(env, basic);
         AutomaticScope scope(env);
         if (finalizer.callback)
             finalizer.callback(reinterpret_cast<napi_env>(env), finalizer.data, finalizer.hint);

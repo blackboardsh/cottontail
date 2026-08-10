@@ -2,7 +2,9 @@ import { EventEmitter } from "./events.js";
 import { readFileSync, writeFileSync } from "./fs.js";
 import { createRequire } from "./module.js";
 import { join } from "./path.js";
+import { isatty } from "./tty.js";
 import { inspect } from "./util.js";
+import "../bun/index.js";
 
 export const REPL_MODE_SLOPPY = Symbol("repl-sloppy");
 export const REPL_MODE_STRICT = Symbol("repl-strict");
@@ -390,7 +392,10 @@ class BuiltinReplSession {
   constructor() {
     this.input = process.stdin;
     this.output = process.stdout;
-    this.terminal = Boolean(this.input?.isTTY && this.output?.isTTY);
+    // The `bun repl` entrypoint may receive the legacy non-stream stdio objects
+    // (plain Objects whose isTTY is undefined) instead of the TTYReadStream, so
+    // detect interactivity from the underlying descriptors via isatty(2).
+    this.terminal = Boolean(isatty(0) && isatty(1));
     this.colors = this.terminal && !process.env.NO_COLOR;
     this.evaluator = new BuiltinReplEvaluator();
     this.line = "";
@@ -710,6 +715,11 @@ class BuiltinReplSession {
     this.input.off?.("error", this.onError);
     this.input.pause?.();
     this.resolve?.();
+    // A raw TTY never signals EOF and the legacy stdin handle keeps the event
+    // loop alive, so an interactive session must exit explicitly once finished.
+    // Piped mode still drains naturally (its stdin closes), avoiding any risk of
+    // truncating buffered output before the pipe flushes.
+    if (this.terminal) process.exit(process.exitCode ?? 0);
   }
 
   async run() {
@@ -734,7 +744,7 @@ class BuiltinReplSession {
     this.input.on("end", this.onEnd);
     this.input.on("error", this.onError);
     this.input.resume?.();
-    this.write(`Welcome to Bun v${Bun.version}\n`);
+    this.write(`Welcome to Cottontail v${process.versions.cottontail ?? Bun.version}\n`);
     this.write("Type .copy [code] to copy to clipboard. .help for more info.\n\n");
     this.prompt();
     await completed;

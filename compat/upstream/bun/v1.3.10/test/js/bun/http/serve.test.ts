@@ -353,7 +353,7 @@ it("should display a welcome message when the response value type is incorrect",
     async server => {
       const response = await fetch(server.url.origin);
       const text = await response.text();
-      expect(text).toContain("Welcome to Bun!");
+      expect(text).toContain("Welcome to Cottontail!");
     },
   );
 });

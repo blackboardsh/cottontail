@@ -11,7 +11,12 @@ const parentOwnsTemp = process.env.COTTONTAIL_UPSTREAM_TEMP_OWNER === "launcher"
 const ownerKey = Symbol.for("cottontail.upstreamTestTempOwner");
 
 if (isCottontail && !parentOwnsTemp && !(globalThis as any)[ownerKey]) {
-  const prefix = "cottontail-bun-tests-";
+  // Keep this short: unix-domain socket paths created under the owned root
+  // (e.g. serve.test.ts) must fit sockaddr_un's 104-byte sun_path on macOS,
+  // and the system temp base already consumes ~58 of those bytes. Tests that
+  // repeat a temp path to probe long-path handling (error-gc-test) also have
+  // to stay under PATH_MAX, and every byte here is multiplied by the repeat.
+  const prefix = "ct-";
   const base = realpathSync.native(resolve(process.env.COTTONTAIL_UPSTREAM_TMPDIR || tmpdir()));
   const ownedRoot = mkdtempSync(join(base, prefix));
   Object.defineProperty(globalThis, ownerKey, { value: ownedRoot, configurable: false });

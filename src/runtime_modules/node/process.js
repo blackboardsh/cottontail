@@ -23,7 +23,7 @@ import {
   permissionsEnabled,
 } from "./internal/permissions.js";
 
-const nodeCompatVersion = "24.11.1";
+const nodeCompatVersion = "24.3.0";
 let sourceMapsState = false;
 let uncaughtExceptionCaptureCallback = null;
 let lastClockNs = 0n;
@@ -1106,20 +1106,12 @@ function makeProcessBinding(name) {
       return makeFsBinding();
     case "buffer":
       return makeBufferBinding();
-    case "os":
-      return makeOsBinding();
-    case "spawn_sync":
-      return makeSpawnSyncBinding();
-    case "zlib":
-      return makeZlibBinding();
     case "uv":
       return uvBinding;
     case "util":
       return utilBinding;
     case "tty_wrap":
       return ttyWrapBinding;
-    case "signal_wrap":
-      return signalWrapBinding;
     case "http_parser":
       return makeHttpParserBinding();
     case "timers":
@@ -1148,6 +1140,14 @@ function makeProcessBinding(name) {
         bits: processObject.arch === "x64" || processObject.arch === "arm64" ? 64 : 32,
         getDefaultLocale: () => Intl.DateTimeFormat().resolvedOptions().locale,
       });
+    case "os":
+      return makeOsBinding();
+    case "spawn_sync":
+      return makeSpawnSyncBinding();
+    case "zlib":
+      return makeZlibBinding();
+    case "signal_wrap":
+      return signalWrapBinding;
     default:
       throwNoSuchBinding(name);
   }
@@ -1296,6 +1296,12 @@ function makeReport() {
       cpus: diagnostics.cpus,
       networkInterfaces,
     };
+    if (typeof diagnostics.glibcVersionCompiler === "string") {
+      reportData.header.glibcVersionCompiler = diagnostics.glibcVersionCompiler;
+    }
+    if (typeof diagnostics.glibcVersionRuntime === "string") {
+      reportData.header.glibcVersionRuntime = diagnostics.glibcVersionRuntime;
+    }
     if (diagnostics.userLimits !== undefined) reportData.userLimits = diagnostics.userLimits;
     return reportData;
   };
@@ -2046,7 +2052,6 @@ function createStdinStream() {
     stopWatching();
     return this;
   };
-
   return stream;
 }
 
@@ -2504,7 +2509,9 @@ const allowedNodeEnvironmentFlagValues = `
 -C
 -r
 `.trim().split(/\s+/);
-export const allowedNodeEnvironmentFlags = new ImmutableSet(allowedNodeEnvironmentFlagValues);
+// Bun 1.3.10 exposes an empty stub set here (verified against the real
+// binary); nothing in the runtime consumes the values.
+export const allowedNodeEnvironmentFlags = new ImmutableSet([]);
 processObject.allowedNodeEnvironmentFlags = allowedNodeEnvironmentFlags;
 const exitCodeDescriptor = Object.getOwnPropertyDescriptor(processObject, "exitCode");
 if (exitCodeDescriptor == null || exitCodeDescriptor.configurable) {
@@ -2524,7 +2531,19 @@ Object.defineProperty(processObject, "sourceMapsEnabled", {
   configurable: true,
 });
 
-export const cwd = processObject.cwd = () => cottontail.cwd();
+let _cachedCwd = null;
+export const cwd = processObject.cwd = () => {
+  try {
+    _cachedCwd = cottontail.cwd();
+    return _cachedCwd;
+  } catch (e) {
+    // If getcwd() fails (e.g. current directory was deleted), return the cached value
+    if (_cachedCwd) return _cachedCwd;
+    throw e;
+  }
+};
+// Initialize the cache at module load time
+try { _cachedCwd = cottontail.cwd(); } catch {}
 
 export const chdir = processObject.chdir = (directory) => {
   if (typeof directory !== "string") throw invalidArgType("directory", "string", directory);
@@ -2532,6 +2551,8 @@ export const chdir = processObject.chdir = (directory) => {
   const source = processObject.cwd();
   try {
     processInfo("chdir", directory);
+    // Update the cached cwd on success
+    try { _cachedCwd = cottontail.cwd(); } catch { _cachedCwd = directory; }
   } catch (cause) {
     const detail = String(cause?.message ?? cause);
     const code = /no such file or directory/i.test(detail)
@@ -2634,7 +2655,7 @@ export const kill = processObject.kill = (targetPid, signal = "SIGTERM") => {
       : signalNamesByNumber.get(signalValue);
   if (pidNumber === processObject.pid && signalName && processObject.listenerCount(signalName) > 0) {
     _enqueueNextTick(() => {
-      if (!processObject.emit(signalName, signalName)) {
+      if (!processObject.emit(signalName, signalName, signalValue)) {
         processObject._kill(pidNumber, signalValue);
       }
     });
@@ -3018,12 +3039,32 @@ export const _debugProcess = processObject._debugProcess = (targetPid) =>
 export const _startProfilerIdleNotifier = processObject._startProfilerIdleNotifier = () => {};
 export const _stopProfilerIdleNotifier = processObject._stopProfilerIdleNotifier = () => {};
 
+// Bun 1.3.10's process.binding() throws for these, even where an internal
+// implementation exists (internal/test/binding bypasses via bindingInternal).
+const processBindingThrowsFor = new Set([
+  "async_wrap", "cares_wrap", "contextify", "crypto", "fs_event_wrap", "icu",
+  "inspector", "js_stream", "os", "pipe_wrap", "process_wrap", "signal_wrap",
+  "spawn_sync", "stream_wrap", "tcp_wrap", "tls_wrap", "udp_wrap", "url",
+  "v8", "zlib",
+]);
+
+function bindingByName(key) {
+  if (!processBindingCache.has(key)) processBindingCache.set(key, makeProcessBinding(key));
+  return processBindingCache.get(key);
+}
+
+export const bindingInternal = processObject.__cottontailBindingInternal = (name) => {
+  const key = String(name);
+  if (key.length === 0) throwNoSuchBinding(key);
+  return bindingByName(key);
+};
+
 export const binding = processObject.binding = (name) => {
   if (typeof name !== "string") throw invalidArgType("module", "string", name);
   const key = name;
   if (key.length === 0) throwNoSuchBinding(key);
-  if (!processBindingCache.has(key)) processBindingCache.set(key, makeProcessBinding(key));
-  return processBindingCache.get(key);
+  if (processBindingThrowsFor.has(key)) throwNoSuchBinding(key);
+  return bindingByName(key);
 };
 
 export const _linkedBinding = processObject._linkedBinding = (name) => {

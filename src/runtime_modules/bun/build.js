@@ -40,13 +40,33 @@ export function createBunBuildFacade(dependencies) {
     const toAbsolute = (value) => (
       value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value) ? value : nodePathResolve(cwd, value)
     );
+    // A path-like entrypoint is anchored to the filesystem (absolute, or an
+    // explicit "./"/"../" relative path). Bare specifiers (e.g. "pkg",
+    // "@scope/pkg") are package entry points that the native resolver must
+    // look up in node_modules — applying the "exports"/"module"/"main" fields
+    // — so they are passed through unchanged rather than force-joined to cwd.
+    const isPathLike = (value) =>
+      value.startsWith("/") ||
+      value.startsWith("./") ||
+      value.startsWith("../") ||
+      value.startsWith(".\\") ||
+      value.startsWith("..\\") ||
+      value === "." ||
+      value === ".." ||
+      /^[A-Za-z]:[\\/]/.test(value);
     try {
       const entrypoints = [];
       const virtualFiles = spec.files && typeof spec.files === "object" ? spec.files : null;
       for (const entrypoint of spec.entrypoints ?? []) {
         const entry = String(entrypoint);
         const absoluteEntry = toAbsolute(entry);
-        if (!Object.prototype.hasOwnProperty.call(virtualFiles ?? {}, absoluteEntry) && !cottontail.existsSync(absoluteEntry)) {
+        // Resolve to a concrete file when the entry exists on disk (or in the
+        // virtual file map). Otherwise, defer bare package specifiers to the
+        // native resolver (node_modules lookup); only reject path-like entries
+        // that point at a non-existent file.
+        if (Object.prototype.hasOwnProperty.call(virtualFiles ?? {}, absoluteEntry) || cottontail.existsSync(absoluteEntry)) {
+          entrypoints.push(absoluteEntry);
+        } else if (isPathLike(entry)) {
           return {
             ok: false,
             name: "AggregateError",
@@ -58,8 +78,9 @@ export function createBunBuildFacade(dependencies) {
               position: null,
             }],
           };
+        } else {
+          entrypoints.push(entry);
         }
-        entrypoints.push(absoluteEntry);
       }
       const request = { ...spec, plugins: undefined, __cottontailWorkingDirectory: undefined, entrypoints };
       const parsed = JSON.parse(cottontail.buildNative(JSON.stringify(request), cwd));
@@ -377,7 +398,15 @@ export function createBunBuildFacade(dependencies) {
       target: options?.target ?? "browser",
       onResolve(constraints, callback) {
         if (!callback || typeof callback !== "function") throw new TypeError("lmao callback must be a function");
-        onResolveRules.push({ ...ctValidatePluginConstraints(constraints), callback });
+        onResolveRules.push({
+          ...ctValidatePluginConstraints(constraints),
+          // Unlike onLoad, omitting the namespace on onResolve means that the
+          // filter applies to imports from every namespace. Keep that intent
+          // separate from the normalized default namespace so an explicitly
+          // requested "file" namespace can still be matched exactly.
+          allNamespaces: constraints.namespace === undefined,
+          callback,
+        });
         return this;
       },
       onLoad(constraints, callback) {
@@ -552,12 +581,11 @@ export function createBunBuildFacade(dependencies) {
     };
 
     const resolveWithPlugins = async (specifier, importer, importerNamespace, resolveDir, kind) => {
+      // Entry points report the empty namespace to callbacks, but participate
+      // in namespace-filter matching as files.
+      const namespaceForMatching = importerNamespace || "file";
       for (const rule of onResolveRules) {
-        // Bun invokes onResolve callbacks registered for the default "file"
-        // namespace for imports from every namespace (including entry points,
-        // whose importer namespace is ""), while callbacks registered for a
-        // custom namespace only fire for importers inside that namespace.
-        if (rule.namespace !== importerNamespace && rule.namespace !== "file") continue;
+        if (!rule.allNamespaces && rule.namespace !== namespaceForMatching) continue;
         if (!rule.filter.test(specifier)) continue;
         const result = await Reflect.apply(rule.callback, undefined, [{
           path: specifier,
@@ -718,7 +746,15 @@ export function createBunBuildFacade(dependencies) {
     };
 
     const loadWithPlugins = async (record) => {
-      const defaultLoader = record.namespace === "file" ? bundleLoaderForPath(record.path) : "js";
+      // The default loader is derived from the resolved path's extension for
+      // every namespace, matching Bun's `Path.loader()` which ignores the
+      // namespace. A path whose extension has no dedicated loader (the "file"
+      // fallback) is treated as JavaScript for non-"file" namespaces, mirroring
+      // Bun's `orelse .js` default for virtual/plugin-resolved modules.
+      const extensionLoader = bundleLoaderForPath(record.path);
+      const defaultLoader = record.namespace === "file"
+        ? extensionLoader
+        : extensionLoader === "file" ? "js" : extensionLoader;
       for (const rule of onLoadRules) {
         if (rule.namespace !== record.namespace) continue;
         if (!rule.filter.test(record.path)) continue;
@@ -907,8 +943,12 @@ export function createBunBuildFacade(dependencies) {
     const shadowName = (sourcePath, loader, entryName, namespace = "file") => {
       const base = String(entryName ?? sourcePath).replace(/\\/g, "/").split("/").pop() || "module";
       const known = /\.(tsx|ts|jsx|mjs|cjs|js|css|html|json|toml|txt|wasm)$/i.exec(base);
-      const stem = known ? base.slice(0, -known[0].length) : base;
       const sourceExtension = ctBuildSourceExtension(base);
+      const stem = known
+        ? base.slice(0, -known[0].length)
+        : loader === "file" && sourceExtension
+          ? base.slice(0, -sourceExtension.length)
+          : base;
       const ext = loader === "file"
         ? (sourceExtension || ".bin")
         : (bundleLoaderExtensions[loader] ?? (known ? known[0] : ".js"));

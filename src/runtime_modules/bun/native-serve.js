@@ -32,6 +32,7 @@ export function startNativeServe(options, runtime) {
     normalizeServeDateHeader,
     normalizeServeListenErrorCode,
     parseHeadersText,
+    invalidateServeHtmlState,
     registerServeHtmlOptions,
     requestIdleTimeout,
     requestWithLazyURL,
@@ -75,6 +76,20 @@ export function startNativeServe(options, runtime) {
       }
     } catch (rawError) {
       const reason = rawError instanceof Error ? rawError.message : String(rawError);
+      if (!unixPath && /(?:EACCES|permission denied|access denied)/i.test(reason)) {
+        // Bun reports the externally visible listen address for privileged-port
+        // failures. Its default listen error uses 0.0.0.0 even though the
+        // public `server.hostname` default remains "localhost".
+        const configuredHostname = options.hostname;
+        const errorHostname = configuredHostname == null || String(configuredHostname).length === 0
+          ? "0.0.0.0"
+          : hostname;
+        const error = new Error(`permission denied ${errorHostname}:${defaultServePort(options)}`);
+        error.code = rawError?.code ?? "EACCES";
+        error.errno = rawError?.errno ?? -13;
+        error.syscall = rawError?.syscall ?? "listen";
+        throw error;
+      }
       const error = rawError instanceof Error
         ? rawError
         : new Error(
@@ -132,8 +147,10 @@ export function startNativeServe(options, runtime) {
         return server.stop(true);
       },
       reload(nextOptions = {}) {
-        registerServeHtmlOptions(activeOptions[serveHtmlStateSymbol], nextOptions);
-        activeOptions = { ...activeOptions, ...nextOptions };
+        const reloadedOptions = { ...activeOptions, ...nextOptions };
+        invalidateServeHtmlState(activeOptions[serveHtmlStateSymbol], reloadedOptions);
+        registerServeHtmlOptions(activeOptions[serveHtmlStateSymbol], reloadedOptions);
+        activeOptions = reloadedOptions;
         server.development = activeOptions.development ?? false;
         return server;
       },

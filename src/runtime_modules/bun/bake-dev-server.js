@@ -1,5 +1,5 @@
 import path from "../node/path.js";
-import { readFileSync, readdirSync, statSync, writeFileSync } from "../node/fs.js";
+import { readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "../node/fs.js";
 import { pathToFileURL } from "../node/url.js";
 import { __setBuiltinModules } from "../node/module.js";
 import bundledReactRefreshModule from "./bake-react-refresh.txt";
@@ -35,6 +35,14 @@ import {
 const bunRuntime = globalThis[Symbol.for("cottontail.internal.bunRuntimeBridge")];
 if (bunRuntime?.abiVersion !== 1) throw new Error("Cottontail Bun runtime bridge ABI mismatch");
 const { Bun, HTMLRewriter, Response: RuntimeResponse, serve } = bunRuntime;
+
+export function canonicalBakeProjectRoot(root = globalThis.process?.cwd?.() ?? ".") {
+  try {
+    return realpathSync(root);
+  } catch {
+    return path.resolve(root);
+  }
+}
 
 let responseOptionsAsyncLocalStorage = null;
 let BakeResponse = null;
@@ -434,7 +442,7 @@ function localHtmlModuleScripts(source, htmlPath) {
         ? path.resolve(globalThis.process?.cwd?.() ?? ".", `.${sourcePath}`)
         : path.resolve(path.dirname(htmlPath), sourcePath);
       scripts.push({
-        assetPath: parsed.pathname,
+        sourceUrl,
         entryPath,
       });
     },
@@ -469,6 +477,22 @@ function rewriteHtmlCssAssets(source, replacements) {
       }
       const replacement = replacements.get(pathname);
       if (replacement) element.setAttribute("href", replacement);
+    },
+  }).transform(source);
+}
+
+function rewriteHtmlModuleScriptAssets(source, replacements) {
+  if (replacements.size === 0) return source;
+  return new HTMLRewriter().on("script", {
+    element(element) {
+      const type = element.getAttribute("type");
+      const sourceUrl = element.getAttribute("src");
+      if (type?.toLowerCase() !== "module" || !sourceUrl) return;
+      // The scanner has already rejected external URLs. Preserve the exact
+      // decoded attribute here so root-relative and HTML-relative entries that
+      // normalize to the same URL pathname still map to their own artifacts.
+      const replacement = replacements.get(sourceUrl);
+      if (replacement) element.setAttribute("src", replacement);
     },
   }).transform(source);
 }
@@ -541,10 +565,21 @@ function matchesHtmlRoute(pattern, pathname) {
   return pathname === prefix || pathname.startsWith(`${prefix}/`);
 }
 
+export function normalizeBakeAssetPath(relativePath, publicPath = "/") {
+  const encodedRelative = String(relativePath)
+    .split("/")
+    .map(segment => segment === "." || segment === ".." ? segment : encodeURIComponent(segment))
+    .join("/");
+  const prefix = normalizePrefix(publicPath);
+  const assetPath = prefix === "/" ? `/${encodedRelative}` : `${prefix}/${encodedRelative}`;
+  const url = new URL("http://localhost");
+  url.pathname = assetPath;
+  return url.pathname;
+}
+
 function outputAssetPath(outdir, artifact, publicPath) {
   const relative = path.relative(outdir, artifact.path).replaceAll(path.sep, "/").replace(/^\.\//, "");
-  const prefix = normalizePrefix(publicPath);
-  return prefix === "/" ? `/${relative}` : `${prefix}/${relative}`;
+  return normalizeBakeAssetPath(relative, publicPath);
 }
 
 function isJavaScriptEntry(artifact) {
@@ -897,15 +932,16 @@ async function buildChangedHtmlHmrModules(projectRoot, changedPaths, previousBun
     if (!isJavaScriptArtifact({ loader: loaderForPath(entryPath) })) continue;
     if (![...loadedModuleIds].some(id => changedPathMatchesModule(projectRoot, [changedPath], id))) continue;
 
-    let artifact;
+    let internal;
     try {
-      artifact = await buildInternalBakeEntry(entryPath, outdir, buildConfig);
+      internal = await buildInternalBakeEntry(entryPath, outdir, buildConfig);
     } catch {
       return null;
     }
 
+    const { artifact, outputs } = internal;
     const source = await artifact.text();
-    const sourceMapRecord = await sourceMapRecordForArtifact(artifact, [artifact], source, projectRoot);
+    const sourceMapRecord = await sourceMapRecordForArtifact(artifact, outputs, source, projectRoot);
     for (const [id, definition] of Object.entries(bakeRegistryModules(source))) {
       if (!loadedModuleIds.has(id) || !changedPathMatchesModule(projectRoot, [changedPath], id)) continue;
       modules[id] = definition;
@@ -917,7 +953,7 @@ async function buildChangedHtmlHmrModules(projectRoot, changedPaths, previousBun
 }
 
 function createHtmlDispatcher(config, development) {
-  const projectRoot = globalThis.process?.cwd?.() ?? ".";
+  const projectRoot = canonicalBakeProjectRoot();
   const routes = { ...(config.routes ?? {}) };
   const staticRoutes = { ...(config.static ?? {}) };
   const htmlRoutes = [];
@@ -926,7 +962,14 @@ function createHtmlDispatcher(config, development) {
     for (const [pattern, value] of Object.entries(routeTable)) {
       if (!isHtmlAsset(value)) continue;
       const htmlPath = typeof value === "string" ? value : value.index;
-      htmlRoutes.push({ id: htmlRoutes.length, pattern, path: path.resolve(projectRoot, htmlPath) });
+      htmlRoutes.push({
+        id: htmlRoutes.length,
+        pattern,
+        // COTTONTAIL-COMPAT: macOS exposes /tmp as a symlink to /private/tmp.
+        // Keep HTML routes in the same canonical namespace as Bun.build's
+        // metafile, watcher paths, and source maps.
+        path: canonicalBakeProjectRoot(path.resolve(projectRoot, htmlPath)),
+      });
       delete routeTable[pattern];
     }
   }
@@ -973,16 +1016,26 @@ function createHtmlDispatcher(config, development) {
     if (scripts.length === 0) return null;
 
     const hmrEntries = [];
-    for (const { assetPath, entryPath } of scripts) {
+    const scriptAssetReplacements = new Map();
+    for (const [scriptIndex, { sourceUrl, entryPath }] of scripts.entries()) {
+      // Each standalone internal entry needs its own output namespace. Two
+      // distinct sources may share a basename (for example ./app.ts and
+      // /app.ts in nested HTML), and separate one-entry builds otherwise both
+      // emit app.js into the same directory.
+      const entryOutdir = scripts.length === 1
+        ? outdir
+        : path.join(outdir, `entry-${scriptIndex}`);
       let internal;
       try {
-        internal = await internalBakeEntry(entryPath, outdir, buildConfig, eagerBuilds);
+        internal = await internalBakeEntry(entryPath, entryOutdir, buildConfig, eagerBuilds);
       } catch {
         return null;
       }
       const { artifact, outputs, refreshId } = internal;
       if (requireStandalone && outputs.some(output => output !== artifact && output.kind !== "sourcemap")) return null;
 
+      const assetPath = outputAssetPath(outdir, artifact, buildConfig.publicPath);
+      scriptAssetReplacements.set(sourceUrl, assetPath);
       let source = await artifact.text();
       if (refreshId !== null) source = addBakeBundleConfig(source, "refresh", refreshId);
       const sourceMapRecord = await sourceMapRecordForArtifact(artifact, [artifact], source, projectRoot);
@@ -1014,9 +1067,17 @@ function createHtmlDispatcher(config, development) {
     }
 
     // COTTONTAIL-COMPAT: Bake's HMR linker defers require/TLA failures until
-    // module evaluation. Keep the original HTML while serving its scripts from
-    // the internal HMR graph so the runtime reports Bun's exact diagnostic.
-    return { body: sourceText, sourceText, hmrEntries, css: new Map(), buildError: false, errors: [] };
+    // module evaluation. Keep the raw HTML separately for invalidation while
+    // serving its scripts at the generated JavaScript URLs from the internal
+    // HMR graph so the runtime reports Bun's exact diagnostic.
+    return {
+      body: rewriteHtmlModuleScriptAssets(sourceText, scriptAssetReplacements),
+      sourceText,
+      hmrEntries,
+      css: new Map(),
+      buildError: false,
+      errors: [],
+    };
   }
 
   async function internalHtmlFailureLogs(sourceText, htmlPath, outdir, buildConfig) {
@@ -1222,6 +1283,7 @@ function createHtmlDispatcher(config, development) {
         sourceText,
         hmrEntries,
         css,
+        hasFileAssets: !supportsInternalHmr,
         buildError: false,
         errors: [],
       };
@@ -1307,7 +1369,18 @@ function createHtmlDispatcher(config, development) {
       const htmlChanged = changedPaths.some(changedPath =>
         path.resolve(projectRoot, changedPath) === htmlPath
       );
-      if (!previousSuccessful || htmlChanged || previousSuccessful.sourceText !== next.sourceText) {
+      // Pages with linked file assets (e.g. <img src="image.png">) can't use the
+      // internal HMR graph and embed content-hashed asset URLs in the document.
+      // Editing such an asset leaves the raw HTML untouched but rewrites the
+      // built body, so compare the rendered body to force a reload. This is
+      // gated on hasFileAssets so CSS pages — whose bodies are stable across
+      // edits — keep flowing through the CSS hot-update path below.
+      const assetBodyChanged = next.hasFileAssets &&
+        typeof previousSuccessful.body === "string" &&
+        typeof next.body === "string" &&
+        previousSuccessful.body !== next.body;
+      if (!previousSuccessful || htmlChanged || previousSuccessful.sourceText !== next.sourceText ||
+          assetBodyChanged) {
         hardReload = true;
         successfulBundles.set(htmlPath, next);
         continue;
