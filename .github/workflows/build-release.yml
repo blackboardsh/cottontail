@@ -137,11 +137,15 @@ jobs:
       - name: Build and strip release binary
         run: node scripts/build-release.js
 
+      # -Dtarget must stay explicit: Zig discards a build script's
+      # default_target as soon as any one of -Dtarget/-Dcpu/-Dofmt/
+      # -Ddynamic-linker is passed, so -Dcpu=baseline alone would resolve
+      # "native" and build the MSVC release against the mingw headers.
       - name: Test Unicode output in a legacy Windows console
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
-          node scripts/zig.js build test-windows-console -Doptimize=ReleaseSmall -Dcpu=baseline
+          node scripts/zig.js build test-windows-console -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSmall -Dcpu=baseline
           if ($LASTEXITCODE -ne 0) { throw "Windows Unicode console test failed" }
 
       - name: Validate stripped release binary
