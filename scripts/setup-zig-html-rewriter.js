@@ -46,9 +46,17 @@ function setup() {
 
   const workRoot = join(ROOT, 'vendors', `.zig-html-rewriter-${process.pid}`);
   // MSYS tar cannot chdir into drive-letter backslash paths; give it
-  // forward-slash paths on Windows.
+  // forward-slash paths on Windows. GNU tar also needs --force-local for
+  // drive letters, but Windows' built-in bsdtar rejects that option and
+  // already understands the normalized paths.
   const tarPath = (p) => (process.platform === 'win32' ? p.replace(/\\/g, '/') : p);
-  const tarLocalFlags = process.platform === 'win32' ? ['--force-local'] : [];
+  let tarLocalFlags = [];
+  if (process.platform === 'win32') {
+    try {
+      execFileSync('tar', ['--force-local', '--version'], { stdio: 'ignore' });
+      tarLocalFlags = ['--force-local'];
+    } catch {}
+  }
   const archivePath = tarPath(join(workRoot, 'source.tar.gz'));
   const extracted = tarPath(join(workRoot, 'extracted'));
   const prefix = `zig-html-rewriter-${MANIFEST.revision}`;
@@ -78,8 +86,6 @@ function setup() {
     }
 
     execFileSync('tar', [
-      // --force-local: on Windows an absolute archive path (D:\...) would
-      // otherwise be parsed as a remote host:file spec.
       ...tarLocalFlags,
       '-xzf',
       archivePath,

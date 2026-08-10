@@ -61,7 +61,7 @@ test('runs the strict complete Cottontail-owned Bun tier without publishing', ()
   assert.match(workflow, /run: node scripts\/test-js\.js/);
   assert.match(
     workflow,
-    /run: node scripts\/run-upstream-tests\.js bun --hutch "\$HUTCH_ENGINE"/,
+    /node scripts\/run-upstream-tests\.js bun --hutch "\$HUTCH_ENGINE" "\$\{job_launcher_args\[@\]\}"/,
   );
   assert.doesNotMatch(workflow, /continue-on-error:|upload-release-r2|publish|secrets\./i);
 
@@ -99,26 +99,65 @@ test('builds and passes the pinned Hutch engine to split package fixtures', () =
   assert.match(hutchManifest.repository, /^https:\/\/github\.com\/[^/]+\/hutch\.git$/);
   assert.match(hutchManifest.commit, /^[0-9a-f]{40}$/);
   assert.match(hutchSetup, /process\.platform === 'win32' \? 'hutch-engine\.exe' : 'hutch-engine'/);
+  assert.match(hutchSetup, /const jobLauncherName = 'hutch-bun-compat-job\.exe'/);
+  assert.match(hutchSetup, /const zigPath = join\(checkoutRoot, 'vendors', 'zig', zigName\)/);
+  assert.match(hutchSetup, /run\('bash', \[setupPath\], checkoutRoot\)/);
+  assert.match(
+    hutchSetup,
+    /stdio: \['inherit', process\.stderr, process\.stderr\]/,
+    'setup child output must go to stderr so stdout remains a machine-readable path',
+  );
+  assert.doesNotMatch(hutchSetup, /stdio:\s*['"]inherit['"]/);
+  assert.match(hutchSetup, /buildArgs\.push\('-Dtarget=x86_64-windows-msvc'\)/);
+  assert.doesNotMatch(hutchSetup, /join\(rootDir, 'vendors', 'zig'/);
+  assert.match(hutchSetup, /\['--engine', '--job-launcher'\]\.includes\(outputKind\)/);
+  assert.match(hutchSetup, /process\.platform === 'win32'\s*\? \[binaryPath, jobLauncherPath\]\s*: \[binaryPath\]/);
+  assert.match(hutchSetup, /outputKind === '--job-launcher' \? jobLauncherPath : binaryPath/);
   assert.doesNotMatch(hutchSetup, /command -v|which\(|["']PATH["']/);
 
   assert.match(workflow, /shell: bash\s+run: \|\s+hutch_engine="\$\(node scripts\/setup-upstream-hutch\.js\)"/);
   assert.match(workflow, /hutch_engine="\$\(node scripts\/setup-upstream-hutch\.js\)"/);
+  assert.match(workflow, /hutch_job_launcher="\$\(node scripts\/setup-upstream-hutch\.js --job-launcher\)"/);
+  assert.match(workflow, /job_launcher=\$\{process\.argv\[1\]\}/);
+  assert.equal(
+    workflow.match(/hashFiles\('compat\/upstream\/hutch\.json', 'scripts\/setup-upstream-hutch\.js', 'scripts\/zig-manifest\.json'\)/g)?.length,
+    2,
+    'the pinned Hutch cache must track the Zig distribution used by its verified setup',
+  );
   assert.equal(
     workflow.match(/HUTCH_ENGINE: \$\{\{ steps\.hutch-engine\.outputs\.binary \}\}/g)?.length,
     2,
     'both the complete tier and focused package cases must use the pinned Hutch engine',
   );
-  assert.match(
-    workflow,
-    /--hutch "\$HUTCH_ENGINE" --test test\/bundler\/bundler_defer\.test\.ts --case '\^\\\$file\$' --expect-pass --jobs 1/,
+  assert.equal(
+    workflow.match(/HUTCH_JOB_LAUNCHER: \$\{\{ steps\.hutch-engine\.outputs\.job_launcher \}\}/g)?.length,
+    2,
+    'both Windows execution steps must receive the pinned native Job Object launcher',
+  );
+  assert.equal(
+    workflow.match(/job_launcher_args=\(\)[\s\S]*?if \[\[ "\$\{\{ matrix\.os \}\}" == "windows" \]\]; then[\s\S]*?job_launcher_args=\(--job-launcher "\$HUTCH_JOB_LAUNCHER"\)[\s\S]*?fi/g)?.length,
+    2,
+    'the launcher argument must be present on Windows and omitted elsewhere',
+  );
+  const suiteCommands = workflow
+    .split('\n')
+    .filter(line => line.includes('node scripts/run-upstream-tests.js') && !line.includes('--list'));
+  assert.equal(suiteCommands.length, 4, 'expected the complete tier and three focused suite commands');
+  assert.ok(
+    suiteCommands.every(line => line.includes('"${job_launcher_args[@]}"')),
+    'every non-list suite command must carry the conditional Windows Job Object launcher',
   );
   assert.match(
     workflow,
-    /--hutch "\$HUTCH_ENGINE" --test test\/bundler\/bundler_npm\.test\.ts --case '\^npm\/ReactSSR\$' --expect-pass --jobs 1/,
+    /--hutch "\$HUTCH_ENGINE" "\$\{job_launcher_args\[@\]\}" --test test\/bundler\/bundler_defer\.test\.ts --case '\^\\\$file\$' --expect-pass --jobs 1/,
   );
   assert.match(
     workflow,
-    /--hutch "\$HUTCH_ENGINE" --test test\/bundler\/bundler_npm\.test\.ts --case '\^npm\/LodashES\$' --expect-pass --jobs 1/,
+    /--hutch "\$HUTCH_ENGINE" "\$\{job_launcher_args\[@\]\}" --test test\/bundler\/bundler_npm\.test\.ts --case '\^npm\/ReactSSR\$' --expect-pass --jobs 1/,
+  );
+  assert.match(
+    workflow,
+    /--hutch "\$HUTCH_ENGINE" "\$\{job_launcher_args\[@\]\}" --test test\/bundler\/bundler_npm\.test\.ts --case '\^npm\/LodashES\$' --expect-pass --jobs 1/,
   );
 });
 

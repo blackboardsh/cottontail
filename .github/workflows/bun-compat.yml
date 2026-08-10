@@ -183,7 +183,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .cottontail-local-tools/upstream-hutch
-          key: cottontail-bun-compat-hutch-${{ matrix.platform }}-v1-${{ hashFiles('compat/upstream/hutch.json', 'scripts/setup-upstream-hutch.js') }}
+          key: cottontail-bun-compat-hutch-${{ matrix.platform }}-v1-${{ hashFiles('compat/upstream/hutch.json', 'scripts/setup-upstream-hutch.js', 'scripts/zig-manifest.json') }}
 
       - name: Build pinned Hutch compatibility engine
         id: hutch-engine
@@ -192,25 +192,41 @@ jobs:
           hutch_engine="$(node scripts/setup-upstream-hutch.js)"
           node -e 'const fs = require("node:fs"); const path = process.argv[1]; if (!fs.statSync(path).isFile()) process.exit(1)' "$hutch_engine"
           node -e 'require("node:fs").appendFileSync(process.env.GITHUB_OUTPUT, `binary=${process.argv[1]}\n`)' "$hutch_engine"
+          if [[ "${{ matrix.os }}" == "windows" ]]; then
+            hutch_job_launcher="$(node scripts/setup-upstream-hutch.js --job-launcher)"
+            node -e 'const fs = require("node:fs"); const path = process.argv[1]; if (!fs.statSync(path).isFile()) process.exit(1)' "$hutch_job_launcher"
+            node -e 'require("node:fs").appendFileSync(process.env.GITHUB_OUTPUT, `job_launcher=${process.argv[1]}\n`)' "$hutch_job_launcher"
+          fi
 
       - name: Save pinned Hutch compatibility engine
         if: steps.pinned-hutch.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .cottontail-local-tools/upstream-hutch
-          key: cottontail-bun-compat-hutch-${{ matrix.platform }}-v1-${{ hashFiles('compat/upstream/hutch.json', 'scripts/setup-upstream-hutch.js') }}
+          key: cottontail-bun-compat-hutch-${{ matrix.platform }}-v1-${{ hashFiles('compat/upstream/hutch.json', 'scripts/setup-upstream-hutch.js', 'scripts/zig-manifest.json') }}
 
       - name: Run complete Cottontail-owned Bun compatibility tier
         env:
           HUTCH_ENGINE: ${{ steps.hutch-engine.outputs.binary }}
+          HUTCH_JOB_LAUNCHER: ${{ steps.hutch-engine.outputs.job_launcher }}
         shell: bash
-        run: node scripts/run-upstream-tests.js bun --hutch "$HUTCH_ENGINE"
+        run: |
+          job_launcher_args=()
+          if [[ "${{ matrix.os }}" == "windows" ]]; then
+            job_launcher_args=(--job-launcher "$HUTCH_JOB_LAUNCHER")
+          fi
+          node scripts/run-upstream-tests.js bun --hutch "$HUTCH_ENGINE" "${job_launcher_args[@]}"
 
       - name: Run Hutch-backed split bundler cases
         env:
           HUTCH_ENGINE: ${{ steps.hutch-engine.outputs.binary }}
+          HUTCH_JOB_LAUNCHER: ${{ steps.hutch-engine.outputs.job_launcher }}
         shell: bash
         run: |
-          node scripts/run-upstream-tests.js bun --hutch "$HUTCH_ENGINE" --test test/bundler/bundler_defer.test.ts --case '^\$file$' --expect-pass --jobs 1
-          node scripts/run-upstream-tests.js bun --hutch "$HUTCH_ENGINE" --test test/bundler/bundler_npm.test.ts --case '^npm/ReactSSR$' --expect-pass --jobs 1
-          node scripts/run-upstream-tests.js bun --hutch "$HUTCH_ENGINE" --test test/bundler/bundler_npm.test.ts --case '^npm/LodashES$' --expect-pass --jobs 1
+          job_launcher_args=()
+          if [[ "${{ matrix.os }}" == "windows" ]]; then
+            job_launcher_args=(--job-launcher "$HUTCH_JOB_LAUNCHER")
+          fi
+          node scripts/run-upstream-tests.js bun --hutch "$HUTCH_ENGINE" "${job_launcher_args[@]}" --test test/bundler/bundler_defer.test.ts --case '^\$file$' --expect-pass --jobs 1
+          node scripts/run-upstream-tests.js bun --hutch "$HUTCH_ENGINE" "${job_launcher_args[@]}" --test test/bundler/bundler_npm.test.ts --case '^npm/ReactSSR$' --expect-pass --jobs 1
+          node scripts/run-upstream-tests.js bun --hutch "$HUTCH_ENGINE" "${job_launcher_args[@]}" --test test/bundler/bundler_npm.test.ts --case '^npm/LodashES$' --expect-pass --jobs 1

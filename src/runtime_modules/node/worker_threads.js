@@ -1,5 +1,6 @@
 import { EventEmitter } from "./events.js";
 import { isAbsolute, resolve } from "./path.js";
+import { fileURLToPath } from "../internal/file-url.js";
 import { Readable, Writable } from "./stream.js";
 import { jscHeapSnapshotToV8 } from "./internal/heap_snapshot.js";
 import { format as formatValue, inspect as inspectValue } from "./util.js";
@@ -587,7 +588,7 @@ function normalizeWorkerInput(filename, options) {
       error.code = "ERR_INVALID_URL_SCHEME";
       throw error;
     }
-    text = decodeURIComponent(url.pathname);
+    text = fileURLToPath(url);
   }
   if (text.startsWith("data:")) return { kind: "module", specifier: text, filename: text };
   const path = resolve(text);

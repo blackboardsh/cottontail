@@ -24,6 +24,12 @@ import os from 'os';
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from 'path';
 import { fileURLToPath } from 'url';
 
+import {
+  isWindowsJobChild,
+  startWindowsJobChild,
+  terminateWindowsJobChild,
+} from './windows-job-child.js';
+
 const rootDir = process.cwd();
 const targetsPath = resolve(
   rootDir,
@@ -39,6 +45,9 @@ let binarySourcePath = null;
 let binarySourceHash = null;
 let hutchSourcePath = null;
 let hutchSourceHash = null;
+let windowsJobLauncherPath = null;
+let windowsJobLauncherSourcePath = null;
+let windowsJobLauncherSourceHash = null;
 const pythonPath = process.env.PYTHON ?? (process.platform === 'win32' ? 'python' : 'python3');
 const tempBase = process.env.COTTONTAIL_UPSTREAM_TMPDIR ?? (process.platform === 'darwin' ? '/tmp' : os.tmpdir());
 const tempRoot = mkdtempSync(join(tempBase, 'cottontail-upstream-tests-'));
@@ -52,6 +61,8 @@ const disabledStatuses = new Set(['disabled', 'skip']);
 const directTestTimeoutMs = Number(process.env.COTTONTAIL_UPSTREAM_TEST_TIMEOUT_MS ?? 30000);
 const directTestMaxBuffer = Number(process.env.COTTONTAIL_UPSTREAM_TEST_MAX_BUFFER ?? 64 * 1024 * 1024);
 const processTerminationGraceMs = 5000;
+const windowsJobTerminationTimeoutMs = 3500;
+const windowsJobTerminatorWatchdogMs = 4000;
 const defaultBunJobs = Math.max(1, Math.min(4, os.availableParallelism?.() ?? os.cpus().length));
 const binaryPreflightPrefix = 'COTTONTAIL_UPSTREAM_BINARY_PREFLIGHT:';
 const hutchPreflightPrefix = 'COTTONTAIL_HUTCH_ENGINE_PREFLIGHT:';
@@ -63,6 +74,7 @@ const duckDBUpstreamTest = 'test/js/third_party/duckdb/duckdb-basic-usage.test.t
 const svelteUpstreamTest = 'test/integration/svelte/client-side.test.ts';
 const svelteBakeEcosystemTest = 'test/bake/dev/ecosystem.test.ts';
 const activeChildren = new Set();
+const childTerminationPromises = new WeakMap();
 const snapshotArtifactRoots = new Map();
 const externallyManagedSnapshotRoots = new Set();
 const nodeHarnessInventoryCache = new Map();
@@ -230,15 +242,15 @@ function removeAllSnapshotArtifacts() {
 }
 
 process.on('exit', () => {
-  const liveChildren = [...activeChildren]
+  const unprovenChildren = [...activeChildren]
     .map((child) => child.pid)
-    .filter(processGroupIsRunning);
-  if (liveChildren.length > 0) {
+    .filter((pid) => Number.isInteger(pid) && pid > 0);
+  if (unprovenChildren.length > 0) {
     skipSnapshotCleanupOnExit = true;
     skipTempCleanupOnExit = true;
     preserveRunLockOnExit = true;
     console.error(
-      `Test process group(s) ${liveChildren.join(', ')} were still live at runner exit; ` +
+      `Contained test process tree(s) ${unprovenChildren.join(', ')} were not proven stopped at runner exit; ` +
       'snapshot cleanup was skipped and the recoverable lock was retained.'
     );
   }
@@ -260,23 +272,21 @@ for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM']) {
     if (signalShutdownStarted) return;
     signalShutdownStarted = true;
     const children = [...activeChildren];
-    for (const child of children) killProcessTree(child);
-    const deadline = Date.now() + 5000;
-    while (
-      children.some((child) => processGroupIsRunning(child.pid)) &&
-      Date.now() < deadline
-    ) {
-      await new Promise((resolveWait) => setTimeout(resolveWait, 50));
-    }
+    const outcomes = await Promise.allSettled(
+      children.map((child) => terminateTrackedChild(child)),
+    );
+    const stopped = outcomes.map((outcome) =>
+      outcome.status === 'fulfilled' && outcome.value === true
+    );
     const liveGroups = children
-      .map((child) => child.pid)
-      .filter(processGroupIsRunning);
+      .filter((child, index) => !stopped[index] || processGroupIsRunning(child.pid))
+      .map((child) => child.pid);
     if (liveGroups.length > 0) {
       skipSnapshotCleanupOnExit = true;
       skipTempCleanupOnExit = true;
       preserveRunLockOnExit = true;
       console.error(
-        `Could not prove test process group(s) ${liveGroups.join(', ')} stopped; ` +
+        `Could not prove contained test process tree(s) ${liveGroups.join(', ')} stopped; ` +
         'snapshot cleanup was skipped and the recoverable lock was retained.'
       );
     }
@@ -482,6 +492,12 @@ function pinSelectedExecutables() {
     hutchSourceHash = hutch.sourceHash;
     hutchPath = hutch.pinnedPath;
   }
+  if (windowsJobLauncherPath != null) {
+    const jobLauncher = pinExecutable(windowsJobLauncherPath, 'Windows Job Object launcher');
+    windowsJobLauncherSourcePath = jobLauncher.sourcePath;
+    windowsJobLauncherSourceHash = jobLauncher.sourceHash;
+    windowsJobLauncherPath = jobLauncher.pinnedPath;
+  }
 }
 
 function processIsRunning(pid) {
@@ -505,21 +521,61 @@ function processGroupIsRunning(pid) {
   }
 }
 
-async function terminateTrackedChild(child) {
-  killProcessTree(child);
-  const deadline = Date.now() + processTerminationGraceMs;
-  while (processGroupIsRunning(child.pid) && Date.now() < deadline) {
-    await new Promise((resolveWait) => setTimeout(resolveWait, 25));
-  }
-  if (processGroupIsRunning(child.pid)) {
-    skipSnapshotCleanupOnExit = true;
-    skipTempCleanupOnExit = true;
-    preserveRunLockOnExit = true;
-    return false;
-  }
-  activeChildren.delete(child);
-  updateExclusiveRunLockChildren();
-  return true;
+async function terminateTrackedChild(child, { naturalExit = false } = {}) {
+  const existing = childTerminationPromises.get(child);
+  if (existing != null) return existing;
+  const completion = (async () => {
+    try {
+      if (!Number.isInteger(child.pid) || child.pid < 1) {
+        activeChildren.delete(child);
+        updateExclusiveRunLockChildren();
+        return true;
+      }
+      let terminationProven = true;
+      if (process.platform === 'win32') {
+        if (!isWindowsJobChild(child)) return false;
+        if (!naturalExit) {
+          try {
+            terminationProven = await terminateWindowsJobChild(child, {
+              spawnProcess: spawn,
+              timeoutMs: windowsJobTerminationTimeoutMs,
+              watchdogMs: windowsJobTerminatorWatchdogMs,
+            });
+          } catch (error) {
+            terminationProven = false;
+            console.error(`Windows Job Object teardown failed for launcher ${child.pid}: ${error.message}`);
+          }
+        }
+      } else {
+        killProcessTree(child);
+      }
+      const deadline = Date.now() + processTerminationGraceMs;
+      while (processGroupIsRunning(child.pid) && Date.now() < deadline) {
+        await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+      }
+      if (!terminationProven || processGroupIsRunning(child.pid)) {
+        skipSnapshotCleanupOnExit = true;
+        skipTempCleanupOnExit = true;
+        preserveRunLockOnExit = true;
+        return false;
+      }
+      activeChildren.delete(child);
+      updateExclusiveRunLockChildren();
+      return true;
+    } catch (error) {
+      activeChildren.add(child);
+      skipSnapshotCleanupOnExit = true;
+      skipTempCleanupOnExit = true;
+      preserveRunLockOnExit = true;
+      console.error(
+        `Could not record teardown proof for child ${child.pid ?? 'without-pid'}: ` +
+        `${error?.message ?? String(error)}`
+      );
+      return false;
+    }
+  })();
+  childTerminationPromises.set(child, completion);
+  return completion;
 }
 
 function writeLockOwner(lockPath, token, owner) {
@@ -743,6 +799,14 @@ function makeRunIdentity(runtime, targets, options) {
     hutchHash: hutchPath == null ? null : hashFile(hutchPath),
     hutchSourcePath,
     hutchSourceHash,
+    windowsJobLauncherPath: windowsJobLauncherPath == null
+      ? null
+      : realpathSync(windowsJobLauncherPath),
+    windowsJobLauncherHash: windowsJobLauncherPath == null
+      ? null
+      : hashFile(windowsJobLauncherPath),
+    windowsJobLauncherSourcePath,
+    windowsJobLauncherSourceHash,
     selection: {
       includeExpectedFailures: options.includeExpectedFailures,
       expectPass: options.expectPass,
@@ -1098,7 +1162,39 @@ function validateHutchEnginePath(path) {
   }
 }
 
-function preflightHutchEngine() {
+function probeWindowsJobLauncher() {
+  if (process.platform !== 'win32') return;
+  if (windowsJobLauncherPath == null) {
+    fail('Windows suite execution requires --job-launcher <path> or COTTONTAIL_UPSTREAM_JOB_LAUNCHER.');
+  }
+  if (!existsSync(windowsJobLauncherPath)) {
+    fail(`Windows Job Object launcher not found: ${windowsJobLauncherPath}`);
+  }
+  if (!statSync(windowsJobLauncherPath).isFile()) {
+    fail(`Windows Job Object launcher is not a file: ${windowsJobLauncherPath}`);
+  }
+  const result = spawnSync(windowsJobLauncherPath, ['probe'], {
+    cwd: rootDir,
+    env: immutableBinaryEnvironment(),
+    encoding: 'utf8',
+    timeout: binaryPreflightTimeoutMs,
+    windowsHide: true,
+  });
+  if (result.error?.code === 'ETIMEDOUT') {
+    fail(`Windows Job Object launcher probe timed out: ${windowsJobLauncherPath}`);
+  }
+  if (result.error) {
+    fail(`Windows Job Object launcher probe failed: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    fail([
+      `Windows Job Object launcher probe exited ${result.status ?? 1}: ${windowsJobLauncherPath}`,
+      binaryPreflightDetails(result),
+    ].filter(Boolean).join('\n'));
+  }
+}
+
+async function preflightHutchEngine() {
   if (hutchPath == null) return;
   const source = `
 const record = {
@@ -1115,7 +1211,7 @@ const record = {
 };
 console.log(${JSON.stringify(hutchPreflightPrefix)} + JSON.stringify(record));
 `;
-  const result = spawnSync(hutchPath, ['--eval', source], {
+  const result = await spawnCapturedAsync(hutchPath, ['--eval', source], {
     cwd: rootDir,
     env: {
       ...immutableBinaryEnvironment(),
@@ -1123,10 +1219,7 @@ console.log(${JSON.stringify(hutchPreflightPrefix)} + JSON.stringify(record));
       DASH_COTTONTAIL: binaryPath,
       COTTONTAIL_UPSTREAM_PREFLIGHT: '1',
     },
-    encoding: 'utf8',
-    timeout: binaryPreflightTimeoutMs,
-    maxBuffer: 1024 * 1024,
-  });
+  }, null, binaryPreflightTimeoutMs);
   const details = binaryPreflightDetails(result);
   if (result.error?.code === 'ETIMEDOUT') {
     fail(`Hutch engine preflight timed out after ${binaryPreflightTimeoutMs}ms: ${hutchPath}`);
@@ -1173,7 +1266,7 @@ console.log(${JSON.stringify(hutchPreflightPrefix)} + JSON.stringify(record));
   }
 }
 
-function preflightBinary() {
+async function preflightBinary() {
   const source = `
 const record = {
   answer: 6 * 7,
@@ -1194,16 +1287,13 @@ const record = {
 };
 console.log(${JSON.stringify(binaryPreflightPrefix)} + JSON.stringify(record));
 `;
-  const result = spawnSync(binaryPath, ['--eval', source], {
+  const result = await spawnCapturedAsync(binaryPath, ['--eval', source], {
     cwd: rootDir,
     env: {
       ...immutableBinaryEnvironment(),
       COTTONTAIL_UPSTREAM_PREFLIGHT: '1',
     },
-    encoding: 'utf8',
-    timeout: binaryPreflightTimeoutMs,
-    maxBuffer: 1024 * 1024,
-  });
+  }, null, binaryPreflightTimeoutMs);
   const details = binaryPreflightDetails(result);
   if (result.error?.code === 'ETIMEDOUT') {
     fail(`Cottontail binary preflight timed out after ${binaryPreflightTimeoutMs}ms: ${binaryPath}`);
@@ -1274,6 +1364,7 @@ function usage() {
     '  --binary <path>              Use an immutable Cottontail executable for this run.',
     '  --expect-pass                Require a focused selection to pass, including recorded xfails.',
     '  --hutch <path>               Use a pinned hutch-engine for the optional composed baseline.',
+    '  --job-launcher <path>         Use the native Windows Job Object launcher.',
     '  --include-expected-failures  Run tests marked expected-failure and require them to fail.',
     '  --case <regexp>              Select generated itBundled case IDs within a split file.',
     '  --jobs <n>                   Bound Bun file, split-case, and in-file test concurrency (default: up to 4).',
@@ -1293,6 +1384,7 @@ function usage() {
     '  COTTONTAIL_UPSTREAM_TARGETS_PATH   Read target metadata from this JSON file.',
     '  COTTONTAIL_UPSTREAM_BUN_SNAPSHOT   Run against an externally managed Bun snapshot.',
     '  COTTONTAIL_UPSTREAM_HUTCH_BINARY   Optional composed-baseline hutch-engine.',
+    '  COTTONTAIL_UPSTREAM_JOB_LAUNCHER   Required native Job Object launcher on Windows.',
     '  COTTONTAIL_BASELINE_REPORTS_DIR    Default parent for durable baseline suite reports.',
     '  COTTONTAIL_BASELINE_HEARTBEAT_MS   Live heartbeat interval (default: 30000).',
     '  COTTONTAIL_BASELINE_LOCK_DIR       Parent for the exclusive suite lock.',
@@ -1333,6 +1425,7 @@ function parseArgs(argv) {
     includeExpectedFailures: false,
     expectPass: false,
     hutch: null,
+    jobLauncher: process.env.COTTONTAIL_UPSTREAM_JOB_LAUNCHER ?? null,
     list: false,
     maxFailures: Infinity,
     jobs: defaultBunJobs,
@@ -1357,6 +1450,8 @@ function parseArgs(argv) {
       options.expectPass = true;
     } else if (arg === '--hutch') {
       options.hutch = args.shift() ?? fail('--hutch requires a path');
+    } else if (arg === '--job-launcher') {
+      options.jobLauncher = args.shift() ?? fail('--job-launcher requires a path');
     } else if (arg === '--binary') {
       options.binary = args.shift() ?? fail('--binary requires a path');
     } else if (arg === '--case') {
@@ -1461,10 +1556,7 @@ function countFiles(dir) {
   return count;
 }
 
-function nodeHarnessInventory(snapshotRoot) {
-  const cached = nodeHarnessInventoryCache.get(snapshotRoot);
-  if (cached) return cached;
-
+function nodeHarnessInventoryInvocation(snapshotRoot) {
   const source = `
 import importlib.util
 import json
@@ -1520,16 +1612,20 @@ for suite in suites:
 records.sort(key=lambda record: (record["path"], record["selector"]))
 print(${JSON.stringify(nodeHarnessInventoryPrefix)} + json.dumps(records, separators=(",", ":")))
 `;
-  const result = spawnSync(pythonPath, ['-c', source, snapshotRoot], {
-    cwd: snapshotRoot,
-    env: {
-      ...immutableBinaryEnvironment(),
-      PYTHONDONTWRITEBYTECODE: '1',
+  return {
+    command: pythonPath,
+    args: ['-c', source, snapshotRoot],
+    spawnOptions: {
+      cwd: snapshotRoot,
+      env: {
+        ...immutableBinaryEnvironment(),
+        PYTHONDONTWRITEBYTECODE: '1',
+      },
     },
-    encoding: 'utf8',
-    timeout: 30000,
-    maxBuffer: directTestMaxBuffer,
-  });
+  };
+}
+
+function parseNodeHarnessInventory(snapshotRoot, result) {
   const details = binaryPreflightDetails(result);
   if (result.error?.code === 'ETIMEDOUT') {
     fail(`Node harness inventory timed out after 30000ms: ${snapshotRoot}`);
@@ -1597,6 +1693,33 @@ print(${JSON.stringify(nodeHarnessInventoryPrefix)} + json.dumps(records, separa
   const inventory = { records, selectorByPath, pathsBySelector };
   nodeHarnessInventoryCache.set(snapshotRoot, inventory);
   return inventory;
+}
+
+function nodeHarnessInventory(snapshotRoot) {
+  const cached = nodeHarnessInventoryCache.get(snapshotRoot);
+  if (cached) return cached;
+  const invocation = nodeHarnessInventoryInvocation(snapshotRoot);
+  const result = spawnSync(invocation.command, invocation.args, {
+    ...invocation.spawnOptions,
+    encoding: 'utf8',
+    timeout: 30000,
+    maxBuffer: directTestMaxBuffer,
+  });
+  return parseNodeHarnessInventory(snapshotRoot, result);
+}
+
+async function prepareNodeHarnessInventory(snapshotRoot) {
+  const cached = nodeHarnessInventoryCache.get(snapshotRoot);
+  if (cached) return cached;
+  const invocation = nodeHarnessInventoryInvocation(snapshotRoot);
+  const result = await spawnCapturedAsync(
+    invocation.command,
+    invocation.args,
+    invocation.spawnOptions,
+    null,
+    30000,
+  );
+  return parseNodeHarnessInventory(snapshotRoot, result);
 }
 
 function discoverRunnableFiles(snapshotRoot, runtime = 'node') {
@@ -1817,7 +1940,7 @@ function expectPassEntries(entries, options) {
   }));
 }
 
-function prepareBunTestDependencies(entries, snapshotRoot) {
+async function prepareBunTestDependencies(entries, snapshotRoot) {
   const selected = new Set(entries.map((entry) => entry.path));
   const fixtures = [
     [[duckDBUpstreamTest], 'DuckDB', 'setup-upstream-duckdb.js'],
@@ -1841,7 +1964,7 @@ function prepareBunTestDependencies(entries, snapshotRoot) {
       }
       setupArgs.push('--hutch', hutchPath);
     }
-    const result = spawnSync(process.execPath, setupArgs, {
+    const result = await spawnCapturedAsync(process.execPath, setupArgs, {
       cwd: rootDir,
       env: immutableBinaryEnvironment(),
       stdio: 'inherit',
@@ -1914,19 +2037,16 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function discoverBundlerTestIds(entry, snapshotRoot, target) {
+async function discoverBundlerTestIds(entry, snapshotRoot, target) {
   const timeout = Number(entry.timeoutMs ?? directTestTimeoutMs);
-  const result = spawnSync(binaryPath, [entry.path, ...entryArgs(entry)], {
+  const result = await spawnCapturedAsync(binaryPath, [entry.path, ...entryArgs(entry)], {
     cwd: snapshotRoot,
     env: makeEnv('bun', target, tempRoot, {
       ...(entry.env ?? {}),
       BUN_BUNDLER_TEST_FILTER: '',
       COTTONTAIL_BUNDLER_TEST_DISCOVER: '1',
     }),
-    encoding: 'utf8',
-    timeout,
-    maxBuffer: directTestMaxBuffer,
-  });
+  }, null, timeout);
   if (result.error || result.status !== 0 || result.signal != null) {
     const details = [
       result.error?.message,
@@ -1969,7 +2089,7 @@ function discoverBundlerTestIds(entry, snapshotRoot, target) {
   return ids;
 }
 
-function expandBunEntries(entries, snapshotRoot, target, options) {
+async function expandBunEntries(entries, snapshotRoot, target, options) {
   const expanded = [];
   for (const entry of entries) {
     if (entry.splitBundlerTests !== true) {
@@ -1977,7 +2097,7 @@ function expandBunEntries(entries, snapshotRoot, target, options) {
       expanded.push(entry);
       continue;
     }
-    const ids = discoverBundlerTestIds(entry, snapshotRoot, target)
+    const ids = (await discoverBundlerTestIds(entry, snapshotRoot, target))
       .filter(id => !options.caseMatch || options.caseMatch.test(id));
     for (const id of ids) {
       const enabledReason = entry.enabledBundlerTests?.[id];
@@ -2173,10 +2293,6 @@ function entryTimeout(entry, options) {
 
 function killProcessTree(child) {
   if (!child.pid) return;
-  if (process.platform === 'win32') {
-    spawnSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore' });
-    return;
-  }
   try {
     process.kill(-child.pid, 'SIGKILL');
   } catch {
@@ -2184,40 +2300,84 @@ function killProcessTree(child) {
   }
 }
 
-function spawnCapturedAsync(command, args, spawnOptions, attemptOutput = null) {
+function spawnSuiteChild(command, args, spawnOptions) {
+  const options = {
+    ...spawnOptions,
+    detached: process.platform !== 'win32',
+  };
+  if (process.platform !== 'win32') return spawn(command, args, options);
+  if (windowsJobLauncherPath == null) {
+    throw new Error('Windows suite execution requires a probed Job Object launcher');
+  }
+  return startWindowsJobChild(command, args, {
+    jobLauncher: windowsJobLauncherPath,
+    spawnOptions: options,
+    spawnProcess: spawn,
+  });
+}
+
+function spawnCapturedAsync(command, args, spawnOptions, attemptOutput = null, timeoutMs = null) {
   return new Promise((resolveResult) => {
-    const child = spawn(command, args, {
-      ...spawnOptions,
-      detached: process.platform !== 'win32',
-    });
+    const child = spawnSuiteChild(command, args, spawnOptions);
     activeChildren.add(child);
     updateExclusiveRunLockChildren();
     let stdout = '';
     let stderr = '';
     let settled = false;
-    child.stdout.on('data', (data) => {
-      attemptOutput?.write('stdout', data);
-      if (stdout.length < directTestMaxBuffer) stdout += data;
-    });
-    child.stderr.on('data', (data) => {
-      attemptOutput?.write('stderr', data);
-      if (stderr.length < directTestMaxBuffer) stderr += data;
-    });
-    const settle = async (status, signal, error = undefined) => {
+    let timedOut = false;
+    let timer = null;
+    const settle = async (status, signal, error = undefined, naturalExit = false) => {
       if (settled) return;
       settled = true;
-      const stopped = await terminateTrackedChild(child);
+      if (timer != null) clearTimeout(timer);
+      const stopped = await terminateTrackedChild(child, {
+        naturalExit: naturalExit && !timedOut,
+      });
       if (!stopped) {
         error = Object.assign(
-          new Error(`could not prove process group ${child.pid} stopped; owned temporary files were retained`),
+          new Error(`could not prove contained process tree ${child.pid} stopped; owned temporary files were retained`),
           { code: 'EPROCESSGROUP' },
         );
       }
-      resolveResult({ status, signal, stdout, stderr, error });
+      resolveResult({
+        status,
+        signal,
+        stdout,
+        stderr,
+        error: error ?? (timedOut
+          ? Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' })
+          : undefined),
+      });
     };
-    child.on('exit', (status, signal) => setTimeout(() => settle(status, signal), 250));
-    child.on('close', (status, signal) => settle(status, signal));
-    child.on('error', (error) => settle(null, null, error));
+    timer = timeoutMs == null ? null : setTimeout(() => {
+      timedOut = true;
+      void settle(null, null);
+    }, timeoutMs);
+    child.stdout?.on('data', (data) => {
+      if (settled) return;
+      try {
+        attemptOutput?.write('stdout', data);
+        if (stdout.length < directTestMaxBuffer) stdout += data;
+      } catch (error) {
+        void settle(null, null, error);
+      }
+    });
+    child.stderr?.on('data', (data) => {
+      if (settled) return;
+      try {
+        attemptOutput?.write('stderr', data);
+        if (stderr.length < directTestMaxBuffer) stderr += data;
+      } catch (error) {
+        void settle(null, null, error);
+      }
+    });
+    child.on('exit', (status, signal) => setTimeout(() => {
+      void settle(status, signal, undefined, status != null && signal == null);
+    }, 250));
+    child.on('close', (status, signal) => {
+      void settle(status, signal, undefined, status != null && signal == null);
+    });
+    child.on('error', (error) => void settle(null, null, error));
   });
 }
 
@@ -2237,7 +2397,7 @@ function runDirectAsync(runtime, target, entry, snapshotRoot, options, attemptOu
     'run-',
   ));
   return new Promise((resolveResult) => {
-    const child = spawn(binaryPath, [entry.path, ...entryArgs(entry, options, serialAttempt)], {
+    const child = spawnSuiteChild(binaryPath, [entry.path, ...entryArgs(entry, options, serialAttempt)], {
       cwd: snapshotRoot,
       env: makeEnv(runtime, target, runTemp, {
         // Spawning with `cwd` changes the child's working directory but not the
@@ -2250,7 +2410,6 @@ function runDirectAsync(runtime, target, entry, snapshotRoot, options, attemptOu
           ? { COTTONTAIL_TEST_TIMEOUT_SCALE: String(options.timeoutScale) }
           : {}),
       }),
-      detached: process.platform !== 'win32',
     });
     activeChildren.add(child);
     updateExclusiveRunLockChildren();
@@ -2258,29 +2417,20 @@ function runDirectAsync(runtime, target, entry, snapshotRoot, options, attemptOu
     let stderr = '';
     let timedOut = false;
     let settled = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      settle(null, null);
-    }, timeout);
-    child.stdout.on('data', (data) => {
-      attemptOutput?.write('stdout', data);
-      if (stdout.length < directTestMaxBuffer) stdout += data;
-    });
-    child.stderr.on('data', (data) => {
-      attemptOutput?.write('stderr', data);
-      if (stderr.length < directTestMaxBuffer) stderr += data;
-    });
+    let timer = null;
     const settle = async (code, signal, spawnError = undefined) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      // A test owns its process group. Remove any grandchildren it left
-      // behind after either a timeout or a normal/failed test exit.
-      const stopped = await terminateTrackedChild(child);
+      // A test owns its contained process tree. Remove any grandchildren it
+      // left behind after either a timeout or a normal/failed test exit.
+      const stopped = await terminateTrackedChild(child, {
+        naturalExit: !timedOut && code != null && signal == null && spawnError == null,
+      });
       if (stopped) removeTemp(runTemp);
       else {
         spawnError = Object.assign(
-          new Error(`could not prove process group ${child.pid} stopped; ${runTemp} was retained`),
+          new Error(`could not prove contained process tree ${child.pid} stopped; ${runTemp} was retained`),
           { code: 'EPROCESSGROUP' },
         );
       }
@@ -2294,11 +2444,33 @@ function runDirectAsync(runtime, target, entry, snapshotRoot, options, attemptOu
           : undefined),
       });
     };
+    timer = setTimeout(() => {
+      timedOut = true;
+      void settle(null, null);
+    }, timeout);
+    child.stdout.on('data', (data) => {
+      if (settled) return;
+      try {
+        attemptOutput?.write('stdout', data);
+        if (stdout.length < directTestMaxBuffer) stdout += data;
+      } catch (error) {
+        void settle(null, null, error);
+      }
+    });
+    child.stderr.on('data', (data) => {
+      if (settled) return;
+      try {
+        attemptOutput?.write('stderr', data);
+        if (stderr.length < directTestMaxBuffer) stderr += data;
+      } catch (error) {
+        void settle(null, null, error);
+      }
+    });
     // 'exit' plus a grace beat: orphaned grandchildren can hold stdio pipes
     // open forever, so never wait solely on 'close'.
-    child.on('exit', (code, signal) => setTimeout(() => settle(code, signal), 250));
-    child.on('close', (code, signal) => settle(code, signal));
-    child.on('error', (error) => settle(null, null, error));
+    child.on('exit', (code, signal) => setTimeout(() => void settle(code, signal), 250));
+    child.on('close', (code, signal) => void settle(code, signal));
+    child.on('error', (error) => void settle(null, null, error));
   });
 }
 
@@ -2473,7 +2645,7 @@ async function runBunEntries(
   }
 
   if (stoppedEarly && active.size > 0) {
-    for (const child of [...activeChildren]) killProcessTree(child);
+    await Promise.allSettled([...activeChildren].map((child) => terminateTrackedChild(child)));
     const canceled = await Promise.allSettled(active.values());
     for (const outcome of canceled) {
       if (outcome.status === 'fulfilled') completeAttempt(outcome.value, false);
@@ -2712,6 +2884,9 @@ function runtimeTargets(runtime, targets) {
 
 const { runtime, options } = parseArgs(process.argv.slice(2));
 if (options.binary != null) binaryPath = resolve(rootDir, options.binary);
+if (process.platform === 'win32' && options.jobLauncher != null) {
+  windowsJobLauncherPath = resolve(rootDir, options.jobLauncher);
+}
 const configuredHutchPath = options.hutch ?? process.env.COTTONTAIL_UPSTREAM_HUTCH_BINARY;
 if (configuredHutchPath != null) {
   hutchPath = resolve(rootDir, configuredHutchPath);
@@ -2731,9 +2906,18 @@ if (!options.list) {
   }
   if (!existsSync(binaryPath)) fail(`Built cottontail binary not found at ${binaryPath}. Run "bun run build" first.`);
   if (statSync(binaryPath).size === 0) fail(`Built cottontail binary is empty at ${binaryPath}. Rebuild after clearing the Zig cache.`);
+  if (process.platform === 'win32' && windowsJobLauncherPath == null) {
+    fail('Windows suite execution requires --job-launcher <path> or COTTONTAIL_UPSTREAM_JOB_LAUNCHER.');
+  }
   pinSelectedExecutables();
-  preflightBinary();
-  preflightHutchEngine();
+  probeWindowsJobLauncher();
+  await preflightBinary();
+  await preflightHutchEngine();
+  for (const name of runtimeTargets(runtime, targets)) {
+    if (name === 'node') {
+      await prepareNodeHarnessInventory(targetSnapshotRoot(name, targets[name]));
+    }
+  }
   reporter = new JavaScriptBaselineReporter(makeRunIdentity(runtime, targets, options), options);
 }
 
@@ -2780,8 +2964,8 @@ for (const [runtimeIndex, name] of selectedRuntimeNames.entries()) {
   }
   if (name === 'node') entries = expectPassEntries(entries, options);
   if (name === 'bun') {
-    prepareBunTestDependencies(entries, snapshotRoot);
-    entries = expandBunEntries(entries, snapshotRoot, target, options);
+    await prepareBunTestDependencies(entries, snapshotRoot);
+    entries = await expandBunEntries(entries, snapshotRoot, target, options);
   }
   const plan = makeRuntimePlan(
     name,
@@ -2845,15 +3029,15 @@ for (const [runtimeIndex, name] of selectedRuntimeNames.entries()) {
 
 const sourceIntegrityErrors = [];
 if (reporter != null) {
-  const liveGroups = [...activeChildren]
+  const unprovenChildren = [...activeChildren]
     .map((child) => child.pid)
-    .filter(processGroupIsRunning);
-  if (liveGroups.length > 0) {
+    .filter((pid) => Number.isInteger(pid) && pid > 0);
+  if (unprovenChildren.length > 0) {
     skipSnapshotCleanupOnExit = true;
     skipTempCleanupOnExit = true;
     preserveRunLockOnExit = true;
     sourceIntegrityErrors.push(
-      `Could not prove test process group(s) ${liveGroups.join(', ')} stopped; ` +
+      `Could not prove contained test process tree(s) ${unprovenChildren.join(', ')} stopped; ` +
       'snapshot and temporary cleanup were skipped and the recoverable lock was retained.'
     );
   } else {

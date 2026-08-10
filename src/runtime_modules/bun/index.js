@@ -3479,7 +3479,7 @@ async function fetchOnceFromNodeHttp(request, redirected = false, transport = {}
     if (error && error.__cottontailPooledRetry) {
       return fetchSocketAttempt(request, redirected, transport, false);
     }
-    throw error;
+    throw normalizeFetchNetworkError(error);
   }
 }
 

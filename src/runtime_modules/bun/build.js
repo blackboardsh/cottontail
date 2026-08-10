@@ -37,9 +37,10 @@ export function createBunBuildFacade(dependencies) {
     const cwd = spec.__cottontailWorkingDirectory != null
       ? nodePathResolve(processCwd, String(spec.__cottontailWorkingDirectory))
       : processCwd;
-    const toAbsolute = (value) => (
-      value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value) ? value : nodePathResolve(cwd, value)
-    );
+    // The native Windows resolver addresses a single-leading-slash path on
+    // the current drive. ctNormalizeBuildFiles installs that canonical alias
+    // while retaining the POSIX spelling for plugin-facing paths.
+    const toAbsolute = value => ctNativeBuildFilePath(value, cwd);
     // A path-like entrypoint is anchored to the filesystem (absolute, or an
     // explicit "./"/"../" relative path). Bare specifiers (e.g. "pkg",
     // "@scope/pkg") are package entry points that the native resolver must
@@ -265,38 +266,108 @@ export function createBunBuildFacade(dependencies) {
     return error;
   }
 
+  function ctBuildWorkingDirectory() {
+    return globalThis.process?.cwd?.() ?? cottontail.cwd();
+  }
+
+  function ctIsWindowsBuildPlatform() {
+    return (globalThis.process?.platform ?? cottontail.platform()) === "win32";
+  }
+
+  function ctIsWindowsPosixVirtualPath(path) {
+    const value = String(path);
+    return ctIsWindowsBuildPlatform() && value.startsWith("/") && !value.startsWith("//");
+  }
+
+  function ctNormalizePosixVirtualPath(path) {
+    const parts = [];
+    for (const part of String(path).replace(/\\/g, "/").split("/")) {
+      if (!part || part === ".") continue;
+      if (part === "..") {
+        parts.pop();
+      } else {
+        parts.push(part);
+      }
+    }
+    return `/${parts.join("/")}`;
+  }
+
+  function ctPublicBuildFilePath(path, cwd = ctBuildWorkingDirectory()) {
+    const value = String(path);
+    if (ctIsWindowsPosixVirtualPath(value)) return ctNormalizePosixVirtualPath(value);
+    // Preserve the pre-existing spelling on non-Windows hosts and for plugin
+    // callbacks; the native alias below handles Windows canonicalization.
+    if (value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value)) return value;
+    return nodePathResolve(cwd, value);
+  }
+
+  function ctNativeBuildFilePath(path, cwd = ctBuildWorkingDirectory()) {
+    const value = String(path);
+    if (ctIsWindowsBuildPlatform()) return nodePathResolve(cwd, value);
+    return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value)
+      ? value
+      : nodePathResolve(cwd, value);
+  }
+
+  function ctBuildFileKeys(path, cwd = ctBuildWorkingDirectory()) {
+    return new Set([
+      ctPublicBuildFilePath(path, cwd),
+      ctNativeBuildFilePath(path, cwd),
+    ]);
+  }
+
+  function ctResolveBuildImportPath(importerPath, specifier) {
+    const importer = String(importerPath);
+    const requested = String(specifier);
+    if (ctIsWindowsPosixVirtualPath(requested)) {
+      return ctNormalizePosixVirtualPath(requested);
+    }
+    if (ctIsWindowsPosixVirtualPath(importer) && !nodePathIsAbsolute(requested)) {
+      const slash = importer.lastIndexOf("/");
+      return ctNormalizePosixVirtualPath(`${importer.slice(0, slash + 1)}${requested}`);
+    }
+    return nodePathResolve(pathDirname(importer), requested);
+  }
+
   async function ctNormalizeBuildFiles(options, preserveBinary = false) {
     if (options?.files == null || typeof options.files !== "object") return options;
-    const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
+    const cwd = ctBuildWorkingDirectory();
     const files = {};
     for (const [path, value] of Object.entries(options.files)) {
-      const absolute = String(path).startsWith("/") || /^[A-Za-z]:[\\/]/.test(String(path))
-        ? String(path)
-        : nodePathResolve(cwd, String(path));
+      let contents;
       if (typeof value === "string") {
-        files[absolute] = value;
+        contents = value;
       } else if (value instanceof ArrayBuffer) {
-        files[absolute] = preserveBinary ? value : ctBuildContentsText(value);
+        contents = preserveBinary ? value : ctBuildContentsText(value);
       } else if (ArrayBuffer.isView(value)) {
         const view = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-        files[absolute] = preserveBinary ? view : ctBuildContentsText(view);
+        contents = preserveBinary ? view : ctBuildContentsText(view);
       } else if (preserveBinary && typeof value?.arrayBuffer === "function") {
-        const buffer = await value.arrayBuffer();
-        files[absolute] = buffer;
+        contents = await value.arrayBuffer();
       } else if (typeof value?.text === "function") {
-        files[absolute] = String(await value.text());
+        contents = String(await value.text());
       } else if (typeof value?.arrayBuffer === "function") {
-        files[absolute] = ctBuildContentsText(await value.arrayBuffer());
+        contents = ctBuildContentsText(await value.arrayBuffer());
       } else {
         throw new TypeError(`Bun.build files[${JSON.stringify(path)}] must be a string, Blob, ArrayBuffer, or typed array`);
       }
+      // Bun exposes POSIX-root virtual paths such as "/entry.js" unchanged to
+      // plugin callbacks on every platform. The native Windows resolver uses a
+      // drive-qualified spelling for the same path, while disk paths may also
+      // arrive with forward slashes. Retain the public spelling and add the
+      // canonical native alias so both resolver boundaries address one file.
+      for (const key of ctBuildFileKeys(path, cwd)) files[key] = contents;
     }
     return { ...options, files };
   }
 
   function ctBuildVirtualFile(options, path) {
     if (options?.files == null) return undefined;
-    return Object.prototype.hasOwnProperty.call(options.files, path) ? options.files[path] : undefined;
+    if (Object.prototype.hasOwnProperty.call(options.files, path)) return options.files[path];
+    for (const key of ctBuildFileKeys(path)) {
+      if (Object.prototype.hasOwnProperty.call(options.files, key)) return options.files[key];
+    }
+    return undefined;
   }
 
   function bundleLoaderForPath(path) {
@@ -717,7 +788,7 @@ export function createBunBuildFacade(dependencies) {
 
     const defaultResolveImport = (specifier, importerRecord) => {
       specifier = applyBuildAlias(specifier);
-      if (!specifier.startsWith("./") && !specifier.startsWith("../") && !specifier.startsWith("/")) {
+      if (!specifier.startsWith("./") && !specifier.startsWith("../") && !nodePathIsAbsolute(specifier)) {
         try {
           let resolved = resolveSync(specifier, importerRecord.path);
           if (resolved.startsWith("node:") || resolved.startsWith("bun:") || nodeIsBuiltin(resolved)) {
@@ -732,7 +803,7 @@ export function createBunBuildFacade(dependencies) {
       if (importerRecord.namespace !== "file" && !specifier.startsWith("/")) {
         return { error: `Could not resolve: "${specifier}"` };
       }
-      const base = specifier.startsWith("/") ? specifier : nodePathResolve(pathDirname(importerRecord.path), specifier);
+      const base = ctResolveBuildImportPath(importerRecord.path, specifier);
       const candidates = [base];
       for (const ext of [".tsx", ".ts", ".jsx", ".mjs", ".js", ".cjs", ".css", ".html", ".json"]) candidates.push(base + ext);
       for (const ext of [".tsx", ".ts", ".jsx", ".mjs", ".js", ".cjs", ".css", ".html", ".json"]) candidates.push(`${base}/index${ext}`);
@@ -1103,7 +1174,7 @@ export function createBunBuildFacade(dependencies) {
       }
       if (resolved?.external) continue;
       if (!resolved) {
-        const abs = entry.startsWith("/") ? entry : nodePathResolve(entry);
+        const abs = ctPublicBuildFilePath(entry);
         if (ctBuildVirtualFile(options, abs) === undefined && !cottontail.existsSync(abs)) {
           errors.push(new BuildMessage({ message: `ModuleNotFound resolving "${entry}" (entry point)` }));
           continue;

@@ -27,8 +27,19 @@ const checkoutRoot = join(checkoutBase, manifest.commit);
 // which is intentionally outside the launcher's config-file contract.
 const executableName = process.platform === 'win32' ? 'hutch-engine.exe' : 'hutch-engine';
 const binaryPath = join(checkoutRoot, 'zig-out', 'bin', executableName);
+const jobLauncherName = 'hutch-bun-compat-job.exe';
+const jobLauncherPath = join(checkoutRoot, 'zig-out', 'bin', jobLauncherName);
 const zigName = process.platform === 'win32' ? 'zig.exe' : 'zig';
-const zigPath = join(rootDir, 'vendors', 'zig', zigName);
+const zigPath = join(checkoutRoot, 'vendors', 'zig', zigName);
+const setupPath = join(checkoutRoot, 'scripts', 'setup.sh');
+const outputKind = process.argv[2] ?? '--engine';
+
+if (!['--engine', '--job-launcher'].includes(outputKind) || process.argv.length > 3) {
+  throw new Error('Usage: node scripts/setup-upstream-hutch.js [--engine|--job-launcher]');
+}
+if (outputKind === '--job-launcher' && process.platform !== 'win32') {
+  throw new Error('--job-launcher is only available on Windows');
+}
 
 function run(command, args, cwd = rootDir) {
   execFileSync(command, args, {
@@ -40,10 +51,6 @@ function run(command, args, cwd = rootDir) {
 
 function output(command, args, cwd = rootDir) {
   return execFileSync(command, args, { cwd, encoding: 'utf8' }).trim();
-}
-
-if (!existsSync(zigPath)) {
-  throw new Error(`Vendored Zig not found at ${zigPath}. Run node scripts/setup.js first.`);
 }
 
 if (!existsSync(join(checkoutRoot, '.git'))) {
@@ -62,11 +69,35 @@ if (checkedOutCommit !== manifest.commit) {
   throw new Error(`Pinned Hutch checkout mismatch: expected ${manifest.commit}, received ${checkedOutCommit}`);
 }
 
-if (!existsSync(binaryPath) || statSync(binaryPath).size === 0) {
-  run(zigPath, ['build', '-Doptimize=ReleaseSmall', '-Dcpu=baseline'], checkoutRoot);
+if (!existsSync(setupPath) || !statSync(setupPath).isFile()) {
+  throw new Error(`Pinned Hutch setup script not found at ${setupPath}`);
+}
+// Hutch carries a narrowly verified Zig standard-library patch for bounded,
+// cancellable hostname connection fan-out. Building it with Cottontail's
+// otherwise identical but unpatched Zig tree silently drops that runtime fix.
+run('bash', [setupPath], checkoutRoot);
+if (!existsSync(zigPath) || !statSync(zigPath).isFile() || statSync(zigPath).size === 0) {
+  throw new Error(`Pinned Hutch setup did not produce ${zigPath}`);
+}
+
+const requiredPaths = process.platform === 'win32'
+  ? [binaryPath, jobLauncherPath]
+  : [binaryPath];
+if (requiredPaths.some(path => !existsSync(path) || statSync(path).size === 0)) {
+  const buildArgs = ['build', '-Doptimize=ReleaseSmall', '-Dcpu=baseline'];
+  if (process.platform === 'win32') buildArgs.push('-Dtarget=x86_64-windows-msvc');
+  run(zigPath, buildArgs, checkoutRoot);
 }
 if (!existsSync(binaryPath) || !statSync(binaryPath).isFile() || statSync(binaryPath).size === 0) {
   throw new Error(`Pinned Hutch build did not produce ${binaryPath}`);
 }
+if (
+  process.platform === 'win32' &&
+  (!existsSync(jobLauncherPath) ||
+    !statSync(jobLauncherPath).isFile() ||
+    statSync(jobLauncherPath).size === 0)
+) {
+  throw new Error(`Pinned Hutch build did not produce ${jobLauncherPath}`);
+}
 
-console.log(binaryPath);
+console.log(outputKind === '--job-launcher' ? jobLauncherPath : binaryPath);
