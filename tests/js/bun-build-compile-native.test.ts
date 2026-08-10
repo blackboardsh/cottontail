@@ -7,6 +7,21 @@ const root = mkdtempSync(join(tmpdir(), "cottontail-native-compile-"));
 
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
+function compiledChildEnvironment() {
+  const env = { ...process.env };
+  delete env.BUN_OPTIONS;
+  delete env.STANDALONE_DOTENV_VALUE;
+  delete env.COTTONTAIL_TEST_CLI_HEADER_PRINTED;
+  delete env.COTTONTAIL_TEST_FILE_COUNT;
+  delete env.COTTONTAIL_TEST_AGGREGATE_FILE;
+  delete env.COTTONTAIL_TEST_REPORTER_AGGREGATE_FILE;
+  // This test validates the compiled program, not bun:test's GitHub reporter.
+  // A compile requested from inside the test runtime retains its mode marker;
+  // prevent the nested standalone from rendering an empty CI test group.
+  env.GITHUB_ACTIONS = "";
+  return env;
+}
+
 test("Bun.build compiles in-process with standalone metadata and embedded assets", async () => {
   const entry = join(root, "entry.ts");
   const executable = join(root, process.platform === "win32" ? "native-compile.exe" : "native-compile");
@@ -56,13 +71,10 @@ console.log(JSON.stringify({
   expect(result.outputs[0].sourcemap).toBe(result.outputs[1]);
   expect(JSON.parse(readFileSync(`${executable}.map`, "utf8")).version).toBe(3);
 
-  const env = { ...process.env };
-  delete env.BUN_OPTIONS;
-  delete env.STANDALONE_DOTENV_VALUE;
   const run = Bun.spawnSync({
     cmd: [executable, "--version", "user-value"],
     cwd: root,
-    env,
+    env: compiledChildEnvironment(),
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
@@ -135,6 +147,7 @@ test("compiled builds preserve an explicit root through direct and plugin-shadow
     const run = Bun.spawnSync({
       cmd: [executable],
       cwd: project,
+      env: compiledChildEnvironment(),
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
