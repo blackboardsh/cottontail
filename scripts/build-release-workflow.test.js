@@ -41,6 +41,15 @@ test('the Windows console test builds the same target as the Windows release', (
       `the Windows console test must pass ${argument}`,
     );
   }
+
+  // The console test's Zig install step writes an unrestricted
+  // cottontail.exe into zig-out/bin. It must run before build-release.js so
+  // it cannot clobber the export-restricted release binary staged there.
+  assert.ok(
+    workflow.indexOf('- name: Test Unicode output in a legacy Windows console') <
+      workflow.indexOf('- name: Build and strip release binary'),
+    'the Windows console test must run before the release build',
+  );
 });
 
 test('packaged Linux releases prove the pinned ICU fallback without system ICU', () => {

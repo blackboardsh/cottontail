@@ -134,9 +134,12 @@ jobs:
           node scripts/zig.js build test
           if ($LASTEXITCODE -ne 0) { throw "Windows tests failed" }
 
-      - name: Build and strip release binary
-        run: node scripts/build-release.js
-
+      # This step must run BEFORE the release build: test-windows-console
+      # depends on the Zig install step, which writes an unrestricted
+      # cottontail.exe into zig-out/bin. Running it after build-release.js
+      # would clobber the export-restricted binary staged there and fail the
+      # native-addon ABI validation.
+      #
       # -Dtarget must stay explicit: Zig discards a build script's
       # default_target as soon as any one of -Dtarget/-Dcpu/-Dofmt/
       # -Ddynamic-linker is passed, so -Dcpu=baseline alone would resolve
@@ -147,6 +150,9 @@ jobs:
         run: |
           node scripts/zig.js build test-windows-console -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSmall -Dcpu=baseline
           if ($LASTEXITCODE -ne 0) { throw "Windows Unicode console test failed" }
+
+      - name: Build and strip release binary
+        run: node scripts/build-release.js
 
       - name: Validate stripped release binary
         run: node scripts/validate-release-binary.js
