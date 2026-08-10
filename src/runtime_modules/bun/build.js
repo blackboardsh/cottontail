@@ -309,10 +309,39 @@ export function createBunBuildFacade(dependencies) {
       : nodePathResolve(cwd, value);
   }
 
+  function ctCanonicalBuildFilePath(path) {
+    const value = String(path);
+    if (ctIsWindowsBuildPlatform() || !nodePathIsAbsolute(value)) return value;
+
+    // The native resolver realpaths disk-backed importers. Preserve a matching
+    // alias for virtual descendants, including descendants whose immediate
+    // directory does not exist, so lexical roots such as macOS /var continue
+    // resolving after the importer becomes /private/var.
+    const missing = [];
+    let existing = value;
+    while (!cottontail.existsSync(existing)) {
+      const parent = pathDirname(existing);
+      if (parent === existing) return value;
+      missing.push(nodePathBasename(existing));
+      existing = parent;
+    }
+    try {
+      let canonical = cottontail.realpathSync(existing);
+      for (let index = missing.length - 1; index >= 0; index--) {
+        canonical = pathJoin(canonical, missing[index]);
+      }
+      return canonical;
+    } catch {
+      return value;
+    }
+  }
+
   function ctBuildFileKeys(path, cwd = ctBuildWorkingDirectory()) {
+    const native = ctNativeBuildFilePath(path, cwd);
     return new Set([
       ctPublicBuildFilePath(path, cwd),
-      ctNativeBuildFilePath(path, cwd),
+      native,
+      ctCanonicalBuildFilePath(native),
     ]);
   }
 
