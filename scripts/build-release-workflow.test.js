@@ -57,8 +57,15 @@ test('packaged Linux releases prove the pinned ICU fallback without system ICU',
   assert.match(smoke, /ldconfig -p \| grep -q "libicu"/);
   assert.match(smoke, /\/app\/share\/cottontail\/icu\/70\.1\/icudt70l\.dat/);
   assert.match(smoke, /\/app\/share\/cottontail\/icu\/70\.1\/LICENSE/);
+  // The entry script runs from /work rather than the filesystem root: a
+  // root-level entry path is the one input where the module resolver's
+  // PathName.init computes an empty dir string, which panics DirInfo
+  // resolution inside this container. Copying into the workdir keeps the
+  // image ICU-free (the part that exercises the fallback) without leaning
+  // on that resolver edge case.
+  assert.match(smoke, /cp \/icu-fallback-smoke\.js \/work\/icu-fallback-smoke\.js/);
   assert.match(
     smoke,
-    /test "\$\(\/app\/bin\/cottontail \/icu-fallback-smoke\.js\)" = "icu fallback passed"/,
+    /test "\$\(\/app\/bin\/cottontail \/work\/icu-fallback-smoke\.js\)" = "icu fallback passed"/,
   );
 });

@@ -230,7 +230,8 @@ jobs:
               tar -xzf /release.tar.gz --strip-components=1 -C /app
               test -f /app/share/cottontail/icu/70.1/icudt70l.dat
               test -f /app/share/cottontail/icu/70.1/LICENSE
-              test "$(/app/bin/cottontail /icu-fallback-smoke.js)" = "icu fallback passed"
+              cp /icu-fallback-smoke.js /work/icu-fallback-smoke.js
+              test "$(/app/bin/cottontail /work/icu-fallback-smoke.js)" = "icu fallback passed"
             '
 
       - name: Retain release artifact
