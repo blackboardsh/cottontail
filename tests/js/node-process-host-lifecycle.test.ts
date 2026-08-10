@@ -42,7 +42,9 @@ async function runExternallySignaledSource(
     : [
         "sh",
         "-c",
-        `trap - ${resetSignalDisposition}; exec "$@"`,
+        // SIGXFSZ's default action dumps core on Linux. Suppress the file so
+        // this fixture proves default termination without stalling CI.
+        `ulimit -c 0; trap - ${resetSignalDisposition}; exec "$@"`,
         "sh",
         process.execPath,
         fixture,
@@ -173,7 +175,9 @@ test.skipIf(process.platform === "win32")("OS signals emit their name", async ()
 
   expect(result.exitCode).toBe(0);
   // Bun 1.3.10 delivers (name, number) to signal listeners.
-  expect(result.stdout).toBe('["SIGUSR1",30]\n');
+  expect(result.stdout).toBe(
+    `${JSON.stringify(["SIGUSR1", process.binding("constants").os.signals.SIGUSR1])}\n`,
+  );
 });
 
 for (const signal of ["SIGALRM", "SIGPROF", "SIGVTALRM", "SIGPWR"] as const) {
