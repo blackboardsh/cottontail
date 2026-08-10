@@ -6,6 +6,8 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
+import { bunStatusPlatformKey } from '../scripts/bun-status-platform.js';
+
 const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const checkerPath = join(rootDir, 'scripts', 'check-bun-status.js');
 
@@ -114,4 +116,49 @@ test('Bun accounting rejects regex fallbacks and opaque test-name filters', (t) 
   assert.equal(result.status, 1);
   assert.match(result.stderr, /regex fallbacks classify future imports implicitly/);
   assert.match(result.stderr, /hides test names without testNameExclusion accounting/);
+});
+
+test('Bun accounting resolves the exact platform override before auditing exclusions', (t) => {
+  const fixture = createFixture(t);
+  const status = baseStatus();
+  const pattern = '^(?!platform-specific case$).*$';
+  status.platformOverrides = {
+    [bunStatusPlatformKey()]: {
+      tests: {
+        'test/alpha.test.ts': {
+          args: [`--test-name-pattern=${pattern}`],
+          testNameExclusion: {
+            pattern,
+            classification: 'environment',
+            testNames: ['platform-specific case'],
+            reason: 'fixture platform exclusion',
+          },
+        },
+      },
+    },
+  };
+  writeJson(join(fixture.snapshotRoot, 'status.json'), status);
+
+  const result = runCheck(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, new RegExp(`status platform: ${bunStatusPlatformKey()}`));
+  assert.match(result.stdout, /test-name exclusions: 1 case\(s\) in 1 file\(s\)/);
+});
+
+test('Bun accounting rejects malformed platform keys and stale override paths', (t) => {
+  const fixture = createFixture(t);
+  const status = baseStatus();
+  status.platformOverrides = {
+    'linux-amd64': {
+      tests: {
+        'test/stale.test.ts': { timeoutMs: 2000 },
+      },
+    },
+  };
+  writeJson(join(fixture.snapshotRoot, 'status.json'), status);
+
+  const result = runCheck(fixture);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /invalid platform key linux-amd64/);
+  assert.match(result.stderr, /contains an unknown path: test\/stale\.test\.ts/);
 });

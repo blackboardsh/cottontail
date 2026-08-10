@@ -17,6 +17,8 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
+import { bunStatusPlatformKey } from "../scripts/bun-status-platform.js";
+
 const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const runnerPath = join(rootDir, "scripts", "run-upstream-tests.js");
 const sharedStateRoot = mkdtempSync(join(tmpdir(), "cottontail-baseline-tools-"));
@@ -602,6 +604,30 @@ test("test metadata cannot reintroduce loader variables", (t) => {
   assert.deepEqual(readInvocations(fixture.bunCapturePath), []);
 });
 
+test("the Bun runner applies the exact platform status override", (t) => {
+  const fixture = createFixture(t);
+  const statusPath = join(fixture.bunSnapshotRoot, "status.json");
+  const status = JSON.parse(readFileSync(statusPath, "utf8"));
+  status.platformOverrides = {
+    [bunStatusPlatformKey()]: {
+      tests: {
+        "test/js/pass-fast.test.js": {
+          args: ["--platform-status-override"],
+        },
+      },
+    },
+  };
+  writeFileSync(statusPath, `${JSON.stringify(status, null, 2)}\n`);
+
+  const result = runRunner(
+    fixture,
+    ["--test", "test/js/pass-fast.test.js"],
+    { runtime: "bun" },
+  );
+  assertSucceeded(result);
+  assert.deepEqual(readJsonLines(fixture.bunCapturePath)[0].argv, ["--platform-status-override"]);
+});
+
 test("per-entry short temp mode bypasses a long ambient root and cleans its owned root", (t) => {
   const fixture = createFixture(t);
   const statusPath = join(fixture.bunSnapshotRoot, "status.json");
@@ -1126,7 +1152,11 @@ test("split bundler discovery fails closed on incomplete output", async (t) => {
     ["nonzero", /discovery must exit cleanly/, {}],
     ["timeout", /discovery must exit cleanly/, {}],
     ["partial", /final record was truncated/, {}],
-    ["truncated", /discovery must exit cleanly/, { COTTONTAIL_UPSTREAM_TEST_MAX_BUFFER: "256" }],
+    [
+      "truncated",
+      process.platform === "win32" ? /discovery must exit cleanly/ : /final record was truncated/,
+      { COTTONTAIL_UPSTREAM_TEST_MAX_BUFFER: "256" },
+    ],
   ]) {
     await t.test(mode, () => {
       const fixture = createFixture(t);

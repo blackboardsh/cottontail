@@ -45,8 +45,18 @@ jobs:
           node-version: 24.18.0
           package-manager-cache: false
 
-      - name: Validate compatibility workflow contract
-        run: node --test scripts/bun-compat-workflow.test.js
+      - name: Validate compatibility runner contracts
+        run: |
+          node --test \
+            scripts/bun-compat-workflow.test.js \
+            scripts/bun-status-platform.test.js \
+            scripts/import-upstream-tests.test.js \
+            scripts/review-bun-test-changes.test.js \
+            tests/upstream-status-accounting.test.mjs \
+            tests/upstream-runner.test.mjs
+
+      - name: Validate platform-resolved Bun status accounting
+        run: node scripts/check-bun-status.js
 
       - name: Set up Bun for repository dependencies
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -204,6 +214,12 @@ jobs:
         with:
           path: .cottontail-local-tools/upstream-hutch
           key: cottontail-bun-compat-hutch-${{ matrix.platform }}-v1-${{ hashFiles('compat/upstream/hutch.json', 'scripts/setup-upstream-hutch.js', 'scripts/zig-manifest.json') }}
+
+      - name: Verify Windows Job Object lifecycle
+        if: matrix.os == 'windows'
+        env:
+          COTTONTAIL_TEST_WINDOWS_JOB_LAUNCHER: ${{ steps.hutch-engine.outputs.job_launcher }}
+        run: node --test scripts/windows-job-child.test.js
 
       - name: Run complete Cottontail-owned Bun compatibility tier
         env:

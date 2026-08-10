@@ -3,6 +3,8 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
+import { resolveBunStatusPlatform } from './bun-status-platform.js';
+
 const workflowPath = new URL('../.github/workflows/bun-compat.yml', import.meta.url);
 const hutchManifestPath = new URL('../compat/upstream/hutch.json', import.meta.url);
 const hutchSetupPath = new URL('./setup-upstream-hutch.js', import.meta.url);
@@ -59,6 +61,14 @@ test('runs the strict complete Cottontail-owned Bun tier without publishing', ()
   );
   assert.match(workflow, /run: node scripts\/zig\.js build test/);
   assert.match(workflow, /run: node scripts\/test-js\.js/);
+  assert.match(workflow, /run: node scripts\/check-bun-status\.js/);
+  for (const contract of [
+    'scripts/bun-status-platform.test.js',
+    'tests/upstream-status-accounting.test.mjs',
+    'tests/upstream-runner.test.mjs',
+  ]) {
+    assert.ok(workflow.includes(contract), `compatibility CI must run ${contract}`);
+  }
   assert.match(
     workflow,
     /node scripts\/run-upstream-tests\.js bun --hutch "\$HUTCH_ENGINE" "\$\{job_launcher_args\[@\]\}"/,
@@ -114,6 +124,12 @@ test('builds and passes the pinned Hutch engine to split package fixtures', () =
   assert.match(hutchSetup, /process\.platform === 'win32'\s*\? \[binaryPath, jobLauncherPath\]\s*: \[binaryPath\]/);
   assert.match(hutchSetup, /outputKind === '--job-launcher' \? jobLauncherPath : binaryPath/);
   assert.doesNotMatch(hutchSetup, /command -v|which\(|["']PATH["']/);
+
+  assert.match(
+    workflow,
+    /COTTONTAIL_TEST_WINDOWS_JOB_LAUNCHER: \$\{\{ steps\.hutch-engine\.outputs\.job_launcher \}\}/,
+  );
+  assert.match(workflow, /run: node --test scripts\/windows-job-child\.test\.js/);
 
   assert.match(workflow, /shell: bash\s+run: \|\s+hutch_engine="\$\(node scripts\/setup-upstream-hutch\.js\)"/);
   assert.match(workflow, /hutch_engine="\$\(node scripts\/setup-upstream-hutch\.js\)"/);
@@ -176,4 +192,32 @@ test('generated bundler deadlines use the owned timeout scale exactly once', () 
   assert.equal(htmlServer.status, 'enabled');
   assert.deepEqual(htmlServer.env, { COTTONTAIL_TEST_TIMEOUT_SCALE: '2' });
   assert.equal(htmlServer.timeoutMs, 60_000);
+});
+
+test('platform status overrides preserve Mac and Windows while retaining Linux evidence', () => {
+  const mac = resolveBunStatusPlatform(status, 'darwin', 'arm64');
+  const windows = resolveBunStatusPlatform(status, 'win32', 'x64');
+  const linuxX64 = resolveBunStatusPlatform(status, 'linux', 'x64');
+  const linuxArm64 = resolveBunStatusPlatform(status, 'linux', 'arm64');
+  const exclusionCases = (resolved) => Object.values(resolved.tests).reduce(
+    (count, entry) => count + (entry.testNameExclusion?.testNames?.length ?? 0),
+    0,
+  );
+
+  assert.equal(exclusionCases(mac), 31);
+  assert.equal(exclusionCases(windows), 31);
+  assert.equal(exclusionCases(linuxX64), 39);
+  assert.equal(exclusionCases(linuxArm64), 45);
+
+  const symbolsPath = 'test/js/bun/symbols.test.ts';
+  for (const resolved of [linuxX64, linuxArm64]) {
+    assert.equal(resolved.tests[symbolsPath].testNameExclusion, undefined);
+    assert.equal(resolved.tests[symbolsPath].args, undefined);
+  }
+
+  const adoptedFdPath = 'test/js/bun/net/socket.test.ts';
+  assert.equal(mac.tests[adoptedFdPath].testNameExclusion, undefined);
+  assert.equal(windows.tests[adoptedFdPath].testNameExclusion, undefined);
+  assert.equal(linuxX64.tests[adoptedFdPath].testNameExclusion, undefined);
+  assert.equal(linuxArm64.tests[adoptedFdPath].testNameExclusion?.testNames.length, 1);
 });

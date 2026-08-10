@@ -3,6 +3,12 @@
 import { lstatSync, readFileSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
+import {
+  bunStatusPlatformKey,
+  resolveBunStatusPlatform,
+  validateBunStatusPlatformOverrides,
+} from './bun-status-platform.js';
+
 const rootDir = process.cwd();
 const targetsPath = resolve(
   rootDir,
@@ -12,7 +18,10 @@ const targets = JSON.parse(readFileSync(targetsPath, 'utf8'));
 const target = targets.bun;
 if (!target) throw new Error(`Missing Bun target in ${targetsPath}`);
 const snapshotRoot = resolve(rootDir, process.env.COTTONTAIL_UPSTREAM_BUN_SNAPSHOT ?? target.snapshot);
-const status = JSON.parse(readFileSync(join(snapshotRoot, 'status.json'), 'utf8'));
+const rawStatus = JSON.parse(readFileSync(join(snapshotRoot, 'status.json'), 'utf8'));
+const statusPlatform = process.env.COTTONTAIL_BUN_STATUS_PLATFORM ?? process.platform;
+const statusArchitecture = process.env.COTTONTAIL_BUN_STATUS_ARCH ?? process.arch;
+const status = resolveBunStatusPlatform(rawStatus, statusPlatform, statusArchitecture);
 const knownStatuses = new Set(['enabled', 'expected-failure', 'disabled', 'skip']);
 const knownExclusionClassifications = new Set([
   'delegated',
@@ -88,7 +97,7 @@ function sourceExclusionMarkers(entries) {
   return { sites, files, groups };
 }
 
-const errors = [];
+const errors = validateBunStatusPlatformOverrides(rawStatus);
 const discoveredPaths = discoverRunnableFiles();
 const discovered = new Set(discoveredPaths);
 const exactEntries = status.tests ?? {};
@@ -221,6 +230,7 @@ validateExpectedCount(errors, expected, 'upstreamTodoSkipSyntaxSites', markerAud
 validateExpectedCount(errors, expected, 'upstreamTodoSkipSyntaxFiles', markerAudit.files);
 
 console.log(`bun ${target.version} (${target.commit.slice(0, 12)})`);
+console.log(`  status platform: ${bunStatusPlatformKey(statusPlatform, statusArchitecture)}`);
 console.log(`  discovered runnable files: ${entries.length}`);
 console.log(`  explicit status.tests entries: ${Object.keys(exactEntries).length}`);
 console.log(`  regex fallback patterns: ${(status.patterns ?? []).length}`);

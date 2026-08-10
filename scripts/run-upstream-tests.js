@@ -29,6 +29,7 @@ import {
   startWindowsJobChild,
   terminateWindowsJobChild,
 } from './windows-job-child.js';
+import { resolveBunStatusPlatform } from './bun-status-platform.js';
 
 const rootDir = process.cwd();
 const targetsPath = resolve(
@@ -2936,7 +2937,8 @@ for (const [runtimeIndex, name] of selectedRuntimeNames.entries()) {
   }
   const sourceIdentity = options.list ? null : snapshotSourceHash(snapshotRoot);
   const statusPath = join(snapshotRoot, 'status.json');
-  const status = readJson(statusPath);
+  const rawStatus = readJson(statusPath);
+  const status = name === 'bun' ? resolveBunStatusPlatform(rawStatus) : rawStatus;
   const counts = statusCounts(snapshotRoot, status, name);
   console.log(`${name} ${target.version} (${target.commit.slice(0, 12)})`);
   console.log(`  copied files: ${counts.copiedFiles}`);
