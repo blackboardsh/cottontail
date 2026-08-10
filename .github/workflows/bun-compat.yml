@@ -46,14 +46,14 @@ jobs:
           package-manager-cache: false
 
       - name: Validate compatibility runner contracts
-        run: |
-          node --test \
-            scripts/bun-compat-workflow.test.js \
-            scripts/bun-status-platform.test.js \
-            scripts/import-upstream-tests.test.js \
-            scripts/review-bun-test-changes.test.js \
-            tests/upstream-status-accounting.test.mjs \
-            tests/upstream-runner.test.mjs
+        run: >-
+          node --test
+          scripts/bun-compat-workflow.test.js
+          scripts/bun-status-platform.test.js
+          scripts/import-upstream-tests.test.js
+          scripts/review-bun-test-changes.test.js
+          tests/upstream-status-accounting.test.mjs
+          tests/upstream-runner.test.mjs
 
       - name: Validate platform-resolved Bun status accounting
         run: node scripts/check-bun-status.js

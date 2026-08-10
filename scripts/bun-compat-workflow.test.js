@@ -42,6 +42,29 @@ test('runs only for compat branches and manual dispatch', () => {
   assert.doesNotMatch(triggers, /\btags:|\bpull_request:|\bschedule:/);
 });
 
+test('cross-platform default-shell steps avoid POSIX line continuations', () => {
+  const steps = workflow.split(/^      - name: /m).slice(1);
+  const contractStep = steps.find((step) =>
+    step.startsWith('Validate compatibility runner contracts\n'),
+  );
+  assert.ok(contractStep, 'missing compatibility runner contract step');
+  assert.match(contractStep, /^Validate compatibility runner contracts\n        run: >-/);
+
+  for (const step of steps) {
+    const name = step.slice(0, step.indexOf('\n'));
+    const hasRun = /^        run:/m.test(step);
+    const hasExplicitShell = /^        shell:/m.test(step);
+    const isPlatformRestricted = /^        if: matrix\.os ==/m.test(step);
+    if (hasRun && !hasExplicitShell && !isPlatformRestricted) {
+      assert.doesNotMatch(
+        step,
+        /\\[ \t]*$/m,
+        `${name} must be valid in both PowerShell and POSIX shells`,
+      );
+    }
+  }
+});
+
 test('runs the strict complete Cottontail-owned Bun tier without publishing', () => {
   for (const platform of ['macos-arm64', 'linux-x64', 'linux-arm64', 'windows-x64']) {
     assert.match(workflow, new RegExp(`platform: ${platform}`));
