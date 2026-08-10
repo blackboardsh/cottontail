@@ -2365,6 +2365,16 @@ typedef struct CtAtomicWaiter {
     struct CtAtomicWaiter *next;
 } CtAtomicWaiter;
 
+typedef struct CtAtomicAsyncWaiter {
+    uint32_t id;
+    void *ptr;
+    bool notified;
+    uint64_t deadline_ns;
+    CtJscRuntime *runtime;
+    CtSharedBuffer *buffer;
+    struct CtAtomicAsyncWaiter *next;
+} CtAtomicAsyncWaiter;
+
 typedef struct CtWorkerMessage {
     char *json;
     struct CtWorkerMessage *next;
@@ -2679,7 +2689,9 @@ static pthread_mutex_t ct_shared_buffers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t ct_shared_buffers_cond = PTHREAD_COND_INITIALIZER;
 static CtSharedBuffer *ct_shared_buffers = NULL;
 static CtAtomicWaiter *ct_atomic_waiters = NULL;
+static CtAtomicAsyncWaiter *ct_atomic_async_waiters = NULL;
 static uint32_t ct_next_shared_buffer_id = 1;
+static uint32_t ct_next_atomic_async_waiter_id = 1;
 
 typedef struct CtHttpRequest {
     uint32_t id;
@@ -4114,7 +4126,15 @@ static int ct_http_read_buffer_reserve(CtHttpReadBuffer *input, size_t capacity,
 }
 
 /* Returns 0 for a request, 1 for an oversized Content-Length, and -1 for an invalid request. */
-static int ct_http_read_request_head(int fd, CtHttpRequest *request, CtHttpReadBuffer *input, size_t max_body_size) {
+static int ct_http_socket_read_ready(int fd, int timeout_ms);
+
+static int ct_http_read_request_head(
+    CtHttpServer *server,
+    int fd,
+    CtHttpRequest *request,
+    CtHttpReadBuffer *input,
+    size_t max_body_size
+) {
     if (input->data == NULL) {
         input->capacity = 8192;
         input->data = (char *)malloc(input->capacity + 1);
@@ -4156,6 +4176,20 @@ static int ct_http_read_request_head(int fd, CtHttpRequest *request, CtHttpReadB
 
         if (header_end == NULL && input->len >= CT_HTTP_MAX_HEADER_SIZE) return -1;
         if (ct_http_read_buffer_grow(input, CT_HTTP_MAX_HEADER_SIZE) != 0) return -1;
+#if defined(_WIN32)
+        /* shutdown(SD_BOTH) does not reliably interrupt a blocking recv on a
+         * different Windows thread. Poll before reading so forced server stop
+         * can retire an idle keep-alive client without waiting forever. */
+        if (ct_http_server_is_stopping(server)) return -1;
+        int ready = ct_http_socket_read_ready(fd, 50);
+        if (ready == 0) continue;
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+#else
+        (void)server;
+#endif
         ssize_t read_count = recv(fd, input->data + input->len, input->capacity - input->len, 0);
         if (read_count < 0) {
             if (errno == EINTR) continue;
@@ -5031,6 +5065,7 @@ static void *ct_http_client_thread(void *opaque) {
 
     while (!ct_http_server_is_stopped(server)) {
         int head_status = ct_http_read_request_head(
+            server,
             request->client_fd,
             request,
             &input,
@@ -14765,7 +14800,7 @@ static bool ct_set_nonblocking_fd(int fd) {
 static void ct_set_blocking_fd(int fd) {
 #if defined(_WIN32)
     u_long nonblocking = 0;
-    ioctlsocket(fd, FIONBIO, &nonblocking);
+    ioctlsocket(ct_windows_socket_from_fd(fd), FIONBIO, &nonblocking);
 #else
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0) fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
@@ -22889,6 +22924,15 @@ static CtSharedBuffer *ct_shared_buffer_find_by_ptr_locked(const void *ptr) {
     return NULL;
 }
 
+static CtSharedBuffer *ct_shared_buffer_find_containing_ptr_locked(const void *ptr) {
+    const uintptr_t address = (uintptr_t)ptr;
+    for (CtSharedBuffer *buffer = ct_shared_buffers; buffer != NULL; buffer = buffer->next) {
+        const uintptr_t start = (uintptr_t)buffer->bytes;
+        if (buffer->byte_len > 0 && address >= start && address < start + buffer->byte_len) return buffer;
+    }
+    return NULL;
+}
+
 static void ct_shared_buffer_unref_locked(CtSharedBuffer *buffer) {
     if (buffer == NULL || buffer->refs == 0) return;
     buffer->refs -= 1;
@@ -23208,6 +23252,155 @@ static JSValueRef ct_shared_atomic_wait(JSContextRef ctx, JSObjectRef function, 
     return ct_make_string(ctx, result);
 }
 
+static CtAtomicAsyncWaiter **ct_atomic_async_waiter_link_locked(uint32_t id) {
+    CtAtomicAsyncWaiter **link = &ct_atomic_async_waiters;
+    while (*link != NULL && (*link)->id != id) link = &(*link)->next;
+    return link;
+}
+
+static void ct_atomic_async_waiter_destroy_locked(CtAtomicAsyncWaiter **link) {
+    CtAtomicAsyncWaiter *waiter = link != NULL ? *link : NULL;
+    if (waiter == NULL) return;
+    *link = waiter->next;
+    ct_shared_buffer_unref_locked(waiter->buffer);
+    free(waiter);
+}
+
+static uint32_t ct_atomic_async_waiter_next_id_locked(void) {
+    for (;;) {
+        uint32_t id = ct_next_atomic_async_waiter_id++;
+        if (id == 0) continue;
+        if (*ct_atomic_async_waiter_link_locked(id) == NULL) return id;
+    }
+}
+
+static bool ct_atomic_async_waiter_expired_locked(const CtAtomicAsyncWaiter *waiter, uint64_t now_ns) {
+    return !waiter->notified && waiter->deadline_ns != 0 && (now_ns == 0 || now_ns >= waiter->deadline_ns);
+}
+
+static bool ct_atomic_async_waiters_has_notified_runtime(CtJscRuntime *runtime) {
+    bool found = false;
+    pthread_mutex_lock(&ct_shared_buffers_mutex);
+    for (CtAtomicAsyncWaiter *waiter = ct_atomic_async_waiters; waiter != NULL; waiter = waiter->next) {
+        if (waiter->runtime == runtime && waiter->notified) {
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ct_shared_buffers_mutex);
+    return found;
+}
+
+static JSValueRef ct_shared_atomic_wait_async_start(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 4) {
+        ct_throw_message(ctx, exception, "sharedAtomicWaitAsyncStart(typedArray, index, value, timeout) requires arguments");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t index = 0;
+    if (ct_atomic_index(ctx, argv[1], &index, exception) != 0) return JSValueMakeUndefined(ctx);
+    void *ptr = NULL;
+    JSTypedArrayType type = kJSTypedArrayTypeNone;
+    if (ct_atomic_view_ptr(ctx, argv[0], index, &ptr, &type, exception) != 0) return JSValueMakeUndefined(ctx);
+    if (type != kJSTypedArrayTypeInt32Array && type != kJSTypedArrayTypeBigInt64Array) {
+        ct_throw_message(ctx, exception, "Atomics.waitAsync requires Int32Array or BigInt64Array");
+        return JSValueMakeUndefined(ctx);
+    }
+    const int64_t expected = (int64_t)ct_value_to_number(ctx, argv[2]);
+    const double timeout_ms = ct_value_to_number(ctx, argv[3]);
+    CtAtomicAsyncWaiter *waiter = (CtAtomicAsyncWaiter *)calloc(1, sizeof(CtAtomicAsyncWaiter));
+    if (waiter == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    pthread_mutex_lock(&ct_shared_buffers_mutex);
+    CtSharedBuffer *buffer = ct_shared_buffer_find_containing_ptr_locked(ptr);
+    if (buffer == NULL) {
+        pthread_mutex_unlock(&ct_shared_buffers_mutex);
+        free(waiter);
+        ct_throw_message(ctx, exception, "Atomics.waitAsync requires a shared typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (ct_atomic_read_value(ptr, type) != expected) {
+        pthread_mutex_unlock(&ct_shared_buffers_mutex);
+        free(waiter);
+        return JSValueMakeNumber(ctx, 0);
+    }
+    if (timeout_ms <= 0) {
+        pthread_mutex_unlock(&ct_shared_buffers_mutex);
+        free(waiter);
+        return JSValueMakeNumber(ctx, -1);
+    }
+    buffer->refs += 1;
+    waiter->id = ct_atomic_async_waiter_next_id_locked();
+    waiter->ptr = ptr;
+    if (isfinite(timeout_ms)) {
+        const uint64_t now_ns = ct_timer_now_ns();
+        const uint64_t timeout_ns = ct_timer_ms_to_ns(timeout_ms);
+        waiter->deadline_ns = timeout_ns > UINT64_MAX - now_ns ? UINT64_MAX : now_ns + timeout_ns;
+    }
+    waiter->runtime = runtime;
+    waiter->buffer = buffer;
+    waiter->next = ct_atomic_async_waiters;
+    ct_atomic_async_waiters = waiter;
+    const uint32_t id = waiter->id;
+    pthread_mutex_unlock(&ct_shared_buffers_mutex);
+    return JSValueMakeNumber(ctx, id);
+}
+
+static JSValueRef ct_shared_atomic_wait_async_poll(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)exception;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 1) return JSValueMakeNumber(ctx, 3);
+    const uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    int state = 3;
+    pthread_mutex_lock(&ct_shared_buffers_mutex);
+    CtAtomicAsyncWaiter **link = ct_atomic_async_waiter_link_locked(id);
+    if (*link != NULL && (*link)->runtime == runtime) {
+        state = 0;
+        if ((*link)->notified) state = 1;
+        else if (ct_atomic_async_waiter_expired_locked(*link, ct_timer_now_ns())) state = 2;
+        if (state != 0) {
+            ct_atomic_async_waiter_destroy_locked(link);
+        }
+    }
+    pthread_mutex_unlock(&ct_shared_buffers_mutex);
+    return JSValueMakeNumber(ctx, state);
+}
+
+static JSValueRef ct_shared_atomic_wait_async_cancel(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)exception;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 1) return JSValueMakeBoolean(ctx, false);
+    const uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    bool found = false;
+    pthread_mutex_lock(&ct_shared_buffers_mutex);
+    CtAtomicAsyncWaiter **link = ct_atomic_async_waiter_link_locked(id);
+    if (*link != NULL && (*link)->runtime == runtime) {
+        found = true;
+        ct_atomic_async_waiter_destroy_locked(link);
+    }
+    pthread_mutex_unlock(&ct_shared_buffers_mutex);
+    return JSValueMakeBoolean(ctx, found);
+}
+
+static void ct_shared_atomic_wait_async_cancel_runtime(CtJscRuntime *runtime) {
+    pthread_mutex_lock(&ct_shared_buffers_mutex);
+    CtAtomicAsyncWaiter **link = &ct_atomic_async_waiters;
+    while (*link != NULL) {
+        if ((*link)->runtime == runtime) {
+            ct_atomic_async_waiter_destroy_locked(link);
+        } else {
+            link = &(*link)->next;
+        }
+    }
+    pthread_mutex_unlock(&ct_shared_buffers_mutex);
+}
+
 static size_t ct_atomic_notify_count(JSContextRef ctx, JSValueRef value) {
     if (value == NULL || JSValueIsUndefined(ctx, value)) return SIZE_MAX;
     double number = ct_value_to_number(ctx, value);
@@ -23240,6 +23433,21 @@ static JSValueRef ct_shared_atomic_notify(JSContextRef ctx, JSObjectRef function
             waiter->notified = true;
             notified += 1;
         }
+    }
+    const uint64_t now_ns = ct_timer_now_ns();
+    CtAtomicAsyncWaiter **async_link = &ct_atomic_async_waiters;
+    while (*async_link != NULL) {
+        CtAtomicAsyncWaiter *waiter = *async_link;
+        if (ct_atomic_async_waiter_expired_locked(waiter, now_ns)) {
+            ct_atomic_async_waiter_destroy_locked(async_link);
+            continue;
+        }
+        if (notified < limit && !waiter->notified && waiter->ptr == ptr) {
+            waiter->notified = true;
+            notified += 1;
+            ct_runtime_wake(waiter->runtime);
+        }
+        async_link = &waiter->next;
     }
     if (notified > 0) pthread_cond_broadcast(&ct_shared_buffers_cond);
     pthread_mutex_unlock(&ct_shared_buffers_mutex);
@@ -37454,7 +37662,26 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
         "  __ctAtomics.wait = (array, index, value, timeout) => cottontail.sharedAtomicWait(array, Number(index), __ctToAtomicNumber(value), timeout == null ? Infinity : Number(timeout));"
         "  __ctAtomics.notify = (array, index, count) => cottontail.sharedAtomicNotify(array, Number(index), count == null ? Infinity : Number(count));"
         "  __ctAtomics.wake = __ctAtomics.notify;"
-        "  __ctAtomics.waitAsync = (array, index, value, timeout) => ({ async: true, value: Promise.resolve(__ctAtomics.wait(array, index, value, timeout)) });"
+        "  __ctAtomics.waitAsync = (array, index, value, timeout) => {"
+        "    let duration = timeout == null ? Infinity : Number(timeout);"
+        "    if (Number.isNaN(duration)) duration = Infinity;"
+        "    if (duration < 0) duration = 0;"
+        "    const token = Number(cottontail.sharedAtomicWaitAsyncStart(array, Number(index), __ctToAtomicNumber(value), duration));"
+        "    if (token === 0) return { async: false, value: 'not-equal' };"
+        "    if (token === -1) return { async: false, value: 'timed-out' };"
+        "    const valuePromise = new Promise((resolve) => {"
+        "      const poll = () => {"
+        "        const state = Number(cottontail.sharedAtomicWaitAsyncPoll(token));"
+        "        if (state === 1) { resolve('ok'); return; }"
+        "        if (state === 2 || state === 3) { resolve('timed-out'); return; }"
+        "        const handle = setTimeout(poll, 1);"
+        "        handle?.unref?.();"
+        "      };"
+        "      const handle = setTimeout(poll, 0);"
+        "      handle?.unref?.();"
+        "    });"
+        "    return { async: true, value: valuePromise };"
+        "  };"
         "  Object.defineProperty(__ctAtomics, '__cottontailPatched', { value: true });"
         "}"
     );
@@ -37641,6 +37868,7 @@ int ct_jsc_runtime_prepare_hot_reload(CtJscRuntime *runtime, char **error_out) {
     ct_dns_requests_cancel_runtime(runtime);
     ct_http_servers_stop_runtime(runtime);
     ct_timer_destroy_all(runtime);
+    ct_shared_atomic_wait_async_cancel_runtime(runtime);
     ct_brotli_encoder_destroy_all(runtime);
     ct_vm_context_destroy_all(runtime);
     ct_module_resolve_cache_clear(runtime);
@@ -37702,6 +37930,7 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
             runtime->napi_env = NULL;
         }
         ct_dns_requests_cancel_runtime(runtime);
+        ct_shared_atomic_wait_async_cancel_runtime(runtime);
         ct_runtime_uv_shutdown(runtime);
         ct_timer_destroy_all(runtime);
         ct_brotli_encoder_destroy_all(runtime);
@@ -39021,6 +39250,8 @@ static bool ct_runtime_has_pending_native_events(CtJscRuntime *runtime) {
     pending = runtime->worker_events_head != NULL;
     pthread_mutex_unlock(&runtime->worker_event_mutex);
     if (pending) return true;
+
+    if (ct_atomic_async_waiters_has_notified_runtime(runtime)) return true;
 
     if (ct_workers_has_referenced_runtime(runtime)) return true;
 

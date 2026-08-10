@@ -631,7 +631,7 @@ try {
       name: 'bun-spawn-readable-stream',
       argv: ['test', join(rootDir, 'tests', 'js', 'bun-spawn-readable-stream.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: [process.platform === 'win32' ? '6 pass' : '8 pass', '0 fail'],
+      stdoutIncludes: ['8 pass', '0 fail'],
     },
     {
       name: 'bun-spawn-native-routing',

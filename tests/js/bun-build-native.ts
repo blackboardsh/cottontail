@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,6 +18,70 @@ assert(result.outputs[0] instanceof Blob, "native Bun.build should return BuildA
 const source = await result.outputs[0].text();
 assert(source.includes("var rexported = 42"), "native Bun.build should include imported modules");
 assert(source.includes("var doubled = rexported * 2"), "native Bun.build should transpile TypeScript");
+
+const posixVirtualFilesResult = await Bun.build({
+  entrypoints: ["/entry.js"],
+  files: {
+    "/entry.js": `import { value } from "./lib/value.js"; console.log(value);`,
+    "/lib/value.js": `export const value = "virtual-relative-ok";`,
+  },
+});
+assert(posixVirtualFilesResult.success, "POSIX-root virtual files should resolve relative imports");
+assert(
+  (await posixVirtualFilesResult.outputs[0].text()).includes("virtual-relative-ok"),
+  "POSIX-root virtual files should include their relative imports",
+);
+
+let posixVirtualPluginPath = "";
+const posixVirtualPluginResult = await Bun.build({
+  entrypoints: ["/entry.js"],
+  files: {
+    "/entry.js": `import { value } from "./lib.js"; console.log(value);`,
+    "/lib.js": `export const value = "original";`,
+  },
+  plugins: [{
+    name: "posix-virtual-path",
+    setup(build) {
+      build.onLoad({ filter: /lib\.js$/ }, args => {
+        posixVirtualPluginPath = args.path;
+        return { contents: `export const value = "plugin-onload-ok";`, loader: "js" };
+      });
+    },
+  }],
+});
+assert(posixVirtualPluginResult.success, "plugins should load POSIX-root virtual files");
+assert(posixVirtualPluginPath === "/lib.js", "plugins should observe the public POSIX-root virtual path");
+assert(
+  (await posixVirtualPluginResult.outputs[0].text()).includes("plugin-onload-ok"),
+  "plugin-loaded POSIX-root virtual files should be included",
+);
+
+const mixedFilesRoot = mkdtempSync(join(tmpdir(), "cottontail-build-files-"));
+try {
+  const mixedEntry = join(mixedFilesRoot, "entry.js");
+  const overridden = join(mixedFilesRoot, "overridden.js");
+  const memoryOnly = join(mixedFilesRoot, "memory-only.js");
+  writeFileSync(mixedEntry, `
+    import { overridden } from "./overridden.js";
+    import { memoryOnly } from "./memory-only.js";
+    console.log(overridden, memoryOnly);
+  `);
+  writeFileSync(overridden, `export const overridden = "disk-value";`);
+  const mixedFilesResult = await Bun.build({
+    entrypoints: [mixedEntry.replaceAll("\\", "/")],
+    files: {
+      [overridden.replaceAll("\\", "/")]: `export const overridden = "memory-override-ok";`,
+      [memoryOnly.replaceAll("\\", "/")]: `export const memoryOnly = "memory-only-ok";`,
+    },
+  });
+  assert(mixedFilesResult.success, "in-memory files should extend a disk graph");
+  const mixedFilesSource = await mixedFilesResult.outputs[0].text();
+  assert(mixedFilesSource.includes("memory-override-ok"), "in-memory files should override disk files");
+  assert(mixedFilesSource.includes("memory-only-ok"), "disk files should import memory-only files");
+  assert(!mixedFilesSource.includes("disk-value"), "overridden disk contents should not be bundled");
+} finally {
+  rmSync(mixedFilesRoot, { recursive: true, force: true });
+}
 
 const bytecodeRoot = mkdtempSync(join(tmpdir(), "cottontail-build-bytecode-"));
 try {

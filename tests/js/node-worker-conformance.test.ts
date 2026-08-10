@@ -72,6 +72,40 @@ test("workerData transfers MessagePort identity and messages", async () => {
   await worker.terminate();
 });
 
+test("Atomics.waitAsync yields until a worker notifies shared memory", async () => {
+  const shared = new SharedArrayBuffer(4);
+  const view = new Int32Array(shared);
+  expect(() => Atomics.waitAsync(new Int32Array(1), 0, 0, 0)).toThrow();
+  expect(Atomics.waitAsync(view, 0, 1)).toEqual({ async: false, value: "not-equal" });
+  expect(Atomics.waitAsync(view, 0, "0" as any, 0)).toEqual({ async: false, value: "timed-out" });
+
+  const notifyWins = Atomics.waitAsync(view, 0, 0, 10);
+  expect(notifyWins.async).toBe(true);
+  expect(Atomics.notify(view, 0, 1)).toBe(1);
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  expect(Atomics.notify(view, 0, 1)).toBe(0);
+  expect(await notifyWins.value).toBe("ok");
+
+  const expiring = Atomics.waitAsync(view, 0, 0, 10);
+  expect(expiring.async).toBe(true);
+  expect(await expiring.value).toBe("timed-out");
+  expect(Atomics.notify(view, 0, 1)).toBe(0);
+
+  const waiting = Atomics.waitAsync(view, 0, 0, 15_000);
+  expect(waiting.async).toBe(true);
+  const worker = new Worker(
+    `const { parentPort, workerData } = require("node:worker_threads");
+     const notified = Atomics.notify(new Int32Array(workerData), 0, 1);
+     parentPort.postMessage(notified);`,
+    { eval: true, workerData: shared },
+  );
+  const message = onceEvent(worker, "message");
+  expect(await waiting.value).toBe("ok");
+  expect((await message)[0]).toBe(1);
+  expect(Atomics.load(view, 0)).toBe(0);
+  await worker.terminate();
+}, 20_000);
+
 test("creating a Worker emits process worker asynchronously", async () => {
   const event = onceEvent(process, "worker");
   const worker = new Worker("", { eval: true });

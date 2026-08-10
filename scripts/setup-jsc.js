@@ -17,11 +17,20 @@ import { cpus } from 'os';
 import { join, dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
-// MSYS tar cannot chdir into drive-letter backslash paths on Windows;
-// --force-local keeps drive-letter archives from being read as remote
-// host:file specs. bsdtar (macOS) supports neither, so both are win32-only.
+// MSYS tar cannot chdir into drive-letter backslash paths on Windows.
+// GNU tar also needs --force-local to keep drive-letter archives from being
+// read as remote host:file specs, while the bsdtar bundled with Windows does
+// not support that option and already understands drive-letter paths.
 const tarPath = (p) => (process.platform === 'win32' ? p.replace(/\\/g, '/') : p);
-const tarLocalFlags = process.platform === 'win32' ? ['--force-local'] : [];
+const tarLocalFlags = (() => {
+  if (process.platform !== 'win32') return [];
+  try {
+    execFileSync('tar', ['--force-local', '--version'], { stdio: 'ignore' });
+    return ['--force-local'];
+  } catch {
+    return [];
+  }
+})();
 
 const ROOT = process.cwd();
 const MANIFEST_PATH = join(dirname(fileURLToPath(import.meta.url)), 'jsc-manifest.json');

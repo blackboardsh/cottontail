@@ -484,6 +484,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             &.{
                 "-std=c++20",
                 "-DJS_NO_EXPORT=1",
+                "-DBEXPORT=",
                 "-fno-rtti",
                 "-DWIN32_LEAN_AND_MEAN=1",
                 "-DNOMINMAX=1",
