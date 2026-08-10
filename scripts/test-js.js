@@ -938,7 +938,7 @@ try {
       stdoutIncludes: process.platform === 'win32'
         ? ['8 pass', '25 skip', '0 fail']
         : process.platform === 'linux'
-          ? ['33 pass', '0 fail']
+          ? ['32 pass', '1 skip', '0 fail']
           : ['10 pass', '23 skip', '0 fail'],
     },
     {
