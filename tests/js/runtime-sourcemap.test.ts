@@ -464,7 +464,9 @@ test("uncaught formatting prefers a readable external frame over a later embedde
 
     expect(formatUncaughtBundleError(error)).toBe(true);
     expect(error.stack).toContain(marker);
-    expect(error.stack).toContain(`at ${externalSource}:${markerLine}:1`);
+    expect(error.stack?.replaceAll("\\", "/")).toContain(
+      `at ${externalSource.replaceAll("\\", "/")}:${markerLine}:1`,
+    );
     expect(error.stack).not.toContain("internal runtime frame");
   } finally {
     runtimeGlobal.__cottontailBundlePath = previous.bundlePath;
