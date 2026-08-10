@@ -593,9 +593,16 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             // drops them before linking. Concrete files preserve the GNU C++
             // ABI and unwind runtime used by the JSC/Rust archives, plus
             // glibc's resolver implementation.
+            //
+            // libresolv must be the shared object, never the static archive:
+            // libresolv.a's ns_parse.o reaches for __libc_dn_expand and the
+            // errno TLS slot, both exported only under GLIBC_PRIVATE, which
+            // pins the release to one host glibc build. libresolv.so.2 keeps
+            // those calls inside itself and exposes ns_initparse/ns_parserr
+            // under a public version instead.
             step.root_module.addObjectFile(copyLinuxSystemLibrary(b, "libstdc++.so"));
             step.root_module.addObjectFile(copyLinuxSystemLibrary(b, "libgcc_s.so.1"));
-            step.root_module.addObjectFile(copyLinuxSystemLibrary(b, "libresolv.a"));
+            step.root_module.addObjectFile(copyLinuxSystemLibrary(b, "libresolv.so"));
             step.root_module.linkSystemLibrary("ssl", .{ .preferred_link_mode = .static });
             step.root_module.linkSystemLibrary("crypto", .{ .preferred_link_mode = .static });
             // OpenSSL 3.4+ can use Zstandard from its static libcrypto archive.
