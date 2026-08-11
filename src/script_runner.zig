@@ -334,6 +334,26 @@ fn validatePosixOwnedExecutable(handle: anytype) !void {
         return error.HutchPrivateUnsafePermissions;
 }
 
+const HutchPrivateUmaskGuard = struct {
+    previous: usize = 0,
+    active: bool = false,
+
+    fn init() HutchPrivateUmaskGuard {
+        if (comptime builtin.os.tag == .windows) return .{};
+        return .{
+            .previous = @intCast(posix_identity.umask(0o077)),
+            .active = true,
+        };
+    }
+
+    fn restore(self: *HutchPrivateUmaskGuard) void {
+        if (comptime builtin.os.tag == .windows) return;
+        if (!self.active) return;
+        _ = posix_identity.umask(@intCast(self.previous));
+        self.active = false;
+    }
+};
+
 fn hashOpenFile(file: std.Io.File, io: std.Io) ![32]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var reader_buffer: [16 * 1024]u8 = undefined;
@@ -559,6 +579,12 @@ pub fn runHutchPrivateFile(
         return 1;
     }
 
+    // File creation modes below the validated private root must not depend on
+    // a caller's umask. This runs before the JavaScript runtime starts, and is
+    // restored on every error path and before any project-controlled code.
+    var private_umask = HutchPrivateUmaskGuard.init();
+    defer private_umask.restore();
+
     var native_environ = try cloneEnvironmentMap(allocator, init.environ_map);
     defer native_environ.deinit();
     _ = native_environ.swapRemove("COTTONTAIL_RUNTIME_MODULES_DIR");
@@ -622,6 +648,7 @@ pub fn runHutchPrivateFile(
 
     // Native storage policy is complete. Runtime configuration and task code
     // must see the exact inherited project environment.
+    private_umask.restore();
     ctx.environ_map = init.environ_map;
     const runnable_path_z = try allocator.dupeZ(u8, runnable.path);
     return try runPrepared(

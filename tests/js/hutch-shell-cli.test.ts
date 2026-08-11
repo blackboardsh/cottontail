@@ -46,6 +46,20 @@ function snapshotTree(directory: string) {
   return snapshot;
 }
 
+function expectPrivateStoragePermissions(directory: string) {
+  const visit = (path: string) => {
+    const stat = lstatSync(path);
+    if (stat.isDirectory()) {
+      expect(stat.mode & 0o777).toBe(0o700);
+      for (const name of readdirSync(path)) visit(join(path, name));
+      return;
+    }
+    expect(stat.isFile()).toBe(true);
+    expect(stat.mode & 0o777).toBe(0o600);
+  };
+  visit(directory);
+}
+
 const shellWrapperSource = String.raw`
 const [command, ...args] = process.argv.slice(2);
 const clearPrivateArgv = () => {
@@ -1277,6 +1291,39 @@ test("returns status 1 for a malformed physical shell wrapper", () => {
   } finally {
     invocation.cleanup();
   }
+});
+
+test("normalizes private native storage under a restrictive caller umask", () => {
+  const shellInvocation = createHutchShellInvocation("/bin/sh -c umask");
+  const configInvocation = createHutchConfigInvocation(
+    `process.stdout.write(process.umask().toString(8));\n`,
+  );
+  try {
+    for (const invocation of [shellInvocation, configInvocation]) {
+      const previousUmask = process.umask(0o777);
+      let child;
+      try {
+        child = Bun.spawnSync(invocation.argv, {
+          cwd: root,
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+      } finally {
+        process.umask(previousUmask);
+      }
+
+      expect(child.exitCode).toBe(0);
+      expect(Number.parseInt(child.stdout.toString().trim(), 8)).toBe(0o777);
+      expect(child.stderr.toString()).toBe("");
+      expect(readdirSync(invocation.privateRoot).some(name => name.startsWith("run-"))).toBe(true);
+      expectPrivateStoragePermissions(invocation.privateRoot);
+    }
+  } finally {
+    shellInvocation.cleanup();
+    configInvocation.cleanup();
+  }
+}, {
+  skip: process.platform === "win32" ? "POSIX umask contract" : false,
 });
 
 test("rejects macro imports before starting their marker subprocess", () => {
