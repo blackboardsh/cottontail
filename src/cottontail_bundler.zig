@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const compiler = @import("cottontail_compiler");
 const bun_color = @import("bun_color.zig");
 const embedded_runtime_modules = @import("embedded_runtime_modules.zig");
@@ -1112,16 +1111,10 @@ pub fn bundleEntryPointGraphWithOptions(
         return error.InvalidVirtualFileMap;
     }
     for (options.virtual_file_paths, options.virtual_file_contents) |path, contents| {
-        const map_path = if (builtin.os.tag == .windows) normalized: {
-            const owned = try c_allocator.dupe(u8, path);
-            std.mem.replaceScalar(u8, owned, '\\', '/');
-            try runtime_file_keys.append(c_allocator, owned);
-            break :normalized owned;
-        } else path;
         const is_external = for (options.external) |external| {
             if (std.mem.eql(u8, path, external)) break true;
         } else false;
-        if (!is_external) try runtime_file_map.map.put(c_allocator, map_path, contents);
+        if (!is_external) try runtime_file_map.map.put(c_allocator, path, contents);
     }
     if (options.include_runtime_modules) {
         const runtime_virtual_root = options.runtime_virtual_root orelse working_dir;
@@ -1145,13 +1138,7 @@ pub fn bundleEntryPointGraphWithOptions(
         }
     }
     if (options.entry_source) |entry_source| {
-        const map_path = if (builtin.os.tag == .windows) normalized: {
-            const owned = try c_allocator.dupe(u8, entry_source.path);
-            std.mem.replaceScalar(u8, owned, '\\', '/');
-            try runtime_file_keys.append(c_allocator, owned);
-            break :normalized owned;
-        } else entry_source.path;
-        try runtime_file_map.map.put(c_allocator, map_path, entry_source.contents);
+        try runtime_file_map.map.put(c_allocator, entry_source.path, entry_source.contents);
     }
     const runtime_file_map_ptr = if (runtime_file_map.map.count() > 0) &runtime_file_map else null;
     const event_loop = compiler.jsc.AnyEventLoop.init(allocator);
