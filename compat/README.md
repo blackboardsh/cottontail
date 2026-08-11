@@ -27,7 +27,7 @@ bun run compat:surface:all
 the Bun-derived JavaScript tests. The Bun tree is no longer a live mirror:
 Cottontail owns and may adapt the runtime/compiler tests as the product diverges
 from Bun. The exact Bun v1.3.10 index contains 1,342 runnable files. Cottontail
-currently enables 1,318 files, carries 20 whole-file expected failures, and
+currently enables 1,319 files, carries 19 whole-file expected failures, and
 deliberately leaves four files out of scope. The former 103-file package-manager
 and project-orchestration tier was retired when dependency management became an
 external tool concern.

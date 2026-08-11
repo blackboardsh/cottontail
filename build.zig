@@ -688,6 +688,28 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("cottontail_compiler", createCompilerModule(b, target, optimize));
     exe.root_module.addAnonymousImport("runtime_modules_blob", .{ .root_source_file = runtime_modules_blob });
 
+    const upstream_command_adapter = b.addExecutable(.{
+        .name = "cottontail-upstream-command",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/upstream-command-adapter.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(upstream_command_adapter);
+
+    if (target.result.os.tag == .windows) {
+        const upstream_job_launcher = b.addExecutable(.{
+            .name = "cottontail-bun-compat-job",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/windows-job-launcher.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        b.installArtifact(upstream_job_launcher);
+    }
+
     configureJsc(exe, b);
 
     const install_exe = b.addInstallArtifact(exe, .{});
@@ -776,6 +798,15 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    const upstream_command_adapter_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/upstream-command-adapter.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(upstream_command_adapter_tests).step);
 
     if (target.result.os.tag == .windows) {
         const windows_console_test = b.addExecutable(.{

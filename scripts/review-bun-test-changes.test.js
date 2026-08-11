@@ -69,8 +69,8 @@ test('review metadata freezes the Bun baseline and all routing destinations', ()
     'utf8',
   ));
   assert.equal(status.expectedCounts.runnableFiles, 1342);
-  assert.equal(status.expectedCounts.enabled, 1318);
-  assert.equal(status.expectedCounts.expectedFailure, 20);
+  assert.equal(status.expectedCounts.enabled, 1319);
+  assert.equal(status.expectedCounts.expectedFailure, 19);
   assert.equal(status.expectedCounts.skip, 4);
   assert.equal(status.expectedCounts.cottontailOwned, 1342);
 
@@ -80,15 +80,15 @@ test('review metadata freezes the Bun baseline and all routing destinations', ()
   assert.equal(entries.reduce(
     (count, entry) => count + (entry.testNameExclusion?.testNames.length ?? 0),
     0,
-  ), 30);
+  ), 29);
   const platformExclusionCases = (platform, arch) => Object.values(
     resolveBunStatusPlatform(status, platform, arch).tests,
   ).reduce(
     (count, entry) => count + (entry.testNameExclusion?.testNames.length ?? 0),
     0,
   );
-  assert.equal(platformExclusionCases('linux', 'x64'), 38);
-  assert.equal(platformExclusionCases('linux', 'arm64'), 44);
+  assert.equal(platformExclusionCases('linux', 'x64'), 37);
+  assert.equal(platformExclusionCases('linux', 'arm64'), 43);
   assert.equal(entries.reduce(
     (count, entry) => count + Object.keys(entry.expectedFailureBundlerTests ?? {}).length,
     0,

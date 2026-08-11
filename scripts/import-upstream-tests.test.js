@@ -151,7 +151,7 @@ test('Bun replacement leaves a stale synchronous-phase runner lock untouched', (
     pid: 2_147_483_647,
     hostname: os.hostname(),
     activeChildren: [],
-    synchronousPhase: { label: 'Hutch engine preflight', startedAt: '2026-08-08T00:00:00.000Z' },
+    synchronousPhase: { label: 'command adapter preflight', startedAt: '2026-08-08T00:00:00.000Z' },
   };
   writeFileSync(join(lockPath, 'owner.json'), `${JSON.stringify(owner)}\n`);
 
@@ -160,7 +160,7 @@ test('Bun replacement leaves a stale synchronous-phase runner lock untouched', (
     () => withBunSnapshotMutationLock(snapshotRoot, () => {
       mutationAttempted = true;
     }, { lockDir: lockRoot }),
-    /stale JavaScript baseline suite lock ended during synchronous phase.*Hutch engine preflight/s,
+    /stale JavaScript baseline suite lock ended during synchronous phase.*command adapter preflight/s,
   );
   assert.equal(mutationAttempted, false);
   assert.equal(

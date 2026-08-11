@@ -27,7 +27,7 @@ export function startWindowsJobChild(command, args, options) {
   }
   if (typeof spawnProcess !== 'function') throw new TypeError('spawnProcess must be a function');
 
-  const jobName = `Local\\HutchBunCompat-${randomUUID()}`;
+  const jobName = `Local\\CottontailBunCompat-${randomUUID()}`;
   const child = spawnProcess(
     jobLauncher,
     ['run', jobName, String(parentPid), command, ...args.map(String)],

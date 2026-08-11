@@ -6,8 +6,9 @@ import test from 'node:test';
 import { resolveBunStatusPlatform } from './bun-status-platform.js';
 
 const workflowPath = new URL('../.github/workflows/bun-compat.yml', import.meta.url);
-const hutchManifestPath = new URL('../compat/upstream/hutch.json', import.meta.url);
-const hutchSetupPath = new URL('./setup-upstream-hutch.js', import.meta.url);
+const buildPath = new URL('../build.zig', import.meta.url);
+const commandAdapterPath = new URL('../tests/upstream-command-adapter.zig', import.meta.url);
+const windowsJobLauncherPath = new URL('../tests/windows-job-launcher.zig', import.meta.url);
 const statusPath = new URL('../compat/upstream/bun/v1.3.10/status.json', import.meta.url);
 const expectBundledPath = new URL(
   '../compat/upstream/bun/v1.3.10/test/bundler/expectBundled.ts',
@@ -18,8 +19,9 @@ const bunTestAdapterPath = new URL('../src/runtime_modules/node/test.js', import
 // normalize so the contract regexes match regardless of checkout config.
 const readText = (path) => readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
 const workflow = readText(workflowPath);
-const hutchManifest = JSON.parse(readText(hutchManifestPath));
-const hutchSetup = readText(hutchSetupPath);
+const build = readText(buildPath);
+const commandAdapter = readText(commandAdapterPath);
+const windowsJobLauncher = readText(windowsJobLauncherPath);
 const status = JSON.parse(readText(statusPath));
 const expectBundled = readText(expectBundledPath);
 const bunTestAdapter = readText(bunTestAdapterPath);
@@ -76,29 +78,29 @@ test('cross-platform default-shell steps avoid POSIX line continuations', () => 
   }
 });
 
-test('Windows runner contracts wait for the native Hutch job launcher', () => {
+test('Windows runner contracts wait for the Cottontail-owned native job launcher', () => {
   const earlyContracts = workflowStep('Validate compatibility runner contracts');
   const nonWindowsRunner = workflowStep('Validate upstream runner contracts');
-  const buildHutch = workflowStep('Build pinned Hutch compatibility engine');
+  const buildCottontail = workflowStep('Build Cottontail');
   const windowsRunner = workflowStep('Validate upstream runner contracts on Windows');
 
   assert.doesNotMatch(earlyContracts.source, /tests\/upstream-runner\.test\.mjs/);
   assert.match(nonWindowsRunner.source, /if: matrix\.os != 'windows'/);
   assert.match(nonWindowsRunner.source, /run: node --test tests\/upstream-runner\.test\.mjs/);
   assert.ok(
-    nonWindowsRunner.start < buildHutch.start,
+    nonWindowsRunner.start < buildCottontail.start,
     'non-Windows runner contracts should remain an early validation gate',
   );
 
   assert.match(windowsRunner.source, /if: matrix\.os == 'windows'/);
   assert.match(
     windowsRunner.source,
-    /COTTONTAIL_UPSTREAM_JOB_LAUNCHER: \$\{\{ steps\.hutch-engine\.outputs\.job_launcher \}\}/,
+    /COTTONTAIL_UPSTREAM_JOB_LAUNCHER: zig-out\/bin\/cottontail-bun-compat-job\.exe/,
   );
   assert.match(windowsRunner.source, /run: node --test tests\/upstream-runner\.test\.mjs/);
   assert.ok(
-    buildHutch.start < windowsRunner.start,
-    'Windows runner contracts must wait until Hutch creates the native launcher',
+    buildCottontail.start < windowsRunner.start,
+    'Windows runner contracts must wait until Cottontail builds the native launcher',
   );
   assert.equal(
     workflow.match(/run: node --test tests\/upstream-runner\.test\.mjs/g)?.length,
@@ -136,7 +138,7 @@ test('runs the strict complete Cottontail-owned Bun tier without publishing', ()
   }
   assert.match(
     workflow,
-    /node scripts\/run-upstream-tests\.js bun --hutch "\$HUTCH_ENGINE" "\$\{job_launcher_args\[@\]\}"/,
+    /node scripts\/run-upstream-tests\.js bun --command-adapter "\$command_adapter" --package-manager "\$package_manager" "\$\{job_launcher_args\[@\]\}"/,
   );
   assert.doesNotMatch(workflow, /continue-on-error:|upload-release-r2|publish|secrets\./i);
 
@@ -160,53 +162,32 @@ test('runs the strict complete Cottontail-owned Bun tier without publishing', ()
   assert.equal(discovered - disabled, enabled + expectedFailures);
 });
 
-test('builds and passes the pinned Hutch engine to split package fixtures', () => {
-  assert.match(hutchManifest.repository, /^https:\/\/github\.com\/[^/]+\/hutch\.git$/);
-  assert.match(hutchManifest.commit, /^[0-9a-f]{40}$/);
-  assert.match(hutchSetup, /process\.platform === 'win32' \? 'hutch-engine\.exe' : 'hutch-engine'/);
-  assert.match(hutchSetup, /const jobLauncherName = 'hutch-bun-compat-job\.exe'/);
-  assert.match(hutchSetup, /const zigPath = join\(checkoutRoot, 'vendors', 'zig', zigName\)/);
-  assert.match(hutchSetup, /run\('bash', \[setupPath\], checkoutRoot\)/);
-  assert.match(
-    hutchSetup,
-    /stdio: \['inherit', process\.stderr, process\.stderr\]/,
-    'setup child output must go to stderr so stdout remains a machine-readable path',
-  );
-  assert.doesNotMatch(hutchSetup, /stdio:\s*['"]inherit['"]/);
-  assert.match(hutchSetup, /buildArgs\.push\('-Dtarget=x86_64-windows-msvc'\)/);
-  assert.doesNotMatch(hutchSetup, /join\(rootDir, 'vendors', 'zig'/);
-  assert.match(hutchSetup, /\['--engine', '--job-launcher'\]\.includes\(outputKind\)/);
-  assert.match(hutchSetup, /process\.platform === 'win32'\s*\? \[binaryPath, jobLauncherPath\]\s*: \[binaryPath\]/);
-  assert.match(hutchSetup, /outputKind === '--job-launcher' \? jobLauncherPath : binaryPath/);
-  assert.doesNotMatch(hutchSetup, /command -v|which\(|["']PATH["']/);
-
-  assert.match(
-    workflow,
-    /COTTONTAIL_TEST_WINDOWS_JOB_LAUNCHER: \$\{\{ steps\.hutch-engine\.outputs\.job_launcher \}\}/,
-  );
+test('uses the Cottontail adapter and external Bun only for package fixtures', () => {
+  assert.match(commandAdapter, /COTTONTAIL_BINARY/);
+  assert.match(commandAdapter, /COTTONTAIL_UPSTREAM_PACKAGE_MANAGER/);
+  assert.match(commandAdapter, /isPackageManagerCommand\(args\[1\]\)/);
+  assert.match(commandAdapter, /"install"/);
+  assert.match(commandAdapter, /"x"/);
+  assert.match(windowsJobLauncher, /Local\\\\CottontailBunCompat-/);
+  assert.match(build, /\.name = "cottontail-upstream-command"/);
+  assert.match(build, /tests\/upstream-command-adapter\.zig/);
+  assert.match(build, /\.name = "cottontail-bun-compat-job"/);
+  assert.match(build, /tests\/windows-job-launcher\.zig/);
+  assert.doesNotMatch(workflow, /Hutch|hutch/);
+  assert.match(workflow, /COTTONTAIL_TEST_WINDOWS_JOB_LAUNCHER: zig-out\/bin\/cottontail-bun-compat-job\.exe/);
   assert.match(workflow, /run: node --test scripts\/windows-job-child\.test\.js/);
-
-  assert.match(workflow, /shell: bash\s+run: \|\s+hutch_engine="\$\(node scripts\/setup-upstream-hutch\.js\)"/);
-  assert.match(workflow, /hutch_engine="\$\(node scripts\/setup-upstream-hutch\.js\)"/);
-  assert.match(workflow, /hutch_job_launcher="\$\(node scripts\/setup-upstream-hutch\.js --job-launcher\)"/);
-  assert.match(workflow, /job_launcher=\$\{process\.argv\[1\]\}/);
   assert.equal(
-    workflow.match(/hashFiles\('compat\/upstream\/hutch\.json', 'scripts\/setup-upstream-hutch\.js', 'scripts\/zig-manifest\.json'\)/g)?.length,
+    workflow.match(/command_adapter="\$\(node -e/g)?.length,
     2,
-    'the pinned Hutch cache must track the Zig distribution used by its verified setup',
+    'both suite steps must select the Cottontail-owned adapter',
   );
   assert.equal(
-    workflow.match(/HUTCH_ENGINE: \$\{\{ steps\.hutch-engine\.outputs\.binary \}\}/g)?.length,
+    workflow.match(/package_manager="\$\(bun -e 'console\.log\(process\.execPath\)'\)"/g)?.length,
     2,
-    'both the complete tier and focused package cases must use the pinned Hutch engine',
+    'both suite steps must select the workflow-pinned Bun executable',
   );
   assert.equal(
-    workflow.match(/HUTCH_JOB_LAUNCHER: \$\{\{ steps\.hutch-engine\.outputs\.job_launcher \}\}/g)?.length,
-    2,
-    'both Windows execution steps must receive the pinned native Job Object launcher',
-  );
-  assert.equal(
-    workflow.match(/job_launcher_args=\(\)[\s\S]*?if \[\[ "\$\{\{ matrix\.os \}\}" == "windows" \]\]; then[\s\S]*?job_launcher_args=\(--job-launcher "\$HUTCH_JOB_LAUNCHER"\)[\s\S]*?fi/g)?.length,
+    workflow.match(/job_launcher_args=\(\)[\s\S]*?if \[\[ "\$\{\{ matrix\.os \}\}" == "windows" \]\]; then[\s\S]*?job_launcher_args=\(--job-launcher zig-out\/bin\/cottontail-bun-compat-job\.exe\)[\s\S]*?fi/g)?.length,
     2,
     'the launcher argument must be present on Windows and omitted elsewhere',
   );
@@ -215,20 +196,24 @@ test('builds and passes the pinned Hutch engine to split package fixtures', () =
     .filter(line => line.includes('node scripts/run-upstream-tests.js') && !line.includes('--list'));
   assert.equal(suiteCommands.length, 4, 'expected the complete tier and three focused suite commands');
   assert.ok(
-    suiteCommands.every(line => line.includes('"${job_launcher_args[@]}"')),
-    'every non-list suite command must carry the conditional Windows Job Object launcher',
+    suiteCommands.every(line =>
+      line.includes('--command-adapter "$command_adapter"') &&
+      line.includes('--package-manager "$package_manager"') &&
+      line.includes('"${job_launcher_args[@]}"')
+    ),
+    'every suite command must carry the adapter, external manager, and conditional Windows launcher',
   );
   assert.match(
     workflow,
-    /--hutch "\$HUTCH_ENGINE" "\$\{job_launcher_args\[@\]\}" --test test\/bundler\/bundler_defer\.test\.ts --case '\^\\\$file\$' --expect-pass --jobs 1/,
+    /--test test\/bundler\/bundler_defer\.test\.ts --case '\^\\\$file\$' --expect-pass --jobs 1/,
   );
   assert.match(
     workflow,
-    /--hutch "\$HUTCH_ENGINE" "\$\{job_launcher_args\[@\]\}" --test test\/bundler\/bundler_npm\.test\.ts --case '\^npm\/ReactSSR\$' --expect-pass --jobs 1/,
+    /--test test\/bundler\/bundler_npm\.test\.ts --case '\^npm\/ReactSSR\$' --expect-pass --jobs 1/,
   );
   assert.match(
     workflow,
-    /--hutch "\$HUTCH_ENGINE" "\$\{job_launcher_args\[@\]\}" --test test\/bundler\/bundler_npm\.test\.ts --case '\^npm\/LodashES\$' --expect-pass --jobs 1/,
+    /--test test\/bundler\/bundler_npm\.test\.ts --case '\^npm\/LodashES\$' --expect-pass --jobs 1/,
   );
 });
 
@@ -259,10 +244,10 @@ test('platform status overrides preserve Mac and Windows while retaining Linux e
     0,
   );
 
-  assert.equal(exclusionCases(mac), 30);
-  assert.equal(exclusionCases(windows), 30);
-  assert.equal(exclusionCases(linuxX64), 38);
-  assert.equal(exclusionCases(linuxArm64), 44);
+  assert.equal(exclusionCases(mac), 29);
+  assert.equal(exclusionCases(windows), 29);
+  assert.equal(exclusionCases(linuxX64), 37);
+  assert.equal(exclusionCases(linuxArm64), 43);
 
   const symbolsPath = 'test/js/bun/symbols.test.ts';
   for (const resolved of [linuxX64, linuxArm64]) {

@@ -649,7 +649,7 @@
     },
     "test/bundler/bundler_defer.test.ts": {
       "status": "enabled",
-      "reason": "All eight generated plugin-defer cases and the package-backed file case pass across concurrent onStart setup, deferred graph scheduling, CSS diagnostics, post-defer plugin errors, double-defer validation, and pinned Hutch dependency setup.",
+      "reason": "All eight generated plugin-defer cases and the package-backed file case pass across concurrent onStart setup, deferred graph scheduling, CSS diagnostics, post-defer plugin errors, double-defer validation, and externally managed dependency setup.",
       "splitBundlerTests": true,
       "includeBundlerFileTests": true
     },
@@ -729,7 +729,7 @@
     },
     "test/bundler/bundler_npm.test.ts": {
       "status": "enabled",
-      "reason": "Both npm-backed bundler cases pass unchanged through the pinned Hutch engine, including React SSR output, exact source-map accounting, generated execution, and the lodash-es bundle.",
+      "reason": "Both npm-backed bundler cases pass unchanged with dependencies installed by the explicitly selected external manager, including React SSR output, exact source-map accounting, generated execution, and the lodash-es bundle.",
       "splitBundlerTests": true
     },
     "test/bundler/bundler_plugin.test.ts": {
@@ -1779,14 +1779,14 @@
     },
     "test/js/bun/shell/bunshell.test.ts": {
       "status": "enabled",
-      "reason": "The complete Bun shell integration file passes 375 active upstream cases (1,016 assertions) with 43 upstream TODOs; eight cases are excluded via testNameExclusion. The suite is spawn-heavy, so it runs in the serial bucket with an extended timeout.",
+      "reason": "The complete Bun shell integration file passes 376 active upstream cases (including the sharp package fixture) with 43 upstream TODOs; seven background-command cases are excluded via testNameExclusion. The suite is spawn-heavy, so it runs in the serial bucket with an extended timeout.",
       "serial": true,
       "timeoutMs": 120000,
       "args": [
-        "--test-name-pattern=^(?!.*(?:complicated pipeline|pipeline with background process|asynchronous command \\(after if\\)|asynchronous command \\(after then\\)|asynchronous command \\(after elif\\)|subshell > sharp|subshell ending with asynchronous list|brace grouping ending with asynchronous list)).*$"
+        "--test-name-pattern=^(?!.*(?:complicated pipeline|pipeline with background process|asynchronous command \\(after if\\)|asynchronous command \\(after then\\)|asynchronous command \\(after elif\\)|subshell ending with asynchronous list|brace grouping ending with asynchronous list)).*$"
       ],
       "testNameExclusion": {
-        "pattern": "^(?!.*(?:complicated pipeline|pipeline with background process|asynchronous command \\(after if\\)|asynchronous command \\(after then\\)|asynchronous command \\(after elif\\)|subshell > sharp|subshell ending with asynchronous list|brace grouping ending with asynchronous list)).*$",
+        "pattern": "^(?!.*(?:complicated pipeline|pipeline with background process|asynchronous command \\(after if\\)|asynchronous command \\(after then\\)|asynchronous command \\(after elif\\)|subshell ending with asynchronous list|brace grouping ending with asynchronous list)).*$",
         "classification": "runtime-gap",
         "testNames": [
           "deno_task > pipeline > complicated pipeline",
@@ -1795,10 +1795,9 @@
           "if_clause > ported from posix shell tests > command ending with asynchronous command (after then)",
           "if_clause > ported from posix shell tests > command ending with asynchronous command (after elif)",
           "subshell > ported > subshell ending with asynchronous list",
-          "subshell > ported > brace grouping ending with asynchronous list",
-          "subshell > sharp"
+          "subshell > ported > brace grouping ending with asynchronous list"
         ],
-        "reason": "Seven cases exercise background commands (the `&` async operator plus the `wait` builtin), which Cottontail's ported shell interpreter does not implement yet (the parser rejects `&` with \"Background commands \\\"&\\\" are not supported yet.\"). The remaining case (subshell > sharp) runs `bun install` of sharp@0.33.3, which Cottontail delegates to Hutch. All other 375 shell integration cases pass."
+        "reason": "Seven cases exercise background commands (the `&` async operator plus the `wait` builtin), which Cottontail's ported shell interpreter does not implement yet (the parser rejects `&` with \"Background commands \\\"&\\\" are not supported yet.\"). The external package-manager fixture path is covered by the active `subshell > sharp` case; all other 376 shell integration cases pass."
       }
     },
     "test/js/bun/shell/commands/basename.test.ts": {
@@ -1826,9 +1825,8 @@
       "reason": "Bun shell false smoke test passes under Cottontail's current shell wrapper."
     },
     "test/js/bun/shell/commands/ls.test.ts": {
-      "status": "expected-failure",
-      "classification": "delegated",
-      "reason": "The shared describe-level beforeAll runs `${BUN} install` to populate a node_modules tree (react, typescript, eslint, esbuild, ...) that the recursive ls case compares against. Cottontail delegates package installation to Hutch, so `cottontail install` exits 1 by design; the beforeAll throws before any case runs and the whole file fails. The ls builtin itself works (verified independently against touch/mkdir fixtures)."
+      "status": "enabled",
+      "reason": "All 27 ls builtin cases pass (81 assertions). The shared fixture dependency tree is installed by the explicitly selected external package manager before Cottontail exercises recursive listing, formatting, escaping, and error behavior."
     },
     "test/js/bun/shell/commands/mv.test.ts": {
       "status": "enabled",
@@ -4660,7 +4658,7 @@
     },
     "test/regression/issue/20144/20144.test.ts": {
       "status": "enabled",
-      "reason": "The copied SIGINT regression still bounds an infinite-loop child, but uses a 3-second child timeout so a cold Hutch+Cottontail process can compile Bun.cc and establish IPC before the parent sends SIGINT."
+      "reason": "The copied SIGINT regression still bounds an infinite-loop child, but uses a 3-second child timeout so a cold command-adapter plus Cottontail process can compile Bun.cc and establish IPC before the parent sends SIGINT."
     },
     "test/regression/issue/20875.test.ts": {
       "status": "enabled",
@@ -4938,7 +4936,7 @@
     },
     "test/regression/issue/26058.test.ts": {
       "status": "enabled",
-      "reason": "The REPL startup regression retains its copied no-package-download and timing checks (1 case, 4 assertions); Hutch treats repl as a reserved Cottontail runtime command so the facade reaches the implemented REPL instead of package-script lookup."
+      "reason": "The REPL startup regression retains its copied no-package-download and timing checks (1 case, 4 assertions); the compatibility adapter routes the runtime command directly to Cottontail."
     },
     "test/regression/issue/26063.test.ts": {
       "status": "enabled",
@@ -6289,7 +6287,7 @@
     },
     "test/regression/issue/02977.test.ts": {
       "status": "enabled",
-      "reason": "The copied broken-pipe completion regression runs through Hutch; completions is reserved as a Cottontail runtime command so it reaches the implemented completion generator rather than package-script lookup."
+      "reason": "The copied broken-pipe completion regression runs through the compatibility adapter, which routes the runtime command directly to Cottontail."
     },
     "test/regression/issue/04298/04298.test.ts": {
       "status": "enabled",
@@ -6618,8 +6616,8 @@
   },
   "expectedCounts": {
     "runnableFiles": 1342,
-    "enabled": 1318,
-    "expectedFailure": 20,
+    "enabled": 1319,
+    "expectedFailure": 19,
     "skip": 4,
     "cottontailOwned": 1342,
     "upstreamTodoSkipSyntaxSites": 667,

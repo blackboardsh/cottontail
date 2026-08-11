@@ -191,67 +191,38 @@ jobs:
         shell: bash
         run: node scripts/test-js.js
 
-      - name: Restore pinned Hutch compatibility engine
-        id: pinned-hutch
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: .cottontail-local-tools/upstream-hutch
-          key: cottontail-bun-compat-hutch-${{ matrix.platform }}-v1-${{ hashFiles('compat/upstream/hutch.json', 'scripts/setup-upstream-hutch.js', 'scripts/zig-manifest.json') }}
-
-      - name: Build pinned Hutch compatibility engine
-        id: hutch-engine
-        shell: bash
-        run: |
-          hutch_engine="$(node scripts/setup-upstream-hutch.js)"
-          node -e 'const fs = require("node:fs"); const path = process.argv[1]; if (!fs.statSync(path).isFile()) process.exit(1)' "$hutch_engine"
-          node -e 'require("node:fs").appendFileSync(process.env.GITHUB_OUTPUT, `binary=${process.argv[1]}\n`)' "$hutch_engine"
-          if [[ "${{ matrix.os }}" == "windows" ]]; then
-            hutch_job_launcher="$(node scripts/setup-upstream-hutch.js --job-launcher)"
-            node -e 'const fs = require("node:fs"); const path = process.argv[1]; if (!fs.statSync(path).isFile()) process.exit(1)' "$hutch_job_launcher"
-            node -e 'require("node:fs").appendFileSync(process.env.GITHUB_OUTPUT, `job_launcher=${process.argv[1]}\n`)' "$hutch_job_launcher"
-          fi
-
       - name: Validate upstream runner contracts on Windows
         if: matrix.os == 'windows'
         env:
-          COTTONTAIL_UPSTREAM_JOB_LAUNCHER: ${{ steps.hutch-engine.outputs.job_launcher }}
+          COTTONTAIL_UPSTREAM_JOB_LAUNCHER: zig-out/bin/cottontail-bun-compat-job.exe
         run: node --test tests/upstream-runner.test.mjs
-
-      - name: Save pinned Hutch compatibility engine
-        if: steps.pinned-hutch.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: .cottontail-local-tools/upstream-hutch
-          key: cottontail-bun-compat-hutch-${{ matrix.platform }}-v1-${{ hashFiles('compat/upstream/hutch.json', 'scripts/setup-upstream-hutch.js', 'scripts/zig-manifest.json') }}
 
       - name: Verify Windows Job Object lifecycle
         if: matrix.os == 'windows'
         env:
-          COTTONTAIL_TEST_WINDOWS_JOB_LAUNCHER: ${{ steps.hutch-engine.outputs.job_launcher }}
+          COTTONTAIL_TEST_WINDOWS_JOB_LAUNCHER: zig-out/bin/cottontail-bun-compat-job.exe
         run: node --test scripts/windows-job-child.test.js
 
       - name: Run complete Cottontail-owned Bun compatibility tier
-        env:
-          HUTCH_ENGINE: ${{ steps.hutch-engine.outputs.binary }}
-          HUTCH_JOB_LAUNCHER: ${{ steps.hutch-engine.outputs.job_launcher }}
         shell: bash
         run: |
+          command_adapter="$(node -e 'const path = require("node:path"); console.log(path.resolve("zig-out", "bin", process.platform === "win32" ? "cottontail-upstream-command.exe" : "cottontail-upstream-command"))')"
+          package_manager="$(bun -e 'console.log(process.execPath)')"
           job_launcher_args=()
           if [[ "${{ matrix.os }}" == "windows" ]]; then
-            job_launcher_args=(--job-launcher "$HUTCH_JOB_LAUNCHER")
+            job_launcher_args=(--job-launcher zig-out/bin/cottontail-bun-compat-job.exe)
           fi
-          node scripts/run-upstream-tests.js bun --hutch "$HUTCH_ENGINE" "${job_launcher_args[@]}"
+          node scripts/run-upstream-tests.js bun --command-adapter "$command_adapter" --package-manager "$package_manager" "${job_launcher_args[@]}"
 
-      - name: Run Hutch-backed split bundler cases
-        env:
-          HUTCH_ENGINE: ${{ steps.hutch-engine.outputs.binary }}
-          HUTCH_JOB_LAUNCHER: ${{ steps.hutch-engine.outputs.job_launcher }}
+      - name: Run external-package-manager split bundler fixtures
         shell: bash
         run: |
+          command_adapter="$(node -e 'const path = require("node:path"); console.log(path.resolve("zig-out", "bin", process.platform === "win32" ? "cottontail-upstream-command.exe" : "cottontail-upstream-command"))')"
+          package_manager="$(bun -e 'console.log(process.execPath)')"
           job_launcher_args=()
           if [[ "${{ matrix.os }}" == "windows" ]]; then
-            job_launcher_args=(--job-launcher "$HUTCH_JOB_LAUNCHER")
+            job_launcher_args=(--job-launcher zig-out/bin/cottontail-bun-compat-job.exe)
           fi
-          node scripts/run-upstream-tests.js bun --hutch "$HUTCH_ENGINE" "${job_launcher_args[@]}" --test test/bundler/bundler_defer.test.ts --case '^\$file$' --expect-pass --jobs 1
-          node scripts/run-upstream-tests.js bun --hutch "$HUTCH_ENGINE" "${job_launcher_args[@]}" --test test/bundler/bundler_npm.test.ts --case '^npm/ReactSSR$' --expect-pass --jobs 1
-          node scripts/run-upstream-tests.js bun --hutch "$HUTCH_ENGINE" "${job_launcher_args[@]}" --test test/bundler/bundler_npm.test.ts --case '^npm/LodashES$' --expect-pass --jobs 1
+          node scripts/run-upstream-tests.js bun --command-adapter "$command_adapter" --package-manager "$package_manager" "${job_launcher_args[@]}" --test test/bundler/bundler_defer.test.ts --case '^\$file$' --expect-pass --jobs 1
+          node scripts/run-upstream-tests.js bun --command-adapter "$command_adapter" --package-manager "$package_manager" "${job_launcher_args[@]}" --test test/bundler/bundler_npm.test.ts --case '^npm/ReactSSR$' --expect-pass --jobs 1
+          node scripts/run-upstream-tests.js bun --command-adapter "$command_adapter" --package-manager "$package_manager" "${job_launcher_args[@]}" --test test/bundler/bundler_npm.test.ts --case '^npm/LodashES$' --expect-pass --jobs 1

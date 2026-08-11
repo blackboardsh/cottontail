@@ -41,11 +41,14 @@ let binaryPath = resolve(
   process.env.COTTONTAIL_UPSTREAM_BINARY ??
     join('zig-out', 'bin', process.platform === 'win32' ? 'cottontail.exe' : 'cottontail'),
 );
-let hutchPath = null;
+let commandAdapterPath = null;
+let packageManagerPath = null;
 let binarySourcePath = null;
 let binarySourceHash = null;
-let hutchSourcePath = null;
-let hutchSourceHash = null;
+let commandAdapterSourcePath = null;
+let commandAdapterSourceHash = null;
+let packageManagerSourcePath = null;
+let packageManagerSourceHash = null;
 let windowsJobLauncherPath = null;
 let windowsJobLauncherSourcePath = null;
 let windowsJobLauncherSourceHash = null;
@@ -66,7 +69,7 @@ const windowsJobTerminationTimeoutMs = 3500;
 const windowsJobTerminatorWatchdogMs = 4000;
 const defaultBunJobs = Math.max(1, Math.min(4, os.availableParallelism?.() ?? os.cpus().length));
 const binaryPreflightPrefix = 'COTTONTAIL_UPSTREAM_BINARY_PREFLIGHT:';
-const hutchPreflightPrefix = 'COTTONTAIL_HUTCH_ENGINE_PREFLIGHT:';
+const commandAdapterPreflightPrefix = 'COTTONTAIL_COMMAND_ADAPTER_PREFLIGHT:';
 const binaryPreflightTimeoutMs = 15000;
 const defaultNodeSelectorChunkChars = 16 * 1024;
 const nodeHarnessInventoryPrefix = 'COTTONTAIL_NODE_HARNESS_INVENTORY:';
@@ -317,16 +320,14 @@ const scrubbedEnvironmentKeys = new Set([
     'COTTONTAIL_RUNTIME_MODULES_DIR',
     'COTTONTAIL_SPAWN_ARGV0',
     'COTTONTAIL_SPAWN_EXEC_PATH',
+    'COTTONTAIL_UPSTREAM_COMMAND_ADAPTER',
+    'COTTONTAIL_UPSTREAM_PACKAGE_MANAGER',
     'COTTONTAIL_UPSTREAM_RUNNER_TEST_NODE_OPTIONS',
-    'DASH_COTTONTAIL',
     'DYLD_FALLBACK_FRAMEWORK_PATH',
     'DYLD_FALLBACK_LIBRARY_PATH',
     'DYLD_FRAMEWORK_PATH',
     'DYLD_INSERT_LIBRARIES',
     'DYLD_LIBRARY_PATH',
-    'HUTCH_ACTIVE_CHANNEL',
-    'HUTCH_LAUNCHER_PATH',
-    'HUTCH_LAUNCHER_VERSION',
     'LD_LIBRARY_PATH',
     'LD_PRELOAD',
     'NODE_OPTIONS',
@@ -487,11 +488,17 @@ function pinSelectedExecutables() {
   binarySourcePath = binary.sourcePath;
   binarySourceHash = binary.sourceHash;
   binaryPath = binary.pinnedPath;
-  if (hutchPath != null) {
-    const hutch = pinExecutable(hutchPath, 'Hutch engine');
-    hutchSourcePath = hutch.sourcePath;
-    hutchSourceHash = hutch.sourceHash;
-    hutchPath = hutch.pinnedPath;
+  if (commandAdapterPath != null) {
+    const adapter = pinExecutable(commandAdapterPath, 'upstream command adapter');
+    commandAdapterSourcePath = adapter.sourcePath;
+    commandAdapterSourceHash = adapter.sourceHash;
+    commandAdapterPath = adapter.pinnedPath;
+  }
+  if (packageManagerPath != null) {
+    const packageManager = pinExecutable(packageManagerPath, 'upstream package manager');
+    packageManagerSourcePath = packageManager.sourcePath;
+    packageManagerSourceHash = packageManager.sourceHash;
+    packageManagerPath = packageManager.pinnedPath;
   }
   if (windowsJobLauncherPath != null) {
     const jobLauncher = pinExecutable(windowsJobLauncherPath, 'Windows Job Object launcher');
@@ -796,10 +803,14 @@ function makeRunIdentity(runtime, targets, options) {
     binaryHash: hashFile(binaryPath),
     binarySourcePath,
     binarySourceHash,
-    hutchPath: hutchPath == null ? null : realpathSync(hutchPath),
-    hutchHash: hutchPath == null ? null : hashFile(hutchPath),
-    hutchSourcePath,
-    hutchSourceHash,
+    commandAdapterPath: commandAdapterPath == null ? null : realpathSync(commandAdapterPath),
+    commandAdapterHash: commandAdapterPath == null ? null : hashFile(commandAdapterPath),
+    commandAdapterSourcePath,
+    commandAdapterSourceHash,
+    packageManagerPath: packageManagerPath == null ? null : realpathSync(packageManagerPath),
+    packageManagerHash: packageManagerPath == null ? null : hashFile(packageManagerPath),
+    packageManagerSourcePath,
+    packageManagerSourceHash,
     windowsJobLauncherPath: windowsJobLauncherPath == null
       ? null
       : realpathSync(windowsJobLauncherPath),
@@ -1150,17 +1161,9 @@ class JavaScriptBaselineReporter {
   }
 }
 
-function validateHutchEnginePath(path) {
-  if (!existsSync(path)) fail(`Hutch engine not found at ${path}.`);
-  if (!statSync(path).isFile()) fail(`Hutch engine is not a file: ${path}.`);
-  const requestedName = basename(path).toLowerCase();
-  const resolvedName = basename(realpathSync(path)).toLowerCase();
-  const outerName = process.platform === 'win32' ? 'hutch.exe' : 'hutch';
-  if (requestedName === outerName || resolvedName === outerName) {
-    fail(
-      `--hutch must point directly to a Hutch engine, not the outer Hutch launcher: ${path}`
-    );
-  }
+function validateExecutablePath(path, label) {
+  if (!existsSync(path)) fail(`${label} not found at ${path}.`);
+  if (!statSync(path).isFile()) fail(`${label} is not a file: ${path}.`);
 }
 
 function probeWindowsJobLauncher() {
@@ -1195,8 +1198,8 @@ function probeWindowsJobLauncher() {
   }
 }
 
-async function preflightHutchEngine() {
-  if (hutchPath == null) return;
+async function preflightCommandAdapter() {
+  if (commandAdapterPath == null || packageManagerPath == null) return;
   const source = `
 const record = {
   answer: 6 * 7,
@@ -1204,66 +1207,67 @@ const record = {
   productVersion: typeof globalThis.cottontail?.processInfo === "function"
     ? String(globalThis.cottontail.processInfo("version"))
     : null,
-  launcherPath: globalThis.process?.env?.HUTCH_LAUNCHER_PATH ?? null,
-  launcherVersion: globalThis.process?.env?.HUTCH_LAUNCHER_VERSION ?? null,
-  activeChannel: globalThis.process?.env?.HUTCH_ACTIVE_CHANNEL ?? null,
   cottontailBinary: globalThis.process?.env?.COTTONTAIL_BINARY ?? null,
-  dashCottontail: globalThis.process?.env?.DASH_COTTONTAIL ?? null,
+  packageManager: globalThis.process?.env?.COTTONTAIL_UPSTREAM_PACKAGE_MANAGER ?? null,
 };
-console.log(${JSON.stringify(hutchPreflightPrefix)} + JSON.stringify(record));
+console.log(${JSON.stringify(commandAdapterPreflightPrefix)} + JSON.stringify(record));
 `;
-  const result = await spawnCapturedAsync(hutchPath, ['--eval', source], {
+  const result = await spawnCapturedAsync(commandAdapterPath, ['--eval', source], {
     cwd: rootDir,
     env: {
       ...immutableBinaryEnvironment(),
       COTTONTAIL_BINARY: binaryPath,
-      DASH_COTTONTAIL: binaryPath,
+      COTTONTAIL_UPSTREAM_PACKAGE_MANAGER: packageManagerPath,
       COTTONTAIL_UPSTREAM_PREFLIGHT: '1',
     },
   }, null, binaryPreflightTimeoutMs);
   const details = binaryPreflightDetails(result);
   if (result.error?.code === 'ETIMEDOUT') {
-    fail(`Hutch engine preflight timed out after ${binaryPreflightTimeoutMs}ms: ${hutchPath}`);
+    fail(`Command adapter preflight timed out after ${binaryPreflightTimeoutMs}ms: ${commandAdapterPath}`);
   }
-  if (result.error) fail(`Hutch engine preflight failed to start ${hutchPath}: ${result.error.message}`);
+  if (result.error) fail(`Command adapter preflight failed to start ${commandAdapterPath}: ${result.error.message}`);
   if (result.status !== 0) {
     fail([
-      `Hutch engine preflight exited ${result.status ?? 1}: ${hutchPath}`,
+      `Command adapter preflight exited ${result.status ?? 1}: ${commandAdapterPath}`,
       details,
     ].filter(Boolean).join('\n'));
   }
   const line = String(result.stdout ?? '')
     .split(/\r?\n/)
-    .find((candidate) => candidate.startsWith(hutchPreflightPrefix));
+    .find((candidate) => candidate.startsWith(commandAdapterPreflightPrefix));
   if (!line) {
     fail([
-      `--hutch is not a working Hutch engine (missing routed identity record): ${hutchPath}`,
+      `--command-adapter did not route to Cottontail: ${commandAdapterPath}`,
       details,
     ].filter(Boolean).join('\n'));
   }
   let record;
   try {
-    record = JSON.parse(line.slice(hutchPreflightPrefix.length));
+    record = JSON.parse(line.slice(commandAdapterPreflightPrefix.length));
   } catch (error) {
-    fail(`Hutch engine preflight emitted invalid identity JSON: ${error.message}`);
+    fail(`Command adapter preflight emitted invalid identity JSON: ${error.message}`);
   }
   const valid = record?.answer === 42 &&
     typeof record.cottontailVersion === 'string' &&
     record.cottontailVersion.length > 0 &&
     record.cottontailVersion === record.productVersion &&
-    record.launcherPath === null &&
-    record.launcherVersion === null &&
-    record.activeChannel === null &&
     record.cottontailBinary === binaryPath &&
-    record.dashCottontail === binaryPath;
+    record.packageManager === packageManagerPath;
   if (!valid) {
-    const launcherHint = record?.launcherPath != null
-      ? ' The outer Hutch launcher was selected; pass hutch-engine instead.'
-      : '';
     fail(
-      `--hutch is not a working direct Hutch engine: ${hutchPath}.${launcherHint}\n` +
+      `--command-adapter is not a working Cottontail command adapter: ${commandAdapterPath}.\n` +
       `received: ${JSON.stringify(record)}`
     );
+  }
+
+  const packageManager = spawnSync(packageManagerPath, ['--version'], {
+    cwd: rootDir,
+    env: immutableBinaryEnvironment(),
+    encoding: 'utf8',
+    timeout: binaryPreflightTimeoutMs,
+  });
+  if (packageManager.error || packageManager.status !== 0) {
+    fail(`External package manager preflight failed: ${packageManagerPath}`);
   }
 }
 
@@ -1364,7 +1368,8 @@ function usage() {
     'Options:',
     '  --binary <path>              Use an immutable Cottontail executable for this run.',
     '  --expect-pass                Require a focused selection to pass, including recorded xfails.',
-    '  --hutch <path>               Use a pinned hutch-engine for the optional composed baseline.',
+    '  --command-adapter <path>      Route runtime commands to Cottontail and fixture installs externally.',
+    '  --package-manager <path>      Use this external executable for fixture package commands.',
     '  --job-launcher <path>         Use the native Windows Job Object launcher.',
     '  --include-expected-failures  Run tests marked expected-failure and require them to fail.',
     '  --case <regexp>              Select generated itBundled case IDs within a split file.',
@@ -1384,7 +1389,8 @@ function usage() {
     'Snapshot overrides:',
     '  COTTONTAIL_UPSTREAM_TARGETS_PATH   Read target metadata from this JSON file.',
     '  COTTONTAIL_UPSTREAM_BUN_SNAPSHOT   Run against an externally managed Bun snapshot.',
-    '  COTTONTAIL_UPSTREAM_HUTCH_BINARY   Optional composed-baseline hutch-engine.',
+    '  COTTONTAIL_UPSTREAM_COMMAND_ADAPTER  Test-only runtime/package command adapter.',
+    '  COTTONTAIL_UPSTREAM_PACKAGE_MANAGER External package manager used only for fixtures.',
     '  COTTONTAIL_UPSTREAM_JOB_LAUNCHER   Required native Job Object launcher on Windows.',
     '  COTTONTAIL_BASELINE_REPORTS_DIR    Default parent for durable baseline suite reports.',
     '  COTTONTAIL_BASELINE_HEARTBEAT_MS   Live heartbeat interval (default: 30000).',
@@ -1425,7 +1431,8 @@ function parseArgs(argv) {
   const options = {
     includeExpectedFailures: false,
     expectPass: false,
-    hutch: null,
+    commandAdapter: null,
+    packageManager: null,
     jobLauncher: process.env.COTTONTAIL_UPSTREAM_JOB_LAUNCHER ?? null,
     list: false,
     maxFailures: Infinity,
@@ -1449,8 +1456,10 @@ function parseArgs(argv) {
       options.includeExpectedFailures = true;
     } else if (arg === '--expect-pass') {
       options.expectPass = true;
-    } else if (arg === '--hutch') {
-      options.hutch = args.shift() ?? fail('--hutch requires a path');
+    } else if (arg === '--command-adapter') {
+      options.commandAdapter = args.shift() ?? fail('--command-adapter requires a path');
+    } else if (arg === '--package-manager') {
+      options.packageManager = args.shift() ?? fail('--package-manager requires a path');
     } else if (arg === '--job-launcher') {
       options.jobLauncher = args.shift() ?? fail('--job-launcher requires a path');
     } else if (arg === '--binary') {
@@ -1919,15 +1928,14 @@ function makeEnv(runtime, target, runTemp = tempRoot, overrides = undefined) {
     COTTONTAIL_UPSTREAM_VERSION: target.version,
     COTTONTAIL_REPO_ROOT: rootDir,
     ...safeOverrides,
-    ...(hutchPath ? {
-      // The test itself remains a direct Cottontail process. Present Hutch's
-      // command engine as Bun's CLI executable so package setup stays on the
-      // build-tool side while runtime children route back to Cottontail. The
-      // outer Hutch version/pragma launcher is deliberately not involved.
-      COTTONTAIL_SPAWN_EXEC_PATH: hutchPath,
-      COTTONTAIL_SPAWN_ARGV0: hutchPath,
+    ...(commandAdapterPath ? {
+      // The test itself remains a direct Cottontail process. Nested runtime
+      // commands return to Cottontail, while the test-only adapter sends only
+      // package fixture commands to the explicitly selected external manager.
+      COTTONTAIL_SPAWN_EXEC_PATH: commandAdapterPath,
+      COTTONTAIL_SPAWN_ARGV0: commandAdapterPath,
       COTTONTAIL_BINARY: binaryPath,
-      DASH_COTTONTAIL: binaryPath,
+      COTTONTAIL_UPSTREAM_PACKAGE_MANAGER: packageManagerPath,
     } : {}),
   };
 }
@@ -1961,12 +1969,11 @@ async function prepareBunTestDependencies(entries, snapshotRoot) {
     const setupArgs = [setupScript, '--snapshot', snapshotRoot];
     const setupEnvironment = immutableBinaryEnvironment();
     if (scriptName === 'setup-upstream-svelte.js') {
-      if (hutchPath == null) {
-        fail(`Svelte fixture preparation requires --hutch for ${testPath}.`);
+      if (packageManagerPath == null) {
+        fail(`Svelte fixture preparation requires --package-manager for ${testPath}.`);
       }
-      setupArgs.push('--hutch', hutchPath);
-      setupEnvironment.COTTONTAIL_BINARY = binaryPath;
-      setupEnvironment.DASH_COTTONTAIL = binaryPath;
+      setupArgs.push('--package-manager', packageManagerPath);
+      setupEnvironment.COTTONTAIL_UPSTREAM_PACKAGE_MANAGER = packageManagerPath;
     }
     const result = await spawnCapturedAsync(process.execPath, setupArgs, {
       cwd: rootDir,
@@ -2891,10 +2898,18 @@ if (options.binary != null) binaryPath = resolve(rootDir, options.binary);
 if (process.platform === 'win32' && options.jobLauncher != null) {
   windowsJobLauncherPath = resolve(rootDir, options.jobLauncher);
 }
-const configuredHutchPath = options.hutch ?? process.env.COTTONTAIL_UPSTREAM_HUTCH_BINARY;
-if (configuredHutchPath != null) {
-  hutchPath = resolve(rootDir, configuredHutchPath);
-  validateHutchEnginePath(hutchPath);
+const configuredCommandAdapter = options.commandAdapter ??
+  process.env.COTTONTAIL_UPSTREAM_COMMAND_ADAPTER;
+const configuredPackageManager = options.packageManager ??
+  process.env.COTTONTAIL_UPSTREAM_PACKAGE_MANAGER;
+if ((configuredCommandAdapter == null) !== (configuredPackageManager == null)) {
+  fail('--command-adapter and --package-manager must be configured together.');
+}
+if (configuredCommandAdapter != null) {
+  commandAdapterPath = resolve(rootDir, configuredCommandAdapter);
+  packageManagerPath = resolve(rootDir, configuredPackageManager);
+  validateExecutablePath(commandAdapterPath, 'Upstream command adapter');
+  validateExecutablePath(packageManagerPath, 'External package manager');
 }
 if (!existsSync(targetsPath)) fail(`Missing ${targetsPath}`);
 const targets = readJson(targetsPath);
@@ -2916,7 +2931,7 @@ if (!options.list) {
   pinSelectedExecutables();
   probeWindowsJobLauncher();
   await preflightBinary();
-  await preflightHutchEngine();
+  await preflightCommandAdapter();
   for (const name of runtimeTargets(runtime, targets)) {
     if (name === 'node') {
       await prepareNodeHarnessInventory(targetSnapshotRoot(name, targets[name]));

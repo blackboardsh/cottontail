@@ -23,11 +23,11 @@ The macOS baseline contains 1,342 runnable Bun-derived files:
 
 | Classification | Count |
 | --- | ---: |
-| Enabled Cottontail JavaScript baseline files | 1,318 |
-| Whole-file expected failures | 20 |
+| Enabled Cottontail JavaScript baseline files | 1,319 |
+| Whole-file expected failures | 19 |
 | Deliberately out of scope | 4 |
 
-There are also 30 explicitly named test-case exclusions and four expected
+There are also 29 explicitly named test-case exclusions and five expected
 failures among individually split bundler cases. These remain visible
 exceptions; they are not part of the zero-unexpected-failure target. An
 unexpected pass is still a result that must be reviewed rather than silently

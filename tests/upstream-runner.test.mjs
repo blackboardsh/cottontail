@@ -30,7 +30,7 @@ function createFixture(t) {
   const bunSnapshotRoot = join(fixtureRoot, "bun-snapshot");
   const capturePath = join(fixtureRoot, "harness-invocations.jsonl");
   const bunCapturePath = join(fixtureRoot, "bun-invocations.jsonl");
-  const hutchCapturePath = join(fixtureRoot, "hutch-invocations.jsonl");
+  const packageManagerCapturePath = join(fixtureRoot, "package-manager-invocations.jsonl");
   const environmentCapturePath = join(fixtureRoot, "harness-environment.jsonl");
   const reportsRoot = join(fixtureRoot, "reports");
   const locksRoot = join(fixtureRoot, "locks");
@@ -43,11 +43,16 @@ function createFixture(t) {
       ? `cottontail-test-${basename(fixtureRoot)}.cmd`
       : `cottontail-test-${basename(fixtureRoot)}`,
   );
-  const hutchEnginePath = join(
+  const commandAdapterPath = join(
     fixtureRoot,
-    process.platform === "win32" ? "hutch-engine.cmd" : "hutch-engine",
+    process.platform === "win32" ? "command-adapter.cmd" : "command-adapter",
   );
-  const hutchEngineDriverPath = join(fixtureRoot, "hutch-engine-driver.cjs");
+  const commandAdapterDriverPath = join(fixtureRoot, "command-adapter-driver.cjs");
+  const packageManagerPath = join(
+    fixtureRoot,
+    process.platform === "win32" ? "package-manager.cmd" : "package-manager",
+  );
+  const packageManagerDriverPath = join(fixtureRoot, "package-manager-driver.cjs");
   t.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
 
   const testPaths = [
@@ -132,10 +137,7 @@ function createFixture(t) {
       "                'spawnExecPath': os.environ.get('COTTONTAIL_SPAWN_EXEC_PATH'),",
       "                'spawnArgv0': os.environ.get('COTTONTAIL_SPAWN_ARGV0'),",
       "                'cottontailBinary': os.environ.get('COTTONTAIL_BINARY'),",
-      "                'dashCottontail': os.environ.get('DASH_COTTONTAIL'),",
-      "                'hutchLauncherPath': os.environ.get('HUTCH_LAUNCHER_PATH'),",
-      "                'hutchLauncherVersion': os.environ.get('HUTCH_LAUNCHER_VERSION'),",
-      "                'hutchActiveChannel': os.environ.get('HUTCH_ACTIVE_CHANNEL'),",
+      "                'packageManager': os.environ.get('COTTONTAIL_UPSTREAM_PACKAGE_MANAGER'),",
       "                'loaderVars': sorted(key for key in os.environ if (",
       "                    key.upper() in {'BUN_OPTIONS', 'NODE_OPTIONS', 'NODE_PATH'} or",
       "                    key.upper().startswith(('DYLD_', 'LD_'))",
@@ -193,9 +195,7 @@ function createFixture(t) {
         "if (capturePath) fs.appendFileSync(capturePath, JSON.stringify({",
         "  ...record,",
         "  at: Date.now(),",
-        "  hutchLauncherPath: process.env.HUTCH_LAUNCHER_PATH ?? null,",
-        "  hutchLauncherVersion: process.env.HUTCH_LAUNCHER_VERSION ?? null,",
-        "  hutchActiveChannel: process.env.HUTCH_ACTIVE_CHANNEL ?? null,",
+        "  packageManager: process.env.COTTONTAIL_UPSTREAM_PACKAGE_MANAGER ?? null,",
         "  temp: Object.fromEntries([",
         "    'COTTONTAIL_TMP_DIR', 'BUN_TMPDIR', 'TEST_TMPDIR', 'TMPDIR', 'TMP', 'TEMP',",
         "  ].map(key => [key, process.env[key] ?? null])),",
@@ -303,21 +303,14 @@ function createFixture(t) {
     ].join("\n"),
   );
   writeFileSync(
-    hutchEngineDriverPath,
+    commandAdapterDriverPath,
     [
       'const { spawnSync } = require("node:child_process");',
-      'const { appendFileSync, mkdirSync } = require("node:fs");',
-      'const { join } = require("node:path");',
-      'if (process.argv[2] === "install") {',
-      '  appendFileSync(process.env.COTTONTAIL_RUNNER_HUTCH_CAPTURE, JSON.stringify({',
-      '    cottontailBinary: process.env.COTTONTAIL_BINARY ?? null,',
-      '    dashCottontail: process.env.DASH_COTTONTAIL ?? null,',
-      '    hutchLauncherPath: process.env.HUTCH_LAUNCHER_PATH ?? null,',
-      '  }) + "\\n");',
-      '  mkdirSync(join(process.cwd(), "node_modules", "svelte", "compiler"), { recursive: true });',
-      '  process.exit(0);',
-      '}',
-      'const result = spawnSync(process.env.COTTONTAIL_BINARY, process.argv.slice(2), {',
+      'const packageCommands = new Set(["add", "audit", "create", "i", "install", "link", "outdated", "patch", "pm", "publish", "remove", "rm", "uninstall", "unlink", "update", "upgrade", "x"]);',
+      'const target = packageCommands.has(process.argv[2])',
+      '  ? process.env.COTTONTAIL_UPSTREAM_PACKAGE_MANAGER',
+      '  : process.env.COTTONTAIL_BINARY;',
+      'const result = spawnSync(target, process.argv.slice(2), {',
       '  env: process.env,',
       '  stdio: "inherit",',
       '});',
@@ -326,18 +319,41 @@ function createFixture(t) {
       '',
     ].join("\n"),
   );
+  writeFileSync(
+    packageManagerDriverPath,
+    [
+      'const { appendFileSync, mkdirSync } = require("node:fs");',
+      'const { join } = require("node:path");',
+      'if (process.argv[2] === "--version") { console.log("1.3.10-test"); process.exit(0); }',
+      'appendFileSync(process.env.COTTONTAIL_RUNNER_PACKAGE_MANAGER_CAPTURE, JSON.stringify({',
+      '  command: process.argv.slice(2),',
+      '  packageManager: process.env.COTTONTAIL_UPSTREAM_PACKAGE_MANAGER ?? null,',
+      '}) + "\\n");',
+      'if (process.argv[2] === "install") {',
+      '  mkdirSync(join(process.cwd(), "node_modules", "svelte", "compiler"), { recursive: true });',
+      '  process.exit(0);',
+      '}',
+      'process.exit(1);',
+      '',
+    ].join("\n"),
+  );
 
   if (process.platform === "win32") {
     const nodePath = process.execPath.replaceAll("%", "%%");
     const shimPath = preflightShimPath.replaceAll("%", "%%");
-    const hutchDriver = hutchEngineDriverPath.replaceAll("%", "%%");
+    const adapterDriver = commandAdapterDriverPath.replaceAll("%", "%%");
+    const packageManagerDriver = packageManagerDriverPath.replaceAll("%", "%%");
     writeFileSync(
       cottontailBinaryPath,
       `@echo off\r\nif "%COTTONTAIL_UPSTREAM_PREFLIGHT%"=="1" set "NODE_OPTIONS=--require=\\"${shimPath}\\""\r\n"${nodePath}" %*\r\n`,
     );
     writeFileSync(
-      hutchEnginePath,
-      `@echo off\r\n"${nodePath}" "${hutchDriver}" %*\r\n`,
+      commandAdapterPath,
+      `@echo off\r\n"${nodePath}" "${adapterDriver}" %*\r\n`,
+    );
+    writeFileSync(
+      packageManagerPath,
+      `@echo off\r\n"${nodePath}" "${packageManagerDriver}" %*\r\n`,
     );
   } else {
     writeFileSync(
@@ -359,16 +375,25 @@ function createFixture(t) {
       ].join("\n"),
     );
     writeFileSync(
-      hutchEnginePath,
+      commandAdapterPath,
       [
         "#!/usr/bin/env node",
-        `require(${JSON.stringify(hutchEngineDriverPath)});`,
+        `require(${JSON.stringify(commandAdapterDriverPath)});`,
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      packageManagerPath,
+      [
+        "#!/usr/bin/env node",
+        `require(${JSON.stringify(packageManagerDriverPath)});`,
         "",
       ].join("\n"),
     );
   }
   chmodSync(cottontailBinaryPath, 0o755);
-  chmodSync(hutchEnginePath, 0o755);
+  chmodSync(commandAdapterPath, 0o755);
+  chmodSync(packageManagerPath, 0o755);
 
   return {
     bunCapturePath,
@@ -376,10 +401,11 @@ function createFixture(t) {
     capturePath,
     cottontailBinaryPath,
     environmentCapturePath,
-    hutchCapturePath,
-    hutchEnginePath,
+    commandAdapterPath,
     locksRoot,
     preflightShimPath,
+    packageManagerCapturePath,
+    packageManagerPath,
     reportsRoot,
     stateRoot,
     snapshotRoot,
@@ -399,7 +425,7 @@ function runRunner(fixture, args, {
     COTTONTAIL_UPSTREAM_TARGETS_PATH: fixture.targetsPath,
     COTTONTAIL_RUNNER_TEST_CAPTURE: fixture.capturePath,
     COTTONTAIL_RUNNER_BUN_CAPTURE: fixture.bunCapturePath,
-    COTTONTAIL_RUNNER_HUTCH_CAPTURE: fixture.hutchCapturePath,
+    COTTONTAIL_RUNNER_PACKAGE_MANAGER_CAPTURE: fixture.packageManagerCapturePath,
     COTTONTAIL_BASELINE_REPORTS_DIR: fixture.reportsRoot,
     COTTONTAIL_BASELINE_LOCK_DIR: fixture.locksRoot,
     COTTONTAIL_BASELINE_STATE_DIR: fixture.stateRoot,
@@ -570,17 +596,21 @@ test("a healed Node expected-failure chunk is reported explicitly as XPASS", (t)
   assert.match(result.stdout, /XPASS Node harness chunk 2\/2/);
 });
 
-test("Hutch is exposed as the CLI while Cottontail remains the test runtime", (t) => {
+test("the command adapter preserves Cottontail runtime identity", (t) => {
   const fixture = createFixture(t);
   const result = runRunner(
     fixture,
-    ["--hutch", fixture.hutchEnginePath, "--match", "^test/parallel/test-alpha\\.js$"],
+    [
+      "--command-adapter",
+      fixture.commandAdapterPath,
+      "--package-manager",
+      fixture.packageManagerPath,
+      "--match",
+      "^test/parallel/test-alpha\\.js$",
+    ],
     {
       environment: {
         COTTONTAIL_RUNNER_TEST_ENV_CAPTURE: fixture.environmentCapturePath,
-        HUTCH_LAUNCHER_PATH: "/wrong/outer/hutch",
-        HUTCH_LAUNCHER_VERSION: "wrong-version",
-        HUTCH_ACTIVE_CHANNEL: "wrong-channel",
         bUn_OpTiOnS: "--smol",
         dYlD_iNsErT_LiBrArIeS: "/not-loaded.dylib",
         dYlD_rOoT_pAtH: "/not-loaded-root",
@@ -593,24 +623,23 @@ test("Hutch is exposed as the CLI while Cottontail remains the test runtime", (t
   );
   assertSucceeded(result);
   const [environment] = readInvocations(fixture.environmentCapturePath);
-  assert.equal(basename(environment.spawnExecPath), basename(fixture.hutchEnginePath));
+  assert.equal(basename(environment.spawnExecPath), basename(fixture.commandAdapterPath));
   assert.equal(environment.spawnArgv0, environment.spawnExecPath);
   assert.equal(basename(environment.cottontailBinary), basename(fixture.cottontailBinaryPath));
-  assert.equal(environment.dashCottontail, environment.cottontailBinary);
-  assert.equal(environment.hutchLauncherPath, null);
-  assert.equal(environment.hutchLauncherVersion, null);
-  assert.equal(environment.hutchActiveChannel, null);
+  assert.equal(basename(environment.packageManager), basename(fixture.packageManagerPath));
   assert.deepEqual(environment.loaderVars, []);
 });
 
-test("Svelte fixture installation uses the runner-pinned Cottontail binary", (t) => {
+test("Svelte fixture installation uses the runner-pinned external package manager", (t) => {
   const fixture = createFixture(t);
   const poisonedBinary = join(dirname(fixture.targetsPath), "unpublished-canary-cottontail");
   const result = runRunner(
     fixture,
     [
-      "--hutch",
-      fixture.hutchEnginePath,
+      "--command-adapter",
+      fixture.commandAdapterPath,
+      "--package-manager",
+      fixture.packageManagerPath,
       "--test",
       "test/integration/svelte/client-side.test.ts",
     ],
@@ -618,34 +647,29 @@ test("Svelte fixture installation uses the runner-pinned Cottontail binary", (t)
       runtime: "bun",
       environment: {
         COTTONTAIL_BINARY: poisonedBinary,
-        DASH_COTTONTAIL: poisonedBinary,
-        HUTCH_LAUNCHER_PATH: "/wrong/outer/hutch",
+        COTTONTAIL_UPSTREAM_PACKAGE_MANAGER: poisonedBinary,
       },
     },
   );
   assertSucceeded(result);
 
-  const [install] = readJsonLines(fixture.hutchCapturePath);
-  assert.ok(install, "expected the selected Hutch engine to install the Svelte fixture");
-  assert.equal(install.cottontailBinary, install.dashCottontail);
-  assert.equal(basename(install.cottontailBinary), basename(fixture.cottontailBinaryPath));
-  assert.notEqual(install.cottontailBinary, poisonedBinary);
-  assert.equal(install.hutchLauncherPath, null);
+  const [install] = readJsonLines(fixture.packageManagerCapturePath);
+  assert.ok(install, "expected the selected external manager to install the Svelte fixture");
+  assert.deepEqual(install.command, ["install"]);
+  assert.equal(basename(install.packageManager), basename(fixture.packageManagerPath));
+  assert.notEqual(install.packageManager, poisonedBinary);
 });
 
-test("the outer Hutch launcher is rejected clearly", (t) => {
+test("the command adapter and external package manager must be selected together", (t) => {
   const fixture = createFixture(t);
-  const outerHutchPath = join(dirname(fixture.targetsPath), process.platform === "win32" ? "hutch.exe" : "hutch");
-  copyFileSync(process.execPath, outerHutchPath);
-  chmodSync(outerHutchPath, 0o755);
   const result = runRunner(fixture, [
-    "--hutch",
-    outerHutchPath,
+    "--command-adapter",
+    fixture.commandAdapterPath,
     "--match",
     "^test/parallel/test-alpha\\.js$",
   ]);
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /must point directly to a Hutch engine, not the outer Hutch launcher/);
+  assert.match(result.stderr, /--command-adapter and --package-manager must be configured together/);
   assert.deepEqual(readInvocations(fixture.capturePath), []);
 });
 
@@ -893,9 +917,6 @@ test("Bun-derived tests report completion order, heartbeat, durable events, and 
       runtime: "bun",
       environment: {
         COTTONTAIL_BASELINE_HEARTBEAT_MS: "20",
-        HUTCH_LAUNCHER_PATH: "/inherited/outer/hutch",
-        HUTCH_LAUNCHER_VERSION: "inherited",
-        HUTCH_ACTIVE_CHANNEL: "canary",
       },
     },
   );
@@ -908,9 +929,7 @@ test("Bun-derived tests report completion order, heartbeat, durable events, and 
   const invocations = readJsonLines(fixture.bunCapturePath);
   assert.equal(invocations.length, 2);
   for (const invocation of invocations) {
-    assert.equal(invocation.hutchLauncherPath, null);
-    assert.equal(invocation.hutchLauncherVersion, null);
-    assert.equal(invocation.hutchActiveChannel, null);
+    assert.equal(invocation.packageManager, null);
     assert.deepEqual(invocation.argv, []);
   }
   const plan = JSON.parse(readFileSync(join(reportDir, "plans", "bun.json"), "utf8"));

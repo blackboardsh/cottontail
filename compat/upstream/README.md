@@ -8,31 +8,31 @@ repository runner, it gives every child an owned temp root through `BUN_TMPDIR`,
 Direct Cottontail runs of the Bun snapshot get the same containment from the snapshot's
 Cottontail-only preload.
 
-## Hutch-backed CLI fixtures
+## External package-manager fixtures
 
-Cottontail owns the runtime and bundler behavior exercised by the Bun corpus, while
-Hutch owns package management. CI and clean checkouts can fetch and build the audited
-Hutch revision in `compat/upstream/hutch.json` with Cottontail's vendored Zig.
-The setup command returns Hutch's command engine, not its user-facing
-version/pragma launcher:
+Cottontail owns the runtime and bundler behavior exercised by the Bun corpus;
+package installation is external. The compatibility build includes a tiny
+test-only command adapter. It routes runtime/compiler commands to the exact
+Cottontail binary and routes only package commands to an explicitly selected
+package manager. CI selects its pinned Bun 1.3.10 executable for that role:
 
 ```sh
-HUTCH_BINARY="$(node scripts/setup-upstream-hutch.js)"
+COMMAND_ADAPTER="$(pwd)/zig-out/bin/cottontail-upstream-command"
+PACKAGE_MANAGER="$(bun -e 'console.log(process.execPath)')"
 node scripts/run-upstream-tests.js bun \
-  --hutch "$HUTCH_BINARY" \
+  --command-adapter "$COMMAND_ADAPTER" \
+  --package-manager "$PACKAGE_MANAGER" \
   --test test/bundler/bundler_npm.test.ts \
   --case '^npm/ReactSSR$' \
   --expect-pass \
   --jobs 1
 ```
 
-The test process remains the Cottontail binary selected by `--binary`. Its CLI child
-identity points at Hutch's engine, and that engine is pinned back to the same Cottontail
-binary for runtime commands. Bypassing Hutch's outer launcher also keeps generated
-one-line bundles out of its `// @dash` pragma parser. A local sibling engine build can
-be passed explicitly instead; the runner never searches for or silently selects a
-global Hutch. `COTTONTAIL_UPSTREAM_HUTCH_BINARY` can provide an already pinned engine
-path in CI.
+The test process remains the Cottontail binary selected by `--binary`. Both the
+adapter and external manager are copied into the run's immutable tool store and
+included in its identity hash. The runner never searches for or silently selects
+a global package manager. `COTTONTAIL_UPSTREAM_COMMAND_ADAPTER` and
+`COTTONTAIL_UPSTREAM_PACKAGE_MANAGER` provide explicit CI/local overrides.
 
 Set `COTTONTAIL_UPSTREAM_KEEP_TEMP=1`, `COTTONTAIL_KEEP_TEMP`, or `DEBUG=1` to preserve
 the run's root for inspection. Cleanup never scans for `bun.test.*` names; it can

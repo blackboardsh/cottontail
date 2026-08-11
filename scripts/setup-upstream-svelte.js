@@ -31,22 +31,22 @@ function defaultSnapshotRoot() {
 
 function parseArgs(argv) {
   let snapshotRoot = defaultSnapshotRoot();
-  let hutchPath = process.env.COTTONTAIL_UPSTREAM_HUTCH_BINARY ?? null;
+  let packageManagerPath = process.env.COTTONTAIL_UPSTREAM_PACKAGE_MANAGER ?? null;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === '--snapshot') {
       const value = argv[++index];
       if (!value) fail('--snapshot requires a path');
       snapshotRoot = resolve(rootDir, value);
-    } else if (arg === '--hutch') {
+    } else if (arg === '--package-manager') {
       const value = argv[++index];
-      if (!value) fail('--hutch requires a path');
-      hutchPath = resolve(rootDir, value);
+      if (!value) fail('--package-manager requires a path');
+      packageManagerPath = resolve(rootDir, value);
     } else {
       fail(`Unknown option: ${arg}`);
     }
   }
-  return { snapshotRoot, hutchPath };
+  return { snapshotRoot, packageManagerPath };
 }
 
 function statOrNull(path) {
@@ -76,7 +76,7 @@ function ensureDirectoryLink(link, target) {
 
 export function setupSvelteFixture(
   snapshotRoot = defaultSnapshotRoot(),
-  hutchPath = process.env.COTTONTAIL_UPSTREAM_HUTCH_BINARY ?? null,
+  packageManagerPath = process.env.COTTONTAIL_UPSTREAM_PACKAGE_MANAGER ?? null,
 ) {
   const snapshot = resolve(snapshotRoot);
   const pluginRoot = join(snapshot, 'packages', 'bun-plugin-svelte');
@@ -96,10 +96,10 @@ export function setupSvelteFixture(
   // beforeAll hook when upstream files execute in parallel.
   rmSync(join(pluginRoot, 'node_modules'), { recursive: true, force: true });
 
-  if (!hutchPath) {
-    fail('The Svelte upstream fixture requires the selected Hutch engine. Pass --hutch <path>.');
+  if (!packageManagerPath) {
+    fail('The Svelte upstream fixture requires an external package manager. Pass --package-manager <path>.');
   }
-  const install = spawnSync(hutchPath, ['install'], {
+  const install = spawnSync(packageManagerPath, ['install'], {
     cwd: pluginRoot,
     env: process.env,
     stdio: 'inherit',
@@ -126,6 +126,6 @@ export function setupSvelteFixture(
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const { snapshotRoot, hutchPath } = parseArgs(process.argv.slice(2));
-  setupSvelteFixture(snapshotRoot, hutchPath);
+  const { snapshotRoot, packageManagerPath } = parseArgs(process.argv.slice(2));
+  setupSvelteFixture(snapshotRoot, packageManagerPath);
 }

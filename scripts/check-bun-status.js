@@ -24,7 +24,6 @@ const statusArchitecture = process.env.COTTONTAIL_BUN_STATUS_ARCH ?? process.arc
 const status = resolveBunStatusPlatform(rawStatus, statusPlatform, statusArchitecture);
 const knownStatuses = new Set(['enabled', 'expected-failure', 'disabled', 'skip']);
 const knownExclusionClassifications = new Set([
-  'delegated',
   'environment',
   'performance',
   'runtime-gap',

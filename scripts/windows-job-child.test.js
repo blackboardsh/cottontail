@@ -21,7 +21,7 @@ const cottontailRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const runnerPath = join(cottontailRoot, 'scripts', 'run-upstream-tests.js');
 const jobLauncher = process.env.COTTONTAIL_TEST_WINDOWS_JOB_LAUNCHER ??
   process.env.COTTONTAIL_UPSTREAM_JOB_LAUNCHER ??
-  join(cottontailRoot, '..', 'hutch', 'zig-out', 'bin', 'hutch-bun-compat-job.exe');
+  join(cottontailRoot, 'zig-out', 'bin', 'cottontail-bun-compat-job.exe');
 const actualLauncherUnavailable = process.platform !== 'win32' || !existsSync(jobLauncher);
 const actualLauncherOnly = {
   skip: actualLauncherUnavailable
@@ -121,7 +121,7 @@ test('upstream runner routes every asynchronous Windows child through the native
   assert.match(source, /Promise\.allSettled\(\s*children\.map\(\(child\) => terminateTrackedChild\(child\)\)/);
   assert.match(source, /attemptOutput\?\.write\('stdout', data\);[\s\S]*?catch \(error\) \{\s*void settle/);
   assert.match(source, /await preflightBinary\(\)/);
-  assert.match(source, /await preflightHutchEngine\(\)/);
+  assert.match(source, /await preflightCommandAdapter\(\)/);
   assert.match(source, /await prepareNodeHarnessInventory\(targetSnapshotRoot\(name, targets\[name\]\)\)/);
   assert.match(source, /await prepareBunTestDependencies\(entries, snapshotRoot\)/);
   assert.match(source, /await discoverBundlerTestIds\(entry, snapshotRoot, target\)/);
@@ -145,7 +145,7 @@ test('launcher adapter reuses the opaque Job name for bounded termination proof'
   assert.equal(started, child);
   assert.equal(calls[0].command, 'launcher.exe');
   assert.equal(calls[0].args[0], 'run');
-  assert.match(calls[0].args[1], /^Local\\HutchBunCompat-[0-9a-f-]+$/i);
+  assert.match(calls[0].args[1], /^Local\\CottontailBunCompat-[0-9a-f-]+$/i);
   assert.deepEqual(calls[0].args.slice(2), ['5678', 'runtime.exe', 'one', 'two']);
   assert.deepEqual(calls[0].options, { cwd: 'fixture' });
 
