@@ -20,7 +20,9 @@ function initializeRuntimeProcess() {
   target.execArgv ??= Array.from(cottontail.execArgv ?? [], String);
   target.env ??= cottontail.env();
 
-  const inheritedSpawnArgv0 = target.env.COTTONTAIL_SPAWN_ARGV0;
+  const inheritedSpawnArgv0 = globalThis.__cottontailHutchPrivateFileMode == null
+    ? target.env.COTTONTAIL_SPAWN_ARGV0
+    : undefined;
   if (inheritedSpawnArgv0 != null) {
     Object.defineProperty(target, "argv0", {
       value: String(inheritedSpawnArgv0),
@@ -31,7 +33,9 @@ function initializeRuntimeProcess() {
     try { delete target.env.COTTONTAIL_SPAWN_ARGV0; } catch {}
   }
 
-  const inheritedSpawnExecPath = target.env.COTTONTAIL_SPAWN_EXEC_PATH;
+  const inheritedSpawnExecPath = globalThis.__cottontailHutchPrivateFileMode == null
+    ? target.env.COTTONTAIL_SPAWN_EXEC_PATH
+    : undefined;
   if (inheritedSpawnExecPath != null) {
     const displayExecPath = String(inheritedSpawnExecPath);
     Object.defineProperty(target, "execPath", {
@@ -48,7 +52,9 @@ function initializeRuntimeProcess() {
   // through its wrapper are part of that handoff, not of the environment the
   // program asked for: keep their values for facade children of our own and
   // drop them (and the marker) from process.env.
-  const injectedRouting = target.env.COTTONTAIL_SPAWN_ROUTING;
+  const injectedRouting = globalThis.__cottontailHutchPrivateFileMode == null
+    ? target.env.COTTONTAIL_SPAWN_ROUTING
+    : undefined;
   if (injectedRouting != null) {
     const routing = {};
     for (const key of String(injectedRouting).split(",")) {

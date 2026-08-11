@@ -25,6 +25,7 @@ pub const MacroContext = struct {
     resolver: ?*Resolver,
     env: ?*DotEnv.Loader,
     remap: MacroRemap,
+    disabled: bool,
     javascript_object: jsc.JSValue = jsc.JSValue.zero,
 
     pub fn getRemap(this: MacroContext, path: string) ?MacroRemapEntry {
@@ -37,6 +38,7 @@ pub const MacroContext = struct {
             .resolver = &transpiler.resolver,
             .env = transpiler.env,
             .remap = transpiler.options.macro_remap,
+            .disabled = transpiler.options.no_macros,
         };
     }
 
@@ -45,6 +47,7 @@ pub const MacroContext = struct {
             .resolver = null,
             .env = null,
             .remap = .{},
+            .disabled = false,
         };
     }
 
@@ -60,6 +63,14 @@ pub const MacroContext = struct {
     ) anyerror!Expr {
         _ = this.env;
         _ = this.javascript_object;
+
+        // Keep the execution boundary fail-closed even if a new parser form
+        // reaches MacroContext without passing an AST visitor's no-macro
+        // check. No resolution or subprocess setup may happen first.
+        if (this.disabled) {
+            log.addRangeError(source, import_range, "Macros are disabled") catch unreachable;
+            return error.MacroFailed;
+        }
 
         const path_without_macro_prefix = if (isMacroPath(import_record_path))
             import_record_path[namespaceWithColon.len..]

@@ -324,18 +324,23 @@ pub const Transpiler = struct {
 
     // This must be run after a framework is configured, if a framework is enabled
     pub fn configureDefines(this: *Transpiler) !void {
+        return this.configureDefinesWithEnvironment(true);
+    }
+
+    pub fn configureDefinesWithEnvironment(this: *Transpiler, load_environment: bool) !void {
         if (this.options.defines_loaded) {
             return;
         }
 
-        if (this.options.target == .bun_macro) {
+        if (load_environment and this.options.target == .bun_macro) {
             this.options.env.behavior = .prefix;
             this.options.env.prefix = "BUN_";
         }
 
-        try this.runEnvLoader(this.options.env.disable_default_env_files);
+        if (load_environment)
+            try this.runEnvLoader(this.options.env.disable_default_env_files);
 
-        var is_production = this.env.isProduction();
+        var is_production = load_environment and this.env.isProduction();
 
         js_ast.Expr.Data.Store.create();
         js_ast.Stmt.Data.Store.create();

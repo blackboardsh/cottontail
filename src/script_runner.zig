@@ -9,6 +9,10 @@ const native_bundler = @import("cottontail_bundler.zig");
 const native_transpiler = @import("cottontail_transpiler.zig");
 const embedded_runtime_modules = @import("embedded_runtime_modules.zig");
 const standalone_executable = @import("standalone_executable.zig");
+const posix_identity = if (builtin.os.tag == .windows) struct {} else @cImport({
+    @cInclude("sys/stat.h");
+    @cInclude("unistd.h");
+});
 
 const script_thread_stack_size = 128 * 1024 * 1024;
 const script_js_stack_size = 96 * 1024 * 1024;
@@ -71,6 +75,11 @@ const ReloadMode = enum {
     watch,
 };
 
+pub const HutchPrivateFileMode = enum {
+    shell,
+    config,
+};
+
 const ReloadExecution = struct {
     ctx: Context,
     entrypoint_path: []const u8,
@@ -92,6 +101,7 @@ const ScriptExecution = struct {
     embedded_files: ?[]const u8 = null,
     embedded_bytecode: ?[]const u8 = null,
     standalone_flags: ?standalone_executable.Flags = null,
+    hutch_private_file: ?HutchPrivateFileMode = null,
     exit_cleanup_path: ?[:0]const u8 = null,
     test_cli_execution: bool = false,
     reload: ?ReloadExecution = null,
@@ -211,6 +221,10 @@ const Context = struct {
     environ_map: *std.process.Environ.Map,
     project_root: []const u8,
     executable_stamp: []const u8,
+    private_temp_root: ?[]const u8 = null,
+    private_temp_dir: ?std.Io.Dir = null,
+    hutch_private_source: ?[]const u8 = null,
+    hutch_private_file: ?HutchPrivateFileMode = null,
     stderr_capture: ?*std.ArrayList(u8) = null,
 
     fn writeStdout(self: *const Context, comptime fmt: []const u8, args: anytype) void {
@@ -241,7 +255,9 @@ const RuntimeArtifact = struct {
 
     fn deinit(self: *RuntimeArtifact, ctx: *const Context) void {
         if (self.lease_file) |file| file.close(ctx.io);
-        cleanupRunnableDirectory(ctx, self.path);
+        // Hutch owns and handle-cleans its whole private root after the child
+        // exits. Never perform path-based cleanup after project code ran.
+        if (ctx.hutch_private_file == null) cleanupRunnableDirectory(ctx, self.path);
         self.* = undefined;
     }
 };
@@ -258,6 +274,369 @@ pub fn runWithExecArgv(
     exec_args: []const [:0]const u8,
 ) !u8 {
     return runWithExecArgvDisplay(init, script_path, null, script_args, exec_args);
+}
+
+const HutchPrivateStorage = struct {
+    root_path: []const u8,
+    wrapper_path: []const u8,
+    wrapper_name: []const u8,
+    root_inode: std.Io.File.INode,
+    wrapper_inode: std.Io.File.INode,
+    wrapper_size: u64,
+    wrapper_digest: [32]u8,
+    root_dir: std.Io.Dir,
+    wrapper_file: std.Io.File,
+
+    fn deinit(self: *HutchPrivateStorage, io: std.Io) void {
+        self.wrapper_file.close(io);
+        self.root_dir.close(io);
+        self.* = undefined;
+    }
+
+    fn identityMatches(self: *const HutchPrivateStorage, ctx: *const Context) bool {
+        var current_root = std.Io.Dir.openDirAbsolute(ctx.io, self.root_path, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        }) catch return false;
+        defer current_root.close(ctx.io);
+        const current_root_stat = current_root.stat(ctx.io) catch return false;
+        if (current_root_stat.kind != .directory or current_root_stat.inode != self.root_inode) return false;
+        validatePosixOwnedMode(current_root.handle, 0o700) catch return false;
+        const current_wrapper = self.root_dir.statFile(ctx.io, self.wrapper_name, .{
+            .follow_symlinks = false,
+        }) catch return false;
+        if (current_wrapper.kind != .file or current_wrapper.inode != self.wrapper_inode or
+            current_wrapper.size != self.wrapper_size)
+        {
+            return false;
+        }
+        validatePosixOwnedMode(self.wrapper_file.handle, 0o600) catch return false;
+        const digest = hashOpenFile(self.wrapper_file, ctx.io) catch return false;
+        return std.mem.eql(u8, &digest, &self.wrapper_digest);
+    }
+};
+
+fn validatePosixOwnedMode(handle: anytype, expected_mode: u16) !void {
+    if (comptime builtin.os.tag == .windows) return;
+    var native_stat: posix_identity.struct_stat = undefined;
+    if (posix_identity.fstat(handle, &native_stat) != 0) return error.HutchPrivateStatFailed;
+    if (native_stat.st_uid != posix_identity.geteuid()) return error.HutchPrivateWrongOwner;
+    if ((native_stat.st_mode & 0o777) != expected_mode) return error.HutchPrivateUnsafePermissions;
+}
+
+fn validatePosixOwnedExecutable(handle: anytype) !void {
+    if (comptime builtin.os.tag == .windows) return;
+    var native_stat: posix_identity.struct_stat = undefined;
+    if (posix_identity.fstat(handle, &native_stat) != 0) return error.HutchPrivateStatFailed;
+    if (native_stat.st_uid != posix_identity.geteuid()) return error.HutchPrivateWrongOwner;
+    const mode: u16 = @intCast(native_stat.st_mode & 0o777);
+    if (mode & 0o100 == 0 or mode & 0o022 != 0)
+        return error.HutchPrivateUnsafePermissions;
+}
+
+fn hashOpenFile(file: std.Io.File, io: std.Io) ![32]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var reader_buffer: [16 * 1024]u8 = undefined;
+    var chunk: [64 * 1024]u8 = undefined;
+    var reader = file.reader(io, &reader_buffer);
+    try reader.seekTo(0);
+    while (true) {
+        const count = try reader.interface.readSliceShort(&chunk);
+        if (count == 0) break;
+        hasher.update(chunk[0..count]);
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn readOpenFile(
+    file: std.Io.File,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    limit: std.Io.Limit,
+) ![]u8 {
+    var reader_buffer: [16 * 1024]u8 = undefined;
+    var reader = file.reader(io, &reader_buffer);
+    try reader.seekTo(0);
+    return reader.interface.allocRemaining(allocator, limit) catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        else => |e| return e,
+    };
+}
+
+fn pathIsWithin(ctx: *const Context, parent: []const u8, child: []const u8) !bool {
+    const relative = try std.fs.path.relative(
+        ctx.allocator,
+        ctx.project_root,
+        ctx.environ_map,
+        parent,
+        child,
+    );
+    if (relative.len == 0 or std.mem.eql(u8, relative, ".")) return true;
+    if (std.fs.path.isAbsolute(relative) or std.mem.eql(u8, relative, "..")) return false;
+    const parent_prefix = try std.fmt.allocPrint(ctx.allocator, "..{c}", .{std.fs.path.sep});
+    return !std.mem.startsWith(u8, relative, parent_prefix);
+}
+
+fn readHutchPrivateArtifact(
+    storage: *const HutchPrivateStorage,
+    ctx: *const Context,
+    absolute_path: []const u8,
+) ![]u8 {
+    const relative = try std.fs.path.relative(
+        ctx.allocator,
+        ctx.project_root,
+        ctx.environ_map,
+        storage.root_path,
+        absolute_path,
+    );
+    if (relative.len == 0 or std.fs.path.isAbsolute(relative) or
+        std.mem.eql(u8, relative, ".."))
+    {
+        return error.HutchPrivateArtifactOutsideRoot;
+    }
+    const parent_prefix = try std.fmt.allocPrint(ctx.allocator, "..{c}", .{std.fs.path.sep});
+    if (std.mem.startsWith(u8, relative, parent_prefix))
+        return error.HutchPrivateArtifactOutsideRoot;
+    var file = try storage.root_dir.openFile(ctx.io, relative, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    });
+    defer file.close(ctx.io);
+    var reader = file.reader(ctx.io, &.{});
+    return reader.interface.allocRemaining(ctx.allocator, .limited(512 * 1024 * 1024)) catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        else => |e| return e,
+    };
+}
+
+fn openHutchPrivateStorage(
+    ctx: *const Context,
+    wrapper_path: []const u8,
+    root_path: []const u8,
+) !HutchPrivateStorage {
+    if (!std.fs.path.isAbsolute(root_path) or !std.fs.path.isAbsolute(wrapper_path))
+        return error.HutchPrivatePathNotAbsolute;
+
+    var root_dir = try std.Io.Dir.openDirAbsolute(ctx.io, root_path, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    errdefer root_dir.close(ctx.io);
+    const root_stat = try root_dir.stat(ctx.io);
+    if (root_stat.kind != .directory) return error.HutchPrivateRootNotDirectory;
+    try validatePosixOwnedMode(root_dir.handle, 0o700);
+
+    var canonical_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const canonical_len = try root_dir.realPath(ctx.io, &canonical_buffer);
+    const canonical_root = try ctx.allocator.dupe(u8, canonical_buffer[0..canonical_len]);
+    if (try pathIsWithin(ctx, ctx.project_root, canonical_root) or
+        try pathIsWithin(ctx, canonical_root, ctx.project_root))
+    {
+        return error.HutchPrivateRootOverlapsProject;
+    }
+    const relative = try std.fs.path.relative(
+        ctx.allocator,
+        ctx.project_root,
+        ctx.environ_map,
+        root_path,
+        wrapper_path,
+    );
+    if (relative.len == 0 or std.fs.path.isAbsolute(relative) or
+        std.fs.path.dirname(relative) != null or
+        std.mem.eql(u8, relative, ".") or std.mem.eql(u8, relative, ".."))
+    {
+        return error.HutchPrivateFileOutsideRoot;
+    }
+    if (!std.ascii.eqlIgnoreCase(std.fs.path.extension(relative), ".mjs"))
+        return error.HutchPrivateFileExtension;
+
+    var wrapper_file = try root_dir.openFile(ctx.io, relative, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    });
+    errdefer wrapper_file.close(ctx.io);
+    const wrapper_stat = try wrapper_file.stat(ctx.io);
+    if (wrapper_stat.kind != .file) return error.HutchPrivateFileNotFile;
+    try validatePosixOwnedMode(wrapper_file.handle, 0o600);
+
+    // Hutch creates a fresh root and may add one empty bunfig as
+    // defense-in-depth. Reject every other preexisting entry before native
+    // compiler/cache/ICU code is allowed to create paths below this root.
+    var iterator = root_dir.iterate();
+    while (try iterator.next(ctx.io)) |entry| {
+        if (std.mem.eql(u8, entry.name, relative)) continue;
+        const launcher_name = if (builtin.os.tag == .windows) "hutch.exe" else "hutch";
+        if (std.mem.eql(u8, entry.name, launcher_name)) {
+            var launcher = try root_dir.openFile(ctx.io, entry.name, .{
+                .allow_directory = false,
+                .follow_symlinks = false,
+                .resolve_beneath = true,
+            });
+            defer launcher.close(ctx.io);
+            const launcher_stat = try launcher.stat(ctx.io);
+            if (launcher_stat.kind != .file) return error.HutchPrivateUnsafeLauncher;
+            try validatePosixOwnedExecutable(launcher.handle);
+            continue;
+        }
+        if (!std.mem.eql(u8, entry.name, "bunfig.toml"))
+            return error.HutchPrivateRootNotEmpty;
+        var bunfig = try root_dir.openFile(ctx.io, entry.name, .{
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        });
+        defer bunfig.close(ctx.io);
+        const bunfig_stat = try bunfig.stat(ctx.io);
+        if (bunfig_stat.kind != .file or bunfig_stat.size != 0)
+            return error.HutchPrivateUnsafeBunfig;
+        try validatePosixOwnedMode(bunfig.handle, 0o600);
+    }
+    const wrapper_digest = try hashOpenFile(wrapper_file, ctx.io);
+
+    return .{
+        .root_path = canonical_root,
+        .wrapper_path = try std.fs.path.join(ctx.allocator, &.{ canonical_root, relative }),
+        .wrapper_name = relative,
+        .root_inode = root_stat.inode,
+        .wrapper_inode = wrapper_stat.inode,
+        .wrapper_size = wrapper_stat.size,
+        .wrapper_digest = wrapper_digest,
+        .root_dir = root_dir,
+        .wrapper_file = wrapper_file,
+    };
+}
+
+fn cloneEnvironmentMap(
+    allocator: std.mem.Allocator,
+    source: *const std.process.Environ.Map,
+) !std.process.Environ.Map {
+    var clone = std.process.Environ.Map.init(allocator);
+    errdefer clone.deinit();
+    for (source.keys(), source.values()) |key, value| try clone.put(key, value);
+    return clone;
+}
+
+/// Runs a Hutch-owned wrapper or loader through Cottontail's ordinary full
+/// runtime bootstrap. The private root controls only native compiler/cache/ICU
+/// storage; the JavaScript task still observes the inherited project env.
+pub fn runHutchPrivateFile(
+    init: std.process.Init,
+    mode: HutchPrivateFileMode,
+    wrapper_path: [:0]const u8,
+    private_root: []const u8,
+    shell_args: []const [:0]const u8,
+) !u8 {
+    const allocator = init.arena.allocator();
+    var ctx = try makeContext(init);
+    var storage = openHutchPrivateStorage(&ctx, wrapper_path, private_root) catch |err| {
+        ctx.writeStderr("cottontail: invalid Hutch private file: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer storage.deinit(ctx.io);
+
+    ctx.hutch_private_file = mode;
+    ctx.private_temp_root = storage.root_path;
+    ctx.private_temp_dir = storage.root_dir;
+    ctx.hutch_private_source = readOpenFile(
+        storage.wrapper_file,
+        ctx.io,
+        allocator,
+        .limited(16 * 1024 * 1024),
+    ) catch |err| {
+        ctx.writeStderr("cottontail: failed to bind Hutch private file: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    var captured_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(ctx.hutch_private_source.?, &captured_digest, .{});
+    if (@as(u64, @intCast(ctx.hutch_private_source.?.len)) != storage.wrapper_size or
+        !std.mem.eql(u8, &captured_digest, &storage.wrapper_digest))
+    {
+        ctx.writeStderr("cottontail: Hutch private file changed while binding\n", .{});
+        return 1;
+    }
+
+    var native_environ = try cloneEnvironmentMap(allocator, init.environ_map);
+    defer native_environ.deinit();
+    _ = native_environ.swapRemove("COTTONTAIL_RUNTIME_MODULES_DIR");
+    _ = native_environ.swapRemove("COTTONTAIL_TEST_CLI_HEADER_PRINTED");
+    _ = native_environ.swapRemove("COTTONTAIL_TEST_FILE_COUNT");
+    for ([_][]const u8{
+        "BUN_TMPDIR",
+        "COTTONTAIL_TMP_DIR",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "LOCALAPPDATA",
+    }) |name| try native_environ.put(name, storage.root_path);
+    ctx.environ_map = &native_environ;
+    icu_bootstrap.ensureWithEnvironment(ctx.io, &native_environ) catch |err| {
+        ctx.writeStderr("cottontail: failed to initialize ICU: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+
+    const process_args = try allocator.alloc([:0]const u8, shell_args.len + 1);
+    process_args[0] = try allocator.dupeZ(u8, storage.wrapper_path);
+    @memcpy(process_args[1..], shell_args);
+    const empty_exec_args: [0][:0]const u8 = .{};
+    const empty_script_args: [0][:0]const u8 = .{};
+    var runnable = bundleScriptNative(
+        &ctx,
+        storage.wrapper_path,
+        empty_exec_args[0..],
+        empty_script_args[0..],
+        null,
+        null,
+        null,
+        false,
+        null,
+        false,
+    ) catch |err| {
+        if (err == error.TestBundleFailed or err == error.SyntaxError or
+            err == error.NativeBundleFailed)
+        {
+            return 1;
+        }
+        return err;
+    };
+    defer runnable.deinit(&ctx);
+    const bundled_source = readHutchPrivateArtifact(&storage, &ctx, runnable.path) catch |err| {
+        ctx.writeStderr("cottontail: failed to read Hutch runtime artifact: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    const source_map_path = try std.mem.concat(allocator, u8, &.{ runnable.path, ".map" });
+    const bundled_source_map = readHutchPrivateArtifact(&storage, &ctx, source_map_path) catch |err| {
+        ctx.writeStderr("cottontail: failed to read Hutch runtime source map: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    if (!storage.identityMatches(&ctx)) {
+        ctx.writeStderr("cottontail: Hutch private file changed while loading\n", .{});
+        return 1;
+    }
+
+    // Native storage policy is complete. Runtime configuration and task code
+    // must see the exact inherited project environment.
+    ctx.environ_map = init.environ_map;
+    const runnable_path_z = try allocator.dupeZ(u8, runnable.path);
+    return try runPrepared(
+        init,
+        &ctx,
+        runnable_path_z,
+        process_args,
+        process_args.len,
+        empty_exec_args[0..],
+        bundled_source,
+        bundled_source_map,
+        null,
+        null,
+        null,
+    );
 }
 
 fn reloadMode(exec_args: []const [:0]const u8) ReloadMode {
@@ -2656,10 +3035,13 @@ fn runPrepared(
 ) !u8 {
     const allocator = init.arena.allocator();
     if (!applyRuntimeEnvFlags(init.io, allocator, exec_args)) return 1;
-    const inspector = inspectorLaunchFromArgs(ctx, exec_args) catch |err| {
-        ctx.writeStderr("cottontail: invalid inspector endpoint: {s}\n", .{@errorName(err)});
-        return 1;
-    };
+    const inspector = if (ctx.hutch_private_file != null)
+        null
+    else
+        inspectorLaunchFromArgs(ctx, exec_args) catch |err| {
+            ctx.writeStderr("cottontail: invalid inspector endpoint: {s}\n", .{@errorName(err)});
+            return 1;
+        };
     icu_bootstrap.ensure(init) catch |err| {
         ctx.writeStderr("cottontail: failed to initialize ICU: {s}\n", .{@errorName(err)});
         return 1;
@@ -2676,14 +3058,18 @@ fn runPrepared(
         .embedded_source_map = embedded_source_map,
         .embedded_files = embedded_files,
         .embedded_bytecode = embedded_bytecode,
+        .hutch_private_file = ctx.hutch_private_file,
         .test_cli_execution = ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null or
             (process_args.len > 0 and isTestEntrypointPath(process_args[0])),
         .standalone_flags = standalone_flags,
-        .exit_cleanup_path = if (runnableDirectoryForCleanup(ctx, runnable_path_z)) |path|
+        .exit_cleanup_path = if (ctx.hutch_private_file != null)
+            null
+        else if (runnableDirectoryForCleanup(ctx, runnable_path_z)) |path|
             try allocator.dupeZ(u8, path)
         else
             null,
     };
+    if (ctx.hutch_private_file != null) execution.test_cli_execution = false;
     return try runExecutionThread(ctx, &execution);
 }
 
@@ -2844,7 +3230,7 @@ fn runExecutionThread(ctx: *const Context, execution: *ScriptExecution) !u8 {
 }
 
 fn shouldRunElectrobunMainThread(ctx: *const Context) bool {
-    return ctx.environ_map.get("COTTONTAIL_ELECTROBUN_DIST") != null;
+    return ctx.hutch_private_file == null and ctx.environ_map.get("COTTONTAIL_ELECTROBUN_DIST") != null;
 }
 
 fn electrobunCoreFileName() []const u8 {
@@ -3306,6 +3692,27 @@ fn runScriptExecution(execution: *ScriptExecution) void {
         return;
     };
     defer js_runtime.deinit();
+
+    {
+        const mode_source = if (execution.hutch_private_file) |mode| switch (mode) {
+            .shell =>
+            \\Object.defineProperty(globalThis, '__cottontailHutchPrivateFileMode', { value: 'shell', writable: false, configurable: false });
+            ,
+            .config =>
+            \\Object.defineProperty(globalThis, '__cottontailHutchPrivateFileMode', { value: 'config', writable: false, configurable: false });
+            ,
+        } else
+            \\Object.defineProperty(globalThis, '__cottontailHutchPrivateFileMode', { value: null, writable: false, configurable: false });
+        ;
+        js_runtime.evalImmediate(
+            mode_source,
+            "cottontail:private-file-mode",
+        ) catch {
+            writeStderr(execution.io, "cottontail: failed to lock private-file mode\n", .{});
+            execution.exit_code = 1;
+            return;
+        };
+    }
 
     // COTTONTAIL-COMPAT: Stock JSCOnly can export the sampling API while being
     // built without ENABLE(SAMPLING_PROFILER). Never synthesize a profile when
@@ -4704,16 +5111,17 @@ fn nativeBundleFailure(
         defer native_bundler.ct_bundle_string_free(message);
         const text = decodeBundleDiagnostic(ctx, std.mem.span(message));
         if (ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null) {
-            const display_text = if (runtime_execution)
+            const display_text = if (runtime_execution and ctx.hutch_private_file == null)
                 (runtimeLinkDiagnostic(ctx, script_abs, script_entry_abs, text) catch null) orelse text
             else
                 text;
             reportTestBundleError(ctx, script_abs, display_text);
             cleanupGeneratedSource(ctx, script_entry_abs, script_abs);
-            std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
+            if (ctx.hutch_private_file == null)
+                std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
             return error.TestBundleFailed;
         }
-        const display_text = if (runtime_execution)
+        const display_text = if (runtime_execution and ctx.hutch_private_file == null)
             (runtimeLinkDiagnostic(ctx, script_abs, script_entry_abs, text) catch null) orelse text
         else
             text;
@@ -4727,8 +5135,10 @@ fn nativeBundleFailure(
         // Resolution and parse diagnostics are complete at this point. Avoid
         // adding a Zig error-return trace to an ordinary JavaScript failure.
         cleanupGeneratedSource(ctx, script_entry_abs, script_abs);
-        std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
+        if (ctx.hutch_private_file == null)
+            std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
         if (ctx.stderr_capture != null) return error.NativeBundleFailed;
+        if (ctx.hutch_private_file != null) return error.NativeBundleFailed;
         if (recoverable) return error.ReloadBundleFailed;
         std.process.exit(1);
     }
@@ -4860,9 +5270,13 @@ fn bundleScriptNative(
 ) !RuntimeArtifact {
     if (reload_dependencies_out) |dependencies| dependencies.* = &.{};
     const tmp_dir = try ensureTempDir(ctx);
-    errdefer std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
+    errdefer if (ctx.hutch_private_file == null)
+        std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
 
-    const script_abs = try resolvePathForCwd(ctx.io, ctx.allocator, script_path);
+    const script_abs = if (ctx.hutch_private_file != null)
+        try ctx.allocator.dupe(u8, script_path)
+    else
+        try resolvePathForCwd(ctx.io, ctx.allocator, script_path);
     const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
     const is_eval_entrypoint = std.mem.startsWith(u8, std.fs.path.basename(script_abs), ".cottontail-eval-");
     const is_internal_macro_eval = is_eval_entrypoint and for (exec_args) |arg| {
@@ -4879,11 +5293,11 @@ fn bundleScriptNative(
     const has_runtime_cli_defines = runtime_cli_define_keys.items.len > 0;
     // A nested `cottontail -e` is a new runtime invocation. Parent test-runner
     // bookkeeping must not turn its launcher into another test harness.
-    const is_test_cli_execution = !is_eval_entrypoint and
+    const is_test_cli_execution = ctx.hutch_private_file == null and !is_eval_entrypoint and
         ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null;
-    const is_test_runtime_execution = is_test_cli_execution or
+    const is_test_runtime_execution = ctx.hutch_private_file == null and (is_test_cli_execution or
         ctx.environ_map.get("COTTONTAIL_TEST_FILE_COUNT") != null or
-        isTestEntrypointPath(script_abs);
+        isTestEntrypointPath(script_abs));
     // `bun test <file>` runs the explicit file as a test regardless of its
     // name (e.g. `index.fixture-test.ts`), so it must load the bunfig `[test]`
     // preloads even though the name misses the `.test`/`_test`/`.spec` pattern.
@@ -4899,16 +5313,19 @@ fn bundleScriptNative(
         else
             false;
     const is_wasm_entrypoint = std.mem.eql(u8, std.fs.path.extension(script_abs), ".wasm");
-    var package_json_patch = try maybePatchEmptyPackageJsonForBundle(ctx, script_dir);
+    var package_json_patch: EmptyMetadataPatch = if (ctx.hutch_private_file != null)
+        .{}
+    else
+        try maybePatchEmptyPackageJsonForBundle(ctx, script_dir);
     defer restoreEmptyMetadataPatch(ctx, &package_json_patch);
-    const bun_compat_entry_abs = if (is_wasm_entrypoint)
+    const bun_compat_entry_abs = if (is_wasm_entrypoint or ctx.hutch_private_file != null)
         script_abs
     else
         try writeBunCompatTransformedSource(ctx, script_abs, source_base_dir, standalone_compile);
     const has_bun_compat_transform = !std.mem.eql(u8, bun_compat_entry_abs, script_abs);
     defer cleanupGeneratedSource(ctx, bun_compat_entry_abs, script_abs);
 
-    const entrypoint_uses_module_mock = if (is_wasm_entrypoint)
+    const entrypoint_uses_module_mock = if (is_wasm_entrypoint or ctx.hutch_private_file != null)
         false
     else
         entrypointUsesModuleMock(ctx, script_abs);
@@ -4920,7 +5337,7 @@ fn bundleScriptNative(
             try tsconfigOverridePath(ctx, script_args)
         else
             null;
-    const runtime_module_launcher_candidate = canUseRuntimeModuleLauncher(.{
+    const runtime_module_launcher_candidate = ctx.hutch_private_file == null and canUseRuntimeModuleLauncher(.{
         .has_source_base_dir = source_base_dir != null,
         .has_build_options = build_options != null,
         .has_graph_output = graph_out != null,
@@ -4962,12 +5379,12 @@ fn bundleScriptNative(
         script_abs
     else
         bun_compat_entry_abs;
-    const script_identity_abs = if (is_wasm_entrypoint)
+    const script_identity_abs = if (is_wasm_entrypoint or ctx.hutch_private_file != null)
         script_abs
     else
         try runtimeEntrypointIdentity(ctx, script_entry_abs, script_abs);
 
-    const bunfig_preload_imports = if (standalone_compile)
+    const bunfig_preload_imports = if (standalone_compile or ctx.hutch_private_file != null)
         ""
     else
         try buildBunfigTestPreloadImports(
@@ -4985,7 +5402,10 @@ fn bundleScriptNative(
         null;
     var cli_startup_imports: std.ArrayList(u8) = .empty;
     try startup_options.appendSource(ctx.allocator, &cli_startup_imports, sql_module_path);
-    const cli_preload_imports = try buildCliPreloadImports(ctx, script_abs, exec_args, true);
+    const cli_preload_imports = if (ctx.hutch_private_file != null)
+        ""
+    else
+        try buildCliPreloadImports(ctx, script_abs, exec_args, true);
     const test_preload_imports = if (is_test_cli_execution)
         try buildCliPreloadImports(ctx, script_abs, script_args, false)
     else
@@ -4996,14 +5416,14 @@ fn bundleScriptNative(
         test_preload_imports.len > 0 or
         startup_options.requiresFullRuntime();
     const runtime_transpiler_cache_enabled = cli_run_execution.runtimeTranspilerCacheEnabled(ctx.environ_map);
-    const runtime_cache_common_js_entrypoint = if (!is_eval_entrypoint and
+    const runtime_cache_common_js_entrypoint = if (ctx.hutch_private_file == null and !is_eval_entrypoint and
         !runtime_module_entrypoint and
         runtime_transpiler_cache_enabled and
         !is_wasm_entrypoint)
         try runtimeCacheCanUseCommonJsLoader(ctx, script_abs)
     else
         false;
-    const detected_common_js_entrypoint = if (is_wasm_entrypoint or runtime_module_entrypoint)
+    const detected_common_js_entrypoint = if (is_wasm_entrypoint or runtime_module_entrypoint or ctx.hutch_private_file != null)
         false
     else
         runtime_candidate_is_common_js or try shouldBundleCommonJsEntrypoint(ctx, script_entry_abs);
@@ -5018,7 +5438,9 @@ fn bundleScriptNative(
         try entrypointRuntimeBootstrapMode(ctx, script_abs)
     else
         null;
-    const runtime_bootstrap_mode: RuntimeBootstrapMode = if (eval_bootstrap_mode) |mode|
+    const runtime_bootstrap_mode: RuntimeBootstrapMode = if (ctx.hutch_private_file != null)
+        .full
+    else if (eval_bootstrap_mode) |mode|
         mode
     else if (is_common_js_entrypoint)
         // CommonJS requires one stable Module instance and a filename-bound
@@ -5055,7 +5477,7 @@ fn bundleScriptNative(
     const ignore_dce_annotations = for (exec_args) |arg| {
         if (std.mem.eql(u8, arg, "--ignore-dce-annotations")) break true;
     } else false;
-    const plain_launcher_cacheable = preload_imports.len == 0 and
+    const plain_launcher_cacheable = ctx.hutch_private_file == null and preload_imports.len == 0 and
         build_options == null and
         !has_custom_conditions and
         !ignore_dce_annotations and
@@ -5168,6 +5590,18 @@ fn bundleScriptNative(
     options.features = features.items;
     options.tsconfig_override = tsconfig_override;
     options.include_runtime_modules = !reuse_minimal_reload_runtime or reload_needs_runtime_module_sources;
+    options.allow_runtime_modules_override = ctx.hutch_private_file == null;
+    if (ctx.hutch_private_file != null) {
+        options.load_tsconfig_json = false;
+        options.load_package_json = false;
+        options.load_process_env = false;
+        // Preserve process.env reads for the runtime. The private compiler
+        // still receives no process/project environment, so this sentinel
+        // prevents both inlining and the implicit "development" fallback.
+        options.env_behavior = .load_all_without_inlining;
+        options.node_path = null;
+        options.no_macros = true;
+    }
     if (!options.include_runtime_modules) {
         // The first hot generation already installed the minimal runtime.
         // Preserve runtime bundle transforms while avoiding a fresh virtual
@@ -5196,6 +5630,10 @@ fn bundleScriptNative(
         );
     }
     options.inline_import_meta_properties = true;
+    if (ctx.hutch_private_file != null) {
+        const captured_source = ctx.hutch_private_source orelse return error.MissingHutchPrivateSource;
+        options.entry_source = .{ .path = script_abs, .contents = captured_source };
+    }
     if (build_options == null and graph_out == null) {
         // Runtime execution can load the original addon directly. A fixed
         // prefix makes the compiler-emitted asset reference unambiguous so it
@@ -5255,7 +5693,8 @@ fn bundleScriptNative(
     defer if (launcher_cache) |*cache| cache.lock_file.close(ctx.io);
     if (launcher_cache) |cache| {
         if (try launcherCacheHit(ctx, &cache)) |cached_artifact| {
-            std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
+            if (ctx.hutch_private_file == null)
+                std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
             return cached_artifact;
         }
     }
@@ -5345,7 +5784,8 @@ fn bundleScriptNative(
             runtime_source_map,
             output.input_files,
         ) catch return .{ .path = bundle_path };
-        std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
+        if (ctx.hutch_private_file == null)
+            std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
         return cached_artifact;
     }
     return .{ .path = bundle_path };
@@ -7377,6 +7817,22 @@ fn writeCottontailEntryWrapper(
         break :blk try jsonStringLiteral(ctx, bundle_map_path);
     };
     const bundle_source_root_literal = try jsonStringLiteral(ctx, ctx.project_root);
+    const runtime_startup_source = if (ctx.hutch_private_file != null)
+        ""
+    else
+        \\globalThis.__cottontailLoadDotenv?.();
+        \\await globalThis.__cottontailLoadStandaloneBunfig?.();
+        \\await globalThis.__cottontailLoadStandaloneExecPreloads?.();
+    ;
+    const entry_start_source = if (ctx.hutch_private_file != null)
+        try std.fmt.allocPrint(ctx.allocator,
+            \\  const __ctEntryNamespace = await import({s});
+        , .{script_import_literal})
+    else
+        try std.fmt.allocPrint(ctx.allocator,
+            \\  const __ctPluginEntry = await globalThis.__cottontailResolvePluginEntrypoint?.({s}, {s});
+            \\  const __ctEntryNamespace = __ctPluginEntry?.matched ? await __ctPluginEntry.value : await import({s});
+        , .{ script_literal, script_literal, script_import_literal });
     // COTTONTAIL-COMPAT: Standalone import-meta resolution starts at the
     // serialized graph entry; ordinary runs retain the source entry path.
     const source = try std.fmt.allocPrint(
@@ -7438,15 +7894,12 @@ fn writeCottontailEntryWrapper(
         \\globalThis.__ctMetaResolveSync = (specifier, parent = __ctImportMetaBase) => globalThis.__cottontailImportMetaResolveSync(specifier, parent);
         \\globalThis.__ctMetaResolve = (specifier, parent = __ctImportMetaBase) => globalThis.__cottontailImportMetaResolve(specifier, parent);
         \\{s}
-        \\globalThis.__cottontailLoadDotenv?.();
-        \\await globalThis.__cottontailLoadStandaloneBunfig?.();
-        \\await globalThis.__cottontailLoadStandaloneExecPreloads?.();
+        \\{s}
         \\globalThis.__cottontailLoadingTestModules = true;
         \\try {{
         \\{s}
         \\{s}  globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
-        \\  const __ctPluginEntry = await globalThis.__cottontailResolvePluginEntrypoint?.({s}, {s});
-        \\  const __ctEntryNamespace = __ctPluginEntry?.matched ? await __ctPluginEntry.value : await import({s});
+        \\{s}
         \\  await __ctStartDefaultApp(__ctEntryNamespace);
         \\}}{s} finally {{
         \\{s}
@@ -7463,11 +7916,10 @@ fn writeCottontailEntryWrapper(
             script_dir_literal,
             script_literal,
             test_header_signal,
+            runtime_startup_source,
             cpu_profiler_start_statement,
             preload_imports,
-            script_literal,
-            script_literal,
-            script_import_literal,
+            entry_start_source,
             try testModuleLoadErrorCatch(ctx, test_cli_execution, script_literal),
             try testModuleFinalizeSource(ctx, test_cli_execution),
         },
@@ -10656,6 +11108,23 @@ fn runtimeModulePathAtRoot(
 }
 
 fn ensureTempDir(ctx: *const Context) ![]const u8 {
+    if (ctx.private_temp_dir) |private_dir| {
+        var random_bytes: [16]u8 = undefined;
+        for (0..8) |_| {
+            ctx.io.random(&random_bytes);
+            const suffix = std.fmt.bytesToHex(random_bytes, .lower);
+            const dirname = try std.fmt.allocPrint(ctx.allocator, "run-{s}", .{&suffix});
+            private_dir.createDir(ctx.io, dirname, if (builtin.os.tag == .windows)
+                .default_dir
+            else
+                .fromMode(0o700)) catch |err| switch (err) {
+                error.PathAlreadyExists => continue,
+                else => return err,
+            };
+            return try std.fs.path.join(ctx.allocator, &.{ ctx.private_temp_root.?, dirname });
+        }
+        return error.TempDirCollision;
+    }
     const run_root = try ensureTempRunRoot(ctx);
 
     var random_bytes: [16]u8 = undefined;

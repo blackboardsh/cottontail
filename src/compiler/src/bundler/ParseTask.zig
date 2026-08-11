@@ -1333,6 +1333,7 @@ fn runWithSourceCode(
     opts.features.auto_import_jsx = task.jsx.parse and transpiler.options.auto_import_jsx;
     opts.features.trim_unused_imports = loader.isTypeScript() or (transpiler.options.trim_unused_imports orelse false);
     opts.features.inlining = transpiler.options.minify_syntax;
+    opts.features.no_macros = transpiler.options.no_macros;
     opts.output_format = output_format;
     opts.inline_import_meta_properties = transpiler.options.inline_import_meta_properties;
     opts.features.minify_syntax = transpiler.options.minify_syntax;

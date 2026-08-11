@@ -2539,7 +2539,16 @@ pub fn NewParser_(
         }
 
         pub fn processImportStatement(p: *P, stmt_: S.Import, path: ParsedPath, loc: logger.Loc, was_originally_bare_import: bool) anyerror!Stmt {
-            const is_macro = FeatureFlags.is_macro_enabled and (path.is_macro or js_ast.Macro.isMacroPath(path.text));
+            const requests_macro = path.is_macro or js_ast.Macro.isMacroPath(path.text);
+            // Reject the syntax even in compiler builds where macro lowering
+            // is compiled out. Otherwise an explicit macro import can silently
+            // degrade into an ordinary runtime import and execute module
+            // top-level code after the private entry starts.
+            if (requests_macro and p.options.features.no_macros) {
+                try p.log.addError(p.source, path.loc, "Macros are disabled");
+                return p.s(S.Empty{}, loc);
+            }
+            const is_macro = FeatureFlags.is_macro_enabled and requests_macro;
             var stmt = stmt_;
             if (is_macro) {
                 const id = p.addImportRecord(.stmt, path.loc, path.text);

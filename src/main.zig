@@ -565,6 +565,35 @@ fn isBunShellScript(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".sh");
 }
 
+fn runHutchPrivateFileCommand(
+    init: std.process.Init,
+    args: []const [:0]const u8,
+    mode: script_runner.HutchPrivateFileMode,
+) !u8 {
+    const minimum_len: usize = if (mode == .shell) 6 else 5;
+    const valid_shape = args.len >= minimum_len and
+        std.mem.eql(u8, args[3], "--hutch-private-root") and
+        (mode == .shell or args.len == minimum_len);
+    if (!valid_shape) {
+        var stderr_buffer: [1024]u8 = undefined;
+        var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+        const spelling = if (mode == .shell) "--hutch-shell-file" else "--hutch-config-file";
+        try stderr_writer.interface.print(
+            "cottontail: {s} requires <absolute-file> --hutch-private-root <absolute-root>{s}\n",
+            .{ spelling, if (mode == .shell) " <command> [args...]" else "" },
+        );
+        try stderr_writer.interface.flush();
+        return 1;
+    }
+    return script_runner.runHutchPrivateFile(
+        init,
+        mode,
+        args[2],
+        args[4],
+        args[5..],
+    );
+}
+
 fn unsupportedEntrypointLoader(path: []const u8) ?[]const u8 {
     const extension = std.fs.path.extension(path);
     if (std.ascii.eqlIgnoreCase(extension, ".css")) return "css";
@@ -3260,6 +3289,16 @@ pub fn main(init: std.process.Init) !void {
     process_args = try consumeSpawnGate(allocator, process_args);
     if (process_args.len > 1 and std.mem.eql(u8, process_args[1], "--cottontail-macro-eval")) {
         const exit_code = try runMacroEvaluator(init, process_args);
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+    if (process_args.len > 1 and std.mem.eql(u8, process_args[1], "--hutch-shell-file")) {
+        const exit_code = try runHutchPrivateFileCommand(init, process_args, .shell);
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+    if (process_args.len > 1 and std.mem.eql(u8, process_args[1], "--hutch-config-file")) {
+        const exit_code = try runHutchPrivateFileCommand(init, process_args, .config);
         if (exit_code != 0) std.process.exit(exit_code);
         return;
     }

@@ -2,6 +2,7 @@ const minimumCacheSize = 50 * 1024;
 const cacheVersion = 1;
 
 function cacheDirectory() {
+  if (globalThis.__cottontailHutchPrivateFileMode != null) return null;
   const env = globalThis.process?.env ?? cottontail.env?.() ?? {};
   const value = env.BUN_RUNTIME_TRANSPILER_CACHE_PATH;
   if (value == null || value === "" || value === "0") return null;

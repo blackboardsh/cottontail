@@ -260,10 +260,14 @@ if (globalThis.process && Object.prototype.toString.call(globalThis.process) !==
   });
 }
 
-installInheritedBunIpcCodec(cottontail);
-installInheritedNodeIpc(cottontail);
+if (globalThis.__cottontailHutchPrivateFileMode == null) {
+  installInheritedBunIpcCodec(cottontail);
+  installInheritedNodeIpc(cottontail);
+}
 
-const inheritedSpawnArgv0 = globalThis.process?.env?.COTTONTAIL_SPAWN_ARGV0;
+const inheritedSpawnArgv0 = globalThis.__cottontailHutchPrivateFileMode == null
+  ? globalThis.process?.env?.COTTONTAIL_SPAWN_ARGV0
+  : undefined;
 if (inheritedSpawnArgv0 != null) {
   Object.defineProperty(globalThis.process, "argv0", {
     value: String(inheritedSpawnArgv0),
@@ -273,7 +277,9 @@ if (inheritedSpawnArgv0 != null) {
   });
   try { delete globalThis.process.env.COTTONTAIL_SPAWN_ARGV0; } catch {}
 }
-const inheritedSpawnExecPath = globalThis.process?.env?.COTTONTAIL_SPAWN_EXEC_PATH;
+const inheritedSpawnExecPath = globalThis.__cottontailHutchPrivateFileMode == null
+  ? globalThis.process?.env?.COTTONTAIL_SPAWN_EXEC_PATH
+  : undefined;
 if (inheritedSpawnExecPath != null) {
   Object.defineProperty(globalThis.process, "execPath", {
     value: String(inheritedSpawnExecPath),
@@ -15249,6 +15255,10 @@ globalThis.Response ??= Response;
 // default export. The static gate (export default + fetch, no serve()/test
 // calls) keeps the re-evaluation limited to side-effect-free config modules.
 (function scheduleEntryAutoServe() {
+  // Hutch private entries execute from a validated, handle-bound source
+  // snapshot. Never reopen or re-import their physical protocol path during
+  // bootstrap or beforeExit.
+  if (globalThis.__cottontailHutchPrivateFileMode != null) return;
   if (globalThis.__cottontailAutoServeInstalled) return;
   globalThis.__cottontailAutoServeInstalled = true;
   const processObject = globalThis.process;

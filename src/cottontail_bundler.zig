@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const compiler = @import("cottontail_compiler");
 const bun_color = @import("bun_color.zig");
 const embedded_runtime_modules = @import("embedded_runtime_modules.zig");
@@ -11,10 +12,25 @@ pub const binary_diagnostic_prefix = "COTTONTAIL_DIAGNOSTIC_BASE64:";
 pub const RuntimeAlias = compiler.resolver.Resolver.RuntimeAlias;
 
 pub const BundleOptions = struct {
+    pub const EntrySource = struct {
+        path: []const u8,
+        contents: []const u8,
+    };
+
+    /// Authoritative in-memory bytes for the selected source entry. Runtime
+    /// bootstrap wrappers may remain the graph entry point; this exact source
+    /// identity still wins over virtual maps, overlays, and the filesystem.
+    entry_source: ?EntrySource = null,
     aliases: []const RuntimeAlias = &.{},
     conditions: []const []const u8 = &.{},
     node_path: ?[]const u8 = null,
     tsconfig_override: ?[]const u8 = null,
+    /// Internal launchers can opt out of project metadata discovery. Their
+    /// selected project's runtime configuration may be loaded after the
+    /// validated entry source has been bound.
+    load_tsconfig_json: bool = true,
+    load_package_json: bool = true,
+    load_process_env: bool = true,
     /// Canonical source root used for output naming. Resolution still uses the
     /// caller's working directory, matching Bun's `--root` behavior.
     root_dir: ?[]const u8 = null,
@@ -47,6 +63,9 @@ pub const BundleOptions = struct {
     loader_values: []const compiler.schema.api.Loader = &.{},
     external_packages: bool = false,
     include_runtime_modules: bool = false,
+    /// Development overlays are intentionally unavailable to the Hutch task
+    /// launcher, even when the inherited project environment requests one.
+    allow_runtime_modules_override: bool = true,
     /// Root used for the synthetic paths of embedded runtime modules. Runtime
     /// launcher artifacts can set this independently of the user's working
     /// directory so one compiled runtime graph is reusable across projects.
@@ -940,7 +959,7 @@ pub fn bundleEntryPointGraphWithOptions(
     // Bun's run/build commands populate the compiler environment before
     // resolution. The resolver consumes NODE_PATH and condition-related env
     // values even when runtime process.env reads are intentionally not inlined.
-    try transpiler.env.loadProcess();
+    if (options.load_process_env) try transpiler.env.loadProcess();
     if (options.node_path) |node_path| try transpiler.env.map.put("NODE_PATH", node_path);
     try transpiler.fs.setTopLevelDir(working_dir_z);
     transpiler.resolver.runtime_aliases = options.aliases;
@@ -1004,6 +1023,10 @@ pub fn bundleEntryPointGraphWithOptions(
     transpiler.options.runtime_file_loader_paths = options.runtime_file_loader_paths;
     transpiler.options.preserve_external_require_name = options.preserve_external_require_name;
     transpiler.options.rewrite_jest_for_tests = options.rewrite_jest_for_tests;
+    transpiler.options.load_tsconfig_json = options.load_tsconfig_json;
+    transpiler.options.load_package_json = options.load_package_json;
+    transpiler.resolver.opts.load_tsconfig_json = options.load_tsconfig_json;
+    transpiler.resolver.opts.load_package_json = options.load_package_json;
     transpiler.options.server_components = options.server_components;
     // Cottontail's vendored JSC has no native `using` / `await using`
     // support; always lower them in bundles that run on this runtime.
@@ -1025,7 +1048,7 @@ pub fn bundleEntryPointGraphWithOptions(
     // "react-jsx"/"react-jsxdev"), and configureDefines() then applies the
     // NODE_ENV production/development override on top (matching upstream
     // bun's configureLinker -> configureDefines ordering).
-    transpiler.configureLinker();
+    transpiler.configureLinkerWithAutoJSX(options.load_tsconfig_json);
     if (options.jsx_factory) |factory| {
         transpiler.options.jsx.factory = try compiler.options.JSX.Pragma.memberListToComponentsIfDifferent(
             allocator,
@@ -1051,7 +1074,7 @@ pub fn bundleEntryPointGraphWithOptions(
         transpiler.options.force_node_env = .unspecified;
     }
     if (options.jsx_side_effects) |side_effects| transpiler.options.jsx.side_effects = side_effects;
-    transpiler.configureDefines() catch |err| {
+    transpiler.configureDefinesWithEnvironment(options.load_process_env) catch |err| {
         setBuildError(error_out, &log, err);
         return err;
     };
@@ -1065,7 +1088,7 @@ pub fn bundleEntryPointGraphWithOptions(
     transpiler.resolver.opts = transpiler.options;
     transpiler.resolver.env_loader = transpiler.env;
 
-    if (std.c.getenv("COTTONTAIL_DEBUG_JSX") != null) {
+    if (options.load_process_env and std.c.getenv("COTTONTAIL_DEBUG_JSX") != null) {
         std.debug.print("dbg jsx: production={} jsx.development={} behavior={s} env_prod={}\n", .{
             transpiler.options.production,
             transpiler.options.jsx.development,
@@ -1089,10 +1112,16 @@ pub fn bundleEntryPointGraphWithOptions(
         return error.InvalidVirtualFileMap;
     }
     for (options.virtual_file_paths, options.virtual_file_contents) |path, contents| {
+        const map_path = if (builtin.os.tag == .windows) normalized: {
+            const owned = try c_allocator.dupe(u8, path);
+            std.mem.replaceScalar(u8, owned, '\\', '/');
+            try runtime_file_keys.append(c_allocator, owned);
+            break :normalized owned;
+        } else path;
         const is_external = for (options.external) |external| {
             if (std.mem.eql(u8, path, external)) break true;
         } else false;
-        if (!is_external) try runtime_file_map.map.put(c_allocator, path, contents);
+        if (!is_external) try runtime_file_map.map.put(c_allocator, map_path, contents);
     }
     if (options.include_runtime_modules) {
         const runtime_virtual_root = options.runtime_virtual_root orelse working_dir;
@@ -1106,12 +1135,23 @@ pub fn bundleEntryPointGraphWithOptions(
         // Dev override: replace only files present on disk. Keeping embedded
         // fallbacks matters for generated modules that have no source-tree
         // counterpart, such as the Buffer compatibility shims.
-        if (std.c.getenv("COTTONTAIL_RUNTIME_MODULES_DIR")) |dir_pointer| {
-            const dir_path = std.mem.span(dir_pointer);
-            if (dir_path.len > 0) {
-                loadRuntimeModulesFromDisk(dir_path, runtime_virtual_root, &runtime_file_map, &runtime_file_keys) catch {};
+        if (options.allow_runtime_modules_override) {
+            if (std.c.getenv("COTTONTAIL_RUNTIME_MODULES_DIR")) |dir_pointer| {
+                const dir_path = std.mem.span(dir_pointer);
+                if (dir_path.len > 0) {
+                    loadRuntimeModulesFromDisk(dir_path, runtime_virtual_root, &runtime_file_map, &runtime_file_keys) catch {};
+                }
             }
         }
+    }
+    if (options.entry_source) |entry_source| {
+        const map_path = if (builtin.os.tag == .windows) normalized: {
+            const owned = try c_allocator.dupe(u8, entry_source.path);
+            std.mem.replaceScalar(u8, owned, '\\', '/');
+            try runtime_file_keys.append(c_allocator, owned);
+            break :normalized owned;
+        } else entry_source.path;
+        try runtime_file_map.map.put(c_allocator, map_path, entry_source.contents);
     }
     const runtime_file_map_ptr = if (runtime_file_map.map.count() > 0) &runtime_file_map else null;
     const event_loop = compiler.jsc.AnyEventLoop.init(allocator);
@@ -2444,7 +2484,7 @@ pub fn buildEntryPointsJson(
     transpiler.resolver.generation = claimBundleGeneration();
     // Match Bun's compiler lifecycle so package resolution sees NODE_PATH and
     // the rest of the inherited process environment.
-    try transpiler.env.loadProcess();
+    if (options.load_process_env) try transpiler.env.loadProcess();
     if (options.node_path) |node_path| try transpiler.env.map.put("NODE_PATH", node_path);
     try transpiler.fs.setTopLevelDir(working_dir_z);
     transpiler.resolver.runtime_aliases = options.aliases;
@@ -2466,6 +2506,10 @@ pub fn buildEntryPointsJson(
     transpiler.options.minify_syntax = options.minify_syntax;
     transpiler.options.keep_names = options.keep_names;
     transpiler.options.rewrite_jest_for_tests = options.rewrite_jest_for_tests;
+    transpiler.options.load_tsconfig_json = options.load_tsconfig_json;
+    transpiler.options.load_package_json = options.load_package_json;
+    transpiler.resolver.opts.load_tsconfig_json = options.load_tsconfig_json;
+    transpiler.resolver.opts.load_package_json = options.load_package_json;
     transpiler.options.no_macros = options.no_macros;
     transpiler.options.allow_unresolved = if (options.allow_unresolved) |patterns|
         compiler.options.AllowUnresolved.fromStrings(patterns)
@@ -2505,7 +2549,7 @@ pub fn buildEntryPointsJson(
     // "react-jsx"/"react-jsxdev"), and configureDefines() then applies the
     // NODE_ENV production/development override on top (matching upstream
     // bun's configureLinker -> configureDefines ordering).
-    transpiler.configureLinker();
+    transpiler.configureLinkerWithAutoJSX(options.load_tsconfig_json);
     if (options.jsx_factory) |factory| {
         transpiler.options.jsx.factory = try compiler.options.JSX.Pragma.memberListToComponentsIfDifferent(
             arena_allocator,
@@ -2528,7 +2572,7 @@ pub fn buildEntryPointsJson(
     }
     if (options.jsx_development) |development| transpiler.options.jsx.development = development;
     if (options.jsx_side_effects) |side_effects| transpiler.options.jsx.side_effects = side_effects;
-    transpiler.configureDefines() catch |err| {
+    transpiler.configureDefinesWithEnvironment(options.load_process_env) catch |err| {
         return try buildFailureJson(arena_allocator, &log, err);
     };
     // An explicit Bun.build jsx.development option wins over NODE_ENV.
@@ -2536,7 +2580,7 @@ pub fn buildEntryPointsJson(
         transpiler.options.jsx.development = development;
         transpiler.options.force_node_env = .unspecified;
     }
-    if (std.c.getenv("COTTONTAIL_DEBUG_JSX") != null) {
+    if (options.load_process_env and std.c.getenv("COTTONTAIL_DEBUG_JSX") != null) {
         std.debug.print("dbg build jsx: requested={any} production={} jsx.development={} side_effects={} source={s}\n", .{
             options.jsx_development,
             transpiler.options.production,
@@ -3027,4 +3071,134 @@ test "compiler diagnostics parity keeps linked calls distinct from function expr
     try std.testing.expect(called_name.len > 0);
     try std.testing.expect(function_name.len > 0);
     try std.testing.expect(!std.mem.eql(u8, called_name, function_name));
+}
+
+test "EntrySource exact bytes win through a generated graph entry wrapper" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "generated-entry.mjs",
+        .data =
+        \\import { selected } from "./selected-source.mjs";
+        \\globalThis.__entrySourceWrapperMarker = "entry-source-wrapper-ran";
+        \\globalThis.__entrySourceSelected = selected;
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "selected-source.mjs",
+        .data = "export const selected = 'entry-source-physical-bytes';\n",
+    });
+
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(relative_root);
+    const absolute_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    defer allocator.free(absolute_root);
+    const wrapper_path = try std.fs.path.join(allocator, &.{ absolute_root, "generated-entry.mjs" });
+    defer allocator.free(wrapper_path);
+    const source_path = try std.fs.path.join(allocator, &.{ absolute_root, "selected-source.mjs" });
+    defer allocator.free(source_path);
+
+    var error_message: ?[*:0]u8 = null;
+    defer if (error_message) |message| ct_bundle_string_free(message);
+    var graph = bundleEntryPointGraphWithOptions(
+        wrapper_path,
+        absolute_root,
+        .{
+            .entry_source = .{
+                .path = source_path,
+                .contents = "export const selected = 'entry-source-authoritative-bytes';\n",
+            },
+            .virtual_file_paths = &.{source_path},
+            .virtual_file_contents = &.{"export const selected = 'entry-source-generic-virtual-bytes';\n"},
+            .output_format = .cjs,
+        },
+        &error_message,
+    ) catch |err| {
+        if (error_message) |message| std.debug.print("EntrySource bundle failed: {s}\n", .{std.mem.span(message)});
+        return err;
+    };
+    defer graph.deinit();
+
+    const entry = graph.entryPoint() orelse return error.MissingEntryPoint;
+    try std.testing.expectEqual(GraphOutputKind.@"entry-point", entry.kind);
+    try std.testing.expect(std.mem.indexOf(u8, entry.contents, "entry-source-wrapper-ran") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.contents, "entry-source-authoritative-bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.contents, "entry-source-generic-virtual-bytes") == null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.contents, "entry-source-physical-bytes") == null);
+}
+
+test "EntrySource supplies an entry that is absent from the filesystem" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(relative_root);
+    const absolute_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    defer allocator.free(absolute_root);
+    const missing_entry_path = try std.fs.path.join(allocator, &.{ absolute_root, "bound-only-entry.mjs" });
+    defer allocator.free(missing_entry_path);
+
+    var error_message: ?[*:0]u8 = null;
+    defer if (error_message) |message| ct_bundle_string_free(message);
+    const output = bundleEntryPointWithOptions(
+        missing_entry_path,
+        absolute_root,
+        .{
+            .entry_source = .{
+                .path = missing_entry_path,
+                .contents = "globalThis.__entrySourceMissingPhysicalMarker = 'entry-source-memory-only';\n",
+            },
+            .output_format = .cjs,
+        },
+        &error_message,
+    ) catch |err| {
+        if (error_message) |message| std.debug.print("EntrySource bundle failed: {s}\n", .{std.mem.span(message)});
+        return err;
+    };
+    defer c_allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "entry-source-memory-only") != null);
+}
+
+test "EntrySource keeps missing relative imports as resolution errors" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(relative_root);
+    const absolute_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    defer allocator.free(absolute_root);
+    const missing_entry_path = try std.fs.path.join(allocator, &.{ absolute_root, "bound-entry-with-missing-sibling.mjs" });
+    defer allocator.free(missing_entry_path);
+
+    var error_message: ?[*:0]u8 = null;
+    defer if (error_message) |message| ct_bundle_string_free(message);
+    const output = bundleEntryPointWithOptions(
+        missing_entry_path,
+        absolute_root,
+        .{
+            .entry_source = .{
+                .path = missing_entry_path,
+                .contents =
+                \\import "./entry-source-missing-relative-sibling.mjs";
+                \\globalThis.__entrySourceMissingSiblingMustNotRun = true;
+                ,
+            },
+            .output_format = .cjs,
+        },
+        &error_message,
+    ) catch {
+        const message = error_message orelse return error.MissingBundleErrorMessage;
+        try std.testing.expect(std.mem.indexOf(u8, std.mem.span(message), "entry-source-missing-relative-sibling.mjs") != null);
+        return;
+    };
+    defer c_allocator.free(output);
+    return error.ExpectedMissingRelativeImportError;
 }

@@ -21,6 +21,8 @@ import { parseShell } from "./bun-shell-parser.js";
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const INPUT_REDIRECTS = new Set(["<", "<<", "0<", "0<<", "0>", "0>>"]);
+const HUTCH_SHELL_TASK = Symbol.for("cottontail.internal.hutchShellTask");
+const HUTCH_SHELL_STDIN = Symbol("cottontail.internal.hutchShellStdin");
 
 function bytes(value = "") {
   if (value instanceof Uint8Array) return value;
@@ -163,7 +165,11 @@ export function parseBunShellSource(source) {
   }
 }
 
-function cloneContext(context, { preserveCommandEnv = false, isolateBackground = false } = {}) {
+function cloneContext(context, {
+  preserveCommandEnv = false,
+  isolateBackground = false,
+  captureOutput = false,
+} = {}) {
   return {
     cwd: context.cwd,
     env: { ...context.env },
@@ -179,7 +185,44 @@ function cloneContext(context, { preserveCommandEnv = false, isolateBackground =
     openRedirects: context.openRedirects,
     pid: context.pid,
     concat,
+    stdoutRoute: captureOutput ? { kind: "capture" } : context.stdoutRoute,
+    stderrRoute: captureOutput ? { kind: "capture" } : context.stderrRoute,
+    hutchStdin: context.hutchStdin,
+    hutchShell: context.hutchShell,
+    children: context.children,
   };
+}
+
+function installTaskSignalForwarding(context, enabled) {
+  const processObject = globalThis.process;
+  if (!enabled || typeof processObject?.on !== "function" ||
+      typeof processObject?.off !== "function" || typeof processObject?.kill !== "function") {
+    return () => {};
+  }
+
+  const handlers = new Map();
+  let reraising = false;
+  const cleanup = () => {
+    for (const [signal, handler] of handlers) processObject.off(signal, handler);
+    handlers.clear();
+  };
+  const signals = processObject.platform === "win32"
+    ? ["SIGINT", "SIGTERM"]
+    : ["SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM"];
+  for (const signal of signals) {
+    const handler = () => {
+      if (reraising) return;
+      reraising = true;
+      for (const child of context.children) {
+        try { child.kill?.(signal); } catch {}
+      }
+      cleanup();
+      processObject.kill(processObject.pid, signal);
+    };
+    handlers.set(signal, handler);
+    processObject.on(signal, handler);
+  }
+  return cleanup;
 }
 
 async function joinBackground(context, output) {
@@ -260,32 +303,25 @@ function exportedEnvironment(context) {
   return env;
 }
 
-function windowsEnvironmentValue(env, name) {
-  const normalized = name.toUpperCase();
-  for (const [key, value] of Object.entries(env ?? {})) {
-    if (key.toUpperCase() === normalized && value != null && String(value) !== "") return String(value);
-  }
-  return undefined;
+export function isWindowsBatchPath(path) {
+  return /\.(?:cmd|bat)$/i.test(String(path).replace(/[ .]+$/g, ""));
 }
 
 function isWindowsBatchExecutable(path) {
-  return globalThis.process?.platform === "win32" &&
-    /\.(?:cmd|bat)$/i.test(String(path).replace(/[ .]+$/g, ""));
+  return globalThis.process?.platform === "win32" && isWindowsBatchPath(path);
 }
 
-function windowsCommandProcessor(env) {
-  const inherited = globalThis.process?.env ?? {};
-  const configured = windowsEnvironmentValue(env, "ComSpec") ??
-    windowsEnvironmentValue(inherited, "ComSpec");
-  if (configured) return configured;
-  const systemRoot = windowsEnvironmentValue(env, "SystemRoot") ??
-    windowsEnvironmentValue(inherited, "SystemRoot");
-  return systemRoot ? join(systemRoot, "System32", "cmd.exe") : "cmd.exe";
+export function windowsBatchUnsupportedMessage(executable) {
+  return `bun: Windows batch commands are unsupported in Bun.$: ${JSON.stringify(String(executable))}; ` +
+    "use a native executable or `hutch pm` for package-manager shims\n";
 }
 
-function windowsBatchCommand(executable, args) {
-  const quote = value => `"${String(value).replaceAll('"', '""')}"`;
-  return `"${[executable, ...args].map(quote).join(" ")}"`;
+function unsupportedWindowsBatchResult(executable) {
+  return result(
+    1,
+    "",
+    windowsBatchUnsupportedMessage(executable),
+  );
 }
 
 function unwrapNestedBraceChoice(value) {
@@ -510,10 +546,19 @@ async function expandText(text, context, execute, quoted) {
         cursor += 1;
       }
       const script = text.slice(index + 2, cursor);
-      const substitutionContext = cloneContext(context, { isolateBackground: true });
+      const substitutionContext = cloneContext(context, {
+        isolateBackground: true,
+        captureOutput: true,
+      });
       const substitution = await joinBackground(
         substitutionContext,
-        await execute(parseBunShellSource(script), substitutionContext, bytes()),
+        await execute(
+          parseBunShellSource(script),
+          substitutionContext,
+          context.hutchShell === true
+            ? context.expansionInput ?? HUTCH_SHELL_STDIN
+            : bytes(),
+        ),
       );
       output.push(commandSubstitutionText(decoder.decode(substitution.stdout), quoted));
       if (substitution.stderr.byteLength) context.expansionStderr?.push(substitution.stderr);
@@ -531,10 +576,19 @@ async function expandText(text, context, execute, quoted) {
         cursor += 1;
       }
       const script = text.slice(index + 1, cursor).replace(/\\`/g, "`");
-      const substitutionContext = cloneContext(context, { isolateBackground: true });
+      const substitutionContext = cloneContext(context, {
+        isolateBackground: true,
+        captureOutput: true,
+      });
       const substitution = await joinBackground(
         substitutionContext,
-        await execute(parseBunShellSource(script), substitutionContext, bytes()),
+        await execute(
+          parseBunShellSource(script),
+          substitutionContext,
+          context.hutchShell === true
+            ? context.expansionInput ?? HUTCH_SHELL_STDIN
+            : bytes(),
+        ),
       );
       output.push(commandSubstitutionText(decoder.decode(substitution.stdout), quoted));
       if (substitution.stderr.byteLength) context.expansionStderr?.push(substitution.stderr);
@@ -607,6 +661,12 @@ function appendExpandedSegment(fields, text, split, globEligible, preserveEmpty)
 }
 
 async function expandWord(word, context, execute, { assignment = false, redirect = false } = {}) {
+  if (!assignment && !redirect && word.parts.length === 1 && word.parts[0].expand &&
+      (word.parts[0].text === "$@" || word.parts[0].text === "${@}")) {
+    // `$@` is a positional array, not a scalar joined string. In particular,
+    // quoted "$@" expands to zero fields when no positional arguments exist.
+    return context.argv.slice(1).map(String);
+  }
   if (word.parts.length === 1 && word.parts[0].quote === "unquoted") {
     const literal = word.parts[0].text;
     if (literal !== ""
@@ -787,16 +847,115 @@ function ambiguousRedirect(redirects, commandName) {
     : null;
 }
 
-async function applyRedirects(commandResult, redirects) {
+function externalOutputRoutes(
+  redirects,
+  stdout = { kind: "fd", fd: 1 },
+  stderr = { kind: "fd", fd: 2 },
+  snapshotDescriptors = false,
+) {
+  const routes = { 1: stdout, 2: stderr };
+  const replaceRoute = (fd, destination) => {
+    if (snapshotDescriptors) {
+      // POSIX descriptor duplication snapshots the current destination. A
+      // later redirect of the source fd must not retarget an earlier duplicate.
+      routes[fd] = destination;
+      return;
+    }
+    // Preserve Bun.$'s public output-target behavior: duplicate descriptors
+    // remain linked when a later redirect selects an object buffer.
+    const previous = routes[fd];
+    for (const key of [1, 2]) {
+      if (routes[key] === previous) routes[key] = destination;
+    }
+  };
+  for (const redirect of redirects ?? []) {
+    if (INPUT_REDIRECTS.has(redirect.operator)) continue;
+    if (redirect.operator === "2>&1") {
+      routes[2] = routes[1];
+      continue;
+    }
+    if (redirect.operator === "1>&2" || redirect.operator === ">&2") {
+      routes[1] = routes[2];
+      continue;
+    }
+    if (redirect.operator === ">&1") continue;
+    const destination = redirect.outputTarget != null
+      ? { kind: "capture" }
+      : { kind: "fd", fd: redirect.fd };
+    if (redirect.operator.startsWith("&")) routes[1] = routes[2] = destination;
+    else replaceRoute(redirect.operator.startsWith("2") ? 2 : 1, destination);
+  }
+  return { stdout: routes[1], stderr: routes[2] };
+}
+
+function externalSpawnOutput(route) {
+  if (route.kind === "fd") return route.fd;
+  return "pipe";
+}
+
+async function writeOutputRoute(route, value) {
+  if (value.byteLength === 0) return true;
+  if (route?.kind === "fd") {
+    writeAllSync(route.fd, value);
+    return true;
+  }
+  if (route?.kind === "pipeline") return route.write(value);
+  return false;
+}
+
+function pipelineOutputRoute(output) {
+  let pending = Promise.resolve(true);
+  return {
+    kind: "pipeline",
+    output,
+    write(value) {
+      const next = pending.then(() => output.write(value));
+      pending = next.catch(() => false);
+      return next;
+    },
+  };
+}
+
+async function routeCommandOutput(commandResult, stdoutRoute, stderrRoute) {
+  const routeStdout = stdoutRoute?.kind === "fd" || stdoutRoute?.kind === "pipeline";
+  const routeStderr = stderrRoute?.kind === "fd" || stderrRoute?.kind === "pipeline";
+  if (routeStdout && commandResult.stdout.byteLength > 0) {
+    await writeOutputRoute(stdoutRoute, commandResult.stdout);
+  }
+  if (routeStderr && commandResult.stderr.byteLength > 0) {
+    await writeOutputRoute(stderrRoute, commandResult.stderr);
+  }
+  return {
+    ...commandResult,
+    stdout: routeStdout ? bytes() : commandResult.stdout,
+    stderr: routeStderr ? bytes() : commandResult.stderr,
+  };
+}
+
+function routeOutputPipeline(route) {
+  return {
+    async write(value) {
+      return await writeOutputRoute(route, bytes(value));
+    },
+  };
+}
+
+function followingInput(input) {
+  return input === HUTCH_SHELL_STDIN ? input : bytes();
+}
+
+async function applyRedirects(commandResult, redirects, snapshotDescriptors = false) {
   const stdoutCapture = { kind: "capture", chunks: [] };
   const stderrCapture = { kind: "capture", chunks: [] };
   const routes = { 1: stdoutCapture, 2: stderrCapture };
   const destinations = [];
   let exitCode = commandResult.exitCode;
   const replaceRoute = (fd, destination) => {
+    if (snapshotDescriptors) {
+      routes[fd] = destination;
+      return;
+    }
     const previous = routes[fd];
-    // Bun merges duplicate_out with a following file/buffer redirect, so
-    // descriptors which alias each other remain linked to the new target.
     for (const key of [1, 2]) {
       if (routes[key] === previous) routes[key] = destination;
     }
@@ -933,8 +1092,8 @@ function cancelPipelineInput(input) {
   pipelineInputChannels.get(input)?.cancel();
 }
 
-async function collectProcess(child, pipelineOutput = null) {
-  if (pipelineOutput == null) {
+async function collectProcess(child, stdoutRoute = null, stderrRoute = null) {
+  if (stdoutRoute == null && stderrRoute == null) {
     const [exitCode, stdout, stderr] = await Promise.all([
       child.exited,
       child.stdout?.bytes?.() ?? Promise.resolve(bytes()),
@@ -943,13 +1102,14 @@ async function collectProcess(child, pipelineOutput = null) {
     return result(exitCode == null ? 1 : Number(exitCode), stdout, stderr);
   }
 
-  const cancelledBeforeSpawn = pipelineOutput.cancelled;
+  const pipelineOutput = stdoutRoute?.output ?? stderrRoute?.output;
+  const cancelledBeforeSpawn = pipelineOutput?.cancelled === true;
   let pipeClosed = cancelledBeforeSpawn;
   let sentPipeSignal = false;
-  const pumpStdout = async () => {
-    if (child.stdout == null) return;
-    for await (const chunk of child.stdout) {
-      if (!pipeClosed && await pipelineOutput.write(chunk)) continue;
+  const pump = async (stream, route) => {
+    if (stream == null || route == null) return;
+    for await (const chunk of stream) {
+      if (!pipeClosed && await writeOutputRoute(route, bytes(chunk))) continue;
       pipeClosed = true;
       if (!sentPipeSignal) {
         sentPipeSignal = true;
@@ -957,14 +1117,18 @@ async function collectProcess(child, pipelineOutput = null) {
       }
     }
   };
-  const [exitCode, , stderr] = await Promise.all([
+  const [exitCode, stdout, stderr] = await Promise.all([
     child.exited,
-    pumpStdout(),
-    child.stderr?.bytes?.() ?? Promise.resolve(bytes()),
+    stdoutRoute == null
+      ? child.stdout?.bytes?.() ?? Promise.resolve(bytes())
+      : pump(child.stdout, stdoutRoute).then(() => bytes()),
+    stderrRoute == null
+      ? child.stderr?.bytes?.() ?? Promise.resolve(bytes())
+      : pump(child.stderr, stderrRoute).then(() => bytes()),
   ]);
   return {
-    ...result(exitCode == null ? 1 : Number(exitCode), "", stderr),
-    piped: true,
+    ...result(exitCode == null ? 1 : Number(exitCode), stdout, stderr),
+    piped: stdoutRoute != null,
     pipeClosed,
   };
 }
@@ -1070,14 +1234,42 @@ export function createBunShellRuntime(host) {
     },
   });
 
-  async function executeCompound(node, context, input, name, callback) {
+  async function executeCompound(node, context, input, name, callback, pipelineOutput = null) {
     const redirects = await prepareRedirects(node.redirects, context, execute);
     const redirectFailure = ambiguousRedirect(redirects, name);
     if (redirectFailure) return redirectFailure;
     const redirected = await setupRedirects(redirects, context, input, name);
     if (redirected.error) return redirected.error;
-    const commandResult = await callback(redirected.input);
-    return applyRedirects(commandResult, redirects);
+    const parentStdout = context.stdoutRoute;
+    const parentStderr = context.stderrRoute;
+    const baseStdout = pipelineOutput == null
+      ? parentStdout
+      : pipelineOutputRoute(pipelineOutput);
+    const outputRoutes = externalOutputRoutes(
+      redirects,
+      baseStdout,
+      parentStderr,
+      context.hutchShell === true,
+    );
+    context.stdoutRoute = outputRoutes.stdout;
+    context.stderrRoute = outputRoutes.stderr;
+    let commandResult;
+    try {
+      commandResult = await callback(redirected.input);
+    } finally {
+      context.stdoutRoute = parentStdout;
+      context.stderrRoute = parentStderr;
+    }
+    const redirectedResult = await applyRedirects(
+      commandResult,
+      redirects,
+      context.hutchShell === true,
+    );
+    return await routeCommandOutput(
+      redirectedResult,
+      baseStdout,
+      parentStderr,
+    );
   }
 
   function isAssignmentOnlyPipelineItem(node) {
@@ -1111,7 +1303,7 @@ export function createBunShellRuntime(host) {
         stdout.push(current.stdout);
         stderr.push(current.stderr);
         if (current.shellExit) break;
-        input = bytes();
+        input = followingInput(input);
       }
       return { ...current, exitCode: current.exitCode, stdout: concat(stdout), stderr: concat(stderr) };
     }
@@ -1121,7 +1313,7 @@ export function createBunShellRuntime(host) {
       context.status = left.exitCode;
       if (left.shellExit) return left;
       if ((node.operator === "&&" && left.exitCode !== 0) || (node.operator === "||" && left.exitCode === 0)) return left;
-      const right = await execute(node.right, context, bytes());
+      const right = await execute(node.right, context, followingInput(input));
       return { ...right, exitCode: right.exitCode, stdout: concat([left.stdout, right.stdout]), stderr: concat([left.stderr, right.stderr]) };
     }
 
@@ -1143,7 +1335,19 @@ export function createBunShellRuntime(host) {
       }
       const completed = await Promise.all(stages);
       const current = completed.at(-1) ?? result();
-      return { ...current, exitCode: current.exitCode, stderr: concat(completed.map(item => item.stderr)), shellExit: false };
+      const pipelineResult = {
+        ...current,
+        exitCode: current.exitCode,
+        stderr: concat(completed.map(item => item.stderr)),
+        shellExit: false,
+      };
+      return await routeCommandOutput(
+        pipelineResult,
+        pipelineOutput == null
+          ? context.stdoutRoute
+          : pipelineOutputRoute(pipelineOutput),
+        context.stderrRoute,
+      );
     }
 
     if (node.type === "negate") {
@@ -1167,11 +1371,18 @@ export function createBunShellRuntime(host) {
         const output = await execute(node.script, subshellContext, redirectedInputBytes);
         context.background.push(...subshellContext.background.splice(0));
         return { ...output, shellExit: false };
-      });
+      }, pipelineOutput);
     }
 
     if (node.type === "group") {
-      return executeCompound(node, context, input, "group", redirectedInputBytes => execute(node.script, context, redirectedInputBytes));
+      return executeCompound(
+        node,
+        context,
+        input,
+        "group",
+        redirectedInputBytes => execute(node.script, context, redirectedInputBytes),
+        pipelineOutput,
+      );
     }
 
     if (node.type === "if") {
@@ -1184,16 +1395,16 @@ export function createBunShellRuntime(host) {
           errors.push(condition.stderr);
           if (condition.shellExit) return { ...condition, stdout: concat(output), stderr: concat(errors) };
           if (condition.exitCode === 0) {
-            const consequent = await execute(branch.consequent, context, bytes());
+            const consequent = await execute(branch.consequent, context, followingInput(redirectedInputBytes));
             return { ...consequent, stdout: concat([...output, consequent.stdout]), stderr: concat([...errors, consequent.stderr]) };
           }
         }
         if (node.alternate) {
-          const alternate = await execute(node.alternate, context, bytes());
+          const alternate = await execute(node.alternate, context, followingInput(redirectedInputBytes));
           return { ...alternate, stdout: concat([...output, alternate.stdout]), stderr: concat([...errors, alternate.stderr]) };
         }
         return { exitCode: 0, stdout: concat(output), stderr: concat(errors) };
-      });
+      }, pipelineOutput);
     }
 
     if (node.type === "conditional") {
@@ -1204,7 +1415,7 @@ export function createBunShellRuntime(host) {
           else values.push(...await expandWord(word, context, execute, { assignment: true }));
         }
         return result(evaluateConditional(values, context) ? 0 : 1);
-      });
+      }, pipelineOutput);
     }
 
     if (node.type === "assignmentPrefix") {
@@ -1221,6 +1432,7 @@ export function createBunShellRuntime(host) {
     }
 
     const commandName = node.words[0]?.raw ?? "";
+    if (context.hutchShell === true) context.expansionInput = input;
     const redirects = await prepareRedirects(node.redirects, context, execute);
     const redirectFailure = ambiguousRedirect(redirects, commandName);
     if (redirectFailure) return redirectFailure;
@@ -1243,7 +1455,7 @@ export function createBunShellRuntime(host) {
     } finally {
       context.expansionStderr = previousExpansionStderr;
     }
-    const expansionStderr = concat(expansionErrors);
+    let expansionStderr = concat(expansionErrors);
     const assignments = [];
     while (expanded.length) {
       const assignment = assignmentParts(expanded[0]);
@@ -1254,7 +1466,18 @@ export function createBunShellRuntime(host) {
     if (expanded.length === 0) {
       for (const assignment of assignments) context.env[assignment.name] = assignment.value;
       if (isStreamingInput(input)) cancelPipelineInput(input);
-      return applyRedirects(result(expansionHadCommandSubstitution ? context.status : 0, "", expansionStderr), redirects);
+      const redirectedResult = await applyRedirects(
+        result(expansionHadCommandSubstitution ? context.status : 0, "", expansionStderr),
+        redirects,
+        context.hutchShell === true,
+      );
+      return await routeCommandOutput(
+        redirectedResult,
+        pipelineOutput == null
+          ? context.stdoutRoute
+          : pipelineOutputRoute(pipelineOutput),
+        context.stderrRoute,
+      );
     }
 
     const commandContext = assignments.length
@@ -1267,16 +1490,44 @@ export function createBunShellRuntime(host) {
       context.externalEnv[assignment.name] = assignment.value;
     }
     let [name, ...args] = expanded;
-    let commandResult = await runBuiltin(name, args, commandContext, input, pipelineOutput);
+    const baseStdout = pipelineOutput == null
+      ? commandContext.stdoutRoute
+      : pipelineOutputRoute(pipelineOutput);
+    const outputRoutes = externalOutputRoutes(
+      redirects,
+      baseStdout,
+      commandContext.stderrRoute,
+      commandContext.hutchShell === true,
+    );
+    const stdoutPipeline = outputRoutes.stdout.kind === "pipeline" ? outputRoutes.stdout : null;
+    const stderrPipeline = outputRoutes.stderr.kind === "pipeline" ? outputRoutes.stderr : null;
+    if (expansionStderr.byteLength > 0 && outputRoutes.stderr.kind !== "capture") {
+      await writeOutputRoute(outputRoutes.stderr, expansionStderr);
+      expansionStderr = bytes();
+    }
+    const builtinInput = input === HUTCH_SHELL_STDIN
+      ? name === "cat" && args.length === 0
+        ? commandContext.hutchStdin()
+        : bytes()
+      : input;
+    const builtinOutput = outputRoutes.stdout.kind === "fd" || outputRoutes.stdout.kind === "pipeline"
+      ? routeOutputPipeline(outputRoutes.stdout)
+        : null;
+    let commandResult = await runBuiltin(name, args, commandContext, builtinInput, builtinOutput);
+    if (commandResult != null && commandContext.hutchShell === true && name === "exit") {
+      if (args.length === 0) commandResult.exitCode = commandContext.status;
+      commandResult.shellExit = true;
+    }
     if (commandResult != null && isStreamingInput(input) && commandResult.consumedInput !== true) {
       cancelPipelineInput(input);
     }
 
     const resolvedRuntimePath = resolve(host.execPath);
-    const invokesRuntime = name === "bun"
-      || name === "cottontail"
-      || resolve(commandContext.cwd, name) === resolvedRuntimePath
-      || basename(name) === basename(resolvedRuntimePath);
+    const invokesSelectedRuntime = value => value === "bun"
+      || value === "cottontail"
+      || resolve(commandContext.cwd, value) === resolvedRuntimePath
+      || basename(value) === basename(resolvedRuntimePath);
+    let invokesRuntime = invokesSelectedRuntime(name);
     if (commandResult == null && invokesRuntime && args[0] === "run" && /\.bun\.sh$/i.test(args[1] ?? "")) {
       const scriptPath = isAbsolute(args[1]) ? args[1] : resolve(commandContext.cwd, args[1]);
       try {
@@ -1293,56 +1544,97 @@ export function createBunShellRuntime(host) {
     }
 
     if (commandResult == null && (name === "exec" || (invokesRuntime && args[0] === "exec"))) {
-      if (name !== "exec") args = args.slice(1);
-      if (args.length === 0) {
+      const target = name === "exec" ? args : args.slice(1);
+      if (target.length === 0) {
         commandResult = result(0, 'Usage: cottontail exec <script>\n\nExecute a shell script directly from Cottontail.\n\nNote: If executing this from a shell, make sure to escape the string!\n\nExamples:\n  cottontail exec "echo hi"\n  cottontail exec "echo \\"hey friends\\"!"\n');
+      } else if (commandContext.hutchShell === true) {
+        // Hutch interpolations are already structured argv. Re-parsing a
+        // joined string here would turn opaque values back into shell syntax.
+        [name, ...args] = target;
       } else {
-        commandResult = await execute(parseBunShellSource(args.join(" ")), commandContext, input);
+        commandResult = await execute(parseBunShellSource(target.join(" ")), commandContext, input);
       }
     }
 
+    if (commandResult == null && isWindowsBatchExecutable(name)) {
+      if (isStreamingInput(input)) cancelPipelineInput(input);
+      commandResult = unsupportedWindowsBatchResult(name);
+    }
+
     if (commandResult == null) {
+      const childEnv = exportedEnvironment(commandContext);
+      let executable = null;
       try {
-        const childEnv = exportedEnvironment(commandContext);
-        const executable = name === "bun"
+        executable = name === "bun"
           ? host.execPath
           : host.which(name, { ...childEnv, cwd: commandContext.cwd });
-        if (executable == null) throw new Error(`command not found: ${name}`);
-        const batch = isWindowsBatchExecutable(executable);
-        const command = batch
-          ? [
-              windowsCommandProcessor(childEnv),
-              "/d",
-              "/s",
-              "/c",
-              windowsBatchCommand(executable, args),
-            ]
-          : [executable, ...args];
-        const child = host.spawn(command, {
-          cwd: commandContext.cwd,
-          env: childEnv,
-          stdin: isStreamingInput(input) ? input : input.byteLength ? input : "ignore",
-          stdout: "pipe",
-          stderr: "pipe",
-          windowsVerbatimArguments: batch,
-        });
-        const streamsToPipeline = pipelineOutput != null
-          && redirects.every(redirect => INPUT_REDIRECTS.has(redirect.operator));
-        commandResult = await collectProcess(child, streamsToPipeline ? pipelineOutput : null);
-      } catch (error) {
+      } catch {}
+      if (executable == null) {
         if (isStreamingInput(input)) cancelPipelineInput(input);
         commandResult = result(1, "", `bun: command not found: ${expanded[0]}\n`);
+      } else {
+        const batch = isWindowsBatchExecutable(executable);
+        if (batch) {
+          if (isStreamingInput(input)) cancelPipelineInput(input);
+          commandResult = unsupportedWindowsBatchResult(executable);
+        } else {
+          let child;
+          try {
+            child = host.spawn([executable, ...args], {
+              cwd: commandContext.cwd,
+              env: childEnv,
+              stdin: input === HUTCH_SHELL_STDIN
+                ? "inherit"
+                : isStreamingInput(input)
+                  ? input
+                  : input.byteLength
+                    ? input
+                    : "ignore",
+              stdout: stdoutPipeline != null
+                ? "pipe"
+                : externalSpawnOutput(outputRoutes.stdout),
+              stderr: externalSpawnOutput(outputRoutes.stderr),
+            });
+          } catch (error) {
+            if (isStreamingInput(input)) cancelPipelineInput(input);
+            commandResult = result(1, "", fileReason(error, expanded[0]));
+          }
+          if (child != null) {
+            commandContext.children.add(child);
+            try {
+              commandResult = await collectProcess(child, stdoutPipeline, stderrPipeline);
+            } finally {
+              commandContext.children.delete(child);
+            }
+          }
+        }
       }
     }
     commandResult.stderr = concat([expansionStderr, commandResult.stderr]);
-    return applyRedirects(commandResult, redirects);
+    const redirectedResult = await applyRedirects(
+      commandResult,
+      redirects,
+      commandContext.hutchShell === true,
+    );
+    return await routeCommandOutput(
+      redirectedResult,
+      baseStdout,
+      commandContext.stderrRoute,
+    );
   }
 
   return async function runShell(source, options = {}) {
     validateOutputReferences(source, options.outputTargets);
     const env = { ...host.env(), ...(options.env ?? {}) };
     const cwd = resolve(String(options.cwd ?? host.cwd()));
+    const hutchTask = globalThis.__cottontailHutchPrivateFileMode === "shell"
+      ? options[HUTCH_SHELL_TASK]
+      : undefined;
+    const input = typeof hutchTask?.input === "function"
+      ? HUTCH_SHELL_STDIN
+      : bytes(options.input ?? "");
     env.PWD = cwd;
+    const passthrough = hutchTask?.passthrough === true && options.quiet !== true;
     const context = {
       cwd,
       env,
@@ -1355,11 +1647,17 @@ export function createBunShellRuntime(host) {
       openRedirects: new Set(),
       pid: globalThis.process?.pid,
       concat,
+      stdoutRoute: passthrough ? { kind: "fd", fd: 1 } : { kind: "capture" },
+      stderrRoute: passthrough ? { kind: "fd", fd: 2 } : { kind: "capture" },
+      hutchStdin: hutchTask?.input,
+      hutchShell: hutchTask != null,
+      children: new Set(),
     };
+    const removeSignalForwarding = installTaskSignalForwarding(context, hutchTask != null);
     try {
       const output = await joinBackground(
         context,
-        await execute(parseBunShellSource(source), context, bytes(options.input ?? "")),
+        await execute(parseBunShellSource(source), context, input),
       );
       return {
         status: output.exitCode,
@@ -1371,6 +1669,7 @@ export function createBunShellRuntime(host) {
       if (error?.code === "BUN_SHELL_PARAMETER") return { status: 1, stdout: bytes(), stderr: bytes(`${error.message}\n`) };
       throw error;
     } finally {
+      removeSignalForwarding();
       for (const fd of context.openRedirects) {
         try { closeSync(fd); } catch {}
       }

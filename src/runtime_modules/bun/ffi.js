@@ -372,11 +372,13 @@ if (cottontail.isWorker?.() === true && typeof g.__cottontailWorkerEvalSource ==
 // They are implementation details of that handoff: promote them to internal
 // globals and drop them from process.env so children spawned by tests (which
 // copy process.env) run exactly like a directly invoked runtime.
-if (g.process.env?.COTTONTAIL_TEST_CLI_HEADER_PRINTED === "1") {
+if (globalThis.__cottontailHutchPrivateFileMode == null &&
+    g.process.env?.COTTONTAIL_TEST_CLI_HEADER_PRINTED === "1") {
   globalThis.__cottontailBunTestHeaderPrinted = true;
   delete g.process.env.COTTONTAIL_TEST_CLI_HEADER_PRINTED;
 }
-if (g.process.env?.COTTONTAIL_TEST_FILE_COUNT !== undefined) {
+if (globalThis.__cottontailHutchPrivateFileMode == null &&
+    g.process.env?.COTTONTAIL_TEST_FILE_COUNT !== undefined) {
   globalThis.__cottontailBunTestFileCount = g.process.env.COTTONTAIL_TEST_FILE_COUNT;
   delete g.process.env.COTTONTAIL_TEST_FILE_COUNT;
 }
@@ -454,7 +456,9 @@ g.process.stdout ??= createWritableStdio(1);
 g.process.stderr ??= createWritableStdio(2);
 
 const ipcPrefix = "__COTTONTAIL_IPC__";
-const nativeIpcFd = Number(g.process.env?.COTTONTAIL_IPC_FD);
+const nativeIpcFd = globalThis.__cottontailHutchPrivateFileMode == null
+  ? Number(g.process.env?.COTTONTAIL_IPC_FD)
+  : Number.NaN;
 let installNativeProcessIpcReader = null;
 let nativeProcessIpcTimer = null;
 if (Number.isInteger(nativeIpcFd) && nativeIpcFd >= 0 &&
@@ -549,7 +553,8 @@ if (Number.isInteger(nativeIpcFd) && nativeIpcFd >= 0 &&
       nativeProcessIpcTimer.unref?.();
     };
   }
-} else if (g.process.env?.COTTONTAIL_IPC_STDIO === "1" &&
+} else if (globalThis.__cottontailHutchPrivateFileMode == null &&
+    g.process.env?.COTTONTAIL_IPC_STDIO === "1" &&
     g.process.env?.COTTONTAIL_IPC_BOOTSTRAP === "bun" &&
     typeof g.process.send !== "function") {
   g.process.connected = true;
@@ -647,6 +652,7 @@ const consoleIdentifierKey = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 }
 
 const bunfigConsoleDepth = () => {
+  if (globalThis.__cottontailHutchPrivateFileMode != null) return undefined;
   try {
     const source = String(cottontail.readFile("bunfig.toml"));
     let inConsoleSection = false;
@@ -2365,8 +2371,10 @@ function installTimers() {
 }
 
 installTimers();
-installInheritedBunIpcCodec(cottontail, g.process);
-installInheritedNodeIpc(cottontail, g.process);
+if (globalThis.__cottontailHutchPrivateFileMode == null) {
+  installInheritedBunIpcCodec(cottontail, g.process);
+  installInheritedNodeIpc(cottontail, g.process);
+}
 installNativeProcessIpcReader?.();
 
 const spawnEventListeners = new Map();

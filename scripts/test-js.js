@@ -643,6 +643,12 @@ try {
       stdoutIncludes: ['3 pass', '0 fail'],
     },
     {
+      name: 'hutch-shell-cli',
+      argv: ['test', join(rootDir, 'tests', 'js', 'hutch-shell-cli.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: [process.platform === 'win32' ? '55 pass' : '60 pass', '0 fail'],
+    },
+    {
       name: 'runtime-cli-define',
       argv: ['test', join(rootDir, 'tests', 'js', 'runtime-cli-define.test.ts')],
       expectExitCode: 0,
@@ -652,7 +658,7 @@ try {
       name: 'bun-shell-runtime',
       argv: ['test', join(rootDir, 'tests', 'js', 'bun-shell-runtime.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: ['13 pass', '0 fail'],
+      stdoutIncludes: ['16 pass', '0 fail'],
     },
     {
       name: 'bun-shell-source-port',

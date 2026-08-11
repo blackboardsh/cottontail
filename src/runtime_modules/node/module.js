@@ -1242,7 +1242,9 @@ function embeddedRuntimeSourceEntry(path) {
     return { found: value !== undefined, value };
   }
 
-  const overrideRoot = globalThis.process?.env?.COTTONTAIL_RUNTIME_MODULES_DIR;
+  const overrideRoot = globalThis.__cottontailHutchPrivateFileMode == null
+    ? globalThis.process?.env?.COTTONTAIL_RUNTIME_MODULES_DIR
+    : undefined;
   if (typeof overrideRoot === "string" && overrideRoot.length > 0) {
     const overridePath = join(overrideRoot, ...relativePath.split("/"));
     try {

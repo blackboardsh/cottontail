@@ -3033,7 +3033,9 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
 
 // The normal runtime bootstrap installs process IPC before user code. Keep a
 // module-local fallback for embedders that load child_process without ffi.js.
-if (globalThis.process?.env?.COTTONTAIL_IPC_BOOTSTRAP === "node" && typeof globalThis.process?.send !== "function") {
+if (globalThis.__cottontailHutchPrivateFileMode == null &&
+    globalThis.process?.env?.COTTONTAIL_IPC_BOOTSTRAP === "node" &&
+    typeof globalThis.process?.send !== "function") {
   try { _forkChild(); } catch {}
 }
 

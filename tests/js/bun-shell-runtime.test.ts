@@ -3,11 +3,81 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { $ } from "bun";
+import {
+  createBunShellRuntime,
+  isWindowsBatchPath,
+  windowsBatchUnsupportedMessage,
+} from "../../src/runtime_modules/internal/bun-shell-runtime.js";
 
 const root = mkdtempSync(join(tmpdir(), "cottontail-shell-"));
 const portableChild = join(import.meta.dir, "fixtures", "shell-portable-child.js");
 
 afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+test("classifies Windows batch paths for fail-closed execution", () => {
+  for (const path of [
+    "npm.cmd",
+    "PNPM.CMD",
+    "yarn.bat",
+    "C:\\Tools\\YARN.BAT",
+    "npm.cmd. ",
+    "pnpm.BaT   ... ",
+  ]) {
+    expect(isWindowsBatchPath(path)).toBe(true);
+  }
+  for (const path of ["npm", "npm.exe", "npm.cmd.exe", "npm.command", "cmd.txt"]) {
+    expect(isWindowsBatchPath(path)).toBe(false);
+  }
+
+  const message = windowsBatchUnsupportedMessage("npm.cmd");
+  expect(message).toContain("Windows batch commands are unsupported in Bun.$");
+  expect(message).toContain("hutch pm");
+  expect(message).toContain("native executable");
+});
+
+test("fails closed before spawning Windows batch commands", async () => {
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  expect(platformDescriptor?.configurable).toBe(true);
+  let spawned = false;
+  try {
+    Object.defineProperty(process, "platform", {
+      ...platformDescriptor,
+      value: "win32",
+    });
+    const run = createBunShellRuntime({
+      env: () => ({ PATH: "C:\\Tools" }),
+      cwd: () => process.cwd(),
+      argv: () => [process.execPath],
+      execPath: process.execPath,
+      which: () => "C:\\Tools\\npm.CMD. ",
+      spawn: () => {
+        spawned = true;
+        throw new Error("batch command reached the native spawn boundary");
+      },
+    });
+    const output = await run('npm "%PATH% & echo injected>marker.txt"');
+    expect(output.status).toBe(1);
+    expect(new TextDecoder().decode(output.stderr)).toBe(
+      windowsBatchUnsupportedMessage("C:\\Tools\\npm.CMD. "),
+    );
+  } finally {
+    Object.defineProperty(process, "platform", platformDescriptor!);
+  }
+  expect(spawned).toBe(false);
+});
+
+test("ordinary runtimes cannot forge Hutch shell passthrough authorization", () => {
+  const descriptor = Object.getOwnPropertyDescriptor(
+    globalThis,
+    "__cottontailHutchPrivateFileMode",
+  );
+  expect(descriptor?.value).toBeNull();
+  expect(descriptor?.writable).toBe(false);
+  expect(descriptor?.configurable).toBe(false);
+  expect(() => Object.defineProperty(globalThis, "__cottontailHutchPrivateFileMode", {
+    value: "shell",
+  })).toThrow();
+});
 
 test("ports Bun shell escaping", () => {
   expect($.escape("1 2 3")).toBe('"1 2 3"');

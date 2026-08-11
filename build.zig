@@ -688,6 +688,30 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("cottontail_compiler", createCompilerModule(b, target, optimize));
     exe.root_module.addAnonymousImport("runtime_modules_blob", .{ .root_source_file = runtime_modules_blob });
 
+    // Cross-target semantic analysis for the Windows Zig code. Depending on
+    // the compile step directly leaves its output unrequested, so Zig uses
+    // -fno-emit-bin and neither links JSC nor requires Windows SDK libraries.
+    const windows_check_target = b.resolveTargetQuery(.{
+        .cpu_arch = .x86_64,
+        .cpu_model = .baseline,
+        .os_tag = .windows,
+        .abi = .gnu,
+    });
+    const windows_check = b.addExecutable(.{
+        .name = "cottontail-windows-check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = windows_check_target,
+            .optimize = optimize,
+        }),
+    });
+    windows_check.root_module.link_libc = true;
+    windows_check.root_module.addIncludePath(b.path("src"));
+    windows_check.root_module.addImport("cottontail_compiler", createCompilerModule(b, windows_check_target, optimize));
+    windows_check.root_module.addAnonymousImport("runtime_modules_blob", .{ .root_source_file = runtime_modules_blob });
+    const check_windows_step = b.step("check-windows", "Semantically check the Windows target without linking");
+    check_windows_step.dependOn(&windows_check.step);
+
     const upstream_command_adapter = b.addExecutable(.{
         .name = "cottontail-upstream-command",
         .root_module = b.createModule(.{
