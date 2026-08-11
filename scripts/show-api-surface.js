@@ -121,7 +121,7 @@ function formatInteger(value) {
 }
 
 function upstreamStatusSummary(upstreamStatus) {
-  const fields = ['enabled', 'delegated', 'expectedFailure', 'disabled', 'notEnabled'];
+  const fields = ['enabled', 'expectedFailure', 'disabled', 'notEnabled'];
   const values = Object.fromEntries(fields.map((field) => [field, upstreamStatus[field] ?? 0]));
   for (const [field, value] of Object.entries(values)) {
     if (!Number.isInteger(value) || value < 0) {
@@ -130,7 +130,7 @@ function upstreamStatusSummary(upstreamStatus) {
   }
 
   const categoryTotal =
-    values.enabled + values.delegated + values.expectedFailure + values.disabled;
+    values.enabled + values.expectedFailure + values.disabled;
   const classifiedTests = upstreamStatus.classifiedTests ?? upstreamStatus.trackedTests ?? categoryTotal;
   const discoveredRunnableFiles = upstreamStatus.discoveredRunnableFiles ?? classifiedTests + values.notEnabled;
   if (!Number.isInteger(classifiedTests) || classifiedTests < 0) {
@@ -165,16 +165,14 @@ function printUpstreamMetric(label, upstreamStatus) {
   }
 
   const tierDetail = [
-    'current repository-owned tier',
-    `${summary.delegated} delegated to Hutch`,
+    'Cottontail-owned tier',
     `${summary.expectedFailure} expected-failure`,
     `${summary.disabled} disabled`,
   ].join('; ');
-  const repositoryOwnedTier = summary.classifiedTests - summary.delegated;
   printMetric(
     label,
     summary.enabled,
-    repositoryOwnedTier,
+    summary.classifiedTests,
     tierDetail,
   );
   console.log(
@@ -184,14 +182,6 @@ function printUpstreamMetric(label, upstreamStatus) {
       'dim'
     )}`
   );
-  if (summary.delegated > 0) {
-    console.log(
-      `${pad('', 22)} ${paint(
-        'Delegated behavior is reported by Hutch; it is not counted as a Cottontail pass.',
-        'dim'
-      )}`
-    );
-  }
 }
 
 function printRows(rows, options = {}) {

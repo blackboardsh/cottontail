@@ -36,52 +36,49 @@
   "routing": {
     "allowedDestinations": [
       "cottontail",
-      "hutch",
       "external",
       "out-of-scope"
     ],
     "destinationSemantics": {
       "cottontail": "owned-in-this-repository",
-      "hutch": "handoff-to-hutch-repository",
       "external": "handoff-to-a-recorded-external-repository",
       "out-of-scope": "recorded-non-adoption"
     },
     "defaultDestination": "cottontail",
     "baselineStatusPath": "compat/upstream/bun/v1.3.10/status.json",
     "baselineOwnerMap": {
-      "cottontail-runtime": "cottontail",
-      "hutch-package-manager": "hutch"
+      "cottontail-runtime": "cottontail"
     },
     "rules": [
       {
         "pathPrefix": "test/cli/install/",
-        "destination": "hutch",
-        "reason": "Hand package installation and package-manager test changes to the Hutch repository."
+        "destination": "out-of-scope",
+        "reason": "Package installation belongs to the project's selected external package manager, not Cottontail."
       },
       {
         "pathPrefix": "test/cli/create/",
-        "destination": "hutch",
-        "reason": "Hand project creation and mutation test changes to the Hutch repository."
+        "destination": "out-of-scope",
+        "reason": "Bun-compatible project creation is outside Cottontail's runtime and compiler scope."
       },
       {
         "pathPrefix": "test/cli/init/",
-        "destination": "hutch",
-        "reason": "Hand project creation and mutation test changes to the Hutch repository."
+        "destination": "out-of-scope",
+        "reason": "Bun-compatible project creation is outside Cottontail's runtime and compiler scope."
       },
       {
         "pathPrefix": "test/cli/update_interactive",
-        "destination": "hutch",
-        "reason": "Hand interactive package-update test changes to the Hutch repository."
+        "destination": "out-of-scope",
+        "reason": "Interactive dependency updates belong to the project's selected external package manager."
       },
       {
         "pathPrefix": "test/js/third_party/pnpm/",
-        "destination": "hutch",
-        "reason": "Hand package-manager test changes to the Hutch repository."
+        "destination": "out-of-scope",
+        "reason": "pnpm package-manager compatibility is outside Cottontail's runtime and compiler scope."
       },
       {
         "pathPrefix": "test/integration/next-pages/",
-        "destination": "hutch",
-        "reason": "Hand Next Pages dependency-install, lockfile/layout, and public development/build orchestration changes to the Hutch repository."
+        "destination": "out-of-scope",
+        "reason": "The copied integration depends on Bun package installation, lockfile layout, and Bun-specific public orchestration outside Cottontail's scope."
       },
       {
         "path": "test/bake/dev/react-response.test.ts",
@@ -120,11 +117,18 @@
       },
       {
         "effectiveAt": "30e609e08073cf7114bfb278506962a5b19d0677",
-        "reviewedAt": "2026-08-08",
+        "reviewedAt": "2026-08-11",
         "pathPrefix": "test/integration/next-pages/",
-        "from": "cottontail",
-        "to": "hutch",
-        "reason": "Moved the three canonical Next Pages install, lockfile/layout, development-server, SSR, and production-build integration files to Hutch ownership without changing their upstream-relative paths."
+        "from": "hutch",
+        "to": "out-of-scope",
+        "reason": "Retired the transitional Hutch package-manager tier after package management became an external tool concern."
+      },
+      {
+        "effectiveAt": "30e609e08073cf7114bfb278506962a5b19d0677",
+        "reviewedAt": "2026-08-11",
+        "from": "hutch",
+        "to": "out-of-scope",
+        "reason": "Retired all 103 Bun package-manager and project-orchestration files from Cottontail's copied runnable corpus; future upstream changes in those areas are explicit non-adoptions."
       }
     ]
   },
@@ -133,7 +137,7 @@
     "licensePath": "compat/upstream/bun/v1.3.10/LICENSE.md"
   },
   "mappingPolicy": {
-    "implicit": "same-relative-path-at-baseline-and-recorded-same-path-handoffs",
+    "implicit": "same-relative-path-at-baseline",
     "relationships": [
       "adapted",
       "reimplemented",

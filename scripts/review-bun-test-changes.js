@@ -84,7 +84,7 @@ export function validateMetadata(metadata) {
     throw new Error('Upstream review metadata requires a full lastReviewed commit.');
   }
   const allowed = metadata.routing?.allowedDestinations;
-  for (const destination of ['cottontail', 'hutch', 'external', 'out-of-scope']) {
+  for (const destination of ['cottontail', 'external', 'out-of-scope']) {
     if (!Array.isArray(allowed) || !allowed.includes(destination)) {
       throw new Error(`Upstream review routing must allow ${destination}.`);
     }

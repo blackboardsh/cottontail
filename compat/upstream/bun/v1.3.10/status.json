@@ -966,477 +966,9 @@
       },
       "timeoutMs": 240000
     },
-    "test/cli/install/bad-workspace.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Invalid workspace globs, ./ paths, and Windows-style .\\ paths fail cleanly without crashing across all three copied cases (8 assertions)."
-    },
-    "test/cli/install/bun-create.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Bun create template resolution, scoped initializer naming, GitHub shorthand handling, argument forwarding, and destination validation pass all 13 copied cases (24 assertions)."
-    },
-    "test/cli/install/bun-info.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Bun info and pm view package selection, rendering, property access, JSON output, diagnostics, and concurrent inline snapshots pass all 19 copied cases (60 assertions)."
-    },
-    "test/cli/install/bun-run.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "All 291 copied Bun run cases pass across script/module/bin/system-command priority, extension and directory resolution, workspace filters and argument forwarding, lifecycle execution, diagnostics, signals, and monorepo roots (416 assertions)."
-    },
-    "test/cli/install/bun-run-dir.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "All three copied auto-install run cases pass with 29 assertions. The extended deadline records Cottontail's current cold package-install cost without weakening behavioral assertions.",
-      "args": [
-        "--timeout",
-        "50000"
-      ],
-      "timeoutMs": 180000
-    },
-    "test/cli/install/bunx.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "All 26 stable bunx cases pass with 115 assertions and one platform skip. The live @angular/cli@latest case is excluded as non-hermetic registry drift because current Angular requires a newer Node patch release and official Bun 1.3.10 fails it identically.",
-      "args": [
-        "--timeout",
-        "300000",
-        "--test-name-pattern=^(?!should handle package that requires node 24$).*"
-      ],
-      "timeoutMs": 360000,
-      "testNameExclusion": {
-        "pattern": "^(?!should handle package that requires node 24$).*",
-        "classification": "environment",
-        "testNames": [
-          "should handle package that requires node 24"
-        ],
-        "reason": "The live @angular/cli registry case has drifted beyond the pinned runtime and fails under Bun 1.3.10 too."
-      }
-    },
-    "test/cli/install/bun-audit.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Audit request shaping, severity filtering, JSON and text output, registry selection, and failure diagnostics pass all 16 copied cases (44 assertions).",
-      "args": [
-        "--timeout",
-        "30000"
-      ],
-      "timeoutMs": 180000
-    },
-    "test/cli/install/bun-install-security-provider.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Install security providers load local scanners, validate scanner and advisory contracts, report progress and fatal advisories, handle large responses, and scan multiple package forms across all 42 copied cases (468 assertions).",
-      "args": [
-        "--timeout",
-        "60000"
-      ],
-      "timeoutMs": 600000
-    },
-    "test/cli/install/bun-install.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "All 171 active copied install cases pass across registry and Git resolution, workspaces, lockfiles, lifecycle scripts, production installs, aliases, peer dependencies, bin linking, and diagnostics (5 snapshots, 1995 assertions); two upstream todos remain.",
-      "serial": true,
-      "args": [
-        "--max-concurrency=1",
-        "--timeout=300000"
-      ],
-      "timeoutMs": 300000
-    },
-    "test/cli/install/bun-install-registry.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "All 220 active copied registry-install cases pass across resolution, hoisting, transitive folder dependencies, updates, prereleases, peer graphs, lockfiles, and reinstall behavior (18 snapshots, 5,404 assertions); five upstream todos remain.",
-      "serial": true,
-      "args": [
-        "--max-concurrency=1",
-        "--timeout=30000"
-      ],
-      "timeoutMs": 120000
-    },
-    "test/cli/install/bun-pm-scan.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Configured local and package scanners, payload validation, advisories, process exits, lockfile requirements, and scanner installation behavior pass all 17 copied cases (44 assertions).",
-      "args": [
-        "--timeout",
-        "30000"
-      ],
-      "timeoutMs": 360000
-    },
-    "test/cli/install/bun-publish.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Publishing, tarballs, scoped packages, binaries, workspaces, lifecycle ordering, dry runs, OTP flows, access, tags, CI user agents, and republish tolerance pass all 31 copied cases (203 assertions).",
-      "serial": true,
-      "args": [
-        "--max-concurrency=1"
-      ],
-      "env": {
-        "COTTONTAIL_TEST_TIMEOUT_SCALE": "6"
-      },
-      "timeoutMs": 180000
-    },
-    "test/cli/install/bun-install-lifecycle-scripts.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Root, workspace, dependency, trust-transition, automatic node-gyp, concurrency, linker, inherited stdio, and npmrc lifecycle behavior passes all 52 copied cases (749 assertions).",
-      "serial": true,
-      "args": [
-        "--max-concurrency=1"
-      ],
-      "env": {
-        "COTTONTAIL_TEST_TIMEOUT_SCALE": "6"
-      },
-      "timeoutMs": 300000
-    },
-    "test/cli/install/bun-security-scanner-workspaces.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Security payload construction deduplicates package identities across workspace and isolated lock contexts while preserving dependency paths, passing all 3 copied cases (9 assertions).",
-      "args": [
-        "--timeout",
-        "30000"
-      ],
-      "timeoutMs": 240000
-    },
-    "test/cli/install/bun-security-scanner-matrix-with-node-modules.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "All 36 upstream CI-selected cases pass with 418 assertions across package commands, linkers, local and installed scanner sources, lock states, advisory outcomes, and TTY behavior.",
-      "args": [
-        "--timeout",
-        "60000"
-      ],
-      "timeoutMs": 600000,
-      "env": {
-        "CI": "1"
-      }
-    },
-    "test/cli/install/bun-security-scanner-matrix-without-node-modules.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "The upstream-authored CI sampling path covers scanner bootstrap, lock and no-lock resolution, all package commands, linkers, advisory outcomes, and TTY choices across 720 registered matrix cases (594 assertions in the validated run).",
-      "args": [
-        "--timeout",
-        "60000"
-      ],
-      "timeoutMs": 600000,
-      "env": {
-        "CI": "1"
-      }
-    },
-    "test/cli/install/bun-update-security-edge-cases.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Update-time and post-install scans detect vulnerable direct and transitive packages and preserve canceled installs across all 6 copied cases (19 assertions).",
-      "args": [
-        "--timeout",
-        "30000"
-      ],
-      "timeoutMs": 360000
-    },
-    "test/cli/install/bun-update-security-provider.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Update security providers run before mutation, block fatal advisories, and remain disabled without configuration across both copied cases (13 assertions).",
-      "args": [
-        "--timeout",
-        "30000"
-      ],
-      "timeoutMs": 180000
-    },
-    "test/cli/install/bun-update-security-scan-all.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Update scanning covers all packages or selected dependency closures, respects configuration, and blocks advisories across all 6 copied cases (18 assertions).",
-      "args": [
-        "--timeout",
-        "30000"
-      ],
-      "timeoutMs": 360000
-    },
-    "test/cli/install/bun-update-security-simple.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Configured update scanners run and block fatal advisories while unconfigured updates bypass scanning across both copied cases (11 assertions).",
-      "args": [
-        "--timeout",
-        "30000"
-      ],
-      "timeoutMs": 180000
-    },
-    "test/cli/install/bun-install-cpu-os.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Repeatable CPU and operating-system target overrides, wildcards, negation, validation, package filtering, and cross-platform lockfile graph preservation pass all 13 copied cases (168 assertions)."
-    },
-    "test/cli/install/bun-install-proxy.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "File is Docker-gated upstream (describeWithContainer/isDockerEnabled); without Docker it registers no tests and exits 0, matching Bun CI behavior."
-    },
-    "test/cli/install/bun-install-tarball-integrity.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Package tarball SHA-512 generation, lockfile persistence, frozen reinstall verification, corruption rejection, and missing-integrity restoration pass the copied upstream coverage (9 bun:test cases, 47 assertions)."
-    },
-    "test/cli/install/bun-install-pathname-trailing-slash.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Custom registry URLs are normalized without duplicate trailing path separators in the copied upstream case (3 assertions)."
-    },
-    "test/cli/install/bun-install-native-binlink.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Native dependency bin redirection uses the platform package's finalized install path for both hoisted and isolated layouts, passing reinstall and .bin regeneration coverage (2 cases, 24 assertions)."
-    },
-    "test/cli/install/bun-install-retry.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Registry package and tarball requests retry transient server failures using Bun-compatible attempt counts and timing behavior (1 bun:test case, 40 assertions)."
-    },
-    "test/cli/install/bun-link.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Global package registration, scoped and unscoped linking, workspace-local placement, binary shims, unlinking, and missing-link diagnostics pass all 4 copied cases (78 assertions)."
-    },
-    "test/cli/install/bun-lock.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Text and binary lockfile conversion, bundled dependency identity, patch hashes, optional peers, canonical formatting, frozen reinstalls, overrides, and unused resolutions pass all 9 copied cases (130 assertions)."
-    },
-    "test/cli/install/bun-lockb.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Cottontail reads, writes, preserves, reloads, and prints Bun's binary bun.lockb format through the vendored Zig lockfile serializer (2 bun:test cases, 35 assertions)."
-    },
-    "test/cli/install/bun-pack.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Bun pack file selection, workspaces, lifecycle scripts, bundled dependencies, metadata rewriting, destination flags, permissions, Unicode paths, and tarball integrity pass all 69 copied cases with 524 assertions."
-    },
-    "test/cli/install/bun-update.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Dependency updates, missing node_modules restoration, no-change lockfile preservation, catalogs, and recursive workspace updates pass all 5 copied cases (139 assertions)."
-    },
-    "test/cli/install/bun-upgrade.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Self-upgrade argument diagnostics, help and stable/profile flags, and mocked insecure-TLS release discovery pass all 6 copied cases (11 assertions); concurrent binary-copy subprocesses require a larger outer budget.",
-      "timeoutMs": 120000
-    },
-    "test/cli/install/lockfile-only.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Text and binary lockfile-only installs fetch package metadata without downloading tarballs and report the selected output format correctly (2 bun:test cases, 20 assertions)."
-    },
-    "test/cli/install/migrate-bun-lockb-v2.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Bun v2 binary lockfiles migrate through the vendored Zig lockfile graph without registry re-resolution, preserving package IDs, metadata snapshots, workspace placements, and byte stability (2 bun:test cases, 14 assertions)."
-    },
-    "test/cli/install/minimum-release-age.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "All 48 copied minimum-release-age cases pass across age filtering, stability fallbacks, prereleases, exclusions, lockfile reuse, workspace linkers, and security scanner payloads (173 assertions).",
-      "args": [
-        "--max-concurrency=1"
-      ],
-      "timeoutMs": 60000
-    },
-    "test/cli/install/bun-install-patch.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Install-time patch application, lockfile patch metadata, malformed-patch diagnostics, and hoisted and isolated linker behavior pass all 17 copied upstream cases (63 assertions).",
-      "timeoutMs": 180000
-    },
-    "test/cli/install/bun-add.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Package adds pass all 51 copied cases and 556 assertions across registry, GitHub and SCP Git dependencies, aliases, local paths and tarballs, workspaces, dependency sections, repeated adds, lockfiles, and analyze/only-missing behavior.",
-      "timeoutMs": 120000
-    },
-    "test/cli/install/bun-run-bunfig.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "All 28 copied bunfig run cases pass with 60 assertions across root and local configuration, preload ordering, shell selection, environment expansion, and nested directories."
-    },
-    "test/cli/install/bun-remove.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Package removal passes all 5 copied cases and 26 assertions across retained dependency reinstall reporting, no-op removals, peer dependencies, package.json newline preservation, and empty lockfile cleanup."
-    },
-    "test/cli/install/bun-workspaces.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Workspace discovery, aliases, duplicate names, filtering, nested adds, config environment, peer/dev overlap, lockfile snapshots, and linker selection pass all 62 copied cases (1,038 assertions and 16 snapshots).",
-      "timeoutMs": 120000
-    },
-    "test/cli/install/catalogs.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Default and named catalogs, root and workspace catalogs, text and binary lockfile updates, invalid versions, and aggregated missing-catalog diagnostics pass all 6 copied cases (101 assertions and 3 snapshots)."
-    },
-    "test/cli/install/test-dev-peer-dependency-priority.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Workspace dev dependency precedence over peers, differing peer/dev versions, behavior ordering, and the Next.js monorepo no-network regression pass all 4 copied cases (17 assertions)."
-    },
-    "test/cli/install/isolated-install.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Isolated store layout, cyclic and self dependencies, workspace links, optional peer contexts, lockfile reinstalls, backend selection, pruning, and lifecycle scripts pass all 28 copied cases (282 assertions).",
-      "args": [
-        "--timeout",
-        "10000"
-      ],
-      "timeoutMs": 120000
-    },
-    "test/cli/install/redacted-config-logs.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Malformed bunfig.toml and .npmrc credentials use Bun's redacting diagnostics without exposing URL passwords, UUIDs, npm tokens, or invalid _auth values (11 bun:test cases, 44 assertions)."
-    },
-    "test/cli/install/public-hoist-pattern.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Public and hidden hoist patterns from bunfig.toml and .npmrc preserve isolated-linker placement and configuration diagnostics across all 14 copied cases (110 assertions)."
-    },
-    "test/cli/install/npmrc.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Bun's vendored INI parser now drives project and home .npmrc loading, UTF-16 BOM conversion, environment expansion, scoped registries, credentials, cache configuration, and testing internals across all 22 copied cases (17 assertions)."
-    },
-    "test/cli/install/symlink-path-traversal.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "GitHub API tarball installs honor GITHUB_API_URL, reject absolute and escaping tar symlinks before creation, and retain safe in-package symlinks across all 3 copied security cases (5 assertions)."
-    },
-    "test/cli/install/GHSA-pfwx-36v6-832x.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "GitHub archive installs persist Bun's four-field resolved-name and SHA-512 lockfile metadata, verify cached archives on reinstall, reject mismatched integrity, and upgrade old lockfiles across all 5 copied security cases (24 assertions)."
-    },
-    "test/cli/install/bun-pm.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Package listing aliases, cache inspection and clearing, npm lockfile migration with Bun's exact SHA-512/256 snapshot, and authenticated whoami routing pass all 12 copied upstream cases (136 assertions)."
-    },
-    "test/cli/install/bun-pm-pkg.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Package metadata get, set, delete, JSON parsing, JSONC input, nested paths, whitespace preservation, and fix behavior pass all 76 copied upstream cases (237 assertions)."
-    },
-    "test/cli/install/bun-pm-version.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Semver increments, prerelease identifiers, Git commits and annotated tags, lifecycle ordering, formatting preservation, workspace lookup, and diagnostics pass all 24 copied upstream cases (177 assertions)."
-    },
-    "test/cli/install/bun-pm-why.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Reverse lockfile dependency traversal, filters, depth controls, workspaces, aliases, and concurrent lockfile-only setup pass all 28 copied upstream cases (116 assertions); the copied file uses an extended timeout while registry resolution remains sequential.",
-      "args": [
-        "--timeout",
-        "120000"
-      ],
-      "timeoutMs": 300000
-    },
-    "test/cli/install/bun-patch.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Bun patch preparation and commit workflows, workspace and nested package selection, patch generation, patched dependency reinstalls, aliases, and executable links pass the copied upstream file (26 bun:test cases).",
-      "timeoutMs": 120000
-    },
-    "test/cli/install/architecture-match.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "npm architecture and operating-system inclusion, wildcard, exclusion, and unknown-value semantics pass all 30 copied upstream cases."
-    },
-    "test/cli/install/config-version.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Current and legacy configVersion selection, isolated monorepo layout, workspace graph records, and exact Bun text-lockfile snapshots pass all 3 copied cases (27 assertions).",
-      "timeoutMs": 180000
-    },
-    "test/cli/install/overrides.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Root and transitive overrides, npm aliases, lockfile updates, frozen installs, removal, and workspace exemption pass the copied upstream coverage (7 bun:test cases, 20 assertions).",
-      "timeoutMs": 120000
-    },
-    "test/cli/install/migration/migrate.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "npm package-lock and Yarn v1 migration semantics pass all 10 copied upstream cases with 26 assertions through Cottontail's source-ported lockfile graph."
-    },
-    "test/cli/install/migration/yarn-lock-migration.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Yarn v1 migration passes all 16 copied cases and 14 snapshots across aliases, hosted Git sources, tarballs, registry packages, nested placement, and dependency cycles through the vendored lockfile hoister.",
-      "timeoutMs": 120000
-    },
-    "test/cli/install/migration/complex-workspace.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Complex npm package-lock migration preserves workspaces, aliases, hosted Git sources, nested placements, integrity metadata, and npm's missing-transitive behavior across all 21 copied cases (15 assertions).",
-      "timeoutMs": 300000
-    },
-    "test/cli/install/migration/pnpm-lock-migration.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "PNPM v9 lockfile migration preserves packages, integrity, aliases, workspace links, peer contexts, and root dependency ordering across all 5 copied cases (21 assertions and 4 snapshots)."
-    },
-    "test/cli/install/migration/pnpm-comprehensive.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "PNPM migration passes all 5 copied comprehensive cases across large dependency graphs, monorepos, patches, overrides, version rejection, and peer contexts (19 assertions and 4 snapshots)."
-    },
-    "test/cli/install/migration/pnpm-migration.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "PNPM automatic migration passes all 3 active copied cases, including registry installation, old-version fallback, and cyclic/root-link resolution (11 assertions and 3 snapshots); the other 11 cases are upstream-authored todos.",
-      "timeoutMs": 30000
-    },
-    "test/cli/install/migration/pnpm-migration-complete.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "PNPM migration passes the copied end-to-end matrix for workspaces, aliases, policies, file dependencies, registries, peers, duplicate versions, catalogs, integrity, mixed dependency groups, and cycles (67 assertions and 13 snapshots).",
-      "timeoutMs": 30000
-    },
-    "test/cli/install/hosted-git-info/boundary-conditions.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
-    },
-    "test/cli/install/hosted-git-info/from-url.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "The vendored Zig hosted-git parser passes all 681 copied URL cases (649 assertions) across shortcuts, scp syntax, authentication, fragments, and all five providers through a stock-JSC host adapter."
-    },
-    "test/cli/install/hosted-git-info/parse-url.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Hosted-git loose URL normalization passes all five copied parseUrl cases through the vendored Zig parser."
-    },
-    "test/cli/install/hoist.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Optional peer resolution across multiple instances of the same package passes the copied hoisting regression (7 assertions)."
-    },
     "test/cli/install/semver.test.ts": {
       "status": "enabled",
       "reason": "Bun.semver order and satisfies pass all 22 copied upstream runtime cases (1,762 assertions), including loose versions, ranges, prereleases, buffers, and error behavior."
-    },
-    "test/cli/install/shebang-normalize.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Installed package binaries normalize CRLF shebangs and preserve non-shebang CRLF content across all 11 copied upstream assertions."
     },
     "test/cli/run/as-node.test.ts": {
       "status": "enabled",
@@ -1474,11 +1006,6 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 0 assertions)."
     },
-    "test/cli/run/if-present.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Passes on the native-bundler pipeline after stabilization (8 bun:test cases, 24 assertions)."
-    },
     "test/cli/run/jsx-namespaced-attributes.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (1 bun:test cases, 4 assertions)."
@@ -1490,15 +1017,6 @@
     "test/cli/run/log-test.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
-    },
-    "test/cli/run/multi-run.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Parallel and sequential multi-run execution, failure handling, output routing and formatting, lifecycle hooks, shell commands, globs, and workspace selection pass all 118 copied cases (527 assertions). The unchanged subprocess-heavy workload needs scaled stock-JSC startup deadlines.",
-      "env": {
-        "COTTONTAIL_TEST_TIMEOUT_SCALE": "6"
-      },
-      "timeoutMs": 240000
     },
     "test/cli/run/no-envfile.test.ts": {
       "status": "enabled",
@@ -1556,11 +1074,6 @@
     "test/cli/run/run-quote.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (1 bun:test cases, 3 assertions)."
-    },
-    "test/cli/run/run_command.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Passes on the native-bundler pipeline after stabilization (2 bun:test cases, 3 assertions)."
     },
     "test/cli/run/self-reference.test.ts": {
       "status": "enabled",
@@ -1636,11 +1149,6 @@
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (2 bun:test cases, 14 assertions)."
     },
-    "test/cli/update_interactive_snapshots.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 10 assertions)."
-    },
     "test/cli/watch/watch.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
@@ -1689,24 +1197,6 @@
     "test/integration/nest/nest_metadata.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (2 bun:test cases, 2 assertions)."
-    },
-    "test/integration/next-pages/test/dev-server.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Owned and run by Hutch because the canonical file installs fixture dependencies, validates Hutch-produced node_modules and lockfile state, and drives the public Next development command; Cottontail remains its JavaScript test runtime.",
-      "timeoutMs": 180000
-    },
-    "test/integration/next-pages/test/dev-server-ssr-100.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Owned and run by Hutch because the canonical file installs the Next fixture and validates Hutch-produced node_modules and lockfile state before exercising 100 SSR requests through the public development command; Cottontail remains its JavaScript test runtime.",
-      "timeoutMs": 300000
-    },
-    "test/integration/next-pages/test/next-build.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Owned and run by Hutch because the canonical file performs two dependency installs, validates Hutch lockfile and node_modules layouts, and compares the public Next production build with Node; Cottontail remains its JavaScript test runtime.",
-      "timeoutMs": 240000
     },
     "test/integration/sass/sass.test.ts": {
       "status": "enabled",
@@ -4961,11 +4451,6 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
     },
-    "test/regression/issue/08093.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Vendored node_modules installation through hardlinks passes the copied regression case (1 case, 17 assertions)."
-    },
     "test/regression/issue/08095.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (4 bun:test cases, 14 assertions)."
@@ -5056,11 +4541,6 @@
       "status": "enabled",
       "reason": "The owned fixture preserves Bun issue #12910's 25-process dynamic-import/require race against a throwing ESM module while explicitly observing the intentionally rejected import promise; the regression oracle is no crash and successful synchronous catch, not Bun's unhandled-rejection policy."
     },
-    "test/regression/issue/13316.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 0 assertions)."
-    },
     "test/regression/issue/14338.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (3 bun:test cases, 7 assertions)."
@@ -5073,11 +4553,6 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
     },
-    "test/regression/issue/14945-lifecycle-script-crash.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Package lifecycle scripts that remove or replace their working tree complete without crashing across both copied regression cases."
-    },
     "test/regression/issue/14976/14976.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (7 bun:test cases, 180 assertions)."
@@ -5085,11 +4560,6 @@
     "test/regression/issue/14982/14982.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
-    },
-    "test/regression/issue/15276.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "npm alias dependency installation and lockfile behavior pass the copied upstream regression."
     },
     "test/regression/issue/15314.test.ts": {
       "status": "enabled",
@@ -5362,11 +4832,6 @@
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (6 bun:test cases, 17 assertions)."
     },
-    "test/regression/issue/24131.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Interactive package update selects the requested package and passes its 4 copied assertions."
-    },
     "test/regression/issue/24129.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (2 bun:test cases, 12 assertions)."
@@ -5379,11 +4844,6 @@
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (2 bun:test cases, 6 assertions)."
     },
-    "test/regression/issue/24314.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "bun pm pack observes package.json mutations made by prepack and prepare lifecycle scripts across both copied cases (10 assertions)."
-    },
     "test/regression/issue/24329.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 10 assertions)."
@@ -5391,11 +4851,6 @@
     "test/regression/issue/24338.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (11 bun:test cases, 0 assertions)."
-    },
-    "test/regression/issue/24364.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "The template test pins Bun 1.3.10-era TypeScript and plugin dependencies, then passes both installation and tsc --noEmit under Cottontail (1 case, 4 assertions)."
     },
     "test/regression/issue/24388.test.ts": {
       "status": "enabled",
@@ -5412,11 +4867,6 @@
     "test/regression/issue/24709.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 6 assertions)."
-    },
-    "test/regression/issue/24806.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "bun publish help and dry-run command behavior pass the copied upstream regression."
     },
     "test/regression/issue/24817.test.ts": {
       "status": "enabled",
@@ -5514,11 +4964,6 @@
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (4 bun:test cases, 15 assertions)."
     },
-    "test/regression/issue/26337.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Stale file-dependency diagnostics pass the copied upstream package-manager regression."
-    },
     "test/regression/issue/26358.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (4 bun:test cases, 10 assertions)."
@@ -5603,11 +5048,6 @@
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (3 bun:test cases, 9 assertions)."
     },
-    "test/regression/issue/3192.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Yarn lockfile quote parsing and migration pass the copied upstream regression."
-    },
     "test/regression/issue/3657.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
@@ -5661,16 +5101,6 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 300 assertions)."
     },
-    "test/regression/issue/ctrl-c.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "All eight copied signal regressions pass across queued self-signals, package-script forwarding, direct package bins, and forced Cottontail runtime execution (22 assertions).",
-      "env": {
-        "COTTONTAIL_TEST_TIMEOUT_SCALE": "6"
-      },
-      "timeoutMs": 180000,
-      "serial": true
-    },
     "test/regression/issue/css-system-color-contexts.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
@@ -5715,11 +5145,6 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 0 assertions)."
     },
-    "test/regression/issue/patch-bounds-check.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Malformed and truncated package patches fail safely across all three copied bounds-check cases."
-    },
     "test/regression/issue/require-extensions-override.test.ts": {
       "status": "enabled",
       "reason": "Live require.extensions overrides and restoration pass the copied upstream regression (8 bun:test cases, 29 assertions)."
@@ -5748,11 +5173,6 @@
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (2 bun:test cases, 0 assertions)."
     },
-    "test/regression/issue/update-interactive-formatting.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Copied upstream file passes directly under Cottontail (5 bun:test cases, 18 assertions)."
-    },
     "test/regression/issue/utf16-encoding-crash.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 8 assertions)."
@@ -5780,87 +5200,6 @@
         "COTTONTAIL_TEST_TIMEOUT_SCALE": "30"
       },
       "timeoutMs": 900000
-    },
-    "test/cli/create/create-jsx.test.ts": {
-      "env": {
-        "CI": "1"
-      },
-      "timeoutMs": 240000,
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
-    },
-    "test/cli/init/init.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
-    },
-    "test/cli/run/filter-workspace.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
-    },
-    "test/cli/run/run-autoinstall.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split. The shared copied fixture checks the core missing-package diagnostic independently of Bun's error: prefix and Cottontail's ResolveMessage: prefix."
-    },
-    "test/cli/run/run-shell.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
-    },
-    "test/cli/run/workspaces.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
-    },
-    "test/cli/update_interactive_formatting.test.ts": {
-      "timeoutMs": 30000,
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
-    },
-    "test/cli/update_interactive_install.test.ts": {
-      "timeoutMs": 30000,
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
-    },
-    "test/js/third_party/pnpm/pnpm.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
-    },
-    "test/regression/issue/00631.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
-    },
-    "test/regression/issue/026039.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
-    },
-    "test/regression/issue/07740.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
-    },
-    "test/regression/issue/11806.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
-    },
-    "test/regression/issue/24502/bun-pm-ls-all-invalid-package-id.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
-    },
-    "test/regression/issue/malformed-integrity-base64.test.ts": {
-      "status": "skip",
-      "owner": "hutch-package-manager",
-      "reason": "Owned and executed by Hutch after the build-time/runtime responsibility split."
     },
     "test/bake/dev/plugins.test.ts": {
       "status": "enabled",
@@ -7278,13 +6617,12 @@
     }
   },
   "expectedCounts": {
-    "runnableFiles": 1445,
+    "runnableFiles": 1342,
     "enabled": 1318,
     "expectedFailure": 20,
-    "skip": 107,
+    "skip": 4,
     "cottontailOwned": 1342,
-    "hutchOwned": 103,
-    "upstreamTodoSkipSyntaxSites": 711,
-    "upstreamTodoSkipSyntaxFiles": 258
+    "upstreamTodoSkipSyntaxSites": 667,
+    "upstreamTodoSkipSyntaxFiles": 241
   }
 }

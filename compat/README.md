@@ -25,24 +25,21 @@ bun run compat:surface:all
 
 `compat/upstream/` contains the Node snapshot and the frozen source baseline for
 the Bun-derived JavaScript tests. The Bun tree is no longer a live mirror:
-Cottontail and Hutch own their tests and may adapt them as the products diverge
-from Bun. The exact Bun v1.3.10 ownership index assigns 1,342 runnable files to
-Cottontail and 103 package-manager, project-mutation, package-script, and public
-Next orchestration files to Hutch. Cottontail currently enables 1,318 files,
-carries 20 whole-file expected failures, and deliberately leaves four files out
-of scope. Hutch's 103 files run from its own repository. A `hutch` review route means handoff to
-that repository, not vendoring Hutch tests or creating a permanent Cottontail
-dependency on Hutch. The long-term dependency direction is Hutch to Cottontail.
+Cottontail owns and may adapt the runtime/compiler tests as the product diverges
+from Bun. The exact Bun v1.3.10 index contains 1,342 runnable files. Cottontail
+currently enables 1,318 files, carries 20 whole-file expected failures, and
+deliberately leaves four files out of scope. The former 103-file package-manager
+and project-orchestration tier was retired when dependency management became an
+external tool concern.
 
 The ownership boundary, reviewed-through Bun commit, future tag-diff process,
 and provenance policy are recorded in
 [`tests/UPSTREAM_REVIEW.md`](../tests/UPSTREAM_REVIEW.md). The adjacent
 `tests/upstream-review.json` supplies the small machine-readable review policy.
 
-Cottontail-local package-manager and project-command regressions also live
-under Hutch's `tests/package-manager/` directory and run through
-`scripts/run-local-package-manager-tests.js`. Runtime-facing
-`bun:internal-for-testing` coverage remains here.
+Runtime-facing `bun:internal-for-testing` coverage remains here. Package-manager
+behavior belongs to the project's selected external package manager and is not
+part of Cottontail's compatibility score.
 
 The pinned upstream targets are recorded in:
 
@@ -66,9 +63,8 @@ Run the accounting check before changing the compatibility headline:
 bun run compat:upstream:check
 ```
 
-The check rejects stale paths, missing exact entries, count drift, unaccounted
-`--test-name-pattern` arguments, and delegated files that are not marked
-`owner: "hutch-package-manager"` plus `status: "skip"`. It also reports every
+The check rejects stale paths, missing exact entries, count drift, and
+unaccounted `--test-name-pattern` arguments. It also reports every
 whole-file expected failure, structured test-name exclusion, split bundler
 expected failure, and source-level upstream todo/skip marker.
 

@@ -140,18 +140,8 @@ test('runs the strict complete Cottontail-owned Bun tier without publishing', ()
   );
   assert.doesNotMatch(workflow, /continue-on-error:|upload-release-r2|publish|secrets\./i);
 
-  const hutchOwned = Object.values(status.tests ?? {}).filter(
-    (entry) => entry.owner === 'hutch-package-manager',
-  );
-  assert.ok(hutchOwned.length > 0, 'expected an explicit Hutch-owned tier');
-  assert.ok(
-    hutchOwned.every((entry) => entry.status === 'skip' || entry.status === 'disabled'),
-    'Hutch-owned files must remain excluded from Cottontail execution',
-  );
   const cottontailOutOfScope = Object.values(status.tests ?? {}).filter(
-    (entry) =>
-      entry.owner !== 'hutch-package-manager' &&
-      (entry.status === 'skip' || entry.status === 'disabled'),
+    (entry) => entry.status === 'skip' || entry.status === 'disabled',
   );
 
   const output = execFileSync(
@@ -165,7 +155,7 @@ test('runs the strict complete Cottontail-owned Bun tier without publishing', ()
   const disabled = countFromList(output, 'disabled');
   const notEnabled = countFromList(output, 'not-enabled');
 
-  assert.equal(disabled, hutchOwned.length + cottontailOutOfScope.length);
+  assert.equal(disabled, cottontailOutOfScope.length);
   assert.equal(notEnabled, 0);
   assert.equal(discovered - disabled, enabled + expectedFailures);
 });
@@ -269,10 +259,10 @@ test('platform status overrides preserve Mac and Windows while retaining Linux e
     0,
   );
 
-  assert.equal(exclusionCases(mac), 31);
-  assert.equal(exclusionCases(windows), 31);
-  assert.equal(exclusionCases(linuxX64), 39);
-  assert.equal(exclusionCases(linuxArm64), 45);
+  assert.equal(exclusionCases(mac), 30);
+  assert.equal(exclusionCases(windows), 30);
+  assert.equal(exclusionCases(linuxX64), 38);
+  assert.equal(exclusionCases(linuxArm64), 44);
 
   const symbolsPath = 'test/js/bun/symbols.test.ts';
   for (const resolved of [linuxX64, linuxArm64]) {

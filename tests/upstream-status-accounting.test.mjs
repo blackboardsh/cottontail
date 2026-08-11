@@ -25,8 +25,7 @@ function baseStatus() {
       enabled: 1,
       expectedFailure: 1,
       skip: 1,
-      cottontailOwned: 2,
-      hutchOwned: 1,
+      cottontailOwned: 3,
       upstreamTodoSkipSyntaxSites: 0,
       upstreamTodoSkipSyntaxFiles: 0,
     },
@@ -42,8 +41,7 @@ function baseStatus() {
       },
       'test/gamma.test.ts': {
         status: 'skip',
-        owner: 'hutch-package-manager',
-        reason: 'fixture delegation',
+        reason: 'fixture exclusion',
       },
     },
   };
@@ -83,13 +81,13 @@ function runCheck(fixture) {
   });
 }
 
-test('Bun accounting check accepts exact classifications and delegated ownership', (t) => {
+test('Bun accounting check accepts exact classifications', (t) => {
   const fixture = createFixture(t);
   const result = runCheck(fixture);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /explicit status\.tests entries: 3/);
   assert.match(result.stdout, /regex fallback patterns: 0/);
-  assert.match(result.stdout, /cottontail-runtime=2, hutch-package-manager=1/);
+  assert.match(result.stdout, /owners: cottontail-runtime=3/);
   assert.match(result.stdout, /accounting check: passed/);
 });
 

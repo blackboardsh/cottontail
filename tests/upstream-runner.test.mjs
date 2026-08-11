@@ -1153,8 +1153,8 @@ test("focused selectors cannot cross status or repository ownership boundaries",
   const status = JSON.parse(readFileSync(statusPath, "utf8"));
   status.tests["test/js/pass-fast.test.js"] = {
     status: "skip",
-    owner: "hutch-package-manager",
-    reason: "owned by Hutch",
+    owner: "external-package-manager",
+    reason: "owned by an external package manager",
   };
   status.tests["test/js/pass-after.test.js"] = {
     status: "not-enabled",
@@ -1168,7 +1168,7 @@ test("focused selectors cannot cross status or repository ownership boundaries",
     { runtime: "bun" },
   );
   assert.equal(owned.status, 1);
-  assert.match(owned.stderr, /owned by hutch-package-manager, not Cottontail/);
+  assert.match(owned.stderr, /owned by external-package-manager, not Cottontail/);
   assert.deepEqual(readJsonLines(fixture.bunCapturePath), []);
 
   const disabledByDefault = runRunner(

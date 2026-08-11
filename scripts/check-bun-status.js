@@ -141,11 +141,8 @@ for (const entry of entries) {
   if (typeof entry.reason !== 'string' || entry.reason.trim() === '') {
     errors.push(`${entry.path} requires a status reason`);
   }
-  if (!['cottontail-runtime', 'hutch-package-manager'].includes(owner)) {
+  if (owner !== 'cottontail-runtime') {
     errors.push(`${entry.path} has unknown owner ${owner}`);
-  }
-  if (owner === 'hutch-package-manager' && entry.status !== 'skip') {
-    errors.push(`${entry.path} is delegated to Hutch but has status ${entry.status}`);
   }
   if (entry.status === 'expected-failure') {
     if (!knownExclusionClassifications.has(entry.classification)) {
@@ -225,7 +222,6 @@ validateExpectedCount(errors, expected, 'enabled', statusCounts.enabled ?? 0);
 validateExpectedCount(errors, expected, 'expectedFailure', statusCounts['expected-failure'] ?? 0);
 validateExpectedCount(errors, expected, 'skip', statusCounts.skip ?? 0);
 validateExpectedCount(errors, expected, 'cottontailOwned', ownerCounts['cottontail-runtime'] ?? 0);
-validateExpectedCount(errors, expected, 'hutchOwned', ownerCounts['hutch-package-manager'] ?? 0);
 validateExpectedCount(errors, expected, 'upstreamTodoSkipSyntaxSites', markerAudit.sites);
 validateExpectedCount(errors, expected, 'upstreamTodoSkipSyntaxFiles', markerAudit.files);
 

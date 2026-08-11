@@ -48,11 +48,9 @@ test('review metadata freezes the Bun baseline and all routing destinations', ()
   assert.match(metadata.lastReviewed.commit, /^[0-9a-f]{40}$/);
   assert.deepEqual(metadata.routing.allowedDestinations, [
     'cottontail',
-    'hutch',
     'external',
     'out-of-scope',
   ]);
-  assert.equal(metadata.routing.destinationSemantics.hutch, 'handoff-to-hutch-repository');
   for (const path of manifest.copiedPaths) {
     assert.equal(existsSync(resolve(snapshotRoot, path)), true, `missing copied path: ${path}`);
     if (path === 'LICENSE.md') continue;
@@ -70,30 +68,27 @@ test('review metadata freezes the Bun baseline and all routing destinations', ()
     resolve(rootDir, metadata.routing.baselineStatusPath),
     'utf8',
   ));
-  assert.equal(status.expectedCounts.runnableFiles, 1445);
+  assert.equal(status.expectedCounts.runnableFiles, 1342);
   assert.equal(status.expectedCounts.enabled, 1318);
   assert.equal(status.expectedCounts.expectedFailure, 20);
-  assert.equal(status.expectedCounts.skip, 107);
+  assert.equal(status.expectedCounts.skip, 4);
   assert.equal(status.expectedCounts.cottontailOwned, 1342);
-  assert.equal(status.expectedCounts.hutchOwned, 103);
 
   const entries = Object.values(status.tests);
-  assert.equal(entries.filter((entry) => entry.owner === 'hutch-package-manager').length, 103);
-  assert.equal(entries.filter(
-    (entry) => entry.status === 'skip' && entry.owner !== 'hutch-package-manager',
-  ).length, 4);
+  assert.equal(entries.filter((entry) => entry.owner != null).length, 0);
+  assert.equal(entries.filter((entry) => entry.status === 'skip').length, 4);
   assert.equal(entries.reduce(
     (count, entry) => count + (entry.testNameExclusion?.testNames.length ?? 0),
     0,
-  ), 31);
+  ), 30);
   const platformExclusionCases = (platform, arch) => Object.values(
     resolveBunStatusPlatform(status, platform, arch).tests,
   ).reduce(
     (count, entry) => count + (entry.testNameExclusion?.testNames.length ?? 0),
     0,
   );
-  assert.equal(platformExclusionCases('linux', 'x64'), 39);
-  assert.equal(platformExclusionCases('linux', 'arm64'), 45);
+  assert.equal(platformExclusionCases('linux', 'x64'), 38);
+  assert.equal(platformExclusionCases('linux', 'arm64'), 44);
   assert.equal(entries.reduce(
     (count, entry) => count + Object.keys(entry.expectedFailureBundlerTests ?? {}).length,
     0,
@@ -102,7 +97,7 @@ test('review metadata freezes the Bun baseline and all routing destinations', ()
   const [newNextPagesTest] = addRouting([
     { status: 'A', path: 'test/integration/next-pages/test/new-upstream.test.ts' },
   ], metadata, status);
-  assert.equal(newNextPagesTest.suggestedDestination, 'hutch');
+  assert.equal(newNextPagesTest.suggestedDestination, 'out-of-scope');
   assert.equal(newNextPagesTest.routingBasis, 'routing-rule');
 });
 
@@ -206,10 +201,10 @@ test('tag comparison uses a disposable no-checkout clone and leaves tests untouc
       reviewedAt: '2026-08-08',
     },
     routing: {
-      allowedDestinations: ['cottontail', 'hutch', 'external', 'out-of-scope'],
+      allowedDestinations: ['cottontail', 'external', 'out-of-scope'],
       defaultDestination: 'cottontail',
       baselineOwnerMap: {},
-      rules: [{ pathPrefix: 'test/cli/install/', destination: 'hutch' }],
+      rules: [{ pathPrefix: 'test/cli/install/', destination: 'out-of-scope' }],
       history: [],
     },
     mappings: [],
@@ -245,7 +240,7 @@ test('tag comparison uses a disposable no-checkout clone and leaves tests untouc
       {
         status: 'A',
         path: 'test/cli/install/new-from-upstream.test.ts',
-        suggestedDestination: 'hutch',
+        suggestedDestination: 'out-of-scope',
       },
       {
         status: 'D',
