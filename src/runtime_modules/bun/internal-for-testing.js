@@ -1005,17 +1005,6 @@ export function getEventLoopStats() {
   const { activeTasks, concurrentRef, numPolls } = cottontail.runtimeDiagnostics().eventLoop;
   return { activeTasks, concurrentRef, numPolls };
 }
-export const install_test_helpers = {
-  parseLockfile(cwd) {
-    const lockfile = JSON.parse(cottontail.packageManagerParseLockfile(String(cwd)));
-    for (const dependency of lockfile?.dependencies ?? []) {
-      if (dependency?.literal === "workspace:" && "workspace" in dependency) {
-        dependency.workspace = "";
-      }
-    }
-    return lockfile;
-  },
-};
 export const npm_manifest_test_helpers = {
   parseManifest(path, _registryUrl) {
     const manifest = JSON.parse(readFileSync(String(path), "utf8"));
@@ -1142,27 +1131,6 @@ export const timerInternals = Object.freeze({
     return cottontail.timerClockMs();
   },
 });
-export const hostedGitInfo = {
-  parseUrl(value) {
-    if (arguments.length !== 1) {
-      throw new Error("hostedGitInfo.prototype.parseUrl takes exactly 1 argument");
-    }
-    if (typeof value !== "string") {
-      throw new Error("hostedGitInfo.prototype.parseUrl takes a string as its first argument");
-    }
-    return cottontail.hostedGitInfoParseUrl(value);
-  },
-  fromUrl(value) {
-    if (arguments.length !== 1) {
-      throw new Error("hostedGitInfo.prototype.fromUrl takes exactly 1 argument");
-    }
-    if (typeof value !== "string") {
-      throw new Error("hostedGitInfo.prototype.fromUrl takes a string as its first argument");
-    }
-    const result = cottontail.hostedGitInfoFromUrl(value);
-    return result === null ? null : JSON.parse(result);
-  },
-};
 function tarString(bytes, start, length) {
   let end = start;
   const limit = Math.min(bytes.length, start + length);
@@ -1316,9 +1284,7 @@ export default {
   getDevServerDeinitCount,
   hasNonReifiedStatic,
   highlightJavaScript,
-  hostedGitInfo,
   iniInternals,
-  install_test_helpers,
   isArchitectureMatch,
   isModuleResolveFilenameSlowPathEnabled,
   isOperatingSystemMatch,

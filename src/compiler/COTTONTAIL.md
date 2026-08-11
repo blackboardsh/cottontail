@@ -11,8 +11,8 @@ be removed as the imported source is reduced to the compiler components used by
 Cottontail.
 
 Compiler-internal install data types and the legacy binary-lockfile codec are
-temporarily retained for narrow services invoked by Hutch. Public package
-management and project mutation live in Hutch. Cottontail does not expose
-package mutation or launch-time auto-install; runtime module resolution only
-reads modules already present on disk. This source is not a dependency on an
-external Bun installation.
+temporarily retained because the resolver and package metadata types are still
+coupled to them. Cottontail exposes no public or hidden package-manager service
+and performs no package mutation or launch-time auto-install; runtime module
+resolution only reads modules already present on disk. This source is not a
+dependency on an external Bun installation.

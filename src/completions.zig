@@ -23,18 +23,18 @@ const Shell = enum {
 
     fn contents(shell: Shell) []const u8 {
         return switch (shell) {
-            .bash => @embedFile("completions/bun.bash"),
-            .zsh => @embedFile("completions/bun.zsh"),
-            .fish => @embedFile("completions/bun.fish"),
+            .bash => @embedFile("completions/cottontail.bash"),
+            .zsh => @embedFile("completions/cottontail.zsh"),
+            .fish => @embedFile("completions/cottontail.fish"),
             else => "",
         };
     }
 
     fn filename(shell: Shell) []const u8 {
         return switch (shell) {
-            .bash => "bun.completion.bash",
-            .zsh => "_bun",
-            .fish => "bun.fish",
+            .bash => "cottontail.completion.bash",
+            .zsh => "_cottontail",
+            .fish => "cottontail.fish",
             else => unreachable,
         };
     }
@@ -81,11 +81,9 @@ fn defaultOutputDirectory(init: std.process.Init, shell: Shell) !?OutputDirector
             }
             if (init.environ_map.get("XDG_DATA_HOME")) |root|
                 if (try openJoinedDirectory(init, &.{ root, "zsh-completions" })) |dir| return dir;
-            if (init.environ_map.get("BUN_INSTALL")) |root|
-                if (openDirectory(init, root)) |dir| return dir;
             if (init.environ_map.get("HOME")) |home| {
                 if (try openJoinedDirectory(init, &.{ home, ".oh-my-zsh", "completions" })) |dir| return dir;
-                if (try openJoinedDirectory(init, &.{ home, ".bun" })) |dir| return dir;
+                if (try openJoinedDirectory(init, &.{ home, ".zfunc" })) |dir| return dir;
             }
             const zsh_dirs = [_][]const u8{
                 "/usr/local/share/zsh/site-functions",

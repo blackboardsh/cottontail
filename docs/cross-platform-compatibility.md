@@ -200,13 +200,15 @@ Never copy the macOS Bun snapshot `node_modules` tree onto Linux or Windows.
 Optional packages and native addons are selected by operating system and
 architecture.
 
-Remove the ignored tree and bootstrap it with Hutch:
+Remove the ignored tree and install it with the project's selected package
+manager. The repository baseline uses npm:
 
 ```sh
 rm -rf compat/upstream/bun/v1.3.10/test/node_modules
-hutch install \
-  --cwd compat/upstream/bun/v1.3.10/test \
-  --ignore-scripts
+npm install \
+  --prefix compat/upstream/bun/v1.3.10/test \
+  --ignore-scripts \
+  --no-package-lock
 ```
 
 Windows PowerShell:
@@ -216,16 +218,17 @@ Remove-Item -Recurse -Force `
   compat\upstream\bun\v1.3.10\test\node_modules `
   -ErrorAction SilentlyContinue
 
-hutch.exe install `
-  --cwd compat\upstream\bun\v1.3.10\test `
-  --ignore-scripts
+npm.exe install `
+  --prefix compat\upstream\bun\v1.3.10\test `
+  --ignore-scripts `
+  --no-package-lock
 ```
 
-If this fails, treat it as the first Hutch package-manager compatibility failure.
-An external Bun installation may be used temporarily to unblock unrelated
-runtime diagnosis, but the final platform gate must bootstrap through Hutch.
-The upstream runner prepares its pinned DuckDB and Svelte fixtures when those
-tests are selected.
+If this fails, treat it as fixture provisioning rather than a Cottontail
+runtime failure. A project may substitute pnpm, yarn, or Bun, but the final
+platform gate must use the package manager selected by that project. The
+upstream runner prepares its pinned DuckDB and Svelte fixtures when those tests
+are selected.
 
 ## Establish a native baseline
 
@@ -312,9 +315,10 @@ Fix shared behavior in the lowest correct layer:
 - Compiler and module loading: `src/cottontail_transpiler.zig`,
   `src/cottontail_bundler.zig`, `src/script_runner.zig`, and
   `src/compiler/src/`.
-- Package management belongs to Hutch. Cottontail's narrow lockfile/service
-  adapters and retained `src/compiler/src/install/` data types only support
-  compiler and legacy-lockfile services during the migration.
+- Package management is external to Cottontail and must be invoked directly.
+  Cottontail has no lockfile or package-manager service adapters; the retained
+  `src/compiler/src/install/` types remain only because the compiler resolver
+  and package metadata are still coupled to them.
 - JSC private ABI adapters: `src/jsc_*_bridge.cpp` and `src/napi_bridge.cpp`.
 
 Prefer Zig, libuv, OpenSSL, and the existing native host boundaries over
@@ -486,7 +490,7 @@ Extract the packaged archive into a clean directory and repeat:
 - `bun:sqlite` imports for `Database`, `SQLiteError`, and `constants`
 - `cottontail test`
 - `cottontail build`
-- `hutch install` in a clean fixture
+- the selected external package manager in a clean fixture
 
 The packaged binary must not load libraries or runtime source from the checkout.
 
@@ -498,8 +502,9 @@ On Windows and both Linux architectures:
 
 1. Remove Bun from `PATH`.
 2. Point Hutch and Electrobun at the exact packaged Cottontail artifact.
-3. Install a clean dependency graph using Hutch.
-4. Build Dash Desktop and the Dash platform applications.
+3. Install a clean dependency graph with the selected external package manager.
+4. Let Hutch vendor the pinned Cottontail/toolchain/SDK inputs, then build Dash
+   Desktop and the Dash platform applications.
 5. Launch the applications and exercise main-process startup, workers, child
    processes, filesystem access, networking, test execution, and rebuild/watch.
 6. Record the Cottontail Git revision, JSC revision, artifact SHA-256, and

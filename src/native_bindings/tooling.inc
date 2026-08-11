@@ -1,8 +1,5 @@
 CT_NATIVE_BINDING("semverOrder", ct_semver_order_native)
 CT_NATIVE_BINDING("semverSatisfies", ct_semver_satisfies_native)
-CT_NATIVE_BINDING("hostedGitInfoParseUrl", ct_hosted_git_info_parse_url_native)
-CT_NATIVE_BINDING("hostedGitInfoFromUrl", ct_hosted_git_info_from_url_native)
-CT_NATIVE_BINDING("packageManagerParseLockfile", ct_package_manager_parse_lockfile_native)
 CT_NATIVE_BINDING("stripTypeScriptTypes", ct_strip_typescript_types_native)
 CT_NATIVE_BINDING("transpilerTransform", ct_transpiler_transform_native)
 CT_NATIVE_BINDING("transpilerScan", ct_transpiler_scan_native)

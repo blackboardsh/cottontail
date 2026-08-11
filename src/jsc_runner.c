@@ -2150,24 +2150,6 @@ extern int ct_semver_satisfies(
     bool *result_out,
     char **error_out
 );
-extern uint8_t *ct_hosted_git_info_parse_url(
-    const uint8_t *input,
-    size_t input_len,
-    size_t *output_len,
-    char **error_out
-);
-extern uint8_t *ct_hosted_git_info_from_url(
-    const uint8_t *input,
-    size_t input_len,
-    size_t *output_len,
-    char **error_out
-);
-extern uint8_t *ct_package_manager_parse_lockfile(
-    const uint8_t *cwd,
-    size_t cwd_len,
-    size_t *output_len,
-    char **error_out
-);
 extern uint8_t *ct_strip_typescript_types(
     const uint8_t *source,
     size_t source_len,
@@ -36132,101 +36114,6 @@ static JSValueRef ct_semver_satisfies_native(JSContextRef ctx, JSObjectRef funct
         return JSValueMakeUndefined(ctx);
     }
     return JSValueMakeBoolean(ctx, result);
-}
-
-static JSValueRef ct_hosted_git_info_call(
-    JSContextRef ctx,
-    size_t argc,
-    const JSValueRef argv[],
-    JSValueRef *exception,
-    bool parse_only
-) {
-    const char *method = parse_only ? "parseUrl" : "fromUrl";
-    if (argc != 1) {
-        char message[128];
-        snprintf(message, sizeof(message), "hostedGitInfo.prototype.%s takes exactly 1 argument", method);
-        ct_throw_message(ctx, exception, message);
-        return JSValueMakeUndefined(ctx);
-    }
-    if (!JSValueIsString(ctx, argv[0])) {
-        char message[160];
-        snprintf(message, sizeof(message), "hostedGitInfo.prototype.%s takes a string as its first argument", method);
-        ct_throw_message(ctx, exception, message);
-        return JSValueMakeUndefined(ctx);
-    }
-
-    size_t input_len = 0;
-    char *input = ct_value_to_utf8_copy_checked(ctx, argv[0], &input_len, exception);
-    if (input == NULL) {
-        if (exception == NULL || *exception == NULL) ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    size_t output_len = 0;
-    char *error = NULL;
-    uint8_t *output = parse_only
-        ? ct_hosted_git_info_parse_url((const uint8_t *)input, input_len, &output_len, &error)
-        : ct_hosted_git_info_from_url((const uint8_t *)input, input_len, &output_len, &error);
-    free(input);
-    if (output == NULL) {
-        if (error != NULL) {
-            ct_throw_message(ctx, exception, error);
-            ct_host_string_free(error);
-            return JSValueMakeUndefined(ctx);
-        }
-        return JSValueMakeNull(ctx);
-    }
-
-    JSValueRef result = ct_make_string_len(ctx, (const char *)output, output_len);
-    ct_host_buffer_free((char *)output);
-    return result;
-}
-
-static JSValueRef ct_hosted_git_info_parse_url_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    return ct_hosted_git_info_call(ctx, argc, argv, exception, true);
-}
-
-static JSValueRef ct_hosted_git_info_from_url_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    return ct_hosted_git_info_call(ctx, argc, argv, exception, false);
-}
-
-static JSValueRef ct_package_manager_parse_lockfile_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 1) {
-        ct_throw_message(ctx, exception, "parseLockfile requires a directory");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    size_t cwd_len = 0;
-    char *cwd = ct_value_to_utf8_copy_checked(ctx, argv[0], &cwd_len, exception);
-    if (cwd == NULL) {
-        if (exception == NULL || *exception == NULL) ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    size_t output_len = 0;
-    char *error = NULL;
-    uint8_t *output = ct_package_manager_parse_lockfile(
-        (const uint8_t *)cwd,
-        cwd_len,
-        &output_len,
-        &error
-    );
-    free(cwd);
-    if (output == NULL) {
-        ct_throw_message(ctx, exception, error != NULL ? error : "failed to parse lockfile");
-        if (error != NULL) ct_host_string_free(error);
-        return JSValueMakeUndefined(ctx);
-    }
-
-    JSValueRef result = ct_make_string_len(ctx, (const char *)output, output_len);
-    ct_host_buffer_free((char *)output);
-    return result;
 }
 
 static JSValueRef ct_transpiler_process_native(JSContextRef ctx, size_t argc, const JSValueRef argv[], JSValueRef *exception, int operation) {

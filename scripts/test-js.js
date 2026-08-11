@@ -458,15 +458,6 @@ try {
       stdoutIncludes: ['bun semver passed'],
     },
     {
-      name: 'bun-package-manager-internals',
-      scriptPath: join(rootDir, 'tests', 'js', 'bun-package-manager-internals.ts'),
-      env: {
-        COTTONTAIL_TMP_DIR: tempDir,
-      },
-      expectExitCode: 0,
-      stdoutIncludes: ['bun package manager internals passed'],
-    },
-    {
       name: 'bun-sqlite',
       scriptPath: join(rootDir, 'tests', 'js', 'bun-sqlite.ts'),
       env: {

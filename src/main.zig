@@ -7,9 +7,6 @@ const cottontail_hash = @import("cottontail_hash.zig");
 const cottontail_markdown = @import("cottontail_markdown.zig");
 const cottontail_password = @import("cottontail_password.zig");
 const jsonc = @import("jsonc.zig");
-const package_manager_host = @import("package_manager_host.zig");
-const package_manager_lockfile_service = @import("package_manager_lockfile_service.zig");
-const cli_create_source_service = @import("cli_create_source_service.zig");
 const repl = @import("repl.zig");
 const signal_forwarding = @import("signal_forwarding.zig");
 const cottontail_transpiler = @import("cottontail_transpiler.zig");
@@ -65,7 +62,8 @@ const help_text_template =
     \\  cottontail --help
     \\  cottontail --version
     \\
-    \\Project setup, package management, package scripts, and package executables are provided by Hutch.
+    \\Package management is external; invoke npm, pnpm, yarn, or Bun directly.
+    \\Electrobun project setup and project scripts are provided by Hutch.
     \\
     \\Status:
     \\  JavaScriptCore is embedded with ESM imports, async job draining, and a small cottontail host API.
@@ -77,19 +75,8 @@ fn printHelp(writer: anytype) !void {
     try writer.print(help_text_template, .{version});
 }
 
-const HutchCommand = struct {
-    requested: []const u8,
-    replacement: []const u8,
-};
-
-fn hutchCommandForName(command: []const u8) ?HutchCommand {
-    const replacement = if (std.mem.eql(u8, command, "c"))
-        "create"
-    else if (std.mem.eql(u8, command, "bunx"))
-        "x"
-    else if (std.mem.eql(u8, command, "upgrade"))
-        "cottontail update"
-    else if (std.mem.eql(u8, command, "audit") or
+fn isExternalPackageCommand(command: []const u8) bool {
+    return std.mem.eql(u8, command, "audit") or
         std.mem.eql(u8, command, "install") or
         std.mem.eql(u8, command, "i") or
         std.mem.eql(u8, command, "ci") or
@@ -113,20 +100,19 @@ fn hutchCommandForName(command: []const u8) ?HutchCommand {
         std.mem.eql(u8, command, "why") or
         std.mem.eql(u8, command, "init") or
         std.mem.eql(u8, command, "create") or
-        std.mem.eql(u8, command, "x"))
-        command
-    else
-        return null;
-    return .{ .requested = command, .replacement = replacement };
+        std.mem.eql(u8, command, "c") or
+        std.mem.eql(u8, command, "x") or
+        std.mem.eql(u8, command, "bunx") or
+        std.mem.eql(u8, command, "upgrade");
 }
 
-fn hutchCommandForArgs(args: []const [:0]const u8) ?HutchCommand {
+fn externalPackageCommandForArgs(args: []const [:0]const u8) ?[]const u8 {
     if (args.len == 0) return null;
     const executable_name = std.fs.path.basename(args[0]);
     if (std.ascii.eqlIgnoreCase(executable_name, "bunx") or
         std.ascii.eqlIgnoreCase(executable_name, "bunx.exe"))
     {
-        return .{ .requested = "bunx", .replacement = "x" };
+        return "bunx";
     }
     if (args.len <= 1) return null;
 
@@ -149,22 +135,24 @@ fn hutchCommandForArgs(args: []const [:0]const u8) ?HutchCommand {
             index += 2;
             continue;
         }
-        return hutchCommandForName(argument);
+        return if (isExternalPackageCommand(argument)) argument else null;
     }
     return null;
 }
 
-fn reportHutchCommand(stderr: *std.Io.Writer, command: HutchCommand) !void {
+fn reportExternalPackageCommand(stderr: *std.Io.Writer, command: []const u8) !void {
     try stderr.print(
-        "error: `cottontail {s}` is a build-time command provided by Hutch.\nRun `hutch {s}` instead.\n",
-        .{ command.requested, command.replacement },
+        "error: `cottontail {s}` is unavailable because Cottontail v2 has no package manager.\n" ++
+            "Invoke npm, pnpm, yarn, or Bun directly for package and project commands.\n",
+        .{command},
     );
 }
 
 fn reportHutchScript(stderr: *std.Io.Writer, script_name: []const u8) !void {
     try stderr.print(
-        "error: package scripts and package executables are provided by Hutch.\nRun `hutch run {s}` instead.\n",
-        .{script_name},
+        "error: `{s}` is not an installed entrypoint or Cottontail command.\n" ++
+            "Run project scripts with `hutch run {s}`; invoke package executables through npm, pnpm, yarn, or Bun directly.\n",
+        .{ script_name, script_name },
     );
 }
 
@@ -3292,75 +3280,8 @@ pub fn main(init: std.process.Init) !void {
     var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
-    if (args.len > 1 and std.mem.eql(u8, args[1], "--cottontail-lockfile-service")) {
-        const exit_code = package_manager_lockfile_service.run(
-            init,
-            args[2..],
-            stdout,
-            stderr,
-        ) catch |err| {
-            try stderr.print("cottontail: lockfile service failed: {s}\n", .{@errorName(err)});
-            try stderr.flush();
-            std.process.exit(1);
-        };
-        try stdout.flush();
-        try stderr.flush();
-        if (exit_code != 0) std.process.exit(exit_code);
-        return;
-    }
-
-    if (args.len > 1 and std.mem.eql(u8, args[1], "--cottontail-scan-package-imports")) {
-        if (args.len < 4) {
-            try stderr.writeAll("cottontail: package import scan requires a working directory and entrypoint\n");
-            try stderr.flush();
-            std.process.exit(1);
-        }
-        const entry_points = try allocator.alloc([]const u8, args.len - 3);
-        for (args[3..], 0..) |entry_point, index| entry_points[index] = entry_point;
-        const working_dir = if (std.fs.path.isAbsolute(args[2]))
-            args[2]
-        else
-            std.Io.Dir.cwd().realPathFileAlloc(init.io, args[2], allocator) catch {
-                try stderr.print("cottontail: package import scan working directory not found: {s}\n", .{args[2]});
-                try stderr.flush();
-                std.process.exit(1);
-            };
-        const dependencies = package_manager_host.scanDependencies(
-            init,
-            allocator,
-            entry_points,
-            working_dir,
-            stderr,
-        ) catch |err| {
-            try stderr.print("cottontail: package import scan failed: {s}\n", .{@errorName(err)});
-            try stderr.flush();
-            std.process.exit(1);
-        };
-        try std.json.Stringify.value(dependencies, .{}, stdout);
-        try stdout.writeByte('\n');
-        try stdout.flush();
-        return;
-    }
-
-    if (args.len > 1 and std.mem.eql(u8, args[1], "--cottontail-create-source-service")) {
-        const exit_code = cli_create_source_service.run(
-            init,
-            args[2..],
-            stdout,
-            stderr,
-        ) catch |err| {
-            try stderr.print("cottontail: create-source service failed: {s}\n", .{@errorName(err)});
-            try stderr.flush();
-            std.process.exit(1);
-        };
-        try stdout.flush();
-        try stderr.flush();
-        if (exit_code != 0) std.process.exit(exit_code);
-        return;
-    }
-
-    if (hutchCommandForArgs(args)) |command| {
-        try reportHutchCommand(stderr, command);
+    if (externalPackageCommandForArgs(args)) |command| {
+        try reportExternalPackageCommand(stderr, command);
         try stderr.flush();
         std.process.exit(1);
     }
@@ -3420,7 +3341,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, arg, "getcompletes")) {
         // Cottontail completion candidates are runtime commands only. Hutch
-        // owns project scripts and project-mutating commands.
+        // owns project scripts; package and project mutation stay external.
         for (completion_commands) |name| {
             try stdout.print("{s}\n", .{name});
         }
@@ -3633,22 +3554,23 @@ test "help text mentions cottontail and script usage" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "high performance JS runtime") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<entrypoint.js|entrypoint.ts>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "cottontail build") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "Package management is external") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "provided by Hutch") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "cottontail create") == null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "cottontail install") == null);
 }
 
-test "build-time commands redirect to Hutch" {
+test "package and project commands stay outside Cottontail" {
     const install = [_][:0]const u8{ "cottontail", "install" };
     const configured_add = [_][:0]const u8{ "cottontail", "--config", "bunfig.toml", "add", "left-pad" };
     const bunx = [_][:0]const u8{ "/tmp/bunx", "tool" };
     const runtime = [_][:0]const u8{ "cottontail", "run", "index.ts" };
 
-    try std.testing.expectEqualStrings("install", hutchCommandForArgs(&install).?.replacement);
-    try std.testing.expectEqualStrings("add", hutchCommandForArgs(&configured_add).?.replacement);
-    try std.testing.expectEqualStrings("x", hutchCommandForArgs(&bunx).?.replacement);
-    try std.testing.expect(hutchCommandForArgs(&runtime) == null);
-    try std.testing.expectEqualStrings("cottontail update", hutchCommandForName("upgrade").?.replacement);
+    try std.testing.expectEqualStrings("install", externalPackageCommandForArgs(&install).?);
+    try std.testing.expectEqualStrings("add", externalPackageCommandForArgs(&configured_add).?);
+    try std.testing.expectEqualStrings("bunx", externalPackageCommandForArgs(&bunx).?);
+    try std.testing.expect(externalPackageCommandForArgs(&runtime) == null);
+    try std.testing.expect(isExternalPackageCommand("upgrade"));
 }
 
 test "runtime flags can precede the test command" {

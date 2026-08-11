@@ -9,15 +9,18 @@ modules, provides the Bun and Node runtime APIs, runs tests, and retains the
 compiler entry point Hutch currently uses for `build`. It does not mutate
 projects or install packages at runtime.
 
-Hutch owns package installation and updates, package scripts, package
-executables, project creation, and runtime version management. Commands such as
-`cottontail install`, `cottontail init`, `cottontail create`, and `cottontail x`
-fail with the corresponding Hutch command. `cottontail run file.ts` remains a
-runtime launch; `hutch run dev` is the project-script form.
+Hutch owns Electrobun toolchain and SDK vendoring, runtime version management,
+project scripts, and `electrobun init`. JavaScript package installation and
+package executables stay with the project's selected package manager; invoke
+npm, pnpm, yarn, or Bun directly. Commands such as `cottontail install`,
+`cottontail init`, `cottontail create`, and `cottontail x` fail with that
+explicit diagnostic. `cottontail run file.ts` remains a runtime launch;
+`hutch run dev` is the project-script form.
 
 Compiler-internal install data types and the legacy binary-lockfile codec remain
-temporarily because Hutch invokes narrow hidden Cottontail compiler services.
-The package-manager implementation and its public commands live in Hutch.
+temporarily because the compiler resolver is still coupled to them. Cottontail
+does not expose public or hidden package-manager services, and its runtime never
+auto-installs a missing package.
 
 After a fresh clone, Node.js 24 can bootstrap the vendored toolchains and build
 Cottontail. Bun remains a supported convenience for the package scripts, but it
