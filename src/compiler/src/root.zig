@@ -16,8 +16,8 @@ pub const Maybe = jsc.Node.Maybe;
 // page_allocator, the pooled allocator also amortizes the many non-arena
 // allocations owned by Bun.build configs, diagnostics, and output artifacts.
 pub const default_allocator = std.heap.smp_allocator;
-/// The retained install sources support compiler data types and Hutch's narrow
-/// lockfile services. Hutch owns package management; runtime auto-install is off.
+/// Installer types remain temporarily coupled to resolver and linker internals.
+/// Runtime auto-install is disabled; package installation is external.
 pub const enable_package_manager = false;
 pub const DefaultAllocator = struct {
     pub fn allocator(_: DefaultAllocator) std.mem.Allocator {
