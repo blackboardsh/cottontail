@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { closeSync, mkdtempSync, openSync, readFileSync, rmSync } from "node:fs";
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync as nodeSpawnSync } from "node:child_process";
@@ -9,6 +9,63 @@ const stdoutCommand = (text: string) => [
   "-e",
   `process.stdout.write(${JSON.stringify(text)})`,
 ];
+
+function expectWindowsBatchRejection(callback: () => unknown, path: string) {
+  let error: any;
+  try {
+    callback();
+  } catch (cause) {
+    error = cause;
+  }
+  expect(error).toBeInstanceOf(Error);
+  expect(error.code).toBe("EINVAL");
+  expect(error.errno).toBe(-4071);
+  expect(error.path).toBe(path);
+  expect(error.message).toContain("Cannot execute Windows .cmd/.bat files directly");
+  expect(error.message).toContain("native .exe/.com");
+}
+
+test("Windows native spawn rejects batch files before and after PATHEXT resolution", () => {
+  if (process.platform !== "win32") return;
+
+  const directory = mkdtempSync(join(tmpdir(), "cottontail-batch-spawn-"));
+  using cleanup = { [Symbol.dispose]: () => rmSync(directory, { recursive: true, force: true }) };
+  const commandName = "cottontail-batch-spawn-probe";
+  const cmdPath = join(directory, `${commandName}.CmD`);
+  const batPath = join(directory, `${commandName}-bat.BaT`);
+  const markerPath = join(directory, "batch-executed.txt");
+  writeFileSync(cmdPath, `@echo executed>"${markerPath}"\r\n@exit /b 0\r\n`);
+  writeFileSync(batPath, `@echo executed>"${markerPath}"\r\n@exit /b 0\r\n`);
+
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => !["PATH", "PATHEXT"].includes(name.toUpperCase())),
+  );
+  Object.assign(env, { PATH: directory, PATHEXT: ".CMD;.BAT;.COM;.EXE" });
+
+  expectWindowsBatchRejection(
+    () => Bun.spawn([cmdPath, "ignored"], { env, stdin: "ignore", stdout: "ignore", stderr: "ignore" }),
+    cmdPath,
+  );
+  expectWindowsBatchRejection(
+    () => Bun.spawnSync([commandName, "ignored"], { env }),
+    commandName,
+  );
+  expectWindowsBatchRejection(
+    () => Bun.spawnSync([batPath], { env }),
+    batPath,
+  );
+  expectWindowsBatchRejection(
+    () => Bun.spawnSync([`${cmdPath}. `], { env }),
+    `${cmdPath}. `,
+  );
+  expect(existsSync(markerPath)).toBe(false);
+
+  const explicitShell = Bun.spawnSync(
+    ["cmd.exe", "/d", "/s", "/c", "exit /b 0"],
+    { windowsVerbatimArguments: true },
+  );
+  expect(explicitShell.exitCode).toBe(0);
+});
 
 test("argv0 overrides do not replace arbitrary executables", async () => {
   const externalNode = Bun.which("node");

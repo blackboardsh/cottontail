@@ -1,5 +1,8 @@
 import { ChildProcess, execFile, execFileSync, spawn, spawnSync } from "node:child_process";
 import { ETIMEDOUT } from "node:constants";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -81,6 +84,53 @@ if (isWindows) {
     assert(batchResult.status === null, `direct Windows batch spawnSync status mismatch for ${suffix}`);
     assert(batchResult.error?.code === "EINVAL", `direct Windows batch spawnSync code mismatch for ${suffix}`);
     assert(batchResult.error?.errno === -4071, `direct Windows batch spawnSync errno mismatch for ${suffix}`);
+  }
+
+  const directory = mkdtempSync(join(tmpdir(), "cottontail-child-process-batch-"));
+  try {
+    const commandName = "cottontail-child-process-batch-probe";
+    const commandPath = join(directory, `${commandName}.CmD`);
+    const markerPath = join(directory, "batch-executed.txt");
+    writeFileSync(
+      commandPath,
+      `@echo batch-shell-ok\r\n@echo executed>"${markerPath}"\r\n@exit /b 0\r\n`,
+    );
+    const systemRoot = process.env.SystemRoot;
+    assert(typeof systemRoot === "string" && systemRoot.length > 0, "parent SystemRoot is missing");
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter(([name]) => !["PATH", "PATHEXT"].includes(name.toUpperCase())),
+    );
+    Object.assign(env, {
+      PATH: `${directory};${join(systemRoot, "System32")}`,
+      PATHEXT: ".CMD;.BAT;.COM;.EXE",
+    });
+
+    const resolvedChild = spawn(commandName, ["ignored"], { env, stdio: "ignore" });
+    const resolvedAsyncError = await new Promise<any>((resolve, reject) => {
+      let spawnError: any;
+      resolvedChild.once("error", (error) => {
+        spawnError = error;
+      });
+      resolvedChild.once("spawn", () => reject(new Error("extensionless Windows batch command unexpectedly spawned")));
+      resolvedChild.once("close", () => resolve(spawnError));
+    });
+    assert(resolvedAsyncError?.code === "EINVAL", "resolved Windows batch spawn code mismatch");
+    assert(resolvedAsyncError?.errno === -4071, "resolved Windows batch spawn errno mismatch");
+    assert(resolvedAsyncError?.path === commandName, "resolved Windows batch spawn path mismatch");
+
+    const resolvedSyncResult = spawnSync(commandName, ["ignored"], { env });
+    assert(resolvedSyncResult.status === null, "resolved Windows batch spawnSync status mismatch");
+    assert(resolvedSyncResult.error?.code === "EINVAL", "resolved Windows batch spawnSync code mismatch");
+    assert(resolvedSyncResult.error?.errno === -4071, "resolved Windows batch spawnSync errno mismatch");
+    assert(resolvedSyncResult.error?.path === commandName, "resolved Windows batch spawnSync path mismatch");
+    assert(!existsSync(markerPath), "rejected Windows batch file executed");
+
+    const shellResult = spawnSync(commandName, [], { encoding: "utf8", env, shell: true });
+    assert(shellResult.status === 0, `shell-enabled Windows batch spawn failed: ${shellResult.stderr}`);
+    assert(shellResult.stdout.includes("batch-shell-ok"), "shell-enabled Windows batch output mismatch");
+    assert(existsSync(markerPath), "shell-enabled Windows batch file did not execute");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 }
 

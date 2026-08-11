@@ -43,6 +43,18 @@ function normalizeResourceUsage(usage) {
 
 function normalizeSpawnError(error, file, cwd = undefined) {
   const source = String(error?.message ?? error ?? "");
+  if (source.includes("WindowsBatchFileUnsupported")) {
+    const out = new Error(
+      `Cannot execute Windows .cmd/.bat files directly: ${JSON.stringify(String(file))}. ` +
+      "Use a native .exe/.com executable or invoke the underlying runtime/CLI directly.",
+    );
+    out.code = "EINVAL";
+    out.errno = -4071;
+    out.path = String(file);
+    out.syscall = "spawn";
+    out.cause = error;
+    return out;
+  }
   if (!source.includes("FileNotFound") && !source.includes("ENOENT") &&
       !source.includes("No such file or directory")) {
     return error;

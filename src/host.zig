@@ -102,6 +102,8 @@ extern "c" fn ct_windows_spawn_host_process(
     stderr_handle_out: *usize,
 ) c_int;
 
+const windows_spawn_batch_file_unsupported: c_int = 0x10000;
+
 pub const CtHostSpawnResult = extern struct {
     exit_code: c_int,
     signal_code: c_int,
@@ -413,7 +415,7 @@ fn spawnWindowsNative(
     args_ptr: ?[*]const [*:0]const u8,
     arg_count: usize,
     options: CtHostSpawnOptions,
-) std.process.SpawnError!std.process.Child {
+) (std.process.SpawnError || error{WindowsBatchFileUnsupported})!std.process.Child {
     var process_handle: usize = 0;
     var thread_handle: usize = 0;
     var stdin_handle: usize = 0;
@@ -430,6 +432,9 @@ fn spawnWindowsNative(
         &stdout_handle,
         &stderr_handle,
     );
+    if (code == windows_spawn_batch_file_unsupported) {
+        return error.WindowsBatchFileUnsupported;
+    }
     if (code != 0) return posixSpawnError(code);
     if (process_handle == 0 or thread_handle == 0) return error.Unexpected;
 

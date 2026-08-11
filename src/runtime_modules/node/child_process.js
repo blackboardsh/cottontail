@@ -221,14 +221,22 @@ function makeSpawnSyncLimitError(code, errno, file, args) {
 
 function makeSpawnFailureResult(file, cause, args = []) {
   const message = cause instanceof Error ? cause.message : String(cause);
+  const batchUnsupported = message.includes("WindowsBatchFileUnsupported");
   const notFound = /filenotfound|enoent|no such file/i.test(message);
-  const error = notFound ? new Error(`spawnSync ${file} ENOENT`) : new Error(message);
-  error.code = notFound ? "ENOENT" : (cause?.code ?? "UNKNOWN");
-  if (notFound) error.errno = -2;
-  else if (cause?.errno !== undefined) error.errno = cause.errno;
+  const error = batchUnsupported
+    ? windowsBatchSpawnError(file, true)
+    : notFound
+      ? new Error(`spawnSync ${file} ENOENT`)
+      : new Error(message);
+  if (!batchUnsupported) {
+    error.code = notFound ? "ENOENT" : (cause?.code ?? "UNKNOWN");
+    if (notFound) error.errno = -2;
+    else if (cause?.errno !== undefined) error.errno = cause.errno;
+  }
   error.syscall = `spawnSync ${file}`;
   error.path = String(file);
   error.spawnargs = Array.from(args, String);
+  if (batchUnsupported) error.cause = cause;
   return {
     status: null,
     signal: null,
@@ -714,6 +722,13 @@ function spawnPreflightError(resolvedFile, spawnargs, originalFile) {
 
 function normalizeSpawnError(file, spawnargs, cause) {
   const message = cause instanceof Error ? cause.message : String(cause);
+  if (message.includes("WindowsBatchFileUnsupported")) {
+    const error = windowsBatchSpawnError(file);
+    error.path = String(file);
+    error.spawnargs = Array.from(spawnargs ?? [], String);
+    error.cause = cause;
+    return error;
+  }
   const causeCode = typeof cause?.code === "string" ? cause.code.toUpperCase() : "";
   let code;
   let errno;

@@ -27881,6 +27881,38 @@ static bool ct_windows_command_append_arg(CtWindowsCommandLine *command, const c
     return ct_windows_command_append_char(command, '\"');
 }
 
+/*
+ * Direct CreateProcessW execution of batch scripts is unsafe because Windows
+ * inserts cmd.exe without providing a way to losslessly quote arbitrary argv.
+ * Keep this value outside the errno range so the Zig host bridge can preserve
+ * the reason instead of collapsing it into a generic spawn failure.
+ */
+#define CT_WINDOWS_SPAWN_BATCH_FILE_UNSUPPORTED 0x10000
+
+typedef enum {
+    CT_WINDOWS_SPAWN_FAILURE_NONE = 0,
+    CT_WINDOWS_SPAWN_FAILURE_BATCH_FILE_UNSUPPORTED = 1,
+} CtWindowsSpawnFailure;
+
+static bool ct_windows_path_is_batch_file(const WCHAR *path) {
+    if (path == NULL) return false;
+    size_t len = wcslen(path);
+    /* Win32 ignores trailing spaces and dots in path components. */
+    while (len > 0 && (path[len - 1] == L' ' || path[len - 1] == L'.')) len -= 1;
+    if (len < 4 || path[len - 4] != L'.') return false;
+    return _wcsnicmp(path + len - 3, L"cmd", 3) == 0 ||
+        _wcsnicmp(path + len - 3, L"bat", 3) == 0;
+}
+
+static bool ct_windows_utf8_path_is_batch_file(const char *path) {
+    if (path == NULL) return false;
+    size_t len = strlen(path);
+    while (len > 0 && (path[len - 1] == ' ' || path[len - 1] == '.')) len -= 1;
+    if (len < 4 || path[len - 4] != '.') return false;
+    return _strnicmp(path + len - 3, "cmd", 3) == 0 ||
+        _strnicmp(path + len - 3, "bat", 3) == 0;
+}
+
 static int ct_windows_env_entry_compare(const void *left, const void *right) {
     const CtHostEnvEntry *const *left_entry = (const CtHostEnvEntry *const *)left;
     const CtHostEnvEntry *const *right_entry = (const CtHostEnvEntry *const *)right;
@@ -28310,14 +28342,22 @@ static WCHAR *ct_windows_resolve_spawn_executable(
     const char *file,
     const WCHAR *cwd,
     const CtHostEnvEntry *env_entries,
-    size_t env_count
+    size_t env_count,
+    bool *batch_file_rejected
 ) {
+    if (batch_file_rejected != NULL) *batch_file_rejected = false;
     if (file == NULL || file[0] == '\0' || strcmp(file, ".") == 0) {
         errno = ENOENT;
         return NULL;
     }
     WCHAR *wide_file = ct_windows_utf8_to_wide(file);
     if (wide_file == NULL) return NULL;
+    if (ct_windows_path_is_batch_file(wide_file)) {
+        free(wide_file);
+        if (batch_file_rejected != NULL) *batch_file_rejected = true;
+        errno = EINVAL;
+        return NULL;
+    }
 
     bool path_found = false;
     bool pathext_found = false;
@@ -28418,7 +28458,13 @@ static WCHAR *ct_windows_resolve_spawn_executable(
     free(wide_file);
     free(path);
     free(pathext);
-    if (result != NULL) return result;
+    if (result != NULL) {
+        if (!ct_windows_path_is_batch_file(result)) return result;
+        free(result);
+        if (batch_file_rejected != NULL) *batch_file_rejected = true;
+        errno = EINVAL;
+        return NULL;
+    }
     if (errno == ENOMEM || errno == ENAMETOOLONG) return NULL;
     ct_windows_set_errno(has_directory ? candidate_error : ERROR_FILE_NOT_FOUND);
     return NULL;
@@ -28720,6 +28766,7 @@ static bool ct_windows_spawn_process(
     bool windows_hide,
     bool windows_verbatim_arguments,
     bool suspended,
+    CtWindowsSpawnFailure *failure_out,
     HANDLE *process_out,
     HANDLE *thread_out,
     DWORD *pid_out,
@@ -28730,6 +28777,7 @@ static bool ct_windows_spawn_process(
     HANDLE *stdout_handle_out,
     HANDLE *stderr_handle_out
 ) {
+    if (failure_out != NULL) *failure_out = CT_WINDOWS_SPAWN_FAILURE_NONE;
     *process_out = NULL;
     *thread_out = NULL;
     *pid_out = 0;
@@ -28739,6 +28787,13 @@ static bool ct_windows_spawn_process(
     if (stdin_handle_out != NULL) *stdin_handle_out = NULL;
     if (stdout_handle_out != NULL) *stdout_handle_out = NULL;
     if (stderr_handle_out != NULL) *stderr_handle_out = NULL;
+
+    /* Classify the requested spelling even if cwd/PATH resolution later fails. */
+    if (ct_windows_utf8_path_is_batch_file(file)) {
+        if (failure_out != NULL) *failure_out = CT_WINDOWS_SPAWN_FAILURE_BATCH_FILE_UNSUPPORTED;
+        errno = EINVAL;
+        return false;
+    }
 
     CtWindowsCommandLine command = { 0 };
     if (!ct_windows_command_append_arg(
@@ -28755,9 +28810,22 @@ static bool ct_windows_spawn_process(
         }
     }
     WCHAR *effective_cwd = ct_windows_spawn_effective_cwd(cwd);
+    bool batch_file_rejected = false;
     WCHAR *file_wide = effective_cwd != NULL
-        ? ct_windows_resolve_spawn_executable(file, effective_cwd, env_entries, env_count)
+        ? ct_windows_resolve_spawn_executable(
+            file,
+            effective_cwd,
+            env_entries,
+            env_count,
+            &batch_file_rejected)
         : NULL;
+    if (batch_file_rejected) {
+        if (failure_out != NULL) *failure_out = CT_WINDOWS_SPAWN_FAILURE_BATCH_FILE_UNSUPPORTED;
+        free(effective_cwd);
+        free(command.data);
+        errno = EINVAL;
+        return false;
+    }
     WCHAR *command_wide = ct_windows_utf8_to_wide(command.data);
     WCHAR *cwd_wide = cwd != NULL ? effective_cwd : NULL;
     WCHAR *environment = (clear_env || env_count > 0) ? ct_windows_environment_block(env_entries, env_count) : NULL;
@@ -28953,6 +29021,7 @@ int ct_windows_spawn_host_process(
     int stdin_fd = -1;
     int stdout_fd = -1;
     int stderr_fd = -1;
+    CtWindowsSpawnFailure failure = CT_WINDOWS_SPAWN_FAILURE_NONE;
     errno = 0;
     if (!ct_windows_spawn_process(
             file,
@@ -28975,6 +29044,7 @@ int ct_windows_spawn_host_process(
             options.windows_hide,
             options.windows_verbatim_arguments,
             true,
+            &failure,
             &process_handle,
             &thread_handle,
             &pid,
@@ -28984,6 +29054,9 @@ int ct_windows_spawn_host_process(
             &stdin_handle,
             &stdout_handle,
             &stderr_handle)) {
+        if (failure == CT_WINDOWS_SPAWN_FAILURE_BATCH_FILE_UNSUPPORTED) {
+            return CT_WINDOWS_SPAWN_BATCH_FILE_UNSUPPORTED;
+        }
         return errno != 0 ? errno : EIO;
     }
 
@@ -29770,15 +29843,22 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     int stdin_fd = -1;
     int stdout_fd = -1;
     int stderr_fd = -1;
+    CtWindowsSpawnFailure spawn_failure = CT_WINDOWS_SPAWN_FAILURE_NONE;
     if (!ct_windows_spawn_process(file, args, arg_count, argv0, cwd, env_entries, env_count, clear_env,
                                   stdin_mode, stdout_mode, stderr_mode,
                                   stdin_source_fd, stdout_source_fd, stderr_source_fd,
                                   extra_stdio, extra_stdio_count,
                                   detached, windows_hide, windows_verbatim_arguments, defer_start,
+                                  &spawn_failure,
                                   &process_handle, &start_thread, &pid,
                                   &stdin_fd, &stdout_fd, &stderr_fd,
                                   NULL, NULL, NULL)) {
-        ct_throw_message(ctx, exception, strerror(errno != 0 ? errno : EIO));
+        ct_throw_message(
+            ctx,
+            exception,
+            spawn_failure == CT_WINDOWS_SPAWN_FAILURE_BATCH_FILE_UNSUPPORTED
+                ? "WindowsBatchFileUnsupported"
+                : strerror(errno != 0 ? errno : EIO));
         free(file);
         ct_free_string_array(args, arg_count);
         free(cwd);
@@ -30608,14 +30688,21 @@ static JSValueRef ct_spawn_detached(JSContextRef ctx, JSObjectRef function, JSOb
     HANDLE start_thread = NULL;
     DWORD pid = 0;
     int stdin_fd = -1, stdout_fd = -1, stderr_fd = -1;
+    CtWindowsSpawnFailure spawn_failure = CT_WINDOWS_SPAWN_FAILURE_NONE;
     if (!ct_windows_spawn_process(file, args, arg_count, NULL, cwd, env_entries, env_count, clear_env,
                                   CT_PROCESS_STDIO_IGNORE, CT_PROCESS_STDIO_IGNORE, CT_PROCESS_STDIO_IGNORE,
                                   -1, -1, -1,
                                   NULL, 0,
                                   true, false, false, false,
+                                  &spawn_failure,
                                   &process_handle, &start_thread, &pid, &stdin_fd, &stdout_fd, &stderr_fd,
                                   NULL, NULL, NULL)) {
-        ct_throw_message(ctx, exception, strerror(errno != 0 ? errno : EIO));
+        ct_throw_message(
+            ctx,
+            exception,
+            spawn_failure == CT_WINDOWS_SPAWN_FAILURE_BATCH_FILE_UNSUPPORTED
+                ? "WindowsBatchFileUnsupported"
+                : strerror(errno != 0 ? errno : EIO));
         pid = 0;
     }
     if (process_handle != NULL) CloseHandle(process_handle);
