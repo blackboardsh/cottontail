@@ -194,7 +194,7 @@ jobs:
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
-          & .\zig-out\bin\cottontail.exe test tests/js/hutch-shell-cli.test.ts
+          node scripts/test-hutch-private-file-release.js .\zig-out\bin\cottontail.exe
           if ($LASTEXITCODE -ne 0) { throw "Windows Hutch private file tests failed" }
 
       - name: Package release

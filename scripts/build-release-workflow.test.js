@@ -57,8 +57,9 @@ test('Windows releases exercise the Hutch private file runner', () => {
   assert.match(privateFileTest, /if: matrix\.os == 'windows'/);
   assert.match(
     privateFileTest,
-    /& \.\\zig-out\\bin\\cottontail\.exe test tests\/js\/hutch-shell-cli\.test\.ts/,
+    /node scripts\/test-hutch-private-file-release\.js \.\\zig-out\\bin\\cottontail\.exe/,
   );
+  assert.doesNotMatch(privateFileTest, /hutch-shell-cli\.test\.ts/);
   assert.match(privateFileTest, /Windows Hutch private file tests failed/);
   assert.ok(
     workflow.indexOf('- name: Build and strip release binary') <
