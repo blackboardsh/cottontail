@@ -52,6 +52,21 @@ test('the Windows console test builds the same target as the Windows release', (
   );
 });
 
+test('Windows releases exercise the Hutch private file runner', () => {
+  const privateFileTest = step('Test Hutch private file runner on Windows');
+  assert.match(privateFileTest, /if: matrix\.os == 'windows'/);
+  assert.match(
+    privateFileTest,
+    /& \.\\zig-out\\bin\\cottontail\.exe test tests\/js\/hutch-shell-cli\.test\.ts/,
+  );
+  assert.match(privateFileTest, /Windows Hutch private file tests failed/);
+  assert.ok(
+    workflow.indexOf('- name: Build and strip release binary') <
+      workflow.indexOf('- name: Test Hutch private file runner on Windows'),
+    'the Hutch private file tests must exercise the release binary',
+  );
+});
+
 test('packaged Linux releases prove the pinned ICU fallback without system ICU', () => {
   const smoke = step('Smoke test packaged pinned ICU fallback');
   assert.match(smoke, /if: matrix\.os == 'linux'/);

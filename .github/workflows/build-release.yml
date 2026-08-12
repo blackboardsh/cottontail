@@ -190,6 +190,13 @@ jobs:
           & .\zig-out\bin\cottontail.exe test tests/js/node-fs-windows-permissions.test.ts
           if ($LASTEXITCODE -ne 0) { throw "Windows filesystem permission tests failed" }
 
+      - name: Test Hutch private file runner on Windows
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          & .\zig-out\bin\cottontail.exe test tests/js/hutch-shell-cli.test.ts
+          if ($LASTEXITCODE -ne 0) { throw "Windows Hutch private file tests failed" }
+
       - name: Package release
         if: matrix.os != 'windows'
         run: node scripts/package-release.js

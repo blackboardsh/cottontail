@@ -399,6 +399,23 @@ fn pathIsWithin(ctx: *const Context, parent: []const u8, child: []const u8) !boo
     return !std.mem.startsWith(u8, relative, parent_prefix);
 }
 
+fn openHutchPrivateReadFile(
+    dir: std.Io.Dir,
+    io: std.Io,
+    relative: []const u8,
+) !std.Io.File {
+    var file = try dir.openFile(io, relative, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    });
+    // Zig 0.16 opens Windows no-follow files for asynchronous I/O but does
+    // not reflect that in the returned File flags. Keep the no-follow handle
+    // and select the matching Windows read path explicitly.
+    if (comptime builtin.os.tag == .windows) file.flags.nonblocking = true;
+    return file;
+}
+
 fn readHutchPrivateArtifact(
     storage: *const HutchPrivateStorage,
     ctx: *const Context,
@@ -419,11 +436,7 @@ fn readHutchPrivateArtifact(
     const parent_prefix = try std.fmt.allocPrint(ctx.allocator, "..{c}", .{std.fs.path.sep});
     if (std.mem.startsWith(u8, relative, parent_prefix))
         return error.HutchPrivateArtifactOutsideRoot;
-    var file = try storage.root_dir.openFile(ctx.io, relative, .{
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    });
+    var file = try openHutchPrivateReadFile(storage.root_dir, ctx.io, relative);
     defer file.close(ctx.io);
     var reader = file.reader(ctx.io, &.{});
     return reader.interface.allocRemaining(ctx.allocator, .limited(512 * 1024 * 1024)) catch |err| switch (err) {
@@ -473,11 +486,7 @@ fn openHutchPrivateStorage(
     if (!std.ascii.eqlIgnoreCase(std.fs.path.extension(relative), ".mjs"))
         return error.HutchPrivateFileExtension;
 
-    var wrapper_file = try root_dir.openFile(ctx.io, relative, .{
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    });
+    var wrapper_file = try openHutchPrivateReadFile(root_dir, ctx.io, relative);
     errdefer wrapper_file.close(ctx.io);
     const wrapper_stat = try wrapper_file.stat(ctx.io);
     if (wrapper_stat.kind != .file) return error.HutchPrivateFileNotFile;
