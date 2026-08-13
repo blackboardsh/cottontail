@@ -22863,6 +22863,23 @@ static void ct_external_array_buffer_noop(void *bytes, void *deallocator_context
     (void)deallocator_context;
 }
 
+// JSObjectMakeArrayBufferWithBytesNoCopy() with a NULL data pointer produces an
+// ArrayBuffer that JSC reports as already detached, so every later view over it
+// throws "TypeError: Buffer is already detached". Empty views are legitimate
+// (e.g. reading an empty C string), so hand back a real zero-length
+// ArrayBuffer instead.
+static JSValueRef ct_make_empty_array_buffer(JSContextRef ctx, JSValueRef *exception) {
+    JSValueRef constructor_exception = NULL;
+    JSValueRef constructor_value = ct_get_property(ctx, JSContextGetGlobalObject(ctx), "ArrayBuffer", &constructor_exception);
+    if (constructor_exception == NULL && constructor_value != NULL && JSValueIsObject(ctx, constructor_value)) {
+        JSValueRef argument = JSValueMakeNumber(ctx, 0);
+        JSObjectRef buffer = JSObjectCallAsConstructor(ctx, (JSObjectRef)constructor_value, 1, &argument, &constructor_exception);
+        if (constructor_exception == NULL && buffer != NULL) return buffer;
+    }
+    // Fall back to the no-copy path; better than returning undefined.
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, NULL, 0, ct_external_array_buffer_noop, NULL, exception);
+}
+
 static JSValueRef ct_memory_view(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     uint64_t address = 0;
     uint64_t offset = 0;
@@ -22879,7 +22896,7 @@ static JSValueRef ct_memory_view(JSContextRef ctx, JSObjectRef function, JSObjec
     }
 
     if (address == 0 || length == 0) {
-        return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, NULL, 0, ct_external_array_buffer_noop, NULL, exception);
+        return ct_make_empty_array_buffer(ctx, exception);
     }
 
     return JSObjectMakeArrayBufferWithBytesNoCopy(

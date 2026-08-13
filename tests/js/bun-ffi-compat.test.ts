@@ -103,6 +103,47 @@ describe("bun:ffi JavaScript compatibility", () => {
     expect(new CString(0).arrayBuffer.byteLength).toBe(0);
   });
 
+  // Regression: reading an empty C string produced a zero-length view backed by
+  // a NULL pointer, which JSC reports as detached. Every read then threw
+  // "TypeError: Buffer is already detached", which killed FFI callbacks that
+  // receive an empty cstring argument (e.g. a macOS tray icon click).
+  test("CString decodes an empty NUL-terminated string without detaching", () => {
+    const bytes = Buffer.from([0, 97]);
+    const address = ptr(bytes);
+    const empty = new CString(address);
+
+    expect(String(empty)).toBe("");
+    expect(empty.length).toBe(0);
+    expect(empty.arrayBuffer.byteLength).toBe(0);
+    expect(Array.from(new Uint8Array(empty.arrayBuffer))).toEqual([]);
+    expect(new Uint8Array(new CString(0).arrayBuffer).length).toBe(0);
+  });
+
+  test("JSCallback survives an empty cstring argument", () => {
+    const received: string[] = [];
+    const callback = new JSCallback(
+      (value: number) => {
+        received.push(new CString(value).toString());
+      },
+      { args: [FFIType.cstring], returns: FFIType.void },
+    );
+
+    const invoke = new CFunction({
+      ptr: callback.ptr!,
+      args: [FFIType.cstring],
+      returns: FFIType.void,
+    });
+
+    const empty = Buffer.from([0]);
+    const text = Buffer.from("hi\0", "utf8");
+    invoke(ptr(empty));
+    invoke(ptr(text));
+    invoke(ptr(empty));
+
+    expect(received).toEqual(["", "hi", ""]);
+    callback.close();
+  });
+
   test("dlopen exposes Bun-style symbol wrappers", () => {
     const library = dlopen(libc, {
       abs: { args: [FFIType.int], returns: FFIType.int },
