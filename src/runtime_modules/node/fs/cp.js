@@ -343,7 +343,7 @@ function unsupportedEntry(sourceStat, destination) {
 }
 
 function copyEntrySync(source, destination, destinationStat, options, operations, activeDirectories) {
-  const stats = sourceStats(source, options, operations);
+  const stats = sourceStats(source, options, operations, true);
   if (stats.isDirectory()) {
     if (!options.recursive) {
       throw cpError("EISDIR", `${source} is a directory (not copied)`, source);
@@ -444,7 +444,7 @@ export function cpSyncImpl(source, destination, rawOptions, operations) {
 }
 
 async function copyEntryAsync(source, destination, destinationStat, options, operations, activeDirectories) {
-  const stats = sourceStats(source, options, operations);
+  const stats = sourceStats(source, options, operations, true);
   if (stats.isDirectory()) {
     if (!options.recursive) {
       throw cpError("EISDIR", `${source} is a directory (not copied)`, source);

@@ -172,6 +172,51 @@ describe("native recursive copy", () => {
     expect(fs.statSync(path.join(asyncTimestampDestination, "root.txt")).mtimeMs).toBe(fixed.getTime());
   });
 
+  test("fallback copies compare exact large directory identities", async () => {
+    const source = createTree("large-directory-identity-source");
+    const nested = path.join(source, "nested");
+    const syncDestination = path.join(root, "large-directory-identity-sync");
+    const asyncDestination = path.join(root, "large-directory-identity-async");
+    const host = (globalThis as any).cottontail;
+    const nativeStat = host.statSync;
+    const sourceIdentity = 9007199254740992n;
+    const nestedIdentity = 9007199254740993n;
+
+    expect(Number(sourceIdentity)).toBe(Number(nestedIdentity));
+    host.statSync = (entry: string, follow: boolean) => {
+      const result = nativeStat(entry, follow);
+      const resolved = path.resolve(entry);
+      const exactIdentity = resolved === path.resolve(source)
+        ? sourceIdentity
+        : resolved === path.resolve(nested)
+          ? nestedIdentity
+          : null;
+      return exactIdentity === null
+        ? result
+        : {
+            ...result,
+            ino: Number(exactIdentity),
+            inoBigInt: exactIdentity.toString(),
+          };
+    };
+
+    try {
+      fs.cpSync(source, syncDestination, {
+        preserveTimestamps: true,
+        recursive: true,
+      });
+      await fsp.cp(source, asyncDestination, {
+        preserveTimestamps: true,
+        recursive: true,
+      });
+    } finally {
+      host.statSync = nativeStat;
+    }
+
+    expect(treeSnapshot(syncDestination)).toEqual(treeSnapshot(source));
+    expect(treeSnapshot(asyncDestination)).toEqual(treeSnapshot(source));
+  });
+
   test("default and verbatim symlink targets retain Node semantics", async () => {
     if (process.platform === "win32") return;
     const source = createTree("verbatim-source");
