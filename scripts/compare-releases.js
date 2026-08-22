@@ -31,6 +31,7 @@ import {
   parsePeakRss,
   parseReleaseBenchmarkArgs,
   renderReleaseBenchmarkMarkdown,
+  renderReleaseBenchmarkTerminal,
   summarizeNumbers,
 } from "./release-benchmark.js";
 
@@ -667,7 +668,8 @@ async function main() {
   mkdirSync(dirname(outputPath), { recursive: true });
   writeFileSync(outputPath, `${JSON.stringify(result, null, 2)}\n`);
   writeFileSync(markdownPath, markdown);
-  process.stdout.write(`\n${markdown}`);
+  const terminalReport = renderReleaseBenchmarkTerminal(result);
+  process.stdout.write(`\n${process.stdout.isTTY ? terminalReport : markdown}`);
   log(`JSON: ${outputPath}`);
   log(`Markdown: ${markdownPath}`);
 }

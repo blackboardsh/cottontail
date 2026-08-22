@@ -136,6 +136,81 @@ function formatRatio(value) {
   return value == null ? "n/a" : `${value.toFixed(2)}x`;
 }
 
+function renderTerminalTable(headers, rows, rightAligned = []) {
+  const widths = headers.map((header, column) => Math.max(
+    header.length,
+    ...rows.map(row => String(row[column]).length),
+  ));
+  const border = (left, join, right) =>
+    left + widths.map(width => "─".repeat(width + 2)).join(join) + right;
+  const line = (row, header = false) => "│ " + row.map((value, column) => {
+    const text = String(value);
+    const alignRight = !header && rightAligned.includes(column);
+    return alignRight ? text.padStart(widths[column]) : text.padEnd(widths[column]);
+  }).join(" │ ") + " │";
+
+  return [
+    border("┌", "┬", "┐"),
+    line(headers, true),
+    border("├", "┼", "┤"),
+    ...rows.map(row => line(row)),
+    border("└", "┴", "┘"),
+  ];
+}
+
+export function renderReleaseBenchmarkTerminal(result) {
+  const lines = [
+    `Cottontail ${result.cottontail.version} vs Bun ${result.bun.version}`,
+    `Host: ${result.host.platform} ${result.host.arch}, ${result.host.cpu}`,
+    `Cottontail revision: ${result.cottontail.revision}`,
+  ];
+
+  if (result.sizes?.length) {
+    const rows = result.sizes.map(row => {
+      const difference = row.cottontail.binaryBytes - row.bun.binaryBytes;
+      const sign = difference > 0 ? "+" : "";
+      return [
+        row.platform,
+        formatBytes(row.cottontail.binaryBytes),
+        formatBytes(row.bun.binaryBytes),
+        formatRatio(row.ratio),
+        `${sign}${formatBytes(difference)}`,
+      ];
+    });
+    lines.push(
+      "",
+      "Executable size",
+      ...renderTerminalTable(
+        ["Platform", "Cottontail", "Bun", "Cottontail / Bun", "Difference"],
+        rows,
+        [1, 2, 3, 4],
+      ),
+      "Sizes are extracted executable bytes. Archive sizes remain in the JSON result.",
+    );
+  }
+
+  if (result.performance?.metrics?.length) {
+    const rows = result.performance.metrics.map(metric => [
+      metric.name,
+      formatMetricValue(metric.cottontail, metric.unit),
+      formatMetricValue(metric.bun, metric.unit),
+      formatRatio(metric.ratio),
+    ]);
+    lines.push(
+      "",
+      `Performance (${result.performance.platform})`,
+      ...renderTerminalTable(
+        ["Metric", "Cottontail", "Bun", "Cottontail / Bun"],
+        rows,
+        [1, 2, 3],
+      ),
+      "Lower is better for every reported metric. Headline values are medians.",
+    );
+  }
+
+  return `${lines.join("\n").trim()}\n`;
+}
+
 export function renderReleaseBenchmarkMarkdown(result) {
   const lines = [
     `# Cottontail ${result.cottontail.version} vs Bun ${result.bun.version}`,

@@ -9,6 +9,7 @@ import {
   parsePeakRss,
   parseReleaseBenchmarkArgs,
   renderReleaseBenchmarkMarkdown,
+  renderReleaseBenchmarkTerminal,
   summarizeNumbers,
 } from "./release-benchmark.js";
 
@@ -100,4 +101,26 @@ test("formats ratios, sizes, and a stable Markdown report", () => {
   assert.match(markdown, /Cottontail 0\.2\.3 vs Bun 1\.3\.10/);
   assert.match(markdown, /\| macos-arm64 \| 50\.00 MiB \| 60\.00 MiB \| 0\.83x \| -10\.00 MiB \|/);
   assert.match(markdown, /\| empty startup \| 15\.000 ms \| 10\.000 ms \| 1\.50x \|/);
+});
+
+test("renders aligned terminal tables for interactive comparisons", () => {
+  const terminal = renderReleaseBenchmarkTerminal({
+    host: { platform: "darwin", arch: "arm64", cpu: "Example CPU" },
+    cottontail: { version: "0.2.3", revision: "a".repeat(40) },
+    bun: { version: "1.3.10" },
+    sizes: [{
+      platform: "macos-arm64",
+      cottontail: { binaryBytes: 50 * 1024 ** 2 },
+      bun: { binaryBytes: 60 * 1024 ** 2 },
+      ratio: 5 / 6,
+    }],
+    performance: {
+      platform: "macos-arm64",
+      metrics: [{ name: "empty startup", unit: "ms", cottontail: 15, bun: 10, ratio: 1.5 }],
+    },
+  });
+  assert.match(terminal, /^┌[─┬]+┐$/m);
+  assert.match(terminal, /│ macos-arm64 │\s+50\.00 MiB │\s+60\.00 MiB │\s+0\.83x │\s+-10\.00 MiB │/);
+  assert.match(terminal, /│ empty startup │\s+15\.000 ms │\s+10\.000 ms │\s+1\.50x │/);
+  assert.doesNotMatch(terminal, /^\| ---/m);
 });
