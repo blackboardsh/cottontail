@@ -1,190 +1,25 @@
-# cottontail
+# Cottontail
 
-`cottontail` is a tiny Zig-based JavaScript runtime for Electrobun workloads.
+Cottontail is a small Zig-based JavaScript and TypeScript runtime built for
+[Electrobun](https://github.com/blackboardsh/electrobun). It uses
+JavaScriptCore and implements the Node and Bun APIs that application workloads
+need.
 
-## Runtime boundary
+## Responsibilities
 
-Cottontail executes JavaScript and TypeScript, resolves already-installed
-modules, provides the Bun and Node runtime APIs, runs tests, and retains the
-compiler entry point Hutch currently uses for `build`. It does not mutate
-projects or install packages at runtime.
+Cottontail runs scripts, resolves installed modules, provides runtime APIs,
+drains async work, runs tests, and exposes the compiler entry point used by
+Hutch.
 
-Hutch owns Electrobun toolchain and SDK vendoring, runtime version management,
-project scripts, and `electrobun init`. JavaScript package installation and
-package executables stay with the project's selected package manager; invoke
-npm, pnpm, yarn, or Bun directly. Commands such as `cottontail install`,
-`cottontail init`, `cottontail create`, and `cottontail x` fail with that
-explicit diagnostic. `cottontail run file.ts` remains a runtime launch;
-`hutch run dev` is the project-script form.
+[Hutch](https://github.com/blackboardsh/hutch) owns project scripts,
+dependencies, toolchains, version selection, and Electrobun orchestration.
+Cottontail does not mutate application projects or act as their package
+manager.
 
-Compiler-internal install data types and the legacy binary-lockfile codec remain
-temporarily because the compiler resolver is still coupled to them. Cottontail
-does not expose public or hidden package-manager services, and its runtime never
-auto-installs a missing package.
+## Build
 
-After a fresh clone, Node.js 24 can bootstrap the vendored toolchains and build
-Cottontail. Bun remains a supported convenience for the package scripts, but it
-is not required by the native cross-platform bring-up path. Once you have built
-the local binary, you can also use `cottontail` itself to drive the repo
-workflow.
-
-This repo currently focuses on developer experience:
-
-- Node.js drives the cross-platform setup and build scripts; Bun package scripts
-  remain available for local convenience.
-- Zig is vendored locally into `vendors/zig`.
-- The pinned Zig version is `0.16.0`.
-- JavaScriptCore is the only JavaScript engine backend.
-- `cottontail` can execute a JavaScript file and exposes a minimal `console.log` / `console.error` host.
-- `cottontail.nanotime()` returns a monotonic nanosecond timestamp as a JavaScript `BigInt`.
-- Zig owns script loading and runtime flow; the C layer is kept to a JavaScriptCore bridge.
-- The current runtime supports ESM entrypoints/imports, async job draining, and a minimal `cottontail` host API.
-
-## JavaScriptCore policy
-
-Cottontail treats JavaScriptCore as an engine, not as the implementation layer
-for Bun or Node compatibility. Runtime APIs and compatibility behavior belong in
-Cottontail's Zig, C bridge, and JavaScript modules rather than in private JSC
-patches.
-
-Cottontail links a Cottontail-owned static JSC build (JSCOnly, published at
-[`blackboardsh/jsc`](https://github.com/blackboardsh/jsc)). This vendored build
-is the build: the earlier macOS system-framework path has been removed. `bun run
-setup` downloads the release pinned in `scripts/jsc-manifest.json` into the
-gitignored `vendors/jsc/` directory (with sha256 verification), and the regular
-`node scripts/zig.js build` links the vendored static libraries. Cross-platform
-distribution uses these Cottontail-owned builds. The pinned release ships
-macOS arm64, Linux x64/arm64, and Windows x64 archives. Cottontail's release
-matrix uses all four directly. The only intended
-Cottontail-specific engine contract is that JSC uses the unversioned ICU 70 C
-ABI. On every supported platform, Cottontail's runtime bridge first uses a
-system ICU with ABI 70 or newer. If none is usable, the executable switches to
-its statically linked ICU 70.1 fallback implementation and a checksum-pinned
-data file. Release archives carry that data file under `share/cottontail/icu`;
-legacy or otherwise unpackaged executables can instead use the verified
-per-user cache and download path. JSC SDK artifacts publish the fallback code
-and metadata; setup ensures the canonical data file is present, downloading
-and verifying the checksum-pinned ICU data when an artifact does not carry it.
-
-Known engine difference: JSC's native ShadowRealm option stays disabled because
-the JSCOnly port cannot safely construct ShadowRealms from C-API-created
-contexts. Cottontail instead exposes a compatibility constructor backed by an
-isolated sibling VM context.
-
-Bun-specific JSC patches, including test clocks and private runtime hooks, are
-not compatibility dependencies. Tests that rely on them should be adapted to
-exercise Cottontail's public behavior, and required host functionality should be
-exposed by Cottontail itself.
-
-## Scripts
-
-- `bun run setup` downloads the pinned Zig toolchain and the pinned JavaScriptCore build if needed.
-- `bun run setup:jsc` vendors only the pinned JavaScriptCore build (see `scripts/jsc-manifest.json`).
-- `bun run pin:jsc -- [WebKit-tag]` pins a completed R2 JSC matrix (or `jsc/latest.json` when omitted) and updates the matching build path.
-- `bun run build` builds the debug executable.
-- `bun run build:local` incrementally builds against a sibling `../jsc` checkout and reuses unchanged local JSC/Cottontail outputs.
-- `bun run build:release` builds with `ReleaseSmall`, strips symbols, and validates the release executable.
-- `bun run package:release` creates a platform archive and SHA-256 file under `release/`.
-- `bun run run -- test.js` builds and runs a JavaScript file through `cottontail`.
-- `bun run dev` vendors, builds, and runs the smoke test in `test.js`.
-- `bun run bench` builds a release binary and runs dedicated startup / loop / JSON / async benchmarks.
-- `node scripts/compare-releases.js --cottontail 0.2.3 --bun 1.3.10` downloads and checksum-verifies those exact releases, compares executable sizes across the release matrix, and benchmarks both host binaries.
-- `bun run test:zig` runs the Zig unit tests.
-- `bun run test:js` runs the JavaScript runtime behavior suite.
-- `bun run test:electrobun` runs the local Electrobun bridge smoke test against a sibling `../electrobun/package/dist`.
-- `bun run test:electrobun:cli` runs the new `cottontail electrobun` CLI fixture against a real `electrobun.config.ts`, TS entrypoints, and a TS `postBuild` hook.
-- `bun run electrobun:window` opens a native window through the local Electrobun core.
-- `bun run test` runs both the Zig and JavaScript tests.
-- `bun run check-zig-version` prints the vendored Zig version through the local wrapper script.
-
-The release comparison command caches immutable artifacts under
-`.cottontail-tmp/release-benchmarks/` and writes JSON plus Markdown results
-there by default. Runtime order alternates for every paired sample, and the
-tables use medians. `--quick` validates the harness with reduced samples;
-`--skip-performance` or `--skip-sizes` runs only one half of the comparison.
-Run `node scripts/compare-releases.js --help` for all options.
-
-## Release builds
-
-GitHub Actions defines native release jobs for macOS arm64, Linux x64, Linux
-arm64, and Windows x64 in `.github/workflows/build-release.yml`. Every job runs Zig
-tests, builds with `ReleaseSmall`, smoke-tests the binary, packages the runtime,
-and stores the archive plus its SHA-256 file. The JavaScript runtime modules are
-embedded in the executable at build time.
-
-For native VM setup, exact workflow-equivalent commands, diagnostics, and the
-cross-platform working loop, see [`docs/cross-platform-bringup.md`](docs/cross-platform-bringup.md).
-
-The schema 1 archive layout contains a standalone executable for Hutch consumption:
-
-- `bin/cottontail` (`bin/cottontail.exe` on Windows)
-- `runtime_modules/` for downstream bundlers that need physical module paths
-- `share/cottontail/icu/70.1/icudt70l.dat`, the checksum-pinned fallback data
-- `share/cottontail/icu/70.1/LICENSE`, the ICU license accompanying that data
-- `cottontail-release.json`
-
-The release manifest records the ICU policy, packaged data path, size, SHA-256,
-and system/fallback ABI requirements. At runtime Cottontail tries a compatible
-system ICU first, then the packaged pinned data. Only legacy or unpackaged
-installs without that file fall back to downloading and verifying
-`icudt70l.dat` in a shared per-user location:
-`~/Library/Application Support/Cottontail/icu/70.1` on macOS,
-`%LOCALAPPDATA%\Cottontail\icu\70.1` on Windows, and
-`${XDG_DATA_HOME:-~/.local/share}/cottontail/icu/70.1` on Linux. A small
-verified marker avoids hashing the 28 MB per-user database on every launch.
-The release workflow is configured to exercise the packaged Linux fallback in
-a minimal image with no system ICU, with networking disabled and the container
-filesystem read-only.
-
-The native matrix exercises the platform host bridge on each supported target.
-
-### Release publishing
-
-Tags are the only release trigger. A tag must exactly match the version in
-`package.json` and `src/version.zig`. A plain `vX.Y.Z` tag advances the production
-target; any valid semantic-version prerelease tag, such as
-`vX.Y.Z-canary.N`, advances the canary channel.
-
-Run `hutch push:canary` to propose the next `canary.N` release, or
-`hutch push:production` to propose a production version. Both commands allow
-editing the proposed semantic version before they commit, tag, and atomically
-push `main` and the tag. Running `node scripts/tag-release.js` directly
-proposes the next minor production version.
-
-After every tagged matrix job succeeds, a fan-in job uploads the complete release
-to Cloudflare R2. Configure these GitHub repository secrets:
-
-- `COTTONTAIL_R2_ACCOUNT_ID`: Cloudflare account ID used to derive the R2 S3 endpoint.
-- `COTTONTAIL_R2_ACCESS_KEY_ID`: access key from an R2 Object Read & Write token scoped to the release bucket.
-- `COTTONTAIL_R2_SECRET_ACCESS_KEY`: secret for that access key.
-
-Configure this value as either a GitHub repository secret or variable. The
-secret takes precedence when both exist:
-
-- `COTTONTAIL_R2_PUBLIC_BASE_URL`: public custom-domain or `r2.dev` origin for the bucket, without a trailing slash.
-
-The target bucket is `electrobun-artifacts`. Archives and manifests use immutable
-revision and version paths:
-
-- `cottontail/builds/<git-sha>/<platform>/cottontail.tar.gz`
-- `cottontail/builds/<git-sha>/manifest.json`
-- `cottontail/releases/<version>/manifest.json`
-
-Version manifests reference the same revision archives rather than uploading a
-second copy. Consumers discover the current releases through:
-
-- `cottontail/channels/production.json`
-- `cottontail/channels/canary.json`
-
-The publisher uploads every archive and both immutable manifests before replacing
-the relevant channel pointer, so a failed build or upload cannot advertise a
-partial matrix. Run `node scripts/upload-release-r2.js --dry-run --all` after
-placing all four platform archives in `release/` to inspect the object sequence
-without requiring credentials.
-
-## Bootstrap
-
-After a fresh clone, the Node-only bootstrap path is:
+A fresh checkout requires Node.js 24. The setup scripts download the pinned Zig,
+JavaScriptCore, and zig-html-rewriter artifacts and verify their checksums.
 
 ```sh
 node scripts/setup.js
@@ -193,70 +28,46 @@ node scripts/setup-jsc.js
 node scripts/zig.js build
 ```
 
-When Bun is installed, `bun run build` remains a convenience wrapper for the
-same setup and build path.
+The binary is written to `zig-out/bin/cottontail`.
 
-After the first local build, you can drive the repo with `cottontail` itself:
+After the first build, Cottontail can drive the repository scripts itself:
 
-- `./zig-out/bin/cottontail scripts/repo.js build`
-- `./zig-out/bin/cottontail scripts/repo.js test`
-- `./zig-out/bin/cottontail scripts/repo.js bench`
-- `./zig-out/bin/cottontail scripts/repo.js run test.js`
+```sh
+./zig-out/bin/cottontail scripts/repo.js build
+./zig-out/bin/cottontail scripts/repo.js test
+./zig-out/bin/cottontail scripts/repo.js bench
+./zig-out/bin/cottontail scripts/repo.js run test.js
+```
 
-## Electrobun bridge
+## Test
 
-There is now a narrow Electrobun bridge mode for local architecture work:
+```sh
+# Zig and JavaScript runtime suites
+bun run test
 
-- `./zig-out/bin/cottontail electrobun tests/js/electrobun-smoke.js`
-- `./zig-out/bin/cottontail electrobun examples/electrobun-window.js`
+# Runtime plus Electrobun bridge and CLI suites
+bun run test:blocking
 
-This mode currently:
+# Imported Node and Bun compatibility suites
+bun run compat:upstream
+```
 
-- stages `libElectrobunCore`, `libNativeWrapper`, and `libasar` beside the local `cottontail` executable
-- looks for a sibling Electrobun checkout at `../electrobun/package/dist` by default
-- exposes a tiny global `electrobun` object with `createWindow({...})` and `quit()`
-- runs JavaScriptCore on a worker thread while the Electrobun native event loop owns the main thread
+See [cross-platform compatibility](docs/cross-platform-compatibility.md) for
+the current platform matrix and known gaps.
 
-This is a bridge alpha, not Bun compatibility:
+## Local Electrobun development
 
-- it is meant to prove the runtime-to-core boundary
-- it does not run Electrobun's existing Bun main-process bundle
-- it does not yet expose webviews, events, or the broader Electrobun API surface
+With a sibling Electrobun checkout built at `../electrobun/package/dist`:
 
-## Electrobun CLI
+```sh
+bun run test:electrobun
+bun run test:electrobun:cli
+bun run electrobun:window
+```
 
-`cottontail` now has a first internal CLI/runtime split and a minimal Electrobun-oriented CLI surface:
+The direct bridge is for local integration work. Production Electrobun builds
+select and package Cottontail through the versioned Electrobun devkit.
 
-- `./zig-out/bin/cottontail electrobun init hello-world --template=hello-world`
-- `./zig-out/bin/cottontail electrobun config`
-- `./zig-out/bin/cottontail electrobun build`
-- `./zig-out/bin/cottontail electrobun run`
-- `./zig-out/bin/cottontail electrobun dev`
-
-This first cut:
-
-- transpiles and evaluates `electrobun.config.ts`
-- transpiles TS lifecycle hooks like `postBuild.ts` and runs them under `cottontail`
-- builds TypeScript/JavaScript entrypoints with Cottontail's native Zig compiler
-- can scaffold projects from the Electrobun template directory
-- can build and launch host-platform `mainProcess: "bun"` Electrobun app bundles from the checked-in `dist[-os-arch]` runtime assets
-- can run `dev --watch` with a simple cross-platform polling watcher
-- copies static assets from `build.copy`
-- runs `mainProcess: "cottontail"` scripts through the local bridge path and `mainProcess: "bun"` scripts through the bundled Bun runtime/launcher path
-
-Current limitations:
-
-- `mainProcess: "zig"` is not implemented in this CLI path yet
-- release packaging/signing/notarization from the old Electrobun CLI has not been ported into this cottontail path yet
-- the direct `cottontail electrobun <entrypoint.js>` bridge is still the narrow `electrobun.createWindow()` / `quit()` surface, not the full Electrobun API
-
-## Current status
-
-Cottontail now has a substantial local Node and Bun compatibility layer covering
-module loading, filesystem and process APIs, child processes, workers, streams,
-networking, SQLite, FFI, testing, building, and package installation. It is not
-yet a complete cross-platform replacement: the copied Node 24.11.1 and Bun
-1.3.10 suites and real application canaries are not green on every target, and
-the full Electrobun main-process API remains incomplete. See
-[`docs/cross-platform-compatibility.md`](docs/cross-platform-compatibility.md)
-for exact platform evidence and remaining gates.
+Prebuilt releases support macOS arm64, Linux x64 and arm64, and Windows x64.
+See [cross-platform bring-up](docs/cross-platform-bringup.md) for native build
+diagnostics.
