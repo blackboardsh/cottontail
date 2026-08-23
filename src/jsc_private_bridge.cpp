@@ -567,6 +567,20 @@ extern "C" void ct_jsc_collect_full(JSContextRef context)
 #endif
 }
 
+extern "C" void ct_jsc_scavenge_allocator(void)
+{
+    // Bytecode generation uses a short-lived VM before the application VM is
+    // created. Releasing that VM frees its objects, but bmalloc/libpas keeps
+    // the committed pages for future allocations. Return them now so the two
+    // VM footprints do not stack in one long-lived process.
+    bmalloc::api::scavengeThisThread();
+    bmalloc::api::scavenge();
+    pas_scavenger_run_synchronously_now();
+#if defined(__APPLE__)
+    malloc_zone_pressure_relief(nullptr, 0);
+#endif
+}
+
 static std::atomic<ptrdiff_t> ct_jsc_control_flow_profiler_offset { -1 };
 
 static JSC::ControlFlowProfiler* ct_jsc_control_flow_profiler(JSC::VM* vm)

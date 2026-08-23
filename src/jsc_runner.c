@@ -35,6 +35,7 @@ extern void *ct_jsc_run_loop_current(void);
 extern void ct_jsc_run_loop_dispatch(void *run_loop, void (*callback)(void *), void *context);
 extern void ct_jsc_drain_microtasks(JSContextRef context);
 extern void ct_jsc_collect_full(JSContextRef context);
+extern void ct_jsc_scavenge_allocator(void);
 extern void *ct_jsc_microtask_delay_begin(JSContextGroupRef group);
 extern void ct_jsc_microtask_delay_end(void *opaque_scope);
 extern int ct_jsc_promise_status(JSValueRef value);
@@ -39408,6 +39409,15 @@ static int ct_jsc_runtime_eval_internal(
 
     if (!wait_for_active_handles) return 0;
 
+    /* Electrobun ships an already-bundled main process and normally stays alive
+     * for the lifetime of its windows. Release unreachable bootstrap objects
+     * before entering that long-lived loop. Use the public collector here: the
+     * force/full path deliberately discards all unlinked code and can create a
+     * large temporary liveness bitmap on substantial application bundles. */
+    if (getenv("COTTONTAIL_ELECTROBUN_DIST") != NULL) {
+        JSGarbageCollect(ctx);
+    }
+
     for (;;) {
         if (runtime->reload_requested) return CT_JSC_EVAL_RELOAD;
         bool has_active_handles = false;
@@ -39554,6 +39564,7 @@ int ct_jsc_generate_bytecode(
     JSStringRelease(script);
     JSStringRelease(source_url);
     JSGlobalContextRelease(context);
+    ct_jsc_scavenge_allocator();
     free(wrapped);
     return status;
 }

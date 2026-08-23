@@ -803,13 +803,32 @@ pub fn runWithExecArgvDisplay(
         );
     }
 
-    var runnable = bundleScriptNative(&ctx, entrypoint_path, exec_args, script_args, null, null, null, false, null, false) catch |err| {
-        if (err == error.TestBundleFailed) return 1;
-        if (err == error.SyntaxError) {
-            ctx.writeStderr("error: Syntax Error\n", .{});
-            return 1;
-        }
-        return err;
+    // Bundling has a much larger transient working set than execution. Keeping
+    // it on Init's process-lifetime arena made that entire graph permanent in
+    // long-running applications (most visibly Electrobun main processes).
+    // Retain only the artifact identity and its cache lease across the handoff
+    // to JSC, then release all compiler allocations before application code
+    // starts running.
+    var runnable: RuntimeArtifact = bundled: {
+        var bundle_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        defer bundle_arena.deinit();
+        var bundle_ctx = ctx;
+        bundle_ctx.allocator = bundle_arena.allocator();
+        var artifact = bundleScriptNative(&bundle_ctx, entrypoint_path, exec_args, script_args, null, null, null, false, null, false) catch |err| {
+            if (err == error.TestBundleFailed) return 1;
+            if (err == error.SyntaxError) {
+                ctx.writeStderr("error: Syntax Error\n", .{});
+                return 1;
+            }
+            return err;
+        };
+        errdefer artifact.deinit(&bundle_ctx);
+        const retained = RuntimeArtifact{
+            .path = try allocator.dupe(u8, artifact.path),
+            .lease_file = artifact.lease_file,
+        };
+        artifact.lease_file = null;
+        break :bundled retained;
     };
     defer runnable.deinit(&ctx);
 
@@ -2686,16 +2705,20 @@ fn maxOldSpaceSizeValue(arg: []const u8) ?[]const u8 {
 }
 
 fn applyRuntimeEnvFlags(io: std.Io, allocator: std.mem.Allocator, exec_args: []const [:0]const u8) bool {
-    for (exec_args) |arg| {
-        if (!std.mem.eql(u8, arg, "--smol")) continue;
+    const electrobun_main = std.c.getenv("COTTONTAIL_ELECTROBUN_DIST") != null;
+    const low_memory_runtime = electrobun_main or for (exec_args) |arg| {
+        if (std.mem.eql(u8, arg, "--smol")) break true;
+    } else false;
+    if (low_memory_runtime) {
         // COTTONTAIL-COMPAT: Bun's --smol selects JSC's low-memory VM
         // policy. Stock JSC exposes the equivalent collection, sweeping,
         // and code-jettisoning behavior through forceMiniVMMode. Bound each
-        // allocation cycle as well; an explicit max-old-space flag below
-        // remains authoritative regardless of argument order.
+        // allocation cycle as well. Electrobun main processes are long-lived
+        // UI coordinators, so use the same policy by default instead of making
+        // every packaged launcher know about this runtime-specific flag. An
+        // explicit max-old-space flag below remains authoritative.
         if (setenv("JSC_forceMiniVMMode", "true", 1) != 0) return false;
         if (setenv("JSC_gcMaxHeapSize", "33554432", 1) != 0) return false;
-        break;
     }
     for (exec_args, 0..) |arg, index| {
         if (maxOldSpaceSizeValue(arg)) |size_text| {
@@ -4741,6 +4764,7 @@ const RuntimeBootstrapMode = enum {
     full,
     bare,
     minimal,
+    sql,
     process,
     http_server,
     eval_fast_fs,
@@ -4764,6 +4788,12 @@ fn entrypointRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !Runtim
 
 fn httpRuntimeBunProperty(name: []const u8) bool {
     return minimalRuntimeBunProperty(name) or std.mem.eql(u8, name, "serve");
+}
+
+fn sqlRuntimeBunProperty(name: []const u8) bool {
+    return std.mem.eql(u8, name, "SQL") or
+        std.mem.eql(u8, name, "sql") or
+        std.mem.eql(u8, name, "postgres");
 }
 
 fn httpRuntimeProcessProperty(name: []const u8) bool {
@@ -4941,6 +4971,10 @@ fn sourceRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBoo
             const property = runtimeMemberProperty(tokens, index) orelse return .full;
             if (has_http_server) {
                 if (!httpRuntimeBunProperty(property)) return .full;
+            } else if (sqlRuntimeBunProperty(property)) {
+                if (mode == .bare or mode == .minimal or mode == .sql) {
+                    mode = .sql;
+                } else return .full;
             } else {
                 if (!minimalRuntimeBunProperty(property)) return .full;
                 if (mode == .bare) mode = .minimal;
@@ -7717,6 +7751,14 @@ fn writeMinimalRuntimeEntryWrapper(
             .{try jsonStringLiteral(ctx, http_server_module)},
         );
     } else "";
+    const sql_import = if (bootstrap_mode == .sql) blk: {
+        const sql_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "bun", "sql.js" });
+        break :blk try std.fmt.allocPrint(
+            ctx.allocator,
+            "import {{ SQL as __ctSQL, sql as __ctSql }} from {s};\n",
+            .{try jsonStringLiteral(ctx, sql_module)},
+        );
+    } else "";
     const process_import = if (bootstrap_mode == .process) blk: {
         const process_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "process.js" });
         break :blk try std.fmt.allocPrint(
@@ -7736,6 +7778,10 @@ fn writeMinimalRuntimeEntryWrapper(
     } else "";
     const process_install = if (bootstrap_mode == .process)
         "globalThis.process = __ctFullProcess;"
+    else
+        "";
+    const sql_install = if (bootstrap_mode == .sql)
+        "globalThis.Bun.SQL = __ctSQL; globalThis.Bun.sql = __ctSql; globalThis.Bun.postgres = __ctSql;"
     else
         "";
     const wrapper_name = try std.fmt.allocPrint(
@@ -7762,7 +7808,9 @@ fn writeMinimalRuntimeEntryWrapper(
         \\{s}
         \\{s}
         \\{s}
+        \\{s}
         \\__ctInstallRuntimeBootstrap({{ fileURLToPath: __ctFileURLToPath, pathToFileURL: __ctPathToFileURL }});
+        \\{s}
         \\{s}
         \\globalThis.__cottontailBundleSourceMap ??= {s};
         \\globalThis.__cottontailBundleSourceRoot ??= {s};
@@ -7787,9 +7835,11 @@ fn writeMinimalRuntimeEntryWrapper(
         try jsonStringLiteral(ctx, bootstrap_module),
         try jsonStringLiteral(ctx, url_module),
         http_server_import,
+        sql_import,
         process_import,
         ipc_bootstrap_import,
         process_install,
+        sql_install,
         bundle_map_literal,
         try jsonStringLiteral(ctx, ctx.project_root),
         try jsonStringLiteral(ctx, script_abs),
