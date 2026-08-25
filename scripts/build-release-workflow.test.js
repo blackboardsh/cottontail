@@ -68,6 +68,20 @@ test('Windows releases exercise the Hutch private file runner', () => {
   );
 });
 
+test('every release activates every packaged standard-library capability', () => {
+  const activation = step('Activate every packaged standard-library capability');
+  assert.doesNotMatch(activation, /if: matrix\.os/);
+  assert.match(
+    activation,
+    /\.\/zig-out\/bin\/cottontail tests\/js\/stdlib-capability-activation\.ts/,
+  );
+  assert.ok(
+    workflow.indexOf('- name: Build and strip release binary') <
+      workflow.indexOf('- name: Activate every packaged standard-library capability'),
+    'capability activation must exercise the optimized release layout',
+  );
+});
+
 test('packaged Linux releases prove the pinned ICU fallback without system ICU', () => {
   const smoke = step('Smoke test packaged pinned ICU fallback');
   assert.match(smoke, /if: matrix\.os == 'linux'/);

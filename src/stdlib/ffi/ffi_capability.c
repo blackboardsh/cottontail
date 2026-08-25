@@ -1586,7 +1586,7 @@ static int ct_ffi_bind(JSContextRef context, JSObjectRef target, CtFfiCapability
     JSClassRef cls = JSClassCreate(&definition); JSObjectRef function = JSObjectMake(context, cls, state); JSClassRelease(cls);
     JSStringRef key = ct_js_string(name); JSValueRef error = NULL; JSObjectSetProperty(context, target, key, function, kJSPropertyAttributeNone, &error); JSStringRelease(key); return error == NULL ? 0 : -1;
 }
-__attribute__((visibility("default"))) int cottontail_capability_init(JSContextRef context, JSObjectRef target, const CtCapabilityHost *host) {
+CT_CAPABILITY_EXPORT int cottontail_capability_init(JSContextRef context, JSObjectRef target, const CtCapabilityHost *host) {
     if (host == NULL || host->register_lifecycle == NULL || host->wake == NULL || host->napi_env_for_library == NULL || host->napi_take_exception == NULL) return -1;
     CtFfiCapabilityState *state = (CtFfiCapabilityState *)calloc(1, sizeof(*state)); if (state == NULL) return -1;
     state->context = context; state->host = *host; pthread_mutex_init(&state->callback_mutex, NULL);

@@ -80,11 +80,17 @@ static int ct_dynamic_library_symbol(const CtDynamicLibrary *library,const char 
 #endif
 return *symbol?0:-1;}
 
+#if defined(_WIN32)
+#define CT_CAPABILITY_EXPORT __declspec(dllexport)
+#else
+#define CT_CAPABILITY_EXPORT __attribute__((visibility("default")))
+#endif
+
 #define CT_CAPABILITY_EXPORT_BINDINGS(list_file) \
     static const struct { const char *name; JSObjectCallAsFunctionCallback callback; } ct_capability_bindings[] = { \
         list_file \
     }; \
-    __attribute__((visibility("default"))) int cottontail_capability_init(JSContextRef context, JSObjectRef target) { \
+    CT_CAPABILITY_EXPORT int cottontail_capability_init(JSContextRef context, JSObjectRef target) { \
         for(size_t i=0;i<sizeof(ct_capability_bindings)/sizeof(ct_capability_bindings[0]);i++){JSClassDefinition definition=kJSClassDefinitionEmpty;definition.className=ct_capability_bindings[i].name;definition.callAsFunction=ct_capability_bindings[i].callback;JSClassRef cls=JSClassCreate(&definition);JSObjectRef fn=JSObjectMake(context,cls,NULL);JSClassRelease(cls);JSStringRef key=ct_js_string(ct_capability_bindings[i].name);JSValueRef error=NULL;JSObjectSetProperty(context,target,key,fn,kJSPropertyAttributeNone,&error);JSStringRelease(key);if(error)return -1;}return 0; \
     }
 #endif

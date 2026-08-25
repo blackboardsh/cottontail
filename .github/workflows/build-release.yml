@@ -183,6 +183,9 @@ jobs:
             throw "Cottontail smoke test failed: $output"
           }
 
+      - name: Activate every packaged standard-library capability
+        run: ./zig-out/bin/cottontail tests/js/stdlib-capability-activation.ts
+
       - name: Test Windows filesystem permissions
         if: matrix.os == 'windows'
         shell: pwsh
