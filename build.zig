@@ -863,6 +863,11 @@ pub fn build(b: *std.Build) void {
         .{ "secrets", "src/stdlib/secrets/main.js" },
     };
 
+    const capability_c_flags: []const []const u8 = if (target.result.os.tag == .windows)
+        &.{"-std=c11"}
+    else
+        &.{ "-std=c11", "-fPIC" };
+
     const sqlite_capability_module = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -878,7 +883,12 @@ pub fn build(b: *std.Build) void {
             "src/stdlib/sqlite/sqlite_capability.c",
             "src/compiler/src/jsc/bindings/sqlite/sqlite3.c",
         },
-        .flags = &.{
+        .flags = if (target.result.os.tag == .windows) &.{
+            "-std=c11",                            "-DSQLITE_ENABLE_COLUMN_METADATA",
+            "-DSQLITE_ENABLE_FTS5",                "-DSQLITE_ENABLE_MATH_FUNCTIONS",
+            "-DSQLITE_ENABLE_SESSION",             "-DSQLITE_ENABLE_PREUPDATE_HOOK",
+            "-DSQLITE_ENABLE_UPDATE_DELETE_LIMIT", "-DSQLITE_THREADSAFE=1",
+        } else &.{
             "-std=c11",                       "-fPIC",                               "-DSQLITE_ENABLE_COLUMN_METADATA",
             "-DSQLITE_ENABLE_FTS5",           "-DSQLITE_ENABLE_MATH_FUNCTIONS",      "-DSQLITE_ENABLE_SESSION",
             "-DSQLITE_ENABLE_PREUPDATE_HOOK", "-DSQLITE_ENABLE_UPDATE_DELETE_LIMIT", "-DSQLITE_THREADSAFE=1",
@@ -902,7 +912,7 @@ pub fn build(b: *std.Build) void {
     sql_capability_module.addIncludePath(b.path(capability_jsc_include));
     sql_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/sql/sql_capability.c"),
-        .flags = &.{ "-std=c11", "-fPIC" },
+        .flags = capability_c_flags,
     });
     const sql_capability = b.addLibrary(.{
         .name = "cottontail-sql",
@@ -921,7 +931,7 @@ pub fn build(b: *std.Build) void {
     compression_capability_module.addIncludePath(b.path(capability_jsc_include));
     compression_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/compression/compression_capability.c"),
-        .flags = &.{ "-std=c11", "-fPIC" },
+        .flags = capability_c_flags,
     });
     if (target.result.os.tag == .macos) {
         compression_capability_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
@@ -936,9 +946,15 @@ pub fn build(b: *std.Build) void {
         .root_module = compression_capability_module,
     });
     compression_capability.linker_allow_shlib_undefined = true;
-    compression_capability.root_module.linkSystemLibrary("z", .{});
-    inline for (&.{ "brotlicommon", "brotlidec", "brotlienc" }) |library| {
-        compression_capability.root_module.linkSystemLibrary(library, .{});
+    if (target.result.os.tag == .windows) {
+        inline for (&.{ "zs.lib", "brotlicommon.lib", "brotlidec.lib", "brotlienc.lib" }) |library| {
+            compression_capability.root_module.addObjectFile(b.path(b.fmt("vendors/windows-deps/x64-windows-static/lib/{s}", .{library})));
+        }
+    } else {
+        compression_capability.root_module.linkSystemLibrary("z", .{});
+        inline for (&.{ "brotlicommon", "brotlidec", "brotlienc" }) |library| {
+            compression_capability.root_module.linkSystemLibrary(library, .{});
+        }
     }
 
     const websocket_capability_module = b.createModule(.{
@@ -953,7 +969,7 @@ pub fn build(b: *std.Build) void {
     websocket_capability_module.addIncludePath(b.path(capability_jsc_include));
     websocket_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/websocket/websocket_capability.c"),
-        .flags = &.{ "-std=c11", "-fPIC", "-D_DEFAULT_SOURCE" },
+        .flags = if (target.result.os.tag == .windows) &.{"-std=c11"} else &.{ "-std=c11", "-fPIC", "-D_DEFAULT_SOURCE" },
     });
     const websocket_capability = b.addLibrary(.{
         .name = "cottontail-websocket",
@@ -986,7 +1002,7 @@ pub fn build(b: *std.Build) void {
     text_capability_module.addIncludePath(b.path(capability_jsc_include));
     text_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/text/text_capability.c"),
-        .flags = &.{ "-std=c11", "-fPIC" },
+        .flags = capability_c_flags,
     });
     const text_capability = b.addLibrary(.{
         .name = "cottontail-text",
@@ -1011,7 +1027,7 @@ pub fn build(b: *std.Build) void {
     uuid_capability_module.addIncludePath(b.path(capability_jsc_include));
     uuid_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/uuid/uuid_capability.c"),
-        .flags = &.{ "-std=c11", "-fPIC" },
+        .flags = capability_c_flags,
     });
     const uuid_capability = b.addLibrary(.{
         .name = "cottontail-uuid",
@@ -1038,7 +1054,7 @@ pub fn build(b: *std.Build) void {
     glob_capability_module.addIncludePath(b.path(capability_jsc_include));
     glob_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/glob/glob_capability.c"),
-        .flags = &.{ "-std=c11", "-fPIC" },
+        .flags = capability_c_flags,
     });
     const glob_capability = b.addLibrary(.{
         .name = "cottontail-glob",
@@ -1064,7 +1080,7 @@ pub fn build(b: *std.Build) void {
     password_capability_module.addIncludePath(b.path(capability_jsc_include));
     password_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/password/password_capability.c"),
-        .flags = &.{ "-std=c11", "-fPIC" },
+        .flags = capability_c_flags,
     });
     const password_capability = b.addLibrary(.{
         .name = "cottontail-password",
@@ -1089,7 +1105,7 @@ pub fn build(b: *std.Build) void {
     hashing_capability_module.addIncludePath(b.path(capability_jsc_include));
     hashing_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/hashing/hashing_capability.c"),
-        .flags = &.{ "-std=c11", "-fPIC" },
+        .flags = capability_c_flags,
     });
     const hashing_capability = b.addLibrary(.{
         .name = "cottontail-hashing",
@@ -1142,7 +1158,7 @@ pub fn build(b: *std.Build) void {
     markdown_capability_module.addIncludePath(b.path(capability_jsc_include));
     markdown_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/markdown/markdown_capability.c"),
-        .flags = &.{ "-std=c11", "-fPIC" },
+        .flags = capability_c_flags,
     });
     const markdown_capability = b.addLibrary(.{
         .name = "cottontail-markdown",
@@ -1161,7 +1177,7 @@ pub fn build(b: *std.Build) void {
     terminal_capability_module.addIncludePath(b.path(capability_jsc_include));
     terminal_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/terminal/terminal_capability.c"),
-        .flags = &.{ "-std=c11", "-fPIC", "-D_DARWIN_C_SOURCE", "-D_GNU_SOURCE" },
+        .flags = if (target.result.os.tag == .windows) &.{"-std=c11"} else &.{ "-std=c11", "-fPIC", "-D_DARWIN_C_SOURCE", "-D_GNU_SOURCE" },
     });
     const terminal_capability = b.addLibrary(.{
         .name = "cottontail-terminal",
@@ -1180,7 +1196,7 @@ pub fn build(b: *std.Build) void {
     ffi_native_module.addIncludePath(b.path(capability_jsc_include));
     ffi_native_module.addCSourceFile(.{
         .file = b.path("src/stdlib/ffi/ffi_capability.c"),
-        .flags = &.{ "-std=c11", "-fPIC" },
+        .flags = capability_c_flags,
     });
     const ffi_native = b.addLibrary(.{
         .name = "cottontail-ffi",
@@ -1233,7 +1249,7 @@ pub fn build(b: *std.Build) void {
         secrets_capability_module.addIncludePath(b.path(capability_jsc_include));
         secrets_capability_module.addCSourceFile(.{
             .file = b.path("src/stdlib/secrets/secrets_capability.c"),
-            .flags = &.{ "-std=c11", "-fPIC" },
+            .flags = capability_c_flags,
         });
         secrets_capability_module.linkSystemLibrary("advapi32", .{});
         const secrets_capability = b.addLibrary(.{
