@@ -6,6 +6,7 @@ import { releaseTargetArgs } from './release-target.js';
 
 const workflowPath = new URL('../.github/workflows/build-release.yml', import.meta.url);
 const workflow = readFileSync(workflowPath, 'utf8').replace(/\r\n/g, '\n');
+const buildZig = readFileSync(new URL('../build.zig', import.meta.url), 'utf8');
 
 function step(name) {
   const marker = `      - name: ${name}\n`;
@@ -79,6 +80,20 @@ test('every release activates every packaged standard-library capability', () =>
     workflow.indexOf('- name: Build and strip release binary') <
       workflow.indexOf('- name: Activate every packaged standard-library capability'),
     'capability activation must exercise the optimized release layout',
+  );
+});
+
+test('Windows capabilities resolve JSC APIs from the statically linked executable', () => {
+  const windowsCapabilityFlags = buildZig.match(
+    /const capability_c_flags:[\s\S]*?else\s*&\.\{ "-std=c11", "-fPIC" \};/,
+  )?.[0];
+  assert.ok(windowsCapabilityFlags, 'missing shared capability C flags');
+  assert.match(windowsCapabilityFlags, /-DJS_NO_EXPORT=1/);
+
+  const windowsFlagOccurrences = buildZig.match(/"-DJS_NO_EXPORT=1"/g)?.length ?? 0;
+  assert.ok(
+    windowsFlagOccurrences >= 8,
+    'shared and custom Windows capability compile paths must disable JSC dllimport declarations',
   );
 });
 

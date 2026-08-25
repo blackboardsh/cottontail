@@ -864,7 +864,7 @@ pub fn build(b: *std.Build) void {
     };
 
     const capability_c_flags: []const []const u8 = if (target.result.os.tag == .windows)
-        &.{"-std=c11"}
+        &.{ "-std=c11", "-DJS_NO_EXPORT=1" }
     else
         &.{ "-std=c11", "-fPIC" };
 
@@ -884,7 +884,8 @@ pub fn build(b: *std.Build) void {
             "src/compiler/src/jsc/bindings/sqlite/sqlite3.c",
         },
         .flags = if (target.result.os.tag == .windows) &.{
-            "-std=c11",                            "-DSQLITE_ENABLE_COLUMN_METADATA",
+            "-std=c11",                            "-DJS_NO_EXPORT=1",
+            "-DSQLITE_ENABLE_COLUMN_METADATA",
             "-DSQLITE_ENABLE_FTS5",                "-DSQLITE_ENABLE_MATH_FUNCTIONS",
             "-DSQLITE_ENABLE_SESSION",             "-DSQLITE_ENABLE_PREUPDATE_HOOK",
             "-DSQLITE_ENABLE_UPDATE_DELETE_LIMIT", "-DSQLITE_THREADSAFE=1",
@@ -969,7 +970,7 @@ pub fn build(b: *std.Build) void {
     websocket_capability_module.addIncludePath(b.path(capability_jsc_include));
     websocket_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/websocket/websocket_capability.c"),
-        .flags = if (target.result.os.tag == .windows) &.{"-std=c11"} else &.{ "-std=c11", "-fPIC", "-D_DEFAULT_SOURCE" },
+        .flags = if (target.result.os.tag == .windows) &.{ "-std=c11", "-DJS_NO_EXPORT=1" } else &.{ "-std=c11", "-fPIC", "-D_DEFAULT_SOURCE" },
     });
     const websocket_capability = b.addLibrary(.{
         .name = "cottontail-websocket",
@@ -1177,7 +1178,7 @@ pub fn build(b: *std.Build) void {
     terminal_capability_module.addIncludePath(b.path(capability_jsc_include));
     terminal_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/terminal/terminal_capability.c"),
-        .flags = if (target.result.os.tag == .windows) &.{"-std=c11"} else &.{ "-std=c11", "-fPIC", "-D_DARWIN_C_SOURCE", "-D_GNU_SOURCE" },
+        .flags = if (target.result.os.tag == .windows) &.{ "-std=c11", "-DJS_NO_EXPORT=1" } else &.{ "-std=c11", "-fPIC", "-D_DARWIN_C_SOURCE", "-D_GNU_SOURCE" },
     });
     const terminal_capability = b.addLibrary(.{
         .name = "cottontail-terminal",
