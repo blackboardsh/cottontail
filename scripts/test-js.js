@@ -264,7 +264,7 @@ try {
       name: 'bun-string-width-native',
       argv: ['test', join(rootDir, 'tests', 'js', 'bun-string-width-native.test.ts')],
       expectExitCode: 0,
-      stderrIncludes: ['7 pass', '0 fail'],
+      stderrIncludes: ['8 pass', '0 fail'],
     },
     {
       name: 'bun-file-mime-native',

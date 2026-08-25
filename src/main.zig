@@ -3,9 +3,7 @@ const builtin = @import("builtin");
 const cottontail_compiler = @import("cottontail_compiler");
 const cottontail_bundler = @import("cottontail_bundler.zig");
 const cottontail_diff = @import("cottontail_diff.zig");
-const cottontail_hash = @import("cottontail_hash.zig");
-const cottontail_markdown = @import("cottontail_markdown.zig");
-const cottontail_password = @import("cottontail_password.zig");
+const cottontail_argon2 = @import("cottontail_argon2.zig");
 const jsonc = @import("jsonc.zig");
 const repl = @import("repl.zig");
 const signal_forwarding = @import("signal_forwarding.zig");
@@ -15,13 +13,18 @@ const native_bindings = @import("native_bindings.zig");
 const cli_run_execution = @import("cli_run_execution.zig");
 const script_runner = @import("script_runner.zig");
 const standalone_executable = @import("standalone_executable.zig");
+const runtime_module = @import("runtime.zig");
+const capability_namespace_source = @embedFile("capability_namespace_source");
+
+export fn ct_capability_namespace_source(size_out: *usize) [*]const u8 {
+    size_out.* = capability_namespace_source.len;
+    return capability_namespace_source.ptr;
+}
 
 comptime {
     cottontail_bundler.forceLink();
     cottontail_diff.forceLink();
-    cottontail_hash.forceLink();
-    cottontail_markdown.forceLink();
-    cottontail_password.forceLink();
+    cottontail_argon2.forceLink();
     cottontail_transpiler.forceLink();
     native_bindings.forceLink();
     script_runner.forceLink();
@@ -2298,7 +2301,8 @@ fn writeMultiTestEntrypoint(
             "if (typeof globalThis[Symbol.for(\"cottontail.internal.startTestRun\")] !== \"function\") {\n" ++
             "  globalThis.__cottontailNodeTestRuntime = await import(\"node:test\");\n" ++
             "  globalThis[Symbol.for(\"cottontail.internal.startTestRun\")]?.();\n" ++
-            "}\n",
+            "}\n" ++
+            "await globalThis[Symbol.for(\"cottontail.internal.finalizeEmptyTestRun\")]?.();\n",
     );
 
     const path = try std.fmt.allocPrint(allocator, "{s}/entry.mjs", .{aggregate_directory});
@@ -3287,6 +3291,29 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     var process_args = try init.minimal.args.toSlice(allocator);
     process_args = try consumeSpawnGate(allocator, process_args);
+    if (process_args.len == 5 and std.mem.eql(u8, process_args[1], "--cottontail-generate-sync-bytecode")) {
+        const source = try std.Io.Dir.cwd().readFileAlloc(init.io, process_args[2], allocator, .limited(64 * 1024 * 1024));
+        const filename = try allocator.dupeZ(u8, process_args[4]);
+        const bytecode = try runtime_module.generateSynchronousCachedBytecode(allocator, source, filename);
+        try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = process_args[3], .data = bytecode });
+        return;
+    }
+    if (process_args.len == 6 and std.mem.eql(u8, process_args[1], "--cottontail-build-capability-bytecode")) {
+        const source = try std.Io.Dir.cwd().readFileAlloc(init.io, process_args[3], allocator, .limited(256 * 1024 * 1024));
+        const filename = try allocator.dupeZ(u8, process_args[5]);
+        const bytecode = try runtime_module.generateSynchronousCachedBytecode(allocator, source, filename);
+        const header_size = 28;
+        const container = try allocator.alloc(u8, header_size + filename.len + source.len + bytecode.len);
+        @memcpy(container[0..8], "CTCAPB01");
+        std.mem.writeInt(u32, container[8..12], @intCast(filename.len), .little);
+        std.mem.writeInt(u64, container[12..20], source.len, .little);
+        std.mem.writeInt(u64, container[20..28], bytecode.len, .little);
+        @memcpy(container[header_size .. header_size + filename.len], filename);
+        @memcpy(container[header_size + filename.len .. header_size + filename.len + source.len], source);
+        @memcpy(container[header_size + filename.len + source.len ..], bytecode);
+        try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = process_args[4], .data = container });
+        return;
+    }
     if (process_args.len > 1 and std.mem.eql(u8, process_args[1], "--cottontail-macro-eval")) {
         const exit_code = try runMacroEvaluator(init, process_args);
         if (exit_code != 0) std.process.exit(exit_code);

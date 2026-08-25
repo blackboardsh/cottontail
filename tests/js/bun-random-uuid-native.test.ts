@@ -2,6 +2,11 @@ import { expect, test } from "bun:test";
 
 const dnsNamespace = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 const urlNamespace = "6ba7b811-9dad-11d1-80b4-00c04fd430c8";
+const nativeUUIDBeforeActivation = [
+  typeof cottontail.randomUUIDv5Native,
+  typeof cottontail.randomUUIDv7Native,
+];
+void (globalThis as any).Cottontail.uuid;
 
 function expectCodedError(
   operation: () => unknown,
@@ -19,7 +24,8 @@ function expectCodedError(
   }
 }
 
-test("native UUID bindings are installed", () => {
+test("native UUID bindings install only when the capability activates", () => {
+  expect(nativeUUIDBeforeActivation).toEqual(["undefined", "undefined"]);
   expect(typeof cottontail.randomUUIDv5Native).toBe("function");
   expect(typeof cottontail.randomUUIDv7Native).toBe("function");
 });

@@ -1,4 +1,5 @@
 import { AsyncResource, _registerAsyncContextDependency, _wrapAsyncCallback } from "./async_hooks.js";
+import { setCoreBuiltinModules } from "../internal/builtin-module-registry.js";
 
 export const captureRejectionSymbol = Symbol.for("nodejs.rejection");
 // Symbol.for so that when ESM `import` and CJS `require` evaluate this module
@@ -502,6 +503,12 @@ export function addAbortListener(signal, listener) {
     },
   };
 }
+
+// Core modules and lazy capability bytecode share one EventEmitter class.
+// Publishing the embedded instance prevents a later capability dependency
+// from evaluating the split node:events bytecode and re-decorating the shared
+// prototype with closures from a second async_hooks module instance.
+setCoreBuiltinModules({ events: EventEmitter, "node:events": EventEmitter });
 
 export function once(emitter, name, options = undefined) {
   return new Promise((resolve, reject) => {

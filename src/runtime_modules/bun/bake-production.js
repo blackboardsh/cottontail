@@ -1,7 +1,7 @@
-import path from "../node/path.js";
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "../node/fs.js";
-import { pathToFileURL } from "../node/url.js";
-import { SourceMap, __setBuiltinModules } from "../node/module.js";
+import path from "node:path";
+import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+import { setCoreBuiltinModules as __setBuiltinModules } from "../internal/builtin-module-registry.js";
 import {
   bakeGraphAttributeFiles,
   copyStaticRouters,
@@ -435,6 +435,7 @@ function formatBakeProductionError(error, projectRoot) {
   if (inline === null) return;
   const generated = generatedErrorPosition(inline.generatedSource, error);
   if (generated === null) return;
+  const { SourceMap } = globalThis[Symbol.for("cottontail.capabilityRequire")]("node:module");
   const entry = new SourceMap(inline.payload).findEntry(generated.line, generated.column);
   if (typeof entry.originalSource !== "string" || !Number.isFinite(entry.originalLine)) return;
   const original = sourceMapContent(inline.payload, entry.originalSource, projectRoot, metadata.filename);

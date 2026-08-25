@@ -16,6 +16,9 @@ type NativeHost = {
   ): ArrayBuffer;
 };
 
+// Native frame operations belong to the optional websocket capability, not
+// the core host. Activate it before inspecting its private test bindings.
+void Cottontail.websocket;
 const host = globalThis.cottontail as NativeHost;
 
 function referenceFrame(

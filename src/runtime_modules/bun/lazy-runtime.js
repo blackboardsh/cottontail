@@ -85,6 +85,7 @@ function alignPrototypeConstructor(source, exposed) {
 export function createLazyFunction(loadModule, exportName, displayName = exportName) {
   let implementation;
   let proxy;
+  const boundMethods = new Map();
 
   const invoke = function (...args) {
     return Reflect.apply(resolve(), this, args);
@@ -131,9 +132,28 @@ export function createLazyFunction(loadModule, exportName, displayName = exportN
       const targetResult = Reflect.deleteProperty(target, property);
       return sourceResult && targetResult;
     },
-    get(_target, property, receiver) {
-      resolve();
-      return Reflect.get(target, property, receiver);
+    get(_target, property) {
+      const source = resolve();
+      // Capability-owned accessors (for example bun:test's `.todo` getter)
+      // keep private state keyed by the real exported function. Invoking a
+      // copied accessor with the lazy Proxy as its receiver loses that state.
+      const value = Reflect.get(source, property, source);
+      let owner = source;
+      let descriptor;
+      while (owner != null && !(descriptor = Reflect.getOwnPropertyDescriptor(owner, property))) {
+        owner = Reflect.getPrototypeOf(owner);
+      }
+      // Likewise, a prototype data method such as `.skipIf()` must receive the
+      // real function as `this`. Do not bind values produced by accessors: a
+      // getter such as `.todo` returns another stateful callable of its own.
+      if (typeof value === "function" && descriptor && "value" in descriptor) {
+        const cached = boundMethods.get(property);
+        if (cached?.value === value) return cached.bound;
+        const bound = value.bind(source);
+        boundMethods.set(property, { value, bound });
+        return bound;
+      }
+      return value;
     },
     getOwnPropertyDescriptor(_target, property) {
       resolve();

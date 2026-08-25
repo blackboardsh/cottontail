@@ -1,13 +1,15 @@
-import {
+import { dirname, isAbsolute, relative, resolve } from "../node/path.js";
+import { fileURLToPath } from "../node/url.js";
+import testHostModules from "./test-host-modules.js";
+
+const {
   existsSync,
   mkdirSync,
   readFileSync,
   renameSync,
   unlinkSync,
   writeFileSync,
-} from "../node/fs.js";
-import { dirname, isAbsolute, relative, resolve } from "../node/path.js";
-import { fileURLToPath } from "../node/url.js";
+} = testHostModules.fs;
 
 const base64Characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const base64Values = new Map(Array.from(base64Characters, (character, index) => [character, index]));
@@ -441,17 +443,20 @@ function collectReports(options) {
 
   // Collect first. Parsing the source map and writing reporters must not count
   // as execution in the measured bundle.
-  const nativeCoverage = decodeNativeCoverage(host.collectTestCoverage());
+  const collectCoverage = host.__cottontailCollectApplicationCoverage ?? host.collectTestCoverage;
+  const nativeCoverage = decodeNativeCoverage(collectCoverage());
   const sourceOffset = Number(host.coverageSourceOffset);
-  const bundlePath = String(globalThis.__cottontailBundlePath ?? "");
+  const bundlePath = String(host.__cottontailBundlePath ?? globalThis.__cottontailBundlePath ?? "");
   if (!bundlePath || !Number.isFinite(sourceOffset)) throw new Error("Coverage bundle metadata is unavailable");
   const evaluatedSource = typeof host.coverageSource === "string"
     ? host.coverageSource
     : String(readFileSync(bundlePath, "utf8"));
   const sourceEnd = sourceOffset + evaluatedSource.length;
-  const mapPayload = globalThis.__cottontailBundleSourceMapData != null
-    ? JSON.parse(String(globalThis.__cottontailBundleSourceMapData))
-    : JSON.parse(String(readFileSync(String(globalThis.__cottontailBundleSourceMap), "utf8")));
+  const sourceMapData = host.__cottontailBundleSourceMapData ?? globalThis.__cottontailBundleSourceMapData;
+  const sourceMapPath = host.__cottontailBundleSourceMap ?? globalThis.__cottontailBundleSourceMap;
+  const mapPayload = sourceMapData != null
+    ? JSON.parse(String(sourceMapData))
+    : JSON.parse(String(readFileSync(String(sourceMapPath), "utf8")));
   const starts = lineStarts(evaluatedSource);
   const mappings = decodeMappings(mapPayload);
   for (const mapping of mappings) {
@@ -461,7 +466,7 @@ function collectReports(options) {
   mappings.sort((left, right) => left.generatedOffset - right.generatedOffset);
 
   const cwd = resolve(String(globalThis.process?.cwd?.() ?? "."));
-  const sourceRoot = resolve(String(globalThis.__cottontailBundleSourceRoot ?? cwd));
+  const sourceRoot = resolve(String(host.__cottontailBundleSourceRoot ?? globalThis.__cottontailBundleSourceRoot ?? cwd));
   const sourceCache = new Map();
   const reports = new Map();
   const functions = nativeCoverage.functions;

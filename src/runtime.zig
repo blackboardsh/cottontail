@@ -68,6 +68,32 @@ pub fn generateCachedBytecode(
         source.ptr,
         source.len,
         filename.ptr,
+        0,
+        &bytecode,
+        &bytecode_len,
+        &generation_error,
+    ) != 0) {
+        defer if (generation_error != null) c.ct_jsc_string_free(generation_error);
+        return error.BytecodeGenerationFailed;
+    }
+    defer c.ct_jsc_bytecode_free(bytecode);
+    if (bytecode == null or bytecode_len == 0) return error.EmptyBytecode;
+    return try allocator.dupe(u8, bytecode[0..bytecode_len]);
+}
+
+pub fn generateSynchronousCachedBytecode(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    filename: [:0]const u8,
+) ![]u8 {
+    var bytecode: [*c]u8 = null;
+    var bytecode_len: usize = 0;
+    var generation_error: [*c]u8 = null;
+    if (c.ct_jsc_generate_bytecode(
+        source.ptr,
+        source.len,
+        filename.ptr,
+        1,
         &bytecode,
         &bytecode_len,
         &generation_error,

@@ -3,7 +3,7 @@
 // tests: client/file presign, write with CR/LF header validation, and the
 // common convenience methods.
 
-import { createHash, createHmac } from "../node/crypto.js";
+import { createHash, createHmac } from "node:crypto";
 
 const DEFAULT_REGION = "us-east-1";
 const DEFAULT_PART_SIZE = 5 * 1024 * 1024;

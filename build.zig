@@ -106,7 +106,12 @@ fn jscVendorPlatformKey(target: std.Target) ?[]const u8 {
     };
 }
 
-fn embedRuntimeModules(b: *std.Build) std.Build.LazyPath {
+const RuntimeModuleArtifacts = struct {
+    core: std.Build.LazyPath,
+    capability_builder: std.Build.LazyPath,
+};
+
+fn embedRuntimeModules(b: *std.Build) RuntimeModuleArtifacts {
     const command = b.addSystemCommand(&.{"node"});
     command.addFileArg(b.path("scripts/embed-runtime-modules.js"));
     const output = command.addOutputFileArg("runtime-modules.bin");
@@ -116,6 +121,16 @@ fn embedRuntimeModules(b: *std.Build) std.Build.LazyPath {
     command.addFileArg(b.path("src/compiler/src/node-fallbacks/buffer.js"));
     command.addFileArg(b.path("src/compiler/src/node-fallbacks/vendor/base64-js.js"));
     command.addFileArg(b.path("src/compiler/src/node-fallbacks/vendor/ieee754.js"));
+    const builder_command = b.addSystemCommand(&.{"node"});
+    builder_command.addFileArg(b.path("scripts/embed-runtime-modules.js"));
+    const builder_output = builder_command.addOutputFileArg("runtime-modules-capability-builder.bin");
+    builder_command.addDirectoryArg(b.path("src/runtime_modules"));
+    builder_command.addFileArg(b.path("src/compiler/src/runtime.js"));
+    builder_command.addFileArg(b.path("src/compiler/src/runtime.bun.js"));
+    builder_command.addFileArg(b.path("src/compiler/src/node-fallbacks/buffer.js"));
+    builder_command.addFileArg(b.path("src/compiler/src/node-fallbacks/vendor/base64-js.js"));
+    builder_command.addFileArg(b.path("src/compiler/src/node-fallbacks/vendor/ieee754.js"));
+    builder_command.addArg("capability-builder");
     const io = std.Io.Threaded.global_single_threaded.io();
     var directory = std.Io.Dir.cwd().openDir(io, "src/runtime_modules", .{ .iterate = true }) catch
         @panic("failed to open src/runtime_modules");
@@ -124,8 +139,60 @@ fn embedRuntimeModules(b: *std.Build) std.Build.LazyPath {
     defer walker.deinit();
     while (walker.next(io) catch @panic("failed to walk src/runtime_modules")) |entry| {
         if (entry.kind != .file) continue;
-        command.addFileInput(b.path(b.fmt("src/runtime_modules/{s}", .{entry.path})));
+        const input = b.path(b.fmt("src/runtime_modules/{s}", .{entry.path}));
+        command.addFileInput(input);
+        builder_command.addFileInput(input);
     }
+    return .{ .core = output, .capability_builder = builder_output };
+}
+
+fn buildStdlibCapability(
+    b: *std.Build,
+    builder_runtime: *std.Build.Step.Compile,
+    runtime: *std.Build.Step.Compile,
+    name: []const u8,
+    entrypoint: []const u8,
+) std.Build.LazyPath {
+    const bundle = b.addRunArtifact(builder_runtime);
+    bundle.addFileArg(b.path("scripts/bundle-stdlib-capability.js"));
+    bundle.addArg(name);
+    bundle.addFileArg(b.path(entrypoint));
+    const source = bundle.addOutputFileArg(b.fmt("{s}/main.js", .{name}));
+    const encode = b.addRunArtifact(runtime);
+    encode.addArg("--cottontail-build-capability-bytecode");
+    encode.addArg(name);
+    encode.addFileArg(source);
+    const output = encode.addOutputFileArg(b.fmt("{s}/main.jsc", .{name}));
+    encode.addArg(b.fmt("cottontail:stdlib/{s}/main", .{name}));
+    return output;
+}
+
+fn buildCoreRuntimeModule(
+    b: *std.Build,
+    builder_runtime: *std.Build.Step.Compile,
+    runtime: *std.Build.Step.Compile,
+    name: []const u8,
+    module_path: []const u8,
+) std.Build.LazyPath {
+    const generate = b.addSystemCommand(&.{"node"});
+    generate.addFileArg(b.path("scripts/generate-core-runtime-entry.js"));
+    generate.addArg(name);
+    generate.addFileArg(b.path(module_path));
+    const entrypoint = generate.addOutputFileArg(b.fmt("core-runtime-{s}/entry.js", .{name}));
+
+    const bundle = b.addRunArtifact(builder_runtime);
+    bundle.setEnvironmentVariable("COTTONTAIL_BUNDLE_CORE_MODULE", "1");
+    bundle.addFileArg(b.path("scripts/bundle-stdlib-capability.js"));
+    bundle.addArg(b.fmt("core-runtime-{s}", .{name}));
+    bundle.addFileArg(entrypoint);
+    const source = bundle.addOutputFileArg(b.fmt("core-runtime-{s}/main.js", .{name}));
+
+    const encode = b.addRunArtifact(runtime);
+    encode.addArg("--cottontail-build-capability-bytecode");
+    encode.addArg(b.fmt("core-runtime-{s}", .{name}));
+    encode.addFileArg(source);
+    const output = encode.addOutputFileArg(b.fmt("core-runtime-{s}/main.jsc", .{name}));
+    encode.addArg(b.fmt("cottontail:core/runtime/{s}", .{name}));
     return output;
 }
 
@@ -419,7 +486,6 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             "src/native_bindings/inspector.c",
             "src/native_bindings/buffer.c",
             "src/native_bindings/filesystem.c",
-            "src/native_bindings/glob.c",
             "src/native_bindings/process.c",
             "src/native_bindings/http.c",
             "src/native_bindings/http_parser.c",
@@ -427,19 +493,13 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             "src/native_bindings/memory_ffi.c",
             "src/native_bindings/worker.c",
             "src/native_bindings/system.c",
-            "src/native_bindings/compression.c",
             "src/native_bindings/crypto.c",
-            "src/native_bindings/data_parser.c",
             "src/native_bindings/dns.c",
             "src/native_bindings/sockets.c",
             "src/native_bindings/tls.c",
-            "src/native_bindings/sqlite.c",
-            "src/native_bindings/sql_wire.c",
-            "src/native_bindings/string_width.c",
             "src/native_bindings/url.c",
             "src/native_bindings/platform.c",
             "src/native_bindings/path.c",
-            "src/native_bindings/uuid.c",
             "src/compiler/src/jsc/bindings/node/http/llhttp/api.c",
             "src/compiler/src/jsc/bindings/node/http/llhttp/http.c",
             "src/compiler/src/jsc/bindings/node/http/llhttp/llhttp.c",
@@ -448,10 +508,6 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             &.{
                 "-std=c11",
                 "-Wno-deprecated-declarations",
-                "-DSQLITE_ENABLE_COLUMN_METADATA",
-                "-DSQLITE_ENABLE_FTS5",
-                "-DSQLITE_ENABLE_SESSION",
-                "-DSQLITE_ENABLE_PREUPDATE_HOOK",
                 "-DCOTTONTAIL_VENDORED_JSC=1",
                 "-DJS_NO_EXPORT=1",
             }
@@ -459,10 +515,6 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             &.{
                 "-std=c11",
                 "-Wno-deprecated-declarations",
-                "-DSQLITE_ENABLE_COLUMN_METADATA",
-                "-DSQLITE_ENABLE_FTS5",
-                "-DSQLITE_ENABLE_SESSION",
-                "-DSQLITE_ENABLE_PREUPDATE_HOOK",
                 "-DCOTTONTAIL_VENDORED_JSC=1",
                 "-DJS_NO_EXPORT=1",
                 "-include",
@@ -529,21 +581,6 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             }
         }
     }
-    step.root_module.addCSourceFile(.{
-        .file = b.path("src/compiler/src/jsc/bindings/sqlite/sqlite3.c"),
-        .flags = &[_][]const u8{
-            "-std=c11",
-            "-Wno-deprecated-declarations",
-            "-DSQLITE_ENABLE_COLUMN_METADATA",
-            "-DSQLITE_ENABLE_FTS5",
-            "-DSQLITE_ENABLE_MATH_FUNCTIONS",
-            "-DSQLITE_ENABLE_SESSION",
-            "-DSQLITE_ENABLE_PREUPDATE_HOOK",
-            "-DSQLITE_ENABLE_UPDATE_DELETE_LIMIT",
-            "-DSQLITE_THREADSAFE=1",
-        },
-    });
-
     switch (resolved_target.os.tag) {
         .macos => {
             requireJscLibrary(b, vendor_dir, "libJavaScriptCore.a");
@@ -561,17 +598,11 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
                 @panic("macOS JSC setup did not provide the static ICU fallback");
             for (fallback_libraries) |library|
                 step.root_module.addObjectFile(b.path(b.fmt("{s}/{s}", .{ fallback_dir, library })));
-            step.root_module.linkSystemLibrary("objc", .{});
-            step.root_module.linkFramework("Foundation", .{});
-            step.root_module.linkSystemLibrary("ffi", .{});
             step.root_module.linkSystemLibrary("pthread", .{});
             step.root_module.linkSystemLibrary("resolv", .{});
             step.root_module.linkSystemLibrary("z", .{});
             step.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
             step.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-            inline for (&.{ "brotlicommon", "brotlidec", "brotlienc" }) |library| {
-                step.root_module.linkSystemLibrary(library, .{ .preferred_link_mode = .static });
-            }
             step.root_module.linkSystemLibrary("ssl", .{ .preferred_link_mode = .static });
             step.root_module.linkSystemLibrary("crypto", .{ .preferred_link_mode = .static });
         },
@@ -586,9 +617,8 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libbmalloc.a", .{vendor_dir})));
             for (fallback_libraries) |library|
                 step.root_module.addObjectFile(b.path(b.fmt("{s}/{s}", .{ fallback_dir, library })));
-            inline for (&.{
-                "atomic", "brotlicommon", "brotlidec", "brotlienc", "ffi", "m", "pthread", "z",
-            }) |library| step.root_module.linkSystemLibrary(library, .{});
+            inline for (&.{ "atomic", "m", "pthread", "z" }) |library|
+                step.root_module.linkSystemLibrary(library, .{});
             // Zig treats these names as aliases for its own libc/libc++ and
             // drops them before linking. Concrete files preserve the GNU C++
             // ABI and unwind runtime used by the JSC/Rust archives, plus
@@ -628,7 +658,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             for (fallback_libraries) |library|
                 step.root_module.addObjectFile(b.path(b.fmt("{s}/{s}", .{ fallback_dir, library })));
             inline for (&.{
-                "brotlicommon.lib", "brotlidec.lib", "brotlienc.lib", "dl.lib", "ffi.lib", "libcrypto.lib", "libssl.lib", "zs.lib", "zstd.lib",
+                "dl.lib", "libcrypto.lib", "libssl.lib", "zs.lib", "zstd.lib",
             }) |library| {
                 step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/{s}", .{ dependency_dir, library })));
             }
@@ -674,7 +704,8 @@ pub fn build(b: *std.Build) void {
         "test-filter",
         "Only compile Zig tests whose names match a filter",
     ) orelse &[0][]const u8{};
-    const runtime_modules_blob = embedRuntimeModules(b);
+    const runtime_module_artifacts = embedRuntimeModules(b);
+    const runtime_modules_blob = runtime_module_artifacts.core;
 
     const exe = b.addExecutable(.{
         .name = "cottontail",
@@ -736,8 +767,563 @@ pub fn build(b: *std.Build) void {
 
     configureJsc(exe, b);
 
+    const capability_builder = b.addExecutable(.{
+        .name = "cottontail-capability-builder",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    capability_builder.root_module.addImport("cottontail_compiler", createCompilerModule(b, target, optimize));
+    capability_builder.root_module.addAnonymousImport("runtime_modules_blob", .{ .root_source_file = runtime_module_artifacts.capability_builder });
+    capability_builder.root_module.addAnonymousImport("capability_namespace_source", .{ .root_source_file = b.path("src/capability_namespace_bootstrap.js") });
+    configureJsc(capability_builder, b);
+    // The build-time runtime must not resolve the production filesystem-backed
+    // capability namespace: it is the process creating those files. It gets a
+    // deliberately small embedded namespace from bun/index.js instead.
+    capability_builder.root_module.addCMacro("COTTONTAIL_CAPABILITY_BUILDER", "1");
+
+    const namespace_bytecode_command = b.addRunArtifact(exe);
+    namespace_bytecode_command.addArg("--cottontail-generate-sync-bytecode");
+    namespace_bytecode_command.addFileArg(b.path("src/capability_namespace_bootstrap.js"));
+    const namespace_bytecode = namespace_bytecode_command.addOutputFileArg("capability-namespace.jsc");
+    namespace_bytecode_command.addArg("cottontail:core/capability-namespace");
+    const host_bootstrap_source_command = b.addSystemCommand(&.{"node"});
+    host_bootstrap_source_command.addFileArg(b.path("scripts/extract-host-bootstrap.js"));
+    host_bootstrap_source_command.addFileArg(b.path("src/jsc_runner.c"));
+    const host_bootstrap_source = host_bootstrap_source_command.addOutputFileArg("host-bootstrap.js");
+    const host_bootstrap_bytecode_command = b.addRunArtifact(exe);
+    host_bootstrap_bytecode_command.addArg("--cottontail-generate-sync-bytecode");
+    host_bootstrap_bytecode_command.addFileArg(host_bootstrap_source);
+    const host_bootstrap_bytecode = host_bootstrap_bytecode_command.addOutputFileArg("host-bootstrap.jsc");
+    host_bootstrap_bytecode_command.addArg("cottontail:core/host-bootstrap");
+    for ([_]*std.Build.Step.Compile{ exe, windows_check }) |runtime_executable| {
+        runtime_executable.root_module.addAnonymousImport("capability_namespace_source", .{ .root_source_file = b.path("src/capability_namespace_bootstrap.js") });
+    }
+    const core_runtime_modules = .{
+        .{ "assert", "src/runtime_modules/node/assert.js" },
+        .{ "async_hooks", "src/runtime_modules/node/async_hooks.js" },
+        .{ "buffer", "src/runtime_modules/node/buffer.js" },
+        .{ "constants", "src/runtime_modules/node/constants.js" },
+        .{ "crypto", "src/runtime_modules/node/crypto.js" },
+        .{ "events", "src/runtime_modules/node/events.js" },
+        .{ "fs", "src/runtime_modules/node/fs.js" },
+        .{ "http", "src/runtime_modules/node/http.js" },
+        .{ "net", "src/runtime_modules/node/net.js" },
+        .{ "path", "src/runtime_modules/node/path.js" },
+        .{ "stream", "src/runtime_modules/node/stream.js" },
+        .{ "tls", "src/runtime_modules/node/tls.js" },
+        .{ "tty", "src/runtime_modules/node/tty.js" },
+        .{ "url", "src/runtime_modules/node/url.js" },
+        .{ "v8", "src/runtime_modules/node/v8.js" },
+    };
+
+    const ffi_capability_bytecode = buildStdlibCapability(b, capability_builder, exe, "ffi", "src/stdlib/ffi/main.js");
+    const sqlite_capability_bytecode = buildStdlibCapability(b, capability_builder, exe, "sqlite", "src/stdlib/sqlite/main.js");
+    const sql_capability_bytecode = buildStdlibCapability(b, capability_builder, exe, "sql", "src/stdlib/sql/main.js");
+    const javascript_capabilities = .{
+        .{ "redis", "src/stdlib/redis/main.js" },
+        .{ "s3", "src/stdlib/s3/main.js" },
+        .{ "toml", "src/stdlib/toml/main.js" },
+        .{ "json5", "src/stdlib/json5/main.js" },
+        .{ "colors", "src/stdlib/colors/main.js" },
+        .{ "cookies", "src/stdlib/cookies/main.js" },
+        .{ "websocket", "src/stdlib/websocket/main.js" },
+        .{ "jsc-tools", "src/stdlib/jsc-tools/main.js" },
+        .{ "yaml", "src/stdlib/yaml/main.js" },
+        .{ "test", "src/stdlib/test/main.js" },
+        .{ "shell", "src/stdlib/shell/main.js" },
+        .{ "build", "src/stdlib/build/main.js" },
+        .{ "bake", "src/stdlib/bake/main.js" },
+        .{ "inspector", "src/stdlib/inspector/main.js" },
+        .{ "repl", "src/stdlib/repl/main.js" },
+        .{ "sea", "src/stdlib/sea/main.js" },
+        .{ "compression", "src/stdlib/compression/main.js" },
+        .{ "glob", "src/stdlib/glob/main.js" },
+        .{ "text", "src/stdlib/text/main.js" },
+        .{ "uuid", "src/stdlib/uuid/main.js" },
+        .{ "password", "src/stdlib/password/main.js" },
+        .{ "hashing", "src/stdlib/hashing/main.js" },
+        .{ "data", "src/stdlib/data/main.js" },
+        .{ "markdown", "src/stdlib/markdown/main.js" },
+        .{ "archive", "src/stdlib/archive/main.js" },
+        .{ "filesystem-router", "src/stdlib/filesystem-router/main.js" },
+        .{ "html-rewriter", "src/stdlib/html-rewriter/main.js" },
+        .{ "terminal", "src/stdlib/terminal/main.js" },
+        .{ "csrf", "src/stdlib/csrf/main.js" },
+        .{ "secrets", "src/stdlib/secrets/main.js" },
+    };
+
+    const sqlite_capability_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .pic = true,
+    });
+    sqlite_capability_module.addIncludePath(b.path("src"));
+    sqlite_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    sqlite_capability_module.addIncludePath(b.path("src/compiler/src/jsc/bindings/sqlite"));
+    sqlite_capability_module.addCSourceFiles(.{
+        .root = b.path("."),
+        .files = &.{
+            "src/stdlib/sqlite/sqlite_capability.c",
+            "src/compiler/src/jsc/bindings/sqlite/sqlite3.c",
+        },
+        .flags = &.{
+            "-std=c11",                       "-fPIC",                               "-DSQLITE_ENABLE_COLUMN_METADATA",
+            "-DSQLITE_ENABLE_FTS5",           "-DSQLITE_ENABLE_MATH_FUNCTIONS",      "-DSQLITE_ENABLE_SESSION",
+            "-DSQLITE_ENABLE_PREUPDATE_HOOK", "-DSQLITE_ENABLE_UPDATE_DELETE_LIMIT", "-DSQLITE_THREADSAFE=1",
+        },
+    });
+    const sqlite_capability = b.addLibrary(.{
+        .name = "cottontail-sqlite",
+        .linkage = .dynamic,
+        .root_module = sqlite_capability_module,
+    });
+    sqlite_capability.linker_allow_shlib_undefined = true;
+
+    const sql_capability_module = b.createModule(.{
+        .root_source_file = b.path("src/sql_wire.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .pic = true,
+    });
+    sql_capability_module.addIncludePath(b.path("src"));
+    sql_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    sql_capability_module.addCSourceFile(.{
+        .file = b.path("src/stdlib/sql/sql_capability.c"),
+        .flags = &.{ "-std=c11", "-fPIC" },
+    });
+    const sql_capability = b.addLibrary(.{
+        .name = "cottontail-sql",
+        .linkage = .dynamic,
+        .root_module = sql_capability_module,
+    });
+    sql_capability.linker_allow_shlib_undefined = true;
+
+    const compression_capability_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .pic = true,
+    });
+    compression_capability_module.addIncludePath(b.path("src"));
+    compression_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    compression_capability_module.addCSourceFile(.{
+        .file = b.path("src/stdlib/compression/compression_capability.c"),
+        .flags = &.{ "-std=c11", "-fPIC" },
+    });
+    if (target.result.os.tag == .macos) {
+        compression_capability_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+        compression_capability_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    } else if (target.result.os.tag == .windows) {
+        compression_capability_module.addIncludePath(b.path("vendors/windows-deps/x64-windows-static/include"));
+        compression_capability_module.addLibraryPath(b.path("vendors/windows-deps/x64-windows-static/lib"));
+    }
+    const compression_capability = b.addLibrary(.{
+        .name = "cottontail-compression",
+        .linkage = .dynamic,
+        .root_module = compression_capability_module,
+    });
+    compression_capability.linker_allow_shlib_undefined = true;
+    compression_capability.root_module.linkSystemLibrary("z", .{});
+    inline for (&.{ "brotlicommon", "brotlidec", "brotlienc" }) |library| {
+        compression_capability.root_module.linkSystemLibrary(library, .{});
+    }
+
+    const websocket_capability_module = b.createModule(.{
+        .root_source_file = b.path("src/websocket_frame.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .pic = true,
+    });
+    websocket_capability_module.addImport("cottontail_compiler", createCompilerModule(b, target, optimize));
+    websocket_capability_module.addIncludePath(b.path("src"));
+    websocket_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    websocket_capability_module.addCSourceFile(.{
+        .file = b.path("src/stdlib/websocket/websocket_capability.c"),
+        .flags = &.{ "-std=c11", "-fPIC" },
+    });
+    const websocket_capability = b.addLibrary(.{
+        .name = "cottontail-websocket",
+        .linkage = .dynamic,
+        .root_module = websocket_capability_module,
+    });
+    websocket_capability.linker_allow_shlib_undefined = true;
+
+    const text_capability_module = b.createModule(.{
+        .root_source_file = b.path("src/stdlib/text/text_capability.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .pic = true,
+    });
+    text_capability_module.addImport("cottontail_compiler", createCompilerModule(b, target, optimize));
+    const text_string_width_module = b.createModule(.{
+        .root_source_file = b.path("src/string_width.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    text_string_width_module.addImport("cottontail_compiler", createCompilerModule(b, target, optimize));
+    text_capability_module.addImport("string_width", text_string_width_module);
+    text_capability_module.addImport("strip_ansi", b.createModule(.{
+        .root_source_file = b.path("src/strip_ansi.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    text_capability_module.addIncludePath(b.path("src"));
+    text_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    text_capability_module.addCSourceFile(.{
+        .file = b.path("src/stdlib/text/text_capability.c"),
+        .flags = &.{ "-std=c11", "-fPIC" },
+    });
+    const text_capability = b.addLibrary(.{
+        .name = "cottontail-text",
+        .linkage = .dynamic,
+        .root_module = text_capability_module,
+    });
+    text_capability.linker_allow_shlib_undefined = true;
+
+    const uuid_capability_module = b.createModule(.{
+        .root_source_file = b.path("src/stdlib/uuid/uuid_capability.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .pic = true,
+    });
+    uuid_capability_module.addImport("native_uuid", b.createModule(.{
+        .root_source_file = b.path("src/native_uuid.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    uuid_capability_module.addIncludePath(b.path("src"));
+    uuid_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    uuid_capability_module.addCSourceFile(.{
+        .file = b.path("src/stdlib/uuid/uuid_capability.c"),
+        .flags = &.{ "-std=c11", "-fPIC" },
+    });
+    const uuid_capability = b.addLibrary(.{
+        .name = "cottontail-uuid",
+        .linkage = .dynamic,
+        .root_module = uuid_capability_module,
+    });
+    uuid_capability.linker_allow_shlib_undefined = true;
+
+    const glob_capability_module = b.createModule(.{
+        .root_source_file = b.path("src/stdlib/glob/glob_capability.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .pic = true,
+    });
+    const glob_native_module = b.createModule(.{
+        .root_source_file = b.path("src/glob_match.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    glob_native_module.addImport("cottontail_compiler", createCompilerModule(b, target, optimize));
+    glob_capability_module.addImport("native_glob", glob_native_module);
+    glob_capability_module.addIncludePath(b.path("src"));
+    glob_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    glob_capability_module.addCSourceFile(.{
+        .file = b.path("src/stdlib/glob/glob_capability.c"),
+        .flags = &.{ "-std=c11", "-fPIC" },
+    });
+    const glob_capability = b.addLibrary(.{
+        .name = "cottontail-glob",
+        .linkage = .dynamic,
+        .root_module = glob_capability_module,
+    });
+    glob_capability.linker_allow_shlib_undefined = true;
+
+    const password_capability_module = b.createModule(.{
+        .root_source_file = b.path("src/stdlib/password/password_capability.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .pic = true,
+    });
+    const password_native_module = b.createModule(.{
+        .root_source_file = b.path("src/cottontail_password.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    password_capability_module.addImport("password_native", password_native_module);
+    password_capability_module.addIncludePath(b.path("src"));
+    password_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    password_capability_module.addCSourceFile(.{
+        .file = b.path("src/stdlib/password/password_capability.c"),
+        .flags = &.{ "-std=c11", "-fPIC" },
+    });
+    const password_capability = b.addLibrary(.{
+        .name = "cottontail-password",
+        .linkage = .dynamic,
+        .root_module = password_capability_module,
+    });
+    password_capability.linker_allow_shlib_undefined = true;
+
+    const hashing_capability_module = b.createModule(.{
+        .root_source_file = b.path("src/stdlib/hashing/hashing_capability.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .pic = true,
+    });
+    hashing_capability_module.addImport("native_hashing", b.createModule(.{
+        .root_source_file = b.path("src/cottontail_hash.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    hashing_capability_module.addIncludePath(b.path("src"));
+    hashing_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    hashing_capability_module.addCSourceFile(.{
+        .file = b.path("src/stdlib/hashing/hashing_capability.c"),
+        .flags = &.{ "-std=c11", "-fPIC" },
+    });
+    const hashing_capability = b.addLibrary(.{
+        .name = "cottontail-hashing",
+        .linkage = .dynamic,
+        .root_module = hashing_capability_module,
+    });
+    hashing_capability.linker_allow_shlib_undefined = true;
+    switch (target.result.os.tag) {
+        .macos => {
+            hashing_capability.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+            hashing_capability.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+            hashing_capability.root_module.linkSystemLibrary("crypto", .{ .preferred_link_mode = .static });
+            hashing_capability.root_module.linkSystemLibrary("zstd", .{ .preferred_link_mode = .static });
+        },
+        .linux => {
+            hashing_capability.root_module.linkSystemLibrary("crypto", .{ .preferred_link_mode = .static });
+            hashing_capability.root_module.linkSystemLibrary("zstd", .{
+                .use_pkg_config = .no,
+                .preferred_link_mode = .static,
+                .search_strategy = .no_fallback,
+            });
+        },
+        .windows => {
+            const dependency_dir = "vendors/windows-deps/x64-windows-static";
+            hashing_capability.root_module.addIncludePath(b.path(b.fmt("{s}/include", .{dependency_dir})));
+            hashing_capability.root_module.addLibraryPath(b.path(b.fmt("{s}/lib", .{dependency_dir})));
+            hashing_capability.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libcrypto.lib", .{dependency_dir})));
+            hashing_capability.root_module.addObjectFile(b.path(b.fmt("{s}/lib/zstd.lib", .{dependency_dir})));
+            hashing_capability.root_module.linkSystemLibrary("bcrypt", .{});
+            hashing_capability.root_module.linkSystemLibrary("crypt32", .{});
+        },
+        else => {},
+    }
+
+    const markdown_capability_module = b.createModule(.{
+        .root_source_file = b.path("src/stdlib/markdown/markdown_capability.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .pic = true,
+    });
+    const native_markdown_module = b.createModule(.{
+        .root_source_file = b.path("src/cottontail_markdown.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    native_markdown_module.addImport("cottontail_compiler", createCompilerModule(b, target, optimize));
+    markdown_capability_module.addImport("native_markdown", native_markdown_module);
+    markdown_capability_module.addIncludePath(b.path("src"));
+    markdown_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    markdown_capability_module.addCSourceFile(.{
+        .file = b.path("src/stdlib/markdown/markdown_capability.c"),
+        .flags = &.{ "-std=c11", "-fPIC" },
+    });
+    const markdown_capability = b.addLibrary(.{
+        .name = "cottontail-markdown",
+        .linkage = .dynamic,
+        .root_module = markdown_capability_module,
+    });
+    markdown_capability.linker_allow_shlib_undefined = true;
+
+    const terminal_capability_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .pic = true,
+    });
+    terminal_capability_module.addIncludePath(b.path("src"));
+    terminal_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    terminal_capability_module.addCSourceFile(.{
+        .file = b.path("src/stdlib/terminal/terminal_capability.c"),
+        .flags = &.{ "-std=c11", "-fPIC", "-D_DARWIN_C_SOURCE" },
+    });
+    const terminal_capability = b.addLibrary(.{
+        .name = "cottontail-terminal",
+        .linkage = .dynamic,
+        .root_module = terminal_capability_module,
+    });
+    terminal_capability.linker_allow_shlib_undefined = true;
+
+    const ffi_native_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .pic = true,
+    });
+    ffi_native_module.addIncludePath(b.path("src"));
+    ffi_native_module.addIncludePath(b.path("vendors/jsc/include"));
+    ffi_native_module.addCSourceFile(.{
+        .file = b.path("src/stdlib/ffi/ffi_capability.c"),
+        .flags = &.{ "-std=c11", "-fPIC" },
+    });
+    const ffi_native = b.addLibrary(.{
+        .name = "cottontail-ffi",
+        .linkage = .dynamic,
+        .root_module = ffi_native_module,
+    });
+    ffi_native.linker_allow_shlib_undefined = true;
+    switch (target.result.os.tag) {
+        .macos => {
+            ffi_native.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+            ffi_native.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+            ffi_native.root_module.linkSystemLibrary("ffi", .{ .preferred_link_mode = .static });
+        },
+        .linux => ffi_native.root_module.linkSystemLibrary("ffi", .{ .preferred_link_mode = .static }),
+        .windows => {
+            const dependency_dir = "vendors/windows-deps/x64-windows-static";
+            ffi_native.root_module.addIncludePath(b.path(b.fmt("{s}/include", .{dependency_dir})));
+            ffi_native.root_module.addObjectFile(b.path(b.fmt("{s}/lib/ffi.lib", .{dependency_dir})));
+        },
+        else => unreachable,
+    }
+
     const install_exe = b.addInstallArtifact(exe, .{});
-    if (target.result.os.tag == .linux and optimize == .ReleaseSmall) {
+    const install_namespace_bytecode = b.addInstallFile(namespace_bytecode, "bin/cottontail-core/capability-namespace.jsc");
+    install_exe.step.dependOn(&install_namespace_bytecode.step);
+    const install_host_bootstrap_bytecode = b.addInstallFile(host_bootstrap_bytecode, "bin/cottontail-core/host-bootstrap.jsc");
+    install_exe.step.dependOn(&install_host_bootstrap_bytecode.step);
+    inline for (core_runtime_modules) |runtime_module_definition| {
+        const bytecode = buildCoreRuntimeModule(
+            b,
+            capability_builder,
+            exe,
+            runtime_module_definition[0],
+            runtime_module_definition[1],
+        );
+        const install = b.addInstallFile(
+            bytecode,
+            b.fmt("bin/cottontail-core/runtime/{s}.jsc", .{runtime_module_definition[0]}),
+        );
+        install_exe.step.dependOn(&install.step);
+    }
+    if (target.result.os.tag == .windows) {
+        const secrets_capability_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .pic = true,
+        });
+        secrets_capability_module.addIncludePath(b.path("src"));
+        secrets_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+        secrets_capability_module.addCSourceFile(.{
+            .file = b.path("src/stdlib/secrets/secrets_capability.c"),
+            .flags = &.{ "-std=c11", "-fPIC" },
+        });
+        secrets_capability_module.linkSystemLibrary("advapi32", .{});
+        const secrets_capability = b.addLibrary(.{
+            .name = "cottontail-secrets",
+            .linkage = .dynamic,
+            .root_module = secrets_capability_module,
+        });
+        secrets_capability.linker_allow_shlib_undefined = true;
+        const install_secrets_library = b.addInstallFile(
+            secrets_capability.getEmittedBin(),
+            "bin/cottontail-stdlib/secrets/secrets.dll",
+        );
+        install_exe.step.dependOn(&install_secrets_library.step);
+    }
+    const install_ffi_capability = b.addInstallFile(
+        ffi_capability_bytecode,
+        "bin/cottontail-stdlib/ffi/main.jsc",
+    );
+    const install_ffi_library = b.addInstallFile(
+        ffi_native.getEmittedBin(),
+        b.fmt("bin/cottontail-stdlib/ffi/ffi{s}", .{target.result.dynamicLibSuffix()}),
+    );
+    const install_sqlite_capability = b.addInstallFile(
+        sqlite_capability_bytecode,
+        "bin/cottontail-stdlib/sqlite/main.jsc",
+    );
+    const install_sqlite_library = b.addInstallFile(
+        sqlite_capability.getEmittedBin(),
+        b.fmt("bin/cottontail-stdlib/sqlite/sqlite{s}", .{target.result.dynamicLibSuffix()}),
+    );
+    const install_sql_capability = b.addInstallFile(
+        sql_capability_bytecode,
+        "bin/cottontail-stdlib/sql/main.jsc",
+    );
+    const install_sql_library = b.addInstallFile(
+        sql_capability.getEmittedBin(),
+        b.fmt("bin/cottontail-stdlib/sql/sql{s}", .{target.result.dynamicLibSuffix()}),
+    );
+    const install_compression_library = b.addInstallFile(
+        compression_capability.getEmittedBin(),
+        b.fmt("bin/cottontail-stdlib/compression/compression{s}", .{target.result.dynamicLibSuffix()}),
+    );
+    const install_websocket_library = b.addInstallFile(
+        websocket_capability.getEmittedBin(),
+        b.fmt("bin/cottontail-stdlib/websocket/websocket{s}", .{target.result.dynamicLibSuffix()}),
+    );
+    const install_text_library = b.addInstallFile(
+        text_capability.getEmittedBin(),
+        b.fmt("bin/cottontail-stdlib/text/text{s}", .{target.result.dynamicLibSuffix()}),
+    );
+    const install_uuid_library = b.addInstallFile(
+        uuid_capability.getEmittedBin(),
+        b.fmt("bin/cottontail-stdlib/uuid/uuid{s}", .{target.result.dynamicLibSuffix()}),
+    );
+    const install_glob_library = b.addInstallFile(
+        glob_capability.getEmittedBin(),
+        b.fmt("bin/cottontail-stdlib/glob/glob{s}", .{target.result.dynamicLibSuffix()}),
+    );
+    const install_password_library = b.addInstallFile(
+        password_capability.getEmittedBin(),
+        b.fmt("bin/cottontail-stdlib/password/password{s}", .{target.result.dynamicLibSuffix()}),
+    );
+    const install_hashing_library = b.addInstallFile(
+        hashing_capability.getEmittedBin(),
+        b.fmt("bin/cottontail-stdlib/hashing/hashing{s}", .{target.result.dynamicLibSuffix()}),
+    );
+    const install_markdown_library = b.addInstallFile(
+        markdown_capability.getEmittedBin(),
+        b.fmt("bin/cottontail-stdlib/markdown/markdown{s}", .{target.result.dynamicLibSuffix()}),
+    );
+    const install_terminal_library = b.addInstallFile(
+        terminal_capability.getEmittedBin(),
+        b.fmt("bin/cottontail-stdlib/terminal/terminal{s}", .{target.result.dynamicLibSuffix()}),
+    );
+    install_exe.step.dependOn(&install_ffi_capability.step);
+    install_exe.step.dependOn(&install_ffi_library.step);
+    install_exe.step.dependOn(&install_sqlite_capability.step);
+    install_exe.step.dependOn(&install_sqlite_library.step);
+    install_exe.step.dependOn(&install_sql_capability.step);
+    install_exe.step.dependOn(&install_sql_library.step);
+    install_exe.step.dependOn(&install_compression_library.step);
+    install_exe.step.dependOn(&install_websocket_library.step);
+    install_exe.step.dependOn(&install_text_library.step);
+    install_exe.step.dependOn(&install_uuid_library.step);
+    install_exe.step.dependOn(&install_glob_library.step);
+    install_exe.step.dependOn(&install_password_library.step);
+    install_exe.step.dependOn(&install_hashing_library.step);
+    install_exe.step.dependOn(&install_markdown_library.step);
+    install_exe.step.dependOn(&install_terminal_library.step);
+    inline for (javascript_capabilities) |capability| {
+        const bytecode = buildStdlibCapability(b, capability_builder, exe, capability[0], capability[1]);
+        const install = b.addInstallFile(
+            bytecode,
+            b.fmt("bin/cottontail-stdlib/{s}/main.jsc", .{capability[0]}),
+        );
+        install_exe.step.dependOn(&install.step);
+    }
+    if (target.result.os.tag == .linux and (optimize == .ReleaseSmall or optimize == .ReleaseFast)) {
         // Zig 0.16 accepts the ELF version script above but its built-in linker
         // does not apply it. Keep ordinary release installs on the same native-
         // addon ABI allowlist as scripts/build-release.js instead of exposing
@@ -816,6 +1402,7 @@ pub fn build(b: *std.Build) void {
     });
     unit_tests.root_module.addImport("cottontail_compiler", createCompilerModule(b, target, test_optimize));
     unit_tests.root_module.addAnonymousImport("runtime_modules_blob", .{ .root_source_file = runtime_modules_blob });
+    unit_tests.root_module.addAnonymousImport("capability_namespace_source", .{ .root_source_file = b.path("src/capability_namespace_bootstrap.js") });
 
     configureJsc(unit_tests, b);
 

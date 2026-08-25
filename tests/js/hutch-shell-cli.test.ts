@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { $ } from "bun";
 
 const root = mkdtempSync(join(tmpdir(), "cottontail-hutch-shell-"));
@@ -1027,8 +1027,23 @@ test("keeps the exact task environment while isolating native compilation", () =
   };
   const variables = Object.keys(values).map(name => `"$${name}"`).join(" ");
   const invocation = createHutchShellInvocation(String.raw`printf '<%s>\n' ` + variables);
-  const launcher = join(invocation.privateRoot, process.platform === "win32" ? "hutch.exe" : "hutch");
+  const runtimeRoot = join(root, "exact-environment-runtime");
+  mkdirSync(runtimeRoot);
+  const launcher = join(runtimeRoot, process.platform === "win32" ? "hutch.exe" : "hutch");
   linkSync(process.execPath, launcher);
+  // This hardlink emulates Hutch's vendored runtime layout. Mandatory runtime
+  // capabilities must travel beside the executable just as they do in a real
+  // app bundle; a hardlinked binary alone is intentionally not self-contained.
+  symlinkSync(
+    join(dirname(process.execPath), "cottontail-stdlib"),
+    join(runtimeRoot, "cottontail-stdlib"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  symlinkSync(
+    join(dirname(process.execPath), "cottontail-core"),
+    join(runtimeRoot, "cottontail-core"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
   invocation.argv[0] = launcher;
   try {
     const child = Bun.spawnSync(invocation.argv, {

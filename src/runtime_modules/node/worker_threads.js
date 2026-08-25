@@ -5,7 +5,7 @@ import { Readable, Writable } from "./stream.js";
 import { jscHeapSnapshotToV8 } from "./internal/heap_snapshot.js";
 import { format as formatValue, inspect as inspectValue } from "./util.js";
 import { isContext } from "./vm.js";
-import "../bun/ffi.js";
+import "../bun/core-bootstrap.js";
 
 const wireVersion = 1;
 const typedArrayConstructors = {

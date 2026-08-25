@@ -1,4 +1,3 @@
-import { parse as parseToml } from "../bun/toml.js";
 import { dirname, resolve } from "../node/path.js";
 
 export function installStandaloneRuntimeLoaders(processObject = globalThis.process) {
@@ -30,7 +29,7 @@ export function installStandaloneRuntimeLoaders(processObject = globalThis.proce
     }
 
     globalThis.__cottontailStandaloneBunfigLoaded = true;
-    const configured = parseToml(contents)?.preload;
+    const configured = globalThis.Cottontail.toml.parse(contents)?.preload;
     const preloads = configured == null ? [] : Array.isArray(configured) ? configured : [configured];
     for (const preload of preloads) {
       if (typeof preload !== "string") throw new TypeError("bunfig.toml preload must be a string or an array of strings");

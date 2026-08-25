@@ -1,7 +1,7 @@
 import Module, { _resolveFilename } from "../node/module.js";
 import fsDefault, { readFileSync } from "../node/fs.js";
 import { createHash } from "../node/crypto.js";
-import { gunzipSync } from "../node/zlib.js";
+import { gunzipSync } from "../node/zlib-capability.js";
 import {
   createLazyModule,
   createLazyObject,

@@ -1,10 +1,11 @@
-import { EventEmitter } from "./events.js";
-import { readFileSync, writeFileSync } from "./fs.js";
-import { createRequire } from "./module.js";
-import { join } from "./path.js";
-import { isatty } from "./tty.js";
-import { inspect } from "./util.js";
-import "../bun/index.js";
+import { EventEmitter } from "node:events";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { isatty } from "node:tty";
+
+function inspect(value, options = undefined) {
+  return globalThis[Symbol.for("cottontail.capabilityRequire")]("node:util").inspect(value, options);
+}
 
 export const REPL_MODE_SLOPPY = Symbol("repl-sloppy");
 export const REPL_MODE_STRICT = Symbol("repl-strict");
@@ -269,6 +270,7 @@ function normalizeReplError(error) {
 function installReplGlobals() {
   const cwd = process.cwd();
   const filename = join(cwd, "[repl]");
+  const { createRequire } = globalThis[Symbol.for("cottontail.capabilityRequire")]("node:module");
   const replRequire = createRequire(filename);
   const replModule = globalThis.module && typeof globalThis.module === "object"
     ? globalThis.module
@@ -707,7 +709,7 @@ class BuiltinReplSession {
     this.closed = true;
     this.saveHistory();
     if (this.terminal) {
-      try { cottontail.terminalSetRawMode?.(0, false); } catch {}
+      try { globalThis.Cottontail.terminal.setRawMode(0, false); } catch {}
       this.input.isRaw = false;
     }
     this.input.off?.("data", this.onData);
@@ -726,7 +728,7 @@ class BuiltinReplSession {
     installReplGlobals();
     this.loadHistory();
     if (this.terminal) {
-      try { cottontail.terminalSetRawMode?.(0, true); } catch {}
+      try { globalThis.Cottontail.terminal.setRawMode(0, true); } catch {}
       this.input.isRaw = true;
     }
     this.onData = chunk => this.consume(Buffer.from(chunk).toString());

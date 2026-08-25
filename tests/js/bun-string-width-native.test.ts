@@ -1,10 +1,17 @@
 import { expect, test } from "bun:test";
 
+const nativeStringWidthBeforeActivation = typeof (globalThis as any).cottontail.stringWidthNative;
+void (globalThis as any).Cottontail.text;
 const nativeStringWidth = (globalThis as any).cottontail.stringWidthNative as (
   value: string,
   countAnsiEscapeCodes: boolean,
   ambiguousIsNarrow: boolean,
 ) => number;
+
+test("text native bindings install only when the capability activates", () => {
+  expect(nativeStringWidthBeforeActivation).toBe("undefined");
+  expect(typeof nativeStringWidth).toBe("function");
+});
 
 function stringFromCodeUnits(units: number[]): string {
   let result = "";

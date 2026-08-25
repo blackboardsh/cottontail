@@ -1,4 +1,4 @@
-import { __setBuiltinModules } from "../module.js";
+import { setCoreBuiltinModules as __setBuiltinModules } from "../../internal/builtin-module-registry.js";
 
 async function chunksFrom(stream) {
   const chunks = [];

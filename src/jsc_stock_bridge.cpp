@@ -2,11 +2,13 @@
 #include <JavaScriptCore/JSValueRef.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
 #if defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
+#include <dlfcn.h>
 #endif
 
 namespace WTF {
@@ -32,6 +34,31 @@ private:
 bool setTimeZoneOverride(StringView);
 
 }
+
+#if defined(__APPLE__)
+namespace bmalloc {
+
+// JSCOnly's stock ProcessCheck.mm uses NSBundle and NSProcessInfo for these
+// command-line process checks, forcing every Cottontail process to load the
+// full Foundation framework graph. Cottontail is never a Cocoa application or
+// a WebKit XPC service, so preserve the relevant behavior using libc alone.
+const char* processNameString()
+{
+    const char* name = getprogname();
+    return name ? name : "cottontail";
+}
+
+bool shouldAllowMiniMode()
+{
+    const char* service_name = std::getenv("XPC_SERVICE_NAME");
+    if (!service_name)
+        return true;
+    return std::strncmp(service_name, "application.", 12)
+        && std::strncmp(service_name, "com.apple.WebKit.", 17);
+}
+
+}
+#endif
 
 namespace JSC {
 
@@ -131,14 +158,19 @@ extern "C" bool ct_jsc_set_time_zone(JSContextRef context, const char* time_zone
 
 #if defined(__APPLE__)
     // Cocoa's stock JSC Date cache also keys a process-wide cache from this
-    // notification. Posting it makes the public override observable without
-    // patching JavaScriptCore.
-    CFNotificationCenterPostNotification(
-        CFNotificationCenterGetLocalCenter(),
-        kCFTimeZoneSystemTimeZoneDidChangeNotification,
-        nullptr,
-        nullptr,
-        true);
+    // notification. Resolve CoreFoundation only when the override is used so
+    // bare command-line processes do not load the Cocoa framework graph.
+    using GetLocalCenter = CFNotificationCenterRef (*)();
+    using PostNotification = void (*)(CFNotificationCenterRef, CFNotificationName, const void*, CFDictionaryRef, Boolean);
+    if (void* framework = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_LAZY | RTLD_LOCAL)) {
+        auto get_local_center = reinterpret_cast<GetLocalCenter>(dlsym(framework, "CFNotificationCenterGetLocalCenter"));
+        auto post_notification = reinterpret_cast<PostNotification>(dlsym(framework, "CFNotificationCenterPostNotification"));
+        auto notification = reinterpret_cast<const CFNotificationName*>(
+            dlsym(framework, "kCFTimeZoneSystemTimeZoneDidChangeNotification"));
+        if (get_local_center && post_notification && notification && *notification) {
+            post_notification(get_local_center(), *notification, nullptr, nullptr, true);
+        }
+    }
 #endif
 
     const auto* vm = reinterpret_cast<const std::uint8_t*>(JSContextGetGroup(context));

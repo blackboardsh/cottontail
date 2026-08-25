@@ -120,11 +120,11 @@ test('runs the strict complete Cottontail-owned Bun tier without publishing', ()
   assert.match(workflow, /fail-fast: false/);
   assert.match(
     workflow,
-    /node scripts\/zig\.js build -Doptimize=ReleaseSmall -Dcpu=baseline/,
+    /node scripts\/zig\.js build -Doptimize=ReleaseFast -Dcpu=baseline/,
   );
   assert.match(
     workflow,
-    /node scripts\/zig\.js build -Doptimize=ReleaseSmall -Dtarget=x86_64-windows-msvc -Dcpu=baseline/,
+    /node scripts\/zig\.js build -Doptimize=ReleaseFast -Dtarget=x86_64-windows-msvc -Dcpu=baseline/,
   );
   assert.match(workflow, /run: node scripts\/zig\.js build test/);
   assert.match(workflow, /run: node scripts\/test-js\.js/);

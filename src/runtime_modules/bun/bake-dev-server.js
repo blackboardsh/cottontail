@@ -1,7 +1,7 @@
-import path from "../node/path.js";
-import { readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "../node/fs.js";
-import { pathToFileURL } from "../node/url.js";
-import { __setBuiltinModules } from "../node/module.js";
+import path from "node:path";
+import { readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+import { setCoreBuiltinModules as __setBuiltinModules } from "../internal/builtin-module-registry.js";
 import bundledReactRefreshModule from "./bake-react-refresh.txt";
 import {
   bakeGraphAttributeFiles,
@@ -32,9 +32,11 @@ import {
   registerBakeServerPatch,
 } from "./bake-source-map.js";
 
-const bunRuntime = globalThis[Symbol.for("cottontail.internal.bunRuntimeBridge")];
-if (bunRuntime?.abiVersion !== 1) throw new Error("Cottontail Bun runtime bridge ABI mismatch");
-const { Bun, HTMLRewriter, Response: RuntimeResponse, serve } = bunRuntime;
+function bakeRuntime() {
+  const runtime = globalThis[Symbol.for("cottontail.internal.bunRuntimeBridge")];
+  if (runtime?.abiVersion !== 1) throw new Error("Cottontail Bun runtime bridge ABI mismatch");
+  return runtime;
+}
 
 export function canonicalBakeProjectRoot(root = globalThis.process?.cwd?.() ?? ".") {
   try {
@@ -117,7 +119,7 @@ function decorateControlResponse(response) {
 
 function ensureBakeResponseInstalled() {
   if (BakeResponse !== null) return BakeResponse;
-  const WebResponse = RuntimeResponse;
+  const WebResponse = bakeRuntime().Response;
   if (typeof WebResponse !== "function") {
     throw new TypeError("The Web Response constructor is not installed");
   }
@@ -169,7 +171,8 @@ function setBakeResponseAsyncLocalStorage(storage) {
 // Bun exposes bun:app natively. Install its stock-JSC equivalent after the
 // cyclic runtime bootstrap has initialized the Web Response constructor.
 queueMicrotask(() => {
-  if (typeof globalThis.Response === "function") ensureBakeResponseInstalled();
+  const runtime = globalThis[Symbol.for("cottontail.internal.bunRuntimeBridge")];
+  if (runtime?.abiVersion === 1 && typeof globalThis.Response === "function") ensureBakeResponseInstalled();
 });
 
 const bakeStateSymbol = Symbol.for("cottontail.bake.dev-server-state");
@@ -354,7 +357,7 @@ function withBakeLiveReloadClient(html) {
 
 function withBakeFrameworkHmrBootstrap(response) {
   if (!response.headers.get("content-type")?.toLowerCase().startsWith("text/html")) return response;
-  return new HTMLRewriter().on("head", {
+  return new (bakeRuntime().HTMLRewriter)().on("head", {
     element(element) {
       element.prepend(bakeFrameworkHmrBootstrap, { html: true });
     },
@@ -372,7 +375,7 @@ async function loadBakeStaticConfig(projectRoot) {
 
   // Use the vendored compiler's TOML loader. Besides keeping this path aligned
   // with Bun's parser, it supports multiline inline tables used by bunfig.toml.
-  const result = await Bun.build({
+  const result = await bakeRuntime().Bun.build({
     entrypoints: [bunfigPath],
     target: "bun",
     format: "cjs",
@@ -423,7 +426,7 @@ function canDeferBakeHmrBuildErrors(logs) {
 
 function localHtmlModuleScripts(source, htmlPath) {
   const scripts = [];
-  new HTMLRewriter().on("script", {
+  new (bakeRuntime().HTMLRewriter)().on("script", {
     element(element) {
       const type = element.getAttribute("type");
       const sourceUrl = element.getAttribute("src");
@@ -452,7 +455,7 @@ function localHtmlModuleScripts(source, htmlPath) {
 
 function hasLinkedHtmlAssets(source) {
   let found = false;
-  new HTMLRewriter()
+  new (bakeRuntime().HTMLRewriter)()
     .on("link[href]", { element() { found = true; } })
     .on("img[src], source[src], source[srcset], video[src], video[poster], audio[src], iframe[src], embed[src], object[data]", {
       element() { found = true; },
@@ -463,7 +466,7 @@ function hasLinkedHtmlAssets(source) {
 
 function rewriteHtmlCssAssets(source, replacements) {
   if (replacements.size === 0) return source;
-  return new HTMLRewriter().on("link", {
+  return new (bakeRuntime().HTMLRewriter)().on("link", {
     element(element) {
       const rel = element.getAttribute("rel");
       const href = element.getAttribute("href");
@@ -483,7 +486,7 @@ function rewriteHtmlCssAssets(source, replacements) {
 
 function rewriteHtmlModuleScriptAssets(source, replacements) {
   if (replacements.size === 0) return source;
-  return new HTMLRewriter().on("script", {
+  return new (bakeRuntime().HTMLRewriter)().on("script", {
     element(element) {
       const type = element.getAttribute("type");
       const sourceUrl = element.getAttribute("src");
@@ -689,7 +692,7 @@ async function buildInternalBakeEntry(entryPath, outdir, buildConfig, refreshOpt
   const projectRoot = globalThis.process?.cwd?.() ?? ".";
   const { alias, files, refreshPath, usesBundledFallback } =
     refreshOptions ?? reactRefreshBuildOptions(entryPath, buildConfig);
-  const result = await Bun.build({
+  const result = await bakeRuntime().Bun.build({
     entrypoints: [entryPath],
     target: "browser",
     outdir,
@@ -1101,7 +1104,7 @@ function createHtmlDispatcher(config, development) {
     if (pending) return pending;
     pending = (async () => {
       const buildConfig = await staticConfig;
-      const sourceText = await Bun.file(htmlPath).text();
+      const sourceText = await bakeRuntime().Bun.file(htmlPath).text();
       const outdir = path.join(projectRoot, ".cottontail-tmp", "bake-html", String(buildId++));
       const htmlScripts = localHtmlModuleScripts(sourceText, htmlPath);
       const eagerInternalBuilds = new Map();
@@ -1127,7 +1130,7 @@ function createHtmlDispatcher(config, development) {
           if (direct !== null) return direct;
         }
       }
-      const result = await Bun.build({
+      const result = await bakeRuntime().Bun.build({
         entrypoints: [htmlPath],
         target: "browser",
         outdir,
@@ -1589,7 +1592,7 @@ function bakeCssId(metafile, artifact, projectRoot) {
     .map(input => metafileInputPath(projectRoot, input))
     .sort();
   const key = inputs.length > 0 ? inputs.join("\0") : path.resolve(projectRoot, String(artifact.path));
-  return BigInt.asUintN(64, Bun.hash(key)).toString(16).padStart(16, "0");
+  return BigInt.asUintN(64, bakeRuntime().Bun.hash(key)).toString(16).padStart(16, "0");
 }
 
 function bakeRouteClientUrl(routeId, generation) {
@@ -2067,7 +2070,7 @@ function createFrameworkDispatcher(config) {
       ssrWrapperPaths.set(record.page, wrapperPath);
     }
     const boundaryPlugins = boundaries.length > 0 ? [pluginBoundaryResolverPlugin(boundaries)] : [];
-    const result = await Bun.build(frameworkBuildOptions({
+    const result = await bakeRuntime().Bun.build(frameworkBuildOptions({
       ...ssrOptions,
       entrypoints: [wrapperPath],
       format: "internal_bake_dev",
@@ -2137,7 +2140,7 @@ function createFrameworkDispatcher(config) {
     ];
     const source = hmrImportWrapperSource(imports);
     const boundaryPlugins = boundaries.length > 0 ? [pluginBoundaryResolverPlugin(boundaries)] : [];
-    const result = await Bun.build(frameworkBuildOptions({
+    const result = await bakeRuntime().Bun.build(frameworkBuildOptions({
       ...clientOptions,
       alias: clientAlias,
       entrypoints: [wrapperPath],
@@ -2269,7 +2272,7 @@ function createFrameworkDispatcher(config) {
             sources: builtIns.sources,
             ssrBridge: serverComponents.separateSSRGraph === true,
           });
-      const result = await Bun.build(frameworkBuildOptions({
+      const result = await bakeRuntime().Bun.build(frameworkBuildOptions({
         ...serverOptions,
         entrypoints: [wrapperPath],
         format: development ? "internal_bake_dev" : "cjs",
@@ -3075,7 +3078,7 @@ export async function startDefaultApp(entryNamespace) {
     };
   }
 
-  const server = trackLifecycle(serve(serveConfig));
+  const server = trackLifecycle(bakeRuntime().serve(serveConfig));
   const protocol = server.url?.protocol?.replace(/:$/, "") ?? "http";
   console.debug(
     `Started ${server.development ? "development " : ""}server: ${protocol}://${server.hostname}:${server.port}`,

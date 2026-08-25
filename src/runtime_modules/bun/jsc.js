@@ -2,8 +2,11 @@ import {
   deserialize as v8Deserialize,
   getHeapStatistics,
   serialize as v8Serialize,
-} from "../node/v8.js";
-import { inspect } from "../node/util.js";
+} from "node:v8";
+
+function inspect(value, options = undefined) {
+  return globalThis[Symbol.for("cottontail.capabilityRequire")]("node:util").inspect(value, options);
+}
 
 let randomSeed = 0;
 let timezone = "";
@@ -289,7 +292,9 @@ function normalizeNativeCallerSourceOrigin(origin) {
 export function callerSourceOrigin() {
   if (typeof cottontail.jscCallerSourceOrigin === "function") {
     const exactOrigin = normalizeNativeCallerSourceOrigin(cottontail.jscCallerSourceOrigin());
-    if (exactOrigin !== "") return exactOrigin;
+    // Once bun:jsc lives in capability bytecode the immediate native caller is
+    // the capability wrapper, not the application that invoked the public API.
+    if (exactOrigin !== "" && !exactOrigin.includes("/jsc-tools-capability.js")) return exactOrigin;
   }
   const stack = String(new Error().stack ?? "");
   for (const line of stack.split("\n").slice(1)) {
@@ -300,7 +305,9 @@ export function callerSourceOrigin() {
     if (
       !match ||
       normalizedSourcePath.includes("runtime_modules/bun/jsc") ||
-      normalizedSourcePath.includes(".cottontail-embedded-runtime/bun/jsc.js")
+      normalizedSourcePath.includes(".cottontail-embedded-runtime/bun/jsc.js") ||
+      normalizedSourcePath.includes("/jsc-tools-capability.js") ||
+      normalizedSourcePath.includes("/jsc-capability.js")
     ) {
       continue;
     }

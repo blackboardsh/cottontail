@@ -80,7 +80,7 @@ const RapidHash = struct {
     }
 };
 
-export fn ct_hash_value(algorithm: c_int, input_ptr: ?[*]const u8, input_len: usize, seed: u64) u64 {
+pub export fn ct_hash_value(algorithm: c_int, input_ptr: ?[*]const u8, input_len: usize, seed: u64) u64 {
     const input = if (input_ptr) |ptr| ptr[0..input_len] else "";
     return switch (algorithm) {
         0 => std.hash.Wyhash.hash(seed, input),

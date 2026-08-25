@@ -8,6 +8,7 @@
 #include "jsc_runner.h"
 #include "icu_bridge/icu-bridge.h"
 #include "napi_bridge.h"
+#include "stdlib/capability_host.h"
 #include "url_bridge.h"
 
 #include <JavaScriptCore/JavaScript.h>
@@ -154,18 +155,11 @@ extern void JSGlobalContextSetUnhandledRejectionCallback(
 #else
 #include <arpa/inet.h>
 #endif
-#include <brotli/decode.h>
-#include <brotli/encode.h>
 #include <dirent.h>
 #if !defined(_WIN32)
 #include <dlfcn.h>
 #endif
 #include <errno.h>
-#if __has_include(<ffi/ffi.h>)
-#include <ffi/ffi.h>
-#else
-#include <ffi.h>
-#endif
 #include <fcntl.h>
 #if !defined(_WIN32)
 #include <grp.h>
@@ -246,7 +240,6 @@ typedef unsigned int gid_t;
 #else
 #include <strings.h>
 #endif
-#include "sqlite3_local.h"
 #if !defined(_WIN32)
 #include <arpa/nameser.h>
 #include <sys/socket.h>
@@ -290,7 +283,6 @@ typedef unsigned int gid_t;
 #include <time.h>
 #include <wchar.h>
 #include <uv.h>
-#include <zlib.h>
 
 int ct_paths_are_same_file(const char *source, const char *destination) {
     uv_fs_t source_request;
@@ -1911,10 +1903,6 @@ static int ct_getrusage(int who, struct rusage *usage) {
 extern char **environ;
 #endif
 
-extern uint8_t *ct_markdown_render_html(const uint8_t *source_ptr, size_t source_len, uint64_t flags, size_t *output_len, char **error_out);
-extern uint8_t *ct_markdown_parse_events(const uint8_t *source_ptr, size_t source_len, uint64_t flags, size_t *output_len, char **error_out);
-extern void ct_markdown_free(uint8_t *ptr, size_t len);
-extern void ct_markdown_string_free(char *ptr);
 extern uint8_t *ct_diff_format(const uint8_t *received_ptr, size_t received_len, const uint8_t *expected_ptr, size_t expected_len, bool not, bool enable_ansi_colors, size_t *output_len, char **error_out);
 extern void ct_diff_free(uint8_t *ptr, size_t len);
 extern void ct_diff_string_free(char *ptr);
@@ -1980,7 +1968,6 @@ extern void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx);
 #define CT_ARCH_STRING "unknown"
 #endif
 
-#define CT_FFI_MAX_ARGS 64
 #define CT_WORKER_STACK_SIZE (32u * 1024u * 1024u)
 #define CT_WORKER_TERMINATION_POLL_SECONDS 0.01
 #define CT_WORKER_RESOURCE_LIMIT_MESSAGE "Worker terminated due to reaching memory limit: JS heap out of memory"
@@ -2197,6 +2184,7 @@ extern uint8_t *ct_bake_source_map_relocate(
 );
 extern void ct_bundle_free(uint8_t *value, size_t len);
 extern void ct_bundle_string_free(char *value);
+extern const uint8_t *ct_capability_namespace_source(size_t *size_out);
 extern uint8_t *ct_compile_build(
     const uint8_t *request,
     size_t request_len,
@@ -2209,24 +2197,6 @@ extern uint8_t *ct_compile_build(
 );
 extern void ct_compile_build_free(uint8_t *value, size_t len);
 extern void ct_compile_build_string_free(char *value);
-extern uint8_t *ct_password_hash(
-    int algorithm,
-    const uint8_t *password,
-    size_t password_len,
-    uint32_t time_cost,
-    uint32_t memory_cost,
-    uint8_t bcrypt_cost,
-    size_t *out_len,
-    char **error_out
-);
-extern int ct_password_verify(
-    int algorithm,
-    const uint8_t *password,
-    size_t password_len,
-    const uint8_t *hash,
-    size_t hash_len,
-    char **error_out
-);
 extern int ct_crypto_argon2(
     int algorithm,
     const uint8_t *message,
@@ -2244,55 +2214,14 @@ extern int ct_crypto_argon2(
     size_t output_len,
     char **error_out
 );
-extern uint64_t ct_hash_value(int algorithm, const uint8_t *input, size_t input_len, uint64_t seed);
 
-typedef enum {
-    CT_FFI_TYPE_VOID,
-    CT_FFI_TYPE_BOOL,
-    CT_FFI_TYPE_U8,
-    CT_FFI_TYPE_I8,
-    CT_FFI_TYPE_U16,
-    CT_FFI_TYPE_I16,
-    CT_FFI_TYPE_U32,
-    CT_FFI_TYPE_I32,
-    CT_FFI_TYPE_U64,
-    CT_FFI_TYPE_I64,
-    CT_FFI_TYPE_F32,
-    CT_FFI_TYPE_F64,
-    CT_FFI_TYPE_PTR,
-    CT_FFI_TYPE_CSTRING,
-    CT_FFI_TYPE_FUNCTION,
-    CT_FFI_TYPE_NAPI_ENV,
-    CT_FFI_TYPE_NAPI_VALUE,
-} CtFfiType;
-
-typedef union {
-    uint8_t u8;
-    int8_t i8;
-    uint16_t u16;
-    int16_t i16;
-    uint32_t u32;
-    int32_t i32;
-    uint64_t u64;
-    int64_t i64;
-    float f32;
-    double f64;
-    void *ptr;
-} CtFfiValue;
-
-typedef struct CtFfiCallback CtFfiCallback;
-
-typedef struct CtFfiCallbackJob {
-    CtFfiCallback *callback;
-    size_t argc;
-    CtFfiValue args[CT_FFI_MAX_ARGS];
-    CtFfiValue result;
-    bool completed;
-    bool wait_for_result;
-    struct CtFfiCallbackJob *next;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-} CtFfiCallbackJob;
+typedef struct CtCapabilityLifecycle {
+    void *state;
+    CtCapabilityHasPending has_pending;
+    CtCapabilityDrain drain;
+    CtCapabilityCleanup cleanup;
+    struct CtCapabilityLifecycle *next;
+} CtCapabilityLifecycle;
 
 typedef struct CtSpawnEvent {
     uint32_t process_id;
@@ -2897,39 +2826,7 @@ typedef struct CtTlsServer {
     struct CtTlsServer *next;
 } CtTlsServer;
 
-typedef struct CtSqliteStmt CtSqliteStmt;
-typedef struct CtSqliteSession CtSqliteSession;
 typedef struct CtCryptoCipher CtCryptoCipher;
-typedef struct CtSqliteFunction CtSqliteFunction;
-typedef int (*CtSqliteEnableLoadExtensionFn)(sqlite3 *, int);
-typedef int (*CtSqliteLoadExtensionFn)(sqlite3 *, const char *, const char *, char **);
-
-typedef struct CtSqliteDb {
-    uint32_t id;
-    sqlite3 *db;
-    CtSqliteStmt *statements;
-    CtSqliteSession *sessions;
-    CtSqliteFunction *authorizer;
-    bool allow_load_extension;
-    bool load_extension_enabled;
-    struct CtSqliteDb *next;
-} CtSqliteDb;
-
-struct CtSqliteStmt {
-    uint32_t id;
-    sqlite3_stmt *stmt;
-    CtSqliteDb *owner;
-    CtSqliteStmt *owner_next;
-    CtSqliteStmt *next;
-};
-
-struct CtSqliteSession {
-    uint32_t id;
-    sqlite3_session *session;
-    CtSqliteDb *owner;
-    CtSqliteSession *owner_next;
-    CtSqliteSession *next;
-};
 
 struct CtCryptoCipher {
     uint32_t id;
@@ -2949,29 +2846,6 @@ struct CtCryptoCipher {
     struct CtCryptoCipher *next;
 };
 
-struct CtSqliteFunction {
-    JSContextRef ctx;
-    JSObjectRef callback;
-    JSObjectRef result_callback;
-    JSObjectRef start_callback;
-    JSObjectRef inverse_callback;
-    JSValueRef start_value;
-    bool has_start_value;
-};
-
-typedef struct CtSqliteAggregateState {
-    bool initialized;
-    JSValueRef accumulator;
-    char *error_message;
-} CtSqliteAggregateState;
-
-typedef struct CtSqliteApplyCallbacks {
-    JSContextRef ctx;
-    JSObjectRef filter;
-    JSObjectRef conflict;
-    char *error_message;
-} CtSqliteApplyCallbacks;
-
 static pthread_mutex_t ct_http_servers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtHttpServer *ct_http_servers = NULL;
 static uint32_t ct_next_http_server_id = 1;
@@ -2981,20 +2855,8 @@ static CtTlsServer *ct_tls_servers = NULL;
 static CtTlsConnection *ct_tls_connections = NULL;
 static uint32_t ct_next_tls_server_id = 1;
 static uint32_t ct_next_tls_connection_id = CT_TLS_CONNECTION_EVENT_ID_BASE;
-static CtSqliteDb *ct_sqlite_dbs = NULL;
-static CtSqliteStmt *ct_sqlite_stmts = NULL;
-static CtSqliteSession *ct_sqlite_sessions = NULL;
-static uint32_t ct_next_sqlite_db_id = 1;
-static uint32_t ct_next_sqlite_stmt_id = 1;
-static uint32_t ct_next_sqlite_session_id = 1;
 static CtCryptoCipher *ct_crypto_ciphers = NULL;
 static uint32_t ct_next_crypto_cipher_id = 1;
-
-typedef struct CtBrotliEncoderHandle {
-    uint32_t id;
-    BrotliEncoderState *state;
-    struct CtBrotliEncoderHandle *next;
-} CtBrotliEncoderHandle;
 
 typedef struct CtTimer {
     struct CtJscRuntime *runtime;
@@ -3047,6 +2909,7 @@ typedef struct CtReloadWatcher {
 } CtReloadWatcher;
 
 typedef struct CtModuleResolveCacheEntry CtModuleResolveCacheEntry;
+typedef struct CtLoadedCapability CtLoadedCapability;
 
 struct CtJscRuntime {
     JSGlobalContextRef context;
@@ -3081,10 +2944,8 @@ struct CtJscRuntime {
     CtWorkerEvent *worker_events_tail;
     CtWorker *worker;
     pthread_t owner_thread;
-    pthread_mutex_t callback_mutex;
-    CtFfiCallbackJob *callback_jobs_head;
-    CtFfiCallbackJob *callback_jobs_tail;
-    CtFfiCallback *callbacks;
+    CtCapabilityLifecycle *capability_lifecycles;
+    CtLoadedCapability *loaded_capabilities;
     CtActiveRequest *active_requests_head;
     CtActiveRequest *active_requests_tail;
     size_t active_request_count;
@@ -3103,10 +2964,8 @@ struct CtJscRuntime {
     uint64_t next_timer_id;
     size_t referenced_timer_count;
     size_t protected_timer_count;
-    CtBrotliEncoderHandle *brotli_encoders;
     CtVmContext *vm_contexts;
     CtNapiEnv *napi_env;
-    uint32_t next_brotli_encoder_id;
     uint64_t next_vm_context_id;
     uint64_t spawn_sync_blocking_count;
     uint64_t spawn_memfd_count;
@@ -3397,7 +3256,16 @@ static CtJscRuntime *ct_jsc_runtime_create_internal(
 );
 static int ct_jsc_runtime_has_active_handles(CtJscRuntime *runtime, bool *has_active_handles_out, char **error_out);
 static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_out, char **error_out);
+static char *ct_prepare_wrapped_source(
+    const uint8_t *source,
+    size_t source_len,
+    const char *filename,
+    size_t *source_offset_out,
+    size_t *source_byte_offset_out,
+    size_t *source_length_out
+);
 static char *ct_prepare_sync_source(const uint8_t *source, size_t source_len, const char *filename);
+static char *ct_source_url_for_filename(const char *filename);
 
 static char *ct_duplicate_bytes(const char *bytes, size_t len) {
     char *copy = (char *)malloc(len + 1);
@@ -5855,11 +5723,6 @@ static void ct_mmap_array_buffer_free(void *bytes, void *deallocator_context) {
 #endif
 }
 
-static void ct_sqlite_array_buffer_free(void *bytes, void *deallocator_context) {
-    (void)deallocator_context;
-    sqlite3_free(bytes);
-}
-
 static JSValueRef ct_array_buffer_from_copy(JSContextRef ctx, const char *bytes, size_t len, JSValueRef *exception) {
     void *copy = malloc(len > 0 ? len : 1);
     if (copy == NULL) {
@@ -5980,778 +5843,6 @@ static JSValueRef ct_random_bytes(JSContextRef ctx, JSObjectRef function, JSObje
         return JSValueMakeUndefined(ctx);
     }
     return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, buffer, len, ct_array_buffer_free, NULL, exception);
-}
-
-typedef enum {
-    CT_ZLIB_DEFLATE,
-    CT_ZLIB_DEFLATE_RAW,
-    CT_ZLIB_GZIP,
-    CT_ZLIB_INFLATE,
-    CT_ZLIB_INFLATE_RAW,
-    CT_ZLIB_GUNZIP,
-    CT_ZLIB_UNZIP,
-    CT_ZLIB_BROTLI_COMPRESS,
-    CT_ZLIB_BROTLI_DECOMPRESS,
-    CT_ZLIB_ZSTD_COMPRESS,
-    CT_ZLIB_ZSTD_DECOMPRESS,
-} CtZlibMode;
-
-static bool ct_zlib_mode_from_name(const char *name, CtZlibMode *mode) {
-    if (strcmp(name, "deflate") == 0) {
-        *mode = CT_ZLIB_DEFLATE;
-        return true;
-    }
-    if (strcmp(name, "deflateRaw") == 0) {
-        *mode = CT_ZLIB_DEFLATE_RAW;
-        return true;
-    }
-    if (strcmp(name, "gzip") == 0) {
-        *mode = CT_ZLIB_GZIP;
-        return true;
-    }
-    if (strcmp(name, "inflate") == 0) {
-        *mode = CT_ZLIB_INFLATE;
-        return true;
-    }
-    if (strcmp(name, "inflateRaw") == 0) {
-        *mode = CT_ZLIB_INFLATE_RAW;
-        return true;
-    }
-    if (strcmp(name, "gunzip") == 0) {
-        *mode = CT_ZLIB_GUNZIP;
-        return true;
-    }
-    if (strcmp(name, "unzip") == 0) {
-        *mode = CT_ZLIB_UNZIP;
-        return true;
-    }
-    if (strcmp(name, "brotliCompress") == 0) {
-        *mode = CT_ZLIB_BROTLI_COMPRESS;
-        return true;
-    }
-    if (strcmp(name, "brotliDecompress") == 0) {
-        *mode = CT_ZLIB_BROTLI_DECOMPRESS;
-        return true;
-    }
-    if (strcmp(name, "zstdCompress") == 0) {
-        *mode = CT_ZLIB_ZSTD_COMPRESS;
-        return true;
-    }
-    if (strcmp(name, "zstdDecompress") == 0) {
-        *mode = CT_ZLIB_ZSTD_DECOMPRESS;
-        return true;
-    }
-    return false;
-}
-
-static bool ct_zlib_mode_compresses(CtZlibMode mode) {
-    return mode == CT_ZLIB_DEFLATE || mode == CT_ZLIB_DEFLATE_RAW || mode == CT_ZLIB_GZIP || mode == CT_ZLIB_BROTLI_COMPRESS || mode == CT_ZLIB_ZSTD_COMPRESS;
-}
-
-static int ct_zlib_window_bits(CtZlibMode mode) {
-    switch (mode) {
-        case CT_ZLIB_DEFLATE:
-        case CT_ZLIB_INFLATE:
-            return MAX_WBITS;
-        case CT_ZLIB_DEFLATE_RAW:
-        case CT_ZLIB_INFLATE_RAW:
-            return -MAX_WBITS;
-        case CT_ZLIB_GZIP:
-        case CT_ZLIB_GUNZIP:
-            return MAX_WBITS + 16;
-        case CT_ZLIB_UNZIP:
-            return MAX_WBITS + 32;
-        case CT_ZLIB_BROTLI_COMPRESS:
-        case CT_ZLIB_BROTLI_DECOMPRESS:
-        case CT_ZLIB_ZSTD_COMPRESS:
-        case CT_ZLIB_ZSTD_DECOMPRESS:
-            return MAX_WBITS;
-    }
-    return MAX_WBITS;
-}
-
-static bool ct_brotli_apply_encoder_params(JSContextRef ctx, BrotliEncoderState *state, JSObjectRef options, JSValueRef *exception) {
-    if (options == NULL) return true;
-    JSValueRef params_value = ct_get_property(ctx, options, "params", exception);
-    if (exception != NULL && *exception != NULL) return false;
-    if (JSValueIsUndefined(ctx, params_value) || JSValueIsNull(ctx, params_value)) return true;
-    if (!JSValueIsObject(ctx, params_value)) {
-        ct_throw_message(ctx, exception, "options.params must be an object");
-        return false;
-    }
-
-    JSObjectRef params = (JSObjectRef)params_value;
-    for (unsigned int key = 0; key <= 9; key += 1) {
-        char property[16];
-        snprintf(property, sizeof(property), "%u", key);
-        JSValueRef value = ct_get_property(ctx, params, property, exception);
-        if (exception != NULL && *exception != NULL) return false;
-        if (JSValueIsUndefined(ctx, value)) continue;
-        double number = ct_value_to_number(ctx, value);
-        if (!isfinite(number) || number < 0 || number > UINT32_MAX || floor(number) != number ||
-            BrotliEncoderSetParameter(state, (BrotliEncoderParameter)key, (uint32_t)number) == BROTLI_FALSE) {
-            ct_throw_message(ctx, exception, "Setting Brotli parameter failed");
-            return false;
-        }
-    }
-    return true;
-}
-
-static CtBrotliEncoderHandle *ct_brotli_encoder_lookup(CtJscRuntime *runtime, uint32_t id) {
-    for (CtBrotliEncoderHandle *handle = runtime != NULL ? runtime->brotli_encoders : NULL;
-         handle != NULL;
-         handle = handle->next) {
-        if (handle->id == id) return handle;
-    }
-    return NULL;
-}
-
-static void ct_brotli_encoder_close_handle(CtJscRuntime *runtime, uint32_t id) {
-    if (runtime == NULL) return;
-    CtBrotliEncoderHandle **cursor = &runtime->brotli_encoders;
-    while (*cursor != NULL) {
-        CtBrotliEncoderHandle *handle = *cursor;
-        if (handle->id != id) {
-            cursor = &handle->next;
-            continue;
-        }
-        *cursor = handle->next;
-        BrotliEncoderDestroyInstance(handle->state);
-        free(handle);
-        return;
-    }
-}
-
-static void ct_brotli_encoder_destroy_all(CtJscRuntime *runtime) {
-    if (runtime == NULL) return;
-    while (runtime->brotli_encoders != NULL) {
-        CtBrotliEncoderHandle *handle = runtime->brotli_encoders;
-        runtime->brotli_encoders = handle->next;
-        BrotliEncoderDestroyInstance(handle->state);
-        free(handle);
-    }
-}
-
-static JSValueRef ct_brotli_encoder_create(
-    JSContextRef ctx,
-    JSObjectRef function,
-    JSObjectRef thisObject,
-    size_t argc,
-    const JSValueRef argv[],
-    JSValueRef *exception
-) {
-    (void)thisObject;
-    CtJscRuntime *runtime = (CtJscRuntime *)JSObjectGetPrivate(function);
-    if (runtime == NULL) {
-        ct_throw_message(ctx, exception, "Brotli runtime is unavailable");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    JSObjectRef options = NULL;
-    if (argc >= 1 && !JSValueIsUndefined(ctx, argv[0]) && !JSValueIsNull(ctx, argv[0])) {
-        if (!JSValueIsObject(ctx, argv[0])) {
-            ct_throw_message(ctx, exception, "Brotli options must be an object");
-            return JSValueMakeUndefined(ctx);
-        }
-        options = (JSObjectRef)argv[0];
-    }
-
-    BrotliEncoderState *state = BrotliEncoderCreateInstance(NULL, NULL, NULL);
-    if (state == NULL) {
-        ct_throw_message(ctx, exception, "Failed to initialize Brotli encoder");
-        return JSValueMakeUndefined(ctx);
-    }
-    if (!ct_brotli_apply_encoder_params(ctx, state, options, exception)) {
-        BrotliEncoderDestroyInstance(state);
-        return JSValueMakeUndefined(ctx);
-    }
-
-    CtBrotliEncoderHandle *handle = (CtBrotliEncoderHandle *)calloc(1, sizeof(CtBrotliEncoderHandle));
-    if (handle == NULL) {
-        BrotliEncoderDestroyInstance(state);
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-    uint32_t id = ++runtime->next_brotli_encoder_id;
-    if (id == 0) id = ++runtime->next_brotli_encoder_id;
-    handle->id = id;
-    handle->state = state;
-    handle->next = runtime->brotli_encoders;
-    runtime->brotli_encoders = handle;
-    return JSValueMakeNumber(ctx, (double)id);
-}
-
-static JSValueRef ct_brotli_encoder_write(
-    JSContextRef ctx,
-    JSObjectRef function,
-    JSObjectRef thisObject,
-    size_t argc,
-    const JSValueRef argv[],
-    JSValueRef *exception
-) {
-    (void)thisObject;
-    if (argc < 3) {
-        ct_throw_message(ctx, exception, "brotliEncoderWrite(id, data, operation) requires three arguments");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    CtJscRuntime *runtime = (CtJscRuntime *)JSObjectGetPrivate(function);
-    uint32_t id = 0;
-    uint32_t operation_number = 0;
-    if (!ct_value_to_uint32_checked(ctx, argv[0], &id, exception, "invalid Brotli encoder id") ||
-        !ct_value_to_uint32_checked(ctx, argv[2], &operation_number, exception, "invalid Brotli operation")) {
-        return JSValueMakeUndefined(ctx);
-    }
-    if (operation_number > (uint32_t)BROTLI_OPERATION_FINISH) {
-        ct_throw_message(ctx, exception, "invalid Brotli operation");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    CtBrotliEncoderHandle *handle = ct_brotli_encoder_lookup(runtime, id);
-    if (handle == NULL) {
-        ct_throw_message(ctx, exception, "Brotli encoder is closed");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    uint8_t *input = NULL;
-    size_t input_len = 0;
-    if (ct_get_bytes(ctx, argv[1], &input, &input_len) != 0) {
-        ct_throw_message(ctx, exception, "Brotli input must be an ArrayBuffer or typed array");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    size_t output_capacity = input_len > 65536 ? input_len : 65536;
-    uint8_t *output = (uint8_t *)malloc(output_capacity);
-    if (output == NULL) {
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    BrotliEncoderOperation operation = (BrotliEncoderOperation)operation_number;
-    const uint8_t *next_in = input;
-    size_t available_in = input_len;
-    uint8_t *next_out = output;
-    size_t available_out = output_capacity;
-    while (true) {
-        size_t before_in = available_in;
-        size_t before_used = (size_t)(next_out - output);
-        if (BrotliEncoderCompressStream(
-                handle->state,
-                operation,
-                &available_in,
-                &next_in,
-                &available_out,
-                &next_out,
-                NULL
-            ) == BROTLI_FALSE) {
-            free(output);
-            ct_throw_message(ctx, exception, "Brotli compression failed");
-            return JSValueMakeUndefined(ctx);
-        }
-
-        bool complete = operation == BROTLI_OPERATION_FINISH
-            ? BrotliEncoderIsFinished(handle->state) == BROTLI_TRUE
-            : available_in == 0 && BrotliEncoderHasMoreOutput(handle->state) == BROTLI_FALSE;
-        if (complete) break;
-
-        if (available_out == 0) {
-            size_t used = (size_t)(next_out - output);
-            if (output_capacity > (size_t)512 * 1024 * 1024) {
-                free(output);
-                ct_throw_message(ctx, exception, "Brotli output is too large");
-                return JSValueMakeUndefined(ctx);
-            }
-            size_t next_capacity = output_capacity * 2;
-            uint8_t *next_output = (uint8_t *)realloc(output, next_capacity);
-            if (next_output == NULL) {
-                free(output);
-                ct_throw_message(ctx, exception, "Out of memory");
-                return JSValueMakeUndefined(ctx);
-            }
-            output = next_output;
-            output_capacity = next_capacity;
-            next_out = output + used;
-            available_out = output_capacity - used;
-            continue;
-        }
-
-        if (before_in == available_in && before_used == (size_t)(next_out - output)) {
-            free(output);
-            ct_throw_message(ctx, exception, "Brotli encoder made no progress");
-            return JSValueMakeUndefined(ctx);
-        }
-    }
-
-    size_t output_len = (size_t)(next_out - output);
-    uint8_t *trimmed = (uint8_t *)realloc(output, output_len > 0 ? output_len : 1);
-    if (trimmed != NULL) output = trimmed;
-    return ct_uint8_array_from_owned_bytes(ctx, output, output_len, exception);
-}
-
-static JSValueRef ct_brotli_encoder_close(
-    JSContextRef ctx,
-    JSObjectRef function,
-    JSObjectRef thisObject,
-    size_t argc,
-    const JSValueRef argv[],
-    JSValueRef *exception
-) {
-    (void)thisObject;
-    if (argc < 1) return JSValueMakeUndefined(ctx);
-    uint32_t id = 0;
-    if (!ct_value_to_uint32_checked(ctx, argv[0], &id, exception, "invalid Brotli encoder id")) {
-        return JSValueMakeUndefined(ctx);
-    }
-    ct_brotli_encoder_close_handle((CtJscRuntime *)JSObjectGetPrivate(function), id);
-    return JSValueMakeUndefined(ctx);
-}
-
-static JSValueRef ct_brotli_transform_sync(
-    JSContextRef ctx,
-    CtZlibMode mode,
-    const uint8_t *input,
-    size_t input_len,
-    JSObjectRef options,
-    JSValueRef *exception
-) {
-    size_t output_capacity = mode == CT_ZLIB_BROTLI_COMPRESS
-        ? BrotliEncoderMaxCompressedSize(input_len)
-        : input_len * 4 + 1024;
-    if (output_capacity < 1024) output_capacity = 1024;
-
-    if (mode == CT_ZLIB_BROTLI_COMPRESS) {
-        BrotliEncoderState *state = BrotliEncoderCreateInstance(NULL, NULL, NULL);
-        if (state == NULL) {
-            ct_throw_message(ctx, exception, "Failed to initialize Brotli encoder");
-            return JSValueMakeUndefined(ctx);
-        }
-        if (!ct_brotli_apply_encoder_params(ctx, state, options, exception)) {
-            BrotliEncoderDestroyInstance(state);
-            return JSValueMakeUndefined(ctx);
-        }
-
-        uint8_t *output = (uint8_t *)malloc(output_capacity);
-        if (output == NULL) {
-            BrotliEncoderDestroyInstance(state);
-            ct_throw_message(ctx, exception, "Out of memory");
-            return JSValueMakeUndefined(ctx);
-        }
-        const uint8_t *next_in = input;
-        size_t available_in = input_len;
-        uint8_t *next_out = output;
-        size_t available_out = output_capacity;
-        while (true) {
-            if (BrotliEncoderCompressStream(
-                    state,
-                    BROTLI_OPERATION_FINISH,
-                    &available_in,
-                    &next_in,
-                    &available_out,
-                    &next_out,
-                    NULL
-                ) == BROTLI_FALSE) {
-                free(output);
-                BrotliEncoderDestroyInstance(state);
-                ct_throw_message(ctx, exception, "Brotli compression failed");
-                return JSValueMakeUndefined(ctx);
-            }
-            if (BrotliEncoderIsFinished(state) == BROTLI_TRUE) {
-                size_t output_len = (size_t)(next_out - output);
-                BrotliEncoderDestroyInstance(state);
-                return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
-            }
-            if (available_out > 0) continue;
-            size_t used = (size_t)(next_out - output);
-            if (output_capacity > (size_t)512 * 1024 * 1024) {
-                free(output);
-                BrotliEncoderDestroyInstance(state);
-                ct_throw_message(ctx, exception, "Brotli output is too large");
-                return JSValueMakeUndefined(ctx);
-            }
-            size_t next_capacity = output_capacity * 2;
-            uint8_t *next_output = (uint8_t *)realloc(output, next_capacity);
-            if (next_output == NULL) {
-                free(output);
-                BrotliEncoderDestroyInstance(state);
-                ct_throw_message(ctx, exception, "Out of memory");
-                return JSValueMakeUndefined(ctx);
-            }
-            output = next_output;
-            output_capacity = next_capacity;
-            next_out = output + used;
-            available_out = output_capacity - used;
-        }
-    }
-
-    for (int attempt = 0; attempt < 12; attempt += 1) {
-        uint8_t *output = (uint8_t *)malloc(output_capacity);
-        if (output == NULL) {
-            ct_throw_message(ctx, exception, "Out of memory");
-            return JSValueMakeUndefined(ctx);
-        }
-        size_t output_len = output_capacity;
-        bool succeeded = BrotliDecoderDecompress(input_len, input, &output_len, output) == BROTLI_DECODER_RESULT_SUCCESS;
-        if (succeeded) {
-            return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
-        }
-        free(output);
-        output_capacity *= 2;
-    }
-    ct_throw_message(ctx, exception, mode == CT_ZLIB_BROTLI_COMPRESS ? "Brotli compression failed" : "Brotli decompression failed");
-    return JSValueMakeUndefined(ctx);
-}
-
-typedef size_t (*CtZstdCompressBoundFn)(size_t src_size);
-typedef size_t (*CtZstdCompressFn)(void *dst, size_t dst_capacity, const void *src, size_t src_size, int compression_level);
-typedef unsigned long long (*CtZstdGetFrameContentSizeFn)(const void *src, size_t src_size);
-typedef size_t (*CtZstdDecompressFn)(void *dst, size_t dst_capacity, const void *src, size_t src_size);
-typedef unsigned int (*CtZstdIsErrorFn)(size_t code);
-typedef const char *(*CtZstdGetErrorNameFn)(size_t code);
-
-typedef struct {
-    bool attempted;
-    CtDynamicLibrary library;
-    CtZstdCompressBoundFn compress_bound;
-    CtZstdCompressFn compress;
-    CtZstdGetFrameContentSizeFn get_frame_content_size;
-    CtZstdDecompressFn decompress;
-    CtZstdIsErrorFn is_error;
-    CtZstdGetErrorNameFn get_error_name;
-} CtZstdApi;
-
-static CtZstdApi ct_zstd_api = {0};
-
-#define CT_ZSTD_CONTENTSIZE_UNKNOWN ((unsigned long long)-1)
-#define CT_ZSTD_CONTENTSIZE_ERROR ((unsigned long long)-2)
-
-#if defined(_WIN32)
-extern size_t ZSTD_compressBound(size_t src_size);
-extern size_t ZSTD_compress(void *dst, size_t dst_capacity, const void *src, size_t src_size, int compression_level);
-extern unsigned long long ZSTD_getFrameContentSize(const void *src, size_t src_size);
-extern size_t ZSTD_decompress(void *dst, size_t dst_capacity, const void *src, size_t src_size);
-extern unsigned int ZSTD_isError(size_t code);
-extern const char *ZSTD_getErrorName(size_t code);
-#endif
-
-static bool ct_zstd_is_available(void) {
-    return ct_zstd_api.compress_bound != NULL && ct_zstd_api.compress != NULL &&
-        ct_zstd_api.get_frame_content_size != NULL && ct_zstd_api.decompress != NULL &&
-        ct_zstd_api.is_error != NULL && ct_zstd_api.get_error_name != NULL;
-}
-
-static bool ct_zstd_load(void) {
-    if (ct_zstd_api.attempted) return ct_zstd_is_available();
-    ct_zstd_api.attempted = true;
-
-#if defined(_WIN32)
-    ct_zstd_api.compress_bound = ZSTD_compressBound;
-    ct_zstd_api.compress = ZSTD_compress;
-    ct_zstd_api.get_frame_content_size = ZSTD_getFrameContentSize;
-    ct_zstd_api.decompress = ZSTD_decompress;
-    ct_zstd_api.is_error = ZSTD_isError;
-    ct_zstd_api.get_error_name = ZSTD_getErrorName;
-    return ct_zstd_is_available();
-#else
-    const char *candidates[] = {
-#if defined(__APPLE__)
-        "libzstd.1.dylib",
-        "libzstd.dylib",
-        "/opt/homebrew/lib/libzstd.dylib",
-        "/usr/local/lib/libzstd.dylib",
-#else
-        "libzstd.so.1",
-        "libzstd.so",
-#endif
-    };
-    for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); index += 1) {
-        void *symbol = NULL;
-        if (ct_dynamic_library_open(&ct_zstd_api.library, candidates[index], NULL) != 0) continue;
-        if (ct_dynamic_library_symbol(&ct_zstd_api.library, "ZSTD_compressBound", &symbol, NULL) == 0)
-            ct_zstd_api.compress_bound = (CtZstdCompressBoundFn)symbol;
-        if (ct_dynamic_library_symbol(&ct_zstd_api.library, "ZSTD_compress", &symbol, NULL) == 0)
-            ct_zstd_api.compress = (CtZstdCompressFn)symbol;
-        if (ct_dynamic_library_symbol(&ct_zstd_api.library, "ZSTD_getFrameContentSize", &symbol, NULL) == 0)
-            ct_zstd_api.get_frame_content_size = (CtZstdGetFrameContentSizeFn)symbol;
-        if (ct_dynamic_library_symbol(&ct_zstd_api.library, "ZSTD_decompress", &symbol, NULL) == 0)
-            ct_zstd_api.decompress = (CtZstdDecompressFn)symbol;
-        if (ct_dynamic_library_symbol(&ct_zstd_api.library, "ZSTD_isError", &symbol, NULL) == 0)
-            ct_zstd_api.is_error = (CtZstdIsErrorFn)symbol;
-        if (ct_dynamic_library_symbol(&ct_zstd_api.library, "ZSTD_getErrorName", &symbol, NULL) == 0)
-            ct_zstd_api.get_error_name = (CtZstdGetErrorNameFn)symbol;
-        if (ct_zstd_api.compress_bound != NULL && ct_zstd_api.compress != NULL && ct_zstd_api.get_frame_content_size != NULL &&
-            ct_zstd_api.decompress != NULL && ct_zstd_api.is_error != NULL && ct_zstd_api.get_error_name != NULL) {
-            return true;
-        }
-        ct_dynamic_library_close(&ct_zstd_api.library);
-        ct_zstd_api.compress_bound = NULL;
-        ct_zstd_api.compress = NULL;
-        ct_zstd_api.get_frame_content_size = NULL;
-        ct_zstd_api.decompress = NULL;
-        ct_zstd_api.is_error = NULL;
-        ct_zstd_api.get_error_name = NULL;
-    }
-    return false;
-#endif
-}
-
-static JSValueRef ct_zstd_transform_sync(JSContextRef ctx, CtZlibMode mode, const uint8_t *input, size_t input_len, int level, JSValueRef *exception) {
-    if (!ct_zstd_load()) {
-        ct_throw_message(ctx, exception, "native Zstd support is unavailable");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    if (mode == CT_ZLIB_ZSTD_COMPRESS) {
-        size_t output_capacity = ct_zstd_api.compress_bound(input_len);
-        uint8_t *output = (uint8_t *)malloc(output_capacity > 0 ? output_capacity : 1);
-        if (output == NULL) {
-            ct_throw_message(ctx, exception, "Out of memory");
-            return JSValueMakeUndefined(ctx);
-        }
-        size_t output_len = ct_zstd_api.compress(output, output_capacity, input, input_len, level);
-        if (ct_zstd_api.is_error(output_len)) {
-            const char *message = ct_zstd_api.get_error_name(output_len);
-            free(output);
-            ct_throw_message(ctx, exception, message != NULL ? message : "Zstd compression failed");
-            return JSValueMakeUndefined(ctx);
-        }
-        return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
-    }
-
-    unsigned long long content_size = ct_zstd_api.get_frame_content_size(input, input_len);
-    if (content_size == CT_ZSTD_CONTENTSIZE_ERROR) {
-        ct_throw_message(ctx, exception, "Zstd decompression failed");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    size_t output_capacity = 0;
-    if (content_size != CT_ZSTD_CONTENTSIZE_UNKNOWN) {
-        output_capacity = (size_t)content_size;
-    } else {
-        output_capacity = input_len * 4 + 65536;
-        if (output_capacity < 65536) output_capacity = 65536;
-    }
-
-    for (int attempt = 0; attempt < 12; attempt += 1) {
-        uint8_t *output = (uint8_t *)malloc(output_capacity > 0 ? output_capacity : 1);
-        if (output == NULL) {
-            ct_throw_message(ctx, exception, "Out of memory");
-            return JSValueMakeUndefined(ctx);
-        }
-        size_t output_len = ct_zstd_api.decompress(output, output_capacity, input, input_len);
-        if (!ct_zstd_api.is_error(output_len)) {
-            return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
-        }
-        const char *message = ct_zstd_api.get_error_name(output_len);
-        free(output);
-        if (content_size != CT_ZSTD_CONTENTSIZE_UNKNOWN) {
-            ct_throw_message(ctx, exception, message != NULL ? message : "Zstd decompression failed");
-            return JSValueMakeUndefined(ctx);
-        }
-        output_capacity *= 2;
-    }
-
-    ct_throw_message(ctx, exception, "Zstd decompression failed");
-    return JSValueMakeUndefined(ctx);
-}
-
-static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 2) {
-        ct_throw_message(ctx, exception, "cottontail.zlibTransformSync(mode, data[, level]) requires mode and data");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    char *mode_name = ct_value_to_string_copy(ctx, argv[0]);
-    if (mode_name == NULL) {
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    CtZlibMode mode;
-    if (!ct_zlib_mode_from_name(mode_name, &mode)) {
-        ct_throw_message(ctx, exception, "Unsupported zlib mode");
-        free(mode_name);
-        return JSValueMakeUndefined(ctx);
-    }
-    free(mode_name);
-
-    uint8_t *input = NULL;
-    size_t input_len = 0;
-    if (ct_get_bytes(ctx, argv[1], &input, &input_len) != 0) {
-        ct_throw_message(ctx, exception, "zlib input must be an ArrayBuffer or typed array");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    int level = Z_DEFAULT_COMPRESSION;
-    int window_bits = ct_zlib_window_bits(mode);
-    int mem_level = MAX_MEM_LEVEL;
-    int strategy = Z_DEFAULT_STRATEGY;
-    int finish_flush = Z_FINISH;
-    size_t max_output_length = (size_t)-1;
-    JSObjectRef options_object = NULL;
-    uint8_t *dictionary = NULL;
-    size_t dictionary_len = 0;
-    if (argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2])) {
-        if (JSValueIsObject(ctx, argv[2])) {
-            JSObjectRef options = (JSObjectRef)argv[2];
-            options_object = options;
-            JSValueRef level_value = ct_get_property(ctx, options, "level", exception);
-            if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
-            if (!JSValueIsUndefined(ctx, level_value) && !JSValueIsNull(ctx, level_value)) level = (int)ct_value_to_number(ctx, level_value);
-            JSValueRef window_bits_value = ct_get_property(ctx, options, "windowBits", exception);
-            if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
-            if (!JSValueIsUndefined(ctx, window_bits_value) && !JSValueIsNull(ctx, window_bits_value)) window_bits = (int)ct_value_to_number(ctx, window_bits_value);
-            JSValueRef mem_level_value = ct_get_property(ctx, options, "memLevel", exception);
-            if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
-            if (!JSValueIsUndefined(ctx, mem_level_value) && !JSValueIsNull(ctx, mem_level_value)) mem_level = (int)ct_value_to_number(ctx, mem_level_value);
-            JSValueRef strategy_value = ct_get_property(ctx, options, "strategy", exception);
-            if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
-            if (!JSValueIsUndefined(ctx, strategy_value) && !JSValueIsNull(ctx, strategy_value)) strategy = (int)ct_value_to_number(ctx, strategy_value);
-            JSValueRef finish_flush_value = ct_get_property(ctx, options, "finishFlush", exception);
-            if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
-            if (!JSValueIsUndefined(ctx, finish_flush_value) && !JSValueIsNull(ctx, finish_flush_value)) finish_flush = (int)ct_value_to_number(ctx, finish_flush_value);
-            JSValueRef max_output_length_value = ct_get_property(ctx, options, "maxOutputLength", exception);
-            if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
-            if (!JSValueIsUndefined(ctx, max_output_length_value) && !JSValueIsNull(ctx, max_output_length_value)) {
-                double requested_max_output_length = ct_value_to_number(ctx, max_output_length_value);
-                if (requested_max_output_length > 0 && requested_max_output_length < (double)((size_t)-1)) {
-                    max_output_length = (size_t)requested_max_output_length;
-                }
-            }
-            JSValueRef dictionary_value = ct_get_property(ctx, options, "dictionary", exception);
-            if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
-            if (!JSValueIsUndefined(ctx, dictionary_value) && !JSValueIsNull(ctx, dictionary_value)) {
-                if (ct_get_bytes(ctx, dictionary_value, &dictionary, &dictionary_len) != 0) {
-                    ct_throw_message(ctx, exception, "zlib dictionary must be an ArrayBuffer or typed array");
-                    return JSValueMakeUndefined(ctx);
-                }
-            }
-        } else {
-            level = (int)ct_value_to_number(ctx, argv[2]);
-        }
-    }
-
-    if (mode == CT_ZLIB_BROTLI_COMPRESS || mode == CT_ZLIB_BROTLI_DECOMPRESS) {
-        return ct_brotli_transform_sync(ctx, mode, input, input_len, options_object, exception);
-    }
-
-    if (mode == CT_ZLIB_ZSTD_COMPRESS || mode == CT_ZLIB_ZSTD_DECOMPRESS) {
-        return ct_zstd_transform_sync(ctx, mode, input, input_len, level == Z_DEFAULT_COMPRESSION ? 3 : level, exception);
-    }
-
-    if (level < Z_NO_COMPRESSION || level > Z_BEST_COMPRESSION) level = Z_DEFAULT_COMPRESSION;
-    if (window_bits == 0) window_bits = ct_zlib_window_bits(mode);
-    // Node's public zlib API always accepts a positive 8..15 windowBits. The
-    // selected transform mode supplies zlib's raw/gzip wrapper modifier.
-    if ((mode == CT_ZLIB_DEFLATE_RAW || mode == CT_ZLIB_INFLATE_RAW) && window_bits > 0) {
-        window_bits = -window_bits;
-    } else if ((mode == CT_ZLIB_GZIP || mode == CT_ZLIB_GUNZIP) && window_bits <= MAX_WBITS) {
-        window_bits += 16;
-    } else if (mode == CT_ZLIB_UNZIP && window_bits <= MAX_WBITS) {
-        window_bits += 32;
-    }
-    if (mem_level < 1 || mem_level > MAX_MEM_LEVEL) mem_level = MAX_MEM_LEVEL;
-    if (strategy < Z_DEFAULT_STRATEGY || strategy > Z_FIXED) strategy = Z_DEFAULT_STRATEGY;
-    if (finish_flush < Z_NO_FLUSH || finish_flush > Z_TREES) finish_flush = Z_FINISH;
-
-    const bool compressing = ct_zlib_mode_compresses(mode);
-    size_t capacity = compressing ? (size_t)compressBound((uLong)input_len) + 64 : (input_len > 0 ? input_len * 3 : 65536);
-    if (capacity < 65536) capacity = 65536;
-    if (capacity > max_output_length) capacity = max_output_length;
-    uint8_t *output = (uint8_t *)malloc(capacity);
-    if (output == NULL) {
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    z_stream stream;
-    memset(&stream, 0, sizeof(stream));
-    stream.next_in = input;
-    stream.avail_in = (uInt)input_len;
-
-    int status = compressing
-        ? deflateInit2(&stream, level, Z_DEFLATED, window_bits, mem_level, strategy)
-        : inflateInit2(&stream, window_bits);
-    if (status != Z_OK) {
-        free(output);
-        ct_throw_message(ctx, exception, "Failed to initialize zlib stream");
-        return JSValueMakeUndefined(ctx);
-    }
-    if (dictionary != NULL && dictionary_len > 0 && compressing) {
-        status = deflateSetDictionary(&stream, dictionary, (uInt)dictionary_len);
-        if (status != Z_OK) {
-            free(output);
-            deflateEnd(&stream);
-            ct_throw_message(ctx, exception, "Failed to set zlib dictionary");
-            return JSValueMakeUndefined(ctx);
-        }
-    }
-
-    bool output_limit_exceeded = false;
-    while (true) {
-        if (stream.total_out >= capacity) {
-            if (capacity >= max_output_length) {
-                output_limit_exceeded = true;
-                status = Z_MEM_ERROR;
-                break;
-            }
-            if (capacity > (size_t)512 * 1024 * 1024) {
-                status = Z_MEM_ERROR;
-                break;
-            }
-            size_t next_capacity = capacity * 2;
-            if (next_capacity < capacity || next_capacity > max_output_length) next_capacity = max_output_length;
-            uint8_t *next_output = (uint8_t *)realloc(output, next_capacity);
-            if (next_output == NULL) {
-                status = Z_MEM_ERROR;
-                break;
-            }
-            output = next_output;
-            capacity = next_capacity;
-        }
-
-        const uLong previous_total_out = stream.total_out;
-        const uInt previous_avail_in = stream.avail_in;
-        stream.next_out = output + stream.total_out;
-        stream.avail_out = (uInt)(capacity - stream.total_out);
-        status = compressing ? deflate(&stream, finish_flush) : inflate(&stream, finish_flush);
-        if (!compressing && status == Z_NEED_DICT && dictionary != NULL && dictionary_len > 0) {
-            status = inflateSetDictionary(&stream, dictionary, (uInt)dictionary_len);
-            if (status == Z_OK) continue;
-        }
-        if (status == Z_STREAM_END) break;
-        if (finish_flush != Z_FINISH && stream.avail_in == 0 && (status == Z_OK || status == Z_BUF_ERROR)) {
-            status = Z_STREAM_END;
-            break;
-        }
-        if (status == Z_OK || status == Z_BUF_ERROR) {
-            if (stream.avail_out == 0) continue;
-            if (!compressing && (stream.total_out != previous_total_out || stream.avail_in != previous_avail_in)) continue;
-        }
-        break;
-    }
-
-    const size_t output_len = stream.total_out;
-    if (compressing) {
-        deflateEnd(&stream);
-    } else {
-        inflateEnd(&stream);
-    }
-
-    if (status != Z_STREAM_END) {
-        if (output_limit_exceeded) {
-            free(output);
-            ct_throw_message(ctx, exception, "COTTONTAIL_ZLIB_OUTPUT_LIMIT");
-            return JSValueMakeUndefined(ctx);
-        }
-        const char *message = stream.msg != NULL ? stream.msg : zError(status);
-        free(output);
-        ct_throw_message(ctx, exception, message != NULL ? message : "zlib transform failed");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    return ct_uint8_array_from_owned_bytes(ctx, output, output_len, exception);
 }
 
 typedef struct {
@@ -7277,100 +6368,6 @@ static JSValueRef ct_crypto_argon2_sync(JSContextRef ctx, JSObjectRef function, 
     }
 
     return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, tag_len, ct_array_buffer_free, NULL, exception);
-}
-
-static JSValueRef ct_password_hash_sync_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 5) {
-        ct_throw_message(ctx, exception, "passwordHashSync requires algorithm, password, timeCost, memoryCost, and bcryptCost");
-        return JSValueMakeUndefined(ctx);
-    }
-    uint8_t *password = NULL;
-    size_t password_len = 0;
-    if (ct_get_bytes(ctx, argv[1], &password, &password_len) != 0) {
-        ct_throw_message(ctx, exception, "password must be an ArrayBuffer or typed array");
-        return JSValueMakeUndefined(ctx);
-    }
-    size_t result_len = 0;
-    char *error = NULL;
-    uint8_t *result = ct_password_hash(
-        (int)ct_value_to_number(ctx, argv[0]),
-        password,
-        password_len,
-        (uint32_t)ct_value_to_number(ctx, argv[2]),
-        (uint32_t)ct_value_to_number(ctx, argv[3]),
-        (uint8_t)ct_value_to_number(ctx, argv[4]),
-        &result_len,
-        &error
-    );
-    if (result == NULL) {
-        ct_throw_message(ctx, exception, error != NULL ? error : "Password hashing failed");
-        if (error != NULL) ct_host_string_free(error);
-        return JSValueMakeUndefined(ctx);
-    }
-    JSValueRef value = ct_make_string_len(ctx, (const char *)result, result_len);
-    ct_host_buffer_free((char *)result);
-    return value;
-}
-
-static JSValueRef ct_password_verify_sync_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 3) {
-        ct_throw_message(ctx, exception, "passwordVerifySync requires algorithm, password, and hash");
-        return JSValueMakeUndefined(ctx);
-    }
-    uint8_t *password = NULL;
-    size_t password_len = 0;
-    uint8_t *hash = NULL;
-    size_t hash_len = 0;
-    if (ct_get_bytes(ctx, argv[1], &password, &password_len) != 0 || ct_get_bytes(ctx, argv[2], &hash, &hash_len) != 0) {
-        ct_throw_message(ctx, exception, "password and hash must be ArrayBuffers or typed arrays");
-        return JSValueMakeUndefined(ctx);
-    }
-    char *error = NULL;
-    int result = ct_password_verify(
-        (int)ct_value_to_number(ctx, argv[0]),
-        password,
-        password_len,
-        hash,
-        hash_len,
-        &error
-    );
-    if (result < 0) {
-        ct_throw_message(ctx, exception, error != NULL ? error : "Password verification failed");
-        if (error != NULL) ct_host_string_free(error);
-        return JSValueMakeUndefined(ctx);
-    }
-    return JSValueMakeBoolean(ctx, result == 1);
-}
-
-static JSValueRef ct_hash_value_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 2) {
-        ct_throw_message(ctx, exception, "hashValue requires an algorithm and input");
-        return JSValueMakeUndefined(ctx);
-    }
-    uint8_t *input = NULL;
-    size_t input_len = 0;
-    if (ct_get_bytes(ctx, argv[1], &input, &input_len) != 0) {
-        ct_throw_message(ctx, exception, "hash input must be an ArrayBuffer or typed array");
-        return JSValueMakeUndefined(ctx);
-    }
-    uint64_t seed = 0;
-    if (argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2])) {
-        char *seed_text = ct_value_to_string_copy(ctx, argv[2]);
-        if (seed_text != NULL) {
-            seed = (uint64_t)strtoull(seed_text, NULL, 10);
-            free(seed_text);
-        }
-    }
-    uint64_t result = ct_hash_value((int)ct_value_to_number(ctx, argv[0]), input, input_len, seed);
-    char result_text[32];
-    snprintf(result_text, sizeof(result_text), "%llu", (unsigned long long)result);
-    return ct_make_string(ctx, result_text);
 }
 
 static JSValueRef ct_crypto_ed25519_generate_key_pair(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -9762,1534 +8759,6 @@ static JSValueRef ct_crypto_cipher_get_auth_tag(JSContextRef ctx, JSObjectRef fu
 #endif
 }
 
-static CtSqliteDb *ct_sqlite_find_db(uint32_t id) {
-    CtSqliteDb *cursor = ct_sqlite_dbs;
-    while (cursor != NULL) {
-        if (cursor->id == id) return cursor;
-        cursor = cursor->next;
-    }
-    return NULL;
-}
-
-static CtSqliteStmt *ct_sqlite_find_stmt(uint32_t id) {
-    CtSqliteStmt *cursor = ct_sqlite_stmts;
-    while (cursor != NULL) {
-        if (cursor->id == id) return cursor;
-        cursor = cursor->next;
-    }
-    return NULL;
-}
-
-static CtSqliteSession *ct_sqlite_find_session(uint32_t id) {
-    CtSqliteSession *cursor = ct_sqlite_sessions;
-    while (cursor != NULL) {
-        if (cursor->id == id) return cursor;
-        cursor = cursor->next;
-    }
-    return NULL;
-}
-
-static CtSqliteEnableLoadExtensionFn ct_sqlite_enable_load_extension_fn(void) {
-    return sqlite3_enable_load_extension;
-}
-
-static CtSqliteLoadExtensionFn ct_sqlite_load_extension_fn(void) {
-    return sqlite3_load_extension;
-}
-
-static void ct_sqlite_throw(JSContextRef ctx, JSValueRef *exception, sqlite3 *db) {
-    ct_throw_message(ctx, exception, db != NULL ? sqlite3_errmsg(db) : "SQLite error");
-}
-
-static void ct_sqlite_unlink_stmt(CtSqliteStmt *stmt) {
-    if (stmt == NULL) return;
-    CtSqliteStmt **global_cursor = &ct_sqlite_stmts;
-    while (*global_cursor != NULL) {
-        if (*global_cursor == stmt) {
-            *global_cursor = stmt->next;
-            break;
-        }
-        global_cursor = &(*global_cursor)->next;
-    }
-    if (stmt->owner != NULL) {
-        CtSqliteStmt **owner_cursor = &stmt->owner->statements;
-        while (*owner_cursor != NULL) {
-            if (*owner_cursor == stmt) {
-                *owner_cursor = stmt->owner_next;
-                break;
-            }
-            owner_cursor = &(*owner_cursor)->owner_next;
-        }
-    }
-}
-
-static void ct_sqlite_finalize_stmt(CtSqliteStmt *stmt) {
-    if (stmt == NULL) return;
-    ct_sqlite_unlink_stmt(stmt);
-    if (stmt->stmt != NULL) sqlite3_finalize(stmt->stmt);
-    free(stmt);
-}
-
-static void ct_sqlite_unlink_session(CtSqliteSession *session) {
-    if (session == NULL) return;
-    CtSqliteSession **global_cursor = &ct_sqlite_sessions;
-    while (*global_cursor != NULL) {
-        if (*global_cursor == session) {
-            *global_cursor = session->next;
-            break;
-        }
-        global_cursor = &(*global_cursor)->next;
-    }
-    if (session->owner != NULL) {
-        CtSqliteSession **owner_cursor = &session->owner->sessions;
-        while (*owner_cursor != NULL) {
-            if (*owner_cursor == session) {
-                *owner_cursor = session->owner_next;
-                break;
-            }
-            owner_cursor = &(*owner_cursor)->owner_next;
-        }
-    }
-}
-
-static void ct_sqlite_delete_session(CtSqliteSession *session) {
-    if (session == NULL) return;
-    ct_sqlite_unlink_session(session);
-    if (session->session != NULL) sqlite3session_delete(session->session);
-    free(session);
-}
-
-static JSValueRef ct_sqlite_column_value(JSContextRef ctx, sqlite3_stmt *stmt, int column, bool safe_integers, JSValueRef *exception) {
-    int type = sqlite3_column_type(stmt, column);
-    switch (type) {
-        case SQLITE_INTEGER: {
-            sqlite3_int64 value = sqlite3_column_int64(stmt, column);
-            if (safe_integers) return JSBigIntCreateWithInt64(ctx, value, exception);
-            return JSValueMakeNumber(ctx, (double)value);
-        }
-        case SQLITE_FLOAT:
-            return JSValueMakeNumber(ctx, sqlite3_column_double(stmt, column));
-        case SQLITE_TEXT:
-            return ct_make_string_len(ctx, (const char *)sqlite3_column_text(stmt, column), (size_t)sqlite3_column_bytes(stmt, column));
-        case SQLITE_BLOB:
-            return ct_array_buffer_from_copy(ctx, (const char *)sqlite3_column_blob(stmt, column), (size_t)sqlite3_column_bytes(stmt, column), exception);
-        case SQLITE_NULL:
-        default:
-            return JSValueMakeNull(ctx);
-    }
-}
-
-static JSObjectRef ct_sqlite_row_object(JSContextRef ctx, sqlite3_stmt *stmt, bool safe_integers, JSValueRef *exception) {
-    int count = sqlite3_column_count(stmt);
-    JSObjectRef row = ct_make_object(ctx);
-    for (int index = 0; index < count; index += 1) {
-        const char *name = sqlite3_column_name(stmt, index);
-        ct_set_property(ctx, row, name != NULL ? name : "", ct_sqlite_column_value(ctx, stmt, index, safe_integers, exception), exception);
-    }
-    return row;
-}
-
-static JSObjectRef ct_sqlite_row_array(JSContextRef ctx, sqlite3_stmt *stmt, bool safe_integers, JSValueRef *exception) {
-    int count = sqlite3_column_count(stmt);
-    JSObjectRef row = ct_make_array(ctx, 0, NULL, exception);
-    for (int index = 0; index < count; index += 1) {
-        JSObjectSetPropertyAtIndex(ctx, row, (unsigned)index, ct_sqlite_column_value(ctx, stmt, index, safe_integers, exception), exception);
-    }
-    return row;
-}
-
-static int ct_sqlite_bind_string_value(JSContextRef ctx, sqlite3_stmt *stmt, int index, JSValueRef value, JSValueRef *exception) {
-    JSStringRef string = JSValueToStringCopy(ctx, value, exception);
-    if (string == NULL) return SQLITE_MISUSE;
-
-    const size_t length = JSStringGetLength(string);
-    const JSChar *characters = JSStringGetCharactersPtr(string);
-    for (size_t offset = 0; offset < length; offset += 1) {
-        // COTTONTAIL-COMPAT: Bun treats the byte-order-mark inverse as an
-        // invalid text conversion and binds an empty string, like lone surrogates.
-        if (characters != NULL && characters[offset] == 0xfffe) {
-            JSStringRelease(string);
-            return sqlite3_bind_text(stmt, index, "", 0, SQLITE_TRANSIENT);
-        }
-    }
-
-    const size_t capacity = JSStringGetMaximumUTF8CStringSize(string);
-    char *text = (char *)malloc(capacity > 0 ? capacity : 1);
-    if (text == NULL) {
-        JSStringRelease(string);
-        ct_throw_message(ctx, exception, "Out of memory");
-        return SQLITE_NOMEM;
-    }
-    const size_t written = JSStringGetUTF8CString(string, text, capacity);
-    JSStringRelease(string);
-    const size_t text_length = written > 0 ? written - 1 : 0;
-    if (text_length > INT_MAX) {
-        free(text);
-        ct_throw_message(ctx, exception, "SQLite bind parameter is too large");
-        return SQLITE_TOOBIG;
-    }
-    const int status = sqlite3_bind_text(stmt, index, text, (int)text_length, SQLITE_TRANSIENT);
-    free(text);
-    return status;
-}
-
-static int ct_sqlite_bind_value(JSContextRef ctx, sqlite3_stmt *stmt, int index, JSValueRef value, JSValueRef *exception) {
-    if (value == NULL || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value)) return sqlite3_bind_null(stmt, index);
-    if (JSValueIsBoolean(ctx, value)) return sqlite3_bind_int(stmt, index, ct_value_to_bool(ctx, value) ? 1 : 0);
-    if (JSValueIsNumber(ctx, value)) return sqlite3_bind_double(stmt, index, ct_value_to_number(ctx, value));
-    if (JSValueIsString(ctx, value)) return ct_sqlite_bind_string_value(ctx, stmt, index, value, exception);
-    uint8_t *bytes = NULL;
-    size_t bytes_len = 0;
-    if (ct_get_bytes(ctx, value, &bytes, &bytes_len) == 0) {
-        return sqlite3_bind_blob(stmt, index, bytes, (int)bytes_len, SQLITE_TRANSIENT);
-    }
-    return ct_sqlite_bind_string_value(ctx, stmt, index, value, exception);
-}
-
-static int ct_sqlite_bind_params(JSContextRef ctx, sqlite3_stmt *stmt, JSValueRef params, JSValueRef *exception) {
-    sqlite3_reset(stmt);
-    sqlite3_clear_bindings(stmt);
-    if (params == NULL || JSValueIsUndefined(ctx, params) || JSValueIsNull(ctx, params)) return SQLITE_OK;
-    if (!JSValueIsObject(ctx, params)) return SQLITE_OK;
-
-    JSObjectRef object = (JSObjectRef)params;
-    JSValueRef length_value = ct_get_property(ctx, object, "length", exception);
-    if (exception != NULL && *exception != NULL) return SQLITE_MISUSE;
-    size_t count = JSValueIsUndefined(ctx, length_value) ? 0 : (size_t)ct_value_to_number(ctx, length_value);
-    if (count > 0) {
-        for (size_t index = 0; index < count; index += 1) {
-            JSValueRef value = JSObjectGetPropertyAtIndex(ctx, object, (unsigned)index, exception);
-            if (exception != NULL && *exception != NULL) return SQLITE_MISUSE;
-            int status = ct_sqlite_bind_value(ctx, stmt, (int)index + 1, value, exception);
-            if (status != SQLITE_OK) return status;
-        }
-        return SQLITE_OK;
-    }
-
-    int bind_count = sqlite3_bind_parameter_count(stmt);
-    for (int index = 1; index <= bind_count; index += 1) {
-        const char *name = sqlite3_bind_parameter_name(stmt, index);
-        if (name == NULL || name[0] == '\0') continue;
-        JSValueRef value = ct_get_property(ctx, object, name, exception);
-        if (exception != NULL && *exception != NULL) return SQLITE_MISUSE;
-        if (JSValueIsUndefined(ctx, value) && (name[0] == ':' || name[0] == '$' || name[0] == '@')) {
-            value = ct_get_property(ctx, object, name + 1, exception);
-            if (exception != NULL && *exception != NULL) return SQLITE_MISUSE;
-        }
-        int status = ct_sqlite_bind_value(ctx, stmt, index, value, exception);
-        if (status != SQLITE_OK) return status;
-    }
-    return SQLITE_OK;
-}
-
-static JSValueRef ct_sqlite_value_to_js(JSContextRef ctx, sqlite3_value *value, JSValueRef *exception) {
-    switch (sqlite3_value_type(value)) {
-        case SQLITE_INTEGER:
-            return JSValueMakeNumber(ctx, (double)sqlite3_value_int64(value));
-        case SQLITE_FLOAT:
-            return JSValueMakeNumber(ctx, sqlite3_value_double(value));
-        case SQLITE_TEXT:
-            return ct_make_string_len(ctx, (const char *)sqlite3_value_text(value), (size_t)sqlite3_value_bytes(value));
-        case SQLITE_BLOB:
-            return ct_array_buffer_from_copy(ctx, (const char *)sqlite3_value_blob(value), (size_t)sqlite3_value_bytes(value), exception);
-        case SQLITE_NULL:
-        default:
-            return JSValueMakeNull(ctx);
-    }
-}
-
-static void ct_sqlite_result_from_js(sqlite3_context *sqlite_ctx, JSContextRef ctx, JSValueRef value) {
-    if (value == NULL || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value)) {
-        sqlite3_result_null(sqlite_ctx);
-        return;
-    }
-    if (JSValueIsBoolean(ctx, value)) {
-        sqlite3_result_int(sqlite_ctx, ct_value_to_bool(ctx, value) ? 1 : 0);
-        return;
-    }
-    if (JSValueIsNumber(ctx, value)) {
-        double number = ct_value_to_number(ctx, value);
-        sqlite3_result_double(sqlite_ctx, number);
-        return;
-    }
-    if (JSValueIsString(ctx, value)) {
-        char *text = ct_value_to_string_copy(ctx, value);
-        if (text == NULL) {
-            sqlite3_result_error_nomem(sqlite_ctx);
-            return;
-        }
-        sqlite3_result_text(sqlite_ctx, text, -1, SQLITE_TRANSIENT);
-        free(text);
-        return;
-    }
-    uint8_t *bytes = NULL;
-    size_t bytes_len = 0;
-    if (ct_get_bytes(ctx, value, &bytes, &bytes_len) == 0) {
-        sqlite3_result_blob(sqlite_ctx, bytes, (int)bytes_len, SQLITE_TRANSIENT);
-        return;
-    }
-    sqlite3_result_error(sqlite_ctx, "Unsupported SQLite function return value", -1);
-}
-
-static void ct_sqlite_function_destroy(void *opaque) {
-    CtSqliteFunction *entry = (CtSqliteFunction *)opaque;
-    if (entry == NULL) return;
-    if (entry->ctx != NULL && entry->callback != NULL) {
-        JSValueUnprotect(entry->ctx, entry->callback);
-    }
-    if (entry->ctx != NULL && entry->result_callback != NULL) {
-        JSValueUnprotect(entry->ctx, entry->result_callback);
-    }
-    if (entry->ctx != NULL && entry->start_callback != NULL) {
-        JSValueUnprotect(entry->ctx, entry->start_callback);
-    }
-    if (entry->ctx != NULL && entry->inverse_callback != NULL) {
-        JSValueUnprotect(entry->ctx, entry->inverse_callback);
-    }
-    if (entry->ctx != NULL && entry->has_start_value && entry->start_value != NULL) {
-        JSValueUnprotect(entry->ctx, entry->start_value);
-    }
-    free(entry);
-}
-
-static JSValueRef ct_sqlite_authorizer_string(JSContextRef ctx, const char *value) {
-    return value != NULL ? ct_make_string(ctx, value) : JSValueMakeNull(ctx);
-}
-
-static int ct_sqlite_authorizer_call(void *opaque, int action_code, const char *arg1, const char *arg2, const char *database_name, const char *trigger_or_view) {
-    CtSqliteFunction *entry = (CtSqliteFunction *)opaque;
-    if (entry == NULL || entry->ctx == NULL || entry->callback == NULL) return SQLITE_DENY;
-
-    JSValueRef args[] = {
-        JSValueMakeNumber(entry->ctx, action_code),
-        ct_sqlite_authorizer_string(entry->ctx, arg1),
-        ct_sqlite_authorizer_string(entry->ctx, arg2),
-        ct_sqlite_authorizer_string(entry->ctx, database_name),
-        ct_sqlite_authorizer_string(entry->ctx, trigger_or_view),
-    };
-    JSValueRef exception = NULL;
-    JSValueRef result = JSObjectCallAsFunction(entry->ctx, entry->callback, NULL, 5, args, &exception);
-    if (exception != NULL) return SQLITE_DENY;
-    double number = JSValueToNumber(entry->ctx, result, &exception);
-    if (exception != NULL || !isfinite(number)) return SQLITE_DENY;
-    int code = (int)number;
-    if ((double)code != number) return SQLITE_DENY;
-    if (code == SQLITE_OK || code == SQLITE_DENY || code == SQLITE_IGNORE) return code;
-    return SQLITE_DENY;
-}
-
-static void ct_sqlite_function_call(sqlite3_context *sqlite_ctx, int argc, sqlite3_value **argv) {
-    CtSqliteFunction *entry = (CtSqliteFunction *)sqlite3_user_data(sqlite_ctx);
-    if (entry == NULL || entry->ctx == NULL || entry->callback == NULL) {
-        sqlite3_result_error(sqlite_ctx, "SQLite function callback is unavailable", -1);
-        return;
-    }
-
-    JSValueRef *args = (JSValueRef *)calloc((size_t)(argc > 0 ? argc : 1), sizeof(JSValueRef));
-    if (args == NULL) {
-        sqlite3_result_error_nomem(sqlite_ctx);
-        return;
-    }
-    JSValueRef exception = NULL;
-    for (int index = 0; index < argc; index += 1) {
-        args[index] = ct_sqlite_value_to_js(entry->ctx, argv[index], &exception);
-        if (exception != NULL) {
-            char *message = ct_copy_exception(entry->ctx, exception);
-            sqlite3_result_error(sqlite_ctx, message != NULL ? message : "SQLite function argument conversion failed", -1);
-            free(message);
-            free(args);
-            return;
-        }
-    }
-
-    JSValueRef result = JSObjectCallAsFunction(entry->ctx, entry->callback, NULL, (size_t)argc, args, &exception);
-    free(args);
-    if (exception != NULL) {
-        char *message = ct_copy_exception(entry->ctx, exception);
-        sqlite3_result_error(sqlite_ctx, message != NULL ? message : "SQLite function callback failed", -1);
-        free(message);
-        return;
-    }
-    ct_sqlite_result_from_js(sqlite_ctx, entry->ctx, result);
-}
-
-static void ct_sqlite_aggregate_state_set_error(sqlite3_context *sqlite_ctx, CtSqliteAggregateState *state, char *message, const char *fallback) {
-    const char *text = fallback;
-    if (state != NULL) {
-        if (state->error_message == NULL) {
-            state->error_message = message != NULL ? message : ct_duplicate_bytes(fallback, strlen(fallback));
-        } else {
-            free(message);
-        }
-        text = state->error_message != NULL ? state->error_message : fallback;
-    } else if (message != NULL) {
-        text = message;
-    }
-    sqlite3_result_error(sqlite_ctx, text != NULL ? text : "SQLite aggregate callback failed", -1);
-    if (state == NULL) {
-        free(message);
-    }
-}
-
-static void ct_sqlite_aggregate_state_clear(CtSqliteFunction *entry, CtSqliteAggregateState *state) {
-    if (entry == NULL || state == NULL) return;
-    if (entry->ctx != NULL && state->initialized && state->accumulator != NULL) {
-        JSValueUnprotect(entry->ctx, state->accumulator);
-    }
-    free(state->error_message);
-    state->initialized = false;
-    state->accumulator = NULL;
-    state->error_message = NULL;
-}
-
-static bool ct_sqlite_aggregate_initialize(sqlite3_context *sqlite_ctx, CtSqliteFunction *entry, CtSqliteAggregateState *state) {
-    if (entry == NULL || entry->ctx == NULL || state == NULL) return false;
-    if (state->initialized) return state->error_message == NULL;
-
-    JSValueRef accumulator = NULL;
-    if (entry->start_callback != NULL) {
-        JSValueRef exception = NULL;
-        accumulator = JSObjectCallAsFunction(entry->ctx, entry->start_callback, NULL, 0, NULL, &exception);
-        if (exception != NULL) {
-            ct_sqlite_aggregate_state_set_error(sqlite_ctx, state, ct_copy_exception(entry->ctx, exception), "SQLite aggregate start callback failed");
-            return false;
-        }
-    } else if (entry->has_start_value) {
-        accumulator = entry->start_value;
-    } else {
-        accumulator = JSValueMakeUndefined(entry->ctx);
-    }
-
-    JSValueProtect(entry->ctx, accumulator);
-    state->accumulator = accumulator;
-    state->initialized = true;
-    return true;
-}
-
-static void ct_sqlite_aggregate_call(sqlite3_context *sqlite_ctx, int argc, sqlite3_value **argv, JSObjectRef callback, const char *name) {
-    CtSqliteFunction *entry = (CtSqliteFunction *)sqlite3_user_data(sqlite_ctx);
-    if (entry == NULL || entry->ctx == NULL || callback == NULL) {
-        sqlite3_result_error(sqlite_ctx, "SQLite aggregate callback is unavailable", -1);
-        return;
-    }
-
-    CtSqliteAggregateState *state = (CtSqliteAggregateState *)sqlite3_aggregate_context(sqlite_ctx, sizeof(CtSqliteAggregateState));
-    if (state == NULL) {
-        sqlite3_result_error_nomem(sqlite_ctx);
-        return;
-    }
-    if (state->error_message != NULL) {
-        sqlite3_result_error(sqlite_ctx, state->error_message, -1);
-        return;
-    }
-    if (!ct_sqlite_aggregate_initialize(sqlite_ctx, entry, state)) return;
-
-    size_t js_argc = (size_t)argc + 1;
-    JSValueRef *args = (JSValueRef *)calloc(js_argc > 0 ? js_argc : 1, sizeof(JSValueRef));
-    if (args == NULL) {
-        sqlite3_result_error_nomem(sqlite_ctx);
-        return;
-    }
-    args[0] = state->accumulator;
-
-    JSValueRef exception = NULL;
-    for (int index = 0; index < argc; index += 1) {
-        args[(size_t)index + 1] = ct_sqlite_value_to_js(entry->ctx, argv[index], &exception);
-        if (exception != NULL) {
-            ct_sqlite_aggregate_state_set_error(sqlite_ctx, state, ct_copy_exception(entry->ctx, exception), "SQLite aggregate argument conversion failed");
-            free(args);
-            return;
-        }
-    }
-
-    JSValueRef result = JSObjectCallAsFunction(entry->ctx, callback, NULL, js_argc, args, &exception);
-    free(args);
-    if (exception != NULL) {
-        char fallback[128];
-        snprintf(fallback, sizeof(fallback), "SQLite aggregate %s callback failed", name != NULL ? name : "step");
-        ct_sqlite_aggregate_state_set_error(sqlite_ctx, state, ct_copy_exception(entry->ctx, exception), fallback);
-        return;
-    }
-
-    JSValueProtect(entry->ctx, result);
-    if (state->accumulator != NULL) JSValueUnprotect(entry->ctx, state->accumulator);
-    state->accumulator = result;
-}
-
-static void ct_sqlite_aggregate_step(sqlite3_context *sqlite_ctx, int argc, sqlite3_value **argv) {
-    CtSqliteFunction *entry = (CtSqliteFunction *)sqlite3_user_data(sqlite_ctx);
-    ct_sqlite_aggregate_call(sqlite_ctx, argc, argv, entry != NULL ? entry->callback : NULL, "step");
-}
-
-static void ct_sqlite_aggregate_inverse(sqlite3_context *sqlite_ctx, int argc, sqlite3_value **argv) {
-    CtSqliteFunction *entry = (CtSqliteFunction *)sqlite3_user_data(sqlite_ctx);
-    ct_sqlite_aggregate_call(sqlite_ctx, argc, argv, entry != NULL ? entry->inverse_callback : NULL, "inverse");
-}
-
-static void ct_sqlite_aggregate_emit_result(sqlite3_context *sqlite_ctx, bool clear_state) {
-    CtSqliteFunction *entry = (CtSqliteFunction *)sqlite3_user_data(sqlite_ctx);
-    if (entry == NULL || entry->ctx == NULL) {
-        sqlite3_result_error(sqlite_ctx, "SQLite aggregate callback is unavailable", -1);
-        return;
-    }
-
-    CtSqliteAggregateState *state = (CtSqliteAggregateState *)sqlite3_aggregate_context(sqlite_ctx, sizeof(CtSqliteAggregateState));
-    if (state == NULL) {
-        sqlite3_result_error_nomem(sqlite_ctx);
-        return;
-    }
-    if (state->error_message != NULL) {
-        sqlite3_result_error(sqlite_ctx, state->error_message, -1);
-        if (clear_state) ct_sqlite_aggregate_state_clear(entry, state);
-        return;
-    }
-    if (!ct_sqlite_aggregate_initialize(sqlite_ctx, entry, state)) {
-        if (clear_state) ct_sqlite_aggregate_state_clear(entry, state);
-        return;
-    }
-
-    JSValueRef result = state->accumulator;
-    if (entry->result_callback != NULL) {
-        JSValueRef exception = NULL;
-        JSValueRef arg = state->accumulator;
-        result = JSObjectCallAsFunction(entry->ctx, entry->result_callback, NULL, 1, &arg, &exception);
-        if (exception != NULL) {
-            ct_sqlite_aggregate_state_set_error(sqlite_ctx, state, ct_copy_exception(entry->ctx, exception), "SQLite aggregate result callback failed");
-            if (clear_state) ct_sqlite_aggregate_state_clear(entry, state);
-            return;
-        }
-    }
-
-    ct_sqlite_result_from_js(sqlite_ctx, entry->ctx, result);
-    if (clear_state) ct_sqlite_aggregate_state_clear(entry, state);
-}
-
-static void ct_sqlite_aggregate_value(sqlite3_context *sqlite_ctx) {
-    ct_sqlite_aggregate_emit_result(sqlite_ctx, false);
-}
-
-static void ct_sqlite_aggregate_final(sqlite3_context *sqlite_ctx) {
-    ct_sqlite_aggregate_emit_result(sqlite_ctx, true);
-}
-
-static JSValueRef ct_sqlite_open(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 1) {
-        ct_throw_message(ctx, exception, "sqliteOpen(path) requires a path");
-        return JSValueMakeUndefined(ctx);
-    }
-    char *path = ct_value_to_string_copy(ctx, argv[0]);
-    if (path == NULL) {
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-    sqlite3 *db = NULL;
-    int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI;
-    if (argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2])) {
-        flags = (int)ct_value_to_number(ctx, argv[2]);
-    }
-    int status = sqlite3_open_v2(path, &db, flags, NULL);
-    free(path);
-    if (status != SQLITE_OK) {
-        ct_sqlite_throw(ctx, exception, db);
-        if (db != NULL) sqlite3_close(db);
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteDb *entry = (CtSqliteDb *)calloc(1, sizeof(CtSqliteDb));
-    if (entry == NULL) {
-        sqlite3_close(db);
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-    entry->id = ct_next_sqlite_db_id++;
-    if (ct_next_sqlite_db_id == 0) ct_next_sqlite_db_id = 1;
-    entry->db = db;
-    entry->allow_load_extension = argc >= 2 && ct_value_to_bool(ctx, argv[1]);
-    entry->load_extension_enabled = entry->allow_load_extension;
-    CtSqliteEnableLoadExtensionFn enable_load_extension = ct_sqlite_enable_load_extension_fn();
-    if (enable_load_extension != NULL) {
-        enable_load_extension(db, entry->load_extension_enabled ? 1 : 0);
-    }
-    entry->next = ct_sqlite_dbs;
-    ct_sqlite_dbs = entry;
-
-    JSObjectRef result = ct_make_object(ctx);
-    ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, entry->id), exception);
-    return result;
-}
-
-static JSValueRef ct_sqlite_close(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 1) {
-        ct_throw_message(ctx, exception, "sqliteClose(id) requires a database id");
-        return JSValueMakeUndefined(ctx);
-    }
-    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
-    CtSqliteDb **cursor = &ct_sqlite_dbs;
-    while (*cursor != NULL && (*cursor)->id != id) cursor = &(*cursor)->next;
-    if (*cursor == NULL) {
-        ct_throw_message(ctx, exception, "SQLite database not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteDb *entry = *cursor;
-    while (entry->sessions != NULL) ct_sqlite_delete_session(entry->sessions);
-    while (entry->statements != NULL) ct_sqlite_finalize_stmt(entry->statements);
-    sqlite3_set_authorizer(entry->db, NULL, NULL);
-    if (entry->authorizer != NULL) {
-        ct_sqlite_function_destroy(entry->authorizer);
-        entry->authorizer = NULL;
-    }
-    int status = sqlite3_close(entry->db);
-    if (status != SQLITE_OK) {
-        ct_sqlite_throw(ctx, exception, entry->db);
-        return JSValueMakeUndefined(ctx);
-    }
-    *cursor = entry->next;
-    free(entry);
-    return JSValueMakeUndefined(ctx);
-}
-
-static JSValueRef ct_sqlite_exec(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 2) {
-        ct_throw_message(ctx, exception, "sqliteExec(id, sql) requires database id and SQL");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite database not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    char *sql = ct_value_to_string_copy(ctx, argv[1]);
-    if (sql == NULL) {
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-    char *error_message = NULL;
-    int status = sqlite3_exec(entry->db, sql, NULL, NULL, &error_message);
-    free(sql);
-    if (status != SQLITE_OK) {
-        ct_throw_message(ctx, exception, error_message != NULL ? error_message : sqlite3_errmsg(entry->db));
-        sqlite3_free(error_message);
-        return JSValueMakeUndefined(ctx);
-    }
-    return JSValueMakeUndefined(ctx);
-}
-
-static JSValueRef ct_sqlite_prepare(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 2) {
-        ct_throw_message(ctx, exception, "sqlitePrepare(id, sql) requires database id and SQL");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite database not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    char *sql = ct_value_to_string_copy(ctx, argv[1]);
-    if (sql == NULL) {
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-    sqlite3_stmt *stmt = NULL;
-    int status = sqlite3_prepare_v2(entry->db, sql, -1, &stmt, NULL);
-    free(sql);
-    if (status != SQLITE_OK) {
-        ct_sqlite_throw(ctx, exception, entry->db);
-        return JSValueMakeUndefined(ctx);
-    }
-    if (stmt == NULL) {
-        ct_throw_message(ctx, exception, "Query contained no valid SQL statement; likely empty query.");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteStmt *stmt_entry = (CtSqliteStmt *)calloc(1, sizeof(CtSqliteStmt));
-    if (stmt_entry == NULL) {
-        sqlite3_finalize(stmt);
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-    stmt_entry->id = ct_next_sqlite_stmt_id++;
-    if (ct_next_sqlite_stmt_id == 0) ct_next_sqlite_stmt_id = 1;
-    stmt_entry->stmt = stmt;
-    stmt_entry->owner = entry;
-    stmt_entry->next = ct_sqlite_stmts;
-    ct_sqlite_stmts = stmt_entry;
-    stmt_entry->owner_next = entry->statements;
-    entry->statements = stmt_entry;
-
-    JSObjectRef result = ct_make_object(ctx);
-    ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, stmt_entry->id), exception);
-    ct_set_property(ctx, result, "sourceSQL", ct_make_string(ctx, sqlite3_sql(stmt) != NULL ? sqlite3_sql(stmt) : ""), exception);
-    ct_set_property(ctx, result, "paramsCount", JSValueMakeNumber(ctx, sqlite3_bind_parameter_count(stmt)), exception);
-    return result;
-}
-
-static JSValueRef ct_sqlite_statement_finalize(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 1) {
-        ct_throw_message(ctx, exception, "sqliteStatementFinalize(id) requires a statement id");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteStmt *stmt = ct_sqlite_find_stmt((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (stmt != NULL) ct_sqlite_finalize_stmt(stmt);
-    return JSValueMakeUndefined(ctx);
-}
-
-static JSValueRef ct_sqlite_statement_all(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 1) {
-        ct_throw_message(ctx, exception, "sqliteStatementAll(id[, params]) requires a statement id");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteStmt *entry = ct_sqlite_find_stmt((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite statement not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    int status = ct_sqlite_bind_params(ctx, entry->stmt, argc >= 2 ? argv[1] : NULL, exception);
-    if (status != SQLITE_OK) {
-        ct_sqlite_throw(ctx, exception, entry->owner->db);
-        return JSValueMakeUndefined(ctx);
-    }
-    JSObjectRef rows = ct_make_array(ctx, 0, NULL, exception);
-    unsigned row_index = 0;
-    bool safe_integers = argc >= 3 && ct_value_to_bool(ctx, argv[2]);
-    while ((status = sqlite3_step(entry->stmt)) == SQLITE_ROW) {
-        JSObjectSetPropertyAtIndex(ctx, rows, row_index++, ct_sqlite_row_object(ctx, entry->stmt, safe_integers, exception), exception);
-    }
-    if (status != SQLITE_DONE) {
-        ct_sqlite_throw(ctx, exception, entry->owner->db);
-        sqlite3_reset(entry->stmt);
-        return JSValueMakeUndefined(ctx);
-    }
-    sqlite3_reset(entry->stmt);
-    return rows;
-}
-
-static JSValueRef ct_sqlite_statement_get(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 1) {
-        ct_throw_message(ctx, exception, "sqliteStatementGet(id[, params]) requires a statement id");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteStmt *entry = ct_sqlite_find_stmt((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite statement not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    int status = ct_sqlite_bind_params(ctx, entry->stmt, argc >= 2 ? argv[1] : NULL, exception);
-    if (status != SQLITE_OK) {
-        ct_sqlite_throw(ctx, exception, entry->owner->db);
-        return JSValueMakeUndefined(ctx);
-    }
-    bool safe_integers = argc >= 3 && ct_value_to_bool(ctx, argv[2]);
-    status = sqlite3_step(entry->stmt);
-    if (status == SQLITE_ROW) {
-        JSObjectRef row = ct_sqlite_row_object(ctx, entry->stmt, safe_integers, exception);
-        sqlite3_reset(entry->stmt);
-        return row;
-    }
-    if (status != SQLITE_DONE) {
-        ct_sqlite_throw(ctx, exception, entry->owner->db);
-        sqlite3_reset(entry->stmt);
-        return JSValueMakeUndefined(ctx);
-    }
-    sqlite3_reset(entry->stmt);
-    return JSValueMakeUndefined(ctx);
-}
-
-static JSValueRef ct_sqlite_statement_values(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 1) {
-        ct_throw_message(ctx, exception, "sqliteStatementValues(id[, params]) requires a statement id");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteStmt *entry = ct_sqlite_find_stmt((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite statement not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    int status = ct_sqlite_bind_params(ctx, entry->stmt, argc >= 2 ? argv[1] : NULL, exception);
-    if (status != SQLITE_OK) {
-        ct_sqlite_throw(ctx, exception, entry->owner->db);
-        return JSValueMakeUndefined(ctx);
-    }
-    JSObjectRef rows = ct_make_array(ctx, 0, NULL, exception);
-    unsigned row_index = 0;
-    bool safe_integers = argc >= 3 && ct_value_to_bool(ctx, argv[2]);
-    while ((status = sqlite3_step(entry->stmt)) == SQLITE_ROW) {
-        JSObjectSetPropertyAtIndex(ctx, rows, row_index++, ct_sqlite_row_array(ctx, entry->stmt, safe_integers, exception), exception);
-    }
-    sqlite3_reset(entry->stmt);
-    if (status != SQLITE_DONE) {
-        ct_sqlite_throw(ctx, exception, entry->owner->db);
-        return JSValueMakeUndefined(ctx);
-    }
-    return rows;
-}
-
-static JSValueRef ct_sqlite_statement_run(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 1) {
-        ct_throw_message(ctx, exception, "sqliteStatementRun(id[, params]) requires a statement id");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteStmt *entry = ct_sqlite_find_stmt((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite statement not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    int status = ct_sqlite_bind_params(ctx, entry->stmt, argc >= 2 ? argv[1] : NULL, exception);
-    if (status != SQLITE_OK) {
-        ct_sqlite_throw(ctx, exception, entry->owner->db);
-        return JSValueMakeUndefined(ctx);
-    }
-    status = sqlite3_step(entry->stmt);
-    if (status != SQLITE_DONE && status != SQLITE_ROW) {
-        ct_sqlite_throw(ctx, exception, entry->owner->db);
-        sqlite3_reset(entry->stmt);
-        return JSValueMakeUndefined(ctx);
-    }
-    sqlite3_reset(entry->stmt);
-    JSObjectRef result = ct_make_object(ctx);
-    ct_set_property(ctx, result, "lastInsertRowid", JSValueMakeNumber(ctx, (double)sqlite3_last_insert_rowid(entry->owner->db)), exception);
-    ct_set_property(ctx, result, "changes", JSValueMakeNumber(ctx, sqlite3_stmt_readonly(entry->stmt) ? 0 : sqlite3_changes(entry->owner->db)), exception);
-    return result;
-}
-
-static JSValueRef ct_sqlite_statement_columns(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 1) {
-        ct_throw_message(ctx, exception, "sqliteStatementColumns(id) requires a statement id");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteStmt *entry = ct_sqlite_find_stmt((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite statement not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    int count = sqlite3_column_count(entry->stmt);
-    JSObjectRef columns = ct_make_array(ctx, 0, NULL, exception);
-    ct_set_property(ctx, columns, "readOnly", JSValueMakeBoolean(ctx, sqlite3_stmt_readonly(entry->stmt) != 0), exception);
-    for (int index = 0; index < count; index += 1) {
-        JSObjectRef column = ct_make_object(ctx);
-        const char *name = sqlite3_column_name(entry->stmt, index);
-        const char *declared_type = sqlite3_column_decltype(entry->stmt, index);
-        const char *table = sqlite3_column_table_name(entry->stmt, index);
-        const char *database = sqlite3_column_database_name(entry->stmt, index);
-        const char *origin = sqlite3_column_origin_name(entry->stmt, index);
-        ct_set_property(ctx, column, "name", ct_make_string(ctx, name != NULL ? name : ""), exception);
-        ct_set_property(ctx, column, "type", ct_make_string(ctx, declared_type != NULL ? declared_type : ""), exception);
-        ct_set_property(ctx, column, "column", ct_make_string(ctx, origin != NULL ? origin : ""), exception);
-        ct_set_property(ctx, column, "table", ct_make_string(ctx, table != NULL ? table : ""), exception);
-        ct_set_property(ctx, column, "database", ct_make_string(ctx, database != NULL ? database : ""), exception);
-        JSObjectSetPropertyAtIndex(ctx, columns, (unsigned)index, column, exception);
-    }
-    return columns;
-}
-
-static JSValueRef ct_sqlite_statement_expanded_sql(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 1) {
-        ct_throw_message(ctx, exception, "sqliteStatementExpandedSql(id) requires a statement id");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteStmt *entry = ct_sqlite_find_stmt((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite statement not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    char *expanded = sqlite3_expanded_sql(entry->stmt);
-    if (expanded == NULL) {
-        ct_throw_message(ctx, exception, "Failed to expand SQLite statement");
-        return JSValueMakeUndefined(ctx);
-    }
-    JSValueRef result = ct_make_string(ctx, expanded);
-    sqlite3_free(expanded);
-    return result;
-}
-
-static JSValueRef ct_sqlite_statement_parameter_names(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 1) {
-        ct_throw_message(ctx, exception, "sqliteStatementParameterNames(id) requires a statement id");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteStmt *entry = ct_sqlite_find_stmt((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite statement not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    int count = sqlite3_bind_parameter_count(entry->stmt);
-    JSObjectRef names = ct_make_array(ctx, 0, NULL, exception);
-    for (int index = 1; index <= count; index += 1) {
-        const char *name = sqlite3_bind_parameter_name(entry->stmt, index);
-        JSObjectSetPropertyAtIndex(ctx, names, (unsigned)(index - 1), name != NULL ? ct_make_string(ctx, name) : JSValueMakeNull(ctx), exception);
-    }
-    return names;
-}
-
-static const char *ct_sqlite_column_type_name(int type) {
-    switch (type) {
-        case SQLITE_INTEGER: return "INTEGER";
-        case SQLITE_FLOAT: return "FLOAT";
-        case SQLITE_TEXT: return "TEXT";
-        case SQLITE_BLOB: return "BLOB";
-        case SQLITE_NULL:
-        default: return "NULL";
-    }
-}
-
-static JSValueRef ct_sqlite_statement_column_types(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 1) {
-        ct_throw_message(ctx, exception, "sqliteStatementColumnTypes(id) requires a statement id");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteStmt *entry = ct_sqlite_find_stmt((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite statement not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    if (sqlite3_stmt_readonly(entry->stmt) == 0) {
-        ct_throw_message(ctx, exception, "columnTypes is not available for non-read-only statements (INSERT, UPDATE, DELETE, etc.)");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    int status = sqlite3_step(entry->stmt);
-    int count = sqlite3_column_count(entry->stmt);
-    JSObjectRef types = ct_make_array(ctx, 0, NULL, exception);
-    if (status == SQLITE_ROW) {
-        for (int index = 0; index < count; index += 1) {
-            JSObjectSetPropertyAtIndex(
-                ctx,
-                types,
-                (unsigned)index,
-                ct_make_string(ctx, ct_sqlite_column_type_name(sqlite3_column_type(entry->stmt, index))),
-                exception
-            );
-        }
-    }
-    sqlite3_reset(entry->stmt);
-    if (status != SQLITE_ROW && status != SQLITE_DONE) {
-        ct_sqlite_throw(ctx, exception, entry->owner->db);
-        return JSValueMakeUndefined(ctx);
-    }
-    return types;
-}
-
-static JSValueRef ct_sqlite_in_transaction(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 1) {
-        ct_throw_message(ctx, exception, "sqliteInTransaction(id) requires a database id");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite database not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    return JSValueMakeBoolean(ctx, sqlite3_get_autocommit(entry->db) == 0);
-}
-
-static JSValueRef ct_sqlite_create_function(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 5) {
-        ct_throw_message(ctx, exception, "sqliteCreateFunction(id, name, argc, flags, callback) requires five arguments");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite database not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    char *name = ct_value_to_string_copy(ctx, argv[1]);
-    if (name == NULL) {
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-    if (!JSValueIsObject(ctx, argv[4]) || !JSObjectIsFunction(ctx, (JSObjectRef)argv[4])) {
-        free(name);
-        ct_throw_message(ctx, exception, "SQLite function callback must be a function");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    CtSqliteFunction *callback = (CtSqliteFunction *)calloc(1, sizeof(CtSqliteFunction));
-    if (callback == NULL) {
-        free(name);
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-    callback->ctx = ctx;
-    callback->callback = (JSObjectRef)argv[4];
-    JSValueProtect(ctx, callback->callback);
-
-    int function_argc = (int)ct_value_to_number(ctx, argv[2]);
-    int flags = SQLITE_UTF8 | (int)ct_value_to_number(ctx, argv[3]);
-    int status = sqlite3_create_function_v2(
-        entry->db,
-        name,
-        function_argc,
-        flags,
-        callback,
-        ct_sqlite_function_call,
-        NULL,
-        NULL,
-        ct_sqlite_function_destroy
-    );
-    free(name);
-    if (status != SQLITE_OK) {
-        ct_sqlite_throw(ctx, exception, entry->db);
-        return JSValueMakeUndefined(ctx);
-    }
-    return JSValueMakeUndefined(ctx);
-}
-
-static JSValueRef ct_sqlite_create_aggregate(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 8) {
-        ct_throw_message(ctx, exception, "sqliteCreateAggregate(id, name, argc, flags, start, step, result, inverse) requires eight arguments");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite database not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    char *name = ct_value_to_string_copy(ctx, argv[1]);
-    if (name == NULL) {
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-    if (!JSValueIsObject(ctx, argv[5]) || !JSObjectIsFunction(ctx, (JSObjectRef)argv[5])) {
-        free(name);
-        ct_throw_message(ctx, exception, "SQLite aggregate step callback must be a function");
-        return JSValueMakeUndefined(ctx);
-    }
-    if (!JSValueIsUndefined(ctx, argv[6]) && !JSValueIsNull(ctx, argv[6]) && (!JSValueIsObject(ctx, argv[6]) || !JSObjectIsFunction(ctx, (JSObjectRef)argv[6]))) {
-        free(name);
-        ct_throw_message(ctx, exception, "SQLite aggregate result callback must be a function");
-        return JSValueMakeUndefined(ctx);
-    }
-    if (!JSValueIsUndefined(ctx, argv[7]) && !JSValueIsNull(ctx, argv[7]) && (!JSValueIsObject(ctx, argv[7]) || !JSObjectIsFunction(ctx, (JSObjectRef)argv[7]))) {
-        free(name);
-        ct_throw_message(ctx, exception, "SQLite aggregate inverse callback must be a function");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    CtSqliteFunction *callback = (CtSqliteFunction *)calloc(1, sizeof(CtSqliteFunction));
-    if (callback == NULL) {
-        free(name);
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-    callback->ctx = ctx;
-    callback->callback = (JSObjectRef)argv[5];
-    JSValueProtect(ctx, callback->callback);
-    if (JSValueIsObject(ctx, argv[4]) && JSObjectIsFunction(ctx, (JSObjectRef)argv[4])) {
-        callback->start_callback = (JSObjectRef)argv[4];
-        JSValueProtect(ctx, callback->start_callback);
-    } else {
-        callback->start_value = argv[4];
-        callback->has_start_value = true;
-        JSValueProtect(ctx, callback->start_value);
-    }
-    if (!JSValueIsUndefined(ctx, argv[6]) && !JSValueIsNull(ctx, argv[6])) {
-        callback->result_callback = (JSObjectRef)argv[6];
-        JSValueProtect(ctx, callback->result_callback);
-    }
-    if (!JSValueIsUndefined(ctx, argv[7]) && !JSValueIsNull(ctx, argv[7])) {
-        callback->inverse_callback = (JSObjectRef)argv[7];
-        JSValueProtect(ctx, callback->inverse_callback);
-    }
-
-    int function_argc = (int)ct_value_to_number(ctx, argv[2]);
-    int flags = SQLITE_UTF8 | (int)ct_value_to_number(ctx, argv[3]);
-    int status;
-    if (callback->inverse_callback != NULL) {
-        status = sqlite3_create_window_function(
-            entry->db,
-            name,
-            function_argc,
-            flags,
-            callback,
-            ct_sqlite_aggregate_step,
-            ct_sqlite_aggregate_final,
-            ct_sqlite_aggregate_value,
-            ct_sqlite_aggregate_inverse,
-            ct_sqlite_function_destroy
-        );
-    } else {
-        status = sqlite3_create_function_v2(
-            entry->db,
-            name,
-            function_argc,
-            flags,
-            callback,
-            NULL,
-            ct_sqlite_aggregate_step,
-            ct_sqlite_aggregate_final,
-            ct_sqlite_function_destroy
-        );
-    }
-    free(name);
-    if (status != SQLITE_OK) {
-        ct_sqlite_function_destroy(callback);
-        ct_sqlite_throw(ctx, exception, entry->db);
-        return JSValueMakeUndefined(ctx);
-    }
-    return JSValueMakeUndefined(ctx);
-}
-
-static JSValueRef ct_sqlite_set_authorizer(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 2) {
-        ct_throw_message(ctx, exception, "sqliteSetAuthorizer(id, callback) requires database id and callback");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite database not found");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    sqlite3_set_authorizer(entry->db, NULL, NULL);
-    if (entry->authorizer != NULL) {
-        ct_sqlite_function_destroy(entry->authorizer);
-        entry->authorizer = NULL;
-    }
-
-    if (JSValueIsNull(ctx, argv[1]) || JSValueIsUndefined(ctx, argv[1])) {
-        return JSValueMakeUndefined(ctx);
-    }
-    if (!JSValueIsObject(ctx, argv[1]) || !JSObjectIsFunction(ctx, (JSObjectRef)argv[1])) {
-        ct_throw_message(ctx, exception, "SQLite authorizer callback must be a function or null");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    CtSqliteFunction *callback = (CtSqliteFunction *)calloc(1, sizeof(CtSqliteFunction));
-    if (callback == NULL) {
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-    callback->ctx = ctx;
-    callback->callback = (JSObjectRef)argv[1];
-    JSValueProtect(ctx, callback->callback);
-
-    int status = sqlite3_set_authorizer(entry->db, ct_sqlite_authorizer_call, callback);
-    if (status != SQLITE_OK) {
-        ct_sqlite_function_destroy(callback);
-        ct_sqlite_throw(ctx, exception, entry->db);
-        return JSValueMakeUndefined(ctx);
-    }
-    entry->authorizer = callback;
-    return JSValueMakeUndefined(ctx);
-}
-
-static JSValueRef ct_sqlite_enable_load_extension(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 2) {
-        ct_throw_message(ctx, exception, "sqliteEnableLoadExtension(id, enabled) requires database id and enabled");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite database not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    if (!entry->allow_load_extension) {
-        ct_throw_message(ctx, exception, "Cannot enable extension loading because it was disabled at database creation.");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    bool enabled = ct_value_to_bool(ctx, argv[1]);
-    CtSqliteEnableLoadExtensionFn enable_load_extension = ct_sqlite_enable_load_extension_fn();
-    if (enable_load_extension == NULL) {
-        if (enabled) {
-            ct_throw_message(ctx, exception, "SQLite extension loading is unavailable in this SQLite build");
-            return JSValueMakeUndefined(ctx);
-        }
-    } else {
-        int status = enable_load_extension(entry->db, enabled ? 1 : 0);
-        if (status != SQLITE_OK) {
-            ct_sqlite_throw(ctx, exception, entry->db);
-            return JSValueMakeUndefined(ctx);
-        }
-    }
-    entry->load_extension_enabled = enabled;
-    return JSValueMakeUndefined(ctx);
-}
-
-static JSValueRef ct_sqlite_load_extension(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 2) {
-        ct_throw_message(ctx, exception, "sqliteLoadExtension(id, path) requires database id and path");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite database not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    if (!entry->allow_load_extension || !entry->load_extension_enabled) {
-        ct_throw_message(ctx, exception, "extension loading is not allowed");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteLoadExtensionFn load_extension = ct_sqlite_load_extension_fn();
-    if (load_extension == NULL) {
-        ct_throw_message(ctx, exception, "SQLite extension loading is unavailable in this SQLite build");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    char *path = ct_value_to_string_copy(ctx, argv[1]);
-    if (path == NULL) {
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-    char *error_message = NULL;
-    int status = load_extension(entry->db, path, NULL, &error_message);
-    free(path);
-    if (status != SQLITE_OK) {
-        ct_throw_message(ctx, exception, error_message != NULL ? error_message : sqlite3_errmsg(entry->db));
-        sqlite3_free(error_message);
-        return JSValueMakeUndefined(ctx);
-    }
-    return JSValueMakeUndefined(ctx);
-}
-
-static JSValueRef ct_sqlite_backup(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 2) {
-        ct_throw_message(ctx, exception, "sqliteBackup(id, path) requires database id and destination path");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteDb *source = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (source == NULL) {
-        ct_throw_message(ctx, exception, "SQLite database not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    char *path = ct_value_to_string_copy(ctx, argv[1]);
-    if (path == NULL) {
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    sqlite3 *destination = NULL;
-    int status = sqlite3_open_v2(path, &destination, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
-    free(path);
-    if (status != SQLITE_OK) {
-        ct_sqlite_throw(ctx, exception, destination);
-        if (destination != NULL) sqlite3_close(destination);
-        return JSValueMakeUndefined(ctx);
-    }
-
-    sqlite3_backup *backup = sqlite3_backup_init(destination, "main", source->db, "main");
-    if (backup == NULL) {
-        ct_sqlite_throw(ctx, exception, destination);
-        sqlite3_close(destination);
-        return JSValueMakeUndefined(ctx);
-    }
-    int pages = 0;
-    do {
-        status = sqlite3_backup_step(backup, 100);
-        pages += 100;
-    } while (status == SQLITE_OK || status == SQLITE_BUSY || status == SQLITE_LOCKED);
-    int finish_status = sqlite3_backup_finish(backup);
-    if (finish_status != SQLITE_OK) status = finish_status;
-    if (status != SQLITE_DONE) {
-        ct_sqlite_throw(ctx, exception, destination);
-        sqlite3_close(destination);
-        return JSValueMakeUndefined(ctx);
-    }
-    sqlite3_close(destination);
-    return JSValueMakeNumber(ctx, (double)pages);
-}
-
-static JSValueRef ct_sqlite_serialize(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 1) {
-        ct_throw_message(ctx, exception, "sqliteSerialize(id[, schema]) requires a database id");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite database not found");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    char *schema = NULL;
-    if (argc >= 2 && !JSValueIsUndefined(ctx, argv[1]) && !JSValueIsNull(ctx, argv[1])) {
-        schema = ct_value_to_string_copy(ctx, argv[1]);
-        if (schema == NULL) {
-            ct_throw_message(ctx, exception, "Out of memory");
-            return JSValueMakeUndefined(ctx);
-        }
-    }
-
-    sqlite3_int64 size = 0;
-    unsigned char *bytes = sqlite3_serialize(entry->db, schema != NULL ? schema : "main", &size, 0);
-    free(schema);
-    if (bytes == NULL) {
-        ct_sqlite_throw(ctx, exception, entry->db);
-        return JSValueMakeUndefined(ctx);
-    }
-
-    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, bytes, (size_t)size, ct_sqlite_array_buffer_free, NULL, exception);
-}
-
-static JSValueRef ct_sqlite_file_control(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 3) {
-        ct_throw_message(ctx, exception, "sqliteFileControl(id, fileName, op[, result]) requires database id, file name, and op");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite database not found");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    char *file_name = NULL;
-    if (!JSValueIsUndefined(ctx, argv[1]) && !JSValueIsNull(ctx, argv[1])) {
-        file_name = ct_value_to_string_copy(ctx, argv[1]);
-        if (file_name == NULL) {
-            ct_throw_message(ctx, exception, "Out of memory");
-            return JSValueMakeUndefined(ctx);
-        }
-    }
-
-    int op;
-    if (!ct_value_to_int_checked(ctx, argv[2], INT_MIN, INT_MAX, &op, exception, "invalid SQLite file-control operation")) {
-        free(file_name);
-        return JSValueMakeUndefined(ctx);
-    }
-    int result_int = -1;
-    void *result_ptr = NULL;
-    uint8_t *bytes = NULL;
-    size_t bytes_len = 0;
-    if (argc >= 4 && !JSValueIsUndefined(ctx, argv[3]) && !JSValueIsNull(ctx, argv[3])) {
-        if (ct_get_bytes(ctx, argv[3], &bytes, &bytes_len) == 0) {
-            result_ptr = bytes;
-        } else if (JSValueIsNumber(ctx, argv[3])) {
-            if (!ct_value_to_int_checked(ctx, argv[3], INT_MIN, INT_MAX, &result_int, exception, "invalid SQLite file-control argument")) {
-                free(file_name);
-                return JSValueMakeUndefined(ctx);
-            }
-            result_ptr = &result_int;
-        } else {
-            free(file_name);
-            ct_throw_message(ctx, exception, "sqliteFileControl result must be a number, null, ArrayBuffer, or typed array");
-            return JSValueMakeUndefined(ctx);
-        }
-    }
-
-    int status = sqlite3_file_control(entry->db, file_name, op, result_ptr);
-    free(file_name);
-    if (status == SQLITE_ERROR) {
-        ct_sqlite_throw(ctx, exception, entry->db);
-        return JSValueMakeUndefined(ctx);
-    }
-    return JSValueMakeNumber(ctx, status);
-}
-
-static JSValueRef ct_sqlite_session_create(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 1) {
-        ct_throw_message(ctx, exception, "sqliteSessionCreate(id[, dbName, table]) requires a database id");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite database not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    char *db_name = argc >= 2 ? ct_value_to_optional_string(ctx, argv[1]) : NULL;
-    char *table = argc >= 3 ? ct_value_to_optional_string(ctx, argv[2]) : NULL;
-
-    sqlite3_session *session = NULL;
-    int status = sqlite3session_create(entry->db, db_name != NULL ? db_name : "main", &session);
-    free(db_name);
-    if (status != SQLITE_OK) {
-        free(table);
-        ct_sqlite_throw(ctx, exception, entry->db);
-        return JSValueMakeUndefined(ctx);
-    }
-    status = sqlite3session_attach(session, table);
-    free(table);
-    if (status != SQLITE_OK) {
-        sqlite3session_delete(session);
-        ct_sqlite_throw(ctx, exception, entry->db);
-        return JSValueMakeUndefined(ctx);
-    }
-
-    CtSqliteSession *session_entry = (CtSqliteSession *)calloc(1, sizeof(CtSqliteSession));
-    if (session_entry == NULL) {
-        sqlite3session_delete(session);
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-    session_entry->id = ct_next_sqlite_session_id++;
-    if (ct_next_sqlite_session_id == 0) ct_next_sqlite_session_id = 1;
-    session_entry->session = session;
-    session_entry->owner = entry;
-    session_entry->next = ct_sqlite_sessions;
-    ct_sqlite_sessions = session_entry;
-    session_entry->owner_next = entry->sessions;
-    entry->sessions = session_entry;
-
-    JSObjectRef result = ct_make_object(ctx);
-    ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, session_entry->id), exception);
-    return result;
-}
-
-static JSValueRef ct_sqlite_session_changeset(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 2) {
-        ct_throw_message(ctx, exception, "sqliteSessionChangeset(id, patchset) requires a session id and patchset flag");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteSession *session = ct_sqlite_find_session((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (session == NULL) {
-        ct_throw_message(ctx, exception, "SQLite session not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    int byte_len = 0;
-    void *bytes = NULL;
-    bool patchset = ct_value_to_bool(ctx, argv[1]);
-    int status = patchset
-        ? sqlite3session_patchset(session->session, &byte_len, &bytes)
-        : sqlite3session_changeset(session->session, &byte_len, &bytes);
-    if (status != SQLITE_OK) {
-        if (bytes != NULL) sqlite3_free(bytes);
-        ct_sqlite_throw(ctx, exception, session->owner != NULL ? session->owner->db : NULL);
-        return JSValueMakeUndefined(ctx);
-    }
-    if (bytes == NULL || byte_len <= 0) {
-        if (bytes != NULL) sqlite3_free(bytes);
-        return ct_array_buffer_from_copy(ctx, "", 0, exception);
-    }
-    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, bytes, (size_t)byte_len, ct_sqlite_array_buffer_free, NULL, exception);
-}
-
-static JSValueRef ct_sqlite_session_close(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 1) {
-        ct_throw_message(ctx, exception, "sqliteSessionClose(id) requires a session id");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteSession *session = ct_sqlite_find_session((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (session != NULL) ct_sqlite_delete_session(session);
-    return JSValueMakeUndefined(ctx);
-}
-
-static int ct_sqlite_changeset_filter(void *opaque, const char *table) {
-    CtSqliteApplyCallbacks *callbacks = (CtSqliteApplyCallbacks *)opaque;
-    if (callbacks == NULL || callbacks->filter == NULL) return 1;
-    JSValueRef arg = ct_make_string(callbacks->ctx, table != NULL ? table : "");
-    JSValueRef call_exception = NULL;
-    JSValueRef result = JSObjectCallAsFunction(callbacks->ctx, callbacks->filter, NULL, 1, &arg, &call_exception);
-    if (call_exception != NULL) {
-        callbacks->error_message = ct_copy_exception(callbacks->ctx, call_exception);
-        return 0;
-    }
-    return ct_value_to_bool(callbacks->ctx, result) ? 1 : 0;
-}
-
-static int ct_sqlite_changeset_conflict(void *opaque, int reason, sqlite3_changeset_iter *iterator) {
-    (void)iterator;
-    CtSqliteApplyCallbacks *callbacks = (CtSqliteApplyCallbacks *)opaque;
-    if (callbacks == NULL || callbacks->conflict == NULL) return SQLITE_CHANGESET_ABORT;
-    JSValueRef arg = JSValueMakeNumber(callbacks->ctx, reason);
-    JSValueRef call_exception = NULL;
-    JSValueRef result = JSObjectCallAsFunction(callbacks->ctx, callbacks->conflict, NULL, 1, &arg, &call_exception);
-    if (call_exception != NULL) {
-        callbacks->error_message = ct_copy_exception(callbacks->ctx, call_exception);
-        return SQLITE_CHANGESET_ABORT;
-    }
-    return (int)ct_value_to_number(callbacks->ctx, result);
-}
-
-static JSValueRef ct_sqlite_apply_changeset(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 2) {
-        ct_throw_message(ctx, exception, "sqliteApplyChangeset(id, changeset[, filter, onConflict]) requires database id and changeset");
-        return JSValueMakeUndefined(ctx);
-    }
-    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (entry == NULL) {
-        ct_throw_message(ctx, exception, "SQLite database not found");
-        return JSValueMakeUndefined(ctx);
-    }
-    uint8_t *bytes = NULL;
-    size_t bytes_len = 0;
-    if (ct_get_bytes(ctx, argv[1], &bytes, &bytes_len) != 0 || bytes_len > INT_MAX) {
-        ct_throw_message(ctx, exception, "changeset must be an ArrayBuffer or typed array");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    CtSqliteApplyCallbacks callbacks;
-    memset(&callbacks, 0, sizeof(callbacks));
-    callbacks.ctx = ctx;
-    if (argc >= 3 && JSValueIsObject(ctx, argv[2]) && JSObjectIsFunction(ctx, (JSObjectRef)argv[2])) {
-        callbacks.filter = (JSObjectRef)argv[2];
-        JSValueProtect(ctx, callbacks.filter);
-    }
-    if (argc >= 4 && JSValueIsObject(ctx, argv[3]) && JSObjectIsFunction(ctx, (JSObjectRef)argv[3])) {
-        callbacks.conflict = (JSObjectRef)argv[3];
-        JSValueProtect(ctx, callbacks.conflict);
-    }
-
-    int status = sqlite3changeset_apply(
-        entry->db,
-        (int)bytes_len,
-        bytes,
-        callbacks.filter != NULL ? ct_sqlite_changeset_filter : NULL,
-        ct_sqlite_changeset_conflict,
-        &callbacks
-    );
-
-    if (callbacks.filter != NULL) JSValueUnprotect(ctx, callbacks.filter);
-    if (callbacks.conflict != NULL) JSValueUnprotect(ctx, callbacks.conflict);
-    if (callbacks.error_message != NULL) {
-        ct_throw_message(ctx, exception, callbacks.error_message);
-        free(callbacks.error_message);
-        return JSValueMakeUndefined(ctx);
-    }
-    if (status == SQLITE_ABORT) return JSValueMakeBoolean(ctx, false);
-    if (status != SQLITE_OK) {
-        ct_sqlite_throw(ctx, exception, entry->db);
-        return JSValueMakeUndefined(ctx);
-    }
-    return JSValueMakeBoolean(ctx, true);
-}
-
 static void ct_free_string_array(char **values, size_t count) {
     if (values == NULL) return;
     for (size_t index = 0; index < count; index += 1) free(values[index]);
@@ -12780,568 +10249,6 @@ static JSValueRef ct_arch(JSContextRef ctx, JSObjectRef function, JSObjectRef th
     (void)argv;
     (void)exception;
     return ct_make_string(ctx, CT_ARCH_STRING);
-}
-
-#if defined(_WIN32)
-static WCHAR ct_windows_secret_username[] = L"Cottontail";
-
-static bool ct_windows_secret_legacy_string_eligible(const JSChar *characters, size_t length) {
-    for (size_t index = 0; index < length; index += 1) {
-        unsigned int code_unit = (unsigned int)characters[index];
-        if (code_unit == 0) return false;
-        if (code_unit >= 0xd800 && code_unit <= 0xdbff) {
-            if (index + 1 >= length) return false;
-            unsigned int trailing = (unsigned int)characters[index + 1];
-            if (trailing < 0xdc00 || trailing > 0xdfff) return false;
-            index += 1;
-        } else if (code_unit >= 0xdc00 && code_unit <= 0xdfff) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static WCHAR *ct_windows_secret_target(
-    JSContextRef ctx,
-    JSValueRef service_value,
-    JSValueRef name_value,
-    bool *legacy_eligible_out,
-    DWORD *error_out,
-    JSValueRef *exception
-) {
-    /* TargetName lookup is case-insensitive. Canonical hex of the UTF-16 code
-       units preserves exact JavaScript string identity, including lone
-       surrogates and embedded NULs, without relying on target-name casing. */
-    static const WCHAR prefix[] = L"CottontailSecrets-v1-";
-    static const WCHAR hex[] = L"0123456789ABCDEF";
-    *legacy_eligible_out = false;
-    *error_out = ERROR_NOT_ENOUGH_MEMORY;
-
-    JSStringRef service = JSValueToStringCopy(ctx, service_value, exception);
-    if (service == NULL) return NULL;
-    if (exception != NULL && *exception != NULL) {
-        JSStringRelease(service);
-        return NULL;
-    }
-    JSStringRef name = JSValueToStringCopy(ctx, name_value, exception);
-    if (name == NULL || (exception != NULL && *exception != NULL)) {
-        if (name != NULL) JSStringRelease(name);
-        JSStringRelease(service);
-        return NULL;
-    }
-
-    size_t service_len = JSStringGetLength(service);
-    size_t name_len = JSStringGetLength(name);
-    const JSChar *service_characters = JSStringGetCharactersPtr(service);
-    const JSChar *name_characters = JSStringGetCharactersPtr(name);
-    *legacy_eligible_out =
-        ct_windows_secret_legacy_string_eligible(service_characters, service_len) &&
-        ct_windows_secret_legacy_string_eligible(name_characters, name_len);
-
-    size_t prefix_len = sizeof(prefix) / sizeof(prefix[0]) - 1;
-    if (service_len > SIZE_MAX / 4 || name_len > SIZE_MAX / 4) {
-        JSStringRelease(service);
-        JSStringRelease(name);
-        return NULL;
-    }
-    size_t service_hex_len = service_len * 4;
-    size_t name_hex_len = name_len * 4;
-    if (service_hex_len > SIZE_MAX - prefix_len - 2 ||
-        name_hex_len > SIZE_MAX - prefix_len - service_hex_len - 2) {
-        JSStringRelease(service);
-        JSStringRelease(name);
-        return NULL;
-    }
-    size_t target_len = prefix_len + service_hex_len + 1 + name_hex_len;
-    if (target_len > CRED_MAX_GENERIC_TARGET_NAME_LENGTH) {
-        JSStringRelease(service);
-        JSStringRelease(name);
-        *error_out = ERROR_BAD_LENGTH;
-        return NULL;
-    }
-    WCHAR *target = (WCHAR *)malloc((target_len + 1) * sizeof(WCHAR));
-    if (target == NULL) {
-        JSStringRelease(service);
-        JSStringRelease(name);
-        return NULL;
-    }
-    WCHAR *cursor = target;
-    memcpy(cursor, prefix, prefix_len * sizeof(WCHAR));
-    cursor += prefix_len;
-    for (size_t index = 0; index < service_len; index += 1) {
-        unsigned int code_unit = (unsigned int)service_characters[index];
-        *cursor++ = hex[(code_unit >> 12) & 0x0f];
-        *cursor++ = hex[(code_unit >> 8) & 0x0f];
-        *cursor++ = hex[(code_unit >> 4) & 0x0f];
-        *cursor++ = hex[code_unit & 0x0f];
-    }
-    *cursor++ = L'-';
-    for (size_t index = 0; index < name_len; index += 1) {
-        unsigned int code_unit = (unsigned int)name_characters[index];
-        *cursor++ = hex[(code_unit >> 12) & 0x0f];
-        *cursor++ = hex[(code_unit >> 8) & 0x0f];
-        *cursor++ = hex[(code_unit >> 4) & 0x0f];
-        *cursor++ = hex[code_unit & 0x0f];
-    }
-    *cursor = L'\0';
-    JSStringRelease(service);
-    JSStringRelease(name);
-    *error_out = ERROR_SUCCESS;
-    return target;
-}
-
-static WCHAR *ct_windows_secret_legacy_target(const char *service, const char *name) {
-    size_t service_len = strlen(service);
-    size_t name_len = strlen(name);
-    if (service_len > SIZE_MAX - name_len - 2) {
-        errno = ENOMEM;
-        return NULL;
-    }
-    size_t target_len = service_len + 1 + name_len;
-    char *target = (char *)malloc(target_len + 1);
-    if (target == NULL) {
-        errno = ENOMEM;
-        return NULL;
-    }
-    memcpy(target, service, service_len);
-    target[service_len] = '/';
-    memcpy(target + service_len + 1, name, name_len);
-    target[target_len] = '\0';
-    WCHAR *wide = ct_windows_utf8_to_wide(target);
-    free(target);
-    return wide;
-}
-
-static bool ct_windows_secret_legacy_matches(
-    PCREDENTIALW credential,
-    const WCHAR *target,
-    const WCHAR *username
-) {
-    /* The old service/name target was ambiguous at slashes. Old entries also
-       stored name as UserName, which conservatively attributes uncorrupted
-       entries. Case-insensitive overwrite history cannot be recovered. */
-    return credential != NULL &&
-        credential->TargetName != NULL &&
-        credential->UserName != NULL &&
-        wcscmp(credential->TargetName, target) == 0 &&
-        wcscmp(credential->UserName, username) == 0;
-}
-
-static bool ct_windows_secret_delete_matching_legacy(
-    const WCHAR *target,
-    const WCHAR *username,
-    bool *deleted_out,
-    DWORD *error_out
-) {
-    *deleted_out = false;
-    *error_out = ERROR_SUCCESS;
-    PCREDENTIALW credential = NULL;
-    if (!CredReadW(target, CRED_TYPE_GENERIC, 0, &credential)) {
-        DWORD error_code = GetLastError();
-        if (error_code == ERROR_NOT_FOUND) return true;
-        *error_out = error_code;
-        return false;
-    }
-    bool matches = ct_windows_secret_legacy_matches(credential, target, username);
-    CredFree(credential);
-    if (!matches) return true;
-
-    /* CredDeleteW has no conditional form, so keep this best-effort migration
-       path limited to an explicit delete (including public set-to-empty). */
-    if (CredDeleteW(target, CRED_TYPE_GENERIC, 0)) {
-        *deleted_out = true;
-        return true;
-    }
-    DWORD error_code = GetLastError();
-    if (error_code == ERROR_NOT_FOUND) return true;
-    *error_out = error_code;
-    return false;
-}
-
-static void ct_windows_secret_throw_error(JSContextRef ctx, JSValueRef *exception, DWORD error_code) {
-    if (exception == NULL) return;
-
-    WCHAR *wide_message = NULL;
-    DWORD wide_length = FormatMessageW(
-        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-        NULL,
-        error_code,
-        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-        (LPWSTR)&wide_message,
-        0,
-        NULL
-    );
-    size_t message_len = 0;
-    char *message = wide_length > 0
-        ? ct_windows_wide_to_utf8(wide_message, (size_t)wide_length, &message_len)
-        : NULL;
-    if (wide_message != NULL) LocalFree(wide_message);
-
-    const char *fallback = "Windows Credential Manager error";
-    if (message == NULL) {
-        message_len = strlen(fallback);
-        message = ct_duplicate_bytes(fallback, message_len);
-    }
-
-    char suffix[64];
-    int suffix_length = snprintf(suffix, sizeof(suffix), " (code: %lu)", (unsigned long)error_code);
-    if (suffix_length < 0) suffix_length = 0;
-    size_t suffix_len = (size_t)suffix_length;
-    char *message_with_code = NULL;
-    if (message != NULL && message_len <= SIZE_MAX - suffix_len - 1) {
-        message_with_code = (char *)malloc(message_len + suffix_len + 1);
-        if (message_with_code != NULL) {
-            memcpy(message_with_code, message, message_len);
-            memcpy(message_with_code + message_len, suffix, suffix_len);
-            message_with_code[message_len + suffix_len] = '\0';
-        }
-    }
-
-    const char *final_message = message_with_code != NULL
-        ? message_with_code
-        : (message != NULL ? message : fallback);
-    size_t final_message_len = message_with_code != NULL
-        ? message_len + suffix_len
-        : strlen(final_message);
-    JSValueRef argument = ct_make_string_len(ctx, final_message, final_message_len);
-    JSObjectRef error = JSObjectMakeError(ctx, 1, &argument, NULL);
-    ct_set_property(
-        ctx,
-        error,
-        "code",
-        ct_make_string(
-            ctx,
-            error_code == ERROR_ACCESS_DENIED
-                ? "ERR_SECRETS_ACCESS_DENIED"
-                : "ERR_SECRETS_PLATFORM_ERROR"
-        ),
-        NULL
-    );
-    *exception = error;
-    free(message_with_code);
-    free(message);
-}
-
-static bool ct_windows_secret_copy_key(
-    JSContextRef ctx,
-    size_t argc,
-    const JSValueRef argv[],
-    char **service_out,
-    char **name_out,
-    JSValueRef *exception
-) {
-    *service_out = NULL;
-    *name_out = NULL;
-    if (argc < 2) {
-        ct_throw_type_error(ctx, exception, "Windows Credential Manager requires service and name");
-        return false;
-    }
-    *service_out = ct_value_to_string_copy(ctx, argv[0]);
-    *name_out = ct_value_to_string_copy(ctx, argv[1]);
-    if (*service_out != NULL && *name_out != NULL) return true;
-    free(*service_out);
-    free(*name_out);
-    *service_out = NULL;
-    *name_out = NULL;
-    ct_throw_message(ctx, exception, "Out of memory");
-    return false;
-}
-#endif
-
-static JSValueRef ct_secret_get(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-#if defined(_WIN32)
-    char *service = NULL;
-    char *name = NULL;
-    if (!ct_windows_secret_copy_key(
-            ctx,
-            argc,
-            argv,
-            &service,
-            &name,
-            exception)) {
-        return JSValueMakeUndefined(ctx);
-    }
-    bool legacy_eligible = false;
-    DWORD target_error = ERROR_SUCCESS;
-    WCHAR *target = ct_windows_secret_target(
-        ctx,
-        argv[0],
-        argv[1],
-        &legacy_eligible,
-        &target_error,
-        exception
-    );
-    WCHAR *legacy_target = legacy_eligible
-        ? ct_windows_secret_legacy_target(service, name)
-        : NULL;
-    WCHAR *legacy_username = legacy_eligible
-        ? ct_windows_utf8_to_wide(name)
-        : NULL;
-    free(service);
-    free(name);
-    bool target_too_long = target == NULL && target_error == ERROR_BAD_LENGTH;
-    bool legacy_setup_failed =
-        legacy_eligible && (legacy_target == NULL || legacy_username == NULL);
-    if ((target == NULL && !target_too_long) || legacy_setup_failed) {
-        DWORD setup_error = legacy_setup_failed
-            ? ERROR_NOT_ENOUGH_MEMORY
-            : target_error;
-        free(target);
-        free(legacy_target);
-        free(legacy_username);
-        if (exception == NULL || *exception == NULL) {
-            ct_windows_secret_throw_error(ctx, exception, setup_error);
-        }
-        return JSValueMakeUndefined(ctx);
-    }
-
-    PCREDENTIALW credential = NULL;
-    BOOL read = target != NULL
-        ? CredReadW(target, CRED_TYPE_GENERIC, 0, &credential)
-        : FALSE;
-    DWORD error_code = target == NULL
-        ? ERROR_NOT_FOUND
-        : (read ? ERROR_SUCCESS : GetLastError());
-    if (!read && error_code == ERROR_NOT_FOUND && legacy_eligible) {
-        read = CredReadW(legacy_target, CRED_TYPE_GENERIC, 0, &credential);
-        error_code = read ? ERROR_SUCCESS : GetLastError();
-        if (read && !ct_windows_secret_legacy_matches(credential, legacy_target, legacy_username)) {
-            CredFree(credential);
-            credential = NULL;
-            read = FALSE;
-            error_code = ERROR_NOT_FOUND;
-        }
-    }
-    free(target);
-    free(legacy_target);
-    free(legacy_username);
-    if (!read) {
-        if (error_code == ERROR_NOT_FOUND) return JSValueMakeNull(ctx);
-        ct_windows_secret_throw_error(ctx, exception, error_code);
-        return JSValueMakeUndefined(ctx);
-    }
-
-    JSValueRef result = JSValueMakeNull(ctx);
-    if (credential->CredentialBlob != NULL && credential->CredentialBlobSize > 0) {
-        result = ct_make_string_len(
-            ctx,
-            (const char *)credential->CredentialBlob,
-            (size_t)credential->CredentialBlobSize
-        );
-    }
-    CredFree(credential);
-    return result;
-#else
-    (void)argc;
-    (void)argv;
-    ct_throw_message(ctx, exception, "Windows Credential Manager is unavailable on this platform");
-    return JSValueMakeUndefined(ctx);
-#endif
-}
-
-static JSValueRef ct_secret_set(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-#if defined(_WIN32)
-    char *service = NULL;
-    char *name = NULL;
-    if (argc < 3 ||
-        !ct_windows_secret_copy_key(
-            ctx,
-            argc,
-            argv,
-            &service,
-            &name,
-            exception)) {
-        if (argc < 3 && (exception == NULL || *exception == NULL)) {
-            ct_throw_type_error(ctx, exception, "Windows Credential Manager requires service, name, and value");
-        }
-        return JSValueMakeUndefined(ctx);
-    }
-    size_t value_len = 0;
-    char *value = ct_value_to_utf8_copy_checked(ctx, argv[2], &value_len, exception);
-    if (value == NULL) {
-        free(service);
-        free(name);
-        if (exception == NULL || *exception == NULL) ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-    bool legacy_eligible = false;
-    DWORD target_error = ERROR_SUCCESS;
-    WCHAR *target = ct_windows_secret_target(
-        ctx,
-        argv[0],
-        argv[1],
-        &legacy_eligible,
-        &target_error,
-        exception
-    );
-    bool needs_legacy_delete = value_len == 0 && legacy_eligible;
-    WCHAR *legacy_target = needs_legacy_delete
-        ? ct_windows_secret_legacy_target(service, name)
-        : NULL;
-    WCHAR *legacy_username = needs_legacy_delete
-        ? ct_windows_utf8_to_wide(name)
-        : NULL;
-    free(service);
-    free(name);
-    bool target_too_long = target == NULL && target_error == ERROR_BAD_LENGTH;
-    bool legacy_setup_failed =
-        needs_legacy_delete && (legacy_target == NULL || legacy_username == NULL);
-    if ((target == NULL && !(value_len == 0 && target_too_long)) ||
-        legacy_setup_failed) {
-        DWORD setup_error = legacy_setup_failed
-            ? ERROR_NOT_ENOUGH_MEMORY
-            : target_error;
-        free(target);
-        free(legacy_target);
-        free(legacy_username);
-        SecureZeroMemory(value, value_len);
-        free(value);
-        if (exception == NULL || *exception == NULL) {
-            ct_windows_secret_throw_error(ctx, exception, setup_error);
-        }
-        return JSValueMakeUndefined(ctx);
-    }
-
-    BOOL written = FALSE;
-    DWORD error_code = ERROR_SUCCESS;
-    if (value_len == 0) {
-        written = target != NULL
-            ? CredDeleteW(target, CRED_TYPE_GENERIC, 0)
-            : TRUE;
-        error_code = target == NULL || written ? ERROR_SUCCESS : GetLastError();
-        if (!written && error_code == ERROR_NOT_FOUND) {
-            written = TRUE;
-            error_code = ERROR_SUCCESS;
-        }
-        if (written && needs_legacy_delete) {
-            bool legacy_deleted = false;
-            if (!ct_windows_secret_delete_matching_legacy(
-                    legacy_target,
-                    legacy_username,
-                    &legacy_deleted,
-                    &error_code)) {
-                written = FALSE;
-            }
-        }
-    } else {
-        CREDENTIALW credential;
-        memset(&credential, 0, sizeof(credential));
-        credential.Type = CRED_TYPE_GENERIC;
-        credential.TargetName = target;
-        credential.UserName = ct_windows_secret_username;
-        credential.CredentialBlobSize = (DWORD)value_len;
-        credential.CredentialBlob = (LPBYTE)value;
-        credential.Persist = CRED_PERSIST_ENTERPRISE;
-        written = CredWriteW(&credential, 0);
-        error_code = written ? ERROR_SUCCESS : GetLastError();
-    }
-
-    free(target);
-    free(legacy_target);
-    free(legacy_username);
-    SecureZeroMemory(value, value_len);
-    free(value);
-    if (!written) {
-        ct_windows_secret_throw_error(ctx, exception, error_code);
-        return JSValueMakeUndefined(ctx);
-    }
-    return JSValueMakeUndefined(ctx);
-#else
-    (void)argc;
-    (void)argv;
-    ct_throw_message(ctx, exception, "Windows Credential Manager is unavailable on this platform");
-    return JSValueMakeUndefined(ctx);
-#endif
-}
-
-static JSValueRef ct_secret_delete(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-#if defined(_WIN32)
-    char *service = NULL;
-    char *name = NULL;
-    if (!ct_windows_secret_copy_key(
-            ctx,
-            argc,
-            argv,
-            &service,
-            &name,
-            exception)) {
-        return JSValueMakeUndefined(ctx);
-    }
-    bool legacy_eligible = false;
-    DWORD target_error = ERROR_SUCCESS;
-    WCHAR *target = ct_windows_secret_target(
-        ctx,
-        argv[0],
-        argv[1],
-        &legacy_eligible,
-        &target_error,
-        exception
-    );
-    WCHAR *legacy_target = legacy_eligible
-        ? ct_windows_secret_legacy_target(service, name)
-        : NULL;
-    WCHAR *legacy_username = legacy_eligible
-        ? ct_windows_utf8_to_wide(name)
-        : NULL;
-    free(service);
-    free(name);
-    bool target_too_long = target == NULL && target_error == ERROR_BAD_LENGTH;
-    bool legacy_setup_failed =
-        legacy_eligible && (legacy_target == NULL || legacy_username == NULL);
-    if ((target == NULL && !target_too_long) || legacy_setup_failed) {
-        DWORD setup_error = legacy_setup_failed
-            ? ERROR_NOT_ENOUGH_MEMORY
-            : target_error;
-        free(target);
-        free(legacy_target);
-        free(legacy_username);
-        if (exception == NULL || *exception == NULL) {
-            ct_windows_secret_throw_error(ctx, exception, setup_error);
-        }
-        return JSValueMakeUndefined(ctx);
-    }
-
-    BOOL deleted = target != NULL
-        ? CredDeleteW(target, CRED_TYPE_GENERIC, 0)
-        : FALSE;
-    DWORD error_code = target == NULL
-        ? ERROR_NOT_FOUND
-        : (deleted ? ERROR_SUCCESS : GetLastError());
-    if (!deleted && error_code != ERROR_NOT_FOUND) {
-        free(target);
-        free(legacy_target);
-        free(legacy_username);
-        ct_windows_secret_throw_error(ctx, exception, error_code);
-        return JSValueMakeUndefined(ctx);
-    }
-    bool legacy_deleted = false;
-    bool legacy_ok = !legacy_eligible ||
-        ct_windows_secret_delete_matching_legacy(
-            legacy_target,
-            legacy_username,
-            &legacy_deleted,
-            &error_code
-        );
-    free(target);
-    free(legacy_target);
-    free(legacy_username);
-    if (!legacy_ok) {
-        ct_windows_secret_throw_error(ctx, exception, error_code);
-        return JSValueMakeUndefined(ctx);
-    }
-    return JSValueMakeBoolean(ctx, deleted || legacy_deleted);
-#else
-    (void)argc;
-    (void)argv;
-    ct_throw_message(ctx, exception, "Windows Credential Manager is unavailable on this platform");
-    return JSValueMakeUndefined(ctx);
-#endif
 }
 
 static JSValueRef ct_hostname(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -22093,67 +19000,14 @@ static JSValueRef ct_os_set_priority(JSContextRef ctx, JSObjectRef function, JSO
     return JSValueMakeUndefined(ctx);
 }
 
-struct CtFfiCallback {
-    CtJscRuntime *runtime;
-    JSContextRef ctx;
-    JSObjectRef function;
-    CtFfiType returns;
-    CtFfiType arg_types[CT_FFI_MAX_ARGS];
-    ffi_type *ffi_arg_types[CT_FFI_MAX_ARGS];
-    size_t argc;
-    bool threadsafe;
-    pthread_t owner_thread;
-    ffi_cif cif;
-    ffi_closure *closure;
-    void *code;
-    bool closed;
-    struct CtFfiCallback *next;
-};
-
 typedef struct CtNativeLibrary {
     char *path;
     CtDynamicLibrary library;
     struct CtNativeLibrary *next;
 } CtNativeLibrary;
 
-typedef enum CtPreparedFfiFastPath {
-    CT_PREPARED_FFI_FAST_PATH_NONE,
-    CT_PREPARED_FFI_FAST_PATH_I32_TO_I32,
-} CtPreparedFfiFastPath;
-
-static CtJscEncodedValue ct_prepared_ffi_i32_call(
-    CtJscInvocation *invocation,
-    void *user_data
-) {
-    const CtJscEncodedValue value = ct_jsc_invocation_argument(invocation, 0);
-    const int32_t argument = ct_jsc_value_to_int32(invocation, value);
-    if (ct_jsc_invocation_has_exception(invocation)) {
-        return ct_jsc_make_undefined(invocation);
-    }
-    int32_t (*native_call)(int32_t) = (int32_t (*)(int32_t))user_data;
-    return ct_jsc_make_int32(invocation, native_call(argument));
-}
-
-typedef struct CtPreparedFfiCall {
-    void *function_pointer;
-    CtFfiType returns;
-    CtFfiType arg_types[CT_FFI_MAX_ARGS];
-    uint8_t return_type_id;
-    uint8_t arg_type_ids[CT_FFI_MAX_ARGS];
-    ffi_type *ffi_arg_types[CT_FFI_MAX_ARGS];
-    size_t argc;
-    ffi_cif cif;
-    CtNapiEnv *napi_env;
-    JSObjectRef callback_constructor;
-    JSObjectRef cstring_constructor;
-    CtPreparedFfiFastPath fast_path;
-} CtPreparedFfiCall;
-
 static pthread_mutex_t ct_native_libraries_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtNativeLibrary *ct_native_libraries = NULL;
-static pthread_mutex_t ct_prepared_ffi_class_mutex = PTHREAD_MUTEX_INITIALIZER;
-static JSClassRef ct_prepared_ffi_class = NULL;
-
 static CtNativeLibrary *ct_find_native_library_locked(const char *path) {
     for (CtNativeLibrary *entry = ct_native_libraries; entry != NULL; entry = entry->next) {
         if (strcmp(entry->path, path) == 0) return entry;
@@ -22207,707 +19061,6 @@ static CtNativeLibrary *ct_get_native_library(const char *path, char **error_out
         return existing;
     }
     return entry;
-}
-
-static ffi_type *ct_ffi_libffi_type(CtFfiType type) {
-    switch (type) {
-        case CT_FFI_TYPE_VOID:
-            return &ffi_type_void;
-        case CT_FFI_TYPE_BOOL:
-        case CT_FFI_TYPE_U8:
-            return &ffi_type_uint8;
-        case CT_FFI_TYPE_I8:
-            return &ffi_type_sint8;
-        case CT_FFI_TYPE_U16:
-            return &ffi_type_uint16;
-        case CT_FFI_TYPE_I16:
-            return &ffi_type_sint16;
-        case CT_FFI_TYPE_U32:
-            return &ffi_type_uint32;
-        case CT_FFI_TYPE_I32:
-            return &ffi_type_sint32;
-        case CT_FFI_TYPE_U64:
-            return &ffi_type_uint64;
-        case CT_FFI_TYPE_I64:
-            return &ffi_type_sint64;
-        case CT_FFI_TYPE_F32:
-            return &ffi_type_float;
-        case CT_FFI_TYPE_F64:
-            return &ffi_type_double;
-        case CT_FFI_TYPE_PTR:
-        case CT_FFI_TYPE_CSTRING:
-        case CT_FFI_TYPE_FUNCTION:
-        case CT_FFI_TYPE_NAPI_ENV:
-        case CT_FFI_TYPE_NAPI_VALUE:
-            return &ffi_type_pointer;
-    }
-
-    return &ffi_type_pointer;
-}
-
-static bool ct_ffi_type_from_name(const char *name, CtFfiType *out) {
-    if (strcmp(name, "void") == 0) *out = CT_FFI_TYPE_VOID;
-    else if (strcmp(name, "bool") == 0) *out = CT_FFI_TYPE_BOOL;
-    else if (strcmp(name, "u8") == 0 || strcmp(name, "uint8_t") == 0) *out = CT_FFI_TYPE_U8;
-    else if (strcmp(name, "i8") == 0 || strcmp(name, "int8_t") == 0) *out = CT_FFI_TYPE_I8;
-    else if (strcmp(name, "u16") == 0 || strcmp(name, "uint16_t") == 0) *out = CT_FFI_TYPE_U16;
-    else if (strcmp(name, "i16") == 0 || strcmp(name, "int16_t") == 0) *out = CT_FFI_TYPE_I16;
-    else if (strcmp(name, "int") == 0) *out = CT_FFI_TYPE_I32;
-    else if (strcmp(name, "u32") == 0 || strcmp(name, "uint32_t") == 0) *out = CT_FFI_TYPE_U32;
-    else if (strcmp(name, "i32") == 0 || strcmp(name, "int32_t") == 0) *out = CT_FFI_TYPE_I32;
-    else if (strcmp(name, "u64") == 0 || strcmp(name, "uint64_t") == 0 || strcmp(name, "usize") == 0 || strcmp(name, "size_t") == 0) *out = CT_FFI_TYPE_U64;
-    else if (strcmp(name, "i64") == 0 || strcmp(name, "int64_t") == 0 || strcmp(name, "isize") == 0 || strcmp(name, "ssize_t") == 0) *out = CT_FFI_TYPE_I64;
-    else if (strcmp(name, "f32") == 0) *out = CT_FFI_TYPE_F32;
-    else if (strcmp(name, "f64") == 0) *out = CT_FFI_TYPE_F64;
-    else if (strcmp(name, "ptr") == 0 || strcmp(name, "pointer") == 0) *out = CT_FFI_TYPE_PTR;
-    else if (strcmp(name, "cstring") == 0) *out = CT_FFI_TYPE_CSTRING;
-    else if (strcmp(name, "function") == 0 || strcmp(name, "callback") == 0) *out = CT_FFI_TYPE_FUNCTION;
-    else if (strcmp(name, "napi_env") == 0) *out = CT_FFI_TYPE_NAPI_ENV;
-    else if (strcmp(name, "napi_value") == 0) *out = CT_FFI_TYPE_NAPI_VALUE;
-    else return false;
-    return true;
-}
-
-static bool ct_ffi_type_from_id(uint8_t id, CtFfiType *out) {
-    switch (id) {
-        case 0:
-        case 1:
-            *out = CT_FFI_TYPE_I8;
-            return true;
-        case 2:
-            *out = CT_FFI_TYPE_U8;
-            return true;
-        case 3:
-            *out = CT_FFI_TYPE_I16;
-            return true;
-        case 4:
-            *out = CT_FFI_TYPE_U16;
-            return true;
-        case 5:
-            *out = CT_FFI_TYPE_I32;
-            return true;
-        case 6:
-            *out = CT_FFI_TYPE_U32;
-            return true;
-        case 7:
-        case 15:
-            *out = CT_FFI_TYPE_I64;
-            return true;
-        case 8:
-        case 16:
-            *out = CT_FFI_TYPE_U64;
-            return true;
-        case 9:
-            *out = CT_FFI_TYPE_F64;
-            return true;
-        case 10:
-            *out = CT_FFI_TYPE_F32;
-            return true;
-        case 11:
-            *out = CT_FFI_TYPE_BOOL;
-            return true;
-        case 12:
-        case 20:
-            *out = CT_FFI_TYPE_PTR;
-            return true;
-        case 13:
-            *out = CT_FFI_TYPE_VOID;
-            return true;
-        case 14:
-            *out = CT_FFI_TYPE_CSTRING;
-            return true;
-        case 17:
-            *out = CT_FFI_TYPE_FUNCTION;
-            return true;
-        case 18:
-            *out = CT_FFI_TYPE_NAPI_ENV;
-            return true;
-        case 19:
-            *out = CT_FFI_TYPE_NAPI_VALUE;
-            return true;
-        default:
-            return false;
-    }
-}
-
-static int ct_parse_ffi_type_id(
-    JSContextRef ctx,
-    JSValueRef value,
-    uint8_t *id_out,
-    CtFfiType *type_out,
-    JSValueRef *exception
-) {
-    JSValueRef local_exception = NULL;
-    double number = JSValueToNumber(ctx, value, &local_exception);
-    if (local_exception != NULL) {
-        if (exception != NULL) *exception = local_exception;
-        return -1;
-    }
-    if (!isfinite(number) || number < 0 || number > 20 || trunc(number) != number) {
-        ct_throw_type_error(ctx, exception, "Unsupported FFI type id");
-        return -1;
-    }
-
-    uint8_t id = (uint8_t)number;
-    if (!ct_ffi_type_from_id(id, type_out)) {
-        ct_throw_type_error(ctx, exception, "Unsupported FFI type id");
-        return -1;
-    }
-    *id_out = id;
-    return 0;
-}
-
-static int ct_parse_ffi_type_id_array(
-    JSContextRef ctx,
-    JSValueRef value,
-    uint8_t *out_ids,
-    CtFfiType *out_types,
-    ffi_type **out_ffi_types,
-    size_t *out_count,
-    JSValueRef *exception
-) {
-    *out_count = 0;
-    if (value == NULL || !JSValueIsObject(ctx, value)) {
-        ct_throw_type_error(ctx, exception, "FFI args must be an array of type ids");
-        return -1;
-    }
-
-    JSObjectRef object = (JSObjectRef)value;
-    JSValueRef length_value = ct_get_property(ctx, object, "length", exception);
-    if (exception != NULL && *exception != NULL) return -1;
-    double length_number = JSValueToNumber(ctx, length_value, exception);
-    if (exception != NULL && *exception != NULL) return -1;
-    if (!isfinite(length_number) || length_number < 0 || trunc(length_number) != length_number ||
-        length_number > CT_FFI_MAX_ARGS) {
-        ct_throw_type_error(ctx, exception, "Cottontail FFI currently supports up to 64 arguments");
-        return -1;
-    }
-
-    size_t length = (size_t)length_number;
-    for (size_t index = 0; index < length; index += 1) {
-        JSValueRef item = JSObjectGetPropertyAtIndex(ctx, object, (unsigned)index, exception);
-        if (exception != NULL && *exception != NULL) return -1;
-        if (ct_parse_ffi_type_id(ctx, item, &out_ids[index], &out_types[index], exception) != 0) return -1;
-        out_ffi_types[index] = ct_ffi_libffi_type(out_types[index]);
-    }
-
-    *out_count = length;
-    return 0;
-}
-
-static int ct_parse_ffi_type(JSContextRef ctx, JSValueRef value, CtFfiType *out, JSValueRef *exception) {
-    char *name = ct_value_to_string_copy(ctx, value);
-    bool ok = false;
-    if (name == NULL) {
-        ct_throw_message(ctx, exception, "unsupported FFI type");
-        return -1;
-    }
-
-    ok = ct_ffi_type_from_name(name, out);
-    free(name);
-    if (!ok) {
-        ct_throw_message(ctx, exception, "unsupported FFI type");
-        return -1;
-    }
-    return 0;
-}
-
-static int ct_parse_ffi_type_array(
-    JSContextRef ctx,
-    JSValueRef value,
-    CtFfiType *out_types,
-    ffi_type **out_ffi_types,
-    size_t *out_count,
-    JSValueRef *exception
-) {
-    *out_count = 0;
-    if (value == NULL || !JSValueIsObject(ctx, value)) {
-        ct_throw_message(ctx, exception, "FFI args must be an array of type names");
-        return -1;
-    }
-
-    JSObjectRef object = (JSObjectRef)value;
-    JSValueRef length_value = ct_get_property(ctx, object, "length", exception);
-    if (exception != NULL && *exception != NULL) return -1;
-    size_t length = (size_t)ct_value_to_number(ctx, length_value);
-    if (length > CT_FFI_MAX_ARGS) {
-        ct_throw_message(ctx, exception, "Cottontail FFI currently supports up to 64 arguments");
-        return -1;
-    }
-
-    for (size_t index = 0; index < length; index += 1) {
-        JSValueRef item = JSObjectGetPropertyAtIndex(ctx, object, (unsigned)index, exception);
-        if (exception != NULL && *exception != NULL) return -1;
-        if (ct_parse_ffi_type(ctx, item, &out_types[index], exception) != 0) return -1;
-        out_ffi_types[index] = ct_ffi_libffi_type(out_types[index]);
-    }
-
-    *out_count = length;
-    return 0;
-}
-
-static int ct_value_to_u64(JSContextRef ctx, JSValueRef value, uint64_t *out) {
-    *out = 0;
-    if (value == NULL || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value)) return 0;
-
-    uint8_t *bytes = NULL;
-    size_t bytes_len = 0;
-    if (ct_get_bytes(ctx, value, &bytes, &bytes_len) == 0) {
-        *out = (uint64_t)(uintptr_t)bytes;
-        return 0;
-    }
-
-    JSValueRef exception = NULL;
-    double number = JSValueToNumber(ctx, value, &exception);
-    if (exception == NULL) {
-        if (!isfinite(number) || number < 0) return -1;
-        *out = (uint64_t)number;
-        return 0;
-    }
-
-    JSStringRef string = JSValueToStringCopy(ctx, value, NULL);
-    if (string == NULL) return -1;
-    size_t max = JSStringGetMaximumUTF8CStringSize(string);
-    char *buffer = (char *)malloc(max);
-    if (buffer == NULL) {
-        JSStringRelease(string);
-        return -1;
-    }
-    JSStringGetUTF8CString(string, buffer, max);
-    JSStringRelease(string);
-    char *end = NULL;
-    *out = strtoull(buffer, &end, 10);
-    bool ok = end != buffer;
-    free(buffer);
-    return ok ? 0 : -1;
-}
-
-static int ct_ffi_value_from_js(JSContextRef ctx, JSValueRef value, CtFfiType type, CtFfiValue *out, JSValueRef *exception) {
-    uint64_t native_value = 0;
-    double number_value = 0;
-
-    memset(out, 0, sizeof(*out));
-
-    switch (type) {
-        case CT_FFI_TYPE_VOID:
-            return 0;
-        case CT_FFI_TYPE_BOOL:
-            out->u8 = JSValueToBoolean(ctx, value) ? 1 : 0;
-            return 0;
-        case CT_FFI_TYPE_F32:
-            number_value = ct_value_to_number(ctx, value);
-            out->f32 = (float)number_value;
-            return 0;
-        case CT_FFI_TYPE_F64:
-            number_value = ct_value_to_number(ctx, value);
-            out->f64 = number_value;
-            return 0;
-        case CT_FFI_TYPE_U8:
-        case CT_FFI_TYPE_I8:
-        case CT_FFI_TYPE_U16:
-        case CT_FFI_TYPE_I16:
-        case CT_FFI_TYPE_U32:
-        case CT_FFI_TYPE_I32:
-        case CT_FFI_TYPE_U64:
-        case CT_FFI_TYPE_I64:
-        case CT_FFI_TYPE_PTR:
-        case CT_FFI_TYPE_CSTRING:
-        case CT_FFI_TYPE_FUNCTION:
-        case CT_FFI_TYPE_NAPI_ENV:
-        case CT_FFI_TYPE_NAPI_VALUE:
-            if (ct_value_to_u64(ctx, value, &native_value) != 0) {
-                ct_throw_message(ctx, exception, "FFI argument must be a number, bigint, ArrayBuffer, typed array, null, or undefined");
-                return -1;
-            }
-            out->u64 = native_value;
-            return 0;
-    }
-
-    return -1;
-}
-
-static void *ct_ffi_value_ptr(CtFfiValue *value, CtFfiType type) {
-    switch (type) {
-        case CT_FFI_TYPE_BOOL:
-        case CT_FFI_TYPE_U8:
-            return &value->u8;
-        case CT_FFI_TYPE_I8:
-            return &value->i8;
-        case CT_FFI_TYPE_U16:
-            return &value->u16;
-        case CT_FFI_TYPE_I16:
-            return &value->i16;
-        case CT_FFI_TYPE_U32:
-            return &value->u32;
-        case CT_FFI_TYPE_I32:
-            return &value->i32;
-        case CT_FFI_TYPE_U64:
-            return &value->u64;
-        case CT_FFI_TYPE_I64:
-            return &value->i64;
-        case CT_FFI_TYPE_F32:
-            return &value->f32;
-        case CT_FFI_TYPE_F64:
-            return &value->f64;
-        case CT_FFI_TYPE_PTR:
-        case CT_FFI_TYPE_CSTRING:
-        case CT_FFI_TYPE_FUNCTION:
-        case CT_FFI_TYPE_NAPI_ENV:
-        case CT_FFI_TYPE_NAPI_VALUE:
-            value->ptr = (void *)(uintptr_t)value->u64;
-            return &value->ptr;
-        case CT_FFI_TYPE_VOID:
-            return NULL;
-    }
-
-    return NULL;
-}
-
-static JSValueRef ct_ffi_value_to_js(JSContextRef ctx, CtFfiType type, CtFfiValue value, JSValueRef *exception) {
-    switch (type) {
-        case CT_FFI_TYPE_VOID:
-            return JSValueMakeUndefined(ctx);
-        case CT_FFI_TYPE_BOOL:
-            return JSValueMakeBoolean(ctx, value.u8 != 0);
-        case CT_FFI_TYPE_U8:
-            return JSValueMakeNumber(ctx, value.u8);
-        case CT_FFI_TYPE_I8:
-            return JSValueMakeNumber(ctx, value.i8);
-        case CT_FFI_TYPE_U16:
-            return JSValueMakeNumber(ctx, value.u16);
-        case CT_FFI_TYPE_I16:
-            return JSValueMakeNumber(ctx, value.i16);
-        case CT_FFI_TYPE_U32:
-            return JSValueMakeNumber(ctx, value.u32);
-        case CT_FFI_TYPE_I32:
-            return JSValueMakeNumber(ctx, value.i32);
-        case CT_FFI_TYPE_U64:
-            return JSBigIntCreateWithUInt64(ctx, value.u64, exception);
-        case CT_FFI_TYPE_I64:
-            return JSBigIntCreateWithInt64(ctx, value.i64, exception);
-        case CT_FFI_TYPE_F32:
-            return JSValueMakeNumber(ctx, value.f32);
-        case CT_FFI_TYPE_F64:
-            return JSValueMakeNumber(ctx, value.f64);
-        case CT_FFI_TYPE_PTR:
-        case CT_FFI_TYPE_CSTRING:
-        case CT_FFI_TYPE_FUNCTION:
-            return JSValueMakeNumber(ctx, (double)(uintptr_t)value.ptr);
-        case CT_FFI_TYPE_NAPI_ENV:
-            return JSValueMakeNumber(ctx, (double)(uintptr_t)value.ptr);
-        case CT_FFI_TYPE_NAPI_VALUE:
-            return value.ptr != NULL ? (JSValueRef)value.ptr : JSValueMakeNull(ctx);
-    }
-
-    return JSValueMakeUndefined(ctx);
-}
-
-static int ct_ffi_result_from_js(JSContextRef ctx, JSValueRef value, CtFfiType type, CtFfiValue *out, JSValueRef *exception) {
-    return ct_ffi_value_from_js(ctx, value, type, out, exception);
-}
-
-static int ct_call_js_callback(CtFfiCallback *callback, CtFfiValue *args, size_t argc, CtFfiValue *result) {
-    JSContextRef ctx = callback->ctx;
-    JSValueRef js_args[CT_FFI_MAX_ARGS];
-    JSValueRef exception = NULL;
-
-    for (size_t index = 0; index < argc; index += 1) {
-        js_args[index] = ct_ffi_value_to_js(ctx, callback->arg_types[index], args[index], &exception);
-        if (exception != NULL) {
-            char *message = ct_copy_exception(ctx, exception);
-            fprintf(stderr, "Cottontail FFI callback argument conversion failed: %s\n", message != NULL ? message : "unknown error");
-            free(message);
-            return -1;
-        }
-    }
-
-    JSValueRef js_result = JSObjectCallAsFunction(ctx, callback->function, NULL, argc, js_args, &exception);
-    if (exception != NULL) {
-        char *message = ct_copy_exception(ctx, exception);
-        fprintf(stderr, "Cottontail FFI callback failed: %s\n", message != NULL ? message : "unknown error");
-        free(message);
-        return -1;
-    }
-
-    if (callback->returns != CT_FFI_TYPE_VOID) {
-        return ct_ffi_result_from_js(ctx, js_result, callback->returns, result, &exception);
-    }
-
-    return 0;
-}
-
-static void ct_write_ffi_return(void *ret, CtFfiType type, CtFfiValue value) {
-    if (ret == NULL) return;
-
-    switch (type) {
-        case CT_FFI_TYPE_VOID:
-            return;
-        case CT_FFI_TYPE_BOOL:
-        case CT_FFI_TYPE_U8:
-            *((uint8_t *)ret) = value.u8;
-            return;
-        case CT_FFI_TYPE_I8:
-            *((int8_t *)ret) = value.i8;
-            return;
-        case CT_FFI_TYPE_U16:
-            *((uint16_t *)ret) = value.u16;
-            return;
-        case CT_FFI_TYPE_I16:
-            *((int16_t *)ret) = value.i16;
-            return;
-        case CT_FFI_TYPE_U32:
-            *((uint32_t *)ret) = value.u32;
-            return;
-        case CT_FFI_TYPE_I32:
-            *((int32_t *)ret) = value.i32;
-            return;
-        case CT_FFI_TYPE_U64:
-            *((uint64_t *)ret) = value.u64;
-            return;
-        case CT_FFI_TYPE_I64:
-            *((int64_t *)ret) = value.i64;
-            return;
-        case CT_FFI_TYPE_F32:
-            *((float *)ret) = value.f32;
-            return;
-        case CT_FFI_TYPE_F64:
-            *((double *)ret) = value.f64;
-            return;
-        case CT_FFI_TYPE_PTR:
-        case CT_FFI_TYPE_CSTRING:
-        case CT_FFI_TYPE_FUNCTION:
-        case CT_FFI_TYPE_NAPI_ENV:
-        case CT_FFI_TYPE_NAPI_VALUE:
-            *((void **)ret) = (void *)(uintptr_t)value.u64;
-            return;
-    }
-}
-
-static void ct_enqueue_callback_job(CtJscRuntime *runtime, CtFfiCallbackJob *job) {
-    pthread_mutex_lock(&runtime->callback_mutex);
-    if (runtime->callback_jobs_tail != NULL) {
-        runtime->callback_jobs_tail->next = job;
-    } else {
-        runtime->callback_jobs_head = job;
-    }
-    runtime->callback_jobs_tail = job;
-    pthread_mutex_unlock(&runtime->callback_mutex);
-    ct_runtime_wake(runtime);
-}
-
-static bool ct_runtime_has_live_callbacks(CtJscRuntime *runtime) {
-    bool has_live_callback = false;
-    pthread_mutex_lock(&runtime->callback_mutex);
-    for (CtFfiCallback *callback = runtime->callbacks; callback != NULL; callback = callback->next) {
-        if (!callback->closed) {
-            has_live_callback = true;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&runtime->callback_mutex);
-    return has_live_callback;
-}
-
-static void ct_ffi_callback_dispatch(ffi_cif *cif, void *ret, void **args, void *userdata) {
-    CtFfiCallback *callback = (CtFfiCallback *)userdata;
-    CtFfiValue values[CT_FFI_MAX_ARGS];
-    CtFfiValue result;
-    bool same_thread = false;
-    bool wait_for_result = false;
-    (void)cif;
-
-    memset(&result, 0, sizeof(result));
-    memset(values, 0, sizeof(values));
-
-    if (callback == NULL || callback->closed) {
-        ct_write_ffi_return(ret, callback != NULL ? callback->returns : CT_FFI_TYPE_VOID, result);
-        return;
-    }
-
-    for (size_t index = 0; index < callback->argc; index += 1) {
-        switch (callback->arg_types[index]) {
-            case CT_FFI_TYPE_BOOL:
-            case CT_FFI_TYPE_U8:
-                values[index].u8 = *((uint8_t *)args[index]);
-                break;
-            case CT_FFI_TYPE_I8:
-                values[index].i8 = *((int8_t *)args[index]);
-                break;
-            case CT_FFI_TYPE_U16:
-                values[index].u16 = *((uint16_t *)args[index]);
-                break;
-            case CT_FFI_TYPE_I16:
-                values[index].i16 = *((int16_t *)args[index]);
-                break;
-            case CT_FFI_TYPE_U32:
-                values[index].u32 = *((uint32_t *)args[index]);
-                break;
-            case CT_FFI_TYPE_I32:
-                values[index].i32 = *((int32_t *)args[index]);
-                break;
-            case CT_FFI_TYPE_U64:
-                values[index].u64 = *((uint64_t *)args[index]);
-                break;
-            case CT_FFI_TYPE_I64:
-                values[index].i64 = *((int64_t *)args[index]);
-                break;
-            case CT_FFI_TYPE_F32:
-                values[index].f32 = *((float *)args[index]);
-                break;
-            case CT_FFI_TYPE_F64:
-                values[index].f64 = *((double *)args[index]);
-                break;
-            case CT_FFI_TYPE_PTR:
-            case CT_FFI_TYPE_CSTRING:
-            case CT_FFI_TYPE_FUNCTION:
-            case CT_FFI_TYPE_NAPI_ENV:
-            case CT_FFI_TYPE_NAPI_VALUE:
-                values[index].u64 = (uint64_t)(uintptr_t)*((void **)args[index]);
-                break;
-            case CT_FFI_TYPE_VOID:
-                break;
-        }
-    }
-
-    same_thread = pthread_equal(pthread_self(), callback->owner_thread) != 0;
-    wait_for_result = !callback->threadsafe || callback->returns != CT_FFI_TYPE_VOID;
-
-    if (same_thread) {
-        if (ct_call_js_callback(callback, values, callback->argc, &result) != 0) {
-            memset(&result, 0, sizeof(result));
-        }
-        ct_write_ffi_return(ret, callback->returns, result);
-        return;
-    }
-
-    CtFfiCallbackJob *job = (CtFfiCallbackJob *)calloc(1, sizeof(CtFfiCallbackJob));
-    if (job == NULL) {
-        ct_write_ffi_return(ret, callback->returns, result);
-        return;
-    }
-
-    job->callback = callback;
-    job->argc = callback->argc;
-    job->wait_for_result = wait_for_result;
-    memcpy(job->args, values, sizeof(CtFfiValue) * callback->argc);
-
-    if (wait_for_result) {
-        pthread_mutex_init(&job->mutex, NULL);
-        pthread_cond_init(&job->cond, NULL);
-        pthread_mutex_lock(&job->mutex);
-    }
-
-    ct_enqueue_callback_job(callback->runtime, job);
-
-    if (wait_for_result) {
-        while (!job->completed) {
-            pthread_cond_wait(&job->cond, &job->mutex);
-        }
-        result = job->result;
-        pthread_mutex_unlock(&job->mutex);
-        pthread_cond_destroy(&job->cond);
-        pthread_mutex_destroy(&job->mutex);
-        free(job);
-    }
-
-    ct_write_ffi_return(ret, callback->returns, result);
-}
-
-static int ct_drain_ffi_callbacks(CtJscRuntime *runtime, char **error_out) {
-    (void)error_out;
-
-    while (true) {
-        pthread_mutex_lock(&runtime->callback_mutex);
-        CtFfiCallbackJob *job = runtime->callback_jobs_head;
-        if (job != NULL) {
-            runtime->callback_jobs_head = job->next;
-            if (runtime->callback_jobs_head == NULL) {
-                runtime->callback_jobs_tail = NULL;
-            }
-        }
-        pthread_mutex_unlock(&runtime->callback_mutex);
-
-        if (job == NULL) break;
-
-        if (ct_call_js_callback(job->callback, job->args, job->argc, &job->result) != 0) {
-            memset(&job->result, 0, sizeof(job->result));
-        }
-
-        if (job->wait_for_result) {
-            pthread_mutex_lock(&job->mutex);
-            job->completed = true;
-            pthread_cond_signal(&job->cond);
-            pthread_mutex_unlock(&job->mutex);
-        } else {
-            free(job);
-        }
-    }
-
-    return 0;
-}
-
-static JSValueRef ct_memory_address(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    uint64_t address = 0;
-    (void)function;
-    (void)thisObject;
-
-    if (argc < 1 || ct_value_to_u64(ctx, argv[0], &address) != 0) {
-        ct_throw_message(ctx, exception, "cottontail.memoryAddress(value) requires an ArrayBuffer, typed array, number, or bigint");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    return JSValueMakeNumber(ctx, (double)address);
-}
-
-static void ct_external_array_buffer_noop(void *bytes, void *deallocator_context) {
-    (void)bytes;
-    (void)deallocator_context;
-}
-
-// JSObjectMakeArrayBufferWithBytesNoCopy() with a NULL data pointer produces an
-// ArrayBuffer that JSC reports as already detached, so every later view over it
-// throws "TypeError: Buffer is already detached". Empty views are legitimate
-// (e.g. reading an empty C string), so hand back a real zero-length
-// ArrayBuffer instead.
-static JSValueRef ct_make_empty_array_buffer(JSContextRef ctx, JSValueRef *exception) {
-    JSValueRef constructor_exception = NULL;
-    JSValueRef constructor_value = ct_get_property(ctx, JSContextGetGlobalObject(ctx), "ArrayBuffer", &constructor_exception);
-    if (constructor_exception == NULL && constructor_value != NULL && JSValueIsObject(ctx, constructor_value)) {
-        JSValueRef argument = JSValueMakeNumber(ctx, 0);
-        JSObjectRef buffer = JSObjectCallAsConstructor(ctx, (JSObjectRef)constructor_value, 1, &argument, &constructor_exception);
-        if (constructor_exception == NULL && buffer != NULL) return buffer;
-    }
-    // Fall back to the no-copy path; better than returning undefined.
-    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, NULL, 0, ct_external_array_buffer_noop, NULL, exception);
-}
-
-static JSValueRef ct_memory_view(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    uint64_t address = 0;
-    uint64_t offset = 0;
-    uint64_t length = 0;
-    (void)function;
-    (void)thisObject;
-
-    if (argc < 3 ||
-        ct_value_to_u64(ctx, argv[0], &address) != 0 ||
-        ct_value_to_u64(ctx, argv[1], &offset) != 0 ||
-        ct_value_to_u64(ctx, argv[2], &length) != 0) {
-        ct_throw_message(ctx, exception, "cottontail.memoryView(ptr, offset, length) requires pointer, offset, and length");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    if (address == 0 || length == 0) {
-        return ct_make_empty_array_buffer(ctx, exception);
-    }
-
-    return JSObjectMakeArrayBufferWithBytesNoCopy(
-        ctx,
-        (uint8_t *)(uintptr_t)(address + offset),
-        (size_t)length,
-        ct_external_array_buffer_noop,
-        NULL,
-        exception
-    );
 }
 
 static CtSharedBuffer *ct_shared_buffer_find_by_id_locked(uint32_t id) {
@@ -23454,203 +19607,723 @@ static JSValueRef ct_shared_atomic_notify(JSContextRef ctx, JSObjectRef function
     return JSValueMakeNumber(ctx, (double)notified);
 }
 
-static JSValueRef ct_native_call(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    CtJscRuntime *runtime = ct_callback_runtime(function);
-    CtNativeLibrary *library = NULL;
-    void *symbol = NULL;
-    char *open_error = NULL;
-    char *symbol_error = NULL;
-    CtFfiType return_type = CT_FFI_TYPE_VOID;
-    CtFfiType arg_types[CT_FFI_MAX_ARGS];
-    ffi_type *ffi_arg_types[CT_FFI_MAX_ARGS];
-    CtFfiValue arg_values[CT_FFI_MAX_ARGS];
-    void *arg_value_ptrs[CT_FFI_MAX_ARGS];
-    CtFfiValue result;
-    ffi_cif cif;
-    size_t arg_count = 0;
-    (void)thisObject;
+typedef int (*CtCapabilityInitialize)(JSContextRef, JSObjectRef, const CtCapabilityHost *);
 
-    memset(&result, 0, sizeof(result));
-
-    if (argc < 5) {
-        ct_throw_message(ctx, exception, "cottontail.nativeCall(library, symbol, returnType, argTypes, args) requires five arguments");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    char *library_path = ct_value_to_string_copy(ctx, argv[0]);
-    char *symbol_name = ct_value_to_string_copy(ctx, argv[1]);
-    if (library_path == NULL || symbol_name == NULL) {
-        free(library_path);
-        free(symbol_name);
-        ct_throw_message(ctx, exception, "cottontail.nativeCall requires string library and symbol names");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    if (ct_parse_ffi_type(ctx, argv[2], &return_type, exception) != 0 ||
-        ct_parse_ffi_type_array(ctx, argv[3], arg_types, ffi_arg_types, &arg_count, exception) != 0) {
-        free(library_path);
-        free(symbol_name);
-        return JSValueMakeUndefined(ctx);
-    }
-
-    if (!JSValueIsObject(ctx, argv[4])) {
-        free(library_path);
-        free(symbol_name);
-        ct_throw_message(ctx, exception, "cottontail.nativeCall args must be an array");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    bool uses_napi = return_type == CT_FFI_TYPE_NAPI_ENV || return_type == CT_FFI_TYPE_NAPI_VALUE;
-    for (size_t index = 0; index < arg_count; index += 1) {
-        if (arg_types[index] == CT_FFI_TYPE_NAPI_ENV || arg_types[index] == CT_FFI_TYPE_NAPI_VALUE) {
-            uses_napi = true;
-            break;
-        }
-    }
-    if (uses_napi && runtime == NULL) {
-        free(library_path);
-        free(symbol_name);
-        ct_throw_message(ctx, exception, "N-API FFI calls require an active Cottontail runtime");
-        return JSValueMakeUndefined(ctx);
-    }
-    if (uses_napi && runtime->napi_env == NULL) {
-        runtime->napi_env = ct_napi_env_create(runtime->context, &runtime->uv_loop, runtime, ct_napi_wake);
-        if (runtime->napi_env == NULL) {
-            free(library_path);
-            free(symbol_name);
-            ct_throw_message(ctx, exception, "failed to initialize the Node-API environment");
-            return JSValueMakeUndefined(ctx);
-        }
-    }
-    CtNapiEnv *ffi_napi_env = uses_napi
-        ? ct_napi_env_for_ffi_library(runtime->napi_env, library_path)
-        : NULL;
-    if (uses_napi && ffi_napi_env == NULL) {
-        free(library_path);
-        free(symbol_name);
-        ct_throw_message(ctx, exception, "failed to initialize the FFI Node-API environment");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    JSObjectRef args_array = (JSObjectRef)argv[4];
-    for (size_t index = 0; index < arg_count; index += 1) {
-        JSValueRef item = JSObjectGetPropertyAtIndex(ctx, args_array, (unsigned)index, exception);
-        if (exception != NULL && *exception != NULL) {
-            free(library_path);
-            free(symbol_name);
-            return JSValueMakeUndefined(ctx);
-        }
-        if (arg_types[index] == CT_FFI_TYPE_NAPI_ENV) {
-            arg_values[index].u64 = (uint64_t)(uintptr_t)ffi_napi_env;
-            arg_value_ptrs[index] = ct_ffi_value_ptr(&arg_values[index], arg_types[index]);
-            continue;
-        }
-        if (arg_types[index] == CT_FFI_TYPE_NAPI_VALUE) {
-            arg_values[index].u64 = (uint64_t)(uintptr_t)item;
-            arg_value_ptrs[index] = ct_ffi_value_ptr(&arg_values[index], arg_types[index]);
-            continue;
-        }
-        if (ct_ffi_value_from_js(ctx, item, arg_types[index], &arg_values[index], exception) != 0) {
-            free(library_path);
-            free(symbol_name);
-            return JSValueMakeUndefined(ctx);
-        }
-        arg_value_ptrs[index] = ct_ffi_value_ptr(&arg_values[index], arg_types[index]);
-    }
-
-    library = ct_get_native_library(library_path, &open_error);
-    if (library == NULL) {
-        char message[1024];
-        snprintf(message, sizeof(message), "uv_dlopen(%s) failed: %s", library_path, open_error != NULL ? open_error : "unknown error");
-        free(open_error);
-        free(library_path);
-        free(symbol_name);
-        ct_throw_message(ctx, exception, message);
-        return JSValueMakeUndefined(ctx);
-    }
-
-    if (ct_dynamic_library_symbol(&library->library, symbol_name, &symbol, &symbol_error) != 0) {
-        char message[1024];
-        snprintf(message, sizeof(message), "uv_dlsym(%s) failed: %s", symbol_name, symbol_error != NULL ? symbol_error : "unknown error");
-        free(symbol_error);
-        free(library_path);
-        free(symbol_name);
-        ct_throw_message(ctx, exception, message);
-        return JSValueMakeUndefined(ctx);
-    }
-
-    if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned int)arg_count, ct_ffi_libffi_type(return_type), ffi_arg_types) != FFI_OK) {
-        char message[1024];
-        snprintf(message, sizeof(message), "ffi_prep_cif failed for %s", symbol_name);
-        free(library_path);
-        free(symbol_name);
-        ct_throw_message(ctx, exception, message);
-        return JSValueMakeUndefined(ctx);
-    }
-
-    ffi_call(&cif, FFI_FN(symbol), ct_ffi_value_ptr(&result, return_type), arg_value_ptrs);
-    if (uses_napi) {
-        JSValueRef napi_exception = ct_napi_env_take_exception(ffi_napi_env);
-        if (napi_exception != NULL) {
-            *exception = napi_exception;
-            free(library_path);
-            free(symbol_name);
-            return JSValueMakeUndefined(ctx);
-        }
-    }
-    JSValueRef js_result = ct_ffi_value_to_js(ctx, return_type, result, exception);
-
-    free(library_path);
-    free(symbol_name);
-    return js_result;
+static void ct_capability_host_wake(void *opaque_runtime) {
+    ct_runtime_wake((CtJscRuntime *)opaque_runtime);
 }
 
-static JSValueRef ct_native_symbol(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    CtNativeLibrary *library = NULL;
-    void *symbol = NULL;
-    char *open_error = NULL;
-    char *symbol_error = NULL;
-    (void)function;
+static void *ct_capability_host_napi_env_for_library(void *opaque_runtime, const char *identity) {
+    CtJscRuntime *runtime = (CtJscRuntime *)opaque_runtime;
+    if (runtime == NULL) return NULL;
+    if (runtime->napi_env == NULL) {
+        runtime->napi_env = ct_napi_env_create(runtime->context, &runtime->uv_loop, runtime, ct_napi_wake);
+        if (runtime->napi_env == NULL) return NULL;
+    }
+    return ct_napi_env_for_ffi_library(runtime->napi_env, identity);
+}
+
+static JSValueRef ct_capability_host_napi_take_exception(void *environment) {
+    return ct_napi_env_take_exception((CtNapiEnv *)environment);
+}
+
+static int ct_capability_host_register_lifecycle(void *opaque_runtime, void *state, CtCapabilityHasPending has_pending, CtCapabilityDrain drain, CtCapabilityCleanup cleanup) {
+    CtJscRuntime *runtime = (CtJscRuntime *)opaque_runtime;
+    if (runtime == NULL || state == NULL) return -1;
+    CtCapabilityLifecycle *entry = (CtCapabilityLifecycle *)calloc(1, sizeof(*entry));
+    if (entry == NULL) return -1;
+    entry->state = state;
+    entry->has_pending = has_pending;
+    entry->drain = drain;
+    entry->cleanup = cleanup;
+    entry->next = runtime->capability_lifecycles;
+    runtime->capability_lifecycles = entry;
+    return 0;
+}
+
+static int ct_capability_lifecycles_drain(CtJscRuntime *runtime, char **error_out) {
+    for (CtCapabilityLifecycle *entry = runtime->capability_lifecycles; entry != NULL; entry = entry->next) {
+        if (entry->drain != NULL && entry->drain(entry->state, error_out) != 0) return -1;
+    }
+    return 0;
+}
+
+static bool ct_capability_lifecycles_have_pending(CtJscRuntime *runtime) {
+    for (CtCapabilityLifecycle *entry = runtime->capability_lifecycles; entry != NULL; entry = entry->next) {
+        if (entry->has_pending != NULL && entry->has_pending(entry->state)) return true;
+    }
+    return false;
+}
+
+static void ct_capability_lifecycles_cleanup(CtJscRuntime *runtime) {
+    CtCapabilityLifecycle *entry = runtime->capability_lifecycles;
+    runtime->capability_lifecycles = NULL;
+    while (entry != NULL) {
+        CtCapabilityLifecycle *next = entry->next;
+        if (entry->cleanup != NULL) entry->cleanup(entry->state);
+        free(entry);
+        entry = next;
+    }
+}
+
+static JSValueRef ct_load_capability_library(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
-
-    if (argc < 2) {
-        ct_throw_message(ctx, exception, "cottontail.nativeSymbol(library, symbol) requires library and symbol names");
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "cottontail.loadCapabilityLibrary(path) requires a library path");
         return JSValueMakeUndefined(ctx);
     }
-
-    char *library_path = ct_value_to_string_copy(ctx, argv[0]);
-    char *symbol_name = ct_value_to_string_copy(ctx, argv[1]);
-    if (library_path == NULL || symbol_name == NULL) {
-        free(library_path);
-        free(symbol_name);
-        ct_throw_message(ctx, exception, "cottontail.nativeSymbol requires string library and symbol names");
+    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    if (path == NULL) {
+        ct_throw_message(ctx, exception, "cottontail.loadCapabilityLibrary requires a string path");
         return JSValueMakeUndefined(ctx);
     }
-
-    library = ct_get_native_library(library_path, &open_error);
+    char *open_error = NULL;
+    CtNativeLibrary *library = ct_get_native_library(path, &open_error);
     if (library == NULL) {
         char message[1024];
-        snprintf(message, sizeof(message), "uv_dlopen(%s) failed: %s", library_path, open_error != NULL ? open_error : "unknown error");
+        snprintf(message, sizeof(message), "Failed to load capability library %s: %s", path, open_error != NULL ? open_error : "unknown error");
         free(open_error);
-        free(library_path);
-        free(symbol_name);
+        free(path);
         ct_throw_message(ctx, exception, message);
         return JSValueMakeUndefined(ctx);
     }
-
-    if (ct_dynamic_library_symbol(&library->library, symbol_name, &symbol, &symbol_error) != 0) {
+    void *symbol = NULL;
+    char *symbol_error = NULL;
+    if (ct_dynamic_library_symbol(&library->library, "cottontail_capability_init", &symbol, &symbol_error) != 0) {
         char message[1024];
-        snprintf(message, sizeof(message), "uv_dlsym(%s) failed: %s", symbol_name, symbol_error != NULL ? symbol_error : "unknown error");
+        snprintf(message, sizeof(message), "Capability library %s has no cottontail_capability_init: %s", path, symbol_error != NULL ? symbol_error : "unknown error");
         free(symbol_error);
-        free(library_path);
-        free(symbol_name);
+        free(path);
         ct_throw_message(ctx, exception, message);
         return JSValueMakeUndefined(ctx);
     }
+    free(path);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    const CtCapabilityHost host = {
+        .runtime = runtime,
+        .wake = ct_capability_host_wake,
+        .register_lifecycle = ct_capability_host_register_lifecycle,
+        .napi_env_for_library = ct_capability_host_napi_env_for_library,
+        .napi_take_exception = ct_capability_host_napi_take_exception,
+    };
+    int status = ((CtCapabilityInitialize)symbol)(ctx, runtime->host_object, &host);
+    if (status != 0) {
+        ct_throw_message(ctx, exception, "Capability library initialization failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeUndefined(ctx);
+}
 
-    free(library_path);
-    free(symbol_name);
-    return JSValueMakeNumber(ctx, (double)(uintptr_t)symbol);
+static uint32_t ct_capability_read_u32(const uint8_t *bytes) {
+    return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+        ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
+}
+
+static uint64_t ct_capability_read_u64(const uint8_t *bytes) {
+    uint64_t value = 0;
+    for (size_t index = 0; index < 8; index += 1) value |= (uint64_t)bytes[index] << (index * 8);
+    return value;
+}
+
+static JSValueRef ct_load_capability_bytecode(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "cottontail.loadCapabilityBytecode(path) requires a path");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    if (path == NULL) {
+        ct_throw_message(ctx, exception, "cottontail.loadCapabilityBytecode requires a string path");
+        return JSValueMakeUndefined(ctx);
+    }
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        char message[1024];
+        snprintf(message, sizeof(message), "Failed to open capability bytecode %s: %s", path, strerror(errno));
+        free(path);
+        ct_throw_message(ctx, exception, message);
+        return JSValueMakeUndefined(ctx);
+    }
+    free(path);
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        ct_throw_message(ctx, exception, "Failed to inspect capability bytecode");
+        return JSValueMakeUndefined(ctx);
+    }
+    long file_size_long = ftell(file);
+    if (file_size_long < 28 || file_size_long > 256 * 1024 * 1024 || fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        ct_throw_message(ctx, exception, "Invalid capability bytecode size");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t file_size = (size_t)file_size_long;
+    uint8_t *container = (uint8_t *)malloc(file_size);
+    if (container == NULL || fread(container, 1, file_size, file) != file_size) {
+        free(container);
+        fclose(file);
+        ct_throw_message(ctx, exception, "Failed to read capability bytecode");
+        return JSValueMakeUndefined(ctx);
+    }
+    fclose(file);
+    if (memcmp(container, "CTCAPB01", 8) != 0) {
+        free(container);
+        ct_throw_message(ctx, exception, "Invalid capability bytecode header");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t filename_len = ct_capability_read_u32(container + 8);
+    uint64_t source_len_u64 = ct_capability_read_u64(container + 12);
+    uint64_t bytecode_len_u64 = ct_capability_read_u64(container + 20);
+    if (source_len_u64 > SIZE_MAX || bytecode_len_u64 > SIZE_MAX) {
+        free(container);
+        ct_throw_message(ctx, exception, "Invalid capability bytecode lengths");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t source_len = (size_t)source_len_u64;
+    size_t bytecode_len = (size_t)bytecode_len_u64;
+    if (filename_len == 0 || source_len == 0 || bytecode_len == 0 ||
+        filename_len > file_size - 28 || source_len > file_size - 28 - filename_len ||
+        bytecode_len != file_size - 28 - filename_len - source_len) {
+        free(container);
+        ct_throw_message(ctx, exception, "Invalid capability bytecode container");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *filename = ct_duplicate_bytes((const char *)container + 28, filename_len);
+    const uint8_t *source = container + 28 + filename_len;
+    const uint8_t *bytecode = source + source_len;
+    char *wrapped = filename != NULL ? ct_prepare_sync_source(source, source_len, filename) : NULL;
+    if (wrapped == NULL) {
+        free(filename);
+        free(container);
+        ct_throw_message(ctx, exception, "Failed to prepare capability bytecode");
+        return JSValueMakeUndefined(ctx);
+    }
+    JSStringRef script = ct_js_string(wrapped);
+    char *source_url_text = ct_source_url_for_filename(filename);
+    JSStringRef source_url = source_url_text != NULL ? ct_js_string(source_url_text) : NULL;
+    free(source_url_text);
+    free(filename);
+    if (script == NULL || source_url == NULL ||
+        ct_jsc_embedder_bytecode_evaluate(ctx, script, source_url, bytecode, bytecode_len, exception) != 0) {
+        if (script != NULL) JSStringRelease(script);
+        if (source_url != NULL) JSStringRelease(source_url);
+        free(wrapped);
+        free(container);
+        if (exception == NULL || *exception == NULL) ct_throw_message(ctx, exception, "Capability JSC bytecode cache was rejected");
+        return JSValueMakeUndefined(ctx);
+    }
+    JSStringRelease(script);
+    JSStringRelease(source_url);
+    free(wrapped);
+    free(container);
+
+    JSObjectRef global = JSContextGetGlobalObject(ctx);
+    JSValueRef result = ct_get_property(ctx, global, "__cottontailCapabilityResult", exception);
+    if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
+    if (result == NULL || JSValueIsUndefined(ctx, result)) {
+        ct_throw_message(ctx, exception, "Capability bytecode did not publish a result");
+        return JSValueMakeUndefined(ctx);
+    }
+    ct_set_property(ctx, global, "__cottontailCapabilityResult", JSValueMakeUndefined(ctx), exception);
+    return result;
+}
+
+struct CtLoadedCapability {
+    char *name;
+    JSValueRef pack;
+    CtLoadedCapability *next;
+};
+
+typedef struct CtCapabilityPropertyDefinition {
+    const char *property;
+    const char *capability;
+    const char *module_path;
+} CtCapabilityPropertyDefinition;
+
+typedef enum CtCapabilityNamespaceKind {
+    CT_CAPABILITY_NAMESPACE_ROOT,
+    CT_CAPABILITY_NAMESPACE_NODE,
+    CT_CAPABILITY_NAMESPACE_BUN,
+} CtCapabilityNamespaceKind;
+
+typedef struct CtCapabilityNamespaceState {
+    CtJscRuntime *runtime;
+    CtCapabilityNamespaceKind kind;
+} CtCapabilityNamespaceState;
+
+static const CtCapabilityPropertyDefinition ct_root_capability_properties[] = {
+    { "sqlite", "sqlite", "bun/sqlite.js" },
+    { "ffi", "ffi", "bun/ffi-implementation.js" },
+    { "redis", "redis", "bun/redis.js" },
+    { "s3", "s3", "bun/s3.js" },
+    { "toml", "toml", "bun/toml.js" },
+    { "json5", "json5", "bun/json5.js" },
+    { "colors", "colors", "bun/color.js" },
+    { "jscTools", "jsc-tools", "bun/jsc.js" },
+    { "yaml", "yaml", "bun/yaml.js" },
+    { "sql", "sql", "bun/sql.js" },
+    { "test", "test", "bun/test.js" },
+    { "shell", "shell", "bun/shell.js" },
+    { "build", "build", "bun/build.js" },
+    { "bake", "bake", "bun/bake-dev-server.js" },
+    { "cookies", "cookies", "bun/cookie.js" },
+    { "websocket", "websocket", "vendor/ws.js" },
+    { "glob", "glob", "bun/glob.js" },
+    { "text", "text", "bun/text.js" },
+    { "uuid", "uuid", "bun/uuid.js" },
+    { "password", "password", "bun/password.js" },
+    { "hashing", "hashing", "bun/hashing.js" },
+    { "data", "data", "bun/data.js" },
+    { "markdown", "markdown", "bun/markdown.js" },
+    { "compression", "compression", "node/zlib.js" },
+    { "archive", "archive", "bun/archive.js" },
+    { "filesystemRouter", "filesystem-router", "bun/filesystem-router.js" },
+    { "htmlRewriter", "html-rewriter", "bun/html-rewriter.js" },
+    { "terminal", "terminal", "bun/terminal.js" },
+    { "csrf", "csrf", "bun/csrf.js" },
+    { "secrets", "secrets", "bun/secrets.js" },
+};
+
+static const CtCapabilityPropertyDefinition ct_node_capability_properties[] = {
+    { "inspector", "inspector", "node/inspector.js" },
+    { "repl", "repl", "node/repl.js" },
+    { "sea", "sea", "node/sea.js" },
+    { "sqlite", "sqlite", "node/sqlite.js" },
+    { "test", "test", "node/test.js" },
+    { "zlib", "compression", "node/zlib.js" },
+};
+
+static const CtCapabilityPropertyDefinition ct_bun_capability_properties[] = {
+    { "archive", "archive", "bun/archive.js" },
+    { "bake", "bake", "bun/bake-dev-server.js" },
+    { "build", "build", "bun/build.js" },
+    { "color", "colors", "bun/color.js" },
+    { "cookie", "cookies", "bun/cookie.js" },
+    { "data", "data", "bun/data.js" },
+    { "ffi", "ffi", "bun/ffi-implementation.js" },
+    { "filesystemRouter", "filesystem-router", "bun/filesystem-router.js" },
+    { "glob", "glob", "bun/glob.js" },
+    { "hashing", "hashing", "bun/hashing.js" },
+    { "htmlRewriter", "html-rewriter", "bun/html-rewriter.js" },
+    { "jsc", "jsc-tools", "bun/jsc.js" },
+    { "json5", "json5", "bun/json5.js" },
+    { "markdown", "markdown", "bun/markdown.js" },
+    { "password", "password", "bun/password.js" },
+    { "redis", "redis", "bun/redis.js" },
+    { "s3", "s3", "bun/s3.js" },
+    { "secrets", "secrets", "bun/secrets.js" },
+    { "shell", "shell", "bun/shell.js" },
+    { "sql", "sql", "bun/sql.js" },
+    { "sqlite", "sqlite", "bun/sqlite.js" },
+    { "terminal", "terminal", "bun/terminal.js" },
+    { "test", "test", "bun/test.js" },
+    { "text", "text", "bun/text.js" },
+    { "toml", "toml", "bun/toml.js" },
+    { "uuid", "uuid", "bun/uuid.js" },
+    { "websocket", "websocket", "vendor/ws.js" },
+    { "yaml", "yaml", "bun/yaml.js" },
+};
+
+static const CtCapabilityPropertyDefinition *ct_capability_property_definition(
+    CtCapabilityNamespaceKind kind,
+    JSStringRef property_name
+) {
+    const CtCapabilityPropertyDefinition *definitions = NULL;
+    size_t count = 0;
+    if (kind == CT_CAPABILITY_NAMESPACE_ROOT) {
+        definitions = ct_root_capability_properties;
+        count = sizeof(ct_root_capability_properties) / sizeof(ct_root_capability_properties[0]);
+    } else if (kind == CT_CAPABILITY_NAMESPACE_NODE) {
+        definitions = ct_node_capability_properties;
+        count = sizeof(ct_node_capability_properties) / sizeof(ct_node_capability_properties[0]);
+    } else {
+        definitions = ct_bun_capability_properties;
+        count = sizeof(ct_bun_capability_properties) / sizeof(ct_bun_capability_properties[0]);
+    }
+    for (size_t index = 0; index < count; index += 1) {
+        if (JSStringIsEqualToUTF8CString(property_name, definitions[index].property)) return &definitions[index];
+    }
+    return NULL;
+}
+
+static JSValueRef ct_native_load_capability_module(
+    JSContextRef ctx,
+    CtJscRuntime *runtime,
+    const CtCapabilityPropertyDefinition *definition,
+    JSValueRef *exception
+) {
+    CtLoadedCapability *loaded = runtime->loaded_capabilities;
+    while (loaded != NULL && strcmp(loaded->name, definition->capability) != 0) loaded = loaded->next;
+    JSValueRef pack = loaded != NULL ? loaded->pack : NULL;
+    if (pack == NULL) {
+        JSValueRef exec_path_value = ct_exec_path(ctx, NULL, NULL, 0, NULL, exception);
+        if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
+        char *exec_path = ct_value_to_string_copy(ctx, exec_path_value);
+        if (exec_path == NULL) {
+            ct_throw_message(ctx, exception, "Failed to resolve the Cottontail executable path");
+            return JSValueMakeUndefined(ctx);
+        }
+        char *separator = strrchr(exec_path, '/');
+#if defined(_WIN32)
+        char *backslash = strrchr(exec_path, '\\');
+        if (backslash != NULL && (separator == NULL || backslash > separator)) separator = backslash;
+#endif
+        if (separator == NULL) {
+            free(exec_path);
+            ct_throw_message(ctx, exception, "Failed to resolve the Cottontail capability directory");
+            return JSValueMakeUndefined(ctx);
+        }
+        *separator = 0;
+#if defined(_WIN32)
+        const char *path_separator = "\\";
+#else
+        const char *path_separator = "/";
+#endif
+        const size_t path_length = strlen(exec_path) + strlen(definition->capability) + 32;
+        char *capability_path = (char *)malloc(path_length);
+        if (capability_path == NULL) {
+            free(exec_path);
+            ct_throw_message(ctx, exception, "Out of memory resolving a Cottontail capability");
+            return JSValueMakeUndefined(ctx);
+        }
+        snprintf(
+            capability_path,
+            path_length,
+            "%s%scottontail-stdlib%s%s%smain.jsc",
+            exec_path,
+            path_separator,
+            path_separator,
+            definition->capability,
+            path_separator
+        );
+        free(exec_path);
+        JSValueRef path_value = ct_make_string(ctx, capability_path);
+        free(capability_path);
+        pack = ct_load_capability_bytecode(ctx, NULL, NULL, 1, &path_value, exception);
+        if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
+
+        loaded = (CtLoadedCapability *)calloc(1, sizeof(*loaded));
+        if (loaded == NULL) {
+            ct_throw_message(ctx, exception, "Out of memory caching a Cottontail capability");
+            return JSValueMakeUndefined(ctx);
+        }
+        loaded->name = strdup(definition->capability);
+        if (loaded->name == NULL) {
+            free(loaded);
+            ct_throw_message(ctx, exception, "Out of memory caching a Cottontail capability");
+            return JSValueMakeUndefined(ctx);
+        }
+        loaded->pack = pack;
+        char root_name[192];
+        snprintf(root_name, sizeof(root_name), "__cottontailCapabilityPack_%s", definition->capability);
+        JSStringRef root_key = ct_js_string(root_name);
+        if (root_key == NULL) {
+            free(loaded->name);
+            free(loaded);
+            ct_throw_message(ctx, exception, "Out of memory rooting a Cottontail capability");
+            return JSValueMakeUndefined(ctx);
+        }
+        JSObjectSetProperty(
+            ctx,
+            JSContextGetGlobalObject(ctx),
+            root_key,
+            pack,
+            kJSPropertyAttributeDontEnum,
+            exception
+        );
+        JSStringRelease(root_key);
+        if (exception != NULL && *exception != NULL) {
+            free(loaded->name);
+            free(loaded);
+            return JSValueMakeUndefined(ctx);
+        }
+        loaded->next = runtime->loaded_capabilities;
+        runtime->loaded_capabilities = loaded;
+    }
+
+    if (!JSValueIsObject(ctx, pack)) {
+        ct_throw_message(ctx, exception, "Cottontail capability bytecode did not return an object");
+        return JSValueMakeUndefined(ctx);
+    }
+    JSValueRef modules = ct_get_property(ctx, (JSObjectRef)pack, "modules", exception);
+    if ((exception != NULL && *exception != NULL) || !JSValueIsObject(ctx, modules)) {
+        if (exception == NULL || *exception == NULL) {
+            ct_throw_message(ctx, exception, "Cottontail capability bytecode did not provide modules");
+        }
+        return JSValueMakeUndefined(ctx);
+    }
+    JSValueRef module = ct_get_property(ctx, (JSObjectRef)modules, definition->module_path, exception);
+    if ((exception == NULL || *exception == NULL) && (module == NULL || JSValueIsUndefined(ctx, module))) {
+        char message[512];
+        snprintf(message, sizeof(message), "Cottontail capability \"%s\" is missing module %s", definition->capability, definition->module_path);
+        ct_throw_message(ctx, exception, message);
+        return JSValueMakeUndefined(ctx);
+    }
+    return module;
+}
+
+static JSValueRef ct_capability_namespace_get_property(
+    JSContextRef ctx,
+    JSObjectRef object,
+    JSStringRef property_name,
+    JSValueRef *exception
+) {
+    CtCapabilityNamespaceState *state = (CtCapabilityNamespaceState *)JSObjectGetPrivate(object);
+    if (state == NULL || state->runtime == NULL) return NULL;
+    const CtCapabilityPropertyDefinition *definition =
+        ct_capability_property_definition(state->kind, property_name);
+    if (definition == NULL) return NULL;
+    JSValueRef module = ct_native_load_capability_module(ctx, state->runtime, definition, exception);
+    if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
+    return module;
+}
+
+#define CT_CAPABILITY_STATIC_VALUE(name) \
+    { name, ct_capability_namespace_get_property, NULL, kJSPropertyAttributeDontDelete }
+
+static const JSStaticValue ct_root_capability_static_values[] = {
+    CT_CAPABILITY_STATIC_VALUE("sqlite"), CT_CAPABILITY_STATIC_VALUE("ffi"),
+    CT_CAPABILITY_STATIC_VALUE("redis"), CT_CAPABILITY_STATIC_VALUE("s3"),
+    CT_CAPABILITY_STATIC_VALUE("toml"), CT_CAPABILITY_STATIC_VALUE("json5"),
+    CT_CAPABILITY_STATIC_VALUE("colors"), CT_CAPABILITY_STATIC_VALUE("jscTools"),
+    CT_CAPABILITY_STATIC_VALUE("yaml"), CT_CAPABILITY_STATIC_VALUE("sql"),
+    CT_CAPABILITY_STATIC_VALUE("test"), CT_CAPABILITY_STATIC_VALUE("shell"),
+    CT_CAPABILITY_STATIC_VALUE("build"), CT_CAPABILITY_STATIC_VALUE("bake"),
+    CT_CAPABILITY_STATIC_VALUE("cookies"), CT_CAPABILITY_STATIC_VALUE("websocket"),
+    CT_CAPABILITY_STATIC_VALUE("glob"), CT_CAPABILITY_STATIC_VALUE("text"),
+    CT_CAPABILITY_STATIC_VALUE("uuid"), CT_CAPABILITY_STATIC_VALUE("password"),
+    CT_CAPABILITY_STATIC_VALUE("hashing"), CT_CAPABILITY_STATIC_VALUE("data"),
+    CT_CAPABILITY_STATIC_VALUE("markdown"), CT_CAPABILITY_STATIC_VALUE("compression"),
+    CT_CAPABILITY_STATIC_VALUE("archive"), CT_CAPABILITY_STATIC_VALUE("filesystemRouter"),
+    CT_CAPABILITY_STATIC_VALUE("htmlRewriter"), CT_CAPABILITY_STATIC_VALUE("terminal"),
+    CT_CAPABILITY_STATIC_VALUE("csrf"), CT_CAPABILITY_STATIC_VALUE("secrets"),
+    { NULL, NULL, NULL, 0 },
+};
+
+static const JSStaticValue ct_node_capability_static_values[] = {
+    CT_CAPABILITY_STATIC_VALUE("inspector"), CT_CAPABILITY_STATIC_VALUE("repl"),
+    CT_CAPABILITY_STATIC_VALUE("sea"), CT_CAPABILITY_STATIC_VALUE("sqlite"),
+    CT_CAPABILITY_STATIC_VALUE("test"), CT_CAPABILITY_STATIC_VALUE("zlib"),
+    { NULL, NULL, NULL, 0 },
+};
+
+static const JSStaticValue ct_bun_capability_static_values[] = {
+    CT_CAPABILITY_STATIC_VALUE("archive"), CT_CAPABILITY_STATIC_VALUE("bake"),
+    CT_CAPABILITY_STATIC_VALUE("build"), CT_CAPABILITY_STATIC_VALUE("color"),
+    CT_CAPABILITY_STATIC_VALUE("cookie"), CT_CAPABILITY_STATIC_VALUE("data"),
+    CT_CAPABILITY_STATIC_VALUE("ffi"), CT_CAPABILITY_STATIC_VALUE("filesystemRouter"),
+    CT_CAPABILITY_STATIC_VALUE("glob"), CT_CAPABILITY_STATIC_VALUE("hashing"),
+    CT_CAPABILITY_STATIC_VALUE("htmlRewriter"), CT_CAPABILITY_STATIC_VALUE("jsc"),
+    CT_CAPABILITY_STATIC_VALUE("json5"), CT_CAPABILITY_STATIC_VALUE("markdown"),
+    CT_CAPABILITY_STATIC_VALUE("password"), CT_CAPABILITY_STATIC_VALUE("redis"),
+    CT_CAPABILITY_STATIC_VALUE("s3"), CT_CAPABILITY_STATIC_VALUE("secrets"),
+    CT_CAPABILITY_STATIC_VALUE("shell"), CT_CAPABILITY_STATIC_VALUE("sql"),
+    CT_CAPABILITY_STATIC_VALUE("sqlite"), CT_CAPABILITY_STATIC_VALUE("terminal"),
+    CT_CAPABILITY_STATIC_VALUE("test"), CT_CAPABILITY_STATIC_VALUE("text"),
+    CT_CAPABILITY_STATIC_VALUE("toml"), CT_CAPABILITY_STATIC_VALUE("uuid"),
+    CT_CAPABILITY_STATIC_VALUE("websocket"), CT_CAPABILITY_STATIC_VALUE("yaml"),
+    { NULL, NULL, NULL, 0 },
+};
+
+#undef CT_CAPABILITY_STATIC_VALUE
+
+static void ct_capability_namespace_finalize(JSObjectRef object) {
+    free(JSObjectGetPrivate(object));
+}
+
+static JSObjectRef ct_make_capability_namespace(
+    JSContextRef ctx,
+    CtJscRuntime *runtime,
+    CtCapabilityNamespaceKind kind
+) {
+    CtCapabilityNamespaceState *state = (CtCapabilityNamespaceState *)calloc(1, sizeof(*state));
+    if (state == NULL) return NULL;
+    state->runtime = runtime;
+    state->kind = kind;
+    JSClassDefinition class_definition = kJSClassDefinitionEmpty;
+    class_definition.className = "CottontailCapabilityNamespace";
+    class_definition.staticValues = kind == CT_CAPABILITY_NAMESPACE_ROOT
+        ? ct_root_capability_static_values
+        : kind == CT_CAPABILITY_NAMESPACE_NODE
+            ? ct_node_capability_static_values
+            : ct_bun_capability_static_values;
+    class_definition.finalize = ct_capability_namespace_finalize;
+    JSClassRef cls = JSClassCreate(&class_definition);
+    JSObjectRef object = JSObjectMake(ctx, cls, state);
+    JSClassRelease(cls);
+    if (object == NULL) free(state);
+    return object;
+}
+
+static int ct_install_native_cottontail_namespace(CtJscRuntime *runtime) {
+    JSContextRef ctx = runtime->context;
+#if defined(COTTONTAIL_CAPABILITY_BUILDER)
+    // This executable creates cottontail-stdlib, so attempting filesystem
+    // capability activation here would introduce a build cycle. Keep its
+    // namespace plain; the embedded builder modules install only the services
+    // the compiler itself needs.
+    JSObjectRef root = ct_make_object(ctx);
+    JSObjectRef node = ct_make_object(ctx);
+    JSObjectRef bun = ct_make_object(ctx);
+    JSValueRef exception = NULL;
+    if (root == NULL || node == NULL || bun == NULL) return -1;
+    ct_set_property(ctx, root, "node", node, &exception);
+    if (exception == NULL) ct_set_property(ctx, root, "bun", bun, &exception);
+    if (exception == NULL) ct_set_property(ctx, JSContextGetGlobalObject(ctx), "Cottontail", root, &exception);
+    return exception == NULL ? 0 : -1;
+#else
+    // Bytecode evaluation from a C API property callback forces JSC to retain
+    // roughly 100 MiB of otherwise-lazy metadata. Keep only the bytecode I/O
+    // native and install a tiny, separately parsed getter program. This avoids
+    // coupling activation to the large generated module-runtime Program while
+    // retaining synchronous first-use semantics.
+    static const char source[] =
+        "(()=>{"
+        "const cacheKey=Symbol.for('cottontail.capabilityModuleCache');const cache=globalThis[cacheKey]||(globalThis[cacheKey]=new Map);"
+        "const load=(name,path)=>{let pack=cache.get(name);if(pack==null){"
+        "const executable=String(cottontail.execPath?cottontail.execPath():'').split(String.fromCharCode(92)).join('/');"
+        "const directory=executable.slice(0,executable.lastIndexOf('/'));"
+        "try{pack=cottontail.loadCapabilityBytecode(directory+'/cottontail-stdlib/'+name+'/main.jsc')}"
+        "catch(error){const detail=String(error&&error.message!=null?error.message:error);throw new Error("
+        "'Cottontail capability '+name+' is unavailable ('+detail+'). Add '+name+' to build.cottontail.capabilities in electrobun.config.ts.')}"
+        "if(!pack||!pack.modules||typeof pack.modules!=='object')throw new Error('Cottontail capability '+name+' did not provide modules');"
+        "cache.set(name,pack)}const value=pack.modules[path];if(value==null)throw new Error('Cottontail capability '+name+' is missing module '+path);return value};"
+        "const install=(parent,definitions)=>{for(const definition of definitions){const property=definition[0],name=definition[1],path=definition[2];Object.defineProperty(parent,property,{configurable:true,get(){"
+        "const value=load(name,path);Object.defineProperty(parent,property,{value:value,configurable:true});return value}})}};"
+        "const root=globalThis.Cottontail||(globalThis.Cottontail={});const node=root.node||{};const bun=root.bun||{};"
+        "Object.defineProperty(root,'node',{value:node,configurable:true});Object.defineProperty(root,'bun',{value:bun,configurable:true});"
+        "install(root,[[\"sqlite\",\"sqlite\",\"bun/sqlite.js\"],[\"ffi\",\"ffi\",\"bun/ffi-implementation.js\"],[\"redis\",\"redis\",\"bun/redis.js\"],[\"s3\",\"s3\",\"bun/s3.js\"],[\"toml\",\"toml\",\"bun/toml.js\"],[\"json5\",\"json5\",\"bun/json5.js\"],[\"colors\",\"colors\",\"bun/color.js\"],[\"jscTools\",\"jsc-tools\",\"bun/jsc.js\"],[\"yaml\",\"yaml\",\"bun/yaml.js\"],[\"sql\",\"sql\",\"bun/sql.js\"],[\"test\",\"test\",\"bun/test.js\"],[\"shell\",\"shell\",\"bun/shell.js\"],[\"build\",\"build\",\"bun/build.js\"],[\"bake\",\"bake\",\"bun/bake-dev-server.js\"],[\"cookies\",\"cookies\",\"bun/cookie.js\"],[\"websocket\",\"websocket\",\"vendor/ws.js\"],[\"glob\",\"glob\",\"bun/glob.js\"],[\"text\",\"text\",\"bun/text.js\"],[\"uuid\",\"uuid\",\"bun/uuid.js\"],[\"password\",\"password\",\"bun/password.js\"],[\"hashing\",\"hashing\",\"bun/hashing.js\"],[\"data\",\"data\",\"bun/data.js\"],[\"markdown\",\"markdown\",\"bun/markdown.js\"],[\"compression\",\"compression\",\"node/zlib.js\"],[\"archive\",\"archive\",\"bun/archive.js\"],[\"filesystemRouter\",\"filesystem-router\",\"bun/filesystem-router.js\"],[\"htmlRewriter\",\"html-rewriter\",\"bun/html-rewriter.js\"],[\"terminal\",\"terminal\",\"bun/terminal.js\"],[\"csrf\",\"csrf\",\"bun/csrf.js\"],[\"secrets\",\"secrets\",\"bun/secrets.js\"]]);"
+        "install(node,[[\"inspector\",\"inspector\",\"node/inspector.js\"],[\"repl\",\"repl\",\"node/repl.js\"],[\"sea\",\"sea\",\"node/sea.js\"],[\"sqlite\",\"sqlite\",\"node/sqlite.js\"],[\"test\",\"test\",\"node/test.js\"],[\"zlib\",\"compression\",\"node/zlib.js\"]]);"
+        "install(bun,[[\"archive\",\"archive\",\"bun/archive.js\"],[\"bake\",\"bake\",\"bun/bake-dev-server.js\"],[\"build\",\"build\",\"bun/build.js\"],[\"color\",\"colors\",\"bun/color.js\"],[\"cookie\",\"cookies\",\"bun/cookie.js\"],[\"data\",\"data\",\"bun/data.js\"],[\"ffi\",\"ffi\",\"bun/ffi-implementation.js\"],[\"filesystemRouter\",\"filesystem-router\",\"bun/filesystem-router.js\"],[\"glob\",\"glob\",\"bun/glob.js\"],[\"hashing\",\"hashing\",\"bun/hashing.js\"],[\"htmlRewriter\",\"html-rewriter\",\"bun/html-rewriter.js\"],[\"jsc\",\"jsc-tools\",\"bun/jsc.js\"],[\"json5\",\"json5\",\"bun/json5.js\"],[\"markdown\",\"markdown\",\"bun/markdown.js\"],[\"password\",\"password\",\"bun/password.js\"],[\"redis\",\"redis\",\"bun/redis.js\"],[\"s3\",\"s3\",\"bun/s3.js\"],[\"secrets\",\"secrets\",\"bun/secrets.js\"],[\"shell\",\"shell\",\"bun/shell.js\"],[\"sql\",\"sql\",\"bun/sql.js\"],[\"sqlite\",\"sqlite\",\"bun/sqlite.js\"],[\"terminal\",\"terminal\",\"bun/terminal.js\"],[\"test\",\"test\",\"bun/test.js\"],[\"text\",\"text\",\"bun/text.js\"],[\"toml\",\"toml\",\"bun/toml.js\"],[\"uuid\",\"uuid\",\"bun/uuid.js\"],[\"websocket\",\"websocket\",\"vendor/ws.js\"],[\"yaml\",\"yaml\",\"bun/yaml.js\"]]);"
+        "})();";
+    (void)source;
+    size_t source_len = 0;
+    const uint8_t *source_bytes = ct_capability_namespace_source(&source_len);
+    JSValueRef exception = NULL;
+    JSValueRef exec_path_value = ct_exec_path(ctx, NULL, NULL, 0, NULL, &exception);
+    char *exec_path = exception == NULL ? ct_value_to_string_copy(ctx, exec_path_value) : NULL;
+    if (exec_path == NULL) return -1;
+    char *separator = strrchr(exec_path, '/');
+#if defined(_WIN32)
+    char *backslash = strrchr(exec_path, '\\');
+    if (backslash != NULL && (separator == NULL || backslash > separator)) separator = backslash;
+#endif
+    if (separator == NULL) {
+        free(exec_path);
+        return -1;
+    }
+    *separator = 0;
+#if defined(_WIN32)
+    const char *path_separator = "\\";
+#else
+    const char *path_separator = "/";
+#endif
+    const char *relative_path = "cottontail-core/capability-namespace.jsc";
+    size_t path_len = strlen(exec_path) + strlen(relative_path) + 2;
+    char *bytecode_path = (char *)malloc(path_len);
+    if (bytecode_path == NULL) {
+        free(exec_path);
+        return -1;
+    }
+    snprintf(bytecode_path, path_len, "%s%s%s", exec_path, path_separator, relative_path);
+    free(exec_path);
+    FILE *bytecode_file = fopen(bytecode_path, "rb");
+    free(bytecode_path);
+    if (bytecode_file == NULL || fseek(bytecode_file, 0, SEEK_END) != 0) {
+        if (bytecode_file != NULL) fclose(bytecode_file);
+        return -1;
+    }
+    long bytecode_size = ftell(bytecode_file);
+    if (bytecode_size <= 0 || bytecode_size > 16 * 1024 * 1024 || fseek(bytecode_file, 0, SEEK_SET) != 0) {
+        fclose(bytecode_file);
+        return -1;
+    }
+    size_t bytecode_len = (size_t)bytecode_size;
+    uint8_t *bytecode = (uint8_t *)malloc(bytecode_len);
+    if (bytecode == NULL || fread(bytecode, 1, bytecode_len, bytecode_file) != bytecode_len) {
+        free(bytecode);
+        fclose(bytecode_file);
+        return -1;
+    }
+    fclose(bytecode_file);
+    char *wrapped = ct_prepare_sync_source(source_bytes, source_len, "cottontail:core/capability-namespace");
+    JSStringRef script = wrapped != NULL ? ct_js_string(wrapped) : NULL;
+    char *source_url_text = ct_source_url_for_filename("cottontail:core/capability-namespace");
+    JSStringRef source_url = source_url_text != NULL ? ct_js_string(source_url_text) : NULL;
+    free(source_url_text);
+    if (script == NULL || source_url == NULL || bytecode == NULL || bytecode_len == 0) {
+        if (script != NULL) JSStringRelease(script);
+        if (source_url != NULL) JSStringRelease(source_url);
+        free(wrapped);
+        free(bytecode);
+        return -1;
+    }
+    const int bytecode_status = ct_jsc_embedder_bytecode_evaluate(
+        ctx,
+        script,
+        source_url,
+        bytecode,
+        bytecode_len,
+        &exception
+    );
+    JSStringRelease(script);
+    JSStringRelease(source_url);
+    free(wrapped);
+    free(bytecode);
+    if (bytecode_status != 0 && exception == NULL) {
+        fprintf(stderr, "Failed to install the Cottontail capability namespace: embedded bytecode was rejected\n");
+        return -1;
+    }
+    if (exception != NULL) {
+        char *message = ct_copy_exception(ctx, exception);
+        if (message != NULL) {
+            fprintf(stderr, "Failed to install the Cottontail capability namespace: %s\n", message);
+            free(message);
+        }
+        return -1;
+    }
+    return 0;
+#endif
+}
+
+static JSValueRef ct_generate_capability_bytecode(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "cottontail.generateCapabilityBytecode(source, filename) requires source and filename");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *source = ct_value_to_string_copy(ctx, argv[0]);
+    char *filename = ct_value_to_string_copy(ctx, argv[1]);
+    if (source == NULL || filename == NULL) {
+        free(source);
+        free(filename);
+        ct_throw_message(ctx, exception, "Capability bytecode source and filename must be strings");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *bytecode = NULL;
+    size_t bytecode_len = 0;
+    char *error = NULL;
+    int status = ct_jsc_generate_bytecode(
+        (const uint8_t *)source,
+        strlen(source),
+        filename,
+        1,
+        &bytecode,
+        &bytecode_len,
+        &error
+    );
+    free(source);
+    free(filename);
+    if (status != 0 || bytecode == NULL || bytecode_len == 0) {
+        ct_throw_message(ctx, exception, error != NULL ? error : "Capability bytecode generation failed");
+        free(error);
+        ct_jsc_bytecode_free(bytecode);
+        return JSValueMakeUndefined(ctx);
+    }
+    JSValueRef result = ct_array_buffer_from_copy(ctx, (const char *)bytecode, bytecode_len, exception);
+    ct_jsc_bytecode_free(bytecode);
+    return result;
 }
 
 typedef struct CtNativePluginArguments CtNativePluginArguments;
@@ -24095,822 +20768,6 @@ static JSValueRef ct_native_addon_load(JSContextRef ctx, JSObjectRef function, J
     JSValueRef result = ct_napi_load_addon(runtime->napi_env, path, exports, exception);
     free(path);
     return result != NULL ? result : JSValueMakeUndefined(ctx);
-}
-
-static JSValueRef ct_native_call_pointer(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    CtJscRuntime *runtime = ct_callback_runtime(function);
-    uint64_t pointer = 0;
-    CtFfiType return_type = CT_FFI_TYPE_VOID;
-    CtFfiType arg_types[CT_FFI_MAX_ARGS];
-    ffi_type *ffi_arg_types[CT_FFI_MAX_ARGS];
-    CtFfiValue arg_values[CT_FFI_MAX_ARGS];
-    void *arg_value_ptrs[CT_FFI_MAX_ARGS];
-    CtFfiValue result;
-    ffi_cif cif;
-    size_t arg_count = 0;
-    (void)thisObject;
-
-    memset(&result, 0, sizeof(result));
-
-    if (argc < 4 || ct_value_to_u64(ctx, argv[0], &pointer) != 0 || pointer == 0) {
-        ct_throw_message(ctx, exception, "cottontail.nativeCallPointer(pointer, returnType, argTypes, args) requires a function pointer");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    if (ct_parse_ffi_type(ctx, argv[1], &return_type, exception) != 0 ||
-        ct_parse_ffi_type_array(ctx, argv[2], arg_types, ffi_arg_types, &arg_count, exception) != 0) {
-        return JSValueMakeUndefined(ctx);
-    }
-
-    if (!JSValueIsObject(ctx, argv[3])) {
-        ct_throw_message(ctx, exception, "cottontail.nativeCallPointer args must be an array");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    bool uses_napi = return_type == CT_FFI_TYPE_NAPI_ENV || return_type == CT_FFI_TYPE_NAPI_VALUE;
-    for (size_t index = 0; index < arg_count; index += 1) {
-        if (arg_types[index] == CT_FFI_TYPE_NAPI_ENV || arg_types[index] == CT_FFI_TYPE_NAPI_VALUE) {
-            uses_napi = true;
-            break;
-        }
-    }
-    if (uses_napi && runtime == NULL) {
-        ct_throw_message(ctx, exception, "N-API FFI calls require an active Cottontail runtime");
-        return JSValueMakeUndefined(ctx);
-    }
-    if (uses_napi && runtime->napi_env == NULL) {
-        runtime->napi_env = ct_napi_env_create(runtime->context, &runtime->uv_loop, runtime, ct_napi_wake);
-        if (runtime->napi_env == NULL) {
-            ct_throw_message(ctx, exception, "failed to initialize the Node-API environment");
-            return JSValueMakeUndefined(ctx);
-        }
-    }
-    char ffi_identity[64];
-    CtNapiEnv *ffi_napi_env = NULL;
-    if (uses_napi) {
-        snprintf(ffi_identity, sizeof(ffi_identity), "pointer:%" PRIu64, pointer);
-        ffi_napi_env = ct_napi_env_for_ffi_library(runtime->napi_env, ffi_identity);
-        if (ffi_napi_env == NULL) {
-            ct_throw_message(ctx, exception, "failed to initialize the FFI Node-API environment");
-            return JSValueMakeUndefined(ctx);
-        }
-    }
-
-    JSObjectRef args_array = (JSObjectRef)argv[3];
-    for (size_t index = 0; index < arg_count; index += 1) {
-        JSValueRef item = JSObjectGetPropertyAtIndex(ctx, args_array, (unsigned)index, exception);
-        if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
-        if (arg_types[index] == CT_FFI_TYPE_NAPI_ENV) {
-            arg_values[index].u64 = (uint64_t)(uintptr_t)ffi_napi_env;
-            arg_value_ptrs[index] = ct_ffi_value_ptr(&arg_values[index], arg_types[index]);
-            continue;
-        }
-        if (arg_types[index] == CT_FFI_TYPE_NAPI_VALUE) {
-            arg_values[index].u64 = (uint64_t)(uintptr_t)item;
-            arg_value_ptrs[index] = ct_ffi_value_ptr(&arg_values[index], arg_types[index]);
-            continue;
-        }
-        if (ct_ffi_value_from_js(ctx, item, arg_types[index], &arg_values[index], exception) != 0) {
-            return JSValueMakeUndefined(ctx);
-        }
-        arg_value_ptrs[index] = ct_ffi_value_ptr(&arg_values[index], arg_types[index]);
-    }
-
-    if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned int)arg_count, ct_ffi_libffi_type(return_type), ffi_arg_types) != FFI_OK) {
-        ct_throw_message(ctx, exception, "ffi_prep_cif failed for function pointer");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    ffi_call(&cif, FFI_FN((void *)(uintptr_t)pointer), ct_ffi_value_ptr(&result, return_type), arg_value_ptrs);
-    if (uses_napi) {
-        JSValueRef napi_exception = ct_napi_env_take_exception(ffi_napi_env);
-        if (napi_exception != NULL) {
-            *exception = napi_exception;
-            return JSValueMakeUndefined(ctx);
-        }
-    }
-    return ct_ffi_value_to_js(ctx, return_type, result, exception);
-}
-
-static uint32_t ct_ffi_to_uint32(double number) {
-    if (!isfinite(number) || number == 0) return 0;
-    double wrapped = fmod(trunc(number), 4294967296.0);
-    if (wrapped < 0) wrapped += 4294967296.0;
-    return (uint32_t)wrapped;
-}
-
-static int ct_ffi_number_from_js(
-    JSContextRef ctx,
-    JSValueRef value,
-    double *out,
-    JSValueRef *exception
-) {
-    if (JSValueIsBigInt(ctx, value)) {
-        char *text = ct_value_to_string_copy(ctx, value);
-        if (text == NULL) {
-            ct_throw_type_error(ctx, exception, "Unable to convert FFI argument to a number");
-            return -1;
-        }
-        *out = strtod(text, NULL);
-        free(text);
-        return 0;
-    }
-
-    JSValueRef local_exception = NULL;
-    *out = JSValueToNumber(ctx, value, &local_exception);
-    if (local_exception != NULL) {
-        if (exception != NULL) *exception = local_exception;
-        return -1;
-    }
-    return 0;
-}
-
-static uint64_t ct_ffi_decimal_word(const char *text) {
-    if (text == NULL) return 0;
-    bool negative = false;
-    if (*text == '-' || *text == '+') {
-        negative = *text == '-';
-        text += 1;
-    }
-
-    uint64_t value = 0;
-    while (*text >= '0' && *text <= '9') {
-        value = value * 10u + (uint64_t)(*text - '0');
-        text += 1;
-    }
-    return negative ? (uint64_t)(0u - value) : value;
-}
-
-static uint64_t ct_ffi_word_from_number(double number) {
-    if (!isfinite(number)) return 0;
-
-    char number_text[512];
-    snprintf(number_text, sizeof(number_text), "%.0f", trunc(number));
-    return ct_ffi_decimal_word(number_text);
-}
-
-static uint64_t ct_ffi_word_from_js(JSContextRef ctx, JSValueRef value) {
-    char *text = NULL;
-    uint64_t result = 0;
-
-    if (JSValueIsBigInt(ctx, value)) {
-        text = ct_value_to_string_copy(ctx, value);
-        result = ct_ffi_decimal_word(text);
-        free(text);
-        return result;
-    }
-
-    JSValueRef local_exception = NULL;
-    double number = JSValueToNumber(ctx, value, &local_exception);
-    if (local_exception != NULL || !isfinite(number)) return 0;
-    return ct_ffi_word_from_number(number);
-}
-
-static int ct_prepared_ffi_pointer_from_js(
-    JSContextRef ctx,
-    JSValueRef value,
-    const CtPreparedFfiCall *call,
-    size_t argument_index,
-    uint64_t *out,
-    JSValueRef *exception
-) {
-    uint8_t type_id = call->arg_type_ids[argument_index];
-    bool function_pointer = type_id == 17;
-    bool typed_array_only = type_id == 20;
-    *out = 0;
-
-    if (value == NULL || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value)) return 0;
-
-    if (JSValueIsObject(ctx, value)) {
-        JSValueRef local_exception = NULL;
-        JSTypedArrayType array_type = JSValueGetTypedArrayType(ctx, value, &local_exception);
-        if (local_exception != NULL) {
-            if (exception != NULL) *exception = local_exception;
-            return -1;
-        }
-        if (array_type != kJSTypedArrayTypeNone) {
-            if (typed_array_only && array_type == kJSTypedArrayTypeArrayBuffer) {
-                ct_throw_type_error(ctx, exception, "Expected a TypedArray");
-                return -1;
-            }
-
-            uint8_t *bytes = NULL;
-            size_t byte_len = 0;
-            if (ct_get_bytes(ctx, value, &bytes, &byte_len) != 0) {
-                ct_throw_type_error(ctx, exception, "Unable to convert buffer to a pointer");
-                return -1;
-            }
-            if (array_type == kJSTypedArrayTypeArrayBuffer && byte_len == 0) {
-                ct_throw_type_error(ctx, exception, "ArrayBufferView must have a length > 0. A pointer to empty memory doesn't work");
-                return -1;
-            }
-            *out = (uint64_t)(uintptr_t)bytes;
-            return 0;
-        }
-
-        if (typed_array_only) {
-            ct_throw_type_error(ctx, exception, "Expected a TypedArray");
-            return -1;
-        }
-
-        bool pointer_wrapper = function_pointer;
-        if (!pointer_wrapper && call->callback_constructor != NULL) {
-            pointer_wrapper = JSValueIsInstanceOfConstructor(
-                ctx,
-                value,
-                call->callback_constructor,
-                exception
-            );
-            if (exception != NULL && *exception != NULL) return -1;
-        }
-        if (!pointer_wrapper && call->cstring_constructor != NULL) {
-            pointer_wrapper = JSValueIsInstanceOfConstructor(
-                ctx,
-                value,
-                call->cstring_constructor,
-                exception
-            );
-            if (exception != NULL && *exception != NULL) return -1;
-        }
-        if (pointer_wrapper) {
-            JSValueRef pointer_value = ct_get_property(ctx, (JSObjectRef)value, "ptr", exception);
-            if (exception != NULL && *exception != NULL) return -1;
-            if (JSValueIsBigInt(ctx, pointer_value)) {
-                if (!function_pointer) {
-                    ct_throw_type_error(ctx, exception, "Unable to convert BigInt to a pointer");
-                    return -1;
-                }
-                double pointer = 0;
-                if (ct_ffi_number_from_js(ctx, pointer_value, &pointer, exception) != 0) return -1;
-                if (!isfinite(pointer) || pointer < 0) {
-                    ct_throw_type_error(ctx, exception, "Expected function to be a JSCallback or a number");
-                    return -1;
-                }
-                *out = (uint64_t)pointer;
-                return 0;
-            }
-            if (JSValueIsNumber(ctx, pointer_value)) {
-                double pointer = JSValueToNumber(ctx, pointer_value, NULL);
-                if (!isfinite(pointer) || pointer < 0) {
-                    ct_throw_type_error(
-                        ctx,
-                        exception,
-                        function_pointer
-                            ? "Expected function to be a JSCallback or a number"
-                            : "Unable to convert value to a pointer"
-                    );
-                    return -1;
-                }
-                *out = (uint64_t)pointer;
-                return 0;
-            }
-
-            ct_throw_type_error(
-                ctx,
-                exception,
-                function_pointer
-                    ? "Expected function to be a JSCallback or a number"
-                    : "Unable to convert value to a pointer"
-            );
-            return -1;
-        }
-
-        ct_throw_type_error(
-            ctx,
-            exception,
-            function_pointer
-                ? "Expected function to be a JSCallback or a number"
-                : "Unable to convert value to a pointer"
-        );
-        return -1;
-    }
-
-    if (typed_array_only) {
-        ct_throw_type_error(ctx, exception, "Expected a TypedArray");
-        return -1;
-    }
-    if (JSValueIsString(ctx, value)) {
-        ct_throw_type_error(ctx, exception, "To convert a string to a pointer, encode it as a buffer");
-        return -1;
-    }
-    if (JSValueIsBigInt(ctx, value)) {
-        if (!function_pointer) {
-            ct_throw_type_error(ctx, exception, "Unable to convert BigInt to a pointer");
-            return -1;
-        }
-        double pointer = 0;
-        if (ct_ffi_number_from_js(ctx, value, &pointer, exception) != 0) return -1;
-        if (!isfinite(pointer) || pointer < 0) {
-            ct_throw_type_error(ctx, exception, "Expected function to be a JSCallback or a number");
-            return -1;
-        }
-        *out = (uint64_t)pointer;
-        return 0;
-    }
-
-    if (JSValueIsNumber(ctx, value)) {
-        double pointer = JSValueToNumber(ctx, value, NULL);
-        if (!isfinite(pointer) || pointer < 0) {
-            ct_throw_type_error(
-                ctx,
-                exception,
-                function_pointer
-                    ? "Expected function to be a JSCallback or a number"
-                    : "Unable to convert value to a pointer"
-            );
-            return -1;
-        }
-        *out = (uint64_t)pointer;
-        return 0;
-    }
-
-    ct_throw_type_error(
-        ctx,
-        exception,
-        function_pointer
-            ? "Expected function to be a JSCallback or a number"
-            : "Unable to convert value to a pointer"
-    );
-    return -1;
-}
-
-static int ct_prepared_ffi_argument_from_js(
-    JSContextRef ctx,
-    JSValueRef value,
-    const CtPreparedFfiCall *call,
-    size_t argument_index,
-    CtFfiValue *out,
-    JSValueRef *exception
-) {
-    uint8_t type_id = call->arg_type_ids[argument_index];
-    double number = 0;
-    uint32_t int32_bits = 0;
-    uint64_t pointer = 0;
-    memset(out, 0, sizeof(*out));
-
-    switch (type_id) {
-        case 0:
-        case 1:
-            if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) return -1;
-            int32_bits = ct_ffi_to_uint32(number);
-            out->i8 = (int8_t)(uint8_t)int32_bits;
-            return 0;
-        case 2:
-            if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) return -1;
-            if (isnan(number) || number <= 0) out->u8 = 0;
-            else if (number >= UINT8_MAX) out->u8 = UINT8_MAX;
-            else out->u8 = (uint8_t)ct_ffi_to_uint32(number);
-            return 0;
-        case 3:
-            if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) return -1;
-            if (isnan(number)) number = 0;
-            if (number <= INT16_MIN) out->i16 = INT16_MIN;
-            else if (number >= 32768.0) out->i16 = INT16_MIN;
-            else out->i16 = (int16_t)(uint16_t)ct_ffi_to_uint32(number);
-            return 0;
-        case 4:
-            if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) return -1;
-            int32_bits = ct_ffi_to_uint32(number);
-            if ((int32_t)int32_bits <= 0) out->u16 = 0;
-            else if (int32_bits > UINT16_MAX) out->u16 = UINT16_MAX;
-            else out->u16 = (uint16_t)int32_bits;
-            return 0;
-        case 5:
-            if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) return -1;
-            out->i32 = (int32_t)ct_ffi_to_uint32(number);
-            return 0;
-        case 6:
-            if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) return -1;
-            if (isnan(number) || number <= 0) out->u32 = 0;
-            else if (number > UINT32_MAX) out->u32 = UINT32_MAX;
-            else out->u32 = ct_ffi_to_uint32(number);
-            return 0;
-        case 7:
-        case 15:
-            out->u64 = ct_ffi_word_from_js(ctx, value);
-            return 0;
-        case 8:
-        case 16:
-            if (JSValueIsBigInt(ctx, value)) {
-                out->u64 = ct_ffi_word_from_js(ctx, value);
-                return 0;
-            }
-            if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) return -1;
-            out->u64 = number > 0 ? ct_ffi_word_from_number(number) : 0;
-            return 0;
-        case 9:
-            if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) return -1;
-            out->f64 = isnan(number) || number == 0 ? 0 : number;
-            return 0;
-        case 10:
-            if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) return -1;
-            out->f32 = isnan(number) || number == 0 ? 0 : (float)number;
-            return 0;
-        case 11:
-            out->u8 = JSValueToBoolean(ctx, value) ? 1 : 0;
-            return 0;
-        case 12:
-        case 14:
-        case 17:
-        case 20:
-            if (ct_prepared_ffi_pointer_from_js(
-                    ctx,
-                    value,
-                    call,
-                    argument_index,
-                    &pointer,
-                    exception
-                ) != 0) {
-                return -1;
-            }
-            out->u64 = pointer;
-            return 0;
-        case 13:
-            return 0;
-        case 18:
-        case 19:
-            return 0;
-        default:
-            ct_throw_type_error(ctx, exception, "Unsupported FFI argument type");
-            return -1;
-    }
-}
-
-static JSValueRef ct_prepared_ffi_result_to_js(
-    JSContextRef ctx,
-    const CtPreparedFfiCall *call,
-    CtFfiValue result,
-    JSValueRef *exception
-) {
-    switch (call->return_type_id) {
-        case 12:
-        case 17:
-            return result.ptr == NULL
-                ? JSValueMakeNull(ctx)
-                : JSValueMakeNumber(ctx, (double)(uintptr_t)result.ptr);
-        case 14:
-        case 20:
-            return JSValueMakeNumber(ctx, (double)(uintptr_t)result.ptr);
-        case 15:
-            return JSValueMakeNumber(ctx, (double)result.i64);
-        case 16:
-            if (result.u64 <= 9007199254740991ULL) return JSValueMakeNumber(ctx, (double)result.u64);
-            return JSBigIntCreateWithUInt64(ctx, result.u64, exception);
-        default:
-            return ct_ffi_value_to_js(ctx, call->returns, result, exception);
-    }
-}
-
-static JSValueRef ct_prepared_ffi_call_as_function(
-    JSContextRef ctx,
-    JSObjectRef function,
-    JSObjectRef thisObject,
-    size_t argc,
-    const JSValueRef argv[],
-    JSValueRef *exception
-) {
-    (void)thisObject;
-    CtPreparedFfiCall *call = (CtPreparedFfiCall *)JSObjectGetPrivate(function);
-    if (call == NULL || call->function_pointer == NULL) {
-        ct_throw_type_error(ctx, exception, "FFI function is unavailable");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    if (call->fast_path == CT_PREPARED_FFI_FAST_PATH_I32_TO_I32) {
-        JSValueRef value = argc > 0 ? argv[0] : JSValueMakeUndefined(ctx);
-        double number = 0;
-        if (ct_ffi_number_from_js(ctx, value, &number, exception) != 0) {
-            return JSValueMakeUndefined(ctx);
-        }
-
-        int32_t argument = number >= INT32_MIN && number <= INT32_MAX
-            ? (int32_t)number
-            : (int32_t)ct_ffi_to_uint32(number);
-        int32_t (*native_call)(int32_t) = (int32_t (*)(int32_t))call->function_pointer;
-        return JSValueMakeNumber(ctx, native_call(argument));
-    }
-
-    CtFfiValue arg_values[CT_FFI_MAX_ARGS];
-    void *arg_value_ptrs[CT_FFI_MAX_ARGS];
-    CtFfiValue result;
-    memset(&result, 0, sizeof(result));
-
-    for (size_t index = 0; index < call->argc; index += 1) {
-        JSValueRef value = index < argc ? argv[index] : JSValueMakeUndefined(ctx);
-        if (call->arg_types[index] == CT_FFI_TYPE_NAPI_ENV) {
-            arg_values[index].u64 = (uint64_t)(uintptr_t)call->napi_env;
-        } else if (call->arg_types[index] == CT_FFI_TYPE_NAPI_VALUE) {
-            arg_values[index].u64 = (uint64_t)(uintptr_t)value;
-        } else if (ct_prepared_ffi_argument_from_js(
-                       ctx,
-                       value,
-                       call,
-                       index,
-                       &arg_values[index],
-                       exception
-                   ) != 0) {
-            return JSValueMakeUndefined(ctx);
-        }
-        arg_value_ptrs[index] = ct_ffi_value_ptr(&arg_values[index], call->arg_types[index]);
-    }
-
-    ffi_call(
-        &call->cif,
-        FFI_FN(call->function_pointer),
-        ct_ffi_value_ptr(&result, call->returns),
-        arg_value_ptrs
-    );
-    if (call->napi_env != NULL) {
-        JSValueRef napi_exception = ct_napi_env_take_exception(call->napi_env);
-        if (napi_exception != NULL) {
-            if (exception != NULL) *exception = napi_exception;
-            return JSValueMakeUndefined(ctx);
-        }
-    }
-    return ct_prepared_ffi_result_to_js(ctx, call, result, exception);
-}
-
-static void ct_prepared_ffi_call_destroy(CtPreparedFfiCall *call) {
-    if (call == NULL) return;
-    free(call);
-}
-
-static void ct_prepared_ffi_call_finalize(JSObjectRef object) {
-    CtPreparedFfiCall *call = (CtPreparedFfiCall *)JSObjectGetPrivate(object);
-    ct_prepared_ffi_call_destroy(call);
-}
-
-static JSClassRef ct_get_prepared_ffi_class(void) {
-    pthread_mutex_lock(&ct_prepared_ffi_class_mutex);
-    if (ct_prepared_ffi_class == NULL) {
-        JSClassDefinition definition = kJSClassDefinitionEmpty;
-        definition.className = "CottontailPreparedFFI";
-        definition.callAsFunction = ct_prepared_ffi_call_as_function;
-        definition.finalize = ct_prepared_ffi_call_finalize;
-        ct_prepared_ffi_class = JSClassCreate(&definition);
-    }
-    JSClassRef result = ct_prepared_ffi_class;
-    pthread_mutex_unlock(&ct_prepared_ffi_class_mutex);
-    return result;
-}
-
-static JSValueRef ct_prepare_native_call(
-    JSContextRef ctx,
-    JSObjectRef function,
-    JSObjectRef thisObject,
-    size_t argc,
-    const JSValueRef argv[],
-    JSValueRef *exception
-) {
-    (void)thisObject;
-    CtJscRuntime *runtime = ct_callback_runtime(function);
-    uint64_t pointer = 0;
-    if (argc < 3 || ct_value_to_u64(ctx, argv[0], &pointer) != 0 || pointer == 0) {
-        ct_throw_type_error(ctx, exception, "prepareNativeCall requires a function pointer and FFI signature");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    CtPreparedFfiCall *call = (CtPreparedFfiCall *)calloc(1, sizeof(*call));
-    if (call == NULL) {
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-    call->function_pointer = (void *)(uintptr_t)pointer;
-
-    if (ct_parse_ffi_type_id(ctx, argv[1], &call->return_type_id, &call->returns, exception) != 0 ||
-        ct_parse_ffi_type_id_array(
-            ctx,
-            argv[2],
-            call->arg_type_ids,
-            call->arg_types,
-            call->ffi_arg_types,
-            &call->argc,
-            exception
-        ) != 0) {
-        ct_prepared_ffi_call_destroy(call);
-        return JSValueMakeUndefined(ctx);
-    }
-
-    if (call->returns == CT_FFI_TYPE_I32 &&
-        call->argc == 1 &&
-        call->arg_types[0] == CT_FFI_TYPE_I32) {
-        call->fast_path = CT_PREPARED_FFI_FAST_PATH_I32_TO_I32;
-    }
-
-    bool needs_pointer_constructors = false;
-    for (size_t index = 0; index < call->argc && !needs_pointer_constructors; index += 1) {
-        needs_pointer_constructors = call->arg_type_ids[index] == 12 ||
-            call->arg_type_ids[index] == 14;
-    }
-    if (needs_pointer_constructors) {
-        if (argc < 6 || !JSValueIsObject(ctx, argv[4]) || !JSValueIsObject(ctx, argv[5])) {
-            ct_prepared_ffi_call_destroy(call);
-            ct_throw_message(ctx, exception, "prepareNativeCall requires FFI pointer constructors");
-            return JSValueMakeUndefined(ctx);
-        }
-        call->callback_constructor = (JSObjectRef)argv[4];
-        call->cstring_constructor = (JSObjectRef)argv[5];
-    }
-
-    bool uses_napi = call->returns == CT_FFI_TYPE_NAPI_ENV || call->returns == CT_FFI_TYPE_NAPI_VALUE;
-    for (size_t index = 0; index < call->argc && !uses_napi; index += 1) {
-        uses_napi = call->arg_types[index] == CT_FFI_TYPE_NAPI_ENV ||
-            call->arg_types[index] == CT_FFI_TYPE_NAPI_VALUE;
-    }
-    if (uses_napi) {
-        if (runtime == NULL) {
-            ct_prepared_ffi_call_destroy(call);
-            ct_throw_message(ctx, exception, "N-API FFI calls require an active Cottontail runtime");
-            return JSValueMakeUndefined(ctx);
-        }
-        if (runtime->napi_env == NULL) {
-            runtime->napi_env = ct_napi_env_create(runtime->context, &runtime->uv_loop, runtime, ct_napi_wake);
-            if (runtime->napi_env == NULL) {
-                ct_prepared_ffi_call_destroy(call);
-                ct_throw_message(ctx, exception, "failed to initialize the Node-API environment");
-                return JSValueMakeUndefined(ctx);
-            }
-        }
-
-        char pointer_identity[64];
-        char *identity = NULL;
-        if (argc >= 4 && !JSValueIsUndefined(ctx, argv[3]) && !JSValueIsNull(ctx, argv[3])) {
-            identity = ct_value_to_string_copy(ctx, argv[3]);
-        } else {
-            snprintf(pointer_identity, sizeof(pointer_identity), "pointer:%" PRIu64, pointer);
-            identity = ct_duplicate_string(pointer_identity);
-        }
-        if (identity == NULL) {
-            ct_prepared_ffi_call_destroy(call);
-            ct_throw_message(ctx, exception, "Out of memory");
-            return JSValueMakeUndefined(ctx);
-        }
-        call->napi_env = ct_napi_env_for_ffi_library(runtime->napi_env, identity);
-        free(identity);
-        if (call->napi_env == NULL) {
-            ct_prepared_ffi_call_destroy(call);
-            ct_throw_message(ctx, exception, "failed to initialize the FFI Node-API environment");
-            return JSValueMakeUndefined(ctx);
-        }
-    }
-
-    if (ffi_prep_cif(
-            &call->cif,
-            FFI_DEFAULT_ABI,
-            (unsigned int)call->argc,
-            ct_ffi_libffi_type(call->returns),
-            call->ffi_arg_types
-        ) != FFI_OK) {
-        ct_prepared_ffi_call_destroy(call);
-        ct_throw_message(ctx, exception, "ffi_prep_cif failed for function pointer");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    JSObjectRef prepared = JSObjectMake(ctx, ct_get_prepared_ffi_class(), call);
-    if (prepared == NULL) {
-        ct_prepared_ffi_call_destroy(call);
-        ct_throw_message(ctx, exception, "failed to create prepared FFI function");
-        return JSValueMakeUndefined(ctx);
-    }
-    if (call->fast_path == CT_PREPARED_FFI_FAST_PATH_I32_TO_I32) {
-        JSObjectRef fast_call = ct_jsc_embedder_create_function(
-            ctx,
-            "ffi",
-            1,
-            ct_prepared_ffi_i32_call,
-            (void *)pointer
-        );
-        if (fast_call != NULL &&
-            !ct_set_property(
-                ctx,
-                prepared,
-                "__cottontailFastCall",
-                fast_call,
-                exception
-            )) {
-            JSObjectSetPrivate(prepared, NULL);
-            ct_prepared_ffi_call_destroy(call);
-            return JSValueMakeUndefined(ctx);
-        }
-    }
-    /* Root pointer constructors through the callable; JSC finalizers may run on any thread. */
-    if (needs_pointer_constructors &&
-        (!ct_set_property(
-             ctx,
-             prepared,
-             "__cottontailFFICallbackConstructor",
-             call->callback_constructor,
-             exception
-         ) ||
-         !ct_set_property(
-             ctx,
-             prepared,
-             "__cottontailFFICStringConstructor",
-             call->cstring_constructor,
-             exception
-         ))) {
-        JSObjectSetPrivate(prepared, NULL);
-        ct_prepared_ffi_call_destroy(call);
-        return JSValueMakeUndefined(ctx);
-    }
-    return prepared;
-}
-
-static JSValueRef ct_create_callback(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    CtJscRuntime *runtime = ct_callback_runtime(function);
-    CtFfiCallback *callback = NULL;
-    (void)thisObject;
-
-    if (argc < 4 || !JSValueIsObject(ctx, argv[0]) || !JSObjectIsFunction(ctx, (JSObjectRef)argv[0])) {
-        ct_throw_message(ctx, exception, "cottontail.createCallback(fn, argTypes, returnType, threadsafe) requires a function");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    callback = (CtFfiCallback *)calloc(1, sizeof(CtFfiCallback));
-    if (callback == NULL) {
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    callback->runtime = runtime;
-    callback->ctx = ctx;
-    callback->function = (JSObjectRef)argv[0];
-    callback->threadsafe = JSValueToBoolean(ctx, argv[3]);
-    callback->owner_thread = pthread_self();
-    JSValueProtect(ctx, callback->function);
-
-    if (ct_parse_ffi_type_array(ctx, argv[1], callback->arg_types, callback->ffi_arg_types, &callback->argc, exception) != 0 ||
-        ct_parse_ffi_type(ctx, argv[2], &callback->returns, exception) != 0) {
-        JSValueUnprotect(ctx, callback->function);
-        free(callback);
-        return JSValueMakeUndefined(ctx);
-    }
-
-    callback->closure = ffi_closure_alloc(sizeof(ffi_closure), &callback->code);
-    if (callback->closure == NULL) {
-        JSValueUnprotect(ctx, callback->function);
-        free(callback);
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    if (ffi_prep_cif(
-            &callback->cif,
-            FFI_DEFAULT_ABI,
-            (unsigned int)callback->argc,
-            ct_ffi_libffi_type(callback->returns),
-            callback->ffi_arg_types
-        ) != FFI_OK ||
-        ffi_prep_closure_loc(
-            callback->closure,
-            &callback->cif,
-            ct_ffi_callback_dispatch,
-            callback,
-            callback->code
-        ) != FFI_OK) {
-        ffi_closure_free(callback->closure);
-        JSValueUnprotect(ctx, callback->function);
-        free(callback);
-        ct_throw_message(ctx, exception, "failed to create FFI callback");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    pthread_mutex_lock(&runtime->callback_mutex);
-    callback->next = runtime->callbacks;
-    runtime->callbacks = callback;
-    pthread_mutex_unlock(&runtime->callback_mutex);
-
-    return JSValueMakeNumber(ctx, (double)(uintptr_t)callback->code);
-}
-
-static JSValueRef ct_close_callback(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    CtJscRuntime *runtime = ct_callback_runtime(function);
-    uint64_t code = 0;
-    (void)thisObject;
-
-    if (runtime == NULL || argc < 1 || ct_value_to_u64(ctx, argv[0], &code) != 0 || code == 0) {
-        ct_throw_message(ctx, exception, "cottontail.closeCallback(ptr) requires a callback pointer");
-        return JSValueMakeBoolean(ctx, false);
-    }
-
-    bool closed = false;
-    JSObjectRef callback_function = NULL;
-    pthread_mutex_lock(&runtime->callback_mutex);
-    for (CtFfiCallback *callback = runtime->callbacks; callback != NULL; callback = callback->next) {
-        if ((uint64_t)(uintptr_t)callback->code == code) {
-            if (!callback->closed) {
-                callback->closed = true;
-                callback_function = callback->function;
-                callback->function = NULL;
-                closed = true;
-            }
-            break;
-        }
-    }
-    pthread_mutex_unlock(&runtime->callback_mutex);
-
-    if (callback_function != NULL) JSValueUnprotect(ctx, callback_function);
-    return JSValueMakeBoolean(ctx, closed);
 }
 
 static void ct_external_string_free(void *context, void *buffer, size_t buffer_size) {
@@ -32997,307 +28854,6 @@ static int ct_fd_write_bytes(int fd, const uint8_t *bytes, size_t len) {
     return 0;
 }
 
-static JSValueRef ct_terminal_create(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-#if defined(_WIN32)
-    (void)argc;
-    (void)argv;
-    ct_throw_message(ctx, exception, "PTY not supported on this platform");
-    return JSValueMakeUndefined(ctx);
-#else
-    int cols = 80;
-    int rows = 24;
-    if (argc >= 1 && !ct_value_to_int_checked(ctx, argv[0], 1, UINT16_MAX, &cols, exception, "invalid terminal column count")) {
-        return JSValueMakeUndefined(ctx);
-    }
-    if (argc >= 2 && !ct_value_to_int_checked(ctx, argv[1], 1, UINT16_MAX, &rows, exception, "invalid terminal row count")) {
-        return JSValueMakeUndefined(ctx);
-    }
-
-    int master_fd = posix_openpt(O_RDWR | O_NOCTTY);
-    if (master_fd < 0) {
-        ct_throw_message(ctx, exception, strerror(errno));
-        return JSValueMakeUndefined(ctx);
-    }
-    if (grantpt(master_fd) != 0 || unlockpt(master_fd) != 0) {
-        int open_error = errno;
-        close(master_fd);
-        ct_throw_message(ctx, exception, strerror(open_error));
-        return JSValueMakeUndefined(ctx);
-    }
-
-    char *slave_name = ptsname(master_fd);
-    if (slave_name == NULL) {
-        int open_error = errno;
-        close(master_fd);
-        ct_throw_message(ctx, exception, strerror(open_error));
-        return JSValueMakeUndefined(ctx);
-    }
-    int slave_fd = open(slave_name, O_RDWR | O_NOCTTY);
-    if (slave_fd < 0) {
-        int open_error = errno;
-        close(master_fd);
-        ct_throw_message(ctx, exception, strerror(open_error));
-        return JSValueMakeUndefined(ctx);
-    }
-    int read_fd = dup(master_fd);
-    int write_fd = dup(master_fd);
-    if (read_fd < 0 || write_fd < 0) {
-        int open_error = errno;
-        if (read_fd >= 0) close(read_fd);
-        if (write_fd >= 0) close(write_fd);
-        close(slave_fd);
-        close(master_fd);
-        ct_throw_message(ctx, exception, strerror(open_error));
-        return JSValueMakeUndefined(ctx);
-    }
-
-    struct winsize size;
-    memset(&size, 0, sizeof(size));
-    size.ws_col = (unsigned short)cols;
-    size.ws_row = (unsigned short)rows;
-    if (ioctl(master_fd, TIOCSWINSZ, &size) != 0) {
-        int resize_error = errno;
-        close(write_fd);
-        close(read_fd);
-        close(slave_fd);
-        close(master_fd);
-        ct_throw_message(ctx, exception, strerror(resize_error));
-        return JSValueMakeUndefined(ctx);
-    }
-
-    ct_process_set_close_on_exec(master_fd);
-    ct_process_set_close_on_exec(read_fd);
-    ct_process_set_close_on_exec(write_fd);
-    ct_process_set_close_on_exec(slave_fd);
-
-    JSObjectRef result = ct_make_object(ctx);
-    ct_set_property(ctx, result, "masterFd", JSValueMakeNumber(ctx, master_fd), exception);
-    ct_set_property(ctx, result, "readFd", JSValueMakeNumber(ctx, read_fd), exception);
-    ct_set_property(ctx, result, "writeFd", JSValueMakeNumber(ctx, write_fd), exception);
-    ct_set_property(ctx, result, "slaveFd", JSValueMakeNumber(ctx, slave_fd), exception);
-    return result;
-#endif
-}
-
-static JSValueRef ct_terminal_write(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-#if defined(_WIN32)
-    (void)argc;
-    (void)argv;
-    ct_throw_message(ctx, exception, "PTY not supported on this platform");
-    return JSValueMakeUndefined(ctx);
-#else
-    if (argc < 2) {
-        ct_throw_message(ctx, exception, "terminalWrite(fd, data) requires a file descriptor and data");
-        return JSValueMakeUndefined(ctx);
-    }
-    int fd;
-    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "invalid terminal file descriptor")) {
-        return JSValueMakeUndefined(ctx);
-    }
-    uint8_t *bytes = NULL;
-    size_t len = 0;
-    if (ct_get_bytes(ctx, argv[1], &bytes, &len) != 0) {
-        ct_throw_message(ctx, exception, "terminal data must be an ArrayBuffer or typed array");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    size_t written_total = 0;
-    while (written_total < len) {
-        ssize_t written = write(fd, bytes + written_total, len - written_total);
-        if (written > 0) {
-            written_total += (size_t)written;
-            continue;
-        }
-        if (written < 0 && errno == EINTR) continue;
-        if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            struct pollfd descriptor = { .fd = fd, .events = POLLOUT, .revents = 0 };
-            int ready;
-            do {
-                ready = poll(&descriptor, 1, 1000);
-            } while (ready < 0 && errno == EINTR);
-            if (ready > 0) continue;
-            if (written_total > 0) break;
-        }
-        if (written_total == 0) {
-            ct_throw_message(ctx, exception, strerror(errno));
-            return JSValueMakeUndefined(ctx);
-        }
-        break;
-    }
-    return JSValueMakeNumber(ctx, (double)written_total);
-#endif
-}
-
-static JSValueRef ct_terminal_resize(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-#if defined(_WIN32)
-    (void)argc;
-    (void)argv;
-    ct_throw_message(ctx, exception, "PTY not supported on this platform");
-    return JSValueMakeUndefined(ctx);
-#else
-    if (argc < 3) {
-        ct_throw_message(ctx, exception, "terminalResize(fd, cols, rows) requires a file descriptor, columns, and rows");
-        return JSValueMakeUndefined(ctx);
-    }
-    int fd;
-    int cols;
-    int rows;
-    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "invalid terminal file descriptor") ||
-        !ct_value_to_int_checked(ctx, argv[1], 1, UINT16_MAX, &cols, exception, "invalid terminal column count") ||
-        !ct_value_to_int_checked(ctx, argv[2], 1, UINT16_MAX, &rows, exception, "invalid terminal row count")) {
-        return JSValueMakeUndefined(ctx);
-    }
-    struct winsize size;
-    memset(&size, 0, sizeof(size));
-    size.ws_col = (unsigned short)cols;
-    size.ws_row = (unsigned short)rows;
-    if (ioctl(fd, TIOCSWINSZ, &size) != 0) {
-        ct_throw_message(ctx, exception, strerror(errno));
-    }
-    return JSValueMakeUndefined(ctx);
-#endif
-}
-
-static JSValueRef ct_terminal_get_flags(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-#if defined(_WIN32)
-    (void)argc;
-    (void)argv;
-    return JSValueMakeNumber(ctx, 0);
-#else
-    if (argc < 2) return JSValueMakeNumber(ctx, 0);
-    int fd;
-    int kind;
-    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "invalid terminal file descriptor") ||
-        !ct_value_to_int_checked(ctx, argv[1], 0, 3, &kind, exception, "invalid terminal flag kind")) {
-        return JSValueMakeUndefined(ctx);
-    }
-    struct termios attributes;
-    if (tcgetattr(fd, &attributes) != 0) return JSValueMakeNumber(ctx, 0);
-    tcflag_t value = kind == 0 ? attributes.c_iflag
-        : kind == 1 ? attributes.c_oflag
-        : kind == 2 ? attributes.c_lflag
-        : attributes.c_cflag;
-    return JSValueMakeNumber(ctx, (double)value);
-#endif
-}
-
-static JSValueRef ct_terminal_set_flags(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-#if defined(_WIN32)
-    (void)argc;
-    (void)argv;
-    return JSValueMakeUndefined(ctx);
-#else
-    if (argc < 3) return JSValueMakeUndefined(ctx);
-    int fd;
-    int kind;
-    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "invalid terminal file descriptor") ||
-        !ct_value_to_int_checked(ctx, argv[1], 0, 3, &kind, exception, "invalid terminal flag kind")) {
-        return JSValueMakeUndefined(ctx);
-    }
-    double numeric = ct_value_to_number(ctx, argv[2]);
-    if (!isfinite(numeric)) numeric = 0;
-    if (numeric < 0) numeric = 0;
-    if (numeric > (double)UINT32_MAX) numeric = (double)UINT32_MAX;
-    struct termios attributes;
-    if (tcgetattr(fd, &attributes) != 0) return JSValueMakeUndefined(ctx);
-    tcflag_t value = (tcflag_t)numeric;
-    if (kind == 0) attributes.c_iflag = value;
-    else if (kind == 1) attributes.c_oflag = value;
-    else if (kind == 2) attributes.c_lflag = value;
-    else attributes.c_cflag = value;
-    (void)tcsetattr(fd, TCSANOW, &attributes);
-    return JSValueMakeUndefined(ctx);
-#endif
-}
-
-static JSValueRef ct_terminal_set_raw_mode(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-#if defined(_WIN32)
-    if (argc < 2) {
-        ct_throw_message(ctx, exception, "terminalSetRawMode(fd, enabled) requires a file descriptor and mode");
-        return JSValueMakeUndefined(ctx);
-    }
-    int fd;
-    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "invalid terminal file descriptor")) {
-        return JSValueMakeUndefined(ctx);
-    }
-
-    intptr_t raw_handle = _get_osfhandle(fd);
-    HANDLE handle = raw_handle == -1 ? INVALID_HANDLE_VALUE : (HANDLE)raw_handle;
-    DWORD current_mode = 0;
-    DWORD pending_events = 0;
-    if (handle == INVALID_HANDLE_VALUE ||
-        !GetConsoleMode(handle, &current_mode) ||
-        !GetNumberOfConsoleInputEvents(handle, &pending_events)) {
-        ct_throw_message(ctx, exception, "PTY not supported on this platform");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    DWORD requested_mode;
-    if (ct_value_to_bool(ctx, argv[1])) {
-        requested_mode = ENABLE_WINDOW_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT;
-        if (current_mode == requested_mode) return JSValueMakeUndefined(ctx);
-        if (SetConsoleMode(handle, requested_mode)) return JSValueMakeUndefined(ctx);
-
-        /* Older Windows consoles do not support virtual-terminal input.
-         * Match libuv's UV_TTY_MODE_RAW_VT behavior by retrying the raw mode
-         * without ENABLE_VIRTUAL_TERMINAL_INPUT. */
-        requested_mode = ENABLE_WINDOW_INPUT;
-        if (SetConsoleMode(handle, requested_mode)) return JSValueMakeUndefined(ctx);
-    } else {
-        requested_mode = ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT;
-        if (current_mode == requested_mode || SetConsoleMode(handle, requested_mode)) {
-            return JSValueMakeUndefined(ctx);
-        }
-    }
-
-    DWORD set_error = GetLastError();
-    ct_windows_set_errno(set_error);
-    ct_throw_message(ctx, exception, strerror(errno));
-    return JSValueMakeUndefined(ctx);
-#else
-    if (argc < 2) {
-        ct_throw_message(ctx, exception, "terminalSetRawMode(fd, enabled) requires a file descriptor and mode");
-        return JSValueMakeUndefined(ctx);
-    }
-    int fd;
-    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "invalid terminal file descriptor")) {
-        return JSValueMakeUndefined(ctx);
-    }
-    struct termios attributes;
-    if (tcgetattr(fd, &attributes) != 0) {
-        ct_throw_message(ctx, exception, strerror(errno));
-        return JSValueMakeUndefined(ctx);
-    }
-    if (ct_value_to_bool(ctx, argv[1])) {
-        cfmakeraw(&attributes);
-    } else {
-        attributes.c_iflag |= BRKINT | ICRNL | IXON;
-        attributes.c_oflag |= OPOST;
-#ifdef ONLCR
-        attributes.c_oflag |= ONLCR;
-#endif
-        attributes.c_cflag |= CREAD;
-        attributes.c_cflag &= ~CSIZE;
-        attributes.c_cflag |= CS8;
-        attributes.c_lflag |= ECHO | ECHOE | ECHOK | ICANON | ISIG | IEXTEN;
-    }
-    if (tcsetattr(fd, TCSANOW, &attributes) != 0) ct_throw_message(ctx, exception, strerror(errno));
-    return JSValueMakeUndefined(ctx);
-#endif
-}
-
 static JSValueRef ct_fd_write(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -36513,70 +32069,6 @@ static JSValueRef ct_compile_build_native(JSContextRef ctx, JSObjectRef function
     return result;
 }
 
-static JSValueRef ct_markdown_html_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 1) {
-        ct_throw_message(ctx, exception, "markdownHtml(source[, flags]) requires source");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    size_t source_len = 0;
-    char *source = ct_value_to_utf8_copy(ctx, argv[0], &source_len);
-    if (source == NULL) {
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    uint64_t flags = argc >= 2 ? (uint64_t)ct_value_to_number(ctx, argv[1]) : 0;
-    size_t output_len = 0;
-    char *error = NULL;
-    uint8_t *output = ct_markdown_render_html((const uint8_t *)source, source_len, flags, &output_len, &error);
-    free(source);
-
-    if (output == NULL) {
-        ct_throw_message(ctx, exception, error != NULL ? error : "Markdown rendering failed");
-        if (error != NULL) ct_markdown_string_free(error);
-        return JSValueMakeUndefined(ctx);
-    }
-
-    JSValueRef result = ct_make_string_len(ctx, (const char *)output, output_len);
-    ct_markdown_free(output, output_len);
-    return result;
-}
-
-static JSValueRef ct_markdown_events_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
-    (void)thisObject;
-    if (argc < 1) {
-        ct_throw_message(ctx, exception, "markdownEvents(source[, flags]) requires source");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    size_t source_len = 0;
-    char *source = ct_value_to_utf8_copy(ctx, argv[0], &source_len);
-    if (source == NULL) {
-        ct_throw_message(ctx, exception, "Out of memory");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    uint64_t flags = argc >= 2 ? (uint64_t)ct_value_to_number(ctx, argv[1]) : 0;
-    size_t output_len = 0;
-    char *error = NULL;
-    uint8_t *output = ct_markdown_parse_events((const uint8_t *)source, source_len, flags, &output_len, &error);
-    free(source);
-
-    if (output == NULL) {
-        ct_throw_message(ctx, exception, error != NULL ? error : "Markdown parsing failed");
-        if (error != NULL) ct_markdown_string_free(error);
-        return JSValueMakeUndefined(ctx);
-    }
-
-    JSValueRef result = ct_make_string_len(ctx, (const char *)output, output_len);
-    ct_markdown_free(output, output_len);
-    return result;
-}
-
 static JSValueRef ct_diff_format_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -37128,16 +32620,9 @@ static JSValueRef ct_unhandled_rejection(
 }
 
 #include "native_bindings/buffer_jsc.inc"
-#include "native_bindings/sql_wire_jsc.inc"
-#include "native_bindings/data_parser_jsc.inc"
 #include "native_bindings/path_jsc.inc"
-#include "native_bindings/glob_jsc.inc"
 #include "native_bindings/url_jsc.inc"
 #include "native_bindings/text_encoding_jsc.inc"
-#include "native_bindings/uuid_jsc.inc"
-#include "native_bindings/websocket_frame_jsc.inc" /* Native WebSocket frame bytes. */
-#include "native_bindings/string_width_jsc.inc"
-#include "native_bindings/crypto_hasher_jsc.inc"
 #include "native_bindings/direct_jsc.inc"
 #include "native_bindings/callbacks.h"
 
@@ -37384,6 +32869,91 @@ static JSObjectRef ct_make_host_object(JSContextRef ctx, CtJscRuntime *runtime) 
     return host;
 }
 
+static int ct_evaluate_core_bytecode(
+    JSContextRef ctx,
+    const char *relative_path,
+    const uint8_t *source,
+    size_t source_len,
+    const char *source_name,
+    JSValueRef *exception
+) {
+    JSValueRef exec_path_value = ct_exec_path(ctx, NULL, NULL, 0, NULL, exception);
+    char *exec_path = exception == NULL || *exception == NULL
+        ? ct_value_to_string_copy(ctx, exec_path_value)
+        : NULL;
+    if (exec_path == NULL) return -1;
+    char *separator = strrchr(exec_path, '/');
+#if defined(_WIN32)
+    char *backslash = strrchr(exec_path, '\\');
+    if (backslash != NULL && (separator == NULL || backslash > separator)) separator = backslash;
+#endif
+    if (separator == NULL) {
+        free(exec_path);
+        return -1;
+    }
+    *separator = 0;
+#if defined(_WIN32)
+    const char *path_separator = "\\";
+#else
+    const char *path_separator = "/";
+#endif
+    size_t path_len = strlen(exec_path) + strlen(relative_path) + 2;
+    char *bytecode_path = (char *)malloc(path_len);
+    if (bytecode_path == NULL) {
+        free(exec_path);
+        return -1;
+    }
+    snprintf(bytecode_path, path_len, "%s%s%s", exec_path, path_separator, relative_path);
+    free(exec_path);
+
+    FILE *bytecode_file = fopen(bytecode_path, "rb");
+    free(bytecode_path);
+    if (bytecode_file == NULL || fseek(bytecode_file, 0, SEEK_END) != 0) {
+        if (bytecode_file != NULL) fclose(bytecode_file);
+        return -1;
+    }
+    long bytecode_size = ftell(bytecode_file);
+    if (bytecode_size <= 0 || bytecode_size > 16 * 1024 * 1024 ||
+        fseek(bytecode_file, 0, SEEK_SET) != 0) {
+        fclose(bytecode_file);
+        return -1;
+    }
+    size_t bytecode_len = (size_t)bytecode_size;
+    uint8_t *bytecode = (uint8_t *)malloc(bytecode_len);
+    if (bytecode == NULL || fread(bytecode, 1, bytecode_len, bytecode_file) != bytecode_len) {
+        free(bytecode);
+        fclose(bytecode_file);
+        return -1;
+    }
+    fclose(bytecode_file);
+
+    char *wrapped = ct_prepare_sync_source(source, source_len, source_name);
+    JSStringRef script = wrapped != NULL ? ct_js_string(wrapped) : NULL;
+    char *source_url_text = ct_source_url_for_filename(source_name);
+    JSStringRef source_url = source_url_text != NULL ? ct_js_string(source_url_text) : NULL;
+    free(source_url_text);
+    if (script == NULL || source_url == NULL) {
+        if (script != NULL) JSStringRelease(script);
+        if (source_url != NULL) JSStringRelease(source_url);
+        free(wrapped);
+        free(bytecode);
+        return -1;
+    }
+    const int status = ct_jsc_embedder_bytecode_evaluate(
+        ctx,
+        script,
+        source_url,
+        bytecode,
+        bytecode_len,
+        exception
+    );
+    JSStringRelease(script);
+    JSStringRelease(source_url);
+    free(wrapped);
+    free(bytecode);
+    return status;
+}
+
 static int ct_install_host_api(CtJscRuntime *runtime) {
     JSContextRef ctx = runtime->context;
     JSValueRef exception = NULL;
@@ -37426,8 +32996,9 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_set_property(ctx, host, "jscVendored", JSValueMakeBoolean(ctx, false), &exception);
 #endif
     ct_set_property(ctx, global, "cottontail", host, &exception);
+    if (exception == NULL && ct_install_native_cottontail_namespace(runtime) != 0) return -1;
 
-    JSStringRef bootstrap = ct_js_string(
+    static const char bootstrap_source[] =
         "globalThis.global = globalThis;"
         "globalThis.__ctUnhandledRejection = undefined;"
         "globalThis.__cottontailRoutedFatalException = undefined;"
@@ -37676,9 +33247,27 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
         "  };"
         "  Object.defineProperty(__ctAtomics, '__cottontailPatched', { value: true });"
         "}"
-    );
+    ;
+    JSStringRef bootstrap = ct_js_string(bootstrap_source);
     JSValueRef bootstrap_exception = NULL;
+#if defined(COTTONTAIL_CAPABILITY_BUILDER)
+    /* The build-time compiler creates the production sidecar, so it cannot
+     * consume that sidecar without introducing a dependency cycle. */
     JSEvaluateScript(ctx, bootstrap, NULL, NULL, 1, &bootstrap_exception);
+#else
+    if (ct_evaluate_core_bytecode(
+            ctx,
+            "cottontail-core/host-bootstrap.jsc",
+            (const uint8_t *)bootstrap_source,
+            sizeof(bootstrap_source) - 1,
+            "cottontail:core/host-bootstrap",
+            &bootstrap_exception
+        ) != 0 && bootstrap_exception == NULL) {
+        JSStringRelease(bootstrap);
+        fprintf(stderr, "cottontail: host bootstrap bytecode was rejected\n");
+        return -1;
+    }
+#endif
     JSStringRelease(bootstrap);
     if (bootstrap_exception != NULL) {
         char *message = ct_copy_exception(ctx, bootstrap_exception);
@@ -37812,7 +33401,6 @@ static CtJscRuntime *ct_jsc_runtime_create_internal(
     pthread_mutex_init(&runtime->spawn_event_mutex, NULL);
     pthread_mutex_init(&runtime->fd_event_mutex, NULL);
     pthread_mutex_init(&runtime->worker_event_mutex, NULL);
-    pthread_mutex_init(&runtime->callback_mutex, NULL);
     pthread_mutex_init(&runtime->inspector_mutex, NULL);
     runtime->inspector_run_loop = ct_jsc_run_loop_current();
     runtime->owner_thread = pthread_self();
@@ -37861,7 +33449,6 @@ int ct_jsc_runtime_prepare_hot_reload(CtJscRuntime *runtime, char **error_out) {
     ct_http_servers_stop_runtime(runtime);
     ct_timer_destroy_all(runtime);
     ct_shared_atomic_wait_async_cancel_runtime(runtime);
-    ct_brotli_encoder_destroy_all(runtime);
     ct_vm_context_destroy_all(runtime);
     ct_module_resolve_cache_clear(runtime);
     ct_active_requests_destroy(runtime);
@@ -37877,6 +33464,7 @@ int ct_jsc_runtime_prepare_hot_reload(CtJscRuntime *runtime, char **error_out) {
 
 void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
     if (runtime == NULL) return;
+    ct_capability_lifecycles_cleanup(runtime);
     while (pthread_mutex_trylock(&runtime->inspector_mutex) != 0) {
         ct_jsc_run_loop_cycle();
         uv_sleep(0);
@@ -37925,13 +33513,18 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
         ct_shared_atomic_wait_async_cancel_runtime(runtime);
         ct_runtime_uv_shutdown(runtime);
         ct_timer_destroy_all(runtime);
-        ct_brotli_encoder_destroy_all(runtime);
         ct_vm_context_destroy_all(runtime);
         ct_module_resolve_cache_clear(runtime);
         ct_active_requests_destroy(runtime);
         if (runtime->spawn_event_handler != NULL) JSValueUnprotect(ctx, runtime->spawn_event_handler);
         if (runtime->fd_event_handler != NULL) JSValueUnprotect(ctx, runtime->fd_event_handler);
         if (runtime->worker_event_handler != NULL) JSValueUnprotect(ctx, runtime->worker_event_handler);
+        while (runtime->loaded_capabilities != NULL) {
+            CtLoadedCapability *loaded = runtime->loaded_capabilities;
+            runtime->loaded_capabilities = loaded->next;
+            free(loaded->name);
+            free(loaded);
+        }
         if (runtime->host_object != NULL) JSValueUnprotect(ctx, runtime->host_object);
         JSGlobalContextRelease(runtime->context);
     }
@@ -37958,22 +33551,9 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
         free(event->message);
         free(event);
     }
-    while (runtime->callback_jobs_head != NULL) {
-        CtFfiCallbackJob *job = runtime->callback_jobs_head;
-        runtime->callback_jobs_head = job->next;
-        if (job->wait_for_result) {
-            pthread_mutex_lock(&job->mutex);
-            job->completed = true;
-            pthread_cond_signal(&job->cond);
-            pthread_mutex_unlock(&job->mutex);
-        } else {
-            free(job);
-        }
-    }
     pthread_mutex_destroy(&runtime->spawn_event_mutex);
     pthread_mutex_destroy(&runtime->fd_event_mutex);
     pthread_mutex_destroy(&runtime->worker_event_mutex);
-    pthread_mutex_destroy(&runtime->callback_mutex);
     pthread_mutex_destroy(&runtime->inspector_mutex);
     free(runtime->exit_cleanup_path);
     free(runtime);
@@ -39172,6 +34752,7 @@ static int ct_route_global_uncaught_exception(CtJscRuntime *runtime, const char 
 
 static bool ct_runtime_has_pending_native_events(CtJscRuntime *runtime) {
     bool pending = false;
+    if (ct_capability_lifecycles_have_pending(runtime)) return true;
 
     if (runtime->uv_loop_initialized) {
         /* A signal raised during script evaluation sits in libuv's queue
@@ -39221,12 +34802,6 @@ static bool ct_runtime_has_pending_native_events(CtJscRuntime *runtime) {
     pthread_mutex_unlock(&ct_tls_mutex);
     if (pending) return true;
 #endif
-
-    pthread_mutex_lock(&runtime->callback_mutex);
-    pending = runtime->callback_jobs_head != NULL;
-    pthread_mutex_unlock(&runtime->callback_mutex);
-    if (pending) return true;
-    if (ct_runtime_has_live_callbacks(runtime)) return true;
 
     pthread_mutex_lock(&runtime->spawn_event_mutex);
     pending = runtime->spawn_events_head != NULL;
@@ -39483,6 +35058,7 @@ int ct_jsc_generate_bytecode(
     const uint8_t *source,
     size_t source_len,
     const char *filename,
+    int synchronous_wrapper,
     uint8_t **bytecode_out,
     size_t *bytecode_len_out,
     char **error_out
@@ -39492,7 +35068,9 @@ int ct_jsc_generate_bytecode(
     if (error_out != NULL) *error_out = NULL;
     if (bytecode_out == NULL || bytecode_len_out == NULL) return -1;
 
-    char *wrapped = ct_prepare_wrapped_source(source, source_len, filename, NULL, NULL, NULL);
+    char *wrapped = synchronous_wrapper
+        ? ct_prepare_sync_source(source, source_len, filename)
+        : ct_prepare_wrapped_source(source, source_len, filename, NULL, NULL, NULL);
     if (wrapped == NULL) {
         ct_set_error_out(error_out, ct_duplicate_bytes("Out of memory", 13));
         return -1;
@@ -39772,7 +35350,7 @@ static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_o
     if (runtime->uv_loop_initialized) (void)ct_runtime_uv_run(runtime, UV_RUN_NOWAIT);
     if (ct_dispatch_signals(runtime, error_out) != 0) return -1;
     if (ct_drain_next_ticks(runtime, true, error_out) != 0) return -1;
-    if (ct_drain_ffi_callbacks(runtime, error_out) != 0) return -1;
+    if (ct_capability_lifecycles_drain(runtime, error_out) != 0) return -1;
     if (runtime->napi_env != NULL) {
         JSValueRef napi_exception = NULL;
         ct_napi_env_drain(runtime->napi_env, &napi_exception);

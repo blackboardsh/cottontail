@@ -4,19 +4,7 @@
 // compression transform streams.
 import * as whatwg from "./whatwg.js";
 import { Buffer } from "../buffer.js";
-import { __setBuiltinModules } from "../module.js";
-import {
-  brotliCompressSync,
-  brotliDecompressSync,
-  deflateRawSync,
-  deflateSync,
-  gunzipSync,
-  gzipSync,
-  inflateRawSync,
-  inflateSync,
-  zstdCompressSync,
-  zstdDecompressSync,
-} from "../zlib.js";
+import { setCoreBuiltinModules as __setBuiltinModules } from "../../internal/builtin-module-registry.js";
 
 const textEncoder = new TextEncoder();
 
@@ -569,18 +557,19 @@ export class TextDecoderStream extends TransformStream {
 // ---------------------------------------------------------------------------
 function compressionMode(format, decompress = false) {
   const normalized = String(format).toLowerCase();
+  const zlib = globalThis[Symbol.for("cottontail.capabilityRequire")]("node:zlib");
   if (decompress) {
-    if (normalized === "gzip") return gunzipSync;
-    if (normalized === "deflate") return inflateSync;
-    if (normalized === "deflate-raw") return inflateRawSync;
-    if (normalized === "br" || normalized === "brotli") return brotliDecompressSync;
-    if (normalized === "zstd") return zstdDecompressSync;
+    if (normalized === "gzip") return zlib.gunzipSync;
+    if (normalized === "deflate") return zlib.inflateSync;
+    if (normalized === "deflate-raw") return zlib.inflateRawSync;
+    if (normalized === "br" || normalized === "brotli") return zlib.brotliDecompressSync;
+    if (normalized === "zstd") return zlib.zstdDecompressSync;
   } else {
-    if (normalized === "gzip") return gzipSync;
-    if (normalized === "deflate") return deflateSync;
-    if (normalized === "deflate-raw") return deflateRawSync;
-    if (normalized === "br" || normalized === "brotli") return brotliCompressSync;
-    if (normalized === "zstd") return zstdCompressSync;
+    if (normalized === "gzip") return zlib.gzipSync;
+    if (normalized === "deflate") return zlib.deflateSync;
+    if (normalized === "deflate-raw") return zlib.deflateRawSync;
+    if (normalized === "br" || normalized === "brotli") return zlib.brotliCompressSync;
+    if (normalized === "zstd") return zlib.zstdCompressSync;
   }
   throw new TypeError(`Invalid compression format: ${format}`);
 }

@@ -9,6 +9,7 @@ if (Symbol.dispose == null) {
 
 const cachedCount = Symbol.for("Bun.Database.cache.count");
 const isTypedArray = ArrayBuffer.isView;
+let sqliteStatementGetNative;
 
 export const constants = Object.freeze({
   SQLITE_OPEN_READONLY: 0x00000001,
@@ -192,8 +193,20 @@ export class Statement {
     this._hasExecuted = false;
     this._statement.setReadBigInts?.(this._safeIntegers);
     database._statements?.add(this);
-    this.get = function (...args) {
-      const row = this._run("get", args);
+    this.get = function () {
+      let row;
+      if (arguments.length === 0) {
+        this._assertActive();
+        try {
+          sqliteStatementGetNative ??= cottontail.sqliteStatementGet;
+          row = sqliteStatementGetNative(this._statement.id, undefined, this._safeIntegers);
+          this._hasExecuted = true;
+        } catch (error) {
+          throw sqliteError(error);
+        }
+      } else {
+        row = this._run("get", Array.from(arguments));
+      }
       return row === undefined ? null : this._shapeRow(row);
     };
     this.all = function (...args) {
@@ -255,9 +268,6 @@ export class Statement {
 
   _shapeRow(row) {
     if (row == null) return row;
-    for (const key of Object.keys(row)) {
-      if (row[key] instanceof ArrayBuffer) row[key] = new Uint8Array(row[key]);
-    }
     if (this._classType == null) return row;
     return Object.assign(new this._classType(), row);
   }

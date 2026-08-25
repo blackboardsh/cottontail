@@ -1,6 +1,5 @@
 import { basename, dirname, isAbsolute, join, resolve } from "./path.js";
 import { fileURLToPath, pathToFileURL } from "./url.js";
-import { parse as parseTOML } from "../bun/toml.js";
 import { openRuntimeTranspilerCache } from "../internal/runtime-transpiler-cache.js";
 import * as path from "./path.js";
 import * as url from "./url.js";
@@ -13,6 +12,9 @@ const IntrinsicSet = globalThis.Set;
 const intrinsicPromiseResolve = IntrinsicPromise.resolve.bind(IntrinsicPromise);
 const intrinsicPromiseReject = IntrinsicPromise.reject.bind(IntrinsicPromise);
 const intrinsicQueueMicrotask = globalThis.queueMicrotask.bind(globalThis);
+const sharedBunModuleMocks = cottontail.__cottontailBunModuleMocks ??=
+  globalThis.__cottontailBunModuleMocks ?? new Map();
+globalThis.__cottontailBunModuleMocks = sharedBunModuleMocks;
 
 const kLazyBuiltin = Symbol.for("cottontail.lazyBuiltin");
 function lazyBuiltin(load) {
@@ -80,7 +82,7 @@ const tty = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/tty.js"));
 const util = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/util.js"));
 const utilTypes = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/util/types.js"));
 const vm = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/vm.js"));
-const zlib = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/zlib.js"));
+const zlib = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/zlib-capability.js"));
 const bunWrap = lazyBuiltin(() => loadEmbeddedRuntimeModule("bun/wrap.js"));
 
 const assertFsRead = (...args) => unwrapBuiltin(permissions).assertFsRead(...args);
@@ -88,18 +90,18 @@ const assertFsWrite = (...args) => unwrapBuiltin(permissions).assertFsWrite(...a
 const cluster = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/cluster.js"));
 const dgram = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/dgram.js"));
 const http2 = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/http2.js"));
-const inspector = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/inspector.js"));
-const inspectorPromises = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/inspector/promises.js"));
+const inspector = lazyBuiltin(() => loadCottontailCapabilityModule("inspector", "node/inspector.js"));
+const inspectorPromises = lazyBuiltin(() => loadCottontailCapabilityModule("inspector", "node/inspector/promises.js"));
 const readline = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/readline.js"));
 const readlinePromises = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/readline/promises.js"));
-const repl = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/repl.js"));
-const sea = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/sea.js"));
-const sqlite = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/sqlite.js"));
+const repl = lazyBuiltin(() => loadCottontailCapabilityModule("repl", "node/repl.js"));
+const sea = lazyBuiltin(() => loadCottontailCapabilityModule("sea", "node/sea.js"));
+const sqlite = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/sqlite-capability.js"));
 const nodeTestBuiltin = lazyBuiltin(() => {
-  const namespace = loadEmbeddedRuntimeModule("node/test.js");
+  const namespace = loadEmbeddedRuntimeModule("node/test-capability.js");
   return namespace.default ?? namespace;
 });
-const testReporters = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/test/reporters.js"));
+const testReporters = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/test-reporters-capability.js"));
 const traceEvents = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/trace_events.js"));
 const v8 = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/v8.js"));
 const wasi = lazyBuiltin(() => loadEmbeddedRuntimeModule("node/wasi.js"));
@@ -131,15 +133,15 @@ const runtimePackageReplacements = new Map([
     return namespace.default ?? namespace;
   })],
   ["ws", lazyBuiltin(() => {
-    const namespace = loadEmbeddedRuntimeModule("vendor/ws.js");
+    const namespace = loadEmbeddedRuntimeModule("vendor/ws-capability.js");
     return namespace.default ?? namespace;
   })],
   ["ws/lib/websocket", lazyBuiltin(() => {
-    const namespace = loadEmbeddedRuntimeModule("vendor/ws.js");
+    const namespace = loadEmbeddedRuntimeModule("vendor/ws-capability.js");
     return namespace.default ?? namespace;
   })],
   ["next/dist/compiled/ws", lazyBuiltin(() => {
-    const namespace = loadEmbeddedRuntimeModule("vendor/ws.js");
+    const namespace = loadEmbeddedRuntimeModule("vendor/ws-capability.js");
     return namespace.default ?? namespace;
   })],
 ]);
@@ -154,6 +156,31 @@ function loadRuntimePackageReplacement(name) {
 
 function loadBuiltinOrReplacement(name) {
   const text = String(name);
+  // These CommonJS specifiers are aliases of the capability's ESM namespace,
+  // not separate runtime-module wrappers. Loading the bytecode here avoids
+  // re-entering the CommonJS loader through the lazy ESM facade.
+  if (text === "bun:ffi") return loadEmbeddedRuntimeModule("bun/ffi-capability.js");
+  if (text === "bun:sqlite") {
+    return loadEmbeddedRuntimeModule("bun/sqlite-capability.js");
+  }
+  if (text === "bun:jsc") {
+    const facadeKey = Symbol.for("cottontail.capabilityFacade.jscTools.bunJsc");
+    let facade = globalThis[facadeKey];
+    if (facade?.module === undefined) {
+      loadEmbeddedRuntimeModule("bun/jsc-capability.js");
+      facade = globalThis[facadeKey];
+    }
+    return facade.module;
+  }
+  if (text === "zlib" || text === "node:zlib") {
+    const facadeKey = Symbol.for("cottontail.capabilityFacade.compression.nodeZlib");
+    let facade = globalThis[facadeKey];
+    if (facade?.module === undefined) {
+      loadEmbeddedRuntimeModule("node/zlib-capability.js");
+      facade = globalThis[facadeKey];
+    }
+    return facade.module;
+  }
   if (text === "process" || text === "node:process") return loadFullProcessBuiltin();
   if (hasRuntimePackageReplacement(text)) return loadRuntimePackageReplacement(text);
   return unwrapBuiltin(builtinModuleMap.get(text) ?? builtinModuleMap.get(text.replace(/^node:/, "")));
@@ -238,7 +265,7 @@ export const builtinModules = [
   "zlib",
 ];
 
-const commonJsCache = new Map();
+const commonJsCache = cottontail.__cottontailCommonJsCache ??= new Map();
 const commonJsWrapperFactoryCache = new Map();
 const bundledCommonJsFactoryCache = new Map();
 const runtimeEsmWrapperCache = new Map();
@@ -249,10 +276,16 @@ const smolDynamicModuleCacheGcInterval = 1024;
 const bundledAsyncEsmGraphCache = new Map();
 const runtimeEsmLinkageRecords = new Map();
 const nativeObjectDefineProperty = Object.defineProperty;
-const builtinModuleMap = new Map();
+const builtinModuleMap = globalThis.__cottontailBuiltinModules ??= new Map();
 const builtinNamespaceEntries = new IntrinsicSet();
-const builtinImportNamespaces = new Map();
 const kBuiltinImportNamespaces = Symbol.for("cottontail.node.builtinImportNamespaces");
+const builtinImportNamespaces = builtinModuleMap[kBuiltinImportNamespaces] ?? new Map();
+if (builtinModuleMap[kBuiltinImportNamespaces] !== builtinImportNamespaces) {
+  Object.defineProperty(builtinModuleMap, kBuiltinImportNamespaces, {
+    value: builtinImportNamespaces,
+    configurable: true,
+  });
+}
 let modulePathCache = Object.create(null);
 const moduleHooks = [];
 const moduleHookIdKey = Symbol("cottontail.moduleHooksId");
@@ -681,7 +714,10 @@ function runtimePluginExecutionPath(descriptor, result) {
 
 function runtimePluginTranspile(contents, loader, path, specifier) {
   if (loader === "json") return `export default ${JSON.stringify(JSON.parse(contents))};`;
-  if (loader === "toml") return `export default ${JSON.stringify(parseTOML(contents))};`;
+  if (loader === "toml") {
+    const { parse } = loadCottontailCapabilityModule("toml", "bun/toml.js");
+    return `export default ${JSON.stringify(parse(contents))};`;
+  }
   if (loader === "yaml") {
     const value = globalThis.Bun?.YAML?.parse?.(contents);
     return `export default ${JSON.stringify(value)};`;
@@ -945,7 +981,7 @@ globalThis.__cottontailImportPluginModule = (specifier, referrer, options, resol
 
 globalThis.__cottontailResolvePluginEntrypoint = resolveRuntimePluginEntrypoint;
 
-globalThis.__cottontailApplyCommonJSModuleMock = (specifier, value) => {
+const applyCommonJSModuleMock = (specifier, value) => {
   let resolved = String(specifier);
   if (!isAbsolute(resolved) && !resolved.startsWith("file://")) {
     try { resolved = resolveRequestCore(resolved, cottontail.cwd()); } catch {}
@@ -964,9 +1000,32 @@ globalThis.__cottontailApplyCommonJSModuleMock = (specifier, value) => {
   }
   return undefined;
 };
+globalThis.__cottontailApplyCommonJSModuleMock = applyCommonJSModuleMock;
+cottontail.__cottontailApplyCommonJSModuleMock = applyCommonJSModuleMock;
+
+function notifyModuleBindings(key, value) {
+  const registry = globalThis.__cottontailModuleBindingListeners;
+  const values = globalThis.__cottontailModuleBindingValues ??= new Map();
+  const candidates = [String(key)];
+  if (String(key).startsWith("file:./")) candidates.push(String(key).slice(5));
+  else if (String(key).startsWith("./")) candidates.push(`file:${String(key)}`);
+  if (String(key).startsWith("node:")) candidates.push(String(key).slice(5));
+  else candidates.push(`node:${String(key)}`);
+  for (const candidate of [...candidates]) {
+    const extensionless = candidate.replace(/\.(?:[cm]?[jt]sx?)$/, "");
+    if (extensionless !== candidate) candidates.push(extensionless);
+  }
+  for (const candidate of candidates) {
+    values.set(candidate, value);
+    if (!registry) continue;
+    for (const listener of registry.get(candidate) ?? []) listener(value);
+  }
+}
+globalThis.__cottontailNotifyModuleBindings = notifyModuleBindings;
+cottontail.__cottontailNotifyModuleBindings = notifyModuleBindings;
 
 function bunModuleMockFor(...keys) {
-  const registry = globalThis.__cottontailBunModuleMocks;
+  const registry = cottontail.__cottontailBunModuleMocks ?? globalThis.__cottontailBunModuleMocks;
   if (!registry || typeof registry.has !== "function" || typeof registry.get !== "function") {
     return { found: false, value: undefined };
   }
@@ -1219,8 +1278,9 @@ function standaloneDirectoryExists(path) {
 }
 
 const embeddedRuntimeDirectoryName = ".cottontail-embedded-runtime";
-const embeddedRuntimeSourceCache = new Map();
-const embeddedRuntimePreloadedModules = new Map();
+const embeddedRuntimeSourceCache = globalThis[Symbol.for("cottontail.runtimeModuleSourceCache")] ??= new Map();
+const embeddedRuntimePreloadedModules = globalThis[Symbol.for("cottontail.runtimeModulePreloadedModules")] ??= new Map();
+const cottontailCapabilityCache = globalThis[Symbol.for("cottontail.capabilityModuleCache")] ??= new Map();
 
 function embeddedRuntimeRelativePath(path) {
   const text = String(path).replace(/\\/g, "/");
@@ -1273,6 +1333,59 @@ export function loadEmbeddedRuntimeModule(relativePath) {
   }
   return loadCommonJsModule(embeddedRuntimePath(relativePath));
 }
+
+function capabilityError(name, detail = "") {
+  const suffix = detail ? ` (${detail})` : "";
+  return new Error(
+    `Cottontail capability "${name}" is unavailable${suffix}. ` +
+    `Add "${name}" to build.cottontail.capabilities in electrobun.config.ts.`,
+  );
+}
+
+function mountCottontailCapability(name) {
+  const normalizedName = String(name);
+  let pack = cottontailCapabilityCache.get(normalizedName);
+  if (pack == null) {
+    for (const key of [
+      "__cottontailBundlePath",
+      "__cottontailBundleSourceMap",
+      "__cottontailBundleSourceMapData",
+      "__cottontailBundleSourceRoot",
+    ]) {
+      if (cottontail[key] === undefined && globalThis[key] !== undefined) cottontail[key] = globalThis[key];
+    }
+    const executable = String(cottontail.execPath?.() ?? globalThis.process?.execPath ?? "");
+    const capabilityPath = join(dirname(executable), "cottontail-stdlib", normalizedName, "main.jsc");
+    try {
+      pack = cottontail.loadCapabilityBytecode(capabilityPath);
+    } catch (error) {
+      const detail = String(error?.message ?? error);
+      if (/failed to open capability bytecode/i.test(detail)) throw capabilityError(normalizedName);
+      throw capabilityError(normalizedName, detail);
+    }
+    if (pack?.modules == null || typeof pack.modules !== "object") {
+      throw capabilityError(normalizedName, "bytecode did not provide modules");
+    }
+    cottontailCapabilityCache.set(normalizedName, pack);
+  }
+  if (pack?.modules == null || typeof pack.modules !== "object") {
+    throw capabilityError(normalizedName, "bytecode did not provide modules");
+  }
+  for (const [relativePath, namespace] of Object.entries(pack.modules)) {
+    embeddedRuntimePreloadedModules.set(
+      String(relativePath).replace(/\\/g, "/").replace(/^\/+/, ""),
+      namespace,
+    );
+  }
+}
+
+export function loadCottontailCapabilityModule(name, relativePath) {
+  mountCottontailCapability(name);
+  return loadEmbeddedRuntimeModule(relativePath);
+}
+
+globalThis[Symbol.for("cottontail.internal.loadEmbeddedRuntimeModule")] ??=
+  loadEmbeddedRuntimeModule;
 
 export function registerEmbeddedRuntimeModules(modules) {
   if (modules == null || typeof modules !== "object") return;
@@ -5661,6 +5774,56 @@ function circularRequireExports(module) {
 
 function loadCommonJsModule(resolved, parent = null, isMain = false) {
   const { bare: resolvedPath, suffix } = splitSpecifierSuffix(resolved);
+  // The CommonJS loader can run in a bootstrap instance whose builtin map has
+  // not yet received bun/index.js registrations. Capability aliases must not
+  // fall through to the historical embedded-source path in that instance.
+  if (resolvedPath === "bun:ffi") {
+    return loadBuiltinOrReplacement(resolvedPath);
+  }
+  if (resolvedPath === "bun:sqlite") {
+    return loadBuiltinOrReplacement(resolvedPath);
+  }
+  if (resolvedPath === "bun:jsc") return loadBuiltinOrReplacement(resolvedPath);
+  if (resolvedPath === "node:test" || resolvedPath === "test") {
+    return loadBuiltinOrReplacement(resolvedPath);
+  }
+  if (resolvedPath === "node:test/reporters" || resolvedPath === "test/reporters") {
+    return loadBuiltinOrReplacement(resolvedPath);
+  }
+  if (resolvedPath === "node:zlib" || resolvedPath === "zlib") {
+    return loadBuiltinOrReplacement(resolvedPath);
+  }
+  const nodeCapability = {
+    "node:inspector": ["inspector", "node/inspector.js"],
+    "inspector": ["inspector", "node/inspector.js"],
+    "node:inspector/promises": ["inspector", "node/inspector/promises.js"],
+    "inspector/promises": ["inspector", "node/inspector/promises.js"],
+    "node:repl": ["repl", "node/repl.js"],
+    "repl": ["repl", "node/repl.js"],
+    "node:sea": ["sea", "node/sea.js"],
+    "sea": ["sea", "node/sea.js"],
+  }[resolvedPath];
+  if (nodeCapability) return loadCottontailCapabilityModule(nodeCapability[0], nodeCapability[1]);
+  if (resolvedPath === "ws" || resolvedPath === "ws/lib/websocket" || resolvedPath === "next/dist/compiled/ws") {
+    const namespace = loadEmbeddedRuntimeModule("vendor/ws-capability.js");
+    return namespace.default ?? namespace;
+  }
+  if (resolvedPath === "bun:test") {
+    const namespace = loadEmbeddedRuntimeModule("bun/test-capability.js");
+    return namespace.default ?? namespace;
+  }
+  const capabilityBuiltin = {
+    "bun:redis": ["redis", "bun/redis.js"],
+    "bun:s3": ["s3", "bun/s3.js"],
+    "bun:toml": ["toml", "bun/toml.js"],
+    "bun:json5": ["json5", "bun/json5.js"],
+    "bun:color": ["colors", "bun/color.js"],
+    "bun:yaml": ["yaml", "bun/yaml.js"],
+    "bun:sql": ["sql", "bun/sql.js"],
+  }[resolvedPath];
+  if (capabilityBuiltin) {
+    return loadCottontailCapabilityModule(capabilityBuiltin[0], capabilityBuiltin[1]);
+  }
   const embeddedRelativePath = embeddedRuntimeRelativePath(resolvedPath);
   if (embeddedRelativePath != null && embeddedRuntimePreloadedModules.has(embeddedRelativePath)) {
     return embeddedRuntimePreloadedModules.get(embeddedRelativePath);
@@ -5740,7 +5903,10 @@ function loadCommonJsModule(resolved, parent = null, isMain = false) {
     return loadRuntimePackageReplacement(resolvedPath);
   }
   if (resolvedPath.endsWith(".jsonc")) return parseJSONC(readModuleFile(resolvedPath));
-  if (resolvedPath.endsWith(".toml")) return parseTOML(readModuleFile(resolvedPath));
+  if (resolvedPath.endsWith(".toml")) {
+    const { parse } = loadCottontailCapabilityModule("toml", "bun/toml.js");
+    return parse(readModuleFile(resolvedPath));
+  }
   if (resolvedPath.endsWith(".txt")) return { default: readModuleFile(resolvedPath) };
 
   const module = makeModule(resolvedPath, parent, isMain);

@@ -2,10 +2,10 @@
 // and MySQL/MariaDB speak their wire protocols directly so construction stays
 // lazy and does not depend on an external command-line client.
 
-import { Database as SQLiteDatabase, SQLiteError } from "./sqlite.js";
-import * as net from "../node/net.js";
-import * as tls from "../node/tls.js";
-import { existsSync } from "../node/fs.js";
+import { Database as SQLiteDatabase, SQLiteError } from "bun:sqlite";
+import * as net from "node:net";
+import * as tls from "node:tls";
+import { existsSync } from "node:fs";
 import {
   constants as cryptoConstants,
   createHash,
@@ -15,7 +15,7 @@ import {
   publicEncrypt,
   randomBytes,
   timingSafeEqual,
-} from "../node/crypto.js";
+} from "node:crypto";
 
 function md5hex(...parts) {
   const hash = createHash("md5");

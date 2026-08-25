@@ -1,5 +1,4 @@
 import { resolve } from "../node/path.js";
-import { parse as parseTOML } from "../bun/toml.js";
 
 const argv = Array.from(globalThis.process?.argv ?? []).slice(2).map(String);
 const emptyConfig = Object.create(null);
@@ -217,7 +216,7 @@ export function bunTestConfig() {
     // through node:fs would make every permission-enabled process require an
     // unrelated grant for an optional bunfig.toml before user code can run.
     const source = String(cottontail.readFile(path));
-    const document = parseTOML(source);
+    const document = globalThis.Cottontail.toml.parse(source);
     const config = document?.test && typeof document.test === "object"
       ? document.test
       : Object.create(null);

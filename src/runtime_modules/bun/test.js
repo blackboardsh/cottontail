@@ -1,6 +1,3 @@
-import nodeAssert from "../node/assert.js";
-import { existsSync as nodeExistsSync, readFileSync as nodeReadFileSync } from "../node/fs.js";
-import { AsyncLocalStorage } from "../node/async_hooks.js";
 import { applyBunFileConcurrency } from "../internal/bun-test-concurrency.js";
 import { formatBunEachLabel, validateBunEachTable } from "../internal/bun-test-each.js";
 import { captureTestRegistrationLine } from "../internal/bun-test-junit.js";
@@ -30,6 +27,13 @@ import {
   setDefaultTimeout as nodeSetDefaultTimeout,
   test as nodeTest,
 } from "../node/test.js";
+import testHostModules from "../internal/test-host-modules.js";
+
+const {
+  AsyncLocalStorage,
+  fs: { existsSync: nodeExistsSync, readFileSync: nodeReadFileSync },
+  nodeAssert,
+} = testHostModules;
 
 // Test orchestration must not depend on userland replacing the global constructor.
 const Promise = globalThis.Promise;
@@ -107,7 +111,8 @@ const mocks = new Set();
 const restores = [];
 const mockRestoreSymbol = Symbol("mockRestore");
 let nextInvocationCallOrder = 1;
-const moduleMocks = globalThis.__cottontailBunModuleMocks ??= new Map();
+const moduleMocks = cottontail.__cottontailBunModuleMocks ??= new Map();
+globalThis.__cottontailBunModuleMocks = moduleMocks;
 const snapshots = new Map();
 const snapshotCounters = new Map();
 const snapshotFiles = new Map();
@@ -3372,6 +3377,11 @@ mock.restore = () => {
   nodeMock.restoreAll?.();
 };
 function notifyModuleBindings(key, value) {
+  const hostNotify = cottontail.__cottontailNotifyModuleBindings;
+  if (typeof hostNotify === "function" && hostNotify !== notifyModuleBindings) {
+    hostNotify(key, value);
+    return;
+  }
   const registry = globalThis.__cottontailModuleBindingListeners;
   const values = globalThis.__cottontailModuleBindingValues ??= new Map();
   const candidates = [String(key)];
@@ -3393,7 +3403,10 @@ globalThis.__cottontailNotifyModuleBindings = notifyModuleBindings;
 mock.module = (specifier, factory = undefined) => {
   const key = String(specifier);
   const value = typeof factory === "function" ? factory() : factory;
-  const restoreCommonJS = globalThis.__cottontailApplyCommonJSModuleMock?.(key, value);
+  const restoreCommonJS = (
+    cottontail.__cottontailApplyCommonJSModuleMock ??
+    globalThis.__cottontailApplyCommonJSModuleMock
+  )?.(key, value);
   if (typeof restoreCommonJS === "function") restores.push(restoreCommonJS);
   const previous = moduleMocks.get(key);
   if (previous && value && typeof previous === "object" && typeof value === "object" &&

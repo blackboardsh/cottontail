@@ -1,6 +1,6 @@
-import { Buffer } from "../node/buffer.js";
-import { createConnection as createNetConnection, isIP } from "../node/net.js";
-import { connect as createTlsConnection } from "../node/tls.js";
+import { Buffer } from "node:buffer";
+import { createConnection as createNetConnection, isIP } from "node:net";
+import { connect as createTlsConnection } from "node:tls";
 
 const redisProtocols = new Set([
   "redis:",
@@ -907,6 +907,7 @@ export function RedisClient(...args) {
   if (!new.target) throw new TypeError("RedisClient constructor cannot be invoked without 'new'");
   return Reflect.construct(RedisClientImplementation, args, new.target);
 }
+Object.defineProperty(RedisClient, "name", { configurable: true, value: "RedisClient" });
 
 Object.setPrototypeOf(RedisClient, RedisClientImplementation);
 const redisClientPublicPrototype = Object.create(RedisClientImplementation.prototype);

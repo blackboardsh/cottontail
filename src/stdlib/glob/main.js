@@ -1,0 +1,8 @@
+import * as module from "../../runtime_modules/bun/glob.js";
+
+const suffix = process.platform === "win32" ? ".dll" : process.platform === "darwin" ? ".dylib" : ".so";
+const executable = String(cottontail.execPath()).replaceAll("\\", "/");
+const directory = executable.slice(0, executable.lastIndexOf("/"));
+cottontail.loadCapabilityLibrary(`${directory}/cottontail-stdlib/glob/glob${suffix}`);
+
+globalThis.__cottontailCapabilityResult = { namespace: module, modules: { "bun/glob.js": module } };

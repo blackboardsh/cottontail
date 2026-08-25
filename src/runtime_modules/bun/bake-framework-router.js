@@ -1,5 +1,5 @@
-import path from "../node/path.js";
-import { readdirSync } from "../node/fs.js";
+import path from "node:path";
+import { readdirSync } from "node:fs";
 
 // COTTONTAIL-COMPAT: bun:bake - JavaScript port of Bun's Zig
 // bake/FrameworkRouter.zig. This keeps the routing rules usable while the full

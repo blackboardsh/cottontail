@@ -1,6 +1,6 @@
 import * as zlibConstants from "./zlib/constants.js";
-import bufferModule from "./buffer.js";
-import { Transform } from "./stream.js";
+import bufferModule from "node:buffer";
+import { Transform } from "node:stream";
 
 const arrayBufferTransfer = ArrayBuffer.prototype.transfer;
 const bufferMaxLengthStateKey = Symbol.for("cottontail.node.buffer.kMaxLength");
@@ -1028,6 +1028,11 @@ function kMaxLengthLimit() {
 
 class Brotli extends Zlib {}
 class Zstd extends Zlib {}
+// Capability bundles are minified before bytecode generation. Preserve the
+// observable constructor hierarchy names required by node:zlib.
+Object.defineProperty(Zlib, "name", { value: "Zlib", configurable: true });
+Object.defineProperty(Brotli, "name", { value: "Brotli", configurable: true });
+Object.defineProperty(Zstd, "name", { value: "Zstd", configurable: true });
 
 // Node's zlib constructors are plain functions, so `zlib.Inflate.call(this,
 // opts)` from a `util.inherits` subclass (pngjs's sync inflate does exactly

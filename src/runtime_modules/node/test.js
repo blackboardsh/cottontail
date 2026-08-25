@@ -1,7 +1,3 @@
-import * as nodeAssert from "./assert.js";
-import { AsyncLocalStorage } from "./async_hooks.js";
-import { appendFileSync, readFileSync } from "./fs.js";
-import { Readable } from "./stream.js";
 import {
   captureTestRegistrationLine,
   junitReporterOptions,
@@ -19,6 +15,15 @@ import {
   reportTestCoverage,
 } from "../internal/bun-test-coverage.js";
 import { finalizeTestReporters } from "../internal/bun-test-reporters.js";
+
+import testHostModules from "../internal/test-host-modules.js";
+
+const {
+  AsyncLocalStorage,
+  Readable,
+  fs: { appendFileSync, readFileSync },
+  nodeAssertNamespace: nodeAssert,
+} = testHostModules;
 
 const tests = [];
 const events = [];
@@ -457,6 +462,10 @@ function deriveCallerTestFile() {
     if (!file || file.startsWith("node:") || file.startsWith("bun:")) continue;
     // Skip the generated multi-file aggregate entry and per-file entry wrappers.
     if (file.includes("test-aggregate-") || file.includes("script-entry-")) continue;
+    // Standard-library bytecode is evaluated from a synthetic
+    // `<name>-capability.js` source. It is an implementation frame, never the
+    // file that registered the user's test.
+    if (/(?:^|[\\/])[^\\/]+-capability\.js$/.test(file)) continue;
     if (!file.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(file)) continue;
     return file;
   }
@@ -2034,6 +2043,14 @@ function scheduleRun() {
 }
 
 if (!primaryTestModule) globalThis[Symbol.for("cottontail.internal.startTestRun")] = scheduleRun;
+if (!primaryTestModule) {
+  globalThis[Symbol.for("cottontail.internal.finalizeEmptyTestRun")] = () => {
+    const noRegisteredWork = tests.length === 0 && failures.length === 0 &&
+      !suiteHasLifecycleWork(rootSuite) && !hasPendingSuiteDefinitions() &&
+      !globalThis.__cottontailHasPendingSnapshots?.();
+    return noRegisteredWork ? finalizeRun(true) : undefined;
+  };
+}
 
 // A test entry module that fails to parse or evaluate never registers any
 // tests, but Bun still reports the load failure through the test reporter: an

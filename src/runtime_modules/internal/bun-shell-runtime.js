@@ -3,8 +3,9 @@
 // filesystem (`echo`, `which`, pipelines into subprocesses) must not pay for
 // it, so the syscalls are bound on first use instead of at import time.
 let fsModule;
+const fsSpecifier = ["node", "fs"].join(":");
 function fs() {
-  return (fsModule ??= require("../node/fs.js"));
+  return (fsModule ??= globalThis.require(fsSpecifier));
 }
 const closeSync = (...args) => fs().closeSync(...args);
 const lstatSync = (...args) => fs().lstatSync(...args);
@@ -13,10 +14,17 @@ const readFileSync = (...args) => fs().readFileSync(...args);
 const readdirSync = (...args) => fs().readdirSync(...args);
 const statSync = (...args) => fs().statSync(...args);
 const writeSync = (...args) => fs().writeSync(...args);
-import { basename, dirname, isAbsolute, join, resolve } from "../node/path.js";
-import picomatch from "../vendor/picomatch.js";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import picomatchModule from "../vendor/picomatch.js";
 import { createShellBuiltins } from "./bun-shell-builtins.js";
 import { parseShell } from "./bun-shell-parser.js";
+
+// The vendored module is already a CJS-to-ESM bundle. A second capability
+// bundle can expose that callable through one additional `.default` layer.
+let picomatch = picomatchModule;
+while (typeof picomatch !== "function" && picomatch?.default && picomatch.default !== picomatch) {
+  picomatch = picomatch.default;
+}
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();

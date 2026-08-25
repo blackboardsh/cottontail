@@ -4,7 +4,7 @@ import { Buffer } from "./buffer.js";
 import { connect as netConnect, createServer as createNetServer, isIP } from "./net.js";
 import { connect as tlsConnect } from "./tls.js";
 import { createHash, randomBytes } from "./crypto.js";
-import { deflateRawSync, inflateRawSync, constants as zlibConstants } from "./zlib.js";
+import { deflateRawSync, inflateRawSync, constants as zlibConstants } from "./zlib-capability.js";
 import { AsyncResource } from "./async_hooks.js";
 import { HTTPParser as BindingHTTPParser, allMethods as bindingHTTPMethods } from "../internal/node-http-parser.js";
 import { normalizeIncomingMessageArgument } from "./http-interception.js";

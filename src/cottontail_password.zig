@@ -1,5 +1,4 @@
 const std = @import("std");
-const host = @import("host.zig");
 
 const allocator = std.heap.c_allocator;
 const argon2 = std.crypto.pwhash.argon2;
@@ -75,14 +74,14 @@ export fn ct_crypto_argon2(
         .p = lanes,
         .secret = optionalBytes(secret_ptr, secret_len),
         .ad = optionalBytes(associated_data_ptr, associated_data_len),
-    }, mode, host.getIo()) catch |err| {
+    }, mode, std.Io.Threaded.global_single_threaded.io()) catch |err| {
         setError(error_out, err);
         return -1;
     };
     return 0;
 }
 
-export fn ct_password_hash(
+pub export fn ct_password_hash(
     algorithm: c_int,
     password_ptr: ?[*]const u8,
     password_len: usize,
@@ -109,12 +108,12 @@ export fn ct_password_hash(
                 else => unreachable,
             },
             .encoding = .phc,
-        }, &out_buffer, host.getIo()),
+        }, &out_buffer, std.Io.Threaded.global_single_threaded.io()),
         3 => bcrypt.strHash(bcryptPassword(password, &digest), .{
             .params = .{ .rounds_log = @intCast(bcrypt_cost), .silently_truncate_password = true },
             .allocator = allocator,
             .encoding = .crypt,
-        }, &out_buffer, host.getIo()),
+        }, &out_buffer, std.Io.Threaded.global_single_threaded.io()),
         else => {
             setError(error_out, error.UnsupportedAlgorithm);
             return null;
@@ -132,7 +131,7 @@ export fn ct_password_hash(
     return result.ptr;
 }
 
-export fn ct_password_verify(
+pub export fn ct_password_verify(
     algorithm: c_int,
     password_ptr: ?[*]const u8,
     password_len: usize,
@@ -146,7 +145,7 @@ export fn ct_password_verify(
     var digest: [std.crypto.hash.sha2.Sha512.digest_length]u8 = undefined;
 
     const result = switch (algorithm) {
-        0, 1, 2 => argon2.strVerify(encoded, password, .{ .allocator = allocator }, host.getIo()),
+        0, 1, 2 => argon2.strVerify(encoded, password, .{ .allocator = allocator }, std.Io.Threaded.global_single_threaded.io()),
         3 => bcrypt.strVerify(encoded, bcryptPassword(password, &digest), .{
             .allocator = allocator,
             .silently_truncate_password = true,
@@ -165,6 +164,4 @@ export fn ct_password_verify(
 
 pub fn forceLink() void {
     _ = &ct_crypto_argon2;
-    _ = &ct_password_hash;
-    _ = &ct_password_verify;
 }

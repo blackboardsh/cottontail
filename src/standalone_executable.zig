@@ -263,6 +263,38 @@ fn writeBuildFile(io: std.Io, path: []const u8, contents: []const u8) !void {
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
 }
 
+fn copyCoreDistribution(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    executable_path: []const u8,
+    output_path: []const u8,
+) !void {
+    const executable_dir = std.fs.path.dirname(executable_path) orelse ".";
+    const output_dir = std.fs.path.dirname(output_path) orelse ".";
+    const source_path = try std.fs.path.join(allocator, &.{ executable_dir, "cottontail-core" });
+    const destination_path = try std.fs.path.join(allocator, &.{ output_dir, "cottontail-core" });
+    const source_resolved = std.fs.path.resolve(allocator, &.{source_path}) catch source_path;
+    const destination_resolved = std.fs.path.resolve(allocator, &.{destination_path}) catch destination_path;
+    if (std.mem.eql(u8, source_resolved, destination_resolved)) return;
+
+    var source = std.Io.Dir.cwd().openDir(init.io, source_path, .{ .iterate = true }) catch return;
+    defer source.close(init.io);
+    var walker = try source.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next(init.io)) |entry| {
+        if (entry.kind != .file) continue;
+        const destination = try std.fs.path.join(allocator, &.{ destination_path, entry.path });
+        try std.Io.Dir.copyFile(
+            source,
+            entry.path,
+            std.Io.Dir.cwd(),
+            destination,
+            init.io,
+            .{ .make_path = true },
+        );
+    }
+}
+
 fn supportsStandaloneMagic(init: std.process.Init, path: []const u8, comptime magic: []const u8) !bool {
     const executable = try std.Io.Dir.cwd().openFile(init.io, path, .{});
     defer executable.close(init.io);
@@ -333,6 +365,7 @@ pub fn write(
         .{ .permissions = .executable_file, .make_path = true },
     );
     errdefer std.Io.Dir.cwd().deleteFile(init.io, output_path) catch {};
+    try copyCoreDistribution(init, allocator, executable_path, output_path);
 
     const output = try std.Io.Dir.cwd().openFile(init.io, output_path, .{ .mode = .read_write });
     defer output.close(init.io);

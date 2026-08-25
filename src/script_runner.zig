@@ -4421,7 +4421,7 @@ const node_runtime_aliases = [_]NodeRuntimeAlias{
     .{ .specifier = "sys", .relative_path = "node/sys.js" },
     .{ .specifier = "repl", .relative_path = "node/repl.js" },
     .{ .specifier = "sea", .relative_path = "node/sea.js" },
-    .{ .specifier = "sqlite", .relative_path = "node/sqlite.js" },
+    .{ .specifier = "sqlite", .relative_path = "node/sqlite-capability.js" },
     .{ .specifier = "test", .relative_path = "node/test.js" },
     .{ .specifier = "test/reporters", .relative_path = "node/test/reporters.js" },
     .{ .specifier = "tty", .relative_path = "node/tty.js" },
@@ -4448,7 +4448,7 @@ const node_runtime_aliases = [_]NodeRuntimeAlias{
     .{ .specifier = "trace_events", .relative_path = "node/trace_events.js" },
     .{ .specifier = "wasi", .relative_path = "node/wasi.js" },
     .{ .specifier = "worker_threads", .relative_path = "node/worker_threads.js" },
-    .{ .specifier = "zlib", .relative_path = "node/zlib.js" },
+    .{ .specifier = "zlib", .relative_path = "node/zlib-capability.js" },
     .{ .specifier = "http", .relative_path = "node/http.js" },
     .{ .specifier = "https", .relative_path = "node/https.js" },
     .{ .specifier = "http2", .relative_path = "node/http2.js" },
@@ -4489,13 +4489,13 @@ fn buildRuntimeAliases(
 ) ![]const native_bundler.RuntimeAlias {
     var aliases: std.ArrayList(native_bundler.RuntimeAlias) = .empty;
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun", "bun/index.js");
-    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:ffi", "bun/ffi.js");
-    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:jsc", "bun/jsc.js");
-    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:sqlite", "bun/sqlite.js");
-    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:test", "bun/test.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:ffi", "bun/ffi-capability.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:jsc", "bun/jsc-capability.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:sqlite", "bun/sqlite-capability.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:test", "bun/test-capability.js");
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:internal-for-testing", "bun/internal-for-testing.js");
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:wrap", "bun/wrap.js");
-    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "vitest", "bun/test.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "vitest", "bun/test-capability.js");
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "string-width", "bun/string-width.js");
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "strip-ansi", "bun/strip-ansi.js");
     // Bun ships built-in overrides for these npm packages.
@@ -4505,9 +4505,9 @@ fn buildRuntimeAliases(
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "@vercel/fetch", "vendor/vercel-fetch.js");
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "abort-controller", "vendor/abort-controller.js");
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "utf-8-validate", "bun/utf-8-validate.js");
-    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "ws", "vendor/ws.js");
-    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "ws/lib/websocket", "vendor/ws.js");
-    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "next/dist/compiled/ws", "vendor/ws.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "ws", "vendor/ws-capability.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "ws/lib/websocket", "vendor/ws-capability.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "next/dist/compiled/ws", "vendor/ws-capability.js");
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "undici", "node/undici-public.js");
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "node:undici", "node/undici-public.js");
 
@@ -4668,6 +4668,7 @@ fn fullRuntimeGlobal(name: []const u8) bool {
         "CloseEvent",
         "CompressionStream",
         "CountQueuingStrategy",
+        "Cottontail",
         "Crypto",
         "CryptoKey",
         "CustomEvent",
@@ -4979,6 +4980,13 @@ fn sourceRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBoo
                 if (!minimalRuntimeBunProperty(property)) return .full;
                 if (mode == .bare) mode = .minimal;
             }
+        } else if (std.mem.eql(u8, token.text, "Cottontail")) {
+            // The capability namespace is installed by the host before entry
+            // evaluation. Capabilities still consume the small core globals
+            // (for example TextDecoder and process), but must not select the
+            // full compatibility bootstrap, which retains the complete Bun/Node
+            // module graph. The getter owns bytecode and native activation.
+            if (mode == .bare) mode = .minimal;
         } else if (std.mem.eql(u8, token.text, "process")) {
             const property = runtimeMemberProperty(tokens, index) orelse return .full;
             if (std.mem.eql(u8, property, "mainModule")) return .full;
@@ -5002,6 +5010,12 @@ fn sourceRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBoo
             } else if (mode == .bare) {
                 mode = .minimal;
             }
+        } else if (std.mem.eql(u8, token.text, "performance")) {
+            // runtime-bootstrap-core installs the basic monotonic clock used by
+            // performance.now(). The much larger full compatibility graph is
+            // only needed for PerformanceEntry/Observer and related globals.
+            if (has_http_server) continue;
+            if (mode == .bare) mode = .minimal;
         } else if (std.mem.eql(u8, token.text, "alert") or
             std.mem.eql(u8, token.text, "confirm") or
             std.mem.eql(u8, token.text, "prompt") or
@@ -5363,7 +5377,7 @@ fn bundleScriptNative(
     const has_runtime_cli_defines = runtime_cli_define_keys.items.len > 0;
     // A nested `cottontail -e` is a new runtime invocation. Parent test-runner
     // bookkeeping must not turn its launcher into another test harness.
-    const is_test_cli_execution = ctx.hutch_private_file == null and !is_eval_entrypoint and
+    const is_test_cli_execution = !standalone_compile and ctx.hutch_private_file == null and !is_eval_entrypoint and
         ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null;
     const is_test_runtime_execution = ctx.hutch_private_file == null and (is_test_cli_execution or
         ctx.environ_map.get("COTTONTAIL_TEST_FILE_COUNT") != null or
@@ -7588,11 +7602,7 @@ fn buildCliPreloadImports(ctx: *const Context, script_abs: []const u8, exec_args
 // Outside test mode this is empty.
 fn testModuleLoadErrorCatch(ctx: *const Context, test_cli_execution: bool, path_literal: []const u8) ![]const u8 {
     if (!test_cli_execution) return "";
-    const bun_test_literal = try jsonStringLiteral(
-        ctx,
-        try runtimeModulePath(ctx, &.{ "bun", "test.js" }),
-    );
-    return std.fmt.allocPrint(ctx.allocator, " catch (error) {{ const __ctLoadErrorHook = () => globalThis[Symbol.for(\"cottontail.internal.testModuleLoadError\")]?.(error, {s}); if (!__ctLoadErrorHook()) {{ try {{ await import({s}); }} catch {{}} if (!__ctLoadErrorHook()) throw error; }} }}", .{ path_literal, bun_test_literal });
+    return std.fmt.allocPrint(ctx.allocator, " catch (error) {{ const __ctLoadErrorHook = () => globalThis[Symbol.for(\"cottontail.internal.testModuleLoadError\")]?.(error, {s}); if (!__ctLoadErrorHook()) {{ try {{ void globalThis.require?.(\"bun:test\")?.test; globalThis[Symbol.for(\"cottontail.internal.loadBunTestCapability\")]?.(); }} catch {{}} if (!__ctLoadErrorHook()) throw error; }} }}", .{path_literal});
 }
 
 // Finish a single-file test entry through the same node:test runner used by
@@ -7602,16 +7612,16 @@ fn testModuleLoadErrorCatch(ctx: *const Context, test_cli_execution: bool, path_
 fn testModuleFinalizeSource(ctx: *const Context, test_cli_execution: bool) ![]const u8 {
     if (!test_cli_execution) return "  globalThis.__cottontailLoadingTestModules = false;\n" ++
         "  globalThis[Symbol.for(\"cottontail.internal.startTestRun\")]?.();";
-    const node_test_literal = try jsonStringLiteral(
-        ctx,
-        try runtimeModulePath(ctx, &.{ "node", "test.js" }),
-    );
-    return std.fmt.allocPrint(ctx.allocator, "  globalThis.__cottontailLoadingTestModules = false;\n" ++
+    _ = ctx;
+    return "  globalThis.__cottontailLoadingTestModules = false;\n" ++
+        "  globalThis.cottontail.__cottontailCollectApplicationCoverage ??= () => globalThis.cottontail.collectTestCoverage();\n" ++
         "  globalThis.__cottontailTestEntrypointLoaded = true;\n" ++
-        "  if (typeof globalThis[Symbol.for(\"cottontail.internal.startTestRun\")] !== \"function\") {{\n" ++
-        "    globalThis.__cottontailNodeTestRuntime = await import({s});\n" ++
-        "  }}\n" ++
-        "  globalThis[Symbol.for(\"cottontail.internal.startTestRun\")]?.();", .{node_test_literal});
+        "  if (typeof globalThis[Symbol.for(\"cottontail.internal.finalizeEmptyTestRun\")] !== \"function\") {\n" ++
+        "    void globalThis.require?.(\"bun:test\")?.test;\n" ++
+        "    globalThis[Symbol.for(\"cottontail.internal.loadBunTestCapability\")]?.();\n" ++
+        "  }\n" ++
+        "  globalThis[Symbol.for(\"cottontail.internal.startTestRun\")]?.();\n" ++
+        "  await globalThis[Symbol.for(\"cottontail.internal.finalizeEmptyTestRun\")]?.();";
 }
 
 fn writeReusedReloadEntryWrapper(
@@ -7658,7 +7668,9 @@ fn writeBareRuntimeEntryWrapper(
     script_abs: []const u8,
     test_cli_execution: bool,
     stable_source_map_path: bool,
+    runtime_virtual_root: []const u8,
 ) ![]const u8 {
+    _ = runtime_virtual_root;
     const wrapper_name = try std.fmt.allocPrint(
         ctx.allocator,
         "script-entry-bare-{x}.mjs",
@@ -7725,6 +7737,7 @@ fn writeMinimalRuntimeEntryWrapper(
         script_abs,
         test_cli_execution,
         stable_source_map_path,
+        runtime_virtual_root,
     );
     const process_bootstrap_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "internal", "runtime-process-bootstrap.js" });
     const bootstrap_module = try runtimeModulePathAtRoot(
@@ -9803,7 +9816,7 @@ fn appendDynamicTargetFactory(
         \\      if (__ctRaw.length === 0) return {{ default: __ctPath{d} }};
         \\    }}
         \\    if (__ctType === "sqlite" || __ctType === "sqlite_embedded") {{
-        \\      const __ctDatabase = new __ctLoaderDatabase(__ctPath{d});
+        \\      const __ctDatabase = new globalThis.Cottontail.sqlite.Database(__ctPath{d});
         \\      for (const __ctKey of Object.keys(__ctDatabase)) {{
         \\        if (__ctKey !== "filename") Object.defineProperty(__ctDatabase, __ctKey, {{ enumerable: false }});
         \\      }}
@@ -10090,26 +10103,13 @@ fn rewriteQueryImports(
     if (occurrences.items.len == 0) return null;
 
     var output: std.ArrayList(u8) = .empty;
-    const json5_module = try runtimeModulePath(ctx, &.{ "bun", "json5.js" });
-    const json5_literal = try jsonStringLiteral(ctx, json5_module);
-    const toml_module = try runtimeModulePath(ctx, &.{ "bun", "toml.js" });
-    const toml_literal = try jsonStringLiteral(ctx, toml_module);
-    const yaml_module = try runtimeModulePath(ctx, &.{ "bun", "yaml.js" });
-    const yaml_literal = try jsonStringLiteral(ctx, yaml_module);
     try output.appendSlice(ctx.allocator,
-        \\import { Database as __ctLoaderDatabase } from "bun:sqlite";
         \\import { createRequire as __ctCreateRequire } from "node:module";
         \\import { pathToFileURL as __ctDynamicPathToFileURL } from "node:url";
-        \\import { parse as __ctParseJSON5 } from 
+        \\const __ctParseJSON5 = (...args) => globalThis.Cottontail.json5.parse(...args);
+        \\const __ctParseRuntimeTOML = (...args) => globalThis.Cottontail.toml.parse(...args);
+        \\const __ctParseRuntimeYAML = (...args) => globalThis.Cottontail.yaml.parse(...args);
     );
-    try output.appendSlice(ctx.allocator, json5_literal);
-    try output.appendSlice(ctx.allocator, ";\n");
-    try output.appendSlice(ctx.allocator, "import { parse as __ctParseRuntimeTOML } from ");
-    try output.appendSlice(ctx.allocator, toml_literal);
-    try output.appendSlice(ctx.allocator, ";\n");
-    try output.appendSlice(ctx.allocator, "import { parse as __ctParseRuntimeYAML } from ");
-    try output.appendSlice(ctx.allocator, yaml_literal);
-    try output.appendSlice(ctx.allocator, ";\n");
     try output.appendSlice(ctx.allocator,
         \\globalThis.Loader ??= { registry: new Map() };
         \\globalThis.__cottontailModuleBindingListeners ??= new Map();
@@ -10580,7 +10580,7 @@ fn writeSelectiveEvalCommonJsEntryWrapper(
     const wrapper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script-entry-eval-commonjs.mjs" });
     const ffi_literal = try jsonStringLiteral(
         ctx,
-        try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "bun", "ffi.js" }),
+        try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "bun", "ffi-capability.js" }),
     );
     const bootstrap_literal = try jsonStringLiteral(
         ctx,
@@ -10856,7 +10856,7 @@ fn writeRuntimeEntryWrapper(
     const sys_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "sys.js" });
     const repl_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "repl.js" });
     const sea_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "sea.js" });
-    const sqlite_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "sqlite.js" });
+    const sqlite_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "sqlite-capability.js" });
     const node_test_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "test.js" });
     const test_reporters_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "test", "reporters.js" });
     const timers_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "timers.js" });
@@ -10864,7 +10864,7 @@ fn writeRuntimeEntryWrapper(
     const trace_events_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "trace_events.js" });
     const wasi_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "wasi.js" });
     const worker_threads_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "worker_threads.js" });
-    const zlib_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "zlib.js" });
+    const zlib_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "zlib-capability.js" });
     const http_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "http.js" });
     const https_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "https.js" });
     const http2_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "http2.js" });

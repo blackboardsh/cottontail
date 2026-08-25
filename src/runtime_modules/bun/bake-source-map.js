@@ -1,6 +1,6 @@
-import path from "../node/path.js";
-import { mkdirSync, statSync, writeFileSync } from "../node/fs.js";
-import { fileURLToPath, pathToFileURL } from "../node/url.js";
+import path from "node:path";
+import { mkdirSync, statSync, writeFileSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // This module owns Bake map URLs and generated-code ranges. The native binding
 // performs all source-map parsing and mapping emission with Bun's compiler.

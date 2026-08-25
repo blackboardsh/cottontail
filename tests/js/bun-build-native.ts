@@ -199,7 +199,7 @@ try {
   assert(bunImportRun.exitCode === 0, `bytecode output importing bun should run: ${bunImportRun.stderr}`);
   assert(
     String(bunImportRun.stdout) === "RedisClient\nRedisClient\nRedisClient\n",
-    "bytecode output should preserve Bun namespace imports and require calls",
+    `bytecode output should preserve Bun namespace imports and require calls: ${bunImportRun.stdout} ${bunImportRun.stderr}`,
   );
 } finally {
   rmSync(bytecodeRoot, { recursive: true, force: true });

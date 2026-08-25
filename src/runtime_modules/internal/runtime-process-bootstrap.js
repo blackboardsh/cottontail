@@ -1,3 +1,4 @@
+
 export const nodeCompatVersion = "24.3.0";
 export const bunCompatVersion = "1.3.10";
 
@@ -10,7 +11,8 @@ function initializeRuntimeProcess() {
     : [execPath, ...(cottontail.args ?? [])];
   if (argv.length === 0) argv.push(execPath);
   if (argv[0] === "cottontail") {
-    argv[0] = globalThis.__cottontailStandaloneFlags == null ? execPath : "bun";
+    argv[0] = globalThis.__cottontailStandaloneFlags == null ||
+      globalThis.__cottontailHutchPrivateFileMode != null ? execPath : "bun";
   }
 
   const target = globalThis.process ?? {};

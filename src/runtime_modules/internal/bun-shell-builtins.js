@@ -6,8 +6,9 @@
 // the filesystem loads node/fs.js on its first call, but `echo`/`which`-only
 // scripts skip the whole node:stream + node:url + bun:ffi graph.
 let fsModule;
+const fsSpecifier = ["node", "fs"].join(":");
 function fs() {
-  return (fsModule ??= require("../node/fs.js"));
+  return (fsModule ??= globalThis.require(fsSpecifier));
 }
 const appendFileSync = (...args) => fs().appendFileSync(...args);
 const cpSync = (...args) => fs().cpSync(...args);
@@ -21,7 +22,7 @@ const rmdirSync = (...args) => fs().rmdirSync(...args);
 const rmSync = (...args) => fs().rmSync(...args);
 const statSync = (...args) => fs().statSync(...args);
 const writeFileSync = (...args) => fs().writeFileSync(...args);
-import { basename, dirname, isAbsolute, join, resolve } from "../node/path.js";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 const encoder = new TextEncoder();
 

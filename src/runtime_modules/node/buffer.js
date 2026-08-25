@@ -1,4 +1,4 @@
-import "../bun/ffi.js";
+import "../bun/core-bootstrap.js";
 import { Buffer as RuntimeBuffer } from "./internal/buffer-polyfill.js";
 
 // Use the complete, Cottontail-vendored Buffer implementation for both the

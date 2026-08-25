@@ -1,8 +1,8 @@
-let internalRequireImplementation;
-
 function internalRequire(id) {
-  internalRequireImplementation ??= require("./util/internal/loader.js").internalRequire;
-  return internalRequireImplementation(id);
+  if (id === "node:util" || id === "util" || id === "fs" || id === "node:fs") {
+    return globalThis[Symbol.for("cottontail.capabilityRequire")](id);
+  }
+  throw new Error(`Unsupported lazy assert dependency: ${id}`);
 }
 
 const kAssertOptions = Symbol("assert options");

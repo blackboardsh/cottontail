@@ -1,13 +1,14 @@
-import EventEmitter from "../node/events.js";
-import { Buffer } from "../node/buffer.js";
-import { Duplex } from "../node/stream.js";
-import {
+const {
+  EventEmitter,
+  Buffer,
+  Duplex,
+  http: {
   STATUS_CODES,
-  WebSocket as RuntimeWebSocket,
+  WebSocket: RuntimeWebSocket,
   consumeWebSocketDataFrame,
   createWebSocketClosePayload,
   createWebSocketMessageState,
-  createServer as createHttpServer,
+  createServer: createHttpServer,
   decodeWebSocketText,
   parseWebSocketFrames,
   parseWebSocketClosePayload,
@@ -17,7 +18,8 @@ import {
   websocketDeflateCompress,
   websocketDeflateDecompress,
   websocketFrame,
-} from "../node/http.js";
+  },
+} = cottontail.__cottontailWebSocketHostModules;
 
 const CONNECTING = 0;
 const OPEN = 1;

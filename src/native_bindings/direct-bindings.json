@@ -25,16 +25,6 @@
     "callback": "ct_direct_buffer_fill_pattern"
   },
   {
-    "name": "websocketFrameEncode",
-    "arity": 5,
-    "callback": "ct_direct_websocket_frame_encode"
-  },
-  {
-    "name": "websocketUnmaskCopy",
-    "arity": 2,
-    "callback": "ct_direct_websocket_unmask_copy"
-  },
-  {
     "name": "whichPathNative",
     "arity": 5,
     "callback": "ct_direct_which_path_native"
@@ -63,51 +53,6 @@
     "name": "textEncode",
     "arity": 1,
     "callback": "ct_direct_text_encode"
-  },
-  {
-    "name": "globCompileNative",
-    "arity": 1,
-    "callback": "ct_direct_glob_compile"
-  },
-  {
-    "name": "stripANSINative",
-    "arity": 1,
-    "callback": "ct_direct_strip_ansi"
-  },
-  {
-    "name": "stringWidthNative",
-    "arity": 3,
-    "callback": "ct_direct_string_width_native"
-  },
-  {
-    "name": "randomUUIDv7Native",
-    "arity": 2,
-    "callback": "ct_direct_random_uuid_v7_native"
-  },
-  {
-    "name": "randomUUIDv5Native",
-    "arity": 3,
-    "callback": "ct_direct_random_uuid_v5_native"
-  },
-  {
-    "name": "cryptoHasherCreate",
-    "arity": 2,
-    "callback": "ct_direct_crypto_hasher_create"
-  },
-  {
-    "name": "cryptoHasherUpdate",
-    "arity": 2,
-    "callback": "ct_direct_crypto_hasher_update"
-  },
-  {
-    "name": "cryptoHasherCopy",
-    "arity": 1,
-    "callback": "ct_direct_crypto_hasher_copy"
-  },
-  {
-    "name": "cryptoHasherDigest",
-    "arity": 3,
-    "callback": "ct_direct_crypto_hasher_digest"
   },
   {
     "name": "moduleResolveCacheGet",

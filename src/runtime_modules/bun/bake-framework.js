@@ -1,11 +1,11 @@
-import path from "../node/path.js";
+import path from "node:path";
 import {
   mkdirSync,
   readFileSync,
   readdirSync,
   statSync,
   writeFileSync,
-} from "../node/fs.js";
+} from "node:fs";
 import reactClientModule from "./bake-react-client.txt";
 import reactServerModule from "./bake-react-server.txt";
 import reactSsrModule from "./bake-react-ssr.txt";

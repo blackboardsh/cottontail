@@ -147,7 +147,7 @@ const EventRenderer = struct {
     }
 };
 
-export fn ct_markdown_render_html(
+pub export fn ct_markdown_render_html(
     source_ptr: ?[*]const u8,
     source_len: usize,
     flags: u64,
@@ -169,7 +169,7 @@ export fn ct_markdown_render_html(
     return rendered.ptr;
 }
 
-export fn ct_markdown_parse_events(
+pub export fn ct_markdown_parse_events(
     source_ptr: ?[*]const u8,
     source_len: usize,
     flags: u64,
@@ -201,11 +201,11 @@ export fn ct_markdown_parse_events(
     return rendered.ptr;
 }
 
-export fn ct_markdown_free(ptr: ?[*]u8, len: usize) void {
+pub export fn ct_markdown_free(ptr: ?[*]u8, len: usize) void {
     if (ptr) |value| c_allocator.free(value[0..len]);
 }
 
-export fn ct_markdown_string_free(ptr: ?[*:0]u8) void {
+pub export fn ct_markdown_string_free(ptr: ?[*:0]u8) void {
     if (ptr) |value| c_allocator.free(std.mem.span(value));
 }
 

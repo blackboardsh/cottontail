@@ -1,4 +1,4 @@
-import { loadEmbeddedRuntimeModule } from "../node/module.js";
+import { loadCottontailCapabilityModule } from "../node/module.js";
 
 const testRegisteredKey = Symbol.for("cottontail.internal.testRegistered");
 
@@ -27,6 +27,6 @@ export async function startDefaultApp(entryNamespace) {
   if (!isServerConfig(entryNamespace?.default) || globalThis.__cottontailServeEverCalled) {
     return null;
   }
-  const bake = loadEmbeddedRuntimeModule("bun/bake-dev-server.js");
+  const bake = loadCottontailCapabilityModule("bake", "bun/bake-dev-server.js");
   return bake.startDefaultApp(entryNamespace);
 }

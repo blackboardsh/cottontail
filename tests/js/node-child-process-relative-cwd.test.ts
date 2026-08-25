@@ -1,6 +1,6 @@
 import { afterAll, expect, test } from "bun:test";
-import { linkSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 
 const root = mkdtempSync(join(process.cwd(), ".cottontail-child-cwd-"));
@@ -22,6 +22,11 @@ test("relative executable paths are resolved from the requested cwd", async () =
   mkdirSync(bin);
   const executable = join(bin, process.platform === "win32" ? "cottontail.exe" : "cottontail");
   linkSync(process.execPath, executable);
+  symlinkSync(
+    join(dirname(process.execPath), "cottontail-core"),
+    join(bin, "cottontail-core"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
 
   const child = spawn(`.${process.platform === "win32" ? "\\" : "/"}bin${process.platform === "win32" ? "\\cottontail.exe" : "/cottontail"}`, [
     "-e",

@@ -1,4 +1,7 @@
-import { appendFileSync, readFileSync, writeFileSync } from "../node/fs.js";
+import testHostModules from "./test-host-modules.js";
+
+const { appendFileSync, readFileSync, writeFileSync } =
+  testHostModules.fs;
 
 export function junitReporterOptions(testOptions) {
   if (!testOptions.reporters.junit) return null;

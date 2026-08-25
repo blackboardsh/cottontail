@@ -1,8 +1,5 @@
 CT_NATIVE_BINDING("platform", ct_platform)
 CT_NATIVE_BINDING("arch", ct_arch)
-CT_NATIVE_BINDING("secretGet", ct_secret_get)
-CT_NATIVE_BINDING("secretSet", ct_secret_set)
-CT_NATIVE_BINDING("secretDelete", ct_secret_delete)
 CT_NATIVE_BINDING("hostname", ct_hostname)
 CT_NATIVE_BINDING("platformConstants", ct_platform_constants)
 CT_NATIVE_BINDING("uvErrorEntries", ct_uv_error_entries)

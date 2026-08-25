@@ -50,6 +50,7 @@ int ct_jsc_generate_bytecode(
     const uint8_t *source,
     size_t source_len,
     const char *filename,
+    int synchronous_wrapper,
     uint8_t **bytecode_out,
     size_t *bytecode_len_out,
     char **error_out

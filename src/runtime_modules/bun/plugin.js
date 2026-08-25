@@ -1,7 +1,7 @@
 import {
   _clearBunPlugins,
   _registerBunPlugin,
-  loadEmbeddedRuntimeModule,
+  loadCottontailCapabilityModule,
 } from "../node/module.js";
 
 export function plugin(pluginOptions) {
@@ -19,7 +19,7 @@ if (typeof globalThis[buildBakeProductionSymbol] !== "function") {
     enumerable: false,
     writable: true,
     value: function buildBakeProductionLazy(options) {
-      return loadEmbeddedRuntimeModule("bun/bake-dev-server.js").buildProductionApp(options);
+      return loadCottontailCapabilityModule("bake", "bun/bake-dev-server.js").buildProductionApp(options);
     },
   });
 }

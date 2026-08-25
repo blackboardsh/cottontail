@@ -148,7 +148,7 @@ jobs:
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
-          node scripts/zig.js build test-windows-console -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseSmall -Dcpu=baseline
+          node scripts/zig.js build test-windows-console -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseFast -Dcpu=baseline
           if ($LASTEXITCODE -ne 0) { throw "Windows Unicode console test failed" }
 
       - name: Build and strip release binary

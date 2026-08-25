@@ -1,4 +1,4 @@
-import path from "../node/path.js";
+import path from "node:path";
 import { createSourceMapConsumer } from "../vendor/sourcemap.js";
 
 const maxReportBytes = 1024 * 1024;

@@ -3,6 +3,7 @@
 import { spawnSync } from 'node:child_process';
 import {
   chmodSync,
+  cpSync,
   copyFileSync,
   existsSync,
   mkdirSync,
@@ -27,6 +28,8 @@ const zigName = process.platform === 'win32' ? 'zig.exe' : 'zig';
 const executableName = process.platform === 'win32' ? 'cottontail.exe' : 'cottontail';
 const zigPath = join(rootDir, 'vendors', 'zig', zigName);
 const executablePath = join(rootDir, 'zig-out', 'bin', executableName);
+const stdlibPath = join(rootDir, 'zig-out', 'bin', 'cottontail-stdlib');
+const corePath = join(rootDir, 'zig-out', 'bin', 'cottontail-core');
 const validatorPath = join(rootDir, 'scripts', 'validate-release-binary.js');
 const macosExportListPath = join(rootDir, 'src', 'compiler', 'src', 'symbols.txt');
 const linuxVersionScriptPath = join(rootDir, 'src', 'compiler', 'src', 'symbols.dyn');
@@ -55,12 +58,14 @@ function run(command, args, label) {
 
 const stagingRoot = mkdtempSync(join(tmpdir(), 'cottontail-release-'));
 const stagedExecutable = join(stagingRoot, 'bin', executableName);
+const stagedStdlib = join(stagingRoot, 'bin', 'cottontail-stdlib');
+const stagedCore = join(stagingRoot, 'bin', 'cottontail-core');
 
 try {
   run(process.execPath, [nativeBindingsGenerator], 'Native binding generation');
   const args = [
     'build',
-    '-Doptimize=ReleaseSmall',
+    '-Doptimize=ReleaseFast',
     ...releaseTargetArgs(process.platform),
     '--prefix',
     stagingRoot,
@@ -119,6 +124,16 @@ try {
 
   mkdirSync(dirname(executablePath), { recursive: true });
   copyFileSync(stagedExecutable, executablePath);
+  if (!existsSync(stagedStdlib)) {
+    throw new Error(`Cottontail release build did not stage its stdlib at ${stagedStdlib}.`);
+  }
+  if (!existsSync(stagedCore)) {
+    throw new Error(`Cottontail release build did not stage its core bytecode at ${stagedCore}.`);
+  }
+  rmSync(stdlibPath, { recursive: true, force: true });
+  cpSync(stagedStdlib, stdlibPath, { recursive: true });
+  rmSync(corePath, { recursive: true, force: true });
+  cpSync(stagedCore, corePath, { recursive: true });
   if (process.platform !== 'win32') chmodSync(executablePath, 0o755);
   run(
     process.execPath,

@@ -2342,7 +2342,14 @@ function installParentIpcChannel(child, serialization = undefined, nodeProtocol 
             pid: child.pid,
             message: ipcMessageSummary(frame.message),
           });
-          queueIpcMessage(() => emitChildMessage(child, frame.message, "message", frame.handle));
+          const deliver = () => emitChildMessage(child, frame.message, "message", frame.handle);
+          // A response can arrive immediately before the child exits. Once a
+          // consumer is listening, deliver it while handling the native frame;
+          // deferring through process.nextTick can otherwise lose the callback
+          // when teardown happens in the same poll. Early frames still defer so
+          // callers have time to attach listeners after fork() returns.
+          if ((child.listenerCount?.("message") ?? 0) > 0) deliver();
+          else queueIpcMessage(deliver);
         }
       }
     } catch (error) {

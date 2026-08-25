@@ -1,7 +1,10 @@
 import { Buffer } from "./buffer.js";
 import { Readable } from "./stream.js";
 import { createHook as createAsyncHook } from "./async_hooks.js";
-import { inspect } from "./util.js";
+
+function inspect(value, options = undefined) {
+  return globalThis[Symbol.for("cottontail.capabilityRequire")]("node:util").inspect(value, options);
+}
 import { captureV8HeapSnapshot } from "./internal/heap_snapshot.js";
 import {
   DefaultDeserializer,

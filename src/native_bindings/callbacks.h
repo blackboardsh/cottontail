@@ -22,10 +22,6 @@ static const JSObjectCallAsFunctionCallback ct_filesystem_native_callbacks[] = {
 #include "filesystem.inc"
 };
 
-static const JSObjectCallAsFunctionCallback ct_glob_native_callbacks[] = {
-#include "glob.inc"
-};
-
 static const JSObjectCallAsFunctionCallback ct_process_native_callbacks[] = {
 #include "process.inc"
 };
@@ -50,16 +46,8 @@ static const JSObjectCallAsFunctionCallback ct_system_native_callbacks[] = {
 #include "system.inc"
 };
 
-static const JSObjectCallAsFunctionCallback ct_compression_native_callbacks[] = {
-#include "compression.inc"
-};
-
 static const JSObjectCallAsFunctionCallback ct_crypto_native_callbacks[] = {
 #include "crypto.inc"
-};
-
-static const JSObjectCallAsFunctionCallback ct_data_parser_native_callbacks[] = {
-#include "data_parser.inc"
 };
 
 static const JSObjectCallAsFunctionCallback ct_dns_native_callbacks[] = {
@@ -74,18 +62,6 @@ static const JSObjectCallAsFunctionCallback ct_tls_native_callbacks[] = {
 #include "tls.inc"
 };
 
-static const JSObjectCallAsFunctionCallback ct_sqlite_native_callbacks[] = {
-#include "sqlite.inc"
-};
-
-static const JSObjectCallAsFunctionCallback ct_sql_wire_native_callbacks[] = {
-#include "sql_wire.inc"
-};
-
-static const JSObjectCallAsFunctionCallback ct_string_width_native_callbacks[] = {
-#include "string_width.inc"
-};
-
 static const JSObjectCallAsFunctionCallback ct_url_native_callbacks[] = {
 #include "url.inc"
 };
@@ -96,10 +72,6 @@ static const JSObjectCallAsFunctionCallback ct_platform_native_callbacks[] = {
 
 static const JSObjectCallAsFunctionCallback ct_path_native_callbacks[] = {
 #include "path.inc"
-};
-
-static const JSObjectCallAsFunctionCallback ct_uuid_native_callbacks[] = {
-#include "uuid.inc"
 };
 
 #undef CT_NATIVE_BINDING
@@ -123,26 +95,19 @@ static void ct_register_host_native_bindings(
     CT_REGISTER_NATIVE_BINDINGS(inspector);
     CT_REGISTER_NATIVE_BINDINGS(buffer);
     CT_REGISTER_NATIVE_BINDINGS(filesystem);
-    CT_REGISTER_NATIVE_BINDINGS(glob);
     CT_REGISTER_NATIVE_BINDINGS(process);
     CT_REGISTER_NATIVE_BINDINGS(http);
     CT_REGISTER_NATIVE_BINDINGS(tooling);
     CT_REGISTER_NATIVE_BINDINGS(memory_ffi);
     CT_REGISTER_NATIVE_BINDINGS(worker);
     CT_REGISTER_NATIVE_BINDINGS(system);
-    CT_REGISTER_NATIVE_BINDINGS(compression);
     CT_REGISTER_NATIVE_BINDINGS(crypto);
-    CT_REGISTER_NATIVE_BINDINGS(data_parser);
     CT_REGISTER_NATIVE_BINDINGS(dns);
     CT_REGISTER_NATIVE_BINDINGS(sockets);
     CT_REGISTER_NATIVE_BINDINGS(tls);
-    CT_REGISTER_NATIVE_BINDINGS(sqlite);
-    CT_REGISTER_NATIVE_BINDINGS(sql_wire);
-    CT_REGISTER_NATIVE_BINDINGS(string_width);
     CT_REGISTER_NATIVE_BINDINGS(url);
     CT_REGISTER_NATIVE_BINDINGS(platform);
     CT_REGISTER_NATIVE_BINDINGS(path);
-    CT_REGISTER_NATIVE_BINDINGS(uuid);
 }
 
 typedef struct CtNativeBindingDefinition {
@@ -158,26 +123,19 @@ static const CtNativeBindingDefinition ct_host_native_binding_definitions[] = {
 #include "inspector.inc"
 #include "buffer.inc"
 #include "filesystem.inc"
-#include "glob.inc"
 #include "process.inc"
 #include "http.inc"
 #include "tooling.inc"
 #include "memory_ffi.inc"
 #include "worker.inc"
 #include "system.inc"
-#include "compression.inc"
 #include "crypto.inc"
-#include "data_parser.inc"
 #include "dns.inc"
 #include "sockets.inc"
 #include "tls.inc"
-#include "sqlite.inc"
-#include "sql_wire.inc"
-#include "string_width.inc"
 #include "url.inc"
 #include "platform.inc"
 #include "path.inc"
-#include "uuid.inc"
 };
 
 #define CT_HOST_NATIVE_BINDING_COUNT \

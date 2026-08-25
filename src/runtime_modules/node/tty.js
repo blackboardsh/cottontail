@@ -36,7 +36,7 @@ Object.setPrototypeOf(ReadStream.prototype, Readable.prototype);
 
 ReadStream.prototype.setRawMode = function setRawMode(mode) {
   const enabled = Boolean(mode);
-  cottontail.terminalSetRawMode?.(this.fd, enabled);
+  globalThis.Cottontail.terminal.setRawMode(this.fd, enabled);
   this.isRaw = enabled;
   return this;
 };

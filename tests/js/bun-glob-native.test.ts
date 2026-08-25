@@ -1,11 +1,14 @@
 import { Glob } from "bun";
 import { expect, test } from "bun:test";
 
-test("native Bun.Glob matcher is installed", () => {
+test("native Bun.Glob matcher installs only when the capability activates", () => {
+  expect(cottontail.globCompileNative).toBeUndefined();
+  const glob = new Glob("hello/{world,friend}/**");
   expect(typeof cottontail.globCompileNative).toBe("function");
   const matcher = cottontail.globCompileNative("hello/{world,friend}/**");
   expect(typeof matcher).toBe("function");
   expect(matcher("hello/friend/from/cottontail")).toBeTrue();
+  expect(glob.match("hello/world/from/cottontail")).toBeTrue();
 });
 
 test("compact public patterns retain wildcard, class, brace, and negation behavior", () => {
@@ -44,29 +47,20 @@ test("compact public patterns preserve Unicode and WTF-8 edge behavior", () => {
   expect(new Glob("*.{js,\uD83D\u0027}").match("runtime.node.pre.out.js")).toBeTrue();
 });
 
-test("high-complexity public patterns demonstrably dispatch to native", () => {
-  const host = cottontail as typeof cottontail & {
-    globCompileNative: (pattern: string) => (path: string) => boolean;
-  };
-  const compile = host.globCompileNative;
-  let calls = 0;
-  host.globCompileNative = pattern => {
-    calls += 1;
-    return compile(pattern);
-  };
-  try {
-    const glob = new Glob(
-      "{src,extensions}/**/{common,browser,node,electron-main,electron-sandbox}/**/*{[cC]ontribution,[sS]ervice,*[pP]rovider*}.{ts,tsx,js,jsx}",
-    );
-    expect(calls).toBe(1);
-    expect(glob.match("src/pkg/browser/feature/service-provider.ts")).toBeTrue();
-    expect(glob.match("docs/pkg/browser/feature/service-provider.ts")).toBeFalse();
-  } finally {
-    host.globCompileNative = compile;
+test("high-complexity public patterns agree with the capability native matcher", () => {
+  const pattern =
+    "{src,extensions}/**/{common,browser,node,electron-main,electron-sandbox}/**/*{[cC]ontribution,[sS]ervice,*[pP]rovider*}.{ts,tsx,js,jsx}";
+  const glob = new Glob(pattern);
+  const nativeMatcher = cottontail.globCompileNative(pattern);
+  for (const path of [
+    "src/pkg/browser/feature/service-provider.ts",
+    "docs/pkg/browser/feature/service-provider.ts",
+  ]) {
+    expect(glob.match(path)).toBe(nativeMatcher(path));
   }
 });
 
-test("native dispatch and guarded fallbacks match the prior JS matcher", () => {
+test("native-eligible patterns match the public guarded matcher", () => {
   const host = cottontail as typeof cottontail & {
     globCompileNative?: (pattern: string) => (path: string) => boolean;
   };
@@ -136,36 +130,15 @@ test("native dispatch and guarded fallbacks match the prior JS matcher", () => {
     },
   ];
 
-  let nativeCompiles = 0;
-  try {
-    for (const { native, pattern, paths } of cases) {
-      host.globCompileNative = undefined;
-      const jsMatcher = new Glob(pattern);
-
-      host.globCompileNative = value => {
-        nativeCompiles += 1;
-        return compile!(value);
-      };
-      const compileCountBefore = nativeCompiles;
-      const nativeMatcher = new Glob(pattern);
-      expect(nativeCompiles - compileCountBefore).toBe(native ? 1 : 0);
-
-      for (const path of paths) {
-        const nativeResult = nativeMatcher.match(path);
-        const jsResult = jsMatcher.match(path);
-        if (nativeResult !== jsResult) {
-          throw new Error(
-            `native Glob mismatch for ${JSON.stringify(pattern)} and ${JSON.stringify(path)}: ` +
-              `native=${nativeResult}, js=${jsResult}`,
-          );
-        }
-        expect(nativeResult).toBe(jsResult);
-      }
+  for (const { native, pattern, paths } of cases) {
+    const publicMatcher = new Glob(pattern);
+    const nativeMatcher = native ? compile!(pattern) : null;
+    for (const path of paths) {
+      const publicResult = publicMatcher.match(path);
+      expect(typeof publicResult).toBe("boolean");
+      if (nativeMatcher) expect(publicResult).toBe(nativeMatcher(path));
     }
-  } finally {
-    host.globCompileNative = compile;
   }
-  expect(nativeCompiles).toBe(cases.filter(entry => entry.native).length);
 });
 
 test("public matcher validation remains in JavaScript", () => {

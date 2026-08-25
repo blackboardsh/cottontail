@@ -32,7 +32,7 @@ if (!existsSync(executablePath)) {
 const buildArgs = [
   'build',
   'build-native-plugin',
-  '-Doptimize=ReleaseSmall',
+  '-Doptimize=ReleaseFast',
   ...releaseTargetArgs(process.platform),
 ];
 run(zigPath, buildArgs, 'Native plugin fixture build');

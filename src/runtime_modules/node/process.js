@@ -1346,7 +1346,8 @@ const cottontailExecPath = cottontail.execPath?.() ?? "cottontail";
 const cottontailArgv = Array.isArray(cottontail.argv) ? [...cottontail.argv] : [cottontailExecPath, ...(cottontail.args || [])];
 if (cottontailArgv.length === 0) cottontailArgv.push(cottontailExecPath);
 if (cottontailArgv[0] === "cottontail") {
-  cottontailArgv[0] = globalThis.__cottontailStandaloneFlags == null ? cottontailExecPath : "bun";
+  cottontailArgv[0] = globalThis.__cottontailStandaloneFlags == null ||
+    globalThis.__cottontailHutchPrivateFileMode != null ? cottontailExecPath : "bun";
 }
 const processObject = globalThis.process ?? {
   argv: cottontailArgv,
@@ -1370,7 +1371,8 @@ createEventApi(processObject);
 
 processObject.argv ??= cottontailArgv;
 if (Array.isArray(processObject.argv)) {
-  if (globalThis.__cottontailStandaloneFlags != null) processObject.argv[0] = "bun";
+  if (globalThis.__cottontailStandaloneFlags != null &&
+      globalThis.__cottontailHutchPrivateFileMode == null) processObject.argv[0] = "bun";
   else if (processObject.argv[0] === "cottontail") processObject.argv[0] = cottontailExecPath;
 }
 processObject.argv0 ??= cottontailExecPath;
@@ -1960,7 +1962,7 @@ function createStdinStream() {
     stream.isRaw = false;
     stream.setRawMode = function setRawMode(mode) {
       const enabled = Boolean(mode);
-      cottontail.terminalSetRawMode?.(this.fd, enabled);
+      globalThis.Cottontail.terminal.setRawMode(this.fd, enabled);
       this.isRaw = enabled;
       return this;
     };

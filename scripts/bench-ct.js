@@ -121,7 +121,7 @@ if (!fs.existsSync(binaryPath)) {
   fail(`Release binary not found at ${binaryPath}. Run the release build command first.`);
 }
 
-console.log('cottontail benchmarks (ReleaseSmall)');
+console.log('cottontail benchmarks (ReleaseFast)');
 console.log('startup-empty wall time approximates process startup + runtime init + empty script eval');
 console.log('startup-full-runtime includes initialization of the complete Bun compatibility surface');
 

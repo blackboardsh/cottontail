@@ -1,4 +1,4 @@
-import "../bun/ffi.js";
+import "../bun/core-bootstrap.js";
 import picomatch from "../vendor/picomatch.js";
 import { _wrapAsyncCallback } from "./async_hooks.js";
 import constantsObject from "./constants.js";

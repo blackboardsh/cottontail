@@ -1,4 +1,4 @@
-import "./ffi.js";
+import "./core-bootstrap.js";
 import "./encoding.js";
 import * as streams from "../node/stream/whatwg.js";
 import { URL, URLSearchParams } from "../vendor/whatwg-url.js";
@@ -11,7 +11,7 @@ import {
 } from "./web-body-lifecycle.js";
 import { createRequestResponseRuntime } from "./web-request-response.js";
 import { createWebPrimitives } from "./web-primitives.js";
-import { createCookieRuntime } from "./cookie.js";
+import { createLazyFunction } from "./lazy-runtime.js";
 import { asBuffer, concatManyBuffers } from "./web-buffer-utils.js";
 import { startNativeServe } from "./native-serve.js";
 import {
@@ -113,7 +113,11 @@ const activeServeUnreadBodyAbortError = new globalThis.DOMException(
   "The operation was aborted.",
   "AbortError",
 );
-const { Cookie, CookieMap } = createCookieRuntime(nodeInspect);
+let cookieRuntime;
+const loadCookieRuntime = () => cookieRuntime ??=
+  globalThis.Cottontail.cookies.createCookieRuntime(nodeInspect);
+const Cookie = createLazyFunction(loadCookieRuntime, "Cookie");
+const CookieMap = createLazyFunction(loadCookieRuntime, "CookieMap");
 
 const {
   arrayBufferFromBytes,
