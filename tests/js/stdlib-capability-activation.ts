@@ -7,6 +7,7 @@ const capabilities = [
 ] as const;
 
 for (const name of capabilities) {
+  console.log(`activating Cottontail.${name}`);
   const namespace = Cottontail[name];
   if (namespace == null || (typeof namespace !== "object" && typeof namespace !== "function")) {
     throw new Error(`Cottontail.${name} did not activate a capability namespace`);
@@ -14,6 +15,7 @@ for (const name of capabilities) {
 }
 
 for (const name of ["inspector", "repl", "sea", "sqlite", "test", "zlib"] as const) {
+  console.log(`activating Cottontail.node.${name}`);
   const namespace = Cottontail.node[name];
   if (namespace == null || (typeof namespace !== "object" && typeof namespace !== "function")) {
     throw new Error(`Cottontail.node.${name} did not activate a capability namespace`);
@@ -21,6 +23,7 @@ for (const name of ["inspector", "repl", "sea", "sqlite", "test", "zlib"] as con
 }
 
 for (const name of ["ffi", "sqlite", "sql", "yaml", "jsc", "build"] as const) {
+  console.log(`activating Cottontail.bun.${name}`);
   const namespace = Cottontail.bun[name];
   if (namespace == null || (typeof namespace !== "object" && typeof namespace !== "function")) {
     throw new Error(`Cottontail.bun.${name} did not activate a capability namespace`);
