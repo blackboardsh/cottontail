@@ -699,6 +699,14 @@ pub fn build(b: *std.Build) void {
         } else .{},
     });
     const optimize = b.standardOptimizeOption(.{});
+    const capability_jsc_platform = jscVendorPlatformKey(target.result) orelse {
+        std.debug.print("error: no vendored JavaScriptCore target for capability build\n", .{});
+        std.process.exit(1);
+    };
+    const capability_jsc_include = b.fmt(
+        "vendors/jsc/{s}/{s}/include",
+        .{ jsc_vendor_tag, capability_jsc_platform },
+    );
     const test_filters = b.option(
         []const []const u8,
         "test-filter",
@@ -862,7 +870,7 @@ pub fn build(b: *std.Build) void {
         .pic = true,
     });
     sqlite_capability_module.addIncludePath(b.path("src"));
-    sqlite_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    sqlite_capability_module.addIncludePath(b.path(capability_jsc_include));
     sqlite_capability_module.addIncludePath(b.path("src/compiler/src/jsc/bindings/sqlite"));
     sqlite_capability_module.addCSourceFiles(.{
         .root = b.path("."),
@@ -891,7 +899,7 @@ pub fn build(b: *std.Build) void {
         .pic = true,
     });
     sql_capability_module.addIncludePath(b.path("src"));
-    sql_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    sql_capability_module.addIncludePath(b.path(capability_jsc_include));
     sql_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/sql/sql_capability.c"),
         .flags = &.{ "-std=c11", "-fPIC" },
@@ -910,7 +918,7 @@ pub fn build(b: *std.Build) void {
         .pic = true,
     });
     compression_capability_module.addIncludePath(b.path("src"));
-    compression_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    compression_capability_module.addIncludePath(b.path(capability_jsc_include));
     compression_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/compression/compression_capability.c"),
         .flags = &.{ "-std=c11", "-fPIC" },
@@ -942,7 +950,7 @@ pub fn build(b: *std.Build) void {
     });
     websocket_capability_module.addImport("cottontail_compiler", createCompilerModule(b, target, optimize));
     websocket_capability_module.addIncludePath(b.path("src"));
-    websocket_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    websocket_capability_module.addIncludePath(b.path(capability_jsc_include));
     websocket_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/websocket/websocket_capability.c"),
         .flags = &.{ "-std=c11", "-fPIC" },
@@ -975,7 +983,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }));
     text_capability_module.addIncludePath(b.path("src"));
-    text_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    text_capability_module.addIncludePath(b.path(capability_jsc_include));
     text_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/text/text_capability.c"),
         .flags = &.{ "-std=c11", "-fPIC" },
@@ -1000,7 +1008,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }));
     uuid_capability_module.addIncludePath(b.path("src"));
-    uuid_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    uuid_capability_module.addIncludePath(b.path(capability_jsc_include));
     uuid_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/uuid/uuid_capability.c"),
         .flags = &.{ "-std=c11", "-fPIC" },
@@ -1027,7 +1035,7 @@ pub fn build(b: *std.Build) void {
     glob_native_module.addImport("cottontail_compiler", createCompilerModule(b, target, optimize));
     glob_capability_module.addImport("native_glob", glob_native_module);
     glob_capability_module.addIncludePath(b.path("src"));
-    glob_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    glob_capability_module.addIncludePath(b.path(capability_jsc_include));
     glob_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/glob/glob_capability.c"),
         .flags = &.{ "-std=c11", "-fPIC" },
@@ -1053,7 +1061,7 @@ pub fn build(b: *std.Build) void {
     });
     password_capability_module.addImport("password_native", password_native_module);
     password_capability_module.addIncludePath(b.path("src"));
-    password_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    password_capability_module.addIncludePath(b.path(capability_jsc_include));
     password_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/password/password_capability.c"),
         .flags = &.{ "-std=c11", "-fPIC" },
@@ -1078,7 +1086,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }));
     hashing_capability_module.addIncludePath(b.path("src"));
-    hashing_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    hashing_capability_module.addIncludePath(b.path(capability_jsc_include));
     hashing_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/hashing/hashing_capability.c"),
         .flags = &.{ "-std=c11", "-fPIC" },
@@ -1131,7 +1139,7 @@ pub fn build(b: *std.Build) void {
     native_markdown_module.addImport("cottontail_compiler", createCompilerModule(b, target, optimize));
     markdown_capability_module.addImport("native_markdown", native_markdown_module);
     markdown_capability_module.addIncludePath(b.path("src"));
-    markdown_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    markdown_capability_module.addIncludePath(b.path(capability_jsc_include));
     markdown_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/markdown/markdown_capability.c"),
         .flags = &.{ "-std=c11", "-fPIC" },
@@ -1150,7 +1158,7 @@ pub fn build(b: *std.Build) void {
         .pic = true,
     });
     terminal_capability_module.addIncludePath(b.path("src"));
-    terminal_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+    terminal_capability_module.addIncludePath(b.path(capability_jsc_include));
     terminal_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/terminal/terminal_capability.c"),
         .flags = &.{ "-std=c11", "-fPIC", "-D_DARWIN_C_SOURCE" },
@@ -1169,7 +1177,7 @@ pub fn build(b: *std.Build) void {
         .pic = true,
     });
     ffi_native_module.addIncludePath(b.path("src"));
-    ffi_native_module.addIncludePath(b.path("vendors/jsc/include"));
+    ffi_native_module.addIncludePath(b.path(capability_jsc_include));
     ffi_native_module.addCSourceFile(.{
         .file = b.path("src/stdlib/ffi/ffi_capability.c"),
         .flags = &.{ "-std=c11", "-fPIC" },
@@ -1222,7 +1230,7 @@ pub fn build(b: *std.Build) void {
             .pic = true,
         });
         secrets_capability_module.addIncludePath(b.path("src"));
-        secrets_capability_module.addIncludePath(b.path("vendors/jsc/include"));
+        secrets_capability_module.addIncludePath(b.path(capability_jsc_include));
         secrets_capability_module.addCSourceFile(.{
             .file = b.path("src/stdlib/secrets/secrets_capability.c"),
             .flags = &.{ "-std=c11", "-fPIC" },
