@@ -6,7 +6,25 @@
 #include <ffi.h>
 #endif
 #include <inttypes.h>
+#if defined(_WIN32)
+#include <windows.h>
+typedef SRWLOCK pthread_mutex_t;
+typedef CONDITION_VARIABLE pthread_cond_t;
+typedef DWORD pthread_t;
+#define PTHREAD_MUTEX_INITIALIZER SRWLOCK_INIT
+static int pthread_mutex_init(pthread_mutex_t *mutex, const void *attributes) { (void)attributes; InitializeSRWLock(mutex); return 0; }
+static int pthread_mutex_destroy(pthread_mutex_t *mutex) { (void)mutex; return 0; }
+static int pthread_mutex_lock(pthread_mutex_t *mutex) { AcquireSRWLockExclusive(mutex); return 0; }
+static int pthread_mutex_unlock(pthread_mutex_t *mutex) { ReleaseSRWLockExclusive(mutex); return 0; }
+static int pthread_cond_init(pthread_cond_t *condition, const void *attributes) { (void)attributes; InitializeConditionVariable(condition); return 0; }
+static int pthread_cond_destroy(pthread_cond_t *condition) { (void)condition; return 0; }
+static int pthread_cond_wait(pthread_cond_t *condition, pthread_mutex_t *mutex) { return SleepConditionVariableSRW(condition, mutex, INFINITE, 0) ? 0 : -1; }
+static int pthread_cond_signal(pthread_cond_t *condition) { WakeConditionVariable(condition); return 0; }
+static pthread_t pthread_self(void) { return GetCurrentThreadId(); }
+static int pthread_equal(pthread_t lhs, pthread_t rhs) { return lhs == rhs; }
+#else
 #include <pthread.h>
+#endif
 #include <stdio.h>
 #define CT_FFI_MAX_ARGS 64
 typedef enum { CT_FFI_TYPE_VOID, CT_FFI_TYPE_BOOL, CT_FFI_TYPE_U8, CT_FFI_TYPE_I8, CT_FFI_TYPE_U16, CT_FFI_TYPE_I16, CT_FFI_TYPE_U32, CT_FFI_TYPE_I32, CT_FFI_TYPE_U64, CT_FFI_TYPE_I64, CT_FFI_TYPE_F32, CT_FFI_TYPE_F64, CT_FFI_TYPE_PTR, CT_FFI_TYPE_CSTRING, CT_FFI_TYPE_FUNCTION, CT_FFI_TYPE_NAPI_ENV, CT_FFI_TYPE_NAPI_VALUE } CtFfiType;

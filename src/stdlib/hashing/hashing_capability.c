@@ -1,6 +1,10 @@
 #include "../native_capability.h"
 #include <stdio.h>
+#if defined(_WIN32)
+#define strcasecmp _stricmp
+#else
 #include <strings.h>
+#endif
 
 #if __has_include(<openssl/evp.h>)
 #define CT_HAS_OPENSSL 1
