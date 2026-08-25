@@ -94,11 +94,22 @@ const releaseRoot = join(rootDir, 'release');
 const artifactBase = `cottontail-v${packageJson.version}-${platform}`;
 const packageRoot = join(releaseRoot, artifactBase);
 const archivePath = join(releaseRoot, `${artifactBase}.tar.gz`);
+const corePath = join(rootDir, 'zig-out', 'bin', 'cottontail-core');
+const stdlibPath = join(rootDir, 'zig-out', 'bin', 'cottontail-stdlib');
+
+for (const [label, path] of [
+  ['Cottontail core bytecode', corePath],
+  ['Cottontail standard library', stdlibPath],
+]) {
+  if (!existsSync(path)) fail(`Missing ${label}: ${path}`);
+}
 
 rmSync(packageRoot, { recursive: true, force: true });
 mkdirSync(join(packageRoot, 'bin'), { recursive: true });
 
 cpSync(executablePath, join(packageRoot, 'bin', executableName));
+cpSync(corePath, join(packageRoot, 'bin', 'cottontail-core'), { recursive: true });
+cpSync(stdlibPath, join(packageRoot, 'bin', 'cottontail-stdlib'), { recursive: true });
 cpSync(join(rootDir, 'src', 'runtime_modules'), join(packageRoot, 'runtime_modules'), {
   recursive: true,
 });

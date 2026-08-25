@@ -1,6 +1,7 @@
 #include "../native_capability.h"
 #include <brotli/decode.h>
 #include <brotli/encode.h>
+#include <stdio.h>
 #include <zlib.h>
 #include <zstd.h>
 

@@ -953,7 +953,7 @@ pub fn build(b: *std.Build) void {
     websocket_capability_module.addIncludePath(b.path(capability_jsc_include));
     websocket_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/websocket/websocket_capability.c"),
-        .flags = &.{ "-std=c11", "-fPIC" },
+        .flags = &.{ "-std=c11", "-fPIC", "-D_DEFAULT_SOURCE" },
     });
     const websocket_capability = b.addLibrary(.{
         .name = "cottontail-websocket",
@@ -1161,7 +1161,7 @@ pub fn build(b: *std.Build) void {
     terminal_capability_module.addIncludePath(b.path(capability_jsc_include));
     terminal_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/terminal/terminal_capability.c"),
-        .flags = &.{ "-std=c11", "-fPIC", "-D_DARWIN_C_SOURCE" },
+        .flags = &.{ "-std=c11", "-fPIC", "-D_DARWIN_C_SOURCE", "-D_GNU_SOURCE" },
     });
     const terminal_capability = b.addLibrary(.{
         .name = "cottontail-terminal",
@@ -1194,7 +1194,7 @@ pub fn build(b: *std.Build) void {
             ffi_native.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
             ffi_native.root_module.linkSystemLibrary("ffi", .{ .preferred_link_mode = .static });
         },
-        .linux => ffi_native.root_module.linkSystemLibrary("ffi", .{ .preferred_link_mode = .static }),
+        .linux => ffi_native.root_module.linkSystemLibrary("ffi", .{ .preferred_link_mode = .dynamic }),
         .windows => {
             const dependency_dir = "vendors/windows-deps/x64-windows-static";
             ffi_native.root_module.addIncludePath(b.path(b.fmt("{s}/include", .{dependency_dir})));

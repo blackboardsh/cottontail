@@ -2,6 +2,7 @@
 #define SQLITE_ENABLE_PREUPDATE_HOOK 1
 #include "sqlite3_local.h"
 #include <JavaScriptCore/JavaScript.h>
+#include <limits.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
