@@ -1,6 +1,6 @@
 {
   "name": "cottontail",
-  "version": "0.6.0-canary.9",
+  "version": "0.6.0-canary.10",
   "description": "Tiny Zig-based JavaScript runtime scaffold for Electrobun.",
   "license": "MIT",
   "author": "Blackboard Technologies Inc.",
