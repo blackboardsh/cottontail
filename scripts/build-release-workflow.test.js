@@ -7,6 +7,10 @@ import { releaseTargetArgs } from './release-target.js';
 const workflowPath = new URL('../.github/workflows/build-release.yml', import.meta.url);
 const workflow = readFileSync(workflowPath, 'utf8').replace(/\r\n/g, '\n');
 const buildZig = readFileSync(new URL('../build.zig', import.meta.url), 'utf8');
+const secretsCapability = readFileSync(
+  new URL('../src/stdlib/secrets/main.js', import.meta.url),
+  'utf8',
+);
 
 function step(name) {
   const marker = `      - name: ${name}\n`;
@@ -93,6 +97,11 @@ test('Windows capabilities resolve JSC APIs from the statically linked executabl
   assert.match(buildZig, /"cottontail\.exe"/);
   assert.match(buildZig, /command\.addOutputFileArg\("cottontail-jsc\.lib"\)/);
   assert.match(buildZig, /capability\.root_module\.addObjectFile\(import_library\)/);
+  assert.ok(
+    secretsCapability.includes('replaceAll("\\\\", "/")'),
+    'the Windows secrets loader must normalize each individual path separator',
+  );
+  assert.ok(!secretsCapability.includes('replaceAll("\\\\\\\\", "/")'));
 });
 
 test('packaged Linux releases prove the pinned ICU fallback without system ICU', () => {

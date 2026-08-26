@@ -1,7 +1,7 @@
 import * as module from "../../runtime_modules/bun/secrets.js";
 
 if (process.platform === "win32") {
-  const executable = String(cottontail.execPath()).replaceAll("\\\\", "/");
+  const executable = String(cottontail.execPath()).replaceAll("\\", "/");
   const directory = executable.slice(0, executable.lastIndexOf("/"));
   cottontail.loadCapabilityLibrary(`${directory}/cottontail-stdlib/secrets/secrets.dll`);
 }
