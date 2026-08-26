@@ -88,13 +88,11 @@ test('Windows capabilities resolve JSC APIs from the statically linked executabl
     /const capability_c_flags:[\s\S]*?else\s*&\.\{ "-std=c11", "-fPIC" \};/,
   )?.[0];
   assert.ok(windowsCapabilityFlags, 'missing shared capability C flags');
-  assert.match(windowsCapabilityFlags, /-DJS_NO_EXPORT=1/);
-
-  const windowsFlagOccurrences = buildZig.match(/"-DJS_NO_EXPORT=1"/g)?.length ?? 0;
-  assert.ok(
-    windowsFlagOccurrences >= 8,
-    'shared and custom Windows capability compile paths must disable JSC dllimport declarations',
-  );
+  assert.doesNotMatch(windowsCapabilityFlags, /-DJS_NO_EXPORT=1/);
+  assert.match(buildZig, /"dlltool"/);
+  assert.match(buildZig, /"cottontail\.exe"/);
+  assert.match(buildZig, /command\.addOutputFileArg\("cottontail-jsc\.lib"\)/);
+  assert.match(buildZig, /capability\.root_module\.addObjectFile\(import_library\)/);
 });
 
 test('packaged Linux releases prove the pinned ICU fallback without system ICU', () => {

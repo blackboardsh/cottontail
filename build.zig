@@ -864,9 +864,28 @@ pub fn build(b: *std.Build) void {
     };
 
     const capability_c_flags: []const []const u8 = if (target.result.os.tag == .windows)
-        &.{ "-std=c11", "-DJS_NO_EXPORT=1" }
+        &.{"-std=c11"}
     else
         &.{ "-std=c11", "-fPIC" };
+
+    const windows_jsc_import_library: ?std.Build.LazyPath = if (target.result.os.tag == .windows) blk: {
+        // A PE DLL cannot bind plain unresolved references against symbols in
+        // the already-running executable. Generate the import library that
+        // names cottontail.exe so native capabilities use the JSC C API
+        // exported by the statically linked runtime core.
+        const command = b.addSystemCommand(&.{
+            b.graph.zig_exe,
+            "dlltool",
+            "-m",
+            "i386:x86-64",
+            "-D",
+            "cottontail.exe",
+            "-d",
+        });
+        command.addFileArg(b.path("src/compiler/src/symbols.def"));
+        command.addArg("-l");
+        break :blk command.addOutputFileArg("cottontail-jsc.lib");
+    } else null;
 
     const sqlite_capability_module = b.createModule(.{
         .target = target,
@@ -884,11 +903,14 @@ pub fn build(b: *std.Build) void {
             "src/compiler/src/jsc/bindings/sqlite/sqlite3.c",
         },
         .flags = if (target.result.os.tag == .windows) &.{
-            "-std=c11",                            "-DJS_NO_EXPORT=1",
+            "-std=c11",
             "-DSQLITE_ENABLE_COLUMN_METADATA",
-            "-DSQLITE_ENABLE_FTS5",                "-DSQLITE_ENABLE_MATH_FUNCTIONS",
-            "-DSQLITE_ENABLE_SESSION",             "-DSQLITE_ENABLE_PREUPDATE_HOOK",
-            "-DSQLITE_ENABLE_UPDATE_DELETE_LIMIT", "-DSQLITE_THREADSAFE=1",
+            "-DSQLITE_ENABLE_FTS5",
+            "-DSQLITE_ENABLE_MATH_FUNCTIONS",
+            "-DSQLITE_ENABLE_SESSION",
+            "-DSQLITE_ENABLE_PREUPDATE_HOOK",
+            "-DSQLITE_ENABLE_UPDATE_DELETE_LIMIT",
+            "-DSQLITE_THREADSAFE=1",
         } else &.{
             "-std=c11",                       "-fPIC",                               "-DSQLITE_ENABLE_COLUMN_METADATA",
             "-DSQLITE_ENABLE_FTS5",           "-DSQLITE_ENABLE_MATH_FUNCTIONS",      "-DSQLITE_ENABLE_SESSION",
@@ -970,7 +992,7 @@ pub fn build(b: *std.Build) void {
     websocket_capability_module.addIncludePath(b.path(capability_jsc_include));
     websocket_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/websocket/websocket_capability.c"),
-        .flags = if (target.result.os.tag == .windows) &.{ "-std=c11", "-DJS_NO_EXPORT=1" } else &.{ "-std=c11", "-fPIC", "-D_DEFAULT_SOURCE" },
+        .flags = if (target.result.os.tag == .windows) &.{"-std=c11"} else &.{ "-std=c11", "-fPIC", "-D_DEFAULT_SOURCE" },
     });
     const websocket_capability = b.addLibrary(.{
         .name = "cottontail-websocket",
@@ -1178,7 +1200,7 @@ pub fn build(b: *std.Build) void {
     terminal_capability_module.addIncludePath(b.path(capability_jsc_include));
     terminal_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/terminal/terminal_capability.c"),
-        .flags = if (target.result.os.tag == .windows) &.{ "-std=c11", "-DJS_NO_EXPORT=1" } else &.{ "-std=c11", "-fPIC", "-D_DARWIN_C_SOURCE", "-D_GNU_SOURCE" },
+        .flags = if (target.result.os.tag == .windows) &.{"-std=c11"} else &.{ "-std=c11", "-fPIC", "-D_DARWIN_C_SOURCE", "-D_GNU_SOURCE" },
     });
     const terminal_capability = b.addLibrary(.{
         .name = "cottontail-terminal",
@@ -1205,6 +1227,22 @@ pub fn build(b: *std.Build) void {
         .root_module = ffi_native_module,
     });
     ffi_native.linker_allow_shlib_undefined = true;
+    if (windows_jsc_import_library) |import_library| {
+        inline for (&.{
+            sqlite_capability,
+            sql_capability,
+            compression_capability,
+            websocket_capability,
+            text_capability,
+            uuid_capability,
+            glob_capability,
+            password_capability,
+            hashing_capability,
+            markdown_capability,
+            terminal_capability,
+            ffi_native,
+        }) |capability| capability.root_module.addObjectFile(import_library);
+    }
     switch (target.result.os.tag) {
         .macos => {
             ffi_native.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
@@ -1259,6 +1297,7 @@ pub fn build(b: *std.Build) void {
             .root_module = secrets_capability_module,
         });
         secrets_capability.linker_allow_shlib_undefined = true;
+        secrets_capability.root_module.addObjectFile(windows_jsc_import_library.?);
         const install_secrets_library = b.addInstallFile(
             secrets_capability.getEmittedBin(),
             "bin/cottontail-stdlib/secrets/secrets.dll",
