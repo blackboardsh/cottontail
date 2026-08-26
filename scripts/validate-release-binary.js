@@ -11,6 +11,7 @@ import {
   listExportedSymbols,
   peExportSymbolsFromModuleDefinition,
 } from './release-binary-contract.js';
+import { assertNamespacedJscBridgeExports } from './jsc-bridge-contract.js';
 
 const rootDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const executableName = process.platform === 'win32' ? 'cottontail.exe' : 'cottontail';
@@ -72,6 +73,15 @@ for (const symbol of [
   if (!exportedSet.has(`${symbolPrefix}${symbol}`)) {
     fail(`${executablePath} does not export required native-addon symbol ${symbol}`);
   }
+}
+
+try {
+  assertNamespacedJscBridgeExports(exportedSymbols, {
+    symbolPrefix,
+    label: executablePath,
+  });
+} catch (error) {
+  fail(error.message);
 }
 
 if (details.format === 'mach-o') {

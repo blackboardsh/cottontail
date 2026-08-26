@@ -1,6 +1,6 @@
 #ifndef COTTONTAIL_STDLIB_NATIVE_CAPABILITY_H
 #define COTTONTAIL_STDLIB_NATIVE_CAPABILITY_H
-#include <JavaScriptCore/JavaScript.h>
+#include "jsc_bridge.h"
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>

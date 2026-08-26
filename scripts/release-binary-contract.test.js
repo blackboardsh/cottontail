@@ -11,6 +11,11 @@ import {
   restrictElfDynamicExports,
   restrictPortableExecutableExports,
 } from './release-binary-contract.js';
+import {
+  assertNamespacedJscBridgeExports,
+  namespacedJscBridgeSymbols,
+  stockJscBridgeSymbols,
+} from './jsc-bridge-contract.js';
 
 function machoFixture(localSymbols) {
   const buffer = Buffer.alloc(32 + 24 + 80);
@@ -294,4 +299,43 @@ test('derives the Windows native-addon ABI from the module definition', () => {
   ]) {
     assert.ok(exports.includes(required), `missing ${required}`);
   }
+});
+
+test('keeps the JSC bridge namespaced in every platform export manifest', () => {
+  const stockSymbols = stockJscBridgeSymbols();
+  const bridgeSymbols = namespacedJscBridgeSymbols();
+  assert.equal(stockSymbols.length, 54);
+  assert.equal(bridgeSymbols.length, 54);
+  assert.throws(
+    () => assertNamespacedJscBridgeExports([...bridgeSymbols, stockSymbols[0]]),
+    /exposes stock JSC symbols/,
+  );
+  assert.throws(
+    () => assertNamespacedJscBridgeExports(bridgeSymbols.slice(1)),
+    /missing Cottontail JSC bridge symbols/,
+  );
+
+  const linuxExports = elfExportSymbolsFromVersionScript(
+    readFileSync(new URL('../src/compiler/src/symbols.dyn', import.meta.url)),
+  );
+  const windowsExports = peExportSymbolsFromModuleDefinition(
+    readFileSync(new URL('../src/compiler/src/symbols.def', import.meta.url)),
+  );
+  const macosExports = readFileSync(
+    new URL('../src/compiler/src/symbols.txt', import.meta.url),
+    'utf8',
+  ).split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
+
+  assert.doesNotThrow(() => assertNamespacedJscBridgeExports(
+    linuxExports,
+    { label: 'Linux export manifest' },
+  ));
+  assert.doesNotThrow(() => assertNamespacedJscBridgeExports(
+    windowsExports,
+    { label: 'Windows export manifest' },
+  ));
+  assert.doesNotThrow(() => assertNamespacedJscBridgeExports(
+    macosExports,
+    { symbolPrefix: '_', label: 'macOS export manifest' },
+  ));
 });

@@ -87,15 +87,16 @@ test('every release activates every packaged standard-library capability', () =>
   );
 });
 
-test('Windows capabilities resolve JSC APIs from the statically linked executable', () => {
+test('Windows capabilities resolve the prefixed JSC bridge from the executable', () => {
   const windowsCapabilityFlags = buildZig.match(
     /const capability_c_flags:[\s\S]*?else\s*&\.\{ "-std=c11", "-fPIC" \};/,
   )?.[0];
   assert.ok(windowsCapabilityFlags, 'missing shared capability C flags');
   assert.doesNotMatch(windowsCapabilityFlags, /-DJS_NO_EXPORT=1/);
+  assert.match(buildZig, /"src\/stdlib\/jsc_bridge\.c"/);
   assert.match(buildZig, /"dlltool"/);
   assert.match(buildZig, /"cottontail\.exe"/);
-  assert.match(buildZig, /command\.addOutputFileArg\("cottontail-jsc\.lib"\)/);
+  assert.match(buildZig, /command\.addOutputFileArg\("cottontail-jsc-bridge\.lib"\)/);
   assert.match(buildZig, /capability\.root_module\.addObjectFile\(import_library\)/);
   assert.ok(
     secretsCapability.includes('replaceAll("\\\\", "/")'),

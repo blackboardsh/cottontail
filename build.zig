@@ -480,6 +480,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
         .root = b.path("."),
         .files = &.{
             "src/signal_forwarding.c",
+            "src/stdlib/jsc_bridge.c",
             "src/jsc_runner.c",
             "src/native_bindings/registry.c",
             "src/native_bindings/runtime.c",
@@ -868,11 +869,11 @@ pub fn build(b: *std.Build) void {
     else
         &.{ "-std=c11", "-fPIC" };
 
-    const windows_jsc_import_library: ?std.Build.LazyPath = if (target.result.os.tag == .windows) blk: {
+    const windows_jsc_bridge_import_library: ?std.Build.LazyPath = if (target.result.os.tag == .windows) blk: {
         // A PE DLL cannot bind plain unresolved references against symbols in
-        // the already-running executable. Generate the import library that
-        // names cottontail.exe so native capabilities use the JSC C API
-        // exported by the statically linked runtime core.
+        // the already-running executable. Generate an import library for the
+        // private, prefixed JSC bridge exported by cottontail.exe. Stock JSC
+        // names must remain private to the statically linked runtime core.
         const command = b.addSystemCommand(&.{
             b.graph.zig_exe,
             "dlltool",
@@ -884,7 +885,7 @@ pub fn build(b: *std.Build) void {
         });
         command.addFileArg(b.path("src/compiler/src/symbols.def"));
         command.addArg("-l");
-        break :blk command.addOutputFileArg("cottontail-jsc.lib");
+        break :blk command.addOutputFileArg("cottontail-jsc-bridge.lib");
     } else null;
 
     const sqlite_capability_module = b.createModule(.{
@@ -1227,7 +1228,7 @@ pub fn build(b: *std.Build) void {
         .root_module = ffi_native_module,
     });
     ffi_native.linker_allow_shlib_undefined = true;
-    if (windows_jsc_import_library) |import_library| {
+    if (windows_jsc_bridge_import_library) |import_library| {
         inline for (&.{
             sqlite_capability,
             sql_capability,
@@ -1297,7 +1298,7 @@ pub fn build(b: *std.Build) void {
             .root_module = secrets_capability_module,
         });
         secrets_capability.linker_allow_shlib_undefined = true;
-        secrets_capability.root_module.addObjectFile(windows_jsc_import_library.?);
+        secrets_capability.root_module.addObjectFile(windows_jsc_bridge_import_library.?);
         const install_secrets_library = b.addInstallFile(
             secrets_capability.getEmittedBin(),
             "bin/cottontail-stdlib/secrets/secrets.dll",
@@ -1387,11 +1388,11 @@ pub fn build(b: *std.Build) void {
         );
         install_exe.step.dependOn(&install.step);
     }
-    if (target.result.os.tag == .linux and (optimize == .ReleaseSmall or optimize == .ReleaseFast)) {
+    if (target.result.os.tag == .linux) {
         // Zig 0.16 accepts the ELF version script above but its built-in linker
-        // does not apply it. Keep ordinary release installs on the same native-
-        // addon ABI allowlist as scripts/build-release.js instead of exposing
-        // every symbol pulled in by -rdynamic.
+        // does not apply it. Restrict every installed Linux executable, including
+        // debug builds: an unrestricted -rdynamic would expose stock JSC symbols
+        // and allow WebKitGTK to bind to Cottontail's incompatible embedded JSC.
         const restrict_exports = b.addSystemCommand(&.{"node"});
         restrict_exports.addFileArg(b.path("scripts/restrict-linux-release-exports.js"));
         restrict_exports.addArg(b.getInstallPath(.bin, exe.out_filename));
