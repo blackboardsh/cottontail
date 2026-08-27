@@ -1423,6 +1423,7 @@ pub fn build(b: *std.Build) void {
         .pic = true,
     });
     native_plugin_fixture_module.addIncludePath(b.path("src/compiler/src/napi"));
+    native_plugin_fixture_module.addIncludePath(b.path("src/compiler/src/jsc/bindings/libuv"));
     native_plugin_fixture_module.addCSourceFile(.{
         .file = b.path("tests/js/fixtures/native-bundler-plugin.c"),
         .flags = &.{"-std=c11"},
