@@ -969,9 +969,13 @@ pub fn build(b: *std.Build) void {
         .linkage = .dynamic,
         .root_module = compression_capability_module,
     });
-    compression_capability.linker_allow_shlib_undefined = true;
+    // Windows capabilities have an explicit import library for the host JSC
+    // bridge, so every other native symbol must resolve at link time. Leaving
+    // Zstd unresolved produces non-null sentinel call targets in the PE file
+    // and turns a missing library into an access violation at runtime.
+    compression_capability.linker_allow_shlib_undefined = target.result.os.tag != .windows;
     if (target.result.os.tag == .windows) {
-        inline for (&.{ "zs.lib", "brotlicommon.lib", "brotlidec.lib", "brotlienc.lib" }) |library| {
+        inline for (&.{ "zs.lib", "zstd.lib", "brotlicommon.lib", "brotlidec.lib", "brotlienc.lib" }) |library| {
             compression_capability.root_module.addObjectFile(b.path(b.fmt("vendors/windows-deps/x64-windows-static/lib/{s}", .{library})));
         }
     } else {

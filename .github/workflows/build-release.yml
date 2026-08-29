@@ -186,6 +186,13 @@ jobs:
       - name: Activate every packaged standard-library capability
         run: ./zig-out/bin/cottontail tests/js/stdlib-capability-activation.ts
 
+      - name: Test Windows Zstd capability and fetch decoding
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          & .\zig-out\bin\cottontail.exe tests/js/fetch-zstd-windows-regression.ts
+          if ($LASTEXITCODE -ne 0) { throw "Windows Zstd regression tests failed" }
+
       - name: Test Windows filesystem permissions
         if: matrix.os == 'windows'
         shell: pwsh

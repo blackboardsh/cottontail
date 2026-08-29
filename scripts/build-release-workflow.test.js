@@ -87,6 +87,31 @@ test('every release activates every packaged standard-library capability', () =>
   );
 });
 
+test('Windows compression capability links and exercises Zstandard', () => {
+  const compressionCapability = buildZig.match(
+    /const compression_capability_module[\s\S]*?const websocket_capability_module/,
+  )?.[0];
+  assert.ok(compressionCapability, 'missing compression capability build configuration');
+  assert.match(compressionCapability, /if \(target\.result\.os\.tag == \.windows\)/);
+  assert.match(compressionCapability, /"zstd\.lib"/);
+  assert.match(
+    compressionCapability,
+    /linker_allow_shlib_undefined = target\.result\.os\.tag != \.windows/,
+  );
+
+  const regressionTest = step('Test Windows Zstd capability and fetch decoding');
+  assert.match(regressionTest, /if: matrix\.os == 'windows'/);
+  assert.match(
+    regressionTest,
+    /cottontail\.exe tests\/js\/fetch-zstd-windows-regression\.ts/,
+  );
+  assert.ok(
+    workflow.indexOf('- name: Build and strip release binary') <
+      workflow.indexOf('- name: Test Windows Zstd capability and fetch decoding'),
+    'the Zstd regression test must exercise the optimized release layout',
+  );
+});
+
 test('Windows capabilities resolve the prefixed JSC bridge from the executable', () => {
   const windowsCapabilityFlags = buildZig.match(
     /const capability_c_flags:[\s\S]*?else\s*&\.\{ "-std=c11", "-fPIC" \};/,

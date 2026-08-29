@@ -1091,6 +1091,11 @@ try {
       stdoutIncludes: ['node zlib streams surface passed'],
     },
     {
+      name: 'fetch-zstd-windows-regression',
+      scriptPath: join(rootDir, 'tests', 'js', 'fetch-zstd-windows-regression.ts'),
+      expectExitCode: 0,
+    },
+    {
       name: 'node-misc-modules-surface',
       scriptPath: join(rootDir, 'tests', 'js', 'node-misc-modules-surface.ts'),
       expectExitCode: 0,
