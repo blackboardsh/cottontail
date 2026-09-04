@@ -9826,8 +9826,13 @@ export const HTMLRewriter = createLazyFunction(loadHtmlRewriterModule, "HTMLRewr
 const loadFileSystemRouterModule = createLazyModule("Cottontail.filesystemRouter", () => loadCottontailCapabilityModule("filesystem-router", "bun/filesystem-router.js"));
 export const FileSystemRouter = createLazyFunction(loadFileSystemRouterModule, "FileSystemRouter");
 const loadTerminalModule = createLazyModule("Cottontail.terminal", () => loadCottontailCapabilityModule("terminal", "bun/terminal.js"));
-function terminalSpawnFd(...args) { return loadTerminalModule().terminalSpawnFd(...args); }
-function terminalProcessExited(...args) { return loadTerminalModule().terminalProcessExited(...args); }
+// Preserve the no-terminal fast path before crossing the optional capability boundary.
+function terminalSpawnFd(terminal) {
+  return terminal ? loadTerminalModule().terminalSpawnFd(terminal) : undefined;
+}
+function terminalProcessExited(terminal, code, signal) {
+  if (terminal) loadTerminalModule().terminalProcessExited(terminal, code, signal);
+}
 export const Terminal = createLazyFunction(loadTerminalModule, "Terminal");
 const loadSecretsModule = createLazyModule("Cottontail.secrets", () => loadCottontailCapabilityModule("secrets", "bun/secrets.js"));
 export const secrets = createLazyObject(loadSecretsModule, "secrets");

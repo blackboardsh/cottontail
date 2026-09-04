@@ -628,7 +628,14 @@ try {
       name: 'bun-spawn-native-routing',
       argv: ['test', join(rootDir, 'tests', 'js', 'bun-spawn-native-routing.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: [process.platform === 'win32' ? '7 pass' : '8 pass', '0 fail'],
+      stdoutIncludes: [process.platform === 'win32' ? '8 pass' : '9 pass', '0 fail'],
+    },
+    {
+      name: 'bun-spawn-without-terminal-capability',
+      executablePath: process.execPath,
+      argv: [join(rootDir, 'scripts', 'test-capability-isolation.js'), binaryPath],
+      expectExitCode: 0,
+      stdoutIncludes: ['bun spawn without terminal capability passed'],
     },
     {
       name: 'bun-spawn-ipc-contract',

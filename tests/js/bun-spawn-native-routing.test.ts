@@ -25,6 +25,24 @@ function expectWindowsBatchRejection(callback: () => unknown, path: string) {
   expect(error.message).toContain("native .exe/.com");
 }
 
+test("ordinary async spawn does not activate the terminal capability", async () => {
+  const terminalCapabilityIsLoaded = () => Boolean(
+    ((globalThis as any)[Symbol.for("cottontail.capabilityModuleCache")] as Map<string, unknown> | undefined)
+      ?.has("terminal"),
+  );
+  expect(terminalCapabilityIsLoaded()).toBe(false);
+  const externalNode = Bun.which("node");
+  expect(externalNode).not.toBeNull();
+
+  const child = Bun.spawn([externalNode!, "-e", "process.exit(0)"], {
+    detached: true,
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  expect(terminalCapabilityIsLoaded()).toBe(false);
+  expect(await child.exited).toBe(0);
+  expect(terminalCapabilityIsLoaded()).toBe(false);
+});
+
 test("Windows native spawn rejects batch files before and after PATHEXT resolution", () => {
   if (process.platform !== "win32") return;
 

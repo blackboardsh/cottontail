@@ -87,6 +87,17 @@ test('every release activates every packaged standard-library capability', () =>
   );
 });
 
+test('every release exercises a core-only runtime without optional capabilities', () => {
+  const isolation = step('Test core-only capability isolation');
+  assert.doesNotMatch(isolation, /if: matrix\.os/);
+  assert.match(isolation, /run: node scripts\/test-capability-isolation\.js/);
+  assert.ok(
+    workflow.indexOf('- name: Build and strip release binary') <
+      workflow.indexOf('- name: Test core-only capability isolation'),
+    'capability isolation must exercise the optimized release layout',
+  );
+});
+
 test('Windows compression capability links and exercises Zstandard', () => {
   const compressionCapability = buildZig.match(
     /const compression_capability_module[\s\S]*?const websocket_capability_module/,
