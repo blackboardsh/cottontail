@@ -17,7 +17,7 @@
     "build:release": "bun run setup && node scripts/build-release.js",
     "package:release": "node scripts/package-release.js",
     "publish:release": "node scripts/upload-release-r2.js --all",
-    "test:release": "node --test scripts/build-release-workflow.test.js scripts/release-benchmark.test.js scripts/release-binary-contract.test.js scripts/release-contract.test.js scripts/release-version.test.js scripts/verify-linux-glibc.test.js scripts/x64-baseline-release.test.js",
+    "test:release": "node --test scripts/build-release-workflow.test.js scripts/capability-manifest.test.js scripts/release-benchmark.test.js scripts/release-binary-contract.test.js scripts/release-contract.test.js scripts/release-version.test.js scripts/verify-linux-glibc.test.js scripts/x64-baseline-release.test.js",
     "test:release-native-plugin": "node scripts/test-release-native-plugin.js",
     "validate:release-binary": "node scripts/validate-release-binary.js",
     "run": "bun run setup && node scripts/run.js",

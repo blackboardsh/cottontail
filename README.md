@@ -16,6 +16,28 @@ dependencies, toolchains, version selection, and Electrobun orchestration.
 Cottontail does not mutate application projects or act as their package
 manager.
 
+## Runtime components
+
+Optional standard-library features are private runtime components, not npm
+packages. Each build emits `bin/cottontail-stdlib/capabilities.json` from the
+final component bundles. The manifest contains only canonical component names
+and their runtime dependencies:
+
+```json
+{
+  "schema": 1,
+  "capabilities": {
+    "archive": { "requires": ["compression"] },
+    "compression": { "requires": [] }
+  }
+}
+```
+
+The complete graph inherits the exact Cottontail release version. Hutch reads
+the manifest when assembling an application and includes the transitive
+`requires` closure; application dependencies remain a separate,
+npm-compatible package-manager graph.
+
 ## Build
 
 A fresh checkout requires Node.js 24. The setup scripts download the pinned Zig,

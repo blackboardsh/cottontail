@@ -11,6 +11,10 @@ const secretsCapability = readFileSync(
   new URL('../src/stdlib/secrets/main.js', import.meta.url),
   'utf8',
 );
+const capabilityActivation = readFileSync(
+  new URL('../tests/js/stdlib-capability-activation.ts', import.meta.url),
+  'utf8',
+);
 
 function step(name) {
   const marker = `      - name: ${name}\n`;
@@ -84,6 +88,22 @@ test('every release activates every packaged standard-library capability', () =>
     workflow.indexOf('- name: Build and strip release binary') <
       workflow.indexOf('- name: Activate every packaged standard-library capability'),
     'capability activation must exercise the optimized release layout',
+  );
+  assert.match(capabilityActivation, /cottontail-stdlib["']\)/);
+  assert.match(capabilityActivation, /capabilities\.json/);
+  assert.match(capabilityActivation, /archive:\s*\["compression"\]/);
+  assert.match(capabilityActivation, /test:\s*\["glob",\s*"shell",\s*"toml"\]/);
+});
+
+test('the build installs a generated runtime capability dependency manifest', () => {
+  assert.match(buildZig, /scripts\/capability-manifest\.js/);
+  assert.match(
+    buildZig,
+    /bin\/cottontail-stdlib\/capabilities\.json/,
+  );
+  assert.match(
+    workflow,
+    /node --test[^\n]*scripts\/capability-manifest\.test\.js/,
   );
 });
 

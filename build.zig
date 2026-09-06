@@ -146,13 +146,18 @@ fn embedRuntimeModules(b: *std.Build) RuntimeModuleArtifacts {
     return .{ .core = output, .capability_builder = builder_output };
 }
 
+const StdlibCapabilityArtifacts = struct {
+    source: std.Build.LazyPath,
+    bytecode: std.Build.LazyPath,
+};
+
 fn buildStdlibCapability(
     b: *std.Build,
     builder_runtime: *std.Build.Step.Compile,
     runtime: *std.Build.Step.Compile,
     name: []const u8,
     entrypoint: []const u8,
-) std.Build.LazyPath {
+) StdlibCapabilityArtifacts {
     const bundle = b.addRunArtifact(builder_runtime);
     bundle.addFileArg(b.path("scripts/bundle-stdlib-capability.js"));
     bundle.addArg(name);
@@ -164,7 +169,7 @@ fn buildStdlibCapability(
     encode.addFileArg(source);
     const output = encode.addOutputFileArg(b.fmt("{s}/main.jsc", .{name}));
     encode.addArg(b.fmt("cottontail:stdlib/{s}/main", .{name}));
-    return output;
+    return .{ .source = source, .bytecode = output };
 }
 
 fn buildCoreRuntimeModule(
@@ -828,9 +833,18 @@ pub fn build(b: *std.Build) void {
         .{ "v8", "src/runtime_modules/node/v8.js" },
     };
 
-    const ffi_capability_bytecode = buildStdlibCapability(b, capability_builder, exe, "ffi", "src/stdlib/ffi/main.js");
-    const sqlite_capability_bytecode = buildStdlibCapability(b, capability_builder, exe, "sqlite", "src/stdlib/sqlite/main.js");
-    const sql_capability_bytecode = buildStdlibCapability(b, capability_builder, exe, "sql", "src/stdlib/sql/main.js");
+    const ffi_capability_artifacts = buildStdlibCapability(b, capability_builder, exe, "ffi", "src/stdlib/ffi/main.js");
+    const sqlite_capability_artifacts = buildStdlibCapability(b, capability_builder, exe, "sqlite", "src/stdlib/sqlite/main.js");
+    const sql_capability_artifacts = buildStdlibCapability(b, capability_builder, exe, "sql", "src/stdlib/sql/main.js");
+    const capability_manifest_command = b.addSystemCommand(&.{"node"});
+    capability_manifest_command.addFileArg(b.path("scripts/capability-manifest.js"));
+    const capability_manifest = capability_manifest_command.addOutputFileArg("capabilities.json");
+    capability_manifest_command.addArg("ffi");
+    capability_manifest_command.addFileArg(ffi_capability_artifacts.source);
+    capability_manifest_command.addArg("sqlite");
+    capability_manifest_command.addFileArg(sqlite_capability_artifacts.source);
+    capability_manifest_command.addArg("sql");
+    capability_manifest_command.addFileArg(sql_capability_artifacts.source);
     const javascript_capabilities = .{
         .{ "redis", "src/stdlib/redis/main.js" },
         .{ "s3", "src/stdlib/s3/main.js" },
@@ -1310,7 +1324,7 @@ pub fn build(b: *std.Build) void {
         install_exe.step.dependOn(&install_secrets_library.step);
     }
     const install_ffi_capability = b.addInstallFile(
-        ffi_capability_bytecode,
+        ffi_capability_artifacts.bytecode,
         "bin/cottontail-stdlib/ffi/main.jsc",
     );
     const install_ffi_library = b.addInstallFile(
@@ -1318,7 +1332,7 @@ pub fn build(b: *std.Build) void {
         b.fmt("bin/cottontail-stdlib/ffi/ffi{s}", .{target.result.dynamicLibSuffix()}),
     );
     const install_sqlite_capability = b.addInstallFile(
-        sqlite_capability_bytecode,
+        sqlite_capability_artifacts.bytecode,
         "bin/cottontail-stdlib/sqlite/main.jsc",
     );
     const install_sqlite_library = b.addInstallFile(
@@ -1326,7 +1340,7 @@ pub fn build(b: *std.Build) void {
         b.fmt("bin/cottontail-stdlib/sqlite/sqlite{s}", .{target.result.dynamicLibSuffix()}),
     );
     const install_sql_capability = b.addInstallFile(
-        sql_capability_bytecode,
+        sql_capability_artifacts.bytecode,
         "bin/cottontail-stdlib/sql/main.jsc",
     );
     const install_sql_library = b.addInstallFile(
@@ -1385,13 +1399,20 @@ pub fn build(b: *std.Build) void {
     install_exe.step.dependOn(&install_markdown_library.step);
     install_exe.step.dependOn(&install_terminal_library.step);
     inline for (javascript_capabilities) |capability| {
-        const bytecode = buildStdlibCapability(b, capability_builder, exe, capability[0], capability[1]);
+        const artifacts = buildStdlibCapability(b, capability_builder, exe, capability[0], capability[1]);
+        capability_manifest_command.addArg(capability[0]);
+        capability_manifest_command.addFileArg(artifacts.source);
         const install = b.addInstallFile(
-            bytecode,
+            artifacts.bytecode,
             b.fmt("bin/cottontail-stdlib/{s}/main.jsc", .{capability[0]}),
         );
         install_exe.step.dependOn(&install.step);
     }
+    const install_capability_manifest = b.addInstallFile(
+        capability_manifest,
+        "bin/cottontail-stdlib/capabilities.json",
+    );
+    install_exe.step.dependOn(&install_capability_manifest.step);
     if (target.result.os.tag == .linux) {
         // Zig 0.16 accepts the ELF version script above but its built-in linker
         // does not apply it. Restrict every installed Linux executable, including
