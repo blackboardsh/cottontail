@@ -23,6 +23,10 @@ void __bun_throw_not_implemented(const char* symbol_name)
 
 uint64_t uv__hrtime(uv_clocktype_t type);
 int ct_internal_uv_gettimeofday(uv_timeval64_t* tv);
+int ct_internal_uv_async_init(uv_loop_t* loop, uv_async_t* async, uv_async_cb async_cb);
+int ct_internal_uv_async_send(uv_async_t* async);
+void ct_internal_uv_close(uv_handle_t* handle, uv_close_cb close_cb);
+int ct_internal_uv_is_closing(const uv_handle_t* handle);
 void ct_internal_uv_sem_destroy(uv_sem_t* sem);
 int ct_internal_uv_sem_init(uv_sem_t* sem, unsigned int value);
 void ct_internal_uv_sem_post(uv_sem_t* sem);
@@ -30,6 +34,26 @@ int ct_internal_uv_sem_trywait(uv_sem_t* sem);
 void ct_internal_uv_sem_wait(uv_sem_t* sem);
 unsigned int ct_internal_uv_version(void);
 const char* ct_internal_uv_version_string(void);
+
+UV_EXTERN int uv_async_init(uv_loop_t* loop, uv_async_t* async, uv_async_cb async_cb)
+{
+    return ct_internal_uv_async_init(loop, async, async_cb);
+}
+
+UV_EXTERN int uv_async_send(uv_async_t* async)
+{
+    return ct_internal_uv_async_send(async);
+}
+
+UV_EXTERN void uv_close(uv_handle_t* handle, uv_close_cb close_cb)
+{
+    ct_internal_uv_close(handle, close_cb);
+}
+
+UV_EXTERN int uv_is_closing(const uv_handle_t* handle)
+{
+    return ct_internal_uv_is_closing(handle);
+}
 
 #if defined(__linux__)
 #include "uv-posix-polyfills-linux.c"
