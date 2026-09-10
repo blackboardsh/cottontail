@@ -2440,9 +2440,11 @@ function removeWorkerListener(target, name, handler) {
 }
 
 function emitWorkerEvent(target, name, event) {
-  const handler = target[`on${name}`];
-  if (typeof handler === "function") handler.call(target, event);
-  for (const listener of workerMessageListeners.get(String(name)) ?? []) {
+  const key = String(name);
+  // Changes during dispatch apply to the next event, except removals, which
+  // must take effect before a removed handler gets its turn.
+  for (const listener of [...(workerMessageListeners.get(key) ?? [])]) {
+    if (!workerMessageListeners.get(key)?.includes(listener)) continue;
     listener.call(target, event);
   }
 }
@@ -2572,6 +2574,35 @@ function installWorkerGlobal() {
   g.removeEventListener = g.self.removeEventListener = function removeEventListener(name, handler) {
     return removeWorkerListener(g, name, handler);
   };
+  g.dispatchEvent = function dispatchEvent(event) {
+    emitWorkerEvent(g, event.type, event);
+    return !event.defaultPrevented;
+  };
+  // The worker bootstrap owns both native message delivery and the global
+  // EventTarget surface. Register handler attributes in this same listener
+  // list, exactly once. Defining them here also keeps the full Bun runtime
+  // from installing a second handler-attribute implementation when loaded.
+  for (const name of ["message", "messageerror", "error"]) {
+    let handler = null;
+    let listener = null;
+    Object.defineProperty(g, `on${name}`, {
+      get() {
+        return handler;
+      },
+      set(value) {
+        handler = typeof value === "function" ? value : null;
+        if (handler === null && listener !== null) {
+          removeWorkerListener(g, name, listener);
+          listener = null;
+        } else if (handler !== null && listener === null) {
+          listener = (event) => handler.call(g, event);
+          addWorkerListener(g, name, listener);
+        }
+      },
+      enumerable: true,
+      configurable: true,
+    });
+  }
 }
 
 function pollWorkerGlobalMessages() {

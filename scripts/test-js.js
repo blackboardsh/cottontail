@@ -192,6 +192,12 @@ try {
       stderrIncludes: ['1 pass', '0 fail'],
     },
     {
+      name: 'web-worker-message-dispatch',
+      argv: ['test', join(rootDir, 'tests', 'js', 'web-worker-message-dispatch.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['7 pass', '0 fail'],
+    },
+    {
       name: 'runtime-sourcemap-regressions',
       argv: ['test', join(rootDir, 'tests', 'js', 'runtime-sourcemap.test.ts')],
       expectExitCode: 0,
