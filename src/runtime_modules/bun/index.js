@@ -11205,8 +11205,15 @@ function webMessagingHasActiveHandles() {
 }
 
 if (cottontail.isWorker?.()) {
-  globalThis.__cottontailWebPollAlways = webMessagingHasActiveHandles;
-  globalThis.__cottontailWebHasActiveHandles = webMessagingHasActiveHandles;
+  // Lazy web globals can load Bun after node:worker_threads has installed its
+  // own messaging hooks. Keep those hooks: replacing them makes transferred
+  // Node MessagePorts stop receiving messages and lets their worker exit early.
+  const previousWebPollAlways = globalThis.__cottontailWebPollAlways;
+  const previousWebHasActiveHandles = globalThis.__cottontailWebHasActiveHandles;
+  globalThis.__cottontailWebPollAlways = () =>
+    Boolean(webMessagingHasActiveHandles() || previousWebPollAlways?.());
+  globalThis.__cottontailWebHasActiveHandles = () =>
+    Boolean(webMessagingHasActiveHandles() || previousWebHasActiveHandles?.());
   globalThis.postMessage = (message, transferOrOptions = undefined) => {
     cottontail.workerPostMessage(encodeWorkerWebMessage(message, transferOrOptions, { parent: true }));
   };

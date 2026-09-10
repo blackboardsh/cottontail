@@ -1,4 +1,7 @@
-import EventEmitter from "./events.js";
+// Keep this import external in the inspector capability bundle. A relative
+// import embeds a second events/async_hooks runtime whose drain hooks replace
+// the main runtime's hooks, stranding callbacks already queued by nextTick.
+import { EventEmitter } from "node:events";
 
 const nativeInspector = globalThis.cottontail;
 const sessions = new Set();

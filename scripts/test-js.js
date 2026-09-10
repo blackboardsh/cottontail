@@ -864,6 +864,12 @@ try {
       stdoutIncludes: ['node child_process conformance passed'],
     },
     {
+      name: 'node-child-process-stdin-lifecycle',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-child-process-stdin-lifecycle.mjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node child_process stdin lifecycle passed'],
+    },
+    {
       name: 'node-child-process-fork',
       scriptPath: join(rootDir, 'tests', 'js', 'node-child-process-fork.ts'),
       expectExitCode: 0,
@@ -1092,10 +1098,28 @@ try {
       stdoutIncludes: ['node worker_threads surface passed'],
     },
     {
+      name: 'node-worker-lazy-web-messaging',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-worker-lazy-web-messaging.mjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node worker lazy web messaging passed'],
+    },
+    {
+      name: 'node-worker-process-bootstrap',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-worker-process-bootstrap.mjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node worker process bootstrap passed'],
+    },
+    {
       name: 'node-zlib-streams-surface',
       scriptPath: join(rootDir, 'tests', 'js', 'node-zlib-streams-surface.ts'),
       expectExitCode: 0,
       stdoutIncludes: ['node zlib streams surface passed'],
+    },
+    {
+      name: 'web-response-subclass',
+      scriptPath: join(rootDir, 'tests', 'js', 'web-response-subclass.mjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['web response subclass passed'],
     },
     {
       name: 'fetch-zstd-windows-regression',
@@ -1182,6 +1206,12 @@ try {
       scriptPath: join(rootDir, 'tests', 'js', 'node-inspector-surface.ts'),
       expectExitCode: 0,
       stdoutIncludes: ['node inspector surface passed'],
+    },
+    {
+      name: 'node-inspector-nexttick-lifecycle',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-inspector-nexttick-lifecycle.mjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node inspector nextTick lifecycle passed'],
     },
     {
       name: 'proxy-function',

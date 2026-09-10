@@ -769,7 +769,6 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
   let preflightError = options.shell ? null : spawnPreflightError(command.file, args, file);
   const stdoutListeners = new Map();
   const stderrListeners = new Map();
-  const stdinListeners = new Map();
   let closed = false;
   let unregisterSpawnListener = null;
 
@@ -1096,16 +1095,54 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
     }
   };
 
+  const makeStdinStream = () => {
+    let closed = false;
+    const closeStdin = () => {
+      if (closed || native.id < 0) return;
+      closed = true;
+      cottontail.spawnCloseStdin(native.id);
+    };
+    // Use the shared Writable lifecycle for stdin. In particular, end() must
+    // set writableEnded immediately but emit finish only after pending write
+    // callbacks, so callers can end() and then await once(stdin, "finish").
+    const stream = new WritableStreamClass({
+      highWaterMark: Number(options.highWaterMark || 16 * 1024),
+      write(chunk, encoding, callback) {
+        let error = null;
+        try {
+          // A synchronous native write may fill the pipe; let the gated child
+          // start reading before writing. Writable normalizes strings to bytes
+          // (including their encoding) so embedded NULs cannot truncate input.
+          releaseStart();
+          if (!cottontail.spawnWrite(native.id, chunk)) {
+            error = tagNodeError(new Error("write EPIPE"), "EPIPE");
+          }
+        } catch (failure) {
+          error = failure;
+        }
+        // Keep writes pending through this turn, preserving stdin backpressure
+        // and callback order even though the native pipe write is synchronous.
+        queueMicrotask(() => callback(error));
+      },
+      final(callback) {
+        closeStdin();
+        // Complete asynchronously, like writes, so destroy() in the same turn
+        // can cancel completion before Writable commits its finish event.
+        queueMicrotask(callback);
+      },
+      destroy(error, callback) {
+        closeStdin();
+        callback(error);
+      },
+    });
+    stream.fd = 0;
+    stream.ref = stream.unref = function () { return this; };
+    return stream;
+  };
+
   const child = Object.assign(target ?? new ChildProcess(), {
     pid: 0,
-    // Convert strings to bytes before crossing into native code: the native
-    // string path measures with strlen and would truncate at embedded NULs.
-    stdin: stdinMode === "pipe" ? makeStream(stdinListeners, 0, (chunk) => {
-      // A synchronous write can fill the pipe before the normal release
-      // microtask runs, so let the gated child start reading first.
-      releaseStart();
-      return cottontail.spawnWrite(native.id, Buffer.isBuffer(chunk) || ArrayBuffer.isView(chunk) ? chunk : Buffer.from(String(chunk)));
-    }) : null,
+    stdin: stdinMode === "pipe" ? makeStdinStream() : null,
     stdout: stdoutMode === "pipe" ? makeStream(stdoutListeners, 1) : null,
     stderr: stderrMode === "pipe" ? makeStream(stderrListeners, 2) : null,
     _nativeId: -1,
@@ -1221,15 +1258,9 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
 
   const finishStdin = () => {
     if (!child.stdin || child.stdin.destroyed) return;
-    if (child.stdin instanceof NetSocket) {
-      child.stdin.destroy();
-      return;
-    }
-    child.stdin.writable = false;
-    child.stdin.writableEnded = true;
-    child.stdin.writableFinished = true;
-    child.stdin.destroyed = true;
-    emitFrom(stdinListeners, "close");
+    // A child exiting closes the pipe; it does not imply that the caller ended
+    // stdin or that pending writes finished successfully.
+    child.stdin.destroy();
   };
   const finishReadable = (stream, map) => {
     if (!stream || stream.readableEnded || stream.destroyed) return;

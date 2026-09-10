@@ -1,3 +1,7 @@
+// A dependency such as picomatch can create a partial global process object
+// before this bootstrap runs in a worker. Fill in the shared lean process
+// defaults first instead of treating any existing object as fully initialized.
+import { processObject as earlyProcessObject } from "../internal/runtime-process-bootstrap.js";
 import "./encoding.js";
 import { createReadableStdio, createWritableStdio } from "../node/stdio.js";
 import {
@@ -346,27 +350,7 @@ function installWindowsProcessEnvironment(processObject) {
 }
 
 const cottontailExecPath = cottontail.execPath?.() ?? "cottontail";
-const processObject = g.process ?? {
-  argv: cottontail.argv || ["cottontail", ...(cottontail.args || [])],
-  argv0: cottontailExecPath,
-  execPath: cottontailExecPath,
-  env: cottontail.env(),
-  platform: platform(),
-  arch: cottontail.arch(),
-  pid: cottontail.pid?.() ?? 0,
-  versions: { node: "24.0.0", cottontail: "0.0.0-dev" },
-  release: { name: "cottontail" },
-  cwd: () => cottontail.cwd(),
-  exit(code = this.exitCode ?? 0) {
-    this.exitCode = Number(code) || 0;
-    if (!this._exiting) {
-      this._exiting = true;
-      this.emit?.("exit", this.exitCode);
-    }
-    cottontail.exit(this.exitCode);
-  },
-  emitWarning: (message, type = "Warning") => console.warn(`${type}: ${message}`),
-};
+const processObject = g.process ?? earlyProcessObject;
 g.process = processObject;
 installWindowsProcessEnvironment(g.process);
 installProcessApi(g.process);

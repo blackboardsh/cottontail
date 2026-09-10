@@ -2063,11 +2063,15 @@ export function createRequestResponseRuntime({
     }
   }
   
+  const responseState = new WeakMap();
+
   class Response {
     constructor(body = null, init = {}) {
       const responseInit = readBunResponseInit(init);
       const rawBody = body;
-      this.status = responseInit.status;
+      // Store status internally: subclasses (including Miniflare's Response)
+      // can override its getter and call super.status during construction.
+      responseState.set(this, { status: responseInit.status });
       this.statusText = responseInit.statusText;
       this.headers = responseInit.headers;
       this._method = responseInit.method;
@@ -2083,6 +2087,11 @@ export function createRequestResponseRuntime({
       this.url = "";
       this.redirected = false;
       this._type = "default";
+    }
+    get status() {
+      const state = responseState.get(this);
+      if (!state) throw new TypeError("The Response.status getter can only be used on instances of Response");
+      return state.status;
     }
     get bodyUsed() {
       return bodyWasUsed(this);
@@ -2114,7 +2123,7 @@ export function createRequestResponseRuntime({
     }
     static error() {
       const response = new Response(null);
-      response.status = 0;
+      responseState.get(response).status = 0;
       response.statusText = "";
       response._type = "error";
       return response;
@@ -2138,8 +2147,9 @@ export function createRequestResponseRuntime({
     clone() {
       if (this._bodyStream?.locked) throw new TypeError("ReadableStream is locked");
       if (bodyWasUsed(this)) throw new TypeError("Body already used");
+      const status = responseState.get(this).status;
       const cloned = responseWithMetadata(null, {
-        status: this.status === 0 || this.status === 101 ? 200 : this.status,
+        status: status === 0 || status === 101 ? 200 : status,
         statusText: this.statusText,
         headers: new Headers(this.headers),
         method: this._method,
@@ -2148,7 +2158,7 @@ export function createRequestResponseRuntime({
         redirected: this.redirected,
         type: this._type,
       });
-      cloned.status = this.status;
+      responseState.get(cloned).status = status;
       cloned._body = teeClonedBody(this);
       return cloned;
     }
@@ -2200,7 +2210,8 @@ export function createRequestResponseRuntime({
       return bodyStreamFor(this);
     }
     get ok() {
-      return this.status >= 200 && this.status < 300;
+      const status = responseState.get(this)?.status;
+      return status >= 200 && status < 300;
     }
     get type() {
       return this._type;
@@ -2230,6 +2241,8 @@ export function createRequestResponseRuntime({
       return `${prefix} {\n${lines.map((line, index) => `  ${line}${index === lines.length - 1 ? "" : ","}`).join("\n")}\n}`;
     }
   }
+  // Class getters default to non-enumerable; Bun and Node enumerate status.
+  Object.defineProperty(Response.prototype, "status", { enumerable: true });
   
   function responseWithMetadata(body, init, metadata = undefined) {
     const response = new Response(body, init);
