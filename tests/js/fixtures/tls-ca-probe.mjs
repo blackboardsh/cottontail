@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import https from "node:https";
 import { isIP } from "node:net";
 import tls from "node:tls";
+import { fileURLToPath } from "node:url";
 
 export async function probeConnections(config) {
   const url = new URL(config.url);
@@ -59,7 +60,7 @@ export async function probeConnections(config) {
 if (import.meta.main) {
   const config = JSON.parse(process.argv[2]);
   const main = await probeConnections(config);
-  const worker = new Worker(new URL("./tls-ca-worker.mjs", import.meta.url).href, { type: "module" });
+  const worker = new Worker(fileURLToPath(new URL("./tls-ca-worker.mjs", import.meta.url)), { type: "module" });
   const threaded = await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error("TLS worker probe timed out")), 30000);
     worker.onmessage = event => {
