@@ -988,6 +988,14 @@ pub fn build(b: *std.Build) void {
     // Zstd unresolved produces non-null sentinel call targets in the PE file
     // and turns a missing library into an access violation at runtime.
     compression_capability.linker_allow_shlib_undefined = target.result.os.tag != .windows;
+    if (target.result.os.tag == .linux) {
+        // Codec archive symbols belong to this capability, not its public ABI.
+        // Local binding also keeps PC-relative references in distro archives
+        // position independent instead of requiring symbol interposition.
+        // Zig's own ELF linker does not yet apply version scripts.
+        compression_capability.use_lld = true;
+        compression_capability.setVersionScript(b.path("src/stdlib/compression/exports.map"));
+    }
     if (target.result.os.tag == .windows) {
         inline for (&.{ "zs.lib", "zstd.lib", "brotlicommon.lib", "brotlidec.lib", "brotlienc.lib" }) |library| {
             compression_capability.root_module.addObjectFile(b.path(b.fmt("vendors/windows-deps/x64-windows-static/lib/{s}", .{library})));

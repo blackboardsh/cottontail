@@ -1,0 +1,4 @@
+{
+    global: cottontail_capability_init;
+    local: *;
+};
