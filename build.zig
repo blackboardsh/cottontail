@@ -994,8 +994,15 @@ pub fn build(b: *std.Build) void {
         }
     } else {
         compression_capability.root_module.linkSystemLibrary("z", .{});
-        inline for (&.{ "brotlicommon", "brotlidec", "brotlienc" }) |library| {
-            compression_capability.root_module.linkSystemLibrary(library, .{});
+        // Fetch advertises Brotli and Zstd support, so the released capability
+        // must include both codecs instead of relying on libraries installed
+        // by Homebrew or the Linux package manager on the user's machine.
+        inline for (&.{ "brotlicommon", "brotlidec", "brotlienc", "zstd" }) |library| {
+            compression_capability.root_module.linkSystemLibrary(library, .{
+                .use_pkg_config = .no,
+                .preferred_link_mode = .static,
+                .search_strategy = .no_fallback,
+            });
         }
     }
 

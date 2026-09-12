@@ -215,115 +215,19 @@ static JSValueRef ct_brotli_transform_sync(
     return JSValueMakeUndefined(ctx);
 }
 
-typedef size_t (*CtZstdCompressBoundFn)(size_t src_size);
-typedef size_t (*CtZstdCompressFn)(void *dst, size_t dst_capacity, const void *src, size_t src_size, int compression_level);
-typedef unsigned long long (*CtZstdGetFrameContentSizeFn)(const void *src, size_t src_size);
-typedef size_t (*CtZstdDecompressFn)(void *dst, size_t dst_capacity, const void *src, size_t src_size);
-typedef unsigned int (*CtZstdIsErrorFn)(size_t code);
-typedef const char *(*CtZstdGetErrorNameFn)(size_t code);
-
-typedef struct {
-    bool attempted;
-    CtDynamicLibrary library;
-    CtZstdCompressBoundFn compress_bound;
-    CtZstdCompressFn compress;
-    CtZstdGetFrameContentSizeFn get_frame_content_size;
-    CtZstdDecompressFn decompress;
-    CtZstdIsErrorFn is_error;
-    CtZstdGetErrorNameFn get_error_name;
-} CtZstdApi;
-
-static CtZstdApi ct_zstd_api = {0};
-
-#define CT_ZSTD_CONTENTSIZE_UNKNOWN ((unsigned long long)-1)
-#define CT_ZSTD_CONTENTSIZE_ERROR ((unsigned long long)-2)
-
-#if defined(_WIN32)
-extern size_t ZSTD_compressBound(size_t src_size);
-extern size_t ZSTD_compress(void *dst, size_t dst_capacity, const void *src, size_t src_size, int compression_level);
-extern unsigned long long ZSTD_getFrameContentSize(const void *src, size_t src_size);
-extern size_t ZSTD_decompress(void *dst, size_t dst_capacity, const void *src, size_t src_size);
-extern unsigned int ZSTD_isError(size_t code);
-extern const char *ZSTD_getErrorName(size_t code);
-#endif
-
-static bool ct_zstd_is_available(void) {
-    return ct_zstd_api.compress_bound != NULL && ct_zstd_api.compress != NULL &&
-        ct_zstd_api.get_frame_content_size != NULL && ct_zstd_api.decompress != NULL &&
-        ct_zstd_api.is_error != NULL && ct_zstd_api.get_error_name != NULL;
-}
-
-static bool ct_zstd_load(void) {
-    if (ct_zstd_api.attempted) return ct_zstd_is_available();
-    ct_zstd_api.attempted = true;
-
-#if defined(_WIN32)
-    ct_zstd_api.compress_bound = ZSTD_compressBound;
-    ct_zstd_api.compress = ZSTD_compress;
-    ct_zstd_api.get_frame_content_size = ZSTD_getFrameContentSize;
-    ct_zstd_api.decompress = ZSTD_decompress;
-    ct_zstd_api.is_error = ZSTD_isError;
-    ct_zstd_api.get_error_name = ZSTD_getErrorName;
-    return ct_zstd_is_available();
-#else
-    const char *candidates[] = {
-#if defined(__APPLE__)
-        "libzstd.1.dylib",
-        "libzstd.dylib",
-        "/opt/homebrew/lib/libzstd.dylib",
-        "/usr/local/lib/libzstd.dylib",
-#else
-        "libzstd.so.1",
-        "libzstd.so",
-#endif
-    };
-    for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); index += 1) {
-        void *symbol = NULL;
-        if (ct_dynamic_library_open(&ct_zstd_api.library, candidates[index], NULL) != 0) continue;
-        if (ct_dynamic_library_symbol(&ct_zstd_api.library, "ZSTD_compressBound", &symbol, NULL) == 0)
-            ct_zstd_api.compress_bound = (CtZstdCompressBoundFn)symbol;
-        if (ct_dynamic_library_symbol(&ct_zstd_api.library, "ZSTD_compress", &symbol, NULL) == 0)
-            ct_zstd_api.compress = (CtZstdCompressFn)symbol;
-        if (ct_dynamic_library_symbol(&ct_zstd_api.library, "ZSTD_getFrameContentSize", &symbol, NULL) == 0)
-            ct_zstd_api.get_frame_content_size = (CtZstdGetFrameContentSizeFn)symbol;
-        if (ct_dynamic_library_symbol(&ct_zstd_api.library, "ZSTD_decompress", &symbol, NULL) == 0)
-            ct_zstd_api.decompress = (CtZstdDecompressFn)symbol;
-        if (ct_dynamic_library_symbol(&ct_zstd_api.library, "ZSTD_isError", &symbol, NULL) == 0)
-            ct_zstd_api.is_error = (CtZstdIsErrorFn)symbol;
-        if (ct_dynamic_library_symbol(&ct_zstd_api.library, "ZSTD_getErrorName", &symbol, NULL) == 0)
-            ct_zstd_api.get_error_name = (CtZstdGetErrorNameFn)symbol;
-        if (ct_zstd_api.compress_bound != NULL && ct_zstd_api.compress != NULL && ct_zstd_api.get_frame_content_size != NULL &&
-            ct_zstd_api.decompress != NULL && ct_zstd_api.is_error != NULL && ct_zstd_api.get_error_name != NULL) {
-            return true;
-        }
-        ct_dynamic_library_close(&ct_zstd_api.library);
-        ct_zstd_api.compress_bound = NULL;
-        ct_zstd_api.compress = NULL;
-        ct_zstd_api.get_frame_content_size = NULL;
-        ct_zstd_api.decompress = NULL;
-        ct_zstd_api.is_error = NULL;
-        ct_zstd_api.get_error_name = NULL;
-    }
-    return false;
-#endif
-}
-
 static JSValueRef ct_zstd_transform_sync(JSContextRef ctx, CtZlibMode mode, const uint8_t *input, size_t input_len, int level, JSValueRef *exception) {
-    if (!ct_zstd_load()) {
-        ct_throw_message(ctx, exception, "native Zstd support is unavailable");
-        return JSValueMakeUndefined(ctx);
-    }
-
+    // The capability links Zstd itself on every platform. Fetch advertises
+    // support even when no package-manager libraries are installed locally.
     if (mode == CT_ZLIB_ZSTD_COMPRESS) {
-        size_t output_capacity = ct_zstd_api.compress_bound(input_len);
+        size_t output_capacity = ZSTD_compressBound(input_len);
         uint8_t *output = (uint8_t *)malloc(output_capacity > 0 ? output_capacity : 1);
         if (output == NULL) {
             ct_throw_message(ctx, exception, "Out of memory");
             return JSValueMakeUndefined(ctx);
         }
-        size_t output_len = ct_zstd_api.compress(output, output_capacity, input, input_len, level);
-        if (ct_zstd_api.is_error(output_len)) {
-            const char *message = ct_zstd_api.get_error_name(output_len);
+        size_t output_len = ZSTD_compress(output, output_capacity, input, input_len, level);
+        if (ZSTD_isError(output_len)) {
+            const char *message = ZSTD_getErrorName(output_len);
             free(output);
             ct_throw_message(ctx, exception, message != NULL ? message : "Zstd compression failed");
             return JSValueMakeUndefined(ctx);
@@ -331,14 +235,14 @@ static JSValueRef ct_zstd_transform_sync(JSContextRef ctx, CtZlibMode mode, cons
         return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
     }
 
-    unsigned long long content_size = ct_zstd_api.get_frame_content_size(input, input_len);
-    if (content_size == CT_ZSTD_CONTENTSIZE_ERROR) {
+    unsigned long long content_size = ZSTD_getFrameContentSize(input, input_len);
+    if (content_size == ZSTD_CONTENTSIZE_ERROR) {
         ct_throw_message(ctx, exception, "Zstd decompression failed");
         return JSValueMakeUndefined(ctx);
     }
 
     size_t output_capacity = 0;
-    if (content_size != CT_ZSTD_CONTENTSIZE_UNKNOWN) {
+    if (content_size != ZSTD_CONTENTSIZE_UNKNOWN) {
         output_capacity = (size_t)content_size;
     } else {
         output_capacity = input_len * 4 + 65536;
@@ -351,13 +255,13 @@ static JSValueRef ct_zstd_transform_sync(JSContextRef ctx, CtZlibMode mode, cons
             ct_throw_message(ctx, exception, "Out of memory");
             return JSValueMakeUndefined(ctx);
         }
-        size_t output_len = ct_zstd_api.decompress(output, output_capacity, input, input_len);
-        if (!ct_zstd_api.is_error(output_len)) {
+        size_t output_len = ZSTD_decompress(output, output_capacity, input, input_len);
+        if (!ZSTD_isError(output_len)) {
             return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
         }
-        const char *message = ct_zstd_api.get_error_name(output_len);
+        const char *message = ZSTD_getErrorName(output_len);
         free(output);
-        if (content_size != CT_ZSTD_CONTENTSIZE_UNKNOWN) {
+        if (content_size != ZSTD_CONTENTSIZE_UNKNOWN) {
             ct_throw_message(ctx, exception, message != NULL ? message : "Zstd decompression failed");
             return JSValueMakeUndefined(ctx);
         }

@@ -1206,6 +1206,13 @@ try {
       expectExitCode: 0,
     },
     {
+      name: 'compression-portability',
+      executablePath: process.execPath,
+      argv: ['--test', join(rootDir, 'scripts', 'compression-portability.test.js')],
+      env: { COTTONTAIL_TEST_BINARY: binaryPath },
+      expectExitCode: 0,
+    },
+    {
       name: 'node-sqlite-surface',
       scriptPath: join(rootDir, 'tests', 'js', 'node-sqlite-surface.ts'),
       env: {

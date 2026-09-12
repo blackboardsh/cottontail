@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import https from "node:https";
@@ -8,6 +9,7 @@ import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { cert, key } from "../tests/js/fixtures/tls-cert.js";
+import { macosWithoutHomebrewProfile } from "./macos-clean-runtime.js";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const binary = process.env.COTTONTAIL_TEST_BINARY || join(root, "zig-out", "bin", process.platform === "win32" ? "cottontail.exe" : "cottontail");
@@ -29,8 +31,7 @@ for (const name of ["COTTONTAIL_RUNTIME_MODULES_DIR", "SSL_CERT_FILE", "SSL_CERT
 
 async function runProbe(config, environment = {}, sandbox = false) {
   const args = [probe, JSON.stringify(config)];
-  const profile = '(version 1)(allow default)(deny file-read* (subpath "/opt/homebrew/etc/openssl@3") (subpath "/opt/homebrew/etc/ca-certificates") (subpath "/usr/local/etc/openssl@3") (subpath "/usr/local/etc/ca-certificates"))';
-  const child = spawn(sandbox ? "/usr/bin/sandbox-exec" : resolve(binary), sandbox ? ["-p", profile, resolve(binary), ...args] : args, {
+  const child = spawn(sandbox ? "/usr/bin/sandbox-exec" : resolve(binary), sandbox ? ["-p", macosWithoutHomebrewProfile, resolve(binary), ...args] : args, {
     cwd: root,
     env: { ...cleanEnvironment, ...environment },
     stdio: ["ignore", "pipe", "pipe"],
@@ -108,12 +109,14 @@ test("CA trust and overrides stay consistent for TLS, HTTPS, fetch and workers",
 });
 
 // Optional release smoke: the normal suite above is entirely local. This checks
-// the real macOS system bundle against a public endpoint without Homebrew CA
-// files, reproducing the clean-machine failure reported by Dash users.
-test("macOS public HTTPS works with Homebrew CA files inaccessible", {
+// the real macOS system bundle and HTTP decoding against a public endpoint
+// without Homebrew libraries or CA files, matching a clean machine.
+test("macOS public HTTPS works with Homebrew entirely inaccessible", {
   skip: process.platform !== "darwin" || !process.env.COTTONTAIL_TLS_PUBLIC_URL,
 }, async () => {
-  const config = { url: process.env.COTTONTAIL_TLS_PUBLIC_URL };
+  const publicUrl = new URL(process.env.COTTONTAIL_TLS_PUBLIC_URL);
+  publicUrl.search = randomBytes(8).toString("hex");
+  const config = { url: String(publicUrl) };
   expectConnections(await runProbe(config, {}, true), true);
   expectConnections(await runProbe(config, { SSL_CERT_FILE: missing, SSL_CERT_DIR: missing }, true), false, /certificate/i);
   expectConnections(await runProbe(config, { SSL_CERT_FILE: "/etc/ssl/cert.pem", SSL_CERT_DIR: missing }, true), true);

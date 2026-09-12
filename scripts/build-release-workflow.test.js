@@ -41,6 +41,18 @@ test('release TLS tests cover default trust on clean Macs and explicit CA overri
   }
 });
 
+test('releases check native dependencies and compressed HTTP without Homebrew', () => {
+  const dependencies = step('Validate macOS native library portability');
+  assert.match(dependencies, /if: matrix\.os == 'macos'/);
+  assert.match(dependencies, /node scripts\/verify-macos-native-deps\.js/);
+  const compression = step('Test bundled HTTP compression');
+  assert.doesNotMatch(compression, /if: matrix\.os/);
+  assert.match(compression, /node --test scripts\/compression-portability\.test\.js/);
+  for (const name of ['Validate macOS native library portability', 'Test bundled HTTP compression']) {
+    assert.ok(workflow.indexOf('- name: Build and strip release binary') < workflow.indexOf(`- name: ${name}`));
+  }
+});
+
 test('Linux releases enforce the GLIBC 2.38 public ABI ceiling', () => {
   const validation = step('Validate Linux glibc ABI');
   assert.match(validation, /if: matrix\.os == 'linux'/);

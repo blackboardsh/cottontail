@@ -188,6 +188,24 @@ if (smoke.status !== 0 || smoke.stdout.trim() !== '42') {
 }
 rmSync(join(packageRoot, '.cottontail-tmp'), { recursive: true, force: true });
 
+// Check the assembled runtime as well as the build output. A build machine can
+// hide missing optional libraries, and a successful core-only smoke is not
+// enough to prove that an installed app can decode an HTTPS response.
+const portabilityChecks = [
+  ...(process.platform === 'darwin'
+    ? [[join(rootDir, 'scripts', 'verify-macos-native-deps.js'), join(packageRoot, 'bin')]]
+    : []),
+  ['--test', join(rootDir, 'scripts', 'compression-portability.test.js')],
+];
+for (const args of portabilityChecks) {
+  const check = spawnSync(process.execPath, args, {
+    cwd: rootDir,
+    stdio: 'inherit',
+    env: { ...process.env, COTTONTAIL_TEST_BINARY: packagedExecutable },
+  });
+  if (check.status !== 0) fail(`Packaged runtime portability check failed: ${args.join(' ')}`);
+}
+
 rmSync(archivePath, { force: true });
 const tar = spawnSync('tar', ['-czf', archivePath, '-C', releaseRoot, basename(packageRoot)], {
   cwd: rootDir,
