@@ -24,6 +24,23 @@ function step(name) {
   return workflow.slice(start, end === -1 ? workflow.length : end);
 }
 
+test('release TLS tests cover default trust on clean Macs and explicit CA overrides', () => {
+  const localTrust = step('Test default TLS certificate trust');
+  assert.doesNotMatch(localTrust, /if: matrix\.os/);
+  assert.match(localTrust, /node --test scripts\/tls-ca-portability\.test\.js/);
+  assert.doesNotMatch(localTrust, /COTTONTAIL_TLS_PUBLIC_URL/);
+  const macosTrust = step('Test macOS certificate trust without Homebrew');
+  assert.match(macosTrust, /if: matrix\.os == 'macos'/);
+  assert.match(macosTrust, /COTTONTAIL_TLS_PUBLIC_URL: https:\/\/electrobun-artifacts\.blackboard\.sh\/cottontail\/channels\/canary\.json/);
+  assert.match(macosTrust, /node --test --test-name-pattern="macOS public HTTPS" scripts\/tls-ca-portability\.test\.js/);
+  for (const name of ['Test default TLS certificate trust', 'Test macOS certificate trust without Homebrew']) {
+    assert.ok(
+      workflow.indexOf('- name: Build and strip release binary') < workflow.indexOf(`- name: ${name}`),
+      'TLS regression tests must exercise the stripped release binary',
+    );
+  }
+});
+
 test('Linux releases enforce the GLIBC 2.38 public ABI ceiling', () => {
   const validation = step('Validate Linux glibc ABI');
   assert.match(validation, /if: matrix\.os == 'linux'/);

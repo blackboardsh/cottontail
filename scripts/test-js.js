@@ -1199,6 +1199,13 @@ try {
       stdoutIncludes: ['node tls http2 surface passed'],
     },
     {
+      name: 'tls-ca-portability',
+      executablePath: process.execPath,
+      argv: ['--test', join(rootDir, 'scripts', 'tls-ca-portability.test.js')],
+      env: { COTTONTAIL_TEST_BINARY: binaryPath },
+      expectExitCode: 0,
+    },
+    {
       name: 'node-sqlite-surface',
       scriptPath: join(rootDir, 'tests', 'js', 'node-sqlite-surface.ts'),
       env: {

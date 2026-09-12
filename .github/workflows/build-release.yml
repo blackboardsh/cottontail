@@ -157,6 +157,15 @@ jobs:
       - name: Validate stripped release binary
         run: node scripts/validate-release-binary.js
 
+      - name: Test default TLS certificate trust
+        run: node --test scripts/tls-ca-portability.test.js
+
+      - name: Test macOS certificate trust without Homebrew
+        if: matrix.os == 'macos'
+        env:
+          COTTONTAIL_TLS_PUBLIC_URL: https://electrobun-artifacts.blackboard.sh/cottontail/channels/canary.json
+        run: node --test --test-name-pattern="macOS public HTTPS" scripts/tls-ca-portability.test.js
+
       - name: Test core-only capability isolation
         run: node scripts/test-capability-isolation.js
 

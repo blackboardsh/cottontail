@@ -14074,7 +14074,30 @@ static int ct_tls_configure_ctx(
             return -1;
         }
     } else if (!server_side) {
+#if defined(__APPLE__)
+        // OpenSSL is linked statically on macOS, so its compiled default CA
+        // location belongs to the build machine (usually Homebrew). Use the
+        // certificate bundle supplied by macOS instead. Keeping this in the
+        // shared native context also covers fetch and worker connections.
+        // Explicit environment locations and per-connection CA options retain
+        // their existing meaning; never fall back after an explicit override.
+        const char *ca_file = getenv("SSL_CERT_FILE");
+        const char *ca_dir = getenv("SSL_CERT_DIR");
+        if (ca_file == NULL) ca_file = "/etc/ssl/cert.pem";
+        if (SSL_CTX_load_verify_locations(ssl_ctx, ca_file, NULL) != 1) {
+            // A missing CA location must leave verification enabled. Clear
+            // lookup errors so a later handshake reports its actual failure.
+            ERR_clear_error();
+        }
+        // OpenSSL loads file and directory defaults independently. A missing
+        // file must not prevent an explicitly configured hashed CA directory
+        // (including a colon-separated directory list) from being consulted.
+        if (ca_dir != NULL && SSL_CTX_load_verify_locations(ssl_ctx, NULL, ca_dir) != 1) {
+            ERR_clear_error();
+        }
+#else
         SSL_CTX_set_default_verify_paths(ssl_ctx);
+#endif
     }
     if (ct_tls_configure_advanced_ctx(ctx, ssl_ctx, advanced_options, dh_warning, exception) != 0) return -1;
     bool has_cert = SSL_CTX_get0_certificate(ssl_ctx) != NULL;
