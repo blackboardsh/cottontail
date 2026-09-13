@@ -124,10 +124,32 @@ await trace('gdb-default-cold', fresh('gdb-default'));
 await trace('gdb-default-warm', fresh('gdb-default'));
 await trace('gdb-dfg-disabled-cold', fresh('gdb-dfg-disabled'), { JSC_useDFGJIT: 'false' });
 await trace('gdb-polling-traps-cold', fresh('gdb-polling-traps'), { JSC_usePollingTraps: 'true' });
+// The continuous worker invocation makes watchdog delivery deterministic even
+// when debugger timing lets the short HTTP probe finish before an optimized trap.
+{
+  const name = 'gdb-worker-top-level';
+  const gdb = join(output, `${name}.gdb`);
+  const core = join(output, `${name}.core`);
+  let commands = readFileSync(join(output, 'gdb-default-cold.gdb'), 'utf8');
+  commands = commands.replace(/^set args .*$/m,
+    `set args ${[join(root, 'tests/js/fixtures/worker-delayed-termination.mjs'), 'top-level'].map(quote).join(' ')}`);
+  const catchStart = commands.indexOf('catch syscall rt_sigaction\n');
+  const fatalStart = commands.indexOf('break ct_crash_signal_handler\n');
+  commands = commands.slice(0, catchStart) + commands.slice(fatalStart);
+  commands = commands.replace(join(output, 'gdb-default-cold.core'), core);
+  writeFileSync(gdb, commands);
+  const result = await execute(name, 'gdb', ['-q', '-nx', '-batch', '-x', gdb], environment(fresh('gdb-worker')));
+  const log = readFileSync(join(output, `${name}.log`), 'utf8');
+  result.core = existsSync(core) && /Saved corefile/.test(log);
+  result.inferiorExitedNormally = /\[Inferior .* exited normally\]/.test(log);
+  result.fixturePassed = /"stage":"passed","mode":"top-level"/.test(log);
+  writeFileSync(join(output, 'results.json'), JSON.stringify(records, null, 2));
+  console.log(JSON.stringify(result));
+}
 await execute('fresh-worker-delayed-termination', process.execPath, ['--test', 'scripts/worker-delayed-termination.test.js'], environment(fresh('worker-delayed')));
 // Diagnostics never reinterpret the failed release gate as resolved by a retry.
 console.log('Diagnostic collection complete; canary9 original release failure remains authoritative.');
 for (const record of records.filter(record => record.name.startsWith('gdb-'))) {
-  assert(record.core || (record.inferiorExitedNormally && record.requests === 24),
+  assert(record.core || (record.inferiorExitedNormally && (record.name === 'gdb-worker-top-level' ? record.fixturePassed : record.requests === 24)),
     `Incomplete native GDB trace: ${JSON.stringify(record)}`);
 }
