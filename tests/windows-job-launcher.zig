@@ -9,7 +9,6 @@ const job_object_query: windows.DWORD = 0x0004;
 const job_object_terminate: windows.DWORD = 0x0008;
 const synchronize: windows.DWORD = 0x00100000;
 const wait_object_0: windows.DWORD = 0;
-const wait_timeout: windows.DWORD = 0x00000102;
 const wait_failed: windows.DWORD = 0xffffffff;
 const infinite: windows.DWORD = 0xffffffff;
 const resume_thread_failed: windows.DWORD = 0xffffffff;
@@ -86,10 +85,8 @@ extern "kernel32" fn TerminateJobObject(
     job: windows.HANDLE,
     exit_code: windows.UINT,
 ) callconv(.winapi) windows.BOOL;
-extern "kernel32" fn WaitForSingleObject(
-    handle: windows.HANDLE,
-    milliseconds: windows.DWORD,
-) callconv(.winapi) windows.DWORD;
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+extern "kernel32" fn Sleep(milliseconds: windows.DWORD) callconv(.winapi) void;
 extern "kernel32" fn WaitForMultipleObjects(
     handle_count: windows.DWORD,
     handles: [*]const windows.HANDLE,
@@ -147,13 +144,14 @@ fn activeProcessCount(job: windows.HANDLE) !windows.DWORD {
 }
 
 fn waitForEmpty(job: windows.HANDLE, timeout_ms: windows.DWORD) !void {
-    switch (WaitForSingleObject(job, timeout_ms)) {
-        wait_object_0 => {},
-        wait_timeout => return error.JobSettlementTimedOut,
-        wait_failed => return error.JobWaitFailed,
-        else => return error.UnexpectedJobWaitResult,
+    // Job handles do not become signaled on normal exit or TerminateJobObject.
+    // Query the owned Job's accounting until every associated process is gone.
+    const started = GetTickCount64();
+    while (try activeProcessCount(job) != 0) {
+        const elapsed = GetTickCount64() -% started;
+        if (elapsed >= timeout_ms) return error.JobSettlementTimedOut;
+        Sleep(@intCast(@min(10, @as(u64, timeout_ms) - elapsed)));
     }
-    if (try activeProcessCount(job) != 0) return error.JobStillActive;
 }
 
 fn terminateAndProveEmpty(job: windows.HANDLE, timeout_ms: windows.DWORD) !void {

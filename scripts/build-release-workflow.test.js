@@ -30,6 +30,18 @@ function step(name) {
   return workflow.slice(start, end === -1 ? workflow.length : end);
 }
 
+test('Windows releases require native Job cleanup tests after building the supervisor', () => {
+  const name = 'Test native Windows Job process cleanup';
+  const gate = step(name);
+  assert.match(gate, /if: matrix\.os == 'windows'/);
+  assert.match(gate, /COTTONTAIL_REQUIRE_WINDOWS_JOB_LAUNCHER: '1'/);
+  assert.match(gate, /COTTONTAIL_TEST_WINDOWS_JOB_LAUNCHER: zig-out\/bin\/cottontail-bun-compat-job\.exe/);
+  assert.match(gate, /node --test scripts\/windows-job-child\.test\.js/);
+  assert.match(gate, /if \(\$LASTEXITCODE -ne 0\) \{ throw/);
+  assert.ok(workflow.indexOf('- name: Test Unicode output in a legacy Windows console') < workflow.indexOf(`- name: ${name}`));
+  assert.ok(workflow.indexOf(`- name: ${name}`) < workflow.indexOf('- name: Package release'));
+});
+
 test('all four releases gate native namespace, worker loader, and socket ownership after final validation', () => {
   for (const platform of ['macos-arm64', 'linux-x64', 'linux-arm64', 'windows-x64']) {
     assert.ok(workflow.includes(`platform: ${platform}`));
@@ -202,6 +214,19 @@ test('the JS suite forwards its selected runtime to native stdio regressions', (
   const stdio = runner.match(/name: 'native-stdio-redirection',[\s\S]*?\n    },/)?.[0];
   assert.ok(stdio, 'missing native stdio regression in the JS suite');
   assert.match(stdio, /env: \{ COTTONTAIL_TEST_BINARY: binaryPath \}/);
+});
+
+test('every release and the JS suite run externally bounded delayed worker termination regressions', () => {
+  const termination = step('Test delayed runaway worker termination');
+  assert.doesNotMatch(termination, /^\s+if:/m, 'worker regression must run on all four native release targets');
+  assert.match(termination, /run: node --test scripts\/worker-delayed-termination\.test\.js/);
+  const index = workflow.indexOf('- name: Test delayed runaway worker termination');
+  assert.ok(workflow.indexOf('- name: Build and strip release binary') < index);
+  assert.ok(index < workflow.indexOf('- name: Package release'));
+  const runner = readFileSync(new URL('./test-js.js', import.meta.url), 'utf8');
+  const worker = runner.match(/name: 'worker-delayed-termination',[\s\S]*?\n    },/)?.[0];
+  assert.ok(worker, 'missing bounded delayed worker regression in the JS suite');
+  assert.match(worker, /env: \{ COTTONTAIL_TEST_BINARY: binaryPath \}/);
 });
 
 test('Linux releases enforce the GLIBC 2.38 public ABI ceiling', () => {

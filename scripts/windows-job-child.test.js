@@ -8,7 +8,7 @@ import {
   rmSync,
 } from 'node:fs';
 import os from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
@@ -19,10 +19,14 @@ import {
 
 const cottontailRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const runnerPath = join(cottontailRoot, 'scripts', 'run-upstream-tests.js');
-const jobLauncher = process.env.COTTONTAIL_TEST_WINDOWS_JOB_LAUNCHER ??
+// Keep the selected supervisor absolute when a fixture changes the child cwd.
+const jobLauncher = resolve(cottontailRoot, process.env.COTTONTAIL_TEST_WINDOWS_JOB_LAUNCHER ??
   process.env.COTTONTAIL_UPSTREAM_JOB_LAUNCHER ??
-  join(cottontailRoot, 'zig-out', 'bin', 'cottontail-bun-compat-job.exe');
+  join(cottontailRoot, 'zig-out', 'bin', 'cottontail-bun-compat-job.exe'));
 const actualLauncherUnavailable = process.platform !== 'win32' || !existsSync(jobLauncher);
+if (process.env.COTTONTAIL_REQUIRE_WINDOWS_JOB_LAUNCHER === '1') {
+  assert.equal(actualLauncherUnavailable, false, `required native Windows Job Object launcher unavailable at ${jobLauncher}`);
+}
 const actualLauncherOnly = {
   skip: actualLauncherUnavailable
     ? `native Windows Job Object launcher unavailable at ${jobLauncher}`
@@ -108,6 +112,23 @@ function pidFromOutput(output, label) {
   assert.ok(match, `missing ${label} PID in output: ${output}`);
   return Number(match[1]);
 }
+
+test('a required native Job gate fails instead of skipping a missing launcher', () => {
+  const env = {
+    ...process.env,
+    COTTONTAIL_REQUIRE_WINDOWS_JOB_LAUNCHER: '1',
+    COTTONTAIL_TEST_WINDOWS_JOB_LAUNCHER: join(os.tmpdir(), `missing-cottontail-job-${process.pid}-${Date.now()}`, 'launcher.exe'),
+  };
+  delete env.NODE_TEST_CONTEXT;
+  const result = spawnSync(process.execPath, ['--test', fileURLToPath(import.meta.url)], {
+    env,
+    encoding: 'utf8', timeout: 5000,
+  });
+  assert.ifError(result.error);
+  assert.equal(result.signal, null);
+  assert.notEqual(result.status, 0);
+  assert.match(`${result.stdout}\n${result.stderr}`, /required native Windows Job Object launcher unavailable/);
+});
 
 test('upstream runner routes every asynchronous Windows child through the native launcher', () => {
   const source = readFileSync(runnerPath, 'utf8').replace(/\r\n/g, '\n');
@@ -195,6 +216,19 @@ test('bounded terminator retries the Job-creation startup race with the same nam
   assert.equal(await proof, true);
   assert.equal(calls.length, 3);
   assert.deepEqual(calls[2].args, calls[1].args);
+});
+
+test('actual launcher promptly settles an empty Job after normal process exit', actualLauncherOnly, async t => {
+  const started = performance.now();
+  const child = startActualTarget(['-e', 'process.exit(0)']);
+  t.after(() => {
+    // This exact supervisor owns a kill-on-close Job; no PID search is needed.
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  });
+  const output = capture(child);
+  const result = await waitForClose(child, 2500);
+  assert.equal(result.code, 0, output.read().stderr);
+  assert.ok(performance.now() - started < 2500, 'an empty Job must settle without waiting for its handle to signal');
 });
 
 test('actual launcher probe and run preserve argv, environment, cwd, stdio, and exit code', actualLauncherOnly, async t => {

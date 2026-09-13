@@ -151,6 +151,16 @@ jobs:
           node scripts/zig.js build test-windows-console -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseFast -Dcpu=baseline
           if ($LASTEXITCODE -ne 0) { throw "Windows Unicode console test failed" }
 
+      - name: Test native Windows Job process cleanup
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          COTTONTAIL_TEST_WINDOWS_JOB_LAUNCHER: zig-out/bin/cottontail-bun-compat-job.exe
+          COTTONTAIL_REQUIRE_WINDOWS_JOB_LAUNCHER: '1'
+        run: |
+          node --test scripts/windows-job-child.test.js
+          if ($LASTEXITCODE -ne 0) { throw "Windows Job cleanup tests failed" }
+
       - name: Build and strip release binary
         run: node scripts/build-release.js
 
@@ -229,6 +239,9 @@ jobs:
         run: |
           node scripts/test-native-boundary-release.js
           if ($LASTEXITCODE -ne 0) { throw "Windows native boundary regression tests failed" }
+
+      - name: Test delayed runaway worker termination
+        run: node --test scripts/worker-delayed-termination.test.js
 
       - name: Test inspector scheduler lifecycle
         run: ./zig-out/bin/cottontail tests/js/node-inspector-nexttick-lifecycle.mjs

@@ -869,6 +869,13 @@ try {
       expectExitCode: 0,
     },
     {
+      name: 'worker-delayed-termination',
+      executablePath: process.execPath,
+      argv: ['--test', join(rootDir, 'scripts', 'worker-delayed-termination.test.js')],
+      env: { COTTONTAIL_TEST_BINARY: binaryPath },
+      expectExitCode: 0,
+    },
+    {
       name: 'node-child-process-inherited-sync',
       scriptPath: join(rootDir, 'tests', 'js', 'node-child-process-inherited-sync.ts'),
       expectExitCode: 0,
