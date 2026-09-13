@@ -1,0 +1,59 @@
+name: Diagnose canary9 Linux x64 compression
+on:
+  push:
+    branches: [diagnostics/canary9-linux-x64-compression-20260913]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: b396dc24ef7b636ddbd38540e43818f49e76480c
+          path: runtime
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+      - name: Install matching native build dependencies and GDB
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang g++ libbrotli-dev libffi-dev libssl-dev libzstd-dev zlib1g-dev gdb
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            runtime/vendors/zig
+            runtime/vendors/jsc
+            runtime/vendors/zig-html-rewriter
+          key: cottontail-linux-x64-v1-${{ hashFiles('runtime/scripts/zig-manifest.json', 'runtime/scripts/jsc-manifest.json', 'runtime/scripts/zig-html-rewriter-manifest.json', 'runtime/vcpkg.json') }}
+      - name: Set up exact canary9 native toolchain
+        working-directory: runtime
+        run: |
+          node scripts/setup.js
+          node scripts/setup-zig-html-rewriter.js
+          node scripts/setup-jsc.js
+          node scripts/zig.js build test
+      - name: Build maintained release and retain matching unstripped executable
+        working-directory: runtime
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/diagnostics"
+          STRIP="$GITHUB_WORKSPACE/scripts/diagnose-save-strip.sh" COTTONTAIL_DIAGNOSTIC_OUTPUT="$GITHUB_WORKSPACE/diagnostics" node scripts/build-release.js
+          git rev-parse HEAD > "$GITHUB_WORKSPACE/diagnostics/runtime-source-revision.txt"
+          cp scripts/jsc-manifest.json "$GITHUB_WORKSPACE/diagnostics/jsc-manifest.json"
+          sha256sum zig-out/bin/cottontail "$GITHUB_WORKSPACE/diagnostics/cottontail.unstripped" > "$GITHUB_WORKSPACE/diagnostics/executable-sha256.txt"
+          tar -czf "$GITHUB_WORKSPACE/diagnostics/runtime-bin.tar.gz" -C zig-out bin
+      - name: Preserve first failure and collect GDB/cache/tier comparisons
+        run: node scripts/diagnose-compression-x64.mjs runtime diagnostics
+      - name: Retain native diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: canary9-linux-x64-compression-diagnostics
+          path: diagnostics
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 1
