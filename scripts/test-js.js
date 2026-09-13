@@ -174,6 +174,18 @@ try {
       stderrIncludes: ['20 pass', '0 fail'],
     },
     {
+      name: 'native-host-namespace-factory',
+      scriptPath: join(rootDir, 'tests', 'js', 'native-host-namespace-factory.mjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['native host namespace factory passed'],
+    },
+    {
+      name: 'native-host-namespace',
+      scriptPath: join(rootDir, 'tests', 'js', 'native-host-namespace.mjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['native host namespace passed'],
+    },
+    {
       name: 'runtime-module-field-resolution',
       argv: ['test', join(rootDir, 'tests', 'js', 'runtime-module-field-resolution.test.ts')],
       expectExitCode: 0,
@@ -1123,6 +1135,12 @@ try {
       stdoutIncludes: ['node worker process bootstrap passed'],
     },
     {
+      name: 'node-worker-internal-loader',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-worker-internal-loader.mjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['full worker bootstrap and lazy runtime loader passed'],
+    },
+    {
       name: 'node-zlib-streams-surface',
       scriptPath: join(rootDir, 'tests', 'js', 'node-zlib-streams-surface.ts'),
       expectExitCode: 0,
@@ -1198,6 +1216,24 @@ try {
       scriptPath: join(rootDir, 'tests', 'js', 'node-dgram-surface.ts'),
       expectExitCode: 0,
       stdoutIncludes: ['node dgram surface passed'],
+    },
+    {
+      name: 'node-dgram-peer-loss',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-dgram-peer-loss.mjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node dgram peer loss passed'],
+    },
+    {
+      name: 'fd-watch-runtime-ownership',
+      scriptPath: join(rootDir, 'tests', 'js', 'fd-watch-runtime-ownership.mjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['fd watch runtime ownership passed'],
+    },
+    {
+      name: 'node-dgram-lifecycle',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-dgram-lifecycle.mjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node dgram lifecycle passed'],
     },
     {
       name: 'node-tls-http2-surface',

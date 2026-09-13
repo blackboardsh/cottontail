@@ -2912,7 +2912,13 @@ function workerRuntimeAliases(runtimeRoot) {
     aliases[`node:${specifier}`] = path;
   }
   for (const [specifier, relativePath] of Object.entries(workerRuntimeAliasPaths)) {
-    aliases[specifier] = workerRuntimePath(runtimeRoot, relativePath);
+    const path = workerRuntimePath(runtimeRoot, relativePath);
+    aliases[specifier] = path;
+    // Bootstrap can run before a main-thread require facade exposes
+    // builtinModules. Every explicit Node runtime alias must still cover its
+    // node: spelling; otherwise the native bundler leaves e.g. node:module as
+    // an external static import in the worker script.
+    if (relativePath.startsWith("node/")) aliases[`node:${specifier}`] = path;
   }
   aliases["node:undici"] = workerRuntimePath(runtimeRoot, "node/undici-public.js");
   for (const specifier of ["sea", "sqlite", "test", "test/reporters"]) {

@@ -544,7 +544,7 @@ export class Socket extends EventEmitter {
 
   _poll() {
     if (this.closed) return;
-    for (;;) {
+    while (!this.closed) {
       let packet;
       try {
         packet = cottontail.udpSocketReceive(this.fd, 65536);

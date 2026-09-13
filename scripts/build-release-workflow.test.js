@@ -3,6 +3,12 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { releaseTargetArgs } from './release-target.js';
+import { EventEmitter } from 'node:events';
+import { join } from 'node:path';
+import {
+  nativeBoundaryEnvironment, nativeBoundaryFixtures, nativeBoundaryPlan,
+  nativeBoundaryTimeoutMs, runNativeBoundaryTest,
+} from './test-native-boundary-release.js';
 
 const workflowPath = new URL('../.github/workflows/build-release.yml', import.meta.url);
 const workflow = readFileSync(workflowPath, 'utf8').replace(/\r\n/g, '\n');
@@ -23,6 +29,121 @@ function step(name) {
   const end = workflow.indexOf('\n      - name:', start + marker.length);
   return workflow.slice(start, end === -1 ? workflow.length : end);
 }
+
+test('all four releases gate native namespace, worker loader, and socket ownership after final validation', () => {
+  for (const platform of ['macos-arm64', 'linux-x64', 'linux-arm64', 'windows-x64']) {
+    assert.ok(workflow.includes(`platform: ${platform}`));
+  }
+  for (const suffix of ['', ' on Windows']) {
+    const name = `Test native namespace, workers, and socket ownership${suffix}`;
+    const gate = step(name);
+    assert.match(gate, /timeout-minutes: 10/);
+    assert.match(gate, /node scripts\/test-native-boundary-release\.js/);
+    assert.match(gate, suffix ? /if: matrix\.os == 'windows'/ : /if: matrix\.os != 'windows'/);
+    if (suffix) {
+      assert.match(gate, /shell: pwsh/);
+      assert.match(gate, /if \(\$LASTEXITCODE -ne 0\) \{ throw/);
+    }
+    assert.ok(workflow.indexOf('- name: Validate stripped release binary') < workflow.indexOf(`- name: ${name}`));
+    assert.ok(workflow.indexOf(`- name: ${name}`) < workflow.indexOf('- name: Package release'));
+  }
+});
+
+test('native boundary plan runs exact release binaries directly with bounded fixture arguments', () => {
+  assert.deepEqual(nativeBoundaryFixtures, [
+    'native-host-namespace-factory.mjs', 'native-host-namespace.mjs',
+    'node-worker-internal-loader.mjs', 'node-dgram-peer-loss.mjs',
+    'fd-watch-runtime-ownership.mjs', 'node-dgram-lifecycle.mjs',
+  ]);
+  for (const platform of ['darwin', 'linux', 'win32']) {
+    const plan = nativeBoundaryPlan('/fixture-root', platform);
+    assert.equal(plan.binary, join('/fixture-root', 'zig-out/bin', platform === 'win32' ? 'cottontail.exe' : 'cottontail'));
+    assert.equal(Boolean(plan.jobLauncher), platform === 'win32');
+    assert.deepEqual(plan.tests.map(test => test.args), nativeBoundaryFixtures.map(name => [join('/fixture-root', 'tests/js', name)]));
+    assert.ok(plan.tests.every(test => test.timeoutMs === 90_000));
+  }
+  assert.equal(nativeBoundaryTimeoutMs, 90_000);
+  const runner = readFileSync(new URL('./test-native-boundary-release.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(runner, /scripts\/zig\.js|build-release\.js|\bbun\s+test/);
+  assert.match(runner, /startWindowsJobChild/);
+  assert.match(runner, /terminateWindowsJobChild/);
+});
+
+test('native release gate removes source and Desktop runtime overlays', () => {
+  assert.deepEqual(nativeBoundaryEnvironment({
+    PATH: 'tools', COTTONTAIL_RUNTIME_MODULES_DIR: 'source',
+    COTTONTAIL_ELECTROBUN_BOOTSTRAP: 'desktop', ELECTROBUN_INSTALL_ROOT_NAME: 'app',
+    ELECTROBUN_LAUNCHER_PID: '123', Keep: 'value',
+  }), { PATH: 'tools', Keep: 'value' });
+});
+
+test('native release gate propagates failures and cannot fall back to Node or Bun', async () => {
+  const plan = nativeBoundaryPlan('/fixture-root', 'linux');
+  for (const code of [0, 9]) {
+    const calls = [];
+    const run = runNativeBoundaryTest(plan, plan.tests[0], {
+      platform: 'linux',
+      spawnProcess(command, args, options) {
+        calls.push({ command, args, options });
+        const child = new EventEmitter();
+        queueMicrotask(() => child.emit('close', code, null));
+        return child;
+      },
+    });
+    if (code) await assert.rejects(run, /native release exited 9/);
+    else await run;
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].command, plan.binary);
+    assert.deepEqual(calls[0].args, plan.tests[0].args);
+    assert.equal(calls[0].options.detached, true);
+    assert.equal(calls[0].options.stdio, 'inherit');
+  }
+});
+
+test('Windows native gate owns a unique Job and preserves the full failure status', async () => {
+  const plan = nativeBoundaryPlan('/fixture-root', 'win32');
+  const calls = [];
+  await assert.rejects(runNativeBoundaryTest(plan, plan.tests[0], {
+    platform: 'win32',
+    spawnProcess(command, args, options) {
+      calls.push({ command, args, options });
+      const child = new EventEmitter();
+      queueMicrotask(() => child.emit('close', 0xc0000409, null));
+      return child;
+    },
+  }), /native release exited 3221226505/);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].command, plan.jobLauncher);
+  assert.equal(calls[0].args[0], 'run');
+  assert.match(calls[0].args[1], /^Local\\CottontailBunCompat-[0-9a-f-]+$/);
+  assert.equal(calls[0].args[2], String(process.pid));
+  assert.equal(calls[0].args[3], plan.binary);
+  assert.deepEqual(calls[0].args.slice(4), plan.tests[0].args);
+  assert.equal(calls[0].options.detached, false);
+  assert.equal(calls[0].options.windowsHide, true);
+});
+
+test('Windows native timeout terminates only the Job started by that fixture', async () => {
+  const plan = nativeBoundaryPlan('/fixture-root', 'win32');
+  const calls = [];
+  let launcher;
+  await assert.rejects(runNativeBoundaryTest(plan, { ...plan.tests[0], timeoutMs: 1 }, {
+    platform: 'win32',
+    spawnProcess(command, args) {
+      calls.push({ command, args });
+      const child = new EventEmitter();
+      if (args[0] === 'run') launcher = child;
+      else queueMicrotask(() => {
+        child.emit('close', 0, null);
+        launcher.emit('close', 1, null);
+      });
+      return child;
+    },
+  }), /exceeded 1ms/);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].command, plan.jobLauncher);
+  assert.deepEqual(calls[1].args, ['terminate', calls[0].args[1], '5000']);
+});
 
 test('release TLS tests cover default trust on clean Macs and explicit CA overrides', () => {
   const localTrust = step('Test default TLS certificate trust');

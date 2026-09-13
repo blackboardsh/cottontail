@@ -1408,6 +1408,7 @@ static int ct_windows_socket_errno(void) {
         case WSAEADDRNOTAVAIL: return EADDRNOTAVAIL;
         case WSAENETDOWN: return ENETDOWN;
         case WSAENETUNREACH: return ENETUNREACH;
+        case WSAENETRESET: return ENETRESET;
         case WSAECONNABORTED: return ECONNABORTED;
         case WSAECONNRESET: return ECONNRESET;
         case WSAENOBUFS: return ENOBUFS;
@@ -2914,7 +2915,7 @@ typedef struct CtLoadedCapability CtLoadedCapability;
 struct CtJscRuntime {
     JSGlobalContextRef context;
     JSObjectRef host_object;
-    uint64_t native_binding_materialized[8];
+    JSObjectRef native_binding_context;
     CtJscInspector *inspector;
     pthread_mutex_t inspector_mutex;
     void *inspector_run_loop;
@@ -11429,9 +11430,17 @@ static JSValueRef ct_udp_socket_receive(JSContextRef ctx, JSObjectRef function, 
     socklen_t source_len = sizeof(source);
     ssize_t received = recvfrom(fd, buffer, max_bytes, 0, (struct sockaddr *)&source, &source_len);
     if (received < 0) {
+        int receive_error = errno;
         free(buffer);
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return JSValueMakeNull(ctx);
-        ct_throw_message(ctx, exception, strerror(errno));
+        if (receive_error == EAGAIN || receive_error == EWOULDBLOCK || receive_error == EINTR) return JSValueMakeNull(ctx);
+#ifdef _WIN32
+        // Winsock reports ICMP errors for earlier UDP sends on the next read.
+        // Like libuv's Windows UDP receive path, consume these notifications
+        // without treating a departed peer as a failure of the local socket.
+        // Other receive errors remain observable; TCP behavior is unchanged.
+        if (receive_error == ECONNRESET || receive_error == ENETRESET) return JSValueMakeNull(ctx);
+#endif
+        ct_throw_message(ctx, exception, strerror(receive_error));
         return JSValueMakeUndefined(ctx);
     }
 
@@ -23255,14 +23264,15 @@ static void ct_fd_watcher_close_uv(CtFdWatcher *watcher) {
 }
 #endif
 
-static bool ct_fd_watcher_stop_id(uint32_t id) {
+static bool ct_fd_watcher_stop_id(CtJscRuntime *runtime, uint32_t id) {
+    if (runtime == NULL) return false;
     bool found = false;
 #if !defined(_WIN32)
     CtFdWatcher *target = NULL;
 #endif
     pthread_mutex_lock(&ct_fd_watchers_mutex);
     for (CtFdWatcher *watcher = ct_fd_watchers; watcher != NULL; watcher = watcher->next) {
-        if (watcher->id == id) {
+        if (watcher->id == id && watcher->runtime == runtime && ct_fd_watcher_is_active(watcher)) {
 #if defined(_WIN32)
             ct_fd_watcher_set_active(watcher, false);
 #else
@@ -23370,7 +23380,7 @@ static void ct_fd_watchers_stop_runtime(CtJscRuntime *runtime) {
         }
         pthread_mutex_unlock(&ct_fd_watchers_mutex);
         if (id == 0) break;
-        (void)ct_fd_watcher_stop_id(id);
+        (void)ct_fd_watcher_stop_id(runtime, id);
     }
 #endif
 }
@@ -30494,16 +30504,16 @@ static JSValueRef ct_fd_watch_start(JSContextRef ctx, JSObjectRef function, JSOb
 }
 
 static JSValueRef ct_fd_watch_stop(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
     (void)thisObject;
     (void)exception;
-    if (argc < 1) return JSValueMakeBoolean(ctx, false);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 1) return JSValueMakeBoolean(ctx, false);
     int id_value;
     if (!ct_value_to_int_checked(ctx, argv[0], 1, INT_MAX, &id_value, exception, "invalid file descriptor watcher id")) {
         return JSValueMakeUndefined(ctx);
     }
     uint32_t id = (uint32_t)id_value;
-    bool stopped = ct_fd_watcher_stop_id(id);
+    bool stopped = ct_fd_watcher_stop_id(runtime, id);
 #if defined(_WIN32)
     if (stopped) {
         /* A socket descriptor can be transferred directly into OpenSSL after
@@ -30517,15 +30527,16 @@ static JSValueRef ct_fd_watch_stop(JSContextRef ctx, JSObjectRef function, JSObj
 }
 
 static JSValueRef ct_fd_watch_set_ref(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
     (void)thisObject;
     (void)exception;
-    if (argc < 2) return JSValueMakeBoolean(ctx, false);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 2) return JSValueMakeBoolean(ctx, false);
     uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
     bool found = false;
     pthread_mutex_lock(&ct_fd_watchers_mutex);
     for (CtFdWatcher *watcher = ct_fd_watchers; watcher != NULL; watcher = watcher->next) {
-        if (watcher->id != id) continue;
+        // A watch ID is not authority to touch another runtime's event loop.
+        if (watcher->id != id || watcher->runtime != runtime || !ct_fd_watcher_is_active(watcher)) continue;
         pthread_mutex_lock(&watcher->mutex);
         watcher->referenced = ct_value_to_bool(ctx, argv[1]);
         pthread_mutex_unlock(&watcher->mutex);
@@ -30541,10 +30552,10 @@ static JSValueRef ct_fd_watch_set_ref(JSContextRef ctx, JSObjectRef function, JS
 }
 
 static JSValueRef ct_fd_watch_set_paused(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
     (void)thisObject;
     (void)exception;
-    if (argc < 2) return JSValueMakeBoolean(ctx, false);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 2) return JSValueMakeBoolean(ctx, false);
     uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
     bool paused = ct_value_to_bool(ctx, argv[1]);
     bool found = false;
@@ -30553,7 +30564,7 @@ static JSValueRef ct_fd_watch_set_paused(JSContextRef ctx, JSObjectRef function,
 #endif
     pthread_mutex_lock(&ct_fd_watchers_mutex);
     for (CtFdWatcher *watcher = ct_fd_watchers; watcher != NULL; watcher = watcher->next) {
-        if (watcher->id != id) continue;
+        if (watcher->id != id || watcher->runtime != runtime || !ct_fd_watcher_is_active(watcher)) continue;
         pthread_mutex_lock(&watcher->mutex);
         watcher->paused = paused;
 #if !defined(_WIN32)
@@ -30577,10 +30588,10 @@ static JSValueRef ct_fd_watch_set_paused(JSContextRef ctx, JSObjectRef function,
 }
 
 static JSValueRef ct_fd_watch_set_writable(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
     (void)thisObject;
     (void)exception;
-    if (argc < 2) return JSValueMakeBoolean(ctx, false);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 2) return JSValueMakeBoolean(ctx, false);
     uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
     bool writable = ct_value_to_bool(ctx, argv[1]);
     bool found = false;
@@ -30589,7 +30600,7 @@ static JSValueRef ct_fd_watch_set_writable(JSContextRef ctx, JSObjectRef functio
 #endif
     pthread_mutex_lock(&ct_fd_watchers_mutex);
     for (CtFdWatcher *watcher = ct_fd_watchers; watcher != NULL; watcher = watcher->next) {
-        if (watcher->id != id) continue;
+        if (watcher->id != id || watcher->runtime != runtime || !ct_fd_watcher_is_active(watcher)) continue;
         pthread_mutex_lock(&watcher->mutex);
         watcher->watch_writable = writable;
 #if !defined(_WIN32)
@@ -32649,11 +32660,9 @@ static JSValueRef ct_unhandled_rejection(
 #include "native_bindings/direct_jsc.inc"
 #include "native_bindings/callbacks.h"
 
-_Static_assert(
-    CT_HOST_NATIVE_BINDING_COUNT + CT_DIRECT_NATIVE_BINDING_COUNT <= 512,
-    "native binding materialization bitmap is too small"
-);
-
+// Export ordinary JS properties, not JSClass has/getProperty hooks. JSC drops
+// and reacquires its VM locks for every host-hook lookup, even after a native
+// function is materialized; this dominates small native calls on Windows x64.
 static bool ct_host_has_legacy_native_binding(const char *name) {
     for (size_t index = 0; index < CT_HOST_NATIVE_BINDING_COUNT; index += 1) {
         if (strcmp(name, ct_host_native_binding_definitions[index].name) == 0) return true;
@@ -32661,138 +32670,25 @@ static bool ct_host_has_legacy_native_binding(const char *name) {
     return false;
 }
 
-#define CT_NATIVE_BINDING_LOOKUP_CAPACITY 1024
-#define CT_NATIVE_BINDING_NAME_CAPACITY 128
-
-_Static_assert(
-    CT_HOST_NATIVE_BINDING_COUNT + CT_DIRECT_NATIVE_BINDING_COUNT <
-        CT_NATIVE_BINDING_LOOKUP_CAPACITY / 2,
-    "native binding lookup table must stay below 50% load"
-);
-
-static uv_once_t ct_native_binding_lookup_once = UV_ONCE_INIT;
-static uint16_t ct_native_binding_lookup[CT_NATIVE_BINDING_LOOKUP_CAPACITY];
-static size_t ct_native_binding_max_name_length = 0;
-
-static const char *ct_native_binding_name(size_t index) {
-    if (index < CT_HOST_NATIVE_BINDING_COUNT) {
-        return ct_host_native_binding_definitions[index].name;
-    }
-    return ct_direct_native_binding_definitions[
-        index - CT_HOST_NATIVE_BINDING_COUNT
-    ].name;
-}
-
-static uint64_t ct_native_binding_name_hash(const char *name, size_t length) {
-    uint64_t hash = UINT64_C(14695981039346656037);
-    for (size_t index = 0; index < length; index += 1) {
-        hash ^= (uint8_t)name[index];
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
-}
-
-static void ct_native_binding_lookup_insert(const char *name, size_t index) {
-    const size_t name_length = strlen(name);
-    if (name_length > ct_native_binding_max_name_length) {
-        ct_native_binding_max_name_length = name_length;
-    }
-    const uint64_t hash = ct_native_binding_name_hash(name, name_length);
-    size_t slot = (size_t)hash & (CT_NATIVE_BINDING_LOOKUP_CAPACITY - 1);
-    for (;;) {
-        const uint16_t stored = ct_native_binding_lookup[slot];
-        if (stored == UINT16_MAX) {
-            ct_native_binding_lookup[slot] = (uint16_t)index;
-            return;
-        }
-        if (strcmp(ct_native_binding_name(stored), name) == 0) {
-            return;
-        }
-        slot = (slot + 1) & (CT_NATIVE_BINDING_LOOKUP_CAPACITY - 1);
-    }
-}
-
-static void ct_native_binding_lookup_initialize(void) {
-    for (size_t index = 0; index < CT_NATIVE_BINDING_LOOKUP_CAPACITY; index += 1) {
-        ct_native_binding_lookup[index] = UINT16_MAX;
-    }
-    for (size_t index = 0; index < CT_HOST_NATIVE_BINDING_COUNT; index += 1) {
-        ct_native_binding_lookup_insert(
-            ct_host_native_binding_definitions[index].name,
-            index
-        );
-    }
-    for (size_t index = 0; index < CT_DIRECT_NATIVE_BINDING_COUNT; index += 1) {
-        ct_native_binding_lookup_insert(
-            ct_direct_native_binding_definitions[index].name,
-            CT_HOST_NATIVE_BINDING_COUNT + index
-        );
-    }
-}
-
-static bool ct_host_native_binding_index(JSStringRef property_name, size_t *index_out) {
-    if (property_name == NULL || index_out == NULL) return false;
-    uv_once(&ct_native_binding_lookup_once, ct_native_binding_lookup_initialize);
-    const size_t utf16_length = JSStringGetLength(property_name);
-    if (utf16_length > ct_native_binding_max_name_length) return false;
-
-    char name[CT_NATIVE_BINDING_NAME_CAPACITY];
-    const size_t utf8_length = JSStringGetUTF8CString(
-        property_name,
-        name,
-        sizeof(name)
-    );
-    if (utf8_length == 0) return false;
-
-    const uint64_t hash = ct_native_binding_name_hash(name, utf8_length - 1);
-    size_t slot = (size_t)hash & (CT_NATIVE_BINDING_LOOKUP_CAPACITY - 1);
-    for (;;) {
-        const uint16_t stored = ct_native_binding_lookup[slot];
-        if (stored == UINT16_MAX) return false;
-        if (strcmp(ct_native_binding_name(stored), name) == 0) {
-            *index_out = stored;
-            return true;
-        }
-        slot = (slot + 1) & (CT_NATIVE_BINDING_LOOKUP_CAPACITY - 1);
-    }
-}
-
-static bool ct_host_native_binding_is_materialized(CtJscRuntime *runtime, size_t index) {
-    if (runtime == NULL || index >= 512) return false;
-    return (runtime->native_binding_materialized[index / 64] & (UINT64_C(1) << (index % 64))) != 0;
-}
-
-static void ct_host_native_binding_mark_materialized(CtJscRuntime *runtime, size_t index) {
-    if (runtime == NULL || index >= 512) return;
-    runtime->native_binding_materialized[index / 64] |= UINT64_C(1) << (index % 64);
-}
-
-static bool ct_host_has_property(
+static JSValueRef ct_materialize_host_binding(
     JSContextRef ctx,
-    JSObjectRef object,
-    JSStringRef property_name
-) {
-    (void)ctx;
-    size_t index = 0;
-    if (!ct_host_native_binding_index(property_name, &index)) return false;
-    return !ct_host_native_binding_is_materialized(
-        (CtJscRuntime *)JSObjectGetPrivate(object),
-        index
-    );
-}
-
-static JSValueRef ct_host_get_property(
-    JSContextRef ctx,
-    JSObjectRef object,
-    JSStringRef property_name,
+    JSObjectRef callback,
+    JSObjectRef this_object,
+    size_t argc,
+    const JSValueRef argv[],
     JSValueRef *exception
 ) {
-    size_t index = 0;
-    if (!ct_host_native_binding_index(property_name, &index)) return NULL;
-
-    CtJscRuntime *runtime = (CtJscRuntime *)JSObjectGetPrivate(object);
-    if (runtime == NULL || ct_host_native_binding_is_materialized(runtime, index)) return NULL;
-
+    (void)this_object;
+    CtJscRuntime *runtime = ct_callback_runtime(callback);
+    const double numeric_index = argc > 0 ? JSValueToNumber(ctx, argv[0], exception) : -1;
+    if ((exception != NULL && *exception != NULL) || runtime == NULL) return JSValueMakeUndefined(ctx);
+    if (!isfinite(numeric_index) || numeric_index < 0 ||
+        numeric_index >= CT_HOST_NATIVE_BINDING_COUNT + CT_DIRECT_NATIVE_BINDING_COUNT ||
+        floor(numeric_index) != numeric_index) {
+        ct_throw_message(ctx, exception, "Invalid native binding index");
+        return JSValueMakeUndefined(ctx);
+    }
+    const size_t index = (size_t)numeric_index;
     const CtNativeBindingDefinition *binding = index < CT_HOST_NATIVE_BINDING_COUNT
         ? &ct_host_native_binding_definitions[index]
         : NULL;
@@ -32802,94 +32698,88 @@ static JSValueRef ct_host_get_property(
         : &ct_direct_native_binding_definitions[index - CT_HOST_NATIVE_BINDING_COUNT];
     if (direct != NULL) {
         function = ct_jsc_embedder_create_function(
-            ctx,
-            direct->name,
-            direct->arity,
-            direct->callback,
-            runtime
+            ctx, direct->name, direct->arity, direct->callback, runtime
         );
     }
     if (function == NULL && binding != NULL) {
         function = ct_jsc_embedder_create_legacy_function(
-            ctx,
-            binding->name,
-            0,
-            binding->callback,
-            object
+            ctx, binding->name, 0, binding->callback, runtime->native_binding_context
         );
     }
     if (function == NULL && binding != NULL) {
         function = ct_make_function(ctx, binding->name, binding->callback, runtime);
     }
-    if (function == NULL) return NULL;
-    ct_host_native_binding_mark_materialized(runtime, index);
-    JSObjectSetProperty(
-        ctx,
-        object,
-        property_name,
-        function,
-        kJSPropertyAttributeNone,
-        exception
+    if (function == NULL) {
+        ct_throw_message(ctx, exception, "Failed to create native binding");
+        return JSValueMakeUndefined(ctx);
+    }
+    return function;
+}
+
+static JSObjectRef ct_make_host_object(JSContextRef ctx, CtJscRuntime *runtime, JSValueRef *exception) {
+    // The legacy adapter stores an opaque callback_context, not a traced JS
+    // field. Protect it for exactly the runtime's lifetime, independently of
+    // getter deletion/replacement and detached native functions.
+    runtime->native_binding_context = (JSObjectRef)ct_make_function(
+        ctx, "materializeNativeBinding", ct_materialize_host_binding, runtime
     );
-    return exception != NULL && *exception != NULL ? NULL : function;
-}
+    if (runtime->native_binding_context == NULL) return NULL;
+    JSValueProtect(ctx, runtime->native_binding_context);
 
-static bool ct_host_set_property(
-    JSContextRef ctx,
-    JSObjectRef object,
-    JSStringRef property_name,
-    JSValueRef value,
-    JSValueRef *exception
-) {
-    (void)ctx;
-    (void)value;
-    (void)exception;
-    size_t index = 0;
-    if (ct_host_native_binding_index(property_name, &index)) {
-        ct_host_native_binding_mark_materialized(
-            (CtJscRuntime *)JSObjectGetPrivate(object),
-            index
-        );
+    static const uint8_t source_path[] = "internal/native-host-namespace.js";
+    const uint8_t *source = NULL;
+    size_t source_length = 0;
+    if (ct_embedded_runtime_module_source(
+            source_path, sizeof(source_path) - 1, &source, &source_length
+        ) != 1) {
+        ct_throw_message(ctx, exception, "Missing embedded native host namespace");
+        return NULL;
     }
-    return false;
-}
-
-static void ct_host_get_property_names(
-    JSContextRef ctx,
-    JSObjectRef object,
-    JSPropertyNameAccumulatorRef property_names
-) {
-    (void)ctx;
-    CtJscRuntime *runtime = (CtJscRuntime *)JSObjectGetPrivate(object);
-    for (size_t index = 0; index < CT_HOST_NATIVE_BINDING_COUNT; index += 1) {
-        if (ct_host_native_binding_is_materialized(runtime, index)) continue;
-        JSStringRef name = ct_js_string(ct_host_native_binding_definitions[index].name);
-        JSPropertyNameAccumulatorAddName(property_names, name);
-        JSStringRelease(name);
+    JSStringRef script = ct_js_string_from_utf8_len((const char *)source, source_length);
+    JSStringRef source_url = ct_js_string("cottontail:internal/native-host-namespace.js");
+    if (script == NULL || source_url == NULL) {
+        if (script != NULL) JSStringRelease(script);
+        if (source_url != NULL) JSStringRelease(source_url);
+        ct_throw_message(ctx, exception, "Failed to create native host namespace source");
+        return NULL;
     }
-    for (size_t index = 0; index < CT_DIRECT_NATIVE_BINDING_COUNT; index += 1) {
-        const CtDirectNativeBindingDefinition *binding =
-            &ct_direct_native_binding_definitions[index];
-        if (ct_host_has_legacy_native_binding(binding->name)) continue;
-        const size_t materialized_index = CT_HOST_NATIVE_BINDING_COUNT + index;
-        if (ct_host_native_binding_is_materialized(runtime, materialized_index)) continue;
-        JSStringRef name = ct_js_string(binding->name);
-        JSPropertyNameAccumulatorAddName(property_names, name);
-        JSStringRelease(name);
+    JSValueRef factory = JSEvaluateScript(ctx, script, NULL, source_url, 1, exception);
+    JSStringRelease(script);
+    JSStringRelease(source_url);
+    if ((exception != NULL && *exception != NULL) || factory == NULL ||
+        !JSValueIsObject(ctx, factory) || !JSObjectIsFunction(ctx, (JSObjectRef)factory)) {
+        return NULL;
     }
-}
-
-static JSObjectRef ct_make_host_object(JSContextRef ctx, CtJscRuntime *runtime) {
-    JSClassDefinition definition = kJSClassDefinitionEmpty;
-    definition.className = "CottontailHost";
-    definition.hasProperty = ct_host_has_property;
-    definition.getProperty = ct_host_get_property;
-    definition.setProperty = ct_host_set_property;
-    definition.getPropertyNames = ct_host_get_property_names;
-    JSClassRef cls = JSClassCreate(&definition);
-    JSObjectRef host = JSObjectMake(ctx, cls, runtime);
-    JSClassRelease(cls);
-    return host;
+    JSValueProtect(ctx, factory);
+    JSObjectRef names = ct_make_array(ctx, 0, NULL, exception);
+    if (exception != NULL && *exception != NULL) {
+        JSValueUnprotect(ctx, factory);
+        return NULL;
+    }
+    JSValueProtect(ctx, names);
+    for (size_t index = 0;
+         index < CT_HOST_NATIVE_BINDING_COUNT + CT_DIRECT_NATIVE_BINDING_COUNT;
+         index += 1) {
+        const char *name = index < CT_HOST_NATIVE_BINDING_COUNT
+            ? ct_host_native_binding_definitions[index].name
+            : ct_direct_native_binding_definitions[index - CT_HOST_NATIVE_BINDING_COUNT].name;
+        JSValueRef value = index >= CT_HOST_NATIVE_BINDING_COUNT && ct_host_has_legacy_native_binding(name)
+            ? JSValueMakeNull(ctx)
+            : ct_make_string(ctx, name);
+        JSObjectSetPropertyAtIndex(ctx, names, (unsigned)index, value, exception);
+        if (exception != NULL && *exception != NULL) break;
+    }
+    JSValueRef result = NULL;
+    if (exception == NULL || *exception == NULL) {
+        JSValueRef args[2] = { runtime->native_binding_context, names };
+        result = JSObjectCallAsFunction(ctx, (JSObjectRef)factory, NULL, 2, args, exception);
+    }
+    JSValueUnprotect(ctx, names);
+    JSValueUnprotect(ctx, factory);
+    if ((exception != NULL && *exception != NULL) || result == NULL || !JSValueIsObject(ctx, result)) {
+        return NULL;
+    }
+    return (JSObjectRef)result;
 }
 
 static int ct_evaluate_core_bytecode(
@@ -32997,7 +32887,8 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_set_property(ctx, console, "warn", ct_make_plain_function(ctx, "warn", ct_console_error), &exception);
     ct_set_property(ctx, global, "console", console, &exception);
 
-    JSObjectRef host = ct_make_host_object(ctx, runtime);
+    JSObjectRef host = ct_make_host_object(ctx, runtime, &exception);
+    if (exception != NULL || host == NULL) return -1;
     runtime->host_object = host;
     JSValueProtect(ctx, host);
 
@@ -33549,6 +33440,7 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
             free(loaded);
         }
         if (runtime->host_object != NULL) JSValueUnprotect(ctx, runtime->host_object);
+        if (runtime->native_binding_context != NULL) JSValueUnprotect(ctx, runtime->native_binding_context);
         JSGlobalContextRelease(runtime->context);
     }
     while (runtime->spawn_events_head != NULL) {

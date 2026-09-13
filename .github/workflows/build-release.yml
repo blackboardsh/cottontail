@@ -217,6 +217,19 @@ jobs:
       - name: Test worker process bootstrap
         run: ./zig-out/bin/cottontail tests/js/node-worker-process-bootstrap.mjs
 
+      - name: Test native namespace, workers, and socket ownership
+        if: matrix.os != 'windows'
+        timeout-minutes: 10
+        run: node scripts/test-native-boundary-release.js
+
+      - name: Test native namespace, workers, and socket ownership on Windows
+        if: matrix.os == 'windows'
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          node scripts/test-native-boundary-release.js
+          if ($LASTEXITCODE -ne 0) { throw "Windows native boundary regression tests failed" }
+
       - name: Test inspector scheduler lifecycle
         run: ./zig-out/bin/cottontail tests/js/node-inspector-nexttick-lifecycle.mjs
 
