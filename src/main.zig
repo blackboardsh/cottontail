@@ -579,7 +579,7 @@ fn runHutchPrivateFileCommand(
         (mode == .shell or args.len == minimum_len);
     if (!valid_shape) {
         var stderr_buffer: [1024]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+        var stderr_writer = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
         const spelling = if (mode == .shell) "--hutch-shell-file" else "--hutch-config-file";
         try stderr_writer.interface.print(
             "cottontail: {s} requires <absolute-file> --hutch-private-root <absolute-root>{s}\n",
@@ -984,7 +984,7 @@ fn reportMissingDebugTsconfigExtends(
                             try std.fs.path.join(allocator, &.{ current, extends_value.string });
                         if (!try tsconfigExtendsExists(init.io, allocator, candidate)) {
                             var buffer: [4096]u8 = undefined;
-                            var writer = std.Io.File.stderr().writer(init.io, &buffer);
+                            var writer = std.Io.File.stderr().writerStreaming(init.io, &buffer);
                             try writer.interface.print("ENOENT loading tsconfig.json extends \"{s}\"\n", .{candidate});
                             try writer.interface.flush();
                         }
@@ -1084,7 +1084,7 @@ fn runFakeNode(init: std.process.Init, node_args: []const [:0]const u8) !u8 {
     const io = init.io;
 
     var stderr_buffer: [1024]u8 = undefined;
-    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+    var stderr_writer = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
     const empty_exec_args: [0][:0]const u8 = .{};
@@ -1335,10 +1335,10 @@ fn nativeBuildGeneration(
 ) !u8 {
     const allocator = init.arena.allocator();
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
     var stderr_buffer: [1024]u8 = undefined;
-    var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+    var stderr_writer = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
     var options: cottontail_bundler.BundleOptions = .{ .target = .browser };
@@ -2181,7 +2181,7 @@ fn runBunShellScript(init: std.process.Init, script_path: [:0]const u8, script_a
                 break :blk syntax.stderr[value_start..value_end];
             } else "";
             var stderr_buffer: [1024]u8 = undefined;
-            var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+            var stderr_writer = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
             if (token.len > 0) {
                 try stderr_writer.interface.print(
                     "error: Failed to run {s} due to error Unexpected '{s}'\n",
@@ -2320,7 +2320,7 @@ fn runMultipleTestFilesWithBail(
 ) !u8 {
     const allocator = init.arena.allocator();
     var stdout_buffer: [256]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
     try stdout_writer.interface.print("bun test v{s} (cottontail)\n", .{testRunnerDisplayVersion(init)});
     try stdout_writer.interface.flush();
     try init.environ_map.put("COTTONTAIL_TEST_CLI_HEADER_PRINTED", "1");
@@ -2411,7 +2411,7 @@ fn runMultipleTestFilesWithBail(
         }
     }
     var stderr_buffer: [1024]u8 = undefined;
-    var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+    var stderr_writer = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
     if (bail_limit > 0 and failed_files >= bail_limit and executed_files < test_files.len) {
         try stderr.print("\nBailed out after {d} failure{s}\n", .{ bail_limit, if (bail_limit == 1) "" else "s" });
@@ -2524,12 +2524,12 @@ fn writeNoTestsDiagnostic(
     filters: []const [:0]const u8,
 ) !u8 {
     var stdout_buffer: [128]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
     try stdout_writer.interface.print("bun test v{s} (cottontail)\n", .{testRunnerDisplayVersion(init)});
     try stdout_writer.interface.flush();
 
     var stderr_buffer: [1024]u8 = undefined;
-    var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+    var stderr_writer = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
     if (filters.len == 0) {
         if (isTestAIAgent(init.environ_map)) {
@@ -2648,7 +2648,7 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
     defer std.Io.Dir.cwd().deleteTree(init.io, aggregate.directory) catch {};
 
     var stdout_buffer: [256]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
     try stdout_writer.interface.print("bun test v{s} (cottontail)\n", .{testRunnerDisplayVersion(init)});
     try stdout_writer.interface.flush();
     try init.environ_map.put("COTTONTAIL_TEST_CLI_HEADER_PRINTED", "1");
@@ -3339,11 +3339,11 @@ pub fn main(init: std.process.Init) !void {
     args = try normalizeLeadingTestRuntimeFlags(allocator, args);
 
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     var stderr_buffer: [1024]u8 = undefined;
-    var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+    var stderr_writer = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
     if (externalPackageCommandForArgs(args)) |command| {

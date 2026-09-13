@@ -53,6 +53,22 @@ test('releases check native dependencies and compressed HTTP without Homebrew', 
   }
 });
 
+test('every release checks native stdio offsets after building and before packaging', () => {
+  const stdio = step('Test native stdio redirection');
+  assert.doesNotMatch(stdio, /^\s+if:/m, 'stdio regression must run on all four native release targets');
+  assert.match(stdio, /run: node --test scripts\/stdio-redirection\.test\.js/);
+  const index = workflow.indexOf('- name: Test native stdio redirection');
+  assert.ok(workflow.indexOf('- name: Build and strip release binary') < index);
+  assert.ok(index < workflow.indexOf('- name: Package release'));
+});
+
+test('the JS suite forwards its selected runtime to native stdio regressions', () => {
+  const runner = readFileSync(new URL('./test-js.js', import.meta.url), 'utf8');
+  const stdio = runner.match(/name: 'native-stdio-redirection',[\s\S]*?\n    },/)?.[0];
+  assert.ok(stdio, 'missing native stdio regression in the JS suite');
+  assert.match(stdio, /env: \{ COTTONTAIL_TEST_BINARY: binaryPath \}/);
+});
+
 test('Linux releases enforce the GLIBC 2.38 public ABI ceiling', () => {
   const validation = step('Validate Linux glibc ABI');
   assert.match(validation, /if: matrix\.os == 'linux'/);

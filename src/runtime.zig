@@ -450,9 +450,9 @@ pub const Runtime = struct {
 
             if (eval_status == -13) return 13;
             // Message and the product-identity crash footer (matching Bun's
-            // trailing "Bun v<v> (<os> <arch>)") share one writer: a second
-            // File.stderr().writer() would rewrite a regular-file stderr from
-            // offset 0 and corrupt the report. The footer is run-mode only;
+            // trailing "Bun v<v> (<os> <arch>)") share one streaming writer,
+            // preserving previous output even when stderr is a regular file.
+            // The footer is run-mode only;
             // `cottontail test` surfaces failures through the bun:test reporter.
             self.writeStderrCrash(
                 if (eval_error != null) errorSpan(eval_error) else "Unknown JavaScript exception",
@@ -741,7 +741,7 @@ pub const Runtime = struct {
 
     fn writeLoadError(self: *Runtime, script_path: []const u8, err: anyerror) void {
         var stderr_buffer: [1024]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writer(self.io, &stderr_buffer);
+        var stderr_writer = std.Io.File.stderr().writerStreaming(self.io, &stderr_buffer);
         const stderr = &stderr_writer.interface;
 
         stderr.print(
@@ -753,7 +753,7 @@ pub const Runtime = struct {
 
     fn writeReloadError(self: *Runtime, message: []const u8) void {
         var stderr_buffer: [1024]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writer(self.io, &stderr_buffer);
+        var stderr_writer = std.Io.File.stderr().writerStreaming(self.io, &stderr_buffer);
         const stderr = &stderr_writer.interface;
 
         var lines = std.mem.splitScalar(u8, message, '\n');
@@ -779,7 +779,7 @@ pub const Runtime = struct {
 
     fn writeStderrLine(self: *Runtime, message: []const u8) void {
         var stderr_buffer: [1024]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writer(self.io, &stderr_buffer);
+        var stderr_writer = std.Io.File.stderr().writerStreaming(self.io, &stderr_buffer);
         const stderr = &stderr_writer.interface;
 
         stderr.print("{s}\n", .{message}) catch {};
@@ -788,7 +788,7 @@ pub const Runtime = struct {
 
     fn writeStderrCrash(self: *Runtime, message: []const u8, with_footer: bool) void {
         var stderr_buffer: [1024]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writer(self.io, &stderr_buffer);
+        var stderr_writer = std.Io.File.stderr().writerStreaming(self.io, &stderr_buffer);
         const stderr = &stderr_writer.interface;
 
         stderr.print("{s}\n", .{message}) catch {};

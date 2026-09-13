@@ -850,6 +850,13 @@ try {
       stdoutIncludes: ['19 pass', '0 fail'],
     },
     {
+      name: 'native-stdio-redirection',
+      executablePath: process.execPath,
+      argv: ['--test', join(rootDir, 'scripts', 'stdio-redirection.test.js')],
+      env: { COTTONTAIL_TEST_BINARY: binaryPath },
+      expectExitCode: 0,
+    },
+    {
       name: 'node-child-process-inherited-sync',
       scriptPath: join(rootDir, 'tests', 'js', 'node-child-process-inherited-sync.ts'),
       expectExitCode: 0,

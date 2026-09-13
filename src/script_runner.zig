@@ -229,7 +229,7 @@ const Context = struct {
 
     fn writeStdout(self: *const Context, comptime fmt: []const u8, args: anytype) void {
         var buffer: [2048]u8 = undefined;
-        var writer = std.Io.File.stdout().writer(self.io, &buffer);
+        var writer = std.Io.File.stdout().writerStreaming(self.io, &buffer);
         const stdout = &writer.interface;
         stdout.print(fmt, args) catch {};
         stdout.flush() catch {};
@@ -242,7 +242,7 @@ const Context = struct {
             return;
         }
         var buffer: [2048]u8 = undefined;
-        var writer = std.Io.File.stderr().writer(self.io, &buffer);
+        var writer = std.Io.File.stderr().writerStreaming(self.io, &buffer);
         const stderr = &writer.interface;
         stderr.print(fmt, args) catch {};
         stderr.flush() catch {};
@@ -2724,7 +2724,7 @@ fn applyRuntimeEnvFlags(io: std.Io, allocator: std.mem.Allocator, exec_args: []c
         if (maxOldSpaceSizeValue(arg)) |size_text| {
             const size_mib = std.fmt.parseUnsigned(usize, size_text, 10) catch {
                 var buffer: [512]u8 = undefined;
-                var writer = std.Io.File.stderr().writer(io, &buffer);
+                var writer = std.Io.File.stderr().writerStreaming(io, &buffer);
                 writer.interface.print(
                     "error: Invalid value for --max-old-space-size: \"{s}\". Must be a non-negative integer\n",
                     .{size_text},
@@ -2734,7 +2734,7 @@ fn applyRuntimeEnvFlags(io: std.Io, allocator: std.mem.Allocator, exec_args: []c
             };
             const size_bytes = std.math.mul(usize, size_mib, 1024 * 1024) catch {
                 var buffer: [512]u8 = undefined;
-                var writer = std.Io.File.stderr().writer(io, &buffer);
+                var writer = std.Io.File.stderr().writerStreaming(io, &buffer);
                 writer.interface.print(
                     "error: Value for --max-old-space-size is too large: \"{s}\"\n",
                     .{size_text},
@@ -2775,7 +2775,7 @@ fn applyRuntimeEnvFlags(io: std.Io, allocator: std.mem.Allocator, exec_args: []c
         if (console_depth) |depth_text| {
             _ = std.fmt.parseUnsigned(u16, depth_text, 10) catch {
                 var buffer: [512]u8 = undefined;
-                var writer = std.Io.File.stderr().writer(io, &buffer);
+                var writer = std.Io.File.stderr().writerStreaming(io, &buffer);
                 writer.interface.print(
                     "error: Invalid value for --console-depth: \"{s}\". Must be a positive integer\n",
                     .{depth_text},
@@ -3621,7 +3621,7 @@ fn runReloadGeneration(
 fn clearReloadScreen(execution: *const ScriptExecution, reload: *const ReloadExecution) void {
     if (!reload.clear_screen or !(std.Io.File.stdout().isTty(execution.io) catch false)) return;
     var buffer: [64]u8 = undefined;
-    var writer = std.Io.File.stdout().writer(execution.io, &buffer);
+    var writer = std.Io.File.stdout().writerStreaming(execution.io, &buffer);
     writer.interface.writeAll("\x1b[2J\x1b[H") catch {};
     writer.interface.flush() catch {};
 }
@@ -4363,7 +4363,7 @@ fn writeCpuProfiles(execution: *ScriptExecution, options: CpuProfileOptions, raw
 
 fn writeStderr(io: std.Io, comptime fmt: []const u8, args: anytype) void {
     var buffer: [2048]u8 = undefined;
-    var writer = std.Io.File.stderr().writer(io, &buffer);
+    var writer = std.Io.File.stderr().writerStreaming(io, &buffer);
     const stderr = &writer.interface;
     stderr.print(fmt, args) catch {};
     stderr.flush() catch {};

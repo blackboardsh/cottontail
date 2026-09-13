@@ -52,7 +52,7 @@ pub fn run(init: std.process.Init, args: []const [:0]const u8) !u8 {
         source = try allocator.dupeZ(u8, arg["--print=".len..]);
     } else {
         var stderr_buffer: [1024]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+        var stderr_writer = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
         try stderr_writer.interface.print("cottontail repl: unknown option '{s}'\n", .{arg});
         try stderr_writer.interface.flush();
         return 1;
@@ -60,7 +60,7 @@ pub fn run(init: std.process.Init, args: []const [:0]const u8) !u8 {
 
     const eval_source = source orelse {
         var stderr_buffer: [1024]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+        var stderr_writer = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
         try stderr_writer.interface.writeAll("cottontail repl: -e/--eval and -p/--print require a script argument\n");
         try stderr_writer.interface.flush();
         return 1;
@@ -78,14 +78,14 @@ pub fn run(init: std.process.Init, args: []const [:0]const u8) !u8 {
 
 fn writeInteractiveBanner(init: std.process.Init) !void {
     var stdout_buffer: [256]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
     try stdout_writer.interface.writeAll(interactive_banner);
     try stdout_writer.interface.flush();
 }
 
 fn writeInteractiveEof(init: std.process.Init) !void {
     var stdout_buffer: [1]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
     try stdout_writer.interface.writeByte('\n');
     try stdout_writer.interface.flush();
 }

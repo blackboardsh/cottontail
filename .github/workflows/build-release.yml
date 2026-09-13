@@ -157,6 +157,9 @@ jobs:
       - name: Validate stripped release binary
         run: node scripts/validate-release-binary.js
 
+      - name: Test native stdio redirection
+        run: node --test scripts/stdio-redirection.test.js
+
       - name: Validate macOS native library portability
         if: matrix.os == 'macos'
         run: node scripts/verify-macos-native-deps.js
