@@ -14,6 +14,7 @@ export const nativeBoundaryFixtures = Object.freeze([
   'node-dgram-peer-loss.mjs',
   'fd-watch-runtime-ownership.mjs',
   'node-dgram-lifecycle.mjs',
+  'runtime-bootstrap-startup.test.ts',
 ]);
 export const nativeBoundaryTimeoutMs = 90_000;
 
@@ -23,7 +24,14 @@ export function nativeBoundaryPlan(root, platform = process.platform) {
     binary,
     jobLauncher: platform === 'win32' ? join(root, 'zig-out', 'bin', 'cottontail-bun-compat-job.exe') : null,
     tests: nativeBoundaryFixtures.map(name => ({
-      name, args: [join(root, 'tests', 'js', name)], timeoutMs: nativeBoundaryTimeoutMs,
+      name,
+      // One explicit absolute test file avoids the Windows multi-file
+      // aggregate's pre-existing zero-test result. This gate intentionally
+      // selects only bytecode identity invalidation (19 tests filtered out).
+      args: name === 'runtime-bootstrap-startup.test.ts'
+        ? ['test', join(root, 'tests', 'js', name), '-t', 'compiled bytecode is embedded']
+        : [join(root, 'tests', 'js', name)],
+      timeoutMs: nativeBoundaryTimeoutMs,
     })),
   };
 }

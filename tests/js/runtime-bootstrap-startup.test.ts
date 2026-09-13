@@ -2,6 +2,7 @@ import { afterAll, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { withOwnedWindowsImageRetry } from "./fixtures/windows-image-sharing-retry.mjs";
 
 const isWindows = process.platform === "win32";
 // Windows x64 currently runs under emulation during bring-up. Keep the
@@ -16,7 +17,8 @@ const coldReadlineTimeoutMs = isWindows ? 30_000 : 5_000;
 const compiledBytecodeTimeoutMs = isWindows ? 30_000 : 5_000;
 const temporaryDirectory = mkdtempSync(join(tmpdir(), "cottontail-runtime-bootstrap-"));
 
-afterAll(() => rmSync(temporaryDirectory, { recursive: true, force: true }));
+afterAll(() => withOwnedWindowsImageRetry(() =>
+  rmSync(temporaryDirectory, { recursive: true, force: true })));
 
 function run(args: string[]) {
   return Bun.spawnSync({
@@ -403,7 +405,9 @@ test("compiled bytecode is embedded and invalidates when source identity changes
   const markerOffset = sourceBytes.indexOf("bytecode-one");
   expect(markerOffset).toBeGreaterThanOrEqual(0);
   sourceBytes.set(Buffer.from("bytecode-two"), markerOffset);
-  writeFileSync(executable, bytes);
+  // Keep the exact executable path and source-identity assertions. Windows
+  // sharing locks can briefly outlive the just-exited standalone process.
+  withOwnedWindowsImageRetry(() => writeFileSync(executable, bytes));
 
   const invalidated = Bun.spawnSync({ cmd: [executable], stdout: "pipe", stderr: "pipe" });
   expect(invalidated.exitCode).toBe(0);

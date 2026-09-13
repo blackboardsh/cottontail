@@ -54,12 +54,16 @@ test('native boundary plan runs exact release binaries directly with bounded fix
     'native-host-namespace-factory.mjs', 'native-host-namespace.mjs',
     'node-worker-internal-loader.mjs', 'node-dgram-peer-loss.mjs',
     'fd-watch-runtime-ownership.mjs', 'node-dgram-lifecycle.mjs',
+    'runtime-bootstrap-startup.test.ts',
   ]);
   for (const platform of ['darwin', 'linux', 'win32']) {
     const plan = nativeBoundaryPlan('/fixture-root', platform);
     assert.equal(plan.binary, join('/fixture-root', 'zig-out/bin', platform === 'win32' ? 'cottontail.exe' : 'cottontail'));
     assert.equal(Boolean(plan.jobLauncher), platform === 'win32');
-    assert.deepEqual(plan.tests.map(test => test.args), nativeBoundaryFixtures.map(name => [join('/fixture-root', 'tests/js', name)]));
+    assert.deepEqual(plan.tests.map(test => test.args), nativeBoundaryFixtures.map(name => name === 'runtime-bootstrap-startup.test.ts'
+      ? ['test', join('/fixture-root', 'tests/js', name), '-t', 'compiled bytecode is embedded']
+      : [join('/fixture-root', 'tests/js', name)]));
+    assert.equal(plan.tests.length, 7);
     assert.ok(plan.tests.every(test => test.timeoutMs === 90_000));
   }
   assert.equal(nativeBoundaryTimeoutMs, 90_000);
@@ -67,6 +71,16 @@ test('native boundary plan runs exact release binaries directly with bounded fix
   assert.doesNotMatch(runner, /scripts\/zig\.js|build-release\.js|\bbun\s+test/);
   assert.match(runner, /startWindowsJobChild/);
   assert.match(runner, /terminateWindowsJobChild/);
+});
+
+test('bytecode release gate preserves the same-path identity assertions and existing test budget', () => {
+  const source = readFileSync(new URL('../tests/js/runtime-bootstrap-startup.test.ts', import.meta.url), 'utf8');
+  assert.match(source, /const compiledBytecodeTimeoutMs = isWindows \? 30_000 : 5_000/);
+  assert.match(source, /withOwnedWindowsImageRetry\(\(\) => writeFileSync\(executable, bytes\)\)/);
+  assert.match(source, /cmd: \[executable\]/);
+  assert.match(source, /expect\(String\(initial\.stdout\)\.trim\(\)\)\.toBe\("bytecode-one"\)/);
+  assert.match(source, /expect\(String\(invalidated\.stdout\)\.trim\(\)\)\.toBe\("bytecode-two"\)/);
+  assert.match(source, /\{ timeout: compiledBytecodeTimeoutMs \}/);
 });
 
 test('native release gate removes source and Desktop runtime overlays', () => {
