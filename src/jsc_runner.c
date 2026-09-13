@@ -34994,6 +34994,12 @@ int ct_jsc_generate_bytecode(
 #if defined(__linux__)
     ct_jsc_configure_gc_signal();
 #endif
+    /* A cold launcher cache creates JSC here before runtime creation. Install
+     * our fallback crash handlers first so JSC can chain them when it installs
+     * its own VM trap handlers. Installing ours later would overwrite JSC's
+     * process-wide signal handling and turn ordinary watchdog traps into fatal
+     * signals when optimized JavaScript is running. */
+    ct_install_crash_handlers();
 #if defined(_WIN32) || defined(__linux__)
     ct_jsc_initialize_main_thread();
 #endif

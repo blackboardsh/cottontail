@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -14,7 +16,7 @@ const probe = join(root, 'tests/js/fixtures/compression-probe.mjs');
 const content = JSON.stringify({ version: '1.2.3', artifact: 'update.app.tar.zst', resources: 'compressed response\n'.repeat(128) });
 const frames = Object.fromEntries(Object.entries({ gzip: gzipSync, deflate: deflateSync, br: brotliCompressSync, zstd: zstdCompressSync }).map(([name, compress]) => [name, compress(Buffer.from(content))]));
 
-async function exerciseRuntime(sandbox) {
+async function exerciseRuntime(sandbox, runtimeEnvironment = {}) {
   const advertised = [];
   const server = createServer((request, response) => {
     const url = new URL(request.url, 'http://localhost');
@@ -28,8 +30,8 @@ async function exerciseRuntime(sandbox) {
   });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
-  const environment = { ...process.env };
-  for (const name of ['COTTONTAIL_RUNTIME_MODULES_DIR', 'DYLD_LIBRARY_PATH', 'DYLD_FALLBACK_LIBRARY_PATH']) delete environment[name];
+  const environment = { ...process.env, ...runtimeEnvironment };
+  for (const name of ['COTTONTAIL_RUNTIME_MODULES_DIR', 'COTTONTAIL_KEEP_TEMP', 'DYLD_LIBRARY_PATH', 'DYLD_FALLBACK_LIBRARY_PATH']) delete environment[name];
   const args = [probe, JSON.stringify({ url: `http://127.0.0.1:${server.address().port}`, content })];
   const child = spawn(sandbox ? '/usr/bin/sandbox-exec' : binary, sandbox ? ['-p', macosWithoutHomebrewProfile, binary, ...args] : args, {
     cwd: root, env: environment, stdio: ['ignore', 'pipe', 'pipe'],
@@ -37,7 +39,7 @@ async function exerciseRuntime(sandbox) {
   let stdout = '', stderr = '';
   child.stdout.setEncoding('utf8').on('data', value => { stdout += value; });
   child.stderr.setEncoding('utf8').on('data', value => { stderr += value; });
-  const timeout = setTimeout(() => child.kill(), 60000);
+  const timeout = setTimeout(() => child.kill('SIGKILL'), 60000);
   try {
     const [code] = await once(child, 'close');
     assert.equal(code, 0, `Compression probe failed:\n${stdout}\n${stderr}`);
@@ -57,3 +59,34 @@ async function exerciseRuntime(sandbox) {
 
 test('bundled codecs decode compressed HTTP in the main thread and workers', { timeout: 70000 }, () => exerciseRuntime(false));
 test('macOS compressed HTTP works with Homebrew entirely inaccessible', { skip: process.platform !== 'darwin', timeout: 70000 }, () => exerciseRuntime(true));
+
+test('cold and warm launcher caches preserve JSC handlers during worker HTTP', { timeout: 140000 }, async (t) => {
+  const cache = mkdtempSync(join(tmpdir(), 'cottontail-compression-cache-'));
+  try {
+    const environment = {
+      COTTONTAIL_TMP_DIR: cache,
+      // Linux arm64 normally uses the baseline JIT. Exercise the optimizing
+      // tier and its signal-based watchdog checks in this regression only.
+      // Shipping defaults remain unchanged, and other platforms keep theirs.
+      ...(process.platform === 'linux' ? { JSC_useDFGJIT: 'true', JSC_usePollingTraps: 'false' } : {}),
+    };
+    let coldArtifacts;
+    for (const state of ['cold', 'warm']) {
+      t.diagnostic(`${state} launcher cache`);
+      await exerciseRuntime(false, environment);
+      const cacheRoot = join(cache, 'cottontail/cache');
+      const names = readdirSync(cacheRoot).filter(name => name.endsWith('.manifest') || name.endsWith('.mjs.jsc')).sort();
+      assert(names.some(name => name.endsWith('.manifest')), 'the cold run must publish a launcher manifest');
+      assert(names.some(name => name.endsWith('.mjs.jsc')), 'the cold run must generate JSC bytecode');
+      const artifacts = names.map(name => {
+        const info = statSync(join(cacheRoot, name), { bigint: true });
+        assert(info.size > 0n);
+        return { name, size: info.size, modified: info.mtimeNs };
+      });
+      if (state === 'cold') coldArtifacts = artifacts;
+      else assert.deepEqual(artifacts, coldArtifacts, 'the warm run must reuse the bytecode and manifest');
+    }
+  } finally {
+    rmSync(cache, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  }
+});
