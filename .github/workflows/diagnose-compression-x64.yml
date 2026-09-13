@@ -5,6 +5,7 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  actions: read
 jobs:
   diagnose:
     runs-on: ubuntu-24.04
@@ -23,29 +24,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang g++ libbrotli-dev libffi-dev libssl-dev libzstd-dev zlib1g-dev gdb
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            runtime/vendors/zig
-            runtime/vendors/jsc
-            runtime/vendors/zig-html-rewriter
-          key: cottontail-linux-x64-v1-${{ hashFiles('runtime/scripts/zig-manifest.json', 'runtime/scripts/jsc-manifest.json', 'runtime/scripts/zig-html-rewriter-manifest.json', 'runtime/vcpkg.json') }}
-      - name: Set up exact canary9 native toolchain
-        working-directory: runtime
+      - name: Reuse the exact first diagnostic executable and symbols
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          node scripts/setup.js
-          node scripts/setup-zig-html-rewriter.js
-          node scripts/setup-jsc.js
-          node scripts/zig.js build test
-      - name: Build maintained release and retain matching unstripped executable
-        working-directory: runtime
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/diagnostics"
-          STRIP="$GITHUB_WORKSPACE/scripts/diagnose-save-strip.sh" COTTONTAIL_DIAGNOSTIC_OUTPUT="$GITHUB_WORKSPACE/diagnostics" node scripts/build-release.js
-          git rev-parse HEAD > "$GITHUB_WORKSPACE/diagnostics/runtime-source-revision.txt"
-          cp scripts/jsc-manifest.json "$GITHUB_WORKSPACE/diagnostics/jsc-manifest.json"
-          sha256sum zig-out/bin/cottontail "$GITHUB_WORKSPACE/diagnostics/cottontail.unstripped" > "$GITHUB_WORKSPACE/diagnostics/executable-sha256.txt"
-          tar -czf "$GITHUB_WORKSPACE/diagnostics/runtime-bin.tar.gz" -C zig-out bin
+          gh run download 34745671151 --repo blackboardsh/cottontail --name canary9-linux-x64-compression-diagnostics --dir seed-runtime
+          mkdir -p diagnostics runtime/zig-out
+          tar -xzf seed-runtime/runtime-bin.tar.gz -C runtime/zig-out
+          cp seed-runtime/cottontail.unstripped diagnostics/cottontail.unstripped
+          cp seed-runtime/runtime-source-revision.txt seed-runtime/jsc-manifest.json seed-runtime/executable-sha256.txt diagnostics/
+          (cd runtime && sha256sum -c ../diagnostics/executable-sha256.txt)
+          git -C runtime rev-parse HEAD
       - name: Preserve first failure and collect GDB/cache/tier comparisons
         run: node scripts/diagnose-compression-x64.mjs runtime diagnostics
       - name: Retain native diagnostic evidence

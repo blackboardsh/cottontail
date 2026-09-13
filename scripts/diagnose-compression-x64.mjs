@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdirSync, writeFileSync, createWriteStream, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, createWriteStream, existsSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { createServer } from 'node:http';
 import { gzipSync, deflateSync, brotliCompressSync, zstdCompressSync } from 'node:zlib';
@@ -83,6 +83,7 @@ handle SIGSEGV nostop noprint pass
 handle SIGABRT nostop noprint pass
 handle SIGUSR1 nostop noprint pass
 handle SIGUSR2 nostop noprint pass
+handle SIG34 nostop noprint pass
 catch syscall rt_sigaction
 commands
 silent
@@ -111,6 +112,7 @@ quit 0
     const result = await execute(name, 'gdb', ['-q', '-nx', '-batch', '-x', gdb], environment(cache, extras));
     result.requests = requests.length;
     result.core = existsSync(core);
+    result.inferiorExitedNormally = /\[Inferior .* exited normally\]/.test(readFileSync(join(output, `${name}.log`), 'utf8'));
     writeFileSync(join(output, 'results.json'), JSON.stringify(records, null, 2));
     console.log(JSON.stringify({ ...result, lastRequest: requests.at(-1) }));
   } finally {
@@ -125,3 +127,7 @@ await trace('gdb-polling-traps-cold', fresh('gdb-polling-traps'), { JSC_usePolli
 await execute('fresh-worker-delayed-termination', process.execPath, ['--test', 'scripts/worker-delayed-termination.test.js'], environment(fresh('worker-delayed')));
 // Diagnostics never reinterpret the failed release gate as resolved by a retry.
 console.log('Diagnostic collection complete; canary9 original release failure remains authoritative.');
+for (const record of records.filter(record => record.name.startsWith('gdb-'))) {
+  assert(record.core || (record.inferiorExitedNormally && record.requests === 24),
+    `Incomplete native GDB trace: ${JSON.stringify(record)}`);
+}
