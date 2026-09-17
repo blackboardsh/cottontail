@@ -23,8 +23,19 @@ function installFdWatchDispatcher() {
   if (!globalThis.__cottontailFdWatchHandlerInstalled && typeof cottontail.fdSetEventHandler === "function") {
     globalThis.__cottontailFdWatchHandlerInstalled = true;
     cottontail.fdSetEventHandler((event) => {
-      const listener = listeners.get(Number(event?.id));
-      if (typeof listener === "function") listener(event);
+      const id = Number(event?.id);
+      const connectListener = globalThis.__cottontailTcpConnectListeners?.get?.(id);
+      if (typeof connectListener === "function") {
+        connectListener(event);
+        return;
+      }
+      const listener = listeners.get(id);
+      if (typeof listener === "function") {
+        listener(event);
+        return;
+      }
+      const tlsListener = globalThis.__cottontailTlsListeners?.get?.(id);
+      if (typeof tlsListener === "function") tlsListener(event);
     });
   }
   return listeners;

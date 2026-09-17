@@ -1623,3 +1623,193 @@ test("a process-group signal reaches the active command tree", async () => {
   skip: process.platform === "win32" ? "Windows uses process-tree termination semantics" : false,
   timeout: 15_000,
 });
+
+for (const scenario of [
+  { mode: "interrupt-cleanup", status: 0 },
+  { mode: "interrupt-cleanup", status: 37 },
+  { mode: "interrupt-default", status: 130 },
+]) {
+  test(`foreground SIGINT preserves ${scenario.mode} status ${scenario.status}`, async () => {
+    const directory = mkdtempSync(join(root, "foreground-interrupt-"));
+    const readyFile = join(directory, "ready");
+    const cleanupFile = join(directory, "cleanup");
+    const command = `${$.escape(process.execPath)} ${$.escape(portableChild)}`;
+    const invocation = createHutchShellInvocation(command, [
+      scenario.mode, readyFile, cleanupFile, String(scenario.status),
+    ]);
+    const child = Bun.spawn(invocation.argv, {
+      cwd: root, stdin: "ignore", stdout: "ignore", stderr: "inherit", detached: true,
+    });
+    let exited = false;
+    let exitTimeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      if (!Number.isSafeInteger(child.pid) || child.pid <= 1) {
+        throw new Error(`invalid detached Hutch pid: ${child.pid}`);
+      }
+      for (let attempt = 0; attempt < 500 && !existsSync(readyFile); attempt++) {
+        await Bun.sleep(10);
+      }
+      expect(existsSync(readyFile)).toBe(true);
+      process.kill(-child.pid, "SIGINT");
+      const status = await Promise.race([
+        child.exited,
+        new Promise<never>((_, reject) => {
+          exitTimeout = setTimeout(() => reject(new Error("interrupted shell did not exit")), 3_000);
+        }),
+      ]);
+      exited = true;
+      expect(status).toBe(scenario.status);
+      // A once-listener dies on a duplicate SIGINT before writing this marker.
+      expect(existsSync(cleanupFile)).toBe(scenario.mode === "interrupt-cleanup");
+      if (scenario.mode === "interrupt-cleanup") {
+        expect(readFileSync(cleanupFile, "utf8")).toBe("done");
+      }
+    } finally {
+      clearTimeout(exitTimeout);
+      if (!exited) {
+        try { process.kill(-child.pid, "SIGKILL"); } catch {}
+        await child.exited.catch(() => {});
+      }
+      invocation.cleanup();
+    }
+  }, {
+    skip: process.platform === "win32" ? "Windows uses console control events" : false,
+    timeout: 10_000,
+  });
+}
+
+async function interruptWaitingHutchShell(
+  invocation: PrivateInvocation,
+  readyFile: string,
+  keepStdinOpen = false,
+) {
+  const child = Bun.spawn(invocation.argv, {
+    cwd: root,
+    stdin: keepStdinOpen ? "pipe" : "ignore",
+    stdout: "ignore",
+    stderr: "inherit",
+    detached: true,
+  });
+  const validPid = Number.isSafeInteger(child.pid) && child.pid > 1;
+  let exitTimeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    if (!validPid) throw new Error(`invalid detached Hutch pid: ${child.pid}`);
+    for (let attempt = 0; attempt < 500 && !existsSync(readyFile); attempt++) {
+      await Bun.sleep(10);
+    }
+    expect(existsSync(readyFile)).toBe(true);
+    process.kill(-child.pid, "SIGINT");
+    return await Promise.race([
+      child.exited,
+      new Promise<never>((_, reject) => {
+        exitTimeout = setTimeout(() => reject(new Error("interrupted shell did not exit")), 3_000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(exitTimeout);
+    // Kill the whole test group even if its wrapper exited first, so a failed
+    // assertion never leaves a child command running in the background.
+    if (validPid) {
+      try { process.kill(-child.pid, "SIGKILL"); } catch {}
+    } else {
+      child.kill("SIGKILL");
+    }
+    if (keepStdinOpen) {
+      try { child.stdin.end(); } catch {}
+    }
+    await child.exited.catch(() => {});
+    invocation.cleanup();
+  }
+}
+
+for (const commandKind of ["command", "compound"]) {
+  test(`foreground SIGINT during ${commandKind} redirect expansion preserves the target file`, async () => {
+    const directory = mkdtempSync(join(root, "redirect-interrupt-"));
+    const readyFile = join(directory, "ready");
+    const cleanupFile = join(directory, "cleanup");
+    const targetFile = join(directory, "existing.txt");
+    writeFileSync(targetFile, "original contents\n");
+    const substitution = [
+      process.execPath, portableChild, "interrupt-cleanup", readyFile,
+      cleanupFile, "37", targetFile,
+    ].map(argument => $.escape(argument)).join(" ");
+    const command = commandKind === "compound" ? "{ echo replaced; }" : "echo replaced";
+    const invocation = createHutchShellInvocation(`${command} > "$(${substitution})"`);
+    expect(await interruptWaitingHutchShell(invocation, readyFile)).toBe(37);
+    expect(readFileSync(cleanupFile, "utf8")).toBe("done");
+    expect(readFileSync(targetFile, "utf8")).toBe("original contents\n");
+  }, {
+    skip: process.platform === "win32" ? "Windows uses console control events" : false,
+    timeout: 10_000,
+  });
+}
+
+test("foreground SIGINT preserves the first substitution status without expanding later words", async () => {
+  const directory = mkdtempSync(join(root, "substitution-interrupt-"));
+  const readyFile = join(directory, "ready");
+  const cleanupFile = join(directory, "cleanup");
+  const continuedFile = join(directory, "continued");
+  const outerFile = join(directory, "outer-command-ran");
+  const substitution = [
+    process.execPath, portableChild, "interrupt-cleanup", readyFile, cleanupFile, "37",
+  ].map(argument => $.escape(argument)).join(" ");
+  const invocation = createHutchShellInvocation(
+    `touch ${$.escape(outerFile)} "$(${substitution})" "$(echo continued > ${$.escape(continuedFile)})"`,
+  );
+  expect(await interruptWaitingHutchShell(invocation, readyFile)).toBe(37);
+  expect(readFileSync(cleanupFile, "utf8")).toBe("done");
+  expect(existsSync(continuedFile)).toBe(false);
+  expect(existsSync(outerFile)).toBe(false);
+}, {
+  skip: process.platform === "win32" ? "Windows uses console control events" : false,
+  timeout: 10_000,
+});
+
+test("foreground SIGINT interrupts builtin cat while stdin remains open", async () => {
+  const directory = mkdtempSync(join(root, "builtin-interrupt-"));
+  const readyFile = join(directory, "ready");
+  // Mark readiness from the input callback itself. This proves the builtin
+  // reached its input read, without closing stdin or depending on startup time.
+  const wrapper = `import { writeFileSync } from "node:fs";\n${shellWrapperSource}`.replace(
+    "input: () => Bun.stdin.stream(),",
+    `input: () => {
+      const stream = Bun.stdin.stream();
+      writeFileSync(${JSON.stringify(readyFile)}, "ready");
+      return stream;
+    },`,
+  );
+  const invocation = createPrivateInvocation("shell", wrapper, ["cat"]);
+  expect(await interruptWaitingHutchShell(invocation, readyFile, true)).toBe(130);
+}, {
+  skip: process.platform === "win32" ? "Windows uses console control events" : false,
+  timeout: 10_000,
+});
+
+for (const scenario of [
+  { mode: "interrupt-default", status: 130, operator: ";" },
+  { mode: "interrupt-cleanup", status: 37, operator: "||" },
+  { mode: "interrupt-cleanup", status: 0, operator: "&&" },
+]) {
+  test(`foreground SIGINT stops subsequent ${scenario.operator} commands while preserving status ${scenario.status}`, async () => {
+    const directory = mkdtempSync(join(root, "compound-interrupt-"));
+    const readyFile = join(directory, "ready");
+    const cleanupFile = join(directory, "cleanup");
+    const continuedFile = join(directory, "continued");
+    const command = [
+      process.execPath, portableChild, scenario.mode, readyFile,
+      cleanupFile, String(scenario.status),
+    ].map(argument => $.escape(argument)).join(" ");
+    const invocation = createHutchShellInvocation(
+      `${command} ${scenario.operator} echo continued > ${$.escape(continuedFile)}`,
+    );
+    expect(await interruptWaitingHutchShell(invocation, readyFile)).toBe(scenario.status);
+    expect(existsSync(continuedFile)).toBe(false);
+    expect(existsSync(cleanupFile)).toBe(scenario.mode === "interrupt-cleanup");
+    if (scenario.mode === "interrupt-cleanup") {
+      expect(readFileSync(cleanupFile, "utf8")).toBe("done");
+    }
+  }, {
+    skip: process.platform === "win32" ? "Windows uses console control events" : false,
+    timeout: 10_000,
+  });
+}

@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 
 const mode = process.argv[2];
@@ -37,6 +37,19 @@ if (mode === "delay") {
   process.stdout.write(`${leaf.pid}\n`);
   setInterval(() => {}, 60_000);
 } else if (mode === "signal-leaf") {
+  setInterval(() => {}, 60_000);
+} else if (mode === "interrupt-cleanup" || mode === "interrupt-default") {
+  const [readyFile, cleanupFile, status, cleanupOutput] = process.argv.slice(3);
+  if (mode === "interrupt-cleanup") {
+    process.once("SIGINT", () => {
+      setTimeout(() => {
+        writeFileSync(cleanupFile, "done");
+        if (cleanupOutput != null) writeFileSync(1, cleanupOutput);
+        process.exit(Number(status));
+      }, 200);
+    });
+  }
+  writeFileSync(readyFile, "ready");
   setInterval(() => {}, 60_000);
 } else if (mode === "tty") {
   process.stdout.write(JSON.stringify([

@@ -198,6 +198,7 @@ function cloneContext(context, {
     hutchStdin: context.hutchStdin,
     hutchShell: context.hutchShell,
     children: context.children,
+    interruption: context.interruption,
   };
 }
 
@@ -219,6 +220,17 @@ function installTaskSignalForwarding(context, enabled) {
     : ["SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM"];
   for (const signal of signals) {
     const handler = () => {
+      // POSIX terminals deliver Ctrl-C to the whole foreground process group.
+      // Hutch's command already receives it; forwarding a second SIGINT can
+      // kill a once-listener's asynchronous cleanup. Interrupt builtin reads
+      // and prevent later commands, but wait for foreground children to finish
+      // and preserve their resulting status. Programmatic cancellation should
+      // likewise signal the process group, as it does for other POSIX shells.
+      if (signal === "SIGINT" && processObject.platform !== "win32") {
+        context.interruption.interrupted = true;
+        for (const interrupt of context.interruption.listeners) interrupt();
+        return;
+      }
       if (reraising) return;
       reraising = true;
       for (const child of context.children) {
@@ -538,6 +550,7 @@ function commandSubstitutionText(value, quoted) {
 async function expandText(text, context, execute, quoted) {
   const output = [];
   for (let index = 0; index < text.length;) {
+    if (context.interruption.interrupted) break;
     if (text.startsWith("$(", index)) {
       let cursor = index + 2;
       let depth = 1;
@@ -695,7 +708,9 @@ async function expandWord(word, context, execute, { assignment = false, redirect
   const expandedFromValue = word.parts.some(part => part.expand && (/\$(?:\(|\{|[A-Za-z_?*@#0-9])/.test(part.text) || part.text.includes("`")));
   const expandedParts = [];
   for (const part of word.parts) {
+    if (context.interruption.interrupted) break;
     const value = part.expand ? await expandText(part.text, context, execute, part.quote !== "unquoted") : part.text;
+    if (context.interruption.interrupted) return [];
     expandedParts.push({
       ...part,
       value: part.quote === "unquoted" ? escapeProtectionMarker(value) : protectShellSyntax(value),
@@ -773,6 +788,7 @@ function fileReason(error, path) {
 async function prepareRedirects(redirects, context, execute) {
   const prepared = [];
   for (const redirect of redirects ?? []) {
+    if (context.interruption.interrupted) break;
     if (redirect.target == null) {
       prepared.push(redirect);
       continue;
@@ -1244,6 +1260,7 @@ export function createBunShellRuntime(host) {
 
   async function executeCompound(node, context, input, name, callback, pipelineOutput = null) {
     const redirects = await prepareRedirects(node.redirects, context, execute);
+    if (context.interruption.interrupted) return { ...result(context.status), shellExit: true };
     const redirectFailure = ambiguousRedirect(redirects, name);
     if (redirectFailure) return redirectFailure;
     const redirected = await setupRedirects(redirects, context, input, name);
@@ -1301,6 +1318,10 @@ export function createBunShellRuntime(host) {
   }
 
   async function execute(node, context, input = bytes(), pipelineOutput = null) {
+    if (context.interruption.interrupted) {
+      if (isStreamingInput(input)) cancelPipelineInput(input);
+      return { ...result(130), shellExit: true };
+    }
     if (node.type === "script") {
       const stdout = [];
       const stderr = [];
@@ -1310,7 +1331,7 @@ export function createBunShellRuntime(host) {
         context.status = current.exitCode;
         stdout.push(current.stdout);
         stderr.push(current.stderr);
-        if (current.shellExit) break;
+        if (current.shellExit || context.interruption.interrupted) break;
         input = followingInput(input);
       }
       return { ...current, exitCode: current.exitCode, stdout: concat(stdout), stderr: concat(stderr) };
@@ -1319,7 +1340,7 @@ export function createBunShellRuntime(host) {
     if (node.type === "binary") {
       const left = await execute(node.left, context, input);
       context.status = left.exitCode;
-      if (left.shellExit) return left;
+      if (left.shellExit || context.interruption.interrupted) return left;
       if ((node.operator === "&&" && left.exitCode !== 0) || (node.operator === "||" && left.exitCode === 0)) return left;
       const right = await execute(node.right, context, followingInput(input));
       return { ...right, exitCode: right.exitCode, stdout: concat([left.stdout, right.stdout]), stderr: concat([left.stderr, right.stderr]) };
@@ -1360,7 +1381,7 @@ export function createBunShellRuntime(host) {
 
     if (node.type === "negate") {
       const commandResult = await execute(node.command, context, input, pipelineOutput);
-      if (commandResult.shellExit) return commandResult;
+      if (commandResult.shellExit || context.interruption.interrupted) return commandResult;
       return { ...commandResult, exitCode: commandResult.exitCode === 0 ? 1 : 0 };
     }
 
@@ -1401,7 +1422,7 @@ export function createBunShellRuntime(host) {
           const condition = await execute(branch.condition, context, redirectedInputBytes);
           output.push(condition.stdout);
           errors.push(condition.stderr);
-          if (condition.shellExit) return { ...condition, stdout: concat(output), stderr: concat(errors) };
+          if (condition.shellExit || context.interruption.interrupted) return { ...condition, stdout: concat(output), stderr: concat(errors) };
           if (condition.exitCode === 0) {
             const consequent = await execute(branch.consequent, context, followingInput(redirectedInputBytes));
             return { ...consequent, stdout: concat([...output, consequent.stdout]), stderr: concat([...errors, consequent.stderr]) };
@@ -1421,6 +1442,7 @@ export function createBunShellRuntime(host) {
         for (const word of node.words) {
           if (word.type === "op") values.push(word.value);
           else values.push(...await expandWord(word, context, execute, { assignment: true }));
+          if (context.interruption.interrupted) return { ...result(context.status), shellExit: true };
         }
         return result(evaluateConditional(values, context) ? 0 : 1);
       }, pipelineOutput);
@@ -1430,6 +1452,7 @@ export function createBunShellRuntime(host) {
       const commandContext = cloneContext(context);
       for (const word of node.assignments) {
         const [expanded = ""] = await expandWord(word, commandContext, execute, { assignment: true });
+        if (context.interruption.interrupted) return { ...result(commandContext.status), shellExit: true };
         const assignment = assignmentParts(expanded);
         if (!assignment) continue;
         commandContext.env[assignment.name] = assignment.value;
@@ -1442,6 +1465,7 @@ export function createBunShellRuntime(host) {
     const commandName = node.words[0]?.raw ?? "";
     if (context.hutchShell === true) context.expansionInput = input;
     const redirects = await prepareRedirects(node.redirects, context, execute);
+    if (context.interruption.interrupted) return { ...result(context.status), shellExit: true };
     const redirectFailure = ambiguousRedirect(redirects, commandName);
     if (redirectFailure) return redirectFailure;
     const redirected = await setupRedirects(redirects, context, input, commandName);
@@ -1456,12 +1480,19 @@ export function createBunShellRuntime(host) {
     let acceptsAssignments = true;
     try {
       for (const word of node.words) {
+        if (context.interruption.interrupted) break;
         const assignment = acceptsAssignments && /^[A-Za-z_][A-Za-z0-9_]*=/.test(word.raw);
         if (!assignment) acceptsAssignments = false;
         expanded.push(...await expandWord(word, context, execute, { assignment }));
       }
     } finally {
       context.expansionStderr = previousExpansionStderr;
+    }
+    // A command substitution can be interrupted while expanding this command.
+    // Do not run the outer command after the foreground child has settled.
+    if (context.interruption.interrupted) {
+      closePreparedRedirects(redirects);
+      return { ...result(context.status, "", concat(expansionErrors)), shellExit: true };
     }
     let expansionStderr = concat(expansionErrors);
     const assignments = [];
@@ -1513,15 +1544,27 @@ export function createBunShellRuntime(host) {
       await writeOutputRoute(outputRoutes.stderr, expansionStderr);
       expansionStderr = bytes();
     }
+    const builtinReadsInheritedStdin = input === HUTCH_SHELL_STDIN && name === "cat" && args.length === 0;
     const builtinInput = input === HUTCH_SHELL_STDIN
-      ? name === "cat" && args.length === 0
+      ? builtinReadsInheritedStdin
         ? commandContext.hutchStdin()
         : bytes()
       : input;
     const builtinOutput = outputRoutes.stdout.kind === "fd" || outputRoutes.stdout.kind === "pipeline"
       ? routeOutputPipeline(outputRoutes.stdout)
         : null;
-    let commandResult = await runBuiltin(name, args, commandContext, builtinInput, builtinOutput);
+    let commandResult;
+    try {
+      commandResult = await runBuiltin(name, args, commandContext, builtinInput, builtinOutput);
+    } finally {
+      // Cancelling Bun.stdin's web reader resolves its read immediately, but
+      // its async iterator can still wait on the underlying Node stdin read.
+      // Release only the inherited input used by this interrupted task so that
+      // its watcher cannot keep the wrapper alive; leave fd 0 open for children.
+      if (builtinReadsInheritedStdin && commandContext.interruption.interrupted) {
+        globalThis.process?.stdin?.unref?.();
+      }
+    }
     if (commandResult != null && commandContext.hutchShell === true && name === "exit") {
       if (args.length === 0) commandResult.exitCode = commandContext.status;
       commandResult.shellExit = true;
@@ -1660,6 +1703,7 @@ export function createBunShellRuntime(host) {
       hutchStdin: hutchTask?.input,
       hutchShell: hutchTask != null,
       children: new Set(),
+      interruption: { interrupted: false, listeners: new Set() },
     };
     const removeSignalForwarding = installTaskSignalForwarding(context, hutchTask != null);
     try {

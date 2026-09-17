@@ -671,7 +671,7 @@ try {
       name: 'hutch-shell-cli',
       argv: ['test', join(rootDir, 'tests', 'js', 'hutch-shell-cli.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: [process.platform === 'win32' ? '55 pass' : '61 pass', '0 fail'],
+      stdoutIncludes: [process.platform === 'win32' ? '55 pass' : '71 pass', '0 fail'],
     },
     {
       name: 'runtime-cli-define',
@@ -972,6 +972,14 @@ try {
       stdoutIncludes: process.platform === 'win32'
         ? ['22 pass', '1 skip', '0 fail']
         : ['23 pass', '0 fail'],
+    },
+    {
+      name: 'process-stdin-network',
+      executablePath: process.execPath,
+      argv: ['--test', '--test-reporter=tap', join(rootDir, 'scripts', 'stdin-network-dispatch.test.js')],
+      env: { COTTONTAIL_TEST_BINARY: binaryPath },
+      expectExitCode: 0,
+      stdoutIncludes: ['# pass 4', '# fail 0'],
     },
     {
       name: 'node-process-host-lifecycle',

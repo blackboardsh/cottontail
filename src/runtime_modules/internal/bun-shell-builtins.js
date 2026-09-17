@@ -258,9 +258,24 @@ function sequence(args) {
   return result(0, output.length ? output.join(separator) + separator + terminator : terminator);
 }
 
-async function readInputBytes(input) {
-  if (input == null || typeof input.getReader !== "function") return bytes(input);
+function interruptibleReader(input, context) {
   const reader = input.getReader();
+  const interruption = context.interruption;
+  const interrupt = () => { reader.cancel().catch(() => {}); };
+  interruption?.listeners.add(interrupt);
+  if (interruption?.interrupted) interrupt();
+  return {
+    reader,
+    release() {
+      interruption?.listeners.delete(interrupt);
+      reader.releaseLock();
+    },
+  };
+}
+
+async function readInputBytes(input, context) {
+  if (input == null || typeof input.getReader !== "function") return bytes(input);
+  const { reader, release } = interruptibleReader(input, context);
   const chunks = [];
   try {
     for (;;) {
@@ -269,7 +284,7 @@ async function readInputBytes(input) {
       chunks.push(bytes(value));
     }
   } finally {
-    reader.releaseLock();
+    release();
   }
   const length = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
   const output = globalThis.Buffer?.alloc ? Buffer.alloc(length) : new Uint8Array(length);
@@ -308,9 +323,9 @@ function catNeedsExternalProcess(args, context) {
   });
 }
 
-async function pipeCatInput(input, output) {
+async function pipeCatInput(input, output, context) {
   if (input == null || typeof input.getReader !== "function") return output.write(bytes(input));
-  const reader = input.getReader();
+  const { reader, release } = interruptibleReader(input, context);
   let complete = false;
   try {
     for (;;) {
@@ -327,7 +342,7 @@ async function pipeCatInput(input, output) {
     if (!complete) {
       try { await reader.cancel(); } catch {}
     }
-    reader.releaseLock();
+    release();
   }
 }
 
@@ -341,7 +356,7 @@ async function cat(args, context, input, pipelineOutput = null) {
     let stderr = "";
     let open = true;
     if (consumesInput) {
-      open = await pipeCatInput(input, pipelineOutput);
+      open = await pipeCatInput(input, pipelineOutput, context);
     } else {
       for (const path of operands) {
         try { open = await pipelineOutput.write(readFileSync(absolute(context, path))); }
@@ -349,11 +364,11 @@ async function cat(args, context, input, pipelineOutput = null) {
         if (!open || stderr) break;
       }
     }
-    return { ...result(stderr ? 1 : open ? 0 : 1, "", stderr), consumedInput: consumesInput, piped: true };
+    return { ...result(context.interruption?.interrupted ? 130 : stderr ? 1 : open ? 0 : 1, "", stderr), consumedInput: consumesInput, piped: true };
   }
 
-  const stdin = consumesInput ? await readInputBytes(input) : bytes();
-  if (operands.length === 0) return { ...result(0, stdin), consumedInput: true };
+  const stdin = consumesInput ? await readInputBytes(input, context) : bytes();
+  if (operands.length === 0) return { ...result(context.interruption?.interrupted ? 130 : 0, stdin), consumedInput: true };
   const chunks = [];
   let stderr = "";
   for (const path of operands) {
