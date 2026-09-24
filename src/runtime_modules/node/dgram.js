@@ -1,6 +1,29 @@
 import { EventEmitter } from "./events.js";
 import { Buffer } from "./buffer.js";
 import { isIP } from "./net.js";
+import { _wrapAsyncCallback } from "./async_hooks.js";
+
+function installFdWatchDispatcher() {
+  const listeners = globalThis.__cottontailFdWatchListeners ??= new Map();
+  if (!globalThis.__cottontailFdWatchHandlerInstalled) {
+    globalThis.__cottontailFdWatchHandlerInstalled = true;
+    cottontail.fdSetEventHandler((event) => {
+      const id = Number(event?.id);
+      const connectListener = globalThis.__cottontailTcpConnectListeners?.get?.(id);
+      if (typeof connectListener === "function") {
+        connectListener(event);
+        return;
+      }
+      const listener = listeners.get(id);
+      if (typeof listener === "function") {
+        listener(event);
+        return;
+      }
+      globalThis.__cottontailTlsListeners?.get?.(id)?.(event);
+    });
+  }
+  return listeners;
+}
 
 function makeNodeError(ErrorType, message, code) {
   const error = new ErrorType(message);
@@ -230,7 +253,9 @@ export class Socket extends EventEmitter {
     this._bindState = "unbound";
     this._connectState = "disconnected";
     this._bindQueue = [];
-    this._pollTimer = null;
+    this._receiveWatchId = 0;
+    this._receiveTimer = null;
+    this._unregisterReceiveWatch = null;
     this._refed = true;
     this._lookup = normalized.lookup;
     this._initialRecvBufferSize = normalized.recvBufferSize;
@@ -332,11 +357,22 @@ export class Socket extends EventEmitter {
           if (this._initialSendBufferSize > 0) cottontail.udpSocketSetBufferSize(this.fd, true, this._initialSendBufferSize);
           this.bound = true;
           this._bindState = "bound";
-          this._startPolling();
+          try {
+            this._startReceiving();
+          } catch (error) {
+            // The descriptor is already bound and cannot be retried as an
+            // unbound socket if receiving could not be initialized.
+            try {
+              this._drainBindQueue(error);
+            } finally {
+              if (!this.closed) this.close();
+            }
+            throw error;
+          }
           this.emit("listening");
           this._drainBindQueue();
         } catch (error) {
-          this._bindState = "unbound";
+          if (!this.closed) this._bindState = "unbound";
           this._drainBindQueue(error);
           this.emit("error", error);
         }
@@ -426,8 +462,7 @@ export class Socket extends EventEmitter {
     this._connectState = "disconnected";
     this.remote = null;
     this._removeAbortSignal();
-    if (this._pollTimer != null) clearInterval(this._pollTimer);
-    this._pollTimer = null;
+    this._stopReceiving();
     this._drainBindQueue(socketNotRunning());
     const fd = this.fd;
     this.fd = null;
@@ -521,13 +556,15 @@ export class Socket extends EventEmitter {
 
   ref() {
     this._refed = true;
-    this._pollTimer?.ref?.();
+    if (this._receiveWatchId) cottontail.fdWatchSetRef(this._receiveWatchId, true);
+    this._receiveTimer?.ref?.();
     return this;
   }
 
   unref() {
     this._refed = false;
-    this._pollTimer?.unref?.();
+    if (this._receiveWatchId) cottontail.fdWatchSetRef(this._receiveWatchId, false);
+    this._receiveTimer?.unref?.();
     return this;
   }
 
@@ -536,10 +573,54 @@ export class Socket extends EventEmitter {
     return new Promise((resolve) => this.close(resolve));
   }
 
-  _startPolling() {
-    if (this._pollTimer != null || this.closed) return;
-    this._pollTimer = setInterval(() => this._poll(), 1);
-    if (!this._refed) this._pollTimer.unref?.();
+  _startReceiving() {
+    if (this._receiveWatchId || this.closed) return;
+    const listeners = installFdWatchDispatcher();
+    // The watcher only reports readiness. recvfrom must read each datagram so
+    // empty packets and sender metadata never go through the stream read path.
+    const watch = cottontail.fdWatchStart(this.fd, 1, this._refed, false, true);
+    const watchId = Number(watch?.id || 0);
+    if (!watchId) throw new Error("failed to watch UDP socket");
+    this._receiveWatchId = watchId;
+    const onEvent = _wrapAsyncCallback((event) => {
+      if (this._receiveWatchId !== watchId) return;
+      if (event.type === "readable") {
+        try {
+          this._poll();
+        } finally {
+          // Readiness pauses the native watch until this drain completes.
+          // A message/error listener may have closed the socket in the meantime.
+          if (this._receiveWatchId === watchId) cottontail.fdWatchSetPaused(watchId, false);
+        }
+      } else if (event.type === "error") {
+        this._stopReceiving();
+        const error = new Error(event.message || "UDP socket receive failed");
+        if (event.code != null) error.code = String(event.code);
+        if (event.errno != null) error.errno = Number(event.errno);
+        this.emit("error", error);
+      }
+    });
+    listeners.set(watchId, (event) => {
+      if (this._receiveWatchId !== watchId) return;
+      // As with net sockets, user callbacks must run outside the native fd
+      // dispatch guard so a nested event loop can continue receiving events.
+      this._receiveTimer = setTimeout(() => {
+        this._receiveTimer = null;
+        onEvent(event);
+      }, 0);
+      if (!this._refed) this._receiveTimer.unref?.();
+    });
+    this._unregisterReceiveWatch = () => listeners.delete(watchId);
+  }
+
+  _stopReceiving() {
+    const watchId = this._receiveWatchId;
+    this._receiveWatchId = 0;
+    this._unregisterReceiveWatch?.();
+    this._unregisterReceiveWatch = null;
+    if (this._receiveTimer != null) clearTimeout(this._receiveTimer);
+    this._receiveTimer = null;
+    if (watchId) cottontail.fdWatchStop(watchId);
   }
 
   _poll() {

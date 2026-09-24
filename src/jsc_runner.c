@@ -11418,7 +11418,10 @@ static JSValueRef ct_udp_socket_receive(JSContextRef ctx, JSObjectRef function, 
         ct_throw_message(ctx, exception, "invalid UDP socket");
         return JSValueMakeUndefined(ctx);
     }
-    if ((poll_fd.revents & POLLIN) == 0) return JSValueMakeNull(ctx);
+    // A connected UDP socket can report an ICMP error as POLLERR alone.
+    // recvfrom consumes that pending error; leaving it queued would repeatedly
+    // wake a readiness watcher after JavaScript rearms the socket.
+    if ((poll_fd.revents & (POLLIN | POLLERR)) == 0) return JSValueMakeNull(ctx);
 #endif
 
     char *buffer = (char *)malloc(max_bytes > 0 ? max_bytes : 1);
