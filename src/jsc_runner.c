@@ -23568,16 +23568,38 @@ static void ct_fd_watcher_uv_poll(uv_poll_t *handle, int status, int events) {
     CtFdWatcher *watcher = (CtFdWatcher *)handle->data;
     if (watcher == NULL || !ct_fd_watcher_is_active(watcher)) return;
 
+    bool readable = false;
+    bool writable = false;
+    bool readiness_only = false;
+    ct_fd_watcher_get_interest(watcher, &readable, &writable, &readiness_only);
+
+    if (status == UV_EBADF && readable && readiness_only) {
+        // libuv's Unix poll backend reports POLLERR as UV_EBADF and stops
+        // polling. For a valid UDP socket this can be a pending ICMP error,
+        // not a dead descriptor. Deliver one readable notification so recvfrom
+        // consumes the error before JavaScript rearms this same watch.
+        int socket_type = 0;
+        socklen_t socket_type_len = sizeof(socket_type);
+        if (getsockopt(watcher->fd, SOL_SOCKET, SO_TYPE, &socket_type, &socket_type_len) == 0 &&
+            socket_type == SOCK_DGRAM) {
+            struct pollfd poll_fd = { .fd = watcher->fd, .events = POLLIN, .revents = 0 };
+            int ready;
+            do {
+                ready = poll(&poll_fd, 1, 0);
+            } while (ready < 0 && errno == EINTR);
+            if (ready > 0 && (poll_fd.revents & (POLLERR | POLLNVAL)) == POLLERR) {
+                status = 0;
+                events |= UV_READABLE;
+            }
+        }
+    }
+
     if (status < 0) {
         ct_queue_fd_error(watcher->runtime, watcher->id, -status, uv_strerror(status));
         ct_fd_watcher_close_uv(watcher);
         return;
     }
 
-    bool readable = false;
-    bool writable = false;
-    bool readiness_only = false;
-    ct_fd_watcher_get_interest(watcher, &readable, &writable, &readiness_only);
     bool writable_ready = writable && (events & (UV_WRITABLE | UV_DISCONNECT)) != 0 &&
         ct_fd_watcher_take_writable(watcher);
     bool readable_ready = readable && readiness_only && (events & (UV_READABLE | UV_DISCONNECT)) != 0 &&

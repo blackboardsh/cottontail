@@ -18,6 +18,7 @@ async function connectedPeerRecovery(client, family, address, peerPort) {
   let receiveCalls = 0;
   try {
     await new Promise((resolve) => client.connect(peerPort, address, resolve));
+    const receiveWatchId = client._receiveWatchId;
     if (nativeReceive) {
       cottontail.udpSocketReceive = (...args) => { receiveCalls++; return nativeReceive(...args); };
     }
@@ -26,7 +27,11 @@ async function connectedPeerRecovery(client, family, address, peerPort) {
     // Either path must consume the pending error and return the socket to idle.
     await delay(150);
     assert.ok(receiveCalls < 10, `${family}: an ICMP error must not cause repeated receive readiness`);
-    if (nativeReceive) cottontail.udpSocketReceive = nativeReceive;
+    if (nativeReceive) {
+      assert.ok(receiveWatchId > 0, `${family}: the connected socket must have an active receive watch`);
+      assert.equal(client._receiveWatchId, receiveWatchId, `${family}: an ICMP error must preserve the receive watch`);
+      cottontail.udpSocketReceive = nativeReceive;
+    }
 
     await bind(replacement, address, peerPort);
     const packet = new Promise((resolve, reject) => {
