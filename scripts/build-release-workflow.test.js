@@ -66,6 +66,7 @@ test('native boundary plan runs exact release binaries directly with bounded fix
     'native-host-namespace-factory.mjs', 'native-host-namespace.mjs',
     'node-worker-internal-loader.mjs', 'node-dgram-peer-loss.mjs',
     'fd-watch-runtime-ownership.mjs', 'node-dgram-lifecycle.mjs',
+    'runtime-active-handles.mjs', 'idle-runtime.test.ts', 'bun-serve-idle-lifecycle.mjs',
     'runtime-bootstrap-startup.test.ts',
   ]);
   for (const platform of ['darwin', 'linux', 'win32']) {
@@ -74,8 +75,9 @@ test('native boundary plan runs exact release binaries directly with bounded fix
     assert.equal(Boolean(plan.jobLauncher), platform === 'win32');
     assert.deepEqual(plan.tests.map(test => test.args), nativeBoundaryFixtures.map(name => name === 'runtime-bootstrap-startup.test.ts'
       ? ['test', join('/fixture-root', 'tests/js', name), '-t', 'compiled bytecode is embedded']
+      : name.endsWith('.test.ts') ? ['test', join('/fixture-root', 'tests/js', name)]
       : [join('/fixture-root', 'tests/js', name)]));
-    assert.equal(plan.tests.length, 7);
+    assert.equal(plan.tests.length, 10);
     assert.ok(plan.tests.every(test => test.timeoutMs === 90_000));
   }
   assert.equal(nativeBoundaryTimeoutMs, 90_000);

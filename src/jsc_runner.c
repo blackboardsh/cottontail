@@ -2608,6 +2608,7 @@ static uint32_t ct_next_atomic_async_waiter_id = 1;
 
 typedef struct CtHttpRequest {
     uint32_t id;
+    struct CtHttpServer *server;
     int client_fd;
     char *method;
     char *url;
@@ -2654,6 +2655,8 @@ typedef struct CtHttpRequest {
 
 typedef struct CtHttpServer {
     uint32_t id;
+    uint32_t event_id;
+    bool referenced;
     int listen_fd;
     uint16_t port;
     size_t max_body_size;
@@ -3681,6 +3684,10 @@ static int ct_http_body_buffer_append(CtHttpRequest *request, const char *data, 
     return 0;
 }
 
+static void ct_http_server_notify(CtHttpServer *server) {
+    ct_queue_fd_simple(server->runtime, server->event_id, "httpReady", NULL);
+}
+
 static int ct_http_body_buffer_complete(CtHttpRequest *request) {
     if (request->body_buffer_capacity != request->body_buffer_len) {
         char *exact = ct_http_body_chunk_alloc(request->body_buffer_len);
@@ -3694,6 +3701,7 @@ static int ct_http_body_buffer_complete(CtHttpRequest *request) {
     }
     request->body_buffering_complete = true;
     pthread_cond_broadcast(&request->cond);
+    ct_http_server_notify(request->server);
     return 0;
 }
 
@@ -4471,6 +4479,7 @@ static void ct_http_request_mark_aborted(CtHttpRequest *request) {
         request->body_forwarding_reported = true;
         request->body_buffering_reported = true;
         pthread_cond_broadcast(&request->cond);
+        ct_http_server_notify(request->server);
     }
     pthread_mutex_unlock(&request->mutex);
 }
@@ -4528,6 +4537,7 @@ static void ct_http_finish_forwarded_body(CtHttpRequest *request, bool failed) {
     request->body_forwarding_complete = true;
     request->completed = true;
     pthread_cond_broadcast(&request->cond);
+    ct_http_server_notify(request->server);
     pthread_mutex_unlock(&request->mutex);
 }
 
@@ -4768,6 +4778,7 @@ static int ct_http_process_request_body(CtHttpServer *server, CtHttpRequest *req
                 request->body_complete = true;
                 request->keep_alive = false;
                 pthread_cond_broadcast(&request->cond);
+                ct_http_server_notify(server);
                 pthread_mutex_unlock(&request->mutex);
                 return -1;
             }
@@ -4778,6 +4789,7 @@ static int ct_http_process_request_body(CtHttpServer *server, CtHttpRequest *req
                 request->client_aborted = true;
                 request->keep_alive = false;
                 pthread_cond_broadcast(&request->cond);
+                ct_http_server_notify(server);
             }
             pthread_mutex_unlock(&request->mutex);
             return complete_status == 0 ? 0 : -1;
@@ -4820,6 +4832,7 @@ static int ct_http_process_request_body(CtHttpServer *server, CtHttpRequest *req
             body_status = -1;
             pthread_cond_broadcast(&request->cond);
         }
+        if (piece != NULL || body_status == 2 || body_status < 0) ct_http_server_notify(server);
         pthread_mutex_unlock(&request->mutex);
 
         if (body_status == 0) continue;
@@ -4904,6 +4917,7 @@ static void ct_http_server_finish_request(CtHttpServer *server, CtHttpRequest *r
         cursor = &(*cursor)->next;
     }
     if (server->active_clients > 0) server->active_clients -= 1;
+    ct_http_server_notify(server);
     pthread_cond_broadcast(&server->clients_cond);
     pthread_mutex_unlock(&server->mutex);
 }
@@ -4948,6 +4962,7 @@ static void *ct_http_client_thread(void *opaque) {
 
         pthread_mutex_lock(&server->mutex);
         request->ready = true;
+        ct_http_server_notify(server);
         pthread_mutex_unlock(&server->mutex);
 
         int body_status = ct_http_process_request_body(server, request, &input);
@@ -4997,6 +5012,7 @@ static void *ct_http_server_thread(void *opaque) {
             continue;
         }
         request->client_fd = client_fd;
+        request->server = server;
         request->status = 200;
         pthread_mutex_init(&request->mutex, NULL);
         pthread_cond_init(&request->cond, NULL);
@@ -11160,6 +11176,16 @@ static int ct_udp_family_from_arg(JSContextRef ctx, JSValueRef value) {
 }
 
 static int ct_udp_resolve_address(JSContextRef ctx, const char *address, int port, int family, struct sockaddr_storage *storage, socklen_t *storage_len, JSValueRef *exception) {
+    /* Most UDP sends already have a numeric peer address. Avoid invoking the
+     * OS resolver for every packet, while retaining its hostname, wildcard,
+     * scoped IPv6, and address-family validation behavior. inet_pton in the
+     * shared helper only accepts unscoped numeric addresses. */
+    if (address != NULL && address[0] != 0 &&
+        ct_dns_sockaddr(address, port, storage, storage_len) == 0 &&
+        storage->ss_family == family) {
+        return 0;
+    }
+
     char port_text[32];
     snprintf(port_text, sizeof(port_text), "%d", port);
 
@@ -28294,7 +28320,7 @@ static void *ct_worker_entry(void *opaque) {
         "g.__cottontailRunLoopTick=()=>{"
         "g.__cottontailPollWorkerMessages();"
         "if(cottontail.drainJobs)cottontail.drainJobs();"
-        "return 16;"
+        "return 50;"
         "};"
         "})();";
 
@@ -30895,6 +30921,8 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
         return JSValueMakeUndefined(ctx);
     }
     server->listen_fd = listen_fd;
+    server->event_id = ct_next_fd_event_id();
+    server->referenced = true;
     server->port = bound_port;
     server->max_body_size = max_body_size;
     server->hostname = unix_path == NULL ? ct_duplicate_string(hostname) : NULL;
@@ -30942,6 +30970,7 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
         ct_set_property(ctx, result, "port", JSValueMakeNumber(ctx, server->port), exception);
         ct_set_property(ctx, result, "hostname", ct_make_string(ctx, server->hostname), exception);
     }
+    ct_set_property(ctx, result, "eventId", JSValueMakeNumber(ctx, server->event_id), exception);
     free(hostname_arg);
     return result;
 }
@@ -31658,6 +31687,19 @@ static JSValueRef ct_http_server_stop(JSContextRef ctx, JSObjectRef function, JS
     CtHttpServer *server = ct_http_find_server(server_id);
     pthread_mutex_unlock(&ct_http_servers_mutex);
     if (server != NULL) ct_http_stop_server(server, true, abrupt);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_http_server_set_ref(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    if (argc < 2) return JSValueMakeUndefined(ctx);
+    uint32_t server_id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    pthread_mutex_lock(&ct_http_servers_mutex);
+    CtHttpServer *server = ct_http_find_server(server_id);
+    if (server != NULL) server->referenced = JSValueToBoolean(ctx, argv[1]);
+    pthread_mutex_unlock(&ct_http_servers_mutex);
     return JSValueMakeUndefined(ctx);
 }
 
@@ -33105,7 +33147,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
         "  let assignedRunLoopTick;"
         "  const nativeTimerTick = function(){"
         "    cottontail.timerTick();"
-        "    return typeof assignedRunLoopTick === 'function' ? assignedRunLoopTick() : 16;"
+        "    return typeof assignedRunLoopTick === 'function' ? assignedRunLoopTick() : 50;"
         "  };"
         "  Object.defineProperty(g, '__cottontailRunLoopTick', {"
         "    configurable: true,"
@@ -34726,6 +34768,15 @@ static bool ct_runtime_has_pending_native_events(CtJscRuntime *runtime) {
     if (runtime->inspector != NULL && ct_jsc_inspector_keeps_event_loop_alive(runtime->inspector)) return true;
     if (runtime->napi_env != NULL && ct_napi_env_has_pending_work(runtime->napi_env)) return true;
     if (runtime->uv_loop_initialized && uv_loop_alive(&runtime->uv_loop)) return true;
+    pthread_mutex_lock(&ct_http_servers_mutex);
+    for (CtHttpServer *server = ct_http_servers; server != NULL; server = server->next) {
+        if (server->runtime == runtime && server->referenced) {
+            pending = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ct_http_servers_mutex);
+    if (pending) return true;
     for (size_t index = 0; index < runtime->signal_watcher_count; index += 1) {
         if (runtime->signal_watchers[index].pending > 0) return true;
     }
@@ -34774,12 +34825,29 @@ static int ct_jsc_runtime_has_active_handles(CtJscRuntime *runtime, bool *has_ac
         return 0;
     }
     JSContextRef ctx = runtime->context;
-    JSStringRef source = ct_js_string(
-        "globalThis.__cottontailHasActiveHandles ? globalThis.__cottontailHasActiveHandles() : false"
-    );
+    JSObjectRef global = JSContextGetGlobalObject(ctx);
     JSValueRef exception = NULL;
-    JSValueRef value = JSEvaluateScript(ctx, source, NULL, NULL, 1, &exception);
-    JSStringRelease(source);
+    JSValueRef value = JSValueMakeBoolean(ctx, false);
+    JSValueRef hook = ct_get_property(ctx, global, "__cottontailHasActiveHandles", &exception);
+    if (exception == NULL && hook != NULL && JSValueToBoolean(ctx, hook)) {
+        /* This check runs on every idle turn. Calling the existing hook avoids
+         * repeatedly compiling/evaluating a script and entering JSC's script
+         * evaluation bookkeeping. Keep the original conditional expression's
+         * second lookup, dynamic replacement, and global receiver semantics. */
+        hook = ct_get_property(ctx, global, "__cottontailHasActiveHandles", &exception);
+        if (exception == NULL) {
+            JSObjectRef callback = hook != NULL && JSValueIsObject(ctx, hook)
+                ? JSValueToObject(ctx, hook, &exception)
+                : NULL;
+            if (exception == NULL) {
+                if (callback == NULL || !JSObjectIsFunction(ctx, callback)) {
+                    ct_throw_type_error(ctx, &exception, "globalThis.__cottontailHasActiveHandles is not a function");
+                } else {
+                    value = JSObjectCallAsFunction(ctx, callback, global, 0, NULL, &exception);
+                }
+            }
+        }
+    }
     if (exception != NULL) {
         ct_set_error_out(error_out, ct_copy_exception(ctx, exception));
         return -1;
@@ -35289,7 +35357,7 @@ int ct_jsc_runtime_emit_process_shutdown(
 
 static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_out, char **error_out) {
     if (error_out != NULL) *error_out = NULL;
-    if (delay_ms_out != NULL) *delay_ms_out = 16;
+    if (delay_ms_out != NULL) *delay_ms_out = 50;
     if (ct_jsc_runtime_should_terminate(runtime)) return -1;
     JSContextRef ctx = runtime->context;
     ct_jsc_run_loop_cycle();
@@ -35334,7 +35402,7 @@ static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_o
     }
     ct_jsc_drain_microtasks(ctx);
     if (ct_take_routed_fatal_exception(runtime, error_out) != 0) return -1;
-    int js_delay_ms = 16;
+    int js_delay_ms = 50;
     if (value != NULL && !JSValueIsUndefined(ctx, value) && !JSValueIsNull(ctx, value)) {
         JSValueRef number_exception = NULL;
         double delay = JSValueToNumber(ctx, value, &number_exception);
@@ -35351,6 +35419,10 @@ static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_o
         int delay_ms = ct_timer_next_delay_ms(runtime, &timer_delay_ms) && timer_delay_ms < js_delay_ms
             ? timer_delay_ms
             : js_delay_ms;
+        // Native IO and cross-thread messages wake libuv immediately. JSC's
+        // separate run loop still needs a bounded pump; keep the inspector's
+        // existing cadence because its dispatch queue does not wake libuv.
+        if (runtime->inspector != NULL && delay_ms > 16) delay_ms = 16;
         if (runtime->uv_loop_initialized && uv_loop_alive(&runtime->uv_loop)) {
             int uv_delay_ms = uv_backend_timeout(&runtime->uv_loop);
             if (uv_delay_ms >= 0 && uv_delay_ms < delay_ms) delay_ms = uv_delay_ms;

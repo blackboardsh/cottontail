@@ -14,6 +14,9 @@ export const nativeBoundaryFixtures = Object.freeze([
   'node-dgram-peer-loss.mjs',
   'fd-watch-runtime-ownership.mjs',
   'node-dgram-lifecycle.mjs',
+  'runtime-active-handles.mjs',
+  'idle-runtime.test.ts',
+  'bun-serve-idle-lifecycle.mjs',
   'runtime-bootstrap-startup.test.ts',
 ]);
 export const nativeBoundaryTimeoutMs = 90_000;
@@ -30,6 +33,7 @@ export function nativeBoundaryPlan(root, platform = process.platform) {
       // selects only bytecode identity invalidation (19 tests filtered out).
       args: name === 'runtime-bootstrap-startup.test.ts'
         ? ['test', join(root, 'tests', 'js', name), '-t', 'compiled bytecode is embedded']
+        : name.endsWith('.test.ts') ? ['test', join(root, 'tests', 'js', name)]
         : [join(root, 'tests', 'js', name)],
       timeoutMs: nativeBoundaryTimeoutMs,
     })),

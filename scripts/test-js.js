@@ -1251,6 +1251,12 @@ try {
       stdoutIncludes: ['node dgram lifecycle passed'],
     },
     {
+      name: 'bun-serve-idle-lifecycle',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-serve-idle-lifecycle.mjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['bun serve idle lifecycle passed'],
+    },
+    {
       name: 'node-tls-http2-surface',
       scriptPath: join(rootDir, 'tests', 'js', 'node-tls-http2-surface.ts'),
       expectExitCode: 0,
@@ -1311,6 +1317,18 @@ try {
       scriptPath: join(rootDir, 'tests', 'js', 'timer-clock.ts'),
       expectExitCode: 0,
       stdoutIncludes: ['timer clock passed'],
+    },
+    {
+      name: 'runtime-active-handles',
+      scriptPath: join(rootDir, 'tests', 'js', 'runtime-active-handles.mjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['runtime active handles passed'],
+    },
+    {
+      name: 'idle-runtime',
+      argv: ['test', join(rootDir, 'tests', 'js', 'idle-runtime.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['3 pass', '0 fail'],
     },
     {
       name: 'worker-request-response',

@@ -1,3 +1,21 @@
+function installNativeServeEvent(binding, eventId, callback) {
+  const listeners = globalThis.__cottontailFdWatchListeners ??= new Map();
+  if (!globalThis.__cottontailFdWatchHandlerInstalled) {
+    globalThis.__cottontailFdWatchHandlerInstalled = true;
+    binding.fdSetEventHandler((event) => {
+      const id = Number(event?.id);
+      const listener = globalThis.__cottontailTcpConnectListeners?.get?.(id)
+        ?? globalThis.__cottontailFdWatchListeners?.get?.(id)
+        ?? globalThis.__cottontailTlsListeners?.get?.(id);
+      if (typeof listener === "function") listener(event);
+    });
+  }
+  listeners.set(eventId, (event) => {
+    if (event?.type === "httpReady") callback();
+  });
+  return () => listeners.delete(eventId);
+}
+
 export function startNativeServe(options, runtime) {
   const {
     CottontailAbortController,
@@ -107,7 +125,9 @@ export function startNativeServe(options, runtime) {
   let activeOptions = options;
   let nativeClosed = false;
   let pumping = false;
-  let interval = null;
+  let referenced = true;
+  let pumpTimer = null;
+  let removeNativeListener = () => {};
   let publicUrl = null;
   const requestTargetCache = { version: 0, target: null, url: null };
   const maxConcurrentNativeRequests = 256;
@@ -161,11 +181,15 @@ export function startNativeServe(options, runtime) {
         return dispatchServeFetch(activeOptions, server, input, init);
       },
       ref() {
-        interval?.ref?.();
+        referenced = true;
+        if (!nativeClosed) cottontail.httpServerSetRef(native.id, true);
+        pumpTimer?.ref?.();
         return server;
       },
       unref() {
-        interval?.unref?.();
+        referenced = false;
+        if (!nativeClosed) cottontail.httpServerSetRef(native.id, false);
+        pumpTimer?.unref?.();
         return server;
       },
       requestIP(request) {
@@ -205,14 +229,21 @@ export function startNativeServe(options, runtime) {
       error.code = "ECONNRESET";
       return error;
     };
-  let bodyPumpQueued = false;
   const scheduleNativeBodyPump = () => {
-      if (nativeClosed || bodyPumpQueued) return;
-      bodyPumpQueued = true;
-      queueMicrotask(() => {
-        bodyPumpQueued = false;
+      if (nativeClosed || pumpTimer != null) return;
+      // Dispatch handlers outside the native event-dispatch guard, just as
+      // socket callbacks do. Native request/body/close events wake this pump;
+      // an idle HTTP listener needs no recurring JavaScript timer.
+      pumpTimer = setTimeout(() => {
+        pumpTimer = null;
         pump();
-      });
+      }, 0);
+      if (!referenced) pumpTimer.unref?.();
+    };
+  const disposeNativeEvents = () => {
+      removeNativeListener();
+      if (pumpTimer != null) clearTimeout(pumpTimer);
+      pumpTimer = null;
     };
   const createNativeRequestState = (item) => createNativeServeRequestState(item, {
       binding: cottontail,
@@ -436,10 +467,7 @@ export function startNativeServe(options, runtime) {
       const status = cottontail.httpServerStatus(native.id);
       if (status == null || Number(status.activeClients) !== 0) return;
       nativeClosed = true;
-      if (interval != null) {
-        clearInterval(interval);
-        interval = null;
-      }
+      disposeNativeEvents();
       cottontail.httpServerStop(native.id, false);
       lifecycle.markTransportDrained();
     };
@@ -452,10 +480,7 @@ export function startNativeServe(options, runtime) {
           operation.dispose();
         }
         nativeClosed = true;
-        if (interval != null) {
-          clearInterval(interval);
-          interval = null;
-        }
+        disposeNativeEvents();
         nativeRequests.clear();
         cottontail.httpServerStop(native.id, true);
         lifecycle.markTransportDrained();
@@ -470,13 +495,17 @@ export function startNativeServe(options, runtime) {
     };
   const pump = () => {
       if (nativeClosed || pumping) return;
-      if (globalThis.__cottontailProcessIpcPending === true) return;
+      if (globalThis.__cottontailProcessIpcPending === true) {
+        scheduleNativeBodyPump();
+        return;
+      }
       pumping = true;
       pollNativeRequestEvents();
       if ((globalThis.__cottontailPollProcessIpc?.() ?? 0) > 0) {
         cottontail.drainJobs?.();
         pumping = false;
         maybeFinishNativeStop();
+        scheduleNativeBodyPump();
         return;
       }
       while (!nativeClosed && server.pendingRequests < maxConcurrentNativeRequests) {
@@ -507,7 +536,7 @@ export function startNativeServe(options, runtime) {
       pumping = false;
       maybeFinishNativeStop();
     };
-  interval = setInterval(pump, 1);
+  removeNativeListener = installNativeServeEvent(cottontail, native.eventId, scheduleNativeBodyPump);
   pump();
   return finalizeServeInspector(server, activeOptions, inspectorReload);
 }

@@ -79,6 +79,20 @@ if (mode) {
       a.send("after idle", b.address().port, address);
       assert.equal(await nextPacket, "after idle");
 
+      // Numeric peers bypass native name resolution, while names and scoped
+      // IPv6 addresses must still use the OS resolver. Exercise actual packets
+      // so the sockaddr family, port byte order, and IPv6 scope stay intact.
+      for (const target of type === "udp4" ? ["localhost"] : ["0:0:0:0:0:0:0:1", "::1%0"]) {
+        const marker = `resolved peer ${target}`;
+        const packet = new Promise((resolve) => b.once("message", (data, info) => {
+          resolve({ text: data.toString(), address: info.address, port: info.port });
+        }));
+        await new Promise((resolve, reject) => {
+          a.send(marker, b.address().port, target, (error) => error ? reject(error) : resolve());
+        });
+        assert.deepEqual(await packet, { text: marker, address, port: a.address().port });
+      }
+
       const watchId = b._receiveWatchId;
       const closed = new Promise((resolve) => b.once("close", resolve));
       let callbacks = 0;
@@ -106,6 +120,21 @@ if (mode) {
     }
   }
   if (typeof cottontail !== "undefined") {
+    for (const [family, wildcard] of [[4, "0.0.0.0"], [6, "::"]]) {
+      const { fd } = cottontail.udpSocketCreate(family);
+      try {
+        if (family === 4) {
+          assert.throws(() => cottontail.udpSocketBind(fd, 0, "::1", family),
+            undefined, "An IPv6 address must not bypass IPv4 resolver validation");
+        }
+        const bound = cottontail.udpSocketBind(fd, 0, null, family);
+        assert.equal(bound.address, wildcard, "Missing bind addresses retain the OS wildcard behavior");
+        assert.equal(bound.family, `IPv${family}`);
+        assert.ok(bound.port > 0);
+      } finally {
+        cottontail.udpSocketClose(fd);
+      }
+    }
     const socket = createSocket("udp4");
     const fd = socket.fd;
     const nativeStart = cottontail.fdWatchStart;

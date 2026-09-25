@@ -2678,7 +2678,9 @@ function installWorkerNativeEventHandler() {
 }
 
 function nextRunLoopDelay(now = timerNow()) {
-  let nextDelay = 16;
+  // IO and worker messages wake the native loop directly. Keep a bounded
+  // fallback for JSC's separate run loop without waking every runtime at 60 Hz.
+  let nextDelay = 50;
   for (const timer of timers.values()) {
     const delay = timer.deadline - now;
     if (delay <= 0) return 1;
