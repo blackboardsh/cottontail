@@ -9669,6 +9669,7 @@ static JSValueRef ct_route_uncaught_exception_host(
 static int ct_dispatch_timers(CtJscRuntime *runtime, char **error_out) {
     if (runtime->timer_heap_len == 0) return 0;
     uint64_t now = ct_timer_now_ns();
+    if (runtime->timer_heap[0]->deadline_ns > now) return 0;
     size_t due_capacity = runtime->timer_heap_len;
     CtTimer **due = (CtTimer **)malloc(due_capacity * sizeof(*due));
     if (due == NULL) {
@@ -27803,9 +27804,8 @@ static int ct_worker_queue_push_locked(CtWorkerMessage **head, CtWorkerMessage *
     return 0;
 }
 
-static JSObjectRef ct_worker_drain_queue(JSContextRef ctx, CtWorker *worker, bool parent_to_worker, JSValueRef *exception) {
+static JSValueRef ct_worker_drain_queue(JSContextRef ctx, CtWorker *worker, bool parent_to_worker, bool skip_empty, JSValueRef *exception) {
     CtWorkerMessage *head = NULL;
-    JSObjectRef array = ct_make_array(ctx, 0, NULL, exception);
     uint32_t index = 0;
 
     pthread_mutex_lock(&worker->mutex);
@@ -27820,6 +27820,10 @@ static JSObjectRef ct_worker_drain_queue(JSContextRef ctx, CtWorker *worker, boo
     }
     pthread_mutex_unlock(&worker->mutex);
 
+    /* Internal idle polling can avoid a fresh array without changing the
+     * default array return contract for callers of the native binding. */
+    if (head == NULL && skip_empty) return JSValueMakeNull(ctx);
+    JSObjectRef array = ct_make_array(ctx, 0, NULL, exception);
     while (head != NULL) {
         CtWorkerMessage *next = head->next;
         JSObjectSetPropertyAtIndex(ctx, array, index++, ct_make_string(ctx, head->json), exception);
@@ -27882,13 +27886,11 @@ static JSValueRef ct_worker_post_message(JSContextRef ctx, JSObjectRef function,
 
 static JSValueRef ct_worker_poll_incoming_messages(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
-    (void)argc;
-    (void)argv;
     CtJscRuntime *runtime = ct_callback_runtime(function);
     if (runtime == NULL || runtime->worker == NULL) {
         return ct_make_array(ctx, 0, NULL, exception);
     }
-    return ct_worker_drain_queue(ctx, runtime->worker, true, exception);
+    return ct_worker_drain_queue(ctx, runtime->worker, true, argc > 0 && JSValueToBoolean(ctx, argv[0]), exception);
 }
 
 static JSValueRef ct_worker_post_message_to(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -27943,7 +27945,7 @@ static JSValueRef ct_worker_poll_messages(JSContextRef ctx, JSObjectRef function
     if (worker == NULL) {
         return ct_make_array(ctx, 0, NULL, exception);
     }
-    return ct_worker_drain_queue(ctx, worker, false, exception);
+    return ct_worker_drain_queue(ctx, worker, false, false, exception);
 }
 
 static int *ct_worker_stdio_slot(CtWorker *worker, const char *stream, bool write_side) {
@@ -28308,7 +28310,9 @@ static void *ct_worker_entry(void *opaque) {
         "g.removeEventListener=g.self.removeEventListener=remove;"
         "g.__cottontailPollWorkerMessages=()=>{"
         "if(!hasMessageListener())return;"
-        "for(const item of cottontail.workerPollIncomingMessages()){"
+        "const messages=cottontail.workerPollIncomingMessages(true);"
+        "if(messages===null)return;"
+        "for(const item of messages){"
         "let data=item;"
         "try{data=JSON.parse(item);}catch{}"
         "emit('message',{data});"

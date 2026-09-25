@@ -19,6 +19,35 @@ async function runWorker(source: string, message?: unknown) {
   }
 }
 
+test("empty incoming worker polls preserve arrays and opt out without losing later messages", async () => {
+  const worker = new globalThis.Worker(`data:text/javascript,${encodeURIComponent(`
+    const empty = cottontail.workerPollIncomingMessages();
+    const skipped = cottontail.workerPollIncomingMessages(true);
+    self.onmessage = event => postMessage({ type: "reply", data: event.data });
+    postMessage({ type: "ready", isArray: Array.isArray(empty), length: empty.length, skipped });
+  `)}`, { type: "module" });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const messages = await new Promise<any[]>((resolve, reject) => {
+      const received: any[] = [];
+      timer = setTimeout(() => reject(new Error("Worker did not receive a message after idle polling")), 5_000);
+      worker.onerror = event => reject(new Error(String(event.message ?? event)));
+      worker.onmessage = event => {
+        received.push(event.data);
+        if (event.data.type === "ready") setTimeout(() => worker.postMessage("after-idle"), 150);
+        else resolve(received);
+      };
+    });
+    expect(messages).toEqual([
+      { type: "ready", isArray: true, length: 0, skipped: null },
+      { type: "reply", data: "after-idle" },
+    ]);
+  } finally {
+    clearTimeout(timer);
+    worker.terminate();
+  }
+});
+
 for (const [name, imports] of [
   ["no builtin imports", ""],
   ["full runtime imports", 'import { spawn } from "node:child_process";'],

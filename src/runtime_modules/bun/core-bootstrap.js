@@ -2608,7 +2608,9 @@ function installWorkerGlobal() {
 function pollWorkerGlobalMessages() {
   if (!cottontail.isWorker?.()) return;
   if (!hasWorkerMessageListener() && !g.__cottontailWebPollAlways?.()) return;
-  for (const item of cottontail.workerPollIncomingMessages()) {
+  const messages = cottontail.workerPollIncomingMessages(true);
+  if (messages === null) return;
+  for (const item of messages) {
     let data = item;
     try {
       data = JSON.parse(item);
@@ -2715,24 +2717,26 @@ g.__cottontailEventLoopHandleStats = () => ({
 
 g.__cottontailRunLoopTick = () => {
   pollWorkerGlobalMessages();
-  const now = timerNow();
-  const due = Array.from(timers.values())
-    .filter((timer) => timer.deadline <= now)
-    .sort((a, b) => a.deadline - b.deadline || a.id - b.id);
-  for (const timer of due) {
-    if (!timers.has(timer.id)) continue;
-    timers.delete(timer.id);
-    timer.callback(...timer.args);
-    if (timer.interval != null && !cancelledTimers.has(timer.id)) {
-      timer.deadline = timerNow() + timer.interval;
-      timers.set(timer.id, timer);
-    } else {
-      cancelledTimers.delete(timer.id);
-      if (!timers.has(timer.id)) timer.destroyed = true;
+  if (timers.size > 0) {
+    const now = timerNow();
+    const due = Array.from(timers.values())
+      .filter((timer) => timer.deadline <= now)
+      .sort((a, b) => a.deadline - b.deadline || a.id - b.id);
+    for (const timer of due) {
+      if (!timers.has(timer.id)) continue;
+      timers.delete(timer.id);
+      timer.callback(...timer.args);
+      if (timer.interval != null && !cancelledTimers.has(timer.id)) {
+        timer.deadline = timerNow() + timer.interval;
+        timers.set(timer.id, timer);
+      } else {
+        cancelledTimers.delete(timer.id);
+        if (!timers.has(timer.id)) timer.destroyed = true;
+      }
     }
   }
   cottontail.drainJobs?.();
-  return nextRunLoopDelay(timerNow());
+  return timers.size > 0 ? nextRunLoopDelay(timerNow()) : 50;
 };
 
 hotReloadHooks.add(() => {
