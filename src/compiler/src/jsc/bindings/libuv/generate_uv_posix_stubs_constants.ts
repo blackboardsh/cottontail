@@ -14,8 +14,6 @@ export const test_skipped = [
 
 export const symbols = [
   "uv_accept",
-  "uv_async_init",
-  "uv_async_send",
   "uv_available_parallelism",
   "uv_backend_fd",
   "uv_backend_timeout",
@@ -29,7 +27,6 @@ export const symbols = [
   "uv_check_start",
   "uv_check_stop",
   "uv_clock_gettime",
-  "uv_close",
   "uv_cond_broadcast",
   "uv_cond_destroy",
   "uv_cond_init",
@@ -140,7 +137,6 @@ export const symbols = [
   "uv_ip6_name",
   "uv_ip_name",
   "uv_is_active",
-  "uv_is_closing",
   "uv_is_readable",
   "uv_is_writable",
   "uv_key_create",
