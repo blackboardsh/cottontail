@@ -5772,6 +5772,16 @@ function circularRequireExports(module) {
   });
 }
 
+function cacheRequiredEsmNamespace(resolved, namespace, parent) {
+  const module = makeModule(resolved, parent);
+  module.exports = namespace;
+  module.loaded = true;
+  module[runtimeEsmSourceModuleKey] = true;
+  commonJsCache.set(resolved, module);
+  attachModuleChild(parent, module);
+  return namespace;
+}
+
 function loadCommonJsModule(resolved, parent = null, isMain = false) {
   const { bare: resolvedPath, suffix } = splitSpecifierSuffix(resolved);
   // The CommonJS loader can run in a bootstrap instance whose builtin map has
@@ -5836,19 +5846,32 @@ function loadCommonJsModule(resolved, parent = null, isMain = false) {
   if (mocked.found) return mocked.value;
   const pathMock = suffix ? bunModuleMockFor(resolvedPath) : { found: false, value: undefined };
   if (pathMock.found) return pathMock.value;
-  const registeredSelfNamespace = registeredSelfEsmNamespaces.get(resolved);
-  if (registeredSelfNamespace !== undefined) {
-    // Bun's require(ESM) view exposes the virtual interop marker on the same
-    // live namespace object; the marker remains inherited/non-exported.
-    try { registeredSelfNamespace.__esModule = true; } catch {}
-    return registeredSelfNamespace;
-  }
-  const registeredEsm = asyncEsmModuleCache.get(resolved);
-  if (registeredEsm?.allowSynchronousRequire === true) return registeredEsm.namespace;
   if (commonJsCache.has(resolved)) {
     const cached = commonJsCache.get(resolved);
     attachModuleChild(parent, cached);
     return cached.loaded === false ? circularRequireExports(cached) : cached.exports;
+  }
+  const registeredSelfNamespace = registeredSelfEsmNamespaces.get(resolved);
+  if (registeredSelfNamespace !== undefined) {
+    // Native bundles create their namespace object before the module runtime
+    // is available. Adopt the same non-exported interop marker as runtime ESM
+    // namespaces without replacing the object held by static importers.
+    if (Object.getPrototypeOf(registeredSelfNamespace) === Object.prototype) {
+      Object.setPrototypeOf(registeredSelfNamespace, moduleNamespacePrototype);
+      Object.defineProperty(registeredSelfNamespace, Symbol.toStringTag, { value: "Module" });
+    }
+    // Bun's require(ESM) view exposes the virtual interop marker on the same
+    // live namespace object; the marker remains inherited/non-exported.
+    try { registeredSelfNamespace.__esModule = true; } catch {}
+    return cacheRequiredEsmNamespace(resolved, registeredSelfNamespace, parent);
+  }
+  const registeredEsm = asyncEsmModuleCache.get(resolved);
+  if (registeredEsm !== undefined) {
+    // Bun shares the live namespace of an import that has already started,
+    // including one still evaluating top-level await. Starting a second
+    // synchronous evaluation here duplicates both state and side effects.
+    try { registeredEsm.namespace.__esModule = true; } catch {}
+    return cacheRequiredEsmNamespace(resolved, registeredEsm.namespace, parent);
   }
   const pluginDescriptor = runtimePluginResolvedModules.get(resolved)
     ?? (runtimePluginVirtualModules.has(resolved)
@@ -6117,6 +6140,7 @@ const commonJsCacheObject = new Proxy(commonJsCacheTarget, {
       asyncEsmModuleCache.has(property) || registry?.has?.(property) === true;
     if (cached) detachModuleChild(cached[moduleParentKey], cached);
     commonJsCache.delete(property);
+    registeredSelfEsmNamespaces.delete(property);
     asyncEsmModuleCache.delete(property);
     registry?.delete?.(property);
     if (cached) maybeCollectSmolModuleCacheChurn(dynamicImport);

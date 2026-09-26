@@ -281,6 +281,26 @@ pub const LinkerContext = struct {
         }
     }
 
+    // Runtime require() must see the bindings already evaluated by a static
+    // ESM import. Publish lazy modules only when their initializer runs;
+    // require() can then share their live namespace, including during TLA.
+    // Ordinary build output must retain the upstream bundler behavior.
+    pub fn registersRuntimeNamespace(this: *LinkerContext, id: u32) bool {
+        if (!this.options.runtime_dynamic_imports or id == Index.runtime.get()) return false;
+        if (!this.parse_graph.input_files.items(.loader)[id].isJavaScriptLike()) return false;
+        const flags = this.graph.meta.items(.flags)[id];
+        if (flags.wrap == .cjs) return false;
+        const exports_kind = this.graph.ast.items(.exports_kind)[id];
+        if (exports_kind != .esm and exports_kind != .esm_with_dynamic_fallback) return false;
+        const source = &this.parse_graph.input_files.items(.source)[id];
+        const path = source.path.text;
+        if (!std.fs.path.isAbsolute(path)) return false;
+        inline for (.{ "/.cottontail-embedded-runtime/", "\\.cottontail-embedded-runtime\\", "/src/runtime_modules/", "\\src\\runtime_modules\\", ".cottontail-compat-" }) |fragment| {
+            if (std.mem.indexOf(u8, path, fragment) != null) return false;
+        }
+        return true;
+    }
+
     pub fn computeDataForSourceMap(
         this: *LinkerContext,
         reachable: []const Index.Int,

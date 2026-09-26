@@ -237,6 +237,7 @@ pub fn createExportsForFile(
     bun.handleOom(ns_export_symbol_uses.ensureTotalCapacity(allocator, export_aliases.len));
 
     const initial_flags = c.graph.meta.items(.flags)[id];
+    const register_runtime_namespace = c.registersRuntimeNamespace(id);
     const needs_exports_variable = initial_flags.needs_exports_variable;
     const force_include_exports_for_entry_point = c.options.output_format == .cjs and initial_flags.force_include_exports_for_entry_point;
 
@@ -248,7 +249,8 @@ pub fn createExportsForFile(
         // + 1 if we need to inject the exports variable
         @as(usize, @intFromBool(needs_exports_variable)) +
         // + 1 if we need to do module.exports = __toCommonJS(exports)
-        @as(usize, @intFromBool(force_include_exports_for_entry_point));
+        @as(usize, @intFromBool(force_include_exports_for_entry_point)) +
+        @as(usize, @intFromBool(register_runtime_namespace));
 
     var stmts = bun.handleOom(js_ast.Stmt.Batcher.init(allocator, stmts_count));
     defer stmts.done();
@@ -342,7 +344,8 @@ pub fn createExportsForFile(
     const exports_ref = c.graph.ast.items(.exports_ref)[id];
     const all_export_stmts: []js_ast.Stmt = stmts.head[0 .. @as(usize, @intFromBool(needs_exports_variable)) +
         @as(usize, @intFromBool(properties.items.len > 0) +
-            @as(usize, @intFromBool(force_include_exports_for_entry_point)))];
+            @as(usize, @intFromBool(force_include_exports_for_entry_point))) +
+        @as(usize, @intFromBool(register_runtime_namespace))];
     stmts.head = stmts.head[all_export_stmts.len..];
     var remaining_stmts = all_export_stmts;
     defer bun.assert(remaining_stmts.len == 0); // all must be used
@@ -450,6 +453,23 @@ pub fn createExportsForFile(
         remaining_stmts = remaining_stmts[1..];
     }
 
+    if (register_runtime_namespace) {
+        const register_ref = c.runtimeFunction("__esmRegister");
+        const args = allocator.alloc(js_ast.Expr, 2) catch unreachable;
+        args[0] = js_ast.Expr.allocate(allocator, js_ast.E.String, js_ast.E.String.init(c.parse_graph.input_files.items(.source)[id].path.text), loc);
+        args[1] = js_ast.Expr.initIdentifier(exports_ref, loc);
+        remaining_stmts[0] = js_ast.Stmt.allocate(allocator, js_ast.S.SExpr, .{
+            .value = js_ast.Expr.allocate(allocator, js_ast.E.Call, .{
+                .target = js_ast.Expr.initIdentifier(register_ref, loc),
+                .args = js_ast.ExprNodeList.fromOwnedSlice(args),
+            }, loc),
+        }, loc);
+        remaining_stmts = remaining_stmts[1..];
+        for (c.topLevelSymbolsToPartsForRuntime(register_ref)) |part_index| {
+            ns_export_dependencies.append(.{ .source_index = Index.runtime, .part_index = part_index }) catch unreachable;
+        }
+    }
+
     // No need to generate a part if it'll be empty
     if (all_export_stmts.len > 0) {
         // - we must already have preallocated the parts array
@@ -464,7 +484,7 @@ pub fn createExportsForFile(
             .declared_symbols = declared_symbols,
 
             // This can be removed if nothing uses it
-            .can_be_removed_if_unused = true,
+            .can_be_removed_if_unused = !register_runtime_namespace,
 
             // Make sure this is trimmed if unused even if tree shaking is disabled
             .force_tree_shaking = true,

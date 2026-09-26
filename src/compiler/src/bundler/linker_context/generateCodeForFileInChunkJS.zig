@@ -142,10 +142,13 @@ pub fn generateCodeForFileInChunkJS(
         namespace_export_part_index < part_range.part_index_end and
         parts[namespace_export_part_index].is_live)
     {
+        const namespace_stmts = parts[namespace_export_part_index].stmts;
+        const register_in_wrapper = flags.wrap == .esm and c.registersRuntimeNamespace(part_range.source_index.get());
+        const prefix_count = namespace_stmts.len - @as(usize, @intFromBool(register_in_wrapper));
         c.convertStmtsForChunk(
             part_range.source_index.get(),
             stmts,
-            parts[namespace_export_part_index].stmts,
+            namespace_stmts[0..prefix_count],
             chunk,
             temp_allocator,
             flags.wrap,
@@ -165,6 +168,24 @@ pub fn generateCodeForFileInChunkJS(
         }
 
         stmts.inside_wrapper_suffix.clearRetainingCapacity();
+        if (register_in_wrapper) {
+            // Namespace getters can be hoisted, but publishing a lazy module
+            // before init() runs would let require() observe unevaluated state.
+            c.convertStmtsForChunk(
+                part_range.source_index.get(),
+                stmts,
+                namespace_stmts[prefix_count..],
+                chunk,
+                temp_allocator,
+                flags.wrap,
+                &ast,
+            ) catch |err| {
+                bun.handleErrorReturnTrace(err, @errorReturnTrace());
+                return .{ .err = err };
+            };
+            stmts.inside_wrapper_prefix.appendNonDependencySlice(stmts.inside_wrapper_suffix.items) catch unreachable;
+            stmts.inside_wrapper_suffix.clearRetainingCapacity();
+        }
     }
 
     // Add all other parts in this chunk

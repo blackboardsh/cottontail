@@ -521,6 +521,15 @@ pub fn scanImportsAndExports(this: *LinkerContext) ScanImportsAndExportsError!vo
                     Index.runtime,
                 );
             }
+            if (this.registersRuntimeNamespace(id)) {
+                try this.graph.generateSymbolImportAndUse(
+                    id,
+                    js_ast.namespace_export_part_index,
+                    this.runtimeFunction("__esmRegister"),
+                    1,
+                    Index.runtime,
+                );
+            }
             var imports_to_bind_list: []RefImportData = this.graph.meta.items(.imports_to_bind);
             var parts_list: []Part.List = ast_fields.items(.parts);
 

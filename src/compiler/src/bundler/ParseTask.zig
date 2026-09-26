@@ -299,6 +299,12 @@ fn getRuntimeSourceComptime(comptime target: options.Target) RuntimeSource {
     // IIFE) so the declaration is a side-effect-free function literal and
     // stays tree-shakeable.
     const runtime_cottontail_helpers =
+        \\export var __esmRegister = (key, ns) => {
+        \\  var registry = globalThis[Symbol.for("cottontail.registeredSelfEsmNamespaces")];
+        \\  if (!registry) globalThis[Symbol.for("cottontail.registeredSelfEsmNamespaces")] = registry = new Map();
+        \\  registry.set(key, ns);
+        \\};
+        \\
         \\export var __esmForce = (fn, res) => ((orig) => (force) => ((fn || force && (fn = orig)) && (res = fn(fn = 0)), res))(fn);
         \\
         \\export var __esmDyn = (key, init, ns) => {
