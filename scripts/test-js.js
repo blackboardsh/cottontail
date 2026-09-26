@@ -497,6 +497,12 @@ try {
       stderrIncludes: ['5 pass', '0 fail'],
     },
     {
+      name: 'bun-ffi-threadsafe-cstrings',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-ffi-threadsafe-cstrings.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['5 pass', '0 fail'],
+    },
+    {
       name: 'bun-test-module',
       scriptPath: join(rootDir, 'tests', 'js', 'bun-test-module.ts'),
       expectExitCode: 0,
