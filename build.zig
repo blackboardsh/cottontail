@@ -1034,6 +1034,8 @@ pub fn build(b: *std.Build) void {
         .root_module = websocket_capability_module,
     });
     websocket_capability.linker_allow_shlib_undefined = true;
+    // ct_fill_random_bytes generates client frame masks with BCryptGenRandom.
+    if (target.result.os.tag == .windows) websocket_capability.root_module.linkSystemLibrary("bcrypt", .{});
 
     const text_capability_module = b.createModule(.{
         .root_source_file = b.path("src/stdlib/text/text_capability.zig"),
@@ -1169,11 +1171,7 @@ pub fn build(b: *std.Build) void {
         .linkage = .dynamic,
         .root_module = hashing_capability_module,
     });
-    // As with compression: on Windows an unresolved import becomes a bad call
-    // target. Here that hid the MSVC CRT DLL hooks left unresolved by Zig's own
-    // DLL entry point (see hashing_capability.zig), which crashed the process
-    // on the first CryptoHasher. Make any such gap a link error instead.
-    hashing_capability.linker_allow_shlib_undefined = target.result.os.tag != .windows;
+    hashing_capability.linker_allow_shlib_undefined = true;
     switch (target.result.os.tag) {
         .macos => {
             hashing_capability.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
@@ -1283,7 +1281,14 @@ pub fn build(b: *std.Build) void {
             markdown_capability,
             terminal_capability,
             ffi_native,
-        }) |capability| capability.root_module.addObjectFile(import_library);
+        }) |capability| {
+            capability.root_module.addObjectFile(import_library);
+            // With the bridge import library every symbol can resolve, so any
+            // unresolved one is a bug. PE links would otherwise emit it as a
+            // bad call target that crashes only when reached at runtime; this
+            // hid libcrypto's system imports and websocket's BCryptGenRandom.
+            capability.linker_allow_shlib_undefined = false;
+        }
     }
     switch (target.result.os.tag) {
         .macos => {
@@ -1340,6 +1345,7 @@ pub fn build(b: *std.Build) void {
         });
         secrets_capability.linker_allow_shlib_undefined = true;
         secrets_capability.root_module.addObjectFile(windows_jsc_bridge_import_library.?);
+        secrets_capability.linker_allow_shlib_undefined = false; // See the capability loop above.
         const install_secrets_library = b.addInstallFile(
             secrets_capability.getEmittedBin(),
             "bin/cottontail-stdlib/secrets/secrets.dll",

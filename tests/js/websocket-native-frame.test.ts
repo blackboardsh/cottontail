@@ -95,6 +95,22 @@ describe("native WebSocket frame byte operations", () => {
     expect(assertions).toBeGreaterThan(250);
   });
 
+  test("generates a fresh client mask when none is supplied", () => {
+    // Without a caller mask the native encoder draws one from the OS RNG
+    // (BCryptGenRandom on Windows), a path the ws client never takes.
+    const payload = Buffer.from("cottontail generated mask");
+    const masks = new Set<string>();
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const frame = Buffer.from(host.websocketFrameEncode(payload, 0x1, true, false));
+      expect(frame[1]).toBe(0x80 | payload.length);
+      const mask = frame.subarray(2, 6);
+      const unmasked = Buffer.from(frame.subarray(6).map((byte, index) => byte ^ mask[index % 4]));
+      expect(unmasked).toEqual(payload);
+      masks.add(mask.toString("hex"));
+    }
+    expect(masks.size).toBeGreaterThan(1);
+  });
+
   test("randomized native encode and unmask match the JS reference", () => {
     const boundaryLengths = [0, 1, 124, 125, 126, 127, 255, 256, 257, 4095, 4096, 65535, 65536];
     let state = 0xc0110a11;

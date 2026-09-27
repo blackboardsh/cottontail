@@ -1019,3 +1019,7 @@ test "SQL wire rejects malformed packet and row bounds" {
     try std.testing.expectEqualStrings("Truncated MySQL column definition", std.mem.span(error_message.?));
     ct_sql_wire_free(error_message);
 }
+// When this file is a capability DLL root on Windows, leave the entry point to
+// msvcrt.lib instead of std.start, so the MSVC CRT initializes this module (see
+// scripts/verify-windows-capability-dlls.js). No effect on other targets.
+pub const _DllMainCRTStartup = {};

@@ -126,3 +126,7 @@ test "WebSocket unmask copies without mutating input" {
     try std.testing.expectEqualSlices(u8, "abcde", &output);
     try std.testing.expectEqualSlices(u8, &.{ 0x60, 0x60, 0x60, 0x60, 0x64 }, &input);
 }
+// When this file is a capability DLL root on Windows, leave the entry point to
+// msvcrt.lib instead of std.start, so the MSVC CRT initializes this module (see
+// scripts/verify-windows-capability-dlls.js). No effect on other targets.
+pub const _DllMainCRTStartup = {};

@@ -224,6 +224,13 @@ jobs:
       - name: Test native CryptoHasher
         run: ./zig-out/bin/cottontail test tests/js/bun-cryptohasher-native.test.ts
 
+      - name: Test native WebSocket frames
+        run: ./zig-out/bin/cottontail test tests/js/websocket-native-frame.test.ts
+
+      - name: Verify capability DLLs start through the MSVC CRT
+        if: matrix.os == 'windows'
+        run: node scripts/verify-windows-capability-dlls.js
+
       - name: Test child stdin lifecycle
         run: ./zig-out/bin/cottontail tests/js/node-child-process-stdin-lifecycle.mjs
 
