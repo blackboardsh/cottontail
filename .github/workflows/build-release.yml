@@ -177,6 +177,9 @@ jobs:
       - name: Test bundled HTTP compression
         run: node --test scripts/compression-portability.test.js
 
+      - name: Test bundled hashing
+        run: node --test scripts/hashing-portability.test.js
+
       - name: Test default TLS certificate trust
         run: node --test scripts/tls-ca-portability.test.js
 
@@ -217,6 +220,9 @@ jobs:
 
       - name: Activate every packaged standard-library capability
         run: ./zig-out/bin/cottontail tests/js/stdlib-capability-activation.ts
+
+      - name: Test native CryptoHasher
+        run: ./zig-out/bin/cottontail test tests/js/bun-cryptohasher-native.test.ts
 
       - name: Test child stdin lifecycle
         run: ./zig-out/bin/cottontail tests/js/node-child-process-stdin-lifecycle.mjs

@@ -207,6 +207,13 @@ function bytesFromData(data, encoding = undefined) {
   return new TextEncoder().encode(String(data));
 }
 
+// Hash/Hmac/Sign/Verify buffer update() input until digest. Node consumes the
+// input immediately, so callers may reuse their buffer: retain a copy.
+function ownedBytesFromData(data, encoding = undefined) {
+  const bytes = bytesFromData(data, encoding);
+  return data instanceof ArrayBuffer || ArrayBuffer.isView(data) ? bytes.slice() : bytes;
+}
+
 function concatBytes(chunks) {
   const length = chunks.reduce((total, chunk) => total + chunk.length, 0);
   const out = new Uint8Array(length);
@@ -2313,7 +2320,7 @@ class HashImpl extends Transform {
 
   update(data, inputEncoding = undefined) {
     if (this.finished) throw new Error("Digest already called");
-    this.chunks.push(bytesFromData(data, inputEncoding));
+    this.chunks.push(ownedBytesFromData(data, inputEncoding));
     return this;
   }
 
@@ -2390,7 +2397,7 @@ class HmacImpl extends Transform {
 
   update(data, inputEncoding = undefined) {
     if (this.finished) throw new Error("Digest already called");
-    this.chunks.push(bytesFromData(data, inputEncoding));
+    this.chunks.push(ownedBytesFromData(data, inputEncoding));
     return this;
   }
 
@@ -3197,7 +3204,7 @@ class SignImplementation extends Writable {
   }
 
   update(data, inputEncoding = undefined) {
-    this.chunks.push(bytesFromData(data, inputEncoding));
+    this.chunks.push(ownedBytesFromData(data, inputEncoding));
     return this;
   }
 
@@ -3237,7 +3244,7 @@ class VerifyImplementation extends Writable {
   }
 
   update(data, inputEncoding = undefined) {
-    this.chunks.push(bytesFromData(data, inputEncoding));
+    this.chunks.push(ownedBytesFromData(data, inputEncoding));
     return this;
   }
 

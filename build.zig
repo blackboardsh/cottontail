@@ -1169,7 +1169,11 @@ pub fn build(b: *std.Build) void {
         .linkage = .dynamic,
         .root_module = hashing_capability_module,
     });
-    hashing_capability.linker_allow_shlib_undefined = true;
+    // As with compression: on Windows an unresolved import becomes a bad call
+    // target. Here that hid the MSVC CRT DLL hooks left unresolved by Zig's own
+    // DLL entry point (see hashing_capability.zig), which crashed the process
+    // on the first CryptoHasher. Make any such gap a link error instead.
+    hashing_capability.linker_allow_shlib_undefined = target.result.os.tag != .windows;
     switch (target.result.os.tag) {
         .macos => {
             hashing_capability.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
@@ -1191,8 +1195,12 @@ pub fn build(b: *std.Build) void {
             hashing_capability.root_module.addLibraryPath(b.path(b.fmt("{s}/lib", .{dependency_dir})));
             hashing_capability.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libcrypto.lib", .{dependency_dir})));
             hashing_capability.root_module.addObjectFile(b.path(b.fmt("{s}/lib/zstd.lib", .{dependency_dir})));
-            hashing_capability.root_module.linkSystemLibrary("bcrypt", .{});
-            hashing_capability.root_module.linkSystemLibrary("crypt32", .{});
+            // The system libraries static libcrypto imports from: CryptoAPI and
+            // event log (advapi32), CAPI/cert stores (crypt32), random (bcrypt),
+            // UI checks (user32) and BIO sockets (ws2_32).
+            inline for (&.{ "advapi32", "bcrypt", "crypt32", "user32", "ws2_32" }) |library| {
+                hashing_capability.root_module.linkSystemLibrary(library, .{});
+            }
         },
         else => {},
     }
