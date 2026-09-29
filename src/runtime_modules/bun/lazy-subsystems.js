@@ -5,7 +5,7 @@ import {
   createLazyObject,
 } from "./lazy-runtime.js";
 import { loadCottontailCapabilityModule, loadEmbeddedRuntimeModule } from "../node/module.js";
-import { loadBunTestCapabilityModule } from "./test-capability.js";
+import BunTestCapability, { loadBunTestCapabilityModule } from "./test-capability.js";
 
 export const loadDNSModule = createLazyModule("bun:dns", () => loadEmbeddedRuntimeModule("bun/dns.js"));
 export const dns = createLazyObject(loadDNSModule, "dns");
@@ -46,10 +46,8 @@ export const connect = createLazyFunction(loadSocketModule, "connect");
 export const listen = createLazyFunction(loadSocketModule, "listen");
 
 export const loadBunTestModule = createLazyModule("bun:test", loadBunTestCapabilityModule);
-export const bunTestBuiltin = createLazyBuiltin(
-  loadBunTestModule,
-  module => module.default ?? module,
-);
+// Match static imports and require(): expose the shared lazy facade.
+export const bunTestBuiltin = createLazyBuiltin(() => BunTestCapability);
 
 export const loadBunJSCModule = createLazyModule("bun:jsc", () => loadCottontailCapabilityModule("jsc-tools", "bun/jsc.js"));
 export const bunJSCBuiltin = createLazyBuiltin(

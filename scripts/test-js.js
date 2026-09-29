@@ -174,6 +174,18 @@ try {
       stderrIncludes: ['20 pass', '0 fail'],
     },
     {
+      name: 'runtime-modular-startup',
+      scriptPath: join(rootDir, 'tests', 'js', 'runtime-modular-startup.mjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['runtime modular startup passed'],
+    },
+    {
+      name: 'stdlib-capability-entrypoints',
+      scriptPath: join(rootDir, 'tests', 'js', 'stdlib-capability-entrypoints.mjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['stdlib capability entrypoints passed'],
+    },
+    {
       name: 'native-host-namespace-factory',
       scriptPath: join(rootDir, 'tests', 'js', 'native-host-namespace-factory.mjs'),
       expectExitCode: 0,

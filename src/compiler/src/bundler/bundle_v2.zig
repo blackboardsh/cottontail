@@ -3126,6 +3126,8 @@ pub const BundleV2 = struct {
                 if (strings.hasPrefixComptime(import_record.path.text, "bun:")) {
                     import_record.path = Fs.Path.init(import_record.path.text["bun:".len..]);
                     import_record.path.namespace = "bun";
+                    // External builtins must keep their protocol in emitted imports/require().
+                    import_record.flags.print_namespace_in_path = true;
                     import_record.source_index = Index.invalid;
                     import_record.flags.is_external_without_side_effects = true;
 

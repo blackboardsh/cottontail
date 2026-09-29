@@ -135,6 +135,8 @@ pub const Linker = struct {
                         if (strings.hasPrefixComptime(import_record.path.text, "bun:")) {
                             import_record.path = Fs.Path.init(import_record.path.text["bun:".len..]);
                             import_record.path.namespace = "bun";
+                            // External builtins must keep their protocol in emitted imports/require().
+                            import_record.flags.print_namespace_in_path = true;
 
                             // don't link bun
                             continue;

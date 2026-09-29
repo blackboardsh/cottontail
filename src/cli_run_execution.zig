@@ -43,7 +43,6 @@ pub const StartupOptions = struct {
         self: *const StartupOptions,
         allocator: std.mem.Allocator,
         output: *std.ArrayList(u8),
-        sql_module_path: ?[]const u8,
     ) !void {
         if (self.user_agent) |user_agent| {
             if (user_agent.len > 0) {
@@ -55,10 +54,7 @@ pub const StartupOptions = struct {
         }
 
         if (self.sql_preconnect) {
-            const module_path = sql_module_path orelse return error.MissingSqlRuntimeModule;
-            try output.appendSlice(allocator, "const { sql: __ctSqlPreconnect } = await import(");
-            try output.appendSlice(allocator, try jsonStringLiteral(allocator, module_path));
-            try output.appendSlice(allocator, ");\nvoid __ctSqlPreconnect.connect();\n");
+            try output.appendSlice(allocator, "void globalThis.Cottontail.sql.sql.connect();\n");
         }
 
         for (self.fetch_preconnect.items) |url| {

@@ -63,6 +63,8 @@ test('all four releases gate native namespace, worker loader, and socket ownersh
 
 test('native boundary plan runs exact release binaries directly with bounded fixture arguments', () => {
   assert.deepEqual(nativeBoundaryFixtures, [
+    'runtime-modular-startup.mjs',
+    'stdlib-capability-entrypoints.mjs',
     'native-host-namespace-factory.mjs', 'native-host-namespace.mjs',
     'node-worker-internal-loader.mjs', 'node-dgram-peer-loss.mjs',
     'fd-watch-runtime-ownership.mjs', 'node-dgram-lifecycle.mjs',
@@ -77,8 +79,12 @@ test('native boundary plan runs exact release binaries directly with bounded fix
       ? ['test', join('/fixture-root', 'tests/js', name), '-t', 'compiled bytecode is embedded']
       : name.endsWith('.test.ts') ? ['test', join('/fixture-root', 'tests/js', name)]
       : [join('/fixture-root', 'tests/js', name)]));
-    assert.equal(plan.tests.length, 10);
-    assert.ok(plan.tests.every(test => test.timeoutMs === 90_000));
+    assert.equal(plan.tests.length, 12);
+    assert.ok(plan.tests.every(test => test.timeoutMs === (
+      ['runtime-modular-startup.mjs', 'stdlib-capability-entrypoints.mjs'].includes(test.name)
+        ? (platform === 'win32' ? 600_000 : 180_000)
+        : 90_000
+    )));
   }
   assert.equal(nativeBoundaryTimeoutMs, 90_000);
   const runner = readFileSync(new URL('./test-native-boundary-release.js', import.meta.url), 'utf8');

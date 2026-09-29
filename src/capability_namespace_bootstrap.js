@@ -39,6 +39,10 @@ const capabilityRequire = specifier => {
     "bun:sql": ["sql", "bun/sql.js"],
     "bun:test": ["test", "bun/test.js"],
     "node:zlib": ["compression", "node/zlib.js"],
+    "node:inspector": ["inspector", "node/inspector.js"],
+    "node:inspector/promises": ["inspector", "node/inspector/promises.js"],
+    "node:repl": ["repl", "node/repl.js"],
+    "node:sea": ["sea", "node/sea.js"],
   }[text];
   if (capabilityAlias) return load(capabilityAlias[0], capabilityAlias[1]);
 

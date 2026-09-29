@@ -4394,12 +4394,31 @@ fn rejectInvalidBunCjsPragma(ctx: *const Context, script_path: []const u8) !bool
     return true;
 }
 
-const NodeRuntimeAlias = struct {
+const RuntimeModuleAlias = struct {
     specifier: []const u8,
     relative_path: []const u8,
 };
 
-const node_runtime_aliases = [_]NodeRuntimeAlias{
+const bun_runtime_aliases = [_]RuntimeModuleAlias{
+    .{ .specifier = "bun", .relative_path = "bun/index.js" },
+    .{ .specifier = "bun:ffi", .relative_path = "bun/ffi-capability.js" },
+    .{ .specifier = "bun:jsc", .relative_path = "bun/jsc-capability.js" },
+    .{ .specifier = "bun:sqlite", .relative_path = "bun/sqlite-capability.js" },
+    .{ .specifier = "bun:test", .relative_path = "bun/test-capability.js" },
+    .{ .specifier = "bun:internal-for-testing", .relative_path = "bun/internal-for-testing.js" },
+    .{ .specifier = "bun:wrap", .relative_path = "bun/wrap.js" },
+    .{ .specifier = "bun:sql", .relative_path = "bun/sql-capability.js" },
+    .{ .specifier = "bun:redis", .relative_path = "bun/redis-capability.js" },
+    .{ .specifier = "bun:s3", .relative_path = "bun/s3-capability.js" },
+    .{ .specifier = "bun:json5", .relative_path = "bun/json5-capability.js" },
+    .{ .specifier = "bun:color", .relative_path = "bun/color-capability.js" },
+    .{ .specifier = "bun:yaml", .relative_path = "bun/yaml-capability.js" },
+    .{ .specifier = "bun:toml", .relative_path = "bun/toml-capability.js" },
+    .{ .specifier = "bun:dns", .relative_path = "bun/dns-public.js" },
+    .{ .specifier = "bun:socket", .relative_path = "bun/socket-public.js" },
+};
+
+const node_runtime_aliases = [_]RuntimeModuleAlias{
     .{ .specifier = "fs", .relative_path = "node/fs.js" },
     .{ .specifier = "fs/promises", .relative_path = "node/fs/promises.js" },
     .{ .specifier = "os", .relative_path = "node/os.js" },
@@ -4419,8 +4438,8 @@ const node_runtime_aliases = [_]NodeRuntimeAlias{
     .{ .specifier = "diagnostics_channel", .relative_path = "node/diagnostics_channel.js" },
     .{ .specifier = "domain", .relative_path = "node/domain.js" },
     .{ .specifier = "sys", .relative_path = "node/sys.js" },
-    .{ .specifier = "repl", .relative_path = "node/repl.js" },
-    .{ .specifier = "sea", .relative_path = "node/sea.js" },
+    .{ .specifier = "repl", .relative_path = "node/repl-capability.js" },
+    .{ .specifier = "sea", .relative_path = "node/sea-capability.js" },
     .{ .specifier = "sqlite", .relative_path = "node/sqlite-capability.js" },
     .{ .specifier = "test", .relative_path = "node/test-capability.js" },
     .{ .specifier = "test/reporters", .relative_path = "node/test-reporters-capability.js" },
@@ -4452,8 +4471,8 @@ const node_runtime_aliases = [_]NodeRuntimeAlias{
     .{ .specifier = "http", .relative_path = "node/http.js" },
     .{ .specifier = "https", .relative_path = "node/https.js" },
     .{ .specifier = "http2", .relative_path = "node/http2.js" },
-    .{ .specifier = "inspector", .relative_path = "node/inspector.js" },
-    .{ .specifier = "inspector/promises", .relative_path = "node/inspector/promises.js" },
+    .{ .specifier = "inspector", .relative_path = "node/inspector-capability.js" },
+    .{ .specifier = "inspector/promises", .relative_path = "node/inspector/promises-capability.js" },
     .{ .specifier = "dgram", .relative_path = "node/dgram.js" },
     .{ .specifier = "dns", .relative_path = "node/dns.js" },
     .{ .specifier = "dns/promises", .relative_path = "node/dns/promises.js" },
@@ -4488,13 +4507,9 @@ fn buildRuntimeAliases(
     runtime_virtual_root: []const u8,
 ) ![]const native_bundler.RuntimeAlias {
     var aliases: std.ArrayList(native_bundler.RuntimeAlias) = .empty;
-    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun", "bun/index.js");
-    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:ffi", "bun/ffi-capability.js");
-    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:jsc", "bun/jsc-capability.js");
-    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:sqlite", "bun/sqlite-capability.js");
-    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:test", "bun/test-capability.js");
-    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:internal-for-testing", "bun/internal-for-testing.js");
-    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:wrap", "bun/wrap.js");
+    for (bun_runtime_aliases) |alias| {
+        try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, alias.specifier, alias.relative_path);
+    }
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "vitest", "bun/test-capability.js");
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "string-width", "bun/string-width.js");
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "strip-ansi", "bun/strip-ansi.js");
@@ -4529,14 +4544,10 @@ fn isRuntimeAliasSpecifier(specifier: []const u8) bool {
     for (node_runtime_aliases) |alias| {
         if (std.mem.eql(u8, bare, alias.specifier)) return true;
     }
-    return std.mem.eql(u8, specifier, "bun") or
-        std.mem.eql(u8, specifier, "bun:ffi") or
-        std.mem.eql(u8, specifier, "bun:jsc") or
-        std.mem.eql(u8, specifier, "bun:sqlite") or
-        std.mem.eql(u8, specifier, "bun:test") or
-        std.mem.eql(u8, specifier, "bun:internal-for-testing") or
-        std.mem.eql(u8, specifier, "bun:wrap") or
-        std.mem.eql(u8, specifier, "vitest") or
+    for (bun_runtime_aliases) |alias| {
+        if (std.mem.eql(u8, specifier, alias.specifier)) return true;
+    }
+    return std.mem.eql(u8, specifier, "vitest") or
         std.mem.eql(u8, specifier, "string-width") or
         std.mem.eql(u8, specifier, "strip-ansi") or
         std.mem.eql(u8, specifier, "node-fetch") or
@@ -5480,12 +5491,8 @@ fn bundleScriptNative(
             script_args,
         );
     const startup_options = try cli_run_execution.StartupOptions.parse(ctx.allocator, exec_args);
-    const sql_module_path = if (startup_options.sql_preconnect)
-        try runtimeModulePath(ctx, &.{ "bun", "sql.js" })
-    else
-        null;
     var cli_startup_imports: std.ArrayList(u8) = .empty;
-    try startup_options.appendSource(ctx.allocator, &cli_startup_imports, sql_module_path);
+    try startup_options.appendSource(ctx.allocator, &cli_startup_imports);
     const cli_preload_imports = if (ctx.hutch_private_file != null)
         ""
     else
@@ -7764,14 +7771,6 @@ fn writeMinimalRuntimeEntryWrapper(
             .{try jsonStringLiteral(ctx, http_server_module)},
         );
     } else "";
-    const sql_import = if (bootstrap_mode == .sql) blk: {
-        const sql_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "bun", "sql.js" });
-        break :blk try std.fmt.allocPrint(
-            ctx.allocator,
-            "import {{ SQL as __ctSQL, sql as __ctSql }} from {s};\n",
-            .{try jsonStringLiteral(ctx, sql_module)},
-        );
-    } else "";
     const process_import = if (bootstrap_mode == .process) blk: {
         const process_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "process.js" });
         break :blk try std.fmt.allocPrint(
@@ -7794,7 +7793,10 @@ fn writeMinimalRuntimeEntryWrapper(
     else
         "";
     const sql_install = if (bootstrap_mode == .sql)
-        "globalThis.Bun.SQL = __ctSQL; globalThis.Bun.sql = __ctSql; globalThis.Bun.postgres = __ctSql;"
+        // SQL is no longer embedded core source. Activate the host-installed
+        // capability after the small runtime bootstrap has installed globals.
+        "const __ctSQLModule = globalThis.Cottontail.sql; " ++
+            "globalThis.Bun.SQL = __ctSQLModule.SQL; globalThis.Bun.sql = __ctSQLModule.sql; globalThis.Bun.postgres = __ctSQLModule.sql;"
     else
         "";
     const wrapper_name = try std.fmt.allocPrint(
@@ -7818,7 +7820,6 @@ fn writeMinimalRuntimeEntryWrapper(
         \\import {s};
         \\import {{ installRuntimeBootstrap as __ctInstallRuntimeBootstrap }} from {s};
         \\import {{ fileURLToPath as __ctFileURLToPath, pathToFileURL as __ctPathToFileURL }} from {s};
-        \\{s}
         \\{s}
         \\{s}
         \\{s}
@@ -7848,7 +7849,6 @@ fn writeMinimalRuntimeEntryWrapper(
         try jsonStringLiteral(ctx, bootstrap_module),
         try jsonStringLiteral(ctx, url_module),
         http_server_import,
-        sql_import,
         process_import,
         ipc_bootstrap_import,
         process_install,
@@ -10854,8 +10854,8 @@ fn writeRuntimeEntryWrapper(
     const path_win32_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "path", "win32.cjs" });
     const string_decoder_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "string_decoder.js" });
     const sys_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "sys.js" });
-    const repl_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "repl.js" });
-    const sea_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "sea.js" });
+    const repl_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "repl-capability.js" });
+    const sea_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "sea-capability.js" });
     const sqlite_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "sqlite-capability.js" });
     const node_test_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "test.js" });
     const test_reporters_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "test", "reporters.js" });
@@ -10868,8 +10868,8 @@ fn writeRuntimeEntryWrapper(
     const http_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "http.js" });
     const https_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "https.js" });
     const http2_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "http2.js" });
-    const inspector_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "inspector.js" });
-    const inspector_promises_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "inspector", "promises.js" });
+    const inspector_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "inspector-capability.js" });
+    const inspector_promises_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "inspector", "promises-capability.js" });
     const dgram_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "dgram.js" });
     const dns_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "dns.js" });
     const dns_promises_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "dns", "promises.js" });

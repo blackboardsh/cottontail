@@ -351,7 +351,17 @@ pub fn scanImportsAndExports(this: *LinkerContext) ScanImportsAndExportsError!vo
                     flags[source_index] = flag;
                 }
 
-                const wrapped_ref = this.graph.ast.items(.wrapper_ref)[source_index];
+                // Namespace registration adds an initializer even when the
+                // parser removed every original statement (comments, `void 0`).
+                // Reserve its wrapper before createWrapperForFile records the
+                // dependency on the ESM runtime helper.
+                const wrapper_ref = &this.graph.ast.items(.wrapper_ref)[source_index];
+                if (flag.wrap == .esm and !wrapper_ref.isValid() and
+                    this.registersRuntimeNamespace(source_index))
+                {
+                    wrapper_ref.* = this.graph.generateNewSymbol(source_index, .other, "init_empty");
+                }
+                const wrapped_ref = wrapper_ref.*;
 
                 // Create the wrapper part for wrapped files. This is needed by a later step.
                 this.createWrapperForFile(

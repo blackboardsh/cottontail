@@ -8,6 +8,8 @@ import { startWindowsJobChild, terminateWindowsJobChild } from './windows-job-ch
 // This is a deliberately narrow native gate, not the full test-js suite. No
 // build, alternate runtime, or runtime-source overlay is allowed here.
 export const nativeBoundaryFixtures = Object.freeze([
+  'runtime-modular-startup.mjs',
+  'stdlib-capability-entrypoints.mjs',
   'native-host-namespace-factory.mjs',
   'native-host-namespace.mjs',
   'node-worker-internal-loader.mjs',
@@ -35,7 +37,11 @@ export function nativeBoundaryPlan(root, platform = process.platform) {
         ? ['test', join(root, 'tests', 'js', name), '-t', 'compiled bytecode is embedded']
         : name.endsWith('.test.ts') ? ['test', join(root, 'tests', 'js', name)]
         : [join(root, 'tests', 'js', name)],
-      timeoutMs: nativeBoundaryTimeoutMs,
+      // These fixtures deliberately launch isolated children for each entrypoint.
+      // Windows ARM CI runs the x64 release under emulation.
+      timeoutMs: name === 'runtime-modular-startup.mjs' || name === 'stdlib-capability-entrypoints.mjs'
+        ? (platform === 'win32' ? 600_000 : 180_000)
+        : nativeBoundaryTimeoutMs,
     })),
   };
 }

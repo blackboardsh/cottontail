@@ -5918,7 +5918,7 @@ function loadCommonJsModule(resolved, parent = null, isMain = false) {
       // For bun: modules that export a default, unwrap appropriately.
       const exports = loaded?.default ?? loaded;
       // Register in the map so subsequent require() calls find it.
-      builtinModuleMap.set(resolvedPath, loaded);
+      builtinModuleMap.set(resolvedPath, exports);
       return exports;
     }
   }

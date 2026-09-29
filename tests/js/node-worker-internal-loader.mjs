@@ -7,9 +7,21 @@ import { join } from "node:path";
 // The full worker bootstrap is evaluated as a script after bundling. Its
 // internal runtime loader must not remain as an external node:module import.
 const source = `
+  import { SQL } from "bun:sql";
+  import { parse } from "bun:yaml";
+  import { Session } from "node:inspector";
+  import { Session as AsyncSession } from "node:inspector/promises";
+  import { writer } from "node:repl";
+  import { isSea } from "node:sea";
   const { parentPort } = require("node:worker_threads");
   parentPort.postMessage({
     yaml: Bun.YAML.parse("answer: 42").answer,
+    staticYaml: parse("answer: 42").answer,
+    sql: typeof SQL,
+    inspector: typeof Session,
+    inspectorPromises: typeof AsyncSession,
+    repl: writer(42),
+    sea: isSea(),
     stream: typeof new ReadableStream({ start(controller) { controller.close(); } }).getReader,
   });
 `;
@@ -31,7 +43,10 @@ try {
       if (!received) reject(new Error(`Worker exited ${code} before responding`));
     });
   });
-  assert.deepEqual(message, { yaml: 42, stream: "function" });
+  assert.deepEqual(message, {
+    yaml: 42, staticYaml: 42, sql: "function", inspector: "function",
+    inspectorPromises: "function", repl: "42", sea: false, stream: "function",
+  });
   console.log("full worker bootstrap and lazy runtime loader passed");
 } finally {
   clearTimeout(timer);
