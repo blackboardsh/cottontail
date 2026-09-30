@@ -68,7 +68,8 @@ jobs:
         run: node scripts/validate-release-tag.js
 
       - name: Restore vendored toolchains
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: vendored-toolchains
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             vendors/zig
@@ -137,6 +138,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "HTML rewriter setup failed" }
           node scripts/setup-jsc.js
           if ($LASTEXITCODE -ne 0) { throw "JavaScriptCore setup failed" }
+
+      # Preserve expensive Windows dependency builds even if a later runtime
+      # test fails. These inputs are complete and validated after setup.
+      - name: Save vendored toolchains
+        if: steps.vendored-toolchains.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            vendors/zig
+            vendors/jsc
+            vendors/zig-html-rewriter
+            vendors/windows-deps
+          key: ${{ steps.vendored-toolchains.outputs.cache-primary-key }}
 
       - name: Run Zig tests
         if: matrix.os != 'windows'

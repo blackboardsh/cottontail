@@ -4,8 +4,10 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { spawnSync } from 'child_process';
 import os from 'os';
 import { join } from 'path';
+import { buildArchitecture } from './build-target.js';
 
 const rootDir = process.cwd();
+const hasJscWebAssembly = process.platform !== 'win32' || buildArchitecture() !== 'arm64';
 const binaryPath = join(
   rootDir,
   'zig-out',
@@ -225,7 +227,7 @@ try {
       name: 'web-worker-message-dispatch',
       argv: ['test', join(rootDir, 'tests', 'js', 'web-worker-message-dispatch.test.ts')],
       expectExitCode: 0,
-      stderrIncludes: ['7 pass', '0 fail'],
+      stderrIncludes: ['8 pass', '0 fail'],
     },
     {
       name: 'runtime-sourcemap-regressions',
@@ -432,8 +434,11 @@ try {
         'wasm',
         'hello-wasi.wasm'
       ),
-      expectExitCode: 0,
-      stdoutIncludes: ['hello world'],
+      // The initial Windows ARM64 SDK explicitly disables WebAssembly.
+      // Cover that unsupported result as well as execution on JIT platforms.
+      expectExitCode: hasJscWebAssembly ? 0 : 1,
+      stdoutIncludes: hasJscWebAssembly ? ['hello world'] : [],
+      stderrIncludes: hasJscWebAssembly ? [] : ['WebAssembly is not defined'],
     },
     {
       name: 'cli-runtime-flag-execargv',
