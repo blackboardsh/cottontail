@@ -46,6 +46,26 @@ test('null removes a baseline field without mutating the source entry', () => {
   assert.deepEqual(entry, { status: 'enabled', args: ['--timeout=1000'] });
 });
 
+test('platform capability gaps retain independent status count ratchets', () => {
+  const status = {
+    expectedCounts: { enabled: 2, expectedFailure: 0, skip: 1 },
+    tests: { 'test/wasm.test.ts': { status: 'enabled' } },
+    platformOverrides: {
+      'win32-arm64': {
+        expectedCounts: { enabled: 1, expectedFailure: 1 },
+        tests: { 'test/wasm.test.ts': { status: 'expected-failure' } },
+      },
+    },
+  };
+  assert.deepEqual(validateBunStatusPlatformOverrides(status), []);
+  const resolved = resolveBunStatusPlatform(status, 'win32', 'arm64');
+  assert.deepEqual(resolved.expectedCounts, { enabled: 1, expectedFailure: 1, skip: 1 });
+  assert.equal(resolved.tests['test/wasm.test.ts'].status, 'expected-failure');
+  assert.equal(resolveBunStatusPlatform(status, 'win32', 'x64').expectedCounts.enabled, 2);
+  status.platformOverrides['win32-arm64'].expectedCounts.enabled = -1;
+  assert.match(validateBunStatusPlatformOverrides(status)[0], /known non-negative count/);
+});
+
 test('validates exact platform keys and known status paths', () => {
   const status = {
     tests: { 'test/example.test.ts': { status: 'enabled' } },

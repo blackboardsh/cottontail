@@ -38,7 +38,7 @@ export function nativeBoundaryPlan(root, platform = process.platform) {
         : name.endsWith('.test.ts') ? ['test', join(root, 'tests', 'js', name)]
         : [join(root, 'tests', 'js', name)],
       // These fixtures deliberately launch isolated children for each entrypoint.
-      // Windows ARM CI runs the x64 release under emulation.
+      // Windows hosts cover both the x64 runtime and ARM64's JSC interpreter.
       timeoutMs: name === 'runtime-modular-startup.mjs' || name === 'stdlib-capability-entrypoints.mjs'
         ? (platform === 'win32' ? 600_000 : 180_000)
         : nativeBoundaryTimeoutMs,

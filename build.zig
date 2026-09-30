@@ -100,9 +100,18 @@ fn jscVendorPlatformKey(target: std.Target) ?[]const u8 {
         },
         .windows => switch (target.cpu.arch) {
             .x86_64 => "windows-amd64",
+            .aarch64 => "windows-arm64",
             else => null,
         },
         else => null,
+    };
+}
+
+fn windowsDependencyDir(target: std.Target) []const u8 {
+    return switch (target.cpu.arch) {
+        .aarch64 => "vendors/windows-deps/arm64-windows-static",
+        .x86_64 => "vendors/windows-deps/x64-windows-static",
+        else => @panic("Unsupported Windows architecture"),
     };
 }
 
@@ -544,6 +553,10 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
                 "-DJS_NO_EXPORT=1",
                 "-DBEXPORT=",
                 "-fno-rtti",
+                // Zig's default MSVC compatibility version enables obsolete
+                // SIMDe ARM64 SDK workarounds that do not compile with Clang.
+                "-fms-compatibility-version=19.38",
+                "-D_CRT_SECURE_NO_WARNINGS=1",
                 "-DWIN32_LEAN_AND_MEAN=1",
                 "-DNOMINMAX=1",
                 "-DU_DISABLE_RENAMING=1",
@@ -650,7 +663,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             });
         },
         .windows => {
-            const dependency_dir = "vendors/windows-deps/x64-windows-static";
+            const dependency_dir = windowsDependencyDir(resolved_target);
             requireJscLibrary(b, vendor_dir, "JavaScriptCore.lib");
             requireJscLibrary(b, vendor_dir, "CottontailJSCEmbedder.lib");
             step.root_module.addIncludePath(b.path(b.fmt("{s}/include", .{dependency_dir})));
@@ -692,13 +705,12 @@ fn requireJscFile(b: *std.Build, vendor_dir: []const u8, relative_path: []const 
 }
 
 pub fn build(b: *std.Build) void {
-    // The Windows release is x86-64 MSVC even when the host is Windows ARM.
-    // Make both the architecture and ABI explicit so Zig does not derive a
-    // native CPU model from the CI host. The vendored JSC, Visual Studio SDK,
-    // and vcpkg dependencies all use this same target.
+    // Keep the native Windows architecture and select the MSVC ABI used by
+    // JSC and vcpkg. scripts/zig.js also passes the requested target explicitly
+    // when the x64 compiler runs under ARM64 emulation.
     const target = b.standardTargetOptions(.{
         .default_target = if (builtin.os.tag == .windows) .{
-            .cpu_arch = .x86_64,
+            .cpu_arch = builtin.cpu.arch,
             .cpu_model = .baseline,
             .os_tag = .windows,
             .abi = .msvc,
@@ -892,7 +904,7 @@ pub fn build(b: *std.Build) void {
             b.graph.zig_exe,
             "dlltool",
             "-m",
-            "i386:x86-64",
+            if (target.result.cpu.arch == .aarch64) "arm64" else "i386:x86-64",
             "-D",
             "cottontail.exe",
             "-d",
@@ -975,8 +987,9 @@ pub fn build(b: *std.Build) void {
         compression_capability_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
         compression_capability_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
     } else if (target.result.os.tag == .windows) {
-        compression_capability_module.addIncludePath(b.path("vendors/windows-deps/x64-windows-static/include"));
-        compression_capability_module.addLibraryPath(b.path("vendors/windows-deps/x64-windows-static/lib"));
+        const dependency_dir = windowsDependencyDir(target.result);
+        compression_capability_module.addIncludePath(b.path(b.fmt("{s}/include", .{dependency_dir})));
+        compression_capability_module.addLibraryPath(b.path(b.fmt("{s}/lib", .{dependency_dir})));
     }
     const compression_capability = b.addLibrary(.{
         .name = "cottontail-compression",
@@ -998,7 +1011,7 @@ pub fn build(b: *std.Build) void {
     }
     if (target.result.os.tag == .windows) {
         inline for (&.{ "zs.lib", "zstd.lib", "brotlicommon.lib", "brotlidec.lib", "brotlienc.lib" }) |library| {
-            compression_capability.root_module.addObjectFile(b.path(b.fmt("vendors/windows-deps/x64-windows-static/lib/{s}", .{library})));
+            compression_capability.root_module.addObjectFile(b.path(b.fmt("{s}/lib/{s}", .{ windowsDependencyDir(target.result), library })));
         }
     } else {
         compression_capability.root_module.linkSystemLibrary("z", .{});
@@ -1188,7 +1201,7 @@ pub fn build(b: *std.Build) void {
             });
         },
         .windows => {
-            const dependency_dir = "vendors/windows-deps/x64-windows-static";
+            const dependency_dir = windowsDependencyDir(target.result);
             hashing_capability.root_module.addIncludePath(b.path(b.fmt("{s}/include", .{dependency_dir})));
             hashing_capability.root_module.addLibraryPath(b.path(b.fmt("{s}/lib", .{dependency_dir})));
             hashing_capability.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libcrypto.lib", .{dependency_dir})));
@@ -1298,7 +1311,7 @@ pub fn build(b: *std.Build) void {
         },
         .linux => ffi_native.root_module.linkSystemLibrary("ffi", .{ .preferred_link_mode = .dynamic }),
         .windows => {
-            const dependency_dir = "vendors/windows-deps/x64-windows-static";
+            const dependency_dir = windowsDependencyDir(target.result);
             ffi_native.root_module.addIncludePath(b.path(b.fmt("{s}/include", .{dependency_dir})));
             ffi_native.root_module.addObjectFile(b.path(b.fmt("{s}/lib/ffi.lib", .{dependency_dir})));
         },

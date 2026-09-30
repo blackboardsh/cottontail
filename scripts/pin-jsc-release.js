@@ -32,6 +32,7 @@ const platformMap = {
   'linux-amd64': 'linux-x64',
   'linux-arm64': 'linux-arm64',
   'windows-amd64': 'windows-x64',
+  'windows-arm64': 'windows-arm64',
 };
 const assets = {};
 for (const [local, published] of Object.entries(platformMap)) {
@@ -40,7 +41,7 @@ for (const [local, published] of Object.entries(platformMap)) {
   if (!archive || !/^https:\/\//.test(archive.url) || !/^[0-9a-f]{64}$/.test(archive.sha256)) {
     throw new Error(`JSC release is missing a valid ${published} archive`);
   }
-  if (published === 'windows-x64' && platform.msvcRuntime !== 'MT') {
+  if (published.startsWith('windows-') && platform.msvcRuntime !== 'MT') {
     throw new Error('JSC Windows release must use the MT static runtime');
   }
   assets[local] = {

@@ -30,6 +30,7 @@ import {
   terminateWindowsJobChild,
 } from './windows-job-child.js';
 import { resolveBunStatusPlatform } from './bun-status-platform.js';
+import { pinRuntimeBundle } from './pin-runtime-bundle.js';
 
 const rootDir = process.cwd();
 const targetsPath = resolve(
@@ -484,7 +485,7 @@ function pinExecutable(sourcePath, label) {
 }
 
 function pinSelectedExecutables() {
-  const binary = pinExecutable(binaryPath, 'Cottontail binary');
+  const binary = pinRuntimeBundle(binaryPath, baselineStateRoot);
   binarySourcePath = binary.sourcePath;
   binarySourceHash = binary.sourceHash;
   binaryPath = binary.pinnedPath;

@@ -16,10 +16,14 @@ test('every Cottontail release platform targets a baseline CPU', () => {
 });
 
 test('the Windows release fixes both its x64 ABI and baseline CPU', () => {
-  assert.deepEqual(releaseTargetArgs('win32'), [
+  assert.deepEqual(releaseTargetArgs('win32', 'x64'), [
     WINDOWS_X64_TARGET_ARG,
     BASELINE_CPU_ARG,
   ]);
+});
+
+test('the Windows ARM64 release selects its MSVC ABI and baseline CPU', () => {
+  assert.deepEqual(releaseTargetArgs('win32', 'arm64'), ['-Dtarget=aarch64-windows-msvc', BASELINE_CPU_ARG]);
 });
 
 test('unsupported release hosts fail instead of inheriting a native CPU', () => {

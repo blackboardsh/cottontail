@@ -4,6 +4,7 @@ import { execFileSync } from 'child_process';
 import { createHash } from 'crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { buildArchitecture, windowsTarget } from './build-target.js';
 
 const ROOT = process.cwd();
 const MANIFEST_PATH = join(ROOT, 'scripts', 'zig-manifest.json');
@@ -26,7 +27,9 @@ function getZigBinaryName() {
 }
 
 function getPlatformKey() {
-  return `${process.platform}-${process.arch}`;
+  // Zig's Windows ARM64 host build crashes on current ARM runners. Its x64
+  // compiler runs under emulation and can emit either target architecture.
+  return `${process.platform}-${process.platform === 'win32' ? 'x64' : process.arch}`;
 }
 
 function sha256File(path) {
@@ -66,9 +69,6 @@ function vendorZig() {
   const platformKey = getPlatformKey();
   const asset = MANIFEST.assets[platformKey];
   if (!asset) {
-    if (process.platform === 'win32' && process.arch === 'arm64') {
-      fail('No Windows ARM64 Zig is pinned. Install and run x64 Node so setup selects the x86-64 toolchain.');
-    }
     fail(`No Zig ${ZIG_VERSION} asset is pinned for ${platformKey}`);
   }
 
@@ -218,9 +218,7 @@ function findVcpkg() {
 
 function vendorWindowsDependencies() {
   if (process.platform !== 'win32') return;
-  if (process.arch !== 'x64') {
-    throw new Error(`Windows release dependencies require x64 Node, found ${process.arch}`);
-  }
+  const target = windowsTarget(buildArchitecture());
 
   const vcpkg = findVcpkg();
   const installRoot = join(ROOT, 'vendors', 'windows-deps');
@@ -230,9 +228,10 @@ function vendorWindowsDependencies() {
     [
       'install',
       '--triplet',
-      'x64-windows-static',
+      target.triplet,
       '--host-triplet',
       'x64-windows',
+      `--overlay-triplets=${join(ROOT, 'scripts', 'vcpkg-triplets')}`,
       `--x-install-root=${installRoot}`,
     ],
     { cwd: ROOT, stdio: 'inherit' }

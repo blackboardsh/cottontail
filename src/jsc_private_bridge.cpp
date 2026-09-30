@@ -31,6 +31,7 @@
 #include <utility>
 #include <vector>
 #include <wtf/Function.h>
+#include <wtf/SharedTask.h>
 #include <wtf/ThreadSafeRefCounted.h>
 #if defined(_WIN32)
 #include <wtf/MainThread.h>
@@ -458,12 +459,11 @@ struct GCRequest {
     {
     }
 
-    // The real trailing member is a null RefPtr for this call. A non-trivial
-    // destructor preserves GCRequest's indirect C++ calling convention.
-    ~GCRequest() { }
-
     std::optional<CollectionScope> scope;
-    void* did_finish_end_phase { nullptr };
+    // Preserve RefPtr's non-trivial copy/move constructors as well as its
+    // destructor. Windows ARM64 otherwise passes this small aggregate in
+    // registers, while JSC's collectNow expects an indirect argument.
+    WTF::RefPtr<WTF::SharedTask<void()>> did_finish_end_phase;
 };
 
 static_assert(sizeof(GCRequest) == 2 * sizeof(void*));
@@ -526,7 +526,10 @@ static JSC::VM* ct_jsc_vm(JSContextRef context)
         const_cast<OpaqueJSContextGroup*>(JSContextGetGroup(context)));
 }
 
-#if defined(_WIN32)
+#if defined(_WIN32) && (defined(_M_ARM64) || defined(__aarch64__))
+// The pinned Windows ARM64 C_LOOP VM includes an interpreter stack before Heap.
+static constexpr ptrdiff_t ct_jsc_vm_heap_offset = 0x140;
+#elif defined(_WIN32)
 static constexpr ptrdiff_t ct_jsc_vm_heap_offset = 0xf0;
 #else
 static constexpr ptrdiff_t ct_jsc_vm_heap_offset = 0xf8;

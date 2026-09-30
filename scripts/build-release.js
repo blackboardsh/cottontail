@@ -22,6 +22,7 @@ import {
   restrictPortableExecutableExports,
 } from './release-binary-contract.js';
 import { releaseTargetArgs } from './release-target.js';
+import { buildJobArgs } from './build-target.js';
 
 const rootDir = process.cwd();
 const zigName = process.platform === 'win32' ? 'zig.exe' : 'zig';
@@ -65,6 +66,7 @@ try {
   run(process.execPath, [nativeBindingsGenerator], 'Native binding generation');
   const args = [
     'build',
+    ...buildJobArgs(),
     '-Doptimize=ReleaseFast',
     ...releaseTargetArgs(process.platform),
     '--prefix',

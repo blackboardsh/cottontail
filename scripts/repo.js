@@ -45,6 +45,8 @@ function resetZigVendorDir() {
 }
 
 function getHostArch() {
+  // The ARM64 Zig 0.16 compiler crashes on Windows; use its x64 host binary.
+  if (os.platform() === 'win32') return 'x86_64';
   if (os.arch() === 'arm64') {
     return 'aarch64';
   }

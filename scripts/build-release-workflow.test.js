@@ -42,8 +42,8 @@ test('Windows releases require native Job cleanup tests after building the super
   assert.ok(workflow.indexOf(`- name: ${name}`) < workflow.indexOf('- name: Package release'));
 });
 
-test('all four releases gate native namespace, worker loader, and socket ownership after final validation', () => {
-  for (const platform of ['macos-arm64', 'linux-x64', 'linux-arm64', 'windows-x64']) {
+test('all five releases gate native namespace, worker loader, and socket ownership after final validation', () => {
+  for (const platform of ['macos-arm64', 'linux-x64', 'linux-arm64', 'windows-x64', 'windows-arm64']) {
     assert.ok(workflow.includes(`platform: ${platform}`));
   }
   for (const suffix of ['', ' on Windows']) {
@@ -245,7 +245,7 @@ test('Linux releases enforce the GLIBC 2.38 public ABI ceiling', () => {
     /run: node scripts\/verify-linux-glibc\.js zig-out\/bin\/cottontail 2\.38/,
   );
 
-  const tagValidation = step('Validate release tag');
+  const tagValidation = step('Validate release contracts');
   assert.match(tagValidation, /scripts\/verify-linux-glibc\.test\.js/);
   assert.match(tagValidation, /scripts\/build-release-workflow\.test\.js/);
 });
@@ -257,11 +257,11 @@ test('the Windows console test builds the same target as the Windows release', (
   // headers. Every Windows step must therefore name its target outright.
   const consoleTest = step('Test Unicode output in a legacy Windows console');
   assert.match(consoleTest, /if: matrix\.os == 'windows'/);
-  for (const argument of releaseTargetArgs('win32')) {
-    assert.ok(
-      consoleTest.includes(`${argument} `) || consoleTest.includes(`${argument}\n`),
-      `the Windows console test must pass ${argument}`,
-    );
+  assert.ok(consoleTest.includes('-Dtarget=${{ matrix.zig-target }}'));
+  assert.ok(consoleTest.includes('-Dcpu=baseline'));
+  for (const arch of ['x64', 'arm64']) {
+    const target = releaseTargetArgs('win32', arch)[0].slice('-Dtarget='.length);
+    assert.match(workflow, new RegExp(`platform: windows-${arch}\\n[\\s\\S]*?arch: ${arch}\\n            zig-target: ${target}`));
   }
 
   // The console test's Zig install step writes an unrestricted

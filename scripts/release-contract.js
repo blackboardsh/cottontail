@@ -7,6 +7,7 @@ export const RELEASE_PLATFORMS = [
   'linux-x64',
   'linux-arm64',
   'windows-x64',
+  'windows-arm64',
 ];
 
 export function parseSemver(version) {

@@ -22,6 +22,7 @@ const artifacts = [
   ['linux-arm64', 'b'],
   ['macos-arm64', 'c'],
   ['linux-x64', 'd'],
+  ['windows-arm64', 'e'],
 ].map(([platform, digit], index) => ({
   platform,
   sha256: digit.repeat(64),

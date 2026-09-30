@@ -89,7 +89,8 @@ and pinned JSC revision satisfy all of these gates on:
 - macOS ARM64
 - Linux x64 on glibc
 - Linux ARM64 on glibc
-- Windows x64, including Windows ARM machines using x64 emulation
+- Windows x64
+- Windows ARM64 with interpreter-only JSC (canary; no JIT or WebAssembly)
 
 Each target must:
 
@@ -176,8 +177,8 @@ node scripts/zig.js build -Doptimize=ReleaseSmall `
 ```
 
 Windows also needs Python 3 available as `python` for Node's copied
-`tools/test.py` harness. On Windows ARM, point `PYTHON` at an x64 Python
-executable and verify that `platform.machine()` reports `AMD64`.
+`tools/test.py` harness. Use Python matching the target architecture; on native
+Windows ARM64, `platform.machine()` should report `ARM64`.
 
 `COTTONTAIL_RUNTIME_MODULES_DIR` is a useful diagnostic overlay while changing
 embedded JavaScript modules:
@@ -474,9 +475,10 @@ node scripts/run-upstream-tests.js bun \
 node scripts/package-release.js
 ```
 
-Use the explicit Windows target for the Windows release build. On Windows ARM
-under x64 emulation, add `-j1` to both Zig build commands and keep all heavy
-phases sequential.
+Use `scripts/zig.js` to select the Windows MSVC target, or pass
+`-Dtarget=x86_64-windows-msvc` / `-Dtarget=aarch64-windows-msvc` explicitly.
+Windows ARM64 uses the x64 Zig compiler under emulation; add `-j1` to development
+builds and keep heavy phases sequential.
 
 Extract the packaged archive into a clean directory and repeat:
 
@@ -520,7 +522,7 @@ native build workflow:
 - Pull requests run local JavaScript tests and affected Node/Bun subsystem
   shards.
 - `main`, scheduled runs, and release candidates run the full macOS, Linux x64,
-  Linux ARM64, and Windows x64 compatibility matrix.
+  Linux ARM64, Windows x64, and Windows ARM64 compatibility matrix.
 - Upload structured platform results and failure logs.
 - Require the complete exact-revision matrix before publishing a release that
   claims cross-platform Node/Bun compatibility.

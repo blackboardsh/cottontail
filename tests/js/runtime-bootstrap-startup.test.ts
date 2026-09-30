@@ -5,6 +5,9 @@ import { join } from "node:path";
 import { withOwnedWindowsImageRetry } from "./fixtures/windows-image-sharing-retry.mjs";
 
 const isWindows = process.platform === "win32";
+// These fixtures start nested runtimes. ARM64's C-loop interpreter can exceed
+// the default test deadline before the child reaches its functional assertions.
+const nestedStartupTimeoutMs = isWindows && process.arch === "arm64" ? 15_000 : 5_000;
 // Windows x64 currently runs under emulation during bring-up. Keep the
 // functional regression coverage while Windows startup performance is deferred.
 const maxStartupRss = (isWindows ? 384 : 250) * 1024 * 1024;
@@ -56,7 +59,7 @@ test("selective bootstrap retains representative builtin behavior", () => {
   expect(String(result.stderr)).toBe("");
   expect(result.exitCode).toBe(0);
   expect(String(result.stdout)).toContain("runtime-bootstrap-builtins-ok");
-});
+}, { timeout: nestedStartupTimeoutMs });
 
 test("selective bootstrap supports process.chdir", () => {
   const destination = join(temporaryDirectory, "selective-chdir");
@@ -262,7 +265,7 @@ test("direct test entries do not auto-start an exported server config", async ()
   } finally {
     await occupied.stop(true);
   }
-});
+}, { timeout: nestedStartupTimeoutMs });
 
 test("node:test default-app guard follows registrations, not module loading", () => {
   const registeredFixture = join(temporaryDirectory, "default-server-node-test.mjs");
@@ -309,7 +312,7 @@ test("node:test default-app guard follows registrations, not module loading", ()
   });
   expect(importOnlyResult.exitCode).not.toBe(0);
   expect(String(importOnlyResult.stderr)).toContain(importOnlySentinel);
-});
+}, { timeout: nestedStartupTimeoutMs });
 
 test("ordinary CommonJS entrypoints retain ownership of -c arguments", () => {
   const fixture = join(temporaryDirectory, "commonjs-cli-arguments.cjs");
@@ -435,7 +438,7 @@ test("nested test runs remove per-invocation artifacts on process.exit", () => {
 
   const runRoot = join(cleanupRoot, "cottontail", "run");
   expect(existsSync(runRoot) ? readdirSync(runRoot) : []).toEqual([]);
-});
+}, { timeout: nestedStartupTimeoutMs });
 
 test("test-runner start hook is hidden from string global enumeration", () => {
   expect(Object.getOwnPropertyNames(globalThis)).not.toContain("__cottontailStartTestRun");

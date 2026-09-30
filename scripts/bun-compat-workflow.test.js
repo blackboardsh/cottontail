@@ -110,13 +110,14 @@ test('Windows runner contracts wait for the Cottontail-owned native job launcher
 });
 
 test('runs the strict complete Cottontail-owned Bun tier without publishing', () => {
-  for (const platform of ['macos-arm64', 'linux-x64', 'linux-arm64', 'windows-x64']) {
+  for (const platform of ['macos-arm64', 'linux-x64', 'linux-arm64', 'windows-x64', 'windows-arm64']) {
     assert.match(workflow, new RegExp(`platform: ${platform}`));
   }
   assert.match(workflow, /runner: macos-26/);
   assert.match(workflow, /runner: ubuntu-24\.04/);
   assert.match(workflow, /runner: ubuntu-24\.04-arm/);
   assert.match(workflow, /runner: windows-2025/);
+  assert.match(workflow, /runner: windows-11-arm/);
   assert.match(workflow, /fail-fast: false/);
   assert.match(
     workflow,
@@ -124,7 +125,7 @@ test('runs the strict complete Cottontail-owned Bun tier without publishing', ()
   );
   assert.match(
     workflow,
-    /node scripts\/zig\.js build -Doptimize=ReleaseFast -Dtarget=x86_64-windows-msvc -Dcpu=baseline/,
+    /node scripts\/zig\.js build -Doptimize=ReleaseFast -Dtarget=\$\{\{ matrix\.zig-target \}\} -Dcpu=baseline/,
   );
   assert.match(workflow, /run: node scripts\/zig\.js build test/);
   assert.match(workflow, /run: node scripts\/test-js\.js/);

@@ -2,6 +2,26 @@
   "schema": 2,
   "defaultStatus": "not-enabled",
   "platformOverrides": {
+    "win32-arm64": {
+      "expectedCounts": { "enabled": 1316, "expectedFailure": 22 },
+      "tests": {
+        "test/bundler/bun-build-compile-wasm.test.ts": {
+          "status": "expected-failure",
+          "classification": "runtime-gap",
+          "reason": "The Windows ARM64 canary uses JSC C_LOOP with WebAssembly disabled. The copied standalone WASM import case builds its executable but that executable exits 1 instead of executing the module (1 failing case, 3 assertions)."
+        },
+        "test/js/bun/wasm/wasi.test.js": {
+          "status": "expected-failure",
+          "classification": "runtime-gap",
+          "reason": "The Windows ARM64 canary uses JSC C_LOOP with WebAssembly disabled. The copied WASI child exits with ReferenceError: WebAssembly is not defined (1 failing case, 1 assertion)."
+        },
+        "test/js/web/fetch/wasm-streaming.test.ts": {
+          "status": "expected-failure",
+          "classification": "runtime-gap",
+          "reason": "The Windows ARM64 canary uses JSC C_LOOP with WebAssembly disabled. All 20 copied compileStreaming/instantiateStreaming cases fail because the WebAssembly global is unavailable."
+        }
+      }
+    },
     "linux-arm64": {
       "tests": {
         "test/bake/dev/hot.test.ts": {

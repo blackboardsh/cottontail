@@ -126,6 +126,12 @@ try {
   );
   const tests = [
     {
+      name: 'jsc-native-abi',
+      scriptPath: join(rootDir, 'tests', 'js', 'jsc-native-abi.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['native JSC heap, GC, roots, snapshot, and time-zone ABI passed'],
+    },
+    {
       name: 'smoke',
       scriptPath: join(rootDir, 'test.js'),
       expectExitCode: 0,
