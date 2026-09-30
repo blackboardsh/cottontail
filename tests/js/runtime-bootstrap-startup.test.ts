@@ -158,7 +158,7 @@ test("stdio-only child evals stay on the selective startup path", () => {
     expect(String(result.stderr)).toBe(`child-${index}\n`);
   }
   expect(Date.now() - startedAt).toBeLessThan(maxStdioStartupDurationMs);
-});
+}, { timeout: nestedStartupTimeoutMs });
 
 test("selective bootstrap initializes process before transitive runtime modules", () => {
   const fixture = join(temporaryDirectory, "selective-process-argv.js");
