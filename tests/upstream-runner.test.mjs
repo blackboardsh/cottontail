@@ -24,6 +24,21 @@ const runnerPath = join(rootDir, "scripts", "run-upstream-tests.js");
 const sharedStateRoot = mkdtempSync(join(tmpdir(), "cottontail-baseline-tools-"));
 process.on("exit", () => rmSync(sharedStateRoot, { recursive: true, force: true }));
 
+let windowsFixtureBinary;
+function nativeWindowsFixture() {
+  if (windowsFixtureBinary) return windowsFixtureBinary;
+  const output = join(sharedStateRoot, "windows-upstream-fixture.exe");
+  const built = spawnSync(join(rootDir, "vendors", "zig", "zig.exe"), [
+    "build-exe", join(rootDir, "tests", "windows-upstream-fixture.zig"),
+    "-O", "ReleaseSmall", "-lc", "-target",
+    process.arch === "arm64" ? "aarch64-windows-msvc" : "x86_64-windows-msvc",
+    `-femit-bin=${output}`,
+  ], { cwd: rootDir, encoding: "utf8", windowsHide: true });
+  assert.equal(built.status, 0, `could not build native Windows fixture:\n${built.error ?? ""}\n${built.stderr}`);
+  windowsFixtureBinary = output;
+  return output;
+}
+
 function createFixture(t) {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "cottontail-upstream-runner-"));
   const snapshotRoot = join(fixtureRoot, "node-snapshot");
@@ -40,17 +55,17 @@ function createFixture(t) {
   const cottontailBinaryPath = join(
     fixtureRoot,
     process.platform === "win32"
-      ? `cottontail-test-${basename(fixtureRoot)}.cmd`
+      ? `cottontail-test-${basename(fixtureRoot)}.exe`
       : `cottontail-test-${basename(fixtureRoot)}`,
   );
   const commandAdapterPath = join(
     fixtureRoot,
-    process.platform === "win32" ? "command-adapter.cmd" : "command-adapter",
+    process.platform === "win32" ? "command-adapter.exe" : "command-adapter",
   );
   const commandAdapterDriverPath = join(fixtureRoot, "command-adapter-driver.cjs");
   const packageManagerPath = join(
     fixtureRoot,
-    process.platform === "win32" ? "package-manager.cmd" : "package-manager",
+    process.platform === "win32" ? "package-manager.exe" : "package-manager",
   );
   const packageManagerDriverPath = join(fixtureRoot, "package-manager-driver.cjs");
   t.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
@@ -339,22 +354,10 @@ function createFixture(t) {
   );
 
   if (process.platform === "win32") {
-    const nodePath = process.execPath.replaceAll("%", "%%");
-    const shimPath = preflightShimPath.replaceAll("%", "%%");
-    const adapterDriver = commandAdapterDriverPath.replaceAll("%", "%%");
-    const packageManagerDriver = packageManagerDriverPath.replaceAll("%", "%%");
-    writeFileSync(
-      cottontailBinaryPath,
-      `@echo off\r\nif "%COTTONTAIL_UPSTREAM_PREFLIGHT%"=="1" set "NODE_OPTIONS=--require=\\"${shimPath}\\""\r\n"${nodePath}" %*\r\n`,
-    );
-    writeFileSync(
-      commandAdapterPath,
-      `@echo off\r\n"${nodePath}" "${adapterDriver}" %*\r\n`,
-    );
-    writeFileSync(
-      packageManagerPath,
-      `@echo off\r\n"${nodePath}" "${packageManagerDriver}" %*\r\n`,
-    );
+    const nativeFixture = nativeWindowsFixture();
+    for (const path of [cottontailBinaryPath, commandAdapterPath, packageManagerPath]) {
+      copyFileSync(nativeFixture, path);
+    }
   } else {
     writeFileSync(
       cottontailBinaryPath,
@@ -424,6 +427,7 @@ function runRunner(fixture, args, {
     ...process.env,
     COTTONTAIL_UPSTREAM_TARGETS_PATH: fixture.targetsPath,
     COTTONTAIL_RUNNER_TEST_CAPTURE: fixture.capturePath,
+    COTTONTAIL_RUNNER_TEST_NODE: process.execPath,
     COTTONTAIL_RUNNER_BUN_CAPTURE: fixture.bunCapturePath,
     COTTONTAIL_RUNNER_PACKAGE_MANAGER_CAPTURE: fixture.packageManagerCapturePath,
     COTTONTAIL_BASELINE_REPORTS_DIR: fixture.reportsRoot,
@@ -1240,7 +1244,7 @@ test("split bundler discovery fails closed on incomplete output", async (t) => {
     ["partial", /final record was truncated/, {}],
     [
       "truncated",
-      process.platform === "win32" ? /discovery must exit cleanly/ : /final record was truncated/,
+      /final record was truncated/,
       { COTTONTAIL_UPSTREAM_TEST_MAX_BUFFER: "256" },
     ],
   ]) {
@@ -1325,6 +1329,7 @@ test("a live baseline-suite lock rejects a competitor and a proven stale lock is
     ...process.env,
     COTTONTAIL_UPSTREAM_TARGETS_PATH: fixture.targetsPath,
     COTTONTAIL_RUNNER_TEST_CAPTURE: fixture.capturePath,
+    COTTONTAIL_RUNNER_TEST_NODE: process.execPath,
     COTTONTAIL_RUNNER_BUN_CAPTURE: fixture.bunCapturePath,
     COTTONTAIL_BASELINE_REPORTS_DIR: fixture.reportsRoot,
     COTTONTAIL_BASELINE_LOCK_DIR: fixture.locksRoot,

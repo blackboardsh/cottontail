@@ -7,7 +7,8 @@ import { join } from 'path';
 import { buildArchitecture } from './build-target.js';
 
 const rootDir = process.cwd();
-const hasJscWebAssembly = process.platform !== 'win32' || buildArchitecture() !== 'arm64';
+const isWindowsArm64 = process.platform === 'win32' && buildArchitecture() === 'arm64';
+const hasJscWebAssembly = !isWindowsArm64;
 const binaryPath = join(
   rootDir,
   'zig-out',
@@ -41,7 +42,13 @@ function embeddedRuntimeEnvironment(overrides = undefined) {
 }
 
 function runCase(testCase) {
-  const argv = testCase.argv ?? [testCase.scriptPath, ...(testCase.args ?? [])];
+  let argv = testCase.argv ?? [testCase.scriptPath, ...(testCase.args ?? [])];
+  // C_LOOP spends longer compiling/loading child runtimes in functional tests.
+  // Change only the runner's default: explicit fixture deadlines and measured
+  // lifecycle/performance assertions retain their own limits.
+  if (isWindowsArm64 && argv[0] === 'test' && !argv.some(arg => /^--timeout(?:=|$)/.test(arg))) {
+    argv = ['test', '--timeout=15000', ...argv.slice(1)];
+  }
   const result = spawnSync(testCase.executablePath ?? binaryPath, argv, {
     cwd: testCase.cwd ?? rootDir,
     env: embeddedRuntimeEnvironment(testCase.env),
@@ -271,6 +278,9 @@ try {
       name: 'upstream-runner-regressions',
       executablePath: process.execPath,
       argv: ['--test-reporter=tap', '--test', join(rootDir, 'tests', 'upstream-runner.test.mjs')],
+      env: process.platform === 'win32' ? {
+        COTTONTAIL_UPSTREAM_JOB_LAUNCHER: join(rootDir, 'zig-out', 'bin', 'cottontail-bun-compat-job.exe'),
+      } : undefined,
       expectExitCode: 0,
       stdoutMatches: [/^# pass [1-9]\d*\r?$/m, /^# fail 0\r?$/m],
     },
