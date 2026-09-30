@@ -489,9 +489,10 @@ function dynamicFunctionRenameCallSite(stack) {
     // Runtime modules are bundled through the same __name helper as user
     // code. Recording those internal renames (for example require3 ->
     // require in node:module) leaves one unresolved call-site record behind
-    // every time a CommonJS module is reloaded.
+    // every time a CommonJS module is reloaded or a modular runtime microtask
+    // wrapper is created. Both generated runtime bundle names are internal.
     if (/^(?:bun|node|internal):/.test(String(file ?? "")) ||
-        /[\\/]cache[\\/]commonjs-runtime-[^\\/]+\.mjs$/.test(String(file ?? ""))) {
+        /[\\/]cache[\\/](?:commonjs|module)-runtime-[^\\/]+\.mjs$/.test(String(file ?? ""))) {
       return null;
     }
     const frameLine = Number(jscFrame?.[3] ?? v8Frame?.[3]);
