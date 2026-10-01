@@ -839,7 +839,7 @@ try {
             name: 'node-fs-windows-permissions',
             argv: ['test', join(rootDir, 'tests', 'js', 'node-fs-windows-permissions.test.ts')],
             expectExitCode: 0,
-            stdoutIncludes: ['4 pass', '0 fail'],
+            stdoutIncludes: ['5 pass', '0 fail'],
           },
           {
             name: 'node-fs-windows-symlink-types',
