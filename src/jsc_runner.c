@@ -19,6 +19,7 @@
 #endif
 
 extern bool ct_jsc_string_is_8_bit(JSStringRef string);
+extern JSStringRef ct_jsc_string_from_valid_utf8(const char *bytes, size_t length);
 typedef void (*CtExternalStringFinalize)(void *, void *, size_t);
 extern JSStringRef ct_jsc_string_create_external_latin1(
     const uint8_t *characters,
@@ -36,6 +37,7 @@ extern void *ct_jsc_run_loop_current(void);
 extern void ct_jsc_run_loop_dispatch(void *run_loop, void (*callback)(void *), void *context);
 extern void ct_jsc_drain_microtasks(JSContextRef context);
 extern void ct_jsc_collect_full(JSContextRef context);
+extern size_t ct_jsc_heap_size(JSContextRef context);
 extern void ct_jsc_scavenge_allocator(void);
 extern void *ct_jsc_microtask_delay_begin(JSContextGroupRef group);
 extern void ct_jsc_microtask_delay_end(void *opaque_scope);
@@ -2917,6 +2919,9 @@ typedef struct CtLoadedCapability CtLoadedCapability;
 
 struct CtJscRuntime {
     JSGlobalContextRef context;
+    bool low_memory_gc_enabled;
+    uint64_t next_low_memory_gc_check_ns;
+    double low_memory_live_heap_bytes;
     JSObjectRef host_object;
     JSObjectRef native_binding_context;
     CtJscInspector *inspector;
@@ -5086,6 +5091,11 @@ static JSValueRef ct_make_ascii_string_len(JSContextRef ctx, const char *value, 
 static JSStringRef ct_js_string_from_utf8_len(const char *value, size_t len) {
     if (value == NULL || len == 0) return JSStringCreateWithUTF8CString("");
     if (len > SIZE_MAX / sizeof(JSChar)) return NULL;
+
+    // Valid text needs no malloc-backed UTF-16 staging buffer or second copy.
+    // This also keeps ASCII compact and honors explicit lengths containing NUL.
+    JSStringRef compact = ct_jsc_string_from_valid_utf8(value, len);
+    if (compact != NULL) return compact;
 
     JSChar *characters = (JSChar *)malloc(len * sizeof(JSChar));
     if (characters == NULL) return NULL;
@@ -32015,31 +32025,23 @@ static JSValueRef ct_compile_function_native(JSContextRef ctx, JSObjectRef funct
         ct_throw_message(ctx, exception, "compileFunction(source, filename) requires two arguments");
         return JSValueMakeUndefined(ctx);
     }
-    size_t source_len = 0;
-    char *source_bytes = ct_value_to_utf8_copy(ctx, argv[0], &source_len);
+    // Preserve JSC's existing string storage (including Latin-1 and embedded
+    // NULs). A UTF-8 round trip followed by UTF-16 decoding duplicated every
+    // compiled module's source and forced compact strings into two-byte form.
+    JSStringRef source = JSValueToStringCopy(ctx, argv[0], exception);
+    if (source == NULL) return JSValueMakeUndefined(ctx);
     char *filename = ct_value_to_string_copy(ctx, argv[1]);
-    if (source_bytes == NULL || filename == NULL) {
-        free(source_bytes);
-        free(filename);
+    if (filename == NULL) {
+        JSStringRelease(source);
         ct_throw_message(ctx, exception, "Out of memory compiling function");
         return JSValueMakeUndefined(ctx);
     }
 
-    // COTTONTAIL-COMPAT: sources may embed U+0000, so build the JSString from
-    // the explicit byte length rather than treating the copy as NUL-terminated.
-    JSStringRef source = ct_js_string_from_utf8_len(source_bytes, source_len);
-    if (source == NULL) {
-        free(source_bytes);
-        free(filename);
-        ct_throw_message(ctx, exception, "Out of memory compiling function");
-        return JSValueMakeUndefined(ctx);
-    }
     JSStringRef source_url = ct_js_string(filename);
     JSValueRef eval_exception = NULL;
     JSValueRef result = JSEvaluateScript(ctx, source, NULL, source_url, 1, &eval_exception);
     JSStringRelease(source);
     JSStringRelease(source_url);
-    free(source_bytes);
     free(filename);
     if (eval_exception != NULL) {
         if (exception != NULL) *exception = eval_exception;
@@ -32073,6 +32075,10 @@ static JSValueRef ct_build_native(JSContextRef ctx, JSObjectRef function, JSObje
 
     size_t output_len = 0;
     char *error = NULL;
+    // Bun's BundleThread serializes builds. The synchronous bridge shares
+    // the same compiler pool as bundleNative, whose wait groups permit one
+    // waiting bundle at a time.
+    pthread_mutex_lock(&ct_bundler_mutex);
     uint8_t *output = ct_bundle_build(
         (const uint8_t *)request,
         request_len,
@@ -32081,6 +32087,7 @@ static JSValueRef ct_build_native(JSContextRef ctx, JSObjectRef function, JSObje
         &output_len,
         &error
     );
+    pthread_mutex_unlock(&ct_bundler_mutex);
     free(request);
     free(working_dir);
     if (output == NULL) {
@@ -33301,6 +33308,9 @@ static CtJscRuntime *ct_jsc_runtime_create_internal(
 #endif
     CtJscRuntime *runtime = (CtJscRuntime *)calloc(1, sizeof(CtJscRuntime));
     if (runtime == NULL) return NULL;
+    const char *mini_vm = getenv("JSC_forceMiniVMMode");
+    runtime->low_memory_gc_enabled = getenv("COTTONTAIL_ELECTROBUN_DIST") != NULL ||
+        (mini_vm != NULL && strcmp(mini_vm, "true") == 0);
     runtime->start_time_ns = uv_hrtime();
     runtime->next_tick_priority_armed = true;
     runtime->should_terminate_callback = terminate_callback;
@@ -34863,6 +34873,38 @@ static int ct_jsc_runtime_has_active_handles(CtJscRuntime *runtime, bool *has_ac
     return 0;
 }
 
+static double ct_live_heap_bytes(JSContextRef ctx) {
+    // Avoid JSGetMemoryUsageStatistics here: constructing its object-type
+    // census would itself allocate and walk the heap on every idle check.
+    return (double)ct_jsc_heap_size(ctx);
+}
+
+static void ct_collect_low_memory_idle(CtJscRuntime *runtime, int delay_ms, uint64_t active_ns) {
+    // Lazy module loads happen after the initial script has finished. In a
+    // mostly idle desktop host their temporary graphs may never provoke JSC's
+    // allocation-triggered collector. Check only before a real event-loop
+    // wait, and collect only after substantial growth since the last full GC.
+    if (!runtime->low_memory_gc_enabled) return;
+    uint64_t now = ct_timer_now_ns();
+    if (now < runtime->next_low_memory_gc_check_ns) return;
+    runtime->next_low_memory_gc_check_ns = now + 1000000000ULL;
+    // Short housekeeping timers are common in desktop hosts. Require a wait
+    // and a lightly loaded turn, rather than an arbitrary long timer gap.
+    double bytes = ct_live_heap_bytes(runtime->context);
+    if (ct_debug_flag("COTTONTAIL_GC_DEBUG")) {
+        fprintf(stderr, "[cottontail:gc] vm=%p delay=%d active_ns=%llu heap=%.0f baseline=%.0f\n",
+            (void *)runtime, delay_ms, (unsigned long long)active_ns, bytes, runtime->low_memory_live_heap_bytes);
+    }
+    if (delay_ms < 1 || active_ns > 1000000ULL || active_ns > (uint64_t)delay_ms * 250000ULL) return;
+    double growth = bytes - runtime->low_memory_live_heap_bytes;
+    if (growth < 8 * 1024 * 1024 || growth < runtime->low_memory_live_heap_bytes * 0.25) return;
+    ct_jsc_collect_full(runtime->context);
+    runtime->low_memory_live_heap_bytes = ct_live_heap_bytes(runtime->context);
+    // No repeated collections of a stable live heap, and at most one full
+    // idle collection per five seconds even when application state grows.
+    runtime->next_low_memory_gc_check_ns = ct_timer_now_ns() + 5000000000ULL;
+}
+
 static int ct_jsc_runtime_eval_internal(
     CtJscRuntime *runtime,
     const uint8_t *source,
@@ -34998,11 +35040,14 @@ static int ct_jsc_runtime_eval_internal(
 
     /* Electrobun ships an already-bundled main process and normally stays alive
      * for the lifetime of its windows. Release unreachable bootstrap objects
-     * before entering that long-lived loop. Use the public collector here: the
-     * force/full path deliberately discards all unlinked code and can create a
-     * large temporary liveness bitmap on substantial application bundles. */
-    if (getenv("COTTONTAIL_ELECTROBUN_DIST") != NULL) {
-        JSGarbageCollect(ctx);
+     * before entering that long-lived loop. The public collector only requests
+     * collection and leaves bootstrap pages committed in otherwise idle VMs.
+     * Collect and scavenge at this startup boundary, outside JS callbacks, so
+     * temporary source maps and compiler objects do not set the idle baseline. */
+    if (runtime->low_memory_gc_enabled) {
+        ct_jsc_collect_full(ctx);
+        runtime->low_memory_live_heap_bytes = ct_live_heap_bytes(ctx);
+        runtime->next_low_memory_gc_check_ns = ct_timer_now_ns() + 1000000000ULL;
     }
 
     for (;;) {
@@ -35011,8 +35056,10 @@ static int ct_jsc_runtime_eval_internal(
         int delay_ms = 16;
         if (ct_jsc_runtime_has_active_handles(runtime, &has_active_handles, error_out) != 0) return -1;
         if (!has_active_handles) break;
+        uint64_t turn_started_ns = ct_timer_now_ns();
         if (ct_jsc_runtime_tick_with_delay(runtime, &delay_ms, error_out) != 0) return -1;
         if (runtime->reload_requested) return CT_JSC_EVAL_RELOAD;
+        ct_collect_low_memory_idle(runtime, delay_ms, ct_timer_now_ns() - turn_started_ns);
         ct_runtime_wait(runtime, delay_ms);
     }
 

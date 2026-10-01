@@ -9,6 +9,9 @@ pub const ThreadPool = struct {
     worker_pool_is_owned: bool = false,
     workers_assignments: bun.AutoArrayHashMap(std.Thread.Id, *Worker) = bun.AutoArrayHashMap(std.Thread.Id, *Worker).init(bun.default_allocator),
     workers_assignments_lock: bun.Mutex = .{},
+    // Bundle-local barrier for the tail of worker callbacks. Phase completion
+    // can be published before their deferred AST allocator restoration runs.
+    active_workers: bun.threading.WaitGroup = .init(),
     v2: *BundleV2,
 
     const debug = Output.scoped(.ThreadPool, .visible);
@@ -238,6 +241,7 @@ pub const ThreadPool = struct {
 
         pub fn get(ctx: *BundleV2) *Worker {
             var worker = ctx.graph.pool.getWorker(std.Thread.getCurrentId());
+            ctx.graph.pool.active_workers.addOne();
             if (!worker.has_created) {
                 worker.create(ctx);
             }
@@ -257,6 +261,7 @@ pub const ThreadPool = struct {
             }
 
             this.ast_memory_allocator.pop();
+            this.ctx.graph.pool.active_workers.finish();
         }
 
         pub const WorkerData = struct {

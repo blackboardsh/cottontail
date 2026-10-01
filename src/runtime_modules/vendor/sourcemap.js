@@ -19,7 +19,10 @@ let cachedMapPath;
 let cachedMapData;
 let cachedBundlePath;
 let cachedSourceRoot;
-let cachedState; // undefined = never attempted for cachedMapPath, null = load failed
+// Decoded maps can dwarf a small application's live heap. Keep the lookup
+// cache weak: consumers own their maps, but incidental stack formatting must
+// not pin map documents, decoded source lines and indexes forever.
+let cachedState; // undefined = never attempted, null = failed, WeakRef = loaded
 const adjacentBundleStates = new Map();
 const virtualSourceMappings = new WeakMap();
 const remapStackMemo = new WeakMap();
@@ -536,20 +539,28 @@ function getState() {
   if (!hasMapPath && !hasMapData) return null;
   if (cachedState !== undefined && cachedMapPath === mapPath && cachedMapData === mapData &&
       cachedBundlePath === bundlePath && cachedSourceRoot === sourceRoot) {
-    return cachedState;
+    if (cachedState === null) return null;
+    const state = cachedState.deref();
+    if (state !== undefined) return state;
   }
   cachedMapPath = mapPath;
   cachedMapData = mapData;
   cachedBundlePath = bundlePath;
   cachedSourceRoot = sourceRoot;
-  cachedState = buildState(hasMapPath ? mapPath : "", hasMapData ? mapData : null, bundlePath, sourceRoot);
-  return cachedState;
+  const state = buildState(hasMapPath ? mapPath : "", hasMapData ? mapData : null, bundlePath, sourceRoot);
+  cachedState = state === null ? null : new WeakRef(state);
+  return state;
 }
 
 function getAdjacentBundleState(bundlePath) {
-  if (adjacentBundleStates.has(bundlePath)) return adjacentBundleStates.get(bundlePath);
+  const cached = adjacentBundleStates.get(bundlePath);
+  if (cached === null) return null;
+  const loaded = cached?.deref();
+  if (loaded !== undefined) return loaded;
   const state = buildState(`${bundlePath}.map`, null, bundlePath);
-  adjacentBundleStates.set(bundlePath, state);
+  // Bound path/negative-cache metadata as well as the decoded map lifetime.
+  if (adjacentBundleStates.size >= 128) adjacentBundleStates.delete(adjacentBundleStates.keys().next().value);
+  adjacentBundleStates.set(bundlePath, state === null ? null : new WeakRef(state));
   return state;
 }
 

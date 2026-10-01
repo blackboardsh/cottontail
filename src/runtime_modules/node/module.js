@@ -265,10 +265,26 @@ export const builtinModules = [
   "zlib",
 ];
 
+// Compiled factories are an optimization, not the module registry. Keeping
+// their entries strongly reachable also pins original and transformed source
+// after evaluation. A collected entry can safely be compiled again following
+// require.cache deletion; live module exports remain in their own registry.
+class ModuleFactoryCache extends Map {
+  get(key) {
+    const entry = super.get(key)?.deref();
+    if (entry === undefined) super.delete(key);
+    return entry;
+  }
+  set(key, entry) {
+    if (!super.has(key) && this.size >= 1024) super.delete(this.keys().next().value);
+    return super.set(key, new WeakRef(entry));
+  }
+}
+
 const commonJsCache = cottontail.__cottontailCommonJsCache ??= new Map();
-const commonJsWrapperFactoryCache = new Map();
-const bundledCommonJsFactoryCache = new Map();
-const runtimeEsmWrapperCache = new Map();
+const commonJsWrapperFactoryCache = new ModuleFactoryCache();
+const bundledCommonJsFactoryCache = new ModuleFactoryCache();
+const runtimeEsmWrapperCache = new ModuleFactoryCache();
 const nodeModulePathsCache = new Map();
 const nodeModulePathsCacheLimit = 256;
 const smolModuleCacheGcInterval = 16;
@@ -1278,7 +1294,9 @@ function standaloneDirectoryExists(path) {
 }
 
 const embeddedRuntimeDirectoryName = ".cottontail-embedded-runtime";
-const embeddedRuntimeSourceCache = globalThis[Symbol.for("cottontail.runtimeModuleSourceCache")] ??= new Map();
+// Sources are reproducible from the embedded runtime. Retain them only while
+// useful during loading, rather than alongside every compiled runtime module.
+const embeddedRuntimeSourceCache = new ModuleFactoryCache();
 const embeddedRuntimePreloadedModules = globalThis[Symbol.for("cottontail.runtimeModulePreloadedModules")] ??= new Map();
 const cottontailCapabilityCache = globalThis[Symbol.for("cottontail.capabilityModuleCache")] ??= new Map();
 
@@ -1297,10 +1315,8 @@ function isEmbeddedRuntimePath(path) {
 function embeddedRuntimeSourceEntry(path) {
   const relativePath = embeddedRuntimeRelativePath(path);
   if (relativePath == null) return { found: false, value: undefined };
-  if (embeddedRuntimeSourceCache.has(relativePath)) {
-    const value = embeddedRuntimeSourceCache.get(relativePath);
-    return { found: value !== undefined, value };
-  }
+  const cachedSource = embeddedRuntimeSourceCache.get(relativePath);
+  if (cachedSource !== undefined) return cachedSource;
 
   const overrideRoot = globalThis.__cottontailHutchPrivateFileMode == null
     ? globalThis.process?.env?.COTTONTAIL_RUNTIME_MODULES_DIR
@@ -1310,15 +1326,17 @@ function embeddedRuntimeSourceEntry(path) {
     try {
       if (cottontail.existsSync(overridePath)) {
         const source = cottontail.readFile(overridePath);
-        embeddedRuntimeSourceCache.set(relativePath, source);
-        return { found: true, value: source };
+        const entry = { found: true, value: source };
+        embeddedRuntimeSourceCache.set(relativePath, entry);
+        return entry;
       }
     } catch {}
   }
 
   const source = cottontail.runtimeModuleSourceNative(relativePath);
-  embeddedRuntimeSourceCache.set(relativePath, source);
-  return { found: source !== undefined, value: source };
+  const entry = { found: source !== undefined, value: source };
+  embeddedRuntimeSourceCache.set(relativePath, entry);
+  return entry;
 }
 
 function embeddedRuntimePath(relativePath) {
@@ -4848,8 +4866,8 @@ function isAsyncModuleRequireError(error) {
 }
 
 const asyncEsmModuleCache = new Map();
-const dynamicEsmFactoryCache = new Map();
-const asyncDynamicEsmFactoryCache = new Map();
+const dynamicEsmFactoryCache = new ModuleFactoryCache();
+const asyncDynamicEsmFactoryCache = new ModuleFactoryCache();
 const registeredSelfEsmNamespacesKey = Symbol.for("cottontail.registeredSelfEsmNamespaces");
 const registeredSelfEsmNamespaces = globalThis[registeredSelfEsmNamespacesKey] ??= new Map();
 const asyncEsmEvaluationContextKey = Symbol("cottontail.asyncEsmEvaluationContext");

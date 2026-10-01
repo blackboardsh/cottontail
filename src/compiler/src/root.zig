@@ -15,7 +15,9 @@ pub const Maybe = jsc.Node.Maybe;
 // tests do not turn every allocation into a guarded mapping. Unlike
 // page_allocator, the pooled allocator also amortizes the many non-arena
 // allocations owned by Bun.build configs, diagnostics, and output artifacts.
-pub const default_allocator = std.heap.smp_allocator;
+// Compiler pools must be reclaimable in long-lived embedders after a build.
+// Zig's SMP allocator keeps its small-allocation slabs for process lifetime.
+pub const default_allocator = std.heap.c_allocator;
 /// Installer types remain temporarily coupled to resolver and linker internals.
 /// Runtime auto-install is disabled; package installation is external.
 pub const enable_package_manager = false;
@@ -1191,12 +1193,10 @@ pub const allocators = struct {
         };
 
         pub fn init() @This() {
-            // Bun gives every bundle its own mimalloc heap. Cottontail keeps
-            // the same bulk-release lifetime but uses Zig's pooled allocator
-            // underneath it. Backing this arena with page_allocator turns
-            // every Bun.build() into a large mmap/munmap cycle, which is
-            // especially costly for repeated small CSS builds.
-            return .{ .arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator) };
+            // Keep bulk arena lifetimes without pinning SMP allocator slabs
+            // after compilation. The system allocator also pools small builds,
+            // and can release freed pages at the runtime's idle boundary.
+            return .{ .arena = std.heap.ArenaAllocator.init(default_allocator) };
         }
 
         pub fn allocator(self: *@This()) std.mem.Allocator {

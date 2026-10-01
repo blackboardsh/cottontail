@@ -249,6 +249,12 @@ try {
       stdoutIncludes: ['22 pass', '0 fail'],
     },
     {
+      name: 'module-factory-retention',
+      argv: ['test', join(rootDir, 'tests', 'js', 'module-factory-retention.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['3 pass', '0 fail'],
+    },
+    {
       name: 'node-module-cache-lifecycle',
       argv: ['test', join(rootDir, 'tests', 'js', 'node-module-cache-lifecycle.test.ts')],
       expectExitCode: 0,
@@ -339,6 +345,13 @@ try {
       stderrIncludes: ['10 pass', '0 fail'],
     },
     {
+      name: 'sourcemap-cache-retention',
+      executablePath: process.execPath,
+      argv: ['--expose-gc', join(rootDir, 'scripts', 'sourcemap-cache-retention.test.js')],
+      expectExitCode: 0,
+      stdoutIncludes: ['pass 2', 'fail 0'],
+    },
+    {
       name: 'cli-version-identity-regressions',
       argv: ['test', join(rootDir, 'tests', 'js', 'cli-version-identity.test.ts')],
       expectExitCode: 0,
@@ -355,6 +368,24 @@ try {
       scriptPath: join(rootDir, 'tests', 'js', 'bun-transpiled-dynamic-import.js'),
       expectExitCode: 0,
       stdoutIncludes: ['bun transpiled dynamic import passed'],
+    },
+    {
+      name: 'bun-transpiler-retention',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-transpiler-retention.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['2 pass', '0 fail'],
+    },
+    {
+      name: 'bun-bundler-retention',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-bundler-retention.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['2 pass', '0 fail'],
+    },
+    {
+      name: 'desktop-idle-retention',
+      argv: ['test', join(rootDir, 'tests', 'js', 'desktop-idle-retention.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['1 pass', '0 fail'],
     },
     {
       name: 'async',

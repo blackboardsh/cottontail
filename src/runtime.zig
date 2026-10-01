@@ -421,20 +421,15 @@ pub const Runtime = struct {
         filename: [:0]const u8,
         bytecode: ?[]const u8,
     ) u8 {
-        const source_z = self.allocator.alloc(u8, source.len + 1) catch {
-            self.writeStderrLine("cottontail: out of memory preparing script source");
-            return 1;
-        };
-        defer self.allocator.free(source_z);
-        @memcpy(source_z[0..source.len], source);
-        source_z[source.len] = 0;
-
+        // The C evaluator consumes an explicit byte length and creates its own
+        // wrapped source. A sentinel copy here would stay dirty throughout the
+        // event loop, defeating runFile's read-only source mapping.
         var eval_error: [*c]u8 = null;
 
         const eval_status = if (bytecode) |cached|
             c.ct_jsc_runtime_eval_bytecode(
                 self.handle,
-                source_z.ptr,
+                source.ptr,
                 source.len,
                 filename.ptr,
                 cached.ptr,
@@ -442,7 +437,7 @@ pub const Runtime = struct {
                 &eval_error,
             )
         else
-            c.ct_jsc_runtime_eval(self.handle, source_z.ptr, source.len, filename.ptr, &eval_error);
+            c.ct_jsc_runtime_eval(self.handle, source.ptr, source.len, filename.ptr, &eval_error);
         if (eval_status != 0) {
             defer if (eval_error != null) {
                 c.ct_jsc_string_free(eval_error);
@@ -531,16 +526,8 @@ pub const Runtime = struct {
         source: []const u8,
         filename: [:0]const u8,
     ) ReloadResult {
-        const source_z = self.allocator.alloc(u8, source.len + 1) catch {
-            self.writeStderrLine("cottontail: out of memory preparing script source");
-            return .{ .failed = 1 };
-        };
-        defer self.allocator.free(source_z);
-        @memcpy(source_z[0..source.len], source);
-        source_z[source.len] = 0;
-
         var eval_error: [*c]u8 = null;
-        const status = c.ct_jsc_runtime_eval(self.handle, source_z.ptr, source.len, filename.ptr, &eval_error);
+        const status = c.ct_jsc_runtime_eval(self.handle, source.ptr, source.len, filename.ptr, &eval_error);
         defer if (eval_error != null) c.ct_jsc_string_free(eval_error);
         if (status == c.CT_JSC_EVAL_RELOAD) {
             _ = c.ct_jsc_runtime_take_reload_request(self.handle);

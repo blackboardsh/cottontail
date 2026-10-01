@@ -552,12 +552,17 @@ fn process(
     var arena_state = std.heap.ArenaAllocator.init(c_allocator);
     defer arena_state.deinit();
     const temporary_allocator = arena_state.allocator();
-    const allocator = compiler.default_allocator;
+    // The standalone parser's nested scopes, statements and lookup tables all
+    // live only until this operation returns. Ast.deinit frees just its three
+    // top-level lists; it does not walk and release that entire parse graph.
+    const allocator = temporary_allocator;
 
-    compiler.ast.Expr.Data.Store.create();
-    compiler.ast.Stmt.Data.Store.create();
-    defer compiler.ast.Expr.Data.Store.reset();
-    defer compiler.ast.Stmt.Data.Store.reset();
+    // Scope expression and statement nodes to this operation too. Resetting
+    // the thread-local stores otherwise retains the largest parsed module on
+    // every runtime/worker thread for the lifetime of the process.
+    var ast_memory: compiler.ast.ASTMemoryAllocator = undefined;
+    const ast_scope = ast_memory.enter(allocator);
+    defer ast_scope.exit();
 
     const parsed_config = parseConfig(options_json, loader_override, temporary_allocator) catch |err| {
         setError(error_out, "Invalid Bun.Transpiler options: {s}", .{@errorName(err)});
@@ -703,7 +708,7 @@ fn process(
             return error.CachedResultUnavailable;
         },
     };
-    defer ast.deinit();
+    // The operation arena owns the AST lists as well as the nested parse graph.
 
     if (config.eval_print) {
         var parts = ast.parts.slice();

@@ -117,6 +117,7 @@ public:
     }
 
     StringImpl* impl() const { return m_impl; }
+    static String fromUTF8(std::span<const char8_t>);
 
     static String adopt(StringImpl& impl)
     {
@@ -202,6 +203,8 @@ struct GnuExternalStringSpan {
 };
 
 using ExternalStringFreeFunction = WTF::ExternalStringImplFreeFunction;
+extern WTF::String string_from_utf8_gnu(GnuExternalStringSpan<char8_t>)
+    asm("_ZN3WTF6String8fromUTF8ESt4spanIKDuLm18446744073709551615EE");
 
 extern WTF::Ref<WTF::ExternalStringImpl> create_external_latin1_gnu(
     GnuExternalStringSpan<uint8_t>,
@@ -212,6 +215,21 @@ extern WTF::Ref<WTF::ExternalStringImpl> create_external_utf16_gnu(
     ExternalStringFreeFunction&&)
     asm("_ZN3WTF18ExternalStringImpl6createESt4spanIKDsLm18446744073709551615EEONS_8FunctionIFvPS0_PvjEEE");
 #endif
+
+// Decode directly into JSC-owned compact storage. Returning null for invalid
+// UTF-8 lets the C caller retain its existing replacement-character behavior.
+extern "C" JSStringRef ct_jsc_string_from_valid_utf8(const char* bytes, size_t length)
+{
+#if defined(__linux__)
+    auto string = string_from_utf8_gnu({ reinterpret_cast<const char8_t*>(bytes), length });
+#else
+    auto string = WTF::String::fromUTF8(std::span<const char8_t>(
+        reinterpret_cast<const char8_t*>(bytes), length));
+#endif
+    if (string.impl() == nullptr)
+        return nullptr;
+    return OpaqueJSString::tryCreate(std::move(string)).leakRef();
+}
 
 static WTF::Ref<WTF::ExternalStringImpl> create_external_impl(
     std::span<const uint8_t> characters,
@@ -471,6 +489,7 @@ static_assert(offsetof(GCRequest, did_finish_end_phase) == sizeof(void*));
 
 class Heap {
 public:
+    size_t size();
     void allowCollection();
     void collectNow(Synchronousness, GCRequest);
     void deleteAllUnlinkedCodeBlocks(DeleteAllCodeEffort);
@@ -539,6 +558,15 @@ static JSC::Heap* ct_jsc_heap(JSC::VM* vm)
 {
     return reinterpret_cast<JSC::Heap*>(
         reinterpret_cast<unsigned char*>(vm) + ct_jsc_vm_heap_offset);
+}
+
+extern "C" size_t ct_jsc_heap_size(JSContextRef context)
+{
+    if (context == nullptr)
+        return 0;
+    auto* vm = ct_jsc_vm(context);
+    JSC::JSLockHolder lock(*vm);
+    return ct_jsc_heap(vm)->size();
 }
 
 extern "C" void ct_jsc_collect_full(JSContextRef context)

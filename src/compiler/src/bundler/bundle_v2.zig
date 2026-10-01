@@ -2268,7 +2268,19 @@ pub const BundleV2 = struct {
     /// while its parked threads still reference it).
     pub fn deinitFromCLI(this: *BundleV2, alloc: std.mem.Allocator) void {
         var heap = this.graph.heap;
+        // Cottontail's worker arenas are ordinary Zig arenas, with no owning
+        // thread affinity. Wait until callbacks (including their unget defers)
+        // finish, then reclaim them here. Queuing cleanup on every idle thread
+        // is insufficient: the pool's shared semaphore wake is consumed by one
+        // thread, leaving other idle queues holding entire completed ASTs.
+        // Do not wait on the shared thread pool: unrelated bundles may still
+        // be running, and its completion condition has only one waiter.
+        this.graph.pool.active_workers.wait();
+        var workers = this.graph.pool.workers_assignments;
+        this.graph.pool.workers_assignments = @TypeOf(workers).init(bun.default_allocator);
         this.deinitWithoutFreeingArena();
+        for (workers.values()) |worker| worker.deinit();
+        workers.deinit();
         heap.deinit();
         alloc.destroy(this);
     }
