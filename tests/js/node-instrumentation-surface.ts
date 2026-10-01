@@ -216,98 +216,103 @@ assert((await collect(spec(testEvents()))).includes("TAP version"), "spec report
 assert((await collect(lcov(testEvents()))) === "", "lcov reporter mismatch");
 
 const wasi = new WASI({ version: "preview1", returnOnExit: true, args: ["a"], env: { A: "1" }, preopens: { "/sandbox": runtimeTmp } });
-const wasiMemory = new WebAssembly.Memory({ initial: 1 });
-const wasiInstance = {
-  exports: {
-    memory: wasiMemory,
-    _initialize() {},
-    _start: () => wasi.getImportObject().wasi_snapshot_preview1.proc_exit(7),
-  },
-};
-wasi.initialize(wasiInstance);
-const wasiImport = wasi.getImportObject().wasi_snapshot_preview1;
-const wasiView = new DataView(wasiMemory.buffer);
-assert(typeof wasiImport.fd_write === "function", "WASI import object mismatch");
-assert(wasiImport.args_sizes_get(0, 4) === 0, "WASI args_sizes_get errno mismatch");
-assert(wasiView.getUint32(0, true) === 1 && wasiView.getUint32(4, true) === 2, "WASI args_sizes_get memory mismatch");
-assert(wasiImport.args_get(8, 16) === 0, "WASI args_get errno mismatch");
-assert(Buffer.from(new Uint8Array(wasiMemory.buffer, 16, 2)).toString() === "a\0", "WASI args_get memory mismatch");
-assert(wasiImport.environ_sizes_get(32, 36) === 0, "WASI environ_sizes_get errno mismatch");
-assert(wasiView.getUint32(32, true) === 1 && wasiView.getUint32(36, true) === 4, "WASI environ_sizes_get memory mismatch");
-assert(wasiImport.random_get(48, 8) === 0, "WASI random_get errno mismatch");
-assert(wasiImport.clock_time_get(1, 0, 64) === 0 && wasiView.getBigUint64(64, true) > 0n, "WASI clock_time_get mismatch");
-new Uint8Array(wasiMemory.buffer, 96, 2).set(Buffer.from("ok"));
-wasiView.setUint32(80, 96, true);
-wasiView.setUint32(84, 2, true);
-assert(wasiImport.fd_write(1, 80, 1, 88) === 0 && wasiView.getUint32(88, true) === 2, "WASI fd_write mismatch");
-assert(wasiImport.fd_fdstat_get(1, 104) === 0, "WASI fd_fdstat_get stdio mismatch");
-assert(wasiImport.fd_prestat_get(3, 128) === 0 && wasiView.getUint32(132, true) === "/sandbox".length, "WASI fd_prestat_get mismatch");
-assert(wasiImport.fd_prestat_dir_name(3, 144, 16) === 0, "WASI fd_prestat_dir_name errno mismatch");
-assert(Buffer.from(new Uint8Array(wasiMemory.buffer, 144, "/sandbox".length)).toString() === "/sandbox", "WASI preopen name mismatch");
-const wasiFileName = `cottontail-wasi-${Date.now()}.txt`;
-const wasiFileNameBytes = Buffer.from(wasiFileName);
-new Uint8Array(wasiMemory.buffer, 1024, wasiFileNameBytes.byteLength).set(wasiFileNameBytes);
-assert(wasiImport.path_open(3, 0, 1024, wasiFileNameBytes.byteLength, 1 | 8, 0n, 0n, 0, 480) === 0, "WASI path_open create mismatch");
-const wasiFd = wasiView.getUint32(480, true);
-const wasiWriteBytes = Buffer.from("wasi-file-ok");
-new Uint8Array(wasiMemory.buffer, 560, wasiWriteBytes.byteLength).set(wasiWriteBytes);
-wasiView.setUint32(544, 560, true);
-wasiView.setUint32(548, wasiWriteBytes.byteLength, true);
-assert(wasiImport.fd_write(wasiFd, 544, 1, 536) === 0, "WASI fd_write file mismatch");
-assert(wasiView.getUint32(536, true) === wasiWriteBytes.byteLength, "WASI fd_write byte count mismatch");
-assert(wasiImport.fd_seek(wasiFd, 0n, 0, 584) === 0 && wasiView.getBigUint64(584, true) === 0n, "WASI fd_seek mismatch");
-wasiView.setUint32(592, 608, true);
-wasiView.setUint32(596, wasiWriteBytes.byteLength, true);
-assert(wasiImport.fd_read(wasiFd, 592, 1, 600) === 0, "WASI fd_read file mismatch");
-assert(wasiView.getUint32(600, true) === wasiWriteBytes.byteLength, "WASI fd_read byte count mismatch");
-assert(Buffer.from(new Uint8Array(wasiMemory.buffer, 608, wasiWriteBytes.byteLength)).toString() === "wasi-file-ok", "WASI fd_read content mismatch");
-assert(wasiImport.fd_filestat_get(wasiFd, 640) === 0, "WASI fd_filestat_get mismatch");
-assert(wasiView.getUint8(656) === 4 && wasiView.getBigUint64(672, true) === BigInt(wasiWriteBytes.byteLength), "WASI fd_filestat_get content mismatch");
-assert(wasiImport.fd_close(wasiFd) === 0, "WASI fd_close mismatch");
-assert(wasiImport.path_filestat_get(3, 1, 1024, wasiFileNameBytes.byteLength, 704) === 0, "WASI path_filestat_get mismatch");
-assert(wasiView.getUint8(720) === 4, "WASI path_filestat_get filetype mismatch");
-assert(wasiImport.path_unlink_file(3, 1024, wasiFileNameBytes.byteLength) === 0, "WASI path_unlink_file mismatch");
-const wasiDirName = `cottontail-wasi-dir-${Date.now()}`;
-const wasiDirNameBytes = Buffer.from(wasiDirName);
-new Uint8Array(wasiMemory.buffer, 2048, wasiDirNameBytes.byteLength).set(wasiDirNameBytes);
-assert(wasiImport.path_create_directory(3, 2048, wasiDirNameBytes.byteLength) === 0, "WASI path_create_directory mismatch");
-const wasiNestedName = `${wasiDirName}/entry.txt`;
-const wasiNestedNameBytes = Buffer.from(wasiNestedName);
-new Uint8Array(wasiMemory.buffer, 2112, wasiNestedNameBytes.byteLength).set(wasiNestedNameBytes);
-assert(wasiImport.path_open(3, 0, 2112, wasiNestedNameBytes.byteLength, 1 | 8, 0n, 0n, 0, 2200) === 0, "WASI nested path_open mismatch");
-const wasiNestedFd = wasiView.getUint32(2200, true);
-assert(wasiImport.fd_close(wasiNestedFd) === 0, "WASI nested fd_close mismatch");
-assert(wasiImport.path_open(3, 0, 2048, wasiDirNameBytes.byteLength, 2, 0n, 0n, 0, 2208) === 0, "WASI directory path_open mismatch");
-const wasiDirFd = wasiView.getUint32(2208, true);
-assert(wasiImport.fd_readdir(wasiDirFd, 2300, 256, 0n, 2280) === 0, "WASI fd_readdir mismatch");
-const readdirBytes = wasiView.getUint32(2280, true);
-const readdirNames: string[] = [];
-let readdirOffset = 2300;
-while (readdirOffset < 2300 + readdirBytes) {
-  const nameLength = wasiView.getUint32(readdirOffset + 16, true);
-  const filetype = wasiView.getUint8(readdirOffset + 20);
-  const name = Buffer.from(new Uint8Array(wasiMemory.buffer, readdirOffset + 24, nameLength)).toString();
-  readdirNames.push(`${filetype}:${name}`);
-  readdirOffset += 24 + nameLength;
+if (typeof WebAssembly === "undefined") {
+  assert(process.platform === "win32" && process.arch === "arm64", "WebAssembly unexpectedly unavailable");
+  console.log("WASI execution unavailable with interpreter-only Windows ARM64 JSC");
+} else {
+  const wasiMemory = new WebAssembly.Memory({ initial: 1 });
+  const wasiInstance = {
+    exports: {
+      memory: wasiMemory,
+      _initialize() {},
+      _start: () => wasi.getImportObject().wasi_snapshot_preview1.proc_exit(7),
+    },
+  };
+  wasi.initialize(wasiInstance);
+  const wasiImport = wasi.getImportObject().wasi_snapshot_preview1;
+  const wasiView = new DataView(wasiMemory.buffer);
+  assert(typeof wasiImport.fd_write === "function", "WASI import object mismatch");
+  assert(wasiImport.args_sizes_get(0, 4) === 0, "WASI args_sizes_get errno mismatch");
+  assert(wasiView.getUint32(0, true) === 1 && wasiView.getUint32(4, true) === 2, "WASI args_sizes_get memory mismatch");
+  assert(wasiImport.args_get(8, 16) === 0, "WASI args_get errno mismatch");
+  assert(Buffer.from(new Uint8Array(wasiMemory.buffer, 16, 2)).toString() === "a\0", "WASI args_get memory mismatch");
+  assert(wasiImport.environ_sizes_get(32, 36) === 0, "WASI environ_sizes_get errno mismatch");
+  assert(wasiView.getUint32(32, true) === 1 && wasiView.getUint32(36, true) === 4, "WASI environ_sizes_get memory mismatch");
+  assert(wasiImport.random_get(48, 8) === 0, "WASI random_get errno mismatch");
+  assert(wasiImport.clock_time_get(1, 0, 64) === 0 && wasiView.getBigUint64(64, true) > 0n, "WASI clock_time_get mismatch");
+  new Uint8Array(wasiMemory.buffer, 96, 2).set(Buffer.from("ok"));
+  wasiView.setUint32(80, 96, true);
+  wasiView.setUint32(84, 2, true);
+  assert(wasiImport.fd_write(1, 80, 1, 88) === 0 && wasiView.getUint32(88, true) === 2, "WASI fd_write mismatch");
+  assert(wasiImport.fd_fdstat_get(1, 104) === 0, "WASI fd_fdstat_get stdio mismatch");
+  assert(wasiImport.fd_prestat_get(3, 128) === 0 && wasiView.getUint32(132, true) === "/sandbox".length, "WASI fd_prestat_get mismatch");
+  assert(wasiImport.fd_prestat_dir_name(3, 144, 16) === 0, "WASI fd_prestat_dir_name errno mismatch");
+  assert(Buffer.from(new Uint8Array(wasiMemory.buffer, 144, "/sandbox".length)).toString() === "/sandbox", "WASI preopen name mismatch");
+  const wasiFileName = `cottontail-wasi-${Date.now()}.txt`;
+  const wasiFileNameBytes = Buffer.from(wasiFileName);
+  new Uint8Array(wasiMemory.buffer, 1024, wasiFileNameBytes.byteLength).set(wasiFileNameBytes);
+  assert(wasiImport.path_open(3, 0, 1024, wasiFileNameBytes.byteLength, 1 | 8, 0n, 0n, 0, 480) === 0, "WASI path_open create mismatch");
+  const wasiFd = wasiView.getUint32(480, true);
+  const wasiWriteBytes = Buffer.from("wasi-file-ok");
+  new Uint8Array(wasiMemory.buffer, 560, wasiWriteBytes.byteLength).set(wasiWriteBytes);
+  wasiView.setUint32(544, 560, true);
+  wasiView.setUint32(548, wasiWriteBytes.byteLength, true);
+  assert(wasiImport.fd_write(wasiFd, 544, 1, 536) === 0, "WASI fd_write file mismatch");
+  assert(wasiView.getUint32(536, true) === wasiWriteBytes.byteLength, "WASI fd_write byte count mismatch");
+  assert(wasiImport.fd_seek(wasiFd, 0n, 0, 584) === 0 && wasiView.getBigUint64(584, true) === 0n, "WASI fd_seek mismatch");
+  wasiView.setUint32(592, 608, true);
+  wasiView.setUint32(596, wasiWriteBytes.byteLength, true);
+  assert(wasiImport.fd_read(wasiFd, 592, 1, 600) === 0, "WASI fd_read file mismatch");
+  assert(wasiView.getUint32(600, true) === wasiWriteBytes.byteLength, "WASI fd_read byte count mismatch");
+  assert(Buffer.from(new Uint8Array(wasiMemory.buffer, 608, wasiWriteBytes.byteLength)).toString() === "wasi-file-ok", "WASI fd_read content mismatch");
+  assert(wasiImport.fd_filestat_get(wasiFd, 640) === 0, "WASI fd_filestat_get mismatch");
+  assert(wasiView.getUint8(656) === 4 && wasiView.getBigUint64(672, true) === BigInt(wasiWriteBytes.byteLength), "WASI fd_filestat_get content mismatch");
+  assert(wasiImport.fd_close(wasiFd) === 0, "WASI fd_close mismatch");
+  assert(wasiImport.path_filestat_get(3, 1, 1024, wasiFileNameBytes.byteLength, 704) === 0, "WASI path_filestat_get mismatch");
+  assert(wasiView.getUint8(720) === 4, "WASI path_filestat_get filetype mismatch");
+  assert(wasiImport.path_unlink_file(3, 1024, wasiFileNameBytes.byteLength) === 0, "WASI path_unlink_file mismatch");
+  const wasiDirName = `cottontail-wasi-dir-${Date.now()}`;
+  const wasiDirNameBytes = Buffer.from(wasiDirName);
+  new Uint8Array(wasiMemory.buffer, 2048, wasiDirNameBytes.byteLength).set(wasiDirNameBytes);
+  assert(wasiImport.path_create_directory(3, 2048, wasiDirNameBytes.byteLength) === 0, "WASI path_create_directory mismatch");
+  const wasiNestedName = `${wasiDirName}/entry.txt`;
+  const wasiNestedNameBytes = Buffer.from(wasiNestedName);
+  new Uint8Array(wasiMemory.buffer, 2112, wasiNestedNameBytes.byteLength).set(wasiNestedNameBytes);
+  assert(wasiImport.path_open(3, 0, 2112, wasiNestedNameBytes.byteLength, 1 | 8, 0n, 0n, 0, 2200) === 0, "WASI nested path_open mismatch");
+  const wasiNestedFd = wasiView.getUint32(2200, true);
+  assert(wasiImport.fd_close(wasiNestedFd) === 0, "WASI nested fd_close mismatch");
+  assert(wasiImport.path_open(3, 0, 2048, wasiDirNameBytes.byteLength, 2, 0n, 0n, 0, 2208) === 0, "WASI directory path_open mismatch");
+  const wasiDirFd = wasiView.getUint32(2208, true);
+  assert(wasiImport.fd_readdir(wasiDirFd, 2300, 256, 0n, 2280) === 0, "WASI fd_readdir mismatch");
+  const readdirBytes = wasiView.getUint32(2280, true);
+  const readdirNames: string[] = [];
+  let readdirOffset = 2300;
+  while (readdirOffset < 2300 + readdirBytes) {
+    const nameLength = wasiView.getUint32(readdirOffset + 16, true);
+    const filetype = wasiView.getUint8(readdirOffset + 20);
+    const name = Buffer.from(new Uint8Array(wasiMemory.buffer, readdirOffset + 24, nameLength)).toString();
+    readdirNames.push(`${filetype}:${name}`);
+    readdirOffset += 24 + nameLength;
+  }
+  assert(readdirNames.includes("4:entry.txt"), "WASI fd_readdir content mismatch");
+  assert(wasiImport.fd_close(wasiDirFd) === 0, "WASI directory fd_close mismatch");
+  assert(wasiImport.path_unlink_file(3, 2112, wasiNestedNameBytes.byteLength) === 0, "WASI nested unlink mismatch");
+  assert(wasiImport.path_remove_directory(3, 2048, wasiDirNameBytes.byteLength) === 0, "WASI path_remove_directory mismatch");
+  assert(wasiImport.poll_oneoff(0, 0, 0, 768) === 0 && wasiView.getUint32(768, true) === 0, "WASI empty poll_oneoff mismatch");
+  wasiView.setBigUint64(1500, 123n, true);
+  wasiView.setUint8(1508, 0);
+  wasiView.setUint32(1516, 1, true);
+  wasiView.setBigUint64(1524, 0n, true);
+  wasiView.setBigUint64(1532, 0n, true);
+  wasiView.setUint16(1540, 0, true);
+  assert(wasiImport.poll_oneoff(1500, 1560, 1, 1596) === 0, "WASI clock poll_oneoff mismatch");
+  assert(wasiView.getUint32(1596, true) === 1 && wasiView.getBigUint64(1560, true) === 123n && wasiView.getUint8(1570) === 0, "WASI clock poll_oneoff event mismatch");
+  wasiView.setBigUint64(1600, 456n, true);
+  wasiView.setUint8(1608, 2);
+  wasiView.setUint32(1616, 1, true);
+  assert(wasiImport.poll_oneoff(1600, 1660, 1, 1696) === 0, "WASI fd poll_oneoff mismatch");
+  assert(wasiView.getUint32(1696, true) === 1 && wasiView.getBigUint64(1660, true) === 456n && wasiView.getUint8(1670) === 2, "WASI fd poll_oneoff event mismatch");
+  assert(wasi.start(wasiInstance) === 7, "WASI start/proc_exit mismatch");
 }
-assert(readdirNames.includes("4:entry.txt"), "WASI fd_readdir content mismatch");
-assert(wasiImport.fd_close(wasiDirFd) === 0, "WASI directory fd_close mismatch");
-assert(wasiImport.path_unlink_file(3, 2112, wasiNestedNameBytes.byteLength) === 0, "WASI nested unlink mismatch");
-assert(wasiImport.path_remove_directory(3, 2048, wasiDirNameBytes.byteLength) === 0, "WASI path_remove_directory mismatch");
-assert(wasiImport.poll_oneoff(0, 0, 0, 768) === 0 && wasiView.getUint32(768, true) === 0, "WASI empty poll_oneoff mismatch");
-wasiView.setBigUint64(1500, 123n, true);
-wasiView.setUint8(1508, 0);
-wasiView.setUint32(1516, 1, true);
-wasiView.setBigUint64(1524, 0n, true);
-wasiView.setBigUint64(1532, 0n, true);
-wasiView.setUint16(1540, 0, true);
-assert(wasiImport.poll_oneoff(1500, 1560, 1, 1596) === 0, "WASI clock poll_oneoff mismatch");
-assert(wasiView.getUint32(1596, true) === 1 && wasiView.getBigUint64(1560, true) === 123n && wasiView.getUint8(1570) === 0, "WASI clock poll_oneoff event mismatch");
-wasiView.setBigUint64(1600, 456n, true);
-wasiView.setUint8(1608, 2);
-wasiView.setUint32(1616, 1, true);
-assert(wasiImport.poll_oneoff(1600, 1660, 1, 1696) === 0, "WASI fd poll_oneoff mismatch");
-assert(wasiView.getUint32(1696, true) === 1 && wasiView.getBigUint64(1660, true) === 456n && wasiView.getUint8(1670) === 2, "WASI fd poll_oneoff event mismatch");
-assert(wasi.start(wasiInstance) === 7, "WASI start/proc_exit mismatch");
 
 console.log("node instrumentation surface passed");

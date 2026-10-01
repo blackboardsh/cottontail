@@ -1251,7 +1251,7 @@ try {
       name: 'websocket-native-frame',
       argv: ['test', join(rootDir, 'tests', 'js', 'websocket-native-frame.test.ts')],
       expectExitCode: 0,
-      stderrIncludes: ['4 pass', '0 fail'],
+      stderrIncludes: ['5 pass', '0 fail'],
     },
     {
       name: 'node-dns-surface',

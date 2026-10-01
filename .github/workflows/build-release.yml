@@ -265,6 +265,13 @@ jobs:
       - name: Test prepared FFI calls and callbacks
         run: ./zig-out/bin/cottontail test tests/js/bun-ffi-prepared-calls.test.ts
 
+      - name: Test socket handle adoption
+        run: ./zig-out/bin/cottontail test tests/js/node-net-duplex.test.ts -t "Socket transfers ownership"
+
+      - name: Test Windows OS information
+        if: matrix.os == 'windows'
+        run: ./zig-out/bin/cottontail tests/js/node-os.ts
+
       - name: Test native WebSocket frames
         run: ./zig-out/bin/cottontail test tests/js/websocket-native-frame.test.ts
 

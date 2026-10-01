@@ -1,5 +1,5 @@
-import { linkSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -14,6 +14,9 @@ if (process.platform === "win32") {
     mkdirSync(winningBin);
     mkdirSync(losingBin);
     linkSync(process.execPath, join(winningBin, "env-case-probe.exe"));
+    for (const bundle of ["cottontail-core", "cottontail-stdlib"]) {
+      symlinkSync(join(dirname(process.execPath), bundle), join(winningBin, bundle), "junction");
+    }
 
     const env = Object.fromEntries(
       Object.entries(process.env).filter(([key]) => {
