@@ -4,11 +4,8 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { spawnSync } from 'child_process';
 import os from 'os';
 import { join } from 'path';
-import { buildArchitecture } from './build-target.js';
 
 const rootDir = process.cwd();
-const isWindowsArm64 = process.platform === 'win32' && buildArchitecture() === 'arm64';
-const hasJscWebAssembly = !isWindowsArm64;
 const binaryPath = join(
   rootDir,
   'zig-out',
@@ -42,13 +39,7 @@ function embeddedRuntimeEnvironment(overrides = undefined) {
 }
 
 function runCase(testCase) {
-  let argv = testCase.argv ?? [testCase.scriptPath, ...(testCase.args ?? [])];
-  // C_LOOP spends longer compiling/loading child runtimes in functional tests.
-  // Change only the runner's default: explicit fixture deadlines and measured
-  // lifecycle/performance assertions retain their own limits.
-  if (isWindowsArm64 && argv[0] === 'test' && !argv.some(arg => /^--timeout(?:=|$)/.test(arg))) {
-    argv = ['test', '--timeout=15000', ...argv.slice(1)];
-  }
+  const argv = testCase.argv ?? [testCase.scriptPath, ...(testCase.args ?? [])];
   const result = spawnSync(testCase.executablePath ?? binaryPath, argv, {
     cwd: testCase.cwd ?? rootDir,
     env: embeddedRuntimeEnvironment(testCase.env),
@@ -475,11 +466,8 @@ try {
         'wasm',
         'hello-wasi.wasm'
       ),
-      // The initial Windows ARM64 SDK explicitly disables WebAssembly.
-      // Cover that unsupported result as well as execution on JIT platforms.
-      expectExitCode: hasJscWebAssembly ? 0 : 1,
-      stdoutIncludes: hasJscWebAssembly ? ['hello world'] : [],
-      stderrIncludes: hasJscWebAssembly ? [] : ['WebAssembly is not defined'],
+      expectExitCode: 0,
+      stdoutIncludes: ['hello world'],
     },
     {
       name: 'cli-runtime-flag-execargv',

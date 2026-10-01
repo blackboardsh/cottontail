@@ -256,6 +256,19 @@ jobs:
       - name: Test native JSC heap and time-zone bridges
         run: ./zig-out/bin/cottontail tests/js/jsc-native-abi.ts
 
+      - name: Test Windows ARM64 JIT and WebAssembly execution
+        if: matrix.platform == 'windows-arm64'
+        run: node scripts/test-jsc-jit-release.js
+
+      - name: Test Windows compiler memory retention
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          & .\zig-out\bin\cottontail.exe test tests/js/bun-bundler-retention.test.ts
+          if ($LASTEXITCODE -ne 0) { throw "Windows bundler memory retention tests failed" }
+          & .\zig-out\bin\cottontail.exe test tests/js/bun-transpiler-retention.test.ts
+          if ($LASTEXITCODE -ne 0) { throw "Windows transpiler memory retention tests failed" }
+
       - name: Test native FFI calling conventions
         run: ./zig-out/bin/cottontail test tests/js/bun-ffi-calling-convention.test.ts
 

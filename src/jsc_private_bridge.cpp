@@ -545,10 +545,9 @@ static JSC::VM* ct_jsc_vm(JSContextRef context)
         const_cast<OpaqueJSContextGroup*>(JSContextGetGroup(context)));
 }
 
-#if defined(_WIN32) && (defined(_M_ARM64) || defined(__aarch64__))
-// The pinned Windows ARM64 C_LOOP VM includes an interpreter stack before Heap.
-static constexpr ptrdiff_t ct_jsc_vm_heap_offset = 0x140;
-#elif defined(_WIN32)
+#if defined(_WIN32)
+// Both pinned Windows JIT SDKs place Heap at 0xf0. The former ARM64 C_LOOP
+// build had an extra interpreter stack before Heap and used 0x140 instead.
 static constexpr ptrdiff_t ct_jsc_vm_heap_offset = 0xf0;
 #else
 static constexpr ptrdiff_t ct_jsc_vm_heap_offset = 0xf8;

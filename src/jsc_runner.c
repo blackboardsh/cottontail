@@ -17727,7 +17727,15 @@ static double ct_rusage_maxrss_bytes(const struct rusage *usage) {
 }
 
 static double ct_current_rss_bytes(void) {
-#if defined(__APPLE__) || defined(__MACH__)
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS memory = { 0 };
+    memory.cb = sizeof(memory);
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &memory, sizeof(memory))) {
+        // process.memoryUsage().rss is current resident memory; resourceUsage
+        // keeps reporting PeakWorkingSetSize through getrusage separately.
+        return (double)memory.WorkingSetSize;
+    }
+#elif defined(__APPLE__) || defined(__MACH__)
     mach_task_basic_info_data_t info;
     mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
     if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) == KERN_SUCCESS) {

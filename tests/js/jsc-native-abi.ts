@@ -12,7 +12,7 @@ function assert(value: unknown, message: string): asserts value {
 }
 
 // These calls cross Cottontail's private JSC ABI adapters. In particular,
-// C_LOOP changes the VM layout, and Windows ARM64 requires GCRequest to retain
+// JSC execution modes change the VM layout, and Windows ARM64 requires GCRequest to retain
 // its non-trivial copy/move constructors to pass the argument indirectly.
 const retained = Array.from({ length: 513 }, (_, index) => ({ index }));
 for (let pass = 0; pass < 3; pass++) {

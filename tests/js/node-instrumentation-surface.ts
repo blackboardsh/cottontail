@@ -216,10 +216,8 @@ assert((await collect(spec(testEvents()))).includes("TAP version"), "spec report
 assert((await collect(lcov(testEvents()))) === "", "lcov reporter mismatch");
 
 const wasi = new WASI({ version: "preview1", returnOnExit: true, args: ["a"], env: { A: "1" }, preopens: { "/sandbox": runtimeTmp } });
-if (typeof WebAssembly === "undefined") {
-  assert(process.platform === "win32" && process.arch === "arm64", "WebAssembly unexpectedly unavailable");
-  console.log("WASI execution unavailable with interpreter-only Windows ARM64 JSC");
-} else {
+assert(typeof WebAssembly === "object", "WebAssembly must be available on every release platform");
+{
   const wasiMemory = new WebAssembly.Memory({ initial: 1 });
   const wasiInstance = {
     exports: {
