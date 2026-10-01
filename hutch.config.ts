@@ -1,4 +1,4 @@
-// @hutch cli=0.5.1 cottontail=0.7.2-canary.2
+// @hutch cli=0.27.2-canary.1 cottontail=0.7.2-canary.2
 export default {
   scripts: {
     "push:canary": "node scripts/tag-release.js canary",
