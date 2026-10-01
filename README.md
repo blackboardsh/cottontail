@@ -90,6 +90,6 @@ bun run electrobun:window
 The direct bridge is for local integration work. Production Electrobun builds
 select and package Cottontail through the versioned Electrobun devkit.
 
-Prebuilt releases support macOS arm64, Linux x64 and arm64, and Windows x64.
+Prebuilt releases support macOS arm64, Linux x64 and arm64, and Windows x64 and arm64. Windows ARM64 initially ships on canary with interpreter-only JavaScriptCore; JIT and WebAssembly are disabled.
 See [cross-platform bring-up](docs/cross-platform-bringup.md) for native build
 diagnostics.

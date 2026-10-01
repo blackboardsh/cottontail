@@ -4,8 +4,11 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { spawnSync } from 'child_process';
 import os from 'os';
 import { join } from 'path';
+import { buildArchitecture } from './build-target.js';
 
 const rootDir = process.cwd();
+const isWindowsArm64 = process.platform === 'win32' && buildArchitecture() === 'arm64';
+const hasJscWebAssembly = !isWindowsArm64;
 const binaryPath = join(
   rootDir,
   'zig-out',
@@ -39,7 +42,13 @@ function embeddedRuntimeEnvironment(overrides = undefined) {
 }
 
 function runCase(testCase) {
-  const argv = testCase.argv ?? [testCase.scriptPath, ...(testCase.args ?? [])];
+  let argv = testCase.argv ?? [testCase.scriptPath, ...(testCase.args ?? [])];
+  // C_LOOP spends longer compiling/loading child runtimes in functional tests.
+  // Change only the runner's default: explicit fixture deadlines and measured
+  // lifecycle/performance assertions retain their own limits.
+  if (isWindowsArm64 && argv[0] === 'test' && !argv.some(arg => /^--timeout(?:=|$)/.test(arg))) {
+    argv = ['test', '--timeout=15000', ...argv.slice(1)];
+  }
   const result = spawnSync(testCase.executablePath ?? binaryPath, argv, {
     cwd: testCase.cwd ?? rootDir,
     env: embeddedRuntimeEnvironment(testCase.env),
@@ -125,6 +134,12 @@ try {
     'if (require("./commonjs-using.js") !== true) throw new Error("CommonJS export changed while lowering using"); console.log("commonjs using passed");\n'
   );
   const tests = [
+    {
+      name: 'jsc-native-abi',
+      scriptPath: join(rootDir, 'tests', 'js', 'jsc-native-abi.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['native JSC heap, GC, roots, snapshot, and time-zone ABI passed'],
+    },
     {
       name: 'smoke',
       scriptPath: join(rootDir, 'test.js'),
@@ -219,7 +234,7 @@ try {
       name: 'web-worker-message-dispatch',
       argv: ['test', join(rootDir, 'tests', 'js', 'web-worker-message-dispatch.test.ts')],
       expectExitCode: 0,
-      stderrIncludes: ['7 pass', '0 fail'],
+      stderrIncludes: ['8 pass', '0 fail'],
     },
     {
       name: 'runtime-sourcemap-regressions',
@@ -263,6 +278,9 @@ try {
       name: 'upstream-runner-regressions',
       executablePath: process.execPath,
       argv: ['--test-reporter=tap', '--test', join(rootDir, 'tests', 'upstream-runner.test.mjs')],
+      env: process.platform === 'win32' ? {
+        COTTONTAIL_UPSTREAM_JOB_LAUNCHER: join(rootDir, 'zig-out', 'bin', 'cottontail-bun-compat-job.exe'),
+      } : undefined,
       expectExitCode: 0,
       stdoutMatches: [/^# pass [1-9]\d*\r?$/m, /^# fail 0\r?$/m],
     },
@@ -426,8 +444,11 @@ try {
         'wasm',
         'hello-wasi.wasm'
       ),
-      expectExitCode: 0,
-      stdoutIncludes: ['hello world'],
+      // The initial Windows ARM64 SDK explicitly disables WebAssembly.
+      // Cover that unsupported result as well as execution on JIT platforms.
+      expectExitCode: hasJscWebAssembly ? 0 : 1,
+      stdoutIncludes: hasJscWebAssembly ? ['hello world'] : [],
+      stderrIncludes: hasJscWebAssembly ? [] : ['WebAssembly is not defined'],
     },
     {
       name: 'cli-runtime-flag-execargv',
@@ -818,7 +839,7 @@ try {
             name: 'node-fs-windows-permissions',
             argv: ['test', join(rootDir, 'tests', 'js', 'node-fs-windows-permissions.test.ts')],
             expectExitCode: 0,
-            stdoutIncludes: ['4 pass', '0 fail'],
+            stdoutIncludes: ['5 pass', '0 fail'],
           },
           {
             name: 'node-fs-windows-symlink-types',
@@ -1230,7 +1251,7 @@ try {
       name: 'websocket-native-frame',
       argv: ['test', join(rootDir, 'tests', 'js', 'websocket-native-frame.test.ts')],
       expectExitCode: 0,
-      stderrIncludes: ['4 pass', '0 fail'],
+      stderrIncludes: ['5 pass', '0 fail'],
     },
     {
       name: 'node-dns-surface',

@@ -26,7 +26,13 @@ export function resolveBunStatusPlatform(
   for (const [path, entryOverride] of Object.entries(override.tests ?? {})) {
     tests[path] = applyBunStatusEntryOverride(tests[path], entryOverride);
   }
-  return { ...status, tests };
+  return {
+    ...status,
+    tests,
+    ...(override.expectedCounts == null ? {} : {
+      expectedCounts: { ...status.expectedCounts, ...override.expectedCounts },
+    }),
+  };
 }
 
 export function validateBunStatusPlatformOverrides(status) {
@@ -45,11 +51,22 @@ export function validateBunStatusPlatformOverrides(status) {
       errors.push(`status.platformOverrides.${key} must be an object`);
       continue;
     }
-    const unknownFields = Object.keys(override).filter((field) => field !== 'tests');
+    const unknownFields = Object.keys(override).filter((field) => field !== 'tests' && field !== 'expectedCounts');
     if (unknownFields.length > 0) {
       errors.push(
         `status.platformOverrides.${key} has unknown field(s): ${unknownFields.join(', ')}`,
       );
+    }
+    if (override.expectedCounts != null) {
+      if (typeof override.expectedCounts !== 'object' || Array.isArray(override.expectedCounts)) {
+        errors.push(`status.platformOverrides.${key}.expectedCounts must be an object`);
+      } else {
+        for (const [field, count] of Object.entries(override.expectedCounts)) {
+          if (!Object.hasOwn(status.expectedCounts ?? {}, field) || !Number.isSafeInteger(count) || count < 0) {
+            errors.push(`status.platformOverrides.${key}.expectedCounts.${field} must be a known non-negative count`);
+          }
+        }
+      }
     }
     if (override.tests == null || typeof override.tests !== 'object' || Array.isArray(override.tests)) {
       errors.push(`status.platformOverrides.${key}.tests must be an object`);

@@ -24,14 +24,16 @@ test("maps the Cottontail release matrix to standard Bun assets", () => {
   assert.equal(bunAssetName("linux-x64"), "bun-linux-x64.zip");
   assert.equal(bunAssetName("linux-arm64"), "bun-linux-aarch64.zip");
   assert.equal(bunAssetName("windows-x64"), "bun-windows-x64.zip");
+  assert.equal(bunAssetName("windows-arm64"), "bun-windows-aarch64.zip");
   assert.throws(() => bunAssetName("macos-x64"), /Unsupported/);
 });
 
-test("maps supported hosts and Windows ARM emulation", () => {
+test("maps supported hosts to their native architecture", () => {
   assert.equal(hostPlatformKey("darwin", "arm64"), "macos-arm64");
   assert.equal(hostPlatformKey("linux", "x64"), "linux-x64");
   assert.equal(hostPlatformKey("linux", "arm64"), "linux-arm64");
-  assert.equal(hostPlatformKey("win32", "arm64"), "windows-x64");
+  assert.equal(hostPlatformKey("win32", "arm64"), "windows-arm64");
+  assert.equal(hostPlatformKey("win32", "x64"), "windows-x64");
   assert.equal(hostPlatformKey("darwin", "x64"), null);
 });
 

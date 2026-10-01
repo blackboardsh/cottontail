@@ -23,7 +23,9 @@ for (const mode of ["top-level", "message-handler", "web-message-handler"]) {
       env,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
-      timeout: 15_000,
+      // Three fresh workers may each need 30s to bootstrap under ARM64 C_LOOP.
+      // The fixture retains its 3s response and hard-termination assertions.
+      timeout: process.platform === "win32" && process.arch === "arm64" ? 120_000 : 15_000,
       killSignal: "SIGKILL",
       maxBuffer: 1024 * 1024,
     });

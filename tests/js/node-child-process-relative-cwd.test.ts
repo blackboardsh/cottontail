@@ -22,11 +22,12 @@ test("relative executable paths are resolved from the requested cwd", async () =
   mkdirSync(bin);
   const executable = join(bin, process.platform === "win32" ? "cottontail.exe" : "cottontail");
   linkSync(process.execPath, executable);
-  symlinkSync(
-    join(dirname(process.execPath), "cottontail-core"),
-    join(bin, "cottontail-core"),
-    process.platform === "win32" ? "junction" : "dir",
-  );
+  for (const bundle of ["cottontail-core", "cottontail-stdlib"]) {
+    symlinkSync(
+      join(dirname(process.execPath), bundle), join(bin, bundle),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+  }
 
   const child = spawn(`.${process.platform === "win32" ? "\\" : "/"}bin${process.platform === "win32" ? "\\cottontail.exe" : "/cottontail"}`, [
     "-e",
@@ -67,6 +68,9 @@ test.skipIf(process.platform !== "win32")("bare executables use the child cwd an
   const bin = join(root, "path-bin");
   mkdirSync(bin);
   linkSync(process.execPath, join(bin, "path-probe.exe"));
+  for (const bundle of ["cottontail-core", "cottontail-stdlib"]) {
+    symlinkSync(join(dirname(process.execPath), bundle), join(bin, bundle), "junction");
+  }
 
   const env = Object.fromEntries(
     Object.entries(process.env).filter(([name]) => {

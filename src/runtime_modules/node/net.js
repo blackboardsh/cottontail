@@ -13,6 +13,7 @@ const MAX_COALESCED_WRITEV_BYTES = 4294967296;
 // briefly after writable shutdown, then closes the pipe and reports EOF.
 const windowsPipeEofTimeoutMilliseconds = 50;
 const kSocketAddressState = new WeakMap();
+const kHoldReadForAccept = Symbol("holdReadForAccept");
 const kSocketAddressReadonlyProperties = new Set(["address", "port", "family", "flowlabel"]);
 const kBlockListState = new WeakMap();
 
@@ -494,6 +495,7 @@ class SocketImpl extends Duplex {
     this._isPipe = options.pipe === true || options.path != null;
     this._path = options.path;
     this._paused = Boolean(options.pauseOnConnect || options.readable === false);
+    this._acceptReadHeld = options[kHoldReadForAccept] === true;
     this._pendingData = [];
     this._pendingEnd = false;
     this._pendingWrites = [];
@@ -1158,13 +1160,13 @@ class SocketImpl extends Duplex {
   _startRead() {
     if (this.fd == null || this.destroyed || typeof cottontail.fdWatchStart !== "function") return this;
     if (this._watchId) {
-      cottontail.fdWatchSetPaused?.(this._watchId, this._paused || this._nativeReadPaused);
+      cottontail.fdWatchSetPaused?.(this._watchId, this._paused || this._nativeReadPaused || this._acceptReadHeld);
       cottontail.fdWatchSetRef?.(this._watchId, this._refed);
       return this;
     }
     const fdWatchListeners = installFdWatchDispatcher();
     const readSize = Math.max(1, Math.min(this.readableHighWaterMark, 1024 * 1024));
-    const watch = cottontail.fdWatchStart(this.fd, readSize, this._refed, this._paused);
+    const watch = cottontail.fdWatchStart(this.fd, readSize, this._refed, this._paused || this._acceptReadHeld);
     this._watchId = Number(watch?.id || 0);
     if (!this._watchId) return this;
     const watchId = this._watchId;
@@ -1243,7 +1245,7 @@ class SocketImpl extends Duplex {
     if (this.destroyed || this.fd == null || this.encrypted) return;
     this._nativeReadPaused = false;
     this._paused = false;
-    if (this._watchId && !this._watchWriteOnly) cottontail.fdWatchSetPaused?.(this._watchId, false);
+    if (this._watchId && !this._watchWriteOnly) cottontail.fdWatchSetPaused?.(this._watchId, this._acceptReadHeld);
     else this._startRead();
   }
 
@@ -2001,7 +2003,7 @@ class SocketImpl extends Duplex {
     this._paused = false;
     super.resume();
     if (!this.destroyed && this.fd != null) {
-      if (this._watchId && !this._watchWriteOnly) cottontail.fdWatchSetPaused?.(this._watchId, false);
+      if (this._watchId && !this._watchWriteOnly) cottontail.fdWatchSetPaused?.(this._watchId, this._acceptReadHeld);
       else this._startRead();
     }
     return this;
@@ -2202,7 +2204,20 @@ class ServerImpl extends EventEmitter {
   }
 
   _createAcceptedSocket(_accepted, options) {
-    return new Socket(options);
+    // Begin paused at the native boundary, before the constructor can consume
+    // bytes. A connection listener may transfer this handle to another Socket.
+    return new Socket({ ...options, [kHoldReadForAccept]: true });
+  }
+
+  _emitAcceptedConnection(socket) {
+    if (!this.pauseOnConnect) socket.resume();
+    try {
+      this.emit("connection", socket);
+    } finally {
+      socket._acceptReadHeld = false;
+      // Preserve an explicit pause in the listener, or a transferred handle.
+      if (!socket._paused && !socket.destroyed) socket._startRead();
+    }
   }
 
   _queueAcceptEvent(type, value, connectAttemptId = null) {
@@ -2226,8 +2241,7 @@ class ServerImpl extends EventEmitter {
           continue;
         }
         const socket = event.value;
-        if (!this.pauseOnConnect) socket.resume();
-        this.emit("connection", socket);
+        this._emitAcceptedConnection(socket);
       }
       this._emitCloseIfDrained();
     };
@@ -2440,8 +2454,7 @@ class ServerImpl extends EventEmitter {
         if (connectAttemptId != null || this._pendingAcceptEvents.length > 0) {
           this._queueAcceptEvent("connection", socket, connectAttemptId);
         } else {
-          if (!this.pauseOnConnect) socket.resume();
-          this.emit("connection", socket);
+          this._emitAcceptedConnection(socket);
         }
       }
     }

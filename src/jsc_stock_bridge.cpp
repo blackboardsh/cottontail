@@ -81,7 +81,12 @@ public:
 namespace {
 
 constexpr std::size_t invalid_count = std::numeric_limits<std::size_t>::max();
-#if defined(_WIN32)
+#if defined(_WIN32) && (defined(_M_ARM64) || defined(__aarch64__))
+// WebKit-7624.4.5.14.1 with C_LOOP enabled and JIT/Wasm disabled. The VM's
+// interpreter stack and omitted JIT state change both offsets from Windows x64.
+constexpr std::size_t vm_heap_offset = 0x140;
+constexpr std::size_t vm_date_cache_offset = 0x1e340;
+#elif defined(_WIN32)
 // The same pinned VM constructor initializes Heap at VM + 0xf0.
 constexpr std::size_t vm_heap_offset = 0xf0;
 // The pinned Windows JavaScriptCore.lib VM constructor initializes DateCache

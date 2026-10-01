@@ -7,6 +7,8 @@ import { basename, join } from 'path';
 
 import { assertStrippedReleaseBinary } from './release-binary-contract.js';
 import { releaseChannel } from './release-contract.js';
+import { buildArchitecture } from './build-target.js';
+import { validateWindowsReleaseArchitecture } from './windows-binary-architecture.mjs';
 
 const rootDir = process.cwd();
 const packageJson = JSON.parse(readFileSync(join(rootDir, 'package.json'), 'utf8'));
@@ -18,12 +20,13 @@ function fail(message) {
 }
 
 function platformKey() {
-  const key = `${process.platform}-${process.arch}`;
+  const key = `${process.platform}-${buildArchitecture()}`;
   const keys = {
     'darwin-arm64': 'macos-arm64',
     'linux-x64': 'linux-x64',
     'linux-arm64': 'linux-arm64',
     'win32-x64': 'windows-x64',
+    'win32-arm64': 'windows-arm64',
   };
   return keys[key] ?? fail(`Unsupported release platform: ${key}`);
 }
@@ -48,6 +51,7 @@ const jscPlatform = {
   'linux-x64': 'linux-amd64',
   'linux-arm64': 'linux-arm64',
   'windows-x64': 'windows-amd64',
+  'windows-arm64': 'windows-arm64',
 }[platform];
 const executableName = process.platform === 'win32' ? 'cottontail.exe' : 'cottontail';
 const executablePath = join(rootDir, 'zig-out', 'bin', executableName);
@@ -110,6 +114,9 @@ mkdirSync(join(packageRoot, 'bin'), { recursive: true });
 cpSync(executablePath, join(packageRoot, 'bin', executableName));
 cpSync(corePath, join(packageRoot, 'bin', 'cottontail-core'), { recursive: true });
 cpSync(stdlibPath, join(packageRoot, 'bin', 'cottontail-stdlib'), { recursive: true });
+if (process.platform === 'win32') {
+  validateWindowsReleaseArchitecture(join(packageRoot, 'bin'), buildArchitecture());
+}
 cpSync(join(rootDir, 'src', 'runtime_modules'), join(packageRoot, 'runtime_modules'), {
   recursive: true,
 });

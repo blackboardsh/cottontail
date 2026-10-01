@@ -64,6 +64,12 @@ function hostPaths() {
 			data: "icudt70l-windows-x64.dat",
 			binary: "cottontail.exe",
 		},
+		"win32-arm64": {
+			platform: "windows-arm64",
+			artifact: "cottontail-jsc-windows-arm64.tar.gz",
+			data: "icudt70l-windows-arm64.dat",
+			binary: "cottontail.exe",
+		},
 	};
 	const config = configs[key];
 	if (!config) return null;
@@ -119,6 +125,8 @@ function fingerprint(paths) {
 		"src",
 		"scripts/build-local.js",
 		"scripts/build-release.js",
+		"scripts/build-target.js",
+		"scripts/release-target.js",
 		"scripts/embed-runtime-modules.js",
 		"scripts/jsc-manifest.json",
 		"scripts/setup.js",

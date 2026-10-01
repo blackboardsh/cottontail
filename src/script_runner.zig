@@ -3326,7 +3326,7 @@ fn runElectrobunMainThread(ctx: *const Context) !u8 {
             return error.MissingElectrobunRunMainThread;
         const error_symbol = GetProcAddress(core, "electrobun_core_last_error") orelse
             return error.MissingElectrobunLastError;
-        break :blk .{ @ptrCast(run_symbol), @ptrCast(error_symbol) };
+        break :blk .{ @ptrCast(@alignCast(run_symbol)), @ptrCast(@alignCast(error_symbol)) };
     } else blk: {
         unix_core = try std.DynLib.open(core_path);
         unix_core_open = true;

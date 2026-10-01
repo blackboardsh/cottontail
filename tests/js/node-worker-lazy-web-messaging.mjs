@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { MessageChannel, Worker, receiveMessageOnPort } from "node:worker_threads";
 
+// The interpreter-only Windows ARM64 runtime needs a larger startup allowance
+// to initialize the worker's lazy web globals. Port shutdown keeps its 2s bound.
+const workerStartupTimeoutMs = process.platform === "win32" && process.arch === "arm64" ? 30_000 : 10_000;
+
 async function checkMessaging(loadWebGlobals) {
   const label = loadWebGlobals ? "after lazy ReadableStream initialization" : "before lazy web initialization";
   const { port1, port2 } = new MessageChannel();
@@ -50,7 +54,7 @@ async function checkMessaging(loadWebGlobals) {
     port1.postMessage({ id: 42, value: 6 });
     // Match Miniflare's synchronous proxy: the parent cannot process ordinary
     // events until the worker replies and wakes this finite native wait.
-    const waited = Atomics.wait(notifyHandle, 0, 0, 10_000);
+    const waited = Atomics.wait(notifyHandle, 0, 0, workerStartupTimeoutMs);
     const response = receiveMessageOnPort(port1)?.message;
     // Surface startup errors which could not be delivered while waiting.
     await new Promise((resolve) => setTimeout(resolve, 0));

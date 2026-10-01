@@ -1,5 +1,6 @@
 import { $ } from "bun";
-import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -25,14 +26,14 @@ if (cottontail.platform() === "win32") {
   const pathBin = join(root, "path-bin");
   const shellCwd = join(root, "shell-cwd");
   const shellCommand = "cottontail-shell-path-probe";
-  const shellExecutable = join(pathBin, `${shellCommand}.cmd`);
+  const shellExecutable = join(pathBin, `${shellCommand}.exe`);
   const batchCmdCommand = "cottontail-batch-cmd-probe";
   const batchBatCommand = "cottontail-batch-bat-probe";
   const unicodeCwd = join(root, "工作 目录-开始-🚀");
   const relativeUnicodeBin = "工具-bin";
   const unicodeBin = join(unicodeCwd, relativeUnicodeBin);
   const unicodeCommand = "cottontail-unicode-path-probe";
-  const unicodeExecutable = join(unicodeBin, `${unicodeCommand}.cmd`);
+  const unicodeExecutable = join(unicodeBin, `${unicodeCommand}.exe`);
 
   rmSync(root, { recursive: true, force: true });
   mkdirSync(pathBin, { recursive: true });
@@ -41,8 +42,18 @@ if (cottontail.platform() === "win32") {
   try {
     writeFileSync(executable, "");
     writeFileSync(slashExecutable, "@echo slash-path-ok\r\n");
-    writeFileSync(shellExecutable, "@echo path-only-ok\r\n");
-    writeFileSync(join(shellCwd, `${shellCommand}.cmd`), "@echo implicit-cwd-bug\r\n");
+    const repository = join(import.meta.dir, "..", "..");
+    const probe = join(root, "command-path-probe.exe");
+    const build = spawnSync(join(repository, "vendors", "zig", "zig.exe"), [
+      "build-exe", join(repository, "tests", "windows-command-path-probe.zig"),
+      "-O", "ReleaseSmall", "-lc", "-target",
+      process.arch === "arm64" ? "aarch64-windows-msvc" : "x86_64-windows-msvc",
+      `-femit-bin=${probe}`,
+    ], { encoding: "utf8", windowsHide: true });
+    assert(build.status === 0, `could not build PATH probe: ${build.error ?? ""}\n${build.stderr}`);
+    for (const target of [shellExecutable, join(shellCwd, `${shellCommand}.exe`), unicodeExecutable]) {
+      copyFileSync(probe, target);
+    }
     writeFileSync(
       join(pathBin, `${batchCmdCommand}.cmd`),
       "@echo off\r\n@echo %~1^|%~2\r\n@exit /b 0\r\n",
@@ -51,7 +62,6 @@ if (cottontail.platform() === "win32") {
       join(pathBin, `${batchBatCommand}.bat`),
       "@echo off\r\n@echo %~1^|%~2\r\n@exit /b 7\r\n",
     );
-    writeFileSync(unicodeExecutable, "@echo unicode-path-ok\r\n");
     const expected = realpathSync(executable).replaceAll("/", "\\").toLowerCase();
     const explicitExtension = Bun.which(`${command}.exe`, { PATH: root });
     const inferredExtension = Bun.which(command, { PATH: root });
@@ -101,7 +111,7 @@ if (cottontail.platform() === "win32") {
 
     assert(
       Bun.which(shellCommand, { PATH: pathBin }) === shellExecutable,
-      "Bun.which did not find a .cmd command on PATH",
+      "Bun.which did not find a native command on PATH",
     );
     assert(
       Bun.which(shellCommand, { PATH: join(root, "missing-path") }) === null,
@@ -114,17 +124,18 @@ if (cottontail.platform() === "win32") {
       .quiet()
       .nothrow();
     assert(pathResult.exitCode === 0, `Bun shell PATH command failed: ${pathResult.stderr}`);
-    assert(pathResult.text().trim() === "path-only-ok", "Bun shell did not execute the PATH command");
+    assert(pathResult.text().trim() === shellExecutable, "Bun shell did not execute the PATH command");
 
     const batchCmdResult = await $`${{ raw: batchCmdCommand }} ${"hello world"} ${"second value"}`
       .cwd(shellCwd)
       .env(environmentWithPath(pathBin))
       .quiet()
       .nothrow();
-    assert(batchCmdResult.exitCode === 0, `Bun shell .cmd mediation failed: ${batchCmdResult.stderr}`);
+    assert(batchCmdResult.exitCode !== 0, "Bun shell accepted an unsupported .cmd command");
     assert(
-      batchCmdResult.text().trim() === "hello world|second value",
-      `Bun shell .cmd argument quoting mismatch: ${batchCmdResult.text()}`,
+      batchCmdResult.stderr.toString().includes("Windows batch commands are unsupported") &&
+        batchCmdResult.text() === "",
+      `Bun shell did not reject .cmd without executing it: ${batchCmdResult.stderr}`,
     );
 
     const batchBatResult = await $`${{ raw: batchBatCommand }} ${"hello world"} ${"second value"}`
@@ -132,10 +143,11 @@ if (cottontail.platform() === "win32") {
       .env(environmentWithPath(pathBin))
       .quiet()
       .nothrow();
-    assert(batchBatResult.exitCode === 7, `Bun shell .bat exit code mismatch: ${batchBatResult.exitCode}`);
+    assert(batchBatResult.exitCode !== 0, "Bun shell accepted an unsupported .bat command");
     assert(
-      batchBatResult.text().trim() === "hello world|second value",
-      `Bun shell .bat argument quoting mismatch: ${batchBatResult.text()}`,
+      batchBatResult.stderr.toString().includes("Windows batch commands are unsupported") &&
+        batchBatResult.text() === "",
+      `Bun shell did not reject .bat without executing it: ${batchBatResult.stderr}`,
     );
 
     assert(
@@ -144,7 +156,7 @@ if (cottontail.platform() === "win32") {
     );
     assert(
       Bun.which(unicodeCommand, { PATH: relativeUnicodeBin, cwd: unicodeCwd }) ===
-        join(relativeUnicodeBin, `${unicodeCommand}.cmd`),
+        join(relativeUnicodeBin, `${unicodeCommand}.exe`),
       "Bun.which did not resolve a relative PATH entry against options.cwd",
     );
 
@@ -154,7 +166,7 @@ if (cottontail.platform() === "win32") {
       .quiet()
       .nothrow();
     assert(unicodeAbsoluteResult.exitCode === 0, `Bun shell non-ASCII PATH failed: ${unicodeAbsoluteResult.stderr}`);
-    assert(unicodeAbsoluteResult.text().trim() === "unicode-path-ok", "Bun shell non-ASCII PATH output mismatch");
+    assert(unicodeAbsoluteResult.text().trim() === unicodeExecutable, "Bun shell non-ASCII PATH output mismatch");
 
     const unicodeRelativeResult = await $`${{ raw: unicodeCommand }}`
       .cwd(unicodeCwd)
@@ -162,7 +174,7 @@ if (cottontail.platform() === "win32") {
       .quiet()
       .nothrow();
     assert(unicodeRelativeResult.exitCode === 0, `Bun shell relative PATH failed: ${unicodeRelativeResult.stderr}`);
-    assert(unicodeRelativeResult.text().trim() === "unicode-path-ok", "Bun shell relative PATH output mismatch");
+    assert(unicodeRelativeResult.text().trim() === unicodeExecutable, "Bun shell relative PATH output mismatch");
 
     const implicitCwdResult = await $`${{ raw: shellCommand }}`
       .cwd(shellCwd)
@@ -170,7 +182,7 @@ if (cottontail.platform() === "win32") {
       .quiet()
       .nothrow();
     assert(implicitCwdResult.exitCode !== 0, "Bun shell implicitly executed a command from cwd");
-    assert(!implicitCwdResult.text().includes("implicit-cwd-bug"), "Bun shell ran the cwd command");
+    assert(implicitCwdResult.text() === "", "Bun shell ran the cwd command");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -761,7 +761,7 @@ function windowsNapiImportLibrary(compiler, sourcePaths, dir) {
   );
   const result = cottontail.spawnSync(
     compiler.file,
-    ["dlltool", "-d", definitionPath, "-l", libraryPath, "-m", "i386:x86-64"],
+    ["dlltool", "-d", definitionPath, "-l", libraryPath, "-m", cottontail.arch() === "arm64" ? "arm64" : "i386:x86-64"],
     { stdio: "pipe" },
   );
   if (Number(result.status ?? 0) !== 0) {
@@ -795,6 +795,11 @@ export function cc(options) {
   const includeDirs = ccArguments(options.include).map(dir => `-I${dir}`);
   const args = [
     ...compiler.prefix,
+    // Windows uses the x64 Zig host compiler on ARM64 too. The generated
+    // library must match this runtime rather than the compiler process.
+    ...(compiler.kind === "zig" && platformName === "win32"
+      ? ["-target", cottontail.arch() === "arm64" ? "aarch64-windows-gnu" : "x86_64-windows-gnu"]
+      : []),
     ...sourcePaths,
     ...(napiImportLibrary ? [napiImportLibrary] : []),
     ...sharedArgs,

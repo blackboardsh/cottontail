@@ -23,6 +23,7 @@ const root = mkdtempSync(join(tmpdir(), "cottontail-hutch-shell-"));
 const portableChild = join(import.meta.dir, "fixtures", "shell-portable-child.js");
 const scriptExecutable = Bun.which("script");
 const privateRoots = new Set<string>();
+const isWindowsArm64 = process.platform === "win32" && process.arch === "arm64";
 
 function snapshotTree(directory: string) {
   const snapshot: Array<[string, string, number, number, string?]> = [];
@@ -185,10 +186,16 @@ function runHutchShell(
   options: { cwd?: string; env?: Record<string, string>; stdin?: Uint8Array } = {},
 ) {
   const invocation = createHutchShellInvocation(command, args);
+  // Windows environment names are case-insensitive. Do not send both the
+  // inherited Path and an explicit PATH override to the child.
+  const overriddenNames = new Set(Object.keys(options.env ?? {}).map(name => name.toUpperCase()));
+  const inheritedEnv = process.platform === "win32" && options.env != null
+    ? Object.fromEntries(Object.entries(process.env).filter(([name]) => !overriddenNames.has(name.toUpperCase())))
+    : process.env;
   try {
     return Bun.spawnSync(invocation.argv, {
       cwd: options.cwd ?? root,
-      env: options.env == null ? process.env : { ...process.env, ...options.env },
+      env: options.env == null ? process.env : { ...inheritedEnv, ...options.env },
       stdin: options.stdin,
       stdout: "pipe",
       stderr: "pipe",
@@ -287,7 +294,8 @@ test("keeps exec and bun exec targets as opaque argv", () => {
     expect(child.stderr.toString()).toBe("");
     expect(existsSync(marker)).toBe(false);
   }
-});
+  // Each iteration starts a shell runtime and a nested external runtime.
+}, isWindowsArm64 ? { timeout: 45_000 } : {});
 
 test("does not expose the private command protocol as shell positional args", () => {
   const child = runHutchShell(String.raw`printf '%s|%s|%s' "$#" "$1" "$@"`);
@@ -713,7 +721,7 @@ for (const [name, wrap] of [
     expect(redirectFirst.stdout.toString()).toBe("");
     expect(redirectFirst.stderr.toString()).toBe("");
     expect(readFileSync(merged, "utf8")).toBe("errout");
-  }, { timeout: 15_000 });
+  }, { timeout: isWindowsArm64 ? 45_000 : 15_000 });
 }
 
 test("emits expansion diagnostics before command output on a merged descriptor", () => {

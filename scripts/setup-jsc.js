@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from 'child_process';
+import { buildArchitecture } from './build-target.js';
 import { createHash } from 'crypto';
 import {
   copyFileSync,
@@ -49,7 +50,7 @@ function fail(message, error) {
 
 function getPlatformKey() {
   const platform = process.platform;
-  const arch = process.arch;
+  const arch = buildArchitecture();
 
   if (platform === 'darwin' && arch === 'arm64') {
     return 'macos-arm64';
@@ -66,6 +67,7 @@ function getPlatformKey() {
   if (platform === 'win32' && arch === 'x64') {
     return 'windows-amd64';
   }
+  if (platform === 'win32' && arch === 'arm64') return 'windows-arm64';
 
   return null;
 }

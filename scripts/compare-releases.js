@@ -37,7 +37,8 @@ import {
 
 const rootDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const packageJson = JSON.parse(readFileSync(join(rootDir, "package.json"), "utf8"));
-const packageBunVersion = packageJson.packageManager?.match(/^bun@(.+)$/)?.[1];
+// The five-platform comparison needs Bun's native Windows ARM64 artifact.
+const benchmarkBunVersion = "1.4.0";
 const defaultCacheDir = join(rootDir, ".cottontail-tmp", "release-benchmarks", "cache");
 const artifactsBaseUrl = (
   process.env.COTTONTAIL_ARTIFACTS_BASE_URL ??
@@ -51,7 +52,7 @@ Compare immutable Cottontail and Bun releases.
 
 Options:
   --cottontail VERSION   Cottontail release version (default: ${packageJson.version})
-  --bun VERSION          Bun release version (default: ${packageBunVersion ?? "required"})
+  --bun VERSION          Bun release version (default: ${benchmarkBunVersion ?? "required"})
   --cache-dir PATH       Download/extraction cache (default: .cottontail-tmp/release-benchmarks/cache)
   --output PATH          JSON result path; a Markdown report is written beside it
   --quick                Reduced samples and filesystem fixtures for harness validation
@@ -60,7 +61,7 @@ Options:
   --help                 Show this help
 
 Example:
-  node scripts/compare-releases.js --cottontail 0.2.3 --bun 1.3.10
+  node scripts/compare-releases.js --cottontail VERSION --bun 1.4.0
 `;
 }
 
@@ -191,7 +192,7 @@ function extractArtifact(record, cacheDir) {
   const extractionKey = `${record.platform}-${record.sha256.slice(0, 16)}`;
   const extractionDir = join(cacheDir, "extracted", record.runtime, record.version, extractionKey);
   const stampPath = join(extractionDir, ".complete");
-  const names = record.platform === "windows-x64"
+  const names = record.platform.startsWith("windows-")
     ? [record.runtime === "cottontail" ? "cottontail.exe" : "bun.exe"]
     : [record.runtime === "cottontail" ? "cottontail" : "bun"];
 
@@ -208,7 +209,7 @@ function extractArtifact(record, cacheDir) {
   });
   const binary = findBinary(extractionDir, names);
   if (!binary) fail(`Could not find ${names.join(" or ")} in ${record.archivePath}`);
-  if (record.platform !== "windows-x64") chmodSync(binary, 0o755);
+  if (!record.platform.startsWith("windows-")) chmodSync(binary, 0o755);
   writeFileSync(stampPath, `${record.sha256}\n`);
   return binary;
 }
@@ -566,7 +567,7 @@ function resolveOutputPath(options) {
 
 async function main() {
   const parsed = parseReleaseBenchmarkArgs(process.argv.slice(2), {
-    bunVersion: packageBunVersion,
+    bunVersion: benchmarkBunVersion,
     cacheDir: defaultCacheDir,
     cottontailVersion: packageJson.version,
   });

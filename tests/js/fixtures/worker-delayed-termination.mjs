@@ -4,6 +4,7 @@ import { Worker } from "node:worker_threads";
 const mode = process.argv[2];
 assert.ok(["top-level", "message-handler", "web-message-handler"].includes(mode), "expected a worker execution mode");
 const webMode = mode === "web-message-handler";
+const startupTimeoutMs = process.platform === "win32" && process.arch === "arm64" ? 30_000 : 3_000;
 if (webMode) await import("bun");
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 async function bounded(promise, label, milliseconds = 3000) {
@@ -15,7 +16,7 @@ async function bounded(promise, label, milliseconds = 3000) {
     ]);
   } finally { clearTimeout(timer); }
 }
-function message(worker) {
+function message(worker, timeoutMs = 3_000) {
   return bounded(new Promise((resolve, reject) => {
     if (!webMode) {
       worker.once("message", resolve);
@@ -27,7 +28,7 @@ function message(worker) {
       worker.addEventListener("message", receive);
       worker.addEventListener("error", fail);
     }
-  }), "worker response");
+  }), "worker response", timeoutMs);
 }
 async function ping(worker, value) {
   const response = message(worker);
@@ -72,7 +73,7 @@ const loopSource = `
 // Do not depend on the very termination operation being tested to bound failure.
 try {
   const companion = echoWorker();
-  assert.equal(await message(companion), "ready");
+  assert.equal(await message(companion, startupTimeoutMs), "ready");
   const progress = webMode ? null : new Int32Array(new SharedArrayBuffer(8));
   const busy = webMode
     ? webWorker(`import "bun"; self.onmessage = () => { postMessage("started"); for (;;) {} }; postMessage("ready");`)
@@ -84,7 +85,7 @@ try {
     if (webMode) busy.addEventListener("exit", (event) => onExit(event.code));
     else busy.on("exit", onExit);
   });
-  assert.equal(await message(busy), "ready");
+  assert.equal(await message(busy, startupTimeoutMs), "ready");
   if (mode === "message-handler") busy.postMessage("start");
   if (webMode) {
     const started = message(busy);
@@ -132,7 +133,7 @@ try {
   assert.equal(await stop(companion, "companion termination"), 1);
 
   const replacement = echoWorker();
-  assert.equal(await message(replacement), "ready");
+  assert.equal(await message(replacement, startupTimeoutMs), "ready");
   await ping(replacement, "new-worker-after-termination");
   assert.equal(await stop(replacement, "replacement termination"), 1);
   console.log(JSON.stringify({ stage: "passed", mode, exitEvents, stoppedAt, mainTicks, terminationMs: terminated.milliseconds }));

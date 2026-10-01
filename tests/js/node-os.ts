@@ -22,7 +22,8 @@ if (process.platform === "win32") {
   assert(/^\d+(?:\.\d+)+$/.test(os.release()), `Windows os.release invalid: ${os.release()}`);
   assert(/^Windows\b/.test(os.version()), `Windows os.version invalid: ${os.version()}`);
   assert(os.type() === "Windows_NT", `Windows os.type mismatch: ${os.type()}`);
-  assert(os.machine() === "x86_64", `Windows os.machine mismatch: ${os.machine()}`);
+  const expectedMachine = process.arch === "arm64" ? "arm64" : "x86_64";
+  assert(os.machine() === expectedMachine, `Windows os.machine mismatch: ${os.machine()}`);
 
   const cpus = os.cpus();
   assert(cpus.length > 0, "Windows os.cpus should not be empty");
