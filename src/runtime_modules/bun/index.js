@@ -9440,7 +9440,9 @@ export function udpSocket(options) {
 }
 
 async function createUdpSocket(options) {
-  const dgram = await import("../node/dgram.js");
+  // A literal dynamic import is linked into every Bun bootstrap bundle.
+  // Preserve deferred loading while sharing the runtime's existing module.
+  const dgram = await Promise.resolve().then(() => loadEmbeddedRuntimeModule("node/dgram.js"));
   const requestedHostname = String(options.hostname ?? (String(options.connect?.hostname ?? "").includes(":") ? "::" : "0.0.0.0"));
   const type = options.type ?? (requestedHostname.includes(":") ? "udp6" : "udp4");
   const socket = dgram.createSocket(type);

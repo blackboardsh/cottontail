@@ -46,6 +46,22 @@ int ct_jsc_runtime_eval_bytecode(
     size_t bytecode_len,
     char **error_out
 );
+typedef void (*CtJscEvalInputsCleanup)(void *context);
+/* Calls cleanup exactly once after copying/evaluating the input buffers, before
+ * waiting for top-level await or active handles, including early error/reload
+ * returns. Only source and bytecode storage may be released by the callback;
+ * filename and runtime retain their ordinary borrowed lifetimes. */
+int ct_jsc_runtime_eval_with_input_cleanup(
+    CtJscRuntime *runtime,
+    const uint8_t *source,
+    size_t source_len,
+    const char *filename,
+    const uint8_t *bytecode,
+    size_t bytecode_len,
+    CtJscEvalInputsCleanup cleanup,
+    void *cleanup_context,
+    char **error_out
+);
 int ct_jsc_generate_bytecode(
     const uint8_t *source,
     size_t source_len,

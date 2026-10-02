@@ -1,6 +1,5 @@
 import { createLazyFunction, createLazyObject } from "./lazy-runtime.js";
-import { loadCottontailCapabilityModule } from "../node/module.js";
-import "../internal/test-host-modules.js";
+import { loadCottontailCapabilityModule, loadEmbeddedRuntimeModule } from "../node/module.js";
 
 const state = globalThis[Symbol.for("cottontail.capabilityFacade.test.bunTest")] ??= {
   namespace: undefined,
@@ -8,6 +7,10 @@ const state = globalThis[Symbol.for("cottontail.capabilityFacade.test.bunTest")]
 };
 export const loadBunTestCapabilityModule = () => {
   if (state.namespace !== undefined) return state.namespace;
+  // The test capability must share the application's builtin instances, but
+  // ordinary applications and workers do not need its fs/stream/assert graph.
+  // Initialize those host modules before evaluating any test capability code.
+  loadEmbeddedRuntimeModule("internal/test-host-modules.js");
   // bun:test eagerly materializes these globals so later user replacement of
   // Promise.prototype.then cannot affect the stream polyfill. Do that through
   // the application-owned facade before capability bytecode evaluates; the

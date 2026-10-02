@@ -216,10 +216,16 @@ try {
       stderrIncludes: ['3 pass', '0 fail'],
     },
     {
+      name: 'bun-bootstrap-retention',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-bootstrap-retention.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['1 pass', '0 fail'],
+    },
+    {
       name: 'web-worker-module-loading',
       argv: ['test', join(rootDir, 'tests', 'js', 'web-worker-module-loading.test.ts')],
       expectExitCode: 0,
-      stderrIncludes: ['1 pass', '0 fail'],
+      stderrIncludes: ['3 pass', '0 fail'],
     },
     {
       name: 'web-worker-message-dispatch',
@@ -231,7 +237,13 @@ try {
       name: 'runtime-sourcemap-regressions',
       argv: ['test', join(rootDir, 'tests', 'js', 'runtime-sourcemap.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: ['10 pass', '0 fail'],
+      stderrIncludes: ['10 pass', '0 fail'],
+    },
+    {
+      name: 'runtime-sourcemap-retention',
+      argv: ['test', join(rootDir, 'tests', 'js', 'runtime-sourcemap-retention.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['1 pass', '0 fail'],
     },
     {
       name: 'generated-loader-module-semantics',
@@ -244,6 +256,18 @@ try {
       argv: ['test', join(rootDir, 'tests', 'js', 'module-factory-retention.test.ts')],
       expectExitCode: 0,
       stdoutIncludes: ['3 pass', '0 fail'],
+    },
+    {
+      name: 'node-module-linkage-retention',
+      argv: ['test', join(rootDir, 'tests', 'js', 'node-module-linkage-retention.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['1 pass', '0 fail'],
+    },
+    {
+      name: 'node-module-error-stack-laziness',
+      argv: ['test', join(rootDir, 'tests', 'js', 'node-module-error-stack-laziness.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['5 pass', '0 fail'],
     },
     {
       name: 'node-module-cache-lifecycle',
@@ -371,6 +395,18 @@ try {
       argv: ['test', join(rootDir, 'tests', 'js', 'bun-bundler-retention.test.ts')],
       expectExitCode: 0,
       stdoutIncludes: ['2 pass', '0 fail'],
+    },
+    {
+      name: 'runtime-options-initialization',
+      argv: ['test', join(rootDir, 'tests', 'js', 'runtime-options-initialization.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['5 pass', '0 fail'],
+    },
+    {
+      name: 'runtime-file-input-lifetime',
+      argv: ['test', join(rootDir, 'tests', 'js', 'runtime-file-input-lifetime.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['2 pass', '0 fail'],
     },
     {
       name: 'desktop-idle-retention',

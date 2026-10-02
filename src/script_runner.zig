@@ -560,6 +560,7 @@ pub fn runHutchPrivateFile(
     shell_args: []const [:0]const u8,
 ) !u8 {
     const allocator = init.arena.allocator();
+    if (!applyRuntimeEnvFlags(init.io, allocator, &.{})) return 1;
     var ctx = try makeContext(init);
     var storage = openHutchPrivateStorage(&ctx, wrapper_path, private_root) catch |err| {
         ctx.writeStderr("cottontail: invalid Hutch private file: {s}\n", .{@errorName(err)});
@@ -777,6 +778,7 @@ pub fn runWithExecArgvDisplay(
     exec_args: []const [:0]const u8,
 ) !u8 {
     const allocator = init.arena.allocator();
+    if (!applyRuntimeEnvFlags(init.io, allocator, exec_args)) return 1;
     const ctx = try makeContext(init);
     const entrypoint_path = try resolveBunEntrypointFallback(&ctx, script_path);
 
@@ -1436,6 +1438,7 @@ pub fn runEval(
     exec_args: []const [:0]const u8,
     print_result: bool,
 ) !u8 {
+    if (!applyRuntimeEnvFlags(init.io, init.arena.allocator(), exec_args)) return 1;
     const ctx = try makeContext(init);
     const executable_source = (try rewriteLegacyHtmlClosingComments(ctx.allocator, source)) orelse source;
     if (!validateEvalSyntax(&ctx, executable_source)) return 1;
@@ -1978,6 +1981,7 @@ pub fn runEmbedded(
     flags: standalone_executable.Flags,
 ) !u8 {
     const allocator = init.arena.allocator();
+    if (!applyRuntimeEnvFlags(init.io, allocator, exec_args)) return 1;
     const ctx = try makeContext(init);
     const native_assets = try prepareStandaloneNativeAssets(init, source, files);
     defer native_assets.deinit(init.io);
@@ -2635,6 +2639,7 @@ pub fn runStdin(
     exec_args: []const [:0]const u8,
 ) !u8 {
     const allocator = init.arena.allocator();
+    if (!applyRuntimeEnvFlags(init.io, allocator, exec_args)) return 1;
     var source: std.ArrayList(u8) = .empty;
     defer source.deinit(allocator);
 
@@ -2704,6 +2709,9 @@ fn maxOldSpaceSizeValue(arg: []const u8) ?[]const u8 {
     return null;
 }
 
+// Apply at the execution entry point, before bundling can create a bytecode VM.
+// JSC reads these process-wide options once; applying them at the execution
+// handoff makes low-memory behavior depend on whether the launcher cache hit.
 fn applyRuntimeEnvFlags(io: std.Io, allocator: std.mem.Allocator, exec_args: []const [:0]const u8) bool {
     const electrobun_main = std.c.getenv("COTTONTAIL_ELECTROBUN_DIST") != null;
     const low_memory_runtime = electrobun_main or for (exec_args) |arg| {
@@ -3093,7 +3101,6 @@ fn runPrepared(
     standalone_flags: ?standalone_executable.Flags,
 ) !u8 {
     const allocator = init.arena.allocator();
-    if (!applyRuntimeEnvFlags(init.io, allocator, exec_args)) return 1;
     const inspector = if (ctx.hutch_private_file != null)
         null
     else
@@ -3215,7 +3222,6 @@ fn runReloadPrepared(
         ctx.writeStderr("error: preload not found {s}\n", .{specifier});
         return 1;
     }
-    if (!applyRuntimeEnvFlags(init.io, allocator, exec_args)) return 1;
     const inspector = inspectorLaunchFromArgs(ctx, exec_args) catch |err| {
         ctx.writeStderr("cottontail: invalid inspector endpoint: {s}\n", .{@errorName(err)});
         return 1;
@@ -4380,9 +4386,10 @@ fn rejectInvalidBunCjsPragma(ctx: *const Context, script_path: []const u8) !bool
     const source = std.Io.Dir.cwd().readFileAlloc(
         ctx.io,
         script_path,
-        ctx.allocator,
+        std.heap.c_allocator,
         .limited(4 * 1024 * 1024),
     ) catch return false;
+    defer std.heap.c_allocator.free(source);
     const line_end = std.mem.indexOfScalar(u8, source, '\n') orelse source.len;
     const first_line = source[0..line_end];
     if (!std.mem.startsWith(u8, first_line, "//") or std.mem.indexOf(u8, first_line, "@bun-cjs") == null) return false;

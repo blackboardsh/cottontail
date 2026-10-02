@@ -3139,6 +3139,9 @@ function prepareWorkerScriptPath(scriptPath, options = undefined) {
       includeRuntimeModules: true,
       inlineImportMetaProperties: true,
       alias: workerRuntimeAliases(runtimeRoot),
+      // Compact each VM's retained runtime source. JSC stack frames use lexical
+      // names even with keepNames, so leave worker identifiers intact.
+      minify: { whitespace: true, identifiers: false, syntax: true, keepNames: true },
     }));
     cottontail.writeFile(bundledPath, bundled);
     if (!hasWorkerOptions) workerBundleCache.set(cacheKey, bundledPath);

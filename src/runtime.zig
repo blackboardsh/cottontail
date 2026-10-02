@@ -328,12 +328,38 @@ pub const Runtime = struct {
         }
     }
 
-    /// Map a file read-only. The event loop runs inside the eval call, so
-    /// buffers passed to it stay alive for the entire process; file-backed
-    /// clean pages stay out of phys_footprint while anonymous readFileAlloc
-    /// copies are dirty for the whole run. Mappings are intentionally left in
-    /// place until process exit (JSC may retain pointers into the cached
-    /// bytecode for lazy function decoding).
+    const FileEvalInputs = struct {
+        source: ?[]const u8 = null,
+        bytecode: ?[]const u8 = null,
+        source_mapped: bool = false,
+        bytecode_mapped: bool = false,
+
+        fn freeBytes(bytes: []const u8, mapped: bool) void {
+            if (comptime builtin.os.tag != .windows) {
+                if (mapped) {
+                    std.posix.munmap(@alignCast(bytes));
+                    return;
+                }
+            }
+            std.heap.c_allocator.free(@constCast(bytes));
+        }
+
+        fn deinit(self: *@This()) void {
+            if (self.source) |bytes| freeBytes(bytes, self.source_mapped);
+            if (self.bytecode) |bytes| freeBytes(bytes, self.bytecode_mapped);
+            self.source = null;
+            self.bytecode = null;
+        }
+
+        fn release(raw: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.deinit();
+        }
+    };
+
+    /// Map file inputs until evaluation copies them. The JSC embedder owns a
+    /// separate CachedBytecode allocation for lazy decoding, so the original
+    /// mapping can be released before the long-lived event loop starts.
     fn mapFileForRead(self: *Runtime, path: []const u8, max_size: usize) ?[]const u8 {
         if (builtin.os.tag == .windows) return null;
         const file = std.Io.Dir.cwd().openFile(self.io, path, .{}) catch return null;
@@ -354,37 +380,41 @@ pub const Runtime = struct {
     }
 
     pub fn runFile(self: *Runtime, script_path: [:0]const u8) u8 {
-        var source_owned = false;
+        var source_mapped = true;
         const source: []const u8 = self.mapFileForRead(script_path, self.max_script_size) orelse blk: {
-            source_owned = true;
+            source_mapped = false;
             break :blk std.Io.Dir.cwd().readFileAlloc(
                 self.io,
                 script_path,
-                self.allocator,
+                std.heap.c_allocator,
                 .limited(self.max_script_size),
             ) catch |err| {
                 self.writeLoadError(script_path, err);
                 return 1;
             };
         };
-        defer if (source_owned) self.allocator.free(@constCast(source));
+        // Init's process-lifetime arena retains intermediate readFileAlloc
+        // growth buffers too. File inputs need individually reclaimable storage.
+        var inputs = FileEvalInputs{ .source = source, .source_mapped = source_mapped };
+        defer inputs.deinit();
 
         const bytecode_path = std.mem.concat(self.allocator, u8, &.{ script_path, ".jsc" }) catch
-            return self.runSource(source, script_path);
+            return self.runSourceInternal(source, script_path, null, &inputs);
         defer self.allocator.free(bytecode_path);
-        var bytecode_owned = false;
+        var bytecode_mapped = true;
         const bytecode: []const u8 = self.mapFileForRead(bytecode_path, self.max_bytecode_size) orelse blk: {
-            bytecode_owned = true;
+            bytecode_mapped = false;
             break :blk std.Io.Dir.cwd().readFileAlloc(
                 self.io,
                 bytecode_path,
-                self.allocator,
+                std.heap.c_allocator,
                 .limited(self.max_bytecode_size),
-            ) catch return self.runSource(source, script_path);
+            ) catch return self.runSourceInternal(source, script_path, null, &inputs);
         };
-        defer if (bytecode_owned) self.allocator.free(@constCast(bytecode));
+        inputs.bytecode = bytecode;
+        inputs.bytecode_mapped = bytecode_mapped;
 
-        return self.runSourceWithBytecode(source, script_path, bytecode);
+        return self.runSourceInternal(source, script_path, bytecode, &inputs);
     }
 
     pub fn evalImmediate(self: *Runtime, source: []const u8, filename: [:0]const u8) !void {
@@ -403,7 +433,7 @@ pub const Runtime = struct {
     }
 
     pub fn runSource(self: *Runtime, source: []const u8, filename: [:0]const u8) u8 {
-        return self.runSourceInternal(source, filename, null);
+        return self.runSourceInternal(source, filename, null, null);
     }
 
     pub fn runSourceWithBytecode(
@@ -412,7 +442,7 @@ pub const Runtime = struct {
         filename: [:0]const u8,
         bytecode: []const u8,
     ) u8 {
-        return self.runSourceInternal(source, filename, bytecode);
+        return self.runSourceInternal(source, filename, bytecode, null);
     }
 
     fn runSourceInternal(
@@ -420,13 +450,26 @@ pub const Runtime = struct {
         source: []const u8,
         filename: [:0]const u8,
         bytecode: ?[]const u8,
+        file_inputs: ?*FileEvalInputs,
     ) u8 {
         // The C evaluator consumes an explicit byte length and creates its own
         // wrapped source. A sentinel copy here would stay dirty throughout the
         // event loop, defeating runFile's read-only source mapping.
         var eval_error: [*c]u8 = null;
 
-        const eval_status = if (bytecode) |cached|
+        const eval_status = if (file_inputs) |inputs|
+            c.ct_jsc_runtime_eval_with_input_cleanup(
+                self.handle,
+                source.ptr,
+                source.len,
+                filename.ptr,
+                if (bytecode) |cached| cached.ptr else null,
+                if (bytecode) |cached| cached.len else 0,
+                FileEvalInputs.release,
+                inputs,
+                &eval_error,
+            )
+        else if (bytecode) |cached|
             c.ct_jsc_runtime_eval_bytecode(
                 self.handle,
                 source.ptr,

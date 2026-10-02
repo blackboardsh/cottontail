@@ -25,7 +25,78 @@ let cachedSourceRoot;
 let cachedState; // undefined = never attempted, null = failed, WeakRef = loaded
 const adjacentBundleStates = new Map();
 const virtualSourceMappings = new WeakMap();
-const remapStackMemo = new WeakMap();
+// Stack formatting often repeats after a GC has discarded the weak map state.
+// Cache only small final strings, before loading that state, so a recurring
+// stack does not reread and reindex the complete source map on every collection.
+const remappedStackResults = new Map();
+const remappedStackResultLimit = 128;
+const remappedStackByteLimit = 256 * 1024;
+let remappedStackBytes = 0;
+let remappedStackContext;
+const copyCodeUnits = String.fromCharCode;
+
+function clearRemappedStackResults() {
+  remappedStackResults.clear();
+  remappedStackBytes = 0;
+  remappedStackContext = undefined;
+}
+
+function useRemappedStackContext(mapPath, mapData, bundlePath, sourceRoot, entryFilename) {
+  const previous = remappedStackContext;
+  if (previous && previous.mapPath === mapPath && previous.mapData === mapData &&
+      previous.bundlePath === bundlePath && previous.sourceRoot === sourceRoot &&
+      previous.entryFilename === entryFilename) return;
+  clearRemappedStackResults();
+  remappedStackContext = { mapPath, mapData, bundlePath, sourceRoot, entryFilename };
+}
+
+function copySmallStackString(text) {
+  // A short substring can otherwise retain a much larger backing string.
+  const codes = new Uint16Array(Math.min(4096, text.length));
+  const parts = [];
+  for (let offset = 0; offset < text.length; offset += codes.length) {
+    const length = Math.min(codes.length, text.length - offset);
+    for (let index = 0; index < length; index += 1) codes[index] = text.charCodeAt(offset + index);
+    parts.push(copyCodeUnits(...codes.subarray(0, length)));
+  }
+  return parts.join("");
+}
+
+function rememberRemappedStack(stack, result) {
+  const bytes = 2 * (stack.length + result.length);
+  if (bytes > remappedStackByteLimit) return;
+  while (remappedStackResults.size >= remappedStackResultLimit ||
+      remappedStackBytes + bytes > remappedStackByteLimit) {
+    const first = remappedStackResults.keys().next().value;
+    const entry = remappedStackResults.get(first);
+    remappedStackBytes -= entry.bytes;
+    remappedStackResults.delete(first);
+  }
+  const copiedStack = copySmallStackString(stack);
+  remappedStackResults.set(copiedStack, {
+    stack: copiedStack, result: copySmallStackString(result), bytes,
+  });
+  remappedStackBytes += bytes;
+}
+
+function hasForeignAdjacentBundle(text, activePath) {
+  const frames = /((?:file:\/\/)?(?:[A-Za-z]:)?[\\/][^@\s()]*[\\/]script\.bundle\.mjs):\d+:\d+/gi;
+  for (const match of text.matchAll(frames)) {
+    if (pathComparisonKey(match[1]) !== activePath) return true;
+  }
+  return false;
+}
+
+const sourceMapReloadHooks = globalThis.__cottontailHotReloadHooks ??= new Set();
+sourceMapReloadHooks.add(() => {
+  clearRemappedStackResults();
+  cachedState = undefined;
+  cachedMapPath = undefined;
+  cachedMapData = undefined;
+  cachedBundlePath = undefined;
+  cachedSourceRoot = undefined;
+  adjacentBundleStates.clear();
+});
 
 function isWindowsAbsolutePath(path) {
   return /^[A-Za-z]:[\\/]/.test(String(path)) || /^[\\/]{2}[^\\/]/.test(String(path));
@@ -1046,23 +1117,27 @@ export function remapStackString(stack) {
   if (typeof stack !== "string" || stack === "") return stack;
   const mapPath = globalThis.__cottontailBundleSourceMap;
   const mapData = globalThis.__cottontailBundleSourceMapData;
+  const bundlePath = globalThis.__cottontailBundlePath;
+  const sourceRoot = globalThis.__cottontailBundleSourceRoot;
+  const entryFilename = typeof globalThis.__filename === "string" ? globalThis.__filename : null;
+  useRemappedStackContext(mapPath, mapData, bundlePath, sourceRoot, entryFilename);
   const hasMapPath = typeof mapPath === "string" && mapPath !== "";
   const hasMapData = typeof mapData === "string" && mapData !== "";
   if (!hasMapPath && !hasMapData) return remapAdjacentBundleFrames(stack);
+  // Adjacent bundles have separate maps that can change without changing the
+  // active bundle context. Preserve their independent lookup/invalidation path.
+  const activePath = typeof bundlePath === "string" ? pathComparisonKey(bundlePath) : null;
+  let canMemoize = stack.length * 2 <= remappedStackByteLimit &&
+    !hasForeignAdjacentBundle(stack, activePath);
+  const memoized = canMemoize ? remappedStackResults.get(stack) : undefined;
+  if (memoized !== undefined) {
+    // Refresh insertion order for bounded least-recently-used eviction.
+    remappedStackResults.delete(stack);
+    remappedStackResults.set(memoized.stack, memoized);
+    return memoized.result;
+  }
   const state = getState();
   if (!state) return remapAdjacentBundleFrames(stack);
-  // Remapping is a pure function of the stack text, the (cached) map state and
-  // the entry filename, and identical stacks recur constantly — loops, retried
-  // assertions, repeated `new Error()` at one site.
-  const entryFilename = typeof globalThis.__filename === "string" ? globalThis.__filename : null;
-  let memo = remapStackMemo.get(state);
-  if (memo === undefined) remapStackMemo.set(state, memo = { entryFilename, entries: new Map() });
-  if (memo.entryFilename !== entryFilename) {
-    memo.entryFilename = entryFilename;
-    memo.entries.clear();
-  }
-  const memoized = memo.entries.get(stack);
-  if (memoized !== undefined) return memoized;
   let remapped = stack;
   if (state?.bundleRegExp) {
     state.bundleRegExp.lastIndex = 0;
@@ -1111,6 +1186,9 @@ export function remapStackString(stack) {
       );
     }
   }
+  // The active map can itself reveal a different bundle, even when the input
+  // stack mentioned only the active entry. That map needs independent lookup.
+  if (canMemoize && hasForeignAdjacentBundle(remapped, activePath)) canMemoize = false;
   remapped = remapAdjacentBundleFrames(remapped);
   const activeBundlePath = state?.bundlePath;
   const activeBundleComparisonPath = activeBundlePath ? pathComparisonKey(activeBundlePath) : null;
@@ -1124,8 +1202,7 @@ export function remapStackString(stack) {
       return !frame || pathComparisonKey(frame[1]) !== activeBundleComparisonPath;
     })
     .join("\n");
-  if (memo.entries.size >= 512) memo.entries.clear();
-  memo.entries.set(stack, result);
+  if (canMemoize) rememberRemappedStack(stack, result);
   return result;
 }
 

@@ -290,7 +290,47 @@ const nodeModulePathsCacheLimit = 256;
 const smolModuleCacheGcInterval = 16;
 const smolDynamicModuleCacheGcInterval = 1024;
 const bundledAsyncEsmGraphCache = new Map();
-const runtimeEsmLinkageRecords = new Map();
+// Linkage records are validation scratch graphs, not evaluated modules. Their
+// sources and edges can be collected after validation; cached namespaces and
+// executable functions have independent lifetimes. Never evict a live record:
+// a shared dependency must retain one export-token identity throughout a graph,
+// including graphs larger than the compiled-factory cache's entry limit.
+class RuntimeEsmLinkageCache extends Map {
+  constructor() {
+    super();
+    this.finalizer = typeof FinalizationRegistry === "function"
+      ? new FinalizationRegistry(({ key, ref }) => {
+        // A newer version of this path may have replaced the collected record.
+        if (super.get(key) === ref) super.delete(key);
+      })
+      : null;
+  }
+  get(key) {
+    const record = super.get(key)?.deref();
+    if (record === undefined) this.delete(key);
+    return record;
+  }
+  set(key, record) {
+    const previous = super.get(key);
+    if (previous !== undefined) this.finalizer?.unregister(previous);
+    const ref = new WeakRef(record);
+    super.set(key, ref);
+    this.finalizer?.register(record, { key, ref }, ref);
+    return this;
+  }
+  delete(key) {
+    const ref = super.get(key);
+    if (ref !== undefined) this.finalizer?.unregister(ref);
+    return super.delete(key);
+  }
+  clear() {
+    if (this.finalizer !== null) {
+      for (const ref of super.values()) this.finalizer.unregister(ref);
+    }
+    super.clear();
+  }
+}
+const runtimeEsmLinkageRecords = new RuntimeEsmLinkageCache();
 const nativeObjectDefineProperty = Object.defineProperty;
 const builtinModuleMap = globalThis.__cottontailBuiltinModules ??= new Map();
 const builtinNamespaceEntries = new IntrinsicSet();
@@ -4840,13 +4880,38 @@ function dynamicModuleErrorConstructor(filename, source) {
   const NativeError = globalThis.Error;
   const annotate = (error) => {
     try {
-      if (typeof error.stack === "string") {
-        error.stack = error.stack.replace(/@(?=\n|$)/g, `@${filename}`);
-      }
       Object.defineProperty(error, dynamicErrorSourceSymbol, {
         value: { filename, source: String(source) },
         configurable: true,
       });
+    } catch {}
+    try {
+      // The runtime's stack accessor remaps source locations and calls
+      // Error.prepareStackTrace on first read. Caught errors must retain that
+      // laziness, including a formatter installed after their construction.
+      const descriptor = Object.getOwnPropertyDescriptor(error, "stack");
+      const annotateStack = stack => typeof stack === "string"
+        ? stack.replace(/@(?=\n|$)/g, `@${filename}`)
+        : stack;
+      if (descriptor?.configurable && typeof descriptor.get === "function") {
+        let assigned = false;
+        Object.defineProperty(error, "stack", {
+          ...descriptor,
+          get() {
+            const stack = Reflect.apply(descriptor.get, this, []);
+            return assigned ? stack : annotateStack(stack);
+          },
+          ...(typeof descriptor.set === "function" ? {
+            set(value) {
+              Reflect.apply(descriptor.set, this, [value]);
+              // A user's explicit stack value is not a generated frame.
+              assigned = true;
+            },
+          } : {}),
+        });
+      } else if (descriptor && "value" in descriptor && typeof descriptor.value === "string") {
+        Object.defineProperty(error, "stack", { ...descriptor, value: annotateStack(descriptor.value) });
+      }
     } catch {}
     return error;
   };

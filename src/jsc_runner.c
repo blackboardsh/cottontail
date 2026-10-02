@@ -3248,14 +3248,29 @@ static void ct_runtime_uv_shutdown(CtJscRuntime *runtime) {
     runtime->uv_loop_initialized = false;
 }
 
+typedef enum {
+    CT_JSC_SOURCE_BORROWED,
+    CT_JSC_SOURCE_OWNED
+} CtJscSourceOwnership;
+
+static int ct_jsc_runtime_eval_owned_source(
+    CtJscRuntime *runtime,
+    char *source,
+    size_t source_len,
+    const char *filename,
+    char **error_out
+);
 static int ct_jsc_runtime_eval_internal(
     CtJscRuntime *runtime,
     const uint8_t *source,
     size_t source_len,
+    CtJscSourceOwnership source_ownership,
     const char *filename,
     const uint8_t *bytecode,
     size_t bytecode_len,
     bool wait_for_active_handles,
+    CtJscEvalInputsCleanup cleanup,
+    void *cleanup_context,
     char **error_out
 );
 static CtJscRuntime *ct_jsc_runtime_create_internal(
@@ -28413,7 +28428,9 @@ static void *ct_worker_entry(void *opaque) {
     start->script_source = NULL;
     start->script_source_len = 0;
 
-    if (ct_jsc_runtime_eval(runtime, (const uint8_t *)source, source_len, start->script_path, &error) != 0) {
+    // The evaluator consumes this malloc buffer on every path, before entering
+    // the worker's long-lived event loop. start no longer owns the source.
+    if (ct_jsc_runtime_eval_owned_source(runtime, source, source_len, start->script_path, &error) != 0) {
         pthread_mutex_lock(&start->worker->mutex);
         bool terminated_during_eval = start->worker->terminate_requested;
         pthread_mutex_unlock(&start->worker->mutex);
@@ -28426,10 +28443,8 @@ static void *ct_worker_entry(void *opaque) {
             terminated_during_eval ? NULL : (error != NULL ? error : "cottontail: worker script failed")
         );
         free(error);
-        free(source);
         return NULL;
     }
-    free(source);
 
     if (ct_worker_check_heap_limit(runtime->context, start->worker)) {
         ct_worker_finish(start, runtime, NULL);
@@ -34917,14 +34932,21 @@ static int ct_jsc_runtime_eval_internal(
     CtJscRuntime *runtime,
     const uint8_t *source,
     size_t source_len,
+    CtJscSourceOwnership source_ownership,
     const char *filename,
     const uint8_t *bytecode,
     size_t bytecode_len,
     bool wait_for_active_handles,
+    CtJscEvalInputsCleanup cleanup,
+    void *cleanup_context,
     char **error_out
 ) {
     if (error_out != NULL) *error_out = NULL;
-    if (runtime->reload_requested) return CT_JSC_EVAL_RELOAD;
+    if (runtime->reload_requested) {
+        if (source_ownership == CT_JSC_SOURCE_OWNED) free((void *)source);
+        if (cleanup != NULL) cleanup(cleanup_context);
+        return CT_JSC_EVAL_RELOAD;
+    }
     JSContextRef ctx = runtime->context;
     size_t coverage_source_offset = 0;
     size_t coverage_source_byte_offset = 0;
@@ -34936,7 +34958,12 @@ static int ct_jsc_runtime_eval_internal(
         &coverage_source_offset,
         &coverage_source_byte_offset,
         &coverage_source_length);
+    // Wrapping copies/re-writes all source bytes into independent storage.
+    // No subsequent evaluation, TLA, coverage or event-loop work borrows the
+    // original bytes, even when wrapping fails. Public APIs keep ownership.
+    if (source_ownership == CT_JSC_SOURCE_OWNED) free((void *)source);
     if (wrapped == NULL) {
+        if (cleanup != NULL) cleanup(cleanup_context);
         ct_set_error_out(error_out, ct_duplicate_bytes("Out of memory", 13));
         return -1;
     }
@@ -34946,6 +34973,7 @@ static int ct_jsc_runtime_eval_internal(
     if (source_url_text == NULL) {
         JSStringRelease(script);
         free(wrapped);
+        if (cleanup != NULL) cleanup(cleanup_context);
         ct_set_error_out(error_out, ct_duplicate_bytes("Out of memory", 13));
         return -1;
     }
@@ -35001,6 +35029,10 @@ static int ct_jsc_runtime_eval_internal(
     JSStringRelease(script);
     JSStringRelease(source_url);
     free(wrapped);
+    // The embedder bridge copies bytecode into its own CachedBytecode storage,
+    // and JSC retains its own source string. Original file buffers can go now,
+    // before top-level await and the long-lived event loop keep this call open.
+    if (cleanup != NULL) cleanup(cleanup_context);
     if (exception != NULL) {
         (void)ct_mark_out_of_memory_exception(runtime, exception);
         ct_set_error_out(error_out, ct_copy_exception(ctx, exception));
@@ -35084,8 +35116,22 @@ static int ct_jsc_runtime_eval_internal(
     return 0;
 }
 
+static int ct_jsc_runtime_eval_owned_source(
+    CtJscRuntime *runtime,
+    char *source,
+    size_t source_len,
+    const char *filename,
+    char **error_out
+) {
+    return ct_jsc_runtime_eval_internal(
+        runtime, (const uint8_t *)source, source_len, CT_JSC_SOURCE_OWNED,
+        filename, NULL, 0, true, NULL, NULL, error_out);
+}
+
 int ct_jsc_runtime_eval(CtJscRuntime *runtime, const uint8_t *source, size_t source_len, const char *filename, char **error_out) {
-    return ct_jsc_runtime_eval_internal(runtime, source, source_len, filename, NULL, 0, true, error_out);
+    return ct_jsc_runtime_eval_internal(
+        runtime, source, source_len, CT_JSC_SOURCE_BORROWED,
+        filename, NULL, 0, true, NULL, NULL, error_out);
 }
 
 int ct_jsc_runtime_eval_bytecode(
@@ -35101,12 +35147,31 @@ int ct_jsc_runtime_eval_bytecode(
         runtime,
         source,
         source_len,
+        CT_JSC_SOURCE_BORROWED,
         filename,
         bytecode,
         bytecode_len,
         true,
+        NULL,
+        NULL,
         error_out
     );
+}
+
+int ct_jsc_runtime_eval_with_input_cleanup(
+    CtJscRuntime *runtime,
+    const uint8_t *source,
+    size_t source_len,
+    const char *filename,
+    const uint8_t *bytecode,
+    size_t bytecode_len,
+    CtJscEvalInputsCleanup cleanup,
+    void *cleanup_context,
+    char **error_out
+) {
+    return ct_jsc_runtime_eval_internal(
+        runtime, source, source_len, CT_JSC_SOURCE_BORROWED,
+        filename, bytecode, bytecode_len, true, cleanup, cleanup_context, error_out);
 }
 
 static char *ct_copy_js_string_ref(JSStringRef string) {
