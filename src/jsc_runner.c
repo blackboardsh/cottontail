@@ -39,6 +39,7 @@ extern void ct_jsc_drain_microtasks(JSContextRef context);
 extern void ct_jsc_collect_full(JSContextRef context);
 extern size_t ct_jsc_heap_size(JSContextRef context);
 extern void ct_jsc_scavenge_allocator(void);
+extern void ct_jsc_trim_allocator_idle(uint64_t now);
 extern void *ct_jsc_microtask_delay_begin(JSContextGroupRef group);
 extern void ct_jsc_microtask_delay_end(void *opaque_scope);
 extern int ct_jsc_promise_status(JSValueRef value);
@@ -34919,6 +34920,7 @@ static void ct_collect_low_memory_idle(CtJscRuntime *runtime, int delay_ms, uint
             (void *)runtime, delay_ms, (unsigned long long)active_ns, bytes, runtime->low_memory_live_heap_bytes);
     }
     if (delay_ms < 1 || active_ns > 1000000ULL || active_ns > (uint64_t)delay_ms * 250000ULL) return;
+    ct_jsc_trim_allocator_idle(now);
     double growth = bytes - runtime->low_memory_live_heap_bytes;
     if (growth < 8 * 1024 * 1024 || growth < runtime->low_memory_live_heap_bytes * 0.25) return;
     ct_jsc_collect_full(runtime->context);

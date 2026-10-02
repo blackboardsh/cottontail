@@ -269,6 +269,10 @@ jobs:
           & .\zig-out\bin\cottontail.exe test tests/js/bun-transpiler-retention.test.ts
           if ($LASTEXITCODE -ne 0) { throw "Windows transpiler memory retention tests failed" }
 
+      - name: Test Linux native allocator retention
+        if: matrix.os == 'linux'
+        run: ./zig-out/bin/cottontail test "${{ github.workspace }}/tests/js/linux-native-allocator-retention.test.ts"
+
       - name: Test native FFI calling conventions
         run: ./zig-out/bin/cottontail test tests/js/bun-ffi-calling-convention.test.ts
 

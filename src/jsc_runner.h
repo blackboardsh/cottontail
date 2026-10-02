@@ -7,6 +7,8 @@
 
 typedef struct CtJscRuntime CtJscRuntime;
 
+void ct_jsc_configure_low_memory_allocator(void);
+
 enum {
     CT_JSC_EVAL_RELOAD = 2,
 };

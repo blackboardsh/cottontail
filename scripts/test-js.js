@@ -420,6 +420,12 @@ try {
       expectExitCode: 0,
       stdoutIncludes: ['1 pass', '0 fail'],
     },
+    ...(process.platform === 'linux' ? [{
+      name: 'linux-native-allocator-retention',
+      argv: ['test', join(rootDir, 'tests', 'js', 'linux-native-allocator-retention.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['4 pass', '0 fail'],
+    }] : []),
     {
       name: 'async',
       scriptPath: join(rootDir, 'tests', 'js', 'async.js'),

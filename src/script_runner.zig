@@ -2718,6 +2718,7 @@ fn applyRuntimeEnvFlags(io: std.Io, allocator: std.mem.Allocator, exec_args: []c
         if (std.mem.eql(u8, arg, "--smol")) break true;
     } else false;
     if (low_memory_runtime) {
+        runtime.configureLowMemoryAllocator();
         // COTTONTAIL-COMPAT: Bun's --smol selects JSC's low-memory VM
         // policy. Stock JSC exposes the equivalent collection, sweeping,
         // and code-jettisoning behavior through forceMiniVMMode. Bound each

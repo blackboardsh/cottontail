@@ -56,6 +56,10 @@ extern fn ct_jsc_runtime_emit_process_shutdown(
 ) c_int;
 extern fn ct_jsc_runtime_had_fatal_exception(runtime: *c.CtJscRuntime) c_int;
 
+pub fn configureLowMemoryAllocator() void {
+    c.ct_jsc_configure_low_memory_allocator();
+}
+
 pub fn generateCachedBytecode(
     allocator: std.mem.Allocator,
     source: []const u8,

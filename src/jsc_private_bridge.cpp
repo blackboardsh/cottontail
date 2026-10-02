@@ -14,12 +14,15 @@
 #include <bmalloc/pas_scavenger.h>
 #if defined(__APPLE__)
 #include <malloc/malloc.h>
+#elif defined(__GLIBC__)
+#include <malloc.h>
 #endif
 
 #include <algorithm>
 #include <atomic>
 #include <bit>
 #include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <cstdint>
 #include <cstddef>
@@ -568,6 +571,28 @@ extern "C" size_t ct_jsc_heap_size(JSContextRef context)
     return ct_jsc_heap(vm)->size();
 }
 
+extern "C" void ct_jsc_configure_low_memory_allocator(void)
+{
+#if defined(__GLIBC__)
+    static std::once_flag once;
+    std::call_once(once, [] {
+        // glibc raises its mmap/trim thresholds after large transient frees.
+        // A compiler bootstrap can therefore leave later multi-MB scratch
+        // allocations scattered through long-lived arenas. Keep the initial
+        // 128 KiB thresholds for desktop/--smol processes so large allocations
+        // can be returned independently, without limiting allocator threads.
+        // Respect explicit allocator policy, including modern glibc tunables.
+        const char* tunables = std::getenv("GLIBC_TUNABLES");
+        if (std::getenv("MALLOC_MMAP_THRESHOLD_") || std::getenv("MALLOC_TRIM_THRESHOLD_")
+            || std::getenv("MALLOC_TOP_PAD_") || std::getenv("MALLOC_MMAP_MAX_")
+            || (tunables && std::strstr(tunables, "glibc.malloc.")))
+            return;
+        mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+        mallopt(M_TRIM_THRESHOLD, 128 * 1024);
+    });
+#endif
+}
+
 extern "C" void ct_jsc_collect_full(JSContextRef context)
 {
     if (context == nullptr)
@@ -594,6 +619,26 @@ extern "C" void ct_jsc_collect_full(JSContextRef context)
     pas_scavenger_run_synchronously_now();
 #if defined(__APPLE__)
     malloc_zone_pressure_relief(nullptr, 0);
+#elif defined(__GLIBC__)
+    // The compiler and native runtime use libc allocations outside libpas.
+    // Freeing their temporary graphs leaves pages in glibc's arenas; idle
+    // desktop hosts may never allocate enough again to return them naturally.
+    malloc_trim(0);
+#endif
+}
+
+extern "C" void ct_jsc_trim_allocator_idle(uint64_t now)
+{
+#if defined(__GLIBC__)
+    // Native frees need not grow the JS heap, so the adaptive GC threshold
+    // cannot detect them. Share the cadence across all worker VMs: one trim
+    // per process per five seconds, only from a lightly loaded idle turn.
+    static std::atomic<uint64_t> nextTrim { 0 };
+    auto next = nextTrim.load(std::memory_order_relaxed);
+    if (now >= next && nextTrim.compare_exchange_strong(next, now + 5000000000ULL, std::memory_order_relaxed))
+        malloc_trim(0);
+#else
+    (void)now;
 #endif
 }
 
@@ -608,6 +653,8 @@ extern "C" void ct_jsc_scavenge_allocator(void)
     pas_scavenger_run_synchronously_now();
 #if defined(__APPLE__)
     malloc_zone_pressure_relief(nullptr, 0);
+#elif defined(__GLIBC__)
+    malloc_trim(0);
 #endif
 }
 
