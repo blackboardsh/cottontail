@@ -1,4 +1,6 @@
 import "../bun/core-bootstrap.js";
+import { registerCoreBuiltinModuleSource } from "../internal/builtin-module-registry.js";
+import * as fsModuleNamespace from "./fs.js";
 import picomatch from "../vendor/picomatch.js";
 import { _wrapAsyncCallback } from "./async_hooks.js";
 import constantsObject from "./constants.js";
@@ -3218,3 +3220,5 @@ export default {
   writev,
   writevSync,
 };
+
+registerCoreBuiltinModuleSource("node/fs.js", fsModuleNamespace);

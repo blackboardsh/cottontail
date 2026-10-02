@@ -1,4 +1,6 @@
 import constantsObject from "./constants.js";
+import { registerCoreBuiltinModuleSource } from "../internal/builtin-module-registry.js";
+import * as cryptoModuleNamespace from "./crypto.js";
 import { Buffer } from "./buffer.js";
 import { Transform, Writable } from "./stream.js";
 
@@ -5244,3 +5246,5 @@ export default {
   verify,
   webcrypto,
 };
+
+registerCoreBuiltinModuleSource("node/crypto.js", cryptoModuleNamespace);

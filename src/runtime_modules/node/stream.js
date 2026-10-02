@@ -3,7 +3,8 @@
 // See ./stream/readable-stream.js (generated bundle; MIT licensed).
 import Stream from "./stream/readable-stream.js";
 import { _wrapAsyncCallback } from "./async_hooks.js";
-import { setCoreBuiltinModules } from "../internal/builtin-module-registry.js";
+import { setCoreBuiltinModules, registerCoreBuiltinModuleSource } from "../internal/builtin-module-registry.js";
+import * as streamModuleNamespace from "./stream.js";
 
 export const Readable = Stream.Readable;
 export const Writable = Stream.Writable;
@@ -711,3 +712,5 @@ setCoreBuiltinModules({ stream: Stream, "node:stream": Stream });
 
 export { Stream };
 export default Stream;
+
+registerCoreBuiltinModuleSource("node/stream.js", streamModuleNamespace);

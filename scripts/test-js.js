@@ -228,6 +228,12 @@ try {
       stderrIncludes: ['3 pass', '0 fail'],
     },
     {
+      name: 'runtime-builtin-identity',
+      argv: ['test', join(rootDir, 'tests', 'js', 'runtime-builtin-identity.test.ts')],
+      expectExitCode: 0,
+      stderrIncludes: ['3 pass', '0 fail'],
+    },
+    {
       name: 'web-worker-message-dispatch',
       argv: ['test', join(rootDir, 'tests', 'js', 'web-worker-message-dispatch.test.ts')],
       expectExitCode: 0,

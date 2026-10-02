@@ -1,4 +1,6 @@
 import { EventEmitter } from "./events.js";
+import { registerCoreBuiltinModuleSource } from "../internal/builtin-module-registry.js";
+import * as childProcessModuleNamespace from "./child_process.js";
 import { Buffer } from "./buffer.js";
 import { deserializeJscValue, serializeJscValue } from "../internal/jsc-value-serialization.js";
 import { Server as NetServer, Socket as NetSocket } from "./net.js";
@@ -3093,3 +3095,5 @@ if (globalThis.__cottontailHutchPrivateFileMode == null &&
 }
 
 export default { ChildProcess, _forkChild, exec, execFile, execFileSync, execSync, fork, spawn, spawnSync };
+
+registerCoreBuiltinModuleSource("node/child_process.js", childProcessModuleNamespace);

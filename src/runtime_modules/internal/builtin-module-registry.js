@@ -39,4 +39,28 @@ export function setCoreBuiltinModules(modules) {
   }
 }
 
+// A statically bundled builtin must also be reused by embedded relative
+// imports. Publish its complete namespace only after module initialization.
+export function registerCoreBuiltinModuleSource(relativePath, namespace) {
+  const preloaded = globalThis[Symbol.for("cottontail.runtimeModulePreloadedModules")] ??= new Map();
+  if (namespace[Symbol.toStringTag] === "Module") {
+    preloaded.set(relativePath, namespace);
+    return;
+  }
+  // The native bundler emits mutable namespace getters without a Module tag.
+  // Match the embedded loader's getter-only namespace while keeping its live
+  // bindings. In particular, fs must not acquire writable exports; crypto's
+  // existing builtin wrapper adds its own reassignable exports when required.
+  const embeddedNamespace = Object.create(null);
+  Object.defineProperty(embeddedNamespace, Symbol.toStringTag, { value: "Module" });
+  for (const name of Object.keys(namespace).sort()) {
+    Object.defineProperty(embeddedNamespace, name, {
+      configurable: true,
+      enumerable: true,
+      get: () => namespace[name],
+    });
+  }
+  preloaded.set(relativePath, embeddedNamespace);
+}
+
 export { builtinImportNamespaces, builtinModules, kBuiltinImportNamespaces };
