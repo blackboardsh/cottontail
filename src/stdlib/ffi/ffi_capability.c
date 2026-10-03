@@ -31,7 +31,7 @@ typedef enum { CT_FFI_TYPE_VOID, CT_FFI_TYPE_BOOL, CT_FFI_TYPE_U8, CT_FFI_TYPE_I
 typedef union { uint8_t u8; int8_t i8; uint16_t u16; int16_t i16; uint32_t u32; int32_t i32; uint64_t u64; int64_t i64; float f32; double f64; void *ptr; } CtFfiValue;
 typedef struct CtFfiCapabilityState CtFfiCapabilityState;
 typedef struct CtFfiCallback CtFfiCallback;
-typedef struct CtFfiCallbackJob { CtFfiCallback *callback; size_t argc; CtFfiValue args[CT_FFI_MAX_ARGS]; CtFfiValue result; bool completed; bool wait_for_result; struct CtFfiCallbackJob *next; pthread_mutex_t mutex; pthread_cond_t cond; } CtFfiCallbackJob;
+typedef struct CtFfiCallbackJob { CtFfiCallback *callback; size_t argc; CtFfiValue args[CT_FFI_MAX_ARGS]; char *owned_cstrings[CT_FFI_MAX_ARGS]; CtFfiValue result; bool completed; bool wait_for_result; struct CtFfiCallbackJob *next; pthread_mutex_t mutex; pthread_cond_t cond; } CtFfiCallbackJob;
 struct CtFfiCallback { CtFfiCapabilityState *state; JSContextRef ctx; JSObjectRef function; CtFfiType returns; CtFfiType arg_types[CT_FFI_MAX_ARGS]; ffi_type *ffi_arg_types[CT_FFI_MAX_ARGS]; size_t argc; bool threadsafe; pthread_t owner_thread; ffi_cif cif; ffi_closure *closure; void *code; bool closed; struct CtFfiCallback *next; };
 typedef enum { CT_PREPARED_FFI_FAST_PATH_NONE, CT_PREPARED_FFI_FAST_PATH_I32_TO_I32 } CtPreparedFfiFastPath;
 typedef struct CtPreparedFfiCall { void *function_pointer; CtFfiType returns; CtFfiType arg_types[CT_FFI_MAX_ARGS]; uint8_t return_type_id; uint8_t arg_type_ids[CT_FFI_MAX_ARGS]; ffi_type *ffi_arg_types[CT_FFI_MAX_ARGS]; size_t argc; ffi_cif cif; void *napi_env; CtFfiCapabilityState *state; JSObjectRef callback_constructor; JSObjectRef cstring_constructor; CtPreparedFfiFastPath fast_path; } CtPreparedFfiCall;
@@ -590,6 +590,13 @@ static bool ct_runtime_has_live_callbacks(CtFfiCapabilityState *state) {
     return has_live_callback;
 }
 
+static void ct_free_callback_job(CtFfiCallbackJob *job) {
+    for (size_t index = 0; index < job->argc; index += 1) {
+        free(job->owned_cstrings[index]);
+    }
+    free(job);
+}
+
 static void ct_ffi_callback_dispatch(ffi_cif *cif, void *ret, void **args, void *userdata) {
     CtFfiCallback *callback = (CtFfiCallback *)userdata;
     CtFfiValue values[CT_FFI_MAX_ARGS];
@@ -673,6 +680,23 @@ static void ct_ffi_callback_dispatch(ffi_cif *cif, void *ret, void **args, void 
     job->wait_for_result = wait_for_result;
     memcpy(job->args, values, sizeof(CtFfiValue) * callback->argc);
 
+    /* A threadsafe void callback returns before the owner thread reads its
+     * arguments. Copy declared C strings while the native caller still owns
+     * them. Other pointers, and callbacks whose caller waits, stay borrowed.
+     * Copied pointers are valid only for the duration of the JS callback. */
+    if (!wait_for_result) {
+        for (size_t index = 0; index < callback->argc; index += 1) {
+            if (callback->arg_types[index] != CT_FFI_TYPE_CSTRING || values[index].ptr == NULL) continue;
+            job->owned_cstrings[index] = ct_duplicate_string(values[index].ptr);
+            if (job->owned_cstrings[index] == NULL) {
+                ct_free_callback_job(job);
+                ct_write_ffi_return(ret, callback->returns, result);
+                return;
+            }
+            job->args[index].ptr = job->owned_cstrings[index];
+        }
+    }
+
     if (wait_for_result) {
         pthread_mutex_init(&job->mutex, NULL);
         pthread_cond_init(&job->cond, NULL);
@@ -689,7 +713,7 @@ static void ct_ffi_callback_dispatch(ffi_cif *cif, void *ret, void **args, void 
         pthread_mutex_unlock(&job->mutex);
         pthread_cond_destroy(&job->cond);
         pthread_mutex_destroy(&job->mutex);
-        free(job);
+        ct_free_callback_job(job);
     }
 
     ct_write_ffi_return(ret, callback->returns, result);
@@ -711,7 +735,8 @@ static int ct_drain_ffi_callbacks(CtFfiCapabilityState *state, char **error_out)
 
         if (job == NULL) break;
 
-        if (ct_call_js_callback(job->callback, job->args, job->argc, &job->result) != 0) {
+        if (!job->callback->closed &&
+            ct_call_js_callback(job->callback, job->args, job->argc, &job->result) != 0) {
             memset(&job->result, 0, sizeof(job->result));
         }
 
@@ -721,7 +746,7 @@ static int ct_drain_ffi_callbacks(CtFfiCapabilityState *state, char **error_out)
             pthread_cond_signal(&job->cond);
             pthread_mutex_unlock(&job->mutex);
         } else {
-            free(job);
+            ct_free_callback_job(job);
         }
     }
 
@@ -1576,7 +1601,18 @@ static void ct_ffi_state_cleanup(void *opaque) {
     for (CtFfiCallback *callback = state->callbacks; callback != NULL; callback = callback->next) callback->closed = true;
     CtFfiCallbackJob *job = state->callback_jobs_head; state->callback_jobs_head = state->callback_jobs_tail = NULL;
     pthread_mutex_unlock(&state->callback_mutex);
-    while (job != NULL) { CtFfiCallbackJob *next = job->next; if (job->wait_for_result) { pthread_mutex_lock(&job->mutex); job->completed = true; pthread_cond_signal(&job->cond); pthread_mutex_unlock(&job->mutex); } else free(job); job = next; }
+    while (job != NULL) {
+        CtFfiCallbackJob *next = job->next;
+        if (job->wait_for_result) {
+            pthread_mutex_lock(&job->mutex);
+            job->completed = true;
+            pthread_cond_signal(&job->cond);
+            pthread_mutex_unlock(&job->mutex);
+        } else {
+            ct_free_callback_job(job);
+        }
+        job = next;
+    }
     CtFfiCallback *callback = state->callbacks;
     while (callback != NULL) { CtFfiCallback *next = callback->next; if (callback->function != NULL) JSValueUnprotect(callback->ctx, callback->function); if (callback->closure != NULL) ffi_closure_free(callback->closure); free(callback); callback = next; }
     pthread_mutex_destroy(&state->callback_mutex); free(state);
