@@ -8,20 +8,6 @@ UV_EXTERN int uv_accept(uv_stream_t* server, uv_stream_t* client)
     __builtin_unreachable();
 }
 
-UV_EXTERN int uv_async_init(uv_loop_t*,
-    uv_async_t* async,
-    uv_async_cb async_cb)
-{
-    __bun_throw_not_implemented("uv_async_init");
-    __builtin_unreachable();
-}
-
-UV_EXTERN int uv_async_send(uv_async_t* async)
-{
-    __bun_throw_not_implemented("uv_async_send");
-    __builtin_unreachable();
-}
-
 UV_EXTERN unsigned int uv_available_parallelism(void)
 {
     __bun_throw_not_implemented("uv_available_parallelism");
@@ -97,12 +83,6 @@ UV_EXTERN int uv_check_stop(uv_check_t* check)
 UV_EXTERN int uv_clock_gettime(uv_clock_id clock_id, uv_timespec64_t* ts)
 {
     __bun_throw_not_implemented("uv_clock_gettime");
-    __builtin_unreachable();
-}
-
-UV_EXTERN void uv_close(uv_handle_t* handle, uv_close_cb close_cb)
-{
-    __bun_throw_not_implemented("uv_close");
     __builtin_unreachable();
 }
 
@@ -910,12 +890,6 @@ UV_EXTERN int uv_ip_name(const struct sockaddr* src, char* dst, size_t size)
 UV_EXTERN int uv_is_active(const uv_handle_t* handle)
 {
     __bun_throw_not_implemented("uv_is_active");
-    __builtin_unreachable();
-}
-
-UV_EXTERN int uv_is_closing(const uv_handle_t* handle)
-{
-    __bun_throw_not_implemented("uv_is_closing");
     __builtin_unreachable();
 }
 
