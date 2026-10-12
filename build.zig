@@ -1542,6 +1542,23 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // Exercise the compiler cache's ownership contract without linking the
+    // runtime and its native dependencies, so allocator regressions stay cheap.
+    const compiler_cache_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/compiler-cache.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .link_libc = true,
+        }),
+        .filters = test_filters,
+    });
+    compiler_cache_tests.root_module.addImport("cottontail_compiler", createCompilerModule(b, target, .ReleaseSafe));
+    const run_compiler_cache_tests = b.addRunArtifact(compiler_cache_tests);
+    const compiler_cache_test_step = b.step("test-compiler-cache", "Test compiler cache pointer stability and ownership");
+    compiler_cache_test_step.dependOn(&run_compiler_cache_tests.step);
+    test_step.dependOn(&run_compiler_cache_tests.step);
+
     const upstream_command_adapter_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/upstream-command-adapter.zig"),

@@ -1011,7 +1011,9 @@ pub const allocators = struct {
 
             allocator: std.mem.Allocator,
             indexes: std.AutoHashMapUnmanaged(u64, IndexType) = .empty,
-            values_list: std.ArrayListUnmanaged(ValueType) = .empty,
+            // Resolver callers retain value pointers while nested lookups add
+            // cache entries. Only the pointer table may move as the map grows.
+            values_list: std.ArrayListUnmanaged(*ValueType) = .empty,
 
             pub var instance: *Self = undefined;
             var loaded = false;
@@ -1031,9 +1033,15 @@ pub const allocators = struct {
 
             pub fn deinit(self: *Self) void {
                 self.indexes.deinit(self.allocator);
+                self.clearValues();
                 self.values_list.deinit(self.allocator);
                 default_allocator.destroy(self);
                 loaded = false;
+            }
+
+            fn clearValues(self: *Self) void {
+                for (self.values_list.items) |value| self.allocator.destroy(value);
+                self.values_list.clearRetainingCapacity();
             }
 
             /// Drops every cached entry while keeping the instance alive.
@@ -1044,7 +1052,7 @@ pub const allocators = struct {
             pub fn resetInstance() void {
                 if (!loaded) return;
                 instance.indexes.clearRetainingCapacity();
-                instance.values_list.clearRetainingCapacity();
+                instance.clearValues();
             }
 
             pub fn isOverflowing() bool {
@@ -1074,21 +1082,27 @@ pub const allocators = struct {
             pub fn atIndex(self: *Self, index: IndexType) ?*ValueType {
                 if (index.index == NotFound.index or index.index == Unassigned.index) return null;
                 if (index.index >= self.values_list.items.len) return null;
-                return &self.values_list.items[index.index];
+                return self.values_list.items[index.index];
             }
 
             pub fn put(self: *Self, result: *Result, value: ValueType) !*ValueType {
                 if (result.index.index == NotFound.index or result.index.index == Unassigned.index) {
-                    result.index = .{ .index = @intCast(self.values_list.items.len) };
-                    try self.values_list.append(self.allocator, value);
+                    const value_ptr = try self.allocator.create(ValueType);
+                    errdefer self.allocator.destroy(value_ptr);
+                    try self.values_list.ensureUnusedCapacity(self.allocator, 1);
+                    const index: IndexType = .{ .index = @intCast(self.values_list.items.len) };
+                    try self.indexes.put(self.allocator, result.hash, index);
+                    value_ptr.* = value;
+                    self.values_list.appendAssumeCapacity(value_ptr);
+                    result.index = index;
                 } else if (result.index.index < self.values_list.items.len) {
-                    self.values_list.items[result.index.index] = value;
+                    try self.indexes.put(self.allocator, result.hash, result.index);
+                    self.values_list.items[result.index.index].* = value;
                 } else {
                     return error.OutOfMemory;
                 }
 
-                try self.indexes.put(self.allocator, result.hash, result.index);
-                return &self.values_list.items[result.index.index];
+                return self.values_list.items[result.index.index];
             }
 
             pub fn remove(self: *Self, denormalized_key: []const u8) bool {
@@ -1096,7 +1110,7 @@ pub const allocators = struct {
                 return self.indexes.remove(std.hash.Wyhash.hash(0, key));
             }
 
-            pub fn values(self: *Self) []ValueType {
+            pub fn values(self: *Self) []*ValueType {
                 return self.values_list.items;
             }
         };
