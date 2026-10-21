@@ -141,7 +141,20 @@ test('runs the strict complete Cottontail-owned Bun tier without publishing', ()
     workflow,
     /node scripts\/run-upstream-tests\.js bun --command-adapter "\$command_adapter" --package-manager "\$package_manager" "\$\{job_launcher_args\[@\]\}"/,
   );
-  assert.doesNotMatch(workflow, /continue-on-error:|upload-release-r2|publish|secrets\./i);
+  const optionalCache = workflowStep('Restore Bun compatibility dependencies');
+  assert.match(optionalCache.source, /uses: actions\/cache\/restore@/);
+  assert.match(optionalCache.source, /timeout-minutes: 5/);
+  assert.match(optionalCache.source, /continue-on-error: true/);
+  assert.match(
+    workflowStep('Restore frozen Bun test dependencies').source,
+    /if: steps\.bun-compat-dependencies\.outcome != 'success' \|\| steps\.bun-compat-dependencies\.outputs\.cache-hit != 'true'/,
+  );
+  // Only the optional cache download may fail without failing compatibility.
+  // Builds, dependency installation, and every runtime assertion stay strict.
+  assert.doesNotMatch(
+    workflow.replace(optionalCache.source, ''),
+    /continue-on-error:|upload-release-r2|publish|secrets\./i,
+  );
 
   const cottontailOutOfScope = Object.values(status.tests ?? {}).filter(
     (entry) => entry.status === 'skip' || entry.status === 'disabled',
