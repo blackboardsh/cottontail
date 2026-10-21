@@ -87,16 +87,38 @@ enum class FunctionAttributes {
 template<PtrTag tag, typename, FunctionAttributes = FunctionAttributes::None>
 class FunctionPtr;
 
+template<FunctionAttributes, typename>
+struct FunctionCallConvention;
+
+template<typename Out, typename... In>
+struct FunctionCallConvention<FunctionAttributes::None, Out(In...)> {
+    using Type = Out (*)(In...);
+};
+
+template<typename Out, typename... In>
+struct FunctionCallConvention<FunctionAttributes::JITOperation, Out(In...)> {
+    using Type = Out (JIT_OPERATION_ATTRIBUTES *)(In...);
+};
+
+template<typename Out, typename... In>
+struct FunctionCallConvention<FunctionAttributes::JSCHostCall, Out(In...)> {
+    using Type = Out (JSC_HOST_CALL_ATTRIBUTES *)(In...);
+};
+
 template<PtrTag tag, typename Out, typename... In, FunctionAttributes attributes>
 class FunctionPtr<tag, Out(In...), attributes> {
 public:
-    constexpr FunctionPtr(Out (*pointer)(In...))
+    using Ptr = typename FunctionCallConvention<attributes, Out(In...)>::Type;
+
+    // In particular, Windows x64 JSC host functions use the SysV ABI. Keep
+    // the constructor typed so an ordinary MSVC-ABI callback is rejected.
+    constexpr FunctionPtr(Ptr pointer)
         : m_pointer(pointer)
     {
     }
 
 private:
-    Out (*m_pointer)(In...);
+    Ptr m_pointer;
 };
 
 class String {
@@ -1107,7 +1129,7 @@ static JSC::EncodedJSValue ct_jsc_throw(
     return 0;
 }
 
-static JSC::EncodedJSValue ct_jsc_collect_test_coverage(
+static JSC::EncodedJSValue JSC_HOST_CALL_ATTRIBUTES ct_jsc_collect_test_coverage(
     JSC::JSGlobalObject* global_object,
     JSC::CallFrame* call_frame)
 {
@@ -1194,7 +1216,7 @@ extern "C" JSObjectRef ct_jsc_create_test_coverage_collector(JSContextRef contex
         nullptr));
 }
 
-static JSC::EncodedJSValue ct_jsc_buffer_is_ascii(
+static JSC::EncodedJSValue JSC_HOST_CALL_ATTRIBUTES ct_jsc_buffer_is_ascii(
     JSC::JSGlobalObject* global_object,
     JSC::CallFrame* call_frame)
 {
@@ -1243,7 +1265,7 @@ static JSC::EncodedJSValue ct_jsc_buffer_is_ascii(
     return ct_jsc_encode(JSValueMakeBoolean(context, is_ascii));
 }
 
-static JSC::EncodedJSValue ct_jsc_not_implemented(
+static JSC::EncodedJSValue JSC_HOST_CALL_ATTRIBUTES ct_jsc_not_implemented(
     JSC::JSGlobalObject* global_object,
     JSC::CallFrame* call_frame)
 {

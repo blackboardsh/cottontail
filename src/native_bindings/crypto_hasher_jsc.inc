@@ -1,10 +1,10 @@
 /*
  * Incremental Bun.CryptoHasher state.
  *
- * The JS-visible value is only a branded private token. Its OpenSSL state is
+ * The JS-visible value is only a branded private token. Its native state is
  * owned by the token and released by the JSC finalizer, following the same
  * lifetime model as the native HTTP parser. Input ArrayBuffer pointers are
- * borrowed only for the duration of EVP/HMAC update calls.
+ * borrowed only for the duration of the native update calls.
  */
 
 enum {
@@ -20,10 +20,19 @@ enum {
 };
 
 #if CT_HAS_OPENSSL
+// Opaque Zig std.crypto state, shared by all platforms regardless of the
+// linked OpenSSL version. The Zig module owns allocation and destruction.
+extern void *ct_blake2b256_create(void);
+extern void *ct_blake2b256_copy(const void *state);
+extern void ct_blake2b256_update(void *state, const uint8_t *input, size_t length);
+extern void ct_blake2b256_digest(void *state, uint8_t output[32]);
+extern void ct_blake2b256_free(void *state);
+
 typedef enum {
     CT_CRYPTO_HASHER_EVP,
     CT_CRYPTO_HASHER_HMAC,
     CT_CRYPTO_HASHER_MD4,
+    CT_CRYPTO_HASHER_BLAKE2B256,
 } CtCryptoHasherKind;
 
 typedef struct {
@@ -32,6 +41,7 @@ typedef struct {
     const EVP_MD *md;
     EVP_MD_CTX *md_ctx;
     HMAC_CTX *hmac_ctx;
+    void *blake2b256_ctx;
     size_t output_len;
     bool is_xof;
     bool consumed;
@@ -53,6 +63,7 @@ static void ct_crypto_hasher_state_free(CtCryptoHasherState *state) {
 #if CT_HAS_OPENSSL
     if (state->md_ctx != NULL) EVP_MD_CTX_free(state->md_ctx);
     if (state->hmac_ctx != NULL) HMAC_CTX_free(state->hmac_ctx);
+    ct_blake2b256_free(state->blake2b256_ctx);
     free(state->algorithm_name);
 #endif
     free(state);
@@ -145,6 +156,17 @@ static CtCryptoHasherState *ct_crypto_hasher_state_create(
         return state;
     }
 
+    if (strcasecmp(algorithm_name, "blake2b256") == 0) {
+        state->kind = CT_CRYPTO_HASHER_BLAKE2B256;
+        state->output_len = 32;
+        state->blake2b256_ctx = ct_blake2b256_create();
+        if (state->blake2b256_ctx == NULL) {
+            ct_crypto_hasher_state_free(state);
+            return NULL;
+        }
+        return state;
+    }
+
 #if CT_HAS_OPENSSL_MD4 && !defined(OPENSSL_NO_MD4)
     if (strcasecmp(algorithm_name, "md4") == 0) {
         state->kind = CT_CRYPTO_HASHER_MD4;
@@ -183,6 +205,13 @@ static CtCryptoHasherState *ct_crypto_hasher_state_copy(const CtCryptoHasherStat
     }
 
     switch (source->kind) {
+        case CT_CRYPTO_HASHER_BLAKE2B256:
+            copy->blake2b256_ctx = ct_blake2b256_copy(source->blake2b256_ctx);
+            if (copy->blake2b256_ctx == NULL) {
+                ct_crypto_hasher_state_free(copy);
+                return NULL;
+            }
+            break;
         case CT_CRYPTO_HASHER_EVP:
             copy->md_ctx = EVP_MD_CTX_new();
             if (
@@ -226,6 +255,10 @@ static bool ct_crypto_hasher_state_update(
     const uint8_t *input = length == 0 ? (const uint8_t *)"" : bytes;
     int ok = 0;
     switch (state->kind) {
+        case CT_CRYPTO_HASHER_BLAKE2B256:
+            ct_blake2b256_update(state->blake2b256_ctx, input, length);
+            ok = 1;
+            break;
         case CT_CRYPTO_HASHER_EVP:
             ok = EVP_DigestUpdate(state->md_ctx, input, length);
             break;
@@ -253,6 +286,11 @@ static bool ct_crypto_hasher_state_digest(
     bool ok = false;
     size_t result_len = state->output_len;
     switch (state->kind) {
+        case CT_CRYPTO_HASHER_BLAKE2B256:
+            ct_blake2b256_digest(state->blake2b256_ctx, output);
+            result_len = 32;
+            ok = true;
+            break;
         case CT_CRYPTO_HASHER_EVP:
             if (state->is_xof) {
                 ok = EVP_DigestFinalXOF(state->md_ctx, output, result_len) == 1;

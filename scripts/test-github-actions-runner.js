@@ -27,7 +27,7 @@ function fixture(t, files) {
     const result = spawnSync(binary, ['test', ...args], {
       cwd: directory, env, encoding: 'utf8', timeout: 30_000, windowsHide: true,
     });
-    const detail = JSON.stringify({ status: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr }, null, 2);
+    const detail = JSON.stringify({ args, githubActions: env.GITHUB_ACTIONS, status: result.status, signal: result.signal, stdout: result.stdout, stderr: result.stderr }, null, 2);
     assert.ifError(result.error);
     assert.equal(result.signal, null, detail);
     return { ...result, detail };

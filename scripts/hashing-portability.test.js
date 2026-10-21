@@ -10,12 +10,16 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const binary = resolve(process.env.COTTONTAIL_TEST_BINARY || join(root, 'zig-out/bin', process.platform === 'win32' ? 'cottontail.exe' : 'cottontail'));
 const probe = join(root, 'tests/js/fixtures/hashing-probe.mjs');
 // Spans several reused 4 KiB update chunks and a partial final block.
-const config = { algorithms: ['md5', 'sha1', 'sha256', 'sha512'], hmacAlgorithms: ['sha256', 'sha512'], key: 'cottontail-hmac-key', length: 1 << 17 | 13 };
+const config = { algorithms: ['blake2b256', 'md5', 'sha1', 'sha256', 'sha512'], hmacAlgorithms: ['sha256', 'sha512'], key: 'cottontail-hmac-key', length: 1 << 17 | 13 };
 
 function expected() {
   const input = Buffer.alloc(config.length);
   for (let index = 0; index < config.length; index++) input[index] = (index * 31 + 7) & 0xff;
-  const digests = Object.fromEntries(config.algorithms.map(algorithm => [algorithm, createHash(algorithm).update(input).digest('hex')]));
+  const digests = Object.fromEntries(config.algorithms.map(algorithm => [algorithm, algorithm === 'blake2b256'
+    // Python hashlib.blake2b(input, digest_size=32), independent of the
+    // runtime and available even when host Node links OpenSSL 3.0.
+    ? 'a349afe07ec31c9f70ec9c30de5f30fc0961a94b7c6020354f15e48bba1a26d2'
+    : createHash(algorithm).update(input).digest('hex')]));
   const hmacs = Object.fromEntries(config.hmacAlgorithms.map(algorithm => [algorithm, createHmac(algorithm, config.key).update(input).digest('hex')]));
   return { cryptoHasher: digests, cryptoHasherCopy: digests, hmac: hmacs, nodeHash: digests, nodeHmac: hmacs, unsupported: 'not-a-digest is not supported' };
 }

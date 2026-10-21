@@ -176,6 +176,36 @@ describe("native Bun.CryptoHasher algorithms and aliases", () => {
     });
   }
 
+  test("blake2b256 preserves its parameterized digest across block boundaries and copies", () => {
+    // Independent hashlib.blake2b(digest_size=32) vectors for bytes
+    // (index * 31 + 7) & 255, including exact 128-byte block boundaries.
+    const vectors = [
+      [0, "0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8"],
+      [127, "cb805dad055a842f1092d84639d7fe552ac7189003dc8d2fc4606d01921b8962"],
+      [128, "82783c69cecd49386e8825c6b20f3b41a43b4c9e3a21b627d88bf025046e4c72"],
+      [129, "b71e24c47c2d5cc68a99732abb05b9f80f2ecdd7744e9d111f453bb26f917e69"],
+      [256, "39041a8098f94c795b569a413ef8f0477df2ee6c974e77c065ca884b008f6b3d"],
+      [257, "80d4c4ba1f51e69caba1a3bf455eaea43f062717d321b1dfbbbb7b6c3a566670"],
+      [131085, "a349afe07ec31c9f70ec9c30de5f30fc0961a94b7c6020354f15e48bba1a26d2"],
+    ] as const;
+    for (const [length, expected] of vectors) {
+      const input = Uint8Array.from({ length }, (_, index) => (index * 31 + 7) & 255);
+      expect(Bun.CryptoHasher.hash("blake2b256", input, "hex")).toBe(expected);
+      expect(Bun.CryptoHasher.hash("blake2b512", input, "hex").slice(0, 64)).not.toBe(expected);
+      const hasher = new Bun.CryptoHasher("blake2b256");
+      hasher.update(input.subarray(0, Math.min(length, 127)));
+      const copied = hasher.copy();
+      for (let offset = 127; offset < length; offset += 4096) {
+        hasher.update(input.subarray(offset, offset + 4096));
+      }
+      copied.update(input.subarray(Math.min(length, 127)));
+      expect(hasher.digest("hex")).toBe(expected);
+      expect(copied.digest("hex")).toBe(expected);
+      expect(hasher.digest("hex")).toBe(vectors[0][1]);
+      expect(hasher.update(input).digest("hex")).toBe(expected);
+    }
+  });
+
   const aliases = [
     ["rmd160", "ripemd160"],
     ["RMD_160", "ripemd160"],

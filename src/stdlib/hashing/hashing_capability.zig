@@ -9,4 +9,9 @@ pub const _DllMainCRTStartup = {};
 
 comptime {
     _ = &hashing.ct_hash_value;
+    _ = &hashing.ct_blake2b256_create;
+    _ = &hashing.ct_blake2b256_copy;
+    _ = &hashing.ct_blake2b256_update;
+    _ = &hashing.ct_blake2b256_digest;
+    _ = &hashing.ct_blake2b256_free;
 }

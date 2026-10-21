@@ -1,5 +1,35 @@
 const std = @import("std");
 
+// OpenSSL only supports configurable BLAKE2b output sizes from 3.2 onward.
+// Keep this native incremental implementation independent of the host's
+// OpenSSL version: BLAKE2b-256 is not a truncated BLAKE2b-512 digest.
+const Blake2b256 = std.crypto.hash.blake2.Blake2b256;
+
+pub export fn ct_blake2b256_create() ?*Blake2b256 {
+    const state = std.heap.c_allocator.create(Blake2b256) catch return null;
+    state.* = Blake2b256.init(.{});
+    return state;
+}
+
+pub export fn ct_blake2b256_copy(source: *const Blake2b256) ?*Blake2b256 {
+    const copy = std.heap.c_allocator.create(Blake2b256) catch return null;
+    copy.* = source.*;
+    return copy;
+}
+
+pub export fn ct_blake2b256_update(state: *Blake2b256, input: [*]const u8, input_len: usize) void {
+    state.update(input[0..input_len]);
+}
+
+pub export fn ct_blake2b256_digest(state: *Blake2b256, output: *[Blake2b256.digest_length]u8) void {
+    state.final(output);
+    state.* = Blake2b256.init(.{});
+}
+
+pub export fn ct_blake2b256_free(state: ?*Blake2b256) void {
+    if (state) |value| std.heap.c_allocator.destroy(value);
+}
+
 const RapidHash = struct {
     const secret = [3]u64{ 0x2d358dccaa6c78a5, 0x8bb84b93962eacc9, 0x4b33a62ed433d4a3 };
 

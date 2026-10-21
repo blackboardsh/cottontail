@@ -6,10 +6,25 @@ import {
   heapSize,
   setTimeZone,
 } from "bun:jsc";
+import { isAscii, transcode } from "node:buffer";
 
 function assert(value: unknown, message: string): asserts value {
   if (!value) throw new Error(message);
 }
+
+// JSC invokes these three callbacks with its host-call convention, which is
+// SysV rather than the default C convention on Windows x64. Exercise argument,
+// result, and exception propagation even when coverage profiling is disabled.
+assert(isAscii(Buffer.from("abc")), "native ASCII callback lost its argument");
+assert(!isAscii(new Uint8Array([0xff])), "native ASCII callback lost its result");
+assert(transcode(Buffer.from("hello"), "utf8", "utf16le").toString("utf16le") === "hello", "native transcode callback lost its arguments");
+let coverageError: unknown;
+try {
+  cottontail.collectTestCoverage();
+} catch (error) {
+  coverageError = error;
+}
+assert(coverageError instanceof Error && coverageError.message === "Control-flow coverage profiler is not enabled", "native coverage callback must propagate its exception");
 
 // These calls cross Cottontail's private JSC ABI adapters. In particular,
 // JSC execution modes change the VM layout, and Windows ARM64 requires GCRequest to retain

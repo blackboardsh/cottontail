@@ -27,7 +27,8 @@ try {
   const outputBytes = await build();
   if (outputBytes < 1_000_000) throw new Error('Large graph was not emitted');
   await collect();
-  console.log(JSON.stringify({ growth: process.memoryUsage().rss - before, outputBytes }));
+  const after = process.memoryUsage().rss;
+  console.log(JSON.stringify({ growth: after - before, outputBytes, beforeRss: before, afterRss: after }));
 } finally {
   rmSync(root, { recursive: true, force: true });
 }

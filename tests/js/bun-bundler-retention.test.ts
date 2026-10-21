@@ -19,6 +19,9 @@ test("completed multi-file builds release idle workers' parsing arenas", async (
   const result = JSON.parse(stdout);
   expect(result.outputBytes).toBeGreaterThan(1_000_000);
   // Idle-thread cleanup previously retained roughly 175 MiB for this graph.
+  if (!(result.growth < 48 * 1024 * 1024)) {
+    console.error(`Bundler retention measurements: ${JSON.stringify(result)}`);
+  }
   expect(result.growth).toBeLessThan(48 * 1024 * 1024);
 }, 60_000);
 
