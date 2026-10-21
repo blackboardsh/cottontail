@@ -134,4 +134,13 @@ for (const phase of ['cold', 'warm']) {
   writeFileSync(join(fileInputDirectory, `${phase}.stderr.txt`), result.stderr ?? '');
   writeFileSync(join(logs, 'minimal-results.json'), JSON.stringify(minimalResults, null, 2));
 }
-process.exitCode = minimalResults.some(result => result.error || result.unsignedStatus === 0xc0000005) ? 1 : 0;
+{
+  const args = ['test', resolve('tests/js/runtime-file-input-lifetime.test.ts')];
+  const result = spawnSync(binary, args, { cwd: root, env: environment, encoding: 'utf8', timeout: 180_000, windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
+  const evidence = { name: 'unchanged-runtime-file-input-lifetime', argv: [binary, ...args], cwd: root, expectedStatus: 0, status: result.status, unsignedStatus: result.status === null ? null : result.status >>> 0, signal: result.signal, error: result.error?.message, stdout: result.stdout, stderr: result.stderr };
+  minimalResults.push(evidence);
+  console.log('MINIMAL EVIDENCE ' + JSON.stringify(evidence));
+  writeFileSync(join(logs, 'runtime-file-input-lifetime.json'), JSON.stringify(evidence, null, 2));
+  writeFileSync(join(logs, 'minimal-results.json'), JSON.stringify(minimalResults, null, 2));
+}
+process.exitCode = minimalResults.some(result => result.error || result.unsignedStatus === 0xc0000005 || (result.expectedStatus !== undefined && result.status !== result.expectedStatus)) ? 1 : 0;
