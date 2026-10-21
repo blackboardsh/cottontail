@@ -1140,15 +1140,26 @@ export function remapStackString(stack) {
   if (!state) return remapAdjacentBundleFrames(stack);
   let remapped = stack;
   if (state?.bundleRegExp) {
-    state.bundleRegExp.lastIndex = 0;
-    remapped = remapped.replace(state.bundleRegExp, (match, lineText, columnText) => {
+    const remapBundlePosition = (match, lineText, columnText) => {
       const line = Number(lineText);
       const column = Number(columnText);
       const initial = lookup(state, line, column);
       const mapped = initial ? preferConstructedErrorCallSite(state, line, column, initial) : null;
       const display = finalizeMappedPosition(state, mapped);
       return display ? `${display.source}:${display.line}:${display.column}` : match;
-    });
+    };
+    state.bundleRegExp.lastIndex = 0;
+    remapped = remapped.replace(state.bundleRegExp, remapBundlePosition);
+    if (remapped.includes("%")) {
+      // Native source URLs escape filesystem characters (including the '~'
+      // in Windows short temp paths). Match decoded URLs before the final
+      // active-bundle filter can discard their otherwise valid user frames.
+      const activeBundle = pathComparisonKey(state.bundlePath);
+      remapped = remapped.replace(/(file:\/\/[^\s]*?):(\d+):(\d+)/gi,
+        (match, file, lineText, columnText) => pathComparisonKey(file) === activeBundle
+          ? remapBundlePosition(match, lineText, columnText)
+          : match);
+    }
   }
   if (state && (remapped.includes("/cache/") || remapped.includes("/run/"))) {
     remapped = remapped.replace(

@@ -276,6 +276,60 @@ test("uncaught formatting resolves encoded Windows drive and UNC file URLs", () 
   }
 });
 
+test("stack remapping preserves mapped frames in encoded bundle file URLs", () => {
+  const runtimeGlobal = globalThis as typeof globalThis & {
+    __cottontailBundlePath?: string;
+    __cottontailBundleSourceMap?: string;
+    __cottontailBundleSourceMapData?: string;
+    __cottontailBundleSourceRoot?: string;
+  };
+  const previous = {
+    bundlePath: runtimeGlobal.__cottontailBundlePath,
+    sourceMap: runtimeGlobal.__cottontailBundleSourceMap,
+    sourceMapData: runtimeGlobal.__cottontailBundleSourceMapData,
+    sourceRoot: runtimeGlobal.__cottontailBundleSourceRoot,
+  };
+  try {
+    runtimeGlobal.__cottontailBundleSourceMap = undefined;
+    runtimeGlobal.__cottontailBundleSourceMapData = JSON.stringify({
+      version: 3,
+      names: [],
+      sources: ["/original/input.ts"],
+      sourcesContent: ['const message = "boom";\nthrow new Error(message);\n'],
+      mappings: "AAAA;AACA",
+    });
+    runtimeGlobal.__cottontailBundleSourceRoot = "/original";
+    for (const [bundlePath, sourceURL] of [
+      ["/tmp/temp~dir/with space/é%/bundle.mjs", "file:///tmp/temp%7Edir/with%20space/%C3%A9%25/bundle.mjs"],
+      ["C:\\Users\\RUNNER~1\\Temp\\bundle.mjs", "file:///c:/users/runner%7e1/temp/bundle.mjs"],
+      ["\\\\Server\\Share Name\\temp~dir\\bundle.mjs", "file://server/Share%20Name/temp%7Edir/bundle.mjs"],
+    ]) {
+      runtimeGlobal.__cottontailBundlePath = bundlePath;
+      const stack = remapStackString([
+        `example@${sourceURL}:2:1`,
+        `    at example (${sourceURL}:2:1)`,
+        `wrapper@${sourceURL}:999:1`,
+        "external@file:///different/temp%7Edir/bundle.mjs:2:1",
+      ].join("\n"));
+      expect(stack).toBe([
+        "example@/original/input.ts:2:1",
+        "    at example (/original/input.ts:2:1)",
+        "external@file:///different/temp%7Edir/bundle.mjs:2:1",
+      ].join("\n"));
+      const error = new Error("boom");
+      error.stack = `example@${sourceURL}:2:1`;
+      expect(formatUncaughtBundleError(error)).toBe(true);
+      expect(error.stack).toContain("2 | throw new Error(message);");
+      expect(error.stack).toContain("/original/input.ts:2:1");
+    }
+  } finally {
+    runtimeGlobal.__cottontailBundlePath = previous.bundlePath;
+    runtimeGlobal.__cottontailBundleSourceMap = previous.sourceMap;
+    runtimeGlobal.__cottontailBundleSourceMapData = previous.sourceMapData;
+    runtimeGlobal.__cottontailBundleSourceRoot = previous.sourceRoot;
+  }
+});
+
 test("stack remapping filters encoded Windows drive and UNC active-bundle file URLs", () => {
   const runtimeGlobal = globalThis as typeof globalThis & {
     __cottontailBundlePath?: string;

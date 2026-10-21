@@ -3,7 +3,9 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const root = mkdtempSync(join(tmpdir(), "cottontail-file-input-lifetime-"));
+// Native source URLs encode '~', as in Windows short temp-directory paths.
+// Keep the source-location checks sensitive to that encoding on every OS.
+const root = mkdtempSync(join(tmpdir(), "cottontail-file-input~lifetime-"));
 const lazyDirectory = join(root, "lazy");
 const errorDirectory = join(root, "error");
 const lazyEntry = join(lazyDirectory, "lazy-input.mjs");

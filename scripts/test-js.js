@@ -243,7 +243,7 @@ try {
       name: 'runtime-sourcemap-regressions',
       argv: ['test', join(rootDir, 'tests', 'js', 'runtime-sourcemap.test.ts')],
       expectExitCode: 0,
-      stderrIncludes: ['10 pass', '0 fail'],
+      stderrIncludes: ['11 pass', '0 fail'],
     },
     {
       name: 'runtime-sourcemap-retention',
