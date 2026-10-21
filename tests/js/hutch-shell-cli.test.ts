@@ -274,28 +274,28 @@ test("forwards adversarial arguments byte-for-byte to an external command", () =
   expect(child.stderr.toString()).toBe("");
 });
 
-test("keeps exec and bun exec targets as opaque argv", () => {
-  const marker = join(root, "exec-argument-injected.txt");
-  const opaque = [
-    "",
-    "spaced value",
-    "$HOME",
-    `$(printf injected > ${marker})`,
-    `; printf injected > ${marker}`,
-    "backtick `printf injected`",
-    "snowman ☃",
-  ];
-  const target = [process.execPath, portableChild, "argv-json", ...opaque];
-
-  for (const command of ["exec", "bun exec"]) {
+// Each command starts a shell runtime and a nested external runtime, so give
+// each independent invocation its own unchanged test deadline.
+for (const command of ["exec", "bun exec"]) {
+  test(`keeps ${command} targets as opaque argv`, () => {
+    const marker = join(root, `exec-argument-injected-${command.replaceAll(" ", "-")}.txt`);
+    const opaque = [
+      "",
+      "spaced value",
+      "$HOME",
+      `$(printf injected > ${marker})`,
+      `; printf injected > ${marker}`,
+      "backtick `printf injected`",
+      "snowman ☃",
+    ];
+    const target = [process.execPath, portableChild, "argv-json", ...opaque];
     const child = runHutchShell(command, target);
     expect(child.exitCode).toBe(0);
     expect(JSON.parse(child.stdout.toString())).toEqual(opaque);
     expect(child.stderr.toString()).toBe("");
     expect(existsSync(marker)).toBe(false);
-  }
-  // Each iteration starts a shell runtime and a nested external runtime.
-}, isWindowsArm64 ? { timeout: 45_000 } : {});
+  }, isWindowsArm64 ? { timeout: 45_000 } : {});
+}
 
 test("does not expose the private command protocol as shell positional args", () => {
   const child = runHutchShell(String.raw`printf '%s|%s|%s' "$#" "$1" "$@"`);

@@ -771,7 +771,7 @@ try {
       name: 'hutch-shell-cli',
       argv: ['test', join(rootDir, 'tests', 'js', 'hutch-shell-cli.test.ts')],
       expectExitCode: 0,
-      stdoutIncludes: [process.platform === 'win32' ? '55 pass' : '71 pass', '0 fail'],
+      stdoutIncludes: [process.platform === 'win32' ? '56 pass' : '72 pass', '0 fail'],
     },
     {
       name: 'runtime-cli-define',
