@@ -220,9 +220,9 @@ function main() {
   const flags = `-O2 -fPIC -arch ${arch === 'arm64' ? 'arm64' : 'x86_64'} -mmacosx-version-min=${deploymentTarget} ${baseline}`;
   const env = {
     ...process.env,
-    CC: clang, CXX: clangxx,
+    CC: clang, CXX: clangxx, CCAS: clang,
     AR: capture('xcrun', ['--find', 'ar']), RANLIB: capture('xcrun', ['--find', 'ranlib']),
-    CFLAGS: flags, CXXFLAGS: flags, ASFLAGS: flags, CPPFLAGS: '',
+    CFLAGS: flags, CXXFLAGS: flags, ASFLAGS: flags, CCASFLAGS: flags, CPPFLAGS: '',
     LDFLAGS: `-arch ${arch === 'arm64' ? 'arm64' : 'x86_64'} -mmacosx-version-min=${deploymentTarget}`,
     SDKROOT: sdk, MACOSX_DEPLOYMENT_TARGET: deploymentTarget,
     ZERO_AR_DATE: '1', MAKEFLAGS: '', MFLAGS: '',
@@ -232,9 +232,11 @@ function main() {
   for (const key of [
     'CPATH', 'C_INCLUDE_PATH', 'CPLUS_INCLUDE_PATH', 'LIBRARY_PATH', 'LIBS',
     'OPENSSL_LOCAL_CONFIG_DIR', 'CONFIG_SITE', 'DESTDIR', 'CPP', 'AS',
+    'CROSS_COMPILE', 'CPPDEFINES', 'CPPINCLUDES', 'LDLIBS',
     'PKG_CONFIG', 'PKG_CONFIG_PATH', 'PKG_CONFIG_LIBDIR', 'PKG_CONFIG_SYSROOT_DIR',
     'CMAKE_PREFIX_PATH', 'CMAKE_LIBRARY_PATH', 'CMAKE_INCLUDE_PATH', 'CMAKE_TOOLCHAIN_FILE',
     'CMAKE_C_COMPILER_LAUNCHER', 'CMAKE_CXX_COMPILER_LAUNCHER', 'CMAKE_ASM_COMPILER_LAUNCHER',
+    ...Object.keys(env).filter((key) => key.startsWith('__CNF_')),
   ]) {
     delete env[key];
   }
