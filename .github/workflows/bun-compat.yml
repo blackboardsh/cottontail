@@ -1,4 +1,4 @@
-name: Intel canary.3 and canary.4 CSS timing comparison
+name: Intel opaque exec argv canary comparison
 on:
   workflow_dispatch:
     inputs:
@@ -28,12 +28,12 @@ jobs:
           path: /tmp/cottontail-css-canary4
           run-id: ${{ inputs.canary4_run }}
           github-token: ${{ github.token }}
-      - name: Alternate unchanged CSS fixture and test complete Hutch shell suite
+      - name: Compare unchanged isolated opaque argv case and capture child results
         shell: bash
-        run: python3 scripts/diagnose-intel-css-canaries.py
+        run: python3 scripts/diagnose-intel-exec-canaries.py
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: intel-canary3-canary4-css-and-hutch-evidence
-          path: /tmp/cottontail-intel-css-evidence/
+          name: intel-canary3-canary4-opaque-exec-evidence
+          path: /tmp/cottontail-intel-exec-evidence/
           if-no-files-found: error
