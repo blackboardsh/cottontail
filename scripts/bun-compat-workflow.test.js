@@ -231,6 +231,29 @@ test('uses the Cottontail adapter and external Bun only for package fixtures', (
   );
 });
 
+test('failed compatibility jobs retain only durable reports and per-test output', () => {
+  const upload = workflowStep('Retain failed compatibility reports');
+  const focusedSuites = workflowStep('Run external-package-manager split bundler fixtures');
+  assert.ok(upload.start > focusedSuites.start, 'capture reports after both suite steps');
+  assert.match(upload.source, /^        if: failure\(\)$/m);
+  assert.match(upload.source, /uses: actions\/upload-artifact@[a-f0-9]{40}/);
+  assert.match(upload.source, /name: cottontail-bun-compat-diagnostics-\$\{\{ matrix\.platform \}\}-\$\{\{ github\.run_attempt \}\}/);
+  assert.match(upload.source, /retention-days: 7/);
+  assert.match(upload.source, /if-no-files-found: warn/);
+  assert.match(workflow, /COTTONTAIL_BASELINE_REPORTS_DIR: \$\{\{ runner\.temp \}\}\/cottontail-bun-compat-reports/);
+
+  const paths = upload.source.match(/^          path: \|\n((?:            .+\n)+)/m);
+  assert.ok(paths, 'upload must enumerate report files rather than runtime state');
+  assert.deepEqual(paths[1].trim().split('\n').map((path) => path.trim()), [
+    '${{ runner.temp }}/cottontail-bun-compat-reports/*/run.json',
+    '${{ runner.temp }}/cottontail-bun-compat-reports/*/summary.json',
+    '${{ runner.temp }}/cottontail-bun-compat-reports/*/events.jsonl',
+    '${{ runner.temp }}/cottontail-bun-compat-reports/*/plans/*.json',
+    '${{ runner.temp }}/cottontail-bun-compat-reports/*/logs/*.log',
+  ]);
+  assert.doesNotMatch(upload.source, /include-hidden-files:\s*true|continue-on-error:/);
+});
+
 test('generated bundler deadlines use the owned timeout scale exactly once', () => {
   assert.doesNotMatch(
     expectBundled,

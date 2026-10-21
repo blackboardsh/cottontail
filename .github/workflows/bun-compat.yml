@@ -26,6 +26,8 @@ jobs:
     env:
       COTTONTAIL_BUILD_JOBS: '2'
       MACOSX_DEPLOYMENT_TARGET: '14.0'
+      # Keep durable suite reports separate from pinned binaries and runtime state.
+      COTTONTAIL_BASELINE_REPORTS_DIR: ${{ runner.temp }}/cottontail-bun-compat-reports
     strategy:
       fail-fast: false
       matrix:
@@ -309,3 +311,18 @@ jobs:
           node scripts/run-upstream-tests.js bun --command-adapter "$command_adapter" --package-manager "$package_manager" "${job_launcher_args[@]}" --test test/bundler/bundler_defer.test.ts --case '^\$file$' --expect-pass --jobs 1
           node scripts/run-upstream-tests.js bun --command-adapter "$command_adapter" --package-manager "$package_manager" "${job_launcher_args[@]}" --test test/bundler/bundler_npm.test.ts --case '^npm/ReactSSR$' --expect-pass --jobs 1
           node scripts/run-upstream-tests.js bun --command-adapter "$command_adapter" --package-manager "$package_manager" "${job_launcher_args[@]}" --test test/bundler/bundler_npm.test.ts --case '^npm/LodashES$' --expect-pass --jobs 1
+
+      - name: Retain failed compatibility reports
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cottontail-bun-compat-diagnostics-${{ matrix.platform }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/cottontail-bun-compat-reports/*/run.json
+            ${{ runner.temp }}/cottontail-bun-compat-reports/*/summary.json
+            ${{ runner.temp }}/cottontail-bun-compat-reports/*/events.jsonl
+            ${{ runner.temp }}/cottontail-bun-compat-reports/*/plans/*.json
+            ${{ runner.temp }}/cottontail-bun-compat-reports/*/logs/*.log
+          # Earlier build/setup failures may occur before the reporter is created.
+          if-no-files-found: warn
+          retention-days: 7
