@@ -63,12 +63,19 @@ for (const name of ['COTTONTAIL_RUNTIME_MODULES_DIR', 'COTTONTAIL_TEST_CLI_HEADE
 const fixture = resolve('tests/js/node-net-duplex.test.ts');
 const overlayRoot = resolve('diagnostics/socket-overlay');
 const overlayNet = join(overlayRoot, 'node/net.js');
-const modes = [{ name: 'published-baseline', overlay: null }];
-if (existsSync(overlayNet)) modes.push({ name: 'net-source-overlay', overlay: overlayRoot });
+const candidateFixture = resolve('diagnostics/socket-candidate/node-net-duplex.test.ts');
+const modes = [{ name: 'published-baseline', overlay: null, fixture, fullCount: 7 }];
+if (existsSync(overlayNet)) {
+  assert.ok(existsSync(candidateFixture), 'Candidate overlay requires the complete unchanged fifteen-case fixture');
+  assert.equal(createHash('sha256').update(readFileSync(overlayNet)).digest('hex'), '549fb262b296d3dd72c043879180baf06e6026f009ea3cc9c7cdcb7b1b8087fb');
+  assert.equal(createHash('sha256').update(readFileSync(candidateFixture)).digest('hex'), 'a25d25cee3a56935fd031ea9787da3128e26127a56ccf52b03b6ce83c6a0df25');
+  modes.push({ name: 'net-source-overlay-original-seven', overlay: overlayRoot, fixture, fullCount: 7 });
+  modes.push({ name: 'net-source-overlay-candidate', overlay: overlayRoot, fixture: candidateFixture, fullCount: 15, fullSuiteOnly: true });
+}
 const plans = [
   { name: 'ownership-transfer', pattern: '^Socket transfers ownership of an existing Socket handle$', expectedPass: 1, repetitions: 20 },
   { name: 'raw-tcp-adoption', pattern: '^Socket adopts a raw TCP client handle$', expectedPass: 1, repetitions: 20 },
-  { name: 'all-seven-socket-contracts', pattern: null, expectedPass: 7, repetitions: 3 },
+  { name: 'full-socket-contracts', pattern: null, expectedPass: 7, repetitions: 3 },
 ];
 const socketProvenance = {
   ...provenance,
@@ -76,6 +83,8 @@ const socketProvenance = {
   fixturePath: fixture,
   fixtureSha256: createHash('sha256').update(readFileSync(fixture)).digest('hex'),
   overlay: existsSync(overlayNet) ? { path: overlayNet, sha256: createHash('sha256').update(readFileSync(overlayNet)).digest('hex') } : null,
+  candidateFixture: existsSync(candidateFixture) ? { path: candidateFixture, sha256: createHash('sha256').update(readFileSync(candidateFixture)).digest('hex') } : null,
+  modes,
   plans,
 };
 writeFileSync(join(logs, 'socket-provenance.json'), JSON.stringify(socketProvenance, null, 2));
@@ -85,22 +94,23 @@ for (const mode of modes) {
   mkdirSync(tempRoot, { recursive: true });
   const env = { ...environment, COTTONTAIL_TMP_DIR: tempRoot };
   if (mode.overlay) env.COTTONTAIL_RUNTIME_MODULES_DIR = mode.overlay;
-  for (const plan of plans) {
+  for (const plan of plans.filter(plan => !mode.fullSuiteOnly || !plan.pattern)) {
     for (let iteration = 1; iteration <= plan.repetitions; iteration++) {
-      const args = ['test', fixture, ...(plan.pattern ? ['--test-name-pattern', plan.pattern] : [])];
+      const expectedPass = plan.pattern ? plan.expectedPass : mode.fullCount;
+      const args = ['test', mode.fixture, ...(plan.pattern ? ['--test-name-pattern', plan.pattern] : [])];
       const startedAt = Date.now();
       const result = spawnSync(binary, args, { cwd: root, env, encoding: 'utf8', timeout: 30_000, windowsHide: true, maxBuffer: 16 * 1024 * 1024 });
       const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
-      const countedBodies = new RegExp(`\\b${plan.expectedPass} pass\\b`).test(output) && /\b0 fail\b/.test(output);
+      const countedBodies = new RegExp(`\\b${expectedPass} pass\\b`).test(output) && /\b0 fail\b/.test(output);
       const passed = result.status === 0 && !result.error && countedBodies;
-      const evidence = { mode: mode.name, name: plan.name, iteration, expectedPass: plan.expectedPass, passed, durationMs: Date.now() - startedAt, argv: [binary, ...args], environment: { CI: env.CI, GITHUB_ACTIONS: env.GITHUB_ACTIONS, AGENT: env.AGENT, COTTONTAIL_TMP_DIR: env.COTTONTAIL_TMP_DIR, COTTONTAIL_RUNTIME_MODULES_DIR: env.COTTONTAIL_RUNTIME_MODULES_DIR ?? null }, status: result.status, unsignedStatus: result.status === null ? null : result.status >>> 0, signal: result.signal, error: result.error?.message, stdout: result.stdout, stderr: result.stderr };
+      const evidence = { mode: mode.name, name: plan.name, iteration, expectedPass, passed, durationMs: Date.now() - startedAt, argv: [binary, ...args], environment: { CI: env.CI, GITHUB_ACTIONS: env.GITHUB_ACTIONS, AGENT: env.AGENT, COTTONTAIL_TMP_DIR: env.COTTONTAIL_TMP_DIR, COTTONTAIL_RUNTIME_MODULES_DIR: env.COTTONTAIL_RUNTIME_MODULES_DIR ?? null }, status: result.status, unsignedStatus: result.status === null ? null : result.status >>> 0, signal: result.signal, error: result.error?.message, stdout: result.stdout, stderr: result.stderr };
       results.push(evidence);
       console.log('SOCKET RESULT ' + JSON.stringify(evidence));
       writeFileSync(join(logs, 'socket-results.json'), JSON.stringify(results, null, 2));
     }
   }
 }
-const summary = modes.map(mode => ({ mode: mode.name, plans: plans.map(plan => ({ name: plan.name, passed: results.filter(result => result.mode === mode.name && result.name === plan.name && result.passed).length, total: plan.repetitions })) }));
+const summary = modes.map(mode => ({ mode: mode.name, fixture: mode.fixture, fullCount: mode.fullCount, plans: plans.filter(plan => !mode.fullSuiteOnly || !plan.pattern).map(plan => ({ name: plan.name, passed: results.filter(result => result.mode === mode.name && result.name === plan.name && result.passed).length, total: plan.repetitions })) }));
 writeFileSync(join(logs, 'socket-summary.json'), JSON.stringify(summary, null, 2));
 console.log('SOCKET SUMMARY ' + JSON.stringify(summary));
 process.exitCode = results.every(result => result.passed) ? 0 : 1;

@@ -7,6 +7,7 @@ on:
       - .github/workflows/diagnostic-windows-socket-ownership.yml
       - scripts/diagnose-windows-socket-ownership.mjs
       - diagnostics/socket-overlay/**
+      - diagnostics/socket-candidate/**
 
 permissions:
   contents: read
