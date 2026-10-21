@@ -1,0 +1,67 @@
+name: Published Windows remaining mandatory release gates
+
+on:
+  push:
+    branches: [diagnostics/windows-remaining-release-gates]
+    paths:
+      - .github/workflows/diagnostic-windows-remaining-release.yml
+      - scripts/diagnose-windows-remaining-release.mjs
+      - scripts/diagnose-windows-native-boundary-fixture.mjs
+      - scripts/diagnose-windows-fixture-setup.mjs
+
+permissions:
+  contents: read
+
+jobs:
+  discovery:
+    name: Published .0 mandatory gates (${{ matrix.platform }}, ${{ matrix.group }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            runner: windows-2025
+            arch: x64
+            group: remaining
+          - platform: windows-x64
+            runner: windows-2025
+            arch: x64
+            group: boundary
+          - platform: windows-arm64
+            runner: windows-11-arm
+            arch: arm64
+            group: remaining
+          - platform: windows-arm64
+            runner: windows-11-arm
+            arch: arm64
+            group: boundary
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+          architecture: ${{ matrix.arch }}
+          package-manager-cache: false
+      - name: Verify native Node identity
+        run: node -e "if (process.versions.node !== '24.18.0' || process.arch !== '${{ matrix.arch }}') throw new Error('Unexpected Node identity')"
+      - name: Build standalone native Job launcher without building the runtime
+        if: matrix.group == 'boundary'
+        run: node scripts/diagnose-windows-fixture-setup.mjs
+      - name: Discover later release gates independently with unchanged assertions
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force diagnostic-logs | Out-Null
+          node scripts/diagnose-windows-remaining-release.mjs ${{ matrix.group }} 2>&1 | Tee-Object -FilePath diagnostic-logs/gates.log
+          exit $LASTEXITCODE
+      - name: Preserve every gate result and published runtime provenance
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: published-remaining-release-${{ matrix.platform }}-${{ matrix.group }}
+          path: diagnostic-logs/
+          if-no-files-found: error
+          retention-days: 14
