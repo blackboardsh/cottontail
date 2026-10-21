@@ -136,6 +136,8 @@ function fingerprint(paths) {
 		"scripts/embed-runtime-modules.js",
 		"scripts/jsc-manifest.json",
 		"scripts/setup.js",
+		"scripts/setup-macos-deps.js",
+		"scripts/macos-deps-manifest.json",
 		"scripts/setup-jsc.js",
 		"scripts/setup-zig-html-rewriter.js",
 		"scripts/zig-html-rewriter-manifest.json",

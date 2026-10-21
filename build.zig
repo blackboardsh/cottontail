@@ -108,14 +108,15 @@ fn jscVendorPlatformKey(target: std.Target) ?[]const u8 {
     };
 }
 
-fn configureMacosHomebrew(module: *std.Build.Module, b: *std.Build) void {
-    const prefix = if (module.resolved_target.?.result.cpu.arch == .aarch64) "/opt/homebrew" else "/usr/local";
-    module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{prefix}) });
-    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{prefix}) });
-    inline for (&.{ "openssl@3", "libffi", "brotli", "zstd" }) |formula| {
-        module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/opt/{s}/include", .{ prefix, formula }) });
-        module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/opt/{s}/lib", .{ prefix, formula }) });
-    }
+fn configureMacosNativeDependencies(module: *std.Build.Module, b: *std.Build) void {
+    const arch = if (module.resolved_target.?.result.cpu.arch == .aarch64) "arm64" else "x64";
+    const prefix = b.fmt("vendors/macos-deps/macos-{s}", .{arch});
+    std.Io.Dir.cwd().access(b.graph.io, b.pathFromRoot(b.fmt("{s}/lib/libcrypto.a", .{prefix})), .{}) catch {
+        std.debug.print("error: missing macOS native dependencies; run `node scripts/setup.js` first\n", .{});
+        std.process.exit(1);
+    };
+    module.addSystemIncludePath(b.path(b.fmt("{s}/include", .{prefix})));
+    module.addLibraryPath(b.path(b.fmt("{s}/lib", .{prefix})));
 }
 
 fn windowsDependencyDir(target: std.Target) []const u8 {
@@ -406,7 +407,18 @@ fn configureLibuv(step: *std.Build.Step.Compile, b: *std.Build) void {
     }
 }
 
-fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
+fn configureMacosSdk(module: *std.Build.Module, b: *std.Build, sdk: ?[]const u8) void {
+    if (sdk) |path| {
+        // Zig's libc and compiler headers must precede SDK fallbacks, notably
+        // stddef.h; placing the SDK first introduces circular Apple typedefs.
+        module.addAfterIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{path}) });
+        module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{path}) });
+        module.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{path}) });
+    }
+}
+
+fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, macos_sdk: ?[]const u8) void {
+    configureMacosSdk(step.root_module, b, macos_sdk);
     const resolved_target = step.root_module.resolved_target.?.result;
     step.rdynamic = resolved_target.os.tag != .windows;
     if (resolved_target.os.tag == .linux) {
@@ -631,9 +643,9 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             step.root_module.linkSystemLibrary("pthread", .{});
             step.root_module.linkSystemLibrary("resolv", .{});
             step.root_module.linkSystemLibrary("z", .{});
-            configureMacosHomebrew(step.root_module, b);
-            step.root_module.linkSystemLibrary("ssl", .{ .preferred_link_mode = .static });
-            step.root_module.linkSystemLibrary("crypto", .{ .preferred_link_mode = .static });
+            configureMacosNativeDependencies(step.root_module, b);
+            step.root_module.linkSystemLibrary("ssl", .{ .use_pkg_config = .no, .preferred_link_mode = .static, .search_strategy = .no_fallback });
+            step.root_module.linkSystemLibrary("crypto", .{ .use_pkg_config = .no, .preferred_link_mode = .static, .search_strategy = .no_fallback });
         },
         .linux => {
             requireJscLibrary(b, vendor_dir, "libJavaScriptCore.a");
@@ -730,6 +742,14 @@ pub fn build(b: *std.Build) void {
             .os_version_min = .{ .semver = .{ .major = 14, .minor = 0, .patch = 0 } },
         } else .{},
     });
+    // Explicit deployment targets disable Zig's native SDK discovery. Add
+    // the selected SDK's headers and libraries without --sysroot, which would
+    // also incorrectly rebase absolute Homebrew library search paths.
+    const macos_sdk: ?[]const u8 = if (builtin.os.tag == .macos and target.result.os.tag == .macos)
+        b.sysroot orelse std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
+            @panic("macOS builds require an Xcode or Command Line Tools SDK")
+    else
+        null;
     const optimize = b.standardOptimizeOption(.{});
     const capability_jsc_platform = jscVendorPlatformKey(target.result) orelse {
         std.debug.print("error: no vendored JavaScriptCore target for capability build\n", .{});
@@ -805,7 +825,7 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(upstream_job_launcher);
     }
 
-    configureJsc(exe, b);
+    configureJsc(exe, b, macos_sdk);
 
     const capability_builder = b.addExecutable(.{
         .name = "cottontail-capability-builder",
@@ -818,7 +838,7 @@ pub fn build(b: *std.Build) void {
     capability_builder.root_module.addImport("cottontail_compiler", createCompilerModule(b, target, optimize));
     capability_builder.root_module.addAnonymousImport("runtime_modules_blob", .{ .root_source_file = runtime_module_artifacts.capability_builder });
     capability_builder.root_module.addAnonymousImport("capability_namespace_source", .{ .root_source_file = b.path("src/capability_namespace_bootstrap.js") });
-    configureJsc(capability_builder, b);
+    configureJsc(capability_builder, b, macos_sdk);
     // The build-time runtime must not resolve the production filesystem-backed
     // capability namespace: it is the process creating those files. It gets a
     // deliberately small embedded namespace from bun/index.js instead.
@@ -936,6 +956,7 @@ pub fn build(b: *std.Build) void {
     });
     sqlite_capability_module.addIncludePath(b.path("src"));
     sqlite_capability_module.addIncludePath(b.path(capability_jsc_include));
+    configureMacosSdk(sqlite_capability_module, b, macos_sdk);
     sqlite_capability_module.addIncludePath(b.path("src/compiler/src/jsc/bindings/sqlite"));
     sqlite_capability_module.addCSourceFiles(.{
         .root = b.path("."),
@@ -974,6 +995,7 @@ pub fn build(b: *std.Build) void {
     });
     sql_capability_module.addIncludePath(b.path("src"));
     sql_capability_module.addIncludePath(b.path(capability_jsc_include));
+    configureMacosSdk(sql_capability_module, b, macos_sdk);
     sql_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/sql/sql_capability.c"),
         .flags = capability_c_flags,
@@ -993,12 +1015,13 @@ pub fn build(b: *std.Build) void {
     });
     compression_capability_module.addIncludePath(b.path("src"));
     compression_capability_module.addIncludePath(b.path(capability_jsc_include));
+    configureMacosSdk(compression_capability_module, b, macos_sdk);
     compression_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/compression/compression_capability.c"),
         .flags = capability_c_flags,
     });
     if (target.result.os.tag == .macos) {
-        configureMacosHomebrew(compression_capability_module, b);
+        configureMacosNativeDependencies(compression_capability_module, b);
     } else if (target.result.os.tag == .windows) {
         const dependency_dir = windowsDependencyDir(target.result);
         compression_capability_module.addIncludePath(b.path(b.fmt("{s}/include", .{dependency_dir})));
@@ -1050,6 +1073,7 @@ pub fn build(b: *std.Build) void {
     websocket_capability_module.addImport("cottontail_compiler", createCompilerModule(b, target, optimize));
     websocket_capability_module.addIncludePath(b.path("src"));
     websocket_capability_module.addIncludePath(b.path(capability_jsc_include));
+    configureMacosSdk(websocket_capability_module, b, macos_sdk);
     websocket_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/websocket/websocket_capability.c"),
         .flags = if (target.result.os.tag == .windows) &.{"-std=c11"} else &.{ "-std=c11", "-fPIC", "-D_DEFAULT_SOURCE" },
@@ -1085,6 +1109,7 @@ pub fn build(b: *std.Build) void {
     }));
     text_capability_module.addIncludePath(b.path("src"));
     text_capability_module.addIncludePath(b.path(capability_jsc_include));
+    configureMacosSdk(text_capability_module, b, macos_sdk);
     text_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/text/text_capability.c"),
         .flags = capability_c_flags,
@@ -1110,6 +1135,7 @@ pub fn build(b: *std.Build) void {
     }));
     uuid_capability_module.addIncludePath(b.path("src"));
     uuid_capability_module.addIncludePath(b.path(capability_jsc_include));
+    configureMacosSdk(uuid_capability_module, b, macos_sdk);
     uuid_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/uuid/uuid_capability.c"),
         .flags = capability_c_flags,
@@ -1137,6 +1163,7 @@ pub fn build(b: *std.Build) void {
     glob_capability_module.addImport("native_glob", glob_native_module);
     glob_capability_module.addIncludePath(b.path("src"));
     glob_capability_module.addIncludePath(b.path(capability_jsc_include));
+    configureMacosSdk(glob_capability_module, b, macos_sdk);
     glob_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/glob/glob_capability.c"),
         .flags = capability_c_flags,
@@ -1163,6 +1190,7 @@ pub fn build(b: *std.Build) void {
     password_capability_module.addImport("password_native", password_native_module);
     password_capability_module.addIncludePath(b.path("src"));
     password_capability_module.addIncludePath(b.path(capability_jsc_include));
+    configureMacosSdk(password_capability_module, b, macos_sdk);
     password_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/password/password_capability.c"),
         .flags = capability_c_flags,
@@ -1188,6 +1216,7 @@ pub fn build(b: *std.Build) void {
     }));
     hashing_capability_module.addIncludePath(b.path("src"));
     hashing_capability_module.addIncludePath(b.path(capability_jsc_include));
+    configureMacosSdk(hashing_capability_module, b, macos_sdk);
     hashing_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/hashing/hashing_capability.c"),
         .flags = capability_c_flags,
@@ -1200,9 +1229,9 @@ pub fn build(b: *std.Build) void {
     hashing_capability.linker_allow_shlib_undefined = true;
     switch (target.result.os.tag) {
         .macos => {
-            configureMacosHomebrew(hashing_capability.root_module, b);
-            hashing_capability.root_module.linkSystemLibrary("crypto", .{ .preferred_link_mode = .static });
-            hashing_capability.root_module.linkSystemLibrary("zstd", .{ .preferred_link_mode = .static });
+            configureMacosNativeDependencies(hashing_capability.root_module, b);
+            hashing_capability.root_module.linkSystemLibrary("crypto", .{ .use_pkg_config = .no, .preferred_link_mode = .static, .search_strategy = .no_fallback });
+            hashing_capability.root_module.linkSystemLibrary("zstd", .{ .use_pkg_config = .no, .preferred_link_mode = .static, .search_strategy = .no_fallback });
         },
         .linux => {
             hashing_capability.root_module.linkSystemLibrary("crypto", .{ .preferred_link_mode = .static });
@@ -1244,6 +1273,7 @@ pub fn build(b: *std.Build) void {
     markdown_capability_module.addImport("native_markdown", native_markdown_module);
     markdown_capability_module.addIncludePath(b.path("src"));
     markdown_capability_module.addIncludePath(b.path(capability_jsc_include));
+    configureMacosSdk(markdown_capability_module, b, macos_sdk);
     markdown_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/markdown/markdown_capability.c"),
         .flags = capability_c_flags,
@@ -1263,6 +1293,7 @@ pub fn build(b: *std.Build) void {
     });
     terminal_capability_module.addIncludePath(b.path("src"));
     terminal_capability_module.addIncludePath(b.path(capability_jsc_include));
+    configureMacosSdk(terminal_capability_module, b, macos_sdk);
     terminal_capability_module.addCSourceFile(.{
         .file = b.path("src/stdlib/terminal/terminal_capability.c"),
         .flags = if (target.result.os.tag == .windows) &.{"-std=c11"} else &.{ "-std=c11", "-fPIC", "-D_DARWIN_C_SOURCE", "-D_GNU_SOURCE" },
@@ -1282,6 +1313,7 @@ pub fn build(b: *std.Build) void {
     });
     ffi_native_module.addIncludePath(b.path("src"));
     ffi_native_module.addIncludePath(b.path(capability_jsc_include));
+    configureMacosSdk(ffi_native_module, b, macos_sdk);
     ffi_native_module.addCSourceFile(.{
         .file = b.path("src/stdlib/ffi/ffi_capability.c"),
         .flags = capability_c_flags,
@@ -1317,8 +1349,8 @@ pub fn build(b: *std.Build) void {
     }
     switch (target.result.os.tag) {
         .macos => {
-            configureMacosHomebrew(ffi_native.root_module, b);
-            ffi_native.root_module.linkSystemLibrary("ffi", .{ .preferred_link_mode = .static });
+            configureMacosNativeDependencies(ffi_native.root_module, b);
+            ffi_native.root_module.linkSystemLibrary("ffi", .{ .use_pkg_config = .no, .preferred_link_mode = .static, .search_strategy = .no_fallback });
         },
         .linux => ffi_native.root_module.linkSystemLibrary("ffi", .{ .preferred_link_mode = .dynamic }),
         .windows => {
@@ -1357,6 +1389,7 @@ pub fn build(b: *std.Build) void {
         });
         secrets_capability_module.addIncludePath(b.path("src"));
         secrets_capability_module.addIncludePath(b.path(capability_jsc_include));
+        configureMacosSdk(secrets_capability_module, b, macos_sdk);
         secrets_capability_module.addCSourceFile(.{
             .file = b.path("src/stdlib/secrets/secrets_capability.c"),
             .flags = capability_c_flags,
@@ -1547,7 +1580,7 @@ pub fn build(b: *std.Build) void {
     unit_tests.root_module.addAnonymousImport("runtime_modules_blob", .{ .root_source_file = runtime_modules_blob });
     unit_tests.root_module.addAnonymousImport("capability_namespace_source", .{ .root_source_file = b.path("src/capability_namespace_bootstrap.js") });
 
-    configureJsc(unit_tests, b);
+    configureJsc(unit_tests, b, macos_sdk);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");

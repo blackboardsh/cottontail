@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { execFileSync } from 'child_process';
-import { buildArchitecture } from './build-target.js';
+import { buildArchitecture, buildJobArgs } from './build-target.js';
+import { verifyMacosStaticArchive } from './verify-macos-native-deps.js';
 import { createHash } from 'crypto';
 import {
   copyFileSync,
@@ -111,7 +112,19 @@ function fallbackLibraryNames(platformKey) {
 function validFallbackDirectory(fallbackDir, platformKey) {
   return fallbackLibraryNames(platformKey).every((name) => {
     const path = join(fallbackDir, name);
-    return existsSync(path) && statSync(path).isFile() && statSync(path).size > 0;
+    if (!existsSync(path) || !statSync(path).isFile() || statSync(path).size === 0) return false;
+    if (platformKey.startsWith('macos-')) {
+      try {
+        verifyMacosStaticArchive(path, {
+          expectedArchitecture: platformKey === 'macos-x64' ? 'x86_64' : 'arm64',
+          maxMacosVersion: '14.0',
+        });
+      } catch (error) {
+        console.log(`Rebuilding incompatible ICU fallback: ${error.message}`);
+        return false;
+      }
+    }
+    return true;
   });
 }
 
@@ -346,6 +359,12 @@ function buildPinnedIcuFallback(vendorDir, platformKey) {
 
     exec('tar', [...tarLocalFlags, '-xzf', tarPath(archivePath), '-C', tarPath(sourceDir), '--strip-components=1']);
     const configurePlatform = platformKey.startsWith('macos-') ? 'MacOSX' : 'Linux';
+    const fallbackEnv = {
+      ...process.env,
+      CC: process.env.CC || 'cc',
+      CXX: process.env.CXX || 'c++',
+      ...(platformKey.startsWith('macos-') ? { MACOSX_DEPLOYMENT_TARGET: '14.0' } : {}),
+    };
     exec(
       join(sourceDir, 'source', 'runConfigureICU'),
       [
@@ -361,15 +380,11 @@ function buildPinnedIcuFallback(vendorDir, platformKey) {
       ],
       {
         cwd: buildDir,
-        env: {
-          ...process.env,
-          CC: process.env.CC || 'cc',
-          CXX: process.env.CXX || 'c++',
-        },
+        env: fallbackEnv,
       }
     );
-    exec('make', [`-j${Math.max(1, Math.min(8, cpus().length))}`], { cwd: buildDir });
-    exec('make', ['install'], { cwd: buildDir });
+    exec('make', [buildJobArgs()[0] ?? `-j${Math.max(1, Math.min(8, cpus().length))}`], { cwd: buildDir, env: fallbackEnv });
+    exec('make', ['install'], { cwd: buildDir, env: fallbackEnv });
 
     mkdirSync(fallbackDir, { recursive: true });
     for (const name of fallbackLibraryNames(platformKey)) {
@@ -389,6 +404,7 @@ function buildPinnedIcuFallback(vendorDir, platformKey) {
         dataSha256: fallback.dataSha256,
         source: fallback.source,
         sourceSha256: fallback.sha256,
+        ...(platformKey.startsWith('macos-') ? { macosDeploymentTarget: '14.0' } : {}),
       }, null, 2)}\n`
     );
 

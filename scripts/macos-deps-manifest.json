@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "recipeRevision": 1,
+  "deploymentTarget": "14.0",
+  "dependencies": {
+    "libffi": {
+      "version": "3.7.1",
+      "url": "https://github.com/libffi/libffi/releases/download/v3.7.1/libffi-3.7.1.tar.gz",
+      "sha256": "d5e9a6638ddbd2513ddb54518eb67e4bbe6fa707bcc01c10f6212f0a088d819d",
+      "sourceDirectory": "libffi-3.7.1",
+      "licenses": ["LICENSE", "LICENSE-BUILDTOOLS"],
+      "libraries": ["libffi.a"],
+      "headers": ["ffi.h", "ffitarget.h"]
+    },
+    "brotli": {
+      "version": "1.2.0",
+      "url": "https://github.com/google/brotli/archive/refs/tags/v1.2.0.tar.gz",
+      "sha256": "816c96e8e8f193b40151dad7e8ff37b1221d019dbcb9c35cd3fadbfe6477dfec",
+      "sourceDirectory": "brotli-1.2.0",
+      "licenses": ["LICENSE"],
+      "libraries": ["libbrotlicommon.a", "libbrotlidec.a", "libbrotlienc.a"],
+      "headers": ["brotli/decode.h", "brotli/encode.h"]
+    },
+    "zstd": {
+      "version": "1.5.7",
+      "url": "https://github.com/facebook/zstd/archive/refs/tags/v1.5.7.tar.gz",
+      "sha256": "37d7284556b20954e56e1ca85b80226768902e2edabd3b649e9e72c0c9012ee3",
+      "sourceDirectory": "zstd-1.5.7",
+      "licenses": ["LICENSE", "COPYING"],
+      "libraries": ["libzstd.a"],
+      "headers": ["zstd.h", "zdict.h"]
+    },
+    "openssl": {
+      "version": "3.6.2",
+      "url": "https://github.com/openssl/openssl/releases/download/openssl-3.6.2/openssl-3.6.2.tar.gz",
+      "sha256": "aaf51a1fe064384f811daeaeb4ec4dce7340ec8bd893027eee676af31e83a04f",
+      "sourceDirectory": "openssl-3.6.2",
+      "licenses": ["LICENSE.txt"],
+      "libraries": ["libssl.a", "libcrypto.a"],
+      "headers": ["openssl/ssl.h", "openssl/crypto.h", "openssl/opensslconf.h"]
+    }
+  }
+}

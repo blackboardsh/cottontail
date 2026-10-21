@@ -116,6 +116,12 @@ mkdirSync(join(packageRoot, 'bin'), { recursive: true });
 cpSync(executablePath, join(packageRoot, 'bin', executableName));
 cpSync(corePath, join(packageRoot, 'bin', 'cottontail-core'), { recursive: true });
 cpSync(stdlibPath, join(packageRoot, 'bin', 'cottontail-stdlib'), { recursive: true });
+if (process.platform === 'darwin') {
+  const licenses = join(rootDir, 'vendors', 'macos-deps', platform, 'share', 'licenses');
+  if (!existsSync(licenses)) fail(`Missing macOS native dependency licenses: ${licenses}`);
+  cpSync(licenses, join(packageRoot, 'share', 'licenses'), { recursive: true });
+}
+
 if (process.platform === 'win32') {
   validateWindowsReleaseArchitecture(join(packageRoot, 'bin'), buildArchitecture());
 }

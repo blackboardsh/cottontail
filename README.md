@@ -42,6 +42,9 @@ npm-compatible package-manager graph.
 
 A fresh checkout requires Node.js 24. The setup scripts download the pinned Zig,
 JavaScriptCore, and zig-html-rewriter artifacts and verify their checksums.
+macOS builds also require Xcode or Command Line Tools and CMake. Setup builds
+pinned static OpenSSL, libffi, Brotli, and Zstandard sources for the macOS 14
+baseline and caches them under `vendors/macos-deps`.
 
 ```sh
 node scripts/setup.js

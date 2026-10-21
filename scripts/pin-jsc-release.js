@@ -81,11 +81,9 @@ writeFileSync(currentPath, `${JSON.stringify(next, null, 2)}\n`);
 
 const buildPath = join(root, 'build.zig');
 const build = readFileSync(buildPath, 'utf8');
-const updated = build.replace(
-  /const jsc_vendor_tag = "[^"]+";/,
-  `const jsc_vendor_tag = "${tag}";`
-);
-if (updated === build) throw new Error(`Could not update ${basename(buildPath)} JSC vendor tag`);
+const vendorTagPattern = /const jsc_vendor_tag = "[^"]+";/;
+if (!vendorTagPattern.test(build)) throw new Error(`Could not find ${basename(buildPath)} JSC vendor tag`);
+const updated = build.replace(vendorTagPattern, `const jsc_vendor_tag = "${tag}";`);
 writeFileSync(buildPath, updated);
 
 console.log(`Pinned ${release.webkitRef} (${release.webkitSha}) from JSC build ${release.revision}`);

@@ -250,6 +250,13 @@ function setup() {
   } catch (error) {
     fail('Failed to vendor Windows native dependencies.', error);
   }
+  if (process.platform === 'darwin') {
+    try {
+      execFileSync(process.execPath, [join(ROOT, 'scripts', 'setup-macos-deps.js')], { cwd: ROOT, stdio: 'inherit' });
+    } catch (error) {
+      fail('Failed to vendor macOS native dependencies.', error);
+    }
+  }
   console.log(`\nSetup complete. Vendored Zig is ready at vendors/zig/${getZigBinaryName()}`);
 }
 

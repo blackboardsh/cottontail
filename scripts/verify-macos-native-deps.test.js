@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, relative, sep } from 'node:path';
 import test from 'node:test';
 
-import { parseOtoolLoadCommands, verifyMacosNativeDependencies } from './verify-macos-native-deps.js';
+import { parseOtoolLoadCommands, verifyMacosNativeDependencies, verifyMacosStaticArchive } from './verify-macos-native-deps.js';
 
 function output({ architecture = 'ARM64', executable = false, dependencies = [], rpaths = [], id, deploymentTargets = [] } = {}) {
   const commands = [];
@@ -32,8 +32,73 @@ function fixture(t, files) {
   return {
     root,
     verify: (options = {}) => verifyMacosNativeDependencies(root, { ...options, inspect: (path) => files[relative(root, path).split(sep).join('/')] }),
+    verifyArchive: (path, options = {}) => verifyMacosStaticArchive(join(root, path), { ...options, inspect: (actual) => files[relative(root, actual).split(sep).join('/')] }),
   };
 }
+
+function archiveOutput(...objects) {
+  return `Archive : libicuuc.a\n${objects.map((options, index) => output(options)
+    .replace('artifact:', `libicuuc.a(member${index + 1}.o):`)
+    .replace(' DYLIB ', ' OBJECT ')).join('')}`;
+}
+
+test('verifies every static archive object and accepts modern and legacy deployment targets', (t) => {
+  const { root, verifyArchive } = fixture(t, {
+    'libicuuc.a': archiveOutput(
+      { architecture: 'X86_64', deploymentTargets: [{ minimumVersion: '14.0.0', platform: '1' }] },
+      { architecture: 'X86_64', deploymentTargets: [{ command: 'LC_VERSION_MIN_MACOSX', minimumVersion: '10.15.7' }] },
+    ),
+  });
+  assert.deepEqual(verifyArchive('libicuuc.a', { expectedArchitecture: 'x86_64' }), {
+    archive: join(root, 'libicuuc.a'), objects: 2,
+  });
+});
+
+test('rejects a wrong-architecture archive member surrounded by matching members', (t) => {
+  const matching = { architecture: 'X86_64', deploymentTargets: [{ minimumVersion: '14.0' }] };
+  const { verifyArchive } = fixture(t, {
+    'libicuuc.a': archiveOutput(matching, { deploymentTargets: [{ minimumVersion: '14.0' }] }, matching),
+  });
+  assert.throws(() => verifyArchive('libicuuc.a', { expectedArchitecture: 'x86_64' }), /object 2 \(arm64\): expected x86_64 architecture/);
+});
+
+test('rejects any archive member above the default macOS 14.0 baseline', (t) => {
+  const matching = { deploymentTargets: [{ minimumVersion: '14.0' }] };
+  const files = { 'libicuuc.a': '' };
+  const { verifyArchive } = fixture(t, files);
+  for (const command of ['LC_BUILD_VERSION', 'LC_VERSION_MIN_MACOSX']) {
+    files['libicuuc.a'] = archiveOutput(matching, { deploymentTargets: [{ command, minimumVersion: '14.0.1' }] }, matching);
+    assert.throws(() => verifyArchive('libicuuc.a', { expectedArchitecture: 'arm64' }), /object 2 \(arm64\): LC_\w+ requires macOS 14.0.1, above allowed 14.0/);
+    assert.equal(verifyArchive('libicuuc.a', { expectedArchitecture: 'arm64', maxMacosVersion: '14.1' }).objects, 3);
+  }
+});
+
+test('rejects empty archives and members with absent, non-macOS, or invalid deployment metadata', (t) => {
+  const files = { 'libicuuc.a': '' };
+  const { verifyArchive } = fixture(t, files);
+  const verify = () => verifyArchive('libicuuc.a', { expectedArchitecture: 'arm64' });
+  assert.throws(verify, /did not report a Mach-O header/);
+  files['libicuuc.a'] = 'Archive : libicuuc.a\nlibicuuc.a(__.SYMDEF):\n';
+  assert.throws(verify, /did not report a Mach-O header/);
+  const matching = { deploymentTargets: [{ minimumVersion: '14.0' }] };
+  for (const invalid of [{}, { deploymentTargets: [{ platform: 'IOS', minimumVersion: '14.0' }] }]) {
+    files['libicuuc.a'] = archiveOutput(matching, invalid);
+    assert.throws(verify, /object 2 \(arm64\): missing macOS deployment target/);
+  }
+  for (const minimumVersion of ['invalid', undefined]) {
+    files['libicuuc.a'] = archiveOutput(matching, { deploymentTargets: [{ minimumVersion }] });
+    assert.throws(verify, /object 2 \(arm64\): LC_BUILD_VERSION: Invalid macOS version/);
+  }
+});
+
+test('requires an explicit supported architecture and valid maximum for static archive verification', (t) => {
+  const { verifyArchive } = fixture(t, {
+    'libicuuc.a': archiveOutput({ deploymentTargets: [{ minimumVersion: '14.0' }] }),
+  });
+  assert.throws(() => verifyArchive('libicuuc.a'), /Unsupported expected Mach-O architecture: undefined/);
+  assert.throws(() => verifyArchive('libicuuc.a', { expectedArchitecture: 'x64' }), /Unsupported expected Mach-O architecture: x64/);
+  assert.throws(() => verifyArchive('libicuuc.a', { expectedArchitecture: 'arm64', maxMacosVersion: '14.x' }), /Invalid macOS version: 14.x/);
+});
 
 test('parses universal load commands, paths with spaces, weak imports, and library IDs', () => {
   const parsed = parseOtoolLoadCommands(output({

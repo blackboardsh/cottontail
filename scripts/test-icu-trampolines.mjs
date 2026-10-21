@@ -4,11 +4,11 @@ import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { windowsTarget } from './build-target.js';
 
-if (process.platform !== 'win32') throw new Error('Run the ICU trampoline test on Windows');
+if (!['darwin', 'linux', 'win32'].includes(process.platform)) throw new Error('Unsupported ICU trampoline host');
 const root = resolve(import.meta.dirname, '..');
 const temp = mkdtempSync(join(tmpdir(), 'cottontail-icu-abi-'));
 const source = join(temp, 'test.c');
-const binary = join(temp, 'test.exe');
+const binary = join(temp, process.platform === 'win32' ? 'test.exe' : 'test');
 writeFileSync(source, `
 #include <assert.h>
 #include <stdint.h>
@@ -40,8 +40,13 @@ int main(void) {
 }
 `);
 try {
-  execFileSync(join(root, 'vendors/zig/zig.exe'), ['cc', '-target', windowsTarget(process.arch).zig,
-    '-O2', '-I', join(root, 'src/icu_bridge'), source, join(root, 'src/icu_bridge/windows-trampolines.S'), '-o', binary],
+  const windows = process.platform === 'win32';
+  const compiler = windows ? join(root, 'vendors/zig/zig.exe') : 'cc';
+  const targetArgs = windows ? ['cc', '-target', windowsTarget(process.arch).zig]
+    : process.platform === 'darwin' ? ['-mmacosx-version-min=14.0'] : [];
+  const assembly = process.platform === 'darwin' ? 'macos' : windows ? 'windows' : 'linux';
+  execFileSync(compiler, [...targetArgs, '-O2', '-I', join(root, 'src/icu_bridge'), source,
+    join(root, `src/icu_bridge/${assembly}-trampolines.S`), '-o', binary],
     { stdio: 'inherit', windowsHide: true, timeout: 300_000 });
   execFileSync(binary, [], { stdio: 'inherit', windowsHide: true, timeout: 30_000 });
 } finally {

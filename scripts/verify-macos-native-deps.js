@@ -149,6 +149,51 @@ function newerThan(version, maximum) {
   return false;
 }
 
+function deploymentTargetErrors(record, label, maximumVersion, maxMacosVersion) {
+  const errors = [];
+  const targets = (record.deploymentTargets ?? []).filter((target) => ['MACOS', '1'].includes(target.platform));
+  if (targets.length === 0) errors.push(`${label}: missing macOS deployment target`);
+  for (const target of targets) {
+    try {
+      if (newerThan(target.minimumVersion, maximumVersion)) {
+        errors.push(`${label}: ${target.command} requires macOS ${target.minimumVersion}, above allowed ${maxMacosVersion}`);
+      }
+    } catch (error) {
+      errors.push(`${label}: ${target.command}: ${error.message}`);
+    }
+  }
+  return errors;
+}
+
+// Unlike universal runtime files, each object in a cached static dependency
+// must match the requested architecture and deployment baseline. A good member
+// must not hide an incompatible object that a later link could select.
+export function verifyMacosStaticArchive(archivePath, {
+  expectedArchitecture,
+  maxMacosVersion = '14.0',
+  inspect = (path) => execFileSync('otool', ['-arch', 'all', '-hv', '-l', path], { encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 }),
+} = {}) {
+  if (!['x86_64', 'arm64'].includes(expectedArchitecture)) {
+    throw new Error(`Unsupported expected Mach-O architecture: ${expectedArchitecture}`);
+  }
+  const maximumVersion = versionComponents(maxMacosVersion);
+  const archive = realpathSync(archivePath);
+  if (!statSync(archive).isFile()) throw new Error(`Expected a static archive file: ${archive}`);
+  const objects = parseOtoolLoadCommands(inspect(archive));
+  const errors = [];
+  for (const [index, object] of objects.entries()) {
+    const label = `object ${index + 1} (${object.architecture})`;
+    if (object.architecture !== expectedArchitecture) {
+      errors.push(`${label}: expected ${expectedArchitecture} architecture`);
+    }
+    errors.push(...deploymentTargetErrors(object, label, maximumVersion, maxMacosVersion));
+  }
+  if (errors.length > 0) {
+    throw new Error(`Non-portable macOS static archive ${archive}:\n${errors.map((error) => `  ${error}`).join('\n')}`);
+  }
+  return { archive, objects: objects.length };
+}
+
 // The root is the complete staged runtime or application bundle. Never consult
 // DYLD_LIBRARY_PATH, the current directory, or libraries installed on the host.
 // The inspector is injectable so the load-command and resolution fixtures run
@@ -234,17 +279,7 @@ export function verifyMacosNativeDependencies(rootPath, {
     for (const record of records) {
       if (expectedArchitecture !== undefined && record.architecture !== expectedArchitecture) continue;
       const label = `${relative(root, record.path).split(sep).join('/')} (${record.architecture})`;
-      const targets = (record.deploymentTargets ?? []).filter((target) => ['MACOS', '1'].includes(target.platform));
-      if (targets.length === 0) errors.push(`${label}: missing macOS deployment target`);
-      for (const target of targets) {
-        try {
-          if (newerThan(target.minimumVersion, maximumVersion)) {
-            errors.push(`${label}: ${target.command} requires macOS ${target.minimumVersion}, above allowed ${maxMacosVersion}`);
-          }
-        } catch (error) {
-          errors.push(`${label}: ${target.command}: ${error.message}`);
-        }
-      }
+      errors.push(...deploymentTargetErrors(record, label, maximumVersion, maxMacosVersion));
     }
   }
   for (const executable of executables) {

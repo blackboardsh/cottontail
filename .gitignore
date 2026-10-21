@@ -20,6 +20,7 @@ fixtures/electrobun-cli/build/
 fixtures/electrobun-cli/.cottontail-tmp/
 vendors/jsc/
 vendors/windows-deps/
+vendors/macos-deps/
 release/
 /vm-*.log
 
