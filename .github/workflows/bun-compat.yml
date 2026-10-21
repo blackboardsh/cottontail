@@ -1,4 +1,4 @@
-name: Intel opaque exec argv canary comparison
+name: Intel exact canary.4 split Hutch fixture validation
 on:
   workflow_dispatch:
     inputs:
@@ -19,21 +19,15 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cottontail-release-macos-x64
-          path: /tmp/cottontail-css-canary3
-          run-id: 39615900708
-          github-token: ${{ github.token }}
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: cottontail-release-macos-x64
           path: /tmp/cottontail-css-canary4
           run-id: ${{ inputs.canary4_run }}
           github-token: ${{ github.token }}
-      - name: Compare unchanged isolated opaque argv case and capture child results
+      - name: Validate frozen split fixture against exact canary.4
         shell: bash
-        run: python3 scripts/diagnose-intel-exec-canaries.py
+        run: python3 scripts/validate-intel-hutch-split.py
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: intel-canary3-canary4-opaque-exec-evidence
-          path: /tmp/cottontail-intel-exec-evidence/
+          name: intel-canary4-split-hutch-evidence
+          path: /tmp/cottontail-intel-hutch-split-evidence/
           if-no-files-found: error
