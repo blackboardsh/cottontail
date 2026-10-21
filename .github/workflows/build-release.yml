@@ -236,6 +236,9 @@ jobs:
       - name: Validate stripped release binary
         run: node scripts/validate-release-binary.js
 
+      - name: Test GitHub Actions test registration
+        run: node scripts/test-github-actions-runner.js
+
       - name: Test native stdio redirection
         run: node --test scripts/stdio-redirection.test.js
 

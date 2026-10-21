@@ -50,17 +50,17 @@ function runCase(testCase) {
     fail(`Failed to execute "${testCase.name}": ${result.error.message}`);
   }
 
+  function failWithOutput(message) {
+    fail([
+      message,
+      `stdout:\n${result.stdout ?? ''}`,
+      `stderr:\n${result.stderr ?? ''}`,
+    ].join('\n'));
+  }
+
   const exitCode = result.status ?? 1;
   if (exitCode !== testCase.expectExitCode) {
-    fail(
-      [
-        `Test "${testCase.name}" exited with ${exitCode}, expected ${testCase.expectExitCode}.`,
-        result.stdout ? `stdout:\n${result.stdout}` : '',
-        result.stderr ? `stderr:\n${result.stderr}` : '',
-      ]
-        .filter(Boolean)
-        .join('\n')
-    );
+    failWithOutput(`Test "${testCase.name}" exited with ${exitCode}, expected ${testCase.expectExitCode}.`);
   }
 
   // Bun's test reporter writes assertion results to stderr while test-body
@@ -71,19 +71,19 @@ function runCase(testCase) {
     : result.stdout;
   for (const expected of testCase.stdoutIncludes ?? []) {
     if (!stdoutSearch.includes(expected)) {
-      fail(`Test "${testCase.name}" stdout did not include: ${expected}`);
+      failWithOutput(`Test "${testCase.name}" stdout did not include: ${expected}`);
     }
   }
 
   for (const expected of testCase.stdoutMatches ?? []) {
     if (!expected.test(stdoutSearch)) {
-      fail(`Test "${testCase.name}" stdout did not match: ${expected}`);
+      failWithOutput(`Test "${testCase.name}" stdout did not match: ${expected}`);
     }
   }
 
   for (const expected of testCase.stderrIncludes ?? []) {
     if (!result.stderr.includes(expected)) {
-      fail(`Test "${testCase.name}" stderr did not include: ${expected}`);
+      failWithOutput(`Test "${testCase.name}" stderr did not include: ${expected}`);
     }
   }
 

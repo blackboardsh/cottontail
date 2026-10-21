@@ -7617,7 +7617,10 @@ fn buildCliPreloadImports(ctx: *const Context, script_abs: []const u8, exec_args
 // Outside test mode this is empty.
 fn testModuleLoadErrorCatch(ctx: *const Context, test_cli_execution: bool, path_literal: []const u8) ![]const u8 {
     if (!test_cli_execution) return "";
-    return std.fmt.allocPrint(ctx.allocator, " catch (error) {{ const __ctLoadErrorHook = () => globalThis[Symbol.for(\"cottontail.internal.testModuleLoadError\")]?.(error, {s}); if (!__ctLoadErrorHook()) {{ try {{ void globalThis.require?.(\"bun:test\")?.test; globalThis[Symbol.for(\"cottontail.internal.loadBunTestCapability\")]?.(); }} catch {{}} if (!__ctLoadErrorHook()) throw error; }} }}", .{path_literal});
+    return std.fmt.allocPrint(ctx.allocator, " catch (error) {{ const __ctLoadErrorHook = () => globalThis[Symbol.for(\"cottontail.internal.testModuleLoadError\")]?.(error, {s}); if (!__ctLoadErrorHook()) {{ try {{ (await import({s})).loadBunTestCapabilityModule(); }} catch {{}} if (!__ctLoadErrorHook()) throw error; }} }}", .{
+        path_literal,
+        try jsonStringLiteral(ctx, try runtimeModulePath(ctx, &.{ "bun", "test-capability.js" })),
+    });
 }
 
 // Finish a single-file test entry through the same node:test runner used by
@@ -7627,16 +7630,19 @@ fn testModuleLoadErrorCatch(ctx: *const Context, test_cli_execution: bool, path_
 fn testModuleFinalizeSource(ctx: *const Context, test_cli_execution: bool) ![]const u8 {
     if (!test_cli_execution) return "  globalThis.__cottontailLoadingTestModules = false;\n" ++
         "  globalThis[Symbol.for(\"cottontail.internal.startTestRun\")]?.();";
-    _ = ctx;
-    return "  globalThis.__cottontailLoadingTestModules = false;\n" ++
+    // Bare entries have neither a global require nor an installed capability
+    // loader. Import the facade explicitly so its absence cannot silently skip
+    // the test runner and its coverage finalizer.
+    return std.fmt.allocPrint(ctx.allocator, "  globalThis.__cottontailLoadingTestModules = false;\n" ++
         "  globalThis.cottontail.__cottontailCollectApplicationCoverage ??= () => globalThis.cottontail.collectTestCoverage();\n" ++
         "  globalThis.__cottontailTestEntrypointLoaded = true;\n" ++
-        "  if (typeof globalThis[Symbol.for(\"cottontail.internal.finalizeEmptyTestRun\")] !== \"function\") {\n" ++
-        "    void globalThis.require?.(\"bun:test\")?.test;\n" ++
-        "    globalThis[Symbol.for(\"cottontail.internal.loadBunTestCapability\")]?.();\n" ++
-        "  }\n" ++
+        "  if (typeof globalThis[Symbol.for(\"cottontail.internal.finalizeEmptyTestRun\")] !== \"function\") {{\n" ++
+        "    (await import({s})).loadBunTestCapabilityModule();\n" ++
+        "  }}\n" ++
         "  globalThis[Symbol.for(\"cottontail.internal.startTestRun\")]?.();\n" ++
-        "  await globalThis[Symbol.for(\"cottontail.internal.finalizeEmptyTestRun\")]?.();";
+        "  await globalThis[Symbol.for(\"cottontail.internal.finalizeEmptyTestRun\")]?.();", .{
+        try jsonStringLiteral(ctx, try runtimeModulePath(ctx, &.{ "bun", "test-capability.js" })),
+    });
 }
 
 fn writeReusedReloadEntryWrapper(

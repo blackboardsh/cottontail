@@ -253,6 +253,9 @@ jobs:
             node scripts/zig.js build -Doptimize=ReleaseFast -Dcpu=baseline
           fi
 
+      - name: Test GitHub Actions test registration
+        run: node scripts/test-github-actions-runner.js
+
       - name: Run first-party JavaScript tests
         shell: bash
         run: node scripts/test-js.js

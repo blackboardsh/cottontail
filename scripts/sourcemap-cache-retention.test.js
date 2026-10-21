@@ -43,6 +43,8 @@ test('incidental map cache can be collected and stack locations still remap', as
   await collect();
   assert.equal(f.references[0].deref(), undefined, 'stack formatting must not pin the decoded map');
   assert.equal(f.context.remapper.remapStackString('example@/tmp/app.js:1:1'), 'example@/tmp/original.js:1:1');
+  assert.equal(f.reads(), firstReads, 'a cached stack must not reload the collected map');
+  assert.equal(f.context.remapper.remapStackString('another@/tmp/app.js:1:1'), 'another@/tmp/original.js:1:1');
   assert.ok(f.reads() > firstReads, 'collected maps reload on demand');
 });
 

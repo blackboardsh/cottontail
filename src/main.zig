@@ -2295,15 +2295,11 @@ fn writeMultiTestEntrypoint(
             try std.fs.path.join(allocator, &.{ cwd_abs, test_file });
         try appendJavaScriptStringLiteral(allocator, &source, absolute);
     }
-    try source.appendSlice(
-        allocator,
-        "];\nglobalThis.__cottontailTestEntrypointLoaded = true;\n" ++
-            "if (typeof globalThis[Symbol.for(\"cottontail.internal.startTestRun\")] !== \"function\") {\n" ++
-            "  globalThis.__cottontailNodeTestRuntime = await import(\"node:test\");\n" ++
-            "  globalThis[Symbol.for(\"cottontail.internal.startTestRun\")]?.();\n" ++
-            "}\n" ++
-            "await globalThis[Symbol.for(\"cottontail.internal.finalizeEmptyTestRun\")]?.();\n",
-    );
+    // The outer script wrapper finishes test-module loading, flushes Bun's
+    // deferred registrations, and only then finalizes an empty run. Doing so
+    // here sees an empty node:test queue while Bun still holds the tests and
+    // exits before their bodies execute (including single-file GitHub runs).
+    try source.appendSlice(allocator, "];\n");
 
     const path = try std.fmt.allocPrint(allocator, "{s}/entry.mjs", .{aggregate_directory});
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = source.items });

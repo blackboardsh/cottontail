@@ -1967,8 +1967,11 @@ function scheduleRun() {
   const noRegisteredWork = tests.length === 0 && failures.length === 0 && !suiteHasLifecycleWork(rootSuite) &&
     !hasPendingSuiteDefinitions() && !globalThis.__cottontailHasPendingSnapshots?.();
   if (noRegisteredWork) {
-    if (reportEmptyGithubFile && globalThis.__cottontailTestEntrypointLoaded) reportResults();
-    if (testCoverageOptions.enabled && testCliModeEnabled() &&
+    // Empty runs still need reporter finalizers before their single summary.
+    // Reporting the GitHub group here would hide the later coverage table.
+    const reportEmptyFile = testCoverageOptions.enabled ||
+      (reportEmptyGithubFile && globalThis.__cottontailTestEntrypointLoaded);
+    if (reportEmptyFile && testCliModeEnabled() &&
         globalThis.__cottontailLoadingTestModules !== true) scheduleAfterHooks();
     return;
   }

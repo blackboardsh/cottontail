@@ -398,7 +398,9 @@ function normalizeCottontailStackFrames(stack) {
       if (nodeFrame) return [`${nodeFrame[1]}@node:${nodeFrame[2]}:${nodeFrame[3]}:${nodeFrame[4]}`];
       return [];
     }
-    if (isFrame && (line.includes("/.cottontail-tmp/") || line.includes("/script.bundle.mjs:"))) return [];
+    // Workers retain generated locations because their bundles have no maps.
+    const workerBundle = cottontail.isWorker?.() === true && /[/\\]bun-worker-[^/\\]*\.js:\d+:\d+\)?$/.test(line);
+    if (isFrame && !workerBundle && (line.includes("/.cottontail-tmp/") || line.includes("/script.bundle.mjs:"))) return [];
     const jscFrame = /^([^@]*)@(.+):([0-9]+):([0-9]+)$/.exec(line);
     if (jscFrame) {
       if (jscFrame[1].startsWith("async ")) sawAsyncFrame = true;
@@ -973,7 +975,10 @@ function limitedCallSites(stack, fallbackSourceURL = undefined, configuredLimit 
   let sites = parseCallSites(stack, fallbackSourceURL, evalPosition);
   sites = sites.filter((site) => {
     const f = site.file ?? site.getFileName?.() ?? "";
-    return !(f.includes("runtime_modules/bun/index.js") || f.includes(".cottontail-embedded-runtime") || f.includes("/src/runtime_modules/") || f.includes(".cottontail-tmp") || f.includes("cottontail:") || f.includes("cottontail-direct-entry"));
+    // Unmapped Web Worker bundles contain user code in the same generated
+    // file as the runtime. Keep their locations even in our temporary root.
+    const workerBundle = cottontail.isWorker?.() === true && /(?:^|[/\\])bun-worker-[^/\\]*\.js$/.test(f);
+    return !(f.includes("runtime_modules/bun/index.js") || f.includes(".cottontail-embedded-runtime") || f.includes("/src/runtime_modules/") || (!workerBundle && f.includes(".cottontail-tmp")) || f.includes("cottontail:") || f.includes("cottontail-direct-entry"));
   });
   const limit = Number(configuredLimit);
   return Number.isFinite(limit) && limit >= 0 ? sites.slice(0, Math.floor(limit)) : sites;
