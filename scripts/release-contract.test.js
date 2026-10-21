@@ -21,6 +21,7 @@ const artifacts = [
   ['windows-x64', 'a'],
   ['linux-arm64', 'b'],
   ['macos-arm64', 'c'],
+  ['macos-x64', 'f'],
   ['linux-x64', 'd'],
   ['windows-arm64', 'e'],
 ].map(([platform, digit], index) => ({

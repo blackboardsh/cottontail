@@ -110,7 +110,7 @@ test('Windows runner contracts wait for the Cottontail-owned native job launcher
 });
 
 test('runs the strict complete Cottontail-owned Bun tier without publishing', () => {
-  for (const platform of ['macos-arm64', 'linux-x64', 'linux-arm64', 'windows-x64', 'windows-arm64']) {
+  for (const platform of ['macos-arm64', 'macos-x64', 'linux-x64', 'linux-arm64', 'windows-x64', 'windows-arm64']) {
     assert.match(workflow, new RegExp(`platform: ${platform}`));
   }
   assert.match(workflow, /runner: macos-26/);

@@ -42,8 +42,8 @@ test('Windows releases require native Job cleanup tests after building the super
   assert.ok(workflow.indexOf(`- name: ${name}`) < workflow.indexOf('- name: Package release'));
 });
 
-test('all five releases gate native namespace, worker loader, and socket ownership after final validation', () => {
-  for (const platform of ['macos-arm64', 'linux-x64', 'linux-arm64', 'windows-x64', 'windows-arm64']) {
+test('all six releases gate native namespace, worker loader, and socket ownership after final validation', () => {
+  for (const platform of ['macos-arm64', 'macos-x64', 'linux-x64', 'linux-arm64', 'windows-x64', 'windows-arm64']) {
     assert.ok(workflow.includes(`platform: ${platform}`));
   }
   for (const suffix of ['', ' on Windows']) {
@@ -210,7 +210,7 @@ test('releases check native dependencies and compressed HTTP without Homebrew', 
 
 test('every release checks native stdio offsets after building and before packaging', () => {
   const stdio = step('Test native stdio redirection');
-  assert.doesNotMatch(stdio, /^\s+if:/m, 'stdio regression must run on all four native release targets');
+  assert.doesNotMatch(stdio, /^\s+if:/m, 'stdio regression must run on all six native release targets');
   assert.match(stdio, /run: node --test scripts\/stdio-redirection\.test\.js/);
   const index = workflow.indexOf('- name: Test native stdio redirection');
   assert.ok(workflow.indexOf('- name: Build and strip release binary') < index);
@@ -226,7 +226,7 @@ test('the JS suite forwards its selected runtime to native stdio regressions', (
 
 test('every release and the JS suite run externally bounded delayed worker termination regressions', () => {
   const termination = step('Test delayed runaway worker termination');
-  assert.doesNotMatch(termination, /^\s+if:/m, 'worker regression must run on all four native release targets');
+  assert.doesNotMatch(termination, /^\s+if:/m, 'worker regression must run on all six native release targets');
   assert.match(termination, /run: node --test scripts\/worker-delayed-termination\.test\.js/);
   const index = workflow.indexOf('- name: Test delayed runaway worker termination');
   assert.ok(workflow.indexOf('- name: Build and strip release binary') < index);

@@ -86,11 +86,11 @@ bring-up. Keep Cottontail's 20 tracked expected failures separate from Hutch's
 A Cottontail revision is cross-platform compatible only when the same revision
 and pinned JSC revision satisfy all of these gates on:
 
-- macOS ARM64
+- macOS ARM64 and Intel x64 (macOS 14 or later)
 - Linux x64 on glibc
 - Linux ARM64 on glibc
 - Windows x64
-- Windows ARM64 with interpreter-only JSC (canary; no JIT or WebAssembly)
+- Windows ARM64 with JIT and WebAssembly
 
 Each target must:
 

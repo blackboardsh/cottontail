@@ -3,7 +3,7 @@
 import { execFileSync, spawnSync } from 'child_process';
 import { existsSync } from 'fs';
 import { join } from 'path';
-import { buildArchitecture, windowsTarget, buildJobArgs } from './build-target.js';
+import { buildArchitecture, macosTarget, windowsTarget, buildJobArgs } from './build-target.js';
 
 const zigBinary = process.platform === 'win32' ? 'zig.exe' : 'zig';
 const zigPath = join(process.cwd(), 'vendors', 'zig', zigBinary);
@@ -20,6 +20,9 @@ const args = process.argv.slice(2);
 if (args[0] === 'build' && !args.some(arg => /^-j/.test(arg))) args.push(...buildJobArgs());
 if (process.platform === 'win32' && args[0] === 'build' && !args.some(arg => arg.startsWith('-Dtarget='))) {
   args.push(`-Dtarget=${windowsTarget(buildArchitecture()).zig}`);
+}
+if (process.platform === 'darwin' && args[0] === 'build' && !args.some(arg => arg.startsWith('-Dtarget='))) {
+  args.push(`-Dtarget=${macosTarget(buildArchitecture())}`);
 }
 const result = spawnSync(zigPath, args, { stdio: 'inherit' });
 

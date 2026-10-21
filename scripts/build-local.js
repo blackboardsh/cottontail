@@ -46,6 +46,12 @@ function hostPaths() {
 			data: "icudt70l-macos-arm64.dat",
 			binary: "cottontail",
 		},
+        "darwin-x64": {
+            platform: "macos-x64",
+            artifact: "cottontail-jsc-macos-amd64.tar.gz",
+            data: "icudt70l-macos-x64.dat",
+            binary: "cottontail",
+        },
 		"linux-x64": {
 			platform: "linux-x64",
 			artifact: "cottontail-jsc-linux-amd64.tar.gz",

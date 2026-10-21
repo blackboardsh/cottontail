@@ -4,6 +4,7 @@ const revisionPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 export const RELEASE_SCHEMA = 1;
 export const RELEASE_PLATFORMS = [
   'macos-arm64',
+  'macos-x64',
   'linux-x64',
   'linux-arm64',
   'windows-x64',

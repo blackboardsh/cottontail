@@ -5,6 +5,11 @@ export function buildArchitecture(platform = process.platform, arch = process.ar
   return target;
 }
 
+export function macosTarget(arch) {
+  if (!['x64', 'arm64'].includes(arch)) throw new Error(`Unsupported macOS architecture: ${arch}`);
+  return `${arch === 'arm64' ? 'aarch64' : 'x86_64'}-macos.14.0`;
+}
+
 export function windowsTarget(arch) {
   if (!['x64', 'arm64'].includes(arch)) throw new Error(`Unsupported Windows architecture: ${arch}`);
   return {

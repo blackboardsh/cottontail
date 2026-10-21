@@ -5,6 +5,11 @@ on:
     branches:
       - "compat/**"
   workflow_dispatch:
+    inputs:
+      jsc_manifest:
+        description: Immutable JSC build manifest to await and validate before this CI build
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -20,6 +25,7 @@ jobs:
     timeout-minutes: 360
     env:
       COTTONTAIL_BUILD_JOBS: '2'
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
     strategy:
       fail-fast: false
       matrix:
@@ -27,6 +33,11 @@ jobs:
           - platform: macos-arm64
             runner: macos-26
             os: macos
+            arch: arm64
+          - platform: macos-x64
+            runner: macos-26-intel
+            os: macos
+            arch: x64
           - platform: linux-x64
             runner: ubuntu-24.04
             os: linux
@@ -167,6 +178,24 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $nodeIdentity.Trim() -ne "24.18.0 win32 ${{ matrix.arch }}") {
             throw "Expected Node 24.18.0 win32 ${{ matrix.arch }}, got '$nodeIdentity'"
           }
+
+      # Bring-up builds can run while a new immutable SDK matrix is still
+      # compiling. Tagged releases always consume the committed manifest.
+      - name: Await requested JSC SDK
+        if: github.event_name == 'workflow_dispatch' && inputs.jsc_manifest != ''
+        shell: bash
+        timeout-minutes: 125
+        env:
+          JSC_MANIFEST_URL: ${{ inputs.jsc_manifest }}
+        run: |
+          for attempt in {1..120}; do
+            if node scripts/pin-jsc-release.js "$JSC_MANIFEST_URL"; then
+              exit 0
+            fi
+            sleep 60
+          done
+          echo "Requested JSC SDK did not become available within two hours" >&2
+          exit 1
 
       - name: Vendor Zig, HTML rewriter, and JavaScriptCore
         shell: bash

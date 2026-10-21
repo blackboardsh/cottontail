@@ -29,6 +29,7 @@ const currentPath = join(root, 'scripts', 'jsc-manifest.json');
 const current = JSON.parse(readFileSync(currentPath, 'utf8'));
 const platformMap = {
   'macos-arm64': 'macos-arm64',
+  'macos-x64': 'macos-x64',
   'linux-amd64': 'linux-x64',
   'linux-arm64': 'linux-arm64',
   'windows-amd64': 'windows-x64',

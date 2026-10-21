@@ -3,6 +3,11 @@ name: Build and publish Cottontail
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      jsc_manifest:
+        description: Immutable JSC build manifest to await and validate before this CI build
+        type: string
+        required: false
   push:
     tags:
       - "v*"
@@ -21,6 +26,7 @@ jobs:
     timeout-minutes: 240
     env:
       COTTONTAIL_BUILD_JOBS: '2'
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
     strategy:
       fail-fast: false
       matrix:
@@ -28,6 +34,11 @@ jobs:
           - platform: macos-arm64
             runner: macos-26
             os: macos
+            arch: arm64
+          - platform: macos-x64
+            runner: macos-26-intel
+            os: macos
+            arch: x64
           - platform: linux-x64
             runner: ubuntu-24.04
             os: linux
@@ -121,6 +132,24 @@ jobs:
             throw "Expected Node 24.18.0 win32 ${{ matrix.arch }}, got '$nodeIdentity'"
           }
 
+      # Bring-up builds can run while a new immutable SDK matrix is still
+      # compiling. Tagged releases always consume the committed manifest.
+      - name: Await requested JSC SDK
+        if: github.event_name == 'workflow_dispatch' && inputs.jsc_manifest != ''
+        shell: bash
+        timeout-minutes: 125
+        env:
+          JSC_MANIFEST_URL: ${{ inputs.jsc_manifest }}
+        run: |
+          for attempt in {1..120}; do
+            if node scripts/pin-jsc-release.js "$JSC_MANIFEST_URL"; then
+              exit 0
+            fi
+            sleep 60
+          done
+          echo "Requested JSC SDK did not become available within two hours" >&2
+          exit 1
+
       - name: Vendor Zig, HTML rewriter, and JavaScriptCore
         if: matrix.os != 'windows'
         run: |
@@ -201,7 +230,7 @@ jobs:
 
       - name: Validate macOS native library portability
         if: matrix.os == 'macos'
-        run: node scripts/verify-macos-native-deps.js
+        run: node scripts/verify-macos-native-deps.js --arch ${{ matrix.arch == 'x64' && 'x86_64' || 'arm64' }} --max-macos 14.0
 
       - name: Test bundled HTTP compression
         run: node --test scripts/compression-portability.test.js
@@ -256,8 +285,8 @@ jobs:
       - name: Test native JSC heap and time-zone bridges
         run: ./zig-out/bin/cottontail tests/js/jsc-native-abi.ts
 
-      - name: Test Windows ARM64 JIT and WebAssembly execution
-        if: matrix.platform == 'windows-arm64'
+      - name: Test JIT and WebAssembly execution
+        if: matrix.platform == 'windows-arm64' || matrix.os == 'macos'
         run: node scripts/test-jsc-jit-release.js
 
       - name: Test Windows compiler memory retention

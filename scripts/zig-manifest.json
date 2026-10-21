@@ -20,6 +20,11 @@
       "folder": "zig-x86_64-windows-0.16.0",
       "archive": "zip",
       "sha256": "68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e"
+    },
+    "darwin-x64": {
+      "folder": "zig-x86_64-macos-0.16.0",
+      "archive": "tar.xz",
+      "sha256": "0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7"
     }
   }
 }

@@ -91,6 +91,7 @@ fn jscVendorPlatformKey(target: std.Target) ?[]const u8 {
     return switch (target.os.tag) {
         .macos => switch (target.cpu.arch) {
             .aarch64 => "macos-arm64",
+            .x86_64 => "macos-x64",
             else => null,
         },
         .linux => switch (target.cpu.arch) {
@@ -105,6 +106,16 @@ fn jscVendorPlatformKey(target: std.Target) ?[]const u8 {
         },
         else => null,
     };
+}
+
+fn configureMacosHomebrew(module: *std.Build.Module, b: *std.Build) void {
+    const prefix = if (module.resolved_target.?.result.cpu.arch == .aarch64) "/opt/homebrew" else "/usr/local";
+    module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{prefix}) });
+    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{prefix}) });
+    inline for (&.{ "openssl@3", "libffi", "brotli", "zstd" }) |formula| {
+        module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/opt/{s}/include", .{ prefix, formula }) });
+        module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/opt/{s}/lib", .{ prefix, formula }) });
+    }
 }
 
 fn windowsDependencyDir(target: std.Target) []const u8 {
@@ -620,8 +631,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             step.root_module.linkSystemLibrary("pthread", .{});
             step.root_module.linkSystemLibrary("resolv", .{});
             step.root_module.linkSystemLibrary("z", .{});
-            step.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-            step.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+            configureMacosHomebrew(step.root_module, b);
             step.root_module.linkSystemLibrary("ssl", .{ .preferred_link_mode = .static });
             step.root_module.linkSystemLibrary("crypto", .{ .preferred_link_mode = .static });
         },
@@ -714,6 +724,10 @@ pub fn build(b: *std.Build) void {
             .cpu_model = .baseline,
             .os_tag = .windows,
             .abi = .msvc,
+        } else if (builtin.os.tag == .macos) .{
+            .cpu_arch = builtin.cpu.arch,
+            .os_tag = .macos,
+            .os_version_min = .{ .semver = .{ .major = 14, .minor = 0, .patch = 0 } },
         } else .{},
     });
     const optimize = b.standardOptimizeOption(.{});
@@ -984,8 +998,7 @@ pub fn build(b: *std.Build) void {
         .flags = capability_c_flags,
     });
     if (target.result.os.tag == .macos) {
-        compression_capability_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-        compression_capability_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+        configureMacosHomebrew(compression_capability_module, b);
     } else if (target.result.os.tag == .windows) {
         const dependency_dir = windowsDependencyDir(target.result);
         compression_capability_module.addIncludePath(b.path(b.fmt("{s}/include", .{dependency_dir})));
@@ -1187,8 +1200,7 @@ pub fn build(b: *std.Build) void {
     hashing_capability.linker_allow_shlib_undefined = true;
     switch (target.result.os.tag) {
         .macos => {
-            hashing_capability.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-            hashing_capability.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+            configureMacosHomebrew(hashing_capability.root_module, b);
             hashing_capability.root_module.linkSystemLibrary("crypto", .{ .preferred_link_mode = .static });
             hashing_capability.root_module.linkSystemLibrary("zstd", .{ .preferred_link_mode = .static });
         },
@@ -1305,8 +1317,7 @@ pub fn build(b: *std.Build) void {
     }
     switch (target.result.os.tag) {
         .macos => {
-            ffi_native.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-            ffi_native.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+            configureMacosHomebrew(ffi_native.root_module, b);
             ffi_native.root_module.linkSystemLibrary("ffi", .{ .preferred_link_mode = .static });
         },
         .linux => ffi_native.root_module.linkSystemLibrary("ffi", .{ .preferred_link_mode = .dynamic }),

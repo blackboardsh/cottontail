@@ -17,7 +17,7 @@ the complete Node and Bun behavior tiers on each operating system.
 - Do not use Bun for this bring-up loop. The commands below use Node directly
   and match the GitHub Actions jobs.
 - Do not upload to R2 from a VM. Let the complete GitHub Actions matrix publish
-  after all five targets pass.
+  after all six targets pass.
 
 After pulling a new revision, leave `vendors/zig`, `vendors/jsc`, and
 `vendors/zig-html-rewriter` in place unless diagnosing setup itself. Their
@@ -167,7 +167,7 @@ or Cottontail behavior failure.
 
 Use native Node.js for the target architecture. The setup scripts select
 `x64-windows-static` or `arm64-windows-static` dependencies and the matching JSC
-SDK. Windows ARM64 uses interpreter-only JSC without JIT or WebAssembly.
+SDK. Windows ARM64 and both macOS architectures gate JIT tiers and WebAssembly in release CI.
 
 The Windows Zig 0.16 ARM64 host compiler crashes, so setup deliberately installs
 the x64 compiler on both architectures. `scripts/zig.js` passes the target

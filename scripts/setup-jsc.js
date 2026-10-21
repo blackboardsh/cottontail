@@ -52,9 +52,7 @@ function getPlatformKey() {
   const platform = process.platform;
   const arch = buildArchitecture();
 
-  if (platform === 'darwin' && arch === 'arm64') {
-    return 'macos-arm64';
-  }
+  if (platform === 'darwin') return `macos-${arch}`;
 
   if (platform === 'linux' && arch === 'x64') {
     return 'linux-amd64';

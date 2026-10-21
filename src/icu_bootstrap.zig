@@ -38,7 +38,9 @@ pub fn ensureWithEnvironment(io: std.Io, environ_map: *std.process.Environ.Map) 
     defer mutex.unlock(io);
     if (initialized) return;
 
-    if (c.cottontail_icu_try_system() != 0) {
+    // Exercise the shipped fallback on systems with compatible ICU too.
+    const force_fallback = std.mem.eql(u8, environ_map.get("COTTONTAIL_ICU_FORCE_FALLBACK") orelse "", "1");
+    if (!force_fallback and c.cottontail_icu_try_system() != 0) {
         initialized = true;
         return;
     }

@@ -4,6 +4,7 @@ export const RELEASE_BENCHMARK_SCHEMA = 1;
 
 export const RELEASE_BENCHMARK_PLATFORMS = Object.freeze([
   "macos-arm64",
+  "macos-x64",
   "linux-x64",
   "linux-arm64",
   "windows-x64",
@@ -12,6 +13,7 @@ export const RELEASE_BENCHMARK_PLATFORMS = Object.freeze([
 
 const bunAssets = Object.freeze({
   "macos-arm64": "bun-darwin-aarch64.zip",
+  "macos-x64": "bun-darwin-x64.zip",
   "linux-x64": "bun-linux-x64.zip",
   "linux-arm64": "bun-linux-aarch64.zip",
   "windows-x64": "bun-windows-x64.zip",
@@ -25,7 +27,7 @@ export function bunAssetName(platform) {
 }
 
 export function hostPlatformKey(platform = hostOs, arch = hostArch) {
-  if (platform === "darwin" && arch === "arm64") return "macos-arm64";
+  if (platform === "darwin" && (arch === "arm64" || arch === "x64")) return `macos-${arch}`;
   if (platform === "linux" && arch === "x64") return "linux-x64";
   if (platform === "linux" && arch === "arm64") return "linux-arm64";
   if (platform === "win32" && (arch === "x64" || arch === "arm64")) return `windows-${arch}`;

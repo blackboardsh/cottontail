@@ -29,3 +29,11 @@ test('the Windows ARM64 release selects its MSVC ABI and baseline CPU', () => {
 test('unsupported release hosts fail instead of inheriting a native CPU', () => {
   assert.throws(() => releaseTargetArgs('freebsd'), /Unsupported Cottontail release platform/);
 });
+
+
+test('both macOS releases fix their architecture and macOS 14 deployment baseline', () => {
+  for (const [arch, cpu] of [['x64', 'x86_64'], ['arm64', 'aarch64']]) {
+    assert.deepEqual(releaseTargetArgs('darwin', arch), [`-Dtarget=${cpu}-macos.14.0`, BASELINE_CPU_ARG]);
+  }
+  assert.throws(() => releaseTargetArgs('darwin', 'ia32'), /Unsupported macOS architecture/);
+});

@@ -21,19 +21,36 @@ export function parseOtoolLoadCommands(output) {
   const slices = [];
   let slice;
   let command;
+  let deploymentTarget;
   for (const line of output.split(/\r?\n/)) {
     const header = line.trim().match(/^MH_(?:MAGIC|CIGAM)(?:_64)?\s+(\S+)\s+\S+\s+\S+\s+(\S+)/);
     if (header) {
       slice = { architecture: header[1].toLowerCase(), executable: header[2] === 'EXECUTE', dependencies: [], rpaths: [] };
       slices.push(slice);
       command = undefined;
+      deploymentTarget = undefined;
       continue;
     }
     if (!slice) continue;
     const loadCommand = line.match(/^\s*cmd (LC_\S+)\s*$/);
     if (loadCommand) {
       command = loadCommand[1];
+      deploymentTarget = undefined;
+      if (command === 'LC_BUILD_VERSION' || command === 'LC_VERSION_MIN_MACOSX') {
+        deploymentTarget = { command };
+        if (command === 'LC_VERSION_MIN_MACOSX') deploymentTarget.platform = 'MACOS';
+        (slice.deploymentTargets ??= []).push(deploymentTarget);
+      }
       continue;
+    }
+    if (deploymentTarget) {
+      const field = line.match(/^\s*(platform|minos|version) (\S+)\s*$/);
+      if (field?.[1] === 'platform' && command === 'LC_BUILD_VERSION') {
+        deploymentTarget.platform = field[2];
+      } else if ((field?.[1] === 'minos' && command === 'LC_BUILD_VERSION')
+        || (field?.[1] === 'version' && command === 'LC_VERSION_MIN_MACOSX')) {
+        deploymentTarget.minimumVersion = field[2];
+      }
     }
     const value = line.match(/^\s*(name|path) (.+) \(offset \d+\)\s*$/);
     if (!value) continue;
@@ -115,13 +132,36 @@ function expandPath(path, loader, executable, inheritedRpaths) {
   return isAbsolute(path) ? [isAppleSystemLibrary(path) ? posix.normalize(path) : resolve(path)] : [];
 }
 
+function versionComponents(version) {
+  if (typeof version !== 'string' || !/^\d+(?:\.\d+){0,2}$/.test(version)) {
+    throw new Error(`Invalid macOS version: ${version}`);
+  }
+  const parts = version.split('.').map(Number);
+  if (parts.some((part) => !Number.isSafeInteger(part))) throw new Error(`Invalid macOS version: ${version}`);
+  return [parts[0], parts[1] ?? 0, parts[2] ?? 0];
+}
+
+function newerThan(version, maximum) {
+  const parts = versionComponents(version);
+  for (let index = 0; index < parts.length; index++) {
+    if (parts[index] !== maximum[index]) return parts[index] > maximum[index];
+  }
+  return false;
+}
+
 // The root is the complete staged runtime or application bundle. Never consult
 // DYLD_LIBRARY_PATH, the current directory, or libraries installed on the host.
 // The inspector is injectable so the load-command and resolution fixtures run
 // on all release platforms; real artifacts are inspected with Apple's otool.
 export function verifyMacosNativeDependencies(rootPath, {
   inspect = (path) => execFileSync('otool', ['-arch', 'all', '-hv', '-l', path], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }),
+  expectedArchitecture,
+  maxMacosVersion,
 } = {}) {
+  if (expectedArchitecture !== undefined && !['x86_64', 'arm64'].includes(expectedArchitecture)) {
+    throw new Error(`Unsupported expected Mach-O architecture: ${expectedArchitecture}`);
+  }
+  const maximumVersion = maxMacosVersion === undefined ? undefined : versionComponents(maxMacosVersion);
   const root = realpathSync(rootPath);
   if (!statSync(root).isDirectory()) throw new Error(`Expected a staged runtime directory: ${root}`);
   const records = inventory(root, inspect);
@@ -180,6 +220,33 @@ export function verifyMacosNativeDependencies(rootPath, {
   }
 
   const errors = [];
+  if (expectedArchitecture !== undefined) {
+    for (const path of new Set(records.map((record) => record.path))) {
+      const architectures = records.filter((record) => record.path === path).map((record) => record.architecture);
+      if (!architectures.includes(expectedArchitecture)) {
+        errors.push(`${relative(root, path).split(sep).join('/')}: missing required ${expectedArchitecture} architecture (found ${architectures.join(', ')})`);
+      }
+    }
+  }
+  if (maximumVersion !== undefined) {
+    // Other slices may legitimately have a newer deployment target. They still
+    // undergo dependency verification, but cannot raise this release's baseline.
+    for (const record of records) {
+      if (expectedArchitecture !== undefined && record.architecture !== expectedArchitecture) continue;
+      const label = `${relative(root, record.path).split(sep).join('/')} (${record.architecture})`;
+      const targets = (record.deploymentTargets ?? []).filter((target) => ['MACOS', '1'].includes(target.platform));
+      if (targets.length === 0) errors.push(`${label}: missing macOS deployment target`);
+      for (const target of targets) {
+        try {
+          if (newerThan(target.minimumVersion, maximumVersion)) {
+            errors.push(`${label}: ${target.command} requires macOS ${target.minimumVersion}, above allowed ${maxMacosVersion}`);
+          }
+        } catch (error) {
+          errors.push(`${label}: ${target.command}: ${error.message}`);
+        }
+      }
+    }
+  }
   for (const executable of executables) {
     const result = check(executable, executable.path);
     if (result.errors.length === 0) accept(result);
@@ -214,13 +281,28 @@ export function verifyMacosNativeDependencies(rootPath, {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  if (process.argv.length > 3) {
-    console.error('Usage: verify-macos-native-deps.js [staged runtime or application directory]');
-    process.exit(2);
+  const options = {};
+  let root;
+  const args = process.argv.slice(2);
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === '--arch' || arg === '--max-macos') {
+      const option = arg === '--arch' ? 'expectedArchitecture' : 'maxMacosVersion';
+      if (options[option] !== undefined || !args[index + 1] || args[index + 1].startsWith('--')) {
+        console.error(`Expected one value for ${arg}`);
+        process.exit(2);
+      }
+      options[option] = args[++index];
+    } else if (arg.startsWith('-') || root !== undefined) {
+      console.error('Usage: verify-macos-native-deps.js [staged runtime or application directory] [--arch x86_64|arm64] [--max-macos 14.0]');
+      process.exit(2);
+    } else {
+      root = arg;
+    }
   }
   try {
-    const root = process.argv[2] ?? fileURLToPath(new URL('../zig-out/bin', import.meta.url));
-    const result = verifyMacosNativeDependencies(root);
+    root ??= fileURLToPath(new URL('../zig-out/bin', import.meta.url));
+    const result = verifyMacosNativeDependencies(root, options);
     console.log(`OK ${result.files} Mach-O files (${result.slices} slices) have portable native dependencies in ${result.root}`);
   } catch (error) {
     console.error(error instanceof Error ? error.message : error);

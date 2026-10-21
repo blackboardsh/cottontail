@@ -23,6 +23,7 @@ function platformKey() {
   const key = `${process.platform}-${buildArchitecture()}`;
   const keys = {
     'darwin-arm64': 'macos-arm64',
+    'darwin-x64': 'macos-x64',
     'linux-x64': 'linux-x64',
     'linux-arm64': 'linux-arm64',
     'win32-x64': 'windows-x64',
@@ -48,6 +49,7 @@ function gitRevision() {
 const platform = platformKey();
 const jscPlatform = {
   'macos-arm64': 'macos-arm64',
+  'macos-x64': 'macos-x64',
   'linux-x64': 'linux-amd64',
   'linux-arm64': 'linux-arm64',
   'windows-x64': 'windows-amd64',
@@ -200,9 +202,10 @@ rmSync(join(packageRoot, '.cottontail-tmp'), { recursive: true, force: true });
 // enough to prove that an installed app can decode an HTTPS response.
 const portabilityChecks = [
   ...(process.platform === 'darwin'
-    ? [[join(rootDir, 'scripts', 'verify-macos-native-deps.js'), join(packageRoot, 'bin')]]
+    ? [[join(rootDir, 'scripts', 'verify-macos-native-deps.js'), join(packageRoot, 'bin'), '--arch', buildArchitecture() === 'x64' ? 'x86_64' : 'arm64', '--max-macos', '14.0']]
     : []),
   ['--test', join(rootDir, 'scripts', 'compression-portability.test.js')],
+  [join(rootDir, 'scripts', 'test-icu-fallback-release.js'), packagedExecutable],
 ];
 for (const args of portabilityChecks) {
   const check = spawnSync(process.execPath, args, {
