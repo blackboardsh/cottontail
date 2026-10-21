@@ -316,21 +316,32 @@ const HutchPrivateStorage = struct {
     }
 };
 
-fn validatePosixOwnedMode(handle: anytype, expected_mode: u16) !void {
-    if (comptime builtin.os.tag == .windows) return;
+fn posixFileIdentity(handle: anytype) !struct { uid: u32, mode: u16 } {
+    if (comptime builtin.os.tag == .macos) {
+        // Intel Darwin requires fstat$INODE64 for the modern stat layout.
+        // translate-c loses that header symbol redirect, so keep the target's
+        // native function and structure together. Linux retains its C ABI.
+        var native_stat: std.c.Stat = undefined;
+        if (std.c.fstat(handle, &native_stat) != 0) return error.HutchPrivateStatFailed;
+        return .{ .uid = native_stat.uid, .mode = native_stat.mode & 0o777 };
+    }
     var native_stat: posix_identity.struct_stat = undefined;
     if (posix_identity.fstat(handle, &native_stat) != 0) return error.HutchPrivateStatFailed;
-    if (native_stat.st_uid != posix_identity.geteuid()) return error.HutchPrivateWrongOwner;
-    if ((native_stat.st_mode & 0o777) != expected_mode) return error.HutchPrivateUnsafePermissions;
+    return .{ .uid = native_stat.st_uid, .mode = @intCast(native_stat.st_mode & 0o777) };
+}
+
+fn validatePosixOwnedMode(handle: anytype, expected_mode: u16) !void {
+    if (comptime builtin.os.tag == .windows) return;
+    const identity = try posixFileIdentity(handle);
+    if (identity.uid != posix_identity.geteuid()) return error.HutchPrivateWrongOwner;
+    if (identity.mode != expected_mode) return error.HutchPrivateUnsafePermissions;
 }
 
 fn validatePosixOwnedExecutable(handle: anytype) !void {
     if (comptime builtin.os.tag == .windows) return;
-    var native_stat: posix_identity.struct_stat = undefined;
-    if (posix_identity.fstat(handle, &native_stat) != 0) return error.HutchPrivateStatFailed;
-    if (native_stat.st_uid != posix_identity.geteuid()) return error.HutchPrivateWrongOwner;
-    const mode: u16 = @intCast(native_stat.st_mode & 0o777);
-    if (mode & 0o100 == 0 or mode & 0o022 != 0)
+    const identity = try posixFileIdentity(handle);
+    if (identity.uid != posix_identity.geteuid()) return error.HutchPrivateWrongOwner;
+    if (identity.mode & 0o100 == 0 or identity.mode & 0o022 != 0)
         return error.HutchPrivateUnsafePermissions;
 }
 
