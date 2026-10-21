@@ -1,0 +1,54 @@
+name: Published Windows FFI cold and warm timing
+
+on:
+  push:
+    branches: [diagnostics/windows-ffi-cold-warm]
+    paths:
+      - .github/workflows/diagnostic-windows-ffi-timing.yml
+      - scripts/diagnose-windows-ffi-timing.mjs
+
+permissions:
+  contents: read
+
+jobs:
+  ffi-timing:
+    name: Published .0 FFI timing (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            runner: windows-2025
+            arch: x64
+          - platform: windows-arm64
+            runner: windows-11-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+          architecture: ${{ matrix.arch }}
+          package-manager-cache: false
+      - name: Vendor the pinned fixture compiler
+        run: |
+          node -e "if (process.arch !== '${{ matrix.arch }}') throw new Error('Unexpected Node architecture')"
+          node scripts/diagnose-windows-fixture-setup.mjs
+      - name: Measure the unchanged FFI calling convention workload
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force diagnostic-logs | Out-Null
+          node scripts/diagnose-windows-ffi-timing.mjs 2>&1 | Tee-Object -FilePath diagnostic-logs/ffi-timing.log
+          exit $LASTEXITCODE
+      - name: Preserve compiler, fixture, artifact, and timing evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: published-ffi-timing-${{ matrix.platform }}
+          path: diagnostic-logs/
+          if-no-files-found: error
+          retention-days: 14
