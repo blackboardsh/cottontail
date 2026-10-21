@@ -1083,15 +1083,27 @@ class SocketImpl extends Duplex {
         const hasUnreadData = this.readableLength > 0;
         if (!hasUnreadData) this.read(0);
         if (!this.allowHalfOpen && this.writable && !this.destroyed) {
-          // Native peer EOF closes a Node socket even when its readable side
-          // remains paused with buffered bytes. readable-stream otherwise
-          // waits indefinitely for `end` to be consumed before auto-destroy.
           if (hasUnreadData) {
-            this.once("finish", () => {
-              if (!this.destroyed && !this.readableEnded) this.destroy();
+            // A native batch can contain data and EOF before Readable's
+            // scheduled resume delivers the buffered data. Let its listeners
+            // write their response before closing the writable side, while
+            // retaining cleanup for sockets that leave the data unconsumed.
+            const eofLifeGeneration = this._lifeGeneration ?? 0;
+            process.nextTick(() => {
+              if ((this._lifeGeneration ?? 0) !== eofLifeGeneration ||
+                  this.allowHalfOpen || this.destroyed ||
+                  this.readableLength === 0 || this.readableFlowing === true) return;
+              if (this.writableFinished) {
+                if (!this.readableEnded) this.destroy();
+                return;
+              }
+              this.once("finish", () => {
+                if ((this._lifeGeneration ?? 0) === eofLifeGeneration &&
+                    !this.destroyed && !this.readableEnded) this.destroy();
+              });
+              if (this.writable) this.end();
             });
-          }
-          this.end();
+          } else this.end();
         }
       }
       return;

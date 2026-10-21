@@ -1172,7 +1172,7 @@ try {
       name: 'node-net-duplex',
       argv: ['test', join(rootDir, 'tests', 'js', 'node-net-duplex.test.ts')],
       expectExitCode: 0,
-      stderrIncludes: ['7 pass', '0 fail'],
+      stderrIncludes: ['15 pass', '0 fail'],
     },
     {
       name: 'node-readline',

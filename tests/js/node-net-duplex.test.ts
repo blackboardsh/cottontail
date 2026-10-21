@@ -194,6 +194,134 @@ test("Socket transfers ownership of an existing Socket handle", async () => {
   assert.strictEqual(originalClosed, true);
 });
 
+// Drive the native read/EOF seam synchronously so this does not depend on
+// whether the OS delivers a payload and its FIN in the same polling batch.
+function socketWithRecordedWrites(options: net.SocketConstructorOpts = {}) {
+  const socket = new Socket(options);
+  const writes: string[] = [];
+  (socket as any)._write = (chunk: Buffer, _encoding: string, callback: () => void) => {
+    writes.push(String(chunk));
+    callback();
+  };
+  (socket as any)._final = (callback: () => void) => callback();
+  return { socket, writes };
+}
+
+for (const attachAfterEof of [false, true]) {
+  test(`coalesced data and EOF preserve replies with ${attachAfterEof ? "immediate resume" : "a flowing listener"}`, async () => {
+    const { socket, writes } = socketWithRecordedWrites();
+    const closed = once(socket, "close");
+    const received: string[] = [];
+    const reply = (chunk: Buffer) => {
+      received.push(String(chunk));
+      socket.end(`reply:${chunk}`);
+    };
+    try {
+      if (!attachAfterEof) socket.once("data", reply);
+      (socket as any)._emitData(Buffer.from("ping"));
+      (socket as any)._emitEnd();
+      assert.strictEqual(socket.writableEnded, false);
+      if (attachAfterEof) {
+        socket.once("data", reply);
+        socket.resume();
+      }
+      await closed;
+      assert.deepStrictEqual(received, ["ping"]);
+      assert.deepStrictEqual(writes, ["reply:ping"]);
+      assert.strictEqual(socket.destroyed, true);
+    } finally {
+      socket.destroy();
+    }
+  });
+}
+
+test("coalesced EOF still closes a paused socket with unconsumed data", async () => {
+  const { socket, writes } = socketWithRecordedWrites();
+  const closed = once(socket, "close");
+  socket.pause();
+  (socket as any)._emitData(Buffer.from("unconsumed"));
+  (socket as any)._emitEnd();
+  await closed;
+  assert.strictEqual(socket.destroyed, true);
+  assert.deepStrictEqual(writes, []);
+});
+
+test("empty EOF closes a socket without an explicit resume", async () => {
+  const { socket } = socketWithRecordedWrites();
+  const closed = once(socket, "close");
+  (socket as any)._emitEnd();
+  await closed;
+  assert.strictEqual(socket.destroyed, true);
+});
+
+for (const buffered of [false, true]) {
+  test(`allowHalfOpen preserves delayed replies after ${buffered ? "buffered" : "empty"} EOF`, async () => {
+    const { socket, writes } = socketWithRecordedWrites({ allowHalfOpen: true });
+    const closed = once(socket, "close");
+    try {
+      if (buffered) (socket as any)._emitData(Buffer.from("held"));
+      (socket as any)._emitEnd();
+      await new Promise<void>(resolve => process.nextTick(resolve));
+      assert.strictEqual(socket.writableEnded, false);
+      assert.strictEqual(socket.destroyed, false);
+      const received: string[] = [];
+      socket.on("data", chunk => received.push(String(chunk)));
+      socket.resume();
+      socket.end("late-reply");
+      await closed;
+      assert.deepStrictEqual(received, buffered ? ["held"] : []);
+      assert.deepStrictEqual(writes, ["late-reply"]);
+      assert.strictEqual(socket.destroyed, true);
+    } finally {
+      socket.destroy();
+    }
+  });
+}
+
+test("deferred EOF cleanup cannot end a reused socket", async () => {
+  const { socket } = socketWithRecordedWrites();
+  try {
+    socket.pause();
+    (socket as any)._emitData(Buffer.from("old"));
+    (socket as any)._emitEnd();
+    socket.destroy();
+    (socket as any)._resetCompletedConnection();
+    (socket as any)._emitData(Buffer.from("new"));
+    await new Promise<void>(resolve => process.nextTick(resolve));
+    assert.strictEqual(socket.destroyed, false);
+    assert.strictEqual(socket.writableEnded, false);
+    assert.strictEqual((socket as any)._readEndSignaled, false);
+  } finally {
+    socket.destroy();
+  }
+});
+
+test("a prior connection's EOF finish listener cannot destroy a reused socket", async () => {
+  const { socket } = socketWithRecordedWrites();
+  try {
+    socket.pause();
+    (socket as any)._final = (_callback: () => void) => {};
+    (socket as any)._emitData(Buffer.from("old"));
+    (socket as any)._emitEnd();
+    await new Promise<void>(resolve => process.nextTick(resolve));
+    assert.strictEqual(socket.writableEnded, true);
+    assert.strictEqual(socket.writableFinished, false);
+    assert.strictEqual(socket.listenerCount("finish"), 1);
+    socket.destroy();
+    (socket as any)._resetCompletedConnection();
+    (socket as any)._final = (callback: () => void) => callback();
+    (socket as any)._emitData(Buffer.from("new"));
+    const finished = once(socket, "finish");
+    socket.end();
+    await finished;
+    assert.strictEqual(socket.writableFinished, true);
+    assert.strictEqual(socket.destroyed, false);
+    assert.strictEqual((socket as any)._readEndSignaled, false);
+  } finally {
+    socket.destroy();
+  }
+});
+
 test("Socket write validation and prototype bytesWritten match Node", () => {
   assert.strictEqual((Socket.prototype as any).bytesWritten, undefined);
   const socket = new Socket();
