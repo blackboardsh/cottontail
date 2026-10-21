@@ -3,6 +3,9 @@ name: Published Windows runtime baseline first-party discovery
 on:
   push:
     branches: [diagnostics/macos-intel-windows-firstparty]
+    paths:
+      - scripts/diagnose-firstparty-baseline.mjs
+      - scripts/diagnose-windows-fixture-setup.mjs
 
 permissions:
   contents: read
