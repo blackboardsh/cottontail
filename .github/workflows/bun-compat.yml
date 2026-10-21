@@ -1,104 +1,26 @@
-name: Bun compatibility
-
+name: Linux ARM exact canary Express memory comparison
 on:
-  push:
-    branches:
-      - "compat/**"
   workflow_dispatch:
-    inputs:
-      jsc_manifest:
-        description: Immutable JSC build manifest to await and validate before this CI build
-        type: string
-        required: false
-
 permissions:
   contents: read
-
-concurrency:
-  group: cottontail-bun-compat-${{ github.ref }}
-  cancel-in-progress: true
-
+  actions: read
 jobs:
-  bun-compat:
-    name: Complete Cottontail-owned Bun tier (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 360
-    env:
-      COTTONTAIL_BUILD_JOBS: '2'
-      MACOSX_DEPLOYMENT_TARGET: '14.0'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: macos-arm64
-            runner: macos-26
-            os: macos
-            arch: arm64
-          - platform: macos-x64
-            runner: macos-26-intel
-            os: macos
-            arch: x64
-          - platform: linux-x64
-            runner: ubuntu-24.04
-            os: linux
-          - platform: linux-arm64
-            runner: ubuntu-24.04-arm
-            os: linux
-          - platform: windows-x64
-            runner: windows-2025
-            os: windows
-            arch: x64
-            zig-target: x86_64-windows-msvc
-          - platform: windows-arm64
-            runner: windows-11-arm
-            os: windows
-            arch: arm64
-            zig-target: aarch64-windows-msvc
-
+  compare:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
     steps:
-      - name: Check out Cottontail
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: 24.18.0
-          package-manager-cache: false
-
-      - name: Validate compatibility runner contracts
-        run: >-
-          node --test
-          scripts/bun-compat-workflow.test.js
-          scripts/bun-status-platform.test.js
-          scripts/pin-runtime-bundle.test.js
-          scripts/import-upstream-tests.test.js
-          scripts/review-bun-test-changes.test.js
-          tests/upstream-status-accounting.test.mjs
-
-      - name: Validate upstream runner contracts
-        if: matrix.os != 'windows'
-        run: node --test tests/upstream-runner.test.mjs
-
-      - name: Validate platform-resolved Bun status accounting
-        run: node scripts/check-bun-status.js
-
-      - name: Set up Bun for repository dependencies
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+          node-version: '24.18.0'
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          # 1.3.10 has no Windows ARM64 host binary. This Bun only installs
-          # dependencies; Cottontail still runs the pinned 1.3.10 test snapshot.
-          bun-version: ${{ matrix.platform == 'windows-arm64' && '1.4.0' || '1.3.10' }}
-
-      - name: Install Cottontail development dependencies
-        # First-party tests import the repo's own devDependencies (e.g.
-        # lodash); fresh checkouts have no root node_modules.
+          bun-version: '1.3.10'
+      - name: Install repository dependencies
         run: bun install --ignore-scripts
-
-      - name: Restore Bun compatibility dependencies
-        id: bun-compat-dependencies
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        # A cache is optional: a stalled download must fall back to the
-        # frozen install below rather than consume the entire job timeout.
+      - name: Restore frozen dependencies
+        id: deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         timeout-minutes: 5
         continue-on-error: true
         env:
@@ -108,204 +30,36 @@ jobs:
             compat/upstream/bun/v1.3.10/test/node_modules
             node_modules/.cache/cottontail-upstream-fixtures
           key: cottontail-bun-compat-dependencies-${{ runner.os }}-${{ runner.arch }}-v1-${{ hashFiles('compat/upstream/bun/v1.3.10/test/bun.lock', 'compat/upstream/bun/v1.3.10/test/package.json', 'compat/upstream/fixtures/duckdb-1.3.1.json') }}
-
-      - name: Remove incomplete compatibility cache restoration
-        if: steps.bun-compat-dependencies.outcome != 'success'
-        run: >-
-          node --input-type=module -e
-          "import { rmSync } from 'node:fs';
-          for (const path of ['compat/upstream/bun/v1.3.10/test/node_modules', 'node_modules/.cache/cottontail-upstream-fixtures'])
-          rmSync(path, { recursive: true, force: true });"
-
-      - name: Set up Bun for frozen dependency restoration
-        if: steps.bun-compat-dependencies.outcome != 'success' || steps.bun-compat-dependencies.outputs.cache-hit != 'true'
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: ${{ matrix.platform == 'windows-arm64' && '1.4.0' || '1.3.10' }}
-
-      - name: Provision linked react package
-        if: steps.bun-compat-dependencies.outcome != 'success' || steps.bun-compat-dependencies.outputs.cache-hit != 'true'
-        # test/package.json links react from file:../node_modules/react,
-        # mirroring Bun's repo where a root install provides it. On a fresh
-        # checkout that target does not exist, so provision it first.
-        run: bun add react@18.3.1 --cwd=compat/upstream/bun/v1.3.10 --ignore-scripts
-
-      - name: Restore frozen Bun test dependencies
-        if: steps.bun-compat-dependencies.outcome != 'success' || steps.bun-compat-dependencies.outputs.cache-hit != 'true'
-        run: bun install --cwd=compat/upstream/bun/v1.3.10/test --frozen-lockfile --ignore-scripts
-
-      - name: Save frozen Bun test dependencies
-        if: steps.bun-compat-dependencies.outcome != 'success' || steps.bun-compat-dependencies.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            compat/upstream/bun/v1.3.10/test/node_modules
-            node_modules/.cache/cottontail-upstream-fixtures
-          key: cottontail-bun-compat-dependencies-${{ runner.os }}-${{ runner.arch }}-v1-${{ hashFiles('compat/upstream/bun/v1.3.10/test/bun.lock', 'compat/upstream/bun/v1.3.10/test/package.json', 'compat/upstream/fixtures/duckdb-1.3.1.json') }}
-
-      - name: Select Xcode 26.4
-        if: matrix.os == 'macos'
+      - name: Remove incomplete cache
+        if: steps.deps.outcome != 'success'
+        run: node -e 'for (const p of ["compat/upstream/bun/v1.3.10/test/node_modules", "node_modules/.cache/cottontail-upstream-fixtures"]) require("node:fs").rmSync(p, {recursive:true,force:true})'
+      - name: Install frozen dependencies on cache miss
+        if: steps.deps.outcome != 'success' || steps.deps.outputs.cache-hit != 'true'
         run: |
-          developer_dir=/Applications/Xcode_26.4.app/Contents/Developer
-          test -d "$developer_dir"
-          sudo xcode-select --switch "$developer_dir"
-          xcodebuild -version
-          xcrun --sdk macosx --show-sdk-path
-
-      - name: Install macOS build dependencies
-        if: matrix.os == 'macos'
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: "1"
-        run: |
-          brew install libffi brotli
-          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
-
-      - name: Install Linux build dependencies
-        if: matrix.os == 'linux'
+          bun add react@18.3.1 --cwd=compat/upstream/bun/v1.3.10 --ignore-scripts
+          bun install --cwd=compat/upstream/bun/v1.3.10/test --frozen-lockfile --ignore-scripts
+      - name: Install Linux native libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            clang \
-            g++ \
-            libbrotli-dev \
-            libffi-dev \
-            libssl-dev \
-            libzstd-dev \
-            zlib1g-dev
-
-      - name: Verify Windows build environment
-        if: matrix.os == 'windows'
-        shell: pwsh
-        run: |
-          $nodeIdentity = node -p "process.versions.node + ' ' + process.platform + ' ' + process.arch"
-          if ($LASTEXITCODE -ne 0 -or $nodeIdentity.Trim() -ne "24.18.0 win32 ${{ matrix.arch }}") {
-            throw "Expected Node 24.18.0 win32 ${{ matrix.arch }}, got '$nodeIdentity'"
-          }
-
-      # Native dependencies are independent of JSC and can compile while a
-      # new SDK matrix is still running. Keep their cache across SDK revisions.
-      - name: Restore vendored toolchains
-        id: vendored-toolchains
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            vendors/zig
-            vendors/zig-html-rewriter
-            vendors/windows-deps
-            vendors/macos-deps
-          key: cottontail-toolchains-${{ matrix.platform }}-v2-${{ hashFiles('scripts/zig-manifest.json', 'scripts/macos-deps-manifest.json', 'scripts/setup-macos-deps.js', 'scripts/setup.js', 'scripts/zig-html-rewriter-manifest.json', 'vcpkg.json', 'scripts/vcpkg-triplets/**') }}
-          restore-keys: |
-            cottontail-toolchains-${{ matrix.platform }}-v2-
-            cottontail-${{ matrix.platform }}-v1-
-
-      - name: Vendor Zig, HTML rewriter, and native dependencies
-        shell: bash
+          sudo apt-get install -y libbrotli-dev libffi-dev libssl-dev libzstd-dev zlib1g-dev
+      - name: Compile only owned command adapter with pinned Zig
         run: |
           node scripts/setup.js
-          node scripts/setup-zig-html-rewriter.js
-
-      - name: Save vendored toolchains
-        if: steps.vendored-toolchains.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+          mkdir -p /tmp/cottontail-express-evidence
+          vendors/zig/zig build-exe tests/upstream-command-adapter.zig -O ReleaseFast -mcpu=baseline -femit-bin=/tmp/cottontail-express-command
+      - name: Download exact unpublished canary.3 CI archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          path: |
-            vendors/zig
-            vendors/zig-html-rewriter
-            vendors/windows-deps
-            vendors/macos-deps
-          key: ${{ steps.vendored-toolchains.outputs.cache-primary-key }}
-
-      - name: Test ICU dispatch ABI
-        run: node scripts/test-icu-trampolines.mjs
-
-      # Tagged releases always consume the committed manifest. Only a manual
-      # validation run may await and validate a new immutable SDK manifest.
-      - name: Await requested JSC SDK
-        if: github.event_name == 'workflow_dispatch' && inputs.jsc_manifest != ''
-        shell: bash
-        timeout-minutes: 125
-        env:
-          JSC_MANIFEST_URL: ${{ inputs.jsc_manifest }}
-        run: |
-          for attempt in {1..120}; do
-            if node scripts/pin-jsc-release.js "$JSC_MANIFEST_URL"; then
-              exit 0
-            fi
-            sleep 60
-          done
-          echo "Requested JSC SDK did not become available within two hours" >&2
-          exit 1
-
-      - name: Restore JavaScriptCore SDK
-        id: vendored-jsc
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+          artifact-ids: '12353812197'
+          path: /tmp/cottontail-express-canary3
+          run-id: '39615900708'
+          github-token: ${{ github.token }}
+          merge-multiple: true
+      - name: Compare each exact runtime once on unchanged Express memory fixture
+        run: python3 scripts/diagnose-linux-arm-express-memory.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
         with:
-          path: vendors/jsc
-          key: cottontail-jsc-${{ matrix.platform }}-v2-${{ hashFiles('scripts/jsc-manifest.json', 'scripts/setup-jsc.js', 'scripts/verify-macos-native-deps.js') }}
-
-      - name: Vendor JavaScriptCore SDK
-        shell: bash
-        run: node scripts/setup-jsc.js
-
-      - name: Save JavaScriptCore SDK
-        if: steps.vendored-jsc.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: vendors/jsc
-          key: ${{ steps.vendored-jsc.outputs.cache-primary-key }}
-
-      - name: Run Zig tests
-        shell: bash
-        run: node scripts/zig.js build test
-
-      - name: Build Cottontail
-        shell: bash
-        run: |
-          if [[ "${{ matrix.os }}" == "windows" ]]; then
-          node scripts/zig.js build -Doptimize=ReleaseFast -Dtarget=${{ matrix.zig-target }} -Dcpu=baseline
-          else
-            node scripts/zig.js build -Doptimize=ReleaseFast -Dcpu=baseline
-          fi
-
-      - name: Test GitHub Actions test registration
-        run: node scripts/test-github-actions-runner.js
-
-      - name: Run first-party JavaScript tests
-        shell: bash
-        run: node scripts/test-js.js
-
-      - name: Validate upstream runner contracts on Windows
-        if: matrix.os == 'windows'
-        env:
-          COTTONTAIL_UPSTREAM_JOB_LAUNCHER: zig-out/bin/cottontail-bun-compat-job.exe
-        run: node --test tests/upstream-runner.test.mjs
-
-      - name: Verify Windows Job Object lifecycle
-        if: matrix.os == 'windows'
-        env:
-          COTTONTAIL_TEST_WINDOWS_JOB_LAUNCHER: zig-out/bin/cottontail-bun-compat-job.exe
-        run: node --test scripts/windows-job-child.test.js
-
-      - name: Run complete Cottontail-owned Bun compatibility tier
-        shell: bash
-        run: |
-          command_adapter="$(node -e 'const path = require("node:path"); console.log(path.resolve("zig-out", "bin", process.platform === "win32" ? "cottontail-upstream-command.exe" : "cottontail-upstream-command"))')"
-          package_manager="$(bun -e 'console.log(process.execPath)')"
-          job_launcher_args=()
-          if [[ "${{ matrix.os }}" == "windows" ]]; then
-            job_launcher_args=(--job-launcher zig-out/bin/cottontail-bun-compat-job.exe)
-          fi
-          node scripts/run-upstream-tests.js bun --command-adapter "$command_adapter" --package-manager "$package_manager" "${job_launcher_args[@]}"
-
-      - name: Run external-package-manager split bundler fixtures
-        shell: bash
-        run: |
-          command_adapter="$(node -e 'const path = require("node:path"); console.log(path.resolve("zig-out", "bin", process.platform === "win32" ? "cottontail-upstream-command.exe" : "cottontail-upstream-command"))')"
-          package_manager="$(bun -e 'console.log(process.execPath)')"
-          job_launcher_args=()
-          if [[ "${{ matrix.os }}" == "windows" ]]; then
-            job_launcher_args=(--job-launcher zig-out/bin/cottontail-bun-compat-job.exe)
-          fi
-          node scripts/run-upstream-tests.js bun --command-adapter "$command_adapter" --package-manager "$package_manager" "${job_launcher_args[@]}" --test test/bundler/bundler_defer.test.ts --case '^\$file$' --expect-pass --jobs 1
-          node scripts/run-upstream-tests.js bun --command-adapter "$command_adapter" --package-manager "$package_manager" "${job_launcher_args[@]}" --test test/bundler/bundler_npm.test.ts --case '^npm/ReactSSR$' --expect-pass --jobs 1
-          node scripts/run-upstream-tests.js bun --command-adapter "$command_adapter" --package-manager "$package_manager" "${job_launcher_args[@]}" --test test/bundler/bundler_npm.test.ts --case '^npm/LodashES$' --expect-pass --jobs 1
+          name: linux-arm-express-canary-comparison-evidence
+          path: /tmp/cottontail-express-evidence/
+          if-no-files-found: error
