@@ -18,6 +18,7 @@ try {
   await build();
   await collect();
   const before = process.memoryUsage().rss;
+  const beforeMaxRss = process.resourceUsage().maxRSS;
   for (let file = 0; file < 8; file++) {
     writeFileSync(join(root, `module${file}.ts`), Array.from({length: 4000}, (_, index) =>
       `export function value${file}_${index}(input: number) { const values = [input, ${index}]; return values[0] + values[1]; }`
@@ -27,7 +28,9 @@ try {
   const outputBytes = await build();
   if (outputBytes < 1_000_000) throw new Error('Large graph was not emitted');
   await collect();
-  console.log(JSON.stringify({ growth: process.memoryUsage().rss - before, outputBytes }));
+  const after = process.memoryUsage().rss;
+  const afterMaxRss = process.resourceUsage().maxRSS;
+  console.log(JSON.stringify({ growth: after - before, outputBytes, beforeRss: before, afterRss: after, beforeMaxRss, afterMaxRss }));
 } finally {
   rmSync(root, { recursive: true, force: true });
 }

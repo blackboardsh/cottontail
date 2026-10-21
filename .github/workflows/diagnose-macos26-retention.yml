@@ -1,0 +1,31 @@
+name: Diagnose macOS 26 bundler retention
+
+on:
+  push:
+    branches:
+      - diagnostics/macos26-bundler-retention
+
+permissions:
+  contents: read
+
+jobs:
+  published-runtime-comparison:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - name: Check out diagnostic fixtures
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6.3.0
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+      - name: Compare checksum-verified published runtimes
+        run: node scripts/diagnose-macos26-retention.js
+      - name: Preserve diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos26-bundler-retention-evidence
+          path: retention-diagnostics/
+          retention-days: 7
