@@ -14,14 +14,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test "$(uname -m)" = x86_64
           curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-macos-0.16.0.tar.xz -o /tmp/zig.tar.xz
           tar -xJf /tmp/zig.tar.xz -C /tmp
           mkdir private-stat-fixture
           chmod 700 private-stat-fixture
+          touch private-stat-executable
+          chmod 600 private-stat-executable
           /tmp/zig-x86_64-macos-0.16.0/zig build-exe scripts/diagnose-private-stat.zig -lc -O ReleaseFast -femit-bin=/tmp/private-stat-probe
           /usr/bin/stat -f 'filesystem uid=%u mode=%Lp inode=%i' private-stat-fixture
           /tmp/private-stat-probe
-          nm -u /tmp/private-stat-probe | rg 'fstat|geteuid'
+          nm -u /tmp/private-stat-probe | grep -E 'fstat|geteuid'
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cottontail-release-macos-x64
