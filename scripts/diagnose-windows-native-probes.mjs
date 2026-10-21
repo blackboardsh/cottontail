@@ -61,13 +61,23 @@ writeFileSync(join(logs, 'published-manifest.json'), JSON.stringify(manifest, nu
 const environment = { ...process.env, CI: 'true', GITHUB_ACTIONS: '', AGENT: '0', COTTONTAIL_DIAGNOSTIC_RESULTS: join(logs, 'results.json') };
 for (const name of ['COTTONTAIL_RUNTIME_MODULES_DIR', 'COTTONTAIL_TEST_CLI_HEADER_PRINTED', 'COTTONTAIL_TEST_FILE_COUNT', 'COTTONTAIL_TEST_AGGREGATE_FILE', 'COTTONTAIL_TEST_REPORTER_AGGREGATE_FILE', 'COTTONTAIL_TEST_GITHUB_CAPTURE']) delete environment[name];
 const debuggerRoots = [process.env['ProgramFiles(x86)'], process.env.ProgramFiles].filter(Boolean);
-const debuggerCandidates = debuggerRoots.flatMap(base => ['arm64', 'x64', 'x86'].map(arch => join(base, 'Windows Kits', '10', 'Debuggers', arch, 'cdb.exe')));
+const debuggerArchitectures = process.arch === 'arm64' ? ['arm64', 'x64', 'x86'] : ['x64', 'x86'];
+const debuggerCandidates = debuggerRoots.flatMap(base => debuggerArchitectures.map(arch => join(base, 'Windows Kits', '10', 'Debuggers', arch, 'cdb.exe')));
 const debuggerPath = debuggerCandidates.find(existsSync);
 writeFileSync(join(logs, 'debugger-discovery.json'), JSON.stringify({ debuggerCandidates, debuggerPath: debuggerPath ?? null }, null, 2));
 const minimalDirectory = join(scratch, 'minimal');
 mkdirSync(minimalDirectory);
 const minimalResults = [];
 let debugged = false;
+function captureNativeCrash(args, env, name) {
+  if (!debuggerPath) return;
+  const dump = join(logs, `${name}-access-violation.dmp`);
+  const command = `sxe -c ".exr -1; .ecxr; r; k; u @rip-20 @rip+20; lm; .dump /m ${dump}; q" av; g`;
+  const debugArgs = ['-o', '-G', '-c', command, binary, ...args];
+  const debug = spawnSync(debuggerPath, debugArgs, { cwd: minimalDirectory, env, encoding: 'utf8', timeout: 120_000, windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
+  writeFileSync(join(logs, `${name}-debugger.json`), JSON.stringify({ argv: [debuggerPath, ...debugArgs], status: debug.status, signal: debug.signal, error: debug.error?.message, stdout: debug.stdout, stderr: debug.stderr }, null, 2));
+  console.log('DEBUGGER EVIDENCE ' + JSON.stringify({ name, status: debug.status, stdout: debug.stdout, stderr: debug.stderr }));
+}
 for (const [name, expression] of Object.entries({
   'coverage-callback-without-profiler': 'try { cottontail.collectTestCoverage() } catch (e) { console.log(e.message) }',
   'buffer-ascii-callback': 'console.log(require("node:buffer").isAscii(Buffer.from("abc")))',
@@ -78,6 +88,7 @@ for (const [name, expression] of Object.entries({
   minimalResults.push(evidence);
   console.log('MINIMAL EVIDENCE ' + JSON.stringify(evidence));
   writeFileSync(join(logs, 'minimal-results.json'), JSON.stringify(minimalResults, null, 2));
+  if (evidence.unsignedStatus === 0xc0000005) captureNativeCrash(args, environment, name);
 }
 for (const [name, source] of Object.entries({
   'private-class.test.ts': 'class Example { #value = 1; }\n',
@@ -97,12 +108,7 @@ for (const [name, source] of Object.entries({
       writeFileSync(join(logs, 'minimal-results.json'), JSON.stringify(minimalResults, null, 2));
       if (!debugged && debuggerPath && (result.status >>> 0) === 0xc0000005) {
         debugged = true;
-        const dump = join(logs, 'baseline-access-violation.dmp');
-        const command = `sxe -c ".exr -1; .ecxr; r; k; .dump /ma ${dump}; q" av; g`;
-        const debugArgs = ['-o', '-G', '-c', command, binary, ...args];
-        const debug = spawnSync(debuggerPath, debugArgs, { cwd: minimalDirectory, env, encoding: 'utf8', timeout: 120_000, windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
-        writeFileSync(join(logs, 'debugger-access-violation.json'), JSON.stringify({ argv: [debuggerPath, ...debugArgs], status: debug.status, signal: debug.signal, error: debug.error?.message, stdout: debug.stdout, stderr: debug.stderr }, null, 2));
-        console.log('DEBUGGER EVIDENCE ' + JSON.stringify({ status: debug.status, stdout: debug.stdout, stderr: debug.stderr }));
+        captureNativeCrash(args, env, 'baseline-test-coverage');
       }
     }
   }
