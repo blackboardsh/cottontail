@@ -1,0 +1,51 @@
+name: Windows socket ownership baseline and source overlay
+
+on:
+  push:
+    branches: [diagnostics/macos-intel-windows-firstparty]
+    paths:
+      - .github/workflows/diagnostic-windows-socket-ownership.yml
+      - scripts/diagnose-windows-socket-ownership.mjs
+      - diagnostics/socket-overlay/**
+
+permissions:
+  contents: read
+
+jobs:
+  socket:
+    name: Native socket ownership (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            runner: windows-2025
+            arch: x64
+          - platform: windows-arm64
+            runner: windows-11-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+          architecture: ${{ matrix.arch }}
+          package-manager-cache: false
+      - name: Repeat unchanged socket assertions against published runtime
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force diagnostic-logs | Out-Null
+          node scripts/diagnose-windows-socket-ownership.mjs 2>&1 | Tee-Object -FilePath diagnostic-logs/socket.log
+          exit $LASTEXITCODE
+      - name: Preserve native socket evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-socket-ownership-${{ matrix.platform }}
+          path: diagnostic-logs/
+          if-no-files-found: error
+          retention-days: 14
