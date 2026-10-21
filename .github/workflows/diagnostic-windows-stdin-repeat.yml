@@ -1,0 +1,55 @@
+name: Published Windows mandatory stdin repetition
+
+on:
+  push:
+    branches: [diagnostics/windows-remaining-release-gates]
+    paths:
+      - .github/workflows/diagnostic-windows-stdin-repeat.yml
+      - scripts/diagnose-windows-stdin-repeat.mjs
+      - scripts/diagnose-windows-stdin-owned-child.mjs
+
+permissions:
+  contents: read
+
+jobs:
+  repeat:
+    name: Published .0 stdin repeat (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            runner: windows-2025
+            arch: x64
+          - platform: windows-arm64
+            runner: windows-11-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+          architecture: ${{ matrix.arch }}
+          package-manager-cache: false
+      - name: Prepare standalone native process ownership helper
+        run: |
+          node -e "if (process.versions.node !== '24.18.0' || process.arch !== '${{ matrix.arch }}') throw new Error('Unexpected Node identity')"
+          node scripts/diagnose-windows-fixture-setup.mjs
+      - name: Repeat only the unchanged mandatory stdin fixture twenty times
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force diagnostic-logs | Out-Null
+          node scripts/diagnose-windows-stdin-repeat.mjs 2>&1 | Tee-Object -FilePath diagnostic-logs/stdin-repeat.log
+          exit $LASTEXITCODE
+      - name: Preserve all twenty outputs and pinned runtime provenance
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: published-stdin-repeat-${{ matrix.platform }}
+          path: diagnostic-logs/
+          if-no-files-found: error
+          retention-days: 14
