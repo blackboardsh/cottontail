@@ -2,7 +2,7 @@ name: Published runtime baseline first-party discovery
 
 on:
   push:
-    branches: [diagnostics/macos-intel-firstparty]
+    branches: [diagnostics/macos-intel-firstparty-full]
 
 permissions:
   contents: read

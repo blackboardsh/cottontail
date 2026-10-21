@@ -50,6 +50,7 @@ const provenance = {
   actualVersion, fixtureHarnessSha256: createHash('sha256').update(original).digest('hex'),
   diagnosticRevision: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
   environment: { CI: 'true', GITHUB_ACTIONS: '', AGENT: '0' },
+  onlyCase: process.env.COTTONTAIL_DIAGNOSTIC_ONLY_CASE ?? null,
   rationale: 'The .0 GitHub aggregate runner can skip test bodies. Clearing only its reporter flag executes real baseline bodies; all assertions remain unchanged.',
 };
 console.log(JSON.stringify(provenance, null, 2));
@@ -92,6 +93,12 @@ console.log('\\nDIAGNOSTIC COMPLETE: ' + diagnosticResults.length + ' cases, ' +
 for (const failure of failedCases) console.log('DIAGNOSTIC FAILURE: ' + failure.name);
 process.exitCode = failedCases.length === 0 ? 0 : 1;
 `;
+if (process.env.COTTONTAIL_DIAGNOSTIC_ONLY_CASE) {
+  const name = process.env.COTTONTAIL_DIAGNOSTIC_ONLY_CASE;
+  assert.ok(original.includes(`name: '${name}'`), `Unknown diagnostic case: ${name}`);
+  replaceOnce('tests.slice(startAtIndex)', `tests.slice(startAtIndex).filter(testCase => testCase.name === ${JSON.stringify(name)})`);
+  replaceOnce("  runDiagnosticCase('hot/watch runtime integration', () => {", "  if (false) runDiagnosticCase('hot/watch runtime integration', () => {");
+}
 const harnessPath = join(scratch, 'test-js-continue-on-failure.mjs');
 writeFileSync(harnessPath, diagnostic);
 writeFileSync(join(logs, 'test-js-continue-on-failure.mjs'), diagnostic);
