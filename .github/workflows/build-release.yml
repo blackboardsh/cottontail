@@ -340,7 +340,7 @@ jobs:
         run: ./zig-out/bin/cottontail test tests/js/bun-ffi-prepared-calls.test.ts
 
       - name: Test socket handle adoption
-        run: ./zig-out/bin/cottontail test tests/js/node-net-duplex.test.ts -t "Socket transfers ownership"
+        run: ./zig-out/bin/cottontail test tests/js/node-net-duplex.test.ts
 
       - name: Test Windows OS information
         if: matrix.os == 'windows'
@@ -398,6 +398,10 @@ jobs:
           & .\zig-out\bin\cottontail.exe test tests/js/node-fs-windows-permissions.test.ts
           if ($LASTEXITCODE -ne 0) { throw "Windows filesystem permission tests failed" }
 
+      - name: Test Hutch private file runner on POSIX
+        if: matrix.os != 'windows'
+        run: node scripts/test-hutch-private-file-release.js ./zig-out/bin/cottontail
+
       - name: Test Hutch private file runner on Windows
         if: matrix.os == 'windows'
         shell: pwsh
@@ -454,6 +458,20 @@ jobs:
               cp /icu-fallback-smoke.js /work/icu-fallback-smoke.js
               test "$(/app/bin/cottontail /work/icu-fallback-smoke.js)" = "icu fallback passed"
             '
+
+      - name: Retain failed Windows runtime for diagnosis
+        if: failure() && matrix.os == 'windows' && hashFiles('zig-out/bin/cottontail.exe') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cottontail-failed-runtime-${{ matrix.platform }}
+          path: |
+            zig-out/bin/
+            vendors/jsc/**/lib/cottontail-icu/
+            package.json
+            src/version.zig
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
 
       - name: Retain release artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

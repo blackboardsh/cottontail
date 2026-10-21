@@ -274,7 +274,13 @@ test('the Windows console test builds the same target as the Windows release', (
   );
 });
 
-test('Windows releases exercise the Hutch private file runner', () => {
+test('all releases exercise the Hutch private file runner', () => {
+  const posixPrivateFileTest = step('Test Hutch private file runner on POSIX');
+  assert.match(posixPrivateFileTest, /if: matrix\.os != 'windows'/);
+  assert.match(
+    posixPrivateFileTest,
+    /node scripts\/test-hutch-private-file-release\.js \.\/zig-out\/bin\/cottontail/,
+  );
   const privateFileTest = step('Test Hutch private file runner on Windows');
   assert.match(privateFileTest, /if: matrix\.os == 'windows'/);
   assert.match(
