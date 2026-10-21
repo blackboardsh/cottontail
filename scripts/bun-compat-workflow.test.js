@@ -240,7 +240,20 @@ test('failed compatibility jobs retain only durable reports and per-test output'
   assert.match(upload.source, /name: cottontail-bun-compat-diagnostics-\$\{\{ matrix\.platform \}\}-\$\{\{ github\.run_attempt \}\}/);
   assert.match(upload.source, /retention-days: 7/);
   assert.match(upload.source, /if-no-files-found: warn/);
-  assert.match(workflow, /COTTONTAIL_BASELINE_REPORTS_DIR: \$\{\{ runner\.temp \}\}\/cottontail-bun-compat-reports/);
+  for (const name of [
+    'Run complete Cottontail-owned Bun compatibility tier',
+    'Run external-package-manager split bundler fixtures',
+  ]) {
+    assert.match(
+      workflowStep(name).source,
+      /^          COTTONTAIL_BASELINE_REPORTS_DIR: \$\{\{ runner\.temp \}\}\/cottontail-bun-compat-reports$/m,
+    );
+  }
+  assert.doesNotMatch(
+    workflow.slice(0, workflow.indexOf('\n    steps:')),
+    /\$\{\{\s*runner\./,
+    'runner context is unavailable in job-level environment expressions',
+  );
 
   const paths = upload.source.match(/^          path: \|\n((?:            .+\n)+)/m);
   assert.ok(paths, 'upload must enumerate report files rather than runtime state');

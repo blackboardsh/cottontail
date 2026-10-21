@@ -26,8 +26,6 @@ jobs:
     env:
       COTTONTAIL_BUILD_JOBS: '2'
       MACOSX_DEPLOYMENT_TARGET: '14.0'
-      # Keep durable suite reports separate from pinned binaries and runtime state.
-      COTTONTAIL_BASELINE_REPORTS_DIR: ${{ runner.temp }}/cottontail-bun-compat-reports
     strategy:
       fail-fast: false
       matrix:
@@ -290,6 +288,9 @@ jobs:
 
       - name: Run complete Cottontail-owned Bun compatibility tier
         shell: bash
+        env:
+          # Keep durable reports separate from pinned binaries and runtime state.
+          COTTONTAIL_BASELINE_REPORTS_DIR: ${{ runner.temp }}/cottontail-bun-compat-reports
         run: |
           command_adapter="$(node -e 'const path = require("node:path"); console.log(path.resolve("zig-out", "bin", process.platform === "win32" ? "cottontail-upstream-command.exe" : "cottontail-upstream-command"))')"
           package_manager="$(bun -e 'console.log(process.execPath)')"
@@ -301,6 +302,8 @@ jobs:
 
       - name: Run external-package-manager split bundler fixtures
         shell: bash
+        env:
+          COTTONTAIL_BASELINE_REPORTS_DIR: ${{ runner.temp }}/cottontail-bun-compat-reports
         run: |
           command_adapter="$(node -e 'const path = require("node:path"); console.log(path.resolve("zig-out", "bin", process.platform === "win32" ? "cottontail-upstream-command.exe" : "cottontail-upstream-command"))')"
           package_manager="$(bun -e 'console.log(process.execPath)')"
