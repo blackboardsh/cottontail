@@ -251,6 +251,14 @@ jobs:
       - name: Test default TLS certificate trust
         run: node --test scripts/tls-ca-portability.test.js
 
+      - name: Test Intel cryptography without CPU acceleration
+        if: matrix.platform == 'macos-x64'
+        env:
+          OPENSSL_ia32cap: '0:0'
+        run: |
+          node --test scripts/hashing-portability.test.js scripts/tls-ca-portability.test.js
+          ./zig-out/bin/cottontail test tests/js/bun-cryptohasher-native.test.ts
+
       - name: Test macOS certificate trust without Homebrew
         if: matrix.os == 'macos'
         env:
