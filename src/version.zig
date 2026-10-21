@@ -1,1 +1,1 @@
-pub const version = "0.7.3-canary.3";
+pub const version = "0.7.3-canary.4";
