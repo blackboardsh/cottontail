@@ -3032,7 +3032,7 @@ for (const [runtimeIndex, name] of selectedRuntimeNames.entries()) {
   }
   if (name === 'bun' && results.length > 0) {
     console.log(
-      `  executed bun:test cases: ${executionTotals.tests}; assertions: ${executionTotals.assertions}; ` +
+      `  reported bun:test cases (successful enabled entries; includes skip/todo): ${executionTotals.tests}; assertions: ${executionTotals.assertions}; ` +
       `files with summaries: ${executionTotals.files}; files without summaries: ${executionTotals.filesWithoutSummary}`
     );
   }
