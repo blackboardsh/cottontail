@@ -239,6 +239,9 @@ jobs:
       - name: Test GitHub Actions test registration
         run: node scripts/test-github-actions-runner.js
 
+      - name: Test runtime source-map locations
+        run: ./zig-out/bin/cottontail test tests/js/runtime-sourcemap.test.ts tests/js/runtime-file-input-lifetime.test.ts
+
       - name: Test native stdio redirection
         run: node --test scripts/stdio-redirection.test.js
 
