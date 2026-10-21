@@ -71,7 +71,7 @@ const minimalResults = [];
 let debugged = false;
 function captureNativeCrash(args, env, name) {
   if (!debuggerPath) return;
-  const dump = join(logs, `${name}-access-violation.dmp`);
+  const dump = join(logs, `${name}-access-violation.dmp`).replaceAll('\\', '/');
   const command = `sxe -c ".exr -1; .ecxr; r; k; u @rip-20 @rip+20; lm; .dump /m ${dump}; q" av; g`;
   const debugArgs = ['-o', '-G', '-c', command, binary, ...args];
   const debug = spawnSync(debuggerPath, debugArgs, { cwd: minimalDirectory, env, encoding: 'utf8', timeout: 120_000, windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
@@ -114,4 +114,24 @@ for (const [name, source] of Object.entries({
   }
 }
 
+// Preserve cold/warm bytecode cache artifacts for the existing Windows error-
+// stack regression. Do not set KEEP_TEMP: it changes the path under diagnosis.
+const fileInputDirectory = join(logs, 'file-input');
+const fileInputCache = join(fileInputDirectory, 'cache');
+mkdirSync(fileInputDirectory, { recursive: true });
+const fileInputEntry = join(fileInputDirectory, 'failure-input.mjs');
+writeFileSync(fileInputEntry, "function failAfterEvaluation() { throw new Error('file-input-cleanup-error'); }\nfailAfterEvaluation();\n");
+for (const phase of ['cold', 'warm']) {
+  const args = ['--smol', fileInputEntry];
+  const env = { ...environment, COTTONTAIL_TMP_DIR: fileInputCache, BUN_JSC_verboseDiskCache: '1' };
+  delete env.COTTONTAIL_KEEP_TEMP;
+  const result = spawnSync(binary, args, { cwd: fileInputDirectory, env, encoding: 'utf8', timeout: 60_000, windowsHide: true });
+  const evidence = { name: `file-input-${phase}`, argv: [binary, ...args], cwd: fileInputDirectory, environment: { CI: env.CI, GITHUB_ACTIONS: env.GITHUB_ACTIONS, AGENT: env.AGENT, COTTONTAIL_TMP_DIR: env.COTTONTAIL_TMP_DIR, BUN_JSC_verboseDiskCache: env.BUN_JSC_verboseDiskCache }, status: result.status, unsignedStatus: result.status === null ? null : result.status >>> 0, signal: result.signal, error: result.error?.message, stdout: result.stdout, stderr: result.stderr };
+  minimalResults.push(evidence);
+  console.log('MINIMAL EVIDENCE ' + JSON.stringify(evidence));
+  writeFileSync(join(fileInputDirectory, `${phase}.json`), JSON.stringify(evidence, null, 2));
+  writeFileSync(join(fileInputDirectory, `${phase}.stdout.txt`), result.stdout ?? '');
+  writeFileSync(join(fileInputDirectory, `${phase}.stderr.txt`), result.stderr ?? '');
+  writeFileSync(join(logs, 'minimal-results.json'), JSON.stringify(minimalResults, null, 2));
+}
 process.exitCode = minimalResults.some(result => result.error || result.unsignedStatus === 0xc0000005) ? 1 : 0;
