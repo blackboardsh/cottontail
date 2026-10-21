@@ -42,6 +42,8 @@ jobs:
       - name: Install first-party fixture dependencies
         run: |
           bun install --ignore-scripts
+          bun add react@18.3.1 --cwd=compat/upstream/bun/v1.3.10 --ignore-scripts
+          bun install --cwd=compat/upstream/bun/v1.3.10/test --frozen-lockfile --ignore-scripts
           node -e "if (process.arch !== '${{ matrix.arch }}') throw new Error('Unexpected Node architecture')"
       - name: Vendor fixture compiler and standalone Windows helpers
         run: node scripts/diagnose-windows-fixture-setup.mjs

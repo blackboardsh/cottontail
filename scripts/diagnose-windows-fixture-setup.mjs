@@ -3,14 +3,14 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 assert.equal(process.platform, 'win32');
 mkdirSync('diagnostic-logs', { recursive: true });
 const manifest = JSON.parse(readFileSync('scripts/zig-manifest.json'));
 const asset = manifest.assets['win32-x64'];
-const scratch = mkdtempSync(join(tmpdir(), 'cottontail-baseline-zig-'));
+mkdirSync('vendors', { recursive: true });
+const scratch = mkdtempSync(resolve('vendors', '.baseline-zig-'));
 const response = await fetch(`https://ziglang.org/download/${manifest.version}/${asset.folder}.zip`);
 assert.ok(response.ok);
 const bytes = Buffer.from(await response.arrayBuffer());
@@ -18,10 +18,8 @@ assert.equal(createHash('sha256').update(bytes).digest('hex'), asset.sha256);
 const archivePath = join(scratch, 'zig.zip');
 const unpacked = join(scratch, 'unpacked');
 writeFileSync(archivePath, bytes);
-execFileSync('powershell.exe', ['-NoProfile', '-Command', 'Expand-Archive -LiteralPath $env:COTTONTAIL_DIAGNOSTIC_ZIG_ZIP -DestinationPath $env:COTTONTAIL_DIAGNOSTIC_ZIG_UNPACKED'], {
-  stdio: 'inherit', env: { ...process.env, COTTONTAIL_DIAGNOSTIC_ZIG_ZIP: archivePath, COTTONTAIL_DIAGNOSTIC_ZIG_UNPACKED: unpacked },
-});
-mkdirSync('vendors', { recursive: true });
+mkdirSync(unpacked);
+execFileSync(join(process.env.SystemRoot, 'System32', 'tar.exe'), ['-xf', archivePath, '-C', unpacked], { stdio: 'inherit' });
 renameSync(join(unpacked, asset.folder), resolve('vendors/zig'));
 const zig = resolve('vendors/zig/zig.exe');
 assert.equal(execFileSync(zig, ['version'], { encoding: 'utf8' }).trim(), manifest.version);

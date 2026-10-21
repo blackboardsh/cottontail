@@ -44,11 +44,15 @@ const binary = resolve('zig-out/bin/cottontail.exe');
 const actualVersion = execFileSync(binary, ['--version'], { encoding: 'utf8' }).trim();
 assert.equal(actualVersion, version);
 
-const original = readFileSync('scripts/test-js.js', 'utf8');
+const originalBytes = readFileSync('scripts/test-js.js');
+// Windows checkout uses CRLF; normalization changes no assertions and lets the
+// diagnostic instrumentation match the same source fragments on both systems.
+const original = originalBytes.toString('utf8').replaceAll('\r\n', '\n');
 const provenance = {
   purpose: 'Published .0 baseline discovery only; final corrected-source acceptance requires GITHUB_ACTIONS=true.',
   fixtureRevision, artifactRevision, version, platform, manifestUrl, archive,
-  actualVersion, fixtureHarnessSha256: createHash('sha256').update(original).digest('hex'),
+  actualVersion, fixtureHarnessSha256: createHash('sha256').update(originalBytes).digest('hex'),
+  normalizedFixtureHarnessSha256: createHash('sha256').update(original).digest('hex'),
   diagnosticRevision: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
   environment: { CI: 'true', GITHUB_ACTIONS: '', AGENT: '0' },
   rationale: 'The .0 GitHub aggregate runner can skip test bodies. Clearing only its reporter flag executes real baseline bodies; all assertions remain unchanged.',
