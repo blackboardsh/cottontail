@@ -1,4 +1,4 @@
-name: Intel exact canary.4 split Hutch fixture validation
+name: Intel exact canary.4 compound descriptor classification
 on:
   workflow_dispatch:
     inputs:
@@ -22,12 +22,12 @@ jobs:
           path: /tmp/cottontail-css-canary4
           run-id: ${{ inputs.canary4_run }}
           github-token: ${{ github.token }}
-      - name: Validate frozen split fixture against exact canary.4
+      - name: Trace isolated compound descriptor case then complete frozen fixture
         shell: bash
-        run: python3 scripts/validate-intel-hutch-split.py
+        run: python3 scripts/diagnose-intel-compound-order.py
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: intel-canary4-split-hutch-evidence
-          path: /tmp/cottontail-intel-hutch-split-evidence/
+          name: intel-canary4-compound-order-evidence
+          path: /tmp/cottontail-intel-compound-order-evidence/
           if-no-files-found: error

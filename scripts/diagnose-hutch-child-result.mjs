@@ -16,6 +16,7 @@ beforeAll(() => {
       command: argv,
       elapsedMs: performance.now() - started,
       remainingBeforeMs,
+      callerTimeoutMs: rest[0]?.timeout ?? null,
       remainingAfterMs: globalThis.__cottontailCurrentTestRemainingMs?.(),
       exitCode: result.exitCode,
       signalCode: result.signalCode,
