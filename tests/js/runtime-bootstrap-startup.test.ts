@@ -15,9 +15,9 @@ const maxStdioStartupDurationMs = isWindows ? 30_000 : 5_000;
 // This is a bounded hang detector, not a startup microbenchmark. Empty caches
 // and a loaded host can legitimately take more than one second.
 const coldReadlineTimeoutMs = isWindows ? 30_000 : 5_000;
-// The bytecode regression launches a compiler and two standalone executables.
-// Windows x64 emulation can exceed Bun's default five-second test deadline.
-const compiledBytecodeTimeoutMs = isWindows ? 30_000 : 5_000;
+// Compilation and two cold standalone launches share the test deadline through
+// Bun.spawnSync. Allow slower CI hosts, including Intel macOS, a bounded budget.
+const compiledBytecodeTimeoutMs = 30_000;
 const temporaryDirectory = mkdtempSync(join(tmpdir(), "cottontail-runtime-bootstrap-"));
 
 afterAll(() => withOwnedWindowsImageRetry(() =>
@@ -379,17 +379,29 @@ test("compiled standalone executables retain the low-RSS bootstrap", () => {
 });
 
 test("compiled bytecode is embedded and invalidates when source identity changes", () => {
+  function expectSuccessfulProcess(phase: string, result: ReturnType<typeof Bun.spawnSync>) {
+    expect({
+      exitCode: result.exitCode,
+      signalCode: result.signalCode ?? null,
+      exitedDueToTimeout: result.exitedDueToTimeout === true,
+      stderr: String(result.stderr),
+    }, phase).toEqual({
+      exitCode: 0,
+      signalCode: null,
+      exitedDueToTimeout: false,
+      stderr: "",
+    });
+  }
+
   const entry = join(temporaryDirectory, "bytecode-entry.mjs");
   const executable = join(temporaryDirectory, process.platform === "win32" ? "bytecode.exe" : "bytecode");
   writeFileSync(entry, 'console.log("bytecode-one");\n');
 
   const build = run(["build", "--compile", "--bytecode", entry, "--outfile", executable]);
-  expect(String(build.stderr)).toBe("");
-  expect(build.exitCode).toBe(0);
+  expectSuccessfulProcess("compile bytecode", build);
 
   const initial = Bun.spawnSync({ cmd: [executable], stdout: "pipe", stderr: "pipe" });
-  expect(initial.exitCode).toBe(0);
-  expect(String(initial.stderr)).toBe("");
+  expectSuccessfulProcess("initial standalone execution", initial);
   expect(String(initial.stdout).trim()).toBe("bytecode-one");
 
   const bytes = readFileSync(executable);
@@ -413,8 +425,7 @@ test("compiled bytecode is embedded and invalidates when source identity changes
   withOwnedWindowsImageRetry(() => writeFileSync(executable, bytes));
 
   const invalidated = Bun.spawnSync({ cmd: [executable], stdout: "pipe", stderr: "pipe" });
-  expect(invalidated.exitCode).toBe(0);
-  expect(String(invalidated.stderr)).toBe("");
+  expectSuccessfulProcess("standalone execution after source mutation", invalidated);
   expect(String(invalidated.stdout).trim()).toBe("bytecode-two");
 }, { timeout: compiledBytecodeTimeoutMs });
 
