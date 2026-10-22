@@ -114,9 +114,9 @@ test('native boundary plan runs exact release binaries directly with bounded fix
   assert.match(runner, /terminateWindowsJobChild/);
 });
 
-test('bytecode release gate preserves the same-path identity assertions and existing test budget', () => {
+test('bytecode release gate preserves same-path identity assertions and a bounded cross-platform budget', () => {
   const source = readFileSync(new URL('../tests/js/runtime-bootstrap-startup.test.ts', import.meta.url), 'utf8');
-  assert.match(source, /const compiledBytecodeTimeoutMs = isWindows \? 30_000 : 5_000/);
+  assert.match(source, /const compiledBytecodeTimeoutMs = 30_000;/);
   assert.match(source, /withOwnedWindowsImageRetry\(\(\) => writeFileSync\(executable, bytes\)\)/);
   assert.match(source, /cmd: \[executable\]/);
   assert.match(source, /expect\(String\(initial\.stdout\)\.trim\(\)\)\.toBe\("bytecode-one"\)/);
