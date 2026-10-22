@@ -5,6 +5,7 @@ import { createHash } from 'crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { buildArchitecture, windowsTarget } from './build-target.js';
+import { patchZigTls, tlsPatch } from './patch-zig-tls.js';
 
 const ROOT = process.cwd();
 const MANIFEST_PATH = join(ROOT, 'scripts', 'zig-manifest.json');
@@ -239,9 +240,13 @@ function vendorWindowsDependencies() {
   console.log('✓ Windows native dependencies are ready');
 }
 
-function setup() {
+async function setup() {
   try {
+    if (tlsPatch.version !== ZIG_VERSION) {
+      throw new Error(`Zig ${ZIG_VERSION} has no matching TLS security policy`);
+    }
     vendorZig();
+    await patchZigTls(ZIG_DIR);
   } catch (error) {
     fail('Failed to vendor Zig.', error);
   }
@@ -260,4 +265,4 @@ function setup() {
   console.log(`\nSetup complete. Vendored Zig is ready at vendors/zig/${getZigBinaryName()}`);
 }
 
-setup();
+await setup();

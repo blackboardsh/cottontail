@@ -1,0 +1,76 @@
+{
+  "version": "0.16.0",
+  "policyVersion": 20261021,
+  "source": "https://github.com/oven-sh/bun/pull/46300",
+  "files": [
+    {
+      "path": "lib/std/crypto/Certificate.zig",
+      "pristineSha256": "577e756a7ffd2cc2a95ed771948e9904941c8afb2b703cb7957b961ea6e33591",
+      "patchedSha256": "0a0a638cd3d8124d43707dd204a201fb184e31ff5c65c834608af12e8974b5bb",
+      "edits": [
+        {
+          "before": "pub const Parsed = struct {",
+          "after": "// Node security release 2026-10-21 / Bun PR #46300.\npub const compromised_spki_policy_version = 20261021;\n\npub const Parsed = struct {"
+        },
+        {
+          "before": "    pub_key_slice: Slice,",
+          "after": "    pub_key_slice: Slice,\n    pub_key_info_slice: Slice,"
+        },
+        {
+          "before": "    pub const VerifyError = error{",
+          "after": "    /// Reject publicly compromised CA keys even when reissued or cross-signed.\n    /// Policy mirrors Node/Bun's October 2026 eMudhra mitigation, not CA names.\n    pub fn rejectCompromisedSpki(p: Parsed) error{CertificateRevoked}!void {\n        var digest: [32]u8 = undefined;\n        std.crypto.hash.sha2.Sha256.hash(p.slice(p.pub_key_info_slice), &digest, .{});\n        const blocked = [_][]const u8{\n            \"49dd353dc2b919a3770645117d0e60c16115e7d1bc259eefe734b00ea434fe5f\",\n            \"5c0660a2b164910d8ff589c18e14552e9e0ec237dcefe2cb736d41a4811f81a0\",\n            \"63ecefee431d49523bc1136c4e72d0206a477086caf606cd5cf025686c109cf8\",\n            \"92c063d67e8f14db71d288e11266ffdaf69cbf115f7bab14f3bc2f68d25e0e30\",\n            \"ebed6475c2c2d80fcb199f3fe8dd6e6b3ce60b77eb15d4e42c3dec0c6f5b5105\",\n            \"ec4ffa1ad0ac88081314b7aaffef6a91f97cd57291bb5ba686c5415f5eb4f6b6\",\n            \"43bffa19d6ef651451f6841e019931e96f6f2eaeff28ab4b6f1ce4576de2717b\",\n            \"e0254c7fcdc265e2f0f8a428dabb75ab4ae039b4872d62f5ee57f0877d5a8a41\",\n        };\n        const encoded = std.fmt.bytesToHex(digest, .lower);\n        for (blocked) |key| {\n            if (mem.eql(u8, &encoded, key)) return error.CertificateRevoked;\n        }\n    }\n\n    pub const VerifyError = error{\n        CertificateRevoked,"
+        },
+        {
+          "before": "    pub fn verify(parsed_subject: Parsed, parsed_issuer: Parsed, now_sec: i64) VerifyError!void {",
+          "after": "    pub fn verify(parsed_subject: Parsed, parsed_issuer: Parsed, now_sec: i64) VerifyError!void {\n        try parsed_subject.rejectCompromisedSpki();\n        try parsed_issuer.rejectCompromisedSpki();"
+        },
+        {
+          "before": "        .pub_key_slice = pub_key,",
+          "after": "        .pub_key_slice = pub_key,\n        .pub_key_info_slice = .{ .start = subject.slice.end, .end = pub_key_info.slice.end },"
+        }
+      ]
+    },
+    {
+      "path": "lib/std/crypto/tls/Client.zig",
+      "pristineSha256": "1464bd0d53f799e7714fa073a0783cb94c68c10fb1ab4381246e01f9cb130c8a",
+      "patchedSha256": "388ad25c590fa5279996c2db458313a6217b7550c09c820c16ceaf834c58c731",
+      "edits": [
+        {
+          "before": "    CertificatePublicKeyInvalid,",
+          "after": "    CertificatePublicKeyInvalid,\n    CertificateRevoked,"
+        },
+        {
+          "before": "                        var certs_decoder = certs;",
+          "after": "                        // Inspect the entire presented chain before normal verification can\n                        // terminate early at a locally trusted intermediate.\n                        var policy_decoder = certs;\n                        while (!policy_decoder.eof()) {\n                            try policy_decoder.ensure(3);\n                            const policy_size = policy_decoder.decode(u24);\n                            const policy_cert = try policy_decoder.sub(policy_size);\n                            const parsed = try (Certificate{\n                                .buffer = policy_cert.buf,\n                                .index = @intCast(policy_cert.idx),\n                            }).parse();\n                            try parsed.rejectCompromisedSpki();\n                            if (tls_version == .tls_1_3) {\n                                try policy_decoder.ensure(2);\n                                const policy_ext_size = policy_decoder.decode(u16);\n                                _ = try policy_decoder.sub(policy_ext_size);\n                            }\n                        }\n\n                        var certs_decoder = certs;"
+        },
+        {
+          "before": "pub const Options = struct {",
+          "after": "pub const compromised_spki_policy_version = 20261021;\n\npub const Options = struct {"
+        }
+      ]
+    },
+    {
+      "path": "lib/std/crypto/Certificate/Chain.zig",
+      "pristineSha256": "c55fb4fd33c9f05b6d8b3e3fbe4d64b4c8d08bf9e548e77bf9bcdaa32d1c30e2",
+      "patchedSha256": "53ae10ca105c3b271a68ca012c15fd0e47c4b1ac26ef0f6f95adab9ef418631a",
+      "edits": [
+        {
+          "before": "    TlsCertificateNotVerified,",
+          "after": "    TlsCertificateNotVerified,\n    CertificateRevoked,"
+        },
+        {
+          "before": "pub fn verify(chain: *const Chain, now: std.Io.Timestamp) VerifyError!void {",
+          "after": "// Prefix layouts from wincrypt.h. Windows may obtain issuers through AIA;\n// checking only the peer-supplied chain would miss those certificates.\nconst ChainContextPrefix = extern struct {\n    cbSize: u32,\n    trust_status: [2]u32,\n    count: u32,\n    chains: [*]const *const SimpleChainPrefix,\n};\nconst SimpleChainPrefix = extern struct {\n    cbSize: u32,\n    trust_status: [2]u32,\n    count: u32,\n    elements: [*]const *const ChainElementPrefix,\n};\nconst ChainElementPrefix = extern struct {\n    cbSize: u32,\n    certificate: *const crypt32.CERT_CONTEXT,\n};\n\nfn rejectCompromisedChain(context: *const crypt32.CERT_CHAIN.CONTEXT) VerifyError!void {\n    const built: *const ChainContextPrefix = @ptrCast(@alignCast(context));\n    for (built.chains[0..built.count]) |simple| {\n        for (simple.elements[0..simple.count]) |element| {\n            const cert = element.certificate;\n            const parsed = (std.crypto.Certificate{\n                .buffer = cert.pbCertEncoded[0..cert.cbCertEncoded],\n                .index = 0,\n            }).parse() catch return error.TlsCertificateNotVerified;\n            try parsed.rejectCompromisedSpki();\n        }\n    }\n}\n\npub fn verify(chain: *const Chain, now: std.Io.Timestamp) VerifyError!void {"
+        },
+        {
+          "before": "    defer crypt32.CertFreeCertificateChain(cert_chain);",
+          "after": "    defer crypt32.CertFreeCertificateChain(cert_chain);\n    try rejectCompromisedChain(cert_chain);"
+        },
+        {
+          "before": "pub const empty: Chain = ",
+          "after": "pub const compromised_spki_policy_version = 20261021;\n\npub const empty: Chain = "
+        }
+      ]
+    }
+  ]
+}

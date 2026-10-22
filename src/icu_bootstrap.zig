@@ -1,6 +1,19 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+comptime {
+    for (.{ std.crypto.Certificate, std.crypto.tls.Client }) |part| {
+        if (!@hasDecl(part, "compromised_spki_policy_version") or
+            part.compromised_spki_policy_version != 20261021)
+            @compileError("Cottontail requires the patched Zig TLS trust policy; run node scripts/setup.js");
+    }
+    if (builtin.os.tag == .windows) {
+        if (!@hasDecl(std.crypto.Certificate.Chain, "compromised_spki_policy_version") or
+            std.crypto.Certificate.Chain.compromised_spki_policy_version != 20261021)
+            @compileError("Cottontail requires the patched Zig Windows TLS trust policy; run node scripts/setup.js");
+    }
+}
+
 const c = @cImport({
     @cInclude("icu_bridge/icu-bridge.h");
 });
