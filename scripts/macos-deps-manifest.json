@@ -31,10 +31,10 @@
       "headers": ["zstd.h", "zdict.h"]
     },
     "openssl": {
-      "version": "3.6.2",
-      "url": "https://github.com/openssl/openssl/releases/download/openssl-3.6.2/openssl-3.6.2.tar.gz",
-      "sha256": "aaf51a1fe064384f811daeaeb4ec4dce7340ec8bd893027eee676af31e83a04f",
-      "sourceDirectory": "openssl-3.6.2",
+      "version": "3.6.5",
+      "url": "https://github.com/openssl/openssl/releases/download/openssl-3.6.5/openssl-3.6.5.tar.gz",
+      "sha256": "a2157c2830efdec3788939b00c9b0638306d3f0bbb76dc4832ee503bb397df98",
+      "sourceDirectory": "openssl-3.6.5",
       "licenses": ["LICENSE.txt"],
       "libraries": ["libssl.a", "libcrypto.a"],
       "headers": ["openssl/ssl.h", "openssl/crypto.h", "openssl/opensslconf.h"]
