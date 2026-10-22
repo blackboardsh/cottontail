@@ -30,6 +30,27 @@ function step(name) {
   return workflow.slice(start, end === -1 ? workflow.length : end);
 }
 
+test('all native release artifacts reject compromised TLS chains before packaging', () => {
+  const gate = step('Reject compromised TLS public keys');
+  assert.doesNotMatch(gate, /\n\s+if:/);
+  assert.match(gate, /node --test scripts\/tls-blocked-keys\.test\.js/);
+  assert.match(gate, /timeout-minutes: 3/);
+  step('Build and strip release binary');
+  assert.ok(workflow.indexOf('- name: Build and strip release binary') < workflow.indexOf('- name: Reject compromised TLS public keys'));
+  assert.ok(workflow.indexOf('- name: Reject compromised TLS public keys') < workflow.indexOf('- name: Package release'));
+});
+
+test('Windows identity checks use the same Node version installed by setup-node', () => {
+  for (const name of ['build-release.yml', 'bun-compat.yml']) {
+    const source = readFileSync(new URL(`../.github/workflows/${name}`, import.meta.url), 'utf8');
+    const versions = [...source.matchAll(/node-version: ['"]?(\d+\.\d+\.\d+)/g)].map(match => match[1]);
+    assert.ok(versions.length > 0);
+    for (const version of versions) {
+      assert.ok(source.includes(`${version} win32`), `${name} expects the installed Node version on Windows`);
+    }
+  }
+});
+
 test('Windows releases require native Job cleanup tests after building the supervisor', () => {
   const name = 'Test native Windows Job process cleanup';
   const gate = step(name);

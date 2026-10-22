@@ -1523,6 +1523,54 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Build and run cottontail");
     run_step.dependOn(&run_cmd.step);
 
+    // Exercise the OpenSSL session policy without linking the full runtime.
+    // Use exactly the headers and libraries shipped by each native build.
+    const tls_security_module = b.createModule(.{
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    configureMacosSdk(tls_security_module, b, macos_sdk);
+    tls_security_module.addIncludePath(b.path("src"));
+    tls_security_module.addCSourceFile(.{
+        .file = b.path("tests/native/tls-session-policy.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    switch (target.result.os.tag) {
+        .macos => {
+            configureMacosNativeDependencies(tls_security_module, b);
+            inline for (&.{ "ssl", "crypto" }) |library|
+                tls_security_module.linkSystemLibrary(library, .{
+                    .use_pkg_config = .no,
+                    .preferred_link_mode = .static,
+                    .search_strategy = .no_fallback,
+                });
+        },
+        .linux => {
+            inline for (&.{ "ssl", "crypto" }) |library|
+                tls_security_module.linkSystemLibrary(library, .{ .preferred_link_mode = .static });
+            inline for (&.{ "zstd", "z", "dl", "pthread" }) |library|
+                tls_security_module.linkSystemLibrary(library, .{});
+        },
+        .windows => {
+            const dependency_dir = windowsDependencyDir(target.result);
+            tls_security_module.addIncludePath(b.path(b.fmt("{s}/include", .{dependency_dir})));
+            inline for (&.{ "libssl.lib", "libcrypto.lib", "zs.lib", "zstd.lib" }) |library|
+                tls_security_module.addObjectFile(b.path(b.fmt("{s}/lib/{s}", .{ dependency_dir, library })));
+            inline for (&.{ "advapi32", "bcrypt", "crypt32", "user32", "ws2_32" }) |library|
+                tls_security_module.linkSystemLibrary(library, .{});
+        },
+        else => unreachable,
+    }
+    const tls_security_probe = b.addExecutable(.{
+        .name = "tls-session-policy",
+        .root_module = tls_security_module,
+    });
+    const run_tls_security_probe = b.addRunArtifact(tls_security_probe);
+    run_tls_security_probe.addDirectoryArg(b.path("tests/js/fixtures/emsign"));
+    const tls_security_step = b.step("test-tls-security", "Test TLS session distrust and safe resumption");
+    tls_security_step.dependOn(&run_tls_security_probe.step);
+
     const native_plugin_fixture_module = b.createModule(.{
         .target = target,
         .optimize = optimize,

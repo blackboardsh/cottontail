@@ -13328,6 +13328,9 @@ static JSValueRef ct_tcp_socket_reset(JSContextRef ctx, JSObjectRef function, JS
 }
 
 #if CT_HAS_OPENSSL
+#include "tls_blocked_spkis.h"
+#include "tls_session_policy.h"
+
 static void ct_tls_initialize(void) {
     SSL_library_init();
     SSL_load_error_strings();
@@ -13393,7 +13396,19 @@ static const char *ct_tls_verify_error_code(long verify_error) {
 }
 
 static long ct_tls_effective_verify_error(SSL *ssl, long verify_error) {
-    if (ssl == NULL || verify_error == X509_V_OK) return verify_error;
+    if (ssl == NULL) return verify_error;
+    // Resumed sessions may not run a certificate-verification callback. Check
+    // the retained peer chain too, including sessions imported by the caller.
+    int blocked_error = ct_tls_blocked_chain_error(SSL_get0_verified_chain(ssl));
+    if (blocked_error == X509_V_OK) {
+        blocked_error = ct_tls_blocked_chain_error(SSL_get_peer_cert_chain(ssl));
+    }
+    X509 *retained_peer = SSL_get0_peer_certificate(ssl);
+    if (blocked_error == X509_V_OK && retained_peer != NULL) {
+        blocked_error = ct_tls_blocked_key_error(retained_peer);
+    }
+    if (blocked_error != X509_V_OK) return blocked_error;
+    if (verify_error == X509_V_OK || verify_error == X509_V_ERR_CERT_REVOKED) return verify_error;
     X509 *peer = SSL_get_peer_certificate(ssl);
     if (peer == NULL) return verify_error;
     BASIC_CONSTRAINTS *constraints = X509_get_ext_d2i(peer, NID_basic_constraints, NULL, NULL);
@@ -13855,6 +13870,12 @@ static SSL_CTX *ct_tls_context_new(const SSL_METHOD *method) {
         // 2 on some platforms, which rejects those certificates before normal
         // Node-compatible verification and error reporting can run.
         SSL_CTX_set_security_level(ssl_ctx, 1);
+        SSL_CTX_set_cert_verify_callback(ssl_ctx, ct_tls_verify_chain, NULL);
+        if (SSL_CTX_set_session_ticket_cb(ssl_ctx, ct_tls_generate_session_ticket,
+                ct_tls_decrypt_session_ticket, NULL) != 1) {
+            SSL_CTX_free(ssl_ctx);
+            return NULL;
+        }
     }
     return ssl_ctx;
 }
@@ -14218,6 +14239,8 @@ static int ct_tls_configure_ctx(
     } else {
         SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, ct_tls_allow_verify_error);
     }
+    SSL_CTX_set_cert_verify_callback(ssl_ctx, ct_tls_verify_chain,
+        reject_unauthorized ? NULL : (void *)(uintptr_t)1);
     return 0;
 }
 
@@ -14426,6 +14449,7 @@ static unsigned char *ct_tls_serialize_session(SSL_SESSION *session, size_t *out
 }
 
 static int ct_tls_new_session_callback(SSL *ssl, SSL_SESSION *session) {
+    ct_tls_stamp_session_policy(ssl, session);
     CtTlsConnection *connection = (CtTlsConnection *)SSL_get_app_data(ssl);
     if (connection == NULL || (connection->server_side && !connection->session_callbacks_enabled)) return 0;
 
@@ -14491,6 +14515,7 @@ static SSL_SESSION *ct_tls_get_session_callback(
 ) {
     CtTlsConnection *connection = (CtTlsConnection *)SSL_get_app_data(ssl);
     if (connection == NULL || !connection->server_side || connection->resume_session == NULL) return NULL;
+    if (!ct_tls_session_has_current_policy(connection->resume_session)) return NULL;
     unsigned int loaded_id_len = 0;
     const unsigned char *loaded_id = SSL_SESSION_get_id(connection->resume_session, &loaded_id_len);
     if (session_id == NULL || session_id_len <= 0 || loaded_id == NULL ||
@@ -14542,6 +14567,7 @@ static JSValueRef ct_tls_session_der(JSContextRef ctx, SSL *ssl, JSValueRef *exc
     if (ssl == NULL) return JSValueMakeNull(ctx);
     SSL_SESSION *session = SSL_get1_session(ssl);
     if (session == NULL) return JSValueMakeNull(ctx);
+    ct_tls_stamp_session_policy(ssl, session);
     size_t len = 0;
     unsigned char *buffer = ct_tls_serialize_session(session, &len);
     SSL_SESSION_free(session);
@@ -14572,6 +14598,10 @@ static int ct_tls_apply_session(
         ct_tls_throw_error(ctx, exception, message, "ERR_SSL_SESSION_ID_CONTEXT_UNINITIALIZED");
         free(message);
         return -1;
+    }
+    if (!ct_tls_session_has_current_policy(session)) {
+        SSL_SESSION_free(session);
+        return 0;
     }
     int status = SSL_set_session(ssl, session);
     SSL_SESSION_free(session);
@@ -16632,6 +16662,10 @@ static JSValueRef ct_tls_connection_resolve_client_hello(JSContextRef ctx, JSObj
         ERR_clear_error();
         resume_session = d2i_SSL_SESSION(NULL, &cursor, (long)session_len);
         ERR_clear_error();
+        if (resume_session != NULL && !ct_tls_session_has_current_policy(resume_session)) {
+            SSL_SESSION_free(resume_session);
+            resume_session = NULL;
+        }
     }
 
     uint8_t *ocsp_response = NULL;

@@ -99,13 +99,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            ca-certificates \
             clang \
             g++ \
             libbrotli-dev \
             libffi-dev \
             libssl-dev \
             libzstd-dev \
+            openssl \
             zlib1g-dev
+          # Ubuntu backports the OpenSSL security fixes to its maintained 3.0
+          # branch; do not replace its system ABI with an unpatched cached SDK.
+          dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libssl-dev)" ge 3.0.13-0ubuntu3.16
+          dpkg-query -W libssl-dev openssl ca-certificates
 
       - name: Verify Windows build environment
         if: matrix.os == 'windows'
@@ -116,8 +122,8 @@ jobs:
           Write-Host "Windows: $($os.Caption) $($os.Version)"
           Write-Host "System ICU: $($icu.FileVersion)"
           $nodeIdentity = node -p "process.versions.node + ' ' + process.platform + ' ' + process.arch"
-          if ($LASTEXITCODE -ne 0 -or $nodeIdentity.Trim() -ne "24.18.0 win32 ${{ matrix.arch }}") {
-            throw "Expected Node 24.18.0 win32 ${{ matrix.arch }}, got '$nodeIdentity'"
+          if ($LASTEXITCODE -ne 0 -or $nodeIdentity.Trim() -ne "24.22.1 win32 ${{ matrix.arch }}") {
+            throw "Expected Node 24.22.1 win32 ${{ matrix.arch }}, got '$nodeIdentity'"
           }
 
       # Native dependencies are independent of JSC and can compile while a
@@ -131,7 +137,7 @@ jobs:
             vendors/zig-html-rewriter
             vendors/windows-deps
             vendors/macos-deps
-          key: cottontail-toolchains-${{ matrix.platform }}-v2-${{ hashFiles('scripts/zig-manifest.json', 'scripts/macos-deps-manifest.json', 'scripts/setup-macos-deps.js', 'scripts/setup.js', 'scripts/zig-html-rewriter-manifest.json', 'vcpkg.json', 'scripts/vcpkg-triplets/**') }}
+          key: cottontail-toolchains-${{ matrix.platform }}-v2-${{ hashFiles('scripts/zig-manifest.json', 'scripts/zig-tls-patch.json', 'scripts/patch-zig-tls.js', 'scripts/macos-deps-manifest.json', 'scripts/setup-macos-deps.js', 'scripts/setup.js', 'scripts/zig-html-rewriter-manifest.json', 'vcpkg.json', 'scripts/vcpkg-triplets/**') }}
           restore-keys: |
             cottontail-toolchains-${{ matrix.platform }}-v2-
             cottontail-${{ matrix.platform }}-v1-
@@ -191,6 +197,17 @@ jobs:
         with:
           path: vendors/jsc
           key: ${{ steps.vendored-jsc.outputs.cache-primary-key }}
+
+      - name: Test native ICU downloader certificate security
+        timeout-minutes: 5
+        run: node scripts/native-tls-security-smoke.mjs
+
+      - name: Test pinned Zig TLS patch integrity
+        run: node --test scripts/patch-zig-tls.test.js
+
+      - name: Test native TLS session security
+        timeout-minutes: 5
+        run: node scripts/zig.js build test-tls-security
 
       - name: Run Zig tests
         if: matrix.os != 'windows'
@@ -257,6 +274,10 @@ jobs:
 
       - name: Test default TLS certificate trust
         run: node --test scripts/tls-ca-portability.test.js
+
+      - name: Reject compromised TLS public keys
+        timeout-minutes: 3
+        run: node --test scripts/tls-blocked-keys.test.js
 
       - name: Test Intel cryptography without CPU acceleration
         if: matrix.platform == 'macos-x64'

@@ -178,8 +178,8 @@ jobs:
         shell: pwsh
         run: |
           $nodeIdentity = node -p "process.versions.node + ' ' + process.platform + ' ' + process.arch"
-          if ($LASTEXITCODE -ne 0 -or $nodeIdentity.Trim() -ne "24.18.0 win32 ${{ matrix.arch }}") {
-            throw "Expected Node 24.18.0 win32 ${{ matrix.arch }}, got '$nodeIdentity'"
+          if ($LASTEXITCODE -ne 0 -or $nodeIdentity.Trim() -ne "24.22.1 win32 ${{ matrix.arch }}") {
+            throw "Expected Node 24.22.1 win32 ${{ matrix.arch }}, got '$nodeIdentity'"
           }
 
       # Native dependencies are independent of JSC and can compile while a
@@ -193,7 +193,7 @@ jobs:
             vendors/zig-html-rewriter
             vendors/windows-deps
             vendors/macos-deps
-          key: cottontail-toolchains-${{ matrix.platform }}-v2-${{ hashFiles('scripts/zig-manifest.json', 'scripts/macos-deps-manifest.json', 'scripts/setup-macos-deps.js', 'scripts/setup.js', 'scripts/zig-html-rewriter-manifest.json', 'vcpkg.json', 'scripts/vcpkg-triplets/**') }}
+          key: cottontail-toolchains-${{ matrix.platform }}-v2-${{ hashFiles('scripts/zig-manifest.json', 'scripts/zig-tls-patch.json', 'scripts/patch-zig-tls.js', 'scripts/macos-deps-manifest.json', 'scripts/setup-macos-deps.js', 'scripts/setup.js', 'scripts/zig-html-rewriter-manifest.json', 'vcpkg.json', 'scripts/vcpkg-triplets/**') }}
           restore-keys: |
             cottontail-toolchains-${{ matrix.platform }}-v2-
             cottontail-${{ matrix.platform }}-v1-
