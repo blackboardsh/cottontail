@@ -2,7 +2,6 @@
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "cottontail-native-dependencies",
   "version-string": "0.1.1-beta.0",
-  "builtin-baseline": "0bcada1615db5b65129d6c93cd0958fcb8d8c1e7",
   "dependencies": [
     "brotli",
     "dirent",

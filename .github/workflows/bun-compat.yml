@@ -193,7 +193,7 @@ jobs:
             vendors/zig-html-rewriter
             vendors/windows-deps
             vendors/macos-deps
-          key: cottontail-toolchains-${{ matrix.platform }}-v2-${{ hashFiles('scripts/zig-manifest.json', 'scripts/zig-tls-patch.json', 'scripts/patch-zig-tls.js', 'scripts/macos-deps-manifest.json', 'scripts/setup-macos-deps.js', 'scripts/setup.js', 'scripts/zig-html-rewriter-manifest.json', 'vcpkg.json', 'scripts/vcpkg-triplets/**') }}
+          key: cottontail-toolchains-${{ matrix.platform }}-v2-${{ hashFiles('scripts/zig-manifest.json', 'scripts/zig-tls-patch.json', 'scripts/patch-zig-tls.js', 'scripts/macos-deps-manifest.json', 'scripts/setup-macos-deps.js', 'scripts/setup.js', 'scripts/zig-html-rewriter-manifest.json', 'vcpkg.json', 'vcpkg-configuration.json', 'scripts/vcpkg-triplets/**') }}
           restore-keys: |
             cottontail-toolchains-${{ matrix.platform }}-v2-
             cottontail-${{ matrix.platform }}-v1-
