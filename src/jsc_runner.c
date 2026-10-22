@@ -18612,6 +18612,15 @@ static JSValueRef ct_process_info(JSContextRef ctx, JSObjectRef function, JSObje
         return ct_make_string(ctx, COTTONTAIL_VERSION);
     }
 
+    if (strcmp(kind, "opensslVersion") == 0) {
+        free(kind);
+#if CT_HAS_OPENSSL
+        return ct_make_string(ctx, OpenSSL_version(OPENSSL_VERSION_STRING));
+#else
+        return JSValueMakeUndefined(ctx);
+#endif
+    }
+
     if (strcmp(kind, "uptime") == 0) {
         CtJscRuntime *runtime = ct_callback_runtime(function);
         uint64_t now_ns = uv_hrtime();

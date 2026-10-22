@@ -1537,7 +1537,7 @@ Object.assign(processObject.versions, {
   node: nodeCompatVersion,
   bun: "1.3.10",
   boringssl: "29a2cd359458c9384694b75456026e4b57e3e567",
-  openssl: "1.1.0",
+  openssl: processInfo("opensslVersion"),
   llhttp: "9.3.0",
   libarchive: "898dc8319355b7e985f68a9819f182aaed61b53a",
   mimalloc: "4c283af60cdae205df5a872530c77e2a6a307d43",
