@@ -3271,7 +3271,11 @@ fn runExecutionThread(ctx: *const Context, execution: *ScriptExecution) !u8 {
         ctx.writeStderr("cottontail: failed to preload Electrobun native wrapper: {s}\n", .{@errorName(err)});
         return 1;
     };
-    defer if (native_wrapper) |*library| library.close();
+    // Zig's DynLib has no Windows close implementation, even for a null
+    // optional handle. Exclude that API during semantic analysis as well.
+    defer if (comptime builtin.os.tag == .macos) {
+        if (native_wrapper) |*library| library.close();
+    };
 
     const main_thread_status: ?u8 = if (builtin.os.tag == .windows) blk: {
         // Zig's Windows Thread.spawn passes stack_size to NtCreateThreadEx as
