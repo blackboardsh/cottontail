@@ -3264,6 +3264,15 @@ fn runReloadPrepared(
 }
 
 fn runExecutionThread(ctx: *const Context, execution: *ScriptExecution) !u8 {
+    // CEF installs process-wide malloc-zone hooks when NativeWrapper loads.
+    // Finish that initialization on the macOS main thread before JSC/ICU can
+    // allocate on the script thread. Keep the library alive through its join.
+    var native_wrapper = preloadElectrobunNativeWrapper(ctx) catch |err| {
+        ctx.writeStderr("cottontail: failed to preload Electrobun native wrapper: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer if (native_wrapper) |*library| library.close();
+
     const main_thread_status: ?u8 = if (builtin.os.tag == .windows) blk: {
         // Zig's Windows Thread.spawn passes stack_size to NtCreateThreadEx as
         // committed memory. A fully committed 128 MiB stack has no reserved
@@ -3308,6 +3317,14 @@ fn runExecutionThread(ctx: *const Context, execution: *ScriptExecution) !u8 {
 
 fn shouldRunElectrobunMainThread(ctx: *const Context) bool {
     return ctx.hutch_private_file == null and ctx.environ_map.get("COTTONTAIL_ELECTROBUN_DIST") != null;
+}
+
+fn preloadElectrobunNativeWrapper(ctx: *const Context) !?std.DynLib {
+    if (builtin.os.tag != .macos or !shouldRunElectrobunMainThread(ctx)) return null;
+    const dist_dir = ctx.environ_map.get("COTTONTAIL_ELECTROBUN_DIST").?;
+    const path = try std.fs.path.join(ctx.allocator, &.{ dist_dir, "libNativeWrapper.dylib" });
+    defer ctx.allocator.free(path);
+    return try std.DynLib.open(path);
 }
 
 fn electrobunCoreFileName() []const u8 {

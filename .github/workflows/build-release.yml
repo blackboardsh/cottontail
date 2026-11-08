@@ -309,6 +309,11 @@ jobs:
         if: matrix.os != 'windows'
         run: node scripts/test-release-native-plugin.js
 
+      - name: Test Electrobun native initialization before JavaScript
+        if: matrix.os == 'macos'
+        timeout-minutes: 3
+        run: node scripts/test-electrobun-startup.js
+
       - name: Smoke test release binary
         if: matrix.os != 'windows'
         run: test "$(./zig-out/bin/cottontail -p '6 * 7')" = "42"

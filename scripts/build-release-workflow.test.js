@@ -40,6 +40,16 @@ test('all native release artifacts reject compromised TLS chains before packagin
   assert.ok(workflow.indexOf('- name: Reject compromised TLS public keys') < workflow.indexOf('- name: Package release'));
 });
 
+test('macOS release binaries verify Electrobun native initialization before JavaScript', () => {
+  const name = 'Test Electrobun native initialization before JavaScript';
+  const gate = step(name);
+  assert.match(gate, /if: matrix\.os == 'macos'/);
+  assert.match(gate, /timeout-minutes: 3/);
+  assert.match(gate, /node scripts\/test-electrobun-startup\.js/);
+  assert.ok(workflow.indexOf('- name: Build and strip release binary') < workflow.indexOf(`- name: ${name}`));
+  assert.ok(workflow.indexOf(`- name: ${name}`) < workflow.indexOf('- name: Package release'));
+});
+
 test('Windows identity checks use the same Node version installed by setup-node', () => {
   for (const name of ['build-release.yml', 'bun-compat.yml']) {
     const source = readFileSync(new URL(`../.github/workflows/${name}`, import.meta.url), 'utf8');
