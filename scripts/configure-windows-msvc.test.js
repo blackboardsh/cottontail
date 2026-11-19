@@ -21,7 +21,7 @@ function filesystem(versions, arch = 'arm64') {
     win32.join(msvcRoot, version, 'include', 'yvals_core.h'),
     win32.join(msvcRoot, version, 'lib', arch, 'vcruntime.lib'),
   ]));
-  for (const [field, name] of [['include_dir', 'stdlib.h'], ['crt_dir', 'ucrt.lib'], ['kernel32_lib_dir', 'kernel32.lib']]) {
+  for (const [field, name] of [['include_dir', 'stdlib.h'], ['crt_dir', 'ucrt.lib'], ['kernel32_lib_dir', 'kernel32.lib'], ['msvc_lib_dir', 'vcruntime.lib']]) {
     const line = nativeLibc.replaceAll('arm64', arch).split('\r\n').find(line => line.startsWith(`${field}=`));
     paths.add(win32.join(line.slice(field.length + 1), name));
   }
@@ -31,30 +31,38 @@ function filesystem(versions, arch = 'arm64') {
   };
 }
 
-test('selects compatible installed STL and libraries, preserving Windows SDK paths', () => {
+test('selects compatible installed STL headers, preserving current MSVC runtime and Windows SDK libraries', () => {
   const result = configureLibc(nativeLibc, 'arm64', filesystem(['14.52.37025', '14.44.35207', '14.44.35211']));
   assert.equal(result.version, '14.44.35211');
   assert.ok(result.config.includes(`sys_include_dir=${msvcRoot}\\14.44.35211\\include\n`));
-  assert.ok(result.config.includes(`msvc_lib_dir=${msvcRoot}\\14.44.35211\\lib\\arm64\n`));
-  for (const line of nativeLibc.split('\r\n').filter(line => /^(include_dir|crt_dir|kernel32_lib_dir|gcc_dir)=/.test(line))) {
+  assert.ok(result.config.includes(`msvc_lib_dir=${msvcRoot}\\14.52.37025\\lib\\arm64\n`));
+  for (const line of nativeLibc.split('\r\n').filter(line => /^(include_dir|crt_dir|msvc_lib_dir|kernel32_lib_dir|gcc_dir)=/.test(line))) {
     assert.ok(result.config.includes(`${line}\n`));
   }
-  assert.doesNotMatch(result.config, /\r|14\.52|^\uFEFF/);
+  assert.doesNotMatch(result.config, /\r|^\uFEFF/);
 });
 
 test('selects x64 libraries for x64 builds', () => {
   const result = configureLibc(nativeLibc.replaceAll('arm64', 'x64'), 'x64', filesystem(['14.44.35211'], 'x64'));
-  assert.ok(result.config.includes(`msvc_lib_dir=${msvcRoot}\\14.44.35211\\lib\\x64\n`));
+  assert.ok(result.config.includes(`msvc_lib_dir=${msvcRoot}\\14.52.37025\\lib\\x64\n`));
 });
 
 test('fails clearly instead of falling back to incompatible or wrong-architecture tools', () => {
-  assert.throws(() => configureLibc(nativeLibc, 'arm64', filesystem(['14.52.37025'])), /MSVC 14\.44 arm64 is required/);
+  assert.throws(() => configureLibc(nativeLibc, 'arm64', filesystem(['14.52.37025'])), /MSVC 14\.44 headers are required/);
   const wrongArchitecture = filesystem(['14.44.35211']);
   const exists = wrongArchitecture.existsSync;
   wrongArchitecture.existsSync = path => !path.endsWith('arm64\\vcruntime.lib') && exists(path);
-  assert.throws(() => configureLibc(nativeLibc, 'arm64', wrongArchitecture), /MSVC 14\.44 arm64 is required/);
+  assert.throws(() => configureLibc(nativeLibc, 'arm64', wrongArchitecture), /Windows SDK file is missing: .*vcruntime\.lib/);
+  assert.throws(() => configureLibc(nativeLibc.replaceAll('arm64', 'x64'), 'arm64', filesystem(['14.44.35211'], 'x64')), /wrong architecture; expected arm64/);
   assert.throws(() => configureLibc(nativeLibc, 'x86', filesystem([])), /Unsupported Windows architecture/);
   assert.throws(() => configureLibc('msvc_lib_dir=x', 'arm64', filesystem([])), /did not detect Windows libc field include_dir/);
+});
+
+test('does not require old runtime libraries when selecting old headers', () => {
+  const fs = filesystem(['14.44.35211']);
+  const exists = fs.existsSync;
+  fs.existsSync = path => !path.includes('14.44.35211\\lib\\') && exists(path);
+  assert.equal(configureLibc(nativeLibc, 'arm64', fs).version, '14.44.35211');
 });
 
 test('detects SDK paths for the requested CPU using the native OS, then validates the supplied config separately', () => {

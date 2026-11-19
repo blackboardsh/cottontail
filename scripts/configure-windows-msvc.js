@@ -32,9 +32,14 @@ export function configureLibc(nativeLibc, arch, fs = { existsSync, readdirSync }
     if (!fields.get(field)) throw new Error(`Zig did not detect Windows libc field ${field}`);
   }
   // `zig libc <file>` only validates the format, not the files on disk.
-  for (const [field, name] of [['include_dir', 'stdlib.h'], ['crt_dir', 'ucrt.lib'], ['kernel32_lib_dir', 'kernel32.lib']]) {
+  for (const [field, name] of [['include_dir', 'stdlib.h'], ['crt_dir', 'ucrt.lib'], ['kernel32_lib_dir', 'kernel32.lib'], ['msvc_lib_dir', 'vcruntime.lib']]) {
     const path = win32.join(fields.get(field), name);
     if (!fs.existsSync(path)) throw new Error(`Windows SDK file is missing: ${path}`);
+  }
+  for (const field of ['crt_dir', 'kernel32_lib_dir', 'msvc_lib_dir']) {
+    if (win32.basename(fields.get(field)).toLowerCase() !== arch) {
+      throw new Error(`Zig detected ${field} for the wrong architecture; expected ${arch}: ${fields.get(field)}`);
+    }
   }
   const msvcRoot = win32.dirname(win32.dirname(win32.dirname(fields.get('msvc_lib_dir'))));
   const versions = fs.readdirSync(msvcRoot)
@@ -43,15 +48,16 @@ export function configureLibc(nativeLibc, arch, fs = { existsSync, readdirSync }
   const version = versions.find(candidate => {
     const root = win32.join(msvcRoot, candidate);
     return fs.existsSync(win32.join(root, 'include', 'vcruntime.h')) &&
-      fs.existsSync(win32.join(root, 'include', 'yvals_core.h')) &&
-      fs.existsSync(win32.join(root, 'lib', arch, 'vcruntime.lib'));
+      fs.existsSync(win32.join(root, 'include', 'yvals_core.h'));
   });
   if (!version) {
-    throw new Error(`MSVC 14.44 ${arch} is required by Zig's C++ compiler. Install the VS 2022 17.14 C++ tools; searched ${msvcRoot}`);
+    throw new Error(`MSVC 14.44 headers are required by Zig's C++ compiler. Install the VS 2022 17.14 C++ tools; searched ${msvcRoot}`);
   }
   const toolsetRoot = win32.join(msvcRoot, version);
   fields.set('sys_include_dir', win32.join(toolsetRoot, 'include'));
-  fields.set('msvc_lib_dir', win32.join(toolsetRoot, 'lib', arch));
+  // Keep the current runtime libraries: the prebuilt JSC SDK may require
+  // newer STL helper symbols absent from 14.44's ARM64 libraries. Newer
+  // MSVC runtime libraries support objects compiled with older headers.
   return {
     version,
     config: [...fields].map(([name, value]) => `${name}=${value}`).join('\n') + '\n',
@@ -84,7 +90,7 @@ function main() {
   // Only explicit target builds consume this. A global ZIG_LIBC would also
   // affect the x64 compiler host/build runner on ARM Windows and GNU probes.
   appendFileSync(process.env.GITHUB_ENV, `COTTONTAIL_ZIG_LIBC=${configPath}\n`);
-  console.log(`Selected MSVC ${version} for ${target}; Windows SDK paths retained from Zig discovery.`);
+  console.log(`Selected MSVC ${version} headers for ${target}; current MSVC runtime and Windows SDK paths retained from Zig discovery.`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();
