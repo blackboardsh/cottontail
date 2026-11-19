@@ -68,6 +68,10 @@ test('Windows releases select compatible Zig C++ headers before native compilati
   assert.match(gate, /node scripts\/configure-windows-msvc\.js/);
   assert.match(step('Validate release contracts'), /scripts\/configure-windows-msvc\.test\.js/);
   assert.match(step('Vendor Zig for Windows toolchain checks'), /node scripts\/setup\.js --zig-only/);
+  // setup's Windows PowerShell ZIP extractor must not inherit PowerShell 7's
+  // incompatible Archive module path from the runner's default pwsh shell.
+  assert.match(step('Vendor Zig for Windows toolchain checks'), /shell: bash/);
+  assert.match(step('Vendor Zig, HTML rewriter, and native dependencies'), /shell: bash/);
   assert.ok(workflow.indexOf('- name: Vendor Zig for Windows toolchain checks') < workflow.indexOf(`- name: ${name}`));
   assert.ok(workflow.indexOf(`- name: ${name}`) < workflow.indexOf('- name: Vendor Zig, HTML rewriter, and native dependencies'));
   assert.ok(workflow.indexOf(`- name: ${name}`) < workflow.indexOf('- name: Test ICU dispatch ABI'));
