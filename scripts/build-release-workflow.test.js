@@ -61,6 +61,16 @@ test('Windows identity checks use the same Node version installed by setup-node'
   }
 });
 
+test('Windows releases select compatible Zig C++ headers before native compilation', () => {
+  const name = 'Select compatible Windows C++ toolset for Zig';
+  const gate = step(name);
+  assert.match(gate, /if: matrix\.os == 'windows'/);
+  assert.match(gate, /node scripts\/configure-windows-msvc\.js/);
+  assert.match(step('Validate release contracts'), /scripts\/configure-windows-msvc\.test\.js/);
+  assert.ok(workflow.indexOf('- name: Vendor Zig, HTML rewriter, and native dependencies') < workflow.indexOf(`- name: ${name}`));
+  assert.ok(workflow.indexOf(`- name: ${name}`) < workflow.indexOf('- name: Test ICU dispatch ABI'));
+});
+
 test('Windows releases require native Job cleanup tests after building the supervisor', () => {
   const name = 'Test native Windows Job process cleanup';
   const gate = step(name);

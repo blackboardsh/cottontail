@@ -5,6 +5,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { releaseTargetArgs } from './release-target.js';
+import { windowsLibcArgs } from './configure-windows-msvc.js';
 
 const rootDir = process.cwd();
 const executableName = process.platform === 'win32' ? 'cottontail.exe' : 'cottontail';
@@ -34,6 +35,7 @@ const buildArgs = [
   'build-native-plugin',
   '-Doptimize=ReleaseFast',
   ...releaseTargetArgs(process.platform),
+  ...windowsLibcArgs(),
 ];
 run(zigPath, buildArgs, 'Native plugin fixture build');
 

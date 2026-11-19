@@ -44,10 +44,14 @@ try {
   const compiler = windows ? join(root, 'vendors/zig/zig.exe') : 'cc';
   const targetArgs = windows ? ['cc', '-target', windowsTarget(process.arch).zig]
     : process.platform === 'darwin' ? ['-mmacosx-version-min=14.0'] : [];
+  const compilerEnvironment = { ...process.env };
+  // The Clang driver does not accept `zig build`'s --libc option. Scope its
+  // equivalent environment setting to this explicitly targeted invocation.
+  if (windows && process.env.COTTONTAIL_ZIG_LIBC) compilerEnvironment.ZIG_LIBC = process.env.COTTONTAIL_ZIG_LIBC;
   const assembly = process.platform === 'darwin' ? 'macos' : windows ? 'windows' : 'linux';
   execFileSync(compiler, [...targetArgs, '-O2', '-I', join(root, 'src/icu_bridge'), source,
     join(root, `src/icu_bridge/${assembly}-trampolines.S`), '-o', binary],
-    { stdio: 'inherit', windowsHide: true, timeout: 300_000 });
+    { stdio: 'inherit', windowsHide: true, timeout: 300_000, env: compilerEnvironment });
   execFileSync(binary, [], { stdio: 'inherit', windowsHide: true, timeout: 30_000 });
 } finally {
   rmSync(temp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
