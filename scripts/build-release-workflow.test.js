@@ -67,7 +67,9 @@ test('Windows releases select compatible Zig C++ headers before native compilati
   assert.match(gate, /if: matrix\.os == 'windows'/);
   assert.match(gate, /node scripts\/configure-windows-msvc\.js/);
   assert.match(step('Validate release contracts'), /scripts\/configure-windows-msvc\.test\.js/);
-  assert.ok(workflow.indexOf('- name: Vendor Zig, HTML rewriter, and native dependencies') < workflow.indexOf(`- name: ${name}`));
+  assert.match(step('Vendor Zig for Windows toolchain checks'), /node scripts\/setup\.js --zig-only/);
+  assert.ok(workflow.indexOf('- name: Vendor Zig for Windows toolchain checks') < workflow.indexOf(`- name: ${name}`));
+  assert.ok(workflow.indexOf(`- name: ${name}`) < workflow.indexOf('- name: Vendor Zig, HTML rewriter, and native dependencies'));
   assert.ok(workflow.indexOf(`- name: ${name}`) < workflow.indexOf('- name: Test ICU dispatch ABI'));
 });
 

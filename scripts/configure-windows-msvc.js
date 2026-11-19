@@ -13,6 +13,16 @@ export function windowsLibcArgs(platform = process.platform, config = process.en
   return platform === 'win32' && config ? ['--libc', config] : [];
 }
 
+export function windowsLibcCommands(arch, configPath) {
+  const target = windowsTarget(arch).zig;
+  return {
+    // Zig accepts native SDK discovery only when the OS is inferred from
+    // the host. Keep the requested CPU: the Zig host is x64 even on ARM64.
+    discover: ['libc', '-target', target.replace('-windows-', '-native-')],
+    validate: ['libc', configPath, '-target', target],
+  };
+}
+
 export function configureLibc(nativeLibc, arch, fs = { existsSync, readdirSync }) {
   windowsTarget(arch); // Reject unsupported target architectures before selecting libraries.
   const fields = new Map(nativeLibc.replace(/\r\n/g, '\n').split('\n')
@@ -20,6 +30,11 @@ export function configureLibc(nativeLibc, arch, fs = { existsSync, readdirSync }
     .map(line => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
   for (const field of ['include_dir', 'sys_include_dir', 'crt_dir', 'msvc_lib_dir', 'kernel32_lib_dir']) {
     if (!fields.get(field)) throw new Error(`Zig did not detect Windows libc field ${field}`);
+  }
+  // `zig libc <file>` only validates the format, not the files on disk.
+  for (const [field, name] of [['include_dir', 'stdlib.h'], ['crt_dir', 'ucrt.lib'], ['kernel32_lib_dir', 'kernel32.lib']]) {
+    const path = win32.join(fields.get(field), name);
+    if (!fs.existsSync(path)) throw new Error(`Windows SDK file is missing: ${path}`);
   }
   const msvcRoot = win32.dirname(win32.dirname(win32.dirname(fields.get('msvc_lib_dir'))));
   const versions = fs.readdirSync(msvcRoot)
@@ -52,18 +67,20 @@ function main() {
   const target = windowsTarget(arch).zig;
   const env = { ...process.env };
   delete env.ZIG_LIBC;
-  const nativeLibc = execFileSync(zig, ['libc', '-target', target], { encoding: 'utf8', env });
-  const { version, config } = configureLibc(nativeLibc, arch);
   const directory = join(root, '.zig-cache', 'msvc');
-  mkdirSync(directory, { recursive: true });
   const configPath = join(directory, `${arch}-libc.txt`);
+  const commands = windowsLibcCommands(arch, configPath);
+  const nativeLibc = execFileSync(zig, commands.discover, { encoding: 'utf8', env });
+  const { version, config } = configureLibc(nativeLibc, arch);
+  mkdirSync(directory, { recursive: true });
   writeFileSync(configPath, config, 'utf8');
-  execFileSync(zig, ['libc', configPath, '-target', target], { stdio: 'inherit', env });
+  execFileSync(zig, commands.validate, { stdio: 'inherit', env });
   env.ZIG_LIBC = configPath;
   // Check the actual embedded C++ compiler against this STL before lengthy builds.
+  // `zig c++` would select Zig's bundled libc++; production uses MSVC headers.
   const probePath = join(directory, 'stl-probe.cpp');
-  writeFileSync(probePath, '#include <string>\nint main() { return std::string("MSVC").size() == 4 ? 0 : 1; }\n');
-  execFileSync(zig, ['c++', '-target', target, '-std=c++20', '-fsyntax-only', probePath], { stdio: 'inherit', env });
+  writeFileSync(probePath, '#include <yvals_core.h>\n#include <string>\nint main() { return std::string("MSVC").size() == 4 ? 0 : 1; }\n');
+  execFileSync(zig, ['cc', '-x', 'c++', '-target', target, '-std=c++20', '-fno-rtti', '-fms-compatibility-version=19.38', '-c', probePath, '-o', join(directory, 'stl-probe.obj')], { stdio: 'inherit', env });
   // Only explicit target builds consume this. A global ZIG_LIBC would also
   // affect the x64 compiler host/build runner on ARM Windows and GNU probes.
   appendFileSync(process.env.GITHUB_ENV, `COTTONTAIL_ZIG_LIBC=${configPath}\n`);

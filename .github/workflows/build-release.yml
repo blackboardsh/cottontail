@@ -142,15 +142,19 @@ jobs:
             cottontail-toolchains-${{ matrix.platform }}-v2-
             cottontail-${{ matrix.platform }}-v1-
 
+      - name: Vendor Zig for Windows toolchain checks
+        if: matrix.os == 'windows'
+        run: node scripts/setup.js --zig-only
+
+      - name: Select compatible Windows C++ toolset for Zig
+        if: matrix.os == 'windows'
+        run: node scripts/configure-windows-msvc.js
+
       - name: Vendor Zig, HTML rewriter, and native dependencies
         shell: bash
         run: |
           node scripts/setup.js
           node scripts/setup-zig-html-rewriter.js
-
-      - name: Select compatible Windows C++ toolset for Zig
-        if: matrix.os == 'windows'
-        run: node scripts/configure-windows-msvc.js
 
       - name: Save vendored toolchains
         if: steps.vendored-toolchains.outputs.cache-hit != 'true'

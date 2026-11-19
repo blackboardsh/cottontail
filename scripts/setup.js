@@ -250,6 +250,10 @@ async function setup() {
   } catch (error) {
     fail('Failed to vendor Zig.', error);
   }
+  if (process.argv.includes('--zig-only')) {
+    console.log(`\nZig toolchain is ready at vendors/zig/${getZigBinaryName()}`);
+    return;
+  }
   try {
     vendorWindowsDependencies();
   } catch (error) {
