@@ -7,33 +7,15 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <uv.h>
+
+#if !defined(_WIN32)
+#include <pthread.h>
+#endif
 
 #if defined(__linux__)
 #include <dlfcn.h>
-#include <pthread.h>
 #include <semaphore.h>
-
-typedef struct {
-    int64_t tv_sec;
-    int32_t tv_usec;
-} CtUvTimeval64;
-
-extern int uv_gettimeofday(CtUvTimeval64 *tv);
-extern void uv_rwlock_destroy(pthread_rwlock_t *rwlock);
-extern int uv_rwlock_init(pthread_rwlock_t *rwlock);
-extern void uv_rwlock_rdlock(pthread_rwlock_t *rwlock);
-extern void uv_rwlock_rdunlock(pthread_rwlock_t *rwlock);
-extern int uv_rwlock_tryrdlock(pthread_rwlock_t *rwlock);
-extern int uv_rwlock_trywrlock(pthread_rwlock_t *rwlock);
-extern void uv_rwlock_wrlock(pthread_rwlock_t *rwlock);
-extern void uv_rwlock_wrunlock(pthread_rwlock_t *rwlock);
-extern void uv_sem_destroy(sem_t *sem);
-extern int uv_sem_init(sem_t *sem, unsigned int value);
-extern void uv_sem_post(sem_t *sem);
-extern int uv_sem_trywait(sem_t *sem);
-extern void uv_sem_wait(sem_t *sem);
-extern unsigned int uv_version(void);
-extern const char *uv_version_string(void);
 #endif
 
 typedef struct NativePluginArguments NativePluginArguments;
@@ -272,7 +254,7 @@ static napi_value uv_gettimeofday_value(napi_env env, napi_callback_info info) {
     napi_value result = NULL;
 
 #if defined(__linux__)
-    CtUvTimeval64 now;
+    uv_timeval64_t now;
     if (uv_gettimeofday(&now) != 0 ||
         napi_create_double(env, (double)now.tv_sec * 1000.0 + (double)now.tv_usec / 1000.0, &result) != napi_ok) {
         return NULL;
@@ -332,6 +314,91 @@ static napi_value uv_rwlock_lifecycle(napi_env env, napi_callback_info info) {
     return result;
 }
 
+#if !defined(_WIN32)
+typedef struct UvAsyncLifecycle {
+    uv_async_t async;
+    pthread_t sender;
+    napi_env env;
+    napi_deferred deferred;
+    int send_status;
+    int closing_before;
+    int closing_after;
+} UvAsyncLifecycle;
+
+static int set_boolean_property(napi_env env, napi_value object, const char *name, int value) {
+    napi_value property = NULL;
+    return napi_get_boolean(env, value, &property) == napi_ok &&
+        napi_set_named_property(env, object, name, property) == napi_ok;
+}
+
+static void uv_async_lifecycle_closed(uv_handle_t *handle) {
+    UvAsyncLifecycle *lifecycle = (UvAsyncLifecycle *)handle->data;
+    napi_value result = NULL;
+    napi_value send_status = NULL;
+
+    if (napi_create_object(lifecycle->env, &result) == napi_ok &&
+        napi_create_int32(lifecycle->env, lifecycle->send_status, &send_status) == napi_ok &&
+        napi_set_named_property(lifecycle->env, result, "sendStatus", send_status) == napi_ok &&
+        set_boolean_property(lifecycle->env, result, "closingBefore", lifecycle->closing_before) &&
+        set_boolean_property(lifecycle->env, result, "closingAfter", lifecycle->closing_after)) {
+        napi_resolve_deferred(lifecycle->env, lifecycle->deferred, result);
+    }
+    free(lifecycle);
+}
+
+static void uv_async_lifecycle_aborted(uv_handle_t *handle) {
+    free(handle->data);
+}
+
+static void uv_async_lifecycle_received(uv_async_t *async) {
+    UvAsyncLifecycle *lifecycle = (UvAsyncLifecycle *)async->data;
+    pthread_join(lifecycle->sender, NULL);
+    lifecycle->closing_before = uv_is_closing((uv_handle_t *)async);
+    uv_close((uv_handle_t *)async, uv_async_lifecycle_closed);
+    lifecycle->closing_after = uv_is_closing((uv_handle_t *)async);
+}
+
+static void *uv_async_lifecycle_send(void *opaque) {
+    UvAsyncLifecycle *lifecycle = (UvAsyncLifecycle *)opaque;
+    lifecycle->send_status = uv_async_send(&lifecycle->async);
+    return NULL;
+}
+#endif
+
+static napi_value uv_async_lifecycle(napi_env env, napi_callback_info info) {
+    (void)info;
+#if defined(_WIN32)
+    napi_value result = NULL;
+    if (napi_get_undefined(env, &result) != napi_ok) return NULL;
+    return result;
+#else
+    UvAsyncLifecycle *lifecycle = (UvAsyncLifecycle *)calloc(1, sizeof(UvAsyncLifecycle));
+    uv_loop_t *loop = NULL;
+    napi_value promise = NULL;
+    if (lifecycle == NULL ||
+        napi_get_uv_event_loop(env, &loop) != napi_ok ||
+        loop == NULL ||
+        napi_create_promise(env, &lifecycle->deferred, &promise) != napi_ok) {
+        free(lifecycle);
+        napi_throw_error(env, NULL, "Failed to prepare libuv async lifecycle");
+        return NULL;
+    }
+    lifecycle->env = env;
+    if (uv_async_init(loop, &lifecycle->async, uv_async_lifecycle_received) != 0) {
+        free(lifecycle);
+        napi_throw_error(env, NULL, "Failed to initialize libuv async handle");
+        return NULL;
+    }
+    lifecycle->async.data = lifecycle;
+    if (pthread_create(&lifecycle->sender, NULL, uv_async_lifecycle_send, lifecycle) != 0) {
+        uv_close((uv_handle_t *)&lifecycle->async, uv_async_lifecycle_aborted);
+        napi_throw_error(env, NULL, "Failed to start libuv async sender");
+        return NULL;
+    }
+    return promise;
+#endif
+}
+
 static int export_function(napi_env env, napi_value exports, const char *name, napi_callback callback) {
     napi_value function = NULL;
     if (napi_create_function(env, name, NAPI_AUTO_LENGTH, callback, NULL, &function) != napi_ok) return 0;
@@ -347,5 +414,6 @@ NAPI_MODULE_INIT() {
     if (!export_function(env, exports, "uvGettimeofday", uv_gettimeofday_value)) return NULL;
     if (!export_function(env, exports, "uvRwlockLifecycle", uv_rwlock_lifecycle)) return NULL;
     if (!export_function(env, exports, "uvSemaphoreLifecycle", uv_semaphore_lifecycle)) return NULL;
+    if (!export_function(env, exports, "uvAsyncLifecycle", uv_async_lifecycle)) return NULL;
     return exports;
 }

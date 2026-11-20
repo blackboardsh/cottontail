@@ -11,6 +11,12 @@ const addon = require(addonPath);
 const abiVisibility = addon.abiVisibility();
 assert(abiVisibility.napiVisible, "native addons should resolve the retained N-API ABI");
 assert(abiVisibility.internalHidden, "non-ABI executable symbols should not resolve through dlsym");
+if (process.platform !== "win32") {
+  const asyncLifecycle = await addon.uvAsyncLifecycle();
+  assert(asyncLifecycle.sendStatus === 0, "native addons should send libuv async handles from another thread");
+  assert(asyncLifecycle.closingBefore === false, "new libuv async handles should not be closing");
+  assert(asyncLifecycle.closingAfter === true, "uv_close should synchronously mark async handles as closing");
+}
 if (process.platform === "linux") {
   assert(addon.uvVersion() === ((1 << 16) | (50 << 8) | 1), "native addons should call the public numeric libuv version ABI");
   assert(addon.uvVersionString() === "1.50.1-dev", "native addons should call the public libuv version ABI");
